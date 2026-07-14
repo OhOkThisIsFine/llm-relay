@@ -1,0 +1,169 @@
+import Ajv2020Import from "ajv/dist/2020.js";
+import type { ValidateFunction } from "ajv";
+import {
+  type AssistantMessage,
+  type ContentBlock,
+  type JsonSchema,
+  isToolUseBlock,
+} from "./anthropic.js";
+
+// ajv is a CJS module; under NodeNext the default import is not seen as
+// constructable, so cast to its constructor type. At runtime `module.exports`
+// IS the class, so `new Ajv2020(...)` works. We use the 2020-12 dialect because
+// tool schemas from Pydantic-v2 / zod-to-json-schema commonly declare it; a
+// draft-07-only Ajv throws on those and would force an accept-all fallback.
+const Ajv2020 = Ajv2020Import as unknown as typeof import("ajv/dist/2020.js").default;
+type AjvInstance = InstanceType<typeof Ajv2020>;
+
+export interface ValidationError {
+  kind:
+    | "unknown_tool"
+    | "input_not_object"
+    | "schema_violation"
+    | "stop_reason_mismatch";
+  blockIndex: number | null;
+  tool: string | null;
+  path?: string;
+  message: string;
+}
+
+export interface ValidationResult {
+  valid: boolean;
+  errors: ValidationError[];
+  /** tool_use blocks seen. */
+  toolUseCount: number;
+  /**
+   * tool_use blocks that could not be schema-checked (declared tool with no
+   * input_schema, or a schema Ajv could not compile). NOT a failure and NOT a
+   * clean pass — surfaced as its own verdict so "uncompilable schema" is never
+   * silently counted as valid.
+   */
+  uncheckableCount: number;
+}
+
+/**
+ * Deterministic tool_use gate. NO LLM. Turns a silently-broken tool call (empty
+ * args, wrong schema, hallucinated tool, or a tool_use without the matching
+ * stop_reason) into an explicit result the caller can log (detect mode) or act
+ * on (repair mode, later).
+ */
+export class ToolUseValidator {
+  private readonly ajv: AjvInstance;
+  private readonly cache = new Map<string, ValidateFunction | null>();
+
+  constructor() {
+    // Non-strict so vendor schemas (unknown formats/keywords) aren't rejected by
+    // the validator itself. allErrors surfaces every violation.
+    this.ajv = new Ajv2020({ strict: false, allErrors: true });
+  }
+
+  /** Returns a compiled validator, or null if the schema could not compile. */
+  private compiledFor(name: string, schema: JsonSchema): ValidateFunction | null {
+    const key = `${name}::${stableStringify(schema)}`;
+    if (this.cache.has(key)) return this.cache.get(key) ?? null;
+    let fn: ValidateFunction | null;
+    try {
+      // Strip $schema so a declared dialect Ajv2020 doesn't recognize (e.g.
+      // draft-07) can't throw on meta-schema resolution; the structural keywords
+      // tools use validate the same under the 2020-12 dialect.
+      const { $schema: _ignored, ...rest } = schema as Record<string, unknown>;
+      fn = this.ajv.compile(rest);
+    } catch {
+      fn = null; // uncheckable — recorded, never treated as pass
+    }
+    this.cache.set(key, fn);
+    return fn;
+  }
+
+  validate(
+    assistant: AssistantMessage,
+    tools: Map<string, JsonSchema | null>,
+  ): ValidationResult {
+    const errors: ValidationError[] = [];
+    const blocks: ContentBlock[] = Array.isArray(assistant.content)
+      ? assistant.content
+      : [];
+    let toolUseCount = 0;
+    let uncheckableCount = 0;
+
+    blocks.forEach((block, blockIndex) => {
+      if (!isToolUseBlock(block)) return;
+      toolUseCount++;
+      const { name, input } = block;
+
+      if (!tools.has(name)) {
+        errors.push({
+          kind: "unknown_tool",
+          blockIndex,
+          tool: name,
+          message: `tool_use references tool "${name}" not present in request tools[]`,
+        });
+        return;
+      }
+
+      // input must be a JSON object for ANY tool, schema or not.
+      if (typeof input !== "object" || input === null || Array.isArray(input)) {
+        errors.push({
+          kind: "input_not_object",
+          blockIndex,
+          tool: name,
+          message: `tool_use.input is not a JSON object (got ${describe(input)})`,
+        });
+        return;
+      }
+
+      const schema = tools.get(name) ?? null;
+      if (schema === null) {
+        uncheckableCount++; // declared built-in/typed tool, no schema to check
+        return;
+      }
+
+      const validate = this.compiledFor(name, schema);
+      if (validate === null) {
+        uncheckableCount++; // schema would not compile
+        return;
+      }
+
+      if (!validate(input)) {
+        for (const err of validate.errors ?? []) {
+          errors.push({
+            kind: "schema_violation",
+            blockIndex,
+            tool: name,
+            path: err.instancePath || "/",
+            message: `${err.instancePath || "(root)"} ${err.message ?? "failed schema"}`,
+          });
+        }
+      }
+    });
+
+    // stop_reason consistency: a tool_use block requires stop_reason "tool_use",
+    // else the harness will not execute the tool (loop stalls).
+    if (toolUseCount > 0 && assistant.stop_reason !== "tool_use") {
+      errors.push({
+        kind: "stop_reason_mismatch",
+        blockIndex: null,
+        tool: null,
+        message: `response has ${toolUseCount} tool_use block(s) but stop_reason is "${assistant.stop_reason}" (expected "tool_use")`,
+      });
+    }
+
+    return { valid: errors.length === 0, errors, toolUseCount, uncheckableCount };
+  }
+}
+
+function describe(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "array";
+  return typeof v;
+}
+
+/** Deterministic key for schema caching (order-independent). */
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  const keys = Object.keys(v as Record<string, unknown>).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableStringify((v as Record<string, unknown>)[k])}`)
+    .join(",")}}`;
+}
