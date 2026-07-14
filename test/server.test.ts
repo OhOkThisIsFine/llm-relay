@@ -6,6 +6,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createProxy } from "../src/server.js";
 import type { Config } from "../src/config.js";
+import type { Reshaper } from "../src/reshaper.js";
+import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
+import { reconstructFromSse } from "../src/sse.js";
 
 /** A mock Anthropic-ish backend the proxy forwards to. */
 function mockBackend(handler: (path: string, body: string) => { status?: number; headers: Record<string, string>; body: string }): Promise<Server> {
@@ -67,6 +70,7 @@ describe("repair-proxy end-to-end (detect mode)", () => {
       port: 0,
       backend: { base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000 },
       mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
     };
     proxy = await startProxy(cfg);
@@ -236,6 +240,7 @@ describe("credential handling", () => {
         ...(authEnv ? { authEnv } : {}),
       },
       mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
     };
     proxy = createProxy(cfg);
@@ -263,6 +268,93 @@ describe("credential handling", () => {
       body: JSON.stringify({ model: "m", messages: [] }),
     });
     expect(received.authorization).toBe("Bearer CLIENT-SECRET");
+  });
+});
+
+describe("repair mode (M2)", () => {
+  let dir: string;
+  let logFile: string;
+  let backend: Server;
+  let proxy: Server;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-rep-"));
+    logFile = join(dir, "log.jsonl");
+  });
+  afterAll(() => {
+    backend?.close();
+    proxy?.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const weatherTools = [
+    { name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
+  ];
+  const fixer: Reshaper = {
+    reshape: async () => ({
+      kind: "message",
+      message: { content: [{ type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } }], stop_reason: "tool_use" } as AssistantMessage,
+    }),
+  };
+
+  async function bootProxy(backendBody: { headers: Record<string, string>; body: string }, reshaper: Reshaper, destructiveTools: string[] = []): Promise<number> {
+    backend = await mockBackend(() => backendBody);
+    const cfg: Config = {
+      host: "127.0.0.1",
+      port: 0,
+      backend: { base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      mode: "repair",
+      repair: { maxAttempts: 2, destructiveTools },
+      log: { level: "metadata", file: logFile },
+    };
+    proxy = createProxy(cfg, { reshaper });
+    return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve(port(proxy))));
+  }
+
+  function reqBody(stream: boolean, tools: object[] = weatherTools): string {
+    return JSON.stringify({ model: "m", stream, messages: [{ role: "user", content: "weather?" }], tools });
+  }
+
+  it("replaces a broken NON-streaming tool call with the reshaped one", async () => {
+    const broken = JSON.stringify({ type: "message", role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }] });
+    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: broken }, fixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false) });
+    const j = (await resp.json()) as { content: unknown[] };
+    const tu = (j.content as AssistantMessage["content"]).find(isToolUseBlock);
+    expect(tu?.input).toEqual({ city: "Paris" }); // client got the repaired call, not the empty one
+    expect(lastLogLine(logFile).repair).toBe("fixed");
+  });
+
+  it("replaces a broken STREAMING tool call and re-emits valid SSE", async () => {
+    const brokenSse =
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"get_weather","input":{}}}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}\n\n' +
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n';
+    const p = await bootProxy({ headers: { "content-type": "text/event-stream" }, body: brokenSse }, fixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(true) });
+    const text = await resp.text();
+    const round = reconstructFromSse(text);
+    const tu = round.content.find(isToolUseBlock);
+    expect(tu?.input).toEqual({ city: "Paris" }); // re-emitted SSE carries the fix
+    expect(lastLogLine(logFile).repair).toBe("fixed");
+  });
+
+  it("passes a VALID tool call through untouched in repair mode", async () => {
+    const good = JSON.stringify({ type: "message", role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "get_weather", input: { city: "Rome" } }] });
+    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: good }, fixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false) });
+    expect(await resp.text()).toBe(good); // byte-identical passthrough
+    expect(lastLogLine(logFile).repair).toBe("none");
+  });
+
+  it("fail-closes (502) on a destructive tool call instead of fabricating it", async () => {
+    const broken = JSON.stringify({ type: "message", role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "delete_file", input: {} }] });
+    const delTools = [{ name: "delete_file", input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }];
+    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: broken }, fixer, ["delete"]);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false, delTools) });
+    expect(resp.status).toBe(502);
+    expect(lastLogLine(logFile).repair).toBe("refused_destructive");
   });
 });
 
@@ -300,6 +392,7 @@ describe("streaming transparency across many chunks", () => {
       port: 0,
       backend: { base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, authHeader: "x-api-key", timeoutMs: 5000 },
       mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },
     };
     proxy = createProxy(cfg);

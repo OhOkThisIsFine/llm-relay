@@ -17,6 +17,8 @@ export interface RequestLog {
   toolUseCount: number;
   uncheckableCount: number;
   errorKinds: string[];
+  /** Repair outcome (repair mode only); "none" when repair did not run. */
+  repair: "none" | "fixed" | "failed" | "refused" | "refused_destructive";
   latencyMs: number;
 }
 

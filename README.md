@@ -4,11 +4,19 @@ A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v
 
 **The one boundary:** it fixes/flags *protocol form* (malformed tool calls), never *judgment* (bad reasoning). See the spec.
 
-## Status — M0 + M1 (of the build plan)
+## Status — M0 + M1 + M2
 
 - ✅ M0 passthrough: forwards streaming + non-streaming `/v1/messages` byte-for-byte.
-- ✅ M1 validator + `detect` mode: deterministic tool_use gate (ajv), metadata-only logging of pass/fail — **behavior unchanged**, it only observes.
-- ⏳ M2 reshaper (repair mode), M3 streaming repair, M4 hardening — not built yet. `repair`/`strict` modes currently behave as `detect`.
+- ✅ M1 validator + `detect` mode: deterministic tool_use gate (Ajv2020), metadata-only logging of pass/fail/uncheckable — **behavior unchanged**, it only observes.
+- ✅ M2 `repair` mode: on a validation failure, a cheap reshaper model reshapes the call, the result is **re-validated**, and the corrected response is re-emitted to the client (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched.
+- ⏳ M4 hardening — streaming repair is implemented (buffer + re-emit); the text-streams-through optimization and broader hardening remain.
+
+### Live demo (no external creds)
+
+```bash
+npm run build && node scripts/live-demo.mjs
+```
+Runs the compiled CLI as a real process against a local flaky-model backend + stub reshaper, showing detect (logs the failure) then repair (delivers the fixed call).
 
 ## Install & run
 
@@ -39,11 +47,29 @@ claude -p "list the files here"
   "listen": "127.0.0.1:8791",              // loopback ONLY — startup refuses non-loopback
   "backend": {
     "base": "https://api.deepseek.com/anthropic",  // origin; the inbound path is appended
-    "authEnv": "DEEPSEEK_API_KEY"           // key injected as x-api-key + Bearer; inbound auth stripped
+    "authEnv": "DEEPSEEK_API_KEY",          // injected into ONE header; inbound auth stripped only when injecting
+    "authHeader": "x-api-key"               // or "authorization" (Bearer). default x-api-key
   },
-  "mode": "detect",                         // detect | (repair | strict — M2+, currently == detect)
+  "mode": "detect",                         // detect | repair (strict accepted, aliases detect)
+  "reshaper": {                             // REQUIRED when mode="repair"
+    "base": "https://api.anthropic.com",
+    "model": "claude-haiku-4-5-20251001",
+    "authEnv": "ANTHROPIC_API_KEY"
+  },
+  "repair": {
+    "maxAttempts": 2,
+    "destructiveTools": ["rm","delete","push","force","overwrite","drop","reset"]
+  },
   "log": { "level": "metadata", "file": null }  // metadata-only; NEVER logs headers/bodies
 }
+```
+
+### Real live run (needs your provider key)
+
+```bash
+# detect first — measure which models trip the validator on YOUR traffic:
+DEEPSEEK_API_KEY=sk-... node dist/cli.js --config config.json   # backend=DeepSeek, mode=detect
+# then point a claude CLI at it (see "Install & run" above) and inspect the log.
 ```
 
 ## What it logs (per request, metadata only)

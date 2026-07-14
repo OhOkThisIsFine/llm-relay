@@ -4,6 +4,14 @@ export type Mode = "detect" | "repair" | "strict";
 
 export type AuthHeader = "x-api-key" | "authorization";
 
+export interface ReshaperConfig {
+  base: string;
+  model: string;
+  authEnv?: string;
+  authHeader: AuthHeader;
+  timeoutMs: number;
+}
+
 export interface Config {
   host: string;
   port: number;
@@ -16,8 +24,13 @@ export interface Config {
     timeoutMs: number;
   };
   mode: Mode;
+  /** Required when mode === "repair". */
+  reshaper?: ReshaperConfig;
+  repair: { maxAttempts: number; destructiveTools: string[] };
   log: { level: "metadata" | "silent"; file: string | null };
 }
+
+const DEFAULT_DESTRUCTIVE = ["rm", "delete", "remove", "push", "force", "overwrite", "drop", "reset"];
 
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export { DEFAULT_ANTHROPIC_VERSION };
@@ -70,6 +83,20 @@ export function loadConfig(path: string): Config {
 
   const mode = normalizeMode(c.mode);
 
+  const reshaper = parseReshaper(c.reshaper);
+  if (mode === "repair" && !reshaper) {
+    throw new Error(`mode "repair" requires a config.reshaper { base, model, authEnv }`);
+  }
+
+  const repairRaw = (c.repair ?? {}) as { maxAttempts?: unknown; destructiveTools?: unknown };
+  const maxAttempts =
+    typeof repairRaw.maxAttempts === "number" && repairRaw.maxAttempts > 0
+      ? Math.floor(repairRaw.maxAttempts)
+      : 2;
+  const destructiveTools = Array.isArray(repairRaw.destructiveTools)
+    ? repairRaw.destructiveTools.filter((s): s is string => typeof s === "string")
+    : DEFAULT_DESTRUCTIVE;
+
   const logRaw = (c.log ?? {}) as { level?: unknown; file?: unknown };
   const level = logRaw.level === "silent" ? "silent" : "metadata";
   const file = typeof logRaw.file === "string" ? logRaw.file : null;
@@ -84,7 +111,22 @@ export function loadConfig(path: string): Config {
       ...(typeof backend.authEnv === "string" ? { authEnv: backend.authEnv } : {}),
     },
     mode,
+    ...(reshaper ? { reshaper } : {}),
+    repair: { maxAttempts, destructiveTools },
     log: { level, file },
+  };
+}
+
+function parseReshaper(raw: unknown): ReshaperConfig | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.base !== "string" || typeof r.model !== "string") return undefined;
+  return {
+    base: r.base.trim().replace(/\/+$/, ""),
+    model: r.model,
+    authHeader: r.authHeader === "authorization" ? "authorization" : "x-api-key",
+    timeoutMs: typeof r.timeoutMs === "number" && r.timeoutMs > 0 ? r.timeoutMs : 60000,
+    ...(typeof r.authEnv === "string" ? { authEnv: r.authEnv } : {}),
   };
 }
 
