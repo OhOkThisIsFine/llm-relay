@@ -9,6 +9,7 @@ import type { Config } from "../src/config.js";
 import type { Reshaper } from "../src/reshaper.js";
 import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
 import { reconstructFromSse } from "../src/sse.js";
+import { reconstruct } from "../src/reshaper.js";
 
 /** A mock Anthropic-ish backend the proxy forwards to. */
 function mockBackend(handler: (path: string, body: string) => { status?: number; headers: Record<string, string>; body: string }): Promise<Server> {
@@ -356,6 +357,147 @@ describe("repair mode (M2)", () => {
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false, delTools) });
     expect(resp.status).toBe(502);
     expect(lastLogLine(logFile).repair).toBe("refused_destructive");
+  });
+});
+
+describe("streaming repair (M4): text-through, buffer-at-tool_use", () => {
+  let dir: string;
+  let logFile: string;
+  let backend: Server;
+  let proxy: Server;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-m4-"));
+    logFile = join(dir, "log.jsonl");
+  });
+  afterAll(() => {
+    backend?.close();
+    proxy?.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const weatherTools = [
+    { name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
+  ];
+  // A reshaper that mirrors the real one: reconstruct the SAME message (blocks +
+  // order + indices preserved) with each failing tool's input set to {city:"Paris"}.
+  const parisFixer: Reshaper = {
+    reshape: async (req) => {
+      const inputs: Record<string, unknown> = {};
+      for (const b of req.rawAssistant.content) if (isToolUseBlock(b)) inputs[b.id] = { city: "Paris" };
+      return { kind: "message", message: reconstruct(req.rawAssistant, inputs) };
+    },
+  };
+
+  async function boot(body: { headers: Record<string, string>; body: string }, reshaper: Reshaper): Promise<number> {
+    backend = await mockBackend(() => body);
+    const cfg: Config = {
+      host: "127.0.0.1",
+      port: 0,
+      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+      mode: "repair",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "metadata", file: logFile },
+    };
+    proxy = createProxy(cfg, { reshaper });
+    return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve(port(proxy))));
+  }
+
+  function reqBody(): string {
+    return JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "weather?" }], tools: weatherTools });
+  }
+
+  const frame = (event: string, data: object) => `event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`;
+  const MSG_START = frame("message_start", { message: { usage: { input_tokens: 3 } } });
+  const MSG_END =
+    frame("message_delta", { delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } }) +
+    frame("message_stop", {});
+  const textBlock = (index: number, text: string) =>
+    frame("content_block_start", { index, content_block: { type: "text", text: "" } }) +
+    frame("content_block_delta", { index, delta: { type: "text_delta", text } }) +
+    frame("content_block_stop", { index });
+  const toolBlock = (index: number, id: string, input: object) =>
+    frame("content_block_start", { index, content_block: { type: "tool_use", id, name: "get_weather", input: {} } }) +
+    frame("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }) +
+    frame("content_block_stop", { index });
+
+  it("streams leading text through, repairs the trailing tool_use, one coherent stream", async () => {
+    const sse = MSG_START + textBlock(0, "Let me check the weather.") + toolBlock(1, "t1", {}) + MSG_END;
+    const p = await boot({ headers: { "content-type": "text/event-stream" }, body: sse }, parisFixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody() });
+    const text = await resp.text();
+
+    expect(text.startsWith(MSG_START)).toBe(true);              // message_start reached the client
+    expect(text).toContain("Let me check the weather.");        // leading text preserved verbatim
+    const round = reconstructFromSse(text);
+    expect(round.content[0]).toEqual({ type: "text", text: "Let me check the weather." });
+    const tu = round.content.find(isToolUseBlock);
+    expect(tu?.input).toEqual({ city: "Paris" });               // trailing tool_use repaired
+    expect(round.content.findIndex(isToolUseBlock)).toBe(1);    // index preserved (still block 1)
+    expect(lastLogLine(logFile).repair).toBe("fixed");
+  });
+
+  it("passes a pure-text streaming response through byte-for-byte (no buffering)", async () => {
+    const sse = MSG_START + textBlock(0, "No tool needed here.") + frame("message_delta", { delta: { stop_reason: "end_turn" } }) + frame("message_stop", {});
+    const p = await boot({ headers: { "content-type": "text/event-stream" }, body: sse }, parisFixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody() });
+    expect(await resp.text()).toBe(sse);                        // zero-touch passthrough
+    const rec = lastLogLine(logFile);
+    expect(rec.validated).toBe("pass");
+    expect(rec.repair).toBe("none");
+  });
+
+  it("passes a VALID streaming tool call through byte-for-byte (withheld frames flushed verbatim)", async () => {
+    const sse = MSG_START + textBlock(0, "Checking.") + toolBlock(1, "t1", { city: "Rome" }) + MSG_END;
+    const p = await boot({ headers: { "content-type": "text/event-stream" }, body: sse }, parisFixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody() });
+    expect(await resp.text()).toBe(sse);                        // byte-identical, reshaper never invoked
+    expect(lastLogLine(logFile).repair).toBe("none");
+  });
+
+  it("repairs INTERLEAVED text/tool_use blocks, preserving every block and index", async () => {
+    const sse =
+      MSG_START + textBlock(0, "First,") + toolBlock(1, "t1", {}) + textBlock(2, "and also") + toolBlock(3, "t2", {}) + MSG_END;
+    const p = await boot({ headers: { "content-type": "text/event-stream" }, body: sse }, parisFixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody() });
+    const round = reconstructFromSse(await resp.text());
+    expect(round.content.map((b) => b.type)).toEqual(["text", "tool_use", "text", "tool_use"]);
+    expect((round.content[2] as { text: string }).text).toBe("and also");   // interior text preserved
+    const tus = round.content.filter(isToolUseBlock);
+    expect(tus.map((b) => b.input)).toEqual([{ city: "Paris" }, { city: "Paris" }]);
+    expect(lastLogLine(logFile).repair).toBe("fixed");
+  });
+
+  it("handles CRLF-delimited SSE frames (repairs across \\r\\n\\r\\n boundaries)", async () => {
+    const crlf = (MSG_START + textBlock(0, "Hi") + toolBlock(1, "t1", {}) + MSG_END).replace(/\n\n/g, "\r\n\r\n");
+    const p = await boot({ headers: { "content-type": "text/event-stream" }, body: crlf }, parisFixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody() });
+    const round = reconstructFromSse(await resp.text());
+    expect(round.content.find(isToolUseBlock)?.input).toEqual({ city: "Paris" });
+    expect(lastLogLine(logFile).repair).toBe("fixed");
+  });
+
+  it("preserves multibyte UTF-8 in streamed-through text while repairing the tool", async () => {
+    const msg = "Weather in 東京 — brrr ❄️ let me check";
+    const sse = MSG_START + textBlock(0, msg) + toolBlock(1, "t1", {}) + MSG_END;
+    const p = await boot({ headers: { "content-type": "text/event-stream" }, body: sse }, parisFixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody() });
+    const text = await resp.text();
+    expect(text).toContain(msg);                                // no mojibake from byte-level frame splitting
+    expect(reconstructFromSse(text).content.find(isToolUseBlock)?.input).toEqual({ city: "Paris" });
+  });
+
+  it("emits a mid-stream SSE error (not a fabricated call) when repair fails after the head is sent", async () => {
+    const refuser: Reshaper = { reshape: async () => ({ kind: "refuse", reason: "ambiguous" }) };
+    const sse = MSG_START + textBlock(0, "Trying") + toolBlock(1, "t1", {}) + MSG_END;
+    const p = await boot({ headers: { "content-type": "text/event-stream" }, body: sse }, refuser);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody() });
+    expect(resp.status).toBe(200);                              // head already committed as a 200 stream
+    const text = await resp.text();
+    expect(text).toContain("Trying");                          // leading text still delivered
+    expect(text).toContain("event: error");                    // failure surfaced as an SSE error event
+    expect(text).not.toContain('"city"');                      // no fabricated tool input
+    expect(lastLogLine(logFile).repair).toBe("refused");
   });
 });
 

@@ -4,7 +4,7 @@ import { DEFAULT_ANTHROPIC_VERSION, type Config } from "./config.js";
 import { MetadataLogger, type RequestLog } from "./log.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
-import { emitSse } from "./emitSse.js";
+import { emitSse, emitSseTail } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { HttpReshaper, type Reshaper } from "./reshaper.js";
 import { fetchBackend } from "./backend.js";
@@ -153,8 +153,163 @@ async function transparentPath(
   });
 }
 
-/** repair: buffer, validate; if invalid, reshape and emit the corrected response. */
+/** repair: route to the streaming or buffered variant. */
 async function repairPath(
+  res: ServerResponse,
+  backendRes: Response,
+  timer: NodeJS.Timeout,
+  ctx: Ctx & { wantsStream: boolean },
+  h: Handlers,
+): Promise<void> {
+  if (ctx.streamed) {
+    await repairStreamingPath(res, backendRes, timer, ctx, h);
+  } else {
+    await repairBufferedPath(res, backendRes, timer, ctx, h);
+  }
+}
+
+/**
+ * repair, streaming: forward text-block SSE frames to the client as they arrive;
+ * withhold everything from the first tool_use `content_block_start` onward. At
+ * end-of-stream, validate the reconstructed message — if the tool calls are valid,
+ * flush the withheld frames byte-for-byte (fully transparent); if invalid, repair
+ * and re-emit only the corrected trailing blocks. `message_start` and any leading
+ * text have already reached the client, so a pure-text response streams through
+ * with zero added latency.
+ */
+async function repairStreamingPath(
+  res: ServerResponse,
+  backendRes: Response,
+  timer: NodeJS.Timeout,
+  ctx: Ctx & { wantsStream: boolean },
+  h: Handlers,
+): Promise<void> {
+  const filtered = filterResponseHeaders(backendRes.headers);
+  const decoder = new TextDecoder();
+  let acc = "";                 // full decoded stream, for reconstruction
+  let overflow = false;         // acc exceeded the validate cap → give up repair
+  let work = Buffer.alloc(0);   // raw bytes not yet split into complete frames
+  const held: Buffer[] = [];    // frames withheld from the client (first tool_use onward)
+  let buffering = false;
+  let firstToolUseIndex = -1;
+  let headWritten = false;
+
+  const ensureHead = () => {
+    if (!headWritten) {
+      res.writeHead(backendRes.status, filtered);
+      headWritten = true;
+    }
+  };
+  const forward = async (frame: Buffer) => {
+    ensureHead();
+    if (!res.write(frame)) await once(res, "drain");
+  };
+  const flushHeld = async () => {
+    for (const f of held) await forward(f);
+    held.length = 0;
+  };
+
+  const processFrame = async (frame: Buffer): Promise<void> => {
+    if (!overflow) {
+      acc += frame.toString("utf8");
+      if (acc.length > MAX_VALIDATE_BYTES) {
+        // Too large to validate/repair safely: stop holding, stream the rest.
+        overflow = true;
+        if (buffering) {
+          await flushHeld();
+          buffering = false;
+        }
+      }
+    }
+    if (buffering) {
+      held.push(frame);
+      return;
+    }
+    const toolUseIdx = overflow ? null : frameOpensToolUse(frame);
+    if (toolUseIdx !== null) {
+      buffering = true;
+      firstToolUseIndex = toolUseIdx;
+      held.push(frame);
+      return;
+    }
+    await forward(frame);
+  };
+
+  try {
+    if (backendRes.body) {
+      for await (const chunk of backendRes.body as unknown as AsyncIterable<Uint8Array>) {
+        work = work.length ? Buffer.concat([work, Buffer.from(chunk)]) : Buffer.from(chunk);
+        let end: number;
+        while ((end = frameEnd(work)) !== -1) {
+          const frame = work.subarray(0, end);
+          work = Buffer.from(work.subarray(end)); // detach from the growing buffer
+          await processFrame(frame);
+        }
+      }
+    }
+    if (work.length) await processFrame(work); // trailing partial frame
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let validated: RequestLog["validated"] = "skipped";
+  let toolUseCount = 0;
+  let uncheckableCount = 0;
+  let errorKinds: string[] = [];
+  let repairOutcome: RepairOutcome | "none" = "none";
+
+  if (overflow || !buffering) {
+    // Nothing was withheld (pure text, or gave up): stream already complete.
+    if (!buffering) {
+      const assistant = overflow ? null : reconstructFromSse(acc);
+      if (assistant) {
+        const r = h.validator.validate(assistant, ctx.tools);
+        validated = r.errors.length > 0 ? "fail" : r.uncheckableCount > 0 ? "uncheckable" : "pass";
+        toolUseCount = r.toolUseCount;
+        uncheckableCount = r.uncheckableCount;
+        errorKinds = dedupe(r.errors.map((e) => e.kind));
+      }
+    }
+    ensureHead();
+    res.end();
+  } else {
+    const assistant = reconstructFromSse(acc);
+    const r = h.validator.validate(assistant, ctx.tools);
+    toolUseCount = r.toolUseCount;
+    uncheckableCount = r.uncheckableCount;
+    if (r.valid) {
+      validated = r.uncheckableCount > 0 ? "uncheckable" : "pass";
+      await flushHeld();
+      ensureHead();
+      res.end();
+    } else {
+      validated = "fail";
+      errorKinds = dedupe(r.errors.map((e) => e.kind));
+      const decision = await repair(assistant, ctx.tools, {
+        validator: h.validator,
+        reshaper: h.reshaper!,
+        maxAttempts: 2,
+        isDestructive: h.isDestructive,
+      });
+      repairOutcome = decision.outcome;
+      ensureHead(); // message_start + leading text already forwarded
+      if (decision.outcome === "fixed" && decision.message) {
+        res.end(emitSseTail(decision.message, firstToolUseIndex));
+      } else {
+        // Head already committed — surface a mid-stream SSE error, never a fabricated call.
+        res.end(sseError(`repair-proxy: tool call could not be repaired (${decision.outcome})`));
+      }
+    }
+  }
+
+  h.logger.write({
+    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, true, backendRes.status, validated),
+    toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
+  });
+}
+
+/** repair, buffered (non-streamed JSON): buffer, validate; if invalid, reshape and re-emit. */
+async function repairBufferedPath(
   res: ServerResponse,
   backendRes: Response,
   timer: NodeJS.Timeout,
@@ -284,6 +439,49 @@ function parseAssistant(text: string): AssistantMessage | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * End offset (exclusive) of the first complete SSE frame in `buf`, or -1 if no
+ * frame boundary is present yet. Frames are delimited by a blank line — `\n\n`
+ * (LF) or `\r\n\r\n` (CRLF); whichever boundary comes first wins. Operates on
+ * raw bytes so multibyte UTF-8 in event payloads is never split.
+ */
+function frameEnd(buf: Buffer): number {
+  const lf = buf.indexOf("\n\n", 0, "latin1");
+  const crlf = buf.indexOf("\r\n\r\n", 0, "latin1");
+  if (lf === -1 && crlf === -1) return -1;
+  if (crlf !== -1 && (lf === -1 || crlf < lf)) return crlf + 4;
+  return lf + 2;
+}
+
+/**
+ * If `frame` is a `content_block_start` event opening a `tool_use` block, return
+ * its block index; otherwise null. This is the trigger to start withholding.
+ */
+function frameOpensToolUse(frame: Buffer): number | null {
+  const dataLines: string[] = [];
+  for (const line of frame.toString("utf8").split(/\r?\n/)) {
+    if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+  }
+  if (dataLines.length === 0) return null;
+  let evt: unknown;
+  try {
+    evt = JSON.parse(dataLines.join("\n"));
+  } catch {
+    return null;
+  }
+  if (typeof evt !== "object" || evt === null) return null;
+  const e = evt as { type?: unknown; index?: unknown; content_block?: { type?: unknown } };
+  if (e.type !== "content_block_start") return null;
+  if (!e.content_block || e.content_block.type !== "tool_use") return null;
+  return typeof e.index === "number" ? e.index : 0;
+}
+
+/** A single Anthropic-style SSE `error` event, for failing an already-open stream. */
+function sseError(message: string): string {
+  const data = JSON.stringify({ type: "error", error: { type: "api_error", message } });
+  return `event: error\ndata: ${data}\n\n`;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {

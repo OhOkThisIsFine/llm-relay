@@ -42,6 +42,34 @@ export function emitSse(msg: AssistantMessage): string {
   return out.join("");
 }
 
+/**
+ * Serialize ONLY the trailing content blocks (from `startIndex` onward) plus the
+ * message terminators — no `message_start`, no earlier blocks. Used by streaming
+ * repair: the proxy has already forwarded `message_start` and any leading text
+ * blocks byte-for-byte, then withheld from the first tool_use block. When a repair
+ * lands, this re-emits just the (corrected) tool_use blocks at their original
+ * indices so the client sees one coherent, contiguous stream.
+ */
+export function emitSseTail(msg: AssistantMessage, startIndex: number): string {
+  const out: string[] = [];
+  const push = (type: string, data: object) => {
+    out.push(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+  };
+
+  msg.content.forEach((block, index) => {
+    if (index < startIndex) return;
+    emitBlock(push, block, index);
+  });
+
+  push("message_delta", {
+    delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: null },
+    usage: { output_tokens: msg.usage?.output_tokens ?? 0 },
+  });
+  push("message_stop", {});
+
+  return out.join("");
+}
+
 function emitBlock(
   push: (type: string, data: object) => void,
   block: ContentBlock,
