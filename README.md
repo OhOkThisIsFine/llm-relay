@@ -161,6 +161,45 @@ This is the dataset for deciding which backend models are *format-broken* (resha
 
 `node scripts/nim-trip-rate.mjs` probes a list of backend models across difficulty-graded tool schemas (× N trials), runs each call through the real validator, and repairs the failures — producing a per-model **trip rate** (share of tool calls that fail schema validation) and **repair-fix rate**. Latest live NIM run: [`docs/nim-trip-rate.md`](docs/nim-trip-rate.md) (raw records in `docs/nim-trip-rate.jsonl`). The sharp result: even strong Llama-3.1 models emit `days:"5"` (string) against an `integer` schema on every trial — and the proxy repairs it every time; the flat/enum/nested schemas pass clean.
 
+## Composing with headroom (optional)
+
+[headroom](../headroom) is a separate loopback proxy that **optimizes/compresses**
+context on the way to the model. Both it and repair-proxy are transparent
+Anthropic-Messages proxies, so they chain — but only in one order, because
+repair-proxy's backend speaks OpenAI/NIM while headroom only forwards Anthropic:
+
+```
+claude → headroom (:8787, context optimization, OUTER) → repair-proxy (:8791, validate/repair + translate, INNER) → NIM/…
+```
+
+repair-proxy must be **innermost**. To chain them, point headroom's upstream at
+repair-proxy — headroom exposes this as a launch flag, so its own code is untouched:
+
+```bash
+ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8791   # headroom → repair-proxy
+```
+
+**Caveat:** that env var repoints *all* of headroom's Anthropic traffic — including
+your real (paid) Claude sessions — at repair-proxy. So run a **second, scoped
+headroom instance** for the multiplexed lane and leave your main one pointed at
+Anthropic:
+
+```bash
+HEADROOM_PORT=8788 ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8791 headroom proxy
+# then point the claude client at :8788 (the wrapper's isolated CLAUDE_CONFIG_DIR keeps
+# your subscription out of the path); :8787 stays your normal Anthropic route.
+```
+
+Note the `claude-proxied` wrappers set `ANTHROPIC_BASE_URL` straight to :8791 and use
+an isolated `CLAUDE_CONFIG_DIR`, so **by default they bypass headroom entirely** — you
+only get the chain if you deliberately point the client at a headroom instance whose
+upstream is repair-proxy.
+
+**Is it worth it?** headroom's headline win is $/token savings vs *paid* Anthropic —
+**moot on the free NIM pool**. What still pays off through the chain: context
+**compression to fit a smaller backend context window** + lower latency, plus
+headroom's backend-agnostic memory/learn layer. So stack it for context-fit, not cost.
+
 ## Design
 
 Consumers (audit-tools dispatch, plain `claude` CLI) point `ANTHROPIC_BASE_URL` at this proxy; it validates one backend per request. Target *selection* / token-prediction is a separate concern (the router/auditor), deliberately not here. For architecture, invariants, and the script inventory, see [CLAUDE.md](CLAUDE.md).
