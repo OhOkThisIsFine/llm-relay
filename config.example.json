@@ -20,6 +20,11 @@
       "base": "https://api.groq.com/openai/v1",
       "kind": "openai",
       "authEnv": "GROQ_API_KEY"
+    },
+    "mistral": {
+      "base": "https://api.mistral.ai/v1",
+      "kind": "openai",
+      "authEnv": "MISTRAL_API_KEY"
     }
   },
   "routing": {

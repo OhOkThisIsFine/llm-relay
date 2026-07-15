@@ -112,6 +112,26 @@ node dist/cli.js --config config.json --default openrouter/openai/gpt-5.2-codex 
 
 `repair-proxy --help` lists every override.
 
+### Model discovery (dynamic + cached)
+
+Model ids are **discovered live** from each provider's `/models` endpoint — never
+hand-maintained. The catalog is cached in `~/.repair-proxy/models-cache.json`
+(10-min TTL, fail-open: a fetch failure serves the last-known list).
+
+```bash
+repair-proxy models                      # list live models for every provider
+repair-proxy models --provider nim       # one provider
+repair-proxy models --provider nim --refresh   # force a re-fetch
+```
+
+On startup the proxy warms the cache and **warns about any routing target its
+provider doesn't serve** — so a stale/typo'd tier model is caught at boot, not
+silently at request time.
+
+> Provider notes: **Groq** returns `403 "check your network settings"` from some
+> IPs/regions (a network-side block, not a key issue) — it works once your network
+> allows it. **Mistral** needs `MISTRAL_API_KEY` set in your environment.
+
 ### Model tiers from leaderboards (never a hand-maintained table)
 
 `npm run sync:tiers` snapshots capability rankings from **BFCL** (Berkeley Function-Calling
