@@ -1,16 +1,16 @@
 import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bridge";
-import { type Config } from "./config.js";
+import { type ResolvedTarget } from "./config.js";
 
 /**
- * Fetch the backend and return an ANTHROPIC-shaped `Response`, regardless of the
- * backend's native wire format. For kind="anthropic" this is a passthrough. For
- * kind="openai" (NIM/vLLM/OpenRouter) the request is translated Anthropic→OpenAI
- * and the response translated back (streaming via llm-bridge's SSE re-encoder,
- * non-streaming via a direct mapper) — so the rest of the proxy (validate/repair)
- * always sees Anthropic Messages.
+ * Fetch the resolved provider target and return an ANTHROPIC-shaped `Response`,
+ * regardless of the backend's native wire format. For kind="anthropic" this is a
+ * passthrough. For kind="openai" (NIM/vLLM/OpenRouter/Gemini) the request is
+ * translated Anthropic→OpenAI and the response translated back (streaming via
+ * llm-bridge's SSE re-encoder, non-streaming via a direct mapper) — so the rest
+ * of the proxy (validate/repair) always sees Anthropic Messages.
  */
 export async function fetchBackend(
-  cfg: Config,
+  target: ResolvedTarget,
   args: {
     path: string;
     method: string;
@@ -22,10 +22,10 @@ export async function fetchBackend(
   },
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
-  if (cfg.backend.kind === "anthropic") {
+  if (target.kind === "anthropic") {
     const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
     if (args.reqBuf.length) init.body = args.reqBuf;
-    return fetchFn(cfg.backend.base + args.path, init);
+    return fetchFn(target.base + args.path, init);
   }
 
   // kind === "openai"
@@ -35,17 +35,17 @@ export async function fetchBackend(
   } catch (e) {
     return anthropicError(502, `request translation failed: ${(e as Error).message}`);
   }
-  openaiBody.model = cfg.backend.model;
+  openaiBody.model = target.model;
   openaiBody.stream = args.wantsStream;
 
   const headers: Record<string, string> = { "content-type": "application/json" };
-  const key = cfg.backend.authEnv ? process.env[cfg.backend.authEnv]?.trim() : undefined;
+  const key = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
   if (key) {
-    if (cfg.backend.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
+    if (target.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
     else headers["x-api-key"] = key;
   }
 
-  const res = await fetchFn(cfg.backend.base + "/chat/completions", {
+  const res = await fetchFn(target.base + "/chat/completions", {
     method: "POST",
     headers,
     body: JSON.stringify(openaiBody),
@@ -64,7 +64,7 @@ export async function fetchBackend(
 
   let anthropicJson: object;
   try {
-    anthropicJson = openAiResponseToAnthropic((await res.json()) as Record<string, unknown>, cfg.backend.model ?? "");
+    anthropicJson = openAiResponseToAnthropic((await res.json()) as Record<string, unknown>, target.model ?? "");
   } catch (e) {
     return anthropicError(502, `response translation failed: ${(e as Error).message}`);
   }

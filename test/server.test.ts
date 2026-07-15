@@ -69,7 +69,8 @@ describe("repair-proxy end-to-end (detect mode)", () => {
     cfg = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
@@ -234,13 +235,16 @@ describe("credential handling", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: {
-        base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
-        kind: "anthropic",
-        authHeader: "x-api-key",
-        timeoutMs: 5000,
-        ...(authEnv ? { authEnv } : {}),
+      providers: {
+        up: {
+          base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
+          kind: "anthropic",
+          authHeader: "x-api-key",
+          timeoutMs: 5000,
+          ...(authEnv ? { authEnv } : {}),
+        },
       },
+      routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
@@ -304,7 +308,8 @@ describe("repair mode", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "repair",
       repair: { maxAttempts: 2, destructiveTools },
       log: { level: "metadata", file: logFile },
@@ -394,7 +399,8 @@ describe("streaming repair: text-through, buffer-at-tool_use", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "repair",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
@@ -519,7 +525,8 @@ describe("OpenAI backend: count_tokens + non-messages paths", () => {
     (boot as unknown as { hits: () => number }).hits = () => backendHits;
     const cfg: Config = {
       host: "127.0.0.1", port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", model: "m", authHeader: "authorization", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
+      routing: { default: "up/m", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },
@@ -584,7 +591,8 @@ describe("streaming transparency across many chunks", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },

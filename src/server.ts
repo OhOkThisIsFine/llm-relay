@@ -1,6 +1,13 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
-import { DEFAULT_ANTHROPIC_VERSION, type Config } from "./config.js";
+import {
+  DEFAULT_ANTHROPIC_VERSION,
+  resolveTarget,
+  reshaperForTarget,
+  RoutingError,
+  type Config,
+  type ResolvedTarget,
+} from "./config.js";
 import { MetadataLogger, type RequestLog } from "./log.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
@@ -25,11 +32,28 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const validator = new ToolUseValidator();
   const logger = new MetadataLogger(cfg.log);
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
-  const reshaper: Reshaper | undefined =
+
+  // Reshaper selection is per-resolved-target: an explicit global reshaper (or an
+  // injected one) wins for every request; otherwise an openai target reshapes on
+  // itself (same base/model/key), built once per (provider, model) and cached.
+  const explicitReshaper: Reshaper | undefined =
     deps.reshaper ?? (cfg.reshaper ? new HttpReshaper(cfg.reshaper) : undefined);
+  const reshaperCache = new Map<string, Reshaper>();
+  const resolveReshaper = (target: ResolvedTarget): Reshaper | undefined => {
+    if (explicitReshaper) return explicitReshaper;
+    const spec = reshaperForTarget(target);
+    if (!spec) return undefined;
+    const key = `${target.provider}::${target.model ?? ""}`;
+    let r = reshaperCache.get(key);
+    if (!r) {
+      r = new HttpReshaper(spec);
+      reshaperCache.set(key, r);
+    }
+    return r;
+  };
 
   return createServer((req, res) => {
-    handle(req, res, cfg, { validator, logger, isDestructive, reshaper }).catch((e) => {
+    handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper }).catch((e) => {
       failClosed(res, 502, `repair-proxy internal error: ${(e as Error).message}`);
     });
   });
@@ -39,7 +63,7 @@ interface Handlers {
   validator: ToolUseValidator;
   logger: MetadataLogger;
   isDestructive: (name: string) => boolean;
-  reshaper: Reshaper | undefined;
+  resolveReshaper: (target: ResolvedTarget) => Reshaper | undefined;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
@@ -61,12 +85,26 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
   const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
 
+  // Route the request's model to a concrete provider + backend model. A bad route
+  // (unknown provider, missing model) is a clean 400, never a crash.
+  let target: ResolvedTarget;
+  try {
+    target = resolveTarget(model, cfg);
+  } catch (e) {
+    if (e instanceof RoutingError) {
+      failClosed(res, 400, `repair-proxy routing: ${e.message}`);
+      h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped"));
+      return;
+    }
+    throw e;
+  }
+
   // OpenAI-compatible backends expose ONLY /chat/completions — they have no
   // count_tokens route and no other Anthropic paths. Rather than mistranslate
   // those into a chat completion (yielding a spurious 400/garbage), answer
   // count_tokens locally with a cheap estimate and reject other paths cleanly.
   // For an Anthropic backend everything forwards as before (it speaks these).
-  if (cfg.backend.kind === "openai") {
+  if (target.kind === "openai") {
     if (isCountTokens) {
       const input_tokens = estimateInputTokens(reqJson);
       res.writeHead(200, { "content-type": "application/json" });
@@ -82,16 +120,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cfg.backend.timeoutMs);
+  const timer = setTimeout(() => controller.abort(), target.timeoutMs);
 
   let backendRes: Response;
   try {
-    backendRes = await fetchBackend(cfg, {
+    backendRes = await fetchBackend(target, {
       path,
       method: req.method ?? "POST",
       reqBuf,
       reqJson,
-      anthropicHeaders: buildForwardHeaders(req.headers, cfg),
+      anthropicHeaders: buildForwardHeaders(req.headers, target),
       wantsStream,
       signal: controller.signal,
     });
@@ -105,10 +143,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
   const willValidate = isMessages && hadTools && backendRes.status < 400;
-  const doRepair = cfg.mode === "repair" && willValidate && h.reshaper !== undefined;
+  const reshaper = h.resolveReshaper(target);
+  const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
 
   if (doRepair) {
-    await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools }, h);
+    await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper! }, h);
   } else {
     await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools }, h);
   }
@@ -175,12 +214,14 @@ async function transparentPath(
   });
 }
 
+type RepairCtx = Ctx & { wantsStream: boolean; reshaper: Reshaper };
+
 /** repair: route to the streaming or buffered variant. */
 async function repairPath(
   res: ServerResponse,
   backendRes: Response,
   timer: NodeJS.Timeout,
-  ctx: Ctx & { wantsStream: boolean },
+  ctx: RepairCtx,
   h: Handlers,
 ): Promise<void> {
   if (ctx.streamed) {
@@ -203,7 +244,7 @@ async function repairStreamingPath(
   res: ServerResponse,
   backendRes: Response,
   timer: NodeJS.Timeout,
-  ctx: Ctx & { wantsStream: boolean },
+  ctx: RepairCtx,
   h: Handlers,
 ): Promise<void> {
   const filtered = filterResponseHeaders(backendRes.headers);
@@ -309,7 +350,7 @@ async function repairStreamingPath(
       errorKinds = dedupe(r.errors.map((e) => e.kind));
       const decision = await repair(assistant, ctx.tools, {
         validator: h.validator,
-        reshaper: h.reshaper!,
+        reshaper: ctx.reshaper,
         maxAttempts: 2,
         isDestructive: h.isDestructive,
       });
@@ -335,7 +376,7 @@ async function repairBufferedPath(
   res: ServerResponse,
   backendRes: Response,
   timer: NodeJS.Timeout,
-  ctx: Ctx & { wantsStream: boolean },
+  ctx: RepairCtx,
   h: Handlers,
 ): Promise<void> {
   let bytes: Buffer;
@@ -372,7 +413,7 @@ async function repairBufferedPath(
       errorKinds = dedupe(r.errors.map((e) => e.kind));
       const decision = await repair(assistant, ctx.tools, {
         validator: h.validator,
-        reshaper: h.reshaper!,
+        reshaper: ctx.reshaper,
         maxAttempts: 2,
         isDestructive: h.isDestructive,
       });
@@ -422,8 +463,8 @@ function toAnthropicMessage(msg: AssistantMessage, model: string | null): object
   };
 }
 
-function buildForwardHeaders(inbound: IncomingMessage["headers"], cfg: Config): Record<string, string> {
-  const apiKey = cfg.backend.authEnv ? process.env[cfg.backend.authEnv]?.trim() : undefined;
+function buildForwardHeaders(inbound: IncomingMessage["headers"], target: ResolvedTarget): Record<string, string> {
+  const apiKey = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
   const stripAuth = !!apiKey;
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(inbound)) {
@@ -435,7 +476,7 @@ function buildForwardHeaders(inbound: IncomingMessage["headers"], cfg: Config): 
   }
   if (!out["anthropic-version"]) out["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION;
   if (apiKey) {
-    if (cfg.backend.authHeader === "authorization") out["authorization"] = `Bearer ${apiKey}`;
+    if (target.authHeader === "authorization") out["authorization"] = `Bearer ${apiKey}`;
     else out["x-api-key"] = apiKey;
   }
   return out;

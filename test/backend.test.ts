@@ -2,15 +2,17 @@ import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { fetchBackend, openAiResponseToAnthropic } from "../src/backend.js";
-import type { Config } from "../src/config.js";
+import type { ResolvedTarget } from "../src/config.js";
 
-function openaiKindCfg(base: string, model = "meta/llama-3.1-70b-instruct"): Config {
+function openaiTarget(base: string, model = "meta/llama-3.1-70b-instruct"): ResolvedTarget {
   return {
-    host: "127.0.0.1", port: 0,
-    backend: { base, kind: "openai", model, authHeader: "authorization", timeoutMs: 5000, authEnv: "RP_BACKEND_KEY" },
-    mode: "detect",
-    repair: { maxAttempts: 2, destructiveTools: [] },
-    log: { level: "silent", file: null },
+    provider: "nim",
+    base,
+    kind: "openai",
+    model,
+    authHeader: "authorization",
+    timeoutMs: 5000,
+    authEnv: "RP_BACKEND_KEY",
   };
 }
 
@@ -58,10 +60,10 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       });
       s.listen(0, "127.0.0.1", () => resolve(s));
     });
-    const cfg = openaiKindCfg(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
+    const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const anthropicReq = { model: "claude-x", stream: false, messages: [{ role: "user", content: "weather in Rome?" }], tools: [{ name: "get_weather", description: "w", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }] };
 
-    const res = await fetchBackend(cfg, {
+    const res = await fetchBackend(target, {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
