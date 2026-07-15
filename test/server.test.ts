@@ -501,6 +501,57 @@ describe("streaming repair (M4): text-through, buffer-at-tool_use", () => {
   });
 });
 
+describe("OpenAI backend: count_tokens + non-messages paths", () => {
+  let backend: Server;
+  let proxy: Server;
+  afterAll(() => { backend?.close(); proxy?.close(); });
+
+  async function boot(): Promise<number> {
+    let backendHits = 0;
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        backendHits++;
+        req.on("data", () => {});
+        req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    (boot as unknown as { hits: () => number }).hits = () => backendHits;
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", model: "m", authHeader: "authorization", timeoutMs: 5000 },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    proxy = createProxy(cfg);
+    return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve(port(proxy))));
+  }
+
+  it("answers count_tokens locally with an estimate, never touching the backend", async () => {
+    const p = await boot();
+    const before = (boot as unknown as { hits: () => number }).hits();
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages/count_tokens`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", system: "you are helpful", messages: [{ role: "user", content: "count these characters please" }] }),
+    });
+    expect(resp.status).toBe(200);
+    const j = (await resp.json()) as { input_tokens: number };
+    expect(j.input_tokens).toBeGreaterThan(0);
+    expect((boot as unknown as { hits: () => number }).hits()).toBe(before); // backend NOT called
+  });
+
+  it("returns a clean 404 for a non-messages path instead of mistranslating it", async () => {
+    const p = await boot();
+    const resp = await fetch(`http://127.0.0.1:${p}/`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    });
+    expect(resp.status).toBe(404);
+    const j = (await resp.json()) as { error?: { message?: string } };
+    expect(j.error?.message).toMatch(/not supported/);
+  });
+});
+
 describe("streaming transparency across many chunks", () => {
   let backend: Server;
   let proxy: Server;

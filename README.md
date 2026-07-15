@@ -30,16 +30,35 @@ NVIDIA_API_KEY=nvapi-... node dist/cli.js --config config.json
 NVIDIA_API_KEY=nvapi-... npm run dev -- --config config.json
 ```
 
-Then point a client at it:
+## Use it from your projects
+
+Point the `claude` CLI at the running proxy. **The one thing that matters:** give claude an **isolated `CLAUDE_CONFIG_DIR`**. Without it, an active claude.ai subscription session conflicts with the proxy token and claude fails client-side with `Invalid API key` / `401 Invalid bearer token` before any request is even sent. With it, the proxy's provider token is the sole credential — and your subscription is never in the path (the safe direction).
+
+Wrappers do this for you (they also set the thinking/beta/attribution flags the harness needs against a non-Anthropic model):
+
+```powershell
+# PowerShell (from any project directory)
+C:\Code\repair-proxy\scripts\claude-proxied.ps1 -p "list the files here"
+```
+```bash
+# bash
+/c/Code/repair-proxy/scripts/claude-proxied.sh -p "list the files here"
+```
+
+Or inline, if you'd rather not use the wrapper:
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8791 \
-ANTHROPIC_AUTH_TOKEN=anything \
-CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 \
-CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 \
-CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
-claude -p "list the files here"
+env -u CLAUDECODE -u ANTHROPIC_API_KEY \
+  CLAUDE_CONFIG_DIR="$HOME/.repair-proxy-claude" \
+  ANTHROPIC_BASE_URL=http://127.0.0.1:8791 \
+  ANTHROPIC_AUTH_TOKEN=dummy \
+  CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
+  claude -p "list the files here"
 ```
+
+`ANTHROPIC_AUTH_TOKEN` can be `dummy` — the proxy strips inbound auth and injects the real backend key itself (from `authEnv`). Override the wrapper defaults with `RP_PROXY_URL`, `RP_AUTH`, `RP_CONFIG_DIR`. Verified live end-to-end: a real `claude` agentic session (tool_use → tool_result → answer) completes through the proxy against NIM.
+
+> Backend note: weak models still fail *reasoning* (they may loop or skip a tool) — repair fixes malformed tool-call *form*, not judgment. Pick a strong tool-caller as the backend model. NIM also rate-limits (HTTP 429) under load; claude's own retry/backoff absorbs it.
 
 ## Config
 

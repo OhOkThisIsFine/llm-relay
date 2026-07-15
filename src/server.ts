@@ -57,7 +57,29 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const hadTools = tools.size > 0;
   const model = pickString(reqJson, "model");
   const wantsStream = pickBool(reqJson, "stream");
-  const isMessages = req.method === "POST" && path.startsWith("/v1/messages");
+  const pathname = path.split("?")[0] ?? path;
+  const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
+  const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
+
+  // OpenAI-compatible backends expose ONLY /chat/completions — they have no
+  // count_tokens route and no other Anthropic paths. Rather than mistranslate
+  // those into a chat completion (yielding a spurious 400/garbage), answer
+  // count_tokens locally with a cheap estimate and reject other paths cleanly.
+  // For an Anthropic backend everything forwards as before (it speaks these).
+  if (cfg.backend.kind === "openai") {
+    if (isCountTokens) {
+      const input_tokens = estimateInputTokens(reqJson);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ input_tokens }));
+      h.logger.write(baseLog(started, path, model, hadTools, false, 200, "skipped"));
+      return;
+    }
+    if (!isMessages) {
+      failClosed(res, 404, `repair-proxy: path not supported for an openai backend: ${pathname}`);
+      h.logger.write(baseLog(started, path, model, hadTools, false, 404, "skipped"));
+      return;
+    }
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.backend.timeoutMs);
@@ -512,6 +534,27 @@ function baseLog(
     toolUseCount: 0, uncheckableCount: 0, errorKinds: [], repair: "none",
     latencyMs: Date.now() - started,
   };
+}
+
+/**
+ * Cheap local token estimate for a /v1/messages/count_tokens request against an
+ * OpenAI backend (which has no native count_tokens). ~4 chars/token over all
+ * string content in system+messages+tools. Advisory only — the harness uses this
+ * for context-budget bookkeeping, not correctness.
+ */
+function estimateInputTokens(body: unknown): number {
+  if (typeof body !== "object" || body === null) return 0;
+  let chars = 0;
+  const walk = (v: unknown): void => {
+    if (typeof v === "string") chars += v.length;
+    else if (Array.isArray(v)) for (const x of v) walk(x);
+    else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x);
+  };
+  const b = body as Record<string, unknown>;
+  walk(b.system);
+  walk(b.messages);
+  walk(b.tools);
+  return Math.max(1, Math.ceil(chars / 4));
 }
 
 function pickString(obj: unknown, key: string): string | null {
