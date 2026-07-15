@@ -2,7 +2,7 @@
 
 A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v1/messages` to any backend model and **validates tool-call responses** against the request's `tools[].input_schema`, so the Claude Code harness (or any `ANTHROPIC_BASE_URL` client) can run on non-Anthropic models without pre-filtering them by tool competence.
 
-**The one boundary:** it fixes/flags *protocol form* (malformed tool calls), never *judgment* (bad reasoning). See the spec.
+**The one boundary:** it fixes/flags *protocol form* (malformed tool calls), never *judgment* (bad reasoning).
 
 ## Status — M0 + M1 + M2 + M4
 
@@ -131,7 +131,7 @@ This is the dataset for deciding which backend models are *format-broken* (resha
 
 ## Design
 
-Full spec: `repair-proxy-spec.md` (in the design scratchpad). Consumers (audit-tools dispatch, plain `claude` CLI) point `ANTHROPIC_BASE_URL` at this proxy; it validates one backend per request. Target *selection* / token-prediction is a separate concern (the router/auditor), deliberately not here.
+Consumers (audit-tools dispatch, plain `claude` CLI) point `ANTHROPIC_BASE_URL` at this proxy; it validates one backend per request. Target *selection* / token-prediction is a separate concern (the router/auditor), deliberately not here. For architecture, invariants, and the script inventory, see [CLAUDE.md](CLAUDE.md).
 
 ## Dev
 
