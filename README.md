@@ -148,7 +148,11 @@ coherent JSON view:
 
 The consumer then dispatches by pointing its OpenAI-compatible pool at :8791 and
 setting each packet's model to a **namespaced** `provider/model` (it picked the exact
-backend). Meanwhile a plain `claude` client that sends `claude-sonnet-…` still gets the
+backend). repair-proxy exposes an **OpenAI-compatible front** for exactly this —
+`POST /v1/chat/completions` (and `/chat/completions`): the request's `model` is routed
+by namespace/tier, rewritten to the backend id, and the upstream OpenAI response is
+returned verbatim (OpenAI in, OpenAI out — the Anthropic `/v1/messages` front with
+tool-call repair stays available in parallel for a Claude-harness client). Meanwhile a plain `claude` client that sends `claude-sonnet-…` still gets the
 **dumb tier/default routing** — both coexist, no mode switch. So the tier map stays the
 default, and dispatcher-style usage is just "send namespaced ids + read `/registry`".
 

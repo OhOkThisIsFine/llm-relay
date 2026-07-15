@@ -106,3 +106,45 @@ function anthropicError(status: number, message: string): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+function openaiError(status: number, message: string): Response {
+  return new Response(JSON.stringify({ error: { message, type: "invalid_request_error" } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * OpenAI-compatible FRONT: an OpenAI `/chat/completions` request comes in, its `model`
+ * has already been resolved to a provider target by namespace/tier routing. For an
+ * openai-kind target this is a routing reverse-proxy — rewrite `model` to the backend
+ * id, inject the backend key, and stream the upstream OpenAI response straight back
+ * (OpenAI in, OpenAI out — no translation). This is the transport a dispatcher (e.g.
+ * audit-tools) consumes to reach many backends behind one endpoint.
+ *
+ * anthropic-kind targets are not served on the OpenAI front (they need OpenAI↔Anthropic
+ * translation and are not the dispatcher use case) — a clean 400, never a mistranslation.
+ */
+export async function fetchOpenAiFront(
+  target: ResolvedTarget,
+  args: { reqJson: unknown; wantsStream: boolean; signal: AbortSignal },
+  fetchFn: typeof fetch = fetch,
+): Promise<Response> {
+  if (target.kind !== "openai") {
+    return openaiError(400, `repair-proxy: OpenAI front requires an openai-kind provider; "${target.provider}" is ${target.kind}`);
+  }
+  const base = (args.reqJson ?? {}) as Record<string, unknown>;
+  const body = { ...base, model: target.model, stream: args.wantsStream };
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const key = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
+  if (key) {
+    if (target.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
+    else headers["x-api-key"] = key;
+  }
+  return fetchFn(target.base + "/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: args.signal,
+  });
+}

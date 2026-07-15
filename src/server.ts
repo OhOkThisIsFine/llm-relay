@@ -14,7 +14,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { buildRegistry } from "./registry.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -115,6 +115,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     throw e;
   }
 
+  // OpenAI-compatible FRONT: a dispatcher (e.g. audit-tools) POSTs OpenAI Chat
+  // Completions with a namespaced model; route by target and reverse-proxy the
+  // upstream OpenAI response straight back (OpenAI in, OpenAI out).
+  if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
+    await openAiFrontPath(res, target, { reqJson, wantsStream, started, path, model, hadTools }, h);
+    return;
+  }
+
   // OpenAI-compatible backends expose ONLY /chat/completions — they have no
   // count_tokens route and no other Anthropic paths. Rather than mistranslate
   // those into a chat completion (yielding a spurious 400/garbage), answer
@@ -176,6 +184,48 @@ interface Ctx {
   started: number;
   path: string;
   hadTools: boolean;
+}
+
+/**
+ * OpenAI front: reverse-proxy the resolved target's /chat/completions to the client,
+ * verbatim (streaming or buffered). No Anthropic translation, no tool-call repair —
+ * this is the multiplexer path a dispatcher uses to reach many backends by namespace.
+ */
+async function openAiFrontPath(
+  res: ServerResponse,
+  target: ResolvedTarget,
+  ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; model: string | null; hadTools: boolean },
+  h: Handlers,
+): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), target.timeoutMs);
+  let upstream: Response;
+  try {
+    upstream = await fetchOpenAiFront(target, { reqJson: ctx.reqJson, wantsStream: ctx.wantsStream, signal: controller.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    const aborted = controller.signal.aborted;
+    const status = aborted ? 504 : 502;
+    if (!res.headersSent) {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
+    }
+    h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, false, status, "skipped"));
+    return;
+  }
+  try {
+    res.writeHead(upstream.status, filterResponseHeaders(upstream.headers));
+    if (upstream.body) {
+      for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
+        if (!res.write(Buffer.from(chunk))) await once(res, "drain");
+      }
+    }
+    res.end();
+  } finally {
+    clearTimeout(timer);
+  }
+  const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+  h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped"));
 }
 
 /** detect/default: forward bytes unchanged, observe + log if applicable. */
