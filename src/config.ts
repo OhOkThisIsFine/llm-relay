@@ -17,8 +17,16 @@ export interface Config {
   port: number;
   backend: {
     base: string;
+    /**
+     * "anthropic" (default): backend speaks Anthropic Messages; forward as-is.
+     * "openai": backend is OpenAI-compatible (NIM/vLLM/OpenRouter); the proxy
+     * translates request+response via llm-bridge. Requires `model`.
+     */
+    kind: "anthropic" | "openai";
+    /** Target model id for kind="openai" (e.g. "meta/llama-3.1-70b-instruct"). */
+    model?: string;
     authEnv?: string;
-    /** Which header to inject the backend key into. Default "x-api-key". */
+    /** Which header to inject the backend key into. Default: x-api-key (anthropic) / authorization (openai). */
     authHeader: AuthHeader;
     /** Backend request deadline in ms. Default 120000. */
     timeoutMs: number;
@@ -72,12 +80,20 @@ export function loadConfig(path: string): Config {
   }
   const backend = backendRaw as {
     base: string;
+    kind?: unknown;
+    model?: unknown;
     authEnv?: unknown;
     authHeader?: unknown;
     timeoutMs?: unknown;
   };
   const base = backend.base.trim().replace(/\/+$/, "");
-  const authHeader: AuthHeader = backend.authHeader === "authorization" ? "authorization" : "x-api-key";
+  const kind: "anthropic" | "openai" = backend.kind === "openai" ? "openai" : "anthropic";
+  if (kind === "openai" && typeof backend.model !== "string") {
+    throw new Error(`config.backend.kind "openai" requires config.backend.model (the target model id)`);
+  }
+  const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
+  const authHeader: AuthHeader =
+    backend.authHeader === "authorization" ? "authorization" : backend.authHeader === "x-api-key" ? "x-api-key" : defaultAuthHeader;
   const timeoutMs =
     typeof backend.timeoutMs === "number" && backend.timeoutMs > 0 ? backend.timeoutMs : 120000;
 
@@ -106,8 +122,10 @@ export function loadConfig(path: string): Config {
     port,
     backend: {
       base,
+      kind,
       authHeader,
       timeoutMs,
+      ...(kind === "openai" ? { model: backend.model as string } : {}),
       ...(typeof backend.authEnv === "string" ? { authEnv: backend.authEnv } : {}),
     },
     mode,

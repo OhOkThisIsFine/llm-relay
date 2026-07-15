@@ -68,7 +68,7 @@ describe("repair-proxy end-to-end (detect mode)", () => {
     cfg = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
@@ -235,6 +235,7 @@ describe("credential handling", () => {
       port: 0,
       backend: {
         base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
+        kind: "anthropic",
         authHeader: "x-api-key",
         timeoutMs: 5000,
         ...(authEnv ? { authEnv } : {}),
@@ -302,7 +303,7 @@ describe("repair mode (M2)", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      backend: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
       mode: "repair",
       repair: { maxAttempts: 2, destructiveTools },
       log: { level: "metadata", file: logFile },
@@ -390,7 +391,7 @@ describe("streaming transparency across many chunks", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      backend: { base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },

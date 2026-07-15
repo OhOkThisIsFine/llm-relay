@@ -1,0 +1,108 @@
+import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bridge";
+import { type Config } from "./config.js";
+
+/**
+ * Fetch the backend and return an ANTHROPIC-shaped `Response`, regardless of the
+ * backend's native wire format. For kind="anthropic" this is a passthrough. For
+ * kind="openai" (NIM/vLLM/OpenRouter) the request is translated Anthropic→OpenAI
+ * and the response translated back (streaming via llm-bridge's SSE re-encoder,
+ * non-streaming via a direct mapper) — so the rest of the proxy (validate/repair)
+ * always sees Anthropic Messages.
+ */
+export async function fetchBackend(
+  cfg: Config,
+  args: {
+    path: string;
+    method: string;
+    reqBuf: Buffer;
+    reqJson: unknown;
+    anthropicHeaders: Record<string, string>;
+    wantsStream: boolean;
+    signal: AbortSignal;
+  },
+  fetchFn: typeof fetch = fetch,
+): Promise<Response> {
+  if (cfg.backend.kind === "anthropic") {
+    const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
+    if (args.reqBuf.length) init.body = args.reqBuf;
+    return fetchFn(cfg.backend.base + args.path, init);
+  }
+
+  // kind === "openai"
+  let openaiBody: Record<string, unknown>;
+  try {
+    openaiBody = translateBetweenProviders("anthropic", "openai", (args.reqJson ?? {}) as never) as Record<string, unknown>;
+  } catch (e) {
+    return anthropicError(502, `request translation failed: ${(e as Error).message}`);
+  }
+  openaiBody.model = cfg.backend.model;
+  openaiBody.stream = args.wantsStream;
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const key = cfg.backend.authEnv ? process.env[cfg.backend.authEnv]?.trim() : undefined;
+  if (key) {
+    if (cfg.backend.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
+    else headers["x-api-key"] = key;
+  }
+
+  const res = await fetchFn(cfg.backend.base + "/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(openaiBody),
+    signal: args.signal,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    return anthropicError(res.status, `openai backend HTTP ${res.status}: ${body.slice(0, 300)}`);
+  }
+
+  if (args.wantsStream && res.body) {
+    const anthStream = handleUniversalStreamRequest(res.body, "openai", "anthropic");
+    return new Response(anthStream, { status: res.status, headers: { "content-type": "text/event-stream" } });
+  }
+
+  let anthropicJson: object;
+  try {
+    anthropicJson = openAiResponseToAnthropic((await res.json()) as Record<string, unknown>, cfg.backend.model ?? "");
+  } catch (e) {
+    return anthropicError(502, `response translation failed: ${(e as Error).message}`);
+  }
+  return new Response(JSON.stringify(anthropicJson), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+/** Map a non-streaming OpenAI chat completion into an Anthropic message. */
+export function openAiResponseToAnthropic(j: Record<string, unknown>, model: string): object {
+  const choice = (j.choices as Array<Record<string, unknown>> | undefined)?.[0] ?? {};
+  const msg = (choice.message as Record<string, unknown> | undefined) ?? {};
+  const content: object[] = [];
+  if (typeof msg.content === "string" && msg.content.length > 0) content.push({ type: "text", text: msg.content });
+  const toolCalls = (msg.tool_calls as Array<Record<string, unknown>> | undefined) ?? [];
+  for (const tc of toolCalls) {
+    const fn = (tc.function as Record<string, unknown> | undefined) ?? {};
+    let input: unknown;
+    try { input = JSON.parse((fn.arguments as string) ?? "{}"); } catch { input = fn.arguments ?? {}; }
+    content.push({ type: "tool_use", id: (tc.id as string) ?? "tu", name: (fn.name as string) ?? "", input });
+  }
+  const finish = choice.finish_reason as string | undefined;
+  const stopReason =
+    toolCalls.length > 0 ? "tool_use" : finish === "length" ? "max_tokens" : finish === "stop" ? "end_turn" : finish ?? "end_turn";
+  const usage = (j.usage as Record<string, number> | undefined) ?? {};
+  return {
+    id: (j.id as string) ?? "msg_translated",
+    type: "message",
+    role: "assistant",
+    model: model || ((j.model as string) ?? ""),
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: { input_tokens: usage.prompt_tokens ?? 0, output_tokens: usage.completion_tokens ?? 0 },
+  };
+}
+
+function anthropicError(status: number, message: string): Response {
+  return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}

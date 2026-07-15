@@ -7,6 +7,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { HttpReshaper, type Reshaper } from "./reshaper.js";
+import { fetchBackend } from "./backend.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
 
 const HOP_BY_HOP = new Set([
@@ -63,13 +64,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   let backendRes: Response;
   try {
-    const init: RequestInit = {
+    backendRes = await fetchBackend(cfg, {
+      path,
       method: req.method ?? "POST",
-      headers: buildForwardHeaders(req.headers, cfg),
+      reqBuf,
+      reqJson,
+      anthropicHeaders: buildForwardHeaders(req.headers, cfg),
+      wantsStream,
       signal: controller.signal,
-    };
-    if (reqBuf.length) init.body = reqBuf;
-    backendRes = await fetch(cfg.backend.base + path, init);
+    });
   } catch (e) {
     clearTimeout(timer);
     const aborted = controller.signal.aborted;

@@ -9,7 +9,8 @@ A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v
 - ✅ M0 passthrough: forwards streaming + non-streaming `/v1/messages` byte-for-byte.
 - ✅ M1 validator + `detect` mode: deterministic tool_use gate (Ajv2020), metadata-only logging of pass/fail/uncheckable — **behavior unchanged**, it only observes.
 - ✅ M2 `repair` mode: on a validation failure, a cheap reshaper model reshapes the call, the result is **re-validated**, and the corrected response is re-emitted to the client (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched.
-- ⏳ M4 hardening — streaming repair is implemented (buffer + re-emit); the text-streams-through optimization and broader hardening remain.
+- ✅ **OpenAI-compatible backends** (`backend.kind:"openai"`): front NIM / vLLM / OpenRouter / LM Studio. Requests are translated Anthropic→OpenAI and responses back (streaming SSE + non-streaming) via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge) (zero-dep). The validate/repair layer is unchanged — it always sees Anthropic Messages. Verified live end-to-end against NIM.
+- ⏳ M4 hardening — streaming repair is implemented (buffer + re-emit); the text-streams-through optimization, OpenAI-format reshaper, and broader hardening remain.
 
 ### Live demo (no external creds)
 
@@ -63,6 +64,23 @@ claude -p "list the files here"
   "log": { "level": "metadata", "file": null }  // metadata-only; NEVER logs headers/bodies
 }
 ```
+
+### Fronting an OpenAI-compatible backend (NIM / vLLM / OpenRouter)
+
+```jsonc
+{
+  "listen": "127.0.0.1:8791",
+  "backend": {
+    "base": "https://integrate.api.nvidia.com/v1",   // OpenAI-compatible base
+    "kind": "openai",                                  // translate Anthropic<->OpenAI
+    "model": "meta/llama-3.1-70b-instruct",            // required for kind=openai
+    "authEnv": "NVIDIA_API_KEY",
+    "authHeader": "authorization"                      // Bearer (default for openai)
+  },
+  "mode": "detect"
+}
+```
+`node scripts/nim-front.mjs` runs the compiled proxy fronting live NIM end-to-end.
 
 ### Real live run (needs your provider key)
 
