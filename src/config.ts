@@ -222,7 +222,7 @@ function splitHostPort(listen: string): [string, string] {
 
 function normalizeMode(v: unknown): Mode {
   if (v === "detect" || v === "repair" || v === "strict") return v;
-  // M1 only implements detect; repair/strict are accepted but behave as detect
-  // until M2/M3 land (documented in the spec).
+  // Unknown values fall back to detect. Note: "strict" is accepted but currently
+  // behaves like "detect" (validate + observe); only "repair" acts on failures.
   return "detect";
 }

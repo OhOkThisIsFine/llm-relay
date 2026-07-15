@@ -273,7 +273,7 @@ describe("credential handling", () => {
   });
 });
 
-describe("repair mode (M2)", () => {
+describe("repair mode", () => {
   let dir: string;
   let logFile: string;
   let backend: Server;
@@ -360,7 +360,7 @@ describe("repair mode (M2)", () => {
   });
 });
 
-describe("streaming repair (M4): text-through, buffer-at-tool_use", () => {
+describe("streaming repair: text-through, buffer-at-tool_use", () => {
   let dir: string;
   let logFile: string;
   let backend: Server;

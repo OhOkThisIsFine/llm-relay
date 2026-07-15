@@ -4,13 +4,13 @@ A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v
 
 **The one boundary:** it fixes/flags *protocol form* (malformed tool calls), never *judgment* (bad reasoning).
 
-## Status — M0 + M1 + M2 + M4
+## What it does
 
-- ✅ M0 passthrough: forwards streaming + non-streaming `/v1/messages` byte-for-byte.
-- ✅ M1 validator + `detect` mode: deterministic tool_use gate (Ajv2020), metadata-only logging of pass/fail/uncheckable — **behavior unchanged**, it only observes.
-- ✅ M2 `repair` mode: on a validation failure, a cheap reshaper model reshapes the call, the result is **re-validated**, and the corrected response is re-emitted to the client (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched.
-- ✅ **OpenAI-compatible backends** (`backend.kind:"openai"`): front NIM / vLLM / OpenRouter / LM Studio. Requests are translated Anthropic→OpenAI and responses back (streaming SSE + non-streaming) via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge) (zero-dep). The validate/repair layer is unchanged — it always sees Anthropic Messages. Verified live end-to-end against NIM.
-- ✅ M4 streaming: in `repair` mode, text-block SSE frames stream to the client **as they arrive**; the proxy only starts withholding at the first `tool_use` `content_block_start`. A pure-text response is byte-for-byte passthrough with zero added latency; a valid tool call flushes the withheld frames verbatim; an invalid one is repaired and only the corrected trailing blocks are re-emitted (`message_start` + leading text already delivered). If a repair fails mid-stream, a well-formed SSE `error` event is emitted — never a fabricated call. Handles LF and CRLF frame delimiters and multibyte UTF-8 across chunk boundaries.
+- **Transparent passthrough** — forwards streaming and non-streaming `/v1/messages` byte-for-byte.
+- **`detect` mode** — deterministic tool_use validation (Ajv2020) with metadata-only logging of pass/fail/uncheckable. Behavior is unchanged; it only observes.
+- **`repair` mode** — on a validation failure, a cheap reshaper model corrects the call, the result is **re-validated**, and the corrected response is re-emitted (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched.
+- **OpenAI-compatible backends** (`backend.kind:"openai"`) — front NIM / vLLM / OpenRouter / LM Studio. Requests are translated Anthropic→OpenAI and responses back (streaming SSE + non-streaming) via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge) (zero-dep). The validate/repair layer always sees Anthropic Messages, regardless of backend. Verified live end-to-end.
+- **Streaming repair** — text-block SSE frames stream to the client **as they arrive**; the proxy only withholds from the first `tool_use` block. A pure-text response is byte-for-byte passthrough with zero added latency; a valid tool call flushes the withheld frames verbatim; an invalid one is repaired with only the corrected trailing blocks re-emitted (`message_start` + leading text already delivered). A mid-stream repair failure surfaces as an SSE `error` event, never a fabricated call. Handles LF and CRLF frame delimiters and multibyte UTF-8 across chunk boundaries.
 
 ### Live demo (no external creds)
 
