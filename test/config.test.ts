@@ -50,3 +50,64 @@ describe("loadConfig", () => {
     expect(c.backend.authHeader).toBe("authorization");
   });
 });
+
+describe("ergonomics: env expansion, overrides, reshaper synthesis", () => {
+  it("expands ${ENV} in base/model and throws on an unset var", () => {
+    process.env.RP_TEST_BASE = "https://nim.test/v1";
+    const c = loadConfig(write("env.json", {
+      listen: "127.0.0.1:8791",
+      backend: { base: "${RP_TEST_BASE}", kind: "openai", model: "meta/llama-3.1-70b-instruct" },
+    }));
+    expect(c.backend.base).toBe("https://nim.test/v1");
+    delete process.env.RP_TEST_BASE;
+
+    expect(() => loadConfig(write("env2.json", {
+      backend: { base: "${RP_MISSING_VAR}" },
+    }))).toThrow(/unset env var \$\{RP_MISSING_VAR\}/);
+  });
+
+  it("applies CLI overrides over the file (base/model/mode/listen)", () => {
+    const p = write("ovr.json", {
+      listen: "127.0.0.1:8791",
+      backend: { base: "https://old.test/v1", kind: "openai", model: "old-model" },
+      mode: "detect",
+    });
+    const c = loadConfig(p, { backendBase: "https://new.test/v1", model: "new-model", mode: "repair", listen: "127.0.0.1:9000" });
+    expect(c.backend.base).toBe("https://new.test/v1");
+    expect(c.backend.model).toBe("new-model");
+    expect(c.port).toBe(9000);
+    expect(c.mode).toBe("repair");
+  });
+
+  it("synthesizes a reshaper from an OpenAI backend in repair mode (no reshaper block)", () => {
+    const c = loadConfig(write("syn.json", {
+      listen: "127.0.0.1:8791",
+      backend: { base: "https://nim.test/v1", kind: "openai", model: "meta/llama-3.1-70b-instruct", authEnv: "NVIDIA_API_KEY" },
+      mode: "repair",
+    }));
+    expect(c.reshaper).toBeDefined();
+    expect(c.reshaper?.kind).toBe("openai");
+    expect(c.reshaper?.base).toBe("https://nim.test/v1");
+    expect(c.reshaper?.model).toBe("meta/llama-3.1-70b-instruct");
+    expect(c.reshaper?.authEnv).toBe("NVIDIA_API_KEY");
+  });
+
+  it("still requires an explicit reshaper for an Anthropic backend in repair mode", () => {
+    expect(() => loadConfig(write("noreshape.json", {
+      listen: "127.0.0.1:8791",
+      backend: { base: "https://api.anthropic.test", kind: "anthropic" },
+      mode: "repair",
+    }))).toThrow(/requires a config\.reshaper/);
+  });
+
+  it("an explicit reshaper block still wins over synthesis", () => {
+    const c = loadConfig(write("explicit.json", {
+      listen: "127.0.0.1:8791",
+      backend: { base: "https://nim.test/v1", kind: "openai", model: "big-model" },
+      mode: "repair",
+      reshaper: { base: "https://cheap.test/v1", kind: "openai", model: "cheap-model" },
+    }));
+    expect(c.reshaper?.base).toBe("https://cheap.test/v1");
+    expect(c.reshaper?.model).toBe("cheap-model");
+  });
+});

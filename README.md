@@ -56,11 +56,12 @@ Primary example — an OpenAI-compatible backend (NVIDIA NIM / vLLM / OpenRouter
     "authHeader": "authorization"            // Bearer (default for openai)
   },
   "mode": "detect",                          // detect | repair (strict accepted, aliases detect)
-  "reshaper": {                              // REQUIRED when mode="repair" (Anthropic-format for now)
-    "base": "https://api.anthropic.com",
-    "model": "claude-haiku-4-5-20251001",
-    "authEnv": "ANTHROPIC_API_KEY"
-  },
+  // reshaper is OPTIONAL for an OpenAI backend: in repair mode it defaults to the
+  // SAME provider (base/model/kind/key above), so repair runs on the backend with
+  // nothing else to edit. Add an explicit block to point repair at a cheaper model
+  // or a different provider (required for an Anthropic backend, which has no fixed
+  // model id):
+  // "reshaper": { "base": "…", "kind": "openai", "model": "…", "authEnv": "…" },
   "repair": {
     "maxAttempts": 2,
     "destructiveTools": ["rm","delete","push","force","overwrite","drop","reset"]
@@ -70,6 +71,23 @@ Primary example — an OpenAI-compatible backend (NVIDIA NIM / vLLM / OpenRouter
 ```
 
 For a backend that already speaks Anthropic Messages, drop `kind`/`model` (defaults to `kind:"anthropic"`, forwarded as-is) and point `base` at its `/anthropic`-style endpoint.
+
+### Repointing without editing the file
+
+Config string values may reference environment variables as `${NAME}` — an unset var is a loud startup error, never a silent empty value:
+
+```jsonc
+"backend": { "base": "${LLM_BACKEND_BASE_URL}", "kind": "openai", "model": "${LLM_MODEL}", "authEnv": "NVIDIA_API_KEY" }
+```
+
+Or override the common knobs from the CLI (they win over the file, so one command repoints at a new provider with no edit):
+
+```bash
+node dist/cli.js --config config.json \
+  --backend-base https://openrouter.ai/api/v1 --model meta-llama/llama-3.1-70b-instruct --mode repair
+```
+
+`repair-proxy --help` lists every override.
 
 The reshaper also takes `"kind": "openai"` — so `repair` mode can run entirely on an OpenAI-compatible provider (e.g. NIM) with no Anthropic key. The reshaper is asked only for the **corrected arguments per tool-call id** (not the full message envelope), which is far more reliable on weaker models; the proxy reconstructs the message and re-validates it.
 

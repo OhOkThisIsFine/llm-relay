@@ -45,8 +45,33 @@ const DEFAULT_DESTRUCTIVE = ["rm", "delete", "remove", "push", "force", "overwri
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export { DEFAULT_ANTHROPIC_VERSION };
 
+/** CLI overrides, applied over the file so a provider can be repointed without editing it. */
+export interface ConfigOverrides {
+  listen?: string | undefined;
+  backendBase?: string | undefined;
+  model?: string | undefined;
+  mode?: string | undefined;
+}
+
+/**
+ * Expand `${ENV}` references in a config string against process.env, failing
+ * loudly if a referenced variable is unset — so a missing provider URL/key is a
+ * clear startup error, never a silent empty value. `$${` is a literal `${`.
+ */
+function expandEnv(value: string, where: string): string {
+  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => {
+    const v = process.env[name];
+    if (v === undefined) throw new Error(`config.${where} references unset env var \${${name}}`);
+    return v;
+  });
+}
+
+function expandField(raw: unknown, where: string): unknown {
+  return typeof raw === "string" && raw.includes("${") ? expandEnv(raw, where) : raw;
+}
+
 /** Load + validate a config file, failing loudly on anything unusable. */
-export function loadConfig(path: string): Config {
+export function loadConfig(path: string, overrides: ConfigOverrides = {}): Config {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -58,7 +83,18 @@ export function loadConfig(path: string): Config {
   }
   const c = parsed as Record<string, unknown>;
 
-  const listen = typeof c.listen === "string" ? c.listen : "127.0.0.1:8791";
+  // Merge CLI overrides over the file before validation, so every check (loopback,
+  // port range, openai-needs-model) runs on the effective config.
+  if (overrides.listen !== undefined) c.listen = overrides.listen;
+  if (overrides.mode !== undefined) c.mode = overrides.mode;
+  if (overrides.backendBase !== undefined || overrides.model !== undefined) {
+    const b = (typeof c.backend === "object" && c.backend !== null ? c.backend : {}) as Record<string, unknown>;
+    if (overrides.backendBase !== undefined) b.base = overrides.backendBase;
+    if (overrides.model !== undefined) b.model = overrides.model;
+    c.backend = b;
+  }
+
+  const listen = typeof c.listen === "string" ? expandEnv(c.listen, "listen") : "127.0.0.1:8791";
   const [host, portStr] = splitHostPort(listen);
   const port = Number(portStr);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -88,9 +124,10 @@ export function loadConfig(path: string): Config {
     authHeader?: unknown;
     timeoutMs?: unknown;
   };
-  const base = backend.base.trim().replace(/\/+$/, "");
+  const base = expandEnv(backend.base, "backend.base").trim().replace(/\/+$/, "");
   const kind: "anthropic" | "openai" = backend.kind === "openai" ? "openai" : "anthropic";
-  if (kind === "openai" && typeof backend.model !== "string") {
+  const model = typeof backend.model === "string" ? expandEnv(backend.model, "backend.model") : undefined;
+  if (kind === "openai" && model === undefined) {
     throw new Error(`config.backend.kind "openai" requires config.backend.model (the target model id)`);
   }
   const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
@@ -98,12 +135,31 @@ export function loadConfig(path: string): Config {
     backend.authHeader === "authorization" ? "authorization" : backend.authHeader === "x-api-key" ? "x-api-key" : defaultAuthHeader;
   const timeoutMs =
     typeof backend.timeoutMs === "number" && backend.timeoutMs > 0 ? backend.timeoutMs : 120000;
+  const backendAuthEnv = typeof backend.authEnv === "string" ? backend.authEnv : undefined;
 
   const mode = normalizeMode(c.mode);
 
-  const reshaper = parseReshaper(c.reshaper);
+  // Reshaper: an explicit block wins; otherwise, for a repair-mode OpenAI backend,
+  // synthesize one that reuses the SAME provider (base/model/kind/key) — so repair
+  // runs on the backend with no second block to edit. An Anthropic backend has no
+  // fixed model id (it's per-request passthrough), so it still needs an explicit
+  // reshaper naming a cheap model.
+  let reshaper = parseReshaper(c.reshaper);
+  if (!reshaper && mode === "repair" && kind === "openai" && model !== undefined) {
+    reshaper = {
+      base,
+      model,
+      kind,
+      authHeader,
+      timeoutMs: Math.min(timeoutMs, 60000),
+      ...(backendAuthEnv ? { authEnv: backendAuthEnv } : {}),
+    };
+  }
   if (mode === "repair" && !reshaper) {
-    throw new Error(`mode "repair" requires a config.reshaper { base, model, authEnv }`);
+    throw new Error(
+      `mode "repair" requires a config.reshaper { base, model, authEnv } ` +
+        `(auto-synthesized only for an OpenAI backend, which this is not)`,
+    );
   }
 
   const repairRaw = (c.repair ?? {}) as { maxAttempts?: unknown; destructiveTools?: unknown };
@@ -127,8 +183,8 @@ export function loadConfig(path: string): Config {
       kind,
       authHeader,
       timeoutMs,
-      ...(kind === "openai" ? { model: backend.model as string } : {}),
-      ...(typeof backend.authEnv === "string" ? { authEnv: backend.authEnv } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(backendAuthEnv ? { authEnv: backendAuthEnv } : {}),
     },
     mode,
     ...(reshaper ? { reshaper } : {}),
@@ -146,8 +202,8 @@ function parseReshaper(raw: unknown): ReshaperConfig | undefined {
   const authHeader: AuthHeader =
     r.authHeader === "authorization" ? "authorization" : r.authHeader === "x-api-key" ? "x-api-key" : defaultAuthHeader;
   return {
-    base: r.base.trim().replace(/\/+$/, ""),
-    model: r.model,
+    base: expandEnv(r.base, "reshaper.base").trim().replace(/\/+$/, ""),
+    model: expandEnv(r.model, "reshaper.model"),
     kind,
     authHeader,
     timeoutMs: typeof r.timeoutMs === "number" && r.timeoutMs > 0 ? r.timeoutMs : 60000,
