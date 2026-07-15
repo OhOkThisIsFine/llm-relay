@@ -25,20 +25,14 @@ This proves the whole chain survives Anthropic↔OpenAI translation: **tool-sche
 
 **Implication:** the proxy does its job; **model quality is the ceiling.** llama-3.1-70b is brittle in the loop — which is exactly why pillar 2 (repair) matters, and also its limit: repair fixes *form*, not a model that reasons itself into a loop.
 
-## Gaps before "frictionless drop-in"
+## Gaps — status after the usability pass (commit 799eed3)
 
-1. **`count_tokens` is unhandled** (`src/server.ts` / `src/backend.ts`): `/v1/messages/count_tokens` matches `isMessages`, and the OpenAI backend path *always* POSTs `/chat/completions` ignoring the request path — so a token-count request is mistranslated into a chat completion. Claude Code calls this for context management. **Fix:** special-case `count_tokens` (either a local heuristic estimate or a proper skip), don't route it to `/chat/completions`.
-2. **OpenAI path ignores the request path entirely** (`backend.ts:48`) — fine for the single completion endpoint, but it means any non-completion Anthropic route is silently wrong for OpenAI backends.
-3. **Non-text content & MCP unverified**: images/PDF/document blocks and MCP tool passthrough through llm-bridge translation were not exercised; the alt-model-routing notes warn native `/anthropic` endpoints drop these. Needs a probe before claiming parity.
-4. **`claude` CLI credential validation is a real hurdle (not the proxy's fault)**: claude 2.1.195 rejects placeholder tokens client-side (`Invalid API key` / `401 Invalid bearer token`) and never emits traffic — yet the *proxy* accepts a `Bearer dummy` fine (proven by curl). A user swapping in repair-proxy must still give the CLI a credential it will accept (a real provider-issued Anthropic-format token via `ANTHROPIC_AUTH_TOKEN`), then let the proxy strip/replace it for the backend. Worth documenting in the README run recipe.
-5. **Backend model reach**: the account exposes **116 NIM models** (84 instruct/chat); earlier "unavailable" results were *wrong model IDs*, not rate limits (e.g. real id is `mixtral-8x22b-v0.1`, no `qwen` at all). Re-run the trip-rate harness with real IDs for a fatter fitness dataset and to pick a stronger loop model than 3.1-70b.
+1. ~~**`count_tokens` unhandled**~~ **FIXED**: OpenAI backends now answer `/v1/messages/count_tokens` locally with a cheap token estimate; never mistranslated into a chat completion.
+2. ~~**OpenAI path ignores the request path**~~ **FIXED**: non-messages paths (e.g. claude's `/` preflight) now return a clean local 404 in ~2ms instead of a spurious NIM 400.
+3. **Non-text content & MCP still unverified**: images/PDF/document blocks and MCP tool passthrough through llm-bridge were not exercised. Needs a probe before claiming full parity. *(Open.)*
+4. ~~**`claude` CLI credential hurdle**~~ **SOLVED**: the cause was an active subscription OAuth session conflicting with the proxy token (client-side `Invalid API key`/`401`, no traffic sent). Running claude with an isolated `CLAUDE_CONFIG_DIR` makes the provider token the sole credential — and keeps the subscription entirely out of the path. Wrappers `scripts/claude-proxied.{ps1,sh}` + README recipe do this. **Verified: a real `claude` agentic session completes end-to-end through the proxy against NIM.**
+5. **Backend model reach**: account exposes **116 NIM models** (84 instruct/chat); earlier "unavailable" were *wrong IDs* (real: `mixtral-8x22b-v0.1`, `gemma-2-2b-it`; no `qwen`). NIM also **rate-limits (429)** under load — claude's retry/backoff absorbs it, but it adds latency. Re-run trip-rate with real IDs to pick a stronger loop model than 3.1-70b. *(Open, low-risk.)*
 
-## Recommendation
+## Bottom line
 
-Short punch-list to reach "confidently drop-in for text+tool agentic work":
-- Handle `count_tokens` for OpenAI backends (gap 1) — small, high-value.
-- Add a non-text/MCP passthrough probe (gap 3) to know the real boundary.
-- Document the CLI credential recipe (gap 4) in the README.
-- Re-run trip-rate with correct NIM IDs (gap 5) and pick the strongest available tool-caller as the default loop model.
-
-Everything above pillar-3 (safety) is already solid and is the main reason this is a *safer* path than fcc-as-third-party-translator.
+**It works and is usable today** for text+tool agentic sessions via the wrappers — proven end-to-end, safe by construction (subscription never in the path). Remaining open items (non-text/MCP probe; trip-rate with real IDs + a stronger default model) are enhancements, not blockers. Model *reasoning* quality on a weak backend remains the ceiling repair can't lift.
