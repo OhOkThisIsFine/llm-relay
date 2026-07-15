@@ -43,16 +43,20 @@ claude -p "list the files here"
 
 ## Config
 
+Primary example — an OpenAI-compatible backend (NVIDIA NIM / vLLM / OpenRouter / LM Studio):
+
 ```jsonc
 {
   "listen": "127.0.0.1:8791",              // loopback ONLY — startup refuses non-loopback
   "backend": {
-    "base": "https://api.deepseek.com/anthropic",  // origin; the inbound path is appended
-    "authEnv": "DEEPSEEK_API_KEY",          // injected into ONE header; inbound auth stripped only when injecting
-    "authHeader": "x-api-key"               // or "authorization" (Bearer). default x-api-key
+    "base": "https://integrate.api.nvidia.com/v1",  // OpenAI-compatible base
+    "kind": "openai",                        // translate Anthropic<->OpenAI (via llm-bridge)
+    "model": "meta/llama-3.1-70b-instruct",  // required for kind=openai
+    "authEnv": "NVIDIA_API_KEY",
+    "authHeader": "authorization"            // Bearer (default for openai)
   },
-  "mode": "detect",                         // detect | repair (strict accepted, aliases detect)
-  "reshaper": {                             // REQUIRED when mode="repair"
+  "mode": "detect",                          // detect | repair (strict accepted, aliases detect)
+  "reshaper": {                              // REQUIRED when mode="repair" (Anthropic-format for now)
     "base": "https://api.anthropic.com",
     "model": "claude-haiku-4-5-20251001",
     "authEnv": "ANTHROPIC_API_KEY"
@@ -65,30 +69,14 @@ claude -p "list the files here"
 }
 ```
 
-### Fronting an OpenAI-compatible backend (NIM / vLLM / OpenRouter)
+For a backend that already speaks Anthropic Messages, drop `kind`/`model` (defaults to `kind:"anthropic"`, forwarded as-is) and point `base` at its `/anthropic`-style endpoint.
 
-```jsonc
-{
-  "listen": "127.0.0.1:8791",
-  "backend": {
-    "base": "https://integrate.api.nvidia.com/v1",   // OpenAI-compatible base
-    "kind": "openai",                                  // translate Anthropic<->OpenAI
-    "model": "meta/llama-3.1-70b-instruct",            // required for kind=openai
-    "authEnv": "NVIDIA_API_KEY",
-    "authHeader": "authorization"                      // Bearer (default for openai)
-  },
-  "mode": "detect"
-}
-```
-`node scripts/nim-front.mjs` runs the compiled proxy fronting live NIM end-to-end.
-
-### Real live run (needs your provider key)
+### Live run
 
 ```bash
-# detect first — measure which models trip the validator on YOUR traffic:
-DEEPSEEK_API_KEY=sk-... node dist/cli.js --config config.json   # backend=DeepSeek, mode=detect
-# then point a claude CLI at it (see "Install & run" above) and inspect the log.
+node scripts/nim-front.mjs   # runs the compiled proxy fronting live NIM end-to-end (uses NVIDIA_API_KEY)
 ```
+Then point a `claude` CLI at it (see "Install & run" above) and inspect the log to see which calls trip the validator on your traffic.
 
 ## What it logs (per request, metadata only)
 

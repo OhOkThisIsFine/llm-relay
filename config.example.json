@@ -1,8 +1,11 @@
 {
   "listen": "127.0.0.1:8791",
   "backend": {
-    "base": "https://api.deepseek.com/anthropic",
-    "authEnv": "DEEPSEEK_API_KEY"
+    "base": "https://integrate.api.nvidia.com/v1",
+    "kind": "openai",
+    "model": "meta/llama-3.1-70b-instruct",
+    "authEnv": "NVIDIA_API_KEY",
+    "authHeader": "authorization"
   },
   "mode": "detect",
   "log": { "level": "metadata", "file": null }
