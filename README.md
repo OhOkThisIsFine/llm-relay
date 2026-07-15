@@ -132,6 +132,26 @@ silently at request time.
 > IPs/regions (a network-side block, not a key issue) — it works once your network
 > allows it. **Mistral** needs `MISTRAL_API_KEY` set in your environment.
 
+### Discovery endpoint (`GET /registry`) — for a dispatcher
+
+For a caller that does its own selection (e.g. audit-tools dispatch, which weighs
+quota / rate limits / token budget), `GET http://127.0.0.1:8791/registry` returns one
+coherent JSON view:
+
+- **providers** — each with `base`, `kind`, `has_key` (auth env set?), `reachable`
+  (did the live `/models` catalog return anything?), and `models[]` where every model
+  carries a best-effort `capability` (raw BFCL + Arena scores, **never collapsed** to
+  tiers — `null` when no confident leaderboard match).
+- **routing** — the current default + tier map.
+- **capability_source** — the full raw leaderboard dataset, so a consumer can run a
+  finer id→score join than the built-in best-effort one.
+
+The consumer then dispatches by pointing its OpenAI-compatible pool at :8791 and
+setting each packet's model to a **namespaced** `provider/model` (it picked the exact
+backend). Meanwhile a plain `claude` client that sends `claude-sonnet-…` still gets the
+**dumb tier/default routing** — both coexist, no mode switch. So the tier map stays the
+default, and dispatcher-style usage is just "send namespaced ids + read `/registry`".
+
 ### Model tiers from leaderboards (never a hand-maintained table)
 
 `npm run sync:tiers` snapshots capability rankings from **BFCL** (Berkeley Function-Calling

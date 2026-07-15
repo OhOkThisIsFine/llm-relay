@@ -111,14 +111,15 @@ async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void
 
 function runProxy(): void {
   const cfg = loadOrExit();
-  const server = createProxy(cfg);
+  const catalog = new ModelCatalog();
+  const server = createProxy(cfg, { catalog });
   server.listen(cfg.port, cfg.host, () => {
     const providers = Object.keys(cfg.providers).join(",");
     process.stderr.write(
       `repair-proxy listening on http://${cfg.host}:${cfg.port} ` +
         `(mode=${cfg.mode}, providers=[${providers}], default=${cfg.routing.default})\n`,
     );
-    void warmAndValidate(cfg, new ModelCatalog());
+    void warmAndValidate(cfg, catalog);
   });
 
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
