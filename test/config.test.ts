@@ -16,7 +16,7 @@ function write(name: string, obj: unknown): string {
   return p;
 }
 
-const BACKEND = { base: "https://api.deepseek.com/anthropic" };
+const BACKEND = { base: "https://example.test/anthropic" };
 
 describe("loadConfig", () => {
   it("accepts 127.0.0.1", () => {

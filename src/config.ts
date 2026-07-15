@@ -7,6 +7,8 @@ export type AuthHeader = "x-api-key" | "authorization";
 export interface ReshaperConfig {
   base: string;
   model: string;
+  /** "anthropic": call /v1/messages. "openai": call /chat/completions (NIM/vLLM). */
+  kind: "anthropic" | "openai";
   authEnv?: string;
   authHeader: AuthHeader;
   timeoutMs: number;
@@ -139,10 +141,15 @@ function parseReshaper(raw: unknown): ReshaperConfig | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const r = raw as Record<string, unknown>;
   if (typeof r.base !== "string" || typeof r.model !== "string") return undefined;
+  const kind: "anthropic" | "openai" = r.kind === "openai" ? "openai" : "anthropic";
+  const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
+  const authHeader: AuthHeader =
+    r.authHeader === "authorization" ? "authorization" : r.authHeader === "x-api-key" ? "x-api-key" : defaultAuthHeader;
   return {
     base: r.base.trim().replace(/\/+$/, ""),
     model: r.model,
-    authHeader: r.authHeader === "authorization" ? "authorization" : "x-api-key",
+    kind,
+    authHeader,
     timeoutMs: typeof r.timeoutMs === "number" && r.timeoutMs > 0 ? r.timeoutMs : 60000,
     ...(typeof r.authEnv === "string" ? { authEnv: r.authEnv } : {}),
   };

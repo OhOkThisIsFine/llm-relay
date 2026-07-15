@@ -7,7 +7,7 @@
 // Run: npm run build && node scripts/nim-probe.mjs
 import { ToolUseValidator } from "../dist/validator.js";
 import { repair, destructiveMatcher } from "../dist/repair.js";
-import { parseReshapeOutput } from "../dist/reshaper.js";
+import { parseCorrectedInputs, reconstruct } from "../dist/reshaper.js";
 import { toolSchemaMap } from "../dist/anthropic.js";
 
 const KEY = process.env.NVIDIA_API_KEY || process.env.LLM_BACKEND_API_KEY;
@@ -80,15 +80,17 @@ function toAssistant(msg) {
   return { content, stop_reason: hasTool ? "tool_use" : "end_turn" };
 }
 
-// A Reshaper (the proxy's interface) backed by a strong NIM model in OpenAI format.
+// A Reshaper (the proxy's interface) backed by a strong NIM model in OpenAI
+// format. Uses the "corrected inputs by id" contract, then reconstructs.
 const nimReshaper = {
   async reshape(req) {
-    const sys = `You repair malformed tool calls into valid Anthropic tool-use JSON. Preserve the model's expressed intent; reconstruct arguments ONLY from what is present. Output ONLY one JSON object: {"content":[{"type":"tool_use","id":"<id>","name":"<tool>","input":{...}}],"stop_reason":"tool_use"} or {"refuse":true,"reason":"..."}. The input must satisfy this schema: ${JSON.stringify(WEATHER_TOOL.input_schema)}.`;
-    const user = JSON.stringify({ tools: [WEATHER_TOOL], validation_errors: req.errors.map((e) => e.message), raw_assistant_message: req.rawAssistant });
+    const sys = `You fix the ARGUMENTS of malformed tool calls to satisfy the schema. Preserve intent; reconstruct only from what is present. Output ONLY one raw JSON object mapping each tool_use id to its corrected input: {"inputs":{"<id>":{...}}} or {"refuse":true,"reason":"..."}. Schema: ${JSON.stringify(WEATHER_TOOL.input_schema)}.`;
+    const user = JSON.stringify({ failing_tool_calls: req.rawAssistant.content.filter((b) => b.type === "tool_use").map((b) => ({ id: b.id, current_input: b.input })), validation_errors: req.errors.map((e) => e.message) });
     const r = await nimChat(RESHAPER_MODEL, [{ role: "system", content: sys }, { role: "user", content: user }]);
     if (r.error) return { kind: "refuse", reason: r.error };
-    const text = r.json.choices?.[0]?.message?.content ?? "";
-    return parseReshapeOutput(text);
+    const parsed = parseCorrectedInputs(r.json.choices?.[0]?.message?.content ?? "");
+    if (parsed.kind === "refuse") return { kind: "refuse", reason: parsed.reason };
+    return { kind: "message", message: reconstruct(req.rawAssistant, parsed.inputs) };
   },
 };
 

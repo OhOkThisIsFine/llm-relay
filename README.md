@@ -25,9 +25,9 @@ Runs the compiled CLI as a real process against a local flaky-model backend + st
 npm install
 npm run build
 cp config.example.json config.json   # edit backend + auth
-DEEPSEEK_API_KEY=sk-... node dist/cli.js --config config.json
+NVIDIA_API_KEY=nvapi-... node dist/cli.js --config config.json
 # or, no build step:
-DEEPSEEK_API_KEY=sk-... npm run dev -- --config config.json
+NVIDIA_API_KEY=nvapi-... npm run dev -- --config config.json
 ```
 
 Then point a client at it:
@@ -70,6 +70,8 @@ Primary example — an OpenAI-compatible backend (NVIDIA NIM / vLLM / OpenRouter
 ```
 
 For a backend that already speaks Anthropic Messages, drop `kind`/`model` (defaults to `kind:"anthropic"`, forwarded as-is) and point `base` at its `/anthropic`-style endpoint.
+
+The reshaper also takes `"kind": "openai"` — so `repair` mode can run entirely on an OpenAI-compatible provider (e.g. NIM) with no Anthropic key. The reshaper is asked only for the **corrected arguments per tool-call id** (not the full message envelope), which is far more reliable on weaker models; the proxy reconstructs the message and re-validates it.
 
 ### Live run
 
