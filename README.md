@@ -60,53 +60,65 @@ env -u CLAUDECODE -u ANTHROPIC_API_KEY \
 
 > Backend note: weak models still fail *reasoning* (they may loop or skip a tool) — repair fixes malformed tool-call *form*, not judgment. Pick a strong tool-caller as the backend model. NIM also rate-limits (HTTP 429) under load; claude's own retry/backoff absorbs it.
 
-## Config
+## Config — multi-provider registry
 
-Primary example — an OpenAI-compatible backend (NVIDIA NIM / vLLM / OpenRouter / LM Studio):
+A `providers{}` registry (any number of OpenAI-compatible or Anthropic backends) plus
+a `routing` block that maps each request's `model` to one provider + backend model:
 
 ```jsonc
 {
   "listen": "127.0.0.1:8791",              // loopback ONLY — startup refuses non-loopback
-  "backend": {
-    "base": "https://integrate.api.nvidia.com/v1",  // OpenAI-compatible base
-    "kind": "openai",                        // translate Anthropic<->OpenAI (via llm-bridge)
-    "model": "meta/llama-3.1-70b-instruct",  // required for kind=openai
-    "authEnv": "NVIDIA_API_KEY",
-    "authHeader": "authorization"            // Bearer (default for openai)
+  "providers": {
+    "nim":        { "base": "https://integrate.api.nvidia.com/v1", "kind": "openai", "authEnv": "NVIDIA_API_KEY" },
+    "openrouter": { "base": "https://openrouter.ai/api/v1",        "kind": "openai", "authEnv": "OPENROUTER_API_KEY" },
+    "gemini":     { "base": "https://generativelanguage.googleapis.com/v1beta/openai", "kind": "openai", "authEnv": "GEMINI_API_KEY" }
   },
-  "mode": "detect",                          // detect | repair (strict accepted, aliases detect)
-  // reshaper is OPTIONAL for an OpenAI backend: in repair mode it defaults to the
-  // SAME provider (base/model/kind/key above), so repair runs on the backend with
-  // nothing else to edit. Add an explicit block to point repair at a cheaper model
-  // or a different provider (required for an Anthropic backend, which has no fixed
-  // model id):
-  // "reshaper": { "base": "…", "kind": "openai", "model": "…", "authEnv": "…" },
-  "repair": {
-    "maxAttempts": 2,
-    "destructiveTools": ["rm","delete","push","force","overwrite","drop","reset"]
+  "routing": {
+    "default": "nim/z-ai/glm-5.2",           // fallback when nothing else matches
+    "tiers": {                                // Claude tier (substring match) → provider/model
+      "opus":   "nim/nvidia/nemotron-3-super-120b-a12b",
+      "sonnet": "nim/z-ai/glm-5.2",
+      "haiku":  "nim/openai/gpt-oss-20b",     // cheap/fast — also catches Claude's haiku side-calls
+      "fable":  "nim/openai/gpt-oss-20b"
+    }
   },
+  "mode": "repair",                          // detect | repair (strict accepted, aliases detect)
+  "repair": { "maxAttempts": 2, "destructiveTools": ["rm","delete","push","force","overwrite","drop","reset"] },
   "log": { "level": "metadata", "file": null }  // metadata-only; NEVER logs headers/bodies
 }
 ```
 
-For a backend that already speaks Anthropic Messages, drop `kind`/`model` (defaults to `kind:"anthropic"`, forwarded as-is) and point `base` at its `/anthropic`-style endpoint.
+**Routing (lifted from free-claude-code's proven scheme — split on the first `/` only):**
+1. **Namespaced** — a request `model` of `provider/rest` where `provider` is a configured
+   provider routes there directly; the entire tail (nested slashes, `:free` suffixes) is the
+   backend model, verbatim. E.g. `nim/openai/gpt-oss-120b`, `openrouter/openai/gpt-5.2-codex`.
+2. **Tier** — otherwise the Claude model id is substring-matched against `routing.tiers`
+   (`opus`/`sonnet`/`haiku`/`fable`). This also fixes Claude's haiku-class side-calls, which
+   would otherwise blindly hit one model and 404.
+3. **Default** — anything unrecognized falls to `routing.default`.
+
+Each provider is `kind:"openai"` (translated Anthropic↔OpenAI via llm-bridge) or
+`kind:"anthropic"` (forwarded as-is). In `repair` mode an openai target reshapes on itself;
+an anthropic provider needs an explicit top-level `reshaper` block.
 
 ### Repointing without editing the file
 
-Config string values may reference environment variables as `${NAME}` — an unset var is a loud startup error, never a silent empty value:
-
-```jsonc
-"backend": { "base": "${LLM_BACKEND_BASE_URL}", "kind": "openai", "model": "${LLM_MODEL}", "authEnv": "NVIDIA_API_KEY" }
-```
-
-Or override the common knobs from the CLI (they win over the file, so one command repoints at a new provider with no edit):
+Config strings may reference env vars as `${NAME}` (unset → loud startup error). Or override
+routing from the CLI (wins over the file):
 
 ```bash
-node dist/cli.js --config config.json \
-  --backend-base https://openrouter.ai/api/v1 --model meta-llama/llama-3.1-70b-instruct --mode repair
+node dist/cli.js --config config.json --default openrouter/openai/gpt-5.2-codex --mode repair
 ```
 
 `repair-proxy --help` lists every override.
+
+### Model tiers from leaderboards (never a hand-maintained table)
+
+`npm run sync:tiers` snapshots capability rankings from **BFCL** (Berkeley Function-Calling
+Leaderboard — tool-use accuracy, the primary signal for a tool-call proxy, incl. its
+Irrelevance-Detection metric = the malformed-call proxy) and **LMArena** (general capability)
+into `docs/tier-data.json`, and prints the top tool-callers so you can pick tier targets from
+real data. Both sources are synced-not-forked; a leaderboard schema change fails the sync loudly.
 
 The reshaper also takes `"kind": "openai"` — so `repair` mode can run entirely on an OpenAI-compatible provider (e.g. NIM) with no Anthropic key. The reshaper is asked only for the **corrected arguments per tool-call id** (not the full message envelope), which is far more reliable on weaker models; the proxy reconstructs the message and re-validates it.
 
