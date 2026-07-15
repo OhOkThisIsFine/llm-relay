@@ -1,0 +1,374 @@
+{
+  "generated": "live-run",
+  "base": "https://integrate.api.nvidia.com/v1",
+  "reshaper": "meta/llama-3.1-70b-instruct",
+  "trials": 3,
+  "scenarios": [
+    {
+      "id": "flat_single",
+      "difficulty": "easy"
+    },
+    {
+      "id": "enum_required",
+      "difficulty": "medium"
+    },
+    {
+      "id": "typed_integer",
+      "difficulty": "medium"
+    },
+    {
+      "id": "nested_object",
+      "difficulty": "hard"
+    }
+  ],
+  "liveModels": [
+    "meta/llama-3.1-8b-instruct",
+    "meta/llama-3.1-70b-instruct"
+  ],
+  "unavailable": {
+    "meta/llama-3.3-70b-instruct": "timeout",
+    "mistralai/mistral-7b-instruct-v0.3": "HTTP 404: {\"status\":404,\"title\":\"Not Found\",\"detail\":\"Function 'cd89bd68-13e3-47a9-861e-9a62e6e14b05': Not fou",
+    "mistralai/mixtral-8x22b-instruct-v0.1": "HTTP 410: {\"type\":\"about:blank\",\"title\":\"Gone\",\"status\":410,\"detail\":\"The model 'mistralai/mixtral-8x22b-instr",
+    "microsoft/phi-3-medium-4k-instruct": "HTTP 404: 404 page not found\n",
+    "google/gemma-2-9b-it": "HTTP 404: 404 page not found\n",
+    "qwen/qwen2.5-coder-7b-instruct": "HTTP 404: 404 page not found\n"
+  },
+  "records": [
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "flat_single",
+      "difficulty": "easy",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Paris"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "flat_single",
+      "difficulty": "easy",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Paris"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "flat_single",
+      "difficulty": "easy",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Paris"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "enum_required",
+      "difficulty": "medium",
+      "verdict": "valid",
+      "rawInput": {
+        "unit": "C",
+        "city": "Tokyo"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "enum_required",
+      "difficulty": "medium",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Tokyo",
+        "unit": "C"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "enum_required",
+      "difficulty": "medium",
+      "verdict": "valid",
+      "rawInput": {
+        "unit": "C",
+        "city": "Tokyo"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "typed_integer",
+      "difficulty": "medium",
+      "verdict": "fail",
+      "errorKinds": [
+        "schema_violation"
+      ],
+      "rawInput": {
+        "days": "5",
+        "city": "Berlin"
+      },
+      "repair": "fixed"
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "typed_integer",
+      "difficulty": "medium",
+      "verdict": "fail",
+      "errorKinds": [
+        "schema_violation"
+      ],
+      "rawInput": {
+        "city": "Berlin",
+        "days": "5"
+      },
+      "repair": "fixed"
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "typed_integer",
+      "difficulty": "medium",
+      "verdict": "fail",
+      "errorKinds": [
+        "schema_violation"
+      ],
+      "rawInput": {
+        "days": "5",
+        "city": "Berlin"
+      },
+      "repair": "fixed"
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "nested_object",
+      "difficulty": "hard",
+      "verdict": "valid",
+      "rawInput": {
+        "location": {
+          "city": "Madrid",
+          "unit": "F"
+        }
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "nested_object",
+      "difficulty": "hard",
+      "verdict": "valid",
+      "rawInput": {
+        "location": {
+          "city": "Madrid",
+          "unit": "F"
+        }
+      }
+    },
+    {
+      "model": "meta/llama-3.1-8b-instruct",
+      "scenario": "nested_object",
+      "difficulty": "hard",
+      "verdict": "valid",
+      "rawInput": {
+        "location": {
+          "city": "Madrid",
+          "unit": "F"
+        }
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "flat_single",
+      "difficulty": "easy",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Paris"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "flat_single",
+      "difficulty": "easy",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Paris"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "flat_single",
+      "difficulty": "easy",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Paris"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "enum_required",
+      "difficulty": "medium",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Tokyo",
+        "unit": "C"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "enum_required",
+      "difficulty": "medium",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Tokyo",
+        "unit": "C"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "enum_required",
+      "difficulty": "medium",
+      "verdict": "valid",
+      "rawInput": {
+        "city": "Tokyo",
+        "unit": "C"
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "typed_integer",
+      "difficulty": "medium",
+      "verdict": "fail",
+      "errorKinds": [
+        "schema_violation"
+      ],
+      "rawInput": {
+        "city": "Berlin",
+        "days": "5"
+      },
+      "repair": "fixed"
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "typed_integer",
+      "difficulty": "medium",
+      "verdict": "fail",
+      "errorKinds": [
+        "schema_violation"
+      ],
+      "rawInput": {
+        "city": "Berlin",
+        "days": "5"
+      },
+      "repair": "fixed"
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "typed_integer",
+      "difficulty": "medium",
+      "verdict": "fail",
+      "errorKinds": [
+        "schema_violation"
+      ],
+      "rawInput": {
+        "city": "Berlin",
+        "days": "5"
+      },
+      "repair": "fixed"
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "nested_object",
+      "difficulty": "hard",
+      "verdict": "valid",
+      "rawInput": {
+        "location": {
+          "city": "Madrid",
+          "unit": "F"
+        }
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "nested_object",
+      "difficulty": "hard",
+      "verdict": "valid",
+      "rawInput": {
+        "location": {
+          "city": "Madrid",
+          "unit": "F"
+        }
+      }
+    },
+    {
+      "model": "meta/llama-3.1-70b-instruct",
+      "scenario": "nested_object",
+      "difficulty": "hard",
+      "verdict": "valid",
+      "rawInput": {
+        "location": {
+          "city": "Madrid",
+          "unit": "F"
+        }
+      }
+    }
+  ],
+  "aggregates": {
+    "byModel": {
+      "meta/llama-3.1-8b-instruct": {
+        "trials": 12,
+        "errors": 0,
+        "no_tool_call": 0,
+        "tool_calls": 12,
+        "valid": 9,
+        "fail": 3,
+        "trip_rate": 0.25,
+        "repair_fix_rate": 1
+      },
+      "meta/llama-3.1-70b-instruct": {
+        "trials": 12,
+        "errors": 0,
+        "no_tool_call": 0,
+        "tool_calls": 12,
+        "valid": 9,
+        "fail": 3,
+        "trip_rate": 0.25,
+        "repair_fix_rate": 1
+      }
+    },
+    "byScenario": {
+      "flat_single": {
+        "trials": 6,
+        "errors": 0,
+        "no_tool_call": 0,
+        "tool_calls": 6,
+        "valid": 6,
+        "fail": 0,
+        "trip_rate": 0,
+        "repair_fix_rate": null
+      },
+      "enum_required": {
+        "trials": 6,
+        "errors": 0,
+        "no_tool_call": 0,
+        "tool_calls": 6,
+        "valid": 6,
+        "fail": 0,
+        "trip_rate": 0,
+        "repair_fix_rate": null
+      },
+      "typed_integer": {
+        "trials": 6,
+        "errors": 0,
+        "no_tool_call": 0,
+        "tool_calls": 6,
+        "valid": 0,
+        "fail": 6,
+        "trip_rate": 1,
+        "repair_fix_rate": 1
+      },
+      "nested_object": {
+        "trials": 6,
+        "errors": 0,
+        "no_tool_call": 0,
+        "tool_calls": 6,
+        "valid": 6,
+        "fail": 0,
+        "trip_rate": 0,
+        "repair_fix_rate": null
+      }
+    }
+  }
+}

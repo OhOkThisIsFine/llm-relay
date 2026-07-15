@@ -4,7 +4,7 @@ A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v
 
 **The one boundary:** it fixes/flags *protocol form* (malformed tool calls), never *judgment* (bad reasoning). See the spec.
 
-## Status — M0 + M1 + M2
+## Status — M0 + M1 + M2 + M4
 
 - ✅ M0 passthrough: forwards streaming + non-streaming `/v1/messages` byte-for-byte.
 - ✅ M1 validator + `detect` mode: deterministic tool_use gate (Ajv2020), metadata-only logging of pass/fail/uncheckable — **behavior unchanged**, it only observes.
@@ -105,6 +105,10 @@ Then point a `claude` CLI at it (see "Install & run" above) and inspect the log 
 `uncheckable` = a declared tool with no `input_schema` (built-in `bash`/`text_editor`/…) or a schema that wouldn't compile — surfaced distinctly so an unvalidatable call is never miscounted as a clean pass.
 
 This is the dataset for deciding which backend models are *format-broken* (reshapeable later) vs pass cleanly. Run in `detect` first, measure, then decide on repair.
+
+### Trip-rate dataset
+
+`node scripts/nim-trip-rate.mjs` probes a list of backend models across difficulty-graded tool schemas (× N trials), runs each call through the real validator, and repairs the failures — producing a per-model **trip rate** (share of tool calls that fail schema validation) and **repair-fix rate**. Latest live NIM run: [`docs/nim-trip-rate.md`](docs/nim-trip-rate.md) (raw records in `docs/nim-trip-rate.jsonl`). The sharp result: even strong Llama-3.1 models emit `days:"5"` (string) against an `integer` schema on every trial — and the proxy repairs it every time; the flat/enum/nested schemas pass clean.
 
 ## Design
 
