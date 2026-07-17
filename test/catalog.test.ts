@@ -33,12 +33,20 @@ describe("ModelCatalog", () => {
     expect(models).toEqual(["m1"]);
   });
 
-  it("re-fetches after TTL expiry, and force bypasses the cache", async () => {
+  it("stale-while-revalidate: past TTL serves the stale list immediately, refreshes in the background", async () => {
     const c = new ModelCatalog({ cachePath: null, ttlMs: 1000 });
     await c.list("p", provider, { now: 0, fetchFn: okFetch(["old"]) });
-    const afterTtl = await c.list("p", provider, { now: 2000, fetchFn: okFetch(["new"]) });
-    expect(afterTtl).toEqual(["new"]);
-    const forced = await c.list("p", provider, { now: 2000, force: true, fetchFn: okFetch(["forced"]) });
+    // Past TTL: MUST NOT block on the refetch — a discovery/liveness probe returns
+    // the stale list at once while a background refresh runs.
+    const immediate = await c.list("p", provider, { now: 2000, fetchFn: okFetch(["new"]) });
+    expect(immediate).toEqual(["old"]);
+    // Let the fire-and-forget refresh settle (macrotask after the fetch microtasks);
+    // the cache now reflects the refreshed list without any further network call.
+    await new Promise((r) => setTimeout(r, 0));
+    const afterRefresh = await c.list("p", provider, { now: 3000, fetchFn: throwFetch() });
+    expect(afterRefresh).toEqual(["new"]);
+    // force still bypasses the cache and awaits a fresh fetch synchronously.
+    const forced = await c.list("p", provider, { now: 3000, force: true, fetchFn: okFetch(["forced"]) });
     expect(forced).toEqual(["forced"]);
   });
 
