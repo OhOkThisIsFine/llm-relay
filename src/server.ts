@@ -1,22 +1,13 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
-import {
-  DEFAULT_ANTHROPIC_VERSION,
-  resolveTarget,
-  reshaperForTarget,
-  RoutingError,
-  type Config,
-  type ResolvedTarget,
-} from "./config.js";
+import { DEFAULT_ANTHROPIC_VERSION, type BackendConfig, type Config } from "./config.js";
 import { MetadataLogger, type RequestLog } from "./log.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront } from "./backend.js";
-import { ModelCatalog } from "./catalog.js";
-import { buildRegistry } from "./registry.js";
+import { fetchBackend } from "./backend.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
 
 const HOP_BY_HOP = new Set([
@@ -28,36 +19,17 @@ const MAX_VALIDATE_BYTES = 8 * 1024 * 1024;
 
 export interface ProxyDeps {
   reshaper?: Reshaper;
-  catalog?: ModelCatalog;
 }
 
 export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const validator = new ToolUseValidator();
   const logger = new MetadataLogger(cfg.log);
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
-  const catalog = deps.catalog ?? new ModelCatalog();
-
-  // Reshaper selection is per-resolved-target: an explicit global reshaper (or an
-  // injected one) wins for every request; otherwise an openai target reshapes on
-  // itself (same base/model/key), built once per (provider, model) and cached.
-  const explicitReshaper: Reshaper | undefined =
+  const reshaper: Reshaper | undefined =
     deps.reshaper ?? (cfg.reshaper ? new HttpReshaper(cfg.reshaper) : undefined);
-  const reshaperCache = new Map<string, Reshaper>();
-  const resolveReshaper = (target: ResolvedTarget): Reshaper | undefined => {
-    if (explicitReshaper) return explicitReshaper;
-    const spec = reshaperForTarget(target);
-    if (!spec) return undefined;
-    const key = `${target.provider}::${target.model ?? ""}`;
-    let r = reshaperCache.get(key);
-    if (!r) {
-      r = new HttpReshaper(spec);
-      reshaperCache.set(key, r);
-    }
-    return r;
-  };
 
   return createServer((req, res) => {
-    handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper, catalog }).catch((e) => {
+    handle(req, res, cfg, { validator, logger, isDestructive, reshaper }).catch((e) => {
       failClosed(res, 502, `repair-proxy internal error: ${(e as Error).message}`);
     });
   });
@@ -67,8 +39,7 @@ interface Handlers {
   validator: ToolUseValidator;
   logger: MetadataLogger;
   isDestructive: (name: string) => boolean;
-  resolveReshaper: (target: ResolvedTarget) => Reshaper | undefined;
-  catalog: ModelCatalog;
+  reshaper?: Reshaper | undefined;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
@@ -88,61 +59,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const wantsStream = pickBool(reqJson, "stream");
   const pathname = path.split("?")[0] ?? path;
 
-  // Discovery endpoint for a dispatcher (e.g. audit-tools): providers × live models
-  // (best-effort capability) + routing + raw leaderboard scores, one coherent view.
-  if (req.method === "GET" && pathname === "/registry") {
-    const view = await buildRegistry(cfg, h.catalog);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(view));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
-    return;
-  }
-
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
   const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
 
-  // Route the request's model to a concrete provider + backend model. A bad route
-  // (unknown provider, missing model) is a clean 400, never a crash.
-  let target: ResolvedTarget;
-  try {
-    target = resolveTarget(model, cfg);
-  } catch (e) {
-    if (e instanceof RoutingError) {
-      failClosed(res, 400, `repair-proxy routing: ${e.message}`);
-      h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped"));
-      return;
-    }
-    throw e;
-  }
-
-  // OpenAI-compatible FRONT: a dispatcher (e.g. audit-tools) POSTs OpenAI Chat
-  // Completions with a namespaced model; route by target and reverse-proxy the
-  // upstream OpenAI response straight back (OpenAI in, OpenAI out).
-  if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
-    await openAiFrontPath(res, target, { reqJson, wantsStream, started, path, model, hadTools }, h);
-    return;
-  }
-
-  // OpenAI-compatible backends expose ONLY /chat/completions — they have no
-  // count_tokens route and no other Anthropic paths. Rather than mistranslate
-  // those into a chat completion (yielding a spurious 400/garbage), answer
-  // count_tokens locally with a cheap estimate and reject other paths cleanly.
-  // For an Anthropic backend everything forwards as before (it speaks these).
-  if (target.kind === "openai") {
-    if (isCountTokens) {
-      const input_tokens = estimateInputTokens(reqJson);
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ input_tokens }));
-      h.logger.write(baseLog(started, path, model, hadTools, false, 200, "skipped"));
-      return;
-    }
-    if (!isMessages) {
-      failClosed(res, 404, `repair-proxy: path not supported for an openai backend: ${pathname}`);
-      h.logger.write(baseLog(started, path, model, hadTools, false, 404, "skipped"));
-      return;
-    }
-  }
-
+  const target = cfg.backend;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), target.timeoutMs);
 
@@ -154,7 +74,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       reqBuf,
       reqJson,
       anthropicHeaders: buildForwardHeaders(req.headers, target),
-      wantsStream,
       signal: controller.signal,
     });
   } catch (e) {
@@ -165,9 +84,22 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     return;
   }
 
+  // Some Anthropic-format backends (LiteLLM included, depending on version) don't
+  // implement count_tokens. If the backend rejects the path, answer locally with a
+  // cheap estimate rather than surfacing a 404 the client can't act on.
+  if (isCountTokens && (backendRes.status === 404 || backendRes.status === 405)) {
+    clearTimeout(timer);
+    await backendRes.arrayBuffer().catch(() => undefined);
+    const input_tokens = estimateInputTokens(reqJson);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ input_tokens }));
+    h.logger.write(baseLog(started, path, model, hadTools, false, 200, "skipped"));
+    return;
+  }
+
   const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
   const willValidate = isMessages && hadTools && backendRes.status < 400;
-  const reshaper = h.resolveReshaper(target);
+  const reshaper = h.reshaper;
   const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
 
   if (doRepair) {
@@ -184,48 +116,6 @@ interface Ctx {
   started: number;
   path: string;
   hadTools: boolean;
-}
-
-/**
- * OpenAI front: reverse-proxy the resolved target's /chat/completions to the client,
- * verbatim (streaming or buffered). No Anthropic translation, no tool-call repair —
- * this is the multiplexer path a dispatcher uses to reach many backends by namespace.
- */
-async function openAiFrontPath(
-  res: ServerResponse,
-  target: ResolvedTarget,
-  ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; model: string | null; hadTools: boolean },
-  h: Handlers,
-): Promise<void> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), target.timeoutMs);
-  let upstream: Response;
-  try {
-    upstream = await fetchOpenAiFront(target, { reqJson: ctx.reqJson, wantsStream: ctx.wantsStream, signal: controller.signal });
-  } catch (e) {
-    clearTimeout(timer);
-    const aborted = controller.signal.aborted;
-    const status = aborted ? 504 : 502;
-    if (!res.headersSent) {
-      res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
-    }
-    h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, false, status, "skipped"));
-    return;
-  }
-  try {
-    res.writeHead(upstream.status, filterResponseHeaders(upstream.headers));
-    if (upstream.body) {
-      for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
-        if (!res.write(Buffer.from(chunk))) await once(res, "drain");
-      }
-    }
-    res.end();
-  } finally {
-    clearTimeout(timer);
-  }
-  const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
-  h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped"));
 }
 
 /** detect/default: forward bytes unchanged, observe + log if applicable. */
@@ -529,7 +419,7 @@ function toAnthropicMessage(msg: AssistantMessage, model: string | null): object
   };
 }
 
-function buildForwardHeaders(inbound: IncomingMessage["headers"], target: ResolvedTarget): Record<string, string> {
+function buildForwardHeaders(inbound: IncomingMessage["headers"], target: BackendConfig): Record<string, string> {
   const apiKey = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
   const stripAuth = !!apiKey;
   const out: Record<string, string> = {};
@@ -644,10 +534,10 @@ function baseLog(
 }
 
 /**
- * Cheap local token estimate for a /v1/messages/count_tokens request against an
- * OpenAI backend (which has no native count_tokens). ~4 chars/token over all
- * string content in system+messages+tools. Advisory only — the harness uses this
- * for context-budget bookkeeping, not correctness.
+ * Cheap local token estimate for a /v1/messages/count_tokens request when the
+ * backend doesn't implement the path. ~4 chars/token over all string content in
+ * system+messages+tools. Advisory only — the harness uses this for
+ * context-budget bookkeeping, not correctness.
  */
 function estimateInputTokens(body: unknown): number {
   if (typeof body !== "object" || body === null) return 0;

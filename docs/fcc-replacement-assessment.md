@@ -1,5 +1,10 @@
 # Is repair-proxy a safe replacement for free-claude-code (fcc)?
 
+> **Historical (2026-07-17 note):** this assessment predates the LiteLLM reshape. The built-in
+> Anthropic↔OpenAI translation (llm-bridge) described below was since removed — provider
+> translation/routing now belongs to a LiteLLM proxy behind repair-proxy (see README). The
+> validate/repair findings still stand; the translation pillar is now LiteLLM's.
+
 Assessed 2026-07-14, live against NVIDIA NIM (`meta/llama-3.1-70b-instruct`), mode=repair, OpenAI backend.
 
 ## Verdict

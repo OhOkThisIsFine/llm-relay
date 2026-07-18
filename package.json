@@ -13,17 +13,14 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
-    "sync:tiers": "node scripts/sync-tiers.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "ajv": "^8.17.1",
-    "llm-bridge": "^2.0.1"
+    "ajv": "^8.17.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "hyparquet": "^1.26.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

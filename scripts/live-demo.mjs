@@ -25,17 +25,14 @@ const backend = createServer(async (req, res) => {
   }));
 });
 
-// A cheap reshaper: returns the corrected Anthropic message as JSON text.
+// A cheap reshaper: returns corrected inputs per tool_use id (the reshaper contract).
 const reshaper = createServer(async (req, res) => {
   await readBody(req);
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({
     id: "msg_reshaper", type: "message", role: "assistant", model: "reshaper",
     stop_reason: "end_turn",
-    content: [{ type: "text", text: JSON.stringify({
-      content: [{ type: "tool_use", id: "tu_1", name: "get_weather", input: { city: "Paris" } }],
-      stop_reason: "tool_use",
-    }) }],
+    content: [{ type: "text", text: JSON.stringify({ inputs: { tu_1: { city: "Paris" } } }) }],
   }));
 });
 
