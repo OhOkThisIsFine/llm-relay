@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
@@ -39,8 +42,17 @@ function splitSpec(spec: string): { provider: string; model?: string } {
   return i === -1 ? { provider: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
 }
 
+function resolveConfigPath(): string {
+  const explicit = argValue("--config");
+  if (explicit) return explicit;
+  if (existsSync("config.json")) return "config.json";
+  const userConfig = join(homedir(), ".llm-relay", "config.json");
+  if (existsSync(userConfig)) return userConfig;
+  return "config.json";
+}
+
 function loadOrExit(): Config {
-  const configPath = argValue("--config") ?? "config.json";
+  const configPath = resolveConfigPath();
   const overrides: ConfigOverrides = {
     routeDefault: argValue("--default"),
     mode: argValue("--mode"),
@@ -49,7 +61,15 @@ function loadOrExit(): Config {
   try {
     return loadConfig(configPath, overrides);
   } catch (e) {
-    process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
+    const isEnoent = (e as Error).message.includes("ENOENT");
+    if (isEnoent && !argValue("--config")) {
+      process.stderr.write(
+        `llm-relay: config.json not found in current directory or ~/.llm-relay/config.json.\n` +
+          `  Please run from a folder with config.json or pass --config <path>.\n`,
+      );
+    } else {
+      process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
+    }
     process.exit(1);
   }
 }
