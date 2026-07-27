@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
 
-const NIM_BASE = process.env.LLM_BACKEND_BASE_URL;
+const NIM_BASE = process.env.LLM_BACKEND_BASE_URL || "https://integrate.api.nvidia.com/v1";
 const RESHAPER_MODEL = "meta/llama-3.1-70b-instruct";
 const freePort = () => new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 async function readLog(p) { for (let i = 0; i < 80; i++) { if (existsSync(p)) { const t = readFileSync(p, "utf8").trim(); if (t) return t.split("\n").pop(); } await new Promise((r) => setTimeout(r, 25)); } return "(no log)"; }
@@ -43,8 +43,8 @@ writeFileSync(cfgPath, JSON.stringify({
   log: { level: "metadata", file: logPath },
 }));
 
-const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "ignore", "pipe"] });
-for await (const c of proc.stderr) { if (/listening on/.test(c.toString())) break; }
+const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "pipe", "pipe"] });
+for await (const c of proc.stdout) { if (/listening on/.test(c.toString())) break; }
 
 const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
   method: "POST", headers: { "content-type": "application/json" },

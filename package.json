@@ -9,13 +9,21 @@
   "bin": {
     "repair-proxy": "dist/cli.js"
   },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "docs/tier-data.json",
+    "README.md",
+    "config.example.json"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "sync:tiers": "node scripts/sync-tiers.mjs",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "ajv": "^8.17.1",

@@ -25,13 +25,25 @@ const logPath = join(dir, "log.jsonl");
 const port = await freePort();
 writeFileSync(cfgPath, JSON.stringify({
   listen: `127.0.0.1:${port}`,
-  backend: { base: process.env.LLM_BACKEND_BASE_URL, kind: "openai", model: MODEL, authEnv: "NVIDIA_API_KEY", authHeader: "authorization" },
+  providers: {
+    nim: { base: process.env.LLM_BACKEND_BASE_URL || "https://integrate.api.nvidia.com/v1", kind: "openai", authEnv: "NVIDIA_API_KEY", authHeader: "authorization" },
+  },
+  routing: {
+    default: `nim/${MODEL}`,
+  },
   mode: "detect",
   log: { level: "metadata", file: logPath },
 }));
 
-const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "ignore", "pipe"] });
-for await (const c of proc.stderr) { if (/listening on/.test(c.toString())) break; }
+const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "pipe", "pipe"] });
+await new Promise((resolve) => {
+  const check = (d) => {
+    const s = d.toString();
+    if (/listening on/.test(s)) resolve();
+  };
+  proc.stdout.on("data", check);
+  proc.stderr.on("data", check);
+});
 
 const anthropicRequest = (stream) => ({
   model: "claude-sonnet-5", max_tokens: 512, stream,
