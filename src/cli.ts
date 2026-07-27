@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
@@ -20,7 +20,7 @@ Usage:
   llm-relay [--config <path>] [overrides]     start the proxy
   llm-relay models [--provider <name>] [--refresh]   list live models per provider
 
-  --config <path>        Config file (default: config.json)
+  --config <path>        Config file (default: ~/.llm-relay/config.json)
 
 Overrides (win over the config file, so routing can be repointed without editing it):
   --default <prov/model> routing.default (fallback provider/model)
@@ -36,6 +36,55 @@ Config string values may reference environment variables as \${NAME}
 (e.g. "base": "\${LLM_BACKEND_BASE_URL}"); an unset var is a startup error.
 `;
 
+const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
+  {
+    listen: "127.0.0.1:8791",
+    providers: {
+      nim: {
+        base: "https://integrate.api.nvidia.com/v1",
+        kind: "openai",
+        authEnv: "NVIDIA_API_KEY",
+      },
+      openrouter: {
+        base: "https://openrouter.ai/api/v1",
+        kind: "openai",
+        authEnv: "OPENROUTER_API_KEY",
+      },
+      gemini: {
+        base: "https://generativelanguage.googleapis.com/v1beta/openai",
+        kind: "openai",
+        authEnv: "GEMINI_API_KEY",
+      },
+      groq: {
+        base: "https://api.groq.com/openai/v1",
+        kind: "openai",
+        authEnv: "GROQ_API_KEY",
+      },
+      mistral: {
+        base: "https://api.mistral.ai/v1",
+        kind: "openai",
+        authEnv: "MISTRAL_API_KEY",
+      },
+    },
+    routing: {
+      default: "nim/meta/llama-3.1-70b-instruct",
+      tiers: {
+        opus: "nim/nvidia/nemotron-3-super-120b-a12b",
+        sonnet: "nim/meta/llama-3.1-70b-instruct",
+        haiku: "nim/meta/llama-3.1-8b-instruct",
+      },
+    },
+    mode: "repair",
+    repair: {
+      maxAttempts: 2,
+      destructiveTools: ["rm", "delete", "push", "force", "overwrite", "drop", "reset"],
+    },
+    log: { level: "metadata", file: null },
+  },
+  null,
+  2,
+);
+
 /** Split a "provider/model" spec on the first slash. */
 function splitSpec(spec: string): { provider: string; model?: string } {
   const i = spec.indexOf("/");
@@ -45,10 +94,21 @@ function splitSpec(spec: string): { provider: string; model?: string } {
 function resolveConfigPath(): string {
   const explicit = argValue("--config");
   if (explicit) return explicit;
-  if (existsSync("config.json")) return "config.json";
-  const userConfig = join(homedir(), ".llm-relay", "config.json");
+
+  const userConfigDir = join(homedir(), ".llm-relay");
+  const userConfig = join(userConfigDir, "config.json");
+
   if (existsSync(userConfig)) return userConfig;
-  return "config.json";
+  if (existsSync("config.json")) return "config.json";
+
+  try {
+    mkdirSync(userConfigDir, { recursive: true });
+    writeFileSync(userConfig, DEFAULT_CONFIG_TEMPLATE, "utf8");
+    process.stderr.write(`llm-relay: initialized global config at ${userConfig}\n`);
+    return userConfig;
+  } catch {
+    return "config.json";
+  }
 }
 
 function loadOrExit(): Config {
@@ -61,15 +121,7 @@ function loadOrExit(): Config {
   try {
     return loadConfig(configPath, overrides);
   } catch (e) {
-    const isEnoent = (e as Error).message.includes("ENOENT");
-    if (isEnoent && !argValue("--config")) {
-      process.stderr.write(
-        `llm-relay: config.json not found in current directory or ~/.llm-relay/config.json.\n` +
-          `  Please run from a folder with config.json or pass --config <path>.\n`,
-      );
-    } else {
-      process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
-    }
+    process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
     process.exit(1);
   }
 }
