@@ -1,13 +1,13 @@
 {
-  "name": "repair-proxy",
+  "name": "llm-relay",
   "version": "0.0.1",
-  "description": "Loopback Anthropic-Messages-API proxy that validates tool-call responses and (later) reshapes protocol failures, so the Claude Code harness can run on any backend model.",
+  "description": "Loopback Anthropic-Messages-API proxy that validates and repairs tool-call responses in flight, routing across multi-provider LLM backends.",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "bin": {
-    "repair-proxy": "dist/cli.js"
+    "llm-relay": "dist/cli.js"
   },
   "license": "MIT",
   "files": [

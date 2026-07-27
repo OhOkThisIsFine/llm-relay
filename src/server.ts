@@ -58,7 +58,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
 
   return createServer((req, res) => {
     handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper, catalog }).catch((e) => {
-      failClosed(res, 502, `repair-proxy internal error: ${(e as Error).message}`);
+      failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
     });
   });
 }
@@ -108,7 +108,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     target = resolveTarget(model, cfg);
   } catch (e) {
     if (e instanceof RoutingError) {
-      failClosed(res, 400, `repair-proxy routing: ${e.message}`);
+      failClosed(res, 400, `llm-relay routing: ${e.message}`);
       h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped"));
       return;
     }
@@ -137,7 +137,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       return;
     }
     if (!isMessages) {
-      failClosed(res, 404, `repair-proxy: path not supported for an openai backend: ${pathname}`);
+      failClosed(res, 404, `llm-relay: path not supported for an openai backend: ${pathname}`);
       h.logger.write(baseLog(started, path, model, hadTools, false, 404, "skipped"));
       return;
     }
@@ -426,7 +426,7 @@ async function repairStreamingPath(
         res.end(emitSseTail(decision.message, firstToolUseIndex));
       } else {
         // Head already committed — surface a mid-stream SSE error, never a fabricated call.
-        res.end(sseError(`repair-proxy: tool call could not be repaired (${decision.outcome})`));
+        res.end(sseError(`llm-relay: tool call could not be repaired (${decision.outcome})`));
       }
     }
   }
@@ -488,7 +488,7 @@ async function repairBufferedPath(
         emitFixed(res, backendRes.status, filtered, decision.message, ctx.wantsStream, ctx.model);
       } else {
         // fail-clean: loud, well-formed error rather than a silently broken call.
-        failClosed(res, 502, `repair-proxy: tool call could not be repaired (${decision.outcome})`);
+        failClosed(res, 502, `llm-relay: tool call could not be repaired (${decision.outcome})`);
       }
     }
   }

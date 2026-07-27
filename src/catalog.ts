@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import type { ProviderConfig } from "./config.js";
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
-const DEFAULT_CACHE = join(homedir(), ".repair-proxy", "models-cache.json");
+const DEFAULT_CACHE = join(homedir(), ".llm-relay", "models-cache.json");
 
 interface Entry {
   fetchedAt: number;

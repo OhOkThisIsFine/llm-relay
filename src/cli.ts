@@ -8,14 +8,14 @@ function argValue(flag: string): string | undefined {
   return i !== -1 ? process.argv[i + 1] : undefined;
 }
 
-const HELP = `repair-proxy — loopback Anthropic-Messages proxy that validates/repairs tool calls.
+const HELP = `llm-relay — loopback Anthropic-Messages proxy that validates/repairs tool calls.
 
 Multi-provider: config declares a providers{} registry; a request's model routes
 to one provider by namespace ("nim/z-ai/glm-5.2") or by Claude tier (routing.tiers).
 
 Usage:
-  repair-proxy [--config <path>] [overrides]     start the proxy
-  repair-proxy models [--provider <name>] [--refresh]   list live models per provider
+  llm-relay [--config <path>] [overrides]     start the proxy
+  llm-relay models [--provider <name>] [--refresh]   list live models per provider
 
   --config <path>        Config file (default: config.json)
 
@@ -25,7 +25,7 @@ Overrides (win over the config file, so routing can be repointed without editing
   --listen <host:port>   listen address (loopback only)
 
 Model ids are discovered dynamically from each provider's /models endpoint and
-cached (~/.repair-proxy/models-cache.json, 10-min TTL). "repair-proxy models" lists
+cached (~/.llm-relay/models-cache.json, 10-min TTL). "llm-relay models" lists
 them; --refresh forces a re-fetch. On startup the proxy warms the cache and warns
 about any routing target its provider does not serve.
 
@@ -49,12 +49,12 @@ function loadOrExit(): Config {
   try {
     return loadConfig(configPath, overrides);
   } catch (e) {
-    process.stderr.write(`repair-proxy: ${(e as Error).message}\n`);
+    process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
     process.exit(1);
   }
 }
 
-/** `repair-proxy models` — dynamic, cached model discovery per provider. */
+/** `llm-relay models` — dynamic, cached model discovery per provider. */
 async function runModels(): Promise<void> {
   const cfg = loadOrExit();
   const only = argValue("--provider");
@@ -62,7 +62,7 @@ async function runModels(): Promise<void> {
   const catalog = new ModelCatalog();
   const names = Object.keys(cfg.providers).filter((n) => !only || n === only);
   if (names.length === 0) {
-    process.stderr.write(`repair-proxy: no provider named "${only}"\n`);
+    process.stderr.write(`llm-relay: no provider named "${only}"\n`);
     process.exit(1);
   }
   for (const name of names) {
@@ -102,8 +102,8 @@ async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void
     const known = await catalog.has(provider, p, model);
     if (known === false) {
       process.stderr.write(
-        `repair-proxy: routing target "${spec}" — provider "${provider}" does not list model "${model}". ` +
-          `Requests routed here will fail; run "repair-proxy models --provider ${provider}" to see valid ids.\n`,
+        `llm-relay: routing target "${spec}" — provider "${provider}" does not list model "${model}". ` +
+          `Requests routed here will fail; run "llm-relay models --provider ${provider}" to see valid ids.\n`,
       );
     }
   }
@@ -116,7 +116,7 @@ function runProxy(): void {
   server.listen(cfg.port, cfg.host, () => {
     const providers = Object.keys(cfg.providers).join(",");
     process.stderr.write(
-      `repair-proxy listening on http://${cfg.host}:${cfg.port} ` +
+      `llm-relay listening on http://${cfg.host}:${cfg.port} ` +
         `(mode=${cfg.mode}, providers=[${providers}], default=${cfg.routing.default})\n`,
     );
     void warmAndValidate(cfg, catalog);

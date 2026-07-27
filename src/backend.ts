@@ -131,7 +131,7 @@ export async function fetchOpenAiFront(
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
   if (target.kind !== "openai") {
-    return openaiError(400, `repair-proxy: OpenAI front requires an openai-kind provider; "${target.provider}" is ${target.kind}`);
+    return openaiError(400, `llm-relay: OpenAI front requires an openai-kind provider; "${target.provider}" is ${target.kind}`);
   }
   const base = (args.reqJson ?? {}) as Record<string, unknown>;
   const body = { ...base, model: target.model, stream: args.wantsStream };
