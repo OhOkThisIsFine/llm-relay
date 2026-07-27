@@ -21,13 +21,20 @@ Runs the compiled CLI as a real process against a local flaky-model backend + st
 
 ## Install & run
 
+### Option 1: Instant run (no installation required)
 ```bash
-npm install
-npm run build
-cp config.example.json config.json   # edit backend + auth
-NVIDIA_API_KEY=nvapi-... node dist/cli.js --config config.json
-# or, no build step:
-NVIDIA_API_KEY=nvapi-... npm run dev -- --config config.json
+NVIDIA_API_KEY=nvapi-... npx llm-relay --config config.json
+```
+
+### Option 2: Global installation
+```bash
+npm install -g llm-relay
+
+# Start the proxy:
+NVIDIA_API_KEY=nvapi-... llm-relay --config config.json
+
+# List available models across configured providers:
+llm-relay models
 ```
 
 ## Use it from your projects
@@ -38,11 +45,11 @@ Wrappers do this for you (they also set the thinking/beta/attribution flags the 
 
 ```powershell
 # PowerShell (from any project directory)
-C:\Code\repair-proxy\scripts\claude-proxied.ps1 -p "list the files here"
+C:\Code\llm-relay\scripts\claude-proxied.ps1 -p "list the files here"
 ```
 ```bash
 # bash
-/c/Code/repair-proxy/scripts/claude-proxied.sh -p "list the files here"
+/c/Code/llm-relay/scripts/claude-proxied.sh -p "list the files here"
 ```
 
 Or inline, if you'd rather not use the wrapper:
