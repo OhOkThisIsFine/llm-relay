@@ -1,22 +1,16 @@
 # repair-proxy
 
-A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v1/messages` to a backend and **validates tool-call responses** against the request's `tools[].input_schema`, so the Claude Code harness (or any `ANTHROPIC_BASE_URL` client) can run on non-Anthropic models without pre-filtering them by tool competence.
+A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v1/messages` to any backend model and **validates tool-call responses** against the request's `tools[].input_schema`, so the Claude Code harness (or any `ANTHROPIC_BASE_URL` client) can run on non-Anthropic models without pre-filtering them by tool competence.
 
 **The one boundary:** it fixes/flags *protocol form* (malformed tool calls), never *judgment* (bad reasoning).
-
-**Division of labor:** repair-proxy does the one thing no gateway does — validate and repair tool calls in flight. Everything else (provider translation, model routing, retries, fallbacks, cost tracking) belongs to the backend it fronts, typically a [LiteLLM proxy](https://docs.litellm.ai/docs/anthropic_unified), which serves the Anthropic Messages format for any provider model:
-
-```
-claude CLI → repair-proxy (:8791, validate/repair) → LiteLLM (:4000, translate/route) → NIM / OpenRouter / …
-```
 
 ## What it does
 
 - **Transparent passthrough** — forwards streaming and non-streaming `/v1/messages` byte-for-byte.
 - **`detect` mode** — deterministic tool_use validation (Ajv2020) with metadata-only logging of pass/fail/uncheckable. Behavior is unchanged; it only observes.
 - **`repair` mode** — on a validation failure, a cheap reshaper model corrects the call, the result is **re-validated**, and the corrected response is re-emitted (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched.
+- **OpenAI-compatible backends** (`backend.kind:"openai"`) — front NIM / vLLM / OpenRouter / LM Studio. Requests are translated Anthropic→OpenAI and responses back (streaming SSE + non-streaming) via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge) (zero-dep). The validate/repair layer always sees Anthropic Messages, regardless of backend. Verified live end-to-end.
 - **Streaming repair** — text-block SSE frames stream to the client **as they arrive**; the proxy only withholds from the first `tool_use` block. A pure-text response is byte-for-byte passthrough with zero added latency; a valid tool call flushes the withheld frames verbatim; an invalid one is repaired with only the corrected trailing blocks re-emitted (`message_start` + leading text already delivered). A mid-stream repair failure surfaces as an SSE `error` event, never a fabricated call. Handles LF and CRLF frame delimiters and multibyte UTF-8 across chunk boundaries.
-- **count_tokens fallback** — `/v1/messages/count_tokens` forwards to the backend; if the backend doesn't implement it (404/405), the proxy answers with a local estimate instead.
 
 ### Live demo (no external creds)
 
@@ -27,22 +21,13 @@ Runs the compiled CLI as a real process against a local flaky-model backend + st
 
 ## Install & run
 
-The backend must speak Anthropic Messages natively. The usual setup is a local LiteLLM proxy:
-
-```bash
-pip install 'litellm[proxy]'
-litellm --config docs/litellm-config.example.yaml --port 4000   # edit models/keys first
-```
-
-Then repair-proxy in front of it:
-
 ```bash
 npm install
 npm run build
-cp config.example.json config.json   # edit backend + reshaper if needed
-node dist/cli.js --config config.json
+cp config.example.json config.json   # edit backend + auth
+NVIDIA_API_KEY=nvapi-... node dist/cli.js --config config.json
 # or, no build step:
-npm run dev -- --config config.json
+NVIDIA_API_KEY=nvapi-... npm run dev -- --config config.json
 ```
 
 ## Use it from your projects
@@ -73,53 +58,118 @@ env -u CLAUDECODE -u ANTHROPIC_API_KEY \
 
 `ANTHROPIC_AUTH_TOKEN` can be `dummy` — the proxy strips inbound auth and injects the real backend key itself (from `authEnv`). Override the wrapper defaults with `RP_PROXY_URL`, `RP_AUTH`, `RP_CONFIG_DIR`. Verified live end-to-end: a real `claude` agentic session (tool_use → tool_result → answer) completes through the proxy against NIM.
 
-> Backend note: weak models still fail *reasoning* (they may loop or skip a tool) — repair fixes malformed tool-call *form*, not judgment. Pick a strong tool-caller as the backend model. Providers rate-limit (HTTP 429) under load; LiteLLM's router retries and claude's own backoff absorb it.
+> Backend note: weak models still fail *reasoning* (they may loop or skip a tool) — repair fixes malformed tool-call *form*, not judgment. Pick a strong tool-caller as the backend model. NIM also rate-limits (HTTP 429) under load; claude's own retry/backoff absorbs it.
 
-## Config
+## Config — multi-provider registry
 
-One backend, one optional reshaper:
+A `providers{}` registry (any number of OpenAI-compatible or Anthropic backends) plus
+a `routing` block that maps each request's `model` to one provider + backend model:
 
 ```jsonc
 {
-  "listen": "127.0.0.1:8791",            // loopback ONLY — startup refuses non-loopback
-  "backend": {
-    "base": "http://127.0.0.1:4000",     // Anthropic-format endpoint (e.g. LiteLLM)
-    // "model": "some-fixed-id",         // optional: rewrite every request's model to this;
-                                         // omit to pass the client's model through (LiteLLM aliases resolve it)
-    "authEnv": "LITELLM_API_KEY",        // env var NAME holding the backend key (never the key itself)
-    "authHeader": "authorization"        // or "x-api-key" (default)
+  "listen": "127.0.0.1:8791",              // loopback ONLY — startup refuses non-loopback
+  "providers": {
+    "nim":        { "base": "https://integrate.api.nvidia.com/v1", "kind": "openai", "authEnv": "NVIDIA_API_KEY" },
+    "openrouter": { "base": "https://openrouter.ai/api/v1",        "kind": "openai", "authEnv": "OPENROUTER_API_KEY" },
+    "gemini":     { "base": "https://generativelanguage.googleapis.com/v1beta/openai", "kind": "openai", "authEnv": "GEMINI_API_KEY" }
   },
-  "reshaper": {                          // required in repair mode
-    "base": "http://127.0.0.1:4000",
-    "model": "reshaper",                 // cheap model (a LiteLLM alias works well)
-    "kind": "anthropic",                 // "anthropic" → /v1/messages, "openai" → /chat/completions
-    "authEnv": "LITELLM_API_KEY",
-    "authHeader": "authorization"
+  "routing": {
+    "default": "nim/z-ai/glm-5.2",           // fallback when nothing else matches
+    "tiers": {                                // Claude tier (substring match) → provider/model
+      "opus":   "nim/nvidia/nemotron-3-super-120b-a12b",
+      "sonnet": "nim/z-ai/glm-5.2",
+      "haiku":  "nim/openai/gpt-oss-20b",     // cheap/fast — also catches Claude's haiku side-calls
+      "fable":  "nim/openai/gpt-oss-20b"
+    }
   },
-  "mode": "repair",                      // detect | repair (strict accepted, aliases detect)
+  "mode": "repair",                          // detect | repair (strict accepted, aliases detect)
   "repair": { "maxAttempts": 2, "destructiveTools": ["rm","delete","push","force","overwrite","drop","reset"] },
   "log": { "level": "metadata", "file": null }  // metadata-only; NEVER logs headers/bodies
 }
 ```
 
-Model routing (which Claude tier maps to which provider model, fallbacks, retries) lives in the **LiteLLM config** — see [docs/litellm-config.example.yaml](docs/litellm-config.example.yaml). Alias the `claude-*` ids there and repair-proxy passes the client's model straight through.
+**Routing (lifted from free-claude-code's proven scheme — split on the first `/` only):**
+1. **Namespaced** — a request `model` of `provider/rest` where `provider` is a configured
+   provider routes there directly; the entire tail (nested slashes, `:free` suffixes) is the
+   backend model, verbatim. E.g. `nim/openai/gpt-oss-120b`, `openrouter/openai/gpt-5.2-codex`.
+2. **Tier** — otherwise the Claude model id is substring-matched against `routing.tiers`
+   (`opus`/`sonnet`/`haiku`/`fable`). This also fixes Claude's haiku-class side-calls, which
+   would otherwise blindly hit one model and 404.
+3. **Default** — anything unrecognized falls to `routing.default`.
 
-The reshaper is asked only for the **corrected arguments per tool-call id** (not the full message envelope), which is far more reliable on weaker models; the proxy reconstructs the message and re-validates it. `kind: "openai"` lets it call an OpenAI-compatible endpoint directly if you'd rather not route the reshaper through LiteLLM.
+Each provider is `kind:"openai"` (translated Anthropic↔OpenAI via llm-bridge) or
+`kind:"anthropic"` (forwarded as-is). In `repair` mode an openai target reshapes on itself;
+an anthropic provider needs an explicit top-level `reshaper` block.
 
 ### Repointing without editing the file
 
-Config strings may reference env vars as `${NAME}` (unset → loud startup error). Or override from the CLI (wins over the file):
+Config strings may reference env vars as `${NAME}` (unset → loud startup error). Or override
+routing from the CLI (wins over the file):
 
 ```bash
-node dist/cli.js --config config.json --backend-base http://127.0.0.1:5000 --model my-model --mode repair
+node dist/cli.js --config config.json --default openrouter/openai/gpt-5.2-codex --mode repair
 ```
 
 `repair-proxy --help` lists every override.
 
+### Model discovery (dynamic + cached)
+
+Model ids are **discovered live** from each provider's `/models` endpoint — never
+hand-maintained. The catalog is cached in `~/.repair-proxy/models-cache.json`
+(10-min TTL, fail-open: a fetch failure serves the last-known list).
+
+```bash
+repair-proxy models                      # list live models for every provider
+repair-proxy models --provider nim       # one provider
+repair-proxy models --provider nim --refresh   # force a re-fetch
+```
+
+On startup the proxy warms the cache and **warns about any routing target its
+provider doesn't serve** — so a stale/typo'd tier model is caught at boot, not
+silently at request time.
+
+> Provider notes: **Groq** returns `403 "check your network settings"` from some
+> IPs/regions (a network-side block, not a key issue) — it works once your network
+> allows it. **Mistral** needs `MISTRAL_API_KEY` set in your environment.
+
+### Discovery endpoint (`GET /registry`) — for a dispatcher
+
+For a caller that does its own selection (e.g. audit-tools dispatch, which weighs
+quota / rate limits / token budget), `GET http://127.0.0.1:8791/registry` returns one
+coherent JSON view:
+
+- **providers** — each with `base`, `kind`, `has_key` (auth env set?), `reachable`
+  (did the live `/models` catalog return anything?), and `models[]` where every model
+  carries a best-effort `capability` (raw BFCL + Arena scores, **never collapsed** to
+  tiers — `null` when no confident leaderboard match).
+- **routing** — the current default + tier map.
+- **capability_source** — the full raw leaderboard dataset, so a consumer can run a
+  finer id→score join than the built-in best-effort one.
+
+The consumer then dispatches by pointing its OpenAI-compatible pool at :8791 and
+setting each packet's model to a **namespaced** `provider/model` (it picked the exact
+backend). repair-proxy exposes an **OpenAI-compatible front** for exactly this —
+`POST /v1/chat/completions` (and `/chat/completions`): the request's `model` is routed
+by namespace/tier, rewritten to the backend id, and the upstream OpenAI response is
+returned verbatim (OpenAI in, OpenAI out — the Anthropic `/v1/messages` front with
+tool-call repair stays available in parallel for a Claude-harness client). Meanwhile a plain `claude` client that sends `claude-sonnet-…` still gets the
+**dumb tier/default routing** — both coexist, no mode switch. So the tier map stays the
+default, and dispatcher-style usage is just "send namespaced ids + read `/registry`".
+
+### Model tiers from leaderboards (never a hand-maintained table)
+
+`npm run sync:tiers` snapshots capability rankings from **BFCL** (Berkeley Function-Calling
+Leaderboard — tool-use accuracy, the primary signal for a tool-call proxy, incl. its
+Irrelevance-Detection metric = the malformed-call proxy) and **LMArena** (general capability)
+into `docs/tier-data.json`, and prints the top tool-callers so you can pick tier targets from
+real data. Both sources are synced-not-forked; a leaderboard schema change fails the sync loudly.
+
+The reshaper also takes `"kind": "openai"` — so `repair` mode can run entirely on an OpenAI-compatible provider (e.g. NIM) with no Anthropic key. The reshaper is asked only for the **corrected arguments per tool-call id** (not the full message envelope), which is far more reliable on weaker models; the proxy reconstructs the message and re-validates it.
+
 ### Live run
 
 ```bash
-node scripts/litellm-front.mjs   # compiled proxy fronting a live LiteLLM (LITELLM_BASE_URL, optional LITELLM_MODEL/LITELLM_API_KEY)
+node scripts/nim-front.mjs   # runs the compiled proxy fronting live NIM end-to-end (uses NVIDIA_API_KEY)
 ```
 Then point a `claude` CLI at it (see "Install & run" above) and inspect the log to see which calls trip the validator on your traffic.
 
@@ -138,14 +188,15 @@ This is the dataset for deciding which backend models are *format-broken* (resha
 ## Composing with headroom (optional)
 
 [headroom](../headroom) is a separate loopback proxy that **optimizes/compresses**
-context on the way to the model. All three layers are transparent Anthropic-Messages
-proxies, so they chain:
+context on the way to the model. Both it and repair-proxy are transparent
+Anthropic-Messages proxies, so they chain — but only in one order, because
+repair-proxy's backend speaks OpenAI/NIM while headroom only forwards Anthropic:
 
 ```
-claude → headroom (:8787, context optimization) → repair-proxy (:8791, validate/repair) → LiteLLM (:4000) → NIM/…
+claude → headroom (:8787, context optimization, OUTER) → repair-proxy (:8791, validate/repair + translate, INNER) → NIM/…
 ```
 
-repair-proxy sits between headroom and LiteLLM. To chain, point headroom's upstream at
+repair-proxy must be **innermost**. To chain them, point headroom's upstream at
 repair-proxy — headroom exposes this as a launch flag, so its own code is untouched:
 
 ```bash
@@ -169,17 +220,17 @@ only get the chain if you deliberately point the client at a headroom instance w
 upstream is repair-proxy.
 
 **Is it worth it?** headroom's headline win is $/token savings vs *paid* Anthropic —
-**moot on a free provider pool**. What still pays off through the chain: context
+**moot on the free NIM pool**. What still pays off through the chain: context
 **compression to fit a smaller backend context window** + lower latency, plus
 headroom's backend-agnostic memory/learn layer. So stack it for context-fit, not cost.
 
 ## Design
 
-Consumers point `ANTHROPIC_BASE_URL` at this proxy; it validates/repairs one Anthropic-format stream per request. Provider translation, model routing, and target *selection* are deliberately not here — LiteLLM (behind) owns translation and routing; a dispatcher that weighs quota/capability talks to LiteLLM directly. For architecture, invariants, and the script inventory, see [CLAUDE.md](CLAUDE.md).
+Consumers (audit-tools dispatch, plain `claude` CLI) point `ANTHROPIC_BASE_URL` at this proxy; it validates one backend per request. Target *selection* / token-prediction is a separate concern (the router/auditor), deliberately not here. For architecture, invariants, and the script inventory, see [CLAUDE.md](CLAUDE.md).
 
 ## Dev
 
 ```bash
 npm run typecheck   # tsc --noEmit
-npm test            # vitest (validator, SSE reconstruction, e2e transparency+detection+repair)
+npm test            # vitest (validator, SSE reconstruction, e2e transparency+detection)
 ```

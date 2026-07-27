@@ -1,12 +1,9 @@
-// Live: run the COMPILED proxy (dist/cli.js) against an Anthropic-format backend —
-// typically a LiteLLM proxy (`litellm --config litellm-config.yaml`), which serves
-// /v1/messages for any provider model. Sends a real Anthropic request and checks
-// tool_use fidelity through the chain: client -> repair-proxy -> LiteLLM -> provider.
+// Live: run the COMPILED proxy (dist/cli.js) with an OpenAI-kind backend pointed
+// at real NVIDIA NIM. Sends a real Anthropic /v1/messages request; the proxy
+// translates Anthropic->OpenAI, calls NIM, translates the response back, and
+// validates it. Proves repair-proxy can FRONT an OpenAI-shaped provider.
 //
-// Env: LITELLM_BASE_URL (e.g. http://127.0.0.1:4000), optional LITELLM_MODEL
-// (fixed model rewrite; omit to pass the client's model through to LiteLLM
-// aliases), optional LITELLM_API_KEY.
-// Run: npm run build && node scripts/litellm-front.mjs
+// Run: npm run build && node scripts/nim-front.mjs
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { writeFileSync, mkdtempSync, existsSync, readFileSync } from "node:fs";
@@ -14,8 +11,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
 
-const BASE = process.env.LITELLM_BASE_URL ?? "http://127.0.0.1:4000";
-const MODEL = process.env.LITELLM_MODEL;
+const MODEL = "meta/llama-3.1-70b-instruct";
 const freePort = () => new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 
 async function readLog(p) {
@@ -23,17 +19,13 @@ async function readLog(p) {
   return "(no log)";
 }
 
-const dir = mkdtempSync(join(tmpdir(), "rp-litellm-"));
+const dir = mkdtempSync(join(tmpdir(), "rp-nim-"));
 const cfgPath = join(dir, "config.json");
 const logPath = join(dir, "log.jsonl");
 const port = await freePort();
 writeFileSync(cfgPath, JSON.stringify({
   listen: `127.0.0.1:${port}`,
-  backend: {
-    base: BASE,
-    ...(MODEL ? { model: MODEL } : {}),
-    ...(process.env.LITELLM_API_KEY ? { authEnv: "LITELLM_API_KEY", authHeader: "authorization" } : {}),
-  },
+  backend: { base: process.env.LLM_BACKEND_BASE_URL, kind: "openai", model: MODEL, authEnv: "NVIDIA_API_KEY", authHeader: "authorization" },
   mode: "detect",
   log: { level: "metadata", file: logPath },
 }));
@@ -51,7 +43,7 @@ const hit = (stream) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
   body: JSON.stringify(anthropicRequest(stream)),
 });
 
-console.log(`\nrepair-proxy fronting ${BASE}${MODEL ? ` (model=${MODEL})` : " (model passthrough)"}, mode=detect\n${"=".repeat(70)}`);
+console.log(`\nrepair-proxy fronting NIM (${MODEL}), mode=detect\n${"=".repeat(70)}`);
 
 // 1) non-streaming
 {
@@ -63,7 +55,7 @@ console.log(`\nrepair-proxy fronting ${BASE}${MODEL ? ` (model=${MODEL})` : " (m
   console.log("            log:", await readLog(logPath));
 }
 
-// 2) streaming — exercises LiteLLM's Anthropic SSE emission through the proxy
+// 2) streaming — exercises the OpenAI->Anthropic SSE re-encoder
 {
   const res = await hit(true);
   const text = await res.text();

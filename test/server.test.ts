@@ -69,7 +69,8 @@ describe("repair-proxy end-to-end (detect mode)", () => {
     cfg = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
@@ -234,12 +235,16 @@ describe("credential handling", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: {
-        base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
-        authHeader: "x-api-key",
-        timeoutMs: 5000,
-        ...(authEnv ? { authEnv } : {}),
+      providers: {
+        up: {
+          base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
+          kind: "anthropic",
+          authHeader: "x-api-key",
+          timeoutMs: 5000,
+          ...(authEnv ? { authEnv } : {}),
+        },
       },
+      routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
@@ -303,7 +308,8 @@ describe("repair mode", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "repair",
       repair: { maxAttempts: 2, destructiveTools },
       log: { level: "metadata", file: logFile },
@@ -393,7 +399,8 @@ describe("streaming repair: text-through, buffer-at-tool_use", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "repair",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
@@ -500,35 +507,26 @@ describe("streaming repair: text-through, buffer-at-tool_use", () => {
   });
 });
 
-describe("backend quirks: count_tokens fallback + model rewrite", () => {
+describe("OpenAI backend: count_tokens + non-messages paths", () => {
   let backend: Server;
   let proxy: Server;
   afterAll(() => { backend?.close(); proxy?.close(); });
 
-  async function boot(opts: { countTokensStatus: number; model?: string }): Promise<number> {
+  async function boot(): Promise<number> {
+    let backendHits = 0;
     backend = await new Promise<Server>((resolve) => {
       const s = createServer((req, res) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => {
-          if ((req.url ?? "").includes("count_tokens")) {
-            res.writeHead(opts.countTokensStatus, { "content-type": "application/json" });
-            res.end(opts.countTokensStatus === 200 ? JSON.stringify({ input_tokens: 42 }) : "{}");
-          } else {
-            // echo the received body back so tests can inspect what was forwarded
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ received: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") }));
-          }
-        });
+        backendHits++;
+        req.on("data", () => {});
+        req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); });
       });
       s.listen(0, "127.0.0.1", () => resolve(s));
     });
+    (boot as unknown as { hits: () => number }).hits = () => backendHits;
     const cfg: Config = {
       host: "127.0.0.1", port: 0,
-      backend: {
-        base: `http://127.0.0.1:${port(backend)}`, authHeader: "x-api-key", timeoutMs: 5000,
-        ...(opts.model ? { model: opts.model } : {}),
-      },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
+      routing: { default: "up/m", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },
@@ -537,8 +535,9 @@ describe("backend quirks: count_tokens fallback + model rewrite", () => {
     return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve(port(proxy))));
   }
 
-  it("falls back to a local estimate when the backend 404s count_tokens", async () => {
-    const p = await boot({ countTokensStatus: 404 });
+  it("answers count_tokens locally with an estimate, never touching the backend", async () => {
+    const p = await boot();
+    const before = (boot as unknown as { hits: () => number }).hits();
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages/count_tokens`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "m", system: "you are helpful", messages: [{ role: "user", content: "count these characters please" }] }),
@@ -546,27 +545,17 @@ describe("backend quirks: count_tokens fallback + model rewrite", () => {
     expect(resp.status).toBe(200);
     const j = (await resp.json()) as { input_tokens: number };
     expect(j.input_tokens).toBeGreaterThan(0);
-    expect(j.input_tokens).not.toBe(42); // locally estimated, not the backend's answer
+    expect((boot as unknown as { hits: () => number }).hits()).toBe(before); // backend NOT called
   });
 
-  it("forwards count_tokens to a backend that implements it", async () => {
-    const p = await boot({ countTokensStatus: 200 });
-    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages/count_tokens`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+  it("returns a clean 404 for a non-messages path instead of mistranslating it", async () => {
+    const p = await boot();
+    const resp = await fetch(`http://127.0.0.1:${p}/`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
     });
-    expect(resp.status).toBe(200);
-    expect(((await resp.json()) as { input_tokens: number }).input_tokens).toBe(42);
-  });
-
-  it("rewrites the request model when backend.model is set, passes through otherwise", async () => {
-    const p = await boot({ countTokensStatus: 200, model: "fixed-loop-model" });
-    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "claude-opus-4", messages: [] }),
-    });
-    const j = (await resp.json()) as { received: { model: string } };
-    expect(j.received.model).toBe("fixed-loop-model");
+    expect(resp.status).toBe(404);
+    const j = (await resp.json()) as { error?: { message?: string } };
+    expect(j.error?.message).toMatch(/not supported/);
   });
 });
 
@@ -602,7 +591,8 @@ describe("streaming transparency across many chunks", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      backend: { base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, authHeader: "x-api-key", timeoutMs: 5000 },
+      providers: { up: { base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },

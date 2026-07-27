@@ -1,16 +1,40 @@
 {
   "listen": "127.0.0.1:8791",
-  "backend": {
-    "base": "http://127.0.0.1:4000",
-    "authEnv": "LITELLM_API_KEY",
-    "authHeader": "authorization"
+  "providers": {
+    "nim": {
+      "base": "https://integrate.api.nvidia.com/v1",
+      "kind": "openai",
+      "authEnv": "NVIDIA_API_KEY"
+    },
+    "openrouter": {
+      "base": "https://openrouter.ai/api/v1",
+      "kind": "openai",
+      "authEnv": "OPENROUTER_API_KEY"
+    },
+    "gemini": {
+      "base": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "kind": "openai",
+      "authEnv": "GEMINI_API_KEY"
+    },
+    "groq": {
+      "base": "https://api.groq.com/openai/v1",
+      "kind": "openai",
+      "authEnv": "GROQ_API_KEY"
+    },
+    "mistral": {
+      "base": "https://api.mistral.ai/v1",
+      "kind": "openai",
+      "authEnv": "MISTRAL_API_KEY"
+    }
   },
-  "reshaper": {
-    "base": "http://127.0.0.1:4000",
-    "model": "reshaper",
-    "kind": "anthropic",
-    "authEnv": "LITELLM_API_KEY",
-    "authHeader": "authorization"
+  "routing": {
+    "default": "nim/z-ai/glm-5.2",
+    "tiers": {
+      "opus": "nim/nvidia/nemotron-3-super-120b-a12b",
+      "sonnet": "nim/z-ai/glm-5.2",
+      "haiku": "nim/openai/gpt-oss-20b",
+      "fable": "nim/openai/gpt-oss-20b"
+    }
   },
   "mode": "repair",
   "repair": {
