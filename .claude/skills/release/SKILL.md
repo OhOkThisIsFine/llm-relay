@@ -71,11 +71,13 @@ the remote (`git fetch && git status -sb` showing no ahead/behind).
 6. **Verify it is actually live** — CI going green is not proof the registry updated:
 
    ```bash
-   npm view llm-relay version
+   npm view llm-relay version --prefer-online
    ```
 
-   It must equal the version you just tagged. Give the registry a moment and re-check once if it
-   still shows the old one.
+   `--prefer-online` is not optional: a plain `npm view` answers from the local metadata cache and
+   will happily report the *previous* version minutes after a successful publish, which looks exactly
+   like a failed release. If it still disagrees, read the registry directly —
+   `curl -s https://registry.npmjs.org/llm-relay` and check `dist-tags.latest`.
 
 7. **Reinstall the global bin** so the installed `llm-relay` isn't silently older than the code:
 
