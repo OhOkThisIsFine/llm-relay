@@ -189,12 +189,17 @@ a `routing` block that maps each request's `model` to one provider + backend mod
     "gemini":     { "base": "https://generativelanguage.googleapis.com/v1beta/openai", "kind": "openai", "authEnv": "GEMINI_API_KEY" }
   },
   "routing": {
-    "default": "nim/z-ai/glm-5.2",           // fallback when nothing else matches
+    // Any spec may be an ARRAY of candidates — that is what turns on benchmark ranking
+    // (it only sorts when there is more than one) AND failover. A lone pinned model disables both.
+    "default": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"],
     "tiers": {                                // Claude tier (substring match) → provider/model
-      "opus":   "nim/nvidia/nemotron-3-super-120b-a12b",
+      "opus":   ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"],
       "sonnet": "nim/z-ai/glm-5.2",
       "haiku":  "nim/openai/gpt-oss-20b",     // cheap/fast — also catches Claude's haiku side-calls
       "fable":  "nim/openai/gpt-oss-20b"
+    },
+    "pools": {                                // addressable as model "pool/<name>"
+      "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"]
     }
   },
   "mode": "repair",                          // detect | repair (strict accepted, aliases detect)
@@ -204,13 +209,23 @@ a `routing` block that maps each request's `model` to one provider + backend mod
 ```
 
 **Routing (lifted from free-claude-code's proven scheme — split on the first `/` only):**
-1. **Namespaced** — a request `model` of `provider/rest` where `provider` is a configured
+1. **Pool** — a request `model` of `pool/<name>` expands to that pool's whole candidate list,
+   which is then benchmark-ranked and failed over. Use this to ask for *the best available*
+   model instead of naming one. An unknown pool is a **400, never a silent fallback** to the
+   default — a typo must not quietly succeed against a different model.
+2. **Namespaced** — a request `model` of `provider/rest` where `provider` is a configured
    provider routes there directly; the entire tail (nested slashes, `:free` suffixes) is the
    backend model, verbatim. E.g. `nim/openai/gpt-oss-120b`, `openrouter/openai/gpt-5.2-codex`.
-2. **Tier** — otherwise the Claude model id is substring-matched against `routing.tiers`
+   Deliberately verbatim: a pinned spec is never re-ranked.
+3. **Tier** — otherwise the Claude model id is substring-matched against `routing.tiers`
    (`opus`/`sonnet`/`haiku`/`fable`). This also fixes Claude's haiku-class side-calls, which
    would otherwise blindly hit one model and 404.
-3. **Default** — anything unrecognized falls to `routing.default`.
+4. **Default** — anything unrecognized falls to `routing.default`.
+
+`pool/<name>` exists because some callers can only express a **single model string** — notably
+Claude Code subagent frontmatter (`model:`), which accepts a full model id but not a candidate
+list. A pool is the indirection that gives those callers ranking and failover. `pool` is a
+reserved provider name; configuring a provider called `pool` fails at load.
 
 Each provider is `kind:"openai"` (translated Anthropic↔OpenAI via llm-bridge) or
 `kind:"anthropic"` (forwarded as-is). In `repair` mode an openai target reshapes on itself;

@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig, resolveTarget, reshaperForTarget } from "../src/config.js";
+import { loadConfig, resolveTarget, resolveTargets, reshaperForTarget } from "../src/config.js";
 
 // Eager (not in beforeAll) so describe-body loadConfig(write(...)) calls work at collection.
 const dir = mkdtempSync(join(tmpdir(), "rp-cfg-"));
@@ -166,6 +166,84 @@ describe("resolveTarget — namespace, tier, default routing", () => {
 
   it("throws RoutingError when a namespace pins an openai provider with an empty model", () => {
     expect(() => resolveTarget("nim/", cfg)).toThrow(/needs a model/);
+  });
+});
+
+describe("resolveTargets — pool/<name> ranked routing", () => {
+  const poolCfg = loadConfig(write("pools.json", {
+    listen: "127.0.0.1:8791",
+    providers: {
+      nim: { base: "https://nim.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" },
+      openrouter: { base: "https://or.test/api/v1", kind: "openai", authEnv: "OPENROUTER_API_KEY" },
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+    },
+    routing: {
+      default: "anthropic",
+      tiers: { opus: "anthropic", sonnet: "anthropic", haiku: "anthropic", fable: "anthropic" },
+      pools: {
+        coding: ["nim/z-ai/glm-5.2", "openrouter/openai/gpt-5.2-codex", "nim/deepseek-ai/deepseek-v4-pro"],
+        cheap: ["nim/openai/gpt-oss-20b"],
+      },
+      // Ranking is orthogonal to pool expansion; pin it off so the assertions below are about
+      // membership, not about today's benchmark table.
+      benchmarkSort: false,
+    },
+  }));
+
+  it("expands a pool to ALL its candidates (so ranking + failover have something to walk)", () => {
+    const ts = resolveTargets("pool/coding", poolCfg);
+    expect(ts).toHaveLength(3);
+    expect(ts.map((t) => `${t.provider}/${t.model}`)).toEqual([
+      "nim/z-ai/glm-5.2",
+      "openrouter/openai/gpt-5.2-codex",
+      "nim/deepseek-ai/deepseek-v4-pro",
+    ]);
+  });
+
+  it("supports a single-candidate pool", () => {
+    const ts = resolveTargets("pool/cheap", poolCfg);
+    expect(ts).toHaveLength(1);
+    expect(ts[0]!.model).toBe("openai/gpt-oss-20b");
+  });
+
+  it("FAILS LOUDLY on an unknown pool instead of silently using routing.default", () => {
+    // The whole point: a typo'd pool must not quietly succeed against a different model.
+    expect(() => resolveTargets("pool/nope", poolCfg)).toThrow(/no pool "nope" configured/);
+  });
+
+  it("does not treat a tier or namespaced spec as a pool", () => {
+    expect(resolveTarget("claude-opus-5", poolCfg).provider).toBe("anthropic");
+    expect(resolveTarget("nim/z-ai/glm-5.2", poolCfg).model).toBe("z-ai/glm-5.2");
+  });
+
+  it("routes every Claude tier to the anthropic passthrough with no model id", () => {
+    // Passthrough targets carry no model — the client's own model id is forwarded upstream.
+    for (const m of ["claude-opus-5", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-fable-5"]) {
+      const t = resolveTarget(m, poolCfg);
+      expect(t.provider).toBe("anthropic");
+      expect(t.kind).toBe("anthropic");
+      expect(t.model).toBeUndefined();
+    }
+  });
+
+  it("rejects a pool naming an unknown provider at load time", () => {
+    expect(() => loadConfig(write("badpool.json", base({
+      routing: { default: "nim/m", pools: { x: ["ghost/m"] } },
+    })))).toThrow(/unknown provider "ghost"/);
+  });
+
+  it("rejects an empty pool at load time", () => {
+    expect(() => loadConfig(write("emptypool.json", base({
+      routing: { default: "nim/m", pools: { x: [] } },
+    })))).toThrow(/at least one valid spec/);
+  });
+
+  it("rejects a provider literally named \"pool\" (it would shadow pool/<name>)", () => {
+    expect(() => loadConfig(write("poolprovider.json", {
+      listen: "127.0.0.1:8791",
+      providers: { pool: { base: "https://x.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" } },
+      routing: { default: "pool/m" },
+    }))).toThrow(/reserved/);
   });
 });
 
