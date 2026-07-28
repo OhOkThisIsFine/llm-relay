@@ -10,6 +10,9 @@
     "llm-relay": "dist/cli.js"
   },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "dist",
     "docs/tier-data.json",
