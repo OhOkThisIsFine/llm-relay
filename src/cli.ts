@@ -271,6 +271,48 @@ export function runProxy() {
   return server;
 }
 
+import { PingLoop } from "./ping/cadence.js";
+
+/** `llm-relay ping` — probe and output model stability, latency, and quota across providers. */
+export async function runPingCommand(): Promise<void> {
+  const cfg = loadOrExit();
+  const catalog = new ModelCatalog();
+  const pingLoop = new PingLoop(cfg, catalog);
+  const only = argValue("--provider", "-p");
+
+  process.stdout.write("⚡ Probing models across providers for latency and stability...\n");
+  await pingLoop.tickOnce();
+
+  const names = Object.keys(cfg.providers).filter((n) => !only || n === only);
+  for (const name of names) {
+    const p = cfg.providers[name]!;
+    let models: string[] = [];
+    if (p.kind === "openai") {
+      try {
+        models = await catalog.list(name, p);
+      } catch {}
+    }
+
+    const quota = pingLoop.getProviderQuota(name);
+    const quotaStr = quota !== null ? `${quota}% remaining` : "N/A";
+    process.stdout.write(`\nProvider: ${name} (quota: ${quotaStr})\n`);
+    if (models.length === 0) {
+      process.stdout.write("  (no models listed or reachable)\n");
+      continue;
+    }
+
+    for (const mId of models.slice(0, 10)) {
+      const summary = pingLoop.getModelSummary(name, mId);
+      const avgStr = summary.avgMs >= 0 ? `${summary.avgMs}ms` : "pending";
+      const p95Str = summary.p95Ms >= 0 ? `${summary.p95Ms}ms` : "pending";
+      const scoreStr = summary.stabilityScore >= 0 ? `${summary.stabilityScore}/100` : "N/A";
+      process.stdout.write(
+        `  ${mId.padEnd(45)} | verdict: ${summary.verdict.padEnd(10)} | avg: ${avgStr.padEnd(8)} | p95: ${p95Str.padEnd(8)} | stability: ${scoreStr}\n`,
+      );
+    }
+  }
+}
+
 export function main(): void {
   const arg2 = process.argv[2];
   if (hasFlag("--help", "-h") || arg2 === "help") {
@@ -294,8 +336,16 @@ export function main(): void {
     });
     return;
   }
+  if (arg2 === "ping" || hasFlag("--ping")) {
+    runPingCommand().catch((e) => {
+      process.stderr.write(`llm-relay ping: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
   runProxy();
 }
+
 
 if (process.argv[1] && (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.ts"))) {
   main();

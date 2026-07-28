@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 import type { Config, ProviderConfig } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 
+import type { PingLoop, ModelHealthSummary } from "./ping/cadence.js";
+
 // Raw leaderboard scores per model — kept verbatim (never collapsed to tiers) so a
 // consumer (e.g. audit-tools dispatch) can weigh them against its own quota/rate/token
 // state to pick a provider+model.
@@ -19,6 +21,7 @@ interface RegistryModel {
   id: string;
   /** Best-effort leaderboard match (null when no confident match — matching is fuzzy). */
   capability: CapabilityScore | null;
+  health?: ModelHealthSummary;
 }
 
 interface RegistryProvider {
@@ -29,6 +32,7 @@ interface RegistryProvider {
   has_key: boolean;
   /** openai providers only: did the live /models catalog return anything (reachable + authorized)? */
   reachable: boolean | null;
+  quota_percent?: number | null;
   models: RegistryModel[];
 }
 
@@ -89,7 +93,7 @@ function joinCapability(modelId: string, byNorm: Array<{ norm: string; rec: Reco
 export async function buildRegistry(
   cfg: Config,
   catalog: ModelCatalog,
-  opts: { now?: string } = {},
+  opts: { now?: string; pingLoop?: PingLoop } = {},
 ): Promise<RegistryView> {
   const tierData = loadTierData();
   const byNorm = (tierData?.models ?? [])
@@ -104,14 +108,22 @@ export async function buildRegistry(
     if (p.kind === "openai") {
       const ids = await catalog.list(name, p);
       reachable = ids.length > 0;
-      models = ids.map((id) => ({ id, capability: joinCapability(id, byNorm) }));
+      models = ids.map((id) => {
+        const capability = joinCapability(id, byNorm);
+        const health = opts.pingLoop ? opts.pingLoop.getModelSummary(name, id) : undefined;
+        return { id, capability, ...(health ? { health } : {}) };
+      });
     }
+
+    const quota_percent = opts.pingLoop ? opts.pingLoop.getProviderQuota(name) : undefined;
+
     providers[name] = {
       base: p.base,
       kind: p.kind,
       ...(p.authEnv ? { authEnv: p.authEnv } : {}),
       has_key,
       reachable,
+      ...(quota_percent !== undefined ? { quota_percent } : {}),
       models,
     };
   }
@@ -130,3 +142,4 @@ export async function buildRegistry(
     },
   };
 }
+
