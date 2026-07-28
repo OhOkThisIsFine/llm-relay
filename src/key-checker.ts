@@ -29,7 +29,7 @@ export async function validateProviderKeys(
         authEnv: envVarName,
         hasEnvKey: false,
         status: "missing_env",
-        message: `Environment variable \${${envVarName}} is not set`,
+        message: `Environment variable ${envVarName} is not set`,
       });
       continue;
     }

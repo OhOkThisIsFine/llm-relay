@@ -348,7 +348,7 @@ export async function runCheckKeys(): Promise<void> {
   process.stdout.write("-".repeat(80) + "\n");
 
   for (const r of results) {
-    const envStr = r.authEnv ? `\${${r.authEnv}}` : "(none)";
+    const envStr = r.authEnv ?? "(none)";
     const quotaStr = r.quotaPercent !== undefined && r.quotaPercent !== null ? ` | Quota: ${r.quotaPercent}%` : "";
     const modelsStr = r.modelsFound !== undefined ? ` | Models: ${r.modelsFound}` : "";
 
