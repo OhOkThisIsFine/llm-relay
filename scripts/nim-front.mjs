@@ -11,7 +11,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
 
-const MODEL = "meta/llama-3.1-70b-instruct";
+// NIM retired the llama-3.1-70b id; glm-5.2 is the current strong tool-use model
+// on the account. Override with RP_MODEL when probing a different backend.
+const MODEL = process.env.RP_MODEL || "z-ai/glm-5.2";
 const freePort = () => new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 
 async function readLog(p) {
