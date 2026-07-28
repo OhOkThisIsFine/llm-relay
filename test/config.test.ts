@@ -82,6 +82,11 @@ describe("loadConfig — listen + providers", () => {
     }));
     expect(c.providers.nim!.authHeader).toBe("x-api-key");
   });
+
+  it("rejects Infinity maxAttempts and falls back to default 2", () => {
+    const c = loadConfig(write("infinity.json", base({ repair: { maxAttempts: Infinity } })));
+    expect(c.repair.maxAttempts).toBe(2);
+  });
 });
 
 describe("resolveTarget — namespace, tier, default routing", () => {

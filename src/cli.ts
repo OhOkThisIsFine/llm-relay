@@ -6,9 +6,51 @@ import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
 
-function argValue(flag: string): string | undefined {
-  const i = process.argv.indexOf(flag);
-  return i !== -1 ? process.argv[i + 1] : undefined;
+export function argValue(...flags: string[]): string | undefined {
+  const allFlags = new Set<string>();
+  for (const flag of flags) {
+    allFlags.add(flag);
+    if (flag.startsWith("--")) {
+      allFlags.add(flag.slice(1));
+    }
+  }
+
+  for (let i = 1; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (!arg) continue;
+
+    for (const f of allFlags) {
+      if (arg === f) {
+        return process.argv[i + 1];
+      }
+      if (arg.startsWith(f + "=")) {
+        return arg.slice(f.length + 1);
+      }
+    }
+  }
+  return undefined;
+}
+
+export function hasFlag(...flags: string[]): boolean {
+  const allFlags = new Set<string>();
+  for (const flag of flags) {
+    allFlags.add(flag);
+    if (flag.startsWith("--")) {
+      allFlags.add(flag.slice(1));
+    }
+  }
+
+  for (let i = 1; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (!arg) continue;
+
+    for (const f of allFlags) {
+      if (arg === f || arg.startsWith(f + "=")) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 const HELP = `llm-relay — loopback Anthropic-Messages proxy that validates/repairs tool calls.
@@ -86,13 +128,13 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
 );
 
 /** Split a "provider/model" spec on the first slash. */
-function splitSpec(spec: string): { provider: string; model?: string } {
+export function splitSpec(spec: string): { provider: string; model?: string } {
   const i = spec.indexOf("/");
   return i === -1 ? { provider: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
 }
 
-function resolveConfigPath(): string {
-  const explicit = argValue("--config");
+export function resolveConfigPath(): string {
+  const explicit = argValue("--config", "-c");
   if (explicit) return explicit;
 
   const userConfigDir = join(homedir(), ".llm-relay");
@@ -111,12 +153,12 @@ function resolveConfigPath(): string {
   }
 }
 
-function loadOrExit(): Config {
+export function loadOrExit(): Config {
   const configPath = resolveConfigPath();
   const overrides: ConfigOverrides = {
-    routeDefault: argValue("--default"),
-    mode: argValue("--mode"),
-    listen: argValue("--listen"),
+    routeDefault: argValue("--default", "-d"),
+    mode: argValue("--mode", "-m"),
+    listen: argValue("--listen", "-l"),
   };
   try {
     return loadConfig(configPath, overrides);
@@ -127,10 +169,10 @@ function loadOrExit(): Config {
 }
 
 /** `llm-relay models` — dynamic, cached model discovery per provider. */
-async function runModels(): Promise<void> {
+export async function runModels(): Promise<void> {
   const cfg = loadOrExit();
-  const only = argValue("--provider");
-  const force = process.argv.includes("--refresh");
+  const only = argValue("--provider", "-p");
+  const force = hasFlag("--refresh", "-r");
   const catalog = new ModelCatalog();
   const names = Object.keys(cfg.providers).filter((n) => !only || n === only);
   if (names.length === 0) {
@@ -162,7 +204,7 @@ async function runModels(): Promise<void> {
  * Warm every provider's catalog and warn about any routing target the provider
  * does not serve — non-blocking (fire-and-forget) so it never delays listen().
  */
-async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void> {
+export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void> {
   const specs = [cfg.routing.default, ...Object.values(cfg.routing.tiers)];
   const seen = new Set<string>();
   for (const spec of specs) {
@@ -181,7 +223,7 @@ async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void
   }
 }
 
-function runProxy(): void {
+export function runProxy() {
   const cfg = loadOrExit();
   const catalog = new ModelCatalog();
   const server = createProxy(cfg, { catalog });
@@ -194,13 +236,22 @@ function runProxy(): void {
     void warmAndValidate(cfg, catalog);
   });
 
+  const shutdown = () => {
+    if (typeof server.closeIdleConnections === "function") {
+      server.closeIdleConnections();
+    }
+    server.close(() => process.exit(0));
+  };
+
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, () => server.close(() => process.exit(0)));
+    process.on(sig, shutdown);
   }
+
+  return server;
 }
 
-function main(): void {
-  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+export function main(): void {
+  if (hasFlag("--help", "-h")) {
     process.stdout.write(HELP);
     process.exit(0);
   }
@@ -214,4 +265,6 @@ function main(): void {
   runProxy();
 }
 
-main();
+if (process.argv[1] && (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.ts"))) {
+  main();
+}

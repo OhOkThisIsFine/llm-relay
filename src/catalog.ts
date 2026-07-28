@@ -24,6 +24,8 @@ export class ModelCatalog {
   private loaded = false;
   /** Providers with a background refresh in flight — dedups stampeding probes. */
   private refreshing = new Set<string>();
+  /** In-flight blocking fetches (cold start / forced) — dedups concurrent requests. */
+  private pending = new Map<string, Promise<string[]>>();
 
   constructor(opts: { ttlMs?: number; cachePath?: string | null } = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
@@ -87,15 +89,24 @@ export class ModelCatalog {
       this.refreshInBackground(name, cfg, opts.fetchFn);
       return prior.models;
     }
-    // Cold (no prior) or forced: block once to obtain / renew the list.
-    try {
-      const models = await this.fetch(cfg, opts.fetchFn ?? fetch);
-      this.mem.set(name, { fetchedAt: now, models });
-      this.saveDisk();
-      return models;
-    } catch {
-      return prior?.models ?? [];
-    }
+    // Cold (no prior) or forced: block once to obtain / renew the list. Deduplicate in-flight fetches.
+    const existing = this.pending.get(name);
+    if (existing) return existing;
+
+    const p = (async () => {
+      try {
+        const models = await this.fetch(cfg, opts.fetchFn ?? fetch);
+        this.mem.set(name, { fetchedAt: now, models });
+        this.saveDisk();
+        return models;
+      } catch {
+        return prior?.models ?? [];
+      } finally {
+        this.pending.delete(name);
+      }
+    })();
+    this.pending.set(name, p);
+    return await p;
   }
 
   /**
@@ -144,7 +155,8 @@ export class ModelCatalog {
       if (cfg.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
       else headers["x-api-key"] = key;
     }
-    const res = await fetchFn(cfg.base + "/models", { headers });
+    const signal = cfg.timeoutMs && cfg.timeoutMs > 0 ? AbortSignal.timeout(cfg.timeoutMs) : undefined;
+    const res = await fetchFn(cfg.base + "/models", { headers, ...(signal ? { signal } : {}) });
     if (!res.ok) throw new Error(`models fetch HTTP ${res.status}`);
     const j = (await res.json()) as { data?: Array<{ id?: unknown }> };
     return (j.data ?? [])

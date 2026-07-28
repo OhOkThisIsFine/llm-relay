@@ -11,7 +11,7 @@ import { parseCorrectedInputs, reconstruct } from "../dist/reshaper.js";
 import { toolSchemaMap } from "../dist/anthropic.js";
 
 const KEY = process.env.NVIDIA_API_KEY || process.env.LLM_BACKEND_API_KEY;
-const BASE = process.env.LLM_BACKEND_BASE_URL; // https://integrate.api.nvidia.com/v1
+const BASE = process.env.LLM_BACKEND_BASE_URL || "https://integrate.api.nvidia.com/v1";
 
 // A tool with TWO required fields incl. an enum — weak models often omit `unit`
 // or send an invalid enum, producing real schema violations.

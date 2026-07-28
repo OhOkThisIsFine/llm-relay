@@ -83,4 +83,53 @@ describe("ModelCatalog", () => {
     const anth: ProviderConfig = { base: "https://a.test", kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 };
     expect(await c.list("a", anth, { fetchFn: throwFetch() })).toEqual([]);
   });
+
+  it("deduplicates concurrent cold-start requests and clears pending cache on completion/failure", async () => {
+    const c = new ModelCatalog({ cachePath: null });
+    let fetchCount = 0;
+    const delayedFetch: typeof fetch = (async () => {
+      fetchCount++;
+      await new Promise((r) => setTimeout(r, 20));
+      return new Response(JSON.stringify({ data: [{ id: "m1" }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    // Concurrent cold-start calls pick up the same in-flight fetch
+    const [r1, r2, r3] = await Promise.all([
+      c.list("p", provider, { fetchFn: delayedFetch }),
+      c.list("p", provider, { fetchFn: delayedFetch }),
+      c.list("p", provider, { fetchFn: delayedFetch }),
+    ]);
+
+    expect(fetchCount).toBe(1);
+    expect(r1).toEqual(["m1"]);
+    expect(r2).toEqual(["m1"]);
+    expect(r3).toEqual(["m1"]);
+
+    // After completion, pending map is cleared, so a forced refresh triggers a new fetch
+    await c.list("p", provider, { force: true, fetchFn: delayedFetch });
+    expect(fetchCount).toBe(2);
+  });
+
+  it("clears pending cache on reject/failure so subsequent attempts retry", async () => {
+    const c = new ModelCatalog({ cachePath: null });
+    const res1 = await c.list("p", provider, { fetchFn: failFetch });
+    expect(res1).toEqual([]);
+
+    // The failed attempt should clear pending map, allowing second attempt to succeed
+    const res2 = await c.list("p", provider, { fetchFn: okFetch(["retry-ok"]) });
+    expect(res2).toEqual(["retry-ok"]);
+  });
+
+  it("enforces provider fetch timeout via signal", async () => {
+    const c = new ModelCatalog({ cachePath: null });
+    let receivedSignal: AbortSignal | undefined;
+    const inspectFetch: typeof fetch = (async (_url: string, opts?: { signal?: AbortSignal }) => {
+      receivedSignal = opts?.signal;
+      return new Response(JSON.stringify({ data: [{ id: "m1" }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await c.list("p", { ...provider, timeoutMs: 3000 }, { fetchFn: inspectFetch });
+    expect(receivedSignal).toBeDefined();
+    expect(receivedSignal?.aborted).toBe(false);
+  });
 });

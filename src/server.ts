@@ -25,6 +25,7 @@ const HOP_BY_HOP = new Set([
 ]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
 const MAX_VALIDATE_BYTES = 8 * 1024 * 1024;
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 export interface ProxyDeps {
   reshaper?: Reshaper;
@@ -74,7 +75,17 @@ interface Handlers {
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
   const started = Date.now();
   const path = req.url ?? "/";
-  const reqBuf = await readBody(req);
+
+  let reqBuf: Buffer;
+  try {
+    reqBuf = await readBody(req);
+  } catch (e) {
+    const msg = (e as Error).message;
+    const status = msg.includes("too large") ? 413 : 400;
+    failClosed(res, status, msg);
+    h.logger.write(baseLog(started, path, null, false, false, status, "skipped"));
+    return;
+  }
 
   let reqJson: unknown;
   try {
@@ -119,7 +130,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Completions with a namespaced model; route by target and reverse-proxy the
   // upstream OpenAI response straight back (OpenAI in, OpenAI out).
   if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
-    await openAiFrontPath(res, target, { reqJson, wantsStream, started, path, model, hadTools }, h);
+    await openAiFrontPath(res, target, { reqJson, wantsStream, started, path, model, hadTools, req }, h);
     return;
   }
 
@@ -145,35 +156,46 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), target.timeoutMs);
+  const onResClose = () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+  };
+  res.on("close", onResClose);
 
-  let backendRes: Response;
   try {
-    backendRes = await fetchBackend(target, {
-      path,
-      method: req.method ?? "POST",
-      reqBuf,
-      reqJson,
-      anthropicHeaders: buildForwardHeaders(req.headers, target),
-      wantsStream,
-      signal: controller.signal,
-    });
-  } catch (e) {
+    let backendRes: Response;
+    try {
+      backendRes = await fetchBackend(target, {
+        path,
+        method: req.method ?? "POST",
+        reqBuf,
+        reqJson,
+        anthropicHeaders: buildForwardHeaders(req.headers, target),
+        wantsStream,
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      const aborted = controller.signal.aborted;
+      failClosed(res, aborted ? 504 : 502, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
+      h.logger.write(baseLog(started, path, model, hadTools, false, aborted ? 504 : 502, "skipped"));
+      return;
+    }
+
+    const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
+    const willValidate = isMessages && hadTools && backendRes.status < 400;
+    const reshaper = h.resolveReshaper(target);
+    const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
+
+    if (doRepair) {
+      await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, req }, h);
+    } else {
+      await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools, req }, h);
+    }
+  } finally {
     clearTimeout(timer);
-    const aborted = controller.signal.aborted;
-    failClosed(res, aborted ? 504 : 502, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
-    h.logger.write(baseLog(started, path, model, hadTools, false, aborted ? 504 : 502, "skipped"));
-    return;
-  }
-
-  const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
-  const willValidate = isMessages && hadTools && backendRes.status < 400;
-  const reshaper = h.resolveReshaper(target);
-  const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
-
-  if (doRepair) {
-    await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper! }, h);
-  } else {
-    await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools }, h);
+    res.off("close", onResClose);
   }
 }
 
@@ -184,6 +206,7 @@ interface Ctx {
   started: number;
   path: string;
   hadTools: boolean;
+  req?: IncomingMessage;
 }
 
 /**
@@ -194,16 +217,24 @@ interface Ctx {
 async function openAiFrontPath(
   res: ServerResponse,
   target: ResolvedTarget,
-  ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; model: string | null; hadTools: boolean },
+  ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; model: string | null; hadTools: boolean; req?: IncomingMessage },
   h: Handlers,
 ): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), target.timeoutMs);
+  const onResClose = () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+  };
+  res.on("close", onResClose);
+
   let upstream: Response;
   try {
     upstream = await fetchOpenAiFront(target, { reqJson: ctx.reqJson, wantsStream: ctx.wantsStream, signal: controller.signal });
   } catch (e) {
     clearTimeout(timer);
+    res.off("close", onResClose);
     const aborted = controller.signal.aborted;
     const status = aborted ? 504 : 502;
     if (!res.headersSent) {
@@ -217,12 +248,13 @@ async function openAiFrontPath(
     res.writeHead(upstream.status, filterResponseHeaders(upstream.headers));
     if (upstream.body) {
       for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
-        if (!res.write(Buffer.from(chunk))) await once(res, "drain");
+        if (!await writeChunk(res, Buffer.from(chunk))) break;
       }
     }
-    res.end();
+    if (!res.writableEnded) res.end();
   } finally {
     clearTimeout(timer);
+    res.off("close", onResClose);
   }
   const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
   h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped"));
@@ -240,23 +272,23 @@ async function transparentPath(
   let assistant: AssistantMessage | null = null;
   try {
     if (!backendRes.body) {
-      res.end();
+      if (!res.writableEnded) res.end();
     } else if (ctx.streamed) {
       const decoder = new TextDecoder();
       let acc = "";
       let overflow = false;
       for await (const chunk of backendRes.body as unknown as AsyncIterable<Uint8Array>) {
-        if (!res.write(Buffer.from(chunk))) await once(res, "drain");
+        if (!await writeChunk(res, Buffer.from(chunk))) break;
         if (ctx.willValidate && !overflow) {
           acc += decoder.decode(chunk, { stream: true });
           if (acc.length > MAX_VALIDATE_BYTES) overflow = true;
         }
       }
-      res.end();
+      if (!res.writableEnded) res.end();
       if (ctx.willValidate && !overflow) assistant = reconstructFromSse(acc + decoder.decode());
     } else {
       const bytes = Buffer.from(await backendRes.arrayBuffer());
-      res.end(bytes);
+      if (!res.writableEnded) res.end(bytes);
       if (ctx.willValidate && bytes.length <= MAX_VALIDATE_BYTES) assistant = parseAssistant(bytes.toString("utf8"));
     }
   } finally {
@@ -331,10 +363,13 @@ async function repairStreamingPath(
   };
   const forward = async (frame: Buffer) => {
     ensureHead();
-    if (!res.write(frame)) await once(res, "drain");
+    await writeChunk(res, frame);
   };
   const flushHeld = async () => {
-    for (const f of held) await forward(f);
+    for (const f of held) {
+      if (res.destroyed) break;
+      await forward(f);
+    }
     held.length = 0;
   };
 
@@ -367,6 +402,7 @@ async function repairStreamingPath(
   try {
     if (backendRes.body) {
       for await (const chunk of backendRes.body as unknown as AsyncIterable<Uint8Array>) {
+        if (res.destroyed) break;
         work = work.length ? Buffer.concat([work, Buffer.from(chunk)]) : Buffer.from(chunk);
         let end: number;
         while ((end = frameEnd(work)) !== -1) {
@@ -400,7 +436,7 @@ async function repairStreamingPath(
       }
     }
     ensureHead();
-    res.end();
+    if (!res.writableEnded) res.end();
   } else {
     const assistant = reconstructFromSse(acc);
     const r = h.validator.validate(assistant, ctx.tools);
@@ -410,7 +446,7 @@ async function repairStreamingPath(
       validated = r.uncheckableCount > 0 ? "uncheckable" : "pass";
       await flushHeld();
       ensureHead();
-      res.end();
+      if (!res.writableEnded) res.end();
     } else {
       validated = "fail";
       errorKinds = dedupe(r.errors.map((e) => e.kind));
@@ -423,10 +459,10 @@ async function repairStreamingPath(
       repairOutcome = decision.outcome;
       ensureHead(); // message_start + leading text already forwarded
       if (decision.outcome === "fixed" && decision.message) {
-        res.end(emitSseTail(decision.message, firstToolUseIndex));
+        if (!res.writableEnded) res.end(emitSseTail(decision.message, firstToolUseIndex));
       } else {
         // Head already committed — surface a mid-stream SSE error, never a fabricated call.
-        res.end(sseError(`llm-relay: tool call could not be repaired (${decision.outcome})`));
+        if (!res.writableEnded) res.end(sseError(`llm-relay: tool call could not be repaired (${decision.outcome})`));
       }
     }
   }
@@ -465,7 +501,7 @@ async function repairBufferedPath(
   if (!assistant) {
     // Couldn't parse — forward unchanged.
     res.writeHead(backendRes.status, filtered);
-    res.end(bytes);
+    if (!res.writableEnded) res.end(bytes);
   } else {
     const r = h.validator.validate(assistant, ctx.tools);
     toolUseCount = r.toolUseCount;
@@ -473,7 +509,7 @@ async function repairBufferedPath(
     if (r.valid) {
       validated = r.uncheckableCount > 0 ? "uncheckable" : "pass";
       res.writeHead(backendRes.status, filtered); // pass through untouched
-      res.end(bytes);
+      if (!res.writableEnded) res.end(bytes);
     } else {
       validated = "fail";
       errorKinds = dedupe(r.errors.map((e) => e.kind));
@@ -502,17 +538,17 @@ async function repairBufferedPath(
 function emitFixed(
   res: ServerResponse,
   status: number,
-  filtered: Record<string, string>,
+  filtered: Record<string, string | string[]>,
   message: AssistantMessage,
   wantsStream: boolean,
   model: string | null,
 ): void {
   if (wantsStream) {
     res.writeHead(status, { ...filtered, "content-type": "text/event-stream" });
-    res.end(emitSse(message));
+    if (!res.writableEnded) res.end(emitSse(message));
   } else {
     res.writeHead(status, { ...filtered, "content-type": "application/json" });
-    res.end(JSON.stringify(toAnthropicMessage(message, model)));
+    if (!res.writableEnded) res.end(JSON.stringify(toAnthropicMessage(message, model)));
   }
 }
 
@@ -548,11 +584,23 @@ function buildForwardHeaders(inbound: IncomingMessage["headers"], target: Resolv
   return out;
 }
 
-function filterResponseHeaders(hh: Headers): Record<string, string> {
-  const out: Record<string, string> = {};
+function filterResponseHeaders(hh: Headers): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
   hh.forEach((value, key) => {
-    if (!HOP_BY_HOP.has(key.toLowerCase())) out[key] = value;
+    const k = key.toLowerCase();
+    if (HOP_BY_HOP.has(k)) return;
+    if (k === "set-cookie") return;
+    out[key] = value;
   });
+  if (typeof hh.getSetCookie === "function") {
+    const cookies = hh.getSetCookie();
+    if (cookies.length > 0) {
+      out["set-cookie"] = cookies;
+    }
+  } else {
+    const sc = hh.get("set-cookie");
+    if (sc) out["set-cookie"] = sc;
+  }
   return out;
 }
 
@@ -613,18 +661,67 @@ function sseError(message: string): string {
   return `event: error\ndata: ${data}\n\n`;
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    let total = 0;
+    let done = false;
+
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+    };
+
+    const onData = (c: Buffer) => {
+      if (done) return;
+      total += c.length;
+      if (total > maxBytes) {
+        done = true;
+        cleanup();
+        req.destroy();
+        reject(new Error("request body too large"));
+        return;
+      }
+      chunks.push(c);
+    };
+
+    const onEnd = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+
+    const onError = (err: Error) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(err);
+    };
+
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
   });
+}
+
+async function writeChunk(res: ServerResponse, chunk: Buffer): Promise<boolean> {
+  if (res.destroyed || res.writableEnded) return false;
+  try {
+    const ok = res.write(chunk);
+    if (!ok && !res.destroyed && !res.writableEnded) {
+      await once(res, "drain");
+    }
+    return !res.destroyed && !res.writableEnded;
+  } catch {
+    return false;
+  }
 }
 
 function failClosed(res: ServerResponse, status: number, message: string): void {
   if (res.headersSent) {
-    res.end();
+    if (!res.writableEnded) res.end();
     return;
   }
   res.writeHead(status, { "content-type": "application/json" });

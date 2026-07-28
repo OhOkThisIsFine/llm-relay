@@ -44,7 +44,7 @@ writeFileSync(cfgPath, JSON.stringify({
 }));
 
 const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "pipe", "pipe"] });
-for await (const c of proc.stdout) { if (/listening on/.test(c.toString())) break; }
+for await (const c of proc.stderr) { if (/listening on/.test(c.toString())) break; }
 
 const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
   method: "POST", headers: { "content-type": "application/json" },

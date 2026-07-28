@@ -226,7 +226,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
 
   const repairRaw = (c.repair ?? {}) as { maxAttempts?: unknown; destructiveTools?: unknown };
   const maxAttempts =
-    typeof repairRaw.maxAttempts === "number" && repairRaw.maxAttempts > 0
+    typeof repairRaw.maxAttempts === "number" && Number.isFinite(repairRaw.maxAttempts) && repairRaw.maxAttempts > 0
       ? Math.floor(repairRaw.maxAttempts)
       : 2;
   const destructiveTools = Array.isArray(repairRaw.destructiveTools)
@@ -268,7 +268,7 @@ function parseProviders(raw: unknown): Record<string, ProviderConfig> {
       base: expandEnv(p.base, `providers.${name}.base`).trim().replace(/\/+$/, ""),
       kind,
       authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
-      timeoutMs: typeof p.timeoutMs === "number" && p.timeoutMs > 0 ? p.timeoutMs : 120000,
+      timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
       ...(typeof p.authEnv === "string" ? { authEnv: p.authEnv } : {}),
     };
   }
@@ -321,7 +321,7 @@ function parseReshaper(raw: unknown): ReshaperConfig | undefined {
     model: expandEnv(r.model, "reshaper.model"),
     kind,
     authHeader: parseAuthHeader(r.authHeader, defaultAuthHeader),
-    timeoutMs: typeof r.timeoutMs === "number" && r.timeoutMs > 0 ? r.timeoutMs : 60000,
+    timeoutMs: typeof r.timeoutMs === "number" && Number.isFinite(r.timeoutMs) && r.timeoutMs > 0 ? r.timeoutMs : 60000,
     ...(typeof r.authEnv === "string" ? { authEnv: r.authEnv } : {}),
   };
 }
