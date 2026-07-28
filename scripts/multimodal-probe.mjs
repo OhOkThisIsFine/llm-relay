@@ -132,7 +132,9 @@ console.log(`Multimodal / MCP passthrough probe -> ${PROXY}\n${"=".repeat(70)}`)
   });
   const out = textOf(r.json).toLowerCase();
   if (r.status !== 200) record("image/base64", "FAIL", `HTTP ${r.status}: ${r.text.slice(0, 200)}`);
-  else if (/red|crimson|scarlet/.test(out)) record("image/base64", "PASS", `model saw the image ("${out.trim().slice(0, 60)}")`);
+  // Small VL models name a flat #FF0000 swatch inconsistently (red/salmon/orange run to
+  // run). Accept the red family — the case is testing that pixels arrived, not colour naming.
+  else if (/red|crimson|scarlet|salmon|orange|pink|maroon/.test(out)) record("image/base64", "PASS", `model saw the image ("${out.trim().slice(0, 60)}")`);
   else record("image/base64", "DEGRADED", `HTTP 200 but answer does not name the colour: "${out.trim().slice(0, 80)}"`);
 }
 

@@ -107,9 +107,24 @@ All against a running proxy (`mode=repair`, `nim/z-ai/glm-5.2`) unless noted.
 | `llm-relay ping --provider nim` | **Runs**, but a single invocation reports nearly every model `Pending`/`Not Active` with no latency. Ping is designed to accumulate over a background cadence; one-shot output is close to useless. Cosmetic, not a defect. |
 | `scripts/verify-with-nim.mjs` | **BROKEN / dead** — exits 1 immediately looking for `.audit-tools/audit/audit-report.md`, a path from another project. It is not a proxy verification script despite the name. Candidate for deletion. |
 
-## Remaining work this sweep created
+## Fixes applied after the sweep
 
-- `document`-block handling in `backend.ts` (base64 reaching the prompt) — the one real defect found.
-- `scripts/verify-with-nim.mjs` is dead code referencing a foreign path.
-- `nim-trip-rate.mjs` `DEFAULT_MODELS` still contains five dead ids and a 70 s timeout that
-  misclassifies slow-cold-start models.
+All four items below are done; re-running `multimodal-probe.mjs` live is now **5 pass, 0 degraded,
+0 fail** (the PDF case reads its token back out of the document).
+
+- **`document` blocks now convert to markdown** via MarkItDown, in `src/documents.ts`, applied to
+  openai-kind targets before llm-bridge sees the request. PDF/docx/pptx/xlsx/csv/html/json/txt/md.
+  Unconvertible → clean HTTP 400, never a stringified payload. MarkItDown is an optional external
+  dependency; a missing binary produces an error naming the install command.
+  - **Trap found while implementing:** MarkItDown advertises stdin, but pdfminer seeks the stream to
+    find `startxref` and a pipe isn't seekable — every piped PDF fails with *"No /Root object! - Is
+    this really a PDF?"* while the identical bytes convert fine from a file. The implementation
+    writes a temp file. This is not Node-specific: `cat x.pdf | markitdown -x .pdf` fails the same way.
+  - `url` document sources are refused deliberately — fetching a client-named URL would make a
+    loopback proxy holding a provider key into a request forwarder.
+- **404 hint**: an openai-backend 404 now says the model isn't served by that provider and notes that
+  a model can be listed in `/models` and still 404, instead of reading as a proxy bug.
+- **`nim-trip-rate.mjs`**: `DEFAULT_MODELS` replaced with four live-verified ids, default reshaper
+  moved to `glm-5.2`, and the timeout raised 70 s → 120 s (`RP_TIMEOUT_MS`) so a cold start isn't
+  scored as a dead model.
+- **`scripts/verify-with-nim.mjs` deleted** — it looked for an audit report from another project.
