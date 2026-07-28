@@ -19,22 +19,95 @@ npm run build && node scripts/live-demo.mjs
 ```
 Runs the compiled CLI as a real process against a local flaky-model backend + stub reshaper, showing detect (logs the failure) then repair (delivers the fixed call).
 
+## Quick Start & Free Model Onboarding
+
+`llm-relay` comes pre-configured with **100%-free model presets** (NVIDIA NIM, Groq, Gemini Free, OpenRouter Free, Cerebras, SambaNova) and supports **pooling your existing subscriptions** (ChatGPT / OpenAI API, AGY, Anthropic).
+
+### Step 1: Run Guided Free Key Setup
+```bash
+npx llm-relay onboard
+```
+Scans your environment for active keys and provides direct links to acquire 100%-free API keys from NVIDIA, Groq, Google Gemini, OpenRouter, Cerebras, and SambaNova.
+
+### Step 2: Configure Claude CLI or Claude Desktop
+
+**For Claude Desktop:**
+```bash
+llm-relay setup claude-desktop
+```
+Auto-patches `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) to route Claude Desktop through `llm-relay` (`http://127.0.0.1:8791`).
+
+**For Claude CLI (`claude`):**
+```bash
+llm-relay setup claude-cli
+```
+Verifies wrapper scripts (`scripts/claude-proxied.ps1` and `scripts/claude-proxied.sh`) that use an isolated `CLAUDE_CONFIG_DIR` so your proxy setup never conflicts with local login tokens.
+
+### Step 3: Start the Proxy
+```bash
+llm-relay
+```
+
+---
+
+## Key Capabilities
+
+### 1. 100%-Free Presets & Subscription Pooling
+- **100%-Free Tier**: NVIDIA NIM (`build.nvidia.com`), Groq (`console.groq.com/keys`), Gemini Free (`aistudio.google.com/app/apikey`), OpenRouter Free (`openrouter.ai/keys`), Cerebras, SambaNova.
+- **Subscription Tier**: Mapped as `subscription` in config (e.g. OpenAI `OPENAI_API_KEY`, Anthropic `ANTHROPIC_API_KEY`).
+- **Priority Cascade**: `llm-relay` prioritizes high-capability subscriptions first, automatically falling back to high-stability free tier targets if 429 rate limits occur.
+
+### 2. Stability-Aware Dynamic Routing & Auto-Failover
+- `CircuitBreaker` tracks latency, jitter, spike rates, and remaining rate-limit quota headers (`x-ratelimit-remaining`), computing a live **Stability Score (0–100)** for every provider target.
+- Target selection dynamically sorts candidates by Stability Score and automatically cascades on 429 rate limits or timeouts.
+- **Multi-Candidate Tier Failover**: `routing.tiers` supports mapping a tier to an array of target specs (e.g. `["nim/z-ai/glm-5.2", "groq/llama-3.3-70b"]`) for continuous fallback.
+
+### 3. Prompt Token & Context Length Guardrails
+- Automatically estimates request prompt token count (`estimateRequestTokens`) against target model context limits (`getModelMetadata`).
+- Rejects oversized requests before network transmission with an HTTP 400 error (`request prompt estimated tokens exceeds model context limit`), protecting backends from context window overflow.
+
+### 4. Background Adaptive Health Monitoring & Persistent Caching
+- **Adaptive Cadence Loop**: Background `PingLoop` dynamically adjusts probe frequency across 4 operational modes: `speed` (2s interval at startup/activity), `normal` (10s), `slow` (30s after 5m idle), and `forced` (4s).
+- **Persistent State**: Background probes, real-world proxy calls, dynamic catalogs, and local keys persist under `~/.llm-relay/` (`models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `.env`).
+
+### 5. Programmatic Telemetry & Quota Access for Claude
+- **HTTP Endpoints**: `GET /telemetry` (live JSON metrics), `GET /registry` (full provider/routing/model catalog with quality scores), `GET /ping` (trigger health probe pass & mode summary), `GET /health` (diagnostic status).
+- **CLI Commands**: `llm-relay telemetry` outputs live telemetry metrics; `llm-relay models` lists live model catalogs with SWE-bench & quality scores; `llm-relay ping` performs live health & latency probes.
+- **Response Headers**: Proxy responses include `x-llm-relay-quota-percent`, `x-llm-relay-stability-score`, and `x-llm-relay-target`.
+
+---
+
+## CLI Command Reference
+
+| Command | Description |
+| :--- | :--- |
+| `llm-relay` | Start loopback HTTP proxy server on `127.0.0.1:8791` |
+| `llm-relay onboard` | Run guided setup wizard for 100%-free providers & subscription keys |
+| `llm-relay setup claude-desktop` (or `desktop`) | Auto-patch `claude_desktop_config.json` for Claude Desktop |
+| `llm-relay setup claude-cli` | Display & verify Claude CLI wrapper configuration |
+| `llm-relay keys` (or `check-keys`) | Validate provider API keys and display signup URLs & quota |
+| `llm-relay telemetry` | Output live JSON telemetry, stability scores, and quota metrics |
+| `llm-relay models [-p <name>] [-r]` | Query live `/models` catalog per provider (`-p` filter, `-r` force refresh) |
+| `llm-relay ping [-p <name>]` | Perform live health, latency & quota probe across providers |
+
+---
+
 ## Install & run
 
 ### Option 1: Instant run (no installation required)
 ```bash
-NVIDIA_API_KEY=nvapi-... npx llm-relay --config config.json
+NVIDIA_API_KEY=nvapi-... npx llm-relay
 ```
 
 ### Option 2: Global installation
 ```bash
 npm install -g llm-relay
 
-# Start the proxy:
-NVIDIA_API_KEY=nvapi-... llm-relay --config config.json
+# Start proxy:
+llm-relay
 
-# List available models across configured providers:
-llm-relay models
+# Check key status & signup URLs:
+llm-relay keys
 ```
 
 ## Use it from your projects
