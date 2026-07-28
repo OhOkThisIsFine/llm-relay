@@ -80,4 +80,76 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(body.stop_reason).toBe("tool_use");
     delete process.env.RP_BACKEND_KEY;
   });
+
+  it("asks a streaming openai backend for usage, and carries it into message_delta", async () => {
+    let seen: any = null;
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          seen = JSON.parse(Buffer.concat(chunks).toString());
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write(`data: ${JSON.stringify({ id: "c", model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "hi" } }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: "c", model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: "c", model: "m", choices: [], usage: { prompt_tokens: 11, completion_tokens: 7 } })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
+    const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
+
+    const res = await fetchBackend(target, {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
+      anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
+    });
+    const sse = await res.text();
+
+    expect(seen.stream_options).toEqual({ include_usage: true });
+    const delta = sse.split("\n").find((l) => l.startsWith("data:") && l.includes("message_delta"));
+    expect(JSON.parse(delta!.slice(5)).usage.output_tokens).toBe(7);
+  });
+
+  it("retries without stream_options when the backend rejects it", async () => {
+    const bodies: any[] = [];
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString());
+          bodies.push(body);
+          if (body.stream_options) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "unknown field: stream_options" } }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write(`data: ${JSON.stringify({ id: "c", model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "ok" } }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: "c", model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
+    const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
+
+    const res = await fetchBackend(target, {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
+      anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
+    });
+
+    expect(res.status).toBe(200);
+    expect(bodies.length).toBe(2);
+    expect(bodies[0].stream_options).toEqual({ include_usage: true });
+    expect(bodies[1].stream_options).toBeUndefined();
+    expect(await res.text()).toContain("content_block_delta");
+  });
 });

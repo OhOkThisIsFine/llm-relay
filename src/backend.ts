@@ -37,6 +37,10 @@ export async function fetchBackend(
   }
   openaiBody.model = target.model;
   openaiBody.stream = args.wantsStream;
+  // OpenAI-compatible backends omit usage from streamed responses unless asked. Without
+  // this the translated `message_delta` reports output_tokens: 0 and anything metering
+  // off the stream undercounts. Not universally supported — see the 400 retry below.
+  if (args.wantsStream) openaiBody.stream_options = { include_usage: true };
 
   const headers: Record<string, string> = { "content-type": "application/json" };
   const key = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
@@ -45,12 +49,22 @@ export async function fetchBackend(
     else headers["x-api-key"] = key;
   }
 
-  const res = await fetchFn(target.base + "/chat/completions", {
-    method: "POST",
-    headers,
-    body: JSON.stringify(openaiBody),
-    signal: args.signal,
-  });
+  const post = (body: Record<string, unknown>) =>
+    fetchFn(target.base + "/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: args.signal,
+    });
+
+  let res = await post(openaiBody);
+
+  // A backend that doesn't know `stream_options` rejects the whole request (400/422).
+  // Drop the hint and retry once rather than failing a request over telemetry.
+  if (!res.ok && openaiBody.stream_options && (res.status === 400 || res.status === 422)) {
+    const { stream_options: _omit, ...withoutUsage } = openaiBody;
+    res = await post(withoutUsage);
+  }
 
   if (!res.ok) {
     const body = await res.text();
