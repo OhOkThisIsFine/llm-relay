@@ -56,7 +56,7 @@ Or inline, if you'd rather not use the wrapper:
 
 ```bash
 env -u CLAUDECODE -u ANTHROPIC_API_KEY \
-  CLAUDE_CONFIG_DIR="$HOME/.repair-proxy-claude" \
+  CLAUDE_CONFIG_DIR="$HOME/.llm-relay-claude" \
   ANTHROPIC_BASE_URL=http://127.0.0.1:8791 \
   ANTHROPIC_AUTH_TOKEN=dummy \
   CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
@@ -117,18 +117,18 @@ routing from the CLI (wins over the file):
 node dist/cli.js --config config.json --default openrouter/openai/gpt-5.2-codex --mode repair
 ```
 
-`repair-proxy --help` lists every override.
+`llm-relay --help` lists every override.
 
 ### Model discovery (dynamic + cached)
 
 Model ids are **discovered live** from each provider's `/models` endpoint — never
-hand-maintained. The catalog is cached in `~/.repair-proxy/models-cache.json`
+hand-maintained. The catalog is cached in `~/.llm-relay/models-cache.json`
 (10-min TTL, fail-open: a fetch failure serves the last-known list).
 
 ```bash
-repair-proxy models                      # list live models for every provider
-repair-proxy models --provider nim       # one provider
-repair-proxy models --provider nim --refresh   # force a re-fetch
+llm-relay models                      # list live models for every provider
+llm-relay models --provider nim       # one provider
+llm-relay models --provider nim --refresh   # force a re-fetch
 ```
 
 On startup the proxy warms the cache and **warns about any routing target its
@@ -155,7 +155,7 @@ coherent JSON view:
 
 The consumer then dispatches by pointing its OpenAI-compatible pool at :8791 and
 setting each packet's model to a **namespaced** `provider/model` (it picked the exact
-backend). repair-proxy exposes an **OpenAI-compatible front** for exactly this —
+backend). llm-relay exposes an **OpenAI-compatible front** for exactly this —
 `POST /v1/chat/completions` (and `/chat/completions`): the request's `model` is routed
 by namespace/tier, rewritten to the backend id, and the upstream OpenAI response is
 returned verbatim (OpenAI in, OpenAI out — the Anthropic `/v1/messages` front with
@@ -195,23 +195,23 @@ This is the dataset for deciding which backend models are *format-broken* (resha
 ## Composing with headroom (optional)
 
 [headroom](../headroom) is a separate loopback proxy that **optimizes/compresses**
-context on the way to the model. Both it and repair-proxy are transparent
+context on the way to the model. Both it and llm-relay are transparent
 Anthropic-Messages proxies, so they chain — but only in one order, because
-repair-proxy's backend speaks OpenAI/NIM while headroom only forwards Anthropic:
+llm-relay's backend speaks OpenAI/NIM while headroom only forwards Anthropic:
 
 ```
-claude → headroom (:8787, context optimization, OUTER) → repair-proxy (:8791, validate/repair + translate, INNER) → NIM/…
+claude → headroom (:8787, context optimization, OUTER) → llm-relay (:8791, validate/repair + translate, INNER) → NIM/…
 ```
 
-repair-proxy must be **innermost**. To chain them, point headroom's upstream at
-repair-proxy — headroom exposes this as a launch flag, so its own code is untouched:
+llm-relay must be **innermost**. To chain them, point headroom's upstream at
+llm-relay — headroom exposes this as a launch flag, so its own code is untouched:
 
 ```bash
-ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8791   # headroom → repair-proxy
+ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8791   # headroom → llm-relay
 ```
 
 **Caveat:** that env var repoints *all* of headroom's Anthropic traffic — including
-your real (paid) Claude sessions — at repair-proxy. So run a **second, scoped
+your real (paid) Claude sessions — at llm-relay. So run a **second, scoped
 headroom instance** for the multiplexed lane and leave your main one pointed at
 Anthropic:
 
@@ -224,7 +224,7 @@ HEADROOM_PORT=8788 ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8791 headroom proxy
 Note the `claude-proxied` wrappers set `ANTHROPIC_BASE_URL` straight to :8791 and use
 an isolated `CLAUDE_CONFIG_DIR`, so **by default they bypass headroom entirely** — you
 only get the chain if you deliberately point the client at a headroom instance whose
-upstream is repair-proxy.
+upstream is llm-relay.
 
 **Is it worth it?** headroom's headline win is $/token savings vs *paid* Anthropic —
 **moot on the free NIM pool**. What still pays off through the chain: context

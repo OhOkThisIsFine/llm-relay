@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { argValue, hasFlag, splitSpec } from "../src/cli.js";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { argValue, hasFlag, splitSpec, main } from "../src/cli.js";
 
 describe("cli helper utilities", () => {
   const origArgv = process.argv;
@@ -61,5 +61,33 @@ describe("cli helper utilities", () => {
 
     process.argv = ["node", "cli.ts", "--other"];
     expect(hasFlag("--refresh", "-r")).toBe(false);
+  });
+
+  it("main exits 0 and prints help when invoked with help or --help", () => {
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    process.argv = ["node", "cli.ts", "help"];
+    expect(() => main()).toThrow("exit:0");
+    expect(stdoutSpy).toHaveBeenCalledWith(expect.stringContaining("llm-relay — loopback Anthropic-Messages proxy"));
+
+    stdoutSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("main exits 0 and prints version when invoked with version or --version", () => {
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    process.argv = ["node", "cli.ts", "--version"];
+    expect(() => main()).toThrow("exit:0");
+    expect(stdoutSpy).toHaveBeenCalledWith(expect.stringMatching(/\d+\.\d+\.\d+/));
+
+    stdoutSpy.mockRestore();
+    exitSpy.mockRestore();
   });
 });

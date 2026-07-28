@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
@@ -59,23 +60,43 @@ Multi-provider: config declares a providers{} registry; a request's model routes
 to one provider by namespace ("nim/z-ai/glm-5.2") or by Claude tier (routing.tiers).
 
 Usage:
-  llm-relay [--config <path>] [overrides]     start the proxy
-  llm-relay models [--provider <name>] [--refresh]   list live models per provider
+  llm-relay [options]                              Start the proxy server (default)
+  llm-relay models [-p <name>] [-r]               List live models per provider
+  llm-relay help | --help | -h                     Show this help documentation
+  llm-relay version | --version | -v               Show version number
 
-  --config <path>        Config file (default: ~/.llm-relay/config.json)
+Commands:
+  (default)                                        Start loopback HTTP proxy server
+  models                                           Query live /models catalog across providers
+  help                                             Show help documentation
+  version                                          Print package version
 
-Overrides (win over the config file, so routing can be repointed without editing it):
-  --default <prov/model> routing.default (fallback provider/model)
-  --mode <detect|repair> mode
-  --listen <host:port>   listen address (loopback only)
+Options:
+  -c, --config <path>                              Config file (default: ~/.llm-relay/config.json)
 
-Model ids are discovered dynamically from each provider's /models endpoint and
-cached (~/.llm-relay/models-cache.json, 10-min TTL). "llm-relay models" lists
-them; --refresh forces a re-fetch. On startup the proxy warms the cache and warns
-about any routing target its provider does not serve.
+Proxy Startup Overrides (win over config file values):
+  -d, --default <provider/model>                   Override routing.default fallback spec
+  -m, --mode <detect|repair|strict>                Override mode (detect | repair | strict)
+  -l, --listen <host:port>                         Override listen address (loopback only)
 
-Config string values may reference environment variables as \${NAME}
-(e.g. "base": "\${LLM_BACKEND_BASE_URL}"); an unset var is a startup error.
+Models Command Options:
+  -p, --provider <name>                            Filter model list to a specific provider
+  -r, --refresh                                    Force re-fetch from backend /models endpoints
+
+Proxy Server Endpoints:
+  POST /v1/messages                                Anthropic Messages proxy with tool repair
+  POST /v1/chat/completions                        OpenAI-compatible front
+  GET /registry                                    Full JSON view of providers, routing & capabilities
+
+Model Discovery & Caching:
+  Model IDs are discovered dynamically from each provider's /models endpoint and
+  cached in ~/.llm-relay/models-cache.json (10-min TTL). "llm-relay models" lists
+  them; --refresh forces a re-fetch. On startup, the proxy warms the cache and warns
+  about any routing target its provider does not serve.
+
+Config Environment Variables:
+  Config string values may reference environment variables as \${NAME}
+  (e.g. "base": "\${LLM_BACKEND_BASE_URL}"); an unset variable is a startup error.
 `;
 
 const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
@@ -251,13 +272,24 @@ export function runProxy() {
 }
 
 export function main(): void {
-  if (hasFlag("--help", "-h")) {
+  const arg2 = process.argv[2];
+  if (hasFlag("--help", "-h") || arg2 === "help") {
     process.stdout.write(HELP);
     process.exit(0);
   }
-  if (process.argv[2] === "models") {
+  if (hasFlag("--version", "-v") || arg2 === "version") {
+    try {
+      const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../package.json");
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+      process.stdout.write(`${pkg.version ?? "0.0.10"}\n`);
+    } catch {
+      process.stdout.write("0.0.10\n");
+    }
+    process.exit(0);
+  }
+  if (arg2 === "models") {
     runModels().catch((e) => {
-      process.stderr.write(`repair-proxy: ${(e as Error).message}\n`);
+      process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
       process.exit(1);
     });
     return;
