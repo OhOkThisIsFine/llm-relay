@@ -56,8 +56,18 @@ export function hasFlag(...flags: string[]): boolean {
 
 const HELP = `llm-relay — loopback Anthropic-Messages proxy that validates/repairs tool calls.
 
-Multi-provider: config declares a providers{} registry; a request's model routes
-to one provider by namespace ("nim/z-ai/glm-5.2") or by Claude tier (routing.tiers).
+Multi-provider: config declares a providers{} registry; a request's model picks the
+route, in this order:
+  pool/<name>          routing.pools[<name>] — ALL its candidates, benchmark-ranked
+                       with failover. Use to ask for the best available model rather
+                       than naming one. An unknown pool is a 400, never a fallback.
+  provider/model       verbatim, e.g. "nim/z-ai/glm-5.2". Never re-ranked.
+  a Claude model id    substring-matched against routing.tiers (opus|sonnet|haiku|fable).
+  anything else        routing.default.
+
+A provider with kind:"anthropic" and NO authEnv is a passthrough: the caller's own
+credentials are forwarded untouched. Point the tiers at one to keep real Claude
+traffic on real Anthropic while pool/* requests go to other providers.
 
 Usage:
   llm-relay [options]                              Start the proxy server (default)
@@ -97,6 +107,10 @@ Proxy Startup Overrides (win over config file values):
   -d, --default <provider/model>                   Override routing.default fallback spec
   -m, --mode <detect|repair|strict>                Override mode (detect | repair | strict)
   -l, --listen <host:port>                         Override listen address (loopback only)
+
+Behind a custom ANTHROPIC_BASE_URL, Claude Code drops the 1M-context beta header and
+disables Remote Control. Neither is caused by this proxy and neither can be fixed here.
+For 1M, launch with a [1m] model suffix:  ANTHROPIC_MODEL='claude-opus-5[1m]' claude
 
 Proxy Server Endpoints:
   POST /v1/messages                                Anthropic Messages proxy with tool repair
