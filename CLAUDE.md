@@ -30,6 +30,10 @@ npx vitest run -t "refuses destructive"        # one test by name
 ```
 **Always verify green before AND after a change:** `npm run build && npm test && npm run typecheck`.
 
+**Releasing: use the `/release` skill** ([.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md)).
+Publishing happens in GitHub Actions via npm **Trusted Publishing**, triggered by pushing a `v*`
+tag — a local `npm publish` has no credentials and fails with a misleading 404.
+
 ## Architecture — file → responsibility (all in `src/`)
 
 | File | Responsibility |
