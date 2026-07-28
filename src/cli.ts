@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
 import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
+import { currentVersion, ensureUpToDate, shouldCheckUpdates } from "./self-update.js";
 
 export function argValue(...flags: string[]): string | undefined {
   const allFlags = new Set<string>();
@@ -86,6 +86,12 @@ Options:
   -c, --config <path>                              Config file (default: ~/.llm-relay/config.json)
   -p, --provider <name>                            Filter models/ping command to a specific provider
   -r, --refresh                                    Force cache refresh when querying provider models
+
+Version currency:
+  Every run (except help/version) checks the npm registry — cached 6h, 2.5s timeout, fail-open.
+  A globally-installed copy updates itself, prunes stale bin shims, and restarts on the new
+  version; any other copy just prints the upgrade command. Set LLM_RELAY_NO_SELF_UPDATE=1 to
+  skip the check entirely.
 
 Proxy Startup Overrides (win over config file values):
   -d, --default <provider/model>                   Override routing.default fallback spec
@@ -372,13 +378,7 @@ export function main(): void {
     process.exit(0);
   }
   if (hasFlag("--version", "-v") || arg2 === "version") {
-    try {
-      const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../package.json");
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
-      process.stdout.write(`${pkg.version ?? "0.0.13"}\n`);
-    } catch {
-      process.stdout.write("0.0.13\n");
-    }
+    process.stdout.write(`${currentVersion()}\n`);
     process.exit(0);
   }
   if (arg2 === "onboard") {
@@ -428,6 +428,21 @@ export function main(): void {
   runProxy();
 }
 
-if (process.argv[1] && (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.ts"))) {
+/**
+ * Entrypoint: currency gate first (may replace this install and re-exec), then
+ * the command itself. `main` stays synchronous so its exit paths are direct.
+ */
+export async function run(): Promise<void> {
+  if (shouldCheckUpdates(process.argv, process.env)) {
+    try {
+      await ensureUpToDate();
+    } catch (e) {
+      process.stderr.write(`llm-relay: update check skipped (${(e as Error).message})\n`);
+    }
+  }
   main();
+}
+
+if (process.argv[1] && (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.ts"))) {
+  void run();
 }
