@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
+import { resolveAuthEnv } from "./authEnv.js";
 
 export type Mode = "detect" | "repair" | "strict";
 
@@ -303,7 +304,12 @@ function parseProviders(raw: unknown): Record<string, ProviderConfig> {
       kind,
       authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
       timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
-      ...(typeof p.authEnv === "string" ? { authEnv: p.authEnv } : {}),
+      // The declared name is a default, not a requirement: if the key is present under
+      // a known alias instead, use that so an already-working env var doesn't have to
+      // be renamed. Resolved here so routing, key checks and the backend all agree.
+      ...(typeof p.authEnv === "string"
+        ? { authEnv: resolveAuthEnv(name, p.authEnv).name ?? p.authEnv }
+        : {}),
     };
   }
   if (Object.keys(out).length === 0) {

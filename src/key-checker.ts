@@ -1,5 +1,6 @@
 import type { Config, ProviderConfig } from "./config.js";
 import { fetchProviderQuota } from "./ping/quota.js";
+import { candidateEnvNames } from "./authEnv.js";
 
 export interface KeyCheckResult {
   provider: string;
@@ -29,7 +30,7 @@ export async function validateProviderKeys(
         authEnv: envVarName,
         hasEnvKey: false,
         status: "missing_env",
-        message: `Environment variable ${envVarName} is not set`,
+        message: `No key found — set ${candidateEnvNames(name, envVarName).slice(0, 4).join(" or ")}`,
       });
       continue;
     }
