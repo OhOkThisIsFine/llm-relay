@@ -1,4 +1,6 @@
-# CLAUDE.md — repair-proxy (agent orientation)
+# CLAUDE.md — llm-relay (agent orientation)
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 Read this first. It's the map; [README.md](README.md) is the user-facing usage guide.
 
@@ -18,9 +20,13 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 54 tests)
+npm test               # vitest run  (currently 135 tests / 23 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
+npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
+
+npx vitest run test/repair.test.ts             # one file
+npx vitest run -t "refuses destructive"        # one test by name
 ```
 **Always verify green before AND after a change:** `npm run build && npm test && npm run typecheck`.
 
@@ -29,6 +35,8 @@ npm run dev -- --config config.json   # run from src via tsx, no build
 | File | Responsibility |
 |---|---|
 | `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`). |
+| `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
+| `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
 | `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), reshaper auto-synthesis. |
 | `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`). |
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
@@ -73,7 +81,7 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
 - **Persistent storage directory:** Local configurations, keys, and probe caches are persisted under `~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`).
 - **Hand-built `Config` objects in tests must include** `backend.kind` and
   `repair: { maxAttempts, destructiveTools }`.
-- **Commit trailer:** `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+- **Commit trailer:** `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 
 ## Scripts inventory (`scripts/`)
 
@@ -85,6 +93,12 @@ Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compat
 - `nim-probe.mjs` / `nim-repair.mjs` — one-off tool-call fidelity + repair probes.
 - `nim-trip-rate.mjs` — the trip-rate dataset harness (models × schemas × trials → `docs/nim-trip-rate.*`).
 - `agentic-loop-probe.mjs` — drives a full agentic STEP (tool_use → tool_result → answer) through a **running** proxy. The end-to-end proof.
+- `verify-live-features.mjs` — boots the proxy on a temp config against live NIM and exercises the runtime endpoints (`/registry`, `/telemetry`, `/ping`, …).
+- `verify-with-nim.mjs` — **dead**: exits immediately looking for an audit report from another project.
+- `multimodal-probe.mjs` — image / PDF / MCP-block passthrough through the Anthropic→OpenAI translation. Needs a **running** proxy pointed at a vision model (`PROXY=... node scripts/multimodal-probe.mjs`).
+
+Needs network (no provider key):
+- `sync-tiers.mjs` (`npm run sync:tiers`) — snapshots BFCL (tool-use accuracy, the primary tiering signal) + LMArena into `docs/tier-data.json`. Both sources are brittle by design and it fails loudly on a missing column rather than silently degrading — don't "fix" that by softening the check.
 
 Usage wrappers (for pointing a real `claude` CLI at a running proxy):
 - `claude-proxied.ps1` / `claude-proxied.sh` — see README "Use it from your projects".
@@ -109,14 +123,28 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 54 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 135 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
-Open (enhancements, not blockers):
-1. Non-text (image/PDF) + MCP passthrough via llm-bridge is **unverified** — needs a probe.
-2. Re-run `nim-trip-rate.mjs` with real NIM IDs (the account has 116 models; earlier "unavailable"
-   were wrong IDs) and pick a stronger default loop model than `llama-3.1-70b` (brittle in-loop).
-3. Model-capability rankings for dispatch (tool-use + chat scores) — **belongs to the separate
+Full live probe sweep: [docs/probe-sweep-2026-07-28.md](docs/probe-sweep-2026-07-28.md) (every script,
+every endpoint, both previously-unverified items). Findings that are still open:
+
+1. **`document` (PDF) blocks are stringified into the prompt, not translated.** llm-bridge's
+   `parseAnthropicContent` only handles `text`/`image`/`tool_use`/`tool_result`; everything else
+   falls through to `text: JSON.stringify(block)`. So a PDF's whole base64 payload lands in the
+   prompt — the model can't read it *and* token count scales with the base64. Images (base64 and
+   url) do work. Reject/down-convert `document` in `backend.ts` before llm-bridge. Probe:
+   `scripts/multimodal-probe.mjs`.
+2. **Catalog listing ≠ inference availability.** Several NIM ids in `/models` return 404 from
+   `/chat/completions`, so the startup routing-target warning in `server.ts` gives false confidence.
+   Separately, `llama-3.3-70b` cold-starts in ~86 s — any timeout under ~90 s misclassifies it as
+   unavailable.
+3. `scripts/verify-with-nim.mjs` is dead — it looks for an audit report from a different project.
+   `nim-trip-rate.mjs`'s `DEFAULT_MODELS` still lists five retired NIM ids.
+4. Model-capability rankings for dispatch (tool-use + chat scores) — **belongs to the separate
    router/auditor project, not here**; research in [docs/model-capability-ranking-sources.md](docs/model-capability-ranking-sources.md).
+
+Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; SWE-bench
+42%). `llama-3.1-8b` trips 25% of calls and the reshaper fixes ~2/3 of those — the proxy's use case.
 
 Durable project state also lives in agent memory (`project-repair-proxy`).
