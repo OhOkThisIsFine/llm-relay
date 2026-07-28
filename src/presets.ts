@@ -70,9 +70,9 @@ export const FREE_PROVIDER_PRESETS: Record<string, PresetProvider> = {
     tierType: "free",
     signupUrl: "https://openrouter.ai/keys",
     recommendedModels: [
-      "meta-llama/llama-3.3-70b-instruct:free",
-      "qwen/qwen-2.5-coder-32b-instruct:free",
-      "google/gemma-2-9b-it:free",
+      "openrouter/free",
+      "meta-llama/llama-3.3-70b-instruct",
+      "qwen/qwen-2.5-coder-32b-instruct",
     ],
   },
   cerebras: {
@@ -103,6 +103,21 @@ export const FREE_PROVIDER_PRESETS: Record<string, PresetProvider> = {
     recommendedModels: [
       "Meta-Llama-3.3-70B-Instruct",
       "Qwen2.5-Coder-32B-Instruct",
+    ],
+  },
+  ollama: {
+    name: "ollama",
+    displayName: "Ollama (Local Inference)",
+    base: "http://localhost:11434/v1",
+    kind: "openai",
+    authHeader: "authorization",
+    timeoutMs: 120000,
+    tierType: "free",
+    signupUrl: "https://ollama.com",
+    recommendedModels: [
+      "qwen2.5-coder:32b",
+      "llama3.3:70b",
+      "deepseek-r1:14b",
     ],
   },
 };
@@ -152,9 +167,11 @@ export const ALL_PROVIDER_PRESETS: Record<string, PresetProvider> = {
 export const DEFAULT_PRESET_ROUTING = {
   default: [
     "groq/llama-3.3-70b-versatile",
+    "openrouter/openrouter/free",
     "nim/z-ai/glm-5.2",
     "gemini/gemini-2.5-flash",
-    "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+    "sambanova/Meta-Llama-3.3-70B-Instruct",
+    "ollama/qwen2.5-coder:32b",
   ],
   tiers: {
     opus: [
@@ -168,12 +185,14 @@ export const DEFAULT_PRESET_ROUTING = {
       "nim/z-ai/glm-5.2",
       "gemini/gemini-2.5-flash",
       "sambanova/Meta-Llama-3.3-70B-Instruct",
+      "ollama/qwen2.5-coder:32b",
     ],
     haiku: [
       "groq/llama-3.1-8b-instant",
       "cerebras/llama3.1-8b",
       "nim/meta/llama-3.1-8b-instruct",
-      "openrouter/google/gemma-2-9b-it:free",
+      "openrouter/openrouter/free",
+      "ollama/deepseek-r1:14b",
     ],
   },
 };

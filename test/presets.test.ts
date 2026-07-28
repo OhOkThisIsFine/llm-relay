@@ -13,6 +13,10 @@ describe("presets", () => {
 
     expect(FREE_PROVIDER_PRESETS.gemini).toBeDefined();
     expect(FREE_PROVIDER_PRESETS.gemini.signupUrl).toBe("https://aistudio.google.com/app/apikey");
+
+    expect(FREE_PROVIDER_PRESETS.ollama).toBeDefined();
+    expect(FREE_PROVIDER_PRESETS.ollama.tierType).toBe("free");
+    expect(FREE_PROVIDER_PRESETS.ollama.authEnv).toBeUndefined();
   });
 
   it("SUBSCRIPTION_PROVIDER_PRESETS contains subscription templates", () => {

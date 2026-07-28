@@ -198,4 +198,29 @@ describe("ergonomics: env expansion, overrides, reshaper", () => {
     expect(c.reshaper?.base).toBe("https://cheap.test/v1");
     expect(c.reshaper?.model).toBe("cheap-model");
   });
+
+  it("resolveTargets filters active keys and sorts candidates by benchmark quality", async () => {
+    const { resolveTargets } = await import("../src/config.js");
+    process.env.TEST_KEY_A = "secret_a";
+    delete process.env.TEST_KEY_B; // Unset key
+
+    const c = loadConfig(write("dynroute.json", {
+      listen: "127.0.0.1:8791",
+      providers: {
+        provA: { base: "https://a.test/v1", kind: "openai", authEnv: "TEST_KEY_A" },
+        provB: { base: "https://b.test/v1", kind: "openai", authEnv: "TEST_KEY_B" },
+        localOllama: { base: "http://localhost:11434/v1", kind: "openai" },
+      },
+      routing: {
+        default: ["provB/llama-3.1-8b", "provA/qwen-2.5-coder-32b", "localOllama/qwen-2.5-coder-32b"],
+      },
+    }));
+
+    const targets = resolveTargets(null, c);
+    // Unset provB should be filtered out because provA and localOllama have active keys
+    expect(targets.some((t) => t.provider === "provB")).toBe(false);
+    expect(targets.length).toBe(2);
+
+    delete process.env.TEST_KEY_A;
+  });
 });

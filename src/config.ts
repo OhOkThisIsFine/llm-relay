@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { rankTargetsByBenchmark } from "./benchmarks.js";
 
 export type Mode = "detect" | "repair" | "strict";
 
@@ -143,11 +144,16 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
  */
 export function resolveTargets(model: string | null, cfg: Config): ResolvedTarget[] {
   const specs = pickSpecs(model, cfg);
-  const targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
+  let targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
+
+  // Prioritize targets with active keys or keyless local providers
+  const activeTargets = targets.filter((t) => !t.authEnv || Boolean(process.env[t.authEnv]));
+  if (activeTargets.length > 0) {
+    targets = activeTargets;
+  }
 
   if (cfg.routing.benchmarkSort !== false && targets.length > 1) {
-    // Dynamically rank target options by coding benchmark score
-    import("./benchmarks.js").then((b) => b.rankTargetsByBenchmark(targets)).catch(() => {});
+    targets = rankTargetsByBenchmark(targets);
   }
   return targets;
 }
