@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 148 tests / 24 files)
+npm test               # vitest run  (currently 175 tests / 25 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -41,7 +41,7 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`). |
 | `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
-| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), reshaper auto-synthesis. |
+| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), reshaper auto-synthesis. |
 | `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`). |
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
 | `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
@@ -127,7 +127,7 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 148 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 175 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 Full live probe sweep: [docs/probe-sweep-2026-07-28.md](docs/probe-sweep-2026-07-28.md) (every script,

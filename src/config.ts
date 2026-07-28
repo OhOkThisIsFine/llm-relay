@@ -42,14 +42,23 @@ export interface ProviderConfig {
  * How an inbound request's `model` maps to a provider + backend model.
  *  - `default`: fallback "provider/model" spec (string or array of target specs) when nothing else matches.
  *  - `tiers`: Claude tier name ("opus"/"sonnet"/"haiku"/"fable") → "provider/model" spec or array.
+ *  - `pools`: named candidate list addressed as "pool/<name>" — the ranked, discovery-friendly
+ *    alternative to pinning one model. A pool resolves to ALL its specs, so `benchmarkSort` ranks
+ *    them and the existing failover walks them in order. This is the only routing form that lets a
+ *    caller say "the best available coding model" instead of naming one; a bare namespaced spec is
+ *    deliberately verbatim and never ranked.
  * A request may also address a provider directly with a namespaced model id
  * ("nim/z-ai/glm-5.2") — the prefix picks the provider, the rest is the model.
  */
 export interface Routing {
   default: string | string[];
   tiers: Record<string, string | string[]>;
+  pools?: Record<string, string[]>;
   benchmarkSort?: boolean;
 }
+
+/** Reserved provider-namespace prefix for `pool/<name>` routing. */
+export const POOL_PREFIX = "pool";
 
 /** A request routed to a concrete provider + backend model. */
 export interface ResolvedTarget {
@@ -95,13 +104,28 @@ function detectTier(model: string): string | null {
 
 /**
  * Pick the "provider/model" spec(s) for an inbound model id:
- *  1. namespaced (`known-provider/…`) → use verbatim;
- *  2. a Claude tier with a configured mapping → that tier's spec(s);
- *  3. otherwise the routing default.
+ *  1. `pool/<name>` → that pool's full candidate list (ranked + failed over downstream);
+ *  2. namespaced (`known-provider/…`) → use verbatim;
+ *  3. a Claude tier with a configured mapping → that tier's spec(s);
+ *  4. otherwise the routing default.
+ *
+ * Pools are checked FIRST so the reserved `pool/` prefix can never be shadowed by a provider that
+ * happens to be named "pool" (config load also rejects that name outright).
  */
 function pickSpecs(model: string | null, cfg: Config): string[] {
   if (model) {
     const slash = model.indexOf("/");
+    if (slash !== -1 && model.slice(0, slash) === POOL_PREFIX) {
+      const pool = cfg.routing.pools?.[model.slice(slash + 1)];
+      // An unknown pool must NOT silently fall through to routing.default — that is exactly the
+      // "succeeded against a much weaker model than you asked for" failure. Fail loudly instead.
+      if (!pool) {
+        throw new RoutingError(
+          `no pool "${model.slice(slash + 1)}" configured (available: ${Object.keys(cfg.routing.pools ?? {}).join(", ") || "none"})`,
+        );
+      }
+      return pool;
+    }
     if (slash !== -1 && cfg.providers[model.slice(0, slash)]) return [model];
     const tier = detectTier(model);
     if (tier && cfg.routing.tiers[tier]) {
@@ -326,8 +350,13 @@ function parseRouting(
   const r = (typeof raw === "object" && raw !== null ? raw : {}) as {
     default?: unknown;
     tiers?: unknown;
+    pools?: unknown;
     benchmarkSort?: unknown;
   };
+  // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
+  if (providers[POOL_PREFIX]) {
+    throw new Error(`config.providers."${POOL_PREFIX}" is reserved — it would shadow "pool/<name>" routing`);
+  }
   const dfltRaw = overrideDefault !== undefined ? overrideDefault : r.default;
   let dflt: string | string[];
 
@@ -354,13 +383,31 @@ function parseRouting(
     }
   }
 
+  const pools: Record<string, string[]> = {};
+  if (typeof r.pools === "object" && r.pools !== null) {
+    for (const [k, v] of Object.entries(r.pools as Record<string, unknown>)) {
+      if (!Array.isArray(v)) {
+        throw new Error(`config.routing.pools.${k} must be an array of "provider/model" specs`);
+      }
+      const arr = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+      if (arr.length === 0) {
+        throw new Error(`config.routing.pools.${k} must contain at least one valid spec string`);
+      }
+      pools[k] = arr;
+    }
+  }
+
   const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
   const routing: Routing = { default: dflt, tiers, benchmarkSort };
+  if (Object.keys(pools).length > 0) routing.pools = pools;
 
   // Fail loudly at load time if any spec names an unknown provider.
   assertSpecResolvable(routing.default, providers, "routing.default");
   for (const [tier, spec] of Object.entries(tiers)) {
     assertSpecResolvable(spec, providers, `routing.tiers.${tier}`);
+  }
+  for (const [pool, specs] of Object.entries(pools)) {
+    assertSpecResolvable(specs, providers, `routing.pools.${pool}`);
   }
   return routing;
 }

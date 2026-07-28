@@ -140,11 +140,20 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
       },
     },
     routing: {
-      default: "nim/meta/llama-3.1-70b-instruct",
+      // Candidate ARRAYS, never a single pinned model. A one-element spec silently disables both
+      // benchmarkSort (it only ranks when >1 candidate) and failover — and on NIM "listed" does not
+      // mean "servable", so a lone pinned model turns one dead backend into a dead relay.
+      default: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"],
       tiers: {
-        opus: "nim/nvidia/nemotron-3-super-120b-a12b",
-        sonnet: "nim/meta/llama-3.1-70b-instruct",
-        haiku: "nim/meta/llama-3.1-8b-instruct",
+        opus: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"],
+        sonnet: ["nim/z-ai/glm-5.2", "nim/moonshotai/kimi-k2.6"],
+        haiku: ["nim/meta/llama-3.1-8b-instruct", "nim/openai/gpt-oss-20b"],
+      },
+      // Addressable as `model: pool/<name>` — including from subagent frontmatter, which only
+      // accepts a single string and so cannot express a candidate list on its own.
+      pools: {
+        coding: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"],
+        fast: ["nim/meta/llama-3.1-8b-instruct", "nim/openai/gpt-oss-20b"],
       },
     },
     mode: "repair",
