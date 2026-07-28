@@ -37,7 +37,10 @@ const logPath = join(dir, "log.jsonl");
 const port = await freePort();
 writeFileSync(cfgPath, JSON.stringify({
   listen: `127.0.0.1:${port}`,
-  backend: { base: `http://127.0.0.1:${stubPort}`, kind: "openai", model: "stub-weak-model" },
+  providers: {
+    stub: { base: `http://127.0.0.1:${stubPort}`, kind: "openai" },
+  },
+  routing: { default: "stub/stub-weak-model" },
   reshaper: { base: NIM_BASE, kind: "openai", model: RESHAPER_MODEL, authEnv: "NVIDIA_API_KEY", authHeader: "authorization" },
   mode: "repair",
   log: { level: "metadata", file: logPath },

@@ -21,14 +21,14 @@ export function getOnboardingStatusList(cfg?: Config): OnboardingStatus[] {
 
   for (const [name, p] of Object.entries(providers)) {
     const preset = ALL_PROVIDER_PRESETS[name];
-    const authEnv = p.authEnv ?? preset?.authEnv ?? `${name.toUpperCase()}_API_KEY`;
-    const hasKey = Boolean(process.env[authEnv]);
+    const authEnv = p.authEnv ?? preset?.authEnv;
+    const hasKey = authEnv ? Boolean(process.env[authEnv]) : true;
 
     result.push({
       provider: name,
       displayName: preset?.displayName ?? name.toUpperCase(),
       tierType: p.tierType ?? preset?.tierType ?? "free",
-      authEnv,
+      authEnv: authEnv ?? "",
       hasKey,
       signupUrl: p.signupUrl ?? preset?.signupUrl,
       recommendedModels: preset?.recommendedModels ?? [],
@@ -49,7 +49,7 @@ export function printOnboardingGuide(cfg?: Config): void {
   for (const p of freeProviders) {
     const statusTag = p.hasKey ? "✅ Ready" : "❌ Missing Key";
     console.log(`  • ${p.displayName} [${statusTag}]`);
-    console.log(`    Env: \$${p.authEnv}`);
+    console.log(`    Env: ${p.authEnv ? `$${p.authEnv}` : "(none required)"}`);
     if (!p.hasKey && p.signupUrl) {
       console.log(`    👉 Get your 100% FREE key here: ${p.signupUrl}`);
     }
@@ -59,7 +59,7 @@ export function printOnboardingGuide(cfg?: Config): void {
   for (const p of subProviders) {
     const statusTag = p.hasKey ? "✅ Pooled" : "⚪ Not Configured";
     console.log(`  • ${p.displayName} [${statusTag}]`);
-    console.log(`    Env: \$${p.authEnv}`);
+    console.log(`    Env: ${p.authEnv ? `$${p.authEnv}` : "(none required)"}`);
     if (!p.hasKey && p.signupUrl) {
       console.log(`    👉 Add your subscription key: ${p.signupUrl}`);
     }

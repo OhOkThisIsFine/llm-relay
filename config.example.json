@@ -25,15 +25,41 @@
       "base": "https://api.mistral.ai/v1",
       "kind": "openai",
       "authEnv": "MISTRAL_API_KEY"
+    },
+    "ollama": {
+      "base": "http://localhost:11434/v1",
+      "kind": "openai"
     }
   },
   "routing": {
-    "default": "nim/z-ai/glm-5.2",
+    "default": [
+      "groq/llama-3.3-70b-versatile",
+      "openrouter/openrouter/free",
+      "nim/z-ai/glm-5.2",
+      "gemini/gemini-2.5-flash",
+      "ollama/qwen2.5-coder:32b"
+    ],
     "tiers": {
-      "opus": "nim/nvidia/nemotron-3-super-120b-a12b",
-      "sonnet": "nim/z-ai/glm-5.2",
-      "haiku": "nim/openai/gpt-oss-20b",
-      "fable": "nim/openai/gpt-oss-20b"
+      "opus": [
+        "nim/nvidia/nemotron-3-super-120b-a12b",
+        "gemini/gemini-2.5-pro"
+      ],
+      "sonnet": [
+        "groq/llama-3.3-70b-versatile",
+        "nim/z-ai/glm-5.2",
+        "gemini/gemini-2.5-flash",
+        "ollama/qwen2.5-coder:32b"
+      ],
+      "haiku": [
+        "groq/llama-3.1-8b-instant",
+        "nim/meta/llama-3.1-8b-instruct",
+        "openrouter/openrouter/free",
+        "ollama/deepseek-r1:14b"
+      ],
+      "fable": [
+        "groq/llama-3.1-8b-instant",
+        "ollama/deepseek-r1:14b"
+      ]
     }
   },
   "mode": "repair",
