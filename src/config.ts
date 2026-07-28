@@ -80,6 +80,12 @@ export interface Config {
   mode: Mode;
   /** Explicit global reshaper override; otherwise repair reshapes on the resolved target itself. */
   reshaper?: ReshaperConfig;
+  /**
+   * Ranked reshaper candidates, from `reshaper: { pool: "<name>" }`. Tried in order, so a single
+   * de-listed model cannot take repair down with it — the whole point of not pinning one model.
+   * `reshaper` is candidates[0] so every existing single-reshaper path keeps working unchanged.
+   */
+  reshaperCandidates?: ReshaperConfig[];
   repair: { maxAttempts: number; destructiveTools: string[] };
   log: { level: "metadata" | "silent"; file: string | null };
 }
@@ -272,13 +278,18 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   // A repair-mode target reshapes on itself (openai) or via the explicit global
   // reshaper. An anthropic provider has no fixed model id, so if any provider is
   // anthropic and no explicit reshaper is set, repair can't reshape it — reject.
-  const reshaper = parseReshaper(c.reshaper);
+  // `reshaper: { pool: "<name>" }` is the resilient form: it expands to the pool's ranked
+  // candidates, so repair survives one model being de-listed. Pinning a single {base, model} still
+  // works but is fragile — the provider dropping that id silently disables repair.
+  const reshaperCandidates = resolveReshaperPool(c.reshaper, routing, providers);
+  const reshaper = reshaperCandidates?.[0] ?? parseReshaper(c.reshaper);
   if (mode === "repair" && !reshaper) {
     const anthropicProvider = Object.entries(providers).find(([, p]) => p.kind === "anthropic");
     if (anthropicProvider) {
       throw new Error(
-        `mode "repair" requires a config.reshaper { base, model, authEnv } because ` +
-          `provider "${anthropicProvider[0]}" is anthropic (no fixed model to reshape on)`,
+        `mode "repair" requires a config.reshaper — either { pool: "<name>" } (preferred: ranked ` +
+          `candidates, survives a de-listed model) or { base, model, authEnv } — because provider ` +
+          `"${anthropicProvider[0]}" is anthropic (no fixed model to reshape on)`,
       );
     }
   }
@@ -303,6 +314,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     routing,
     mode,
     ...(reshaper ? { reshaper } : {}),
+    ...(reshaperCandidates && reshaperCandidates.length > 1 ? { reshaperCandidates } : {}),
     repair: { maxAttempts, destructiveTools },
     log: { level, file },
   };
@@ -420,6 +432,54 @@ function assertSpecResolvable(spec: string | string[], providers: Record<string,
     if (!p) throw new Error(`config.${where} "${s}" names unknown provider "${provider}"`);
     if (p.kind === "openai" && !model) throw new Error(`config.${where} "${s}" needs a model id for openai provider "${provider}"`);
   }
+}
+
+/**
+ * Expand `reshaper: { pool: "<name>" }` into ranked reshaper candidates.
+ *
+ * Only openai-kind targets can reshape (an anthropic passthrough has no fixed model id to send),
+ * so anthropic entries in the pool are skipped rather than failing the whole pool. A pool naming
+ * no usable target IS an error — silently ending up with no reshaper would disable repair without
+ * saying so, which is the failure this whole form exists to prevent.
+ */
+function resolveReshaperPool(
+  raw: unknown,
+  routing: Routing,
+  providers: Record<string, ProviderConfig>,
+): ReshaperConfig[] | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const poolName = (raw as Record<string, unknown>).pool;
+  if (typeof poolName !== "string" || poolName.length === 0) return undefined;
+
+  const specs = routing.pools?.[poolName];
+  if (!specs) {
+    throw new Error(
+      `config.reshaper.pool "${poolName}" is not defined in routing.pools (available: ${Object.keys(routing.pools ?? {}).join(", ") || "none"})`,
+    );
+  }
+
+  const timeoutOverride = (raw as Record<string, unknown>).timeoutMs;
+  const out: ReshaperConfig[] = [];
+  for (const spec of specs) {
+    const { provider, model } = splitSpec(spec);
+    const p = providers[provider];
+    if (!p || p.kind !== "openai" || !model) continue;
+    out.push({
+      base: p.base,
+      model,
+      kind: "openai",
+      authHeader: p.authHeader,
+      timeoutMs:
+        typeof timeoutOverride === "number" && Number.isFinite(timeoutOverride) && timeoutOverride > 0
+          ? timeoutOverride
+          : Math.min(p.timeoutMs, 60000),
+      ...(p.authEnv ? { authEnv: p.authEnv } : {}),
+    });
+  }
+  if (out.length === 0) {
+    throw new Error(`config.reshaper.pool "${poolName}" contains no openai-kind target that can reshape`);
+  }
+  return out;
 }
 
 function parseReshaper(raw: unknown): ReshaperConfig | undefined {

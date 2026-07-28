@@ -247,6 +247,55 @@ describe("resolveTargets — pool/<name> ranked routing", () => {
   });
 });
 
+describe("reshaper: { pool } — no single pinned model", () => {
+  const poolReshaperCfg = {
+    listen: "127.0.0.1:8791",
+    providers: {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+      nim: { base: "https://nim.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" },
+    },
+    routing: {
+      default: "anthropic",
+      tiers: { opus: "anthropic" },
+      pools: { coding: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"], none: ["anthropic"] },
+    },
+    mode: "repair",
+    reshaper: { pool: "coding" },
+  };
+
+  it("expands the pool into ranked reshaper candidates (so a de-listed model can't kill repair)", () => {
+    const c = loadConfig(write("resh-pool.json", poolReshaperCfg));
+    expect(c.reshaperCandidates).toHaveLength(2);
+    expect(c.reshaperCandidates!.map((r) => r.model)).toEqual(["z-ai/glm-5.2", "deepseek-ai/deepseek-v4-pro"]);
+    expect(c.reshaperCandidates![0]!.authEnv).toBe("NVIDIA_API_KEY");
+    // candidates[0] is mirrored onto .reshaper so every existing single-reshaper path still works.
+    expect(c.reshaper?.model).toBe("z-ai/glm-5.2");
+  });
+
+  it("satisfies repair-mode validation against an anthropic passthrough provider", () => {
+    // The pinned-model form is what used to be required here; the pool form must also satisfy it.
+    expect(() => loadConfig(write("resh-pool-ok.json", poolReshaperCfg))).not.toThrow();
+  });
+
+  it("throws on an undefined pool name rather than silently having no reshaper", () => {
+    expect(() => loadConfig(write("resh-pool-missing.json", {
+      ...poolReshaperCfg, reshaper: { pool: "ghost" },
+    }))).toThrow(/not defined in routing.pools/);
+  });
+
+  it("throws when the pool has no openai-kind target able to reshape", () => {
+    // An anthropic passthrough has no fixed model id to send, so it cannot be a reshaper.
+    expect(() => loadConfig(write("resh-pool-anth.json", {
+      ...poolReshaperCfg, reshaper: { pool: "none" },
+    }))).toThrow(/no openai-kind target that can reshape/);
+  });
+
+  it("still rejects repair mode + anthropic provider when no reshaper is given at all", () => {
+    const { reshaper, ...noReshaper } = poolReshaperCfg;
+    expect(() => loadConfig(write("resh-none.json", noReshaper))).toThrow(/requires a config.reshaper/);
+  });
+});
+
 describe("ergonomics: env expansion, overrides, reshaper", () => {
   it("expands ${ENV} in provider.base and throws on an unset var", () => {
     process.env.RP_TEST_BASE = "https://nim.test/v1";

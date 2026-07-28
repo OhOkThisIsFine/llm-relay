@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { HttpReshaper, parseCorrectedInputs, type ReshapeRequest } from "../src/reshaper.js";
+import { FailoverReshaper, HttpReshaper, parseCorrectedInputs, type ReshapeRequest } from "../src/reshaper.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
 
 const tools = toolSchemaMap({
@@ -75,5 +75,42 @@ describe("HttpReshaper", () => {
     const r = new HttpReshaper({ base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
     const out = await r.reshape(req);
     expect(out.kind).toBe("refuse");
+  });
+});
+
+describe("FailoverReshaper", () => {
+  const req = {
+    tools: new Map(),
+    rawAssistant: { role: "assistant" as const, content: [], stop_reason: "tool_use" },
+    errors: [],
+    backendModel: "m",
+  };
+  const ok = { kind: "message" as const, message: { role: "assistant" as const, content: [], stop_reason: "tool_use" } };
+
+  it("advances past a transport failure to the next candidate", async () => {
+    const dead = { reshape: async () => { throw new Error("model de-listed"); } };
+    const live = { reshape: async () => ok };
+    const r = new FailoverReshaper([dead, live]);
+    expect((await r.reshape(req)).kind).toBe("message");
+  });
+
+  it("returns a refusal WITHOUT trying other candidates (no shopping for a compliant answer)", async () => {
+    let secondCalled = false;
+    const refuser = { reshape: async () => ({ kind: "refuse" as const, reason: "would have to guess" }) };
+    const other = { reshape: async () => { secondCalled = true; return ok; } };
+    const res = await new FailoverReshaper([refuser, other]).reshape(req);
+    expect(res.kind).toBe("refuse");
+    expect(secondCalled).toBe(false);
+  });
+
+  it("refuses cleanly when every candidate fails at the transport level", async () => {
+    const dead = { reshape: async () => { throw new Error("down"); } };
+    const res = await new FailoverReshaper([dead, dead]).reshape(req);
+    expect(res.kind).toBe("refuse");
+    expect((res as { reason: string }).reason).toMatch(/all reshaper candidates/);
+  });
+
+  it("rejects an empty delegate list", () => {
+    expect(() => new FailoverReshaper([])).toThrow(/at least one delegate/);
   });
 });
