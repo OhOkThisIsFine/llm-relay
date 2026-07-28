@@ -60,7 +60,9 @@ llm-relay
 ### 2. Stability-Aware Dynamic Routing & Auto-Failover
 - `CircuitBreaker` tracks latency, jitter, spike rates, and remaining rate-limit quota headers (`x-ratelimit-remaining`), computing a live **Stability Score (0–100)** for every provider target.
 - Target selection dynamically sorts candidates by Stability Score and automatically cascades on 429 rate limits or timeouts.
-- **Multi-Candidate Tier Failover**: `routing.tiers` supports mapping a tier to an array of target specs (e.g. `["nim/z-ai/glm-5.2", "groq/llama-3.3-70b"]`) for continuous fallback.
+- **Multi-Candidate Failover**: `routing.default` and every `routing.tiers` entry accept an **array** of target specs (e.g. `["nim/z-ai/glm-5.2", "groq/llama-3.3-70b"]`) for continuous fallback. ⚠ Ranking and failover both require **more than one** candidate — a single pinned model silently disables both, and on providers where a listed model may not actually be servable that turns one dead backend into a dead relay. Prefer arrays.
+- **Named pools** (`routing.pools`, addressed as `model: "pool/<name>"`): the same ranked-candidate behaviour for callers that can only send **one model string** — notably Claude Code subagent frontmatter. Lets an agent ask for *the best available coding model* instead of naming one. An unknown pool is a loud 400, never a silent fall-through.
+- **Passthrough targets**: a provider with `kind:"anthropic"` and **no `authEnv`** forwards the caller's own credentials untouched, so real Claude traffic stays on real Anthropic while `pool/*` requests route elsewhere — from the same proxy.
 
 ### 3. Prompt Token & Context Length Guardrails
 - Automatically estimates request prompt token count (`estimateRequestTokens`) against target model context limits (`getModelMetadata`).
@@ -174,6 +176,26 @@ env -u CLAUDECODE -u ANTHROPIC_API_KEY \
 `ANTHROPIC_AUTH_TOKEN` can be `dummy` — the proxy strips inbound auth and injects the real backend key itself (from `authEnv`). Override the wrapper defaults with `RP_PROXY_URL`, `RP_AUTH`, `RP_CONFIG_DIR`. Verified live end-to-end: a real `claude` agentic session (tool_use → tool_result → answer) completes through the proxy against NIM.
 
 > Backend note: weak models still fail *reasoning* (they may loop or skip a tool) — repair fixes malformed tool-call *form*, not judgment. Pick a strong tool-caller as the backend model. NIM also rate-limits (HTTP 429) under load; claude's own retry/backoff absorbs it.
+
+### What Claude Code gives up behind ANY custom `ANTHROPIC_BASE_URL`
+
+**None of these are caused by llm-relay, and none can be fixed by llm-relay** — Claude Code changes
+its own behaviour the moment `ANTHROPIC_BASE_URL` is not `api.anthropic.com`. They apply equally to
+any gateway (headroom, LiteLLM, a corporate proxy). Listed here because the symptoms look like proxy
+bugs and cost real time to diagnose otherwise.
+
+Verified against **Claude Code 2.1.220 (2026-07-28)**. These are client-version behaviours, not
+laws — re-check after a Claude Code upgrade.
+
+| What breaks | Why | Workaround |
+|---|---|---|
+| **1M context silently drops to 200k** | Claude Code omits the `context-1m-2025-08-07` beta header behind a custom base URL. Nothing errors — you just quietly get a smaller window than you are entitled to. | **Yes.** Pin the model with a `[1m]` suffix at launch: `ANTHROPIC_MODEL='claude-opus-5[1m]' claude`. Cost: this *pins* the model and overrides the in-session model picker, so set it per-launch, not globally. |
+| **`/remote-control` (`/rc`) is disabled** | Claude Code ≥2.1.196 hard-gates Remote Control to `api.anthropic.com`; the check is compiled in ("Remote Control is only available when using Claude via api.anthropic.com"). It also breaks under `ANTHROPIC_AUTH_TOKEN` alone. | **None.** It is a binary choice: a proxy, or Remote Control. Unset `ANTHROPIC_BASE_URL` to get it back. |
+| **MCP tool search off by default** | Disabled behind a non-first-party base URL. | Set `ENABLE_TOOL_SEARCH=true` (needs the proxy to forward `tool_reference` blocks — llm-relay does). |
+
+llm-relay forwards `anthropic-beta` verbatim on passthrough targets, so the 1M header **does** survive
+the proxy hop — the header is simply never sent by the client in the first place. That is why the
+workaround is client-side.
 
 ## Config — multi-provider registry
 
@@ -349,21 +371,32 @@ llm-relay — headroom exposes this as a launch flag, so its own code is untouch
 ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8791   # headroom → llm-relay
 ```
 
-**Caveat:** that env var repoints *all* of headroom's Anthropic traffic — including
-your real (paid) Claude sessions — at llm-relay. So run a **second, scoped
-headroom instance** for the multiplexed lane and leave your main one pointed at
-Anthropic:
+That env var repoints *all* of headroom's Anthropic traffic — including your real
+subscription sessions — at llm-relay. **That is fine, and you do not need a second
+headroom instance for it**, provided you give llm-relay an `anthropic` passthrough
+provider and point every tier at it:
 
-```bash
-HEADROOM_PORT=8788 ANTHROPIC_TARGET_API_URL=http://127.0.0.1:8791 headroom proxy
-# then point the claude client at :8788 (the wrapper's isolated CLAUDE_CONFIG_DIR keeps
-# your subscription out of the path); :8787 stays your normal Anthropic route.
+```jsonc
+"providers": { "anthropic": { "base": "https://api.anthropic.com", "kind": "anthropic" } },
+"routing": {
+  "default": "anthropic",
+  "tiers": { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
+  "pools":  { "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"] }
+}
 ```
 
-Note the `claude-proxied` wrappers set `ANTHROPIC_BASE_URL` straight to :8791 and use
-an isolated `CLAUDE_CONFIG_DIR`, so **by default they bypass headroom entirely** — you
-only get the chain if you deliberately point the client at a headroom instance whose
-upstream is llm-relay.
+A passthrough provider declares **no `authEnv`**, so llm-relay forwards the caller's own
+credentials byte-for-byte (`authorization`/`x-api-key` *and* `anthropic-beta`). Every Claude
+model you pick therefore reaches real Anthropic untouched, while anything addressed as
+`pool/<name>` goes to another provider. One instance, both behaviours.
+
+⚠ **Do not route Codex through this.** headroom has a single OpenAI upstream covering both
+`/v1/chat/completions` and `/v1/responses`; Codex uses `/v1/responses` and must reach
+api.openai.com. Point `--anthropic-api-url` at llm-relay and leave `--openai-api-url` alone.
+
+Note the `claude-proxied` wrappers set `ANTHROPIC_BASE_URL` straight to :8791 with a dummy
+token and an isolated `CLAUDE_CONFIG_DIR`, so **they bypass headroom entirely** — they are for
+testing this proxy against a non-Anthropic backend, not for subscription use.
 
 **Is it worth it?** headroom's headline win is $/token savings vs *paid* Anthropic —
 **moot on the free NIM pool**. What still pays off through the chain: context
