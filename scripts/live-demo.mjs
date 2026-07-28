@@ -33,8 +33,7 @@ const reshaper = createServer(async (req, res) => {
     id: "msg_reshaper", type: "message", role: "assistant", model: "reshaper",
     stop_reason: "end_turn",
     content: [{ type: "text", text: JSON.stringify({
-      content: [{ type: "tool_use", id: "tu_1", name: "get_weather", input: { city: "Paris" } }],
-      stop_reason: "tool_use",
+      inputs: { tu_1: { city: "Paris" } },
     }) }],
   }));
 });
@@ -61,12 +60,17 @@ async function startProxy(cfg) {
   const cfgPath = join(dir, "config.json");
   const logPath = join(dir, "log.jsonl");
   writeFileSync(cfgPath, JSON.stringify({ ...cfg, log: { level: "metadata", file: logPath } }));
-  const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "ignore", "pipe"] });
-  // wait for the "listening on http://host:port" banner
+  const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "pipe", "pipe"] });
   let port;
+  let stderrOutput = "";
   for await (const chunk of proc.stderr) {
-    const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(chunk.toString());
+    const text = chunk.toString();
+    stderrOutput += text;
+    const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(text);
     if (m) { port = Number(m[1]); break; }
+  }
+  if (!port) {
+    throw new Error(`Proxy failed to start: ${stderrOutput}`);
   }
   return { proc, port, logPath };
 }
@@ -77,7 +81,12 @@ const reshaperPort = await listen(reshaper);
 console.log("\n=== 1) DETECT mode — measure the trip-rate (no change to output) ===");
 {
   const { proc, port, logPath } = await startProxy({
-    listen: `127.0.0.1:${await freePort()}`, backend: { base: `http://127.0.0.1:${backendPort}` }, mode: "detect",
+    listen: `127.0.0.1:${await freePort()}`,
+    providers: {
+      demo: { base: `http://127.0.0.1:${backendPort}`, kind: "anthropic" },
+    },
+    routing: { default: "demo" },
+    mode: "detect",
   });
   const got = await request(port, "detect");
   console.log("client received tool input :", JSON.stringify(got.content[0].input), "  <-- still broken (detect never alters)");
@@ -90,8 +99,11 @@ console.log("\n=== 2) REPAIR mode — reshape the broken call before the client 
 {
   const { proc, port, logPath } = await startProxy({
     listen: `127.0.0.1:${await freePort()}`,
-    backend: { base: `http://127.0.0.1:${backendPort}` },
-    reshaper: { base: `http://127.0.0.1:${reshaperPort}`, model: "stub-haiku" },
+    providers: {
+      demo: { base: `http://127.0.0.1:${backendPort}`, kind: "anthropic" },
+    },
+    routing: { default: "demo" },
+    reshaper: { base: `http://127.0.0.1:${reshaperPort}`, model: "stub-haiku", kind: "anthropic" },
     mode: "repair",
   });
   const got = await request(port, "repair");

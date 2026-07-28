@@ -217,7 +217,12 @@ export async function runModels(): Promise<void> {
       continue;
     }
     process.stdout.write(`\n${name} — ${models.length} models:\n`);
-    for (const m of models) process.stdout.write(`  ${m}\n`);
+    for (const m of models) {
+      const scores = getBenchmarkScores(m);
+      const quality = calculateQualityScore(scores);
+      const benchStr = scores.sweBench ? ` (SWE-bench: ${scores.sweBench}%, quality: ${quality})` : "";
+      process.stdout.write(`  ${m.padEnd(50)}${benchStr}\n`);
+    }
   }
 }
 
@@ -226,7 +231,13 @@ export async function runModels(): Promise<void> {
  * does not serve — non-blocking (fire-and-forget) so it never delays listen().
  */
 export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void> {
-  const specs = [cfg.routing.default, ...Object.values(cfg.routing.tiers)];
+  const rawSpecs = [cfg.routing.default, ...Object.values(cfg.routing.tiers)];
+  const specs: string[] = [];
+  for (const s of rawSpecs) {
+    if (Array.isArray(s)) specs.push(...s);
+    else if (typeof s === "string") specs.push(s);
+  }
+
   const seen = new Set<string>();
   for (const spec of specs) {
     if (seen.has(spec)) continue;
@@ -250,8 +261,10 @@ export function runProxy() {
   const server = createProxy(cfg, { catalog });
   server.listen(cfg.port, cfg.host, () => {
     const providers = Object.keys(cfg.providers).join(",");
+    const addr = server.address();
+    const boundPort = typeof addr === "object" && addr !== null ? addr.port : cfg.port;
     process.stderr.write(
-      `llm-relay listening on http://${cfg.host}:${cfg.port} ` +
+      `llm-relay listening on http://${cfg.host}:${boundPort} ` +
         `(mode=${cfg.mode}, providers=[${providers}], default=${cfg.routing.default})\n`,
     );
     void warmAndValidate(cfg, catalog);
@@ -313,6 +326,34 @@ export async function runPingCommand(): Promise<void> {
   }
 }
 
+import { validateProviderKeys } from "./key-checker.js";
+import { getBenchmarkScores, calculateQualityScore } from "./benchmarks.js";
+
+/** `llm-relay check-keys` — pre-flight verification of provider environment keys. */
+export async function runCheckKeys(): Promise<void> {
+  const cfg = loadOrExit();
+  process.stdout.write("🔑 Validating configured provider API keys...\n\n");
+  const results = await validateProviderKeys(cfg);
+
+  process.stdout.write(
+    `Provider`.padEnd(16) +
+      `Env Var`.padEnd(24) +
+      `Status`.padEnd(16) +
+      `Details\n`,
+  );
+  process.stdout.write("-".repeat(80) + "\n");
+
+  for (const r of results) {
+    const envStr = r.authEnv ? `\${${r.authEnv}}` : "(none)";
+    const quotaStr = r.quotaPercent !== undefined && r.quotaPercent !== null ? ` | Quota: ${r.quotaPercent}%` : "";
+    const modelsStr = r.modelsFound !== undefined ? ` | Models: ${r.modelsFound}` : "";
+
+    process.stdout.write(
+      `${r.provider.padEnd(16)}${envStr.padEnd(24)}${r.status.toUpperCase().padEnd(16)}${r.message}${quotaStr}${modelsStr}\n`,
+    );
+  }
+}
+
 export function main(): void {
   const arg2 = process.argv[2];
   if (hasFlag("--help", "-h") || arg2 === "help") {
@@ -323,11 +364,18 @@ export function main(): void {
     try {
       const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../package.json");
       const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
-      process.stdout.write(`${pkg.version ?? "0.0.10"}\n`);
+      process.stdout.write(`${pkg.version ?? "0.0.11"}\n`);
     } catch {
-      process.stdout.write("0.0.10\n");
+      process.stdout.write("0.0.11\n");
     }
     process.exit(0);
+  }
+  if (arg2 === "check-keys") {
+    runCheckKeys().catch((e) => {
+      process.stderr.write(`llm-relay check-keys: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
   }
   if (arg2 === "models") {
     runModels().catch((e) => {
