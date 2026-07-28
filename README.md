@@ -229,7 +229,23 @@ reserved provider name; configuring a provider called `pool` fails at load.
 
 Each provider is `kind:"openai"` (translated Anthropic↔OpenAI via llm-bridge) or
 `kind:"anthropic"` (forwarded as-is). In `repair` mode an openai target reshapes on itself;
-an anthropic provider needs an explicit top-level `reshaper` block.
+an anthropic provider has no fixed model id to reshape on, so it needs an explicit top-level
+`reshaper` block.
+
+**Prefer the pool form — do not pin one reshaper model:**
+
+```jsonc
+"reshaper": { "pool": "coding" }     // ranked candidates, tried in order
+```
+
+A pinned `{ "base": …, "model": … }` still works, but if the provider stops serving that exact id
+your repair path dies with it and nothing says so. `{ "pool": … }` expands to the pool's ranked
+candidates and fails over on transport errors. A **refusal** is never retried on the next
+candidate — a reshaper declining to guess is a real judgement, and retrying it elsewhere is
+shopping for a more compliant answer, which is how a fabricated tool call gets through.
+
+Anthropic-kind entries in the pool are skipped (they cannot reshape); a pool with no usable
+target is a loud startup error, never a silently absent reshaper.
 
 ### Repointing without editing the file
 

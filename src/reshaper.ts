@@ -82,6 +82,36 @@ export function reconstruct(raw: AssistantMessage, inputs: Record<string, unknow
 }
 
 /** Reshaper backed by an Anthropic- or OpenAI-compatible endpoint. */
+/**
+ * Tries several reshapers in ranked order so repair does not depend on one model staying servable.
+ *
+ * Only *transport* failures advance to the next candidate. A reshaper that answers with `refuse`
+ * is a real judgement — the model looked at the call and declined to guess — so it is returned
+ * as-is. Retrying a refusal on another model would be shopping for a more compliant answer, which
+ * is exactly how a fabricated tool call gets through.
+ */
+export class FailoverReshaper implements Reshaper {
+  constructor(private readonly delegates: Reshaper[]) {
+    if (delegates.length === 0) throw new Error("FailoverReshaper needs at least one delegate");
+  }
+
+  async reshape(req: ReshapeRequest): Promise<ReshapeResult> {
+    let lastRefusal: ReshapeResult | undefined;
+    for (const d of this.delegates) {
+      try {
+        const r = await d.reshape(req);
+        if (r.kind === "message") return r;
+        lastRefusal = r; // a genuine refusal — keep it, do not shop it around
+        return r;
+      } catch {
+        // transport/HTTP failure (model de-listed, 5xx, timeout) — try the next candidate
+        continue;
+      }
+    }
+    return lastRefusal ?? { kind: "refuse", reason: "all reshaper candidates failed to respond" };
+  }
+}
+
 export class HttpReshaper implements Reshaper {
   constructor(
     private readonly cfg: {

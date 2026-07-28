@@ -14,7 +14,7 @@ import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
-import { HttpReshaper, type Reshaper } from "./reshaper.js";
+import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
 import { fetchBackend, fetchOpenAiFront } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { buildRegistry } from "./registry.js";
@@ -49,8 +49,15 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   // Reshaper selection is per-resolved-target: an explicit global reshaper (or an
   // injected one) wins for every request; otherwise an openai target reshapes on
   // itself (same base/model/key), built once per (provider, model) and cached.
+  // A pool-backed reshaper (cfg.reshaperCandidates) becomes a FailoverReshaper so one de-listed
+  // model cannot disable repair; a single pinned reshaper keeps the original single-client path.
   const explicitReshaper: Reshaper | undefined =
-    deps.reshaper ?? (cfg.reshaper ? new HttpReshaper(cfg.reshaper) : undefined);
+    deps.reshaper ??
+    (cfg.reshaperCandidates && cfg.reshaperCandidates.length > 1
+      ? new FailoverReshaper(cfg.reshaperCandidates.map((c) => new HttpReshaper(c)))
+      : cfg.reshaper
+        ? new HttpReshaper(cfg.reshaper)
+        : undefined);
   const reshaperCache = new Map<string, Reshaper>();
   const resolveReshaper = (target: ResolvedTarget): Reshaper | undefined => {
     if (explicitReshaper) return explicitReshaper;
