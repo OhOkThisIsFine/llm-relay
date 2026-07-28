@@ -70,7 +70,19 @@ llm-relay
 - **Adaptive Cadence Loop**: Background `PingLoop` dynamically adjusts probe frequency across 4 operational modes: `speed` (2s interval at startup/activity), `normal` (10s), `slow` (30s after 5m idle), and `forced` (4s).
 - **Persistent State**: Background probes, real-world proxy calls, dynamic catalogs, and local keys persist under `~/.llm-relay/` (`models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `.env`).
 
-### 5. Programmatic Telemetry & Quota Access for Claude
+### 5. Document (PDF/Office) Attachments on Non-Anthropic Backends
+- Anthropic `document` content blocks are converted to markdown **before** the request reaches an
+  OpenAI-compatible backend, via [MarkItDown](https://github.com/microsoft/markitdown). Supported:
+  PDF, `.docx`, `.pptx`, `.xlsx`, CSV, HTML, JSON, plain text and markdown.
+- MarkItDown is an **optional** external dependency (a Python CLI). Install it with
+  `pip install 'markitdown[all]'`, or point `LLM_RELAY_MARKITDOWN` at the executable. Without it, a
+  request carrying a document gets a clear HTTP 400 naming the install command.
+- Images (`image` blocks, base64 and url sources) pass through natively and need nothing installed.
+- A document that can't be converted is **refused, never truncated or inlined raw** — the underlying
+  translation library would otherwise stringify the block and inject the whole base64 payload into
+  the prompt.
+
+### 6. Programmatic Telemetry & Quota Access for Claude
 - **HTTP Endpoints**: `GET /telemetry` (live JSON metrics), `GET /registry` (full provider/routing/model catalog with quality scores), `GET /ping` (trigger health probe pass & mode summary), `GET /health` (diagnostic status).
 - **CLI Commands**: `llm-relay telemetry` outputs live telemetry metrics; `llm-relay models` lists live model catalogs with SWE-bench & quality scores; `llm-relay ping` performs live health & latency probes.
 - **Response Headers**: Proxy responses include `x-llm-relay-quota-percent`, `x-llm-relay-stability-score`, and `x-llm-relay-target`.

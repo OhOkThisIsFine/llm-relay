@@ -19,17 +19,18 @@ const BASE = process.env.LLM_BACKEND_BASE_URL || "https://integrate.api.nvidia.c
 if (!KEY) { console.error("Set NVIDIA_API_KEY (or LLM_BACKEND_API_KEY)."); process.exit(1); }
 
 const TRIALS = Number(process.env.RP_TRIALS) || 3;
-const RESHAPER_MODEL = process.env.RP_RESHAPER || "meta/llama-3.1-70b-instruct";
-const TIMEOUT_MS = 70000;
+const RESHAPER_MODEL = process.env.RP_RESHAPER || "z-ai/glm-5.2";
+// 70s was too tight: llama-3.3-70b cold-starts in ~86s and got scored `timeout`,
+// which reads identically to "model is dead". Give a cold start room to finish.
+const TIMEOUT_MS = Number(process.env.RP_TIMEOUT_MS) || 120000;
+// Verified live on 2026-07-28. Ids are checked against /models AND an actual
+// completion — several ids NIM still lists return 404 from /chat/completions,
+// so listing alone is not evidence a model is usable.
 const DEFAULT_MODELS = [
   "meta/llama-3.1-8b-instruct",
-  "meta/llama-3.1-70b-instruct",
   "meta/llama-3.3-70b-instruct",
-  "mistralai/mistral-7b-instruct-v0.3",
-  "mistralai/mixtral-8x22b-instruct-v0.1",
-  "microsoft/phi-3-medium-4k-instruct",
-  "google/gemma-2-9b-it",
-  "qwen/qwen2.5-coder-7b-instruct",
+  "nvidia/nemotron-3-super-120b-a12b",
+  "z-ai/glm-5.2",
 ];
 const MODELS = (process.env.RP_MODELS ? process.env.RP_MODELS.split(",").map((s) => s.trim()).filter(Boolean) : DEFAULT_MODELS);
 

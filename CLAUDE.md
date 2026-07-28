@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 135 tests / 23 files)
+npm test               # vitest run  (currently 148 tests / 24 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -46,6 +46,7 @@ npx vitest run -t "refuses destructive"        # one test by name
 | `sse.ts` | `reconstructFromSse()` — rebuild an AssistantMessage from a captured SSE stream (to validate it). |
 | `emitSse.ts` | `emitSse()` / `emitSseTail()` — serialize a (repaired) message back to Anthropic SSE. `emitSseTail` re-emits only trailing blocks (streaming repair). |
 | `anthropic.ts` | Minimal Anthropic Messages shapes + `toolSchemaMap()`. Only the fields the proxy inspects. |
+| `documents.ts` | `transcodeDocuments()` — Anthropic `document` blocks → markdown text via **MarkItDown** (optional external Python CLI), applied to openai-kind targets before llm-bridge. Refuses (`DocumentError` → 400) rather than letting an unconvertible document through; llm-bridge would stringify it and inject raw base64 into the prompt. Uses a **temp file, not stdin** — pdfminer needs a seekable stream and every piped PDF dies with "No /Root object". |
 | `log.ts` | Metadata-only logger (never headers/bodies). |
 | `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). |
 | `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Sorts targets by Stability Score. |
@@ -94,7 +95,6 @@ Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compat
 - `nim-trip-rate.mjs` — the trip-rate dataset harness (models × schemas × trials → `docs/nim-trip-rate.*`).
 - `agentic-loop-probe.mjs` — drives a full agentic STEP (tool_use → tool_result → answer) through a **running** proxy. The end-to-end proof.
 - `verify-live-features.mjs` — boots the proxy on a temp config against live NIM and exercises the runtime endpoints (`/registry`, `/telemetry`, `/ping`, …).
-- `verify-with-nim.mjs` — **dead**: exits immediately looking for an audit report from another project.
 - `multimodal-probe.mjs` — image / PDF / MCP-block passthrough through the Anthropic→OpenAI translation. Needs a **running** proxy pointed at a vision model (`PROXY=... node scripts/multimodal-probe.mjs`).
 
 Needs network (no provider key):
@@ -123,26 +123,15 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 135 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 148 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 Full live probe sweep: [docs/probe-sweep-2026-07-28.md](docs/probe-sweep-2026-07-28.md) (every script,
-every endpoint, both previously-unverified items). Findings that are still open:
+every endpoint). Everything it found is now fixed; `multimodal-probe.mjs` is 5/5 green live.
 
-1. **`document` (PDF) blocks are stringified into the prompt, not translated.** llm-bridge's
-   `parseAnthropicContent` only handles `text`/`image`/`tool_use`/`tool_result`; everything else
-   falls through to `text: JSON.stringify(block)`. So a PDF's whole base64 payload lands in the
-   prompt — the model can't read it *and* token count scales with the base64. Images (base64 and
-   url) do work. Reject/down-convert `document` in `backend.ts` before llm-bridge. Probe:
-   `scripts/multimodal-probe.mjs`.
-2. **Catalog listing ≠ inference availability.** Several NIM ids in `/models` return 404 from
-   `/chat/completions`, so the startup routing-target warning in `server.ts` gives false confidence.
-   Separately, `llama-3.3-70b` cold-starts in ~86 s — any timeout under ~90 s misclassifies it as
-   unavailable.
-3. `scripts/verify-with-nim.mjs` is dead — it looks for an audit report from a different project.
-   `nim-trip-rate.mjs`'s `DEFAULT_MODELS` still lists five retired NIM ids.
-4. Model-capability rankings for dispatch (tool-use + chat scores) — **belongs to the separate
-   router/auditor project, not here**; research in [docs/model-capability-ranking-sources.md](docs/model-capability-ranking-sources.md).
+Still open — one item, unchanged and **not this repo's**: model-capability rankings for dispatch
+(tool-use + chat scores) belong to the separate router/auditor project; research in
+[docs/model-capability-ranking-sources.md](docs/model-capability-ranking-sources.md).
 
 Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; SWE-bench
 42%). `llama-3.1-8b` trips 25% of calls and the reshaper fixes ~2/3 of those — the proxy's use case.

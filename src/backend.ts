@@ -1,5 +1,6 @@
 import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bridge";
 import { type ResolvedTarget } from "./config.js";
+import { DocumentError, transcodeDocuments } from "./documents.js";
 
 /**
  * Fetch the resolved provider target and return an ANTHROPIC-shaped `Response`,
@@ -29,9 +30,19 @@ export async function fetchBackend(
   }
 
   // kind === "openai"
+  // llm-bridge stringifies any block type it doesn't know, which would put a document's
+  // whole base64 payload in the prompt. Convert documents to markdown first, or refuse.
+  let reqJson = args.reqJson;
+  try {
+    reqJson = await transcodeDocuments(reqJson);
+  } catch (e) {
+    if (e instanceof DocumentError) return anthropicError(400, `llm-relay: ${e.message}`);
+    return anthropicError(502, `document conversion failed: ${(e as Error).message}`);
+  }
+
   let openaiBody: Record<string, unknown>;
   try {
-    openaiBody = translateBetweenProviders("anthropic", "openai", (args.reqJson ?? {}) as never) as Record<string, unknown>;
+    openaiBody = translateBetweenProviders("anthropic", "openai", (reqJson ?? {}) as never) as Record<string, unknown>;
   } catch (e) {
     return anthropicError(502, `request translation failed: ${(e as Error).message}`);
   }
@@ -68,7 +79,14 @@ export async function fetchBackend(
 
   if (!res.ok) {
     const body = await res.text();
-    return anthropicError(res.status, `openai backend HTTP ${res.status}: ${body.slice(0, 300)}`);
+    // A 404 here is nearly always the model id, not the route — and a provider's
+    // /models catalog is not proof: several ids NIM lists return 404 from
+    // /chat/completions. Say so, or this reads as a proxy bug.
+    const hint =
+      res.status === 404
+        ? ` — model "${target.model}" is not served by provider "${target.provider}" (a model can be listed in /models and still 404 here)`
+        : "";
+    return anthropicError(res.status, `openai backend HTTP ${res.status}${hint}: ${body.slice(0, 300)}`);
   }
 
   if (args.wantsStream && res.body) {

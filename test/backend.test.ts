@@ -81,6 +81,36 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete process.env.RP_BACKEND_KEY;
   });
 
+  it("refuses a document block it cannot convert instead of leaking base64 into the prompt", async () => {
+    let hit = false;
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((_req, res) => {
+        hit = true;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] }));
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
+    const b64 = Buffer.from("%PDF-1.4 fake").toString("base64");
+    const anthropicReq = {
+      model: "claude-x",
+      messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x.invalid/a.pdf" } }] }],
+    };
+
+    const res = await fetchBackend(target, {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
+      anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
+    });
+
+    expect(res.status).toBe(400);
+    expect(hit).toBe(false); // never reached the provider
+    const body = (await res.json()) as any;
+    expect(body.error.message).toMatch(/url. source are not supported/);
+    expect(JSON.stringify(body)).not.toContain(b64);
+  });
+
   it("asks a streaming openai backend for usage, and carries it into message_delta", async () => {
     let seen: any = null;
     backend = await new Promise<Server>((resolve) => {
