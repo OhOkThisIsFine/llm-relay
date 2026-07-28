@@ -77,13 +77,20 @@ the remote (`git fetch && git status -sb` showing no ahead/behind).
    `--prefer-online` is not optional: a plain `npm view` answers from the local metadata cache and
    will happily report the *previous* version minutes after a successful publish, which looks exactly
    like a failed release. If it still disagrees, read the registry directly —
-   `curl -s https://registry.npmjs.org/llm-relay` and check `dist-tags.latest`.
+   `curl -s https://registry.npmjs.org/llm-relay` and check `dist-tags.latest`. The registry is the
+   tie-breaker: when it already shows the new version, any disagreement is local cache, not a failure.
 
 7. **Reinstall the global bin** so the installed `llm-relay` isn't silently older than the code:
 
    ```bash
-   npm install -g llm-relay@latest && llm-relay --version
+   npm install -g llm-relay@latest --prefer-online && llm-relay --version
    ```
+
+   `--prefer-online` is needed **here too**, for the same cache reason as step 6 — and it is easy to
+   miss because the failure looks different. Right after a publish, `npm install -g llm-relay@latest`
+   resolves from the cached packument and dies with `E404 notarget … version doesn't exist`, which
+   reads as a broken publish even while `npm view --prefer-online` and the registry both already
+   report the new version. Pin the exact version if it still refuses.
 
 ## Report
 
