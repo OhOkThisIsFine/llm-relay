@@ -18,6 +18,8 @@ import { fetchBackend, fetchOpenAiFront } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { buildRegistry } from "./registry.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
+import { PingLoop } from "./ping/cadence.js";
+import { recordModelCall } from "./ping/runtime-telemetry.js";
 
 const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -30,6 +32,7 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 export interface ProxyDeps {
   reshaper?: Reshaper;
   catalog?: ModelCatalog;
+  pingLoop?: PingLoop;
 }
 
 export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
@@ -37,6 +40,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const logger = new MetadataLogger(cfg.log);
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
   const catalog = deps.catalog ?? new ModelCatalog();
+  const pingLoop = deps.pingLoop ?? new PingLoop(cfg, catalog);
 
   // Reshaper selection is per-resolved-target: an explicit global reshaper (or an
   // injected one) wins for every request; otherwise an openai target reshapes on
@@ -58,7 +62,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   };
 
   return createServer((req, res) => {
-    handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper, catalog }).catch((e) => {
+    handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper, catalog, pingLoop }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
     });
   });
@@ -70,6 +74,7 @@ interface Handlers {
   isDestructive: (name: string) => boolean;
   resolveReshaper: (target: ResolvedTarget) => Reshaper | undefined;
   catalog: ModelCatalog;
+  pingLoop?: PingLoop;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
@@ -102,12 +107,37 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Discovery endpoint for a dispatcher (e.g. audit-tools): providers × live models
   // (best-effort capability) + routing + raw leaderboard scores, one coherent view.
   if (req.method === "GET" && pathname === "/registry") {
-    const view = await buildRegistry(cfg, h.catalog);
+    const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view));
     h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
     return;
   }
+
+  if (req.method === "GET" && pathname === "/ping") {
+    if (h.pingLoop) {
+      await h.pingLoop.tickOnce();
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, pingMode: h.pingLoop?.getMode(), intervalMs: h.pingLoop?.getIntervalMs() }));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    return;
+  }
+
+  if (req.method === "GET" && (pathname === "/health/stats" || pathname === "/health")) {
+    const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
+    const stats: Record<string, unknown> = {
+      generated_at: view.generated_at,
+      ping_mode: h.pingLoop?.getMode(),
+      providers: view.providers,
+    };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(stats));
+
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    return;
+  }
+
 
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
   const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
