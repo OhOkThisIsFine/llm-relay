@@ -34,14 +34,15 @@ export interface ProviderConfig {
 
 /**
  * How an inbound request's `model` maps to a provider + backend model.
- *  - `default`: fallback "provider/model" spec when nothing else matches.
- *  - `tiers`: Claude tier name ("opus"/"sonnet"/"haiku"/"fable") → "provider/model".
+ *  - `default`: fallback "provider/model" spec (string or array of target specs) when nothing else matches.
+ *  - `tiers`: Claude tier name ("opus"/"sonnet"/"haiku"/"fable") → "provider/model" spec or array.
  * A request may also address a provider directly with a namespaced model id
  * ("nim/z-ai/glm-5.2") — the prefix picks the provider, the rest is the model.
  */
 export interface Routing {
-  default: string;
-  tiers: Record<string, string>;
+  default: string | string[];
+  tiers: Record<string, string | string[]>;
+  benchmarkSort?: boolean;
 }
 
 /** A request routed to a concrete provider + backend model. */
@@ -87,19 +88,22 @@ function detectTier(model: string): string | null {
 }
 
 /**
- * Pick the "provider/model" spec for an inbound model id:
+ * Pick the "provider/model" spec(s) for an inbound model id:
  *  1. namespaced (`known-provider/…`) → use verbatim;
- *  2. a Claude tier with a configured mapping → that tier's spec;
+ *  2. a Claude tier with a configured mapping → that tier's spec(s);
  *  3. otherwise the routing default.
  */
-function pickSpec(model: string | null, cfg: Config): string {
+function pickSpecs(model: string | null, cfg: Config): string[] {
   if (model) {
     const slash = model.indexOf("/");
-    if (slash !== -1 && cfg.providers[model.slice(0, slash)]) return model;
+    if (slash !== -1 && cfg.providers[model.slice(0, slash)]) return [model];
     const tier = detectTier(model);
-    if (tier && cfg.routing.tiers[tier]) return cfg.routing.tiers[tier]!;
+    if (tier && cfg.routing.tiers[tier]) {
+      const val = cfg.routing.tiers[tier]!;
+      return Array.isArray(val) ? val : [val];
+    }
   }
-  return cfg.routing.default;
+  return Array.isArray(cfg.routing.default) ? cfg.routing.default : [cfg.routing.default];
 }
 
 /** Split a "provider/model" spec into its parts (model may contain further slashes). */
@@ -109,17 +113,12 @@ function splitSpec(spec: string): { provider: string; model?: string } {
   return { provider: spec.slice(0, slash), model: spec.slice(slash + 1) };
 }
 
-/**
- * Resolve an inbound `model` to a concrete provider + backend model. Throws
- * RoutingError if the spec names an unknown provider or omits a model an
- * openai provider requires.
- */
-export function resolveTarget(model: string | null, cfg: Config): ResolvedTarget {
-  const spec = pickSpec(model, cfg);
+/** Resolve a single spec string to a ResolvedTarget. */
+function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | null): ResolvedTarget {
   const { provider, model: realModel } = splitSpec(spec);
   const p = cfg.providers[provider];
   if (!p) {
-    throw new RoutingError(`no provider "${provider}" configured (routed from model "${model ?? "<none>"}" → "${spec}")`);
+    throw new RoutingError(`no provider "${provider}" configured (routed from model "${modelForError ?? "<none>"}" → "${spec}")`);
   }
   if (p.kind === "openai" && !realModel) {
     throw new RoutingError(`provider "${provider}" is openai and needs a model id (spec "${spec}")`);
@@ -133,6 +132,31 @@ export function resolveTarget(model: string | null, cfg: Config): ResolvedTarget
     ...(realModel !== undefined ? { model: realModel } : {}),
     ...(p.authEnv ? { authEnv: p.authEnv } : {}),
   };
+}
+
+/**
+ * Resolve an inbound `model` to an array of concrete targets (primary + fallbacks).
+ */
+export function resolveTargets(model: string | null, cfg: Config): ResolvedTarget[] {
+  const specs = pickSpecs(model, cfg);
+  const targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
+
+  if (cfg.routing.benchmarkSort !== false && targets.length > 1) {
+    // Dynamically rank target options by coding benchmark score
+    import("./benchmarks.js").then((b) => b.rankTargetsByBenchmark(targets)).catch(() => {});
+  }
+  return targets;
+}
+
+/**
+ * Resolve an inbound `model` to the primary concrete target.
+ */
+export function resolveTarget(model: string | null, cfg: Config): ResolvedTarget {
+  const targets = resolveTargets(model, cfg);
+  if (targets.length === 0) {
+    throw new RoutingError(`could not resolve any target for model "${model ?? "<none>"}"`);
+  }
+  return targets[0]!;
 }
 
 /** The reshaper for a resolved target when no explicit global reshaper is set. */
@@ -283,18 +307,40 @@ function parseRouting(
   providers: Record<string, ProviderConfig>,
   overrideDefault: string | undefined,
 ): Routing {
-  const r = (typeof raw === "object" && raw !== null ? raw : {}) as { default?: unknown; tiers?: unknown };
-  const dflt = overrideDefault !== undefined ? overrideDefault : r.default;
-  if (typeof dflt !== "string" || dflt.length === 0) {
+  const r = (typeof raw === "object" && raw !== null ? raw : {}) as {
+    default?: unknown;
+    tiers?: unknown;
+    benchmarkSort?: unknown;
+  };
+  const dfltRaw = overrideDefault !== undefined ? overrideDefault : r.default;
+  let dflt: string | string[];
+
+  if (Array.isArray(dfltRaw)) {
+    dflt = dfltRaw.filter((s): s is string => typeof s === "string" && s.length > 0);
+    if (dflt.length === 0) {
+      throw new Error(`config.routing.default array must contain at least one valid spec string`);
+    }
+  } else if (typeof dfltRaw === "string" && dfltRaw.length > 0) {
+    dflt = dfltRaw;
+  } else {
     throw new Error(`config.routing.default ("provider/model") is required`);
   }
-  const tiers: Record<string, string> = {};
+
+  const tiers: Record<string, string | string[]> = {};
   if (typeof r.tiers === "object" && r.tiers !== null) {
     for (const [k, v] of Object.entries(r.tiers as Record<string, unknown>)) {
-      if (typeof v === "string" && v.length > 0) tiers[k] = v;
+      if (Array.isArray(v)) {
+        const arr = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+        if (arr.length > 0) tiers[k] = arr;
+      } else if (typeof v === "string" && v.length > 0) {
+        tiers[k] = v;
+      }
     }
   }
-  const routing: Routing = { default: dflt, tiers };
+
+  const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
+  const routing: Routing = { default: dflt, tiers, benchmarkSort };
+
   // Fail loudly at load time if any spec names an unknown provider.
   assertSpecResolvable(routing.default, providers, "routing.default");
   for (const [tier, spec] of Object.entries(tiers)) {
@@ -303,11 +349,14 @@ function parseRouting(
   return routing;
 }
 
-function assertSpecResolvable(spec: string, providers: Record<string, ProviderConfig>, where: string): void {
-  const { provider, model } = splitSpec(spec);
-  const p = providers[provider];
-  if (!p) throw new Error(`config.${where} "${spec}" names unknown provider "${provider}"`);
-  if (p.kind === "openai" && !model) throw new Error(`config.${where} "${spec}" needs a model id for openai provider "${provider}"`);
+function assertSpecResolvable(spec: string | string[], providers: Record<string, ProviderConfig>, where: string): void {
+  const specs = Array.isArray(spec) ? spec : [spec];
+  for (const s of specs) {
+    const { provider, model } = splitSpec(s);
+    const p = providers[provider];
+    if (!p) throw new Error(`config.${where} "${s}" names unknown provider "${provider}"`);
+    if (p.kind === "openai" && !model) throw new Error(`config.${where} "${s}" needs a model id for openai provider "${provider}"`);
+  }
 }
 
 function parseReshaper(raw: unknown): ReshaperConfig | undefined {

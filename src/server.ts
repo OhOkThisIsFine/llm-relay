@@ -3,6 +3,7 @@ import { once } from "node:events";
 import {
   DEFAULT_ANTHROPIC_VERSION,
   resolveTarget,
+  resolveTargets,
   reshaperForTarget,
   RoutingError,
   type Config,
@@ -20,6 +21,8 @@ import { buildRegistry } from "./registry.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
+import { globalCircuitBreaker } from "./circuit-breaker.js";
+import { getModelMetadata, estimateRequestTokens } from "./metadata.js";
 
 const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -142,11 +145,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
   const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
 
-  // Route the request's model to a concrete provider + backend model. A bad route
-  // (unknown provider, missing model) is a clean 400, never a crash.
-  let target: ResolvedTarget;
+  // Route the request's model to a concrete provider + backend model candidates.
+  let targetCandidates: ResolvedTarget[];
   try {
-    target = resolveTarget(model, cfg);
+    targetCandidates = resolveTargets(model, cfg);
   } catch (e) {
     if (e instanceof RoutingError) {
       failClosed(res, 400, `llm-relay routing: ${e.message}`);
@@ -154,6 +156,27 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       return;
     }
     throw e;
+  }
+
+  // Filter candidates by circuit breaker health
+  const healthyTargets = globalCircuitBreaker.getHealthyTargets(targetCandidates);
+  let target = healthyTargets[0]!;
+
+  // Validate request prompt token count against model context limits if available
+  if (isMessages && reqJson) {
+    const meta = getModelMetadata(target.model ? `${target.provider}/${target.model}` : target.provider);
+    if (meta.contextLength) {
+      const estimatedTokens = estimateRequestTokens(reqJson);
+      if (estimatedTokens > meta.contextLength) {
+        failClosed(
+          res,
+          400,
+          `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds model context limit (${meta.contextLength})`,
+        );
+        h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped"));
+        return;
+      }
+    }
   }
 
   // OpenAI-compatible FRONT: a dispatcher (e.g. audit-tools) POSTs OpenAI Chat
@@ -184,48 +207,73 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), target.timeoutMs);
-  const onResClose = () => {
-    if (!res.writableEnded) {
-      controller.abort();
-    }
-  };
-  res.on("close", onResClose);
+  // Candidate execution loop with failover across healthyTargets
+  for (let i = 0; i < healthyTargets.length; i++) {
+    target = healthyTargets[i]!;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), target.timeoutMs);
+    const onResClose = () => {
+      if (!res.writableEnded) {
+        controller.abort();
+      }
+    };
+    res.on("close", onResClose);
 
-  try {
-    let backendRes: Response;
     try {
-      backendRes = await fetchBackend(target, {
-        path,
-        method: req.method ?? "POST",
-        reqBuf,
-        reqJson,
-        anthropicHeaders: buildForwardHeaders(req.headers, target),
-        wantsStream,
-        signal: controller.signal,
-      });
-    } catch (e) {
-      clearTimeout(timer);
-      const aborted = controller.signal.aborted;
-      failClosed(res, aborted ? 504 : 502, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
-      h.logger.write(baseLog(started, path, model, hadTools, false, aborted ? 504 : 502, "skipped"));
+      let backendRes: Response;
+      try {
+        backendRes = await fetchBackend(target, {
+          path,
+          method: req.method ?? "POST",
+          reqBuf,
+          reqJson,
+          anthropicHeaders: buildForwardHeaders(req.headers, target),
+          wantsStream,
+          signal: controller.signal,
+        });
+      } catch (e) {
+        clearTimeout(timer);
+        res.off("close", onResClose);
+        const aborted = controller.signal.aborted;
+        const status = aborted ? 504 : 502;
+        globalCircuitBreaker.recordFailure(target, status);
+
+        // Failover if additional candidates exist
+        if (i < healthyTargets.length - 1) {
+          continue;
+        }
+
+        failClosed(res, status, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
+        h.logger.write(baseLog(started, path, model, hadTools, false, status, "skipped"));
+        return;
+      }
+
+      // Check HTTP 400 / 404 / 429 / 5xx for failover to next candidate
+      const isRetriableError = backendRes.status === 400 || backendRes.status === 404 || backendRes.status === 429 || backendRes.status >= 500;
+      if (isRetriableError && i < healthyTargets.length - 1) {
+        globalCircuitBreaker.recordFailure(target, backendRes.status);
+        clearTimeout(timer);
+        res.off("close", onResClose);
+        continue; // Failover to next target
+      }
+
+      globalCircuitBreaker.recordSuccess(target);
+
+      const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
+      const willValidate = isMessages && hadTools && backendRes.status < 400;
+      const reshaper = h.resolveReshaper(target);
+      const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
+
+      if (doRepair) {
+        await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, req }, h);
+      } else {
+        await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools, req }, h);
+      }
       return;
+    } finally {
+      clearTimeout(timer);
+      res.off("close", onResClose);
     }
-
-    const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
-    const willValidate = isMessages && hadTools && backendRes.status < 400;
-    const reshaper = h.resolveReshaper(target);
-    const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
-
-    if (doRepair) {
-      await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, req }, h);
-    } else {
-      await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools, req }, h);
-    }
-  } finally {
-    clearTimeout(timer);
-    res.off("close", onResClose);
   }
 }
 

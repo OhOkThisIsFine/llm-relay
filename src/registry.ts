@@ -40,7 +40,7 @@ export interface RegistryView {
   generated_at: string;
   /** How to address a backend: namespace a request model "provider/model" (audit-tools names the
    *  exact model), or let routing map by Claude tier / default (dumb-client convenience). */
-  routing: { default: string; tiers: Record<string, string> };
+  routing: { default: string | string[]; tiers: Record<string, string | string[]> };
   providers: Record<string, RegistryProvider>;
   capability_source: {
     present: boolean;
