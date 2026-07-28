@@ -23,6 +23,7 @@ import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
 import { getModelMetadata, estimateRequestTokens } from "./metadata.js";
+import { getTelemetryReport } from "./telemetry.js";
 
 const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -137,6 +138,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(stats));
 
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/telemetry") {
+    const report = getTelemetryReport(cfg, globalCircuitBreaker);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(report, null, 2));
     h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
     return;
   }

@@ -1,15 +1,19 @@
 import type { ResolvedTarget } from "./config.js";
+import { getStabilityScore, type PingRecord } from "./ping/metrics.js";
 
 export interface CircuitState {
   consecutiveFailures: number;
   lastFailureTime: number;
   cooldownUntil: number;
   lastStatus?: number | undefined;
+  pings: PingRecord[];
+  quotaPercent?: number | null | undefined;
 }
 
 const DEFAULT_COOLDOWN_MS = 60000; // 1 minute cooldown after consecutive failures
 const RATE_LIMIT_COOLDOWN_MS = 120000; // 2 minutes cooldown on 429
 const MAX_FAILURES_BEFORE_TRIP = 2;
+const MAX_PING_HISTORY = 10;
 
 export class CircuitBreaker {
   private states = new Map<string, CircuitState>();
@@ -17,6 +21,19 @@ export class CircuitBreaker {
   private getKey(target: ResolvedTarget | string): string {
     if (typeof target === "string") return target;
     return target.model ? `${target.provider}/${target.model}` : target.provider;
+  }
+
+  private getOrCreate(key: string, now = Date.now()): CircuitState {
+    const existing = this.states.get(key);
+    if (existing) return existing;
+    const fresh: CircuitState = {
+      consecutiveFailures: 0,
+      lastFailureTime: 0,
+      cooldownUntil: 0,
+      pings: [],
+    };
+    this.states.set(key, fresh);
+    return fresh;
   }
 
   /** Check if a target spec or ResolvedTarget is healthy to receive traffic. */
@@ -33,38 +50,61 @@ export class CircuitBreaker {
   }
 
   /** Record a successful completion for a target, resetting its circuit. */
-  recordSuccess(target: ResolvedTarget | string): void {
+  recordSuccess(target: ResolvedTarget | string, ms = 500, quotaPercent?: number | null, now = Date.now()): void {
     const key = this.getKey(target);
-    this.states.delete(key);
+    const state = this.getOrCreate(key, now);
+    state.consecutiveFailures = 0;
+    state.cooldownUntil = 0;
+    state.lastStatus = 200;
+    if (quotaPercent !== undefined) state.quotaPercent = quotaPercent;
+    state.pings.push({ ms, code: "200", timestamp: now });
+    if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
   }
 
   /** Record a failure (e.g. 429 rate limit, 5xx error, timeout) for a target. */
-  recordFailure(target: ResolvedTarget | string, status?: number, now = Date.now()): void {
+  recordFailure(target: ResolvedTarget | string, status?: number, now = Date.now(), ms = 1000): void {
     const key = this.getKey(target);
-    const existing = this.states.get(key) ?? {
-      consecutiveFailures: 0,
-      lastFailureTime: now,
-      cooldownUntil: 0,
-    };
+    const state = this.getOrCreate(key, now);
 
-    existing.consecutiveFailures += 1;
-    existing.lastFailureTime = now;
-    existing.lastStatus = status;
+    state.consecutiveFailures += 1;
+    state.lastFailureTime = now;
+    state.lastStatus = status;
+    const statusCode = status ? String(status) : "500";
+    state.pings.push({ ms, code: statusCode, timestamp: now });
+    if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
 
     // HTTP 429 (Rate Limit) trips immediately for 2 minutes
     if (status === 429) {
-      existing.cooldownUntil = now + RATE_LIMIT_COOLDOWN_MS;
-    } else if (existing.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
-      existing.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
+      state.cooldownUntil = now + RATE_LIMIT_COOLDOWN_MS;
+    } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
+      state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
     }
-
-    this.states.set(key, existing);
   }
 
-  /** Filter an array of targets to only healthy candidates. Fall back to all if all are open. */
+  /** Get computed stability score (0–100) for a target (returns 100 if untracked). */
+  getStabilityScore(target: ResolvedTarget | string): number {
+    const key = this.getKey(target);
+    const state = this.states.get(key);
+    if (!state || state.pings.length === 0) return 100;
+    const score = getStabilityScore(state.pings);
+    return score >= 0 ? score : 100;
+  }
+
+  /** Get full state for a target. */
+  getState(target: ResolvedTarget | string): CircuitState | undefined {
+    return this.states.get(this.getKey(target));
+  }
+
+  /** Get all tracked circuit states. */
+  getAllStates(): Map<string, CircuitState> {
+    return this.states;
+  }
+
+  /** Filter an array of targets to healthy candidates, sorted by Stability Score (highest first). */
   getHealthyTargets(targets: ResolvedTarget[], now = Date.now()): ResolvedTarget[] {
     const healthy = targets.filter((t) => this.isHealthy(t, now));
-    return healthy.length > 0 ? healthy : targets; // Fallback to all if all in cooldown
+    const candidates = healthy.length > 0 ? healthy : targets;
+    return [...candidates].sort((a, b) => this.getStabilityScore(b) - this.getStabilityScore(a));
   }
 
   /** Reset all circuit states. */

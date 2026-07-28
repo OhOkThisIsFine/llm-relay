@@ -28,17 +28,32 @@ npm run dev -- --config config.json   # run from src via tsx, no build
 
 | File | Responsibility |
 |---|---|
-| `cli.ts` | Entry point. Parses `--config` + overrides (`--backend-base/--model/--mode/--listen`), `--help`. |
-| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, reshaper auto-synthesis. `loadConfig(path, overrides?)`. |
-| `server.ts` | The proxy. Request routing, detect vs repair paths, streaming vs buffered, `count_tokens`/non-messages handling, header/auth filtering, metadata logging. |
-| `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` for either `kind`. `anthropic` = passthrough; `openai` = translate req+resp via `llm-bridge`. |
+| `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`). |
+| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), reshaper auto-synthesis. |
+| `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`). |
+| `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
 | `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
-| `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai) + injectable `Reshaper` for tests. |
+| `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai). |
 | `repair.ts` | Repair orchestrator. Destructive-refusal check → reshape ≤ maxAttempts → re-validate each attempt. |
 | `sse.ts` | `reconstructFromSse()` — rebuild an AssistantMessage from a captured SSE stream (to validate it). |
 | `emitSse.ts` | `emitSse()` / `emitSseTail()` — serialize a (repaired) message back to Anthropic SSE. `emitSseTail` re-emits only trailing blocks (streaming repair). |
 | `anthropic.ts` | Minimal Anthropic Messages shapes + `toolSchemaMap()`. Only the fields the proxy inspects. |
 | `log.ts` | Metadata-only logger (never headers/bodies). |
+| `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). |
+| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Sorts targets by Stability Score. |
+| `benchmarks.ts` | Coding benchmark database (SWE-bench, HumanEval, LiveCodeBench, Arena Elo) and target ranking algorithms. |
+| `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
+| `metadata.ts` | Lookup table for model context windows, token limits, and prompt token estimation logic. |
+| `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. |
+| `key-checker.ts` | Pre-flight validator checking provider API key health and remaining rate-limit quota percentages. |
+| `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). |
+| `setup-claude.ts` | Configuration generator for Claude Desktop (`claude_desktop_config.json`) and Claude CLI wrappers. |
+| `ping/cadence.ts` | Adaptive background monitoring loop (`PingLoop`) with dynamic mode transitions (`speed`, `normal`, `slow`, `forced`). |
+| `ping/metrics.ts` | Latency statistical calculations (average, p95, jitter, uptime, spike rate) and composite Stability Score calculation (0-100). |
+| `ping/ping.ts` | Single probe executor for model latency, status codes, and rate-limit header quota extraction. |
+| `ping/probe-cache.ts` | Disk-cached background probe results (`probe-cache.json`) with TTL checks. |
+| `ping/quota.ts` | Provider-specific quota balance fetcher (e.g. OpenRouter key auth endpoint). |
+| `ping/runtime-telemetry.ts` | Real-world proxy request telemetry storage (`runtime-telemetry.json`) and real-world quality scoring. |
 
 **Request flow:** `handle()` in `server.ts` → `fetchBackend()` → then either `repairPath` (repair
 mode, invalid tool call) or `transparentPath` (detect/passthrough). Repair splits into
@@ -55,6 +70,7 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
 - **Logs are metadata only** — never request/response headers or bodies.
 - **Destructive tool calls are refused, never fabricated** (repair output may run under
   `--dangerously-skip-permissions`). Unrepairable → fail-clean (502, or a mid-stream SSE `error`).
+- **Persistent storage directory:** Local configurations, keys, and probe caches are persisted under `~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`).
 - **Hand-built `Config` objects in tests must include** `backend.kind` and
   `repair: { maxAttempts, destructiveTools }`.
 - **Commit trailer:** `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.

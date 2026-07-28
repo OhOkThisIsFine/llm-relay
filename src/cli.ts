@@ -61,43 +61,47 @@ to one provider by namespace ("nim/z-ai/glm-5.2") or by Claude tier (routing.tie
 
 Usage:
   llm-relay [options]                              Start the proxy server (default)
+  llm-relay onboard                                Guided setup for 100%-free providers & subscriptions
+  llm-relay setup [claude-cli|claude-desktop]     Configure Claude CLI wrappers or Claude Desktop
+  llm-relay keys | check-keys                      Check status of all free & subscription keys
+  llm-relay telemetry                              Programmatic JSON metrics and quota report
   llm-relay models [-p <name>] [-r]               List live models per provider
+  llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
   llm-relay help | --help | -h                     Show this help documentation
   llm-relay version | --version | -v               Show version number
 
 Commands:
   (default)                                        Start loopback HTTP proxy server
+  onboard                                          Run 100%-free provider onboarding wizard
+  setup claude-cli                                 Verify & configure Claude CLI wrapper scripts
+  setup claude-desktop | setup desktop             Auto-patch Claude Desktop config (claude_desktop_config.json)
+  keys | check-keys                                Validate provider API keys & display signup links
+  telemetry                                        Output JSON telemetry & quota report
   models                                           Query live /models catalog across providers
+  ping                                             Probe model latency, stability & quota metrics
   help                                             Show help documentation
   version                                          Print package version
 
 Options:
   -c, --config <path>                              Config file (default: ~/.llm-relay/config.json)
+  -p, --provider <name>                            Filter models/ping command to a specific provider
+  -r, --refresh                                    Force cache refresh when querying provider models
 
 Proxy Startup Overrides (win over config file values):
   -d, --default <provider/model>                   Override routing.default fallback spec
   -m, --mode <detect|repair|strict>                Override mode (detect | repair | strict)
   -l, --listen <host:port>                         Override listen address (loopback only)
 
-Models Command Options:
-  -p, --provider <name>                            Filter model list to a specific provider
-  -r, --refresh                                    Force re-fetch from backend /models endpoints
-
 Proxy Server Endpoints:
   POST /v1/messages                                Anthropic Messages proxy with tool repair
-  POST /v1/chat/completions                        OpenAI-compatible front
+  POST /v1/messages/count_tokens                   Local token estimation for OpenAI backends
+  POST /v1/chat/completions                        OpenAI-compatible front (OpenAI in, OpenAI out)
   GET /registry                                    Full JSON view of providers, routing & capabilities
-
-Model Discovery & Caching:
-  Model IDs are discovered dynamically from each provider's /models endpoint and
-  cached in ~/.llm-relay/models-cache.json (10-min TTL). "llm-relay models" lists
-  them; --refresh forces a re-fetch. On startup, the proxy warms the cache and warns
-  about any routing target its provider does not serve.
-
-Config Environment Variables:
-  Config string values may reference environment variables as \${NAME}
-  (e.g. "base": "\${LLM_BACKEND_BASE_URL}"); an unset variable is a startup error.
+  GET /telemetry                                   Live JSON telemetry, quota & stability scores for Claude
+  GET /ping                                        Trigger health probe pass & query ping mode summary
+  GET /health                                      Diagnostic JSON summary of provider availability & health
 `;
+
 
 const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
   {
@@ -354,8 +358,15 @@ export async function runCheckKeys(): Promise<void> {
   }
 }
 
+import { runInteractiveOnboarding, printOnboardingGuide } from "./onboarding.js";
+import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
+import { getTelemetryReport } from "./telemetry.js";
+import { globalCircuitBreaker } from "./circuit-breaker.js";
+
 export function main(): void {
   const arg2 = process.argv[2];
+  const arg3 = process.argv[3];
+
   if (hasFlag("--help", "-h") || arg2 === "help") {
     process.stdout.write(HELP);
     process.exit(0);
@@ -364,13 +375,36 @@ export function main(): void {
     try {
       const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../package.json");
       const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
-      process.stdout.write(`${pkg.version ?? "0.0.11"}\n`);
+      process.stdout.write(`${pkg.version ?? "0.0.13"}\n`);
     } catch {
-      process.stdout.write("0.0.11\n");
+      process.stdout.write("0.0.13\n");
     }
     process.exit(0);
   }
-  if (arg2 === "check-keys") {
+  if (arg2 === "onboard") {
+    const cfg = loadOrExit();
+    runInteractiveOnboarding(cfg).catch((e) => {
+      process.stderr.write(`llm-relay onboard: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
+  if (arg2 === "setup") {
+    if (arg3 === "claude-desktop" || arg3 === "desktop") {
+      const res = setupClaudeDesktop();
+      process.stdout.write(`${res.message}\n`);
+    } else {
+      setupClaudeCli();
+    }
+    return;
+  }
+  if (arg2 === "telemetry") {
+    const cfg = loadOrExit();
+    const report = getTelemetryReport(cfg, globalCircuitBreaker);
+    process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    return;
+  }
+  if (arg2 === "keys" || arg2 === "check-keys") {
     runCheckKeys().catch((e) => {
       process.stderr.write(`llm-relay check-keys: ${(e as Error).message}\n`);
       process.exit(1);
@@ -393,7 +427,6 @@ export function main(): void {
   }
   runProxy();
 }
-
 
 if (process.argv[1] && (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.ts"))) {
   main();

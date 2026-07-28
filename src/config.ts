@@ -30,6 +30,10 @@ export interface ProviderConfig {
   authHeader: AuthHeader;
   /** Backend request deadline in ms. Default 120000. */
   timeoutMs: number;
+  /** "free": 100% free model endpoint. "subscription": user paid subscription quota endpoint. */
+  tierType?: "free" | "subscription";
+  /** Web URL where users can sign up or obtain API keys. */
+  signupUrl?: string;
 }
 
 /**
