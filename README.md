@@ -122,6 +122,29 @@ llm-relay
 llm-relay keys
 ```
 
+### Staying current
+
+Every start (except `help` and `version`) compares the running version against the npm registry —
+answer cached 6h in `~/.llm-relay/update-check.json`, 2.5s timeout, and any failure is silent and
+non-blocking, so an offline or slow registry never delays a start.
+
+When a newer version exists:
+
+- **a global install updates itself** — `npm install -g llm-relay@<latest>`, then it re-execs into the
+  new build and runs your command there. Nothing to remember, and no half-updated state: if the install
+  or the version check after it fails, it says so and continues on the version you already had.
+- **any other copy** (source checkout, `npx`, project dependency) just prints the version gap and the
+  exact upgrade command, and continues.
+
+The replace is clean. Any bin shim the *old* version installed that the new one no longer declares is
+deleted in all of npm's spellings (bare, `.cmd`, `.ps1`, `.bat`), so a renamed or dropped command can
+never leave a dangling entry on your `PATH`. If pre-existing shims block npm's overwrite (`EEXIST` —
+typically left by a `npm link` or a half-finished install), the update clears them and reinstalls rather
+than leaving you pinned to an old build.
+
+Set `LLM_RELAY_NO_SELF_UPDATE=1` to skip the check entirely — it is also set automatically on the
+re-exec'd process, so an update can never recurse.
+
 ## Use it from your projects
 
 Point the `claude` CLI at the running proxy. **The one thing that matters:** give claude an **isolated `CLAUDE_CONFIG_DIR`**. Without it, an active claude.ai subscription session conflicts with the proxy token and claude fails client-side with `Invalid API key` / `401 Invalid bearer token` before any request is even sent. With it, the proxy's provider token is the sole credential — and your subscription is never in the path (the safe direction).
