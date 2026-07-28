@@ -24,6 +24,29 @@ function base(extra: Record<string, unknown> = {}) {
   };
 }
 
+describe("loadConfig — authEnv alias resolution", () => {
+  it("keeps the declared authEnv when that variable is the one set", () => {
+    process.env.GEMINI_API_KEY = "declared";
+    const c = loadConfig(write("env-declared.json", base({
+      providers: { gemini: { base: "https://g.test/v1", kind: "openai", authEnv: "GEMINI_API_KEY" } },
+      routing: { default: "gemini/gemini-2.5-flash" },
+    })));
+    expect(c.providers.gemini!.authEnv).toBe("GEMINI_API_KEY");
+    delete process.env.GEMINI_API_KEY;
+  });
+
+  it("adopts an alias env var when the declared one is unset", () => {
+    delete process.env.GEMINI_API_KEY;
+    process.env.GOOGLEAI_API_KEY = "alias";
+    const c = loadConfig(write("env-alias.json", base({
+      providers: { gemini: { base: "https://g.test/v1", kind: "openai", authEnv: "GEMINI_API_KEY" } },
+      routing: { default: "gemini/gemini-2.5-flash" },
+    })));
+    expect(c.providers.gemini!.authEnv).toBe("GOOGLEAI_API_KEY");
+    delete process.env.GOOGLEAI_API_KEY;
+  });
+});
+
 describe("loadConfig — listen + providers", () => {
   it("accepts 127.0.0.1 and defaults provider authHeader/timeout", () => {
     const c = loadConfig(write("a.json", base()));
