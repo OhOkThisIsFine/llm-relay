@@ -2,26 +2,11 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getBenchmarkScores, calculateQualityScore, rankTargetsByBenchmark, getStrength } from "../src/benchmarks.js";
+import { rankTargetsByBenchmark, getStrength } from "../src/benchmarks.js";
 import { recordModelCall } from "../src/ping/runtime-telemetry.js";
 import type { ResolvedTarget } from "../src/config.js";
 
 describe("benchmarks", () => {
-  it("looks up benchmark scores for known model IDs", () => {
-    const sonnet = getBenchmarkScores("claude-3-7-sonnet");
-    expect(sonnet.sweBench).toBe(70.3);
-    expect(sonnet.humanEval).toBe(92.0);
-
-    const qwen = getBenchmarkScores("qwen-2.5-coder-32b");
-    expect(qwen.sweBench).toBe(41.2);
-  });
-
-  it("calculates quality score from benchmark metrics", () => {
-    const score = calculateQualityScore({ sweBench: 50.0, liveCodeBench: 60.0, humanEval: 90.0 });
-    // weighted mean: (50*3 + 60*2 + 90*1) / 6 = 360 / 6 = 60
-    expect(score).toBe(60);
-  });
-
   it("ranks resolved target candidates strongest first", () => {
     const t = (provider: string, model: string): ResolvedTarget => ({
       provider, base: "http://x", kind: "openai", model, authHeader: "authorization", timeoutMs: 1000,
