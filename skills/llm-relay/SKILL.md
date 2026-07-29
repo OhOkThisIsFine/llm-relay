@@ -106,20 +106,27 @@ are the *first* resort, not the fallback:
    ```
    `-high` for analysis and tracing, `-medium` for ordinary recon, `-low` for mechanical sweeps.
    Other flags: `--add-dir <path>` to scope the workspace, `--json-schema` for structured output,
-   `--print-timeout` (default 5m), `--mode plan` for analysis-only runs. Spends AGY CLI credits.
-   *Exhausted when:* the CLI reports credits/quota exhausted or rate-limits.
-2. **Antigravity — Claude, same CLI and credits.** When Flash is not strong enough for the task,
-   stay on AGY and step up rather than leaving the lane: `--model claude-opus-4-6-thinking` for
+   `--print-timeout` (default 5m), `--mode plan` for analysis-only runs.
+   *Exhausted when:* the CLI reports the **Gemini** credit balance exhausted, or rate-limits.
+2. **Antigravity — Claude, same CLI, SEPARATE quota.** ⚠ AGY meters Gemini and Claude against
+   **two independent credit balances**, so exhausting rung 1 does *not* exhaust this rung — that
+   is precisely why it is a real fallback and not a duplicate of rung 1. Step up here when Flash
+   is not strong enough, or when Gemini credits are gone: `--model claude-opus-4-6-thinking` for
    hard reasoning, `--model claude-sonnet-4-6` for everything else. (Neither id carries a level
-   suffix — use the session flag `--effort low|medium|high` if you need to tune them.)
-   *Exhausted when:* AGY credits are gone — i.e. this rung and rung 1 exhaust together.
+   suffix — use the session flag `--effort low|medium|high` to tune them.)
+   *Exhausted when:* the **Claude** balance is exhausted — independently of rung 1, in either
+   direction.
 3. **Codex — Sol, then Terra, then Luna.** Spends the ChatGPT subscription:
    ```bash
-   codex exec --model gpt-5.6-sol "<task>"
+   codex exec --model gpt-5.6-sol -c model_reasoning_effort="medium" "<task>"
    ```
-   Walk `gpt-5.6-sol` → `gpt-5.6-terra` → `gpt-5.6-luna` in that order. Set reasoning to suit with
-   `-c model_reasoning_effort="high|medium|low"` (the config default is `high`). `codex exec review`
-   runs a repo review. *Exhausted when:* it reports usage-limit errors.
+   Walk `gpt-5.6-sol` → `gpt-5.6-terra` → `gpt-5.6-luna` in that order. Reasoning level is a
+   config override, not a flag — Codex has no `--effort`: `-c model_reasoning_effort=` accepts
+   `minimal|low|medium|high|xhigh` (the config default in `~/.codex/config.toml` is `high`;
+   `plan_mode_reasoning_effort` sets it separately for plan mode). ⚠ Codex's own guidance is that
+   high effort burns subscription rate limits fast — match the level to the task rather than
+   leaving it at `high` for mechanical work. `codex exec review` runs a repo review.
+   *Exhausted when:* it reports usage-limit errors.
 4. **Relay pools — free API-key capacity, benchmark order.** `@relay: pool/coding` (or the tier
    mapping in `routing.subagents` when offload is on). Ordering *inside* a pool is by synced
    benchmark strength, not config order — see "Reordering dispatch" below. *Exhausted when:* the
@@ -139,6 +146,9 @@ Rules for walking it:
   source) exactly like relay-offloaded output. Do NOT wrap them in a bare one-shot HTTP helper.
 - A **refusal or a wrong answer is not a transport failure** — do not walk the ladder to shop for
   a more compliant model. Only availability failures (errors, quota, rate limits) advance a rung.
+- **The rungs draw on five independent buckets**, so exhausting one never implies the next is
+  gone: AGY-Gemini, AGY-Claude (separate balances despite one CLI), ChatGPT, provider API keys,
+  Anthropic primary. Re-check the rung you skipped on the next dispatch — a reset refills it.
 - Interactive-only quotas (e.g. an IDE-bound plan with no CLI) are unreachable by any dispatcher;
   don't try to MITM them into the ladder.
 
