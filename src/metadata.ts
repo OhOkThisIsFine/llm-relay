@@ -1,65 +1,14 @@
-export interface ModelMetadata {
-  contextLength?: number;
-  maxOutputTokens?: number;
-  supportsTools?: boolean;
-  supportsThinking?: boolean;
-}
-
-const DEFAULT_METADATA_TABLE: Array<{ pattern: string | RegExp; metadata: ModelMetadata }> = [
-  // Anthropic / Claude
-  { pattern: "claude-3-7-sonnet", metadata: { contextLength: 200000, maxOutputTokens: 64000, supportsTools: true, supportsThinking: true } },
-  { pattern: "claude-3-5-sonnet", metadata: { contextLength: 200000, maxOutputTokens: 8192, supportsTools: true, supportsThinking: false } },
-  { pattern: "claude-3-5-haiku", metadata: { contextLength: 200000, maxOutputTokens: 8192, supportsTools: true, supportsThinking: false } },
-  { pattern: "claude-3-opus", metadata: { contextLength: 200000, maxOutputTokens: 4096, supportsTools: true, supportsThinking: false } },
-
-  // OpenAI
-  { pattern: "gpt-4o", metadata: { contextLength: 128000, maxOutputTokens: 16384, supportsTools: true, supportsThinking: false } },
-  { pattern: "gpt-4o-mini", metadata: { contextLength: 128000, maxOutputTokens: 16384, supportsTools: true, supportsThinking: false } },
-  { pattern: "o3-mini", metadata: { contextLength: 200000, maxOutputTokens: 100000, supportsTools: true, supportsThinking: true } },
-  { pattern: "o1", metadata: { contextLength: 200000, maxOutputTokens: 100000, supportsTools: true, supportsThinking: true } },
-
-  // DeepSeek
-  { pattern: "deepseek-r1", metadata: { contextLength: 128000, maxOutputTokens: 8192, supportsTools: true, supportsThinking: true } },
-  { pattern: "deepseek-v3", metadata: { contextLength: 128000, maxOutputTokens: 8192, supportsTools: true, supportsThinking: false } },
-
-  // Qwen
-  { pattern: "qwen-2.5-coder", metadata: { contextLength: 128000, maxOutputTokens: 8192, supportsTools: true, supportsThinking: false } },
-  { pattern: "qwen-2.5-72b", metadata: { contextLength: 128000, maxOutputTokens: 8192, supportsTools: true, supportsThinking: false } },
-
-  // GLM / Llama / Mistral
-  { pattern: "glm-4", metadata: { contextLength: 128000, maxOutputTokens: 4096, supportsTools: true, supportsThinking: false } },
-  { pattern: "glm-5", metadata: { contextLength: 128000, maxOutputTokens: 8192, supportsTools: true, supportsThinking: false } },
-  { pattern: "llama-3.3-70b", metadata: { contextLength: 128000, maxOutputTokens: 4096, supportsTools: true, supportsThinking: false } },
-  { pattern: "nemotron", metadata: { contextLength: 128000, maxOutputTokens: 4096, supportsTools: true, supportsThinking: false } },
-];
-
-/**
- * Lookup model metadata for a given model ID or provider/model string.
- *
- * ⚠ Falls back to a blanket 128k/4096 GUESS for anything unmatched, so a value from here is never
- * evidence. Prefer `resolveMetadata()`, which tries the provider's own published limits first and
- * labels whatever it ends up using.
- */
-export function getModelMetadata(modelId: string): ModelMetadata {
-  const norm = modelId.toLowerCase();
-  for (const entry of DEFAULT_METADATA_TABLE) {
-    if (typeof entry.pattern === "string") {
-      if (norm.includes(entry.pattern)) return entry.metadata;
-    } else if (entry.pattern.test(norm)) {
-      return entry.metadata;
-    }
-  }
-  return { contextLength: 128000, maxOutputTokens: 4096, supportsTools: true };
-}
-
 /**
  * Where a metadata value came from, in descending trustworthiness.
- *  - `provider`      the provider serving this target published it about its OWN deployment;
- *  - `reference`     another provider publishes it for the same model id. Deployments differ —
- *                    quantization, context caps, per-plan output limits — so this is indicative;
- *  - `static-table`  the hardcoded table in this file, including its blanket 128k/4096 guess.
+ *  - `provider`   the provider serving this target published it about its OWN deployment;
+ *  - `reference`  another provider publishes it for the same model id. Deployments differ —
+ *                 quantization, context caps, per-plan output limits — so this is indicative.
+ *
+ * There is deliberately no third rung. A hardcoded table used to sit here, handing out a blanket
+ * 128k/4096 for anything it did not recognise; a guess presented as a limit is worse than a null,
+ * because callers cannot tell it apart from a measurement.
  */
-export type MetadataSource = "provider" | "reference" | "static-table";
+export type MetadataSource = "provider" | "reference";
 
 export interface ResolvedMetadata {
   contextLength: number | null;
@@ -82,7 +31,7 @@ function toPerMillion(perToken: number | null | undefined): number | null {
 }
 
 /**
- * Resolve a target's limits per FIELD, each with its own provenance.
+ * Resolve a target's limits and price per FIELD, each with its own provenance.
  *
  * Per-field because coverage is ragged: Groq publishes both context and max-output, Mistral only
  * context, NIM neither. Resolving the pair together would force a single label onto two values of
@@ -107,27 +56,23 @@ export function resolveMetadata(
     } | null;
   } = {},
 ): ResolvedMetadata {
-  const table = getModelMetadata(modelId);
   const p = opts.providerLimits;
   const r = opts.reference;
 
   const pick = (
     provider: number | null | undefined,
     reference: number | null | undefined,
-    fromTable: number | undefined,
   ): [number | null, MetadataSource | null] => {
     if (typeof provider === "number") return [provider, "provider"];
     if (typeof reference === "number") return [reference, "reference"];
-    if (typeof fromTable === "number") return [fromTable, "static-table"];
     return [null, null];
   };
 
-  const [contextLength, contextLengthSource] = pick(p?.contextLength, r?.contextLength, table.contextLength);
-  const [maxOutputTokens, maxOutputTokensSource] = pick(p?.maxOutputTokens, r?.maxOutputTokens, table.maxOutputTokens);
+  const [contextLength, contextLengthSource] = pick(p?.contextLength, r?.contextLength);
+  const [maxOutputTokens, maxOutputTokensSource] = pick(p?.maxOutputTokens, r?.maxOutputTokens);
 
-  // Price has no hardcoded-table rung — there has never been one, and inventing a guess for what
-  // something costs would be worse than saying nothing. In/out resolve together: they come from
-  // one `pricing` object, so a split would report a provider's input price beside another's output.
+  // In/out resolve together: they come from one `pricing` object, so a split would report one
+  // provider's input price beside another's output price.
   const providerPriced = typeof p?.pricePromptPerToken === "number" || typeof p?.priceCompletionPerToken === "number";
   const referencePriced = typeof r?.pricePromptPerToken === "number" || typeof r?.priceCompletionPerToken === "number";
   const priceSource: MetadataSource | null = providerPriced ? "provider" : referencePriced ? "reference" : null;
