@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { FailoverReshaper, HttpReshaper, parseCorrectedInputs, type ReshapeRequest } from "../src/reshaper.js";
+import { FailoverReshaper, HttpReshaper, ReshaperTransportError, parseCorrectedInputs, type ReshapeRequest } from "../src/reshaper.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
 
 const tools = toolSchemaMap({
@@ -70,11 +70,16 @@ describe("HttpReshaper", () => {
     if (out.kind === "inputs") expect(out.inputs.t1).toEqual({ city: "Paris" });
   });
 
-  it("refuses on a non-2xx reshaper response", async () => {
+  it("THROWS a transport error on a non-2xx response (a 500 is not a judgement, so failover may advance)", async () => {
     const base = await startServer(() => ({ status: 500, body: "boom" }));
     const r = new HttpReshaper({ base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
-    const out = await r.reshape(req);
-    expect(out.kind).toBe("refuse");
+    await expect(r.reshape(req)).rejects.toThrow(ReshaperTransportError);
+  });
+
+  it("throws a transport error when the endpoint is unreachable", async () => {
+    // Port 1 is reserved and never has a listener on loopback.
+    const r = new HttpReshaper({ base: "http://127.0.0.1:1", model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
+    await expect(r.reshape(req)).rejects.toThrow(ReshaperTransportError);
   });
 });
 
@@ -113,4 +118,37 @@ describe("FailoverReshaper", () => {
   it("rejects an empty delegate list", () => {
     expect(() => new FailoverReshaper([])).toThrow(/at least one delegate/);
   });
+
+  it("end-to-end: fails over past an HTTP-dead HttpReshaper to a live one", async () => {
+    // The regression this pins: HttpReshaper used to RETURN a refusal on transport/HTTP
+    // failure, so FailoverReshaper (which advances only on throws) never failed over.
+    const deadBase = await startTempServer(() => ({ status: 503, body: "down" }));
+    const liveBase = await startTempServer(() => ({ body: JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }) }));
+    try {
+      const r = new FailoverReshaper([
+        new HttpReshaper({ base: deadBase.base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 }),
+        new HttpReshaper({ base: liveBase.base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 }),
+      ]);
+      const out = await r.reshape(req);
+      expect(out.kind).toBe("message");
+    } finally {
+      deadBase.server.close();
+      liveBase.server.close();
+    }
+  });
 });
+
+/** Like startServer but self-contained (no shared module state), for multi-server tests. */
+function startTempServer(handler: () => { status?: number; body: string }): Promise<{ base: string; server: Server }> {
+  return new Promise((resolve) => {
+    const s = createServer((rq, res) => {
+      rq.on("data", () => {});
+      rq.on("end", () => {
+        const out = handler();
+        res.writeHead(out.status ?? 200, { "content-type": "application/json" });
+        res.end(out.body);
+      });
+    });
+    s.listen(0, "127.0.0.1", () => resolve({ base: `http://127.0.0.1:${(s.address() as AddressInfo).port}`, server: s }));
+  });
+}

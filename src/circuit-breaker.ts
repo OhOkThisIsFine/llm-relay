@@ -23,7 +23,7 @@ export class CircuitBreaker {
     return target.model ? `${target.provider}/${target.model}` : target.provider;
   }
 
-  private getOrCreate(key: string, now = Date.now()): CircuitState {
+  private getOrCreate(key: string): CircuitState {
     const existing = this.states.get(key);
     if (existing) return existing;
     const fresh: CircuitState = {
@@ -52,7 +52,7 @@ export class CircuitBreaker {
   /** Record a successful completion for a target, resetting its circuit. */
   recordSuccess(target: ResolvedTarget | string, ms = 500, quotaPercent?: number | null, now = Date.now()): void {
     const key = this.getKey(target);
-    const state = this.getOrCreate(key, now);
+    const state = this.getOrCreate(key);
     state.consecutiveFailures = 0;
     state.cooldownUntil = 0;
     state.lastStatus = 200;
@@ -64,7 +64,7 @@ export class CircuitBreaker {
   /** Record a failure (e.g. 429 rate limit, 5xx error, timeout) for a target. */
   recordFailure(target: ResolvedTarget | string, status?: number, now = Date.now(), ms = 1000): void {
     const key = this.getKey(target);
-    const state = this.getOrCreate(key, now);
+    const state = this.getOrCreate(key);
 
     state.consecutiveFailures += 1;
     state.lastFailureTime = now;

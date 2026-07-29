@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { repair, destructiveMatcher } from "../src/repair.js";
 import { ToolUseValidator } from "../src/validator.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
-import type { Reshaper, ReshapeResult } from "../src/reshaper.js";
+import { ReshaperTransportError, type Reshaper, type ReshapeResult } from "../src/reshaper.js";
 
 const validator = new ToolUseValidator();
 const tools = toolSchemaMap({
@@ -34,6 +34,12 @@ describe("repair orchestration", () => {
 
   it("returns failed when the reshaper keeps producing invalid output", async () => {
     const d = await repair(badCall, tools, { validator, reshaper: reshaperOf({ kind: "message", message: badCall }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+  });
+
+  it("returns failed (fail-clean, no crash) when the reshaper dies at the transport level", async () => {
+    const dead: Reshaper = { reshape: async () => { throw new ReshaperTransportError("connection refused"); } };
+    const d = await repair(badCall, tools, { validator, reshaper: dead, maxAttempts: 2, isDestructive: noDestruct });
     expect(d.outcome).toBe("failed");
   });
 

@@ -20,6 +20,8 @@
   "files": [
     "dist",
     "docs/tier-data.json",
+    "skills",
+    "scripts/install-skill.mjs",
     "README.md",
     "config.example.json"
   ],
@@ -30,6 +32,7 @@
     "sync:tiers": "node scripts/sync-tiers.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "postinstall": "node scripts/install-skill.mjs || exit 0",
     "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {

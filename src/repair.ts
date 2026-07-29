@@ -43,12 +43,19 @@ export async function repair(
   let current = assistant;
 
   for (let attempt = 0; attempt < deps.maxAttempts; attempt++) {
-    const result = await deps.reshaper.reshape({
-      tools,
-      rawAssistant: current,
-      errors,
-      backendModel: null,
-    });
+    let result;
+    try {
+      result = await deps.reshaper.reshape({
+        tools,
+        rawAssistant: current,
+        errors,
+        backendModel: null,
+      });
+    } catch {
+      // Transport-level failure (single reshaper down, or every failover candidate down).
+      // Nothing answered — not a refusal, but nothing to retry against either: fail clean.
+      return { outcome: "failed" };
+    }
     if (result.kind === "refuse") return { outcome: "refused" };
 
     const check = deps.validator.validate(result.message, tools);

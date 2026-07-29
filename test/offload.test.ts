@@ -121,18 +121,33 @@ describe("/offload endpoint", () => {
     });
     const upPort = await listen(upstream);
 
+    // Stand-in offload target (openai kind): hits here are the signal the subagents map applied.
+    let offloadHits = 0;
+    const offloadUpstream = createServer((_req, res) => {
+      offloadHits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "cmpl_1",
+        choices: [{ message: { role: "assistant", content: "from-offload" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }));
+    });
+    const offloadPort = await listen(offloadUpstream);
+
     const path = join(dir, "endpoint.json");
     writeFileSync(
       path,
       JSON.stringify({
         listen: "127.0.0.1:8791", // the test binds port 0 explicitly; config just has to be valid
-        providers: { anthropic: { base: `http://127.0.0.1:${upPort}`, kind: "anthropic" } },
+        providers: {
+          anthropic: { base: `http://127.0.0.1:${upPort}`, kind: "anthropic" },
+          nim: { base: `http://127.0.0.1:${offloadPort}`, kind: "openai" },
+        },
         routing: {
           default: "anthropic",
           tiers: { opus: "anthropic" },
-          // Deliberately unresolvable: if the map is consulted at all, it is a loud 400 —
-          // which is exactly the signal that offload switched on.
-          subagents: { default: "pool/does-not-exist" },
+          pools: { offloaded: ["nim/test-model"] },
+          subagents: { default: "pool/offloaded" },
         },
         mode: "detect",
         log: { level: "silent", file: null },
@@ -156,6 +171,7 @@ describe("/offload endpoint", () => {
 
     // Off (the default): the subagent goes wherever a normal request goes.
     expect((await subagentCall()).status).toBe(200);
+    expect(offloadHits).toBe(0);
 
     const on = await fetch(`http://127.0.0.1:${port}/offload`, {
       method: "POST",
@@ -165,10 +181,11 @@ describe("/offload endpoint", () => {
     expect(on.status).toBe(200);
     expect((await on.json()).enabled).toBe(true);
 
-    // Same server process, same request: now routed through routing.subagents.
+    // Same server process, same request: now routed through routing.subagents to the pool.
     const after = await subagentCall();
-    expect(after.status).toBe(400);
-    expect(JSON.stringify(await after.json())).toMatch(/does-not-exist/);
+    expect(after.status).toBe(200);
+    expect(offloadHits).toBe(1);
+    expect(JSON.stringify(await after.json())).toMatch(/from-offload/);
 
     // …and the decision reached disk.
     expect(JSON.parse(readFileSync(path, "utf8")).routing.offload).toBe(true);

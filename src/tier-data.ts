@@ -75,11 +75,14 @@ export interface TierMatch {
  * Look a routing spec up in the snapshot. Matches on the id's last segment, which is exactly the
  * key `sync-tiers.mjs` stores for OpenRouter models — so a spec like `nim/z-ai/glm-5.2` hits the
  * `glm-5.2` row exactly rather than fuzzily landing on `glm-5.2-max`.
+ *
+ * Generic over the record type so callers holding looser row shapes (registry's raw
+ * leaderboard records) can share this one matcher instead of reimplementing it.
  */
-export function findTierModel(
+export function findTierModel<T = TierModel>(
   modelId: string,
-  byNorm: Array<{ norm: string; rec: TierModel }>,
-): TierMatch | null {
+  byNorm: Array<{ norm: string; rec: T }>,
+): { rec: T; match: "exact" | "fuzzy" } | null {
   const seg = (modelId.split("/").pop() ?? modelId).toLowerCase().trim();
   if (seg.length < 5) return null;
   const exact = byNorm.find((e) => e.norm === seg);

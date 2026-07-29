@@ -2,7 +2,6 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { once } from "node:events";
 import {
   DEFAULT_ANTHROPIC_VERSION,
-  resolveTarget,
   resolveTargets,
   reshaperForTarget,
   subagentSpec,
@@ -155,10 +154,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Un-blended decision table for picking an offload target: benchmarks, live health, quota,
   // observed traffic and breaker state side by side, in config order.
   if (req.method === "GET" && pathname === "/candidates") {
+    const providerFilter = pickQuery(path, "provider");
     const view = await buildCandidates(cfg, {
       catalog: h.catalog,
       ...(h.pingLoop ? { pingLoop: h.pingLoop } : {}),
-      ...(pickQuery(path, "provider") ? { provider: pickQuery(path, "provider")! } : {}),
+      ...(providerFilter ? { provider: providerFilter } : {}),
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view, null, 2));
@@ -202,8 +202,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it) or
   // routing.subagents[<tier>]. Main-conversation requests are untouched, which is what lets
   // routing.tiers stay pointed at an Anthropic passthrough.
-  const routedModel = isMessages ? (subagentSpec(reqJson, model, cfg) ?? model) : model;
-  if (routedModel !== model) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
+  const subSpec = isMessages ? subagentSpec(reqJson, model, cfg) : null;
+  const routedModel = subSpec ?? model;
+  // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson
+  // in place, and it must not reach the backend even when the spec matches the nominal model.
+  if (subSpec !== null) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
 
   // Route the request's model to a concrete provider + backend model candidates.
   let targetCandidates: ResolvedTarget[];
@@ -306,6 +309,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         const aborted = controller.signal.aborted;
         const status = aborted ? 504 : 502;
         globalCircuitBreaker.recordFailure(target, status);
+        recordCall(target, false, started);
 
         // Failover if additional candidates exist
         if (i < healthyTargets.length - 1) {
@@ -319,14 +323,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
       // Check HTTP 400 / 404 / 429 / 5xx for failover to next candidate
       const isRetriableError = backendRes.status === 400 || backendRes.status === 404 || backendRes.status === 429 || backendRes.status >= 500;
-      if (isRetriableError && i < healthyTargets.length - 1) {
+      if (isRetriableError) {
+        // A failing response is a breaker failure whether or not another candidate exists —
+        // recording "success" on a last-candidate 429/5xx (the common single-candidate case)
+        // resets the breaker on every error and it never trips.
         globalCircuitBreaker.recordFailure(target, backendRes.status);
-        clearTimeout(timer);
-        res.off("close", onResClose);
-        continue; // Failover to next target
+        recordCall(target, false, started);
+        if (i < healthyTargets.length - 1) {
+          clearTimeout(timer);
+          res.off("close", onResClose);
+          continue; // Failover to next target
+        }
+      } else {
+        globalCircuitBreaker.recordSuccess(target);
+        recordCall(target, backendRes.status < 400, started);
       }
-
-      globalCircuitBreaker.recordSuccess(target);
 
       const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
       const willValidate = isMessages && hadTools && backendRes.status < 400;
@@ -343,6 +354,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       clearTimeout(timer);
       res.off("close", onResClose);
     }
+  }
+}
+
+/**
+ * Feed the proxy's own request outcome into runtime telemetry — the "observed traffic"
+ * evidence `getStrength()` ranks on (basis "telemetry") and `/candidates` reports under
+ * `observed`. Only targets with a concrete model id are recorded; the Anthropic passthrough
+ * has none. Skipped under vitest so tests never write the user's real telemetry file.
+ */
+function recordCall(target: ResolvedTarget, ok: boolean, started: number): void {
+  if (!target.model || process.env.VITEST) return;
+  try {
+    recordModelCall(target.provider, target.model, { ok, latencyMs: Date.now() - started });
+  } catch {
+    /* telemetry is best-effort, never in the request's way */
   }
 }
 
@@ -379,9 +405,11 @@ async function openAiFrontPath(
   let upstream: Response;
   try {
     upstream = await fetchOpenAiFront(target, { reqJson: ctx.reqJson, wantsStream: ctx.wantsStream, signal: controller.signal });
+    recordCall(target, upstream.status < 400, ctx.started);
   } catch (e) {
     clearTimeout(timer);
     res.off("close", onResClose);
+    recordCall(target, false, ctx.started);
     const aborted = controller.signal.aborted;
     const status = aborted ? 504 : 502;
     if (!res.headersSent) {

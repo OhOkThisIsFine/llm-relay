@@ -51,6 +51,13 @@ function buildUserContent(req: ReshapeRequest): string {
   );
 }
 
+/**
+ * A transport-level reshaper failure: network error, timeout, non-2xx HTTP, unparseable
+ * HTTP body. The model never rendered a judgement, so failover MAY try another candidate.
+ * Distinct from a `refuse` result, which is a judgement and must never be shopped around.
+ */
+export class ReshaperTransportError extends Error {}
+
 export type CorrectedInputs =
   | { kind: "inputs"; inputs: Record<string, unknown> }
   | { kind: "refuse"; reason: string };
@@ -96,19 +103,21 @@ export class FailoverReshaper implements Reshaper {
   }
 
   async reshape(req: ReshapeRequest): Promise<ReshapeResult> {
-    let lastRefusal: ReshapeResult | undefined;
+    let lastError: Error | undefined;
     for (const d of this.delegates) {
       try {
-        const r = await d.reshape(req);
-        if (r.kind === "message") return r;
-        lastRefusal = r; // a genuine refusal — keep it, do not shop it around
-        return r;
-      } catch {
+        // A message OR a refusal is final — a refusal is a judgement, never shopped around.
+        return await d.reshape(req);
+      } catch (e) {
         // transport/HTTP failure (model de-listed, 5xx, timeout) — try the next candidate
+        lastError = e as Error;
         continue;
       }
     }
-    return lastRefusal ?? { kind: "refuse", reason: "all reshaper candidates failed to respond" };
+    return {
+      kind: "refuse",
+      reason: `all reshaper candidates failed to respond${lastError ? ` (last: ${lastError.message})` : ""}`,
+    };
   }
 }
 
@@ -161,20 +170,31 @@ export class HttpReshaper implements Reshaper {
             };
       if (this.cfg.kind === "anthropic") headers["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION;
 
-      const res = await this.fetchFn(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!res.ok) return { kind: "refuse", reason: `reshaper HTTP ${res.status}` };
-      const json = (await res.json()) as Record<string, unknown>;
+      // Transport-level failures THROW (ReshaperTransportError) rather than returning a
+      // refusal: a refusal is a model's judgement, and FailoverReshaper advances only on
+      // throws — reporting "connection refused" as `refuse` silently disabled failover.
+      let res: Response;
+      try {
+        res = await this.fetchFn(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (e) {
+        throw new ReshaperTransportError(`reshaper unreachable: ${(e as Error).message}`);
+      }
+      if (!res.ok) throw new ReshaperTransportError(`reshaper HTTP ${res.status}`);
+      let json: Record<string, unknown>;
+      try {
+        json = (await res.json()) as Record<string, unknown>;
+      } catch (e) {
+        throw new ReshaperTransportError(`reshaper returned non-JSON: ${(e as Error).message}`);
+      }
       const text = this.cfg.kind === "openai" ? openaiText(json) : anthropicText(json);
       const parsed = parseCorrectedInputs(text);
       if (parsed.kind === "refuse") return { kind: "refuse", reason: parsed.reason };
       return { kind: "message", message: reconstruct(req.rawAssistant, parsed.inputs) };
-    } catch (e) {
-      return { kind: "refuse", reason: `reshaper error: ${(e as Error).message}` };
     } finally {
       clearTimeout(timer);
     }

@@ -103,7 +103,6 @@ export function getVerdict(
     if (measurable.length >= 3 && p95 > 5000) return "Spiky";
     return "Normal";
   }
-  if (avg < 3000) return "Slow";
   if (avg < 5000) return "Slow";
   return "Unstable";
 }

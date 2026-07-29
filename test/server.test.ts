@@ -5,6 +5,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createProxy } from "../src/server.js";
+import { globalCircuitBreaker } from "../src/circuit-breaker.js";
 import type { Config } from "../src/config.js";
 import type { Reshaper } from "../src/reshaper.js";
 import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
@@ -608,5 +609,48 @@ describe("streaming transparency across many chunks", () => {
     const text = await resp.text();
     expect(text.length).toBe(full.length);
     expect(text).toBe(full);
+  });
+});
+
+describe("circuit breaker accounting", () => {
+  let backend: Server;
+  let proxy: Server;
+  afterAll(() => {
+    backend?.close();
+    proxy?.close();
+    globalCircuitBreaker.reset(); // don't leak a tripped cooldown into other tests
+  });
+
+  it("records a FAILURE when the only candidate returns a retriable error (no false recordSuccess)", async () => {
+    // The regression this pins: with no further candidate to fail over to, a 429/5xx used to
+    // fall through to recordSuccess, resetting the breaker on every failing response.
+    globalCircuitBreaker.reset();
+    backend = await mockBackend(() => ({
+      status: 429,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }),
+    }));
+    const cfg: Config = {
+      host: "127.0.0.1",
+      port: 0,
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    proxy = await startProxy(cfg);
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: REQUEST_BODY,
+    });
+    expect(resp.status).toBe(429); // the response itself still passes through untouched
+
+    const state = globalCircuitBreaker.getState("up");
+    expect(state?.consecutiveFailures).toBe(1);
+    expect(state?.lastStatus).toBe(429);
+    expect(state!.cooldownUntil).toBeGreaterThan(Date.now()); // 429 trips the cooldown immediately
   });
 });

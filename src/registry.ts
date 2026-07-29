@@ -1,4 +1,4 @@
-import { loadTierData } from "./tier-data.js";
+import { loadTierData, findTierModel } from "./tier-data.js";
 
 export { loadTierData };
 import type { Config, ProviderConfig } from "./config.js";
@@ -84,12 +84,8 @@ export function joinCapability(
   modelId: string,
   byNorm: Array<{ norm: string; rec: Record<string, unknown> }>,
 ): CapabilityScore | null {
-  const seg = (modelId.split("/").pop() ?? modelId).toLowerCase().trim();
-  if (seg.length < 5) return null;
-  const exact = byNorm.find((e) => e.norm === seg);
-  if (exact) return toScore(exact.rec, "exact");
-  const contained = byNorm.find((e) => e.norm.includes(seg));
-  return contained ? toScore(contained.rec, "fuzzy") : null;
+  const m = findTierModel(modelId, byNorm);
+  return m ? toScore(m.rec, m.match) : null;
 }
 
 /** Build the discovery view: providers × live models (best-effort capability) + routing + raw scores. */
