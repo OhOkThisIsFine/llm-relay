@@ -115,31 +115,40 @@ dimensions **side by side and un-blended**:
 
 | Group | Columns |
 |---|---|
-| Capability | SWE-bench, HumanEval, LiveCodeBench, BFCL (tool-use), Arena rating + rank, context window |
+| Capability (per source) | AA intelligence / coding / agentic, BFCL overall + multi-turn + irrelevance, Aider pass-rate + well-formed, Design Arena Elo, LMArena rating + rank |
+| Cost / shape | context window, price per M tokens in + out, declares tool support |
 | Live behaviour | verdict, avg / p95 latency, jitter, uptime %, last ping code |
 | Availability now | provider quota %, circuit-breaker open/closed + cooldown, listed in live catalog |
 | Observed traffic | calls, successes, average latency through this proxy |
 
-Nothing is ranked or averaged and the order is config order. Capability, latency and remaining quota
-trade off differently per task — "cheapest thing that can do it" and "best available" are different
-questions, and one blended number answers neither. The two composites that already exist in the
-product (`benchmarkSort`'s quality score, the breaker's stability score) appear under `sortInputs`,
-labelled as what they drive rather than as a recommendation.
+Nothing is ranked or averaged across dimensions and the order is config order. Capability, latency
+and remaining quota trade off differently per task — "cheapest thing that can do it" and "best
+available" are different questions, and one blended number answers neither. Each leaderboard keeps
+its own field under `scores`; they disagree, and that disagreement is information.
+
+The one scalar is `sortInputs.strength`, and it exists only because `benchmarkSort` has to put a
+pool in *some* order. It never travels without `strengthBasis` (`snapshot` | `static-table` |
+`telemetry` | `neutral`) and `strengthSignals`, so a five-source consensus and a "nothing is known,
+assume neutral" placeholder can't be confused.
 
 The CLI prefers a running proxy so it can use warm ping history and real breaker state; run it cold
 and the live-behaviour columns are empty because nothing has been measured yet.
 
-**A blank capability cell means "not measured", not "bad"** — and the two sources have different
-coverage. SWE-bench / HumanEval / LiveCodeBench come from the hand-maintained `BENCHMARK_DB` in
-`benchmarks.ts`, which lags the roster badly (as of 0.4.1 it has no row for deepseek-v4-pro,
-kimi-k2.6 or any gpt-oss model). BFCL and Arena come from `docs/tier-data.json` via `npm run
-sync:tiers`, which covers all of them — BFCL simply hasn't scored the newest models yet.
+**A blank capability cell means "not measured", not "bad"**, and the sources have very different
+coverage — see [capability-sources.md](capability-sources.md) for the probe results. Capability is
+synced, never typed: `npm run sync:tiers` merges OpenRouter, BFCL, LMArena and Aider into
+`docs/tier-data.json`. Add a source by writing a fetcher there.
 
-⚠ Both sources match by substring, so a model with no row of its own can inherit a **different**
-model's scores. The leaderboard join now reports this: `capability.match` is `exact` or `fuzzy` and
-`capability.matched_name` names the row used (`glm-5.2` → `glm-5.2-max`), rendered as `~` in the
-table. `BENCHMARK_DB` has no equivalent provenance — its `glm-5` pattern matches `glm-5.2` silently
-— so treat its columns as family-level indicators, not per-SKU measurements.
+⚠ Name-keyed sources match by substring, so a model with no row of its own can inherit a
+**different** model's scores. That is why OpenRouter is the spine — its ids are the same shape as
+routing specs, so `z-ai/glm-5.2` matches exactly instead of landing on `glm-5.2-max`. Where a fuzzy
+match is still the only option, `capability.match` / `capability.matched_name` name the row used and
+the CLI marks it `~`.
+
+⚠ `BENCHMARK_DB` in `benchmarks.ts` is a **legacy fallback only — do not add rows**. Hand-typed,
+substring-matched, no provenance, last updated for a 2025 roster. Until 0.5.0 it was the *only*
+ranking input, which meant models it had never heard of all collapsed to a flat 50.0 and tied, so
+pool order silently fell back to whatever order the config happened to list.
 
 This gives a dispatcher three levels of control, all optional:
 

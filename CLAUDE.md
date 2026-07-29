@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 209 tests / 26 files)
+npm test               # vitest run  (currently 212 tests / 26 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -56,10 +56,11 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `log.ts` | Metadata-only logger (never headers/bodies). |
 | `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). |
 | `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Sorts targets by Stability Score. |
-| `benchmarks.ts` | Coding benchmark database (SWE-bench, HumanEval, LiveCodeBench, Arena Elo) and target ranking algorithms. |
+| `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → legacy `BENCHMARK_DB` → observed runtime telemetry (≥5 calls) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). ⚠ `BENCHMARK_DB` is a **legacy fallback — do not add rows**; it is hand-typed, substring-matched, and has no provenance. |
+| `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
 | `metadata.ts` | Lookup table for model context windows, token limits, and prompt token estimation logic. |
-| `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. `loadTierData()` **memoizes `docs/tier-data.json` + its `byNorm` index on mtime** — three endpoints need it per request; re-reading and re-indexing ~400 rows each time is waste, and mtime keying means `npm run sync:tiers` still lands without a restart. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
+| `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. Re-exports `loadTierData` from `tier-data.ts`. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
 | `key-checker.ts` | Pre-flight validator checking provider API key health and remaining rate-limit quota percentages. |
 | `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). |
 | `setup-claude.ts` | Configuration generator for Claude Desktop (`claude_desktop_config.json`) and Claude CLI wrappers. |
@@ -104,7 +105,7 @@ Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compat
 - `multimodal-probe.mjs` — image / PDF / MCP-block passthrough through the Anthropic→OpenAI translation. Needs a **running** proxy pointed at a vision model (`PROXY=... node scripts/multimodal-probe.mjs`).
 
 Needs network (no provider key):
-- `sync-tiers.mjs` (`npm run sync:tiers`) — snapshots BFCL (tool-use accuracy, the primary tiering signal) + LMArena into `docs/tier-data.json`. Both sources are brittle by design and it fails loudly on a missing column rather than silently degrading — don't "fix" that by softening the check.
+- `sync-tiers.mjs` (`npm run sync:tiers`) — snapshots **OpenRouter** (Artificial Analysis intelligence/coding/agentic indices, Design Arena Elo, context length, pricing, tool support — and the only source whose ids match our routing specs exactly), **BFCL** (tool-use accuracy), **LMArena** (general) and **Aider polyglot** (edit benchmark + edit-format compliance) into `docs/tier-data.json` (~770 models). Each source is independently failable and records a warning; schema drift inside a source still throws loudly — don't "fix" that by softening the check. Zero working sources is fatal.
 
 Usage wrappers (for pointing a real `claude` CLI at a running proxy):
 - `claude-proxied.ps1` / `claude-proxied.sh` — see README "Use it from your projects".
@@ -138,7 +139,17 @@ test stale code.
   defaults to OFF", `test/offload.test.ts` "flips routing for the NEXT request").
 - **Don't add a blended "best target" score to `candidates.ts`.** The dimensions are deliberately
   separate; averaging them buries the judgement the reader is there to make. Tests assert no
-  `score`/`rank` field and that composites stay under `sortInputs`.
+  `score`/`rank` field, that every source keeps its own key under `scores`, and that the one
+  scalar (`sortInputs.strength` — which exists only because pool ordering needs an order) never
+  travels without `strengthBasis` + `strengthSignals`.
+- **Capability data is synced, never typed.** Add a source by writing a fetcher in
+  `scripts/sync-tiers.mjs`, not a row in `BENCHMARK_DB`. Sources are independently failable — one
+  dead endpoint must not cost the others — but **schema drift inside a source still throws** (a
+  renamed column is corruption, not absence). Zero working sources is fatal. Coverage probe results
+  and the reasons three sources were rejected: [docs/capability-sources.md](docs/capability-sources.md).
+- **A source's absence is not a low score.** Models are never penalised for signals nobody
+  publishes; `signal_count` travels with the score instead, so a 1-source guess and a 5-source
+  consensus are distinguishable. Don't "fix" a sparse row by defaulting it to zero.
 - **Never route subagents by editing `routing.tiers`.** A subagent asking for `haiku` and a human
   picking Haiku are byte-identical requests, so a tier→provider mapping silently drops the human's
   own conversation onto a weak model. Tiers stay on the passthrough; `routing.subagents` is the
@@ -146,7 +157,7 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 209 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 212 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 **Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code
@@ -158,11 +169,14 @@ candidates`. Design + evidence: [docs/subagent-routing.md](docs/subagent-routing
 Full live probe sweep: [docs/probe-sweep-2026-07-28.md](docs/probe-sweep-2026-07-28.md) (every script,
 every endpoint). Everything it found is now fixed; `multimodal-probe.mjs` is 5/5 green live.
 
-Still open — one item, unchanged and **not this repo's**: model-capability rankings for dispatch
-(tool-use + chat scores) belong to the separate router/auditor project; research in
-[docs/model-capability-ranking-sources.md](docs/model-capability-ranking-sources.md).
+**Capability ranking now lives here** (0.5.0), no longer deferred to the router/auditor project:
+`npm run sync:tiers` merges OpenRouter + BFCL + LMArena + Aider into `docs/tier-data.json` and
+`getStrength()` ranks pools off it. Source probe results, coverage per source, and why EvalPlus /
+HF Open LLM / LiveCodeBench were rejected: [docs/capability-sources.md](docs/capability-sources.md).
+Older background research: [docs/model-capability-ranking-sources.md](docs/model-capability-ranking-sources.md).
 
-Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; SWE-bench
-42%). `llama-3.1-8b` trips 25% of calls and the reshaper fixes ~2/3 of those — the proxy's use case.
+Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; top of the
+`coding` pool by synced strength, 4 signals). `llama-3.1-8b` trips 25% of calls and the reshaper
+fixes ~2/3 of those — the proxy's use case.
 
 Durable project state also lives in agent memory (`project-repair-proxy`).

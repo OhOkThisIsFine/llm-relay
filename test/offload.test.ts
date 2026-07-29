@@ -220,11 +220,25 @@ describe("candidates view", () => {
     expect(c).toHaveProperty("breaker");
     expect(c).toHaveProperty("observed");
     expect(c).toHaveProperty("contextLength");
-    // The only composites present are the ones the proxy already sorts by, and they are
-    // quarantined under sortInputs rather than presented as a ranking.
-    expect(Object.keys(c.sortInputs).sort()).toEqual(["benchmarkQuality", "breakerStability"]);
+
+    // Every leaderboard keeps its own field. They measure different things and disagree, so
+    // collapsing them into one another would destroy the comparison the table exists for.
+    expect(Object.keys(c.scores).sort()).toEqual([
+      "aaAgentic", "aaCoding", "aaIntelligence",
+      "aiderPassRate", "aiderWellFormed",
+      "arenaRank", "arenaRating",
+      "bfclIrrelevance", "bfclMultiTurn", "bfclOverall",
+      "designArenaAgentsEloMean", "designArenaModelsEloMean",
+    ]);
+
+    // Exactly one scalar exists, because pool ordering needs one — and it never travels without
+    // the basis and signal list that say how much to trust it.
+    expect(Object.keys(c.sortInputs).sort()).toEqual([
+      "breakerStability", "strength", "strengthBasis", "strengthSignals",
+    ]);
     expect(c).not.toHaveProperty("score");
     expect(c).not.toHaveProperty("rank");
+    expect(c).not.toHaveProperty("recommendation");
   });
 
   it("surfaces live breaker state per target", async () => {

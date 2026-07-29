@@ -2,15 +2,22 @@
 // Sync model capability rankings from someone-else-maintained leaderboards into a
 // local snapshot (docs/tier-data.json) — never a hand-maintained table.
 //
-//   BFCL  (Berkeley Function-Calling Leaderboard) — TOOL-USE accuracy. This is the
-//         primary signal: repair-proxy validates tool calls, so function-calling
-//         skill (and Irrelevance Detection = "declines when no tool fits", the
-//         malformed/hallucinated-call proxy) is what should tier a backend model.
-//   Arena (LMArena / Chatbot Arena, HF parquet) — general capability, secondary.
+// SOURCES (see docs/capability-sources.md for why these and not others):
+//   OpenRouter — the spine. Its model ids are the SAME SHAPE as our routing specs
+//                ("z-ai/glm-5.2"), so it joins exactly instead of fuzzily. Carries
+//                Artificial Analysis intelligence/coding/AGENTIC indices, Design Arena
+//                per-category Elo, context length, pricing and tool support.
+//   BFCL       — Berkeley Function-Calling Leaderboard. Direct TOOL-USE accuracy; this
+//                proxy validates tool calls, so it stays a first-class signal even though
+//                it has not scored the newest models.
+//   LMArena    — general capability, broad coverage (~430 models).
+//   Aider      — polyglot edit benchmark + "percent cases well formed", which is the
+//                closest published analogue of what the repair path measures.
 //
-// Both sources are BRITTLE (undocumented site asset / no stable model ids), so this
-// snapshots + diffs: a missing expected column fails loudly rather than silently
-// corrupting tiers. Output ranks by RELATIVE position, never absolute score.
+// Every source is INDEPENDENTLY failable: one dead endpoint must not cost us the other
+// three. Schema drift inside a source still throws loudly for that source (a renamed
+// column is corruption, not absence) — it is just no longer fatal to the whole sync.
+// Zero working sources IS fatal.
 //
 // Usage: node scripts/sync-tiers.mjs
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
@@ -20,11 +27,14 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = join(ROOT, "docs", "tier-data.json");
 
+const OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models";
 const BFCL_CSV = "https://gorilla.cs.berkeley.edu/data_overall.csv";
 const ARENA_PARQUET =
   "https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset/resolve/main/text_style_control/latest-00000-of-00001.parquet";
+const AIDER_YML =
+  "https://raw.githubusercontent.com/Aider-AI/aider/main/aider/website/_data/polyglot_leaderboard.yml";
 
-// Columns we depend on — a rename here should FAIL the sync, not silently drop data.
+// Columns we depend on — a rename here should FAIL the source, not silently drop data.
 const BFCL_REQUIRED = ["Model", "Overall Acc"];
 const BFCL_WANTED = ["Model", "Overall Acc", "Multi Turn Acc", "Irrelevance Detection"];
 
@@ -37,12 +47,26 @@ function normName(raw) {
     .toLowerCase();
 }
 
+/**
+ * Join key for an OpenRouter id: the segment after the vendor prefix, which is exactly what
+ * `joinCapability()` in src/registry.ts extracts from a routing spec. "z-ai/glm-5.2" on both
+ * sides, so the match is exact and the fuzzy contains-fallback never fires for these models.
+ */
+function normId(id) {
+  return String(id).split("/").pop().toLowerCase().trim();
+}
+
 function pctToNum(v) {
   if (v == null) return null;
   const s = String(v).replace("%", "").trim();
   if (s === "" || s.toUpperCase() === "N/A") return null;
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
+}
+
+function mean(xs) {
+  const v = xs.filter((x) => Number.isFinite(x));
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
 }
 
 // --- minimal RFC-4180-ish CSV parser (handles quoted fields + embedded commas) ---
@@ -64,6 +88,45 @@ function parseCsv(text) {
   }
   if (field.length || row.length) { row.push(field); rows.push(row); }
   return rows.filter((r) => r.length > 1 || (r.length === 1 && r[0] !== ""));
+}
+
+async function fetchOpenRouter() {
+  const res = await fetch(OPENROUTER_MODELS);
+  if (!res.ok) throw new Error(`OpenRouter fetch HTTP ${res.status}`);
+  const j = await res.json();
+  if (!Array.isArray(j.data) || j.data.length === 0) throw new Error("OpenRouter returned no models");
+  if (!("context_length" in j.data[0])) {
+    throw new Error(`OpenRouter schema drift — no context_length. Keys: ${Object.keys(j.data[0]).join(" | ")}`);
+  }
+
+  const out = [];
+  for (const m of j.data) {
+    if (!m.id) continue;
+    const aa = m.benchmarks?.artificial_analysis ?? {};
+    const da = Array.isArray(m.benchmarks?.design_arena) ? m.benchmarks.design_arena : [];
+    // Design Arena publishes one row per category (up to ~20). Storing every row would bloat the
+    // snapshot ~20x, so we keep the mean per arena — named _mean so it is never mistaken for a
+    // measured value — plus the category count that produced it.
+    const agents = da.filter((d) => d.arena === "agents").map((d) => Number(d.elo));
+    const models = da.filter((d) => d.arena === "models").map((d) => Number(d.elo));
+    out.push({
+      name: m.name ?? m.id,
+      norm: normId(m.id),
+      or_id: m.id,
+      aa_intelligence: Number.isFinite(aa.intelligence_index) ? aa.intelligence_index : null,
+      aa_coding: Number.isFinite(aa.coding_index) ? aa.coding_index : null,
+      aa_agentic: Number.isFinite(aa.agentic_index) ? aa.agentic_index : null,
+      design_arena_agents_elo_mean: mean(agents),
+      design_arena_agents_categories: agents.length,
+      design_arena_models_elo_mean: mean(models),
+      design_arena_models_categories: models.length,
+      context_length: Number.isFinite(m.context_length) ? m.context_length : null,
+      price_prompt: m.pricing?.prompt != null ? Number(m.pricing.prompt) : null,
+      price_completion: m.pricing?.completion != null ? Number(m.pricing.completion) : null,
+      supports_tools: Array.isArray(m.supported_parameters) ? m.supported_parameters.includes("tools") : null,
+    });
+  }
+  return out;
 }
 
 async function fetchBfcl() {
@@ -99,10 +162,12 @@ async function fetchBfcl() {
 }
 
 async function fetchArena() {
-  // Best-effort: LMArena enriches but BFCL is the load-bearing signal. Never fatal.
   const { asyncBufferFromUrl, parquetQuery } = await import("hyparquet");
   const file = await asyncBufferFromUrl({ url: ARENA_PARQUET });
   const rows = await parquetQuery({ file });
+  if (rows.length && !("model_name" in rows[0])) {
+    throw new Error(`LMArena schema drift — no model_name. Keys: ${Object.keys(rows[0]).join(" | ")}`);
+  }
   const out = [];
   for (const r of rows) {
     if (r.category !== "overall") continue;
@@ -112,7 +177,49 @@ async function fetchArena() {
   return out;
 }
 
-/** Rank-normalize a field to [0,1] (1 = best); null-safe. */
+/**
+ * Aider's polyglot leaderboard is a flat YAML list — `- key: value` records with no nesting,
+ * so a 3-field regex read beats taking on a YAML dependency. If it ever nests, the field count
+ * drops and the schema check below fires.
+ */
+async function fetchAider() {
+  const res = await fetch(AIDER_YML);
+  if (!res.ok) throw new Error(`Aider fetch HTTP ${res.status}`);
+  const text = await res.text();
+  const out = [];
+  let cur = null;
+  for (const line of text.split("\n")) {
+    const start = /^- dirname:\s*(.+)$/.exec(line);
+    if (start) {
+      if (cur?.norm) out.push(cur);
+      cur = { dirname: start[1].trim() };
+      continue;
+    }
+    if (!cur) continue;
+    // [a-z0-9_] — the digits matter: the headline field is `pass_rate_2`.
+    const kv = /^\s{2}([a-z0-9_]+):\s*(.+)$/.exec(line);
+    if (!kv) continue;
+    const [, k, raw] = kv;
+    const v = raw.trim();
+    if (k === "model") { cur.name = v; cur.norm = normName(v); }
+    else if (k === "pass_rate_2") cur.aider_pass_rate = pctToNum(v);
+    else if (k === "percent_cases_well_formed") cur.aider_well_formed = pctToNum(v);
+  }
+  if (cur?.norm) out.push(cur);
+  if (out.length === 0) throw new Error("Aider YAML parsed to zero records — format likely changed");
+  if (!out.some((m) => m.aider_pass_rate != null)) {
+    throw new Error("Aider YAML had no pass_rate_2 values — column renamed?");
+  }
+  // Keep the best run per model (the file is one record per benchmark run).
+  const best = new Map();
+  for (const m of out) {
+    const prev = best.get(m.norm);
+    if (!prev || (m.aider_pass_rate ?? -1) > (prev.aider_pass_rate ?? -1)) best.set(m.norm, m);
+  }
+  return [...best.values()].map(({ dirname, ...rest }) => ({ ...rest, aider_run: dirname }));
+}
+
+/** Rank-normalize a field to [0,1] (1 = best) across models that have it; null-safe. */
 function rankNormalize(models, field) {
   const scored = models.filter((m) => m[field] != null).sort((a, b) => b[field] - a[field]);
   const map = new Map();
@@ -120,69 +227,128 @@ function rankNormalize(models, field) {
   return map;
 }
 
+/**
+ * Weighted signals for the strength score. Weights encode what THIS proxy cares about: it drives
+ * tool-calling subagents, so tool-use and agentic ability outrank general chat preference.
+ * Everything is rank-normalized first, because the raw units (a 0-100 accuracy, a 1500-ish Elo,
+ * a 0-70 index) are not comparable.
+ */
+const SIGNALS = [
+  { field: "bfcl_overall", weight: 2.0, note: "tool-call accuracy (direct)" },
+  { field: "aa_agentic", weight: 2.0, note: "agentic index (drives a tool loop)" },
+  { field: "aa_coding", weight: 1.5, note: "coding index" },
+  { field: "bfcl_irrelevance", weight: 1.0, note: "declines when no tool fits" },
+  { field: "aider_pass_rate", weight: 1.0, note: "polyglot edit benchmark" },
+  { field: "aider_well_formed", weight: 1.0, note: "edit-format compliance" },
+  { field: "design_arena_agents_elo_mean", weight: 1.0, note: "agent-arena Elo (mean)" },
+  { field: "arena_rating", weight: 1.0, note: "general preference" },
+  { field: "aa_intelligence", weight: 1.0, note: "general intelligence index" },
+];
+
 async function main() {
   const warnings = [];
-  const bfcl = await fetchBfcl();
-  let arena = [];
-  try {
-    arena = await fetchArena();
-  } catch (e) {
-    warnings.push(`LMArena sync skipped: ${e.message}`);
+  const sources = {};
+
+  const run = async (key, url, note, fn) => {
+    try {
+      const rows = await fn();
+      sources[key] = { url, note, model_count: rows.length, ok: true };
+      return rows;
+    } catch (e) {
+      warnings.push(`${key} sync FAILED: ${e.message}`);
+      sources[key] = { url, note, model_count: 0, ok: false, error: e.message };
+      return [];
+    }
+  };
+
+  // Independent: one dead source costs only its own columns.
+  const [openrouter, bfcl, arena, aider] = await Promise.all([
+    run("openrouter", OPENROUTER_MODELS, "AA intelligence/coding/agentic + design arena + context/pricing; EXACT ids", fetchOpenRouter),
+    run("bfcl", BFCL_CSV, "tool-use / function-calling accuracy", fetchBfcl),
+    run("lmarena", ARENA_PARQUET, "general capability", fetchArena),
+    run("aider", AIDER_YML, "polyglot edit benchmark + edit-format compliance", fetchAider),
+  ]);
+
+  if (openrouter.length + bfcl.length + arena.length + aider.length === 0) {
+    throw new Error(`every source failed:\n  ${warnings.join("\n  ")}`);
   }
 
-  // Join arena onto bfcl by normalized name; keep arena-only entries too.
-  const byNorm = new Map(bfcl.map((m) => [m.norm, { ...m }]));
-  for (const a of arena) {
-    const m = byNorm.get(a.norm) ?? { name: a.norm, norm: a.norm, bfcl_overall: null, bfcl_multi_turn: null, bfcl_irrelevance: null };
-    m.arena_rating = a.arena_rating;
-    m.arena_rank = a.arena_rank;
-    byNorm.set(a.norm, m);
-  }
+  // Merge on `norm`. OpenRouter contributes exact-id keys ("glm-5.2"); the leaderboards contribute
+  // display-name keys ("glm-5.2-max"). Those stay SEPARATE rows on purpose — they are different
+  // SKUs, and collapsing them is precisely the borrowed-score bug this replaces.
+  const byNorm = new Map();
+  const absorb = (rows, source) => {
+    for (const r of rows) {
+      if (!r.norm) continue;
+      const m = byNorm.get(r.norm) ?? { name: r.name ?? r.norm, norm: r.norm, sources: [] };
+      Object.assign(m, r);
+      if (!m.sources.includes(source)) m.sources.push(source);
+      byNorm.set(r.norm, m);
+    }
+  };
+  absorb(openrouter, "openrouter");
+  absorb(bfcl, "bfcl");
+  absorb(arena, "lmarena");
+  absorb(aider, "aider");
   const models = [...byNorm.values()];
 
-  // Composite = mean of available rank-normalized (BFCL overall, BFCL irrelevance, Arena rating).
-  // Tool-use weighted 2x (this is a tool-call proxy).
-  const rOverall = rankNormalize(models, "bfcl_overall");
-  const rIrrel = rankNormalize(models, "bfcl_irrelevance");
-  const rArena = rankNormalize(models, "arena_rating");
+  // Strength = weighted mean of whatever rank-normalized signals a model actually has. Models are
+  // NOT penalised for signals nobody publishes about them; instead `signal_count`/`signals` travel
+  // with the score so a 1-source guess never looks like a 5-source consensus.
+  const normalized = Object.fromEntries(SIGNALS.map((s) => [s.field, rankNormalize(models, s.field)]));
   for (const m of models) {
-    const parts = [];
-    if (rOverall.has(m)) { parts.push(rOverall.get(m) * 2); }
-    if (rIrrel.has(m)) { parts.push(rIrrel.get(m)); }
-    if (rArena.has(m)) { parts.push(rArena.get(m)); }
-    m.composite = parts.length ? parts.reduce((a, b) => a + b, 0) / (rOverall.has(m) ? (rIrrel.has(m) ? (rArena.has(m) ? 4 : 3) : (rArena.has(m) ? 3 : 2)) : parts.length) : null;
+    let sum = 0, weight = 0;
+    const used = [];
+    for (const s of SIGNALS) {
+      const v = normalized[s.field].get(m);
+      if (v === undefined) continue;
+      sum += v * s.weight;
+      weight += s.weight;
+      used.push(s.field);
+    }
+    m.strength = weight > 0 ? Math.round((sum / weight) * 1000) / 1000 : null;
+    m.signals = used;
+    m.signal_count = used.length;
   }
-  models.sort((a, b) => (b.composite ?? -1) - (a.composite ?? -1));
-  models.forEach((m, i) => { m.composite_rank = m.composite != null ? i + 1 : null; });
+  models.sort((a, b) => (b.strength ?? -1) - (a.strength ?? -1));
+  models.forEach((m, i) => { m.strength_rank = m.strength != null ? i + 1 : null; });
+  // Back-compat: consumers pinned to the old field names keep working.
+  for (const m of models) { m.composite = m.strength; m.composite_rank = m.strength_rank; }
 
   if (!existsSync(dirname(OUT))) mkdirSync(dirname(OUT), { recursive: true });
   const prev = existsSync(OUT) ? JSON.parse(readFileSync(OUT, "utf8")) : null;
   const snapshot = {
     synced_at: new Date().toISOString(),
-    sources: {
-      bfcl: { url: BFCL_CSV, note: "tool-use / function-calling accuracy (primary signal)", model_count: bfcl.length },
-      lmarena: { url: ARENA_PARQUET, note: "general capability (secondary)", model_count: arena.length },
-    },
+    sources,
     warnings,
-    composite_note: "Rank-normalized mean; BFCL overall weighted 2x (tool-call proxy). Relative only.",
+    signals: SIGNALS,
+    composite_note:
+      "strength = weighted mean of available rank-normalized signals (see `signals`). Relative only, " +
+      "never an absolute score. Check signal_count before trusting a rank: a model scored by one " +
+      "source is a guess, not a consensus. Raw per-source values are kept alongside and never collapsed.",
     models,
   };
   writeFileSync(OUT, JSON.stringify(snapshot, null, 2) + "\n");
 
   // --- console report ---
   const fmt = (m, i) =>
-    `${String(i + 1).padStart(2)}. ${m.name.padEnd(42).slice(0, 42)}  ` +
+    `${String(i + 1).padStart(3)}. ${(m.name ?? m.norm).padEnd(38).slice(0, 38)}  ` +
+    `str=${m.strength != null ? m.strength.toFixed(3) : "  —  "} ` +
+    `n=${String(m.signal_count).padStart(2)}  ` +
     `bfcl=${m.bfcl_overall != null ? String(m.bfcl_overall).padStart(5) : "   — "}  ` +
-    `irrel=${m.bfcl_irrelevance != null ? String(m.bfcl_irrelevance).padStart(5) : "   — "}  ` +
+    `agentic=${m.aa_agentic != null ? String(m.aa_agentic).padStart(5) : "   — "}  ` +
     `arena=${m.arena_rating != null ? String(Math.round(m.arena_rating)).padStart(4) : "  — "}`;
+
   console.log(`\nSynced ${models.length} models → ${OUT}`);
+  for (const [k, s] of Object.entries(sources)) {
+    console.log(`  ${s.ok ? "✓" : "✗"} ${k.padEnd(11)} ${String(s.model_count).padStart(4)} models${s.ok ? "" : `  — ${s.error}`}`);
+  }
   if (warnings.length) console.log(warnings.map((w) => `  ⚠ ${w}`).join("\n"));
   if (prev) console.log(`  (previous snapshot: ${prev.synced_at}, ${prev.models?.length ?? "?"} models)`);
-  console.log(`\nTop 15 by composite (tool-use-weighted):`);
-  console.log(models.slice(0, 15).map(fmt).join("\n"));
-  const byTool = models.filter((m) => m.bfcl_overall != null).sort((a, b) => b.bfcl_overall - a.bfcl_overall);
-  console.log(`\nTop 10 by BFCL tool-use accuracy (pick tier targets from here):`);
-  console.log(byTool.slice(0, 10).map(fmt).join("\n"));
+
+  const multi = models.filter((m) => m.signal_count >= 3);
+  console.log(`\nTop 15 by strength (>=3 signals — ${multi.length} of ${models.length} qualify):`);
+  console.log(multi.slice(0, 15).map(fmt).join("\n"));
 }
 
 main().catch((e) => {
