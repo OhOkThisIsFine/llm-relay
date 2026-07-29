@@ -130,6 +130,10 @@ operating guide (addressing pools/models, the offload switch, `@relay:` directiv
 candidates table, failure modes) that Claude loads on demand. It refreshes automatically on every
 upgrade; local/dev installs never touch `~/.claude`.
 
+If your npm blocks unknown install scripts (`npm warn install-scripts … blocked`), allow this one —
+`npm config set allow-scripts=llm-relay --location=user` — or install the skill by hand:
+`node "$(npm root -g)/llm-relay/scripts/install-skill.mjs" --force`.
+
 ### Staying current
 
 Every start (except `help` and `version`) compares the running version against the npm registry —
