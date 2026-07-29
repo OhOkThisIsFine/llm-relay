@@ -95,47 +95,41 @@ targets — the host agent reaches them by shelling out to the vendor CLI, and t
 **one ordered ladder** together with the relay's pools. Walk it top to bottom; each rung falls
 back to the next on failure or quota exhaustion, exactly like candidates inside a relay pool.
 
-**Default ladder for offloadable work** (bulk recon, extraction, analysis). Included
-subscription/credit allowances are spent before metered-or-free API capacity, so the cheap lanes
-are the *first* resort, not the fallback:
+### The lanes, and how to drive each
 
-1. **Antigravity — Gemini 3.6 Flash, any tier.** The default workhorse for every tier; pick the
-   reasoning level to suit the task, since AGY bakes it into the model id:
-   ```bash
-   agy -p "<task>" --model gemini-3.6-flash-medium --output-format json
-   ```
-   `-high` for analysis and tracing, `-medium` for ordinary recon, `-low` for mechanical sweeps.
-   Other flags: `--add-dir <path>` to scope the workspace, `--json-schema` for structured output,
-   `--print-timeout` (default 5m), `--mode plan` for analysis-only runs.
-   *Exhausted when:* the CLI reports the **Gemini** credit balance exhausted, or rate-limits.
-2. **Antigravity — Claude, same CLI, SEPARATE quota.** ⚠ AGY meters Gemini and Claude against
-   **two independent credit balances**, so exhausting rung 1 does *not* exhaust this rung — that
-   is precisely why it is a real fallback and not a duplicate of rung 1. Step up here when Flash
-   is not strong enough, or when Gemini credits are gone: `--model claude-opus-4-6-thinking` for
-   hard reasoning, `--model claude-sonnet-4-6` for everything else. (Neither id carries a level
-   suffix — use the session flag `--effort low|medium|high` to tune them.)
-   *Exhausted when:* the **Claude** balance is exhausted — independently of rung 1, in either
-   direction.
-3. **Codex — Sol, then Terra, then Luna.** Spends the ChatGPT subscription:
-   ```bash
-   codex exec --model gpt-5.6-sol -c model_reasoning_effort="medium" "<task>"
-   ```
-   Walk `gpt-5.6-sol` → `gpt-5.6-terra` → `gpt-5.6-luna` in that order. Reasoning level is a
-   config override, not a flag — Codex has no `--effort`: `-c model_reasoning_effort=` accepts
-   `minimal|low|medium|high|xhigh` (the config default in `~/.codex/config.toml` is `high`;
-   `plan_mode_reasoning_effort` sets it separately for plan mode). ⚠ Codex's own guidance is that
-   high effort burns subscription rate limits fast — match the level to the task rather than
-   leaving it at `high` for mechanical work. `codex exec review` runs a repo review.
-   *Exhausted when:* it reports usage-limit errors.
-4. **Relay pools — free API-key capacity, benchmark order.** `@relay: pool/coding` (or the tier
-   mapping in `routing.subagents` when offload is on). Ordering *inside* a pool is by synced
-   benchmark strength, not config order — see "Reordering dispatch" below. *Exhausted when:* the
-   pool 4xx/5xxs after failover walks every candidate, or `llm-relay candidates` shows the breaker
-   open / quota drained across the pool.
-5. **Anthropic subagent** — plain `Agent(...)`, no directive. Spends primary quota; always works.
+- **Relay pools** — `@relay: pool/coding` on a subagent prompt, or the tier mapping in
+  `routing.subagents` when offload is on. Spends provider API keys. *Exhausted when:* the pool
+  4xx/5xxs after failover walks every candidate, or `llm-relay candidates` shows the breaker open
+  / quota drained across the pool.
+- **Antigravity (`agy`)** — `agy -p "<task>" --model <id> --output-format json`. Ask
+  `agy models` for the roster; ids may carry a reasoning-level suffix (`…-high|-medium|-low`),
+  and `--effort low|medium|high` tunes ids that don't. Other flags: `--add-dir <path>` to scope
+  the workspace, `--json-schema` for structured output, `--print-timeout` (default 5m),
+  `--mode plan` for analysis-only runs. ⚠ **AGY meters its Gemini and its Claude models against
+  two independent credit balances** — exhausting one leaves the other fully available, so they
+  are two distinct rungs, not one.
+- **Codex** — `codex exec --model <id> "<task>"`, spending the ChatGPT subscription. Reasoning
+  level is a config override, not a flag (there is no `--effort`):
+  `-c model_reasoning_effort="minimal|low|medium|high|xhigh"`, defaulting to whatever
+  `~/.codex/config.toml` sets; `plan_mode_reasoning_effort` sets it separately for plan mode.
+  ⚠ Codex's own guidance is that high effort burns subscription rate limits fast — match the
+  level to the task rather than leaving it high for mechanical work. `codex exec review` runs a
+  repo review.
+- **Anthropic subagent** — plain `Agent(...)`, no directive. Spends primary quota; always works,
+  so it is the natural bottom of any ladder.
 
-`agy models` and the Codex model list are the authority on what exists — re-check them rather than
-trusting these ids after a CLI upgrade, since a de-listed id fails the whole rung.
+The CLIs' own model lists are the authority on what exists — re-check them rather than trusting
+ids written down anywhere, since a de-listed id fails a whole rung.
+
+### Order
+
+**A user's own ordering wins. Look for it first**, in `~/.claude/CLAUDE.md` (or a project
+`CLAUDE.md`) — that is where a personal ladder belongs, because **this file is overwritten by
+`npm i -g llm-relay` on every install and upgrade** and any ordering edited into it would be
+silently lost. Never write a user's personal preference here; write it there.
+
+Absent such an instruction, the package default is simply: **relay pools → peer agent CLIs (if
+installed) → Anthropic subagent** — cheapest metered capacity first, primary quota last.
 
 Rules for walking it:
 
@@ -156,11 +150,12 @@ Rules for walking it:
 
 Ordering exists at three levels; change the right one:
 
-- **The ladder above** (which lane is tried first): it is instructions, not code — edit the
-  numbered list in this skill file (`skills/llm-relay/SKILL.md` in the repo; the installed copy
-  lives in `~/.claude/skills/llm-relay/`, refreshed on package upgrade). E.g. to preserve AGY
-  credits and spend free API capacity first, move rung 4 to the top. The user can also reorder
-  per-request in chat ("try codex first for this").
+- **Which lane is tried first**: it is instructions, not code. Put the ordered list in
+  **`~/.claude/CLAUDE.md`** (all projects) or a project `CLAUDE.md` (one repo) — both are loaded
+  every session and **neither is touched by an npm install**, so the ordering survives reinstalls
+  and upgrades. ⚠ Do *not* put it in `~/.claude/skills/llm-relay/SKILL.md`: `postinstall`
+  overwrites that file from the package on every global install, silently discarding the edit.
+  The user can also reorder per-request in chat ("try codex first for this").
 - **Which pool a tier lands on** (`routing.subagents` in `~/.llm-relay/config.json`): maps the
   Agent tool's `model` param (opus/sonnet/haiku/…) to a pool or pinned spec. Takes effect on the
   next request; no restart.
