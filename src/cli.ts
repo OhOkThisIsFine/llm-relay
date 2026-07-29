@@ -510,12 +510,13 @@ export async function runCandidates(): Promise<void> {
 
   const head =
     "target".padEnd(34) +
-    "pools / tiers".padEnd(30) +
+    "pools / tiers".padEnd(26) +
     "live".padEnd(6) +
     "SWE".padEnd(6) +
     "LCB".padEnd(6) +
-    "Elo".padEnd(6) +
     "BFCL".padEnd(7) +
+    "arena".padEnd(7) +
+    "rank".padEnd(7) +
     "verdict".padEnd(11) +
     "p95".padEnd(9) +
     "up%".padEnd(6) +
@@ -531,12 +532,15 @@ export async function runCandidates(): Promise<void> {
     const breaker = c.breaker.open ? `OPEN ${Math.round(c.breaker.cooldownRemainingMs / 1000)}s` : "closed";
     process.stdout.write(
       c.spec.slice(0, 33).padEnd(34) +
-        tags.slice(0, 29).padEnd(30) +
+        tags.slice(0, 25).padEnd(26) +
         live.padEnd(6) +
         fmt(c.benchmarks.sweBench).padEnd(6) +
         fmt(c.benchmarks.liveCodeBench).padEnd(6) +
-        fmt(c.benchmarks.arenaElo).padEnd(6) +
         fmt(c.capability?.bfcl_overall ?? null).padEnd(7) +
+        // Arena comes from the synced leaderboard, so it covers models the static
+        // benchmark table has never heard of. `~` marks a fuzzy (different-model) join.
+        (c.capability?.arena_rating ? `${Math.round(c.capability.arena_rating)}${c.capability.match === "fuzzy" ? "~" : ""}` : "-").padEnd(7) +
+        (c.capability?.arena_rank ? `#${c.capability.arena_rank}` : "-").padEnd(7) +
         (c.health?.verdict ?? "-").padEnd(11) +
         fmt(c.health?.p95Ms ?? null, "ms").padEnd(9) +
         fmt(c.health?.uptimePct ?? null).padEnd(6) +
@@ -547,10 +551,22 @@ export async function runCandidates(): Promise<void> {
     );
   }
 
+  const fuzzy = view.candidates.filter((c) => c.capability?.match === "fuzzy");
   process.stdout.write(
-    "\nColumns are independent — weigh them yourself. SWE/LCB/Elo/BFCL are capability, " +
+    "\nColumns are independent — weigh them yourself. SWE/LCB/BFCL/arena are capability, " +
       "verdict/p95/up% are live behaviour, quota/breaker are availability right now.\n" +
-      `Full detail (jitter, observed traffic, max output tokens, sort inputs): curl 127.0.0.1:${cfg.port}/candidates\n`,
+      "SWE/LCB come from a hand-maintained table that lags the roster; arena/BFCL come from the\n" +
+      "synced leaderboard (`npm run sync:tiers`). A blank cell means NOT MEASURED, not bad.\n",
+  );
+  if (fuzzy.length > 0) {
+    process.stdout.write(
+      `~ = scores borrowed from a similarly-named model, not this one: ` +
+        fuzzy.map((c) => `${c.model ?? c.spec} -> ${c.capability!.matched_name}`).join(", ") +
+        "\n",
+    );
+  }
+  process.stdout.write(
+    `Full detail (jitter, observed traffic, max output tokens, sort inputs): curl 127.0.0.1:${cfg.port}/candidates\n`,
   );
 }
 

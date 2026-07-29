@@ -1,7 +1,7 @@
 import { describe, it, expect, afterAll } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { buildRegistry } from "../src/registry.js";
+import { buildRegistry, loadTierData, joinCapability } from "../src/registry.js";
 import { createProxy } from "../src/server.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
@@ -61,6 +61,35 @@ describe("buildRegistry", () => {
     expect(view.providers.claude!.reachable).toBeNull();
     expect(view.providers.claude!.models).toEqual([]);
     expect(view.providers.claude!.has_key).toBe(true); // no authEnv → configured
+  });
+});
+
+describe("tier-data caching + join provenance", () => {
+  it("memoizes the leaderboard file instead of re-reading it per request", () => {
+    const a = loadTierData();
+    const b = loadTierData();
+    // Same object identity: /registry, /health and /candidates all hit this on every call, so a
+    // fresh read + re-index per request is pure waste.
+    expect(a).toBe(b);
+    if (a) expect(a.byNorm.length).toBeGreaterThan(0);
+  });
+
+  it("distinguishes an exact leaderboard match from a borrowed one", () => {
+    const byNorm = [
+      { norm: "glm-5.2-max", rec: { norm: "glm-5.2-max", arena_rating: 1469 } },
+      { norm: "deepseek-v4-pro", rec: { norm: "deepseek-v4-pro", arena_rating: 1457 } },
+    ];
+    const exact = joinCapability("deepseek-ai/deepseek-v4-pro", byNorm)!;
+    expect(exact.match).toBe("exact");
+    expect(exact.matched_name).toBe("deepseek-v4-pro");
+
+    // glm-5.2 has no row of its own; the scores come from a DIFFERENT, stronger model.
+    // Without provenance that substitution is invisible in the output.
+    const fuzzy = joinCapability("z-ai/glm-5.2", byNorm)!;
+    expect(fuzzy.match).toBe("fuzzy");
+    expect(fuzzy.matched_name).toBe("glm-5.2-max");
+
+    expect(joinCapability("nothing/at-all-here", byNorm)).toBeNull();
   });
 });
 
