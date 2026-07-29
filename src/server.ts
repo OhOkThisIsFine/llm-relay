@@ -34,6 +34,56 @@ const HOP_BY_HOP = new Set([
   "te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-encoding", "host",
 ]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
+
+/** Loopback names a Host header may legitimately carry (see config.ts's bind check). */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+/** A task string long enough to be an abuse attempt rather than a task. */
+const MAX_TASK_LEN = 4096;
+
+/**
+ * Request admission for mutating and command-rendering routes.
+ *
+ * Binding to loopback is NOT authorization. Any web page the user visits can
+ * issue a cross-origin POST to 127.0.0.1, and because the handler JSON-parses
+ * whatever body arrives regardless of declared content type, a `text/plain` POST
+ * is a CORS *simple request* — no preflight, and it succeeds. The attacker never
+ * reads the response, but every interesting operation here is a WRITE: flipping
+ * offload routing, rewriting config.json on disk, marking dispatch lanes spent,
+ * or spending provider keys.
+ *
+ * Returns null when the request may proceed, or a reason to reject with 403.
+ * A CLI sends no Origin, so an ABSENT Origin is allowed; a present-but-unknown
+ * one is not. Host is checked against the loopback names to close DNS rebinding,
+ * where a hostile name resolves to 127.0.0.1 and thus looks local to the socket.
+ */
+function admissionFailure(req: IncomingMessage, mutating: boolean): string | null {
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && origin.length > 0) {
+    try {
+      const host = new URL(origin).hostname;
+      if (!LOOPBACK_HOSTS.has(host)) return `cross-origin request from ${origin} is not allowed`;
+    } catch {
+      return "malformed Origin header";
+    }
+  }
+
+  const hostHeader = req.headers.host;
+  if (typeof hostHeader === "string" && hostHeader.length > 0) {
+    const bare = hostHeader.replace(/:\d+$/, "");
+    if (!LOOPBACK_HOSTS.has(bare)) return `Host ${hostHeader} is not a loopback address`;
+  }
+
+  if (mutating) {
+    const ct = (req.headers["content-type"] ?? "").toString().split(";")[0]?.trim().toLowerCase();
+    // Requiring application/json is what makes a body-bearing cross-origin POST
+    // need a preflight, which a hostile page cannot satisfy.
+    if (ct !== "application/json") {
+      return `mutating requests require content-type: application/json (got ${ct || "none"})`;
+    }
+  }
+  return null;
+}
+
 const MAX_VALIDATE_BYTES = 8 * 1024 * 1024;
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
@@ -172,6 +222,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // very next subagent request is routed the new way — no restart — and is persisted back to
   // the config file so the choice survives one.
   if ((req.method === "GET" || req.method === "POST") && pathname === "/offload") {
+    const denied = admissionFailure(req, req.method === "POST");
+    if (denied) {
+      failClosed(res, 403, denied);
+      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped"));
+      return;
+    }
     let state = offloadState(cfg);
     if (req.method === "POST") {
       const want = (reqJson as { enabled?: unknown } | undefined)?.enabled;
@@ -193,6 +249,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // command); POST reports a rung spent so the next read walks past it. The relay decides the
   // ORDER and never executes a cli rung itself — spawning agents is the host's job.
   if ((req.method === "GET" || req.method === "POST") && pathname === "/dispatch") {
+    const deniedDispatch = admissionFailure(req, req.method === "POST");
+    if (deniedDispatch) {
+      failClosed(res, 403, deniedDispatch);
+      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped"));
+      return;
+    }
     if (req.method === "POST") {
       const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown };
       const ttlMs = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
@@ -212,8 +274,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         return;
       }
     }
+    // Bound the task text: it is unauthenticated query input that ends up in a
+    // command the host is told to run, so an unbounded value is both a rendering
+    // hazard and a trivial way to bloat the response.
+    const rawTask = pickQuery(path, "task");
+    if (typeof rawTask === "string" && rawTask.length > MAX_TASK_LEN) {
+      failClosed(res, 400, `?task= exceeds ${MAX_TASK_LEN} characters`);
+      h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+      return;
+    }
+    const taskParam = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : undefined;
     const view = buildDispatch(cfg, {
-      ...(pickQuery(path, "task") ? { task: pickQuery(path, "task") as string } : {}),
+      ...(taskParam ? { task: taskParam } : {}),
       ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
       ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
     });
@@ -967,10 +1039,25 @@ function baseLog(
 ): RequestLog {
   return {
     ts: new Date(started).toISOString(),
-    path, backendModel: model, hadTools, streamed, backendStatus, validated,
+    path: logSafePath(path), backendModel: model, hadTools, streamed, backendStatus, validated,
     toolUseCount: 0, uncheckableCount: 0, errorKinds: [], repair: "none",
     latencyMs: Date.now() - started,
   };
+}
+
+/**
+ * A request path is metadata; the VALUES in its query string are not. `?task=`
+ * carries user prose, so logging the raw path put request content into a log this
+ * project promises is metadata-only. Keep the route and the parameter NAMES,
+ * replace each value with its length.
+ */
+export function logSafePath(path: string): string {
+  const q = path.indexOf("?");
+  if (q === -1) return path;
+  const route = path.slice(0, q);
+  const params = new URLSearchParams(path.slice(q + 1));
+  const shape = [...params.keys()].map((k) => `${k}=<${params.get(k)?.length ?? 0}c>`).join("&");
+  return shape ? `${route}?${shape}` : route;
 }
 
 /**
