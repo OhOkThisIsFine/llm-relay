@@ -63,7 +63,7 @@ llm-relay
 - **Multi-Candidate Failover**: `routing.default` and every `routing.tiers` entry accept an **array** of target specs (e.g. `["nim/z-ai/glm-5.2", "groq/llama-3.3-70b"]`) for continuous fallback. ⚠ Ranking and failover both require **more than one** candidate — a single pinned model silently disables both, and on providers where a listed model may not actually be servable that turns one dead backend into a dead relay. Prefer arrays.
 - **Named pools** (`routing.pools`, addressed as `model: "pool/<name>"`): the same ranked-candidate behaviour for callers that can only send **one model string** — notably Claude Code subagent frontmatter. Lets an agent ask for *the best available coding model* instead of naming one. An unknown pool is a loud 400, never a silent fall-through.
 - **Passthrough targets**: a provider with `kind:"anthropic"` and **no `authEnv`** forwards the caller's own credentials untouched, so real Claude traffic stays on real Anthropic while `pool/*` requests route elsewhere — from the same proxy.
-- **Subagent-aware routing** (`routing.subagents`): route Claude Code *subagents* to other providers while the human's own conversation stays on passthrough — with no agent files and no model ids in the prompt. See below.
+- **Subagent offload** (`routing.offload` + `routing.subagents`): route Claude Code *subagents* to other providers while the human's own conversation stays on passthrough — with no agent files and no model ids in the prompt. **Off by default**; `llm-relay offload on` flips it without a restart, `llm-relay candidates` shows what to point it at. See below.
 
 ### 3. Prompt Token & Context Length Guardrails
 - Automatically estimates request prompt token count (`estimateRequestTokens`) against target model context limits (`getModelMetadata`).
@@ -250,17 +250,32 @@ Claude Code subagent frontmatter (`model:`), which accepts a full model id but n
 list. A pool is the indirection that gives those callers ranking and failover. `pool` is a
 reserved provider name; configuring a provider called `pool` fails at load.
 
-### Subagent-aware routing (`routing.subagents`)
+### Subagent offload (`routing.offload` + `routing.subagents`)
 
 Send Claude Code **subagents** to other providers while the human's own conversation stays on the
 Anthropic passthrough — without writing agent files and without naming a model.
 
+**Off by default.** Until you turn it on, subagents route exactly like everything else:
+
+```bash
+llm-relay offload on
+```
+
+That reaches the running proxy over loopback, so it applies to the next request without a restart,
+and is persisted to `config.json` so it survives one. `llm-relay offload status` shows the state and
+where each tier goes; `off` reverts.
+
 ```jsonc
 "routing": {
+  "offload":   false,   // master switch (default). `subagents` is inert until this is true.
   "tiers":     { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
   "subagents": { "opus": "pool/reasoning", "haiku": "pool/fast", "default": "pool/coding" }
 }
 ```
+
+Why opt-in: offloading silently changes *which model answers* for every built-in agent (Explore,
+general-purpose, every one-off dispatch). That is worth deciding on purpose rather than inheriting
+from the presence of a config key.
 
 Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests (built-in
 agents like Explore included — verified on the wire, Claude Code 2.1.220). llm-relay reads that flag
@@ -281,7 +296,8 @@ Trace every caller of parseConfig and report the file:line of each.
 ```
 
 `<spec>` is any normal spec (`pool/<name>` or `<provider>/<model>`). The line is **stripped before
-the request is forwarded**, so the model never sees it.
+the request is forwarded**, so the model never sees it. This works **whether or not the switch is
+on** — it is the per-call opt-in, so you can offload one dispatch without offloading everything.
 
 ⚠ **The directive is read only from the last text block of `messages[0]`** — the dispatcher's
 authored prompt. Block 0 is Claude Code's injected `<system-reminder>` (your CLAUDE.md, the date,
@@ -289,7 +305,28 @@ authored prompt. Block 0 is Claude Code's injected `<system-reminder>` (your CLA
 subagent happens to read redirect its own routing. Both cases are covered by tests.
 
 Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` →
-`subagents.default` → normal routing. Omit `routing.subagents` entirely and nothing changes.
+`subagents.default` → normal routing. The middle two apply only while `routing.offload` is on; omit
+`routing.subagents` entirely and nothing changes either way.
+
+### Choosing where to offload (`llm-relay candidates`)
+
+```
+target                            pools / tiers        live  SWE  LCB  Elo   BFCL   verdict  p95    up%  quota  breaker  ctx
+nim/z-ai/glm-5.2                  coding,@opus         yes   42   53   1240  -      Perfect  310ms  100  84%    closed   128k
+nim/meta/llama-3.1-8b-instruct    fast,@haiku,@fable   yes   -    -    -     25.83  Perfect  120ms  100  84%    closed   128k
+```
+
+Every offload target with its dimensions side by side: capability (SWE-bench, HumanEval,
+LiveCodeBench, Arena Elo, BFCL tool-use, context window), live behaviour (verdict, avg/p95 latency,
+jitter, uptime), availability right now (provider quota, circuit-breaker state, whether the provider
+still lists the model) and traffic actually observed through the proxy.
+
+**Nothing is ranked or averaged** — capability, latency and remaining quota trade off differently
+per task, and one blended number answers neither "cheapest that can do it" nor "best available". The
+composites the proxy itself sorts by are reported under `sortInputs`, labelled as what they drive.
+
+`GET /candidates` returns the full JSON (the table shows a subset). The CLI prefers a running proxy
+so the live columns come from warm ping history rather than a cold start.
 
 📄 Full design, the wire evidence behind it, and **how to re-verify the marker after a Claude Code
 upgrade**: [docs/subagent-routing.md](docs/subagent-routing.md).
