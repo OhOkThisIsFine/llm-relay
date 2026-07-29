@@ -359,7 +359,7 @@ describe("repair mode", () => {
   it("fail-closes (502) on a destructive tool call instead of fabricating it", async () => {
     const broken = JSON.stringify({ type: "message", role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "delete_file", input: {} }] });
     const delTools = [{ name: "delete_file", input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }];
-    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: broken }, fixer, ["delete"]);
+    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: broken }, fixer, ["delete_file"]);
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false, delTools) });
     expect(resp.status).toBe(502);
     expect(lastLogLine(logFile).repair).toBe("refused_destructive");

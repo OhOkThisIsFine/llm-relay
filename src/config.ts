@@ -221,7 +221,36 @@ export interface Config {
   warnings?: string[];
 }
 
-const DEFAULT_DESTRUCTIVE = ["rm", "delete", "remove", "push", "force", "overwrite", "drop", "reset"];
+/**
+ * Tools a repaired call is never allowed to name. THE single definition — the
+ * shipped config template, config.example.json and the README all derive from or
+ * are asserted equal to this list, because they previously disagreed: this array
+ * had 8 entries including "remove" while the other three had 7, so a config that
+ * omitted repair.destructiveTools got different coverage than a generated one.
+ *
+ * Matching is exact (see destructiveMatcher), so these are real tool names, not
+ * fragments. The harness's own destructive tools are listed first — they are the
+ * ones that can actually destroy something, and the previous fragment list
+ * ("rm", "delete", …) matched none of them.
+ */
+export const DEFAULT_DESTRUCTIVE = [
+  // Claude Code / harness tools that write, delete, or execute.
+  "Bash",
+  "BashOutput",
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  // Conventional names an MCP server or custom tool may use.
+  "rm",
+  "delete",
+  "delete_file",
+  "remove",
+  "overwrite",
+  "drop",
+  "reset",
+  "force_push",
+];
 
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export { DEFAULT_ANTHROPIC_VERSION };
