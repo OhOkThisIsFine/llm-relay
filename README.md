@@ -262,7 +262,7 @@ a `routing` block that maps each request's `model` to one provider + backend mod
     }
   },
   "mode": "repair",                          // detect | repair (strict accepted, aliases detect)
-  "repair": { "maxAttempts": 2, "destructiveTools": ["rm","delete","push","force","overwrite","drop","reset"] },
+  "repair": { "maxAttempts": 2, "destructiveTools": ["Bash","Write","Edit","MultiEdit","NotebookEdit","rm","delete","overwrite","drop","reset"] },
   "log": { "level": "metadata", "file": null }  // metadata-only; NEVER logs headers/bodies
 }
 ```

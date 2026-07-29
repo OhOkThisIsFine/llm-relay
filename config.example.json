@@ -89,13 +89,20 @@
   "repair": {
     "maxAttempts": 2,
     "destructiveTools": [
+      "Bash",
+      "BashOutput",
+      "Write",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
       "rm",
       "delete",
-      "push",
-      "force",
+      "delete_file",
+      "remove",
       "overwrite",
       "drop",
-      "reset"
+      "reset",
+      "force_push"
     ]
   },
   "log": {

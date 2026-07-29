@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
+import { loadConfig, type Config, type ConfigOverrides, DEFAULT_DESTRUCTIVE } from "./config.js";
 import { loadEnvFile } from "./dotenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
@@ -223,7 +223,7 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
     mode: "repair",
     repair: {
       maxAttempts: 2,
-      destructiveTools: ["rm", "delete", "push", "force", "overwrite", "drop", "reset"],
+      destructiveTools: [...DEFAULT_DESTRUCTIVE],
     },
     log: { level: "metadata", file: null },
   },

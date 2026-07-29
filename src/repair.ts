@@ -67,11 +67,31 @@ export async function repair(
   return { outcome: "failed" };
 }
 
-/** Build a destructive-tool matcher from name patterns (case-insensitive substring). */
+/**
+ * Build a destructive-tool matcher.
+ *
+ * Matching is EXACT on the tool name (case-insensitively), not substring.
+ * Substring matching was wrong in both directions at once: none of the default
+ * patterns ("rm", "delete", "remove", …) occur in the harness's actual
+ * destructive tools — Bash, Write, Edit, MultiEdit, NotebookEdit, BashOutput —
+ * so the check that guards "never fabricate a destructive call" did not cover
+ * the tools that can actually destroy anything; meanwhile "push" matched
+ * PushNotification and "reset" matched ResetZoom, refusing safe calls.
+ *
+ * A pattern ending in `*` is still a prefix match, so a config can opt into
+ * families (`git_*`) deliberately rather than by accident.
+ */
 export function destructiveMatcher(namePatterns: string[]): (name: string) => boolean {
-  const lowered = namePatterns.map((p) => p.toLowerCase());
+  const exact = new Set<string>();
+  const prefixes: string[] = [];
+  for (const p of namePatterns) {
+    const low = p.toLowerCase();
+    if (low.endsWith("*")) prefixes.push(low.slice(0, -1));
+    else exact.add(low);
+  }
   return (name: string) => {
     const n = name.toLowerCase();
-    return lowered.some((p) => n.includes(p));
+    if (exact.has(n)) return true;
+    return prefixes.some((p) => p.length > 0 && n.startsWith(p));
   };
 }

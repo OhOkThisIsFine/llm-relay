@@ -48,7 +48,7 @@ describe("repair orchestration", () => {
     const destrCall: AssistantMessage = { content: [{ type: "tool_use", id: "t1", name: "delete_file", input: {} }], stop_reason: "tool_use" };
     let reshaperCalled = false;
     const spy: Reshaper = { reshape: async () => { reshaperCalled = true; return { kind: "message", message: destrCall }; } };
-    const d = await repair(destrCall, dtools, { validator, reshaper: spy, maxAttempts: 2, isDestructive: destructiveMatcher(["delete"]) });
+    const d = await repair(destrCall, dtools, { validator, reshaper: spy, maxAttempts: 2, isDestructive: destructiveMatcher(["delete_file"]) });
     expect(d.outcome).toBe("refused_destructive");
     expect(reshaperCalled).toBe(false); // never even asked to reshape it
   });
