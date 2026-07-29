@@ -5,6 +5,7 @@ import {
   resolveTarget,
   resolveTargets,
   reshaperForTarget,
+  subagentSpec,
   RoutingError,
   type Config,
   type ResolvedTarget,
@@ -161,10 +162,17 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
   const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
 
+  // A SUBAGENT request may route somewhere other than its nominal model: either an explicit
+  // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it) or
+  // routing.subagents[<tier>]. Main-conversation requests are untouched, which is what lets
+  // routing.tiers stay pointed at an Anthropic passthrough.
+  const routedModel = isMessages ? (subagentSpec(reqJson, model, cfg) ?? model) : model;
+  if (routedModel !== model) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
+
   // Route the request's model to a concrete provider + backend model candidates.
   let targetCandidates: ResolvedTarget[];
   try {
-    targetCandidates = resolveTargets(model, cfg);
+    targetCandidates = resolveTargets(routedModel, cfg);
   } catch (e) {
     if (e instanceof RoutingError) {
       failClosed(res, 400, `llm-relay routing: ${e.message}`);

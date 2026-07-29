@@ -54,11 +54,86 @@ export interface Routing {
   default: string | string[];
   tiers: Record<string, string | string[]>;
   pools?: Record<string, string[]>;
+  /**
+   * Tier → spec for SUBAGENT requests only (`cc_is_subagent=true`). Lets the dispatcher pick a
+   * destination with the one per-call knob it actually has — the Agent tool's `model` enum
+   * (sonnet|opus|haiku|fable) — without writing an agent file. `default` catches anything that
+   * matches no tier. Main-conversation requests never consult this, which is what keeps
+   * `routing.tiers` free to stay on an Anthropic passthrough.
+   */
+  subagents?: Record<string, string>;
   benchmarkSort?: boolean;
 }
 
 /** Reserved provider-namespace prefix for `pool/<name>` routing. */
 export const POOL_PREFIX = "pool";
+
+/**
+ * Marker Claude Code stamps into the `system` block of SUBAGENT requests only (verified on wire,
+ * Claude Code 2.1.220): `x-anthropic-billing-header: …; cc_entrypoint=…; cc_is_subagent=true;`.
+ * Built-in subagents (Explore, general-purpose) carry it too, not just custom `.md` agents.
+ *
+ * This is what makes tier-based subagent routing safe. Without it, a subagent declaring
+ * `model: haiku` and a HUMAN picking Haiku for their own conversation are byte-identical, so any
+ * tier→provider mapping silently drops the human's own conversation onto a weak model.
+ */
+const SUBAGENT_MARKER = "cc_is_subagent=true";
+
+/** Routing directive the dispatcher may put on its own line in a subagent prompt. */
+const RELAY_DIRECTIVE = /^[ \t]*@relay:[ \t]*(\S+)[ \t]*$/m;
+
+/** Flatten an Anthropic `system` field (string or content-block array) to plain text. */
+function systemText(system: unknown): string {
+  if (typeof system === "string") return system;
+  if (!Array.isArray(system)) return "";
+  return system.map((b) => (typeof b === "string" ? b : ((b as { text?: unknown }).text ?? ""))).join("\n");
+}
+
+/** True when this request is a Claude Code SUBAGENT rather than a main conversation. */
+export function isSubagentRequest(reqJson: unknown): boolean {
+  if (typeof reqJson !== "object" || reqJson === null) return false;
+  return systemText((reqJson as { system?: unknown }).system).includes(SUBAGENT_MARKER);
+}
+
+/**
+ * Read (and optionally strip) an `@relay: <spec>` directive from the dispatcher's prompt.
+ *
+ * ⚠ Only the LAST text block of `messages[0]` is inspected — that is the dispatcher-authored
+ * prompt. Block 0 is Claude Code's injected `<system-reminder>` (CLAUDE.md, date, …) and later
+ * messages carry tool results, i.e. file contents. Reading those would let any file the subagent
+ * happens to read redirect its own routing.
+ */
+export function readRelayDirective(reqJson: unknown, strip = false): string | null {
+  if (typeof reqJson !== "object" || reqJson === null) return null;
+  const messages = (reqJson as { messages?: unknown }).messages;
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const content = (messages[0] as { content?: unknown })?.content;
+  if (!Array.isArray(content)) return null;
+
+  for (let i = content.length - 1; i >= 0; i--) {
+    const block = content[i] as { type?: unknown; text?: unknown };
+    if (block?.type !== "text" || typeof block.text !== "string") continue;
+    const m = RELAY_DIRECTIVE.exec(block.text);
+    if (!m) return null; // last text block only — do not keep scanning earlier blocks
+    if (strip) block.text = block.text.replace(RELAY_DIRECTIVE, "").replace(/^\n+/, "");
+    return m[1]!;
+  }
+  return null;
+}
+
+/**
+ * The spec a subagent request should route to, or null to leave routing unchanged.
+ * Directive wins over tier; tier falls back to `subagents.default`.
+ */
+export function subagentSpec(reqJson: unknown, model: string | null, cfg: Config): string | null {
+  if (!isSubagentRequest(reqJson)) return null;
+  const directive = readRelayDirective(reqJson, true);
+  if (directive) return directive;
+  const map = cfg.routing.subagents;
+  if (!map) return null;
+  const tier = model ? detectTier(model) : null;
+  return (tier ? map[tier] : undefined) ?? map["default"] ?? null;
+}
 
 /** A request routed to a concrete provider + backend model. */
 export interface ResolvedTarget {
@@ -363,6 +438,7 @@ function parseRouting(
     default?: unknown;
     tiers?: unknown;
     pools?: unknown;
+    subagents?: unknown;
     benchmarkSort?: unknown;
   };
   // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
@@ -409,9 +485,17 @@ function parseRouting(
     }
   }
 
+  const subagents: Record<string, string> = {};
+  if (typeof r.subagents === "object" && r.subagents !== null) {
+    for (const [k, v] of Object.entries(r.subagents as Record<string, unknown>)) {
+      if (typeof v === "string" && v.length > 0) subagents[k] = v;
+    }
+  }
+
   const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
   const routing: Routing = { default: dflt, tiers, benchmarkSort };
   if (Object.keys(pools).length > 0) routing.pools = pools;
+  if (Object.keys(subagents).length > 0) routing.subagents = subagents;
 
   // Fail loudly at load time if any spec names an unknown provider.
   assertSpecResolvable(routing.default, providers, "routing.default");

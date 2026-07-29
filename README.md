@@ -63,6 +63,7 @@ llm-relay
 - **Multi-Candidate Failover**: `routing.default` and every `routing.tiers` entry accept an **array** of target specs (e.g. `["nim/z-ai/glm-5.2", "groq/llama-3.3-70b"]`) for continuous fallback. ⚠ Ranking and failover both require **more than one** candidate — a single pinned model silently disables both, and on providers where a listed model may not actually be servable that turns one dead backend into a dead relay. Prefer arrays.
 - **Named pools** (`routing.pools`, addressed as `model: "pool/<name>"`): the same ranked-candidate behaviour for callers that can only send **one model string** — notably Claude Code subagent frontmatter. Lets an agent ask for *the best available coding model* instead of naming one. An unknown pool is a loud 400, never a silent fall-through.
 - **Passthrough targets**: a provider with `kind:"anthropic"` and **no `authEnv`** forwards the caller's own credentials untouched, so real Claude traffic stays on real Anthropic while `pool/*` requests route elsewhere — from the same proxy.
+- **Subagent-aware routing** (`routing.subagents`): route Claude Code *subagents* to other providers while the human's own conversation stays on passthrough — with no agent files and no model ids in the prompt. See below.
 
 ### 3. Prompt Token & Context Length Guardrails
 - Automatically estimates request prompt token count (`estimateRequestTokens`) against target model context limits (`getModelMetadata`).
@@ -248,6 +249,47 @@ a `routing` block that maps each request's `model` to one provider + backend mod
 Claude Code subagent frontmatter (`model:`), which accepts a full model id but not a candidate
 list. A pool is the indirection that gives those callers ranking and failover. `pool` is a
 reserved provider name; configuring a provider called `pool` fails at load.
+
+### Subagent-aware routing (`routing.subagents`)
+
+Send Claude Code **subagents** to other providers while the human's own conversation stays on the
+Anthropic passthrough — without writing agent files and without naming a model.
+
+```jsonc
+"routing": {
+  "tiers":     { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
+  "subagents": { "opus": "pool/reasoning", "haiku": "pool/fast", "default": "pool/coding" }
+}
+```
+
+Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests (built-in
+agents like Explore included — verified on the wire, Claude Code 2.1.220). llm-relay reads that flag
+and only then consults `routing.subagents`. **This is the entire reason the feature is safe.**
+Without the flag, a subagent asking for `haiku` and a human picking Haiku are byte-identical
+requests, so any tier→provider mapping silently drops the human's own conversation onto a weak
+model. `routing.tiers` therefore stays free to point at a passthrough.
+
+A dispatcher then chooses a destination with the one per-call knob it already has — the Agent tool's
+`model` parameter (`sonnet|opus|haiku|fable`) — or by not choosing at all, in which case
+`subagents.default` applies and the pool's ranking picks the model.
+
+**To pin an exact model for one call**, put a directive on its own line in the subagent's prompt:
+
+```
+@relay: nim/z-ai/glm-5.2
+Trace every caller of parseConfig and report the file:line of each.
+```
+
+`<spec>` is any normal spec (`pool/<name>` or `<provider>/<model>`). The line is **stripped before
+the request is forwarded**, so the model never sees it.
+
+⚠ **The directive is read only from the last text block of `messages[0]`** — the dispatcher's
+authored prompt. Block 0 is Claude Code's injected `<system-reminder>` (your CLAUDE.md, the date,
+…), and later messages carry tool results, i.e. file contents. Reading either would let any file a
+subagent happens to read redirect its own routing. Both cases are covered by tests.
+
+Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` →
+`subagents.default` → normal routing. Omit `routing.subagents` entirely and nothing changes.
 
 Each provider is `kind:"openai"` (translated Anthropic↔OpenAI via llm-bridge) or
 `kind:"anthropic"` (forwarded as-is). In `repair` mode an openai target reshapes on itself;
