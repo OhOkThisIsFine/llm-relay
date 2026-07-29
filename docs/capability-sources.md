@@ -67,3 +67,28 @@ signals backed it — a one-source score and a four-source consensus must not lo
 
 These are skipped **deliberately**, not overlooked. Revisit if a roster shifts toward open-weight
 models, where HF/EvalPlus coverage is real.
+
+## Limits and prices are per-(provider, model)
+
+Separate from *capability*, which is a property of the model. A **deployment's** ceilings and price
+are properties of the host, and the two must not be conflated:
+
+| Provider | What its `/models` publishes |
+|---|---|
+| Groq | `context_window`, `max_completion_tokens`, `pricing` |
+| OpenRouter | `context_length`, `top_provider.max_completion_tokens`, `pricing` |
+| Mistral | `max_context_length` only |
+| **NIM** | **nothing** — `id`, `object`, `created`, `owned_by` |
+
+`catalog.ts` harvests whatever a provider publishes (generic field-alias list, no per-provider
+switch, so a new provider using `context_window` is picked up with no code change).
+`resolveMetadata()` then resolves **per field**, because coverage is ragged — Mistral gives context
+but no output ceiling — and labels each one:
+
+- `provider` — the serving provider published it about its own deployment;
+- `reference` (`~`) — borrowed from another provider serving the same id. Indicative only;
+- `static-table` (`?`) — the hardcoded table in `metadata.ts`, including its blanket 128k/4096 guess.
+
+Price has no `static-table` rung on purpose: an unknown cost stays null rather than becoming a
+fabricated number. This is why every NIM row renders `1049k~` and `$2.402~` — those are OpenRouter's
+figures for the same model id, and NIM's real ceilings and rates are simply not published.

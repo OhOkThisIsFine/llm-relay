@@ -312,9 +312,9 @@ Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` �
 
 ```
 target                          pools / tiers      str      agentic coding BFCL   arena  $/Mout  verdict  p95    quota  breaker  ctx
-nim/z-ai/glm-5.2                coding,@opus       83.3/4   43.1    68.8   -      -      $2.402  Perfect  310ms  84%    closed   1049k
-nim/moonshotai/kimi-k2.6        coding,@sonnet     77.4/5   30.3    61.8   -      1461   $2.72   Perfect  280ms  84%    closed   262k
-nim/meta/llama-3.1-8b-instruct  fast,@haiku,@fable  9.7/6    0.5     5.4   25.83  1211   $0.08   Perfect  120ms  84%    closed   131k
+nim/z-ai/glm-5.2                coding,@opus       83.3/4   43.1    68.8   -      -      $2.402~ Perfect  310ms  84%    closed   1049k~
+nim/moonshotai/kimi-k2.6        coding,@sonnet     77.4/5   30.3    61.8   -      1461   $2.72~  Perfect  280ms  84%    closed   262k~
+nim/meta/llama-3.1-8b-instruct  fast,@haiku,@fable  9.7/6    0.5     5.4   25.83  1211   $0.08~  Perfect  120ms  84%    closed   131k~
 ```
 
 Every offload target with its dimensions side by side: capability from each leaderboard separately,
@@ -343,9 +343,16 @@ available".
 `str` is the single exception, and it exists only because ordering a pool requires an order. It is a
 weighted mean of whatever rank-normalized signals a model actually has (tool-use and agentic ability
 weighted highest — this proxy drives tool loops), and it never appears without its provenance:
-`83.3/4` means four published signals backed it, while `old` (stale hardcoded table), `obs` (this
-proxy's own traffic, ≥5 calls) and `neut` (nothing known) mark the fallbacks. A trailing `?` on `ctx`
-means the value came from the hardcoded table rather than the provider.
+`83.3/4` means four published signals backed it, while `obs` (ranked on this proxy's own traffic,
+≥5 calls) and `neut` (nothing known) mark the fallbacks.
+
+**Limits and prices are per-(provider, model), and labelled.** The same model id on two providers is
+two deployments — different context ceilings, different output caps, and possibly free on one and
+metered on the other. Where a provider publishes its own figures (Groq, Mistral, OpenRouter) those
+are used; where it publishes none (NIM returns only `id`/`object`/`created`/`owned_by`) the table
+falls back to another provider's figure for the same id and marks it `~`, or to the hardcoded
+table's guess and marks it `?`. Unmarked means the serving provider published it. An unknown price
+stays blank rather than being guessed.
 
 `GET /candidates` returns the full JSON (the table shows a subset). The CLI prefers a running proxy
 so the live columns come from warm ping history rather than a cold start.

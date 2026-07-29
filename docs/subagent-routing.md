@@ -145,10 +145,17 @@ routing specs, so `z-ai/glm-5.2` matches exactly instead of landing on `glm-5.2-
 match is still the only option, `capability.match` / `capability.matched_name` name the row used and
 the CLI marks it `~`.
 
-⚠ `BENCHMARK_DB` in `benchmarks.ts` is a **legacy fallback only — do not add rows**. Hand-typed,
-substring-matched, no provenance, last updated for a 2025 roster. Until 0.5.0 it was the *only*
+⚠ `BENCHMARK_DB` — the hardcoded score table in `benchmarks.ts` — was **deleted in 0.6.0**. Every
+pattern it carried was already in the snapshot, so it contributed only a stale, provenance-free
+number that outranked synced data for anything it substring-matched. Until 0.5.0 it was the *only*
 ranking input, which meant models it had never heard of all collapsed to a flat 50.0 and tied, so
-pool order silently fell back to whatever order the config happened to list.
+pool order silently fell back to whatever order the config happened to list. Don't reintroduce one.
+
+⚠ **Limits and prices are per-(provider, model), not per-model.** The same id on two providers is
+two deployments with different ceilings and different prices — possibly free on one and metered on
+the other. `candidates` reports each field's provenance (`provider` / `reference` / `static-table`,
+rendered `~` and `?`), so a NIM row never presents OpenRouter's context window or rate as its own.
+NIM publishes no metadata at all; Groq and Mistral publish real limits.
 
 This gives a dispatcher three levels of control, all optional:
 
