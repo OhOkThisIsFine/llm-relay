@@ -59,8 +59,7 @@ export interface Candidate {
   /**
    * Limits, each with its own provenance. `provider` = this provider published it about its own
    * deployment; `reference` = borrowed from another provider serving the same model id (different
-   * deployment, so indicative only — `metadataReferenceFrom` names it); `static-table` = the
-   * hardcoded table, including its blanket 128k/4096 guess.
+   * deployment, so indicative only — `metadataReferenceFrom` names it). Null = nobody publishes it.
    */
   contextLength: number | null;
   contextLengthSource: MetadataSource | null;
@@ -194,7 +193,7 @@ export async function buildCandidates(
 
     const summary = opts.pingLoop && model ? opts.pingLoop.getModelSummary(provider, model) : null;
     const state = breaker.getState(spec);
-    const obs = telemetry.models[`${provider}/${model}`];
+    const obs = model ? telemetry.models[`${provider}/${model}`] : undefined;
     const strength = getStrength(spec);
     const matched = findTierModel(model ?? spec, byNorm);
     const tier = matched?.rec;

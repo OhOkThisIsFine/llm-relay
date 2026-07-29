@@ -252,6 +252,48 @@ describe("resolveTargets — pool/<name> ranked routing", () => {
       routing: { default: "pool/m" },
     }))).toThrow(/reserved/);
   });
+
+  it("expands a pool referenced from routing.tiers (pools work uniformly, not just as inbound models)", () => {
+    const c = loadConfig(write("tierpool.json", {
+      listen: "127.0.0.1:8791",
+      providers: {
+        nim: { base: "https://nim.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" },
+        anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+      },
+      routing: {
+        default: "anthropic",
+        tiers: { haiku: "pool/cheap" },
+        pools: { cheap: ["nim/openai/gpt-oss-20b"] },
+        benchmarkSort: false,
+      },
+    }));
+    const ts = resolveTargets("claude-haiku-4-5", c);
+    expect(ts.map((t) => `${t.provider}/${t.model}`)).toEqual(["nim/openai/gpt-oss-20b"]);
+  });
+
+  it("rejects a tier naming an unknown pool at load time", () => {
+    expect(() => loadConfig(write("tierbadpool.json", base({
+      routing: { default: "nim/m", tiers: { haiku: "pool/nope" } },
+    })))).toThrow(/unknown pool "nope"/);
+  });
+
+  it("rejects a subagent target naming an unknown pool at load time (not first request)", () => {
+    expect(() => loadConfig(write("subbadpool.json", base({
+      routing: { default: "nim/m", subagents: { opus: "pool/nope" } },
+    })))).toThrow(/unknown pool "nope"/);
+  });
+
+  it("rejects a subagent target naming an unknown provider at load time", () => {
+    expect(() => loadConfig(write("subbadprov.json", base({
+      routing: { default: "nim/m", subagents: { opus: "ghost/m" } },
+    })))).toThrow(/unknown provider "ghost"/);
+  });
+
+  it("rejects a pool member that references another pool (no recursion)", () => {
+    expect(() => loadConfig(write("poolinpool.json", base({
+      routing: { default: "nim/m", pools: { a: ["nim/m"], b: ["pool/a"] } },
+    })))).toThrow(/cannot reference another pool/);
+  });
 });
 
 describe("subagent-aware routing", () => {

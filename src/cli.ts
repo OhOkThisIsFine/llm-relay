@@ -296,7 +296,15 @@ export async function runModels(): Promise<void> {
  * does not serve — non-blocking (fire-and-forget) so it never delays listen().
  */
 export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void> {
-  const rawSpecs = [cfg.routing.default, ...Object.values(cfg.routing.tiers)];
+  // Pools and subagent targets are the offload path — they need this warning at least as
+  // much as tiers do. `pool/<name>` refs skip harmlessly below (no provider named "pool");
+  // their members are covered via routing.pools.
+  const rawSpecs = [
+    cfg.routing.default,
+    ...Object.values(cfg.routing.tiers),
+    ...Object.values(cfg.routing.pools ?? {}),
+    ...Object.values(cfg.routing.subagents ?? {}),
+  ];
   const specs: string[] = [];
   for (const s of rawSpecs) {
     if (Array.isArray(s)) specs.push(...s);

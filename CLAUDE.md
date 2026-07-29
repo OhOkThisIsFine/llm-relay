@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 217 tests / 26 files)
+npm test               # vitest run  (currently 226 tests / 26 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -95,6 +95,10 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
 
 Offline / unit-test-safe (no external creds):
 - `live-demo.mjs` — runs the compiled CLI against a local flaky backend + stub reshaper. Good smoke test.
+- `install-skill.mjs` — npm `postinstall` hook: copies `skills/llm-relay/SKILL.md` to
+  `~/.claude/skills/llm-relay/` on GLOBAL installs only (env var or global-tree path detection);
+  a repo-local `npm install` never touches `~/.claude`. `--force` overrides for manual runs.
+  Ships in the package, so the self-updater refreshes the skill on every upgrade.
 
 Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compatible provider):
 - `nim-front.mjs` — run the compiled proxy fronting a live backend end-to-end.
@@ -133,6 +137,17 @@ test stale code.
   subagent silently falls back to normal routing — safe (passthrough) but **silent**, so nothing
   will alert you. Re-verify with the capture recipe in
   [docs/subagent-routing.md](docs/subagent-routing.md#re-verifying).
+- **Pool refs (`pool/<name>`) are legal in `routing.tiers`, `routing.default` and
+  `routing.subagents`,** expanded by `expandPoolSpecs()` at resolve time and validated at config
+  load (pool-aware `assertSpecResolvable`). Pool members themselves must be provider specs —
+  pool-in-pool is rejected at load.
+- **Reshaper transport failures THROW (`ReshaperTransportError`), refusals return.** That
+  distinction is what makes `FailoverReshaper` real: it advances only on throws. Converting a
+  timeout/5xx into a `refuse` result (the pre-0.8 behaviour) silently disabled reshaper failover.
+  `repair()` catches the throw and fails clean (`outcome: "failed"`).
+- **The breaker records failure on EVERY retriable error response (429/5xx/400/404),** including
+  on the last candidate — `test/server.test.ts` "circuit breaker accounting" pins that a
+  single-candidate 429 is never recorded as a success.
 - **Offload is off by default and an absent `routing.offload` is false.** Don't "helpfully" default
   it on when a `subagents` map exists — that was the 0.3.x behaviour and it silently changed which
   vendor answered every built-in subagent. Two tests pin this (`test/config.test.ts` "offload

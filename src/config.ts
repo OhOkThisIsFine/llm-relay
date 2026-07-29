@@ -214,17 +214,10 @@ function detectTier(model: string): string | null {
 function pickSpecs(model: string | null, cfg: Config): string[] {
   if (model) {
     const slash = model.indexOf("/");
-    if (slash !== -1 && model.slice(0, slash) === POOL_PREFIX) {
-      const pool = cfg.routing.pools?.[model.slice(slash + 1)];
-      // An unknown pool must NOT silently fall through to routing.default — that is exactly the
-      // "succeeded against a much weaker model than you asked for" failure. Fail loudly instead.
-      if (!pool) {
-        throw new RoutingError(
-          `no pool "${model.slice(slash + 1)}" configured (available: ${Object.keys(cfg.routing.pools ?? {}).join(", ") || "none"})`,
-        );
-      }
-      return pool;
-    }
+    // Pools are checked before providers so the reserved `pool/` prefix can never be
+    // shadowed (config load also rejects a provider named "pool"). Expansion — and the
+    // loud unknown-pool error — happens in expandPoolSpecs.
+    if (slash !== -1 && model.slice(0, slash) === POOL_PREFIX) return [model];
     if (slash !== -1 && cfg.providers[model.slice(0, slash)]) return [model];
     const tier = detectTier(model);
     if (tier && cfg.routing.tiers[tier]) {
@@ -233,6 +226,35 @@ function pickSpecs(model: string | null, cfg: Config): string[] {
     }
   }
   return Array.isArray(cfg.routing.default) ? cfg.routing.default : [cfg.routing.default];
+}
+
+/**
+ * Expand any `pool/<name>` spec into that pool's candidate list. Applied to whatever
+ * pickSpecs chose, so pools work uniformly whether addressed directly by the request,
+ * from routing.tiers/default, or via routing.subagents. Pool members themselves are
+ * provider specs only (config load rejects pool-in-pool), so no recursion.
+ *
+ * An unknown pool must NOT silently fall through to routing.default — that is exactly the
+ * "succeeded against a much weaker model than you asked for" failure. Fail loudly instead.
+ */
+function expandPoolSpecs(specs: string[], cfg: Config): string[] {
+  const out: string[] = [];
+  for (const s of specs) {
+    const slash = s.indexOf("/");
+    if (slash === -1 || s.slice(0, slash) !== POOL_PREFIX) {
+      out.push(s);
+      continue;
+    }
+    const name = s.slice(slash + 1);
+    const pool = cfg.routing.pools?.[name];
+    if (!pool) {
+      throw new RoutingError(
+        `no pool "${name}" configured (available: ${Object.keys(cfg.routing.pools ?? {}).join(", ") || "none"})`,
+      );
+    }
+    out.push(...pool);
+  }
+  return out;
 }
 
 /** Split a "provider/model" spec into its parts (model may contain further slashes). */
@@ -267,7 +289,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
  * Resolve an inbound `model` to an array of concrete targets (primary + fallbacks).
  */
 export function resolveTargets(model: string | null, cfg: Config): ResolvedTarget[] {
-  const specs = pickSpecs(model, cfg);
+  const specs = expandPoolSpecs(pickSpecs(model, cfg), cfg);
   let targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
 
   // Prioritize targets with active keys or keyless local providers
@@ -501,6 +523,11 @@ function parseRouting(
       if (arr.length === 0) {
         throw new Error(`config.routing.pools.${k} must contain at least one valid spec string`);
       }
+      // Members are provider specs only — pool-in-pool would make expansion recursive.
+      const nested = arr.find((s) => s.startsWith(`${POOL_PREFIX}/`));
+      if (nested) {
+        throw new Error(`config.routing.pools.${k} member "${nested}" — a pool cannot reference another pool`);
+      }
       pools[k] = arr;
     }
   }
@@ -520,21 +547,37 @@ function parseRouting(
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
 
-  // Fail loudly at load time if any spec names an unknown provider.
-  assertSpecResolvable(routing.default, providers, "routing.default");
+  // Fail loudly at load time if any spec names an unknown provider or pool.
+  assertSpecResolvable(routing.default, providers, pools, "routing.default");
   for (const [tier, spec] of Object.entries(tiers)) {
-    assertSpecResolvable(spec, providers, `routing.tiers.${tier}`);
+    assertSpecResolvable(spec, providers, pools, `routing.tiers.${tier}`);
   }
   for (const [pool, specs] of Object.entries(pools)) {
-    assertSpecResolvable(specs, providers, `routing.pools.${pool}`);
+    assertSpecResolvable(specs, providers, {}, `routing.pools.${pool}`);
+  }
+  for (const [tier, spec] of Object.entries(subagents)) {
+    assertSpecResolvable(spec, providers, pools, `routing.subagents.${tier}`);
   }
   return routing;
 }
 
-function assertSpecResolvable(spec: string | string[], providers: Record<string, ProviderConfig>, where: string): void {
+function assertSpecResolvable(
+  spec: string | string[],
+  providers: Record<string, ProviderConfig>,
+  pools: Record<string, string[]>,
+  where: string,
+): void {
   const specs = Array.isArray(spec) ? spec : [spec];
   for (const s of specs) {
     const { provider, model } = splitSpec(s);
+    if (provider === POOL_PREFIX) {
+      if (!model || !pools[model]) {
+        throw new Error(
+          `config.${where} "${s}" names unknown pool "${model ?? ""}" (available: ${Object.keys(pools).join(", ") || "none"})`,
+        );
+      }
+      continue;
+    }
     const p = providers[provider];
     if (!p) throw new Error(`config.${where} "${s}" names unknown provider "${provider}"`);
     if (p.kind === "openai" && !model) throw new Error(`config.${where} "${s}" needs a model id for openai provider "${provider}"`);

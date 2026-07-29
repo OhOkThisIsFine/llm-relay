@@ -125,6 +125,11 @@ llm-relay
 llm-relay keys
 ```
 
+A global install also drops a **Claude Code skill** at `~/.claude/skills/llm-relay/SKILL.md` — an
+operating guide (addressing pools/models, the offload switch, `@relay:` directives, reading the
+candidates table, failure modes) that Claude loads on demand. It refreshes automatically on every
+upgrade; local/dev installs never touch `~/.claude`.
+
 ### Staying current
 
 Every start (except `help` and `version`) compares the running version against the npm registry —

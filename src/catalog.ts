@@ -88,8 +88,6 @@ export class ModelCatalog {
   private refreshing = new Set<string>();
   /** In-flight blocking fetches (cold start / forced) — dedups concurrent requests. */
   private pending = new Map<string, Promise<string[]>>();
-  /** Limits harvested by the most recent `fetch()`, handed to the Entry by its caller. */
-  private lastLimits: Record<string, ModelLimits> = {};
 
   constructor(opts: { ttlMs?: number; cachePath?: string | null } = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
@@ -159,8 +157,8 @@ export class ModelCatalog {
 
     const p = (async () => {
       try {
-        const models = await this.fetch(cfg, opts.fetchFn ?? fetch);
-        this.mem.set(name, { fetchedAt: now, models, limits: this.lastLimits });
+        const { models, limits } = await this.fetch(cfg, opts.fetchFn ?? fetch);
+        this.mem.set(name, { fetchedAt: now, models, limits });
         this.saveDisk();
         return models;
       } catch {
@@ -183,8 +181,8 @@ export class ModelCatalog {
     this.refreshing.add(name);
     void (async () => {
       try {
-        const models = await this.fetch(cfg, fetchFn ?? fetch);
-        this.mem.set(name, { fetchedAt: Date.now(), models, limits: this.lastLimits });
+        const { models, limits } = await this.fetch(cfg, fetchFn ?? fetch);
+        this.mem.set(name, { fetchedAt: Date.now(), models, limits });
         this.saveDisk();
       } catch {
         /* keep the stale entry; next list retries */
@@ -241,9 +239,14 @@ export class ModelCatalog {
     return isEmpty(l) ? null : l;
   }
 
-  private async fetch(cfg: ProviderConfig, fetchFn: typeof fetch): Promise<string[]> {
+  /** Returned together so concurrent fetches for different providers can never cross-assign
+   *  one provider's limits to another's cache entry (which shared mutable state used to allow). */
+  private async fetch(
+    cfg: ProviderConfig,
+    fetchFn: typeof fetch,
+  ): Promise<{ models: string[]; limits: Record<string, ModelLimits> }> {
     // Anthropic-kind backends have no OpenAI-style /models list we consume.
-    if (cfg.kind !== "openai") return [];
+    if (cfg.kind !== "openai") return { models: [], limits: {} };
     const key = cfg.authEnv ? process.env[cfg.authEnv]?.trim() : undefined;
     const headers: Record<string, string> = {};
     if (key) {
@@ -255,15 +258,16 @@ export class ModelCatalog {
     if (!res.ok) throw new Error(`models fetch HTTP ${res.status}`);
     const j = (await res.json()) as { data?: Array<Record<string, unknown>> };
     const records = j.data ?? [];
-    this.lastLimits = {};
+    const limits: Record<string, ModelLimits> = {};
     for (const rec of records) {
       if (typeof rec?.id !== "string") continue;
       const l = limitsFromRecord(rec);
-      if (!isEmpty(l)) this.lastLimits[rec.id] = l;
+      if (!isEmpty(l)) limits[rec.id] = l;
     }
-    return records
+    const models = records
       .map((m) => m.id)
       .filter((s): s is string => typeof s === "string")
       .sort();
+    return { models, limits };
   }
 }
