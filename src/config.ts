@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
-import { resolveAuthEnv } from "./authEnv.js";
+import { resolveAuthEnv, keyIsPresent } from "./authEnv.js";
 
 export type Mode = "detect" | "repair" | "strict";
 
