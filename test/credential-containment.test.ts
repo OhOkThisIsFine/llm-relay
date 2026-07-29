@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { credentialState, keyIsPresent, resolveAuthEnv } from "../src/authEnv.js";
+import {
+  buildAuthHeaders,
+  credentialState,
+  keyIsPresent,
+  readCredential,
+  resolveAuthEnv,
+} from "../src/authEnv.js";
 
 /**
  * Pins ARC-c9155ca2-2 / SEC-a5e9156b: containment was inferred from key presence
@@ -57,5 +63,79 @@ describe("credential containment is declared, not inferred", () => {
     expect(r.name).toBe("NVIDIA_API_KEY");
     expect(r.viaAlias).toBe(false);
     expect(r.candidates).not.toContain("TOTALLY_UNRELATED_API_KEY");
+  });
+});
+
+describe("readCredential", () => {
+  it("returns the trimmed value only when the credential is present", () => {
+    expect(readCredential("K", { K: "  sk-live  " })).toBe("sk-live");
+    expect(readCredential("K", { K: "   " })).toBeUndefined();
+    expect(readCredential("K", {})).toBeUndefined();
+  });
+
+  it("returns undefined when no authEnv is declared, without consulting the env", () => {
+    // A passthrough declares nothing; it must not pick up an ambient key.
+    expect(readCredential(undefined, { ANTHROPIC_API_KEY: "sk-ant-ambient" })).toBeUndefined();
+  });
+
+  it("agrees with credentialState on every input", () => {
+    const cases: Array<[string | undefined, NodeJS.ProcessEnv]> = [
+      [undefined, {}],
+      [undefined, { K: "sk" }],
+      ["K", {}],
+      ["K", { K: "" }],
+      ["K", { K: "  " }],
+      ["K", { K: "sk" }],
+    ];
+    for (const [declared, env] of cases) {
+      const hasValue = readCredential(declared, env) !== undefined;
+      expect(hasValue).toBe(credentialState(declared, env) === "declared-present");
+    }
+  });
+});
+
+describe("buildAuthHeaders is the single construction site", () => {
+  it("injects the credential into the DECLARED header", () => {
+    expect(buildAuthHeaders("sk-live", "x-api-key")).toEqual({ "x-api-key": "sk-live" });
+    expect(buildAuthHeaders("sk-live", "authorization")).toEqual({ authorization: "Bearer sk-live" });
+  });
+
+  it("builds NOTHING for an absent or blank credential", () => {
+    // The builder, not the caller, is what keeps an empty `x-api-key` or a bare
+    // `Bearer` off the wire — that is the point of having one construction site.
+    for (const header of ["x-api-key", "authorization"] as const) {
+      expect(buildAuthHeaders(undefined, header)).toEqual({});
+      expect(buildAuthHeaders("", header)).toEqual({});
+      expect(buildAuthHeaders("   ", header)).toEqual({});
+      expect(buildAuthHeaders("\t\n", header)).toEqual({});
+    }
+  });
+
+  it("trims the value, so a key pasted with a trailing newline still authenticates", () => {
+    expect(buildAuthHeaders(" sk-live\n", "x-api-key")).toEqual({ "x-api-key": "sk-live" });
+    expect(buildAuthHeaders(" sk-live\n", "authorization")).toEqual({ authorization: "Bearer sk-live" });
+  });
+
+  it("prefixes Bearer idempotently", () => {
+    // Three existing sites accept a value that already carries the prefix;
+    // double-prefixing it would break them on migration.
+    expect(buildAuthHeaders("Bearer sk-live", "authorization")).toEqual({ authorization: "Bearer sk-live" });
+    expect(buildAuthHeaders("  Bearer sk-live  ", "authorization")).toEqual({ authorization: "Bearer sk-live" });
+    // x-api-key is sent verbatim — it has no prefix convention.
+    expect(buildAuthHeaders("Bearer sk-live", "x-api-key")).toEqual({ "x-api-key": "Bearer sk-live" });
+  });
+
+  it("emits exactly one credential header, never both", () => {
+    expect(Object.keys(buildAuthHeaders("sk-live", "x-api-key"))).toEqual(["x-api-key"]);
+    expect(Object.keys(buildAuthHeaders("sk-live", "authorization"))).toEqual(["authorization"]);
+  });
+
+  it("composes with readCredential end to end", () => {
+    const env = { NVIDIA_API_KEY: " nvapi-xyz \n" };
+    expect(buildAuthHeaders(readCredential("NVIDIA_API_KEY", env), "authorization")).toEqual({
+      authorization: "Bearer nvapi-xyz",
+    });
+    // A declared-but-unset credential yields no header at all.
+    expect(buildAuthHeaders(readCredential("MISSING_KEY", env), "authorization")).toEqual({});
   });
 });

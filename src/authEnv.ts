@@ -96,6 +96,72 @@ export function credentialState(
 }
 
 /**
+ * Read a declared provider credential, normalised.
+ *
+ * Returns the trimmed value when the credential is PRESENT (per `keyIsPresent`) and
+ * `undefined` otherwise, so a caller cannot accidentally hold a whitespace-only
+ * string that is truthy to `if (key)` but blank on the wire. Every credential read
+ * should go through here rather than open-coding `env[name]?.trim()` — that
+ * open-coding is what let the presence predicate drift between call sites.
+ */
+export function readCredential(
+  declaredAuthEnv: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (!declaredAuthEnv) return undefined;
+  const raw = env[declaredAuthEnv];
+  return keyIsPresent(raw) ? raw!.trim() : undefined;
+}
+
+/**
+ * Which header a provider's credential is injected into.
+ *
+ * Structurally identical to `AuthHeader` in `config.ts` and freely assignable in
+ * both directions. It is redeclared here rather than imported so this module keeps
+ * ZERO dependency on `config.ts` — `config.ts` imports this one, and `tier-data.ts`
+ * already exists as a separate module for exactly that reason.
+ */
+export type AuthHeaderName = "x-api-key" | "authorization";
+
+/**
+ * THE construction site for a provider credential header.
+ *
+ * Returns `{}` when the credential is absent, so the builder — not each caller —
+ * is what guarantees a blank key never reaches the wire as an empty `x-api-key` or
+ * a bare `Bearer`. Callers merge the result; they must not test the key themselves.
+ *
+ * Two normalisations, both deliberate:
+ * - The value is trimmed. A key pasted into `~/.llm-relay/.env` with a trailing
+ *   newline is a valid key that 401s, which reads as "my key is bad".
+ * - `Bearer ` prefixing is idempotent. Three of the existing sites already accept a
+ *   value that carries its own `Bearer ` prefix; double-prefixing it would break
+ *   them on migration.
+ *
+ * ⚠ It obeys the DECLARED `authHeader` and never consults `provider.kind`. Three
+ * current sites (`key-checker.ts`, `ping/ping.ts`, `pool-health.ts`) additionally
+ * force `x-api-key` on any `kind: "anthropic"` provider, which silently discards an
+ * explicit `authHeader: "authorization"`. `config.ts` already defaults an
+ * anthropic-kind provider's `authHeader` to `x-api-key`, so migrating those sites is
+ * behaviour-preserving in every case EXCEPT that explicit override — where honouring
+ * the config is the correct answer. It is called out rather than encoded so the
+ * change is a visible decision, not a silent one.
+ *
+ * Non-credential companions (`anthropic-version`, `Content-Type`) stay with the
+ * caller: this function builds the auth header and nothing else.
+ */
+export function buildAuthHeaders(
+  key: string | undefined,
+  authHeader: AuthHeaderName,
+): Record<string, string> {
+  if (!keyIsPresent(key)) return {};
+  const value = key!.trim();
+  if (authHeader === "authorization") {
+    return { authorization: value.startsWith("Bearer ") ? value : `Bearer ${value}` };
+  }
+  return { "x-api-key": value };
+}
+
+/**
  * Pick the env-var name this provider's key actually lives under. Falls back to the
  * declared name when nothing is set, so "missing key" diagnostics still name the
  * variable the config asked for.

@@ -13,6 +13,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { keyIsPresent } from "./authEnv.js";
 
 export interface DotEnvResult {
   /** Path consulted, whether or not it existed. */
@@ -60,7 +61,10 @@ export function loadEnvFile(path: string = defaultEnvPath(), env: NodeJS.Process
     return result;
   }
   for (const [k, v] of Object.entries(parseDotEnv(text))) {
-    if ((env[k] ?? "").length > 0) {
+    // The shared presence predicate, not a local `.length > 0`: a whitespace-only
+    // exported variable is ABSENT, so it must not shadow a real key in the file.
+    // Presence has exactly one definition in this codebase.
+    if (keyIsPresent(env[k])) {
       result.skipped.push(k);
       continue;
     }

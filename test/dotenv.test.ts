@@ -59,6 +59,17 @@ describe("loadEnvFile", () => {
     expect(env.BLANK).toBe("fromfile");
   });
 
+  // Presence has ONE definition (`keyIsPresent`), so a whitespace-only exported
+  // variable is absent here too and must not shadow a real key in the file.
+  it("treats a whitespace-only existing value as unset", () => {
+    writeFileSync(file, "SPACES=fromfile\n");
+    const env: NodeJS.ProcessEnv = { SPACES: "   " };
+    const res = loadEnvFile(file, env);
+    expect(env.SPACES).toBe("fromfile");
+    expect(res.loaded).toEqual(["SPACES"]);
+    expect(res.skipped).toEqual([]);
+  });
+
   it("is a no-op when the file does not exist", () => {
     const env: NodeJS.ProcessEnv = {};
     const res = loadEnvFile(join(dir, "nope.env"), env);
