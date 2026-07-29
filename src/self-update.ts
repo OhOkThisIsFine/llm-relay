@@ -1,20 +1,24 @@
 /**
  * Version currency: nobody should unknowingly run a stale llm-relay.
  *
- * Every start compares the running version against the registry (cached, short
- * timeout, fail-open). If a newer version exists:
+ * A start whose caller classified it as `mutating` compares the running version
+ * against the registry (cached, short timeout, fail-open). If a newer version
+ * exists:
  *   - a globally-installed copy updates itself and re-execs into the new build;
  *   - any other copy (dev checkout, npx, local dependency) is told, with the
  *     exact command, and continues on the old version.
+ * A `read-only` invocation — the default — never consults the registry at all,
+ * so a status query is never the moment the global install gets replaced.
  *
  * The update is a clean replace: npm installs the new version, then any bin
  * shim that belonged to the OLD package but is not a bin of the new one is
  * deleted, so a renamed/dropped bin never leaves a dangling `.cmd`/`.ps1`
- * behind on the PATH.
+ * behind on the PATH. The working install is never removed before its
+ * replacement is on local disk (see `installGlobalUpdate`).
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -27,6 +31,19 @@ const CHECK_TIMEOUT_MS = 2500;
 export const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export type InstallKind = "global" | "dev" | "managed";
+
+/**
+ * How the CALLER classified this invocation. A `read-only` command (a status
+ * query, a help screen) must never be the moment a global package is replaced
+ * and the process re-execed; only a `mutating` one may be.
+ *
+ * This module deliberately cannot derive the classification itself: the
+ * subcommand table lives in `cli.ts`, which already imports this module, so
+ * importing that table back would be a cycle. It arrives as a RUNTIME
+ * PARAMETER instead, and its absence means `read-only` — this module never
+ * guesses that an invocation is a safe moment to update.
+ */
+export type CommandEffect = "read-only" | "mutating";
 
 export interface UpdateCache {
   checkedAt: number;
@@ -262,12 +279,138 @@ export function pruneStaleShims(binDir: string | null, previous: string[], curre
 
 const notify = (msg: string) => process.stderr.write(`llm-relay: ${msg}\n`);
 
-/** True when this invocation should consult the registry at all. */
-export function shouldCheckUpdates(argv: string[], env: NodeJS.ProcessEnv): boolean {
+/**
+ * True when this invocation should consult the registry at all.
+ *
+ * The decision is the CALLER's: `classification` says whether this invocation
+ * is a moment at which replacing the global install and re-execing is
+ * acceptable. It defaults to `read-only`, so a caller that has not classified
+ * its command yet gets the safe answer — a status query like `llm-relay keys`
+ * must not rewrite the user's global install underneath them.
+ *
+ * `argv` may only ever SUPPRESS the check (help/version stay instant and
+ * offline even if the caller classified the invocation as mutating). It can
+ * never promote one, so this module cannot decide on its own that an update is
+ * safe here.
+ */
+export function shouldCheckUpdates(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  classification: CommandEffect = "read-only",
+): boolean {
   if (env[SUPPRESS_ENV]) return false;
+  if (classification !== "mutating") return false;
   const arg = argv[2];
   if (arg === "version" || arg === "help") return false;
   return !argv.slice(1).some((a) => /^--?(version|v|help|h)(=|$)/.test(a));
+}
+
+/** The seams `installGlobalUpdate` needs, so it can be exercised without touching a real install. */
+export interface GlobalInstallDeps {
+  /** Run npm. Takes an ARGV ARRAY — never a command string (see `npm()`). */
+  run: (args: string[]) => { ok: boolean; stdout: string; stderr: string };
+  /** Create a scratch dir for the proof tarball, or "" when one cannot be made. */
+  stage: () => string;
+  /** Absolute paths of the tarballs sitting in a staging dir. */
+  staged: (dir: string) => string[];
+  /** Remove a staging dir. */
+  discard: (dir: string) => void;
+  /** Delete the shims of bins the new version will not re-declare. */
+  pruneShims: (previous: string[]) => void;
+  notify: (msg: string) => void;
+}
+
+export interface GlobalInstallOutcome {
+  ok: boolean;
+  /** npm's stderr from the attempt that decided the outcome. */
+  stderr: string;
+  /**
+   * True only in the one state that must never be reported as "continuing on
+   * the old version": the working global package was removed and neither its
+   * replacement nor the old version could be put back.
+   */
+  missingInstall: boolean;
+}
+
+/**
+ * Install `latest` over the current global package.
+ *
+ * The EEXIST branch used to `npm uninstall -g` the WORKING package and then
+ * retry the install; a transient registry or network failure on that retry left
+ * the user with no binary at all, while stderr claimed we were "continuing on"
+ * the version that had just been deleted. This binary sits in the path of every
+ * agent session, so that blast radius is total.
+ *
+ * The removal is therefore REORDERED behind a proof: `npm pack` puts the exact
+ * replacement tarball on local disk first. If that fails, nothing is removed
+ * and the working install is untouched. If it succeeds the reinstall reads that
+ * local file, so it no longer depends on the registry at all — and a rollback to
+ * `current` is still attempted if even the local install fails, so the only way
+ * to end with no install is for three npm invocations in a row to fail.
+ */
+export function installGlobalUpdate(
+  latest: string,
+  current: string,
+  previousBins: string[],
+  deps: GlobalInstallDeps,
+): GlobalInstallOutcome {
+  const attempt = deps.run(["install", "-g", `${PACKAGE_NAME}@${latest}`]);
+  if (attempt.ok) return { ok: true, stderr: "", missingInstall: false };
+  // Any other failure never removed anything: the working install still stands.
+  if (!/EEXIST/i.test(attempt.stderr)) return { ok: false, stderr: attempt.stderr, missingInstall: false };
+
+  // A shim npm does not consider its own (left by a link, a rename, or a
+  // half-finished install) blocks the overwrite. Clearing it means removing the
+  // copy that currently works, so fetch the replacement BEFORE touching it.
+  deps.notify("existing bin shims block the overwrite; staging a clean reinstall");
+  const stage = deps.stage();
+  if (!stage) return { ok: false, stderr: attempt.stderr, missingInstall: false };
+  try {
+    const packed = deps.run(["pack", `${PACKAGE_NAME}@${latest}`, "--pack-destination", stage]);
+    const tarball = packed.ok ? deps.staged(stage)[0] : undefined;
+    if (!tarball) {
+      // The replacement is not in hand — do NOT remove the working install.
+      return { ok: false, stderr: packed.stderr || attempt.stderr, missingInstall: false };
+    }
+    deps.run(["uninstall", "-g", PACKAGE_NAME]);
+    deps.pruneShims(previousBins);
+    const clean = deps.run(["install", "-g", tarball]);
+    if (clean.ok) return { ok: true, stderr: "", missingInstall: false };
+    // Last resort: put back exactly the version that was working a moment ago.
+    deps.notify(`clean reinstall failed; restoring ${current}`);
+    const restored = deps.run(["install", "-g", `${PACKAGE_NAME}@${current}`]);
+    return { ok: false, stderr: clean.stderr, missingInstall: !restored.ok };
+  } finally {
+    deps.discard(stage);
+  }
+}
+
+function makeStageDir(): string {
+  try {
+    return mkdtempSync(join(tmpdir(), "llm-relay-update-"));
+  } catch {
+    return "";
+  }
+}
+
+function stagedTarballs(dir: string): string[] {
+  try {
+    return readdirSync(dir)
+      .filter((f) => f.endsWith(".tgz"))
+      .sort()
+      .map((f) => join(dir, f));
+  } catch {
+    return [];
+  }
+}
+
+function discardStageDir(dir: string): void {
+  if (!dir) return;
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* a scratch dir we cannot delete is not worth failing an update over */
+  }
 }
 
 /**
@@ -296,18 +439,24 @@ export async function ensureUpToDate(now = Date.now()): Promise<void> {
 
   notify(`update available — ${current} → ${latest}; updating this global install…`);
   const previousBins = binNames(readPackageJson(root));
-  let install = npm(["install", "-g", `${PACKAGE_NAME}@${latest}`]);
-  if (!install.ok && /EEXIST/i.test(install.stderr)) {
-    // A shim npm does not consider its own (left by a link, a rename, or a
-    // half-finished install) blocks the overwrite. Clear the install out and
-    // lay it down fresh rather than leaving the user pinned to an old build.
-    notify("existing bin shims block the overwrite; reinstalling clean");
-    npm(["uninstall", "-g", PACKAGE_NAME]);
-    pruneStaleShims(globalBinDir(), previousBins, []);
-    install = npm(["install", "-g", `${PACKAGE_NAME}@${latest}`]);
-  }
+  const install = installGlobalUpdate(latest, current, previousBins, {
+    run: npm,
+    stage: makeStageDir,
+    staged: stagedTarballs,
+    discard: discardStageDir,
+    pruneShims: (previous) => {
+      pruneStaleShims(globalBinDir(), previous, []);
+    },
+    notify,
+  });
   if (!install.ok) {
-    notify(`self-update failed (${install.stderr.split("\n")[0] ?? "npm error"}); continuing on ${current}`);
+    const reason = install.stderr.split("\n")[0] || "npm error";
+    notify(
+      install.missingInstall
+        ? `self-update failed (${reason}) AND the global install could not be restored — ` +
+            `run "npm install -g ${PACKAGE_NAME}@latest" to reinstall the CLI`
+        : `self-update failed (${reason}); continuing on ${current} (the global install is unchanged)`,
+    );
     return;
   }
 
