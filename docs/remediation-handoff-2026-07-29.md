@@ -99,3 +99,75 @@ Each owned by the module that owns the file, gated on its consumer landing. None
 - `test/setup-claude.test.ts` writes the developer's REAL `claude_desktop_config.json`.
   `SetupOptions.configDir` only redirects the env VALUE written, never `targetPath`, so closing it
   needs a source-level seam — it is not test-only work despite being filed under the tests lens.
+
+## Pending work that is NOT from the audit
+
+Two feature requests were made mid-run. Both are unstarted, both were scoped against real source,
+and both should land as their OWN commits — they touch files inside the remediation's module scopes,
+and burying a feature in a 400-finding diff makes both unreviewable.
+
+### 1. `leave_me_alone` provider-suppression list
+
+`~/.llm-relay/config.json` is npm-proof (never touched by reinstall), so it is the right home for a
+list of providers the user has told the agent to stop prompting them to configure:
+
+```json
+"leave_me_alone": ["nim", "ollama"]
+```
+
+Verified design constraints:
+
+- `config.ts` does **not** reject unknown top-level keys today, so the field is backward compatible
+  and an older binary simply ignores it.
+- Validation must **tolerate names matching no currently-known provider.** A provider can be removed
+  and re-added; erroring on an unknown name would break a working config — reintroducing exactly the
+  staleness problem that storing only the negative space avoids. This is the whole point of the
+  design: persist the suppression list, never a full roster.
+- The consumer is `getOnboardingStatusList` (`src/onboarding.ts:18-33`) and its renderer at `:42-60`,
+  which today prints `⚪ Not Configured` plus a `👉 Get your 100% FREE key here:` line for every
+  keyless free provider. That is the nagging to suppress.
+- Suppressed providers are dropped from the **prompting** output but must still appear in factual
+  surfaces (`llm-relay keys`, `/registry`). Silencing a nudge is not hiding state, and the relay's
+  honesty invariants lean that way. *(Operator has not explicitly confirmed this call.)*
+
+Files: `src/config.ts`, `src/onboarding.ts`, possibly `src/cli.ts` for a setter. Ships with a test.
+
+### 2. Skill install registers itself in the global `CLAUDE.md`
+
+Extend `scripts/install-skill.mjs` so a GLOBAL install also registers llm-relay in
+`~/.claude/CLAUDE.md`, not only `~/.claude/skills/llm-relay/SKILL.md`.
+
+Hard constraints, driven by what is actually on the operator's machine (332 hand-authored lines,
+37 existing `llm-relay` mentions, no marker blocks):
+
+- Writes MUST be delimited (`<!-- llm-relay:begin -->` / `<!-- llm-relay:end -->`) and must never
+  modify a byte outside them.
+- Idempotent — replace between markers if present, append if not. The self-updater reinstalls
+  globally on every upgrade, so this hook runs often and a naive append duplicates the block.
+- One-time backup (`CLAUDE.md.pre-llm-relay.bak`) before the first write.
+- Keep the block SHORT — a pointer plus a few commands, never a copy of the 225-line SKILL.md.
+  Duplicated prose goes stale and would sit next to the operator's own detailed sections with no
+  signal about which is authoritative.
+- Same global-only gate and same best-effort try/catch as the skill copy, so it can never fail an
+  install. Plus an opt-out (`LLM_RELAY_NO_CLAUDEMD=1`) and a documented removal path.
+- ⚠ Do NOT describe this as required for the skill to work: skills in `~/.claude/skills/` are
+  already auto-discovered via the SKILL.md `description`. This is redundancy for reliability.
+
+File: `scripts/install-skill.mjs` (scripts-and-packaging scope). Test fresh-insert,
+re-install idempotency, and never-touches-outside-markers.
+
+## Where the machine-readable state lives
+
+All under `.audit-tools/remediation/` — **untracked, local-only, 13 MB**:
+
+| File | What |
+|---|---|
+| `intake/contract/approved-findings.json` | the 410 in-scope findings (+9 reinstated merged in) |
+| `disposition-ledger.json` | reconciles all 471: 410 approved + 9 reinstated + 50 noise + 2 excluded |
+| `finding-closure-ledger.json` | per finding: owning modules, phases, `closes_at_phase` |
+| `intake/contract/finalized_module_contracts.json` | 13 module contracts with invariants + seam adjustments |
+| `intake/contract/seam_reconciliation_report.input.json` | 33 cross-module seams with agreed interfaces |
+| `intake/contract/test_validator_plan.input.json` | 164 test specs, paired positive/negative assertions |
+| `intake/contract/module-waves/module_contract_drafting/` | per-module shards carrying the ACYCLIC dependency graph — use this for ordering, not `phase_cut.json` |
+| `dropped-triage.json` | the 58 evidence-free findings triaged 8 real / 50 noise |
+| `strategic-review-digest.md` | all 72 strategic findings as presented for approval |
