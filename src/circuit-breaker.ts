@@ -49,7 +49,17 @@ export class CircuitBreaker {
     return true; // Healthy or cooldown expired
   }
 
-  /** Record a successful completion for a target, resetting its circuit. */
+  /**
+   * Record a successful completion for a target, resetting its circuit.
+   *
+   * ⚠ `ms` defaults to a CONSTANT and every real call site in server.ts used to
+   * omit it, which meant p95/jitter/spike-rate math ran over 500/1000 rather
+   * than over measurements — the provenance-free-number-driving-a-choice
+   * failure this project built benchmarks.ts to prevent. The default survives
+   * only for the probe paths that genuinely have no elapsed time; a request
+   * path that has one MUST pass it. `recordOutcome` is the preferred entry
+   * point precisely because it cannot be called without a measurement.
+   */
   recordSuccess(target: ResolvedTarget | string, ms = 500, quotaPercent?: number | null, now = Date.now()): void {
     const key = this.getKey(target);
     const state = this.getOrCreate(key);
@@ -79,6 +89,46 @@ export class CircuitBreaker {
     } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
       state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
     }
+  }
+
+  /**
+   * Record one request outcome with its MEASURED elapsed time. Preferred over
+   * recordSuccess/recordFailure because `elapsedMs` is required, so a caller
+   * cannot silently fall back to a fabricated constant.
+   */
+  recordOutcome(
+    target: ResolvedTarget | string,
+    outcome: { ok: boolean; elapsedMs: number; status?: number; quotaPercent?: number | null; at?: number },
+  ): void {
+    const now = outcome.at ?? Date.now();
+    if (outcome.ok) {
+      this.recordSuccess(target, outcome.elapsedMs, outcome.quotaPercent, now);
+    } else {
+      this.recordFailure(target, outcome.status, now, outcome.elapsedMs);
+    }
+  }
+
+  /**
+   * Stability for a target whose behaviour has actually been observed, or
+   * `null` when nothing has been measured.
+   *
+   * `null` is not a low score — it means unknown, and callers must render it as
+   * such rather than as healthy. getStabilityScore() below keeps returning 100
+   * for an unseen key so existing callers are unaffected until they migrate,
+   * but that conflation is exactly what let a target whose every probe failed
+   * sort level with a proven-healthy one.
+   */
+  getMeasuredStability(target: ResolvedTarget | string): number | null {
+    const state = this.states.get(this.getKey(target));
+    if (!state || state.pings.length === 0) return null;
+    const score = getStabilityScore(state.pings);
+    return score >= 0 ? score : null;
+  }
+
+  /** True only when this target has at least one recorded observation. */
+  hasObservations(target: ResolvedTarget | string): boolean {
+    const state = this.states.get(this.getKey(target));
+    return !!state && state.pings.length > 0;
   }
 
   /** Get computed stability score (0–100) for a target (returns 100 if untracked). */

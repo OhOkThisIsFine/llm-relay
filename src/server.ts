@@ -344,7 +344,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         res.off("close", onResClose);
         const aborted = controller.signal.aborted;
         const status = aborted ? 504 : 502;
-        globalCircuitBreaker.recordFailure(target, status);
+        globalCircuitBreaker.recordOutcome(target, { ok: false, status, elapsedMs: Date.now() - started });
         recordCall(target, false, started);
 
         // Failover if additional candidates exist
@@ -363,7 +363,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         // A failing response is a breaker failure whether or not another candidate exists —
         // recording "success" on a last-candidate 429/5xx (the common single-candidate case)
         // resets the breaker on every error and it never trips.
-        globalCircuitBreaker.recordFailure(target, backendRes.status);
+        globalCircuitBreaker.recordOutcome(target, { ok: false, status: backendRes.status, elapsedMs: Date.now() - started });
         recordCall(target, false, started);
         if (i < healthyTargets.length - 1) {
           clearTimeout(timer);
@@ -371,7 +371,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           continue; // Failover to next target
         }
       } else {
-        globalCircuitBreaker.recordSuccess(target);
+        globalCircuitBreaker.recordOutcome(target, { ok: true, status: backendRes.status, elapsedMs: Date.now() - started });
         recordCall(target, backendRes.status < 400, started);
       }
 
