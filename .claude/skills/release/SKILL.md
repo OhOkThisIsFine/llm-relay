@@ -14,6 +14,24 @@ misleading `E401`/`E404`; if you see that, you are on the wrong path, not missin
 The whole job is therefore: get `main` green and clean, bump, tag, push the tag, then watch CI and
 confirm the version actually landed.
 
+## What the publish workflow now refuses
+
+The trigger IS the credential (there is no npm token), so the workflow gates itself. Four things
+will stop a tag from publishing, and each one is a *correct* refusal — do not work around them:
+
+- **The tag must be in this repository and match `refs/tags/v*`.** A fork's tag, or any branch
+  push, never starts the job.
+- **The tag's commit must be contained in the default branch.** Tag `main` after the work is
+  merged; a tag cut from a feature branch is refused with `compare status: diverged|ahead`.
+- **The tag must equal `v<package.json version>`.** This is what `npm version` gives you for free
+  and what hand-editing the version field breaks (see the known trap below).
+- **The job runs in the `npm-publish` GitHub environment.** If that environment carries required
+  reviewers, the run *waits for an approval* instead of failing — a release that looks stuck at
+  step 5 is usually this. Approve it in the run's UI, or check
+  Settings → Environments → npm-publish. ⚠ GitHub auto-creates the environment with **no** rules
+  on first use, so its presence in the workflow is not itself proof of a gate; the reviewer and
+  protected-tag rules have to be set in repo settings.
+
 ## Gate: the tree must be clean
 
 Non-negotiable, and check it **first** — a dirty tree means the tag would point at a commit that

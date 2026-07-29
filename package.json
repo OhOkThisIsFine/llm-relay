@@ -33,7 +33,7 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check": "npm run typecheck && npm test",
-    "postinstall": "node scripts/install-skill.mjs || exit 0",
+    "postinstall": "node scripts/install-skill.mjs || node -e \"process.stderr.write('llm-relay: the postinstall hook crashed, so the bundled Claude Code skill was NOT installed. The package itself is fine. Retry with: node scripts/install-skill.mjs --force\\n')\"",
     "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
