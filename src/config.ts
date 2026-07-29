@@ -213,6 +213,12 @@ export interface Config {
   /** Path this config was loaded from. Set by `loadConfig`; absent for hand-built test configs.
    *  Only consumer is the runtime offload toggle, which persists back to the same file. */
   sourcePath?: string;
+  /**
+   * Non-fatal load-time problems (a provider disabled for an unset `${ENV}`, a pool member
+   * dropped with it). Present so startup can print them — a degraded config that boots
+   * silently is how you end up running on one provider without noticing.
+   */
+  warnings?: string[];
 }
 
 const DEFAULT_DESTRUCTIVE = ["rm", "delete", "remove", "push", "force", "overwrite", "drop", "reset"];
@@ -290,7 +296,7 @@ function expandPoolSpecs(specs: string[], cfg: Config): string[] {
 }
 
 /** Split a "provider/model" spec into its parts (model may contain further slashes). */
-function splitSpec(spec: string): { provider: string; model?: string } {
+export function splitSpec(spec: string): { provider: string; model?: string } {
   const slash = spec.indexOf("/");
   if (slash === -1) return { provider: spec };
   return { provider: spec.slice(0, slash), model: spec.slice(slash + 1) };
@@ -383,6 +389,28 @@ function expandEnv(value: string, where: string): string {
   });
 }
 
+/**
+ * Like `expandEnv`, but reports the missing variable names instead of throwing.
+ *
+ * Used ONLY for a provider's `base`. An unset `${ENV}` there used to be fatal, which meant
+ * one optional provider (e.g. Cloudflare, whose URL embeds an account id) could stop the
+ * whole proxy from starting — and since the proxy fronts every client session, that is a
+ * total outage caused by a provider nobody was using. Disabling that one provider with a
+ * loud warning is proportionate; refusing to boot is not.
+ */
+function expandEnvSoft(value: string): { value: string; missing: string[] } {
+  const missing: string[] = [];
+  const out = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => {
+    const v = process.env[name];
+    if (v === undefined) {
+      missing.push(name);
+      return "";
+    }
+    return v;
+  });
+  return { value: out, missing };
+}
+
 function parseAuthHeader(raw: unknown, dflt: AuthHeader): AuthHeader {
   return raw === "authorization" ? "authorization" : raw === "x-api-key" ? "x-api-key" : dflt;
 }
@@ -417,8 +445,10 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     );
   }
 
-  const providers = parseProviders(c.providers);
-  const routing = parseRouting(c.routing, providers, overrides.routeDefault);
+  const warnings: string[] = [];
+  const disabledProviders = new Set<string>();
+  const providers = parseProviders(c.providers, warnings, disabledProviders);
+  const routing = parseRouting(c.routing, providers, overrides.routeDefault, warnings, disabledProviders);
 
   const mode = normalizeMode(c.mode);
 
@@ -465,10 +495,15 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     repair: { maxAttempts, destructiveTools },
     log: { level, file },
     sourcePath: path,
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
 
-function parseProviders(raw: unknown): Record<string, ProviderConfig> {
+function parseProviders(
+  raw: unknown,
+  warnings: string[] = [],
+  disabled: Set<string> = new Set(),
+): Record<string, ProviderConfig> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new Error(`config.providers (object of named providers) is required`);
   }
@@ -481,10 +516,21 @@ function parseProviders(raw: unknown): Record<string, ProviderConfig> {
     if (typeof p.base !== "string") {
       throw new Error(`config.providers.${name}.base (string URL) is required`);
     }
+    // An unset ${ENV} in `base` disables just this provider — see expandEnvSoft.
+    const expanded = expandEnvSoft(p.base);
+    if (expanded.missing.length > 0) {
+      warnings.push(
+        `provider "${name}" DISABLED — base references unset env var ` +
+          `${expanded.missing.map((n) => `\${${n}}`).join(", ")}. ` +
+          `Set it and restart, or remove the provider. Everything else still works.`,
+      );
+      disabled.add(name);
+      continue;
+    }
     const kind: Kind = p.kind === "openai" ? "openai" : "anthropic";
     const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
     out[name] = {
-      base: expandEnv(p.base, `providers.${name}.base`).trim().replace(/\/+$/, ""),
+      base: expanded.value.trim().replace(/\/+$/, ""),
       kind,
       authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
       timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
@@ -506,6 +552,8 @@ function parseRouting(
   raw: unknown,
   providers: Record<string, ProviderConfig>,
   overrideDefault: string | undefined,
+  warnings: string[] = [],
+  disabledProviders: Set<string> = new Set(),
 ): Routing {
   const r = (typeof raw === "object" && raw !== null ? raw : {}) as {
     default?: unknown;
@@ -552,7 +600,17 @@ function parseRouting(
       if (!Array.isArray(v)) {
         throw new Error(`config.routing.pools.${k} must be an array of "provider/model" specs`);
       }
-      const arr = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+      const declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+      // Members of a DISABLED provider are dropped, not fatal — the pool's whole purpose is
+      // surviving the loss of one candidate. A member naming a provider that simply doesn't
+      // exist is still an error below: that's a typo, and silently dropping it would spend
+      // primary quota via the passthrough instead of failing loudly.
+      const arr = declared.filter((s) => {
+        const { provider } = splitSpec(s);
+        if (!disabledProviders.has(provider)) return true;
+        warnings.push(`routing.pools.${k}: dropped "${s}" — provider "${provider}" is disabled`);
+        return false;
+      });
       if (arr.length === 0) {
         throw new Error(`config.routing.pools.${k} must contain at least one valid spec string`);
       }

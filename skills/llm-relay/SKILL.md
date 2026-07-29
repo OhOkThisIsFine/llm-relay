@@ -193,13 +193,29 @@ Ordering exists at three levels; change the right one:
 
 ```bash
 llm-relay models -p nim      # live roster per provider (listed ≠ servable — some listed ids 404)
-llm-relay keys               # provider key health + quota
+llm-relay keys               # are the CREDENTIALS good?
+llm-relay pools --probe      # will each configured MODEL answer? real completion per member
 llm-relay ping               # latency/stability probe across providers
 llm-relay telemetry          # JSON health/quota report
 ```
 
 Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload` (GET/POST),
 `/telemetry`, `/ping`, `/health`.
+
+**`keys` and `pools --probe` answer different questions — you need both.**
+
+- `keys` can be wrong in BOTH directions, which is why it hedges. A 200 from a public
+  `/models` proves nothing about a key (it re-probes anonymously and escalates when needed);
+  and a 401/403 on the escalated probe does not prove a key is bad, because free-tier rosters
+  list premium models a valid key cannot touch. When the probe answers identically with and
+  without credentials, nothing can be concluded and it reports **`UNVERIFIED`** — treat that
+  as "unknown", never as "broken", and do not tell the user to rotate a key on that basis.
+- `pools --probe` is the ground truth for whether a *model* works, and the only thing that
+  catches a member that is configured, catalogued, and dead. **Run it after editing
+  `routing.pools`.** A `DEAD`/`AUTH` member should be removed: pools are strength-ranked, so a
+  dead model can sit at the top and burn a failover hop on every request. `EMPTY` is NOT dead —
+  that is a reasoning model that spent its token budget thinking.
+- Never add a spec to a pool without probing that exact spec first.
 
 ## Failure modes worth knowing
 

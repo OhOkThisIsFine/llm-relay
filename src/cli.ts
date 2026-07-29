@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
+import { loadEnvFile } from "./dotenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
 import { buildDispatch, type DispatchView } from "./dispatch.js";
@@ -88,6 +89,18 @@ Independently of the switch, a dispatcher may offload ONE call by putting
 "@relay: <spec>" on its own line in that subagent's prompt; the line is stripped
 before forwarding, so the model never sees it.
 
+VERIFYING A SETUP — the two checks answer different questions, and the cheap one
+can be confidently wrong:
+  llm-relay keys           are the CREDENTIALS good? Where a provider serves its
+                           /models list publicly, this escalates to an authenticated
+                           probe, because a public 200 says nothing about the key.
+  llm-relay pools --probe  will each configured MODEL actually answer? The only way
+                           to catch a member that is listed and still dead. Run it
+                           after editing routing.pools — nothing else detects this.
+
+Keys are read from the environment, and from ~/.llm-relay/.env if present. A variable
+already set in the environment always wins over the file.
+
 Usage:
   llm-relay [options]                              Start the proxy server (default)
   llm-relay onboard                                Guided setup for 100%-free providers & subscriptions
@@ -95,6 +108,7 @@ Usage:
   llm-relay keys | check-keys                      Check status of all free & subscription keys
   llm-relay telemetry                              Programmatic JSON metrics and quota report
   llm-relay models [-p <name>] [-r]               List live models per provider
+  llm-relay pools [--probe]                        List pool members; --probe tests each for real
   llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
   llm-relay offload [on|off|status]                Turn subagent offload on/off (default: off)
   llm-relay dispatch [lane] [-t <task>]            Which lane to hand a delegated task to next
@@ -243,7 +257,20 @@ export function resolveConfigPath(): string {
   }
 }
 
+let envFileLoaded = false;
+
+/**
+ * Merge `~/.llm-relay/.env` into the environment, once per process, before anything reads
+ * a key or expands a `${ENV}` in the config. Already-set variables win.
+ */
+export function ensureEnvFileLoaded(): void {
+  if (envFileLoaded) return;
+  envFileLoaded = true;
+  loadEnvFile();
+}
+
 export function loadOrExit(): Config {
+  ensureEnvFileLoaded();
   const configPath = resolveConfigPath();
   const overrides: ConfigOverrides = {
     routeDefault: argValue("--default", "-d"),
@@ -251,7 +278,11 @@ export function loadOrExit(): Config {
     listen: argValue("--listen", "-l"),
   };
   try {
-    return loadConfig(configPath, overrides);
+    const cfg = loadConfig(configPath, overrides);
+    for (const w of cfg.warnings ?? []) {
+      process.stderr.write(`llm-relay: ⚠ ${w}\n`);
+    }
+    return cfg;
   } catch (e) {
     process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
     process.exit(1);
@@ -681,6 +712,64 @@ export async function runCandidates(): Promise<void> {
   );
 }
 
+/**
+ * `llm-relay pools` — list pool members; `--probe` sends a real completion to each.
+ *
+ * The listing is cheap and offline. The probe is the only thing that can actually catch a
+ * member that is configured, catalogued, and nonetheless dead — see pool-health.ts.
+ */
+export async function runPools(): Promise<void> {
+  const cfg = loadOrExit();
+  const pools = cfg.routing.pools ?? {};
+  const names = Object.keys(pools);
+  if (names.length === 0) {
+    process.stdout.write("No pools configured (routing.pools).\n");
+    return;
+  }
+
+  if (!hasFlag("--probe")) {
+    for (const name of names) {
+      process.stdout.write(`\npool/${name} — ${pools[name]!.length} members\n`);
+      for (const spec of pools[name]!) process.stdout.write(`  ${spec}\n`);
+    }
+    process.stdout.write(`\nMembership only — no liveness checked. Run "llm-relay pools --probe" to test each for real.\n`);
+    return;
+  }
+
+  process.stdout.write("Probing every pool member with a real completion...\n\n");
+  const results = await probeAllPools(cfg);
+  const icon: Record<MemberVerdict, string> = {
+    live: "LIVE",
+    empty: "EMPTY",
+    auth: "AUTH",
+    rate_limited: "429",
+    missing: "DEAD",
+    error: "ERR",
+  };
+  let dead = 0;
+  for (const name of names) {
+    process.stdout.write(`pool/${name}\n`);
+    for (const r of results.filter((x) => x.pool === name)) {
+      if (DEAD_VERDICTS.has(r.verdict)) dead++;
+      const lat = r.latencyMs !== undefined ? `${r.latencyMs}ms` : "";
+      process.stdout.write(
+        `  ${icon[r.verdict].padEnd(6)} ${r.spec.padEnd(50)} ${lat.padEnd(8)} ${r.detail ?? ""}\n`,
+      );
+    }
+    process.stdout.write("\n");
+  }
+
+  const live = results.filter((r) => r.verdict === "live").length;
+  process.stdout.write(`${live}/${results.length} live.\n`);
+  if (dead > 0) {
+    process.stdout.write(
+      `⚠ ${dead} member(s) will never answer (DEAD/AUTH). Remove them from routing.pools — a pool\n` +
+        `  ranked by strength can otherwise put a dead model first and burn a failover hop on every call.\n`,
+    );
+  }
+}
+
+import { probeAllPools, DEAD_VERDICTS, type MemberVerdict } from "./pool-health.js";
 import { runInteractiveOnboarding } from "./onboarding.js";
 import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
 import { getTelemetryReport } from "./telemetry.js";
@@ -752,6 +841,13 @@ export function main(): void {
   if (arg2 === "candidates") {
     runCandidates().catch((e) => {
       process.stderr.write(`llm-relay candidates: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
+  if (arg2 === "pools") {
+    runPools().catch((e) => {
+      process.stderr.write(`llm-relay pools: ${(e as Error).message}\n`);
       process.exit(1);
     });
     return;

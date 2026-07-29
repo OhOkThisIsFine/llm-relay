@@ -100,7 +100,8 @@ llm-relay
 | `llm-relay onboard` | Run guided setup wizard for 100%-free providers & subscription keys |
 | `llm-relay setup claude-desktop` (or `desktop`) | Auto-patch `claude_desktop_config.json` for Claude Desktop |
 | `llm-relay setup claude-cli` | Display & verify Claude CLI wrapper configuration |
-| `llm-relay keys` (or `check-keys`) | Validate provider API keys and display signup URLs & quota |
+| `llm-relay keys` (or `check-keys`) | Validate provider API **credentials** (escalates past a public `/models` to an authenticated probe) |
+| `llm-relay pools [--probe]` | List pool members; `--probe` sends a real completion to each — the only check that catches a listed-but-dead **model** |
 | `llm-relay telemetry` | Output live JSON telemetry, stability scores, and quota metrics |
 | `llm-relay models [-p <name>] [-r]` | Query live `/models` catalog per provider (`-p` filter, `-r` force refresh) |
 | `llm-relay ping [-p <name>]` | Perform live health, latency & quota probe across providers |
@@ -123,7 +124,33 @@ llm-relay
 
 # Check key status & signup URLs:
 llm-relay keys
+
+# Check that every model in your pools actually answers:
+llm-relay pools --probe
 ```
+
+**New here?** [docs/QUICKSTART.md](docs/QUICKSTART.md) is a staged setup guide written to be
+handed straight to an AI assistant ("set this up for me"), covering free providers, the offload
+switch, local models, and using your other CLI subscriptions as fallback lanes.
+
+### Verifying a setup — two checks, two different questions
+
+`keys` answers *are my credentials good?* `pools --probe` answers *will the models I configured
+actually answer?* Both are needed, and the cheap one can be confidently wrong in either
+direction:
+
+- A 200 from a provider's `/models` proves nothing when that endpoint is **public** — a revoked
+  key still returns the full catalogue. `keys` now re-probes anonymously and escalates to an
+  authenticated completion when it must.
+- A 401/403 on that probe does **not** prove the key is bad — free-tier rosters list premium
+  models a valid key cannot touch. The probe is compared against the same request sent with no
+  credentials: a different status means the key authenticated; an identical one means nothing
+  could be concluded, reported as `UNVERIFIED` rather than as a bad key.
+- Neither of those can see a model that is configured, catalogued, and dead. Only
+  `pools --probe` can.
+
+Keys are read from the environment and, if present, from `~/.llm-relay/.env` (one `KEY=value`
+per line). **A variable already set in the environment always wins over the file.**
 
 A global install also drops a **Claude Code skill** at `~/.claude/skills/llm-relay/SKILL.md` — an
 operating guide (addressing pools/models, the offload switch, `@relay:` directives, reading the

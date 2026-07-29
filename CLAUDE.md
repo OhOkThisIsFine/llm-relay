@@ -20,10 +20,13 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 226 tests / 26 files)
+npm test               # vitest run  (currently 282 tests / 30 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
+
+llm-relay keys         # are the CREDENTIALS good?
+llm-relay pools --probe # will each configured MODEL actually answer? (the only real liveness check)
 
 npx vitest run test/repair.test.ts             # one file
 npx vitest run -t "refuses destructive"        # one test by name
@@ -39,6 +42,8 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | File | Responsibility |
 |---|---|
 | `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`, `offload`, `candidates`). `offload`/`candidates` talk to a **running** proxy over loopback when there is one, so a toggle takes effect without a restart and the table gets warm health data. |
+| `dotenv.ts` | Loads `~/.llm-relay/.env` into `process.env` at startup, **never overwriting an already-set variable**. `onboard` always wrote this file and nothing ever read it, so a wizard-saved key worked for one shell and then "stopped working". The real environment wins because it is the more explicit signal. |
+| `pool-health.ts` | `llm-relay pools --probe` — sends a REAL completion to every pool member. Config-time validation cannot see a model that is listed and still dead (de-listed behind the scenes, gated to a paid tier, routed to a missing function), and that is exactly how a pool ends up with one live member and paper failover. Probes at 400 max_tokens because reasoning models return an empty 200 at a low cap — `empty` is a distinct verdict from `missing`, not a synonym. |
 | `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
 | `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **subagent-aware routing** (`isSubagentRequest` reads the `cc_is_subagent=true` marker Claude Code stamps into `system`; `subagentSpec` applies `routing.subagents` — **only when `routing.offload` is on, default false** — or an `@relay:` directive read ONLY from the last text block of `messages[0]`, which works with the switch off), reshaper auto-synthesis. |
@@ -62,7 +67,7 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
 | `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value (`provider`) → another provider's figure for the same id (`reference`, indicative only) → **null**. There is no hardcoded-table rung: the old blanket 128k/4096 guess was deleted in 0.7.0 because a caller cannot tell a guess from a measurement. Plus `estimateRequestTokens()`. |
 | `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. Re-exports `loadTierData` from `tier-data.ts`. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
-| `key-checker.ts` | Pre-flight validator checking provider API key health and remaining rate-limit quota percentages. |
+| `key-checker.ts` | Pre-flight key validator. Providers are checked **concurrently** (a dozen-plus providers checked serially, one of them a dead local daemon, turns a status command into a multi-minute one). A 200 from `/models` is NOT accepted as proof: several providers serve that endpoint publicly, so it is re-probed anonymously, and only a genuine 401/403 there makes it evidence. Otherwise it escalates to an authenticated completion **on a model this config actually routes to that provider** — a catalogue's first entry is often a premium SKU the key legitimately cannot touch. A 401/403 on that probe is compared against the same request sent anonymously: a *different* status proves the key authenticated (the wall is the model's plan), an *identical* one proves nothing and reports `unverified` rather than accusing a working key. |
 | `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). |
 | `setup-claude.ts` | Configuration generator for Claude Desktop (`claude_desktop_config.json`) and Claude CLI wrappers. |
 | `ping/cadence.ts` | Adaptive background monitoring loop (`PingLoop`) with dynamic mode transitions (`speed`, `normal`, `slow`, `forced`). |
@@ -83,6 +88,10 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
 - **Provider/model agnostic.** No hardcoded provider URLs, models, or keys in `src/`. Everything
   comes from config: `backend.base`, `backend.model`, `backend.kind`, `backend.authEnv` (env var
   NAME, not the key), `backend.authHeader`. NIM/llama in `src/` are doc-comment examples only.
+- **Never assert a key is bad without evidence that distinguishes it from an entitlement
+  wall.** Free-tier rosters list premium models; a 401/403 on one of them says nothing about
+  the credential. `unverified` exists precisely so the check can decline to conclude — a false
+  "your key is broken" sends the user to rotate a perfectly good key.
 - **Loopback only.** Startup refuses a non-loopback bind (it holds a provider key, does no auth).
 - **Logs are metadata only** — never request/response headers or bodies.
 - **Destructive tool calls are refused, never fabricated** (repair output may run under
@@ -120,6 +129,14 @@ test stale code.
 
 ## Gotchas (things that will bite you)
 
+- **An unset `${ENV}` in a provider `base` disables THAT provider, it does not abort startup.**
+  The proxy fronts every client session, so a fatal error there turns one unused optional
+  provider into a total outage. Pool members belonging to a disabled provider are dropped with
+  a warning; a member naming a provider that was never declared is still a hard error, because
+  that is a typo and silently dropping it would spend primary quota via the passthrough.
+  Losing every provider, or emptying a pool entirely, is still fatal. `Config.warnings` carries
+  these so startup can print them — a degraded config that boots silently is how you end up
+  running on one provider without noticing.
 - **Worktrees.** Work may happen in a git worktree under `.claude/worktrees/…`. Edit and run
   tests **in the worktree path**, not the main checkout — they have separate working trees. vitest
   run from the wrong root will silently pick up the other copy's `src/`.
@@ -188,7 +205,7 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 217 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 282 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 **Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code
