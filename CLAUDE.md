@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 194 tests / 25 files)
+npm test               # vitest run  (currently 207 tests / 26 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -38,10 +38,12 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 
 | File | Responsibility |
 |---|---|
-| `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`). |
+| `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`, `offload`, `candidates`). `offload`/`candidates` talk to a **running** proxy over loopback when there is one, so a toggle takes effect without a restart and the table gets warm health data. |
 | `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
-| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **subagent-aware routing** (`isSubagentRequest` reads the `cc_is_subagent=true` marker Claude Code stamps into `system`; `subagentSpec` applies `routing.subagents` or an `@relay:` directive read ONLY from the last text block of `messages[0]`), reshaper auto-synthesis. |
+| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **subagent-aware routing** (`isSubagentRequest` reads the `cc_is_subagent=true` marker Claude Code stamps into `system`; `subagentSpec` applies `routing.subagents` — **only when `routing.offload` is on, default false** — or an `@relay:` directive read ONLY from the last text block of `messages[0]`, which works with the switch off), reshaper auto-synthesis. |
+| `offload.ts` | The subagent-offload switch. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites only `routing.offload` in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
+| `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
 | `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`). |
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
 | `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
@@ -130,6 +132,13 @@ test stale code.
   subagent silently falls back to normal routing — safe (passthrough) but **silent**, so nothing
   will alert you. Re-verify with the capture recipe in
   [docs/subagent-routing.md](docs/subagent-routing.md#re-verifying).
+- **Offload is off by default and an absent `routing.offload` is false.** Don't "helpfully" default
+  it on when a `subagents` map exists — that was the 0.3.x behaviour and it silently changed which
+  vendor answered every built-in subagent. Two tests pin this (`test/config.test.ts` "offload
+  defaults to OFF", `test/offload.test.ts` "flips routing for the NEXT request").
+- **Don't add a blended "best target" score to `candidates.ts`.** The dimensions are deliberately
+  separate; averaging them buries the judgement the reader is there to make. Tests assert no
+  `score`/`rank` field and that composites stay under `sortInputs`.
 - **Never route subagents by editing `routing.tiers`.** A subagent asking for `haiku` and a human
   picking Haiku are byte-identical requests, so a tier→provider mapping silently drops the human's
   own conversation onto a weak model. Tiers stay on the passthrough; `routing.subagents` is the
@@ -137,13 +146,14 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 194 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 207 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
-**Subagent offload is live** (0.3.0): a Claude Code subagent — including built-ins like Explore, with
-no agent file — runs on a non-Anthropic provider while the human's own conversation stays on an
-Anthropic passthrough. Verified end-to-end on the wire. Design + evidence:
-[docs/subagent-routing.md](docs/subagent-routing.md).
+**Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code
+subagent — including built-ins like Explore, with no agent file — runs on a non-Anthropic provider
+while the human's own conversation stays on an Anthropic passthrough. Verified end-to-end on the
+wire. Turn it on with `llm-relay offload on` (no restart); choose a target with `llm-relay
+candidates`. Design + evidence: [docs/subagent-routing.md](docs/subagent-routing.md).
 
 Full live probe sweep: [docs/probe-sweep-2026-07-28.md](docs/probe-sweep-2026-07-28.md) (every script,
 every endpoint). Everything it found is now fixed; `multimodal-probe.mjs` is 5/5 green live.

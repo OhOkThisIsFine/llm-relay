@@ -3,9 +3,13 @@
 How llm-relay sends Claude Code **subagents** to non-Anthropic providers while the human's own
 conversation keeps reaching real Anthropic — with no agent files and no model ids in prompts.
 
-Shipped in **0.3.0**. Config: `routing.subagents`. Code: `isSubagentRequest()`, `readRelayDirective()`,
-`subagentSpec()` in [`src/config.ts`](../src/config.ts), applied in `handle()` in
-[`src/server.ts`](../src/server.ts).
+Shipped in **0.3.0**; **off by default since 0.4.0**. Config: `routing.subagents` gated by
+`routing.offload`. Code: `isSubagentRequest()`, `readRelayDirective()`, `subagentSpec()` in
+[`src/config.ts`](../src/config.ts), applied in `handle()` in [`src/server.ts`](../src/server.ts).
+
+> **Offload is opt-in.** With `routing.offload` false (the default) a subagent routes exactly like
+> the human's own conversation. Turn it on with `llm-relay offload on`; pick a destination with
+> `llm-relay candidates`. See [The switch](#the-switch).
 
 ---
 
@@ -67,9 +71,10 @@ For a request carrying the marker, the destination resolves in this order:
 
 1. **`@relay: <spec>`** on its own line in the dispatcher's prompt. `<spec>` is any normal spec —
    `pool/<name>` or `<provider>/<model>`. The line is **stripped before forwarding**, so the model
-   never sees it.
+   never sees it. Works whether or not the switch is on: it is the per-call opt-in.
 2. **`routing.subagents[<tier>]`** — tier substring-matched from the inbound Claude model id.
-3. **`routing.subagents.default`**.
+   *Requires `routing.offload`.*
+3. **`routing.subagents.default`**. *Requires `routing.offload`.*
 4. Otherwise unchanged — normal tier/default routing.
 
 Requests **without** the marker never consult any of this. That is the invariant the whole feature
@@ -77,11 +82,52 @@ rests on.
 
 ```jsonc
 "routing": {
+  "offload":   false,   // master switch — subagents behave normally until this is on
   "tiers":     { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
   "subagents": { "opus": "pool/reasoning", "sonnet": "pool/coding", "haiku": "pool/fast", "default": "pool/coding" },
   "pools":     { "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"] }
 }
 ```
+
+## The switch
+
+`routing.offload` defaults to **false**, and an absent key is false — a config written before 0.4.0
+does not start offloading on upgrade.
+
+Offloading every subagent the moment a `subagents` map exists was the 0.3.x behaviour, and it is the
+wrong default: it silently changes *who is answering* for every built-in agent (Explore,
+general-purpose, every one-off dispatch), with no per-call signal that it happened. Which model
+answers your reconnaissance is a decision worth making on purpose, so it is now a decision.
+
+```bash
+llm-relay offload status
+```
+
+`on` / `off` reach the running proxy over loopback (`POST /offload`), so the change applies to the
+**next request with no restart**, and are persisted back to `config.json` so they survive one. With
+no proxy listening the CLI writes the file and says so. `GET /offload` reports state without
+changing it.
+
+## Choosing a destination
+
+`llm-relay candidates` (or `GET /candidates`) is the decision table — every offload target with its
+dimensions **side by side and un-blended**:
+
+| Group | Columns |
+|---|---|
+| Capability | SWE-bench, HumanEval, LiveCodeBench, Arena Elo, BFCL (tool-use), context window |
+| Live behaviour | verdict, avg / p95 latency, jitter, uptime %, last ping code |
+| Availability now | provider quota %, circuit-breaker open/closed + cooldown, listed in live catalog |
+| Observed traffic | calls, successes, average latency through this proxy |
+
+Nothing is ranked or averaged and the order is config order. Capability, latency and remaining quota
+trade off differently per task — "cheapest thing that can do it" and "best available" are different
+questions, and one blended number answers neither. The two composites that already exist in the
+product (`benchmarkSort`'s quality score, the breaker's stability score) appear under `sortInputs`,
+labelled as what they drive rather than as a recommendation.
+
+The CLI prefers a running proxy so it can use warm ping history and real breaker state; run it cold
+and the live-behaviour columns are empty because nothing has been measured yet.
 
 This gives a dispatcher three levels of control, all optional:
 
@@ -155,3 +201,7 @@ curl -s localhost:8791/v1/messages -H 'content-type: application/json' \
 
 # without marker: identical body, directive ignored, goes to the passthrough
 ```
+
+The directive path is used here on purpose: it works with the switch off, so this check tests the
+marker rather than the switch. To exercise the switch itself, `llm-relay offload on` first and drop
+the `@relay:` line — the same bogus-pool 400 then proves `routing.subagents` is being consulted.

@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
+import { offloadState, setOffload, type OffloadState } from "./offload.js";
+import { buildCandidates, type CandidatesView } from "./candidates.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
 import { currentVersion, ensureUpToDate, shouldCheckUpdates } from "./self-update.js";
@@ -69,11 +71,21 @@ A provider with kind:"anthropic" and NO authEnv is a passthrough: the caller's o
 credentials are forwarded untouched. Point the tiers at one to keep real Claude
 traffic on real Anthropic while pool/* requests go to other providers.
 
-Claude Code SUBAGENTS (flagged cc_is_subagent=true on the wire) additionally consult
-routing.subagents{} — a tier -> spec map — so subagents can run on other providers
-while the human's own conversation stays on passthrough. A dispatcher may pin one
-call by putting "@relay: <spec>" on its own line in the subagent's prompt; the line
-is stripped before forwarding.
+Claude Code SUBAGENTS (flagged cc_is_subagent=true on the wire) may be OFFLOADED to
+other providers while the human's own conversation stays on passthrough. This is OFF
+by default and is a deliberate choice, not a background behaviour:
+
+  llm-relay offload on         routing.subagents{} (a tier -> spec map) starts applying
+  llm-relay offload off        subagents route like any other request (the default)
+  llm-relay offload status     current switch state and where each tier goes
+  llm-relay candidates         every dimension of every target, side by side, unranked
+
+The toggle reaches a running proxy over loopback, so it takes effect on the next
+request without a restart, and is persisted to the config file.
+
+Independently of the switch, a dispatcher may offload ONE call by putting
+"@relay: <spec>" on its own line in that subagent's prompt; the line is stripped
+before forwarding, so the model never sees it.
 
 Usage:
   llm-relay [options]                              Start the proxy server (default)
@@ -83,6 +95,8 @@ Usage:
   llm-relay telemetry                              Programmatic JSON metrics and quota report
   llm-relay models [-p <name>] [-r]               List live models per provider
   llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
+  llm-relay offload [on|off|status]                Turn subagent offload on/off (default: off)
+  llm-relay candidates [-p <name>]                 Un-blended decision table for offload targets
   llm-relay help | --help | -h                     Show this help documentation
   llm-relay version | --version | -v               Show version number
 
@@ -95,6 +109,8 @@ Commands:
   telemetry                                        Output JSON telemetry & quota report
   models                                           Query live /models catalog across providers
   ping                                             Probe model latency, stability & quota metrics
+  offload on | off | status                        Master switch for subagent offload (off by default)
+  candidates                                       Benchmarks, health, quota & breaker state per target
   help                                             Show help documentation
   version                                          Print package version
 
@@ -123,6 +139,8 @@ Proxy Server Endpoints:
   POST /v1/messages/count_tokens                   Local token estimation for OpenAI backends
   POST /v1/chat/completions                        OpenAI-compatible front (OpenAI in, OpenAI out)
   GET /registry                                    Full JSON view of providers, routing & capabilities
+  GET /candidates [?provider=]                     Per-target raw benchmarks, health, quota, breaker state
+  GET|POST /offload                                Read or set the subagent-offload switch {"enabled":bool}
   GET /telemetry                                   Live JSON telemetry, quota & stability scores for Claude
   GET /ping                                        Trigger health probe pass & query ping mode summary
   GET /health                                      Diagnostic JSON summary of provider availability & health
@@ -175,6 +193,11 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
         coding: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"],
         fast: ["nim/meta/llama-3.1-8b-instruct", "nim/openai/gpt-oss-20b"],
       },
+      // Where subagents go WHEN offload is on. Inert while `offload` is false.
+      subagents: { opus: "pool/coding", sonnet: "pool/coding", haiku: "pool/fast", default: "pool/coding" },
+      // Master switch, off by default: subagents route like everything else until you run
+      // `llm-relay offload on`. Silently answering as a different vendor's model has to be chosen.
+      offload: false,
     },
     mode: "repair",
     repair: {
@@ -393,6 +416,144 @@ export async function runCheckKeys(): Promise<void> {
   }
 }
 
+/**
+ * Talk to a RUNNING proxy if there is one. The offload switch has to reach the live process to
+ * take effect without a restart, and `candidates` gets better data from it (warm ping history,
+ * real breaker state) than a cold CLI process can compute. null = no proxy listening.
+ */
+async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise<unknown | null> {
+  try {
+    const res = await fetch(`http://${cfg.host}:${cfg.port}${path}`, {
+      ...init,
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** `llm-relay offload [on|off|status]` — the subagent-offload master switch. */
+export async function runOffload(arg: string | undefined): Promise<void> {
+  const cfg = loadOrExit();
+  const want = arg === "on" || arg === "enable" ? true : arg === "off" || arg === "disable" ? false : null;
+
+  if (want === null && arg !== undefined && arg !== "status") {
+    process.stderr.write(`llm-relay offload: expected "on", "off" or "status" (got "${arg}")\n`);
+    process.exit(1);
+  }
+
+  const live = (await tryServer(
+    cfg,
+    "/offload",
+    want === null
+      ? undefined
+      : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: want }) },
+  )) as OffloadState | null;
+
+  // No proxy listening: still honour the change by writing the file, but say plainly that
+  // nothing is running to apply it to.
+  const state = live ?? (want === null ? offloadState(cfg) : setOffload(cfg, want));
+
+  process.stdout.write(`subagent offload: ${state.enabled ? "ON" : "OFF"}\n`);
+  // Only a real change reports where it went; a status read must not imply it wrote anything.
+  if (want !== null) {
+    process.stdout.write(
+      live ? "  applied to the running proxy (effective now)\n" : "  no proxy listening — config file only\n",
+    );
+    if (!state.persisted) {
+      process.stdout.write(`  ⚠ NOT persisted${state.persistError ? ` (${state.persistError})` : ""} — reverts on restart\n`);
+    } else if (state.configPath) {
+      process.stdout.write(`  persisted to ${state.configPath}\n`);
+    }
+  } else {
+    process.stdout.write(`  source: ${live ? "running proxy" : `${state.configPath ?? "config"} (no proxy listening)`}\n`);
+  }
+
+  if (state.enabled) {
+    const entries = Object.entries(state.subagents);
+    if (entries.length === 0) {
+      process.stdout.write("  ⚠ routing.subagents is empty — offload is on but routes nowhere\n");
+    } else {
+      process.stdout.write("\n  tier      -> target\n");
+      for (const [tier, spec] of entries) process.stdout.write(`  ${tier.padEnd(9)} -> ${spec}\n`);
+    }
+  } else {
+    process.stdout.write("\n  Subagents route like any other request (Anthropic passthrough).\n");
+    process.stdout.write("  An `@relay: <spec>` line in a subagent prompt still offloads that one call.\n");
+  }
+}
+
+function fmt(v: number | null | undefined, suffix = ""): string {
+  return v === null || v === undefined ? "-" : `${v}${suffix}`;
+}
+
+/** `llm-relay candidates` — every dimension of every offload target, side by side, unranked. */
+export async function runCandidates(): Promise<void> {
+  const cfg = loadOrExit();
+  const only = argValue("--provider", "-p");
+  const q = only ? `?provider=${encodeURIComponent(only)}` : "";
+
+  let view = (await tryServer(cfg, `/candidates${q}`)) as CandidatesView | null;
+  if (!view) {
+    view = await buildCandidates(cfg, { catalog: new ModelCatalog(), ...(only ? { provider: only } : {}) });
+  }
+
+  if (view.candidates.length === 0) {
+    process.stdout.write("No offload targets configured (routing.pools / routing.subagents are empty).\n");
+    return;
+  }
+
+  process.stdout.write(`Offload targets — offload is ${view.offload_enabled ? "ON" : "OFF"}\n`);
+  process.stdout.write(`${view.note}\n\n`);
+
+  const head =
+    "target".padEnd(34) +
+    "pools / tiers".padEnd(30) +
+    "live".padEnd(6) +
+    "SWE".padEnd(6) +
+    "LCB".padEnd(6) +
+    "Elo".padEnd(6) +
+    "BFCL".padEnd(7) +
+    "verdict".padEnd(11) +
+    "p95".padEnd(9) +
+    "up%".padEnd(6) +
+    "quota".padEnd(7) +
+    "breaker".padEnd(9) +
+    "ctx";
+  process.stdout.write(head + "\n" + "-".repeat(head.length) + "\n");
+
+  for (const c of view.candidates) {
+    const tags = [...c.pools, ...c.subagentTiers.map((t) => `@${t}`)].join(",") || "-";
+    const live = c.listed === null ? "?" : c.listed ? "yes" : "NO";
+    const ctx = c.contextLength ? `${Math.round(c.contextLength / 1000)}k` : "-";
+    const breaker = c.breaker.open ? `OPEN ${Math.round(c.breaker.cooldownRemainingMs / 1000)}s` : "closed";
+    process.stdout.write(
+      c.spec.slice(0, 33).padEnd(34) +
+        tags.slice(0, 29).padEnd(30) +
+        live.padEnd(6) +
+        fmt(c.benchmarks.sweBench).padEnd(6) +
+        fmt(c.benchmarks.liveCodeBench).padEnd(6) +
+        fmt(c.benchmarks.arenaElo).padEnd(6) +
+        fmt(c.capability?.bfcl_overall ?? null).padEnd(7) +
+        (c.health?.verdict ?? "-").padEnd(11) +
+        fmt(c.health?.p95Ms ?? null, "ms").padEnd(9) +
+        fmt(c.health?.uptimePct ?? null).padEnd(6) +
+        fmt(c.quotaPercent, "%").padEnd(7) +
+        breaker.padEnd(9) +
+        ctx +
+        "\n",
+    );
+  }
+
+  process.stdout.write(
+    "\nColumns are independent — weigh them yourself. SWE/LCB/Elo/BFCL are capability, " +
+      "verdict/p95/up% are live behaviour, quota/breaker are availability right now.\n" +
+      `Full detail (jitter, observed traffic, max output tokens, sort inputs): curl 127.0.0.1:${cfg.port}/candidates\n`,
+  );
+}
+
 import { runInteractiveOnboarding, printOnboardingGuide } from "./onboarding.js";
 import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
 import { getTelemetryReport } from "./telemetry.js";
@@ -443,6 +604,20 @@ export function main(): void {
   if (arg2 === "models") {
     runModels().catch((e) => {
       process.stderr.write(`llm-relay: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
+  if (arg2 === "offload") {
+    runOffload(arg3).catch((e) => {
+      process.stderr.write(`llm-relay offload: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
+  if (arg2 === "candidates") {
+    runCandidates().catch((e) => {
+      process.stderr.write(`llm-relay candidates: ${(e as Error).message}\n`);
       process.exit(1);
     });
     return;

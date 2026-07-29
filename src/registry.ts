@@ -8,7 +8,7 @@ import type { PingLoop, ModelHealthSummary } from "./ping/cadence.js";
 // Raw leaderboard scores per model — kept verbatim (never collapsed to tiers) so a
 // consumer (e.g. audit-tools dispatch) can weigh them against its own quota/rate/token
 // state to pick a provider+model.
-interface CapabilityScore {
+export interface CapabilityScore {
   bfcl_overall: number | null;
   bfcl_multi_turn: number | null;
   bfcl_irrelevance: number | null;
@@ -51,7 +51,7 @@ export interface RegistryView {
   };
 }
 
-function loadTierData(): { synced_at?: string; models: Array<Record<string, unknown>> } | null {
+export function loadTierData(): { synced_at?: string; models: Array<Record<string, unknown>> } | null {
   try {
     const path = fileURLToPath(new URL("../docs/tier-data.json", import.meta.url));
     const j = JSON.parse(readFileSync(path, "utf8")) as { synced_at?: string; models?: Array<Record<string, unknown>> };
@@ -80,7 +80,10 @@ function toScore(r: Record<string, unknown>): CapabilityScore {
  * miss (null capability) over a wrong score. Consumers wanting a better join use the full
  * dataset in capability_source.models.
  */
-function joinCapability(modelId: string, byNorm: Array<{ norm: string; rec: Record<string, unknown> }>): CapabilityScore | null {
+export function joinCapability(
+  modelId: string,
+  byNorm: Array<{ norm: string; rec: Record<string, unknown> }>,
+): CapabilityScore | null {
   const seg = (modelId.split("/").pop() ?? modelId).toLowerCase().trim();
   if (seg.length < 5) return null;
   const exact = byNorm.find((e) => e.norm === seg);
