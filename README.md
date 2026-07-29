@@ -291,6 +291,9 @@ subagent happens to read redirect its own routing. Both cases are covered by tes
 Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` →
 `subagents.default` → normal routing. Omit `routing.subagents` entirely and nothing changes.
 
+📄 Full design, the wire evidence behind it, and **how to re-verify the marker after a Claude Code
+upgrade**: [docs/subagent-routing.md](docs/subagent-routing.md).
+
 Each provider is `kind:"openai"` (translated Anthropic↔OpenAI via llm-bridge) or
 `kind:"anthropic"` (forwarded as-is). In `repair` mode an openai target reshapes on itself;
 an anthropic provider has no fixed model id to reshape on, so it needs an explicit top-level
