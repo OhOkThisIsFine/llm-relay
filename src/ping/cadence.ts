@@ -3,6 +3,7 @@ import type { ModelCatalog } from "../catalog.js";
 import { pingProviderModel, type PingResult } from "./ping.js";
 import { type PingRecord, getAvg, getP95, getJitter, getStabilityScore, getVerdict, getUptime } from "./metrics.js";
 import { recordProbeResult, getModelsDueForProbe } from "./probe-cache.js";
+import { readCredential } from "../authEnv.js";
 
 export type PingMode = "speed" | "normal" | "slow" | "forced";
 
@@ -128,9 +129,13 @@ export class PingLoop {
     const stabilityScore = getStabilityScore(pings);
     const uptimePct = getUptime(pings);
     const lastPing = pings[pings.length - 1];
+    // A 401 is DOWN. It was excluded here alongside 200 on the theory that the endpoint
+    // answered, but this flag is the availability verdict: a provider with a revoked key
+    // reported "Perfect" and could be preferred over a working one. `getUptime()` already
+    // counts only "200" — this is the signal that disagreed with it.
     const verdict = getVerdict(pings, {
       httpCode: lastPing?.code ?? null,
-      isDown: lastPing ? lastPing.code !== "200" && lastPing.code !== "401" : false,
+      isDown: lastPing ? lastPing.code !== "200" : false,
     });
 
     return {
@@ -152,7 +157,9 @@ export class PingLoop {
     this.refreshAutoPingMode();
 
     for (const [providerName, pCfg] of Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>) {
-      const apiKey = pCfg.authEnv ? process.env[pCfg.authEnv] : undefined;
+      // Via the shared reader, not `process.env[...]` — a whitespace-only value is absent,
+      // and open-coding the presence test is what let three call sites drift apart.
+      const apiKey = readCredential(pCfg.authEnv);
       let modelIds: string[] = [];
 
       try {

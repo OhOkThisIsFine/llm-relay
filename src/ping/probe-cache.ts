@@ -116,7 +116,12 @@ export function recordProbeResult(
     cache.providers[providerKey] = { models: {} };
   }
 
-  const isOk = result.code === "200" || result.code === "401";
+  // A 401 is NOT ok. It used to count as ok here on the theory that the endpoint answered,
+  // but `status` feeds `getModelsDueForProbe`, so a provider whose key was revoked stopped
+  // being re-probed and kept reading as available — able to outrank a working target.
+  // Reachability is not availability; only a 2xx (normalised to "200" by pingProviderModel)
+  // proves this model will actually serve a request.
+  const isOk = result.code === "200";
   const entry: ProbeEntry = {
     modelId,
     status: isOk ? "ok" : "broken",

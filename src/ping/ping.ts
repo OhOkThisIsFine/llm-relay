@@ -1,4 +1,5 @@
 import type { ProviderConfig } from "../config.js";
+import { buildAuthHeaders } from "../authEnv.js";
 
 export const DEFAULT_PING_TIMEOUT_MS = 15000;
 
@@ -75,15 +76,15 @@ export function buildPingRequest(
   options: { disableThinking?: boolean } = {},
 ): { url: string; headers: Record<string, string>; body: Record<string, unknown> } {
   const url = buildPingEndpoint(cfg.base, cfg.kind);
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-
-  if (apiKey) {
-    if (cfg.authHeader === "x-api-key" || cfg.kind === "anthropic") {
-      headers["x-api-key"] = apiKey;
-    } else {
-      headers["authorization"] = apiKey.startsWith("Bearer ") ? apiKey : `Bearer ${apiKey}`;
-    }
-  }
+  // The credential header comes from the shared builder, which returns {} for an absent or
+  // whitespace-only key. It obeys the DECLARED `authHeader` and does not force `x-api-key` on
+  // an anthropic-kind provider the way this site used to — `config.ts` already defaults that,
+  // so the only changed case is an explicit `authHeader: "authorization"`, where honouring the
+  // config is the correct answer.
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...buildAuthHeaders(apiKey, cfg.authHeader),
+  };
 
   if (cfg.kind === "openai") {
     const body: Record<string, unknown> = {

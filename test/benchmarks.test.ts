@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { rankTargetsByBenchmark, getStrength } from "../src/benchmarks.js";
+import { rankTargetsByBenchmark, rankTargetsWithProvenance, getStrength } from "../src/benchmarks.js";
 import { recordModelCall } from "../src/ping/runtime-telemetry.js";
 import type { ResolvedTarget } from "../src/config.js";
 
@@ -21,6 +21,49 @@ describe("benchmarks", () => {
       "openai/gpt-oss-20b",
       "meta/llama-3.1-8b-instruct",
     ]);
+  });
+});
+
+/**
+ * ARC-31833353: the comparator read `getStrength(spec).score` and discarded basis/signals, so a
+ * `neutral` 50 — nothing published about this model at all — ranked identically to a `snapshot` 50
+ * measured across several leaderboards. A provenance-free number was choosing the backend.
+ */
+describe("ranking keeps the provenance that produced the order", () => {
+  const t = (provider: string, model: string): ResolvedTarget => ({
+    provider, base: "http://x", kind: "openai", model, authHeader: "authorization", timeoutMs: 1000,
+  });
+
+  it("reports the basis and signals behind every position", () => {
+    const ranked = rankTargetsWithProvenance([
+      t("nim", "z-ai/glm-5.2"),
+      t("nim", "nobody/has-ever-heard-of-this-xyz"),
+    ]);
+
+    expect(ranked.map((r) => r.spec)).toEqual([
+      "nim/z-ai/glm-5.2",
+      "nim/nobody/has-ever-heard-of-this-xyz",
+    ]);
+    // The scalar never travels alone: each position carries how it was reached.
+    expect(ranked[0]!.strength.basis).toBe("snapshot");
+    expect(ranked[0]!.strength.signalCount).toBeGreaterThan(1);
+    expect(ranked[1]!.strength.basis).toBe("neutral");
+    expect(rankTargetsByBenchmark([t("nim", "z-ai/glm-5.2")]).length).toBe(1);
+  });
+
+  it("breaks an exact tie towards the better-evidenced basis, never by adjusting the score", () => {
+    // Two models nothing is published about both sit at the neutral 50, so they tie on score
+    // and on basis and keep config order — absence of a signal is not a penalty.
+    const a = t("nim", "nobody/unknown-model-a-xyz");
+    const b = t("nim", "nobody/unknown-model-b-xyz");
+    const ranked = rankTargetsWithProvenance([a, b]);
+    expect(ranked.map((r) => r.target)).toEqual([a, b]);
+    expect(ranked.every((r) => r.strength.basis === "neutral")).toBe(true);
+    expect(ranked.every((r) => r.strength.score === 50)).toBe(true);
+
+    // Reversing the input reverses the output: the tie is resolved by config order, which is
+    // only observable because the comparator does not fabricate a difference.
+    expect(rankTargetsWithProvenance([b, a]).map((r) => r.target)).toEqual([b, a]);
   });
 });
 

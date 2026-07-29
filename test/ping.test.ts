@@ -9,7 +9,7 @@ import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { unlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
 
 function testConfig(providers: Record<string, ProviderConfig>): Config {
   return {
@@ -121,6 +121,19 @@ describe("Probe Cache Persistence", () => {
     // m1 is fresh + ok (skipped), m2 is broken (always due), m3 is missing (due)
     expect(due).toEqual(["m2", "m3"]);
   });
+
+  // A 401 used to be recorded as `ok` here on the theory that the endpoint answered. It made a
+  // provider with a revoked key look available AND stopped it being re-probed.
+  it("records a 401 as broken, not as ok", () => {
+    loadProbeCache({ path: tmpPath });
+    const now = Date.now();
+
+    const entry = recordProbeResult("prov1", "unauthorised", { code: "401", ms: 40, quotaPercent: null }, { now, path: tmpPath });
+    expect(entry.status).toBe("broken");
+
+    const due = getModelsDueForProbe("prov1", ["unauthorised"], { now, path: tmpPath });
+    expect(due).toEqual(["unauthorised"]);
+  });
 });
 
 describe("Runtime Telemetry", () => {
@@ -141,6 +154,25 @@ describe("Runtime Telemetry", () => {
 });
 
 describe("PingLoop Cadence", () => {
+  // `recordPing` persists through `recordProbeResult` with no explicit path, which resolves to
+  // ~/.llm-relay/probe-cache.json — the developer's real machine. Redirect the cache root and
+  // re-prime the module-level handle so the whole describe writes into a temp dir instead.
+  let cacheRoot: string;
+  let priorXdg: string | undefined;
+
+  beforeEach(() => {
+    priorXdg = process.env.XDG_CACHE_HOME;
+    cacheRoot = mkdtempSync(join(tmpdir(), "rp-pingloop-"));
+    process.env.XDG_CACHE_HOME = cacheRoot;
+    loadProbeCache();
+  });
+
+  afterEach(() => {
+    if (priorXdg === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = priorXdg;
+    rmSync(cacheRoot, { recursive: true, force: true });
+  });
+
   it("initializes in speed mode and steps through tickOnce", async () => {
     const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
     const mockCatalog: ModelCatalog = {
@@ -156,6 +188,22 @@ describe("PingLoop Cadence", () => {
     const summary = loop.getModelSummary("testProv", "model-1");
     expect(summary.verdict).toBe("Perfect");
     expect(summary.lastPingCode).toBe("200");
+  });
+
+  // The availability verdict used to exclude 401 alongside 200, so a provider whose key had
+  // been revoked reported "Perfect" — while getUptime() on the same pings said 0%.
+  it("reports a 401-only model as down, not Perfect", async () => {
+    const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+    const mockCatalog: ModelCatalog = { list: async () => ["model-1"] } as any;
+    const mockFetch = async () => new Response("{}", { status: 401 });
+
+    const loop = new PingLoop(testConfig({ testProv: pCfg }), mockCatalog, { fetchFn: mockFetch as any });
+    await loop.tickOnce();
+
+    const summary = loop.getModelSummary("testProv", "model-1");
+    expect(summary.lastPingCode).toBe("401");
+    expect(summary.verdict).not.toBe("Perfect");
+    expect(summary.uptimePct).toBe(0);
   });
 });
 

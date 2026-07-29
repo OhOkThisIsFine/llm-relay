@@ -103,8 +103,12 @@ export interface Candidate {
     strengthBasis: StrengthBasis;
     /** How many published signals backed it. 1 is a guess; 5 is a consensus. */
     strengthSignals: string[];
-    /** Drives circuit-breaker candidate ordering. 100 when untracked. */
-    breakerStability: number;
+    /**
+     * Drives circuit-breaker candidate ordering. **null when nothing has been measured** —
+     * it used to report 100 for an untracked target, which made "never probed" and "proven
+     * fast" the same number and the same sort position (INV-TS-7).
+     */
+    breakerStability: number | null;
   };
 }
 
@@ -223,7 +227,9 @@ export async function buildCandidates(
       ...(model ? { model } : {}),
       pools: membership.pools,
       subagentTiers: membership.subagentTiers,
-      hasKey: p?.authEnv ? !!process.env[p.authEnv]?.trim() : true,
+      // The shared presence predicate, not an open-coded `?.trim()`. Three sites disagreed
+      // about whether a whitespace-only key counts as present; this is the single answer.
+      hasKey: p?.authEnv ? keyIsPresent(process.env[p.authEnv]) : true,
       listed,
       capabilityMatch: matched ? { name: matched.rec.norm, match: matched.match } : null,
       health: summary
@@ -280,7 +286,7 @@ export async function buildCandidates(
         strength: strength.score,
         strengthBasis: strength.basis,
         strengthSignals: strength.signals ?? [],
-        breakerStability: breaker.getStabilityScore(spec),
+        breakerStability: breaker.getMeasuredStability(spec),
       },
     });
   }

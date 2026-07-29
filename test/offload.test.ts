@@ -266,7 +266,9 @@ describe("candidates view", () => {
     const cfg = freshConfig("h.json");
     const breaker = new CircuitBreaker();
     const now = 1_000_000;
-    breaker.recordFailure("nim/z-ai/glm-5.2", 429, now);
+    // Mechanical migration off the deleted defaulted writers — same target, same 429, same
+    // timestamp, with the elapsed time the old signature let the caller omit.
+    breaker.recordOutcome("nim/z-ai/glm-5.2", { ok: false, status: 429, elapsedMs: 42, at: now });
 
     const view = await buildCandidates(cfg, { breaker, nowMs: now + 1000 });
     const glm = view.candidates.find((c) => c.spec === "nim/z-ai/glm-5.2")!;

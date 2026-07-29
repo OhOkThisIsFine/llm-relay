@@ -40,8 +40,11 @@ describe("telemetry", () => {
     };
 
     const cb = new CircuitBreaker();
-    cb.recordSuccess("nim", 350, 95);
-    cb.recordFailure("openai", 429, 100000);
+    // Mechanical migration off the deleted defaulted writers; the BARE provider keys are
+    // left exactly as they were, because `CircuitBreaker.getKey()` writing `provider/model`
+    // while /telemetry queries by bare name is OBS-dc5f56e7 and is not this change's fix.
+    cb.recordOutcome("nim", { ok: true, elapsedMs: 350, quotaPercent: 95 });
+    cb.recordOutcome("openai", { ok: false, status: 429, elapsedMs: 350, at: 100000 });
 
     const report = getTelemetryReport(dummyCfg, cb, 100000);
     expect(report.timestamp).toBeDefined();
