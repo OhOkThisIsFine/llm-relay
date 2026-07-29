@@ -4,6 +4,7 @@ import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
 import { getStrength, type StrengthBasis } from "./benchmarks.js";
 import { findTierModel } from "./tier-data.js";
+import { keyIsPresent } from "./authEnv.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
 import { loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";

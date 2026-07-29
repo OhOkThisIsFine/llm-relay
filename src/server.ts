@@ -10,6 +10,7 @@ import {
   type ResolvedTarget,
 } from "./config.js";
 import { MetadataLogger, type RequestLog } from "./log.js";
+import { credentialState } from "./authEnv.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail } from "./emitSse.js";
@@ -776,9 +777,24 @@ function toAnthropicMessage(msg: AssistantMessage, model: string | null): object
   };
 }
 
+/** A provider declared an authEnv whose variable is unset — a configuration error, not a passthrough. */
+class CredentialConfigError extends Error {
+  constructor(provider: string, authEnv: string) {
+    super(`provider "${provider}" declares authEnv ${authEnv} but it is unset or blank`);
+    this.name = "CredentialConfigError";
+  }
+}
+
 function buildForwardHeaders(inbound: IncomingMessage["headers"], target: ResolvedTarget): Record<string, string> {
-  const apiKey = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
-  const stripAuth = !!apiKey;
+  const state = credentialState(target.authEnv);
+  const apiKey = state === "declared-present" ? process.env[target.authEnv!]?.trim() : undefined;
+  // Containment is DECLARED, not inferred from key presence. The old
+  // `stripAuth = !!apiKey` was identically falsy for two opposite configurations —
+  // "no authEnv declared" (an intentional passthrough: forward the caller's own
+  // credential) and "authEnv declared but unset" (a misconfiguration) — so in the
+  // second case the caller's own Anthropic token was forwarded verbatim to a
+  // third-party base URL. Only a real passthrough forwards inbound auth now.
+  const stripAuth = state !== "not-declared";
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(inbound)) {
     const key = k.toLowerCase();
@@ -788,6 +804,12 @@ function buildForwardHeaders(inbound: IncomingMessage["headers"], target: Resolv
     out[key] = Array.isArray(v) ? v.join(", ") : v;
   }
   if (!out["anthropic-version"]) out["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION;
+  if (state === "declared-missing") {
+    // Should be unreachable — resolveTargets drops keyless targets — but thrown
+    // rather than silently proceeding so a routing change that lets one through
+    // fails loudly instead of egressing whatever the caller happened to send.
+    throw new CredentialConfigError(target.provider, target.authEnv!);
+  }
   if (apiKey) {
     if (target.authHeader === "authorization") out["authorization"] = `Bearer ${apiKey}`;
     else out["x-api-key"] = apiKey;

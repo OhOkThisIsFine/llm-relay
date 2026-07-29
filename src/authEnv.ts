@@ -62,6 +62,40 @@ export interface AuthEnvResolution {
 }
 
 /**
+ * Whether a credential value counts as PRESENT. The single predicate — three
+ * call sites used to disagree (config.ts tested Boolean() with no trim while
+ * server.ts and candidates.ts trimmed), so a whitespace-only key read present
+ * to the active-key filter and absent to header construction. That gap is how a
+ * blank credential slipped past containment entirely.
+ */
+export function keyIsPresent(value: string | undefined): boolean {
+  return (value ?? "").trim().length > 0;
+}
+
+/**
+ * Whether a provider's credential handling is DECLARED, and if so whether the
+ * key is actually there.
+ *
+ * ⚠ Derived from the config DECLARATION, never from `resolveAuthEnv` having
+ * returned a name. Those are different questions: the alias list for anthropic
+ * includes ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN, so a provider with NO
+ * declared authEnv — an intentional passthrough — still resolves to a name
+ * whenever either variable happens to be set in the environment. Deriving state
+ * from the name would classify that passthrough as `declared-present`, making it
+ * inject a key and strip the caller's own token: the exact inversion of the one
+ * behaviour a passthrough exists to provide.
+ */
+export type CredentialState = "not-declared" | "declared-present" | "declared-missing";
+
+export function credentialState(
+  declaredAuthEnv: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): CredentialState {
+  if (!declaredAuthEnv) return "not-declared";
+  return keyIsPresent(env[declaredAuthEnv]) ? "declared-present" : "declared-missing";
+}
+
+/**
  * Pick the env-var name this provider's key actually lives under. Falls back to the
  * declared name when nothing is set, so "missing key" diagnostics still name the
  * variable the config asked for.
@@ -72,7 +106,7 @@ export function resolveAuthEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): AuthEnvResolution {
   const candidates = candidateEnvNames(providerName, declared);
-  const found = candidates.find((n) => (env[n] ?? "").trim().length > 0);
+  const found = candidates.find((n) => keyIsPresent(env[n]));
   return {
     name: found ?? declared,
     viaAlias: Boolean(found && found !== declared),
