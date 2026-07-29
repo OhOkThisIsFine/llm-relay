@@ -311,26 +311,41 @@ Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` �
 ### Choosing where to offload (`llm-relay candidates`)
 
 ```
-target                            pools / tiers        live  SWE  LCB  BFCL   arena  rank  verdict  p95    up%  quota  breaker  ctx
-nim/z-ai/glm-5.2                  coding,@opus         yes   42   53   -      1469~  #31   Perfect  310ms  100  84%    closed   128k
-nim/meta/llama-3.1-8b-instruct    fast,@haiku,@fable   yes   -    -    25.83  1211   #308  Perfect  120ms  100  84%    closed   128k
+target                          pools / tiers      str      agentic coding BFCL   arena  $/Mout  verdict  p95    quota  breaker  ctx
+nim/z-ai/glm-5.2                coding,@opus       83.3/4   43.1    68.8   -      -      $2.402  Perfect  310ms  84%    closed   1049k
+nim/moonshotai/kimi-k2.6        coding,@sonnet     77.4/5   30.3    61.8   -      1461   $2.72   Perfect  280ms  84%    closed   262k
+nim/meta/llama-3.1-8b-instruct  fast,@haiku,@fable  9.7/6    0.5     5.4   25.83  1211   $0.08   Perfect  120ms  84%    closed   131k
 ```
 
-Every offload target with its dimensions side by side: capability (SWE-bench, HumanEval,
-LiveCodeBench, BFCL tool-use, Arena rating/rank, context window), live behaviour (verdict, avg/p95
-latency, jitter, uptime), availability right now (provider quota, circuit-breaker state, whether the
-provider still lists the model) and traffic actually observed through the proxy.
+Every offload target with its dimensions side by side: capability from each leaderboard separately,
+live behaviour (verdict, avg/p95 latency, jitter, uptime), availability and cost right now (quota,
+circuit-breaker state, price per million tokens, whether the provider still lists the model), and
+traffic actually observed through the proxy.
 
-A blank cell means **not measured**, not bad. The two capability sources have different coverage:
-SWE-bench/HumanEval/LiveCodeBench come from a hand-maintained table in `benchmarks.ts` that lags the
-roster, while BFCL and Arena come from the synced leaderboard (`npm run sync:tiers`). `~` marks a
-score **borrowed from a similarly-named model** — the leaderboard has no `glm-5.2` row, so those
-numbers are `glm-5.2-max`'s. The JSON carries `capability.matched_name` and `capability.match`
-(`exact` | `fuzzy`) so the substitution is never invisible.
+**Capability comes from `npm run sync:tiers`**, which merges four sources into
+`docs/tier-data.json` (~770 models) — see [docs/capability-sources.md](docs/capability-sources.md):
 
-**Nothing is ranked or averaged** — capability, latency and remaining quota trade off differently
-per task, and one blended number answers neither "cheapest that can do it" nor "best available". The
-composites the proxy itself sorts by are reported under `sortInputs`, labelled as what they drive.
+| Source | Contributes |
+|---|---|
+| OpenRouter | Artificial Analysis intelligence / coding / **agentic** indices, Design Arena Elo, context length, pricing, tool support — and the only source whose ids match routing specs exactly |
+| BFCL | tool-call accuracy, multi-turn, irrelevance detection |
+| LMArena | general preference rating + rank |
+| Aider | polyglot edit benchmark + edit-format compliance |
+
+They **disagree** — the agentic index puts deepseek above kimi while the coding index puts kimi
+above deepseek — which is exactly why each keeps its own column, and why a blank cell means *not
+measured*, never *bad*.
+
+**Nothing is ranked or averaged across dimensions** — capability, latency and remaining quota trade
+off differently per task, and one blended number answers neither "cheapest that can do it" nor "best
+available".
+
+`str` is the single exception, and it exists only because ordering a pool requires an order. It is a
+weighted mean of whatever rank-normalized signals a model actually has (tool-use and agentic ability
+weighted highest — this proxy drives tool loops), and it never appears without its provenance:
+`83.3/4` means four published signals backed it, while `old` (stale hardcoded table), `obs` (this
+proxy's own traffic, ≥5 calls) and `neut` (nothing known) mark the fallbacks. A trailing `?` on `ctx`
+means the value came from the hardcoded table rather than the provider.
 
 `GET /candidates` returns the full JSON (the table shows a subset). The CLI prefers a running proxy
 so the live columns come from warm ping history rather than a cold start.
