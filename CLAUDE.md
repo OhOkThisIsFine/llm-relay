@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 207 tests / 26 files)
+npm test               # vitest run  (currently 209 tests / 26 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -59,7 +59,7 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `benchmarks.ts` | Coding benchmark database (SWE-bench, HumanEval, LiveCodeBench, Arena Elo) and target ranking algorithms. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
 | `metadata.ts` | Lookup table for model context windows, token limits, and prompt token estimation logic. |
-| `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. |
+| `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. `loadTierData()` **memoizes `docs/tier-data.json` + its `byNorm` index on mtime** — three endpoints need it per request; re-reading and re-indexing ~400 rows each time is waste, and mtime keying means `npm run sync:tiers` still lands without a restart. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
 | `key-checker.ts` | Pre-flight validator checking provider API key health and remaining rate-limit quota percentages. |
 | `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). |
 | `setup-claude.ts` | Configuration generator for Claude Desktop (`claude_desktop_config.json`) and Claude CLI wrappers. |
@@ -146,7 +146,7 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 207 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 209 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 **Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code

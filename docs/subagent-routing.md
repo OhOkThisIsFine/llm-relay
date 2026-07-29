@@ -115,7 +115,7 @@ dimensions **side by side and un-blended**:
 
 | Group | Columns |
 |---|---|
-| Capability | SWE-bench, HumanEval, LiveCodeBench, Arena Elo, BFCL (tool-use), context window |
+| Capability | SWE-bench, HumanEval, LiveCodeBench, BFCL (tool-use), Arena rating + rank, context window |
 | Live behaviour | verdict, avg / p95 latency, jitter, uptime %, last ping code |
 | Availability now | provider quota %, circuit-breaker open/closed + cooldown, listed in live catalog |
 | Observed traffic | calls, successes, average latency through this proxy |
@@ -128,6 +128,18 @@ labelled as what they drive rather than as a recommendation.
 
 The CLI prefers a running proxy so it can use warm ping history and real breaker state; run it cold
 and the live-behaviour columns are empty because nothing has been measured yet.
+
+**A blank capability cell means "not measured", not "bad"** — and the two sources have different
+coverage. SWE-bench / HumanEval / LiveCodeBench come from the hand-maintained `BENCHMARK_DB` in
+`benchmarks.ts`, which lags the roster badly (as of 0.4.1 it has no row for deepseek-v4-pro,
+kimi-k2.6 or any gpt-oss model). BFCL and Arena come from `docs/tier-data.json` via `npm run
+sync:tiers`, which covers all of them — BFCL simply hasn't scored the newest models yet.
+
+⚠ Both sources match by substring, so a model with no row of its own can inherit a **different**
+model's scores. The leaderboard join now reports this: `capability.match` is `exact` or `fuzzy` and
+`capability.matched_name` names the row used (`glm-5.2` → `glm-5.2-max`), rendered as `~` in the
+table. `BENCHMARK_DB` has no equivalent provenance — its `glm-5` pattern matches `glm-5.2` silently
+— so treat its columns as family-level indicators, not per-SKU measurements.
 
 This gives a dispatcher three levels of control, all optional:
 
