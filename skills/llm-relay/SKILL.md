@@ -121,15 +121,39 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
 The CLIs' own model lists are the authority on what exists — re-check them rather than trusting
 ids written down anywhere, since a de-listed id fails a whole rung.
 
-### Order
+### Order — ask the relay, don't guess
 
-**A user's own ordering wins. Look for it first**, in `~/.claude/CLAUDE.md` (or a project
-`CLAUDE.md`) — that is where a personal ladder belongs, because **this file is overwritten by
-`npm i -g llm-relay` on every install and upgrade** and any ordering edited into it would be
-silently lost. Never write a user's personal preference here; write it there.
+The ordering is **config, not prose**: `routing.ladder` in `~/.llm-relay/config.json`, an ordered
+list of rungs. Ask for the next lane rather than deciding yourself:
 
-Absent such an instruction, the package default is simply: **relay pools → peer agent CLIs (if
-installed) → Anthropic subagent** — cheapest metered capacity first, primary quota last.
+```bash
+llm-relay dispatch -t "<the task>"     # ordered ladder + the exact command to run
+llm-relay dispatch --json              # same, machine-readable
+```
+
+`next` is the lane to use and `reason` says why. Then:
+
+- **Override with a specific target:** `llm-relay dispatch <lane> -t "<task>"` (or
+  `GET /dispatch?lane=<id>`). Honoured even if that rung is cooling down — you asked for it.
+- **A lane failed on availability** (quota gone, rate-limited, CLI missing): report it and get
+  the next one — `llm-relay dispatch -x <lane>`, or
+  `POST /dispatch {"exhausted":"<lane>","ttlMs":…}`. Rungs sharing a `quota` bucket cool down
+  together; rungs that merely share a binary do not. `{"clear":true}` resets.
+- **Walk manually:** `GET /dispatch?after=<lane>` for the first ready rung past one.
+- **Turn subagent routing on/off:** `llm-relay offload on|off` — `/dispatch` reports the switch
+  state, and flags relay rungs `requiresDirective: true` while it is off, meaning a bare subagent
+  will *not* offload and you must put `@relay: <spec>` in its prompt or flip the switch.
+
+The relay decides order and remembers what is spent; **it never runs a `cli` rung for you** — it
+hands you the command and you execute it. That boundary is deliberate: a CLI agent runs its own
+tool loop and returns only final text, so nothing it produces could serve an HTTP turn.
+
+⚠ Config lives in `~/.llm-relay/config.json`, which npm never touches, so a ladder survives
+reinstalls. **Never write a user's ordering into this skill file** — `postinstall` overwrites it
+from the package on every global install and the edit would be silently lost.
+
+With no `routing.ladder` configured, `/dispatch` says so and expresses no opinion; fall back to
+the user's `CLAUDE.md`, or to relay pools first and primary quota last.
 
 Rules for walking it:
 
@@ -150,12 +174,11 @@ Rules for walking it:
 
 Ordering exists at three levels; change the right one:
 
-- **Which lane is tried first**: it is instructions, not code. Put the ordered list in
-  **`~/.claude/CLAUDE.md`** (all projects) or a project `CLAUDE.md` (one repo) — both are loaded
-  every session and **neither is touched by an npm install**, so the ordering survives reinstalls
-  and upgrades. ⚠ Do *not* put it in `~/.claude/skills/llm-relay/SKILL.md`: `postinstall`
-  overwrites that file from the package on every global install, silently discarding the edit.
-  The user can also reorder per-request in chat ("try codex first for this").
+- **Which lane is tried first** (`routing.ladder` in `~/.llm-relay/config.json`): reorder the
+  array; rung order *is* the ladder. Add `"enabled": false` to park a rung without deleting it.
+  Validated at load — a bad spec, a duplicate id, or a `cli` rung whose `args` lack `{task}`
+  fails at startup, not mid-fallback. ⚠ Never put a personal ordering in
+  `~/.claude/skills/llm-relay/SKILL.md`: `postinstall` overwrites it on every global install.
 - **Which pool a tier lands on** (`routing.subagents` in `~/.llm-relay/config.json`): maps the
   Agent tool's `model` param (opus/sonnet/haiku/…) to a pool or pinned spec. Takes effect on the
   next request; no restart.

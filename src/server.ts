@@ -20,6 +20,7 @@ import { ModelCatalog } from "./catalog.js";
 import { buildRegistry } from "./registry.js";
 import { buildCandidates } from "./candidates.js";
 import { offloadState, setOffload } from "./offload.js";
+import { buildDispatch, markExhausted, clearExhausted } from "./dispatch.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
@@ -182,6 +183,41 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(state, null, 2));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    return;
+  }
+
+  // The dispatch ladder: which lane the host should hand a delegated task to next. GET reads
+  // (with ?lane= to override, ?after= to walk past a spent rung, ?task= to get a runnable
+  // command); POST reports a rung spent so the next read walks past it. The relay decides the
+  // ORDER and never executes a cli rung itself — spawning agents is the host's job.
+  if ((req.method === "GET" || req.method === "POST") && pathname === "/dispatch") {
+    if (req.method === "POST") {
+      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown };
+      const ttlMs = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
+      if (typeof body.clear === "string") {
+        clearExhausted(cfg, body.clear);
+      } else if (body.clear === true) {
+        clearExhausted(cfg);
+      } else if (typeof body.exhausted === "string") {
+        if (!markExhausted(cfg, body.exhausted, ttlMs)) {
+          failClosed(res, 400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
+          h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+          return;
+        }
+      } else {
+        failClosed(res, 400, `POST /dispatch needs {"exhausted":"<lane>"} or {"clear":"<lane>"|true}`);
+        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+        return;
+      }
+    }
+    const view = buildDispatch(cfg, {
+      ...(pickQuery(path, "task") ? { task: pickQuery(path, "task") as string } : {}),
+      ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
+      ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(view, null, 2));
     h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
     return;
   }
