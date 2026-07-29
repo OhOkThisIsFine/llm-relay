@@ -7,7 +7,7 @@ import { findTierModel } from "./tier-data.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
 import { loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
-import { loadTierData, joinCapability, type CapabilityScore } from "./registry.js";
+import { loadTierData } from "./registry.js";
 
 /**
  * Everything known about one offload destination, kept as SEPARATE raw dimensions.
@@ -30,8 +30,9 @@ export interface Candidate {
   hasKey: boolean;
   /** In the provider's live /models catalog. null = not checkable (anthropic kind, or catalog down). */
   listed: boolean | null;
-  /** BFCL tool-use + LMArena scores, best-effort id→leaderboard match (null when no confident match). */
-  capability: CapabilityScore | null;
+  /** Which snapshot row `scores` came from, and how confidently. `fuzzy` = a similarly-named but
+   *  DIFFERENT model's row, so those numbers are indicative. Null = no row matched. */
+  capabilityMatch: { name: string; match: "exact" | "fuzzy" } | null;
   health: {
     verdict: string;
     avgMs: number | null;
@@ -195,7 +196,8 @@ export async function buildCandidates(
     const state = breaker.getState(spec);
     const obs = telemetry.models[`${provider}/${model}`];
     const strength = getStrength(spec);
-    const tier = findTierModel(model ?? spec, byNorm)?.rec;
+    const matched = findTierModel(model ?? spec, byNorm);
+    const tier = matched?.rec;
     const num = (k: string) => (typeof tier?.[k] === "number" ? (tier[k] as number) : null);
 
     // Limits THIS provider publishes about its own deployment, if any. NIM publishes none;
@@ -223,7 +225,7 @@ export async function buildCandidates(
       subagentTiers: membership.subagentTiers,
       hasKey: p?.authEnv ? !!process.env[p.authEnv]?.trim() : true,
       listed,
-      capability: model ? joinCapability(model, byNorm) : null,
+      capabilityMatch: matched ? { name: matched.rec.norm, match: matched.match } : null,
       health: summary
         ? {
             verdict: summary.verdict,

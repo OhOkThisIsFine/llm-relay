@@ -87,8 +87,12 @@ but no output ceiling — and labels each one:
 
 - `provider` — the serving provider published it about its own deployment;
 - `reference` (`~`) — borrowed from another provider serving the same id. Indicative only;
-- `static-table` (`?`) — the hardcoded table in `metadata.ts`, including its blanket 128k/4096 guess.
+- `null` — nobody publishes it. Rendered blank.
 
-Price has no `static-table` rung on purpose: an unknown cost stays null rather than becoming a
-fabricated number. This is why every NIM row renders `1049k~` and `$2.402~` — those are OpenRouter's
-figures for the same model id, and NIM's real ceilings and rates are simply not published.
+There is no third, guessing rung. `metadata.ts` used to hand out a blanket 128k/4096 for anything it
+did not recognise; that was deleted in 0.7.0, because a caller cannot tell a guess from a
+measurement and the context guardrail was rejecting requests against it. The guardrail now fires
+**only** on a `provider` figure.
+
+This is why every NIM row renders `1049k~` and `$2.402~` — those are OpenRouter's figures for the
+same model id, and NIM's real ceilings and rates are simply not published anywhere.

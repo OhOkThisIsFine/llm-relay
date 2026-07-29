@@ -213,7 +213,7 @@ describe("candidates view", () => {
     const c = view.candidates[0]!;
 
     // Capability, live behaviour, availability and observed traffic are distinct fields.
-    expect(c).toHaveProperty("capability");
+    expect(c).toHaveProperty("capabilityMatch");
     expect(c).toHaveProperty("health");
     expect(c).toHaveProperty("quotaPercent");
     expect(c).toHaveProperty("breaker");

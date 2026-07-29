@@ -153,9 +153,10 @@ pool order silently fell back to whatever order the config happened to list. Don
 
 ⚠ **Limits and prices are per-(provider, model), not per-model.** The same id on two providers is
 two deployments with different ceilings and different prices — possibly free on one and metered on
-the other. `candidates` reports each field's provenance (`provider` / `reference` / `static-table`,
-rendered `~` and `?`), so a NIM row never presents OpenRouter's context window or rate as its own.
-NIM publishes no metadata at all; Groq and Mistral publish real limits.
+the other. `candidates` reports each field's provenance (`provider`, or `reference` rendered `~`),
+so a NIM row never presents OpenRouter's context window or rate as its own. NIM publishes no
+metadata at all; Groq and Mistral publish real limits. Nothing is guessed: unknown renders blank,
+and the context guardrail only enforces a `provider` figure.
 
 This gives a dispatcher three levels of control, all optional:
 

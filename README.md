@@ -349,10 +349,13 @@ weighted highest — this proxy drives tool loops), and it never appears without
 **Limits and prices are per-(provider, model), and labelled.** The same model id on two providers is
 two deployments — different context ceilings, different output caps, and possibly free on one and
 metered on the other. Where a provider publishes its own figures (Groq, Mistral, OpenRouter) those
-are used; where it publishes none (NIM returns only `id`/`object`/`created`/`owned_by`) the table
-falls back to another provider's figure for the same id and marks it `~`, or to the hardcoded
-table's guess and marks it `?`. Unmarked means the serving provider published it. An unknown price
-stays blank rather than being guessed.
+are used and shown unmarked; where it publishes none (NIM returns only `id`/`object`/`created`/
+`owned_by`) the table falls back to another provider's figure for the same id and marks it `~`.
+If nobody publishes one, the cell is blank — llm-relay does not guess a limit or a price.
+
+That honesty is load-bearing: the **context guardrail only fires against a limit the serving
+provider published**. If the limit is unknown the request goes upstream and the backend answers with
+its own error, rather than llm-relay rejecting it against a number it made up.
 
 `GET /candidates` returns the full JSON (the table shows a subset). The CLI prefers a running proxy
 so the live columns come from warm ping history rather than a cold start.
