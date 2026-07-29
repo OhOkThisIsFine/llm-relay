@@ -32,6 +32,7 @@
     "sync:tiers": "node scripts/sync-tiers.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "npm run typecheck && npm test",
     "postinstall": "node scripts/install-skill.mjs || exit 0",
     "prepublishOnly": "npm run build && npm test"
   },
