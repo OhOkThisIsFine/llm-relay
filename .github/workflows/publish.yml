@@ -1,8 +1,32 @@
 name: Publish to npm
 
+# Publishes via npm Trusted Publishing (OIDC, `id-token: write`) — there is no npm token in this
+# repository, which is exactly why the *trigger* is the credential. Anything that can start this
+# job can publish llm-relay, so the trigger surface is deliberately narrow.
+#
+# A `v*` tag push is the ONLY path to the registry. The `release: published` trigger was removed:
+# it was a second, independent way in, and a release created from a tag fired both, producing a
+# duplicate publish attempt that fails confusingly on the version already being live.
+#
+# Four gates stand between a tag push and `npm publish`:
+#   1. job-level `if` — this repository only, and only a ref under `refs/tags/v*`. A fork's tag
+#      push and any branch push never reach the job.
+#   2. `environment: npm-publish` — GitHub evaluates the environment's protection rules before the
+#      job starts, and only jobs naming it can mint the OIDC token scoped to that environment.
+#      ⚠ The rules themselves live in repo settings, NOT here: Settings → Environments →
+#      npm-publish must carry required reviewers and/or a protected-tag deployment rule. Without
+#      them the environment is an audit trail with no gate — and GitHub silently auto-creates the
+#      environment on first run, so its mere presence here proves nothing.
+#   3. "tag is contained in the default branch" — a tag pointing at an unmerged, unreviewed commit
+#      cannot publish, which is the actual attack the bare `v*` trigger allowed.
+#   4. "tag matches package.json version" — a tag that disagrees with the manifest is a mistake,
+#      and on npm a mistake is permanent (a published version cannot be replaced).
+#
+# Actions are pinned to immutable commit SHAs; the trailing `# vX.Y.Z` is the human-readable
+# version. A mutable `@v4` lets the action's owner change what executes inside a job holding a
+# token good for publishing this package.
+
 on:
-  release:
-    types: [published]
   push:
     tags:
       - 'v*'
@@ -11,23 +35,73 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  id-token: write
+# No ambient permissions; the publish job grants itself the minimum it needs.
+permissions: {}
 
 jobs:
   publish:
+    if: github.repository == 'OhOkThisIsFine/llm-relay' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/llm-relay
+    permissions:
+      contents: read
+      id-token: write # npm Trusted Publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing after this step needs git write access, and `npm ci`/`npm test` must not
+          # inherit a usable push credential.
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Refuse a tag whose commit is not on the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE:-}" ]; then
+            echo "::error::could not determine the default branch; refusing to publish"
+            exit 1
+          fi
+          # `compare` is used instead of `git merge-base` on purpose: the checkout above is
+          # shallow and carries no credentials, so the ancestry question is answered by the API.
+          # identical = the tag IS the branch head; behind = the tag is an ancestor of it.
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASE}...${GITHUB_SHA}" --jq .status)
+          echo "compare ${BASE}...${GITHUB_SHA} -> ${status}"
+          case "$status" in
+            identical | behind) ;;
+            *)
+              echo "::error::refusing to publish ${GITHUB_REF_NAME}: its commit is not contained in ${BASE} (compare status: ${status})"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
+          # Deliberately no `registry-url`: it writes an `_authToken=${NODE_AUTH_TOKEN}` line into
+          # .npmrc, and with no token set that empty auth breaks Trusted Publishing.
 
-      - run: npm install -g npm@latest
-      - run: npm ci
+      - name: Refuse a tag that disagrees with package.json
+        run: |
+          set -euo pipefail
+          want="v$(node -p "require('./package.json').version")"
+          echo "tag=${GITHUB_REF_NAME} package.json=${want}"
+          if [ "${GITHUB_REF_NAME}" != "${want}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${want}"
+            exit 1
+          fi
+
+      # Trusted Publishing requires npm >= 11.5.1. Pinned to the 11.x line rather than `latest` so
+      # a future major cannot change publish semantics under this workflow without a code change.
+      - run: npm install -g npm@^11.5.1
+      # --ignore-scripts: a publish job holding an OIDC token must not execute dependency install
+      # hooks. This package's own postinstall only acts on global installs, so nothing is lost.
+      - run: npm ci --ignore-scripts
       - run: npm run build
-      - run: npm test
+      # `check` is typecheck + the suite. Publishing was previously gated on the suite alone.
+      - run: npm run check
       - run: npm publish --access public

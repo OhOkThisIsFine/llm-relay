@@ -1,0 +1,53 @@
+name: CI
+
+# Every "suite green / tsc clean" claim in this repository used to rest on somebody's local run:
+# `npm run typecheck` ran in no workflow at all, and the suite ran only inside the publish job —
+# i.e. first at the moment a version was already being shipped. This is the gate that runs before
+# that point.
+#
+# Ubuntu only, on purpose: development happens on Windows, so Linux is the platform whose result
+# nobody sees locally. Adding a Windows leg would re-verify what the developer already ran.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      # --ignore-scripts: CI does not run dependency install hooks. This package's own postinstall
+      # is exercised explicitly below instead, so skipping it here costs no coverage.
+      - run: npm ci --ignore-scripts
+
+      # `build` first: scripts/*.mjs read dist/, and a tsc failure should read as a build failure
+      # rather than surfacing as a confusing test error.
+      - run: npm run build
+
+      # typecheck + vitest. The one command a release is gated on, run on every push and PR.
+      - run: npm run check
+
+      - name: postinstall hook stays inert on a non-global install
+        # `--ignore-scripts` above means nothing else in CI ever loads this file, so a syntax error
+        # in the hook would otherwise reach users as a failed `npm i -g`. Exit 0 here also pins the
+        # contract that replaced package.json's blanket `|| exit 0`.
+        run: node scripts/install-skill.mjs
