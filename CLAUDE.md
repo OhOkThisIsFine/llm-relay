@@ -124,11 +124,26 @@ test stale code.
 - **`count_tokens` and non-`/v1/messages` paths** are handled locally for OpenAI backends (token
   estimate / clean 404) — they must NOT be routed to `/chat/completions`. See `server.ts` `handle()`.
 - Backends rate-limit (HTTP 429). The proxy passes it through; the client's retry/backoff handles it.
+- **Subagent routing depends on a Claude Code client behaviour, not an API contract.**
+  `routing.subagents` only applies when the request carries `cc_is_subagent=true` in its `system`
+  block (verified against Claude Code 2.1.220). If a Claude Code upgrade drops that marker, every
+  subagent silently falls back to normal routing — safe (passthrough) but **silent**, so nothing
+  will alert you. Re-verify with the capture recipe in
+  [docs/subagent-routing.md](docs/subagent-routing.md#re-verifying).
+- **Never route subagents by editing `routing.tiers`.** A subagent asking for `haiku` and a human
+  picking Haiku are byte-identical requests, so a tier→provider mapping silently drops the human's
+  own conversation onto a weak model. Tiers stay on the passthrough; `routing.subagents` is the
+  only correct place. Full reasoning: [docs/subagent-routing.md](docs/subagent-routing.md).
 
 ## Status & open work
 
 Current: **usable end-to-end**, 194 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
+
+**Subagent offload is live** (0.3.0): a Claude Code subagent — including built-ins like Explore, with
+no agent file — runs on a non-Anthropic provider while the human's own conversation stays on an
+Anthropic passthrough. Verified end-to-end on the wire. Design + evidence:
+[docs/subagent-routing.md](docs/subagent-routing.md).
 
 Full live probe sweep: [docs/probe-sweep-2026-07-28.md](docs/probe-sweep-2026-07-28.md) (every script,
 every endpoint). Everything it found is now fixed; `multimodal-probe.mjs` is 5/5 green live.
