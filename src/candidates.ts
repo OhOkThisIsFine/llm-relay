@@ -130,10 +130,7 @@ export async function buildCandidates(
 ): Promise<CandidatesView> {
   const breaker = opts.breaker ?? globalCircuitBreaker;
   const nowMs = opts.nowMs ?? Date.now();
-  const tierData = loadTierData();
-  const byNorm = (tierData?.models ?? [])
-    .filter((r) => typeof r.norm === "string")
-    .map((r) => ({ norm: (r.norm as string).toLowerCase(), rec: r }));
+  const byNorm = loadTierData()?.byNorm ?? [];
   const telemetry = loadRuntimeTelemetry();
 
   const candidates: Candidate[] = [];

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Config, ProviderConfig } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
@@ -15,6 +15,11 @@ export interface CapabilityScore {
   arena_rating: number | null;
   arena_rank: number | null;
   composite_rank: number | null;
+  /** Leaderboard row these scores came from, and how confidently. A `fuzzy` match is a DIFFERENT
+   *  model whose name contains this one's (glm-5.2 → glm-5.2-max), so the scores are indicative,
+   *  not this model's. Without this the substitution is invisible. */
+  matched_name: string | null;
+  match: "exact" | "fuzzy" | null;
 }
 
 interface RegistryModel {
@@ -51,17 +56,53 @@ export interface RegistryView {
   };
 }
 
-export function loadTierData(): { synced_at?: string; models: Array<Record<string, unknown>> } | null {
+export interface TierData {
+  synced_at?: string;
+  models: Array<Record<string, unknown>>;
+  /** Lower-cased `norm` index, built once per load — the join is a scan over this. */
+  byNorm: Array<{ norm: string; rec: Record<string, unknown> }>;
+}
+
+/**
+ * Memoized tier-data, keyed on the file's mtime so `npm run sync:tiers` is picked up without a
+ * restart. The file is ~400 rows and every /registry, /health and /candidates call needs it, plus
+ * an index built over it — re-reading and re-indexing per request is pure waste. Cached negatives
+ * too (mtime null when the file is absent), so a missing file isn't a stat+throw per request.
+ */
+let _tierCache: { mtimeMs: number | null; data: TierData | null } | null = null;
+
+export function loadTierData(): TierData | null {
+  let mtimeMs: number | null = null;
+  let path: string;
   try {
-    const path = fileURLToPath(new URL("../docs/tier-data.json", import.meta.url));
-    const j = JSON.parse(readFileSync(path, "utf8")) as { synced_at?: string; models?: Array<Record<string, unknown>> };
-    return { ...(j.synced_at ? { synced_at: j.synced_at } : {}), models: Array.isArray(j.models) ? j.models : [] };
+    path = fileURLToPath(new URL("../docs/tier-data.json", import.meta.url));
+    mtimeMs = statSync(path).mtimeMs;
   } catch {
+    if (_tierCache && _tierCache.mtimeMs === null) return _tierCache.data;
+    _tierCache = { mtimeMs: null, data: null };
+    return null;
+  }
+  if (_tierCache && _tierCache.mtimeMs === mtimeMs) return _tierCache.data;
+
+  try {
+    const j = JSON.parse(readFileSync(path, "utf8")) as { synced_at?: string; models?: Array<Record<string, unknown>> };
+    const models = Array.isArray(j.models) ? j.models : [];
+    const data: TierData = {
+      ...(j.synced_at ? { synced_at: j.synced_at } : {}),
+      models,
+      byNorm: models
+        .filter((r) => typeof r.norm === "string")
+        .map((r) => ({ norm: (r.norm as string).toLowerCase(), rec: r })),
+    };
+    _tierCache = { mtimeMs, data };
+    return data;
+  } catch {
+    _tierCache = { mtimeMs, data: null };
     return null;
   }
 }
 
-function toScore(r: Record<string, unknown>): CapabilityScore {
+function toScore(r: Record<string, unknown>, match: "exact" | "fuzzy"): CapabilityScore {
   const n = (k: string) => (typeof r[k] === "number" ? (r[k] as number) : null);
   return {
     bfcl_overall: n("bfcl_overall"),
@@ -70,6 +111,8 @@ function toScore(r: Record<string, unknown>): CapabilityScore {
     arena_rating: n("arena_rating"),
     arena_rank: n("arena_rank"),
     composite_rank: n("composite_rank"),
+    matched_name: typeof r.norm === "string" ? r.norm : null,
+    match,
   };
 }
 
@@ -87,9 +130,9 @@ export function joinCapability(
   const seg = (modelId.split("/").pop() ?? modelId).toLowerCase().trim();
   if (seg.length < 5) return null;
   const exact = byNorm.find((e) => e.norm === seg);
-  if (exact) return toScore(exact.rec);
+  if (exact) return toScore(exact.rec, "exact");
   const contained = byNorm.find((e) => e.norm.includes(seg));
-  return contained ? toScore(contained.rec) : null;
+  return contained ? toScore(contained.rec, "fuzzy") : null;
 }
 
 /** Build the discovery view: providers × live models (best-effort capability) + routing + raw scores. */
@@ -99,9 +142,7 @@ export async function buildRegistry(
   opts: { now?: string; pingLoop?: PingLoop } = {},
 ): Promise<RegistryView> {
   const tierData = loadTierData();
-  const byNorm = (tierData?.models ?? [])
-    .filter((r) => typeof r.norm === "string")
-    .map((r) => ({ norm: (r.norm as string).toLowerCase(), rec: r }));
+  const byNorm = tierData?.byNorm ?? [];
 
   const providers: Record<string, RegistryProvider> = {};
   for (const [name, p] of Object.entries(cfg.providers) as Array<[string, ProviderConfig]>) {

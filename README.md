@@ -311,15 +311,22 @@ Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` �
 ### Choosing where to offload (`llm-relay candidates`)
 
 ```
-target                            pools / tiers        live  SWE  LCB  Elo   BFCL   verdict  p95    up%  quota  breaker  ctx
-nim/z-ai/glm-5.2                  coding,@opus         yes   42   53   1240  -      Perfect  310ms  100  84%    closed   128k
-nim/meta/llama-3.1-8b-instruct    fast,@haiku,@fable   yes   -    -    -     25.83  Perfect  120ms  100  84%    closed   128k
+target                            pools / tiers        live  SWE  LCB  BFCL   arena  rank  verdict  p95    up%  quota  breaker  ctx
+nim/z-ai/glm-5.2                  coding,@opus         yes   42   53   -      1469~  #31   Perfect  310ms  100  84%    closed   128k
+nim/meta/llama-3.1-8b-instruct    fast,@haiku,@fable   yes   -    -    25.83  1211   #308  Perfect  120ms  100  84%    closed   128k
 ```
 
 Every offload target with its dimensions side by side: capability (SWE-bench, HumanEval,
-LiveCodeBench, Arena Elo, BFCL tool-use, context window), live behaviour (verdict, avg/p95 latency,
-jitter, uptime), availability right now (provider quota, circuit-breaker state, whether the provider
-still lists the model) and traffic actually observed through the proxy.
+LiveCodeBench, BFCL tool-use, Arena rating/rank, context window), live behaviour (verdict, avg/p95
+latency, jitter, uptime), availability right now (provider quota, circuit-breaker state, whether the
+provider still lists the model) and traffic actually observed through the proxy.
+
+A blank cell means **not measured**, not bad. The two capability sources have different coverage:
+SWE-bench/HumanEval/LiveCodeBench come from a hand-maintained table in `benchmarks.ts` that lags the
+roster, while BFCL and Arena come from the synced leaderboard (`npm run sync:tiers`). `~` marks a
+score **borrowed from a similarly-named model** — the leaderboard has no `glm-5.2` row, so those
+numbers are `glm-5.2-max`'s. The JSON carries `capability.matched_name` and `capability.match`
+(`exact` | `fuzzy`) so the substitution is never invisible.
 
 **Nothing is ranked or averaged** — capability, latency and remaining quota trade off differently
 per task, and one blended number answers neither "cheapest that can do it" nor "best available". The
