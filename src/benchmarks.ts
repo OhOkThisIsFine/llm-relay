@@ -1,4 +1,6 @@
 import type { ResolvedTarget } from "./config.js";
+import { loadTierData, findTierModel } from "./tier-data.js";
+import { getRealWorldScore } from "./ping/runtime-telemetry.js";
 
 export interface BenchmarkScores {
   sweBench?: number; // SWE-bench Verified pass@1 % (0-100)
@@ -7,7 +9,17 @@ export interface BenchmarkScores {
   arenaElo?: number; // Chatbot Arena / coding ELO
 }
 
-/** Built-in coding benchmark database for popular coding models. */
+/**
+ * ⚠ LEGACY FALLBACK ONLY — do not add rows here.
+ *
+ * Hand-typed scores for a 2025-era roster, matched by substring. It was the ONLY ranking input
+ * until 0.5.0, which meant pool order came from a table nobody had updated: models it never heard
+ * of all collapsed to the flat 50.0 baseline and therefore tied, so `sort` silently fell back to
+ * config order. Capability now comes from `docs/tier-data.json` (`npm run sync:tiers`, multi-source,
+ * ~770 models); this survives only to score the handful of models no source has published on.
+ *
+ * It has no provenance: `glm-5` here matches `glm-5.2`, so its numbers can be a different SKU's.
+ */
 const BENCHMARK_DB: Array<{ pattern: RegExp | string; scores: BenchmarkScores }> = [
   // Anthropic / Claude models
   { pattern: "claude-3-7-sonnet", scores: { sweBench: 70.3, humanEval: 92.0, liveCodeBench: 64.5, arenaElo: 1320 } },
@@ -81,17 +93,86 @@ export function calculateQualityScore(scores: BenchmarkScores): number {
   return 50.0; // Default baseline score for unlisted models
 }
 
-/** Rank an array of resolved targets by coding benchmark quality (descending). */
+/** Where a strength score came from. Ranking is only as trustworthy as its basis. */
+export type StrengthBasis = "snapshot" | "static-table" | "telemetry" | "neutral";
+
+export interface Strength {
+  /** 0-100, comparable across bases. Higher is better. */
+  score: number;
+  basis: StrengthBasis;
+  /** snapshot only: which signals backed it, and how many. 1 signal is a guess, 5 is a consensus. */
+  signals?: string[];
+  signalCount?: number;
+  /** snapshot only: `fuzzy` means the row belongs to a similarly-named, DIFFERENT model. */
+  match?: "exact" | "fuzzy";
+  /** snapshot only: the row actually used. */
+  matchedName?: string;
+}
+
+const NEUTRAL = 50;
+
+/**
+ * Strength of one target, from the best evidence available, in this order:
+ *
+ *  1. the synced multi-source snapshot — real published capability, refreshed by `sync:tiers`;
+ *  2. the legacy hardcoded table — stale, but still a capability measurement;
+ *  3. observed runtime telemetry — not capability, but this deployment's own evidence that the
+ *     model answers successfully and quickly. Needs ≥5 real calls, so a brand-new model does not
+ *     get ranked off one lucky request;
+ *  4. neutral — nothing is known, so claim nothing.
+ *
+ * The basis travels with the score precisely so a telemetry-derived number is never mistaken for
+ * a benchmark one.
+ */
+export function getStrength(spec: string, opts: { telemetryPath?: string } = {}): Strength {
+  const hit = findTierModel(spec, loadTierData()?.byNorm ?? []);
+  if (hit && typeof hit.rec.strength === "number") {
+    return {
+      score: Math.round(hit.rec.strength * 1000) / 10, // 0-1 → 0-100
+      basis: "snapshot",
+      signals: hit.rec.signals ?? [],
+      signalCount: hit.rec.signal_count ?? 0,
+      match: hit.match,
+      matchedName: hit.rec.norm,
+    };
+  }
+
+  const scores = getBenchmarkScores(spec);
+  if (Object.keys(scores).length > 0) {
+    return { score: calculateQualityScore(scores), basis: "static-table" };
+  }
+
+  const i = spec.indexOf("/");
+  if (i !== -1) {
+    const observed = getRealWorldScore(
+      spec.slice(0, i),
+      spec.slice(i + 1),
+      opts.telemetryPath ? { path: opts.telemetryPath } : {},
+    );
+    if (observed !== null) return { score: observed, basis: "telemetry" };
+  }
+
+  return { score: NEUTRAL, basis: "neutral" };
+}
+
+/**
+ * Rank targets strongest-first. Ties are left in config order (`sort` is stable), which is what
+ * makes a pool's declared order the tie-breaker when nothing distinguishes two candidates.
+ */
 export function rankTargetsByBenchmark(targets: ResolvedTarget[]): ResolvedTarget[] {
   if (targets.length <= 1) return [...targets];
 
-  return [...targets].sort((a, b) => {
-    const specA = a.model ? `${a.provider}/${a.model}` : a.provider;
-    const specB = b.model ? `${b.provider}/${b.model}` : b.provider;
+  const specOf = (t: ResolvedTarget) => (t.model ? `${t.provider}/${t.model}` : t.provider);
+  const cache = new Map<string, number>();
+  const score = (t: ResolvedTarget) => {
+    const spec = specOf(t);
+    let v = cache.get(spec);
+    if (v === undefined) {
+      v = getStrength(spec).score;
+      cache.set(spec, v);
+    }
+    return v;
+  };
 
-    const scoreA = calculateQualityScore(getBenchmarkScores(specA));
-    const scoreB = calculateQualityScore(getBenchmarkScores(specB));
-
-    return scoreB - scoreA; // Highest score first
-  });
+  return [...targets].sort((a, b) => score(b) - score(a));
 }

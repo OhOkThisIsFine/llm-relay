@@ -2,7 +2,8 @@ import type { Config, ProviderConfig } from "./config.js";
 import { POOL_PREFIX } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
-import { getBenchmarkScores, calculateQualityScore, type BenchmarkScores } from "./benchmarks.js";
+import { getBenchmarkScores, getStrength, type BenchmarkScores, type StrengthBasis } from "./benchmarks.js";
+import { findTierModel } from "./tier-data.js";
 import { getModelMetadata } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
 import { loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
@@ -55,11 +56,42 @@ export interface Candidate {
     lastCalledAt: string | null;
   } | null;
   contextLength: number | null;
+  /** Where contextLength came from — the synced snapshot is authoritative, the static table lags. */
+  contextLengthSource: "snapshot" | "static-table" | null;
   maxOutputTokens: number | null;
-  /** Existing composites, reported for transparency about what the proxy itself sorts by. */
+  pricePerMTokIn: number | null;
+  pricePerMTokOut: number | null;
+  supportsTools: boolean | null;
+  /** Which leaderboards published anything about this model. */
+  capabilitySources: string[];
+  /** Raw per-source capability values — kept separate, never collapsed into one another. */
+  scores: {
+    /** Berkeley Function-Calling: tool-call accuracy, multi-turn, irrelevance detection. */
+    bfclOverall: number | null;
+    bfclMultiTurn: number | null;
+    bfclIrrelevance: number | null;
+    /** Artificial Analysis indices, via OpenRouter. */
+    aaIntelligence: number | null;
+    aaCoding: number | null;
+    aaAgentic: number | null;
+    /** Aider polyglot edit benchmark + edit-format compliance. */
+    aiderPassRate: number | null;
+    aiderWellFormed: number | null;
+    /** Design Arena Elo, averaged per arena (means, not measurements — see the `_mean` naming). */
+    designArenaAgentsEloMean: number | null;
+    designArenaModelsEloMean: number | null;
+    /** LMArena. */
+    arenaRating: number | null;
+    arenaRank: number | null;
+  };
+  /** What the proxy itself sorts by — the ONE place a scalar exists, with its provenance. */
   sortInputs: {
     /** Drives `routing.benchmarkSort` ordering within a pool. */
-    benchmarkQuality: number;
+    strength: number;
+    /** snapshot | static-table | telemetry | neutral. A telemetry score is not a benchmark score. */
+    strengthBasis: StrengthBasis;
+    /** How many published signals backed it. 1 is a guess; 5 is a consensus. */
+    strengthSignals: string[];
     /** Drives circuit-breaker candidate ordering. 100 when untracked. */
     breakerStability: number;
   };
@@ -74,8 +106,9 @@ export interface CandidatesView {
 
 const NOTE =
   "Raw per-dimension data for choosing an offload target. Nothing here is ranked or averaged — " +
-  "order is config order (pools, then subagent targets). `sortInputs` reports the composites the " +
-  "proxy already sorts by; they are not a recommendation.";
+  "order is config order (pools, then subagent targets), and every source's score is kept " +
+  "separately under `scores`. `sortInputs` reports the ONE scalar the proxy needs for pool " +
+  "ordering, with the basis and signal list that produced it; it is not a recommendation.";
 
 /** Expand a spec that may itself be `pool/<name>` into concrete "provider/model" specs. */
 function expandSpec(spec: string, cfg: Config): string[] {
@@ -153,6 +186,12 @@ export async function buildCandidates(
     const obs = telemetry.models[`${provider}/${model}`];
     const meta = getModelMetadata(model ?? provider);
     const benchmarks = getBenchmarkScores(spec);
+    const strength = getStrength(spec);
+    const tier = findTierModel(model ?? spec, byNorm)?.rec;
+    const num = (k: string) => (typeof tier?.[k] === "number" ? (tier[k] as number) : null);
+    // The snapshot is fetched from the provider itself, so it beats the hand-typed metadata table
+    // — which had glm-5.2 at 128k when it actually serves 1M.
+    const snapshotCtx = num("context_length");
 
     candidates.push({
       spec,
@@ -190,10 +229,32 @@ export async function buildCandidates(
             lastCalledAt: obs.lastCalledAt ? new Date(obs.lastCalledAt).toISOString() : null,
           }
         : null,
-      contextLength: meta.contextLength ?? null,
+      contextLength: snapshotCtx ?? meta.contextLength ?? null,
+      contextLengthSource: snapshotCtx ? "snapshot" : meta.contextLength ? "static-table" : null,
       maxOutputTokens: meta.maxOutputTokens ?? null,
+      // OpenRouter quotes per-token; per-million is the unit humans compare in.
+      pricePerMTokIn: num("price_prompt") !== null ? Math.round(num("price_prompt")! * 1e6 * 1000) / 1000 : null,
+      pricePerMTokOut: num("price_completion") !== null ? Math.round(num("price_completion")! * 1e6 * 1000) / 1000 : null,
+      supportsTools: typeof tier?.supports_tools === "boolean" ? tier.supports_tools : null,
+      capabilitySources: Array.isArray(tier?.sources) ? (tier.sources as string[]) : [],
+      scores: {
+        bfclOverall: num("bfcl_overall"),
+        bfclMultiTurn: num("bfcl_multi_turn"),
+        bfclIrrelevance: num("bfcl_irrelevance"),
+        aaIntelligence: num("aa_intelligence"),
+        aaCoding: num("aa_coding"),
+        aaAgentic: num("aa_agentic"),
+        aiderPassRate: num("aider_pass_rate"),
+        aiderWellFormed: num("aider_well_formed"),
+        designArenaAgentsEloMean: num("design_arena_agents_elo_mean"),
+        designArenaModelsEloMean: num("design_arena_models_elo_mean"),
+        arenaRating: num("arena_rating"),
+        arenaRank: num("arena_rank"),
+      },
       sortInputs: {
-        benchmarkQuality: calculateQualityScore(benchmarks),
+        strength: strength.score,
+        strengthBasis: strength.basis,
+        strengthSignals: strength.signals ?? [],
         breakerStability: breaker.getStabilityScore(spec),
       },
     });

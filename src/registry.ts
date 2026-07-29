@@ -1,5 +1,6 @@
-import { readFileSync, statSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { loadTierData } from "./tier-data.js";
+
+export { loadTierData };
 import type { Config, ProviderConfig } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 
@@ -56,51 +57,7 @@ export interface RegistryView {
   };
 }
 
-export interface TierData {
-  synced_at?: string;
-  models: Array<Record<string, unknown>>;
-  /** Lower-cased `norm` index, built once per load — the join is a scan over this. */
-  byNorm: Array<{ norm: string; rec: Record<string, unknown> }>;
-}
-
-/**
- * Memoized tier-data, keyed on the file's mtime so `npm run sync:tiers` is picked up without a
- * restart. The file is ~400 rows and every /registry, /health and /candidates call needs it, plus
- * an index built over it — re-reading and re-indexing per request is pure waste. Cached negatives
- * too (mtime null when the file is absent), so a missing file isn't a stat+throw per request.
- */
-let _tierCache: { mtimeMs: number | null; data: TierData | null } | null = null;
-
-export function loadTierData(): TierData | null {
-  let mtimeMs: number | null = null;
-  let path: string;
-  try {
-    path = fileURLToPath(new URL("../docs/tier-data.json", import.meta.url));
-    mtimeMs = statSync(path).mtimeMs;
-  } catch {
-    if (_tierCache && _tierCache.mtimeMs === null) return _tierCache.data;
-    _tierCache = { mtimeMs: null, data: null };
-    return null;
-  }
-  if (_tierCache && _tierCache.mtimeMs === mtimeMs) return _tierCache.data;
-
-  try {
-    const j = JSON.parse(readFileSync(path, "utf8")) as { synced_at?: string; models?: Array<Record<string, unknown>> };
-    const models = Array.isArray(j.models) ? j.models : [];
-    const data: TierData = {
-      ...(j.synced_at ? { synced_at: j.synced_at } : {}),
-      models,
-      byNorm: models
-        .filter((r) => typeof r.norm === "string")
-        .map((r) => ({ norm: (r.norm as string).toLowerCase(), rec: r })),
-    };
-    _tierCache = { mtimeMs, data };
-    return data;
-  } catch {
-    _tierCache = { mtimeMs, data: null };
-    return null;
-  }
-}
+export { type TierData } from "./tier-data.js";
 
 function toScore(r: Record<string, unknown>, match: "exact" | "fuzzy"): CapabilityScore {
   const n = (k: string) => (typeof r[k] === "number" ? (r[k] as number) : null);
