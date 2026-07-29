@@ -468,7 +468,7 @@ describe("reshaper: { pool } — no single pinned model", () => {
 });
 
 describe("ergonomics: env expansion, overrides, reshaper", () => {
-  it("expands ${ENV} in provider.base and throws on an unset var", () => {
+  it("expands ${ENV} in provider.base", () => {
     process.env.RP_TEST_BASE = "https://nim.test/v1";
     const c = loadConfig(write("env.json", {
       listen: "127.0.0.1:8791",
@@ -477,11 +477,27 @@ describe("ergonomics: env expansion, overrides, reshaper", () => {
     }));
     expect(c.providers.nim!.base).toBe("https://nim.test/v1");
     delete process.env.RP_TEST_BASE;
+  });
 
+  // An unset ${ENV} in a provider base disables THAT provider rather than aborting startup —
+  // the proxy fronts every client session, so one optional provider must not be able to take
+  // it down. Losing every provider is still fatal. See test/degraded-config.test.ts.
+  it("disables a provider whose base references an unset var, but still refuses an empty registry", () => {
+    delete process.env.RP_MISSING_VAR;
     expect(() => loadConfig(write("env2.json", {
       providers: { nim: { base: "${RP_MISSING_VAR}", kind: "openai" } },
       routing: { default: "nim/m" },
-    }))).toThrow(/unset env var \$\{RP_MISSING_VAR\}/);
+    }))).toThrow(/at least one provider/);
+
+    const c = loadConfig(write("env3.json", {
+      providers: {
+        good: { base: "https://good.test/v1", kind: "openai" },
+        broken: { base: "${RP_MISSING_VAR}", kind: "openai" },
+      },
+      routing: { default: "good/m" },
+    }));
+    expect(Object.keys(c.providers)).toEqual(["good"]);
+    expect((c.warnings ?? []).join("\n")).toMatch(/RP_MISSING_VAR/);
   });
 
   it("applies CLI overrides (default/mode/listen) over the file", () => {
