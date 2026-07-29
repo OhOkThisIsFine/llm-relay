@@ -213,13 +213,17 @@ describe("candidates view", () => {
     const c = view.candidates[0]!;
 
     // Capability, live behaviour, availability and observed traffic are distinct fields.
-    expect(c).toHaveProperty("benchmarks");
     expect(c).toHaveProperty("capability");
     expect(c).toHaveProperty("health");
     expect(c).toHaveProperty("quotaPercent");
     expect(c).toHaveProperty("breaker");
     expect(c).toHaveProperty("observed");
+    // Limits carry per-field provenance: a NIM row must never present another provider's
+    // ceiling for the same model id as its own.
     expect(c).toHaveProperty("contextLength");
+    expect(c).toHaveProperty("contextLengthSource");
+    expect(c).toHaveProperty("maxOutputTokens");
+    expect(c).toHaveProperty("maxOutputTokensSource");
 
     // Every leaderboard keeps its own field. They measure different things and disagree, so
     // collapsing them into one another would destroy the comparison the table exists for.

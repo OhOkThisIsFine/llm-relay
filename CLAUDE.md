@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 212 tests / 26 files)
+npm test               # vitest run  (currently 217 tests / 26 files)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -54,12 +54,12 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `anthropic.ts` | Minimal Anthropic Messages shapes + `toolSchemaMap()`. Only the fields the proxy inspects. |
 | `documents.ts` | `transcodeDocuments()` — Anthropic `document` blocks → markdown text via **MarkItDown** (optional external Python CLI), applied to openai-kind targets before llm-bridge. Refuses (`DocumentError` → 400) rather than letting an unconvertible document through; llm-bridge would stringify it and inject raw base64 into the prompt. Uses a **temp file, not stdin** — pdfminer needs a seekable stream and every piped PDF dies with "No /Root object". |
 | `log.ts` | Metadata-only logger (never headers/bodies). |
-| `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). |
+| `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). Also harvests **per-(provider, model) limits + pricing** via `limitsFromRecord()` — a generic field-alias list (`context_window`/`max_context_length`/…), never a per-provider switch. `limits()` returns null when a provider publishes nothing (NIM), and that null must not be filled with another provider's numbers. |
 | `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Sorts targets by Stability Score. |
-| `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → legacy `BENCHMARK_DB` → observed runtime telemetry (≥5 calls) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). ⚠ `BENCHMARK_DB` is a **legacy fallback — do not add rows**; it is hand-typed, substring-matched, and has no provenance. |
+| `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → observed runtime telemetry (≥5 calls, so one lucky request can't promote a model) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
 | `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
-| `metadata.ts` | Lookup table for model context windows, token limits, and prompt token estimation logic. |
+| `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value → another provider's figure for the same id (`reference`, indicative only) → the hardcoded table (`static-table`, including its blanket 128k/4096 guess). Price has no table rung: unknown cost stays null rather than becoming a guess. `getModelMetadata()` is the legacy raw-table lookup — prefer the resolver. |
 | `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. Re-exports `loadTierData` from `tier-data.ts`. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
 | `key-checker.ts` | Pre-flight validator checking provider API key health and remaining rate-limit quota percentages. |
 | `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). |
@@ -142,6 +142,11 @@ test stale code.
   `score`/`rank` field, that every source keeps its own key under `scores`, and that the one
   scalar (`sortInputs.strength` — which exists only because pool ordering needs an order) never
   travels without `strengthBasis` + `strengthSignals`.
+- **Limits and prices are per-(provider, model).** The same model id on two providers is two
+  deployments — different context ceilings, different output caps, free on one and metered on the
+  other. Never present one provider's figure as another's: resolve through `resolveMetadata()` and
+  keep the `provider` / `reference` / `static-table` label. Tests in `test/metadata.test.ts` pin
+  this, including that an unknown price stays null instead of being guessed.
 - **Capability data is synced, never typed.** Add a source by writing a fetcher in
   `scripts/sync-tiers.mjs`, not a row in `BENCHMARK_DB`. Sources are independently failable — one
   dead endpoint must not cost the others — but **schema drift inside a source still throws** (a
@@ -157,7 +162,7 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 212 tests green, tsc clean. A real `claude` agentic session
+Current: **usable end-to-end**, 217 tests green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 **Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code

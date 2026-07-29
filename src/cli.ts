@@ -280,10 +280,13 @@ export async function runModels(): Promise<void> {
     }
     process.stdout.write(`\n${name} — ${models.length} models:\n`);
     for (const m of models) {
-      const scores = getBenchmarkScores(m);
-      const quality = calculateQualityScore(scores);
-      const benchStr = scores.sweBench ? ` (SWE-bench: ${scores.sweBench}%, quality: ${quality})` : "";
-      process.stdout.write(`  ${m.padEnd(50)}${benchStr}\n`);
+      const s = getStrength(`${name}/${m}`);
+      // Only say something when there is evidence; a neutral placeholder is not information.
+      const str = s.basis === "snapshot" ? ` str ${s.score.toFixed(1)} (${s.signalCount} signals)` : "";
+      const lim = await catalog.limits(name, p, m).catch(() => null);
+      const ctx = lim?.contextLength ? `  ctx ${Math.round(lim.contextLength / 1000)}k` : "";
+      const out = lim?.maxOutputTokens ? `  max_out ${lim.maxOutputTokens}` : "";
+      process.stdout.write(`  ${m.padEnd(50)}${str}${ctx}${out}\n`);
     }
   }
 }
@@ -389,7 +392,7 @@ export async function runPingCommand(): Promise<void> {
 }
 
 import { validateProviderKeys } from "./key-checker.js";
-import { getBenchmarkScores, calculateQualityScore } from "./benchmarks.js";
+import { getStrength } from "./benchmarks.js";
 
 /** `llm-relay check-keys` — pre-flight verification of provider environment keys. */
 export async function runCheckKeys(): Promise<void> {
@@ -497,8 +500,6 @@ function strengthTag(c: Candidate): string {
   switch (c.sortInputs.strengthBasis) {
     case "snapshot":
       return `/${c.sortInputs.strengthSignals.length}`;
-    case "static-table":
-      return " old";
     case "telemetry":
       return " obs";
     default:
@@ -558,13 +559,18 @@ export async function runCandidates(): Promise<void> {
         fmt(c.scores.bfclOverall).padEnd(7) +
         fmt(c.scores.aiderPassRate).padEnd(7) +
         (c.scores.arenaRating ? String(Math.round(c.scores.arenaRating)) : "-").padEnd(7) +
-        (c.pricePerMTokOut !== null ? `$${c.pricePerMTokOut}` : "-").padEnd(8) +
+        (c.pricePerMTokOut !== null
+          ? `$${c.pricePerMTokOut}${c.priceSource === "reference" ? "~" : ""}`
+          : "-"
+        ).padEnd(8) +
         (c.health?.verdict ?? "-").padEnd(10) +
         fmt(c.health?.p95Ms ?? null, "ms").padEnd(8) +
         fmt(c.quotaPercent, "%").padEnd(7) +
         breaker.padEnd(9) +
+        // Provenance inline: "~" = another provider's figure for this model id, "?" = the
+        // hardcoded table's guess. A NIM row must never present OpenRouter's ceiling as its own.
         ctx +
-        (c.contextLengthSource === "static-table" ? "?" : "") +
+        (c.contextLengthSource === "reference" ? "~" : c.contextLengthSource === "static-table" ? "?" : "") +
         (live === "NO" ? "  ⚠UNLISTED" : "") +
         "\n",
     );
@@ -577,8 +583,9 @@ export async function runCandidates(): Promise<void> {
       "capability from DIFFERENT leaderboards and they disagree; verdict/p95 are live behaviour;\n" +
       "quota/breaker/$ are what it costs to use right now. A blank cell means NOT MEASURED.\n" +
       `  str = the one scalar pool ordering needs. "83.3/4" = 4 published signals behind it;\n` +
-      `        "old" = stale hardcoded table, "obs" = this proxy's own traffic, "neut" = nothing known.\n` +
-      `  ctx trailing "?" = from the hardcoded table, not the provider.\n` +
+      `        "obs" = ranked on this proxy's own traffic, "neut" = nothing known.\n` +
+      `  "~" on ctx/$ = another provider's figure for the same model id (this one publishes none);\n` +
+      `  "?" on ctx   = the hardcoded table's guess. Unmarked = this provider published it.\n` +
       (srcs.length ? `Sources contributing: ${srcs.join(", ")} (refresh: npm run sync:tiers)\n` : ""),
   );
   if (fuzzy.length > 0) {

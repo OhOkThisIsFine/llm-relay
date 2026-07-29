@@ -6,9 +6,71 @@ import type { ProviderConfig } from "./config.js";
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
 const DEFAULT_CACHE = join(homedir(), ".llm-relay", "models-cache.json");
 
+/**
+ * Limits a provider publishes about its OWN deployment of a model.
+ *
+ * Deliberately per-(provider, model): the same model id served by two providers is two different
+ * deployments with different ceilings, so one provider's numbers must never be presented as
+ * another's. Null means "this provider does not publish it" — NIM's /models returns only
+ * id/object/created/owned_by, while Groq and Mistral publish real limits.
+ */
+export interface ModelLimits {
+  contextLength: number | null;
+  maxOutputTokens: number | null;
+  /** Per-TOKEN price, as published. Per-provider for the same reason limits are. */
+  pricePromptPerToken: number | null;
+  priceCompletionPerToken: number | null;
+}
+
 interface Entry {
   fetchedAt: number;
   models: string[];
+  /** model id → limits, for providers that publish them. Absent on older cache files. */
+  limits?: Record<string, ModelLimits>;
+}
+
+/**
+ * Field aliases across OpenAI-compatible `/models` implementations. Kept as a generic alias list
+ * rather than a per-provider switch — a new provider that happens to publish `context_window` is
+ * picked up with no code change, and no provider name is hardcoded.
+ */
+const CONTEXT_FIELDS = ["context_length", "context_window", "max_context_length", "max_model_len"];
+const MAX_OUTPUT_FIELDS = ["max_completion_tokens", "max_output_length", "max_output_tokens", "max_tokens"];
+const PRICE_IN_FIELDS = ["prompt", "input", "input_tokens"];
+const PRICE_OUT_FIELDS = ["completion", "output", "output_tokens"];
+
+/** Providers publish prices as numeric STRINGS ("0.00000015") as often as numbers. */
+function pickNumber(rec: Record<string, unknown>, fields: string[], allowZero = false): number | null {
+  for (const f of fields) {
+    const raw = rec[f];
+    const v = typeof raw === "string" ? Number(raw) : raw;
+    if (typeof v === "number" && Number.isFinite(v) && (allowZero ? v >= 0 : v > 0)) return v;
+  }
+  return null;
+}
+
+/** Read limits + pricing out of one `/models` record, including a nested `top_provider` (OpenRouter). */
+export function limitsFromRecord(rec: Record<string, unknown>): ModelLimits {
+  const obj = (v: unknown) => (typeof v === "object" && v !== null ? (v as Record<string, unknown>) : {});
+  const top = obj(rec.top_provider);
+  const pricing = obj(rec.pricing);
+  return {
+    contextLength: pickNumber(rec, CONTEXT_FIELDS) ?? pickNumber(top, CONTEXT_FIELDS),
+    maxOutputTokens: pickNumber(rec, MAX_OUTPUT_FIELDS) ?? pickNumber(top, MAX_OUTPUT_FIELDS),
+    // Zero is a real, meaningful price (free tiers) — not "unpublished".
+    pricePromptPerToken: pickNumber(pricing, PRICE_IN_FIELDS, true),
+    priceCompletionPerToken: pickNumber(pricing, PRICE_OUT_FIELDS, true),
+  };
+}
+
+/** True when a provider published nothing at all about a model. */
+function isEmpty(l: ModelLimits): boolean {
+  return (
+    l.contextLength === null &&
+    l.maxOutputTokens === null &&
+    l.pricePromptPerToken === null &&
+    l.priceCompletionPerToken === null
+  );
 }
 
 /**
@@ -26,6 +88,8 @@ export class ModelCatalog {
   private refreshing = new Set<string>();
   /** In-flight blocking fetches (cold start / forced) — dedups concurrent requests. */
   private pending = new Map<string, Promise<string[]>>();
+  /** Limits harvested by the most recent `fetch()`, handed to the Entry by its caller. */
+  private lastLimits: Record<string, ModelLimits> = {};
 
   constructor(opts: { ttlMs?: number; cachePath?: string | null } = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
@@ -96,7 +160,7 @@ export class ModelCatalog {
     const p = (async () => {
       try {
         const models = await this.fetch(cfg, opts.fetchFn ?? fetch);
-        this.mem.set(name, { fetchedAt: now, models });
+        this.mem.set(name, { fetchedAt: now, models, limits: this.lastLimits });
         this.saveDisk();
         return models;
       } catch {
@@ -120,7 +184,7 @@ export class ModelCatalog {
     void (async () => {
       try {
         const models = await this.fetch(cfg, fetchFn ?? fetch);
-        this.mem.set(name, { fetchedAt: Date.now(), models });
+        this.mem.set(name, { fetchedAt: Date.now(), models, limits: this.lastLimits });
         this.saveDisk();
       } catch {
         /* keep the stale entry; next list retries */
@@ -146,6 +210,24 @@ export class ModelCatalog {
     return models.includes(model);
   }
 
+  /**
+   * Limits this provider publishes for one of its own models, or null when it publishes none.
+   *
+   * Null is meaningful and must not be papered over with another provider's number — see
+   * `resolveMetadata()` in metadata.ts, which decides what to fall back to and labels it.
+   */
+  async limits(
+    name: string,
+    cfg: ProviderConfig,
+    model: string,
+    opts: { force?: boolean; now?: number; fetchFn?: typeof fetch } = {},
+  ): Promise<ModelLimits | null> {
+    await this.list(name, cfg, opts);
+    const l = this.mem.get(name)?.limits?.[model];
+    if (!l) return null;
+    return isEmpty(l) ? null : l;
+  }
+
   private async fetch(cfg: ProviderConfig, fetchFn: typeof fetch): Promise<string[]> {
     // Anthropic-kind backends have no OpenAI-style /models list we consume.
     if (cfg.kind !== "openai") return [];
@@ -158,8 +240,15 @@ export class ModelCatalog {
     const signal = cfg.timeoutMs && cfg.timeoutMs > 0 ? AbortSignal.timeout(cfg.timeoutMs) : undefined;
     const res = await fetchFn(cfg.base + "/models", { headers, ...(signal ? { signal } : {}) });
     if (!res.ok) throw new Error(`models fetch HTTP ${res.status}`);
-    const j = (await res.json()) as { data?: Array<{ id?: unknown }> };
-    return (j.data ?? [])
+    const j = (await res.json()) as { data?: Array<Record<string, unknown>> };
+    const records = j.data ?? [];
+    this.lastLimits = {};
+    for (const rec of records) {
+      if (typeof rec?.id !== "string") continue;
+      const l = limitsFromRecord(rec);
+      if (!isEmpty(l)) this.lastLimits[rec.id] = l;
+    }
+    return records
       .map((m) => m.id)
       .filter((s): s is string => typeof s === "string")
       .sort();

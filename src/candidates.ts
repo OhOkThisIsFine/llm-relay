@@ -2,9 +2,9 @@ import type { Config, ProviderConfig } from "./config.js";
 import { POOL_PREFIX } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
-import { getBenchmarkScores, getStrength, type BenchmarkScores, type StrengthBasis } from "./benchmarks.js";
+import { getStrength, type StrengthBasis } from "./benchmarks.js";
 import { findTierModel } from "./tier-data.js";
-import { getModelMetadata } from "./metadata.js";
+import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
 import { loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { loadTierData, joinCapability, type CapabilityScore } from "./registry.js";
@@ -12,11 +12,12 @@ import { loadTierData, joinCapability, type CapabilityScore } from "./registry.j
 /**
  * Everything known about one offload destination, kept as SEPARATE raw dimensions.
  *
- * Deliberately un-blended: benchmark quality, live stability, quota and observed traffic measure
- * different things and trade off against each other differently per task ("cheapest that can do
- * it" vs "best available"). Averaging them into one number would bury exactly the judgement the
- * reader is here to make. The two composites that already exist in the product are reported under
- * `sortInputs`, labelled as what they drive — not as a recommendation.
+ * Deliberately un-blended: each leaderboard, live stability, cost, quota and observed traffic
+ * measure different things and trade off against each other differently per task ("cheapest that
+ * can do it" vs "best available"). Averaging them into one number would bury exactly the judgement
+ * the reader is here to make. The one scalar that does exist lives under `sortInputs` with the
+ * basis and signals that produced it — because ordering a pool requires an order, not because it
+ * is a recommendation.
  */
 export interface Candidate {
   spec: string;
@@ -29,7 +30,6 @@ export interface Candidate {
   hasKey: boolean;
   /** In the provider's live /models catalog. null = not checkable (anthropic kind, or catalog down). */
   listed: boolean | null;
-  benchmarks: BenchmarkScores;
   /** BFCL tool-use + LMArena scores, best-effort id→leaderboard match (null when no confident match). */
   capability: CapabilityScore | null;
   health: {
@@ -55,12 +55,22 @@ export interface Candidate {
     avgLatencyMs: number | null;
     lastCalledAt: string | null;
   } | null;
+  /**
+   * Limits, each with its own provenance. `provider` = this provider published it about its own
+   * deployment; `reference` = borrowed from another provider serving the same model id (different
+   * deployment, so indicative only — `metadataReferenceFrom` names it); `static-table` = the
+   * hardcoded table, including its blanket 128k/4096 guess.
+   */
   contextLength: number | null;
-  /** Where contextLength came from — the synced snapshot is authoritative, the static table lags. */
-  contextLengthSource: "snapshot" | "static-table" | null;
+  contextLengthSource: MetadataSource | null;
   maxOutputTokens: number | null;
+  maxOutputTokensSource: MetadataSource | null;
+  metadataReferenceFrom?: string;
+  /** Per-million-token price, with the same provenance rules — a model free on one host and
+   *  metered on another must not report the other's rate. */
   pricePerMTokIn: number | null;
   pricePerMTokOut: number | null;
+  priceSource: MetadataSource | null;
   supportsTools: boolean | null;
   /** Which leaderboards published anything about this model. */
   capabilitySources: string[];
@@ -88,7 +98,7 @@ export interface Candidate {
   sortInputs: {
     /** Drives `routing.benchmarkSort` ordering within a pool. */
     strength: number;
-    /** snapshot | static-table | telemetry | neutral. A telemetry score is not a benchmark score. */
+    /** snapshot | telemetry | neutral. A telemetry score is not a capability score. */
     strengthBasis: StrengthBasis;
     /** How many published signals backed it. 1 is a guess; 5 is a consensus. */
     strengthSignals: string[];
@@ -184,14 +194,26 @@ export async function buildCandidates(
     const summary = opts.pingLoop && model ? opts.pingLoop.getModelSummary(provider, model) : null;
     const state = breaker.getState(spec);
     const obs = telemetry.models[`${provider}/${model}`];
-    const meta = getModelMetadata(model ?? provider);
-    const benchmarks = getBenchmarkScores(spec);
     const strength = getStrength(spec);
     const tier = findTierModel(model ?? spec, byNorm)?.rec;
     const num = (k: string) => (typeof tier?.[k] === "number" ? (tier[k] as number) : null);
-    // The snapshot is fetched from the provider itself, so it beats the hand-typed metadata table
-    // — which had glm-5.2 at 128k when it actually serves 1M.
-    const snapshotCtx = num("context_length");
+
+    // Limits THIS provider publishes about its own deployment, if any. NIM publishes none;
+    // Groq and Mistral publish real ones. The snapshot's numbers come from OpenRouter, so for a
+    // NIM target they are a different deployment's figures and are labelled `reference`, never
+    // presented as this provider's own.
+    const providerLimits = p && p.kind === "openai" && model && opts.catalog
+      ? await opts.catalog.limits(provider, p, model).catch(() => null)
+      : null;
+    const meta = resolveMetadata(model ?? provider, {
+      providerLimits,
+      reference: {
+        contextLength: num("context_length"),
+        pricePromptPerToken: num("price_prompt"),
+        priceCompletionPerToken: num("price_completion"),
+        from: "openrouter",
+      },
+    });
 
     candidates.push({
       spec,
@@ -201,7 +223,6 @@ export async function buildCandidates(
       subagentTiers: membership.subagentTiers,
       hasKey: p?.authEnv ? !!process.env[p.authEnv]?.trim() : true,
       listed,
-      benchmarks,
       capability: model ? joinCapability(model, byNorm) : null,
       health: summary
         ? {
@@ -229,12 +250,14 @@ export async function buildCandidates(
             lastCalledAt: obs.lastCalledAt ? new Date(obs.lastCalledAt).toISOString() : null,
           }
         : null,
-      contextLength: snapshotCtx ?? meta.contextLength ?? null,
-      contextLengthSource: snapshotCtx ? "snapshot" : meta.contextLength ? "static-table" : null,
-      maxOutputTokens: meta.maxOutputTokens ?? null,
-      // OpenRouter quotes per-token; per-million is the unit humans compare in.
-      pricePerMTokIn: num("price_prompt") !== null ? Math.round(num("price_prompt")! * 1e6 * 1000) / 1000 : null,
-      pricePerMTokOut: num("price_completion") !== null ? Math.round(num("price_completion")! * 1e6 * 1000) / 1000 : null,
+      contextLength: meta.contextLength,
+      contextLengthSource: meta.contextLengthSource,
+      maxOutputTokens: meta.maxOutputTokens,
+      maxOutputTokensSource: meta.maxOutputTokensSource,
+      ...(meta.referenceFrom ? { metadataReferenceFrom: meta.referenceFrom } : {}),
+      pricePerMTokIn: meta.pricePerMTokIn,
+      pricePerMTokOut: meta.pricePerMTokOut,
+      priceSource: meta.priceSource,
       supportsTools: typeof tier?.supports_tools === "boolean" ? tier.supports_tools : null,
       capabilitySources: Array.isArray(tier?.sources) ? (tier.sources as string[]) : [],
       scores: {
