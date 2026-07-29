@@ -43,6 +43,7 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
 | `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **subagent-aware routing** (`isSubagentRequest` reads the `cc_is_subagent=true` marker Claude Code stamps into `system`; `subagentSpec` applies `routing.subagents` — **only when `routing.offload` is on, default false** — or an `@relay:` directive read ONLY from the last text block of `messages[0]`, which works with the switch off), reshaper auto-synthesis. |
 | `offload.ts` | The subagent-offload switch. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites only `routing.offload` in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
+| `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. Exhaustion is host-reported for every rung kind because the relay cannot see a CLI's credit balance, and a `quota` bucket cools sibling rungs together (one binary can meter two independent balances — cooling both would skip a live lane). |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
 | `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`). |
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
@@ -175,6 +176,11 @@ test stale code.
 - **A source's absence is not a low score.** Models are never penalised for signals nobody
   publishes; `signal_count` travels with the score instead, so a 1-source guess and a 5-source
   consensus are distinguishable. Don't "fix" a sparse row by defaulting it to zero.
+- **The dispatch ladder decides ORDER, never execution.** `routing.ladder` may name agent CLIs
+  (`kind: "cli"`), but `src/` must never spawn one: their quota is client-bound, they run their
+  own tool loop, and they return only final text — so a relay that shelled out could never return
+  the `tool_use` blocks an HTTP turn owes its caller, and the subagent's granted tools would go
+  silently unused. `/dispatch` hands the host a command; the host runs it. Keep it that way.
 - **Never route subagents by editing `routing.tiers`.** A subagent asking for `haiku` and a human
   picking Haiku are byte-identical requests, so a tier→provider mapping silently drops the human's
   own conversation onto a weak model. Tiers stay on the passthrough; `routing.subagents` is the

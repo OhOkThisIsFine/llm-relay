@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { loadConfig, type Config, type ConfigOverrides } from "./config.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
+import { buildDispatch, type DispatchView } from "./dispatch.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
 import { currentVersion, ensureUpToDate, shouldCheckUpdates } from "./self-update.js";
@@ -96,6 +97,7 @@ Usage:
   llm-relay models [-p <name>] [-r]               List live models per provider
   llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
   llm-relay offload [on|off|status]                Turn subagent offload on/off (default: off)
+  llm-relay dispatch [lane] [-t <task>]            Which lane to hand a delegated task to next
   llm-relay candidates [-p <name>]                 Un-blended decision table for offload targets
   llm-relay help | --help | -h                     Show this help documentation
   llm-relay version | --version | -v               Show version number
@@ -110,6 +112,10 @@ Commands:
   models                                           Query live /models catalog across providers
   ping                                             Probe model latency, stability & quota metrics
   offload on | off | status                        Master switch for subagent offload (off by default)
+  dispatch [lane]                                  Next lane from routing.ladder; -t/--task to render
+                                                   the command, --after <lane> to walk past a spent
+                                                   rung, -x/--exhausted <lane> to report one spent,
+                                                   --json for the raw view
   candidates                                       Benchmarks, health, quota & breaker state per target
   help                                             Show help documentation
   version                                          Print package version
@@ -141,6 +147,7 @@ Proxy Server Endpoints:
   GET /registry                                    Full JSON view of providers, routing & capabilities
   GET /candidates [?provider=]                     Per-target raw benchmarks, health, quota, breaker state
   GET|POST /offload                                Read or set the subagent-offload switch {"enabled":bool}
+  GET|POST /dispatch [?lane=&after=&task=]         Next dispatch lane; POST {"exhausted":"<lane>"} to walk on
   GET /telemetry                                   Live JSON telemetry, quota & stability scores for Claude
   GET /ping                                        Trigger health probe pass & query ping mode summary
   GET /health                                      Diagnostic JSON summary of provider availability & health
@@ -445,6 +452,72 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
   }
 }
 
+/**
+ * `llm-relay dispatch [lane]` — which lane to hand a delegated task to next.
+ *
+ * Prefers a running proxy so the answer reflects live exhaustion state reported by whichever
+ * host last walked the ladder; falls back to a cold local read, which is still correct about
+ * order and configuration but knows nothing about what is currently spent.
+ */
+export async function runDispatch(arg: string | undefined): Promise<void> {
+  const cfg = loadOrExit();
+  const task = argValue("--task", "-t");
+  const spent = argValue("--exhausted", "-x");
+  const after = argValue("--after");
+  const lane = arg && !arg.startsWith("-") ? arg : argValue("--lane");
+
+  if (spent) {
+    const live = await tryServer(cfg, "/dispatch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ exhausted: spent }),
+    });
+    // Cooldowns are runtime state held by the proxy; with nothing listening there is no
+    // process to remember it, and pretending otherwise would silently lose the report.
+    if (!live) {
+      process.stderr.write(`llm-relay dispatch: no proxy running — "${spent}" not recorded as spent\n`);
+      process.exit(1);
+    }
+  }
+
+  const qs = new URLSearchParams();
+  if (task) qs.set("task", task);
+  if (lane) qs.set("lane", lane);
+  if (after) qs.set("after", after);
+  const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
+
+  const live = (await tryServer(cfg, path)) as DispatchView | null;
+  const view =
+    live ??
+    buildDispatch(cfg, {
+      ...(task ? { task } : {}),
+      ...(lane ? { lane } : {}),
+      ...(after ? { after } : {}),
+    });
+
+  if (hasFlag("--json")) {
+    process.stdout.write(JSON.stringify(view, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`subagent offload: ${view.offload ? "ON" : "OFF"}\n`);
+  if (!live) process.stdout.write(`(no proxy running — live exhaustion state unknown)\n`);
+  process.stdout.write("\n");
+
+  for (const l of view.ladder) {
+    const mark = view.next && l.id === view.next.id ? "->" : "  ";
+    const state = l.state === "ready" ? "" : ` [${l.state}${l.readyAt ? ` until ${l.readyAt}` : ""}]`;
+    const target = l.kind === "cli" ? `${l.invoke?.command ?? ""} ${(l.invoke?.args ?? []).join(" ")}` : (l.spec ?? "");
+    process.stdout.write(`${mark} ${l.position}. ${l.id}${state}\n     ${target}\n`);
+    if (l.requiresDirective) {
+      process.stdout.write(`     needs "@relay: ${l.spec}" in the subagent prompt (offload is off)\n`);
+    }
+    if (l.note) process.stdout.write(`     ${l.note}\n`);
+  }
+
+  process.stdout.write(`\n${view.next ? `use: ${view.next.id}` : "no lane available"} — ${view.reason}\n`);
+}
+
 /** `llm-relay offload [on|off|status]` — the subagent-offload master switch. */
 export async function runOffload(arg: string | undefined): Promise<void> {
   const cfg = loadOrExit();
@@ -665,6 +738,13 @@ export function main(): void {
   if (arg2 === "offload") {
     runOffload(arg3).catch((e) => {
       process.stderr.write(`llm-relay offload: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
+  if (arg2 === "dispatch") {
+    runDispatch(arg3).catch((e) => {
+      process.stderr.write(`llm-relay dispatch: ${(e as Error).message}\n`);
       process.exit(1);
     });
     return;

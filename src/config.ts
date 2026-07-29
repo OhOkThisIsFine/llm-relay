@@ -73,6 +73,38 @@ export interface Routing {
    */
   offload?: boolean;
   benchmarkSort?: boolean;
+  /**
+   * Ordered dispatch ladder consulted by `/dispatch` — which LANE a host agent should hand a
+   * whole delegated task to, and in what order to fall back. Distinct from `subagents`, which
+   * routes one HTTP turn: a ladder rung may be an agent CLI that never traverses this proxy,
+   * because its quota is client-bound and only the vendor's own binary can spend it.
+   *
+   * Absent means the relay expresses no opinion and dispatch order stays the host's to choose.
+   */
+  ladder?: LadderRung[];
+}
+
+/**
+ * One rung of `routing.ladder`.
+ *
+ * `cli` rungs are executed by the HOST (the relay never spawns a process — it is a proxy, not a
+ * process supervisor); `relay` rungs are addressed through this proxy in the ordinary way.
+ * `quota` names the balance a rung draws on so that rungs sharing one are cooled down together
+ * and rungs that merely share a binary are not: one CLI can meter two model families against
+ * two independent balances, and treating those as one bucket would skip a live lane.
+ */
+export interface LadderRung {
+  id: string;
+  kind: "cli" | "relay";
+  /** Parked rungs stay visible in the ladder but are never auto-selected. Default true. */
+  enabled: boolean;
+  quota?: string;
+  note?: string;
+  /** cli rungs: the binary to run, and its args — one of which must contain the task placeholder. */
+  command?: string;
+  args?: string[];
+  /** relay rungs: the spec to address (`pool/<name>`, `<provider>/<model>`, a provider name). */
+  spec?: string;
 }
 
 /** Reserved provider-namespace prefix for `pool/<name>` routing. */
@@ -482,6 +514,7 @@ function parseRouting(
     offload?: unknown;
     subagents?: unknown;
     benchmarkSort?: unknown;
+    ladder?: unknown;
   };
   // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
   if (providers[POOL_PREFIX]) {
@@ -546,6 +579,8 @@ function parseRouting(
   const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
+  const ladder = parseLadder(r.ladder);
+  if (ladder.length > 0) routing.ladder = ladder;
 
   // Fail loudly at load time if any spec names an unknown provider or pool.
   assertSpecResolvable(routing.default, providers, pools, "routing.default");
@@ -558,7 +593,72 @@ function parseRouting(
   for (const [tier, spec] of Object.entries(subagents)) {
     assertSpecResolvable(spec, providers, pools, `routing.subagents.${tier}`);
   }
+  for (const rung of ladder) {
+    if (rung.kind === "relay" && rung.spec) {
+      assertSpecResolvable(rung.spec, providers, pools, `routing.ladder[${rung.id}].spec`);
+    }
+  }
   return routing;
+}
+
+/** Placeholder a cli rung's args must contain. Duplicated from dispatch.ts as a literal rather
+ *  than imported, to keep config.ts free of dependencies on modules that import it. */
+const LADDER_TASK_TOKEN = "{task}";
+
+/**
+ * Validate `routing.ladder` at load, not at request time — a ladder whose rung cannot be invoked
+ * is a configuration mistake, and discovering it only when the host is mid-fallback is exactly
+ * when it is least useful. Absent/empty is legal and simply means "no opinion".
+ */
+function parseLadder(raw: unknown): LadderRung[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`config.routing.ladder must be an array of rungs`);
+
+  const out: LadderRung[] = [];
+  const seen = new Set<string>();
+  for (const [i, entry] of raw.entries()) {
+    const where = `config.routing.ladder[${i}]`;
+    if (typeof entry !== "object" || entry === null) throw new Error(`${where} must be an object`);
+    const e = entry as Record<string, unknown>;
+
+    const id = e.id;
+    if (typeof id !== "string" || id.length === 0) throw new Error(`${where}.id must be a non-empty string`);
+    // Ids address rungs in /dispatch overrides and exhaustion reports; a duplicate would make
+    // "use lane X" ambiguous, and silently picking the first is not a decision to make for the user.
+    if (seen.has(id)) throw new Error(`${where}.id "${id}" is already used by an earlier rung`);
+    seen.add(id);
+
+    const kind = e.kind;
+    if (kind !== "cli" && kind !== "relay") throw new Error(`${where}.kind must be "cli" or "relay" (got ${JSON.stringify(kind)})`);
+
+    const rung: LadderRung = { id, kind, enabled: e.enabled !== false };
+    if (typeof e.quota === "string" && e.quota.length > 0) rung.quota = e.quota;
+    if (typeof e.note === "string" && e.note.length > 0) rung.note = e.note;
+
+    if (kind === "cli") {
+      if (typeof e.command !== "string" || e.command.length === 0) {
+        throw new Error(`${where}.command must be a non-empty string for a "cli" rung`);
+      }
+      if (!Array.isArray(e.args) || e.args.some((a) => typeof a !== "string")) {
+        throw new Error(`${where}.args must be an array of strings for a "cli" rung`);
+      }
+      const args = e.args as string[];
+      // Without the placeholder the task text has nowhere to go and the rung would invoke the
+      // agent with an empty prompt — a failure that looks like the model ignoring the request.
+      if (!args.some((a) => a.includes(LADDER_TASK_TOKEN))) {
+        throw new Error(`${where}.args must contain "${LADDER_TASK_TOKEN}" in one argument — otherwise the task is never passed to ${e.command}`);
+      }
+      rung.command = e.command;
+      rung.args = args;
+    } else {
+      if (typeof e.spec !== "string" || e.spec.length === 0) {
+        throw new Error(`${where}.spec must be a non-empty string for a "relay" rung`);
+      }
+      rung.spec = e.spec;
+    }
+    out.push(rung);
+  }
+  return out;
 }
 
 function assertSpecResolvable(
