@@ -269,6 +269,23 @@ describe("subagent-aware routing", () => {
       tiers: { opus: "anthropic", sonnet: "anthropic", haiku: "anthropic", fable: "anthropic" },
       pools: { coding: ["nim/z-ai/glm-5.2"], fast: ["nim/openai/gpt-oss-20b"] },
       subagents: { opus: "pool/coding", haiku: "pool/fast", default: "pool/coding" },
+      offload: true,
+      benchmarkSort: false,
+    },
+  }));
+
+  // Same routing, offload switch OFF — the shipped default.
+  const cfgOff = loadConfig(write("subagents-off.json", {
+    listen: "127.0.0.1:8791",
+    providers: {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+      nim: { base: "https://nim.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" },
+    },
+    routing: {
+      default: "anthropic",
+      tiers: { opus: "anthropic", sonnet: "anthropic", haiku: "anthropic", fable: "anthropic" },
+      pools: { coding: ["nim/z-ai/glm-5.2"], fast: ["nim/openai/gpt-oss-20b"] },
+      subagents: { opus: "pool/coding", haiku: "pool/fast", default: "pool/coding" },
       benchmarkSort: false,
     },
   }));
@@ -290,6 +307,23 @@ describe("subagent-aware routing", () => {
     // Even a literal directive must not reroute a human's own conversation.
     expect(subagentSpec(main, "claude-opus-5", cfg)).toBeNull();
     expect(resolveTarget("claude-opus-5", cfg).provider).toBe("anthropic");
+  });
+
+  it("offload defaults to OFF — routing.offload absent means the map is inert", () => {
+    expect(cfgOff.routing.offload).toBe(false);
+    // Same request that lands on pool/coding with offload on must pass straight through.
+    expect(subagentSpec(msg("find the bug"), "claude-opus-5", cfgOff)).toBeNull();
+    expect(subagentSpec(msg("list files"), "claude-haiku-4-5", cfgOff)).toBeNull();
+    expect(subagentSpec(msg("do a thing"), "some-unknown-model", cfgOff)).toBeNull();
+    expect(resolveTarget("claude-opus-5", cfgOff).provider).toBe("anthropic");
+  });
+
+  it("honours an explicit @relay directive even while offload is OFF (per-call opt-in)", () => {
+    expect(subagentSpec(msg("@relay: pool/fast\nlist files"), "claude-opus-5", cfgOff)).toBe("pool/fast");
+    // …and still strips it, so the off path can't leak the directive to the model either.
+    const body = msg("@relay: nim/z-ai/glm-5.2\nsummarise this");
+    subagentSpec(body, "claude-opus-5", cfgOff);
+    expect(body.messages[0]!.content[0]!.text).toBe("summarise this");
   });
 
   it("maps a subagent tier to its pool", () => {

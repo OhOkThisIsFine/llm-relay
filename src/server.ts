@@ -19,6 +19,8 @@ import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
 import { fetchBackend, fetchOpenAiFront } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { buildRegistry } from "./registry.js";
+import { buildCandidates } from "./candidates.js";
+import { offloadState, setOffload } from "./offload.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
@@ -146,6 +148,40 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(stats));
 
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    return;
+  }
+
+  // Un-blended decision table for picking an offload target: benchmarks, live health, quota,
+  // observed traffic and breaker state side by side, in config order.
+  if (req.method === "GET" && pathname === "/candidates") {
+    const view = await buildCandidates(cfg, {
+      catalog: h.catalog,
+      ...(h.pingLoop ? { pingLoop: h.pingLoop } : {}),
+      ...(pickQuery(path, "provider") ? { provider: pickQuery(path, "provider")! } : {}),
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(view, null, 2));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    return;
+  }
+
+  // The offload switch. POST applies to the LIVE config object the request path reads, so the
+  // very next subagent request is routed the new way — no restart — and is persisted back to
+  // the config file so the choice survives one.
+  if ((req.method === "GET" || req.method === "POST") && pathname === "/offload") {
+    let state = offloadState(cfg);
+    if (req.method === "POST") {
+      const want = (reqJson as { enabled?: unknown } | undefined)?.enabled;
+      if (typeof want !== "boolean") {
+        failClosed(res, 400, `POST /offload needs a JSON body {"enabled": true|false}`);
+        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+        return;
+      }
+      state = setOffload(cfg, want);
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(state, null, 2));
     h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
     return;
   }
@@ -869,6 +905,13 @@ function pickString(obj: unknown, key: string): string | null {
     if (typeof v === "string") return v;
   }
   return null;
+}
+
+/** Read one query-string param off a raw request path. */
+function pickQuery(path: string, key: string): string | null {
+  const q = path.indexOf("?");
+  if (q === -1) return null;
+  return new URLSearchParams(path.slice(q + 1)).get(key);
 }
 
 function pickBool(obj: unknown, key: string): boolean {

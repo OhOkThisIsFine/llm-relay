@@ -62,6 +62,16 @@ export interface Routing {
    * `routing.tiers` free to stay on an Anthropic passthrough.
    */
   subagents?: Record<string, string>;
+  /**
+   * Master switch for subagent offload. **Default false** — subagents route exactly like the
+   * human's own conversation (i.e. straight to the Anthropic passthrough) until offload is
+   * deliberately turned on. Offloading every subagent by default is a surprising, invisible
+   * change of who is answering; it has to be a decision.
+   *
+   * Gates `subagents` ONLY. An explicit `@relay:` directive in a subagent prompt is a per-call
+   * opt-in and is honoured whether or not this is on.
+   */
+  offload?: boolean;
   benchmarkSort?: boolean;
 }
 
@@ -123,12 +133,17 @@ export function readRelayDirective(reqJson: unknown, strip = false): string | nu
 
 /**
  * The spec a subagent request should route to, or null to leave routing unchanged.
- * Directive wins over tier; tier falls back to `subagents.default`.
+ *
+ * Precedence: an explicit `@relay:` directive (per-call opt-in, works even with offload off) >
+ * `routing.subagents[<tier>]` > `routing.subagents.default` — the last two only when
+ * `routing.offload` is on. Offload off is the default, so a subagent behaves like any other
+ * request until someone turns it on.
  */
 export function subagentSpec(reqJson: unknown, model: string | null, cfg: Config): string | null {
   if (!isSubagentRequest(reqJson)) return null;
   const directive = readRelayDirective(reqJson, true);
   if (directive) return directive;
+  if (!cfg.routing.offload) return null;
   const map = cfg.routing.subagents;
   if (!map) return null;
   const tier = model ? detectTier(model) : null;
@@ -163,6 +178,9 @@ export interface Config {
   reshaperCandidates?: ReshaperConfig[];
   repair: { maxAttempts: number; destructiveTools: string[] };
   log: { level: "metadata" | "silent"; file: string | null };
+  /** Path this config was loaded from. Set by `loadConfig`; absent for hand-built test configs.
+   *  Only consumer is the runtime offload toggle, which persists back to the same file. */
+  sourcePath?: string;
 }
 
 const DEFAULT_DESTRUCTIVE = ["rm", "delete", "remove", "push", "force", "overwrite", "drop", "reset"];
@@ -392,6 +410,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     ...(reshaperCandidates && reshaperCandidates.length > 1 ? { reshaperCandidates } : {}),
     repair: { maxAttempts, destructiveTools },
     log: { level, file },
+    sourcePath: path,
   };
 }
 
@@ -438,6 +457,7 @@ function parseRouting(
     default?: unknown;
     tiers?: unknown;
     pools?: unknown;
+    offload?: unknown;
     subagents?: unknown;
     benchmarkSort?: unknown;
   };
@@ -493,7 +513,10 @@ function parseRouting(
   }
 
   const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
-  const routing: Routing = { default: dflt, tiers, benchmarkSort };
+  // Absent => false. Offload is opt-in: a missing key must never mean "send every subagent
+  // to another provider", which is what an implicit-on default would do to an existing config.
+  const offload = r.offload === true;
+  const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
 
