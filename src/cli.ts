@@ -567,16 +567,16 @@ export async function runCandidates(): Promise<void> {
         fmt(c.health?.p95Ms ?? null, "ms").padEnd(8) +
         fmt(c.quotaPercent, "%").padEnd(7) +
         breaker.padEnd(9) +
-        // Provenance inline: "~" = another provider's figure for this model id, "?" = the
-        // hardcoded table's guess. A NIM row must never present OpenRouter's ceiling as its own.
+        // Provenance inline: "~" = another provider's figure for this model id. A NIM row must
+        // never present OpenRouter's ceiling as its own.
         ctx +
-        (c.contextLengthSource === "reference" ? "~" : c.contextLengthSource === "static-table" ? "?" : "") +
+        (c.contextLengthSource === "reference" ? "~" : "") +
         (live === "NO" ? "  ⚠UNLISTED" : "") +
         "\n",
     );
   }
 
-  const fuzzy = view.candidates.filter((c) => c.capability?.match === "fuzzy");
+  const fuzzy = view.candidates.filter((c) => c.capabilityMatch?.match === "fuzzy");
   const srcs = [...new Set(view.candidates.flatMap((c) => c.capabilitySources))].sort();
   process.stdout.write(
     "\nColumns are independent — weigh them yourself. agentic/coding/BFCL/aider/arena are\n" +
@@ -585,13 +585,13 @@ export async function runCandidates(): Promise<void> {
       `  str = the one scalar pool ordering needs. "83.3/4" = 4 published signals behind it;\n` +
       `        "obs" = ranked on this proxy's own traffic, "neut" = nothing known.\n` +
       `  "~" on ctx/$ = another provider's figure for the same model id (this one publishes none);\n` +
-      `  "?" on ctx   = the hardcoded table's guess. Unmarked = this provider published it.\n` +
+      `                 unmarked = the serving provider published it; blank = nobody publishes it.\n` +
       (srcs.length ? `Sources contributing: ${srcs.join(", ")} (refresh: npm run sync:tiers)\n` : ""),
   );
   if (fuzzy.length > 0) {
     process.stdout.write(
       `~ = scores borrowed from a similarly-named model, not this one: ` +
-        fuzzy.map((c) => `${c.model ?? c.spec} -> ${c.capability!.matched_name}`).join(", ") +
+        fuzzy.map((c) => `${c.model ?? c.spec} -> ${c.capabilityMatch!.name}`).join(", ") +
         "\n",
     );
   }
@@ -600,7 +600,7 @@ export async function runCandidates(): Promise<void> {
   );
 }
 
-import { runInteractiveOnboarding, printOnboardingGuide } from "./onboarding.js";
+import { runInteractiveOnboarding } from "./onboarding.js";
 import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
 import { getTelemetryReport } from "./telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";

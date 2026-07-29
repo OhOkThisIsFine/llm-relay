@@ -25,7 +25,7 @@ import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthrop
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
-import { getModelMetadata, estimateRequestTokens } from "./metadata.js";
+import { estimateRequestTokens } from "./metadata.js";
 import { getTelemetryReport } from "./telemetry.js";
 
 const HOP_BY_HOP = new Set([
@@ -222,16 +222,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const healthyTargets = globalCircuitBreaker.getHealthyTargets(targetCandidates);
   let target = healthyTargets[0]!;
 
-  // Validate request prompt token count against model context limits if available
-  if (isMessages && reqJson) {
-    const meta = getModelMetadata(target.model ? `${target.provider}/${target.model}` : target.provider);
-    if (meta.contextLength) {
+  // Context guardrail — enforced ONLY against a limit the serving provider published about its own
+  // deployment. An unknown limit means no guardrail: the request goes upstream and the provider
+  // answers with its own (authoritative) error.
+  //
+  // This deliberately does not fall back to another provider's figure for the same model id, nor to
+  // a hardcoded guess — both used to happen. Either could reject a request the backend would have
+  // accepted, and a 400 invented from a number we made up is worse than an upstream error that is
+  // actually true. `cachedLimits` never fetches, so a cold cache degrades to "no guardrail" rather
+  // than blocking the request on an upstream round-trip.
+  if (isMessages && reqJson && target.model) {
+    const limits = h.catalog.cachedLimits(target.provider, target.model);
+    if (limits?.contextLength) {
       const estimatedTokens = estimateRequestTokens(reqJson);
-      if (estimatedTokens > meta.contextLength) {
+      if (estimatedTokens > limits.contextLength) {
         failClosed(
           res,
           400,
-          `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds model context limit (${meta.contextLength})`,
+          `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds the context limit ` +
+            `"${target.provider}" publishes for "${target.model}" (${limits.contextLength})`,
         );
         h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped"));
         return;

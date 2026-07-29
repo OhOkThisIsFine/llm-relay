@@ -59,7 +59,7 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → observed runtime telemetry (≥5 calls, so one lucky request can't promote a model) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
 | `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
-| `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value → another provider's figure for the same id (`reference`, indicative only) → the hardcoded table (`static-table`, including its blanket 128k/4096 guess). Price has no table rung: unknown cost stays null rather than becoming a guess. `getModelMetadata()` is the legacy raw-table lookup — prefer the resolver. |
+| `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value (`provider`) → another provider's figure for the same id (`reference`, indicative only) → **null**. There is no hardcoded-table rung: the old blanket 128k/4096 guess was deleted in 0.7.0 because a caller cannot tell a guess from a measurement. Plus `estimateRequestTokens()`. |
 | `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. Re-exports `loadTierData` from `tier-data.ts`. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
 | `key-checker.ts` | Pre-flight validator checking provider API key health and remaining rate-limit quota percentages. |
 | `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). |
@@ -145,8 +145,13 @@ test stale code.
 - **Limits and prices are per-(provider, model).** The same model id on two providers is two
   deployments — different context ceilings, different output caps, free on one and metered on the
   other. Never present one provider's figure as another's: resolve through `resolveMetadata()` and
-  keep the `provider` / `reference` / `static-table` label. Tests in `test/metadata.test.ts` pin
-  this, including that an unknown price stays null instead of being guessed.
+  keep the `provider` / `reference` label. Tests in `test/metadata.test.ts` pin this, including that
+  an unknown limit or price stays **null** instead of being guessed.
+- **The context guardrail fires only on a limit the SERVING provider published.** Unknown limit ⇒
+  no guardrail; the request goes upstream and the backend returns its own authoritative error. It
+  reads `catalog.cachedLimits()`, which never fetches — a cold cache degrades to "no guardrail",
+  never to a blocking round-trip on the request path. Don't reintroduce a fallback ceiling: a 400
+  invented from a number we made up is worse than a true upstream error.
 - **Capability data is synced, never typed.** Add a source by writing a fetcher in
   `scripts/sync-tiers.mjs`, not a row in `BENCHMARK_DB`. Sources are independently failable — one
   dead endpoint must not cost the others — but **schema drift inside a source still throws** (a
@@ -178,7 +183,6 @@ every endpoint). Everything it found is now fixed; `multimodal-probe.mjs` is 5/5
 `npm run sync:tiers` merges OpenRouter + BFCL + LMArena + Aider into `docs/tier-data.json` and
 `getStrength()` ranks pools off it. Source probe results, coverage per source, and why EvalPlus /
 HF Open LLM / LiveCodeBench were rejected: [docs/capability-sources.md](docs/capability-sources.md).
-Older background research: [docs/model-capability-ranking-sources.md](docs/model-capability-ranking-sources.md).
 
 Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; top of the
 `coding` pool by synced strength, 4 signals). `llama-3.1-8b` trips 25% of calls and the reshaper

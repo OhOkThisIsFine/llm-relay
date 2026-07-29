@@ -64,10 +64,6 @@ export function loadTierData(): TierData | null {
   }
 }
 
-/** Test seam: drop the memo so a fixture written mid-test is re-read. */
-export function _resetTierDataCache(): void {
-  _cache = null;
-}
 
 export interface TierMatch {
   rec: TierModel;

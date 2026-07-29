@@ -1,15 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { getModelMetadata, estimateRequestTokens, resolveMetadata } from "../src/metadata.js";
+import { estimateRequestTokens, resolveMetadata } from "../src/metadata.js";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { limitsFromRecord, ModelCatalog } from "../src/catalog.js";
+import { createProxy } from "../src/server.js";
 import type { ProviderConfig } from "../src/config.js";
 
 describe("metadata", () => {
-  it("looks up context window limits for models", () => {
-    const meta = getModelMetadata("claude-3-7-sonnet");
-    expect(meta.contextLength).toBe(200000);
-    expect(meta.supportsThinking).toBe(true);
-  });
-
   it("estimates request token count accurately", () => {
     const req = {
       system: "You are a helpful coding assistant.",
@@ -65,6 +62,82 @@ describe("per-provider limits", () => {
     expect(rich).toEqual({ contextLength: 131072, maxOutputTokens: 32768, pricePromptPerToken: null, priceCompletionPerToken: null });
     // null, NOT the other provider's numbers — that conflation is the bug this guards.
     expect(bare).toBeNull();
+  });
+});
+
+describe("context guardrail", () => {
+  const cfgFor = (base: string) => ({
+    host: "127.0.0.1", port: 0,
+    providers: { nim: { base, kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 5000 } },
+    routing: { default: "nim/small/model", tiers: {}, benchmarkSort: false },
+    mode: "detect" as const,
+    repair: { maxAttempts: 2, destructiveTools: [] },
+    log: { level: "silent" as const, file: null },
+  });
+
+  const listen = async (s: Server): Promise<number> =>
+    new Promise((r) => s.listen(0, "127.0.0.1", () => r((s.address() as AddressInfo).port)));
+
+  const send = (port: number, words: number) =>
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "nim/small/model",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "lorem ipsum ".repeat(words) }],
+      }),
+    });
+
+  it("enforces only the limit the SERVING provider published, and passes through when unknown", async () => {
+    const servers: Server[] = [];
+    try {
+      // Upstream doubles as the provider's own /models endpoint.
+      let publishLimits = true;
+      const upstream = createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        if ((req.url ?? "").includes("/models")) {
+          res.end(JSON.stringify({
+            data: [{ id: "small/model", ...(publishLimits ? { context_window: 50 } : {}) }],
+          }));
+        } else {
+          res.end(JSON.stringify({ id: "m", type: "message", role: "assistant", content: [], model: "small/model" }));
+        }
+      });
+      servers.push(upstream);
+      const upPort = await listen(upstream);
+
+      const catalog = new ModelCatalog({ cachePath: null });
+      const cfg = cfgFor(`http://127.0.0.1:${upPort}/v1`);
+      const proxy = createProxy(cfg as never, { catalog });
+      servers.push(proxy);
+      const port = await listen(proxy);
+
+      // Warm the catalog so cachedLimits() has something (it never fetches on the hot path).
+      await catalog.list("nim", cfg.providers.nim);
+
+      // Comfortably over the published 50-token ceiling → rejected, naming the provider.
+      const over = await send(port, 400);
+      expect(over.status).toBe(400);
+      const body = (await over.json()) as { error: { message: string } };
+      // The message names the provider AND the model: an unqualified "context limit" would
+      // re-introduce exactly the ambiguity this change removes.
+      expect(body.error.message).toContain('context limit "nim" publishes for "small/model" (50)');
+
+      // Same oversized request against a provider that publishes NO limit: no local guardrail,
+      // the request goes upstream and the backend gets to answer for itself.
+      publishLimits = false;
+      const bare = new ModelCatalog({ cachePath: null });
+      const cfg2 = cfgFor(`http://127.0.0.1:${upPort}/v1`);
+      const proxy2 = createProxy(cfg2 as never, { catalog: bare });
+      servers.push(proxy2);
+      const port2 = await listen(proxy2);
+      await bare.list("nim", cfg2.providers.nim);
+
+      expect((await send(port2, 400)).status).toBe(200);
+    } finally {
+      servers.forEach((s) => s.close());
+    }
   });
 });
 
@@ -125,9 +198,14 @@ describe("resolveMetadata provenance", () => {
     expect(unknown.priceSource).toBeNull();
   });
 
-  it("falls back to the hardcoded table last, and says so", () => {
+  it("reports UNKNOWN rather than guessing when nobody publishes a limit", () => {
+    // There used to be a hardcoded table handing out a blanket 128k/4096 here. A guess that a
+    // caller cannot distinguish from a measurement is worse than a null — and the context
+    // guardrail in server.ts would reject real requests against an invented ceiling.
     const m = resolveMetadata("totally-unknown-model-xyz", { providerLimits: null, reference: null });
-    expect(m.contextLengthSource).toBe("static-table"); // the blanket 128k guess — labelled, not hidden
-    expect(m.contextLength).toBe(128000);
+    expect(m.contextLength).toBeNull();
+    expect(m.contextLengthSource).toBeNull();
+    expect(m.maxOutputTokens).toBeNull();
+    expect(m.maxOutputTokensSource).toBeNull();
   });
 });

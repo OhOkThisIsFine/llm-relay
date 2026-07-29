@@ -210,6 +210,19 @@ export class ModelCatalog {
     return models.includes(model);
   }
 
+/**
+   * Already-cached limits for a model — synchronous, never fetches.
+   *
+   * For the request hot path, where a blocking upstream fetch to learn a context window would be a
+   * worse outcome than simply not enforcing a guardrail on the first request. Returns null until
+   * the catalog has been warmed (startup does that), which callers must treat as "unknown".
+   */
+  cachedLimits(name: string, model: string): ModelLimits | null {
+    this.loadDisk();
+    const l = this.mem.get(name)?.limits?.[model];
+    return l && !isEmpty(l) ? l : null;
+  }
+
   /**
    * Limits this provider publishes for one of its own models, or null when it publishes none.
    *
