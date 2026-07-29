@@ -161,7 +161,9 @@ describe("PingLoop Cadence", () => {
 
 describe("Proxy Health Endpoints", () => {
   it("exposes /ping and /health/stats on proxy server", async () => {
-    const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+    // Probe timeout must be well under the test timeout: /ping probes this fake
+    // host live, and how fast the connect fails depends on the machine's DNS.
+    const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 1000 };
     const mockCatalog: ModelCatalog = {
       list: async () => ["m1"],
     } as any;

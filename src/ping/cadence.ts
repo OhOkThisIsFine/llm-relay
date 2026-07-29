@@ -166,7 +166,10 @@ export class PingLoop {
       const toProbe = dueIds.slice(0, 3);
 
       for (const mId of toProbe) {
-        const res = await pingProviderModel(providerName, mId, pCfg, apiKey, optsObj(this.opts.fetchFn));
+        const res = await pingProviderModel(providerName, mId, pCfg, apiKey, {
+          ...optsObj(this.opts.fetchFn),
+          ...(pCfg.timeoutMs !== undefined ? { timeoutMs: pCfg.timeoutMs } : {}),
+        });
         this.recordPing(providerName, mId, res);
       }
     }
