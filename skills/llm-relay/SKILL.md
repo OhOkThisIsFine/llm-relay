@@ -95,24 +95,45 @@ targets — the host agent reaches them by shelling out to the vendor CLI, and t
 **one ordered ladder** together with the relay's pools. Walk it top to bottom; each rung falls
 back to the next on failure or quota exhaustion, exactly like candidates inside a relay pool.
 
-**Default ladder for offloadable work** (bulk recon, extraction, analysis):
+**Default ladder for offloadable work** (bulk recon, extraction, analysis). Included
+subscription/credit allowances are spent before metered-or-free API capacity, so the cheap lanes
+are the *first* resort, not the fallback:
 
-1. **Relay pool** — `@relay: pool/coding` subagent (or tier via `routing.subagents` when offload
-   is on). Free API-key capacity. *Exhausted when:* the pool 4xx/5xxs after failover walks every
-   candidate, or `llm-relay candidates` shows the breaker open / quota drained across the pool.
-2. **Antigravity CLI** — `agy -p "<task>" --output-format json` (spends AGY CLI credits; the
-   `gemini` CLI is its deprecated former name). Useful flags: `--model` (`agy models` lists),
-   `--effort low|medium|high`, `--add-dir <path>` to scope the workspace, `--json-schema` for
-   structured output, `--print-timeout` (default 5m), `--mode plan` for analysis-only runs.
+1. **Antigravity — Gemini 3.6 Flash, any tier.** The default workhorse for every tier; pick the
+   reasoning level to suit the task, since AGY bakes it into the model id:
+   ```bash
+   agy -p "<task>" --model gemini-3.6-flash-medium --output-format json
+   ```
+   `-high` for analysis and tracing, `-medium` for ordinary recon, `-low` for mechanical sweeps.
+   Other flags: `--add-dir <path>` to scope the workspace, `--json-schema` for structured output,
+   `--print-timeout` (default 5m), `--mode plan` for analysis-only runs. Spends AGY CLI credits.
    *Exhausted when:* the CLI reports credits/quota exhausted or rate-limits.
-3. **Codex CLI** — `codex exec "<task>"` (spends the ChatGPT subscription). Also
-   `codex exec review` for repo review. *Exhausted when:* it reports usage-limit errors.
-4. **Anthropic subagent** — plain `Agent(...)`, no directive. Spends primary quota; always works.
+2. **Antigravity — Claude, same CLI and credits.** When Flash is not strong enough for the task,
+   stay on AGY and step up rather than leaving the lane: `--model claude-opus-4-6-thinking` for
+   hard reasoning, `--model claude-sonnet-4-6` for everything else. (Neither id carries a level
+   suffix — use the session flag `--effort low|medium|high` if you need to tune them.)
+   *Exhausted when:* AGY credits are gone — i.e. this rung and rung 1 exhaust together.
+3. **Codex — Sol, then Terra, then Luna.** Spends the ChatGPT subscription:
+   ```bash
+   codex exec --model gpt-5.6-sol "<task>"
+   ```
+   Walk `gpt-5.6-sol` → `gpt-5.6-terra` → `gpt-5.6-luna` in that order. Set reasoning to suit with
+   `-c model_reasoning_effort="high|medium|low"` (the config default is `high`). `codex exec review`
+   runs a repo review. *Exhausted when:* it reports usage-limit errors.
+4. **Relay pools — free API-key capacity, benchmark order.** `@relay: pool/coding` (or the tier
+   mapping in `routing.subagents` when offload is on). Ordering *inside* a pool is by synced
+   benchmark strength, not config order — see "Reordering dispatch" below. *Exhausted when:* the
+   pool 4xx/5xxs after failover walks every candidate, or `llm-relay candidates` shows the breaker
+   open / quota drained across the pool.
+5. **Anthropic subagent** — plain `Agent(...)`, no directive. Spends primary quota; always works.
+
+`agy models` and the Codex model list are the authority on what exists — re-check them rather than
+trusting these ids after a CLI upgrade, since a de-listed id fails the whole rung.
 
 Rules for walking it:
 
 - **Skip a rung whose CLI is not installed** (`Get-Command agy` / `codex` or `command -v`) — this
-  ladder degrades gracefully to "relay, then Anthropic" on machines without the peer CLIs.
+  ladder degrades gracefully to "relay pools, then Anthropic" on machines without the peer CLIs.
 - Both CLIs are **full agents with their own tool loops** — hand them a self-contained prompt with
   file paths, run long tasks in the background, and treat output as advisory (verify against
   source) exactly like relay-offloaded output. Do NOT wrap them in a bare one-shot HTTP helper.
@@ -127,9 +148,9 @@ Ordering exists at three levels; change the right one:
 
 - **The ladder above** (which lane is tried first): it is instructions, not code — edit the
   numbered list in this skill file (`skills/llm-relay/SKILL.md` in the repo; the installed copy
-  lives in `~/.claude/skills/llm-relay/`, refreshed on package upgrade). E.g. to burn AGY credits
-  before free API keys, swap rungs 1 and 2. The user can also reorder per-request in chat
-  ("try codex first for this").
+  lives in `~/.claude/skills/llm-relay/`, refreshed on package upgrade). E.g. to preserve AGY
+  credits and spend free API capacity first, move rung 4 to the top. The user can also reorder
+  per-request in chat ("try codex first for this").
 - **Which pool a tier lands on** (`routing.subagents` in `~/.llm-relay/config.json`): maps the
   Agent tool's `model` param (opus/sonnet/haiku/…) to a pool or pinned spec. Takes effect on the
   next request; no restart.
