@@ -40,10 +40,50 @@ interface Parsed {
   prerelease: string | null;
 }
 
+/**
+ * Strict, END-ANCHORED semver. The anchor is load-bearing, not cosmetic: this
+ * value arrives from an HTTPS response to the npm registry and from a
+ * user-writable cache file, and it is passed to a subprocess. An unanchored
+ * pattern accepts `9.9.9 & calc.exe` as a clean parse of `9.9.9`, and the
+ * trailing shell metacharacters then travel with it.
+ */
 function parseVersion(v: string): Parsed | null {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(v.trim());
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(v.trim());
   if (!m) return null;
   return { release: [Number(m[1]), Number(m[2]), Number(m[3])], prerelease: m[4] ?? null };
+}
+
+/** True only for a full-string semver — the gate every registry- or cache-supplied version must clear. */
+export function isValidVersion(v: unknown): v is string {
+  return typeof v === "string" && parseVersion(v) !== null;
+}
+
+/**
+ * Semver prerelease ordering: dot-separated identifiers left to right, numeric
+ * identifiers compared numerically, a numeric identifier ranking below an
+ * alphanumeric one, and a shorter run of otherwise-equal identifiers ranking
+ * lower. Plain string comparison gets this wrong — it sorts `rc.9` above `rc.10`.
+ */
+function comparePrerelease(a: string, b: string): number {
+  const pa = a.split(".");
+  const pb = b.split(".");
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i];
+    const y = pb[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (nx !== ny) {
+      return nx ? -1 : 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
 }
 
 /** -1 / 0 / 1, semver-ordered for the subset we publish. Unparseable sorts equal. */
@@ -58,7 +98,7 @@ export function compareVersions(a: string, b: string): number {
   if (pa.prerelease === pb.prerelease) return 0;
   if (pa.prerelease === null) return 1;
   if (pb.prerelease === null) return -1;
-  return pa.prerelease < pb.prerelease ? -1 : 1;
+  return comparePrerelease(pa.prerelease, pb.prerelease);
 }
 
 export function isOutdated(current: string, latest: string): boolean {
@@ -121,7 +161,11 @@ const cacheFile = () => join(homedir(), ".llm-relay", "update-check.json");
 export function readCache(now: number): string | null {
   try {
     const c = JSON.parse(readFileSync(cacheFile(), "utf8")) as UpdateCache;
-    if (typeof c.latest !== "string" || typeof c.checkedAt !== "number") return null;
+    if (typeof c.checkedAt !== "number") return null;
+    // Re-validate on READ, not only on fetch. This is a user-writable file on
+    // the path to a subprocess argument, so a value that never cleared the
+    // semver gate must not be able to replay out of it for the cache lifetime.
+    if (!isValidVersion(c.latest)) return null;
     return now - c.checkedAt < CHECK_INTERVAL_MS ? c.latest : null;
   } catch {
     return null;
@@ -148,26 +192,35 @@ export async function fetchLatestVersion(): Promise<string | null> {
     });
     if (!res.ok) return null;
     const body = (await res.json()) as { version?: string };
-    return typeof body.version === "string" ? body.version : null;
+    // Network-controlled input: reject anything that is not a full-string semver
+    // at the boundary, so nothing downstream has to be careful about it.
+    return isValidVersion(body.version) ? body.version : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Windows resolves `npm` to a `.cmd` shim, which Node can only launch through
- * the command interpreter — spawning it with `shell: true` is deprecated
- * (DEP0190), so the interpreter is invoked explicitly instead. Every argument
- * here is ours (a package name and a semver), never user input.
+ * Windows resolves `npm` to a `.cmd` shim. An earlier revision launched it by
+ * joining the argv into a single `cmd.exe /c` STRING and asserted here that
+ * "every argument is ours, never user input" — which was false: the version
+ * comes from an HTTPS registry response and from a user-writable cache, so
+ * `cmd` metacharacters in it became live shell syntax.
+ *
+ * The interpreter must still be named explicitly (spawning a `.cmd` with
+ * `shell: true` is deprecated, DEP0190), but arguments are now passed as a real
+ * ARGV ARRAY, so nothing inside an argument can introduce a new command.
+ * Callers must still only pass values that cleared `isValidVersion`.
  */
 function npm(args: string[]): { ok: boolean; stdout: string; stderr: string } {
   const win = process.platform === "win32";
   const res = win
-    ? spawnSync("cmd.exe", ["/d", "/s", "/c", ["npm", ...args].join(" ")], {
+    ? spawnSync("cmd.exe", ["/d", "/s", "/c", "npm", ...args], {
         encoding: "utf8",
         windowsHide: true,
+        shell: false,
       })
-    : spawnSync("npm", args, { encoding: "utf8" });
+    : spawnSync("npm", args, { encoding: "utf8", shell: false });
   return {
     ok: res.status === 0,
     stdout: (res.stdout ?? "").trim(),
