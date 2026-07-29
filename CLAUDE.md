@@ -20,7 +20,7 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 ```bash
 npm install
 npm run build          # tsc -> dist/
-npm test               # vitest run  (currently 282 tests / 30 files)
+npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
 npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -205,7 +205,17 @@ test stale code.
 
 ## Status & open work
 
-Current: **usable end-to-end**, 282 tests green, tsc clean. A real `claude` agentic session
+> ⚠ **An audit remediation is IN PROGRESS on branch `remediate/audit-2026-07-29`.**
+> Read [docs/remediation-handoff-2026-07-29.md](docs/remediation-handoff-2026-07-29.md) FIRST if you
+> are continuing it. 11 of 410 approved findings have landed (both criticals); 399 remain, four
+> tightening obligations block completion, and several existing tests pin the defect they should
+> catch — a correct fix can turn the suite red. That doc also records why `phase_cut.json` must not
+> be trusted for ordering, and which findings name the wrong module.
+>
+> The audit + remediation artifacts live in `.audit-tools/`, which is **untracked and local-only** —
+> `git clean -fd` destroys them. The handoff doc is the committed source of truth.
+
+Current: **usable end-to-end**, suite green, tsc clean. A real `claude` agentic session
 completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 **Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code
