@@ -69,6 +69,12 @@ A provider with kind:"anthropic" and NO authEnv is a passthrough: the caller's o
 credentials are forwarded untouched. Point the tiers at one to keep real Claude
 traffic on real Anthropic while pool/* requests go to other providers.
 
+Claude Code SUBAGENTS (flagged cc_is_subagent=true on the wire) additionally consult
+routing.subagents{} — a tier -> spec map — so subagents can run on other providers
+while the human's own conversation stays on passthrough. A dispatcher may pin one
+call by putting "@relay: <spec>" on its own line in the subagent's prompt; the line
+is stripped before forwarding.
+
 Usage:
   llm-relay [options]                              Start the proxy server (default)
   llm-relay onboard                                Guided setup for 100%-free providers & subscriptions

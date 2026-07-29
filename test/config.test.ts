@@ -2,7 +2,14 @@ import { describe, it, expect, afterAll } from "vitest";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig, resolveTarget, resolveTargets, reshaperForTarget } from "../src/config.js";
+import {
+  loadConfig,
+  resolveTarget,
+  resolveTargets,
+  reshaperForTarget,
+  isSubagentRequest,
+  subagentSpec,
+} from "../src/config.js";
 
 // Eager (not in beforeAll) so describe-body loadConfig(write(...)) calls work at collection.
 const dir = mkdtempSync(join(tmpdir(), "rp-cfg-"));
@@ -244,6 +251,94 @@ describe("resolveTargets — pool/<name> ranked routing", () => {
       providers: { pool: { base: "https://x.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" } },
       routing: { default: "pool/m" },
     }))).toThrow(/reserved/);
+  });
+});
+
+describe("subagent-aware routing", () => {
+  const SUB = "x-anthropic-billing-header: cc_version=2.1.220.e23; cc_entrypoint=sdk-cli; cc_is_subagent=true;\nYou are a Claude agent.";
+  const MAIN = "x-anthropic-billing-header: cc_version=2.1.220.337; cc_entrypoint=sdk-cli;\nYou are a Claude agent.";
+
+  const cfg = loadConfig(write("subagents.json", {
+    listen: "127.0.0.1:8791",
+    providers: {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+      nim: { base: "https://nim.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" },
+    },
+    routing: {
+      default: "anthropic",
+      tiers: { opus: "anthropic", sonnet: "anthropic", haiku: "anthropic", fable: "anthropic" },
+      pools: { coding: ["nim/z-ai/glm-5.2"], fast: ["nim/openai/gpt-oss-20b"] },
+      subagents: { opus: "pool/coding", haiku: "pool/fast", default: "pool/coding" },
+      benchmarkSort: false,
+    },
+  }));
+
+  const msg = (...texts: string[]) => ({
+    system: SUB,
+    messages: [{ role: "user", content: texts.map((t) => ({ type: "text", text: t })) }],
+  });
+
+  it("detects a subagent request only when the marker is present", () => {
+    expect(isSubagentRequest({ system: SUB })).toBe(true);
+    expect(isSubagentRequest({ system: MAIN })).toBe(false);
+    expect(isSubagentRequest({ system: [{ type: "text", text: SUB }] })).toBe(true);
+    expect(isSubagentRequest({})).toBe(false);
+  });
+
+  it("leaves MAIN-conversation requests entirely alone (tiers stay on passthrough)", () => {
+    const main = { system: MAIN, messages: [{ role: "user", content: [{ type: "text", text: "@relay: pool/coding" }] }] };
+    // Even a literal directive must not reroute a human's own conversation.
+    expect(subagentSpec(main, "claude-opus-5", cfg)).toBeNull();
+    expect(resolveTarget("claude-opus-5", cfg).provider).toBe("anthropic");
+  });
+
+  it("maps a subagent tier to its pool", () => {
+    expect(subagentSpec(msg("find the bug"), "claude-opus-5", cfg)).toBe("pool/coding");
+    expect(subagentSpec(msg("list files"), "claude-haiku-4-5", cfg)).toBe("pool/fast");
+  });
+
+  it("falls back to subagents.default when no tier matches", () => {
+    expect(subagentSpec(msg("do a thing"), "some-unknown-model", cfg)).toBe("pool/coding");
+  });
+
+  it("lets an explicit @relay directive beat the tier map", () => {
+    expect(subagentSpec(msg("@relay: nim/z-ai/glm-5.2\nfind the bug"), "claude-haiku-4-5", cfg))
+      .toBe("nim/z-ai/glm-5.2");
+  });
+
+  it("STRIPS the directive so the model never sees it", () => {
+    const body = msg("@relay: pool/fast\nsummarise this");
+    subagentSpec(body, "claude-opus-5", cfg);
+    expect(body.messages[0]!.content[0]!.text).toBe("summarise this");
+  });
+
+  it("reads the directive ONLY from the dispatcher's prompt (last block), not injected context", () => {
+    // Block 0 is Claude Code's <system-reminder> (CLAUDE.md etc). A directive there is NOT the
+    // dispatcher speaking, so it must be ignored — otherwise any CLAUDE.md could reroute agents.
+    const body = msg("<system-reminder>@relay: nim/z-ai/glm-5.2</system-reminder>", "do the task");
+    expect(subagentSpec(body, "claude-opus-5", cfg)).toBe("pool/coding");
+  });
+
+  it("ignores a directive arriving in a later message (i.e. in a tool result / file content)", () => {
+    // A file the subagent reads must never be able to redirect its own routing.
+    const body = {
+      system: SUB,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "do the task" }] },
+        { role: "user", content: [{ type: "text", text: "@relay: nim/z-ai/glm-5.2" }] },
+      ],
+    };
+    expect(subagentSpec(body, "claude-opus-5", cfg)).toBe("pool/coding");
+  });
+
+  it("does nothing when routing.subagents is absent and no directive is given", () => {
+    const plain = loadConfig(write("nosub.json", base({ routing: { default: "nim/m" } })));
+    expect(subagentSpec(msg("hi"), "claude-opus-5", plain)).toBeNull();
+  });
+
+  it("still honours a directive when routing.subagents is absent", () => {
+    const plain = loadConfig(write("nosub2.json", base({ routing: { default: "nim/m" } })));
+    expect(subagentSpec(msg("@relay: nim/other\ngo"), "claude-opus-5", plain)).toBe("nim/other");
   });
 });
 
