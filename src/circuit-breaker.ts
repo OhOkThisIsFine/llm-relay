@@ -15,6 +15,36 @@ const RATE_LIMIT_COOLDOWN_MS = 120000; // 2 minutes cooldown on 429
 const MAX_FAILURES_BEFORE_TRIP = 2;
 const MAX_PING_HISTORY = 10;
 
+/**
+ * The ordering value for a target nothing has been measured about.
+ *
+ * NOT a score, and deliberately NOT 100. `getStabilityScore()` used to return 100
+ * for an unseen key, so three untracked targets all scored 100, the comparator
+ * returned 0, `Array.prototype.sort` is stable, and an "order is preserved"
+ * assertion passed with a competing re-sort fully intact (INV-TS-7).
+ *
+ * It is the neutral mid-band rather than 0 for the same reason `benchmarks.ts`
+ * uses a neutral 50: absence of evidence is not evidence of badness. A target
+ * measured at 30 is KNOWN to be erratic and must not be preferred over one nobody
+ * has probed; a target measured at 90 is known good and must outrank it.
+ */
+export const UNMEASURED_STABILITY = 50;
+
+/**
+ * The ping code an outcome contributes to the health history.
+ *
+ * Any 2xx collapses to "200"; every other status is recorded under its OWN code.
+ * The previous writer hardcoded "200" for anything the caller called successful,
+ * and `server.ts` does not classify 401/403 as retriable — so a provider with a
+ * revoked key had a wall of synthetic "200" pings and read as available. A 401 is
+ * never an availability signal.
+ */
+function outcomeCode(outcome: { ok: boolean; status?: number }): string {
+  if (outcome.status === undefined) return outcome.ok ? "200" : "500";
+  if (outcome.status >= 200 && outcome.status < 300) return "200";
+  return String(outcome.status);
+}
+
 export class CircuitBreaker {
   private states = new Map<string, CircuitState>();
 
@@ -50,41 +80,39 @@ export class CircuitBreaker {
   }
 
   /**
-   * Record a successful completion for a target, resetting its circuit.
+   * Record one request outcome with its MEASURED elapsed time.
    *
-   * ⚠ `ms` defaults to a CONSTANT and every real call site in server.ts used to
-   * omit it, which meant p95/jitter/spike-rate math ran over 500/1000 rather
-   * than over measurements — the provenance-free-number-driving-a-choice
-   * failure this project built benchmarks.ts to prevent. The default survives
-   * only for the probe paths that genuinely have no elapsed time; a request
-   * path that has one MUST pass it. `recordOutcome` is the preferred entry
-   * point precisely because it cannot be called without a measurement.
+   * ⚠ This is the ONLY writer, and `elapsedMs` is required, so a caller cannot
+   * fall back to a fabricated constant. The deleted `recordSuccess`/
+   * `recordFailure` pair defaulted `ms` to 500/1000 and every real call site in
+   * `server.ts` omitted it, so p95/jitter/spike-rate — the numbers that decide
+   * which backend serves a request — were computed over parameter defaults
+   * rather than over measurements. Do not reintroduce a defaulted entry point:
+   * `tsc` over `src/` is what now enforces the measured-latency invariant.
    */
-  recordSuccess(target: ResolvedTarget | string, ms = 500, quotaPercent?: number | null, now = Date.now()): void {
-    const key = this.getKey(target);
-    const state = this.getOrCreate(key);
-    state.consecutiveFailures = 0;
-    state.cooldownUntil = 0;
-    state.lastStatus = 200;
-    if (quotaPercent !== undefined) state.quotaPercent = quotaPercent;
-    state.pings.push({ ms, code: "200", timestamp: now });
-    if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
-  }
+  recordOutcome(
+    target: ResolvedTarget | string,
+    outcome: { ok: boolean; elapsedMs: number; status?: number; quotaPercent?: number | null; at?: number },
+  ): void {
+    const now = outcome.at ?? Date.now();
+    const state = this.getOrCreate(this.getKey(target));
 
-  /** Record a failure (e.g. 429 rate limit, 5xx error, timeout) for a target. */
-  recordFailure(target: ResolvedTarget | string, status?: number, now = Date.now(), ms = 1000): void {
-    const key = this.getKey(target);
-    const state = this.getOrCreate(key);
+    if (outcome.quotaPercent !== undefined) state.quotaPercent = outcome.quotaPercent;
+    state.lastStatus = outcome.status ?? (outcome.ok ? 200 : undefined);
+    state.pings.push({ ms: outcome.elapsedMs, code: outcomeCode(outcome), timestamp: now });
+    if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
+
+    if (outcome.ok) {
+      state.consecutiveFailures = 0;
+      state.cooldownUntil = 0;
+      return;
+    }
 
     state.consecutiveFailures += 1;
     state.lastFailureTime = now;
-    state.lastStatus = status;
-    const statusCode = status ? String(status) : "500";
-    state.pings.push({ ms, code: statusCode, timestamp: now });
-    if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
 
     // HTTP 429 (Rate Limit) trips immediately for 2 minutes
-    if (status === 429) {
+    if (outcome.status === 429) {
       state.cooldownUntil = now + RATE_LIMIT_COOLDOWN_MS;
     } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
       state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
@@ -92,37 +120,19 @@ export class CircuitBreaker {
   }
 
   /**
-   * Record one request outcome with its MEASURED elapsed time. Preferred over
-   * recordSuccess/recordFailure because `elapsedMs` is required, so a caller
-   * cannot silently fall back to a fabricated constant.
-   */
-  recordOutcome(
-    target: ResolvedTarget | string,
-    outcome: { ok: boolean; elapsedMs: number; status?: number; quotaPercent?: number | null; at?: number },
-  ): void {
-    const now = outcome.at ?? Date.now();
-    if (outcome.ok) {
-      this.recordSuccess(target, outcome.elapsedMs, outcome.quotaPercent, now);
-    } else {
-      this.recordFailure(target, outcome.status, now, outcome.elapsedMs);
-    }
-  }
-
-  /**
    * Stability for a target whose behaviour has actually been observed, or
-   * `null` when nothing has been measured.
+   * `null` when NOTHING has been measured.
    *
-   * `null` is not a low score — it means unknown, and callers must render it as
-   * such rather than as healthy. getStabilityScore() below keeps returning 100
-   * for an unseen key so existing callers are unaffected until they migrate,
-   * but that conflation is exactly what let a target whose every probe failed
-   * sort level with a proven-healthy one.
+   * `null` means unknown and callers must render it as such, never as healthy.
+   * A target that HAS been observed but never returned a usable response scores
+   * 0, not null — that is evidence, and conflating it with "unknown" is what let
+   * a target whose every probe failed sort level with a proven-healthy one.
    */
   getMeasuredStability(target: ResolvedTarget | string): number | null {
     const state = this.states.get(this.getKey(target));
     if (!state || state.pings.length === 0) return null;
     const score = getStabilityScore(state.pings);
-    return score >= 0 ? score : null;
+    return score >= 0 ? score : 0;
   }
 
   /** True only when this target has at least one recorded observation. */
@@ -131,13 +141,17 @@ export class CircuitBreaker {
     return !!state && state.pings.length > 0;
   }
 
-  /** Get computed stability score (0–100) for a target (returns 100 if untracked). */
+  /**
+   * The ORDERING value for a target: its measured stability, or
+   * `UNMEASURED_STABILITY` when nothing has been observed.
+   *
+   * ⚠ Retained only because `telemetry.ts` still reports a bare `number` and has
+   * not migrated (`OBS-dc5f56e7`). Prefer `getMeasuredStability()` +
+   * `hasObservations()`, which cannot present a guess as a measurement; this
+   * method is deleted once that consumer lands.
+   */
   getStabilityScore(target: ResolvedTarget | string): number {
-    const key = this.getKey(target);
-    const state = this.states.get(key);
-    if (!state || state.pings.length === 0) return 100;
-    const score = getStabilityScore(state.pings);
-    return score >= 0 ? score : 100;
+    return this.getMeasuredStability(target) ?? UNMEASURED_STABILITY;
   }
 
   /** Get full state for a target. */
@@ -150,11 +164,30 @@ export class CircuitBreaker {
     return this.states;
   }
 
-  /** Filter an array of targets to healthy candidates, sorted by Stability Score (highest first). */
+  /**
+   * Filter an array of targets to healthy candidates, best-first.
+   *
+   * Ordering is measured stability descending, with an UNTRACKED target placed at
+   * `UNMEASURED_STABILITY` — so it sinks below a target proven fast and rises
+   * above one proven erratic, and never compares EQUAL to a measured-healthy one
+   * (INV-TS-7). On an exact tie the measured target wins, because a real
+   * observation beats a mid-band placeholder that happens to land on the same
+   * number. Untracked targets tie with each other, so a fully cold breaker leaves
+   * the incoming (benchmark-ranked) order untouched — that is the intended
+   * behaviour, not the accident the old all-100 comparator produced.
+   */
   getHealthyTargets(targets: ResolvedTarget[], now = Date.now()): ResolvedTarget[] {
     const healthy = targets.filter((t) => this.isHealthy(t, now));
     const candidates = healthy.length > 0 ? healthy : targets;
-    return [...candidates].sort((a, b) => this.getStabilityScore(b) - this.getStabilityScore(a));
+    return [...candidates].sort((a, b) => {
+      const sa = this.getMeasuredStability(a);
+      const sb = this.getMeasuredStability(b);
+      const ra = sa ?? UNMEASURED_STABILITY;
+      const rb = sb ?? UNMEASURED_STABILITY;
+      if (ra !== rb) return rb - ra;
+      if ((sa === null) !== (sb === null)) return sa === null ? 1 : -1;
+      return 0;
+    });
   }
 
   /** Reset all circuit states. */

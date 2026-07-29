@@ -62,24 +62,62 @@ export function getStrength(spec: string, opts: { telemetryPath?: string } = {})
   return { score: NEUTRAL, basis: "neutral" };
 }
 
+/** How much a basis is worth as a TIE-BREAK only. Never mixed into the score itself. */
+const BASIS_CONFIDENCE: Record<StrengthBasis, number> = { snapshot: 2, telemetry: 1, neutral: 0 };
+
+/** One target with the strength that ranked it, and the provenance of that strength. */
+export interface RankedTarget {
+  target: ResolvedTarget;
+  spec: string;
+  strength: Strength;
+}
+
+export function specOfTarget(t: ResolvedTarget): string {
+  return t.model ? `${t.provider}/${t.model}` : t.provider;
+}
+
 /**
- * Rank targets strongest-first. Ties are left in config order (`sort` is stable), which is what
- * makes a pool's declared order the tie-breaker when nothing distinguishes two candidates.
+ * Rank targets strongest-first, KEEPING the provenance that produced each position.
+ *
+ * ⚠ The comparator used to read `getStrength(spec).score` and throw the rest away, which made a
+ * `neutral` 50 — "nobody publishes anything about this model" — indistinguishable from a `snapshot`
+ * 50 measured across five leaderboards (`ARC-31833353`). A provenance-free number was deciding
+ * which backend serves a request, the one thing this module exists to prevent.
+ *
+ * Resolution order:
+ *  1. score, highest first — the actual capability estimate, unchanged and never adjusted by basis;
+ *  2. on an exact tie, the better-evidenced basis (snapshot > telemetry > neutral);
+ *  3. still tied, the larger signal count — a 5-source consensus over a 1-source guess;
+ *  4. still tied, config order (`sort` is stable), so a pool's declared order is the last word.
+ *
+ * Steps 2–3 are tie-breaks, never score adjustments: a model is not penalised for signals nobody
+ * publishes, it just loses a coin-flip to one we actually know something about.
  */
+export function rankTargetsWithProvenance(targets: ResolvedTarget[]): RankedTarget[] {
+  const cache = new Map<string, Strength>();
+  const ranked: RankedTarget[] = targets.map((target) => {
+    const spec = specOfTarget(target);
+    let strength = cache.get(spec);
+    if (strength === undefined) {
+      strength = getStrength(spec);
+      cache.set(spec, strength);
+    }
+    return { target, spec, strength };
+  });
+
+  if (ranked.length <= 1) return ranked;
+
+  return ranked.sort((a, b) => {
+    if (b.strength.score !== a.strength.score) return b.strength.score - a.strength.score;
+    const cb = BASIS_CONFIDENCE[b.strength.basis];
+    const ca = BASIS_CONFIDENCE[a.strength.basis];
+    if (cb !== ca) return cb - ca;
+    return (b.strength.signalCount ?? 0) - (a.strength.signalCount ?? 0);
+  });
+}
+
+/** Ranked targets only. Use `rankTargetsWithProvenance` when the caller can report WHY. */
 export function rankTargetsByBenchmark(targets: ResolvedTarget[]): ResolvedTarget[] {
   if (targets.length <= 1) return [...targets];
-
-  const specOf = (t: ResolvedTarget) => (t.model ? `${t.provider}/${t.model}` : t.provider);
-  const cache = new Map<string, number>();
-  const score = (t: ResolvedTarget) => {
-    const spec = specOf(t);
-    let v = cache.get(spec);
-    if (v === undefined) {
-      v = getStrength(spec).score;
-      cache.set(spec, v);
-    }
-    return v;
-  };
-
-  return [...targets].sort((a, b) => score(b) - score(a));
+  return rankTargetsWithProvenance(targets).map((r) => r.target);
 }

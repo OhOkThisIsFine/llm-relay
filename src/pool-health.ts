@@ -12,6 +12,7 @@
  */
 import type { Config, ProviderConfig } from "./config.js";
 import { splitSpec } from "./config.js";
+import { buildAuthHeaders, readCredential } from "./authEnv.js";
 
 export type MemberVerdict = "live" | "empty" | "auth" | "rate_limited" | "missing" | "error";
 
@@ -27,16 +28,19 @@ export interface MemberHealth {
 /** Verdicts that mean "this member will never answer until someone changes something". */
 export const DEAD_VERDICTS: ReadonlySet<MemberVerdict> = new Set<MemberVerdict>(["missing", "auth"]);
 
+/**
+ * Probe headers. The credential half comes from the shared builder — it obeys the DECLARED
+ * `authHeader` (which `config.ts` already defaults to `x-api-key` for an anthropic-kind
+ * provider) and returns nothing at all for an absent or whitespace-only key, so this site
+ * cannot drift from the others. `anthropic-version` is a protocol header, not a credential,
+ * so it stays here and is keyed off `kind` as before.
+ */
 function authHeaders(p: ProviderConfig, apiKey: string | undefined): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (!apiKey) return headers;
-  if (p.authHeader === "x-api-key" || p.kind === "anthropic") {
-    headers["x-api-key"] = apiKey;
-    headers["anthropic-version"] = "2023-06-01";
-  } else {
-    headers["authorization"] = apiKey.startsWith("Bearer ") ? apiKey : `Bearer ${apiKey}`;
-  }
-  return headers;
+  return {
+    "Content-Type": "application/json",
+    ...(p.kind === "anthropic" ? { "anthropic-version": "2023-06-01" } : {}),
+    ...buildAuthHeaders(apiKey, p.authHeader),
+  };
 }
 
 /**
@@ -59,7 +63,9 @@ export async function probeMember(
   if (!p) {
     return { pool, spec, verdict: "missing", detail: `no provider "${provider}" configured` };
   }
-  const apiKey = p.authEnv ? process.env[p.authEnv] : undefined;
+  // `readCredential` treats a whitespace-only value as absent, so a key pasted as a blank
+  // line is reported here as an auth problem instead of being sent as a bare `Bearer`.
+  const apiKey = readCredential(p.authEnv);
   if (p.authEnv && !apiKey) {
     return { pool, spec, verdict: "auth", detail: `${p.authEnv} is not set` };
   }

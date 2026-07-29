@@ -14,6 +14,16 @@ export type Verdict =
   | "Not Active"
   | "Pending";
 
+/**
+ * Codes whose round-trip time is a real LATENCY sample. A 401 came back from the provider,
+ * so it timed the network path and belongs in avg/p95/jitter/spike.
+ *
+ * ⚠ Latency only — this is NOT an availability set. Availability is decided by `getUptime()`
+ * below, which counts `"200"` and nothing else, so a target answering only 401s reports 0%
+ * uptime and its composite score is capped accordingly. Two other sites used to treat 401 as
+ * equivalent to 200 for availability (`probe-cache.ts`, `cadence.ts`) and a provider with a
+ * revoked key read as healthy; both now follow the 200-only rule.
+ */
 const MEASURABLE_CODES = new Set(["200", "401"]);
 
 /** Calculate average latency from measurable pings (HTTP 200/401). Returns Infinity if none. */
