@@ -518,7 +518,7 @@ silently at request time.
 
 ### Discovery endpoint (`GET /registry`) — for a dispatcher
 
-For a caller that does its own selection (e.g. audit-tools dispatch, which weighs
+For a caller that does its own selection (an external dispatcher weighing
 quota / rate limits / token budget), `GET http://127.0.0.1:8791/registry` returns one
 coherent JSON view:
 
@@ -629,7 +629,7 @@ headroom's backend-agnostic memory/learn layer. So stack it for context-fit, not
 
 ## Design
 
-Consumers (audit-tools dispatch, plain `claude` CLI) point `ANTHROPIC_BASE_URL` at this proxy; it validates one backend per request. Target *selection* / token-prediction is a separate concern (the router/auditor), deliberately not here. For architecture, invariants, and the script inventory, see [CLAUDE.md](CLAUDE.md).
+Consumers (an external dispatcher, plain `claude` CLI) point `ANTHROPIC_BASE_URL` at this proxy; it validates one backend per request. Target *selection* / token-prediction is a separate concern (the router/auditor), deliberately not here. For architecture, invariants, and the script inventory, see [CLAUDE.md](CLAUDE.md).
 
 ## Dev
 

@@ -50,11 +50,11 @@ surface does not EXIST — a type-level assertion only says it is untyped. (Two 
 were misled by the older "vitest is what checks those" claim here.)
 
 ⚠ **`vitest.config.ts` scopes the suite to this checkout's `test/` directory on purpose.**
-Without an explicit `include`,
-vitest's default glob walks the whole tree — including the per-node git worktrees the remediation
-tooling creates under `.audit-tools/worktrees/` — so `npm test` ran every worktree's copy of every
-test file. That breaks the gate in both directions: another worktree's half-finished edit fails this
-tree's run, and a worktree's stale copy passes one. Don't widen the glob.
+Without an explicit `include`, vitest's default glob walks the whole tree, so **any nested checkout**
+— a git worktree under the repo root, a vendored copy — contributes its own copy of every test file.
+Tooling that fanned work out across per-task worktrees inside the repo once made `npm test` run 70
+files / 638 tests instead of the real suite. That breaks the gate in both directions: another
+worktree's half-finished edit fails this tree's run, and a stale copy passes one. Don't widen it.
 
 **CI** (`.github/workflows/ci.yml`) runs `npm ci --ignore-scripts` → `npm run build` →
 `npm run check` on every push to `main` and every PR, plus a check that the `postinstall` hook stays
@@ -193,11 +193,10 @@ test stale code.
   startup can print it; the subagent warning states the CONSEQUENCE (that traffic now falls through
   to `routing.default`, i.e. primary quota), because a silent fall-through there looks like a
   successful offload.
-- **Worktrees.** Work may happen in a git worktree under `.claude/worktrees/…` or
-  `.audit-tools/worktrees/…`. Edit and run tests **in the worktree path**, not the main checkout —
-  they have separate working trees. vitest run from the wrong root will silently pick up the other
-  copy's `src/`. (`vitest.config.ts` stops the reverse case — this tree's `npm test` reaching into
-  the worktrees.)
+- **Worktrees.** Work may happen in a git worktree (e.g. under `.claude/worktrees/…`). Edit and run
+  tests **in the worktree path**, not the main checkout — they have separate working trees. vitest
+  run from the wrong root will silently pick up the other copy's `src/`. (`vitest.config.ts` stops
+  the reverse case — this tree's `npm test` reaching into a worktree nested under the repo root.)
 - **vitest reads `src/` directly; scripts read `dist/`.** Tests reflect your edits immediately;
   `scripts/*.mjs` do not until you `npm run build`.
 - **Using the `claude` CLI through the proxy needs an isolated `CLAUDE_CONFIG_DIR`.** An active
@@ -299,21 +298,20 @@ test stale code.
 
 ## Status & open work
 
-> **The audit remediation is COMPLETE**, on `main`, and its follow-up list is discharged
-> (2026-07-30). [docs/remediation-handoff-2026-07-29.md](docs/remediation-handoff-2026-07-29.md)
-> records what the run changed and what was deliberately left out; read it before reopening
-> anything in that area.
->
-> Still true and worth knowing when you work near it: **several tests pinned the defect they
-> should catch**, so a correct fix in this codebase can legitimately turn the suite red — read the
-> failing test's reasoning before assuming your change is wrong. The audit artifacts live in
-> `.audit-tools/`, which is **untracked and local-only** (`git clean -fd` destroys them); the
-> handoff doc is the committed source of truth.
+**Nothing is pending.** A full audit was remediated to completion and its follow-up list closed in
+v0.12.0; the audit apparatus, its artifacts and its handoff doc have all been deleted, because a
+finished run's ledger is just a stale to-do list. Anything that mattered from it is a code change,
+a test, or a paragraph in this file.
 
-Current: **usable end-to-end**, suite green, tsc clean — and as of this run that is verified by CI
-(`.github/workflows/ci.yml` runs `npm run check`) rather than by a local run only. A real `claude`
-agentic session completes through the proxy against NIM. Full assessment:
-[docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
+⚠ One durable lesson from it, because it will cost you an hour otherwise: **several tests in this
+repo were written to pin the defect they should have caught.** A correct fix here can legitimately
+turn the suite red — read the failing test's stated reasoning before assuming your change is wrong,
+and change the test in the SAME commit as the source fix.
+
+Current: **usable end-to-end**, suite green, tsc clean — and verified by CI
+(`.github/workflows/ci.yml` runs `npm run check`, which type-checks `src/` AND `test/`) rather than
+by a local run only. A real `claude` agentic session completes through the proxy against NIM. Full
+assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 **Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code
 subagent — including built-ins like Explore, with no agent file — runs on a non-Anthropic provider
@@ -321,8 +319,8 @@ while the human's own conversation stays on an Anthropic passthrough. Verified e
 wire. Turn it on with `llm-relay offload on` (no restart); choose a target with `llm-relay
 candidates`. Design + evidence: [docs/subagent-routing.md](docs/subagent-routing.md).
 
-Full live probe sweep: [docs/probe-sweep-2026-07-28.md](docs/probe-sweep-2026-07-28.md) (every script,
-every endpoint). Everything it found is now fixed; `multimodal-probe.mjs` is 5/5 green live.
+Every script in `scripts/` and every proxy endpoint has been exercised live against NIM;
+`multimodal-probe.mjs` is 5/5 green.
 
 **Capability ranking now lives here** (0.5.0), no longer deferred to the router/auditor project:
 `npm run sync:tiers` merges OpenRouter + BFCL + LMArena + Aider into `docs/tier-data.json` and

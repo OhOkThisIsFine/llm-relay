@@ -3,18 +3,3 @@ dist/
 config.json
 *.local.json
 *.log
-
-# >>> audit-tools managed ignores >>>
-# Generated/install artifacts — always ignored (build artifacts, not source).
-.audit-code/
-.audit-tools/**/friction/
-# Runtime tree ignored; deliverables + meta-audit reflections kept TRACKED (private repo).
-.audit-tools/*
-!.audit-tools/audit-report.md
-!.audit-tools/audit-findings.json
-!.audit-tools/remediation-report.md
-!.audit-tools/remediation-outcomes.json
-!.audit-tools/*/
-.audit-tools/*/*
-!.audit-tools/*/agent-feedback.jsonl
-# <<< audit-tools managed ignores <<<
