@@ -1,6 +1,6 @@
 import type { Config, ProviderConfig } from "./config.js";
 import { fetchProviderQuota } from "./ping/quota.js";
-import { candidateEnvNames } from "./authEnv.js";
+import { buildAuthHeaders, candidateEnvNames, keyIsPresent, readCredential } from "./authEnv.js";
 import { splitSpec } from "./config.js";
 
 /**
@@ -10,8 +10,81 @@ import { splitSpec } from "./config.js";
  */
 const KEY_CHECK_TIMEOUT_MS = 45_000;
 
+/**
+ * Whole-provider wall-clock cap, and the reason it exists: the per-request `AbortSignal`
+ * above is only a REQUEST hint, and it is honoured by whatever `fetchFn` was injected — the
+ * quota fetch does not take one at all, and one provider check can chain up to five requests
+ * (quota → /models → anonymous /models → authenticated probe → anonymous probe). Neither
+ * bounds the CHECK. This does, in the checker's own code, so a black-holing host costs its
+ * own slot and nothing else.
+ */
+const PROVIDER_CHECK_BUDGET_MS = 90_000;
+
 function withTimeout(): { signal: AbortSignal } | Record<string, never> {
   return typeof AbortSignal?.timeout === "function" ? { signal: AbortSignal.timeout(KEY_CHECK_TIMEOUT_MS) } : {};
+}
+
+/**
+ * Race `work` against a wall clock, resolving to `onExpired()` if the clock wins.
+ *
+ * The timer is unref'd and always cleared, so a fast check does not hold the process (or a
+ * test runner) open for the length of the budget.
+ */
+async function withBudget<T>(ms: number, work: () => Promise<T>, onExpired: () => T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(onExpired()), ms);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([work(), expiry]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** A token safe to put in a diagnostic: an identifier, not free-form text. */
+const SAFE_TOKEN = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
+
+/**
+ * Describe a thrown error WITHOUT quoting it.
+ *
+ * `KeyCheckResult.message` is printed by `llm-relay keys`, so it must describe outcomes
+ * (an env-var NAME, an HTTP status, a quota percent) and can never carry the credential.
+ * Interpolating `(e as Error).message` broke that: an error text is uncontrolled and
+ * routinely echoes the request — a provider that takes its key in the query string, a
+ * proxy that quotes the failing URL, or an injected `fetchFn` that stringifies its own
+ * init all put the key inside it. Classifying instead of quoting removes the whole class:
+ * the only thing that survives is an error CODE or NAME, and anything that is not a bare
+ * identifier is dropped rather than trimmed or masked.
+ */
+export function describeFailure(e: unknown): string {
+  const err = e as { name?: unknown; code?: unknown; cause?: { code?: unknown; name?: unknown } } | null;
+  const raw = [err?.cause?.code, err?.code, err?.cause?.name, err?.name].find(
+    (v) => typeof v === "string" && SAFE_TOKEN.test(v),
+  );
+  return `Network error (${raw ?? "unclassified"})`;
+}
+
+/**
+ * Request headers for a probe.
+ *
+ * The credential half comes from the shared builder in `authEnv.ts` — this used to be the
+ * EIGHTH open-coded construction site. `anthropic-version` is a protocol header, not a
+ * credential, so it stays here and is keyed off `kind` as before.
+ *
+ * ⚠ Behaviour change, deliberate: this site used to force `x-api-key` on any
+ * `kind: "anthropic"` provider, silently discarding an explicit
+ * `authHeader: "authorization"`. `config.ts` already defaults an anthropic-kind provider's
+ * `authHeader` to `x-api-key`, so the only case that moves is that explicit override — and
+ * there, honouring the declared config is the correct answer.
+ */
+function probeHeaders(p: ProviderConfig, apiKey: string | undefined): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    ...(p.kind === "anthropic" ? { "anthropic-version": "2023-06-01" } : {}),
+    ...buildAuthHeaders(apiKey, p.authHeader),
+  };
 }
 
 export interface KeyCheckResult {
@@ -57,13 +130,7 @@ async function probeAuthenticated(
 ): Promise<{ status: KeyCheckResult["status"]; httpStatus: number | undefined; message: string }> {
   const isOpenAi = p.kind === "openai";
   const url = isOpenAi ? `${p.base}/chat/completions` : `${p.base}/v1/messages`;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (p.authHeader === "x-api-key" || p.kind === "anthropic") {
-    headers["x-api-key"] = apiKey;
-    headers["anthropic-version"] = "2023-06-01";
-  } else {
-    headers["authorization"] = apiKey.startsWith("Bearer ") ? apiKey : `Bearer ${apiKey}`;
-  }
+  const headers = probeHeaders(p, apiKey);
   const body = JSON.stringify({
     model: modelId,
     max_tokens: 1,
@@ -105,7 +172,7 @@ async function probeAuthenticated(
       message: `Could not confirm — /models is public and the probe model answers HTTP ${r.status} with or without the key`,
     };
   } catch (e) {
-    return { status: "unreachable", httpStatus: undefined, message: `Network error: ${(e as Error).message}` };
+    return { status: "unreachable", httpStatus: undefined, message: describeFailure(e) };
   }
 }
 
@@ -137,13 +204,20 @@ function routedModelsByProvider(cfg: Config): Map<string, string> {
 export async function validateProviderKeys(
   cfg: Config,
   fetchFn: typeof fetch = fetch,
+  opts: { budgetMs?: number } = {},
 ): Promise<KeyCheckResult[]> {
   const entries = Object.entries(cfg.providers);
   const routed = routedModelsByProvider(cfg);
+  const budgetMs = opts.budgetMs ?? PROVIDER_CHECK_BUDGET_MS;
 
   const checkOne = async ([name, p]: [string, ProviderConfig]): Promise<KeyCheckResult> => {
     const envVarName = p.authEnv;
-    const apiKey = envVarName ? process.env[envVarName] : undefined;
+    // `readCredential` applies the shared presence predicate: a whitespace-only value is
+    // ABSENT, not present. The old `process.env[name]` read was untrimmed, so a key pasted
+    // as a blank line was truthy, slipped past this branch, and went to the wire as an
+    // empty `x-api-key` / bare `Bearer` — reported back as a broken key rather than an
+    // unset one.
+    const apiKey = readCredential(envVarName);
 
     if (envVarName && !apiKey) {
       return {
@@ -154,6 +228,10 @@ export async function validateProviderKeys(
         message: `No key found — set ${candidateEnvNames(name, envVarName).slice(0, 4).join(" or ")}`,
       };
     }
+    // A provider with no declared `authEnv` is an intentional passthrough: it has no key,
+    // and reporting `hasEnvKey: true` for it (as this did unconditionally) claims evidence
+    // that does not exist.
+    const hasEnvKey = keyIsPresent(apiKey);
 
     try {
       // 1. Fetch quota if applicable
@@ -161,14 +239,7 @@ export async function validateProviderKeys(
 
       // 2. Perform test probe to provider /models or completions endpoint
       const url = p.kind === "openai" ? `${p.base}/models` : `${p.base}/v1/messages`;
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (apiKey) {
-        if (p.authHeader === "x-api-key" || p.kind === "anthropic") {
-          headers["x-api-key"] = apiKey;
-        } else {
-          headers["authorization"] = apiKey.startsWith("Bearer ") ? apiKey : `Bearer ${apiKey}`;
-        }
-      }
+      const headers = probeHeaders(p, apiKey);
 
       const resp = await fetchFn(url, { method: "GET", headers, ...withTimeout() });
 
@@ -176,7 +247,7 @@ export async function validateProviderKeys(
         return {
           provider: name,
           authEnv: envVarName,
-          hasEnvKey: true,
+          hasEnvKey,
           status: "invalid_key",
           httpStatus: resp.status,
           message: `Authentication failed (HTTP ${resp.status})`,
@@ -185,7 +256,7 @@ export async function validateProviderKeys(
         return {
           provider: name,
           authEnv: envVarName,
-          hasEnvKey: true,
+          hasEnvKey,
           status: "rate_limited",
           httpStatus: 429,
           message: "Rate limited or quota exhausted (HTTP 429)",
@@ -228,7 +299,7 @@ export async function validateProviderKeys(
             return {
               provider: name,
               authEnv: envVarName,
-              hasEnvKey: true,
+              hasEnvKey,
               status: verdict.status,
               httpStatus: verdict.httpStatus,
               message: verdict.message,
@@ -241,7 +312,7 @@ export async function validateProviderKeys(
         return {
           provider: name,
           authEnv: envVarName,
-          hasEnvKey: true,
+          hasEnvKey,
           status: "valid",
           httpStatus: resp.status,
           message: "Key verified & healthy",
@@ -252,7 +323,7 @@ export async function validateProviderKeys(
         return {
           provider: name,
           authEnv: envVarName,
-          hasEnvKey: true,
+          hasEnvKey,
           status: "unreachable",
           httpStatus: resp.status,
           message: `Provider returned HTTP ${resp.status}`,
@@ -262,12 +333,29 @@ export async function validateProviderKeys(
       return {
         provider: name,
         authEnv: envVarName,
-        hasEnvKey: true,
+        hasEnvKey,
         status: "unreachable",
-        message: `Network error: ${(e as Error).message}`,
+        message: describeFailure(e),
       };
     }
   };
 
-  return Promise.all(entries.map(checkOne));
+  // Each provider gets its OWN wall clock. `unreachable` is the honest verdict for a host
+  // that never answered — silence is not evidence about the credential, so this must never
+  // resolve to `invalid_key`.
+  return Promise.all(
+    entries.map(([name, p]) =>
+      withBudget(
+        budgetMs,
+        () => checkOne([name, p]),
+        () => ({
+          provider: name,
+          authEnv: p.authEnv,
+          hasEnvKey: keyIsPresent(readCredential(p.authEnv)),
+          status: "unreachable" as const,
+          message: `No answer within ${budgetMs}ms`,
+        }),
+      ),
+    ),
+  );
 }
