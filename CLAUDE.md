@@ -116,7 +116,8 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `ping/cadence.ts` | Adaptive background monitoring loop (`PingLoop`) with dynamic mode transitions (`speed`, `normal`, `slow`, `forced`). |
 | `ping/metrics.ts` | Latency statistical calculations (average, p95, jitter, uptime, spike rate) and composite Stability Score calculation (0-100). |
 | `ping/ping.ts` | Single probe executor for model latency, status codes, and rate-limit header quota extraction. |
-| `ping/probe-cache.ts` | Disk-cached background probe results (`probe-cache.json`) with TTL checks. |
+| `ping/probe-cache.ts` | Disk-cached background probe results (`probe-cache.json`) with TTL checks. Each entry keeps a **rolling window of samples** (`MAX_SAMPLES`) plus lifetime `totals` that outlive the window — a scalar `ms`/`code` made p95, jitter and spike rate all restatements of the most recent request. `loadPersistedSamples`/`loadTotals`/`persistedModels` are the read side `cadence.ts` rehydrates from. Under vitest the default path is redirected to a temp dir, because the suite was writing `openai_mock` entries into the user's live health data. |
+| `winenv.ts` | Recovers Windows User/Machine-scope environment variables a **long-running** process never received (a User-scope var enters a process only at start; the relay launches at logon and runs for days). Fills gaps only — the real environment always wins, same contract as `dotenv.ts`. ⚠ Never imports `PATH`: the User scope holds a fragment, and importing it wholesale breaks executable lookup. |
 | `ping/quota.ts` | Provider-specific quota balance fetcher (e.g. OpenRouter key auth endpoint). |
 | `ping/runtime-telemetry.ts` | Real-world proxy request telemetry storage (`runtime-telemetry.json`) and real-world quality scoring. |
 
@@ -346,11 +347,23 @@ fabricates credential bugs.** On Windows a User-scope environment variable enter
 that a freshly launched shell had. `llm-relay keys` / `llm-relay candidates` run as new processes and
 report *their own* env; `GET /registry` and `GET /candidates` are answered by the relay and are the
 authoritative `has_key`. The two disagreed, and the whole "half the pool is dead, seven 401s" finding
-of 2026-07-30 was this — **not** bad keys. Relaunching the relay with the variables present took it
-from 6 providers without a key to **0**, and `pool/coding` from 5 live members to **11** (`llm-relay
-pools --probe`: 29/35 live overall). ⚠ **Check `curl 127.0.0.1:8791/registry | grep has_key` before
-ever concluding a key is bad.** Genuinely down now: `gemini` (real 429/quota),
-`ollama/qwen2.5-coder:7b` (local daemon not running), `nim/deepseek-ai/deepseek-v4-flash` (HTTP 529).
+of 2026-07-30 was this — **not** bad keys. `pool/coding` went from 5 live members to **11**
+(`llm-relay pools --probe`: 29/35 live overall). **`winenv.ts` now closes the gap at startup**, so a
+key added after logon is picked up on the next relay restart rather than needing a reboot. ⚠ Still
+check `curl 127.0.0.1:8791/registry | grep has_key` before ever concluding a key is bad. Genuinely
+down: `gemini` (real 429/quota), `ollama/qwen2.5-coder:7b` (local daemon not running),
+`nim/deepseek-ai/deepseek-v4-flash` (HTTP 529).
+
+⚠ **Health data must survive a restart, and a verdict must not turn on one sample.** Both were
+broken together: `PingLoop` held ping history in memory and read only that while `recordProbeResult`
+wrote to disk and nothing read it back (so every restart reset every model to `Pending`/`p95: -1`),
+and `getVerdict` was handed `isDown: lastPing.code !== "200"` (so one transient 503 buried fifty good
+samples). Now: entries carry a sample window + lifetime totals, `getModelPings()` hydrates from disk,
+and `isPersistentlyDown()` needs a RUN of failures plus poor uptime. ⚠ **The transient tolerance is
+scoped to transient codes.** A 401/403 is the provider stating a fact about the credential and is
+down immediately — otherwise a revoked key reads "Perfect", since fast 401s are still fast. When
+threading a probe-cache path through `PingLoop`, thread it to `getModelsDueForProbe` too: the module
+keeps a cache keyed by the last path it saw, so a call that omits it silently asks a different cache.
 
 ⚠ One durable lesson from it, because it will cost you an hour otherwise: **several tests in this
 repo were written to pin the defect they should have caught.** A correct fix here can legitimately
