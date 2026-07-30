@@ -9,7 +9,7 @@ import { buildCandidates, type CandidatesView, type Candidate } from "./candidat
 import { buildDispatch, type DispatchView } from "./dispatch.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
-import { currentVersion, ensureUpToDate, shouldCheckUpdates } from "./self-update.js";
+import { currentVersion, ensureUpToDate, shouldCheckUpdates, type CommandEffect } from "./self-update.js";
 
 export function argValue(...flags: string[]): string | undefined {
   const allFlags = new Set<string>();
@@ -129,6 +129,7 @@ Commands:
   dispatch [lane]                                  Next lane from routing.ladder; -t/--task to render
                                                    the command, --after <lane> to walk past a spent
                                                    rung, -x/--exhausted <lane> to report one spent,
+                                                   --shell sh|pwsh to quote for another shell,
                                                    --json for the raw view
   candidates                                       Benchmarks, health, quota & breaker state per target
   help                                             Show help documentation
@@ -483,6 +484,97 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
   }
 }
 
+/** Which shell's literal-quoting rules a rendered command line is written for. */
+export type RenderShell = "sh" | "pwsh";
+
+/** Human name for the shell a line was quoted for. Precise on purpose — see `quoteArg`. */
+export const SHELL_LABEL: Record<RenderShell, string> = {
+  sh: "sh/bash",
+  pwsh: "PowerShell 7+ (pwsh)",
+};
+
+/**
+ * The shell a host on `platform` is going to paste a rendered command into.
+ *
+ * A guess, and it can be wrong in a way that matters: Git Bash on Windows is `sh`, not
+ * PowerShell. `--shell` overrides it, which is why `parseRenderShell` exists.
+ */
+export function shellFor(platform: NodeJS.Platform = process.platform): RenderShell {
+  return platform === "win32" ? "pwsh" : "sh";
+}
+
+/** `--shell sh|pwsh`. An unrecognised value is a loud error, never a silent default. */
+export function parseRenderShell(value: string | undefined): RenderShell | null {
+  if (value === undefined) return null;
+  const v = value.trim().toLowerCase();
+  if (v === "sh" || v === "bash" || v === "posix") return "sh";
+  if (v === "pwsh" || v === "powershell") return "pwsh";
+  process.stderr.write(`llm-relay dispatch: --shell expects "sh" or "pwsh" (got "${value}")\n`);
+  process.exit(1);
+}
+
+/**
+ * Characters that need no quoting in EITHER shell rendered for. An ALLOW-list, so a character
+ * nobody thought about is quoted rather than passed through. `@` and `%` are deliberately
+ * absent even though `sh` treats them as ordinary: `@` leads PowerShell splatting and `%` is
+ * cmd.exe variable expansion, and this line gets pasted into whatever the operator is running.
+ */
+const SHELL_SAFE = /^[A-Za-z0-9_+=:,.\/\\-]+$/;
+
+/** C0 + C1 control characters except tab and newline. ESC — the ANSI carrier — is among them. */
+const RENDER_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+
+/**
+ * Quote ONE argv element so it stays exactly one argv element.
+ *
+ * `llm-relay dispatch` prints a command line the host is told to run verbatim, and the task
+ * text inside it is caller-supplied (`--task`, or `?task=` on a proxy that answered). This used
+ * to render `args.join(" ")`, so a task containing a space, a quote or a `&` broke out into
+ * extra shell words and `-t "fix the bug & rm -rf /"` printed a line with a second command in
+ * it. `dispatch.ts` deliberately hands over `{ command, args }` and never a pre-joined string —
+ * quoting is this renderer's job, and it is the only place that can know which shell.
+ *
+ * Both forms below are LITERAL: `sh` performs no expansion of any kind inside single quotes,
+ * and neither does PowerShell, so the content cannot be re-parsed whatever it contains.
+ *  - `sh`   — `'…'`; an embedded `'` closes, escapes, reopens: `'\''`.
+ *  - `pwsh` — `'…'`; an embedded `'` is doubled: `''`.
+ *
+ * ⚠ `pwsh` means **PowerShell 7+**, and the version is load-bearing, not pedantry. Measured on
+ * this platform: Windows PowerShell 5.1 does not escape an embedded `"` when it builds the
+ * command line for a native executable, so `'a " b " c'` — correctly single-quoted, one PS
+ * string — reaches the program as THREE argv elements (`a `, `b`, ` c`). pwsh 7.6 passes it as
+ * one. No single-quoting can fix 5.1: the split happens after PowerShell is done parsing, and
+ * the 5.1 workaround (writing `\"` inside the string) is itself wrong under 7.x. The two are
+ * irreconcilable in one rendering, so this targets 7+, `SHELL_LABEL` names the version out
+ * loud, and `--shell sh` is the way out for anyone pasting somewhere else (Git Bash included).
+ */
+export function quoteArg(arg: string, shell: RenderShell = shellFor()): string {
+  // This is printed to a terminal before it is run, so an ESC sequence in the task could
+  // otherwise rewrite what the operator sees they are about to execute — the same reason
+  // `dispatch.ts` scrubs an echoed lane id. Tab and newline survive: both are legal inside
+  // either literal form and a multi-line task is a real thing, not an attack.
+  const clean = arg.replace(RENDER_CONTROL, "�");
+  if (clean.length > 0 && SHELL_SAFE.test(clean)) return clean;
+  return shell === "pwsh" ? `'${clean.replace(/'/g, "''")}'` : `'${clean.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Render a cli rung's `{ command, args }` as a runnable line. Every element is quoted FIRST and
+ * only the quoted forms are joined — never `args.join(" ")`, which is the defect this replaces.
+ *
+ * A quoted command NAME is not a command in PowerShell (`'agy' -p x` evaluates a string and
+ * throws the rest away), so a command that needed quoting gets the call operator in front of it.
+ */
+export function renderCommand(
+  invoke: { command: string; args: string[] } | undefined,
+  shell: RenderShell = shellFor(),
+): string {
+  if (!invoke) return "";
+  const cmd = quoteArg(invoke.command, shell);
+  const head = cmd === invoke.command || shell === "sh" ? cmd : `& ${cmd}`;
+  return [head, ...invoke.args.map((a) => quoteArg(a, shell))].join(" ");
+}
+
 /**
  * `llm-relay dispatch [lane]` — which lane to hand a delegated task to next.
  *
@@ -535,15 +627,34 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (!live) process.stdout.write(`(no proxy running — live exhaustion state unknown)\n`);
   process.stdout.write("\n");
 
+  const shell = parseRenderShell(argValue("--shell")) ?? shellFor();
+  let renderedCli = false;
   for (const l of view.ladder) {
     const mark = view.next && l.id === view.next.id ? "->" : "  ";
     const state = l.state === "ready" ? "" : ` [${l.state}${l.readyAt ? ` until ${l.readyAt}` : ""}]`;
-    const target = l.kind === "cli" ? `${l.invoke?.command ?? ""} ${(l.invoke?.args ?? []).join(" ")}` : (l.spec ?? "");
+    // Quoted per element. The task text is caller-supplied and this line is meant to be run
+    // verbatim, so joining the raw argv would hand the host extra shell words.
+    let target: string;
+    if (l.kind === "cli") {
+      target = renderCommand(l.invoke, shell);
+      renderedCli = true;
+    } else {
+      target = l.spec ?? "";
+    }
     process.stdout.write(`${mark} ${l.position}. ${l.id}${state}\n     ${target}\n`);
     if (l.requiresDirective) {
       process.stdout.write(`     needs "@relay: ${l.spec}" in the subagent prompt (offload is off)\n`);
     }
     if (l.note) process.stdout.write(`     ${l.note}\n`);
+  }
+
+  // Say which shell the quoting is for. A command line that is safe in one shell and not in
+  // another is worth nothing if the reader has to guess which one it was written for — and on
+  // Windows the right answer depends on where the host pastes it (pwsh vs Git Bash).
+  if (renderedCli) {
+    process.stdout.write(
+      `\ncli lines are quoted for ${SHELL_LABEL[shell]} — the task is a single argument (--shell to change)\n`,
+    );
   }
 
   process.stdout.write(`\n${view.next ? `use: ${view.next.id}` : "no lane available"} — ${view.reason}\n`);
@@ -863,11 +974,60 @@ export function main(): void {
 }
 
 /**
+ * Does THIS invocation already change durable state on this machine?
+ *
+ * Only such an invocation may be the moment the global install is replaced and the process
+ * re-execed. `llm-relay keys` is a status query: reinstalling the user's global package
+ * underneath a question about their credentials is a side effect nobody asked for, and it used
+ * to happen on every read-only subcommand.
+ *
+ * Read-only is the DEFAULT and the fall-through, so a subcommand added later is safe until
+ * someone deliberately classifies it — the failure mode of an unlisted command is "no update
+ * check", never "surprise reinstall".
+ *
+ * This is passed to `shouldCheckUpdates()` as a RUNTIME PARAMETER. `self-update.ts` cannot
+ * import this table: `cli.ts` already imports that module, so the reverse import would be a
+ * cycle. The classification travels as an argument precisely to keep the dependency one-way.
+ */
+export function classifyCommand(argv: string[]): CommandEffect {
+  // `main()` routes `--ping` to the ping command wherever it appears, so match it the same
+  // way — otherwise `llm-relay --ping` looks like a bare proxy start and gets classified as one.
+  const isPing = argv
+    .slice(1)
+    .some((a) => a === "--ping" || a === "-ping" || a.startsWith("--ping=") || a.startsWith("-ping="));
+  if (isPing) return "read-only";
+
+  const sub = argv[2];
+  // No subcommand (or flags only) starts the proxy. That start already writes this machine's
+  // config when none exists (`resolveConfigPath`), it is the long-lived process, and it is the
+  // one moment a re-exec costs nothing because nothing has been served yet.
+  if (sub === undefined || sub.startsWith("-")) return "mutating";
+
+  const arg3 = argv[3];
+  switch (sub) {
+    // Writes ~/.llm-relay/.env.
+    case "onboard":
+      return "mutating";
+    // `setup claude-desktop` writes claude_desktop_config.json; bare `setup` only prints.
+    case "setup":
+      return arg3 === "claude-desktop" || arg3 === "desktop" ? "mutating" : "read-only";
+    // `offload on|off` rewrites config.json; `offload` / `offload status` only report.
+    case "offload":
+      return arg3 === "on" || arg3 === "enable" || arg3 === "off" || arg3 === "disable" ? "mutating" : "read-only";
+    // keys, check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
+    // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a
+    // running proxy's in-memory cooldowns and changes nothing on this machine.
+    default:
+      return "read-only";
+  }
+}
+
+/**
  * Entrypoint: currency gate first (may replace this install and re-exec), then
  * the command itself. `main` stays synchronous so its exit paths are direct.
  */
 export async function run(): Promise<void> {
-  if (shouldCheckUpdates(process.argv, process.env)) {
+  if (shouldCheckUpdates(process.argv, process.env, classifyCommand(process.argv))) {
     try {
       await ensureUpToDate();
     } catch (e) {
