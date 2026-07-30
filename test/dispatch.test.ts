@@ -1,10 +1,11 @@
-import { describe, it, expect, afterAll, beforeEach } from "vitest";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { describe, it, expect, afterAll } from "vitest";
+import { writeFileSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "../src/config.js";
 import { createProxy } from "../src/server.js";
-import { buildDispatch, markExhausted, clearExhausted } from "../src/dispatch.js";
+import { buildDispatch, markExhausted, clearExhausted, MAX_EXHAUSTED_MS } from "../src/dispatch.js";
 
 const dir = mkdtempSync(join(tmpdir(), "rp-dispatch-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -40,8 +41,11 @@ function cfgWith(routing: Record<string, unknown> = {}): Config {
   return loadConfig(p);
 }
 
-// Cooldowns are module-level runtime state; a leak between tests would make order matter.
-beforeEach(() => clearExhausted(cfgWith({ ladder: LADDER })));
+// No global cooldown reset here on purpose. Cooldowns are scoped to the Config they were reported
+// against, and every test builds its own via cfgWith(), so each starts clean by construction.
+// The old `beforeEach(() => clearExhausted(cfgWith(...)))` only worked because state was process-
+// global and a clear-all on a throwaway config wiped every OTHER config's cooldowns too — it was
+// papering over exactly the leak asserted against below.
 
 describe("dispatch ladder — config", () => {
   it("is absent by default and expresses no opinion", () => {
@@ -170,6 +174,125 @@ describe("dispatch ladder — host control", () => {
     const on = buildDispatch(cfgWith({ ladder: LADDER, offload: true }));
     expect(on.offload).toBe(true);
     expect(on.ladder.find((l) => l.id === "pools")?.requiresDirective).toBe(false);
+  });
+});
+
+describe("dispatch ladder — caller input is not trusted", () => {
+  // DispatchOptions is typed, but the values arrive off a raw query string / JSON body, so the
+  // types are not enforced at runtime. Nothing type-checks test/ either, hence runtime asserts.
+  const bad = (v: unknown) => v as string;
+
+  it("treats a non-string task/lane/after as absent rather than coercing it", () => {
+    const cfg = cfgWith({ ladder: LADDER });
+    const view = buildDispatch(cfg, { task: bad(42), lane: bad({}), after: bad(["agy-claude"]) });
+    // No invented intent: no override, no walk-past, placeholder left visible.
+    expect(view.next?.id).toBe("agy-gemini");
+    expect(view.next?.invoke?.args).toContain("{task}");
+    expect(view.reason).not.toContain("override");
+  });
+
+  it("treats a blank task as no task, keeping the placeholder visible", () => {
+    const view = buildDispatch(cfgWith({ ladder: LADDER }), { task: "   " });
+    // Substituting would render `agy -p '   ' --model g-flash` — a command asking for nothing.
+    expect(view.next?.invoke?.args).toContain("{task}");
+  });
+
+  it("treats an empty lane/after as not supplied, not as a missed lookup", () => {
+    const cfg = cfgWith({ ladder: LADDER });
+    expect(buildDispatch(cfg, { lane: "" }).next?.id).toBe("agy-gemini");
+    expect(buildDispatch(cfg, { after: "" }).next?.id).toBe("agy-gemini");
+  });
+
+  it("never echoes control characters from a caller-supplied lane into the reason", () => {
+    // The reason is returned as JSON and printed to a terminal by `llm-relay dispatch`; an ESC
+    // sequence reflected verbatim would rewrite the operator's screen.
+    const view = buildDispatch(cfgWith({ ladder: LADDER }), { lane: "\u001b[31mowned\u0007" });
+    expect(view.next).toBeNull();
+    expect(view.reason).not.toContain("\u001b");
+    expect(view.reason).not.toContain("\u0007");
+    expect(view.reason).toContain("agy-gemini"); // the valid-id list still helps the caller
+  });
+
+  it("bounds the caller-supplied id echoed back in the reason", () => {
+    const view = buildDispatch(cfgWith({ ladder: LADDER }), { after: "z".repeat(10_000) });
+    expect(view.next).toBeNull();
+    expect(view.reason.length).toBeLessThan(500);
+  });
+
+  it("clamps a non-finite ttl instead of poisoning the ladder with an unrenderable date", () => {
+    // `1e999` is a legal JSON number that parses to Infinity and passes `typeof x === "number"`,
+    // so it reached `new Date(Infinity).toISOString()` and threw RangeError on EVERY later read —
+    // one bad exhaustion report took the whole ladder down until the process restarted.
+    const cfg = cfgWith({ ladder: LADDER });
+    const ttl = JSON.parse('{"ttlMs":1e999}').ttlMs as number;
+    expect(ttl).toBe(Infinity);
+    expect(markExhausted(cfg, "agy-gemini", ttl)).toBe(true);
+
+    const view = buildDispatch(cfg);
+    expect(view.ladder[0]?.state).toBe("exhausted");
+    expect(Date.parse(view.ladder[0]?.readyAt ?? "")).not.toBeNaN();
+    expect(Date.parse(view.ladder[0]?.readyAt ?? "")).toBeLessThanOrEqual(Date.now() + MAX_EXHAUSTED_MS);
+    expect(view.next?.id).toBe("agy-claude");
+  });
+
+  it("clamps a NaN ttl to the default rather than a permanent cooldown", () => {
+    const cfg = cfgWith({ ladder: LADDER });
+    markExhausted(cfg, "agy-gemini", Number.NaN);
+    const view = buildDispatch(cfg);
+    expect(Date.parse(view.ladder[0]?.readyAt ?? "")).not.toBeNaN();
+  });
+
+  it("ignores an exhaustion report for a non-string id", () => {
+    const cfg = cfgWith({ ladder: LADDER });
+    expect(markExhausted(cfg, bad(null))).toBe(false);
+    expect(buildDispatch(cfg).next?.id).toBe("agy-gemini");
+  });
+});
+
+describe("dispatch ladder — state isolation", () => {
+  it("scopes cooldowns to the config they were reported against", () => {
+    // Two configs in one process share rung ids and quota bucket names. Process-global cooldown
+    // state made exhausting a lane in one silently park the same-named lane in the other.
+    const a = cfgWith({ ladder: LADDER });
+    const b = cfgWith({ ladder: LADDER });
+    markExhausted(a, "agy-gemini");
+    expect(buildDispatch(a).next?.id).toBe("agy-claude");
+    expect(buildDispatch(b).next?.id).toBe("agy-gemini");
+  });
+
+  it("clears only the caller's cooldowns, not every config's", () => {
+    const a = cfgWith({ ladder: LADDER });
+    const b = cfgWith({ ladder: LADDER });
+    markExhausted(a, "agy-gemini");
+    markExhausted(b, "agy-gemini");
+    clearExhausted(b);
+    expect(buildDispatch(a).next?.id).toBe("agy-claude");
+    expect(buildDispatch(b).next?.id).toBe("agy-gemini");
+  });
+});
+
+describe("dispatch ladder — order, never execution", () => {
+  const source = readFileSync(fileURLToPath(new URL("../src/dispatch.ts", import.meta.url)), "utf8");
+
+  it("never reaches for a process spawner", () => {
+    // The relay owns the ORDER; the host executes. A CLI rung's quota is client-bound and it
+    // returns only final text, so anything spawned here could never serve an HTTP turn.
+    const spawners = [/node:child_process/, /\bspawn(Sync)?\s*\(/, /\bexec(File|Sync|FileSync)?\s*\(/];
+    for (const spawner of spawners) {
+      expect(source).not.toMatch(spawner);
+    }
+  });
+
+  it("hands back the structured invoke form and never a pre-joined command string", () => {
+    // A convenience "command line" field would be the carrier for exactly the unquoted-join
+    // rendering defect the audit is removing — the task must stay inside one argv element.
+    const view = buildDispatch(cfgWith({ ladder: LADDER }), { task: "rm -rf /; echo $(whoami)" });
+    const lane = view.next!;
+    expect(Object.keys(lane).sort()).toEqual(["id", "invoke", "kind", "position", "quota", "state"]);
+    expect(lane.invoke?.args).toEqual(["-p", "rm -rf /; echo $(whoami)", "--model", "g-flash"]);
+    for (const value of Object.values(view)) {
+      expect(typeof value === "string" ? value : "").not.toContain("rm -rf /;");
+    }
   });
 });
 
