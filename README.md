@@ -8,7 +8,7 @@ A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v
 
 - **Transparent passthrough** — forwards streaming and non-streaming `/v1/messages` byte-for-byte.
 - **`detect` mode** — deterministic tool_use validation (Ajv2020) with metadata-only logging of pass/fail/uncheckable. Behavior is unchanged; it only observes.
-- **`repair` mode** — on a validation failure, a cheap reshaper model corrects the call, the result is **re-validated**, and the corrected response is re-emitted (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched.
+- **`repair` mode** — on a validation failure, a cheap reshaper model corrects the call, the result is **re-validated**, and the corrected response is re-emitted (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched. The refusal matches the tool **name exactly** (case-insensitively) — see [Destructive-tool refusal](#destructive-tool-refusal-repairdestructivetools) for which tools that now covers.
 - **OpenAI-compatible backends** (`backend.kind:"openai"`) — front NIM / vLLM / OpenRouter / LM Studio. Requests are translated Anthropic→OpenAI and responses back (streaming SSE + non-streaming) via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge) (zero-dep). The validate/repair layer always sees Anthropic Messages, regardless of backend. Verified live end-to-end.
 - **Streaming repair** — text-block SSE frames stream to the client **as they arrive**; the proxy only withholds from the first `tool_use` block. A pure-text response is byte-for-byte passthrough with zero added latency; a valid tool call flushes the withheld frames verbatim; an invalid one is repaired with only the corrected trailing blocks re-emitted (`message_start` + leading text already delivered). A mid-stream repair failure surfaces as an SSE `error` event, never a fabricated call. Handles LF and CRLF frame delimiters and multibyte UTF-8 across chunk boundaries.
 
@@ -66,8 +66,9 @@ llm-relay
 - **Subagent offload** (`routing.offload` + `routing.subagents`): route Claude Code *subagents* to other providers while the human's own conversation stays on passthrough — with no agent files and no model ids in the prompt. **Off by default**; `llm-relay offload on` flips it without a restart, `llm-relay candidates` shows what to point it at. See below.
 
 ### 3. Prompt Token & Context Length Guardrails
-- Automatically estimates request prompt token count (`estimateRequestTokens`) against target model context limits (`getModelMetadata`).
-- Rejects oversized requests before network transmission with an HTTP 400 error (`request prompt estimated tokens exceeds model context limit`), protecting backends from context window overflow.
+- Estimates the request's prompt token count (`estimateRequestTokens`) against the target model's context limit, read from the warm catalog cache (`cachedLimits()` — it never fetches, so a cold cache costs no round-trip on the request path).
+- Rejects an oversized request before network transmission with an HTTP 400 (`request prompt estimated tokens … exceeds the context limit …`), protecting backends from context-window overflow.
+- ⚠ **It only fires against a limit the *serving* provider published.** If that provider publishes no limit (NIM publishes none), there is no guardrail: the request goes upstream and the backend returns its own authoritative error. llm-relay will not reject a request against a number it guessed — see the per-(provider, model) note under [Choosing where to offload](#choosing-where-to-offload-llm-relay-candidates).
 
 ### 4. Background Adaptive Health Monitoring & Persistent Caching
 - **Adaptive Cadence Loop**: Background `PingLoop` dynamically adjusts probe frequency across 4 operational modes: `speed` (2s interval at startup/activity), `normal` (10s), `slow` (30s after 5m idle), and `forced` (4s).
@@ -86,7 +87,8 @@ llm-relay
   the prompt.
 
 ### 6. Programmatic Telemetry & Quota Access for Claude
-- **HTTP Endpoints**: `GET /telemetry` (live JSON metrics), `GET /registry` (full provider/routing/model catalog with quality scores), `GET /ping` (trigger health probe pass & mode summary), `GET /health` (diagnostic status).
+- **Read-only HTTP endpoints**: `GET /telemetry` (live JSON metrics), `GET /registry` (full provider/routing/model catalog with quality scores), `GET /ping` (trigger health probe pass & mode summary), `GET /health` (diagnostic status), `GET /candidates` (the un-blended offload decision table).
+- **Mutating HTTP endpoints**: `GET|POST /offload` (read/flip the subagent-offload switch), `GET|POST /dispatch` (the dispatch ladder). ⚠ **Loopback is not authorization** — any page you visit can POST cross-origin to a loopback listener without a preflight, and these two write your `config.json` and steer lane order. They therefore reject a present-but-non-loopback `Origin` with 403, require `content-type: application/json` on a mutating request, and require a loopback `Host` (closing DNS rebinding). An **absent** `Origin` is allowed on purpose — that is what a CLI sends, and it is what keeps `llm-relay offload on` working against a running proxy with no restart.
 - **CLI Commands**: `llm-relay telemetry` outputs live telemetry metrics; `llm-relay models` lists live model catalogs with SWE-bench & quality scores; `llm-relay ping` performs live health & latency probes.
 - **Response Headers**: Proxy responses include `x-llm-relay-quota-percent`, `x-llm-relay-stability-score`, and `x-llm-relay-target`.
 
@@ -105,6 +107,9 @@ llm-relay
 | `llm-relay telemetry` | Output live JSON telemetry, stability scores, and quota metrics |
 | `llm-relay models [-p <name>] [-r]` | Query live `/models` catalog per provider (`-p` filter, `-r` force refresh) |
 | `llm-relay ping [-p <name>]` | Perform live health, latency & quota probe across providers |
+| `llm-relay offload [on\|off\|status]` | Read or flip the subagent-offload switch — applies to the next request, no restart |
+| `llm-relay candidates [-p <name>]` | The un-blended offload decision table (capability, cost, live health, quota, breaker state) |
+| `llm-relay dispatch [lane] [-t <task>]` | Which lane to hand a whole delegated task to next; it returns the command, **you** run it (`-x <lane>` reports one spent) |
 
 ---
 
@@ -262,7 +267,8 @@ a `routing` block that maps each request's `model` to one provider + backend mod
     }
   },
   "mode": "repair",                          // detect | repair (strict accepted, aliases detect)
-  "repair": { "maxAttempts": 2, "destructiveTools": ["Bash","Write","Edit","MultiEdit","NotebookEdit","rm","delete","overwrite","drop","reset"] },
+  // Omit `destructiveTools` to get exactly this default list. Names are matched EXACTLY.
+  "repair": { "maxAttempts": 2, "destructiveTools": ["Bash","BashOutput","Write","Edit","MultiEdit","NotebookEdit","rm","delete","delete_file","remove","overwrite","drop","reset","force_push"] },
   "log": { "level": "metadata", "file": null }  // metadata-only; NEVER logs headers/bodies
 }
 ```
@@ -285,6 +291,33 @@ a `routing` block that maps each request's `model` to one provider + backend mod
 Claude Code subagent frontmatter (`model:`), which accepts a full model id but not a candidate
 list. A pool is the indirection that gives those callers ranking and failover. `pool` is a
 reserved provider name; configuring a provider called `pool` fails at load.
+
+### Destructive-tool refusal (`repair.destructiveTools`)
+
+A repaired tool call may run under `--dangerously-skip-permissions`, so llm-relay refuses to emit
+one that names a destructive tool — it never guesses arguments for it. Two things about the list
+are worth knowing before you configure it:
+
+- **Matching is exact on the tool name, case-insensitively** — not substring. A pattern ending in
+  `*` is an opt-in prefix form (`"git_*"` covers `git_push` and `git_reset_hard` but not
+  `gitlab_read`); a bare `"*"` matches nothing.
+- **The default list leads with the harness's own write/execute tools** — `Bash`, `BashOutput`,
+  `Write`, `Edit`, `MultiEdit`, `NotebookEdit` — then the conventional MCP-style names (`rm`,
+  `delete`, `delete_file`, `remove`, `overwrite`, `drop`, `reset`, `force_push`).
+
+Both of those changed, and both are visible in behaviour. Refusal used to be substring matching
+over fragments like `rm`/`delete`/`push`, which was wrong in **both** directions at once: none of
+those fragments occur in `Bash`/`Write`/`Edit`, so the tools that can actually destroy something
+were never guarded — while `push` matched `PushNotification` and `reset` matched `ResetZoom`,
+refusing safe calls. So:
+
+- a malformed `Bash`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`BashOutput` call that used to be
+  repaired is now **refused** (logged as `repair: "refused_destructive"`; the request fails clean
+  instead of emitting a call the model did not correctly produce);
+- a call named `PushNotification`, `ResetZoom` or `ForceRefresh` is now **permitted**.
+
+There is no built-in list inside the proxy: an empty `repair.destructiveTools` refuses nothing, so
+coverage is always traceable to your config.
 
 ### Subagent offload (`routing.offload` + `routing.subagents`)
 
@@ -416,6 +449,11 @@ candidates and fails over on transport errors. A **refusal** is never retried on
 candidate — a reshaper declining to guess is a real judgement, and retrying it elsewhere is
 shopping for a more compliant answer, which is how a fabricated tool call gets through.
 
+If **every** candidate fails at the transport level, that is a total outage, not a judgement: the
+turn fails clean and is logged `repair: "failed"` (nothing was reachable), never `"refused"` (a
+model declined). The two are kept distinguishable in the log because they call for opposite
+responses — one is an infrastructure problem, the other is the safety boundary working.
+
 Anthropic-kind entries in the pool are skipped (they cannot reshape); a pool with no usable
 target is a loud startup error, never a silently absent reshaper.
 
@@ -476,11 +514,15 @@ default, and dispatcher-style usage is just "send namespaced ids + read `/regist
 
 ### Model tiers from leaderboards (never a hand-maintained table)
 
-`npm run sync:tiers` snapshots capability rankings from **BFCL** (Berkeley Function-Calling
-Leaderboard — tool-use accuracy, the primary signal for a tool-call proxy, incl. its
-Irrelevance-Detection metric = the malformed-call proxy) and **LMArena** (general capability)
-into `docs/tier-data.json`, and prints the top tool-callers so you can pick tier targets from
-real data. Both sources are synced-not-forked; a leaderboard schema change fails the sync loudly.
+`npm run sync:tiers` snapshots capability rankings into `docs/tier-data.json` from **four** sources
+— **OpenRouter** (Artificial Analysis intelligence / coding / agentic indices, Design Arena Elo,
+context length, pricing, tool support), **BFCL** (Berkeley Function-Calling Leaderboard — tool-use
+accuracy, the primary signal for a tool-call proxy, incl. its Irrelevance-Detection metric = the
+malformed-call proxy), **LMArena** (general capability) and **Aider** (polyglot edit benchmark) —
+and prints the top tool-callers so you can pick tier targets from real data. Every source is
+synced-not-forked, and each is independently failable so one dead endpoint does not cost the
+others; a **schema change inside** a source still fails the sync loudly, because a renamed column
+is corruption rather than absence. Zero working sources is fatal.
 
 The reshaper also takes `"kind": "openai"` — so `repair` mode can run entirely on an OpenAI-compatible provider (e.g. NIM) with no Anthropic key. The reshaper is asked only for the **corrected arguments per tool-call id** (not the full message envelope), which is far more reliable on weaker models; the proxy reconstructs the message and re-validates it.
 
@@ -493,9 +535,13 @@ Then point a `claude` CLI at it (see "Install & run" above) and inspect the log 
 
 ## What it logs (per request, metadata only)
 
-`{ ts, path, backendModel, hadTools, streamed, backendStatus, validated: pass|fail|uncheckable|skipped, toolUseCount, uncheckableCount, errorKinds[], latencyMs }`
+`{ ts, path, backendModel, servedProvider, servedModel, hadTools, streamed, backendStatus, validated: pass|fail|uncheckable|skipped, toolUseCount, uncheckableCount, errorKinds[], repair: none|fixed|failed|refused|refused_destructive, latencyMs }`
+
+That list is an **allow-list applied at the sink**, not a convention: the writer projects every record through it, so a caller that hands over a wider object cannot leak a header, a body or an error string carrying a key — and a new field starts being logged only when someone deliberately adds it to the list. `path` is passed through `logSafePath()`, which keeps the route and each query parameter's *name* and replaces its value with the value's length, because a `?task=` value is user prose, not metadata. A failed log write is swallowed to stderr: a full disk is a logging problem, never a request failure.
 
 `uncheckable` = a declared tool with no `input_schema` (built-in `bash`/`text_editor`/…) or a schema that wouldn't compile — surfaced distinctly so an unvalidatable call is never miscounted as a clean pass.
+
+⚠ `backendModel` is the model the **client asked for**, which for a tier or pool spec is routinely not the one that answered; `servedProvider`/`servedModel` are the deployment that actually served it. Draw "which model trips the validator" conclusions from the served fields. (`backendModel` is deprecated and on its way out; the served fields are absent — not `null` — on call sites not yet migrated, so an unmigrated call site can never be mistaken for a request nothing served.)
 
 This is the dataset for deciding which backend models are *format-broken* (reshapeable later) vs pass cleanly. Run in `detect` first, measure, then decide on repair.
 
@@ -560,6 +606,15 @@ Consumers (audit-tools dispatch, plain `claude` CLI) point `ANTHROPIC_BASE_URL` 
 ## Dev
 
 ```bash
-npm run typecheck   # tsc --noEmit
+npm run check       # typecheck + suite — the one gate, and exactly what CI runs
+npm run typecheck   # tsc --noEmit, src/ only
 npm test            # vitest (validator, SSE reconstruction, e2e transparency+detection)
+npm run build       # tsc -> dist/  (scripts/*.mjs read dist/, so rebuild before running them)
 ```
+
+`.github/workflows/ci.yml` runs `npm run check` on every push to `main` and every pull request.
+
+⚠ **Nothing type-checks `test/`.** `tsconfig.json` compiles `src/` only and excludes `**/*.test.ts`,
+and vitest transpiles tests without type-checking them (no `typecheck` block in
+`vitest.config.ts`). A `@ts-expect-error` inside a test file is therefore never evaluated and
+proves nothing — assert at runtime instead.
