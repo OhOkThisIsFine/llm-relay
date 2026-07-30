@@ -3,7 +3,7 @@ import { POOL_PREFIX } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
 import { getStrength, type StrengthBasis } from "./benchmarks.js";
-import { findTierModel } from "./tier-data.js";
+import { findTierModel, type TierData } from "./tier-data.js";
 import { keyIsPresent } from "./authEnv.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
@@ -61,6 +61,10 @@ export interface Candidate {
    * Limits, each with its own provenance. `provider` = this provider published it about its own
    * deployment; `reference` = borrowed from another provider serving the same model id (different
    * deployment, so indicative only — `metadataReferenceFrom` names it). Null = nobody publishes it.
+   *
+   * `metadataReferenceFrom` is `openrouter` when the borrowed row is that exact model id, and
+   * `openrouter:<matched-name>` when the snapshot row was only a FUZZY name match — i.e. the
+   * number belongs to a different SKU. Read it before quoting a reference figure.
    */
   contextLength: number | null;
   contextLengthSource: MetadataSource | null;
@@ -174,11 +178,15 @@ export async function buildCandidates(
     provider?: string;
     now?: string;
     nowMs?: number;
+    /** Capability snapshot override. Injected the same way `breaker`/`nowMs` are, so the
+     *  match-quality behaviour can be exercised against a fixed row set instead of whatever
+     *  `npm run sync:tiers` last wrote. Omitted ⇒ the real snapshot. */
+    tierData?: TierData | null;
   } = {},
 ): Promise<CandidatesView> {
   const breaker = opts.breaker ?? globalCircuitBreaker;
   const nowMs = opts.nowMs ?? Date.now();
-  const byNorm = loadTierData()?.byNorm ?? [];
+  const byNorm = (opts.tierData === undefined ? loadTierData() : opts.tierData)?.byNorm ?? [];
   const telemetry = loadRuntimeTelemetry();
 
   const candidates: Candidate[] = [];
@@ -211,13 +219,21 @@ export async function buildCandidates(
     const providerLimits = p && p.kind === "openai" && model && opts.catalog
       ? await opts.catalog.limits(provider, p, model).catch(() => null)
       : null;
+    // ⚠ On a FUZZY snapshot match these figures describe a similarly-named but different
+    // SKU (`glm-5.2` → `glm-5.2-max`), and `from` named only the host — so a borrowed
+    // ceiling or price was indistinguishable from one published for this very model id
+    // unless the reader separately correlated `capabilityMatch`. The matched name travels
+    // with the attribution instead, so `metadataReferenceFrom` states both WHOSE figure it
+    // is and WHICH model's.
+    const referenceFrom =
+      matched && matched.match === "fuzzy" ? `openrouter:${matched.rec.norm}` : "openrouter";
     const meta = resolveMetadata(model ?? provider, {
       providerLimits,
       reference: {
         contextLength: num("context_length"),
         pricePromptPerToken: num("price_prompt"),
         priceCompletionPerToken: num("price_completion"),
-        from: "openrouter",
+        from: referenceFrom,
       },
     });
 

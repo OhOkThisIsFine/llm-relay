@@ -269,7 +269,10 @@ a `routing` block that maps each request's `model` to one provider + backend mod
   "mode": "repair",                          // detect | repair (strict accepted, aliases detect)
   // Omit `destructiveTools` to get exactly this default list. Names are matched EXACTLY.
   "repair": { "maxAttempts": 2, "destructiveTools": ["Bash","BashOutput","Write","Edit","MultiEdit","NotebookEdit","rm","delete","delete_file","remove","overwrite","drop","reset","force_push"] },
-  "log": { "level": "metadata", "file": null }  // metadata-only; NEVER logs headers/bodies
+  "log": { "level": "metadata", "file": null },  // metadata-only; NEVER logs headers/bodies
+  // Stop `llm-relay onboard` nudging you about providers you have decided not to configure.
+  // Nudge suppression ONLY — see below.
+  "leave_me_alone": ["openai", "anthropic"]
 }
 ```
 
@@ -291,6 +294,31 @@ a `routing` block that maps each request's `model` to one provider + backend mod
 Claude Code subagent frontmatter (`model:`), which accepts a full model id but not a candidate
 list. A pool is the indirection that gives those callers ranking and failover. `pool` is a
 reserved provider name; configuring a provider called `pool` fails at load.
+
+### Quieting the onboarding nudge (`leave_me_alone`)
+
+`llm-relay onboard` walks every known provider and prompts for the keys you are missing. For a
+provider you have deliberately decided not to configure, that prompt is permanent noise. List it
+in `leave_me_alone` and onboarding stops mentioning it.
+
+```jsonc
+"leave_me_alone": ["openai", "anthropic", "some-provider-you-never-set-up"]
+```
+
+Two deliberate properties:
+
+- **A name matching no configured provider is legal** — no error, no warning. The list is the
+  *negative space*: the providers worth suppressing are exactly the ones that are not in your
+  `providers{}` block, and most are only ever preset names. Validating against the known set would
+  reject the main use case. (The value's *shape* is still checked loudly — a bare string where a
+  list belongs is a mistake with no plausible reading.)
+- **It suppresses a nudge, it does not hide state.** A suppressed provider still appears in
+  `llm-relay keys`, in `/registry`, in telemetry and in `llm-relay candidates`, and still routes
+  normally. Those are the surfaces you go to when something is wrong; a provider that vanished
+  from them would be undebuggable.
+
+Matching is case- and whitespace-insensitive, and is against the provider *name* only — never its
+`authEnv` or display name — so one entry can never silence a provider you did not name.
 
 ### Destructive-tool refusal (`repair.destructiveTools`)
 
@@ -535,13 +563,13 @@ Then point a `claude` CLI at it (see "Install & run" above) and inspect the log 
 
 ## What it logs (per request, metadata only)
 
-`{ ts, path, backendModel, servedProvider, servedModel, hadTools, streamed, backendStatus, validated: pass|fail|uncheckable|skipped, toolUseCount, uncheckableCount, errorKinds[], repair: none|fixed|failed|refused|refused_destructive, latencyMs }`
+`{ ts, path, servedProvider, servedModel, hadTools, streamed, backendStatus, validated: pass|fail|uncheckable|skipped, toolUseCount, uncheckableCount, errorKinds[], repair: none|fixed|failed|refused|refused_destructive, latencyMs }`
 
 That list is an **allow-list applied at the sink**, not a convention: the writer projects every record through it, so a caller that hands over a wider object cannot leak a header, a body or an error string carrying a key — and a new field starts being logged only when someone deliberately adds it to the list. `path` is passed through `logSafePath()`, which keeps the route and each query parameter's *name* and replaces its value with the value's length, because a `?task=` value is user prose, not metadata. A failed log write is swallowed to stderr: a full disk is a logging problem, never a request failure.
 
 `uncheckable` = a declared tool with no `input_schema` (built-in `bash`/`text_editor`/…) or a schema that wouldn't compile — surfaced distinctly so an unvalidatable call is never miscounted as a clean pass.
 
-⚠ `backendModel` is the model the **client asked for**, which for a tier or pool spec is routinely not the one that answered; `servedProvider`/`servedModel` are the deployment that actually served it. Draw "which model trips the validator" conclusions from the served fields. (`backendModel` is deprecated and on its way out; the served fields are absent — not `null` — on call sites not yet migrated, so an unmigrated call site can never be mistaken for a request nothing served.)
+⚠ `servedProvider`/`servedModel` are the deployment that actually served the request — draw "which model trips the validator" conclusions from them. The model the **client asked for** is deliberately not recorded: there used to be a `backendModel` field carrying it, and for a tier or pool spec it is routinely not the model that answered, so every conclusion drawn from this dataset was attributed to whatever id the client happened to send. `null` in the served fields means genuinely nothing served the turn (a guardrail rejection, a routing error, an admin endpoint answered locally).
 
 This is the dataset for deciding which backend models are *format-broken* (reshapeable later) vs pass cleanly. Run in `detect` first, measure, then decide on repair.
 
@@ -606,15 +634,17 @@ Consumers (audit-tools dispatch, plain `claude` CLI) point `ANTHROPIC_BASE_URL` 
 ## Dev
 
 ```bash
-npm run check       # typecheck + suite — the one gate, and exactly what CI runs
-npm run typecheck   # tsc --noEmit, src/ only
-npm test            # vitest (validator, SSE reconstruction, e2e transparency+detection)
-npm run build       # tsc -> dist/  (scripts/*.mjs read dist/, so rebuild before running them)
+npm run check         # both typechecks + suite — the one gate, and exactly what CI runs
+npm run typecheck     # tsc --noEmit, src/ only (tsconfig.json — it drives dist/)
+npm run typecheck:test # tsc over the suite (tsconfig.test.json)
+npm test              # vitest (validator, SSE reconstruction, e2e transparency+detection)
+npm run build         # tsc -> dist/  (scripts/*.mjs read dist/, so rebuild before running them)
 ```
 
 `.github/workflows/ci.yml` runs `npm run check` on every push to `main` and every pull request.
 
-⚠ **Nothing type-checks `test/`.** `tsconfig.json` compiles `src/` only and excludes `**/*.test.ts`,
-and vitest transpiles tests without type-checking them (no `typecheck` block in
-`vitest.config.ts`). A `@ts-expect-error` inside a test file is therefore never evaluated and
-proves nothing — assert at runtime instead.
+`test/` needs its own tsconfig because `tsconfig.json` compiles `src/` only and vitest transpiles
+tests without type-checking them. Until `tsconfig.test.json` existed nothing checked them at all,
+so a `@ts-expect-error` in a test file was never evaluated and proved nothing — treat any
+pre-existing one with suspicion, and prefer a runtime assertion when the point is that a surface
+does not exist.

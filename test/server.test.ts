@@ -370,7 +370,12 @@ describe("repair mode", () => {
     }),
   };
 
-  async function bootProxy(backendBody: { headers: Record<string, string>; body: string }, reshaper: Reshaper, destructiveTools: string[] = []): Promise<number> {
+  async function bootProxy(
+    backendBody: { headers: Record<string, string>; body: string },
+    reshaper: Reshaper,
+    destructiveTools: string[] = [],
+    maxAttempts = 2,
+  ): Promise<number> {
     backend = await mockBackend(() => backendBody);
     const cfg: Config = {
       host: "127.0.0.1",
@@ -378,7 +383,7 @@ describe("repair mode", () => {
       providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
       routing: { default: "up", tiers: {} },
       mode: "repair",
-      repair: { maxAttempts: 2, destructiveTools },
+      repair: { maxAttempts, destructiveTools },
       log: { level: "metadata", file: logFile },
     };
     proxy = await startProxy(cfg, { reshaper });
@@ -420,6 +425,73 @@ describe("repair mode", () => {
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false) });
     expect(await resp.text()).toBe(good); // byte-identical passthrough
     expect(lastLogLine(logFile).repair).toBe("none");
+  });
+
+  /**
+   * A repair changes the tool INPUT and nothing else about the response's identity.
+   *
+   * The buffered path used to rebuild the message from scratch: a constant `id: "msg_repair"`
+   * (so every repaired turn in a session was indistinguishable to anything keying off the id,
+   * and disagreed with the id the provider would answer questions about), the model the CLIENT
+   * asked for rather than the one that answered, and a zero-filled `usage` reporting a token
+   * count nobody measured.
+   */
+  it("carries the backend's own id, model and usage through a buffered repair", async () => {
+    const broken = JSON.stringify({
+      id: "msg_backend_abc", type: "message", role: "assistant", model: "z-ai/glm-5.2",
+      stop_reason: "tool_use", usage: { input_tokens: 91, output_tokens: 7 },
+      content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }],
+    });
+    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: broken }, fixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false) });
+    const j = (await resp.json()) as { id: string; model: string; usage?: unknown; content: unknown[] };
+
+    expect(j.id).toBe("msg_backend_abc");
+    expect(j.id).not.toBe("msg_repair");
+    expect(j.model).toBe("z-ai/glm-5.2"); // the model that ANSWERED, not the requested "m"
+    expect(j.usage).toEqual({ input_tokens: 91, output_tokens: 7 });
+    expect((j.content as AssistantMessage["content"]).find(isToolUseBlock)?.input).toEqual({ city: "Paris" });
+  });
+
+  /**
+   * Same rule the streaming path and the metadata resolver follow: an absent measurement stays
+   * absent. `{input_tokens: 0, output_tokens: 0}` is a claim that the call was free, which a
+   * consumer metering off the response cannot tell apart from a call that genuinely was.
+   */
+  it("omits usage rather than zero-filling it when the backend reported none", async () => {
+    const broken = JSON.stringify({
+      type: "message", role: "assistant", stop_reason: "tool_use",
+      content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }],
+    });
+    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: broken }, fixer);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false) });
+    const j = (await resp.json()) as Record<string, unknown>;
+
+    expect(j).not.toHaveProperty("usage");
+    // No id to carry: the fallback is the relay-marked synthetic one, never the old constant.
+    expect(j.id as string).toMatch(/^msg_relay_/);
+  });
+
+  /**
+   * `repair.maxAttempts` is parsed, validated and documented in config.ts — and both `repair()`
+   * call sites passed a hardcoded 2, so the configured value was ignored on every request.
+   */
+  it("honours the CONFIGURED repair.maxAttempts instead of a hardcoded 2", async () => {
+    let calls = 0;
+    // Never actually fixes the call, so repair burns every attempt it is allowed.
+    const useless: Reshaper = {
+      reshape: async () => {
+        calls++;
+        return { kind: "message", message: { content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }], stop_reason: "tool_use" } as AssistantMessage };
+      },
+    };
+    const broken = JSON.stringify({ type: "message", role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }] });
+
+    const p = await bootProxy({ headers: { "content-type": "application/json" }, body: broken }, useless, [], 3);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: reqBody(false) });
+
+    expect(resp.status).toBe(502); // unrepairable → fail-clean
+    expect(calls).toBe(3);
   });
 
   it("fail-closes (502) on a destructive tool call instead of fabricating it", async () => {
@@ -766,6 +838,35 @@ describe("circuit breaker accounting", () => {
     expect(state?.consecutiveFailures).toBe(0);
     expect(state?.cooldownUntil).toBe(0);
   });
+
+  /**
+   * A credential fault is not health data.
+   *
+   * 401/403 are not retriable, so they fell into the else-branch and were recorded as
+   * `ok: true`: a revoked or exhausted key cleared `consecutiveFailures` and refreshed the
+   * stability score on every request, so the breaker could never trip and the target stayed
+   * at the front of the ranking while failing 100% of calls. Recording a FAILURE would be the
+   * opposite error — it would open the breaker on a config problem and hide the 401 behind a
+   * "target unhealthy" skip. So the breaker is told nothing at all.
+   */
+  for (const status of [401, 403]) {
+    it(`records neither success nor failure for a ${status}, and does not erase prior failures`, async () => {
+      globalCircuitBreaker.recordOutcome("up", { ok: false, status: 500, elapsedMs: 10 });
+      expect(globalCircuitBreaker.getState("up")?.consecutiveFailures).toBe(1);
+
+      const p = await bootStatus(status, JSON.stringify({ type: "error", error: { message: "invalid x-api-key" } }));
+      const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: REQUEST_BODY,
+      });
+      expect(resp.status).toBe(status); // the real error still reaches the client
+
+      const state = globalCircuitBreaker.getState("up");
+      expect(state?.consecutiveFailures).toBe(1); // not reset to 0 by a false success
+      expect(state?.lastStatus).toBe(500); // and not overwritten by the auth status
+    });
+  }
 
   it("passes a 429 body through verbatim — the client's own backoff owns the retry", async () => {
     const body = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } });

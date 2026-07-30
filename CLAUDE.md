@@ -21,8 +21,9 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 npm install
 npm run build          # tsc -> dist/
 npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
-npm run typecheck      # tsc --noEmit  — src/ ONLY. See the warning below.
-npm run check          # typecheck + test. The one gate; CI runs exactly this.
+npm run typecheck      # tsc --noEmit — src/ (tsconfig.json)
+npm run typecheck:test # tsc — the SUITE (tsconfig.test.json). See the note below.
+npm run check          # both typechecks + test. The one gate; CI runs exactly this.
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
 
@@ -34,12 +35,19 @@ npx vitest run -t "refuses destructive"        # one test by name
 ```
 **Always verify green before AND after a change:** `npm run build && npm run check`.
 
-⚠ **Nothing type-checks `test/`.** `tsconfig.json` is `include: ["src/**/*.ts"]` with
-`exclude: [… "**/*.test.ts"]`, and `vitest.config.ts` declares **no `typecheck` block** — vitest
-transpiles tests, it does not type-check them. So a test's types are never checked by anything, and
-a `@ts-expect-error` in a test file is inert: it is never evaluated, so it neither passes nor fails
-and proves nothing. Don't rely on one to pin a type contract; assert at runtime instead. (Two
-independent workers were misled by the old "vitest is what checks those" claim here.)
+**`test/` is type-checked by `tsconfig.test.json`, not by `tsconfig.json` or by vitest.**
+`tsconfig.json` is `include: ["src/**/*.ts"]` with `exclude: [… "**/*.test.ts"]` because it drives
+`dist/`, and vitest **transpiles** tests rather than type-checking them (`vitest.config.ts` declares
+no `typecheck` block, deliberately — it would run tsc twice). `tsconfig.test.json` extends the base
+with the same strictness, widens `rootDir` and adds `test/`, and `npm run check` runs it. Its first
+run found 23 errors, including hand-built `ProviderConfig`/`ReshaperConfig` literals missing a
+required field — i.e. tests asserting against a shape the source no longer has.
+
+⚠ A `@ts-expect-error` in a test file was inert for the whole life of the project before this
+(never evaluated ⇒ neither passing nor failing), so **any pre-existing one proves nothing about
+when it was written**. It is live now, but prefer a runtime assertion where the point is that a
+surface does not EXIST — a type-level assertion only says it is untyped. (Two independent workers
+were misled by the older "vitest is what checks those" claim here.)
 
 ⚠ **`vitest.config.ts` scopes the suite to this checkout's `test/` directory on purpose.**
 Without an explicit `include`,
@@ -60,12 +68,13 @@ the *trigger* is the credential. A local `npm publish` has no credentials and fa
 404. `.github/workflows/publish.yml` now stands four gates between a tag and the registry:
 
 1. a job-level `if` — this repository only, ref under `refs/tags/v*`;
-2. `environment: npm-publish`; ⚠ its protection rules live in **repo settings** (Settings →
+2. `environment: npm-publish`; its protection rules live in **repo settings** (Settings →
    Environments → npm-publish), not in the workflow, and GitHub auto-creates the environment with
-   **no** rules on first run — **they are not configured yet**, so today the environment is an audit
-   trail, not a gate;
-3. the tag's commit must be **contained in the default branch** (this is the check actually holding
-   the line until (2) is configured);
+   **no** rules. It now carries a **custom deployment branch policy limiting it to the `v*` tag
+   pattern** (`gh api repos/OhOkThisIsFine/llm-relay/environments/npm-publish/deployment-branch-policies`
+   to inspect), so the ref restriction is enforced by the platform and not only by the workflow's
+   own `if`. No required reviewer — a release stays one command, by the owner's decision;
+3. the tag's commit must be **contained in the default branch**;
 4. the tag must **match `package.json`'s version** — an npm mistake is permanent.
 
 The `release: published` trigger was **removed**: it was a second independent path to the registry
@@ -80,7 +89,7 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `pool-health.ts` | `llm-relay pools --probe` — sends a REAL completion to every pool member. Config-time validation cannot see a model that is listed and still dead (de-listed behind the scenes, gated to a paid tier, routed to a missing function), and that is exactly how a pool ends up with one live member and paper failover. Probes at 400 max_tokens because reasoning models return an empty 200 at a low cap — `empty` is a distinct verdict from `missing`, not a synonym. |
 | `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
-| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **subagent-aware routing** (`isSubagentRequest` reads the `cc_is_subagent=true` marker Claude Code stamps into `system`; `subagentSpec` applies `routing.subagents` — **only when `routing.offload` is on, default false** — or an `@relay:` directive read ONLY from the last text block of `messages[0]`, which works with the switch off), reshaper auto-synthesis. |
+| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **subagent-aware routing** (`isSubagentRequest` reads the `cc_is_subagent=true` marker Claude Code stamps into `system`; `subagentSpec` applies `routing.subagents` — **only when `routing.offload` is on, default false** — or an `@relay:` directive read ONLY from the last text block of `messages[0]`, which works with the switch off), reshaper auto-synthesis. Also `leave_me_alone` — the onboarding-nudge suppression list, whose entries are deliberately NOT validated against the known providers (see `onboarding.ts`). |
 | `offload.ts` | The subagent-offload switch. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites only `routing.offload` in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
 | `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. Exhaustion is host-reported for every rung kind because the relay cannot see a CLI's credit balance, and a `quota` bucket cools sibling rungs together (one binary can meter two independent balances — cooling both would skip a live lane). |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
@@ -88,21 +97,21 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
 | `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
 | `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai) + `FailoverReshaper` (ranked candidates from `reshaper: { pool }`; advances on transport failure only — a refusal is returned as-is, never retried elsewhere, and **exhausting every candidate throws `ReshaperTransportError`**, it does not return a refusal). |
-| `repair.ts` | Repair orchestrator. Destructive-refusal check → reshape ≤ maxAttempts → re-validate each attempt. `destructiveMatcher()` matches the tool name **exactly** (case-insensitively), with `name*` as an opt-in prefix form; `guardReshaped()` re-checks the reshaped message for destructive calls and for structural conservation (same block count/order, same tool_use `id`+`name`) — an added, dropped or re-pointed call is a contract violation, not a repair. |
+| `repair.ts` | Repair orchestrator. Destructive-refusal check → reshape ≤ maxAttempts → re-validate each attempt. `destructiveMatcher()` matches the tool name **exactly** (case-insensitively), with `name*` as an opt-in prefix form; `guardReshaped()` re-checks the reshaped message for destructive calls and for structural conservation (same block count/order, same tool_use `id`+`name`) — an added, dropped or re-pointed call is a contract violation, not a repair. `withEnvelopeOf()` re-attaches the BACKEND's `id`/`model`/`stop_sequence`/`usage` to whatever the reshaper returned — same reasoning as the guard: `Reshaper` is an interface, and a repair changes the tool arguments, never whose answer this is. |
 | `sse.ts` | `reconstructFromSse()` — rebuild an AssistantMessage from a captured SSE stream (to validate it). |
 | `emitSse.ts` | `emitSse()` / `emitSseTail()` — serialize a (repaired) message back to Anthropic SSE. `emitSseTail` re-emits only trailing blocks (streaming repair). |
 | `anthropic.ts` | Minimal Anthropic Messages shapes + `toolSchemaMap()`. Only the fields the proxy inspects. |
 | `documents.ts` | `transcodeDocuments()` — Anthropic `document` blocks → markdown text via **MarkItDown** (optional external Python CLI), applied to openai-kind targets before llm-bridge. Refuses (`DocumentError` → 400) rather than letting an unconvertible document through; llm-bridge would stringify it and inject raw base64 into the prompt. Uses a **temp file, not stdin** — pdfminer needs a seekable stream and every piped PDF dies with "No /Root object". |
-| `log.ts` | Metadata-only logger (never headers/bodies). "Metadata only" is enforced **at the sink**: `write()` projects each record through the `LOG_FIELDS` allow-list, so a caller that hands over a wider object cannot leak it and a new field is logged only when someone adds it to that list. Log-write failure is swallowed — a full disk is a logging problem, never a request failure. |
+| `log.ts` | Metadata-only logger (never headers/bodies). "Metadata only" is enforced **at the sink**: `write()` projects each record through the `LOG_FIELDS` allow-list, so a caller that hands over a wider object cannot leak it and a new field is logged only when someone adds it to that list. Log-write failure is swallowed — a full disk is a logging problem, never a request failure. Records the deployment that ANSWERED (`servedProvider`/`servedModel`, required); the model the client asked for is deliberately not a field. |
 | `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). Also harvests **per-(provider, model) limits + pricing** via `limitsFromRecord()` — a generic field-alias list (`context_window`/`max_context_length`/…), never a per-provider switch. `limits()` returns null when a provider publishes nothing (NIM), and that null must not be filled with another provider's numbers. |
-| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Sorts targets by Stability Score. |
+| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Orders targets by `getMeasuredStability()`, which returns **null when nothing has been measured** — the mid-band placeholder is applied locally in `getHealthyTargets`, not by an accessor. There is deliberately no scalar `getStabilityScore()`: a `number` return cannot say "unmeasured", so every caller got a plausible score and none could tell a guess from an observation. |
 | `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → observed runtime telemetry (≥5 calls, so one lucky request can't promote a model) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
 | `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
 | `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value (`provider`) → another provider's figure for the same id (`reference`, indicative only) → **null**. There is no hardcoded-table rung: the old blanket 128k/4096 guess was deleted in 0.7.0 because a caller cannot tell a guess from a measurement. Plus `estimateRequestTokens()`. |
 | `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. Re-exports `loadTierData` from `tier-data.ts`. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
 | `key-checker.ts` | Pre-flight key validator. Providers are checked **concurrently** (a dozen-plus providers checked serially, one of them a dead local daemon, turns a status command into a multi-minute one). A 200 from `/models` is NOT accepted as proof: several providers serve that endpoint publicly, so it is re-probed anonymously, and only a genuine 401/403 there makes it evidence. Otherwise it escalates to an authenticated completion **on a model this config actually routes to that provider** — a catalogue's first entry is often a premium SKU the key legitimately cannot touch. A 401/403 on that probe is compared against the same request sent anonymously: a *different* status proves the key authenticated (the wall is the model's plan), an *identical* one proves nothing and reports `unverified` rather than accusing a working key. |
-| `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). |
+| `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). Honours `leave_me_alone` — and ONLY here: a suppressed provider stays visible in `llm-relay keys`, `/registry`, telemetry and `candidates`, because silencing a nudge is not hiding state. Entries matching no known provider are legal on purpose; the list stores the negative space, so validating it against the configured providers would reject its main use case. |
 | `setup-claude.ts` | Configuration generator for Claude Desktop (`claude_desktop_config.json`) and Claude CLI wrappers. |
 | `ping/cadence.ts` | Adaptive background monitoring loop (`PingLoop`) with dynamic mode transitions (`speed`, `normal`, `slow`, `forced`). |
 | `ping/metrics.ts` | Latency statistical calculations (average, p95, jitter, uptime, spike rate) and composite Stability Score calculation (0-100). |
@@ -174,9 +183,16 @@ test stale code.
   provider into a total outage. Pool members belonging to a disabled provider are dropped with
   a warning; a member naming a provider that was never declared is still a hard error, because
   that is a typo and silently dropping it would spend primary quota via the passthrough.
-  Losing every provider, or emptying a pool entirely, is still fatal. `Config.warnings` carries
-  these so startup can print them — a degraded config that boots silently is how you end up
-  running on one provider without noticing.
+  **The same degradation now applies to `routing.tiers`, `routing.subagents`, an ARRAY
+  `routing.default` and relay ladder rungs** — they were validated against the *post-disabling*
+  provider map, so a tier pointing at the degraded provider was reported as naming an unknown one
+  and aborted startup, reaching the same total outage by another route. Losing every provider,
+  emptying a pool entirely, or a single-spec `routing.default` naming the disabled provider is
+  still fatal — there is nowhere left to fall through to — and that last error names the unset
+  `${ENV}` rather than accusing the operator of a typo. `Config.warnings` carries all of it so
+  startup can print it; the subagent warning states the CONSEQUENCE (that traffic now falls through
+  to `routing.default`, i.e. primary quota), because a silent fall-through there looks like a
+  successful offload.
 - **Worktrees.** Work may happen in a git worktree under `.claude/worktrees/…` or
   `.audit-tools/worktrees/…`. Edit and run tests **in the worktree path**, not the main checkout —
   they have separate working trees. vitest run from the wrong root will silently pick up the other
@@ -283,20 +299,16 @@ test stale code.
 
 ## Status & open work
 
-> ⚠ **An audit remediation is IN PROGRESS, and it lands on `main`.**
-> Read [docs/remediation-handoff-2026-07-29.md](docs/remediation-handoff-2026-07-29.md) FIRST if you
-> are continuing it — but ⚠ **that doc's own header is stale**: it names branch
-> `remediate/audit-2026-07-29`, which is 0 ahead / 8 behind `main` and holds **none** of the work.
-> Read the branch fact from here, the rest from there. It also pins a test count in its gate line;
-> the suite grows every wave, so treat the count as historical, not a target.
+> **The audit remediation is COMPLETE**, on `main`, and its follow-up list is discharged
+> (2026-07-30). [docs/remediation-handoff-2026-07-29.md](docs/remediation-handoff-2026-07-29.md)
+> records what the run changed and what was deliberately left out; read it before reopening
+> anything in that area.
 >
-> A small fraction of the 410 approved findings has landed (both criticals among them); the bulk
-> remains, several tightening obligations block completion, and **several existing tests pin the
-> defect they should catch** — a correct fix can turn the suite red. That doc also records why
-> `phase_cut.json` must not be trusted for ordering, and which findings name the wrong module.
->
-> The audit + remediation artifacts live in `.audit-tools/`, which is **untracked and local-only** —
-> `git clean -fd` destroys them. The handoff doc is the committed source of truth.
+> Still true and worth knowing when you work near it: **several tests pinned the defect they
+> should catch**, so a correct fix in this codebase can legitimately turn the suite red — read the
+> failing test's reasoning before assuming your change is wrong. The audit artifacts live in
+> `.audit-tools/`, which is **untracked and local-only** (`git clean -fd` destroys them); the
+> handoff doc is the committed source of truth.
 
 Current: **usable end-to-end**, suite green, tsc clean — and as of this run that is verified by CI
 (`.github/workflows/ci.yml` runs `npm run check`) rather than by a local run only. A real `claude`

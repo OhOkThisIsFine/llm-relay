@@ -248,6 +248,17 @@ export interface Config {
   reshaperCandidates?: ReshaperConfig[];
   repair: { maxAttempts: number; destructiveTools: string[] };
   log: { level: "metadata" | "silent"; file: string | null };
+  /**
+   * Providers the onboarding nudge must stop asking about (`leave_me_alone` in config.json).
+   *
+   * Scope is deliberately narrow: it silences the "❌ Missing Key / 👉 get one here" prompt in
+   * `llm-relay onboard`, and nothing else. Suppressed providers still appear in `llm-relay keys`,
+   * in `/registry` and in every status surface — silencing a nudge is not hiding state, and a
+   * provider that vanished from the status commands would be undebuggable later.
+   *
+   * Names that match no known provider are legal (see `parseLeaveMeAlone`).
+   */
+  leaveMeAlone?: string[];
   /** Path this config was loaded from. Set by `loadConfig`; absent for hand-built test configs.
    *  Only consumer is the runtime offload toggle, which persists back to the same file. */
   sourcePath?: string;
@@ -560,6 +571,8 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   const level = logRaw.level === "silent" ? "silent" : "metadata";
   const file = typeof logRaw.file === "string" ? logRaw.file : null;
 
+  const leaveMeAlone = parseLeaveMeAlone(c["leave_me_alone"]);
+
   return {
     host,
     port,
@@ -570,9 +583,37 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     ...(reshaperCandidates && reshaperCandidates.length > 1 ? { reshaperCandidates } : {}),
     repair: { maxAttempts, destructiveTools },
     log: { level, file },
+    ...(leaveMeAlone.length > 0 ? { leaveMeAlone } : {}),
     sourcePath: path,
     ...(warnings.length > 0 ? { warnings } : {}),
   };
+}
+
+/**
+ * Parse `leave_me_alone` — the provider suppression list.
+ *
+ * ⚠ A name matching NO known provider is deliberately legal and produces neither an error nor a
+ * warning. Storing only the negative space is the whole point: you suppress the nudge for a
+ * provider you have chosen not to configure, which by definition is not in `config.providers`,
+ * and most of them are only ever preset names. Validating against the known set would reject
+ * exactly the entries the feature exists for.
+ *
+ * The VALUE's shape is still checked loudly — a string where a list belongs, or a number in the
+ * list, is a mistake with no plausible reading, and silently ignoring it would leave the user
+ * being nagged with no idea why.
+ */
+function parseLeaveMeAlone(raw: unknown): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error(`config.leave_me_alone must be an array of provider names (got ${typeof raw})`);
+  }
+  const bad = raw.find((v) => typeof v !== "string" || v.trim().length === 0);
+  if (bad !== undefined) {
+    throw new Error(
+      `config.leave_me_alone entries must be non-empty provider-name strings (got ${JSON.stringify(bad)})`,
+    );
+  }
+  return (raw as string[]).map((s) => s.trim());
 }
 
 function parseProviders(
@@ -716,8 +757,41 @@ function parseRouting(
   const ladder = parseLadder(r.ladder);
   if (ladder.length > 0) routing.ladder = ladder;
 
-  // Fail loudly at load time if any spec names an unknown provider or pool.
-  assertSpecResolvable(routing.default, providers, pools, "routing.default");
+  // A spec naming a DISABLED provider is dropped with a warning, exactly like a pool member;
+  // a spec naming a provider that was never declared is still fatal below. Doing this before
+  // the assertions is what keeps "one optional provider lost its ${ENV}" from being a total
+  // outage: assertSpecResolvable sees the post-disabling provider map, so it cannot tell the
+  // two apart and used to abort startup for the degraded case too.
+  for (const [tier, spec] of Object.entries(tiers)) {
+    const kept = dropDisabledSpecs(spec, disabledProviders, warnings, `routing.tiers.${tier}`);
+    if (kept === null) delete tiers[tier];
+    else tiers[tier] = kept;
+  }
+  for (const [tier, spec] of Object.entries(subagents)) {
+    // A subagent entry is a single spec, so the result is a string or nothing.
+    const kept = dropDisabledSpecs(spec, disabledProviders, warnings, `routing.subagents.${tier}`) as
+      | string
+      | null;
+    if (kept === null) delete subagents[tier];
+    else subagents[tier] = kept;
+  }
+  if (Array.isArray(routing.default)) {
+    // Only an ARRAY default can degrade — the survivors still answer. A single-spec default
+    // has nothing left to fall back to, so it stays fatal below.
+    const kept = dropDisabledSpecs(routing.default, disabledProviders, warnings, "routing.default");
+    if (kept !== null) routing.default = kept;
+  }
+  routing.ladder = ladder.filter((rung) => {
+    if (rung.kind !== "relay" || !rung.spec) return true;
+    return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `routing.ladder[${rung.id}].spec`) !== null;
+  });
+  if (routing.ladder.length === 0) delete routing.ladder;
+
+  // Fail loudly at load time if any spec names an unknown provider or pool. Only
+  // `routing.default` can still trip on a DISABLED provider — everything else degraded
+  // above — and it is fatal on purpose: it is the fall-through for everything, so there
+  // is nowhere left to fall through to.
+  assertSpecResolvable(routing.default, providers, pools, "routing.default", disabledProviders);
   for (const [tier, spec] of Object.entries(tiers)) {
     assertSpecResolvable(spec, providers, pools, `routing.tiers.${tier}`);
   }
@@ -727,12 +801,46 @@ function parseRouting(
   for (const [tier, spec] of Object.entries(subagents)) {
     assertSpecResolvable(spec, providers, pools, `routing.subagents.${tier}`);
   }
-  for (const rung of ladder) {
+  for (const rung of routing.ladder ?? []) {
     if (rung.kind === "relay" && rung.spec) {
       assertSpecResolvable(rung.spec, providers, pools, `routing.ladder[${rung.id}].spec`);
     }
   }
   return routing;
+}
+
+/**
+ * Drop the members of a spec (or spec list) whose provider was disabled by an unset `${ENV}`,
+ * warning for each. Returns the survivors, or `null` when nothing survives.
+ *
+ * ⚠ The warning states the CONSEQUENCE, not just the fact. When a `routing.subagents` entry
+ * disappears, that traffic falls through to `routing.default` — the Anthropic passthrough — so
+ * the dispatcher believes it offloaded while spending primary quota, and nothing in the
+ * response says otherwise. That is the same hazard an unresolvable `@relay:` directive is a
+ * hard error for; the difference is that this one is visible once, at startup, where the
+ * operator can act on it, and the alternative (aborting) takes down every client session for
+ * a provider that may not even be in use.
+ */
+function dropDisabledSpecs(
+  spec: string | string[],
+  disabled: Set<string>,
+  warnings: string[],
+  where: string,
+): string | string[] | null {
+  if (disabled.size === 0) return spec;
+  const specs = Array.isArray(spec) ? spec : [spec];
+  const kept = specs.filter((s) => {
+    const { provider } = splitSpec(s);
+    if (provider === POOL_PREFIX || !disabled.has(provider)) return true;
+    warnings.push(
+      `config.${where}: dropped "${s}" — provider "${provider}" is disabled. ` +
+        `That routing now falls through to routing.default, which for a passthrough default ` +
+        `means primary quota.`,
+    );
+    return false;
+  });
+  if (kept.length === 0) return null;
+  return Array.isArray(spec) ? kept : kept[0]!;
 }
 
 /** Placeholder a cli rung's args must contain. Duplicated from dispatch.ts as a literal rather
@@ -800,6 +908,7 @@ function assertSpecResolvable(
   providers: Record<string, ProviderConfig>,
   pools: Record<string, string[]>,
   where: string,
+  disabled: Set<string> = new Set(),
 ): void {
   const specs = Array.isArray(spec) ? spec : [spec];
   for (const s of specs) {
@@ -813,6 +922,16 @@ function assertSpecResolvable(
       continue;
     }
     const p = providers[provider];
+    // A disabled provider is absent from `providers`, so without this it is reported as a
+    // typo — sending the operator to look for a misspelling that isn't there instead of at
+    // the unset environment variable that actually caused it.
+    if (!p && disabled.has(provider)) {
+      throw new Error(
+        `config.${where} "${s}" names provider "${provider}", which is DISABLED because its ` +
+          `base references an unset \${ENV} (see the warning above). Set the variable, or point ` +
+          `${where} somewhere else.`,
+      );
+    }
     if (!p) throw new Error(`config.${where} "${s}" names unknown provider "${provider}"`);
     if (p.kind === "openai" && !model) throw new Error(`config.${where} "${s}" needs a model id for openai provider "${provider}"`);
   }

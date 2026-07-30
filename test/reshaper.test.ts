@@ -140,6 +140,36 @@ describe("reconstruct", () => {
     const textOnly: AssistantMessage = { content: [{ type: "text", text: "hi" }], stop_reason: "end_turn" };
     expect(reconstruct(textOnly, {}).stop_reason).toBe("end_turn");
   });
+
+  /**
+   * Repair must not be observable in the response ENVELOPE — only in the tool input it
+   * repaired. This returned `{ content, stop_reason }` and nothing else, so a message that
+   * went through repair reached the re-serializer stripped of the backend's own id, model
+   * and usage and was re-emitted under a synthesized id with no token counts, while a
+   * message that merely passed validation kept all three.
+   */
+  it("carries the backend's own id, model, stop_sequence and usage through unchanged", () => {
+    const withIdentity: AssistantMessage = {
+      id: "msg_backend_abc",
+      model: "z-ai/glm-5.2",
+      stop_sequence: null,
+      usage: { input_tokens: 91, output_tokens: 7 },
+      content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }],
+      stop_reason: "tool_use",
+    };
+    const out = reconstruct(withIdentity, { t1: { city: "Paris" } });
+    expect(out.id).toBe("msg_backend_abc");
+    expect(out.model).toBe("z-ai/glm-5.2");
+    expect(out.stop_sequence).toBeNull();
+    expect(out.usage).toEqual({ input_tokens: 91, output_tokens: 7 });
+  });
+
+  it("does not invent an id, model or usage the source message never carried", () => {
+    const out = reconstruct(raw, { t1: { city: "Paris" } });
+    expect(out.id).toBeUndefined();
+    expect(out.model).toBeUndefined();
+    expect(out.usage).toBeUndefined();
+  });
 });
 
 describe("FailoverReshaper", () => {

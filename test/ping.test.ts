@@ -226,12 +226,12 @@ describe("Proxy Health Endpoints", () => {
     try {
       const pingResp = await fetch(`${baseUrl}/ping`);
       expect(pingResp.status).toBe(200);
-      const pingData = await pingResp.json();
+      const pingData = (await pingResp.json()) as { ok: boolean };
       expect(pingData.ok).toBe(true);
 
       const healthResp = await fetch(`${baseUrl}/health/stats`);
       expect(healthResp.status).toBe(200);
-      const healthData = await healthResp.json();
+      const healthData = (await healthResp.json()) as { providers?: unknown };
       expect(healthData.providers).toBeDefined();
     } finally {
       proxy.close();

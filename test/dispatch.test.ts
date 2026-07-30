@@ -7,6 +7,10 @@ import { loadConfig, type Config } from "../src/config.js";
 import { createProxy } from "../src/server.js";
 import { buildDispatch, markExhausted, clearExhausted, MAX_EXHAUSTED_MS } from "../src/dispatch.js";
 
+/** Just enough of the `/dispatch` payload for the assertions below — `Response.json()` is
+ *  `unknown`, and an untyped `any` here would let a renamed field pass silently. */
+type DispatchBody = { next: { id: string; invoke: { args: string[] } } };
+
 const dir = mkdtempSync(join(tmpdir(), "rp-dispatch-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -311,26 +315,26 @@ describe("dispatch ladder — endpoint", () => {
   it("serves the ladder, walks it on a POSTed exhaustion, and restores on clear", async () => {
     const cfg = cfgWith({ ladder: LADDER });
     await withProxy(cfg, async (base) => {
-      const first = await (await fetch(`${base}/dispatch?task=go`)).json();
+      const first = (await (await fetch(`${base}/dispatch?task=go`)).json()) as DispatchBody;
       expect(first.next.id).toBe("agy-gemini");
       expect(first.next.invoke.args).toContain("go");
 
-      const walked = await (
+      const walked = (await (
         await fetch(`${base}/dispatch`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ exhausted: "agy-gemini" }),
         })
-      ).json();
+      ).json()) as DispatchBody;
       expect(walked.next.id).toBe("agy-claude");
 
-      const cleared = await (
+      const cleared = (await (
         await fetch(`${base}/dispatch`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ clear: true }),
         })
-      ).json();
+      ).json()) as DispatchBody;
       expect(cleared.next.id).toBe("agy-gemini");
     });
   });

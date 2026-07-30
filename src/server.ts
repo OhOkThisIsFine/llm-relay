@@ -13,7 +13,7 @@ import { MetadataLogger, type RequestLog } from "./log.js";
 import { credentialState } from "./authEnv.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
-import { emitSse, emitSseTail } from "./emitSse.js";
+import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
 import { fetchBackend, fetchOpenAiFront } from "./backend.js";
@@ -134,7 +134,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       // here means a turn ended with NO log record — the operator would see a client
       // error with nothing at all in the log to match it against. A duplicate line
       // in some future edge case is much cheaper than an invisible request.
-      logger.write(baseLog(started, req.url ?? "/", null, false, false, 502, "skipped", null));
+      logger.write(baseLog(started, req.url ?? "/", false, false, 502, "skipped", null));
     });
   });
 }
@@ -159,7 +159,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const msg = (e as Error).message;
     const status = msg.includes("too large") ? 413 : 400;
     failClosed(res, status, msg);
-    h.logger.write(baseLog(started, path, null, false, false, status, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, status, "skipped", null));
     return;
   }
 
@@ -181,7 +181,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return;
   }
 
@@ -191,7 +191,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, pingMode: h.pingLoop?.getMode(), intervalMs: h.pingLoop?.getIntervalMs() }));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return;
   }
 
@@ -205,7 +205,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(stats));
 
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return;
   }
 
@@ -220,7 +220,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return;
   }
 
@@ -231,7 +231,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const denied = admissionFailure(req, req.method === "POST");
     if (denied) {
       failClosed(res, 403, denied);
-      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped", null));
+      h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
       return;
     }
     let state = offloadState(cfg);
@@ -239,14 +239,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const want = (reqJson as { enabled?: unknown } | undefined)?.enabled;
       if (typeof want !== "boolean") {
         failClosed(res, 400, `POST /offload needs a JSON body {"enabled": true|false}`);
-        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
+        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
         return;
       }
       state = setOffload(cfg, want);
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(state, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return;
   }
 
@@ -258,7 +258,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const deniedDispatch = admissionFailure(req, req.method === "POST");
     if (deniedDispatch) {
       failClosed(res, 403, deniedDispatch);
-      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped", null));
+      h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
       return;
     }
     if (req.method === "POST") {
@@ -271,12 +271,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       } else if (typeof body.exhausted === "string") {
         if (!markExhausted(cfg, body.exhausted, ttlMs)) {
           failClosed(res, 400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
-          h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
+          h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
           return;
         }
       } else {
         failClosed(res, 400, `POST /dispatch needs {"exhausted":"<lane>"} or {"clear":"<lane>"|true}`);
-        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
+        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
         return;
       }
     }
@@ -286,7 +286,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const rawTask = pickQuery(path, "task");
     if (typeof rawTask === "string" && rawTask.length > MAX_TASK_LEN) {
       failClosed(res, 400, `?task= exceeds ${MAX_TASK_LEN} characters`);
-      h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
+      h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
       return;
     }
     const taskParam = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : undefined;
@@ -297,7 +297,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return;
   }
 
@@ -305,7 +305,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const report = getTelemetryReport(cfg, globalCircuitBreaker);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(report, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
+    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return;
   }
 
@@ -336,7 +336,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   } catch (e) {
     if (e instanceof RoutingError) {
       failClosed(res, 400, `llm-relay routing: ${e.message}`);
-      h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped", null));
+      h.logger.write(baseLog(started, path, hadTools, false, 400, "skipped", null));
       return;
     }
     throw e;
@@ -379,7 +379,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds the context limit ` +
             `"${target.provider}" publishes for "${target.model}" (${limits.contextLength})`,
         );
-        h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped", null));
+        h.logger.write(baseLog(started, path, hadTools, false, 400, "skipped", null));
         return;
       }
     }
@@ -389,7 +389,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Completions with a namespaced model; route by target and reverse-proxy the
   // upstream OpenAI response straight back (OpenAI in, OpenAI out).
   if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
-    await openAiFrontPath(res, target, { reqJson, wantsStream, started, path, model, hadTools, req }, h);
+    await openAiFrontPath(res, target, { reqJson, wantsStream, started, path, hadTools, req }, h);
     return;
   }
 
@@ -403,12 +403,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const input_tokens = estimateInputTokens(reqJson);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ input_tokens }));
-      h.logger.write(baseLog(started, path, model, hadTools, false, 200, "skipped", null));
+      h.logger.write(baseLog(started, path, hadTools, false, 200, "skipped", null));
       return;
     }
     if (!isMessages) {
       failClosed(res, 404, `llm-relay: path not supported for an openai backend: ${pathname}`);
-      h.logger.write(baseLog(started, path, model, hadTools, false, 404, "skipped", null));
+      h.logger.write(baseLog(started, path, hadTools, false, 404, "skipped", null));
       return;
     }
   }
@@ -447,7 +447,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           // from somewhere else while the misconfiguration stayed invisible. Nothing
           // was forwarded — buildForwardHeaders threw before returning any headers.
           failClosed(res, 502, `llm-relay configuration: ${e.message}`);
-          h.logger.write(baseLog(started, path, model, hadTools, false, 502, "skipped", null));
+          h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null));
           return;
         }
         const aborted = controller.signal.aborted;
@@ -461,7 +461,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         }
 
         failClosed(res, status, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
-        h.logger.write(baseLog(started, path, model, hadTools, false, status, "skipped", target));
+        h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", target));
         return;
       }
 
@@ -478,9 +478,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           res.off("close", onResClose);
           continue; // Failover to next target
         }
-      } else {
+      } else if (backendRes.status < 400) {
         globalCircuitBreaker.recordOutcome(target, { ok: true, status: backendRes.status, elapsedMs: Date.now() - started });
-        recordCall(target, backendRes.status < 400, started);
+        recordCall(target, true, started);
+      } else {
+        // A non-retriable 4xx — 401/403 above all — is neither a success nor evidence
+        // about the target's health, so the breaker is told NOTHING. It used to be told
+        // `ok: true`, which cleared `consecutiveFailures` and refreshed the stability
+        // score: a revoked or exhausted key made every request look like a healthy,
+        // fast response, so the breaker could never trip and the candidate stayed at the
+        // front of the ranking while failing 100% of calls. Recording a failure instead
+        // would be the opposite error — it would open the breaker on a credential fault
+        // and hide the 401 the operator needs to see behind a "target unhealthy" skip.
+        // Telemetry still records the call as unsuccessful; that dataset is about
+        // outcomes, not about whether to keep routing here.
+        recordCall(target, false, started);
       }
 
       const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
@@ -489,9 +501,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
 
       if (doRepair) {
-        await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, req, target }, h);
+        await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target }, h);
       } else {
-        await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools, req, target }, h);
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target }, h);
       }
       return;
     } finally {
@@ -518,8 +530,6 @@ function recordCall(target: ResolvedTarget, ok: boolean, started: number): void 
 
 interface Ctx {
   tools: Map<string, JsonSchema | null>;
-  /** The model the CLIENT asked for. Use `target` for the one that answered. */
-  model: string | null;
   streamed: boolean;
   started: number;
   path: string;
@@ -543,7 +553,7 @@ interface Ctx {
 async function openAiFrontPath(
   res: ServerResponse,
   target: ResolvedTarget,
-  ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; model: string | null; hadTools: boolean; req?: IncomingMessage },
+  ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; hadTools: boolean; req?: IncomingMessage },
   h: Handlers,
 ): Promise<void> {
   const controller = new AbortController();
@@ -569,7 +579,7 @@ async function openAiFrontPath(
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
     }
-    h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, false, status, "skipped", target));
+    h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target));
     return;
   }
   const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
@@ -585,7 +595,7 @@ async function openAiFrontPath(
     const message = midStreamMessage(e);
     endMidStreamFailure(res, streamed ? openAiSseError(message) : null, message);
     h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped", target),
+      ...baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target),
       errorKinds: [MID_STREAM_ERROR_KIND],
     });
     return;
@@ -593,7 +603,7 @@ async function openAiFrontPath(
     clearTimeout(timer);
     res.off("close", onResClose);
   }
-  h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped", target));
+  h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target));
 }
 
 /** detect/default: forward bytes unchanged, observe + log if applicable. */
@@ -635,7 +645,7 @@ async function transparentPath(
     const message = midStreamMessage(e);
     endMidStreamFailure(res, ctx.streamed ? sseError(message) : null, message);
     h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
+      ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
       errorKinds: [MID_STREAM_ERROR_KIND],
     });
     return;
@@ -655,12 +665,18 @@ async function transparentPath(
     errorKinds = dedupe(r.errors.map((e) => e.kind));
   }
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
+    ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds,
   });
 }
 
-type RepairCtx = Ctx & { wantsStream: boolean; reshaper: Reshaper };
+/**
+ * `maxAttempts` is carried from `cfg.repair.maxAttempts` rather than read at the call
+ * site. Both `repair()` call sites passed a hardcoded `2`, so the configured value —
+ * parsed, validated and documented in `config.ts`, and settable per install — was
+ * silently ignored on every request.
+ */
+type RepairCtx = Ctx & { wantsStream: boolean; reshaper: Reshaper; maxAttempts: number };
 
 /** repair: route to the streaming or buffered variant. */
 async function repairPath(
@@ -772,7 +788,7 @@ async function repairStreamingPath(
     held.length = 0;
     endMidStreamFailure(res, sseError(message), message);
     h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, true, backendRes.status, "skipped", ctx.target),
+      ...baseLog(ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, "skipped", ctx.target),
       errorKinds: [MID_STREAM_ERROR_KIND],
     });
     return;
@@ -816,7 +832,7 @@ async function repairStreamingPath(
       const decision = await repair(assistant, ctx.tools, {
         validator: h.validator,
         reshaper: ctx.reshaper,
-        maxAttempts: 2,
+        maxAttempts: ctx.maxAttempts,
         isDestructive: h.isDestructive,
         backendModel: ctx.target.model ?? null,
       });
@@ -832,7 +848,7 @@ async function repairStreamingPath(
   }
 
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, true, backendRes.status, validated, ctx.target),
+    ...baseLog(ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
 }
@@ -855,7 +871,7 @@ async function repairBufferedPath(
     const message = midStreamMessage(e);
     endMidStreamFailure(res, null, message);
     h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
+      ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
       errorKinds: [MID_STREAM_ERROR_KIND],
     });
     return;
@@ -891,13 +907,13 @@ async function repairBufferedPath(
       const decision = await repair(assistant, ctx.tools, {
         validator: h.validator,
         reshaper: ctx.reshaper,
-        maxAttempts: 2,
+        maxAttempts: ctx.maxAttempts,
         isDestructive: h.isDestructive,
         backendModel: ctx.target.model ?? null,
       });
       repairOutcome = decision.outcome;
       if (decision.outcome === "fixed" && decision.message) {
-        emitFixed(res, backendRes.status, filtered, decision.message, ctx.wantsStream, ctx.model);
+        emitFixed(res, backendRes.status, filtered, decision.message, ctx.wantsStream);
       } else {
         // fail-clean: loud, well-formed error rather than a silently broken call.
         failClosed(res, 502, `llm-relay: tool call could not be repaired (${decision.outcome})`);
@@ -906,7 +922,7 @@ async function repairBufferedPath(
   }
 
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
+    ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
 }
@@ -917,27 +933,38 @@ function emitFixed(
   filtered: Record<string, string | string[]>,
   message: AssistantMessage,
   wantsStream: boolean,
-  model: string | null,
 ): void {
   if (wantsStream) {
     res.writeHead(status, { ...filtered, "content-type": "text/event-stream" });
     if (!res.writableEnded) res.end(emitSse(message));
   } else {
     res.writeHead(status, { ...filtered, "content-type": "application/json" });
-    if (!res.writableEnded) res.end(JSON.stringify(toAnthropicMessage(message, model)));
+    if (!res.writableEnded) res.end(JSON.stringify(toAnthropicMessage(message)));
   }
 }
 
-function toAnthropicMessage(msg: AssistantMessage, model: string | null): object {
+/**
+ * Re-serialize a repaired message as a buffered Anthropic Message — the JSON counterpart
+ * of `emitSse`, and it now follows the same rules.
+ *
+ * It used to hardcode `id: "msg_repair"`, take `model` from what the CLIENT asked for (which
+ * is routinely not the deployment that answered), and zero-fill `usage`. All three rewrote
+ * the response's identity on the way through: every repaired turn looked like the same
+ * message, attributed to the wrong model, reporting a token count nobody measured. The
+ * backend's own values are carried whenever the response had them; an unknown id falls back
+ * to the same relay-marked synthetic id the streaming path uses, and an unreported `usage`
+ * is OMITTED rather than stated as zero.
+ */
+function toAnthropicMessage(msg: AssistantMessage): object {
   return {
-    id: "msg_repair",
+    id: msg.id ?? syntheticMessageId(),
     type: "message",
     role: "assistant",
-    model: model ?? "",
+    model: msg.model ?? "",
     content: msg.content,
     stop_reason: msg.stop_reason ?? "end_turn",
-    stop_sequence: null,
-    usage: msg.usage ?? { input_tokens: 0, output_tokens: 0 },
+    stop_sequence: msg.stop_sequence ?? null,
+    ...(msg.usage ? { usage: msg.usage } : {}),
   };
 }
 
@@ -1024,15 +1051,30 @@ function filterResponseHeaders(hh: Headers): Record<string, string | string[]> {
   return out;
 }
 
+/**
+ * Parse a buffered (non-streamed) backend response into the shape the validator inspects.
+ *
+ * `id` / `model` / `stop_sequence` are read here for the same reason `reconstructFromSse`
+ * reads them off `message_start`: a repaired buffered response is re-serialized from this
+ * shape, so anything not captured here is gone by the time it is re-emitted — which is how
+ * every repaired non-streamed turn used to go out under the constant `msg_repair` with the
+ * backend's real id discarded. Absent fields stay absent; nothing is invented.
+ */
 function parseAssistant(text: string): AssistantMessage | null {
   try {
     const j = JSON.parse(text) as Record<string, unknown>;
     if (!Array.isArray(j.content)) return null;
-    return {
+    const msg: AssistantMessage = {
       content: j.content as AssistantMessage["content"],
       stop_reason: (j.stop_reason ?? null) as AssistantMessage["stop_reason"],
       usage: j.usage as AssistantMessage["usage"],
     };
+    if (typeof j.id === "string" && j.id) msg.id = j.id;
+    if (typeof j.model === "string" && j.model) msg.model = j.model;
+    if (typeof j.stop_sequence === "string" || j.stop_sequence === null) {
+      msg.stop_sequence = j.stop_sequence;
+    }
+    return msg;
   } catch {
     return null;
   }
@@ -1198,23 +1240,22 @@ function failClosed(res: ServerResponse, status: number, message: string): void 
  * `served` is the target a backend request was actually DISPATCHED to, or `null`
  * when none was — a guardrail rejection, a routing error, an admin endpoint, or
  * anything answered locally. It is a required parameter, without a default, so
- * `tsc` names every call site that has not decided which of the two it is: an
- * absent `servedProvider`/`servedModel` is documented in `log.ts` as "this call
- * site is unmigrated", and a default would quietly recreate exactly that state.
+ * `tsc` names every call site that has not decided which of the two it is; a
+ * default would quietly turn "nobody decided" into a confident claim.
  *
- * `model` (→ the deprecated `backendModel`) is the model the CLIENT asked for and
- * is routinely NOT the one that answered; it is still emitted only because
- * `RequestLog.backendModel` is non-optional in `log.ts`, which this module may not
- * edit. Deleting it there is the remaining half of OBS-b5ade458.
+ * The model the CLIENT asked for is deliberately NOT recorded (OBS-b5ade458 is
+ * finished): routing resolves a tier/pool spec to a `ResolvedTarget`, so it is
+ * routinely not the model that answered, and it was the id every "which model
+ * trips the validator" reading of this log was attributed to.
  */
 function baseLog(
-  started: number, path: string, model: string | null, hadTools: boolean,
+  started: number, path: string, hadTools: boolean,
   streamed: boolean, backendStatus: number, validated: RequestLog["validated"],
   served: ResolvedTarget | null,
 ): RequestLog {
   return {
     ts: new Date(started).toISOString(),
-    path: logSafePath(path), backendModel: model,
+    path: logSafePath(path),
     servedProvider: served ? served.provider : null,
     servedModel: served ? served.model ?? null : null,
     hadTools, streamed, backendStatus, validated,

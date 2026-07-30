@@ -179,7 +179,7 @@ describe("/offload endpoint", () => {
       body: JSON.stringify({ enabled: true }),
     });
     expect(on.status).toBe(200);
-    expect((await on.json()).enabled).toBe(true);
+    expect(((await on.json()) as { enabled: boolean }).enabled).toBe(true);
 
     // Same server process, same request: now routed through routing.subagents to the pool.
     const after = await subagentCall();
@@ -357,5 +357,44 @@ describe("candidates view", () => {
     const cfg = freshConfig("i.json");
     const view = await buildCandidates(cfg, { breaker: new CircuitBreaker(), provider: "nowhere" });
     expect(view.candidates).toEqual([]);
+  });
+
+  /**
+   * Reference limits and prices come from the snapshot row `findTierModel` matched — and on a
+   * FUZZY match that row is a similarly-named but DIFFERENT SKU. `metadataReferenceFrom` named
+   * only the host ("openrouter"), so a figure borrowed from another model was indistinguishable
+   * from one published for this exact id unless the reader separately correlated
+   * `capabilityMatch`. The matched name travels with the attribution.
+   */
+  describe("reference metadata attribution", () => {
+    /** A fixed two-row snapshot: `glm-5.2` matches exactly, `glm-5.2-max` is what a spec for
+     *  `glm-5.2-m` (short of an exact key) falls back onto by containment. */
+    const snapshot = {
+      models: [],
+      byNorm: [
+        { norm: "glm-5.2-max", rec: { norm: "glm-5.2-max", context_length: 999_000, price_prompt: 0.000_004 } },
+        { norm: "gpt-oss-20b", rec: { norm: "gpt-oss-20b", context_length: 131_072, price_prompt: 0.000_001 } },
+      ],
+    };
+
+    it("names the borrowed model, not just the host, when the snapshot match was fuzzy", async () => {
+      const cfg = freshConfig("j.json");
+      const view = await buildCandidates(cfg, { breaker: new CircuitBreaker(), tierData: snapshot });
+
+      const glm = view.candidates.find((c) => c.spec === "nim/z-ai/glm-5.2")!;
+      expect(glm.capabilityMatch).toEqual({ name: "glm-5.2-max", match: "fuzzy" });
+      // NIM publishes no limits, so the figure is a reference — and it is a DIFFERENT SKU's.
+      expect(glm.contextLengthSource).toBe("reference");
+      expect(glm.metadataReferenceFrom).toBe("openrouter:glm-5.2-max");
+    });
+
+    it("names only the host when the match was exact — same id, other deployment", async () => {
+      const cfg = freshConfig("k.json");
+      const view = await buildCandidates(cfg, { breaker: new CircuitBreaker(), tierData: snapshot });
+
+      const oss = view.candidates.find((c) => c.spec === "nim/openai/gpt-oss-20b")!;
+      expect(oss.capabilityMatch).toEqual({ name: "gpt-oss-20b", match: "exact" });
+      expect(oss.metadataReferenceFrom).toBe("openrouter");
+    });
   });
 });

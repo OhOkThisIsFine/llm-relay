@@ -90,12 +90,36 @@ export async function repair(
     if (guard !== null) return { outcome: guard };
 
     const check = deps.validator.validate(result.message, tools);
-    if (check.valid) return { outcome: "fixed", message: result.message };
+    if (check.valid) return { outcome: "fixed", message: withEnvelopeOf(assistant, result.message) };
     // Feed the new errors back into the next attempt.
     errors = check.errors;
     current = result.message;
   }
   return { outcome: "failed" };
+}
+
+/**
+ * Re-attach the BACKEND's response envelope to a repaired message.
+ *
+ * `id`, `model`, `stop_sequence` and `usage` identify the response the client is receiving —
+ * they belong to the backend that produced it, and a repair changes the tool arguments, not
+ * whose answer this is. Taken unconditionally from the original for the same reason
+ * `guardReshaped` re-checks the output rather than trusting the reshaper: `Reshaper` is an
+ * interface, so this function cannot assume the in-tree implementation. One that dropped these
+ * fields left the response to be re-serialized under a synthesized id with no token counts;
+ * one that filled them from its OWN completion would report the repair model's identity and
+ * token usage as the serving model's, which is worse — the client would meter and attribute
+ * the turn to a model that never answered it.
+ *
+ * `content` and `stop_reason` are the repair's output and are kept from the candidate.
+ */
+function withEnvelopeOf(original: AssistantMessage, repaired: AssistantMessage): AssistantMessage {
+  const out: AssistantMessage = { content: repaired.content, stop_reason: repaired.stop_reason };
+  if (original.id !== undefined) out.id = original.id;
+  if (original.model !== undefined) out.model = original.model;
+  if (original.stop_sequence !== undefined) out.stop_sequence = original.stop_sequence;
+  if (original.usage !== undefined) out.usage = original.usage;
+  return out;
 }
 
 /**
