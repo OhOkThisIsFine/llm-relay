@@ -1,16 +1,50 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createProxy } from "../src/server.js";
+import { createProxy, type ProxyDeps } from "../src/server.js";
+import { ModelCatalog, type ModelLimits } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
 import type { Config } from "../src/config.js";
 import type { Reshaper } from "../src/reshaper.js";
 import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
 import { reconstructFromSse } from "../src/sse.js";
 import { reconstruct } from "../src/reshaper.js";
+
+/**
+ * Every listener this file opens, closed after each test.
+ *
+ * HERMETICITY: the describes below reboot a backend + proxy per test into the SAME
+ * `let backend` / `let proxy` binding, so an `afterAll` closing those two bindings closed
+ * only the LAST pair — every earlier listener stayed bound for the whole run (5 tests in
+ * the first describe alone leaked 4 backends and 4 proxies). Register here instead, so a
+ * rebooted describe cannot orphan the handle it just overwrote.
+ */
+const openServers: Server[] = [];
+function track<T extends Server>(s: T): T {
+  openServers.push(s);
+  return s;
+}
+async function closeTracked(): Promise<void> {
+  const servers = openServers.splice(0);
+  await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
+}
+
+/**
+ * `globalCircuitBreaker` is a module singleton shared by every test in the process.
+ *
+ * HERMETICITY: only the breaker-accounting describe reset it, so any earlier test that
+ * tripped provider "up" (they all use that name) left a cooldown behind, and the order
+ * tests happened to run in decided whether a later one saw a healthy target. Reset
+ * before AND after every test so neither direction of that leak survives.
+ */
+beforeEach(() => globalCircuitBreaker.reset());
+afterEach(async () => {
+  await closeTracked();
+  globalCircuitBreaker.reset();
+});
 
 /** A mock Anthropic-ish backend the proxy forwards to. */
 function mockBackend(handler: (path: string, body: string) => { status?: number; headers: Record<string, string>; body: string }): Promise<Server> {
@@ -23,21 +57,55 @@ function mockBackend(handler: (path: string, body: string) => { status?: number;
       res.end(out.body);
     });
   });
-  return new Promise((resolve) => s.listen(0, "127.0.0.1", () => resolve(s)));
+  return new Promise((resolve) => s.listen(0, "127.0.0.1", () => resolve(track(s))));
 }
 
 function port(s: Server): number {
   return (s.address() as AddressInfo).port;
 }
 
-function startProxy(cfg: Config): Promise<Server> {
-  const s = createProxy(cfg);
-  return new Promise((resolve) => s.listen(0, "127.0.0.1", () => resolve(s)));
+/**
+ * A catalog that cannot read or write the developer's machine.
+ *
+ * HERMETICITY: `createProxy(cfg)` with no deps builds `new ModelCatalog()`, whose default
+ * cache path is `~/.llm-relay/models-cache.json` — and the context guardrail calls
+ * `cachedLimits()` on the REQUEST path, so every test here was reading the developer's real
+ * cache. A machine that happened to hold limits for the provider/model a test routes to would
+ * 400 the request the test expected to reach its mock backend. `cachePath: null` disables the
+ * disk entirely; `catalogWithLimits` seeds from a temp file when a test needs real limits.
+ */
+function hermeticCatalog(): ModelCatalog {
+  return new ModelCatalog({ cachePath: null });
+}
+
+/** A catalog seeded from a temp cache file — the only way to give `cachedLimits()` data without fetching. */
+function catalogWithLimits(dir: string, seed: Record<string, Record<string, Partial<ModelLimits>>>): ModelCatalog {
+  const file = join(dir, `cache-${Math.random().toString(36).slice(2)}.json`);
+  const entries: Record<string, unknown> = {};
+  for (const [provider, models] of Object.entries(seed)) {
+    const limits: Record<string, ModelLimits> = {};
+    for (const [model, l] of Object.entries(models)) {
+      limits[model] = { contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, ...l };
+    }
+    entries[provider] = { fetchedAt: Date.now(), models: Object.keys(models), limits };
+  }
+  writeFileSync(file, JSON.stringify(entries));
+  return new ModelCatalog({ cachePath: file });
+}
+
+/** Boot a proxy with a hermetic catalog unless the test supplies its own. */
+function startProxy(cfg: Config, deps: ProxyDeps = {}): Promise<Server> {
+  const s = createProxy(cfg, { catalog: hermeticCatalog(), ...deps });
+  return new Promise((resolve) => s.listen(0, "127.0.0.1", () => resolve(track(s))));
 }
 
 function lastLogLine(file: string): Record<string, unknown> {
   const lines = readFileSync(file, "utf8").trim().split("\n");
   return JSON.parse(lines[lines.length - 1]!);
+}
+
+function allLogText(file: string): string {
+  return readFileSync(file, "utf8");
 }
 
 const REQUEST_BODY = JSON.stringify({
@@ -60,8 +128,6 @@ describe("repair-proxy end-to-end (detect mode)", () => {
     logFile = join(dir, "log.jsonl");
   });
   afterAll(() => {
-    backend?.close();
-    proxy?.close();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -213,9 +279,12 @@ describe("credential handling", () => {
     logFile = join(dir, "log.jsonl");
   });
   afterAll(() => {
-    backend?.close();
-    proxy?.close();
     rmSync(dir, { recursive: true, force: true });
+  });
+  // The key is process-global: a failing assertion between `process.env.X = …` and the
+  // `delete` at the end of a test body used to leak it into every later test in the run.
+  afterEach(() => {
+    delete process.env.RP_TEST_KEY;
   });
 
   async function bootEcho(authEnv?: string): Promise<number> {
@@ -231,7 +300,7 @@ describe("credential handling", () => {
           res.end(JSON.stringify({ type: "message", role: "assistant", stop_reason: "end_turn", content: [] }));
         });
       });
-      s.listen(0, "127.0.0.1", () => resolve(s));
+      s.listen(0, "127.0.0.1", () => resolve(track(s)));
     });
     const cfg: Config = {
       host: "127.0.0.1",
@@ -250,8 +319,8 @@ describe("credential handling", () => {
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
     };
-    proxy = createProxy(cfg);
-    return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve((proxy.address() as AddressInfo).port)));
+    proxy = await startProxy(cfg);
+    return port(proxy);
   }
 
   it("strips inbound auth and injects the backend key when authEnv is set", async () => {
@@ -264,7 +333,6 @@ describe("credential handling", () => {
     });
     expect(received["x-api-key"]).toBe("sk-backend-xyz");
     expect(received.authorization).toBeUndefined(); // client bearer never reaches backend
-    delete process.env.RP_TEST_KEY;
   });
 
   it("passes the caller's auth through when no authEnv is configured", async () => {
@@ -289,8 +357,6 @@ describe("repair mode", () => {
     logFile = join(dir, "log.jsonl");
   });
   afterAll(() => {
-    backend?.close();
-    proxy?.close();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -315,8 +381,8 @@ describe("repair mode", () => {
       repair: { maxAttempts: 2, destructiveTools },
       log: { level: "metadata", file: logFile },
     };
-    proxy = createProxy(cfg, { reshaper });
-    return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve(port(proxy))));
+    proxy = await startProxy(cfg, { reshaper });
+    return port(proxy);
   }
 
   function reqBody(stream: boolean, tools: object[] = weatherTools): string {
@@ -377,8 +443,6 @@ describe("streaming repair: text-through, buffer-at-tool_use", () => {
     logFile = join(dir, "log.jsonl");
   });
   afterAll(() => {
-    backend?.close();
-    proxy?.close();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -406,8 +470,8 @@ describe("streaming repair: text-through, buffer-at-tool_use", () => {
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "metadata", file: logFile },
     };
-    proxy = createProxy(cfg, { reshaper });
-    return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve(port(proxy))));
+    proxy = await startProxy(cfg, { reshaper });
+    return port(proxy);
   }
 
   function reqBody(): string {
@@ -509,21 +573,23 @@ describe("streaming repair: text-through, buffer-at-tool_use", () => {
 });
 
 describe("OpenAI backend: count_tokens + non-messages paths", () => {
-  let backend: Server;
-  let proxy: Server;
-  afterAll(() => { backend?.close(); proxy?.close(); });
+  // Every path the backend was asked for, in order. The previous shape hung a `hits()`
+  // closure off the `boot` FUNCTION OBJECT, which made the counter survive between tests
+  // and could only answer "how many", never "which path" — and "which path" is the whole
+  // invariant: an OpenAI backend has no count_tokens route, so mistranslating one into
+  // /chat/completions would spend a real completion and return garbage.
+  let seenPaths: string[] = [];
 
   async function boot(): Promise<number> {
-    let backendHits = 0;
-    backend = await new Promise<Server>((resolve) => {
+    seenPaths = [];
+    const backend = await new Promise<Server>((resolve) => {
       const s = createServer((req, res) => {
-        backendHits++;
+        seenPaths.push(req.url ?? "/");
         req.on("data", () => {});
         req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); });
       });
-      s.listen(0, "127.0.0.1", () => resolve(s));
+      s.listen(0, "127.0.0.1", () => resolve(track(s)));
     });
-    (boot as unknown as { hits: () => number }).hits = () => backendHits;
     const cfg: Config = {
       host: "127.0.0.1", port: 0,
       providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
@@ -532,13 +598,11 @@ describe("OpenAI backend: count_tokens + non-messages paths", () => {
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },
     };
-    proxy = createProxy(cfg);
-    return new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve(port(proxy))));
+    return port(await startProxy(cfg));
   }
 
   it("answers count_tokens locally with an estimate, never touching the backend", async () => {
     const p = await boot();
-    const before = (boot as unknown as { hits: () => number }).hits();
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages/count_tokens`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "m", system: "you are helpful", messages: [{ role: "user", content: "count these characters please" }] }),
@@ -546,7 +610,8 @@ describe("OpenAI backend: count_tokens + non-messages paths", () => {
     expect(resp.status).toBe(200);
     const j = (await resp.json()) as { input_tokens: number };
     expect(j.input_tokens).toBeGreaterThan(0);
-    expect((boot as unknown as { hits: () => number }).hits()).toBe(before); // backend NOT called
+    expect(seenPaths).toEqual([]);                       // backend NOT called at all…
+    expect(seenPaths).not.toContain("/chat/completions"); // …and specifically never mistranslated
   });
 
   it("returns a clean 404 for a non-messages path instead of mistranslating it", async () => {
@@ -557,16 +622,42 @@ describe("OpenAI backend: count_tokens + non-messages paths", () => {
     expect(resp.status).toBe(404);
     const j = (await resp.json()) as { error?: { message?: string } };
     expect(j.error?.message).toMatch(/not supported/);
+    expect(seenPaths).toEqual([]); // a 404 the proxy answers itself, not one the backend produced
+  });
+
+  it("does NOT hijack count_tokens for an ANTHROPIC backend — that one speaks the route", async () => {
+    // The local answer exists because an openai backend has no such endpoint. An anthropic
+    // target does, and its own count is authoritative; answering locally would substitute an
+    // estimate for a real number.
+    seenPaths = [];
+    const backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        seenPaths.push(req.url ?? "/");
+        req.on("data", () => {});
+        req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ input_tokens: 4242 })); });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(track(s)));
+    });
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    const p = port(await startProxy(cfg));
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages/count_tokens`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect((await resp.json()) as unknown).toEqual({ input_tokens: 4242 }); // the backend's number, not an estimate
+    expect(seenPaths).toEqual(["/v1/messages/count_tokens"]);
   });
 });
 
 describe("streaming transparency across many chunks", () => {
   let backend: Server;
-  let proxy: Server;
-  afterAll(() => {
-    backend?.close();
-    proxy?.close();
-  });
 
   it("forwards a large multi-write SSE stream byte-for-byte", async () => {
     // Build a >64KB SSE body and emit it in many small writes, splitting frames.
@@ -587,7 +678,7 @@ describe("streaming transparency across many chunks", () => {
           res.end();
         });
       });
-      s.listen(0, "127.0.0.1", () => resolve(s));
+      s.listen(0, "127.0.0.1", () => resolve(track(s)));
     });
     const cfg: Config = {
       host: "127.0.0.1",
@@ -598,8 +689,7 @@ describe("streaming transparency across many chunks", () => {
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },
     };
-    proxy = createProxy(cfg);
-    const p: number = await new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve((proxy.address() as AddressInfo).port)));
+    const p = port(await startProxy(cfg));
 
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
       method: "POST",
@@ -613,23 +703,9 @@ describe("streaming transparency across many chunks", () => {
 });
 
 describe("circuit breaker accounting", () => {
-  let backend: Server;
-  let proxy: Server;
-  afterAll(() => {
-    backend?.close();
-    proxy?.close();
-    globalCircuitBreaker.reset(); // don't leak a tripped cooldown into other tests
-  });
-
-  it("records a FAILURE when the only candidate returns a retriable error (no false recordSuccess)", async () => {
-    // The regression this pins: with no further candidate to fail over to, a 429/5xx used to
-    // fall through to recordSuccess, resetting the breaker on every failing response.
-    globalCircuitBreaker.reset();
-    backend = await mockBackend(() => ({
-      status: 429,
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }),
-    }));
+  /** Boot a single-candidate proxy whose only backend answers with `status` and `body`. */
+  async function bootStatus(status: number, body: string, contentType = "application/json"): Promise<number> {
+    const backend = await mockBackend(() => ({ status, headers: { "content-type": contentType }, body }));
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
@@ -639,9 +715,15 @@ describe("circuit breaker accounting", () => {
       repair: { maxAttempts: 2, destructiveTools: [] },
       log: { level: "silent", file: null },
     };
-    proxy = await startProxy(cfg);
+    return port(await startProxy(cfg));
+  }
 
-    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+  it("records a FAILURE when the only candidate returns a retriable error (no false recordSuccess)", async () => {
+    // The regression this pins: with no further candidate to fail over to, a 429/5xx used to
+    // fall through to recordSuccess, resetting the breaker on every failing response.
+    const p = await bootStatus(429, JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: REQUEST_BODY,
@@ -652,5 +734,225 @@ describe("circuit breaker accounting", () => {
     expect(state?.consecutiveFailures).toBe(1);
     expect(state?.lastStatus).toBe(429);
     expect(state!.cooldownUntil).toBeGreaterThan(Date.now()); // 429 trips the cooldown immediately
+  });
+
+  // The invariant is "EVERY retriable error response, including on the last candidate" — but
+  // only 429 was ever exercised, and 429 is the one status with its own immediate-trip branch.
+  // A regression that recorded 400/404/5xx as successes would have gone unnoticed.
+  for (const status of [400, 404, 500, 502, 503]) {
+    it(`records a FAILURE for a last-candidate ${status}, not a success`, async () => {
+      const p = await bootStatus(status, JSON.stringify({ type: "error", error: { message: "nope" } }));
+      const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: REQUEST_BODY,
+      });
+      expect(resp.status).toBe(status); // upstream status reaches the client untouched
+      const state = globalCircuitBreaker.getState("up");
+      expect(state?.consecutiveFailures).toBe(1);
+      expect(state?.lastStatus).toBe(status);
+    });
+  }
+
+  it("records a SUCCESS for a 2xx, so an occasional error does not permanently demote a live target", async () => {
+    const p = await bootStatus(200, JSON.stringify({ type: "message", role: "assistant", stop_reason: "end_turn", content: [] }));
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: REQUEST_BODY,
+    });
+    expect(resp.status).toBe(200);
+    const state = globalCircuitBreaker.getState("up");
+    expect(state?.consecutiveFailures).toBe(0);
+    expect(state?.cooldownUntil).toBe(0);
+  });
+
+  it("passes a 429 body through verbatim — the client's own backoff owns the retry", async () => {
+    const body = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } });
+    const p = await bootStatus(429, body);
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: REQUEST_BODY,
+    });
+    expect(resp.status).toBe(429);
+    expect(await resp.text()).toBe(body); // not swallowed, not rewritten into a 502
+  });
+});
+
+/**
+ * INV: the context guardrail fires ONLY on a limit the SERVING provider published.
+ *
+ * Nothing pinned this. It reads `catalog.cachedLimits()`, which never fetches, and there must
+ * be no invented fallback ceiling — a 400 built from a number the proxy made up rejects a
+ * request the backend would have accepted, which is worse than a true upstream error.
+ */
+describe("context guardrail", () => {
+  let dir: string;
+  beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "rp-guard-")); });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  /** A backend that records whether it was reached at all. */
+  async function bootWithCatalog(catalog: ModelCatalog): Promise<{ p: number; reached: () => number }> {
+    let hits = 0;
+    const backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        hits++;
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ type: "message", role: "assistant", stop_reason: "end_turn", content: [] }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(track(s)));
+    });
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up/m", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    return { p: port(await startProxy(cfg, { catalog })), reached: () => hits };
+  }
+
+  const bigBody = (chars: number) =>
+    JSON.stringify({ model: "up/m", messages: [{ role: "user", content: "x".repeat(chars) }] });
+
+  it("rejects with 400 when the SERVING provider published a limit the request exceeds", async () => {
+    const { p, reached } = await bootWithCatalog(catalogWithLimits(dir, { up: { m: { contextLength: 100 } } }));
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: bigBody(40_000),
+    });
+    expect(resp.status).toBe(400);
+    const j = (await resp.json()) as { error?: { message?: string } };
+    // The message must name the provider whose figure it is — that is the whole point of
+    // per-(provider, model) limits.
+    expect(j.error?.message).toMatch(/"up" publishes for "m"/);
+    expect(j.error?.message).toContain("100");
+    expect(reached()).toBe(0); // rejected before any upstream spend
+  });
+
+  it("lets a request UNDER the published limit through", async () => {
+    const { p, reached } = await bootWithCatalog(catalogWithLimits(dir, { up: { m: { contextLength: 100_000 } } }));
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: bigBody(40),
+    });
+    expect(resp.status).toBe(200);
+    expect(reached()).toBe(1);
+  });
+
+  it("does NOT guard when the provider published nothing — no invented fallback ceiling", async () => {
+    // A hardcoded 128k guess used to live here. An enormous prompt must now reach the backend
+    // and get the backend's own authoritative answer.
+    const { p, reached } = await bootWithCatalog(hermeticCatalog());
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: bigBody(600_000),
+    });
+    expect(resp.status).toBe(200);
+    expect(reached()).toBe(1);
+  });
+
+  it("does NOT borrow ANOTHER provider's figure for the same model id", async () => {
+    // Same model id, different deployment: `other` publishes a tiny ceiling, `up` publishes
+    // none. Reaching across would 400 a request `up` would have served.
+    const { p, reached } = await bootWithCatalog(catalogWithLimits(dir, { other: { m: { contextLength: 10 } } }));
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: bigBody(200_000),
+    });
+    expect(resp.status).toBe(200);
+    expect(reached()).toBe(1);
+  });
+
+  it("never FETCHES on the request path — a cold cache degrades to no guardrail, not a round-trip", async () => {
+    // `cachedLimits()` is the sync, disk-only reader. If the guardrail ever reached for the
+    // fetching `limits()` instead, an unreachable provider would block every request on a
+    // network timeout.
+    class NoFetchCatalog extends ModelCatalog {
+      async limits(): Promise<ModelLimits | null> {
+        throw new Error("guardrail must not fetch on the request path");
+      }
+    }
+    const { p, reached } = await bootWithCatalog(new NoFetchCatalog({ cachePath: null }));
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: bigBody(500),
+    });
+    expect(resp.status).toBe(200);
+    expect(reached()).toBe(1);
+  });
+});
+
+/**
+ * INV: logs are metadata only — never a header value, never a body, never any substring of a key.
+ *
+ * `log.ts` enforces the field allow-list at the sink and `test/log.test.ts` pins that; what had
+ * no coverage is the end-to-end claim, driven through a real request carrying real secrets.
+ */
+describe("logs stay metadata-only end to end", () => {
+  let dir: string;
+  let logFile: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-log-"));
+    logFile = join(dir, "log.jsonl");
+  });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const CLIENT_SECRET = "sk-ant-CLIENTSECRET0000";
+  const BACKEND_KEY = "sk-backend-BACKENDSECRET0";
+  const USER_PROSE = "the quarterly revenue figures are confidential";
+  const BACKEND_PROSE = "assistant reply nobody should log";
+
+  it("writes no header value, no request body and no response body — and no substring of either key", async () => {
+    process.env.RP_LOG_KEY = BACKEND_KEY;
+    try {
+      const backend = await mockBackend(() => ({
+        headers: { "content-type": "application/json", "x-backend-trace": "trace-value-should-not-be-logged" },
+        body: JSON.stringify({ type: "message", role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: BACKEND_PROSE }] }),
+      }));
+      const cfg: Config = {
+        host: "127.0.0.1", port: 0,
+        providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000, authEnv: "RP_LOG_KEY" } },
+        routing: { default: "up", tiers: {} },
+        mode: "detect",
+        repair: { maxAttempts: 2, destructiveTools: [] },
+        log: { level: "metadata", file: logFile },
+      };
+      const p = port(await startProxy(cfg));
+
+      const resp = await fetch(`http://127.0.0.1:${p}/v1/messages?task=${encodeURIComponent(USER_PROSE)}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${CLIENT_SECRET}`,
+          "x-api-key": CLIENT_SECRET,
+          "x-custom-tracking": "tracking-value-should-not-be-logged",
+        },
+        body: JSON.stringify({ model: "m", messages: [{ role: "user", content: USER_PROSE }] }),
+      });
+      expect(resp.status).toBe(200);
+
+      const written = allLogText(logFile);
+      expect(written.length).toBeGreaterThan(0); // something WAS logged — otherwise this proves nothing
+      for (const forbidden of [
+        CLIENT_SECRET, BACKEND_KEY,
+        // Substrings too: a truncated or prefixed key is still a key.
+        CLIENT_SECRET.slice(0, 12), BACKEND_KEY.slice(0, 12),
+        USER_PROSE, BACKEND_PROSE,
+        // Percent-encoded and word-level too: a raw `?task=` written into the log leaks the
+        // prose in escaped form, which a whole-phrase match would sail straight past.
+        encodeURIComponent(USER_PROSE), "quarterly", "confidential",
+        "trace-value-should-not-be-logged", "tracking-value-should-not-be-logged",
+        "Bearer",
+      ]) {
+        expect(written).not.toContain(forbidden);
+      }
+      // The metadata itself did survive — this is a metadata logger, not a silent one.
+      const rec = lastLogLine(logFile);
+      expect(rec.path).toBe("/v1/messages?task=<46c>"); // route + parameter NAME + value LENGTH
+      expect(rec.backendStatus).toBe(200);
+    } finally {
+      delete process.env.RP_LOG_KEY;
+    }
   });
 });
