@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
-import { resolveAuthEnv, keyIsPresent } from "./authEnv.js";
+import { resolveAuthEnv, credentialState } from "./authEnv.js";
 
 export type Mode = "detect" | "repair" | "strict";
 
@@ -164,17 +164,55 @@ export function readRelayDirective(reqJson: unknown, strip = false): string | nu
 }
 
 /**
+ * Why routing could not reach this spec, or null when it can.
+ *
+ * Mirrors what `pickSpecs` + `resolveSingleSpec` will do with it: `pool/<name>` needs a configured
+ * pool, anything else needs a declared provider (plus a model id when that provider is openai-kind).
+ * Deliberately does NOT accept "detectTier thinks this looks like a Claude id" as resolvable — that
+ * route ends at the passthrough, which for a directive means a typo like `opus-coder` is answered
+ * by primary quota instead of failing.
+ */
+function directiveUnresolvableReason(spec: string, cfg: Config): string | null {
+  const names = (o: object | undefined) => Object.keys(o ?? {}).join(", ") || "none";
+  const { provider, model } = splitSpec(spec);
+  if (provider === POOL_PREFIX) {
+    if (model && cfg.routing.pools?.[model]) return null;
+    return `names unknown pool "${model ?? ""}" (available: ${names(cfg.routing.pools)})`;
+  }
+  const p = cfg.providers[provider];
+  if (!p) return `names unknown provider "${provider}" (available: ${names(cfg.providers)})`;
+  if (p.kind === "openai" && !model) return `names openai provider "${provider}" but carries no model id`;
+  return null;
+}
+
+/**
  * The spec a subagent request should route to, or null to leave routing unchanged.
  *
  * Precedence: an explicit `@relay:` directive (per-call opt-in, works even with offload off) >
  * `routing.subagents[<tier>]` > `routing.subagents.default` — the last two only when
  * `routing.offload` is on. Offload off is the default, so a subagent behaves like any other
  * request until someone turns it on.
+ *
+ * ⚠ An unresolvable directive is a loud `RoutingError`, never a quiet fall-through. The map forms
+ * are validated at config load (`assertSpecResolvable`), but a directive arrives per request and
+ * had no check at all: a typo'd provider or pool name matched nothing in `pickSpecs`, so it landed
+ * on `routing.default` — the Anthropic passthrough. That spends PRIMARY quota while the dispatcher
+ * believes it offloaded, and nothing in the response says otherwise. Same rule as an unknown pool:
+ * fail and name what IS configured.
  */
 export function subagentSpec(reqJson: unknown, model: string | null, cfg: Config): string | null {
   if (!isSubagentRequest(reqJson)) return null;
   const directive = readRelayDirective(reqJson, true);
-  if (directive) return directive;
+  if (directive) {
+    const why = directiveUnresolvableReason(directive, cfg);
+    if (why !== null) {
+      throw new RoutingError(
+        `@relay: "${directive}" ${why} — refusing to fall back to routing.default, ` +
+          `which would spend primary quota while looking like a successful offload`,
+      );
+    }
+    return directive;
+  }
   if (!cfg.routing.offload) return null;
   const map = cfg.routing.subagents;
   if (!map) return null;
@@ -359,8 +397,17 @@ export function resolveTargets(model: string | null, cfg: Config): ResolvedTarge
   const specs = expandPoolSpecs(pickSpecs(model, cfg), cfg);
   let targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
 
-  // Prioritize targets with active keys or keyless local providers
-  const activeTargets = targets.filter((t) => !t.authEnv || Boolean(process.env[t.authEnv]));
+  // Prioritize targets whose credential is usable: no authEnv declared (a real passthrough or a
+  // keyless local provider) or a declared authEnv that is actually present.
+  //
+  // ⚠ Presence is decided by `credentialState`, the SAME predicate `server.ts`'s
+  // `buildForwardHeaders` uses — not an open-coded `Boolean(process.env[...])`. This site used to
+  // test truthiness without trimming while header construction trimmed, so a whitespace-only key
+  // read PRESENT here and ABSENT there: the blank-key target survived the filter, the
+  // keep-everything fallback below never ran, and the request went to a provider the proxy could
+  // not authenticate to. Any drift between the two answers reopens that gap, so both must keep
+  // calling the one predicate.
+  const activeTargets = targets.filter((t) => credentialState(t.authEnv) !== "declared-missing");
   if (activeTargets.length > 0) {
     targets = activeTargets;
   }

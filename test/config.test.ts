@@ -416,6 +416,51 @@ describe("subagent-aware routing", () => {
     const plain = loadConfig(write("nosub2.json", base({ routing: { default: "nim/m" } })));
     expect(subagentSpec(msg("@relay: nim/other\ngo"), "claude-opus-5", plain)).toBe("nim/other");
   });
+
+  // A directive is checked per REQUEST, so it gets none of the load-time validation the
+  // routing.subagents map gets. Unchecked, a typo matched no provider and no pool, fell through
+  // pickSpecs to routing.default (the Anthropic passthrough) and was answered by PRIMARY quota —
+  // while the dispatcher, and the response, both looked like a successful offload.
+  it("FAILS LOUDLY on an @relay directive naming an unknown provider", () => {
+    expect(() => subagentSpec(msg("@relay: nimm/z-ai/glm-5.2\ngo"), "claude-opus-5", cfg))
+      .toThrow(/names unknown provider "nimm"/);
+    // …with the switch off too: the directive is the per-call opt-in either way.
+    expect(() => subagentSpec(msg("@relay: nimm/z-ai/glm-5.2\ngo"), "claude-opus-5", cfgOff))
+      .toThrow(/names unknown provider "nimm"/);
+  });
+
+  it("FAILS LOUDLY on an @relay directive naming an unknown pool", () => {
+    expect(() => subagentSpec(msg("@relay: pool/codeing\ngo"), "claude-opus-5", cfg))
+      .toThrow(/names unknown pool "codeing"/);
+  });
+
+  it("FAILS LOUDLY on an @relay directive that omits the model id an openai provider needs", () => {
+    expect(() => subagentSpec(msg("@relay: nim\ngo"), "claude-opus-5", cfg))
+      .toThrow(/carries no model id/);
+  });
+
+  it("does not accept a tier-shaped @relay directive as resolvable (it would mean the passthrough)", () => {
+    // `opus-coder` is a typo, not a destination — detectTier would match "opus" and land it on
+    // routing.tiers.opus, i.e. primary quota. Refuse instead of quietly billing the human.
+    expect(() => subagentSpec(msg("@relay: opus-coder\ngo"), "claude-haiku-4-5", cfg))
+      .toThrow(/names unknown provider "opus-coder"/);
+  });
+
+  it("never resolves a bad directive to routing.default", () => {
+    // The failure mode stated positively: whatever happens, it is not a silent passthrough hit.
+    let spec: string | null = "unset";
+    try {
+      spec = subagentSpec(msg("@relay: ghost/model\ngo"), "claude-opus-5", cfg);
+    } catch {
+      spec = null;
+    }
+    expect(spec).toBeNull();
+    expect(cfg.routing.default).toBe("anthropic"); // what the silent fall-through used to reach
+  });
+
+  it("still accepts a directive naming an anthropic provider with no model id (passthrough is a real target)", () => {
+    expect(subagentSpec(msg("@relay: anthropic\ngo"), "claude-opus-5", cfg)).toBe("anthropic");
+  });
 });
 
 describe("reshaper: { pool } — no single pinned model", () => {
@@ -559,5 +604,56 @@ describe("ergonomics: env expansion, overrides, reshaper", () => {
     expect(targets.length).toBe(2);
 
     delete process.env.TEST_KEY_A;
+  });
+
+  // A whitespace-only key used to be PRESENT here (`Boolean(process.env[x])`, no trim) and ABSENT
+  // to server.ts's header builder (which trims). The blank-key target therefore survived the
+  // active-key filter, the keep-everything fallback never ran, and the request went to a provider
+  // the proxy had no usable credential for. Both sites must give the same answer.
+  it("treats a whitespace-only key as ABSENT, same as the header builder does", () => {
+    process.env.TEST_KEY_BLANK = "   \n";
+    process.env.TEST_KEY_REAL = "secret_real";
+
+    const c = loadConfig(write("blankkey.json", {
+      listen: "127.0.0.1:8791",
+      providers: {
+        blankProv: { base: "https://blank.test/v1", kind: "openai", authEnv: "TEST_KEY_BLANK" },
+        realProv: { base: "https://real.test/v1", kind: "openai", authEnv: "TEST_KEY_REAL" },
+      },
+      routing: {
+        default: ["blankProv/some-model", "realProv/some-model"],
+        benchmarkSort: false,
+      },
+    }));
+
+    const targets = resolveTargets(null, c);
+    expect(targets.map((t) => t.provider)).toEqual(["realProv"]);
+
+    delete process.env.TEST_KEY_BLANK;
+    delete process.env.TEST_KEY_REAL;
+  });
+
+  it("keeps the whole candidate list when NO candidate has a usable key (the unfiltered fallback)", () => {
+    process.env.TEST_KEY_BLANK = " ";
+    delete process.env.TEST_KEY_MISSING;
+
+    const c = loadConfig(write("allblank.json", {
+      listen: "127.0.0.1:8791",
+      providers: {
+        blankProv: { base: "https://blank.test/v1", kind: "openai", authEnv: "TEST_KEY_BLANK" },
+        goneProv: { base: "https://gone.test/v1", kind: "openai", authEnv: "TEST_KEY_MISSING" },
+      },
+      routing: {
+        default: ["blankProv/some-model", "goneProv/some-model"],
+        benchmarkSort: false,
+      },
+    }));
+
+    // The blank one is no longer privileged over the unset one: the filter empties, so the
+    // fallback returns both in config order and the caller fails on a real credential error
+    // rather than on whichever provider happened to hold a blank variable.
+    expect(resolveTargets(null, c).map((t) => t.provider)).toEqual(["blankProv", "goneProv"]);
+
+    delete process.env.TEST_KEY_BLANK;
   });
 });
