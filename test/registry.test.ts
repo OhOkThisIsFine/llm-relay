@@ -91,6 +91,24 @@ describe("tier-data caching + join provenance", () => {
 
     expect(joinCapability("nothing/at-all-here", byNorm)).toBeNull();
   });
+
+  it("keeps an EXACT match on a short model id, while still refusing a short fuzzy one", () => {
+    // The length floor exists to stop a short fragment matching promiscuously down the containment
+    // path. It used to be applied before the exact check too, which threw away measurements we
+    // hold: `o3` and `o1` are real snapshot rows with real published signals, so every spec ending
+    // in one resolved to "nothing known" — a synced score silently downgraded to no capability.
+    const byNorm = [
+      { norm: "o3", rec: { norm: "o3", arena_rating: 1440 } },
+      { norm: "gpt-4o-mini", rec: { norm: "gpt-4o-mini", arena_rating: 1300 } },
+    ];
+    const exact = joinCapability("openai/o3", byNorm)!;
+    expect(exact.match).toBe("exact");
+    expect(exact.matched_name).toBe("o3");
+    expect(exact.arena_rating).toBe(1440);
+
+    // No exact row for `gpt`, and it is below the floor — a miss beats borrowing gpt-4o-mini's row.
+    expect(joinCapability("openai/gpt", byNorm)).toBeNull();
+  });
 });
 
 describe("GET /registry endpoint", () => {

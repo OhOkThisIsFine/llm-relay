@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ModelCatalog } from "../src/catalog.js";
@@ -118,6 +118,45 @@ describe("ModelCatalog", () => {
     // The failed attempt should clear pending map, allowing second attempt to succeed
     const res2 = await c.list("p", provider, { fetchFn: okFetch(["retry-ok"]) });
     expect(res2).toEqual(["retry-ok"]);
+  });
+
+  it("never presents a non-numeric disk value as a published limit", async () => {
+    // The cache is a FILE: it can be stale from an older schema, half-written or hand-edited, and
+    // `cachedLimits()` feeds the request-path context guardrail. Anything that is not a finite
+    // number is "unknown", never a ceiling the proxy reports or enforces.
+    const cachePath = join(dir, "junk-limits-cache.json");
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        p: {
+          fetchedAt: 1000,
+          models: ["good", "bad", "hollow", "older"],
+          limits: {
+            good: { contextLength: 131072, maxOutputTokens: 4096, pricePromptPerToken: 0, priceCompletionPerToken: 0 },
+            // A string ceiling would sail straight into the guardrail's `>` comparison.
+            bad: { contextLength: "lots", maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null },
+            // Nothing usable at all → not a "publishes limits" entry.
+            hollow: { contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null },
+            // Written by a version before pricing existed: the newer keys are absent, not null.
+            older: { contextLength: 32768, maxOutputTokens: 8192 },
+          },
+        },
+      }) + "\n",
+    );
+
+    const c = new ModelCatalog({ cachePath, ttlMs: 10_000 });
+    expect(c.cachedLimits("p", "good")).toEqual({
+      contextLength: 131072, maxOutputTokens: 4096, pricePromptPerToken: 0, priceCompletionPerToken: 0,
+    });
+    expect(c.cachedLimits("p", "bad")).toBeNull();
+    expect(c.cachedLimits("p", "hollow")).toBeNull();
+    // An older-schema row keeps what it really had and reports the rest as unknown — explicit
+    // nulls, so `resolveMetadata()` sees "unpublished" rather than a hollow object of undefineds.
+    expect(c.cachedLimits("p", "older")).toEqual({
+      contextLength: 32768, maxOutputTokens: 8192, pricePromptPerToken: null, priceCompletionPerToken: null,
+    });
+    // The models list still loads warm — sanitizing limits must not cost the cache its purpose.
+    expect(await c.list("p", provider, { now: 2000, fetchFn: throwFetch() })).toEqual(["good", "bad", "hollow", "older"]);
   });
 
   it("enforces provider fetch timeout via signal", async () => {

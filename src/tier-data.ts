@@ -84,9 +84,17 @@ export function findTierModel<T = TierModel>(
   byNorm: Array<{ norm: string; rec: T }>,
 ): { rec: T; match: "exact" | "fuzzy" } | null {
   const seg = (modelId.split("/").pop() ?? modelId).toLowerCase().trim();
-  if (seg.length < 5) return null;
+  if (!seg) return null;
+  // Exact equality is tried FIRST and is deliberately not subject to the length floor below. An id
+  // that equals a snapshot key cannot have borrowed a different SKU's row, however short it is —
+  // the floor exists to protect the containment path, not this one. Gating it here silently threw
+  // away measurements we hold: `o3` and `o1` are real snapshot rows carrying real published
+  // signals, and every spec ending in one resolved to "nothing known" instead.
   const exact = byNorm.find((e) => e.norm === seg);
   if (exact) return { rec: exact.rec, match: "exact" };
+  // Containment only: a short fragment matches promiscuously (`gpt` would land on whichever
+  // `gpt-*` row happens to come first), so below the floor a miss beats a wrong SKU's scores.
+  if (seg.length < 5) return null;
   const contained = byNorm.find((e) => e.norm.includes(seg));
   return contained ? { rec: contained.rec, match: "fuzzy" } : null;
 }

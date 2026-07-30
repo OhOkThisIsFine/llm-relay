@@ -39,6 +39,32 @@ describe("per-provider limits", () => {
       .toEqual({ contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null });
   });
 
+  it("treats a BLANK published price as unpublished, not as free", () => {
+    // `Number("")` and `Number("   ")` are both 0, and 0 is a legitimate price (free tiers), so a
+    // provider that emits the key with an empty value used to be reported as costing ZERO —
+    // a fabricated measurement a caller cannot tell from a real free tier.
+    const blank = limitsFromRecord({ id: "x", pricing: { prompt: "", completion: "   " } });
+    expect(blank.pricePromptPerToken).toBeNull();
+    expect(blank.priceCompletionPerToken).toBeNull();
+    // A genuinely published 0 is still 0 — the distinction is the whole point.
+    expect(limitsFromRecord({ id: "x", pricing: { prompt: "0", completion: 0 } }))
+      .toMatchObject({ pricePromptPerToken: 0, priceCompletionPerToken: 0 });
+    // And a record whose ONLY "figures" were blank publishes nothing at all, so the catalog
+    // reports null rather than caching a hollow entry that reads as "this provider publishes limits".
+    expect(blank).toEqual({ contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null });
+  });
+
+  it("reports null — not a hollow object — when a blank-priced record is all a provider publishes", async () => {
+    const catalog = new ModelCatalog({ cachePath: null });
+    const fetchFn = (async () =>
+      new Response(JSON.stringify({ data: [{ id: "shared/model-a", object: "model", pricing: { prompt: "", completion: "" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const cfg: ProviderConfig = { base: "http://blank.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+    expect(await catalog.limits("blank", cfg, "shared/model-a", { fetchFn })).toBeNull();
+  });
+
   it("keeps limits per (provider, model) — the same id on two providers is two deployments", async () => {
     const cfg = (base: string): ProviderConfig => ({
       base, kind: "openai", authHeader: "authorization", timeoutMs: 5000,

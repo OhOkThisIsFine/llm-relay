@@ -3,6 +3,7 @@ import { loadTierData, findTierModel } from "./tier-data.js";
 export { loadTierData };
 import type { Config, ProviderConfig } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
+import { keyIsPresent } from "./authEnv.js";
 
 import type { PingLoop, ModelHealthSummary } from "./ping/cadence.js";
 
@@ -99,7 +100,10 @@ export async function buildRegistry(
 
   const providers: Record<string, RegistryProvider> = {};
   for (const [name, p] of Object.entries(cfg.providers) as Array<[string, ProviderConfig]>) {
-    const has_key = p.authEnv ? !!process.env[p.authEnv]?.trim() : true;
+    // The shared presence predicate, not an open-coded `?.trim()` — call sites that each decided
+    // for themselves whether a whitespace-only key counts as present is exactly how a blank
+    // credential once read "present" here and "absent" to header construction.
+    const has_key = p.authEnv ? keyIsPresent(process.env[p.authEnv]) : true;
     let models: RegistryModel[] = [];
     let reachable: boolean | null = p.kind === "openai" ? false : null;
     if (p.kind === "openai") {
