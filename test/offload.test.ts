@@ -195,6 +195,79 @@ describe("/offload endpoint", () => {
     expect(get.enabled).toBe(true);
   });
 
+  /**
+   * The per-call opt-in, end-to-end. `test/config.test.ts` pins the directive's semantics at the
+   * `subagentSpec` unit level; nothing pinned that the request actually LANDS on the named target,
+   * which is the claim a dispatcher relies on when it believes it offloaded. Asserted from both
+   * sides: the named target is hit AND the Anthropic passthrough is not, because "it offloaded"
+   * and "it quietly spent primary quota" are indistinguishable from a 200 alone.
+   */
+  it("routes an @relay: directive to the named target with the switch OFF, and never leaks it", async () => {
+    let passthroughHits = 0;
+    const upstream = createServer((_req, res) => {
+      passthroughHits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "msg_1", type: "message", role: "assistant", content: [], model: "x" }));
+    });
+    const upPort = await listen(upstream);
+
+    let directedBody = "";
+    const directed = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        directedBody = Buffer.concat(chunks).toString("utf8");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "cmpl_1",
+          choices: [{ message: { role: "assistant", content: "from-directive" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+      });
+    });
+    const directedPort = await listen(directed);
+
+    const path = join(dir, "directive.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: {
+          anthropic: { base: `http://127.0.0.1:${upPort}`, kind: "anthropic" },
+          nim: { base: `http://127.0.0.1:${directedPort}`, kind: "openai" },
+        },
+        // No routing.subagents at all, and offload therefore off: the directive is the ONLY
+        // thing that can move this request off the passthrough.
+        routing: { default: "anthropic", tiers: { opus: "anthropic" } },
+        mode: "detect",
+        log: { level: "silent", file: null },
+      }),
+    );
+    const cfg = loadConfig(path);
+    expect(cfg.routing.offload).toBe(false);
+    const proxy = createProxy(cfg);
+    const port = await listen(proxy);
+
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-opus-5",
+        max_tokens: 16,
+        system: SUB,
+        messages: [{ role: "user", content: [{ type: "text", text: "@relay: nim/test-model\ntrace the callers" }] }],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(await res.json())).toMatch(/from-directive/);
+    // The dispatcher believed it offloaded — so primary quota must NOT have been spent.
+    expect(passthroughHits).toBe(0);
+    // …and the directive is stripped before forwarding, so the model never sees it.
+    expect(directedBody).toContain("trace the callers");
+    expect(directedBody).not.toContain("@relay:");
+  });
+
   it("rejects a POST without an explicit boolean", async () => {
     const cfg = freshConfig("reject.json");
     const proxy = createProxy(cfg);
