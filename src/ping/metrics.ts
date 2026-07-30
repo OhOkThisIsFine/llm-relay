@@ -87,15 +87,80 @@ export function getStabilityScore(pings: PingRecord[]): number {
   return Math.round(score);
 }
 
-/** Determine human-readable health verdict for a model based on average latency and tail latency. */
+/**
+ * How many of the MOST RECENT probes failed, consecutively.
+ *
+ * The unit of "is this thing broken" — one failure in a row is weather, five in a row is a
+ * pattern. Anything reading the single last sample cannot tell those apart.
+ */
+export function trailingFailures(pings: PingRecord[]): number {
+  let n = 0;
+  for (let i = pings.length - 1; i >= 0 && pings[i]!.code !== "200"; i--) n++;
+  return n;
+}
+
+/**
+ * Consecutive recent failures before a target is called down rather than merely erratic.
+ *
+ * A VPN the provider blocks, a DNS hiccup, a rate-limit window, a laptop resuming from sleep —
+ * all produce isolated failures against a model that is completely fine. Requiring a RUN of them
+ * is what stops one such blip from disqualifying a model that has answered hundreds of times.
+ */
+export const DOWN_AFTER_CONSECUTIVE_FAILURES = 3;
+
+/**
+ * Codes that are a DETERMINISTIC refusal rather than weather.
+ *
+ * The line that matters: a 429, a 503, a DNS failure or a blocked VPN egress may all succeed on
+ * the very next call, so one of them proves nothing. A 401/403 is the provider stating a fact
+ * about the credential — it will answer 401 again next time, and no amount of patience changes
+ * that. Tolerating transients must never become tolerating a revoked key: that was the exact
+ * regression where a provider whose key had been revoked reported "Perfect" (fast 401s are still
+ * fast) and could outrank a working target.
+ */
+const CREDENTIAL_CODES = new Set(["401", "403"]);
+
+/**
+ * Is this target persistently down, as opposed to having just had a bad moment?
+ *
+ * Three ways to be down, and only the last one is forgiving:
+ *   1. the latest probe was a credential refusal — deterministic, see above;
+ *   2. it has never once answered 200 — there is no good record to protect;
+ *   3. a RUN of recent failures AND a poor overall record.
+ *
+ * (3) is what stops a blip disqualifying a model: one with 95% uptime that just hit three
+ * rate-limited probes is rate-limited, not dead. The caller can still reach it, and the circuit
+ * breaker will step over it independently if it really is failing.
+ */
+export function isPersistentlyDown(pings: PingRecord[]): boolean {
+  if (pings.length === 0) return false;
+  const last = pings[pings.length - 1]!;
+  if (CREDENTIAL_CODES.has(last.code)) return true;
+  if (!pings.some((p) => p.code === "200")) return true;
+  return trailingFailures(pings) >= DOWN_AFTER_CONSECUTIVE_FAILURES && getUptime(pings) < 50;
+}
+
+/**
+ * Determine human-readable health verdict for a model based on average latency and tail latency.
+ *
+ * ⚠ Down-ness is derived from the ACCUMULATED history, never from the caller's reading of the
+ * most recent ping. `cadence.ts` used to pass `isDown: lastPing.code !== "200"`, so a single
+ * transient 503 — a VPN block, a resumed laptop, one rate-limited probe — overrode fifty good
+ * samples and reported a healthy model as `Not Active`/`Unstable`. `opts.isDown` is still
+ * honoured when a caller genuinely knows better, but nothing has to supply it.
+ */
 export function getVerdict(
   pings: PingRecord[],
   opts: { httpCode?: string | null; isDown?: boolean } = {},
 ): Verdict {
-  if (opts.httpCode === "429") return "Overloaded";
+  const down = opts.isDown ?? isPersistentlyDown(pings);
+
+  // Rate limiting is a transient, self-describing condition, and it is not down-ness: report it
+  // as such only when the recent record actually shows it, not because one probe caught a window.
+  if (opts.httpCode === "429" && trailingFailures(pings) > 0) return "Overloaded";
 
   const wasUpBefore = pings.length > 0 && pings.some((p) => p.code === "200");
-  if (opts.isDown) {
+  if (down) {
     return wasUpBefore ? "Unstable" : "Not Active";
   }
 

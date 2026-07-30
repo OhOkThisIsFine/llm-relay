@@ -1,9 +1,37 @@
-import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import type { PingRecord } from "./metrics.js";
 
 export const DEFAULT_PROBE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-export const CURRENT_PROBE_VERSION = 1;
+/**
+ * Bumped to 2 when entries gained a sample HISTORY. A version mismatch marks a model due for
+ * probing (see `getModelsDueForProbe`), so v1 single-sample entries re-probe and refill naturally
+ * instead of needing a migration.
+ */
+export const CURRENT_PROBE_VERSION = 2;
+
+/**
+ * How many recent probes are kept per model.
+ *
+ * p95 and jitter need a DISTRIBUTION, so a rolling window is unavoidable; `totals` below carries
+ * the long-run figures the window drops. 25 keeps a full roster's cache in the low hundreds of KB.
+ */
+export const MAX_SAMPLES = 25;
+
+/**
+ * Long-run counters that OUTLIVE the rolling window.
+ *
+ * The window answers "how does this model behave lately"; these answer "how has it behaved since
+ * we first saw it". Keeping both is what stops a single bad afternoon from erasing a model's
+ * record — and what makes uptime mean something after a restart.
+ */
+export interface ProbeTotals {
+  probes: number;
+  ok: number;
+  sumMs: number;
+  firstProbedAt: number;
+}
 
 export interface ProbeEntry {
   modelId: string;
@@ -13,6 +41,10 @@ export interface ProbeEntry {
   ms: number;
   code: string;
   quotaPercent: number | null;
+  /** Rolling window, oldest first. Absent on v1 entries. */
+  samples?: PingRecord[];
+  /** Cumulative counters. Absent on v1 entries. */
+  totals?: ProbeTotals;
 }
 
 export interface ProbeCacheData {
@@ -21,6 +53,11 @@ export interface ProbeCacheData {
 }
 
 export function getProbeCachePath(): string {
+  // ⚠ Under vitest, never touch the developer's real cache. Any test that exercises `PingLoop`
+  // calls `recordProbeResult`, and the user's file was found holding `openai_mock` /
+  // `mock-model-a` entries written by the suite — test fixtures polluting live health data that
+  // the router then ranks on. Tests needing persistence pass an explicit `path`.
+  if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "probe-cache.json");
   const xdg = process.env.XDG_CACHE_HOME;
   const baseDir = xdg && xdg.trim() ? join(xdg, "llm-relay") : join(homedir(), ".llm-relay");
   return join(baseDir, "probe-cache.json");
@@ -122,6 +159,22 @@ export function recordProbeResult(
   // Reachability is not availability; only a 2xx (normalised to "200" by pingProviderModel)
   // proves this model will actually serve a request.
   const isOk = result.code === "200";
+  const prev = cache.providers[providerKey]!.models[modelId];
+
+  // Append to the rolling window rather than replacing the single sample a v1 entry held.
+  // One probe cannot describe latency: p95, jitter and spike rate are distribution statistics,
+  // and a scalar `ms` made every one of them a restatement of the most recent request.
+  const samples = [...(prev?.samples ?? []), { ms: result.ms, code: result.code, timestamp: now }];
+  if (samples.length > MAX_SAMPLES) samples.splice(0, samples.length - MAX_SAMPLES);
+
+  const prevTotals = prev?.totals;
+  const totals: ProbeTotals = {
+    probes: (prevTotals?.probes ?? 0) + 1,
+    ok: (prevTotals?.ok ?? 0) + (isOk ? 1 : 0),
+    sumMs: (prevTotals?.sumMs ?? 0) + result.ms,
+    firstProbedAt: prevTotals?.firstProbedAt ?? now,
+  };
+
   const entry: ProbeEntry = {
     modelId,
     status: isOk ? "ok" : "broken",
@@ -130,10 +183,50 @@ export function recordProbeResult(
     ms: result.ms,
     code: result.code,
     quotaPercent: result.quotaPercent,
+    samples,
+    totals,
   };
 
   cache.providers[providerKey]!.models[modelId] = entry;
   flushProbeCache({ ...(opts.path ? { path: opts.path } : {}), cache });
   return entry;
+}
+
+/**
+ * Every persisted sample for a model, oldest first — the history a restarted process needs to
+ * avoid starting from zero.
+ *
+ * `PingLoop` kept its history in an in-memory `Map` and read only that, while `recordProbeResult`
+ * wrote to disk and nothing ever read it back. So every restart reset every model to `Pending`
+ * with `p95: -1`, and a proxy that restarts (a laptop that sleeps, an upgrade, a crash) never
+ * accumulated anything at all. This is the read side that was missing.
+ */
+export function loadPersistedSamples(
+  providerKey: string,
+  modelId: string,
+  opts: { path?: string } = {},
+): PingRecord[] {
+  const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
+  return cache.providers[providerKey]?.models[modelId]?.samples ?? [];
+}
+
+/** Long-run counters for a model, or null when it has never been probed. */
+export function loadTotals(
+  providerKey: string,
+  modelId: string,
+  opts: { path?: string } = {},
+): ProbeTotals | null {
+  const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
+  return cache.providers[providerKey]?.models[modelId]?.totals ?? null;
+}
+
+/** Every (provider, model) the cache holds samples for — what a restarting PingLoop rehydrates. */
+export function persistedModels(opts: { path?: string } = {}): Array<{ provider: string; model: string }> {
+  const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
+  const out: Array<{ provider: string; model: string }> = [];
+  for (const [provider, bucket] of Object.entries(cache.providers)) {
+    for (const model of Object.keys(bucket.models)) out.push({ provider, model });
+  }
+  return out;
 }
 
