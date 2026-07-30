@@ -97,13 +97,32 @@ strangely; the list being ranked was half the size it appeared to be.
 `hasKey: false`, and distinguishes **dropped** (no key — never routed to) from **demoted**
 (auth-faulted or cooling — tried last).
 
-⚠ **A consequence worth acting on:** two of the members the report measured as *working*
-(`opencode/deepseek-v4-flash-free` and `kilo/nvidia/nemotron-3-ultra-550b-a55b:free`, both HTTP 200)
-are among the dropped seven. They serve **without** a key, but they declare an `authEnv` that is
-unset, so they are excluded from every pool they belong to. Either set the variable to any
-non-empty value or remove the `authEnv` declaration for those providers, and `pool/coding` gains
-two live free members. This is config, not code — the drop rule is deliberate (it is what stops the
-proxy sending an unauthenticated request to a provider that needs one).
+⚠ **Why those seven had no key — and the trap that hid it.** They were not unconfigured. All eleven
+provider keys were set as **Windows User-scope environment variables**, and Windows only puts a
+User-scope variable into a process's environment when that process **starts**. The relay is
+long-running (launched from `Startup` at logon), so it predated the variables and never had them —
+while a *freshly launched* shell did. That split is what makes this so easy to misdiagnose:
+
+- `llm-relay keys` and `llm-relay candidates` run as **new CLI processes** and report **their own**
+  environment, which is not necessarily the running relay's.
+- `GET /registry` and `GET /candidates` are answered **by the relay**, so `has_key` there is the
+  authoritative answer about the process that actually serves traffic.
+
+The two disagreed: the relay reported `has_key=false` for six providers whose keys were sitting in
+the registry the whole time. Relaunching the relay from an environment carrying those variables took
+it from **6 providers without a key to 0**, and `pool/coding` from 5 live members to **11**. Seven
+members that had been reported dead with `401 Wrong API Key` / `no api key supplied` answered
+normally, several in under 400ms.
+
+**Diagnose this by asking the relay, never a fresh CLI process:**
+
+```bash
+curl -s 127.0.0.1:8791/registry | grep -o '"has_key":[a-z]*'   # what the SERVING process sees
+```
+
+A `401` from a provider whose key you know is set is this, not a bad credential — check `has_key`
+before rotating anything. (`~/.llm-relay/.env` is the durable alternative: `dotenv.ts` loads it at
+startup and an already-set real environment variable always wins, so it composes safely.)
 
 **What actually proves a member can serve is still `llm-relay pools --probe`.** Config validation
 cannot see a model that is listed and dead, and `/candidates` reports evidence rather than
