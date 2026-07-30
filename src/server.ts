@@ -16,7 +16,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { buildRegistry } from "./registry.js";
 import { buildCandidates } from "./candidates.js";
@@ -342,7 +342,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     throw e;
   }
 
-  // Demote candidates whose breaker is open — and do NOTHING else to the order.
+  // Demote unusable candidates — and do NOTHING else to the order.
   //
   // ⚠ Deliberately NOT `getHealthyTargets()`: that filters AND re-sorts by measured
   // stability, which is a second ranking pass competing with the capability ranking
@@ -352,11 +352,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // to promote: a target the breaker is cooling steps aside, everything else keeps
   // its benchmark rank. (The re-sort was invisible for as long as an untracked target
   // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
-  //
-  // When EVERY candidate is cooling there is nothing left to prefer, so the full
-  // ranked list is tried rather than failing the request outright.
-  const healthy = targetCandidates.filter((t) => globalCircuitBreaker.isHealthy(t));
-  const healthyTargets = healthy.length > 0 ? healthy : targetCandidates;
+  const healthyTargets = orderByUsability(targetCandidates);
   let target = healthyTargets[0]!;
 
   // Context guardrail — enforced ONLY against a limit the serving provider published about its own
@@ -389,7 +385,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Completions with a namespaced model; route by target and reverse-proxy the
   // upstream OpenAI response straight back (OpenAI in, OpenAI out).
   if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
-    await openAiFrontPath(res, target, { reqJson, wantsStream, started, path, hadTools, req }, h);
+    await openAiFrontPath(res, healthyTargets, { reqJson, wantsStream, started, path, hadTools, req }, h);
     return;
   }
 
@@ -465,34 +461,23 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         return;
       }
 
-      // Check HTTP 400 / 404 / 429 / 5xx for failover to next candidate
-      const isRetriableError = backendRes.status === 400 || backendRes.status === 404 || backendRes.status === 429 || backendRes.status >= 500;
-      if (isRetriableError) {
-        // A failing response is a breaker failure whether or not another candidate exists —
-        // recording "success" on a last-candidate 429/5xx (the common single-candidate case)
-        // resets the breaker on every error and it never trips.
-        globalCircuitBreaker.recordOutcome(target, { ok: false, status: backendRes.status, elapsedMs: Date.now() - started });
-        recordCall(target, false, started);
-        if (i < healthyTargets.length - 1) {
-          clearTimeout(timer);
-          res.off("close", onResClose);
-          continue; // Failover to next target
-        }
-      } else if (backendRes.status < 400) {
-        globalCircuitBreaker.recordOutcome(target, { ok: true, status: backendRes.status, elapsedMs: Date.now() - started });
-        recordCall(target, true, started);
-      } else {
-        // A non-retriable 4xx — 401/403 above all — is neither a success nor evidence
-        // about the target's health, so the breaker is told NOTHING. It used to be told
-        // `ok: true`, which cleared `consecutiveFailures` and refreshed the stability
-        // score: a revoked or exhausted key made every request look like a healthy,
-        // fast response, so the breaker could never trip and the candidate stayed at the
-        // front of the ranking while failing 100% of calls. Recording a failure instead
-        // would be the opposite error — it would open the breaker on a credential fault
-        // and hide the 401 the operator needs to see behind a "target unhealthy" skip.
-        // Telemetry still records the call as unsuccessful; that dataset is about
-        // outcomes, not about whether to keep routing here.
-        recordCall(target, false, started);
+      // One shared policy with the OpenAI front — see `classifyStatus` / `recordAttempt`.
+      //
+      // A 401/403 now fails over WHEN ANOTHER CANDIDATE EXISTS. It did not before, so a pool
+      // whose top-ranked member had a revoked key returned that 401 to the client with the
+      // other 13 members untouched — and half of a real 14-member pool answers 401. The
+      // credential fault is still kept out of the breaker's health data (it is recorded on
+      // its own axis, and demotes rather than trips), so the operator sees the 401 in
+      // `/candidates` instead of it hiding behind a "target unhealthy" skip. With a single
+      // candidate nothing changes: there is nowhere to fail over to, so the real error is
+      // returned exactly as before.
+      const cls = classifyStatus(backendRes.status);
+      const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
+      const tryNext = recordAttempt(target, cls, backendRes.status, started, retryAfterMs);
+      if (tryNext && i < healthyTargets.length - 1) {
+        clearTimeout(timer);
+        res.off("close", onResClose);
+        continue; // Failover to next target
       }
 
       const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
@@ -511,6 +496,102 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       res.off("close", onResClose);
     }
   }
+}
+
+/**
+ * Order candidates worst-last WITHOUT dropping any: live, then credential-faulted, then cooling.
+ *
+ * Three states, and the distinction between them is the whole point:
+ *   - live               — breaker closed, no standing 401/403. Keeps its benchmark rank.
+ *   - credential-faulted — answered 401/403 recently. It is not sick, it is unusable, and it
+ *                          must not cost a round-trip per request ahead of a working member.
+ *   - cooling            — breaker open (rate-limited or repeatedly failing).
+ *
+ * Demotion, not filtering. The previous `filter(isHealthy)` with a keep-everything fallback
+ * removed cooling candidates outright whenever at least one was healthy, so a pool could be
+ * narrowed to a single member and then have nothing to fall back to when that one failed too.
+ * Ordering is strictly better: a demoted target is only ever reached after every better one has
+ * actually failed on this request, and a pool with 14 members always has 14 chances.
+ *
+ * Stable within each band, so capability rank still decides among equals.
+ */
+export function orderByUsability(
+  targets: ResolvedTarget[],
+  breaker = globalCircuitBreaker,
+  now = Date.now(),
+): ResolvedTarget[] {
+  const live: ResolvedTarget[] = [];
+  const faulted: ResolvedTarget[] = [];
+  const cooling: ResolvedTarget[] = [];
+  for (const t of targets) {
+    if (!breaker.isHealthy(t, now)) cooling.push(t);
+    else if (breaker.hasCredentialFault(t, now)) faulted.push(t);
+    else live.push(t);
+  }
+  return [...live, ...faulted, ...cooling];
+}
+
+/**
+ * What one backend status means for failover and for the breaker. THE single policy — both the
+ * Anthropic path and the OpenAI front read it, because the bug this exists to prevent is exactly
+ * the two of them disagreeing.
+ *
+ *   ok         — serve it; the target is proven healthy.
+ *   retriable  — the deployment could not serve this request (429/5xx, or a 400/404 that here is
+ *                nearly always "this model won't take this shape"). Breaker failure, try the next.
+ *   credential — 401/403. Try the next candidate, but tell the breaker's HEALTH side nothing:
+ *                see `recordCredentialFault`.
+ *   client     — a genuine client-side 4xx (413, 422, …). The next candidate would reject it
+ *                identically, so failing over would just multiply one bad request by 14.
+ */
+export type OutcomeClass = "ok" | "retriable" | "credential" | "client";
+
+export function classifyStatus(status: number): OutcomeClass {
+  if (status < 400) return "ok";
+  if (status === 401 || status === 403) return "credential";
+  if (status === 400 || status === 404 || status === 429 || status >= 500) return "retriable";
+  return "client";
+}
+
+/**
+ * Apply one attempt's outcome to the breaker and to runtime telemetry, per `classifyStatus`.
+ * Returns true when another candidate should be tried.
+ */
+function recordAttempt(
+  target: ResolvedTarget,
+  cls: OutcomeClass,
+  status: number,
+  started: number,
+  retryAfterMs: number | null,
+): boolean {
+  const elapsedMs = Date.now() - started;
+  if (cls === "ok") {
+    globalCircuitBreaker.recordOutcome(target, { ok: true, status, elapsedMs });
+    recordCall(target, true, started);
+    return false;
+  }
+  if (cls === "retriable") {
+    // A failing response is a breaker failure whether or not another candidate exists —
+    // recording "success" on a last-candidate 429/5xx (the common single-candidate case)
+    // resets the breaker on every error and it never trips.
+    globalCircuitBreaker.recordOutcome(target, {
+      ok: false,
+      status,
+      elapsedMs,
+      ...(retryAfterMs !== null ? { retryAfterMs } : {}),
+    });
+    recordCall(target, false, started);
+    return true;
+  }
+  if (cls === "credential") {
+    // Neither a success nor a health failure — see `CircuitState.credentialFailures`. Telemetry
+    // still records the call as unsuccessful; that dataset is about outcomes, not about routing.
+    globalCircuitBreaker.recordCredentialFault(target, status);
+    recordCall(target, false, started);
+    return true;
+  }
+  recordCall(target, false, started);
+  return false;
 }
 
 /**
@@ -546,64 +627,121 @@ interface Ctx {
 }
 
 /**
- * OpenAI front: reverse-proxy the resolved target's /chat/completions to the client,
+ * OpenAI front: reverse-proxy a resolved candidate's /chat/completions to the client,
  * verbatim (streaming or buffered). No Anthropic translation, no tool-call repair —
  * this is the multiplexer path a dispatcher uses to reach many backends by namespace.
+ *
+ * ⚠ This path failed over across candidates for exactly as long as this comment has existed,
+ * which is to say it never did. It was handed `healthyTargets[0]` and returned before the
+ * Anthropic path's failover loop, and it reported outcomes to runtime telemetry but never to the
+ * circuit breaker — so a rate-limited candidate was neither stepped over within a request nor
+ * demoted for the next one, and a 14-member pool served every single request from the same dead
+ * member. Measured: 8 sequential requests to a 14-candidate pool, 6 consecutive 429s, 0 other
+ * candidates tried, breaker `lastStatus: null` throughout. Both halves are fixed here; the
+ * classification and breaker accounting come from the SAME helpers the Anthropic path uses, so
+ * the two cannot drift apart again.
  */
 async function openAiFrontPath(
   res: ServerResponse,
-  target: ResolvedTarget,
+  candidates: ResolvedTarget[],
   ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; hadTools: boolean; req?: IncomingMessage },
   h: Handlers,
 ): Promise<void> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), target.timeoutMs);
-  const onResClose = () => {
-    if (!res.writableEnded) {
-      controller.abort();
-    }
-  };
-  res.on("close", onResClose);
+  const tried: string[] = [];
 
-  let upstream: Response;
-  try {
-    upstream = await fetchOpenAiFront(target, { reqJson: ctx.reqJson, wantsStream: ctx.wantsStream, signal: controller.signal });
-    recordCall(target, upstream.status < 400, ctx.started);
-  } catch (e) {
-    clearTimeout(timer);
-    res.off("close", onResClose);
-    recordCall(target, false, ctx.started);
-    const aborted = controller.signal.aborted;
-    const status = aborted ? 504 : 502;
-    if (!res.headersSent) {
-      res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
-    }
-    h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target));
-    return;
-  }
-  const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
-  try {
-    res.writeHead(upstream.status, filterResponseHeaders(upstream.headers));
-    if (upstream.body) {
-      for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
-        if (!await writeChunk(res, Buffer.from(chunk))) break;
+  for (let i = 0; i < candidates.length; i++) {
+    const target = candidates[i]!;
+    const isLast = i === candidates.length - 1;
+    tried.push(specOf(target));
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), target.timeoutMs);
+    const onResClose = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    res.on("close", onResClose);
+
+    let upstream: Response;
+    try {
+      upstream = await fetchOpenAiFront(target, { reqJson: ctx.reqJson, wantsStream: ctx.wantsStream, signal: controller.signal });
+    } catch (e) {
+      clearTimeout(timer);
+      res.off("close", onResClose);
+      const aborted = controller.signal.aborted;
+      const status = aborted ? 504 : 502;
+      globalCircuitBreaker.recordOutcome(target, { ok: false, status, elapsedMs: Date.now() - ctx.started });
+      recordCall(target, false, ctx.started);
+      // The client hanging up aborts every candidate; walking the rest would be pointless work
+      // against a socket nobody is reading.
+      if (!isLast && !res.writableEnded) continue;
+      if (!res.headersSent) {
+        res.writeHead(status, { "content-type": "application/json", [SERVED_BY_HEADER]: tried.join(", ") });
+        res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
       }
+      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target));
+      return;
     }
-    if (!res.writableEnded) res.end();
-  } catch (e) {
-    const message = midStreamMessage(e);
-    endMidStreamFailure(res, streamed ? openAiSseError(message) : null, message);
-    h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target),
-      errorKinds: [MID_STREAM_ERROR_KIND],
-    });
+
+    const cls = classifyStatus(upstream.status);
+    const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
+    const tryNext = recordAttempt(target, cls, upstream.status, ctx.started, retryAfterMs);
+
+    if (tryNext && !isLast && !res.writableEnded) {
+      clearTimeout(timer);
+      res.off("close", onResClose);
+      // Release the skipped candidate's socket — an un-consumed body holds the connection open.
+      await upstream.body?.cancel().catch(() => {});
+      continue;
+    }
+
+    // This candidate's answer IS the response: it either succeeded, or it is the last one and
+    // its real upstream error is more informative than anything the proxy could synthesize.
+    //
+    // On success the header names the one deployment that served. On an error it names every
+    // deployment tried, in order — so an exhausted pool is self-describing and the reader can
+    // see that the failure they are holding is the last of N, not the only one.
+    const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+    try {
+      const servedBy = upstream.status >= 400 ? tried.join(", ") : specOf(target);
+      const headers = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
+      if (upstream.status >= 400) {
+        // Error bodies are small and are never streamed: buffer, normalize the envelope, send.
+        const raw = await upstream.text().catch(() => "");
+        const normalized = normalizeOpenAiErrorBody(raw, upstream.status);
+        const out = Buffer.from(normalized ?? raw, "utf8");
+        res.writeHead(upstream.status, { ...headers, "content-type": "application/json" });
+        res.end(out);
+      } else {
+        res.writeHead(upstream.status, headers);
+        if (upstream.body) {
+          for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
+            if (!await writeChunk(res, Buffer.from(chunk))) break;
+          }
+        }
+        if (!res.writableEnded) res.end();
+      }
+    } catch (e) {
+      const message = midStreamMessage(e);
+      endMidStreamFailure(res, streamed ? openAiSseError(message) : null, message);
+      h.logger.write({
+        ...baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target),
+        errorKinds: [MID_STREAM_ERROR_KIND],
+      });
+      return;
+    } finally {
+      clearTimeout(timer);
+      res.off("close", onResClose);
+    }
+    h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target));
     return;
-  } finally {
-    clearTimeout(timer);
-    res.off("close", onResClose);
   }
-  h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target));
+  // Unreachable with candidates present: the last iteration always responds and returns. An
+  // empty candidate list cannot get here either — routing rejects that with a 400 upstream.
+}
+
+/** The `provider/model` spec a resolved target came from — what a reader recognises from config. */
+function specOf(t: ResolvedTarget): string {
+  return t.model ? `${t.provider}/${t.model}` : t.provider;
 }
 
 /** detect/default: forward bytes unchanged, observe + log if applicable. */

@@ -23,6 +23,42 @@ export function errorOrigin(res: Response): ErrorOrigin | null {
 }
 
 /**
+ * Response header naming the deployment that actually answered — the (provider, model) left
+ * standing after pool expansion, benchmark ranking, breaker demotion and failover.
+ *
+ * A pool request's most basic debugging question is "who served this?", and until now the only
+ * way to answer it was to correlate timestamps against the proxy's own log. When every candidate
+ * fails it carries the list that was tried instead, so an exhausted pool is self-describing.
+ */
+export const SERVED_BY_HEADER = "x-llm-relay-served-by";
+
+/**
+ * The provider's `Retry-After` in milliseconds, or null.
+ *
+ * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both
+ * (groq sends seconds, some CDNs in front of a provider send a date). A date in the past, a
+ * negative delta or an unparseable value yields null rather than 0: "the provider said nothing
+ * usable" and "the provider said retry immediately" call for different cooldowns, and treating
+ * garbage as 0 would silently disable the backoff this exists to honour.
+ */
+export function parseRetryAfterMs(value: string | null | undefined, now = Date.now()): number | null {
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
+  if (raw.length === 0) return null;
+
+  // delta-seconds — integer per the RFC, but providers do emit fractions ("20.45").
+  if (/^\d+(\.\d+)?$/.test(raw)) {
+    const ms = Math.round(Number(raw) * 1000);
+    return Number.isFinite(ms) && ms >= 0 ? ms : null;
+  }
+
+  const at = Date.parse(raw);
+  if (Number.isNaN(at)) return null;
+  const delta = at - now;
+  return delta > 0 ? delta : null;
+}
+
+/**
  * Fetch the resolved provider target and return an ANTHROPIC-shaped `Response`,
  * regardless of the backend's native wire format. For kind="anthropic" this is a
  * passthrough. For kind="openai" (NIM/vLLM/OpenRouter/Gemini) the request is
@@ -109,7 +145,12 @@ export async function fetchBackend(
         ? ` — model "${target.model}" is not served by provider "${target.provider}" (a model can be listed in /models and still 404 here)`
         : "";
     // The provider really answered with this status — the body is reworded, the origin is not.
-    return anthropicError(res.status, `openai backend HTTP ${res.status}${hint}: ${body.slice(0, 300)}`, "upstream");
+    // `Retry-After` is carried onto the synthesized error: this response is a NEW Response, so
+    // without this the one header stating when the provider will serve again was destroyed here,
+    // and neither the breaker's cooldown nor the client's backoff could ever honour it.
+    return anthropicError(res.status, `openai backend HTTP ${res.status}${hint}: ${body.slice(0, 300)}`, "upstream", {
+      ...retryAfterHeader(res.headers),
+    });
   }
 
   if (args.wantsStream && res.body) {
@@ -157,10 +198,21 @@ export function openAiResponseToAnthropic(j: Record<string, unknown>, model: str
   };
 }
 
-function anthropicError(status: number, message: string, origin: ErrorOrigin): Response {
+/** The upstream's `Retry-After`, as a header object to spread, or `{}` when it sent none. */
+function retryAfterHeader(hh: Headers): Record<string, string> {
+  const v = hh.get("retry-after");
+  return v ? { "retry-after": v } : {};
+}
+
+function anthropicError(
+  status: number,
+  message: string,
+  origin: ErrorOrigin,
+  extra: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), {
     status,
-    headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin },
+    headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin, ...extra },
   });
 }
 
@@ -168,6 +220,54 @@ function openaiError(status: number, message: string, origin: ErrorOrigin): Resp
   return new Response(JSON.stringify({ error: { message, type: "invalid_request_error" } }), {
     status,
     headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin },
+  });
+}
+
+/**
+ * Coerce an upstream error body into the OpenAI error envelope — WITHOUT rewriting one that
+ * already conforms.
+ *
+ * The OpenAI front promises "OpenAI in, OpenAI out", but on the error path it returned whatever
+ * shape the provider chose. Gemini wraps its error in a JSON ARRAY (`[{"error":{…}}]`); a client
+ * reading `response.choices[0]` gets `undefined` from that and reports a malformed completion,
+ * so a plain 429 surfaces as "the model returned garbage" — which is exactly how a rate limit
+ * cost two days of debugging on the caller's side.
+ *
+ * Rules, in order:
+ *   - already `{error:{…}}`     → returned BYTE-EXACT. A conforming provider's message, code and
+ *                                 type are its own to state, and rewriting them would lose detail.
+ *   - `[{error:{…}}, …]`        → unwrapped to the element. Same fields, now at the top level.
+ *   - anything else (HTML, text,
+ *     a bare string, empty)     → wrapped, with the original preserved as the message.
+ *
+ * Returns null when the body is already conforming, so the caller can stream the original bytes
+ * rather than re-serialize them.
+ */
+export function normalizeOpenAiErrorBody(body: string, status: number): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    const message = body.trim().slice(0, 2000) || `upstream returned HTTP ${status} with an empty body`;
+    return JSON.stringify({ error: { message, type: "upstream_error", code: status } });
+  }
+
+  const hasError = (v: unknown): v is { error: Record<string, unknown> } =>
+    typeof v === "object" && v !== null && typeof (v as { error?: unknown }).error === "object" && (v as { error?: unknown }).error !== null;
+
+  if (hasError(parsed)) return null; // conforms — do not touch it
+
+  if (Array.isArray(parsed)) {
+    const wrapped = parsed.find(hasError);
+    if (wrapped) return JSON.stringify(wrapped);
+  }
+
+  return JSON.stringify({
+    error: {
+      message: body.trim().slice(0, 2000) || `upstream returned HTTP ${status} with an empty body`,
+      type: "upstream_error",
+      code: status,
+    },
   });
 }
 

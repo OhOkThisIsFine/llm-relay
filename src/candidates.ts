@@ -49,6 +49,19 @@ export interface Candidate {
     consecutiveFailures: number;
     lastStatus: number | null;
     cooldownRemainingMs: number;
+    /**
+     * Credential faults observed on real traffic, on their own axis.
+     *
+     * A member answering 401 on every call used to be indistinguishable here from a healthy
+     * one — verdict `Pending`, breaker `closed`, no failure count — because a 401 is
+     * deliberately not health data and so reached none of the fields above. It is still not
+     * health data; it is reported as what it is. `credentialFault` true means the router is
+     * currently DEMOTING this member (it is tried only after every other candidate fails),
+     * and it expires, so a rotated key recovers without a restart.
+     */
+    credentialFailures: number;
+    lastCredentialStatus: number | null;
+    credentialFault: boolean;
   };
   /** Observed real traffic through this proxy (not synthetic probes). */
   observed: {
@@ -265,6 +278,9 @@ export async function buildCandidates(
         consecutiveFailures: state?.consecutiveFailures ?? 0,
         lastStatus: state?.lastStatus ?? null,
         cooldownRemainingMs: Math.max(0, (state?.cooldownUntil ?? 0) - nowMs),
+        credentialFailures: state?.credentialFailures ?? 0,
+        lastCredentialStatus: state?.lastCredentialStatus ?? null,
+        credentialFault: breaker.hasCredentialFault(spec, nowMs),
       },
       observed: obs
         ? {

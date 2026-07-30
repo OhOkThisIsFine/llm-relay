@@ -94,7 +94,7 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. Exhaustion is host-reported for every rung kind because the relay cannot see a CLI's credit balance, and a `quota` bucket cools sibling rungs together (one binary can meter two independent balances — cooling both would skip a live lane). |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
 | `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`, `/candidates`, `/offload`, `/dispatch`). **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
-| `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
+| `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. Also the wire-shape helpers both paths share: `parseRetryAfterMs()` (both RFC 9110 forms; null, never 0, for garbage) and `normalizeOpenAiErrorBody()` (passes a conforming `{error:{…}}` through byte-exact, unwraps gemini's array envelope, wraps everything else). |
 | `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
 | `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai) + `FailoverReshaper` (ranked candidates from `reshaper: { pool }`; advances on transport failure only — a refusal is returned as-is, never retried elsewhere, and **exhausting every candidate throws `ReshaperTransportError`**, it does not return a refusal). |
 | `repair.ts` | Repair orchestrator. Destructive-refusal check → reshape ≤ maxAttempts → re-validate each attempt. `destructiveMatcher()` matches the tool name **exactly** (case-insensitively), with `name*` as an opt-in prefix form; `guardReshaped()` re-checks the reshaped message for destructive calls and for structural conservation (same block count/order, same tool_use `id`+`name`) — an added, dropped or re-pointed call is a contract violation, not a repair. `withEnvelopeOf()` re-attaches the BACKEND's `id`/`model`/`stop_sequence`/`usage` to whatever the reshaper returned — same reasoning as the guard: `Reshaper` is an interface, and a repair changes the tool arguments, never whose answer this is. |
@@ -104,7 +104,7 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `documents.ts` | `transcodeDocuments()` — Anthropic `document` blocks → markdown text via **MarkItDown** (optional external Python CLI), applied to openai-kind targets before llm-bridge. Refuses (`DocumentError` → 400) rather than letting an unconvertible document through; llm-bridge would stringify it and inject raw base64 into the prompt. Uses a **temp file, not stdin** — pdfminer needs a seekable stream and every piped PDF dies with "No /Root object". |
 | `log.ts` | Metadata-only logger (never headers/bodies). "Metadata only" is enforced **at the sink**: `write()` projects each record through the `LOG_FIELDS` allow-list, so a caller that hands over a wider object cannot leak it and a new field is logged only when someone adds it to that list. Log-write failure is swallowed — a full disk is a logging problem, never a request failure. Records the deployment that ANSWERED (`servedProvider`/`servedModel`, required); the model the client asked for is deliberately not a field. |
 | `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). Also harvests **per-(provider, model) limits + pricing** via `limitsFromRecord()` — a generic field-alias list (`context_window`/`max_context_length`/…), never a per-provider switch. `limits()` returns null when a provider publishes nothing (NIM), and that null must not be filled with another provider's numbers. |
-| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Orders targets by `getMeasuredStability()`, which returns **null when nothing has been measured** — the mid-band placeholder is applied locally in `getHealthyTargets`, not by an accessor. There is deliberately no scalar `getStabilityScore()`: a `number` return cannot say "unmeasured", so every caller got a plausible score and none could tell a guess from an observation. |
+| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Orders targets by `getMeasuredStability()`, which returns **null when nothing has been measured** — the mid-band placeholder is applied locally in `getHealthyTargets`, not by an accessor. There is deliberately no scalar `getStabilityScore()`: a `number` return cannot say "unmeasured", so every caller got a plausible score and none could tell a guess from an observation. Credential faults (401/403) are a **separate axis** (`recordCredentialFault` / `hasCredentialFault`) that demotes without tripping and expires, because a revoked key is neither a sick backend nor a healthy one. A 429/503's `Retry-After` sets the cooldown in place of the flat guess. |
 | `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → observed runtime telemetry (≥5 calls, so one lucky request can't promote a model) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
 | `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
@@ -120,8 +120,9 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `ping/quota.ts` | Provider-specific quota balance fetcher (e.g. OpenRouter key auth endpoint). |
 | `ping/runtime-telemetry.ts` | Real-world proxy request telemetry storage (`runtime-telemetry.json`) and real-world quality scoring. |
 
-**Request flow:** `handle()` in `server.ts` → `fetchBackend()` → then either `repairPath` (repair
-mode, invalid tool call) or `transparentPath` (detect/passthrough). Repair splits into
+**Request flow:** `handle()` in `server.ts` → `orderByUsability()` → a candidate loop (BOTH paths —
+`openAiFrontPath` for the OpenAI front, the inline loop for `/v1/messages`) → `fetchBackend()` →
+then either `repairPath` (repair mode, invalid tool call) or `transparentPath` (detect/passthrough). Repair splits into
 `repairStreamingPath` (SSE: stream text through, buffer from first tool_use) and
 `repairBufferedPath` (non-streamed JSON). The validate/repair layer **always sees Anthropic
 Messages** regardless of backend kind — translation is isolated in `backend.ts`.
@@ -259,6 +260,41 @@ test stale code.
 - **The breaker records failure on EVERY retriable error response (429/5xx/400/404),** including
   on the last candidate — `test/server.test.ts` "circuit breaker accounting" pins that a
   single-candidate 429 is never recorded as a success.
+- **BOTH request paths must classify outcomes through `classifyStatus()` + `recordAttempt()`.**
+  The OpenAI front (`/v1/chat/completions`) had neither failover nor breaker accounting: it was
+  handed `healthyTargets[0]` and returned before the Anthropic path's loop, and it reported to
+  runtime telemetry only. A 14-member pool served every request from the same rate-limited member
+  and returned its 429 to the client — measured, 6 consecutive 429s with `lastStatus: null` on the
+  breaker throughout. Two paths, two policies, one of them empty. Keep the policy in one place.
+  Full write-up: [docs/pool-failover.md](docs/pool-failover.md).
+- **⚠ A failover test with ONE candidate proves nothing.** With a single candidate, "fails over
+  correctly" and "cannot fail over at all" are the same observation — which is how the above
+  shipped past a suite that covered the front path. `test/pool-failover.test.ts` uses ≥2 throughout.
+- **A credential fault (401/403) is neither health data nor a success.** It lives on its own axis
+  (`credentialFailures` / `credentialFaultUntil`), fails over when another candidate exists, and
+  DEMOTES rather than trips the breaker — so the operator still sees the 401 in `/candidates`
+  (`AUTH 401` in the table) instead of it hiding behind a "target unhealthy" skip. It expires
+  (5 min) and clears on any success, so a rotated key recovers with no restart. Don't fold it back
+  into `recordOutcome`: recording a failure opens the breaker on a *config* problem, recording a
+  success launders a permanently broken member into a healthy one, and both were tried.
+- **Health DEMOTES candidates; it never drops them.** `orderByUsability()` returns every candidate,
+  ordered live → credential-faulted → cooling. The old `filter(isHealthy)` deleted cooling
+  candidates whenever any healthy one remained, so a pool could narrow to one member and then have
+  nothing left when that member failed too. Only an unset credential removes a candidate, and that
+  happens in `resolveTargets` for a different reason.
+- **`Retry-After` sets the cooldown; the proxy never sleeps on it.** `parseRetryAfterMs()` handles
+  both RFC 9110 forms and returns null (never 0) for garbage. For a pool the right answer to "retry
+  in 20s" is "use another candidate now" — blocking the request path would trade one symptom for
+  another. `fetchBackend()` must keep carrying the header onto the error Response it synthesizes;
+  it builds a NEW Response, so the header was being destroyed there.
+- **A conforming error body is passed through BYTE-EXACT.** `normalizeOpenAiErrorBody()` exists only
+  for shapes that break an OpenAI client — gemini's array envelope `[{"error":{…}}]` (no `choices`,
+  so `response.choices[0]` is `undefined` and a plain 429 reads as "the model returned garbage"),
+  and non-JSON bodies. It is not there to reword providers.
+- **A pool routes to fewer members than it lists.** `resolveTargets` drops targets whose declared
+  `authEnv` is unset, so a 14-member pool can resolve to 7 — and `benchmarkSort` then ranks that
+  smaller list, which is why a pool's *tenth* config entry can legitimately be the one that answers.
+  ⚠ This also excludes free providers that would serve WITHOUT a key but declare an unset `authEnv`.
 - **Offload is off by default and an absent `routing.offload` is false.** Don't "helpfully" default
   it on when a `subagents` map exists — that was the 0.3.x behaviour and it silently changed which
   vendor answered every built-in subagent. Two tests pin this (`test/config.test.ts` "offload
@@ -298,10 +334,19 @@ test stale code.
 
 ## Status & open work
 
-**Nothing is pending.** A full audit was remediated to completion and its follow-up list closed in
-v0.12.0; the audit apparatus, its artifacts and its handoff doc have all been deleted, because a
-finished run's ledger is just a stale to-do list. Anything that mattered from it is a code change,
-a test, or a paragraph in this file.
+**Nothing is pending in the code.** A full audit was remediated to completion and its follow-up list
+closed in v0.12.0; the audit apparatus, its artifacts and its handoff doc have all been deleted,
+because a finished run's ledger is just a stale to-do list. Anything that mattered from it is a code
+change, a test, or a paragraph in this file. The 2026-07-30 pool-failover symptoms are likewise
+fixed and closed — see [docs/pool-failover.md](docs/pool-failover.md) and the gotchas above.
+
+⚠ **One CONFIG item is outstanding, and it is the owner's call, not a code change.** `pool/coding`
+lists 14 members and routes to 7: seven providers have no key set (`llm-relay keys` → `MISSING_ENV`),
+and `resolveTargets` drops a declared-but-unset `authEnv` before ranking. Two of the dropped seven —
+`opencode/deepseek-v4-flash-free` and `kilo/nvidia/nemotron-3-ultra-550b-a55b:free` — answer HTTP 200
+**without** a key, so setting their variable to any non-empty value (or removing the `authEnv`
+declaration) adds two live free members. Of the 7 that do route, `mistral` answers 401
+(`INVALID_KEY`) and `ollama` is not running locally.
 
 ⚠ One durable lesson from it, because it will cost you an hour otherwise: **several tests in this
 repo were written to pin the defect they should have caught.** A correct fix here can legitimately
