@@ -17,7 +17,7 @@
  * document gets a clear error naming the install command — never a mangled prompt.
  */
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -166,6 +166,46 @@ function decodeSource(block: Record<string, unknown>, maxBytes: number): { buf: 
   return { buf, ext };
 }
 
+/**
+ * The fence tag wrapping a converted document, derived from the CONTENT — never from the
+ * client-supplied `title`.
+ *
+ * The old form was `<${title}>…</${title}>`, interpolated raw. A title is attacker-shaped
+ * input on the same footing as the document bytes, so `title: "doc>\n</doc"` closed the
+ * fence early and everything after it read to the model as user-authored instructions
+ * rather than attachment content. Escaping the title would work only for as long as the
+ * escape stays exhaustive; a delimiter the client cannot influence at all cannot be
+ * escaped wrong.
+ *
+ * Derived (hashed), not random, because these blocks carry `cache_control`: a fresh nonce
+ * per request would change the prompt prefix every turn and bust the provider cache. A
+ * hash of the exact content is stable across identical requests, and the collision guard
+ * below closes the one theoretical gap — content that happens to contain its own tag.
+ */
+function fenceTag(content: string, title: string): string {
+  const digest = createHash("sha256").update(content).digest("hex");
+  for (let n = 0; n < 8; n++) {
+    const tag = `document-${digest.slice(n * 8, n * 8 + 12)}`;
+    if (!content.includes(tag) && !title.includes(tag)) return tag;
+  }
+  // Unreachable in practice; a random tag is still correct, it just costs the cache hit.
+  return `document-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+}
+
+/**
+ * Render the client's title as an inert label. It is metadata about an attachment, not
+ * markup and not instructions: anything that could read as a tag boundary or a line break
+ * is flattened, and the length is capped so a title cannot become the payload.
+ */
+function labelTitle(raw: unknown): string {
+  const s = typeof raw === "string" ? raw : "";
+  // Control characters (newlines included), angle brackets and quotes only — a deny-list
+  // narrow enough that a non-Latin title survives intact. It is defence in depth: the tag
+  // itself is already independent of this value, so the title cannot reach the delimiter.
+  const flattened = s.replace(/[\u0000-\u001f\u007f<>"]+/g, " ").replace(/\s+/g, " ").trim();
+  return flattened.slice(0, 120) || "document";
+}
+
 /** True if the request carries at least one `document` content block. */
 export function hasDocumentBlocks(body: unknown): boolean {
   const messages = (body as { messages?: unknown })?.messages;
@@ -204,13 +244,17 @@ export async function transcodeDocuments(body: unknown, opts: TranscodeOptions =
           const b = block as Record<string, unknown>;
           const decoded = decodeSource(b, maxBytes);
           const text = "text" in decoded ? decoded.text : await run(decoded.buf, decoded.ext, { command, timeoutMs });
-          const title = typeof b.title === "string" && b.title ? b.title : "document";
+          const title = labelTitle(b.title);
           const converted = text.trim();
           if (!converted) throw new DocumentError(`markitdown produced no text for ${title}`);
+          const tag = fenceTag(converted, title);
           return {
             type: "text",
-            // Fenced so the model reads it as an attachment, not as instructions from the user.
-            text: `<${title}>\n${converted}\n</${title}>`,
+            // Fenced so the model reads it as an attachment, not as instructions from the
+            // user. The tag comes from `fenceTag` (content-derived) and NOT from the title:
+            // the delimiter must not be something the client can choose, or it can close
+            // the fence early and have the rest read as its own instructions.
+            text: `<${tag} title="${title}">\n${converted}\n</${tag}>`,
             ...(b.cache_control ? { cache_control: b.cache_control } : {}),
           };
         }),

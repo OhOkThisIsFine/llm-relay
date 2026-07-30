@@ -42,10 +42,30 @@ export type StopReason =
   | string
   | null;
 
-/** The assistant message the proxy validates (from JSON body or reconstructed from SSE). */
+/**
+ * The assistant message the proxy validates (from JSON body or reconstructed from SSE).
+ *
+ * `id` / `model` / `stop_sequence` exist only because a repaired response has to be
+ * re-serialized and the backend's own identity has to survive that (DAT-27df2443): the
+ * shape previously carried neither, so `emitSse` had nowhere to read an id from and fell
+ * back to the constant `msg_repair` for every repaired turn — every repair looked like
+ * the same message. They are all `undefined` when the source response did not carry them,
+ * which is deliberately distinguishable from a captured value; nothing here invents one.
+ * This is still not an SDK model — do not add a field without a finding that needs it AND
+ * a consumer that actually threads it through.
+ */
 export interface AssistantMessage {
+  /** The backend's own message id, when the response carried one. */
+  id?: string | undefined;
+  /** The model the backend reported serving, when the response carried one. */
+  model?: string | undefined;
   content: ContentBlock[];
   stop_reason: StopReason;
+  stop_sequence?: string | null | undefined;
+  /**
+   * Token usage as the backend reported it. An ABSENT field means "the backend did not
+   * tell us", which is not the same claim as `0`; callers must not fill it with a zero.
+   */
   usage?: { input_tokens?: number; output_tokens?: number } | undefined;
 }
 
