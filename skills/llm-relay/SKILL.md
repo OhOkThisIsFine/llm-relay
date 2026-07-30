@@ -32,7 +32,8 @@ Three forms in a request's `model` field, resolved in this order:
 | a Claude model id (`claude-opus-5`, …) | `routing.tiers` → Anthropic passthrough | n/a |
 
 **Prefer `pool/<name>` over a pinned spec** — a pool survives one model being de-listed; a pin does
-not. An unknown pool or provider is a loud 400 listing valid names, never a silent fallback.
+not. An unknown pool or provider is a loud 400 (`llm-relay routing: …`), never a silent fallback;
+for a pool the error also lists the configured pool names.
 Pool refs also work inside `routing.tiers`, `routing.default` and `routing.subagents`; all of them
 are validated at config load, so a typo fails at startup, not on the first request.
 
@@ -200,7 +201,20 @@ llm-relay telemetry          # JSON health/quota report
 ```
 
 Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload` (GET/POST),
-`/telemetry`, `/ping`, `/health`.
+`/dispatch` (GET/POST), `/telemetry`, `/ping`, `/health`.
+
+⚠ **`/offload` and `/dispatch` are admission-checked — loopback is not authorization.** They flip
+routing and rewrite `~/.llm-relay/config.json`, and any web page can POST to `127.0.0.1`, so the
+proxy rejects with **403** when the `Origin` header is present and not loopback, or when `Host` is
+not a loopback name (DNS rebinding). A `POST` must also send `content-type: application/json`. The
+CLI and a normal `curl -H 'content-type: application/json'` are unaffected — a missing `Origin` is
+allowed. A surprise 403 from these two paths is this check, not a broken proxy. This closes the
+browser-driven write path only; the proxy still does no authentication, so never bind it off-loopback.
+
+`llm-relay telemetry` reports health as a tri-state: `true`, `false`, or **`null` = nothing has been
+observed yet**. `null` is not `false` — an unmeasured provider is unknown, not unhealthy, and
+`unmeasuredProvidersCount` says how many are in that state. Same rule for `stabilityScore` and
+`quotaPercent`: unmeasured stays `null` rather than becoming a confident-looking zero.
 
 **`keys` and `pools --probe` answer different questions — you need both.**
 
@@ -226,15 +240,35 @@ Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload` (
   cools that target down and failover walks the next pool candidate.
 - **400 "exceeds the context limit"** fires only when the serving provider itself published a
   limit. Unknown limit = no guardrail; the backend answers with its own authoritative error.
-- **Repair refused/failed** → 502 `tool call could not be repaired (…)`. That is fail-clean by
-  design: a refusal is a judgement and is never retried on another model.
+- **Repair refused/failed** → 502 `llm-relay: tool call could not be repaired (<outcome>)`
+  (mid-stream, the same text as an SSE `error`). That is fail-clean by design. Read the outcome —
+  the four are not interchangeable:
+  - `refused_destructive` — the failing call named a destructive tool, so its arguments were never
+    model-authored. Expected, not a bug; see below.
+  - `refused` — a reshaper looked at the call and declined to guess. A **judgement**, so it is
+    returned as-is and never retried on another model; retrying would be shopping for a more
+    compliant answer, which is how a fabricated call gets through.
+  - `failed` — nothing usable came back: the reshaper never validated within `maxAttempts`, **or**
+    every pooled reshaper candidate was unreachable. A total outage is reported as `failed`, never
+    as `refused`, because nobody answered and so there is no judgement to report.
+- **A malformed `Bash`, `BashOutput`, `Write`, `Edit`, `MultiEdit` or `NotebookEdit` call is
+  refused, not repaired** — that is `refused_destructive`, and a repair that used to "succeed" on
+  one of these was the bug, not the feature. Matching is **exact on the tool name**
+  (case-insensitive), so safe tools that merely contain a scary fragment — `PushNotification`,
+  `ResetZoom`, `ForceRefresh` — are permitted; a config can opt a whole family in deliberately with
+  a trailing `*` (`git_*`). The list is `repair.destructiveTools`, and it is the ONLY source: an
+  empty list refuses nothing, because there is no hidden built-in set in `src/`.
 - **Document blocks** to openai backends are converted to markdown via MarkItDown
   (`pip install 'markitdown[all]'`); without it, requests carrying documents fail with a clear
   error instead of injecting base64 into the prompt.
 
 ## Safety invariants (do not work around these)
 
-- Loopback bind only — it holds provider keys and does no auth.
+- Loopback bind only — it holds provider keys and does no auth. Loopback is not authorization
+  either: the control routes (`/offload`, `/dispatch`) admission-check `Origin`, `Host` and (on
+  POST) the content type, and that check is not a workaround target.
 - Logs are metadata-only; never ask it to log request/response bodies.
 - Destructive tool calls are refused, never fabricated — repair output may run under
-  `--dangerously-skip-permissions`.
+  `--dangerously-skip-permissions`. The set is `repair.destructiveTools`, matched exactly by name
+  and covering the harness's own write/execute tools (see *Failure modes* above). Narrowing it to
+  make a repair "work" removes the guard, it does not fix the call.

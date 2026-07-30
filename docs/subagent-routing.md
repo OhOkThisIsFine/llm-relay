@@ -43,6 +43,15 @@ answering as though it were Claude. Same for every other tier.
 **Conclusion: tier is not a subagent signal.** `routing.tiers` must stay pointed at an Anthropic
 passthrough. A separate signal was required.
 
+Scope note: that rule is about the **offload topology**, the one this document describes — the human
+keeps reaching real Anthropic and only subagents are redirected. It is not a rule about every
+config. The shipped [`config.example.json`](../config.example.json) is the *other* topology, the
+proxy's original one: no Anthropic provider is declared at all, every tier maps to a free provider,
+and the whole session — human included — runs on non-Anthropic models on purpose. There is no
+conversation to protect there, so nothing is silently downgraded. The failure mode above appears
+precisely when the two are mixed: an Anthropic passthrough in the config *and* a tier pointed
+somewhere else.
+
 ## The signal: `cc_is_subagent=true`
 
 Claude Code stamps a billing header as the **first line of the `system` block**, and on subagent
@@ -108,6 +117,20 @@ llm-relay offload status
 no proxy listening the CLI writes the file and says so. `GET /offload` reports state without
 changing it.
 
+⚠ **Binding to loopback is not authorization**, and `/offload` no longer treats it as such. Flipping
+this switch decides which vendor answers every subagent and rewrites `config.json` on disk, so any
+page the user happens to be visiting could otherwise have flipped it: a cross-origin `POST` to
+`127.0.0.1` with a `text/plain` body is a CORS *simple request*, needs no preflight, and succeeds —
+the attacker never reads the response, but the write has already happened. So `admissionFailure()`
+in [`src/server.ts`](../src/server.ts) rejects (403) any request to `/offload` or `/dispatch` whose
+`Origin` is present and non-loopback, or whose `Host` is not a loopback name (closing DNS
+rebinding, where a hostile name resolves to `127.0.0.1` and so looks local to the socket); a
+mutating `POST` must additionally declare `content-type: application/json`, which is exactly what
+forces a preflight a hostile page cannot satisfy. A CLI sends no `Origin`, so an **absent** one is
+allowed — `llm-relay offload on` keeps working unchanged, and so does a hand-written `curl` that
+sets the JSON content type. The proxy still does no authentication: this closes the browser-driven
+path, it does not make the endpoint safe to expose off-loopback.
+
 ## Choosing a destination
 
 `llm-relay candidates` (or `GET /candidates`) is the decision table — every offload target with its
@@ -127,9 +150,12 @@ available" are different questions, and one blended number answers neither. Each
 its own field under `scores`; they disagree, and that disagreement is information.
 
 The one scalar is `sortInputs.strength`, and it exists only because `benchmarkSort` has to put a
-pool in *some* order. It never travels without `strengthBasis` (`snapshot` | `static-table` |
-`telemetry` | `neutral`) and `strengthSignals`, so a five-source consensus and a "nothing is known,
-assume neutral" placeholder can't be confused.
+pool in *some* order. It never travels without `strengthBasis` and `strengthSignals`, so a
+five-source consensus and a "nothing is known, assume neutral" placeholder can't be confused.
+`StrengthBasis` has exactly three values — `snapshot` | `telemetry` | `neutral` (see
+[`src/benchmarks.ts`](../src/benchmarks.ts)). There is no `static-table` basis: the hardcoded table
+that produced one was deleted in 0.6.0, and a score can now only come from published capability,
+from this deployment's own observed traffic, or from nowhere at all.
 
 The CLI prefers a running proxy so it can use warm ping history and real breaker state; run it cold
 and the live-behaviour columns are empty because nothing has been measured yet.
@@ -234,3 +260,8 @@ curl -s localhost:8791/v1/messages -H 'content-type: application/json' \
 The directive path is used here on purpose: it works with the switch off, so this check tests the
 marker rather than the switch. To exercise the switch itself, `llm-relay offload on` first and drop
 the `@relay:` line — the same bogus-pool 400 then proves `routing.subagents` is being consulted.
+
+(`/v1/messages` is a proxy path, not a control path, so the admission check described under
+[The switch](#the-switch) does not apply to it — these probes need no extra headers. A 403 rather
+than the expected 400 means you hit `/offload` or `/dispatch` from a non-loopback `Origin`/`Host`,
+or POSTed without `content-type: application/json`.)
