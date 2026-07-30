@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { repair, destructiveMatcher } from "../src/repair.js";
+import { repair, destructiveMatcher, guardReshaped } from "../src/repair.js";
 import { ToolUseValidator } from "../src/validator.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
-import { ReshaperTransportError, type Reshaper, type ReshapeResult } from "../src/reshaper.js";
+import { FailoverReshaper, ReshaperTransportError, type Reshaper, type ReshapeRequest, type ReshapeResult } from "../src/reshaper.js";
 
 const validator = new ToolUseValidator();
 const tools = toolSchemaMap({
@@ -51,5 +51,192 @@ describe("repair orchestration", () => {
     const d = await repair(destrCall, dtools, { validator, reshaper: spy, maxAttempts: 2, isDestructive: destructiveMatcher(["delete_file"]) });
     expect(d.outcome).toBe("refused_destructive");
     expect(reshaperCalled).toBe(false); // never even asked to reshape it
+  });
+
+  it("reports failed (not refused) when every failover candidate is down", async () => {
+    // A total outage is not a model's judgement. FailoverReshaper throws once it is
+    // exhausted, and repair() must translate that into fail-clean, so the log says
+    // "nothing was reachable" rather than "a model declined to guess".
+    const dead: Reshaper = { reshape: async () => { throw new Error("down"); } };
+    const d = await repair(badCall, tools, { validator, reshaper: new FailoverReshaper([dead, dead]), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+  });
+
+  it("forwards the serving backend model to the reshaper instead of a hardcoded null", async () => {
+    let seen: ReshapeRequest | null = null;
+    const spy: Reshaper = { reshape: async (r) => { seen = r; return { kind: "message", message: fixedMsg }; } };
+    await repair(badCall, tools, { validator, reshaper: spy, maxAttempts: 2, isDestructive: noDestruct, backendModel: "some-provider/some-model" });
+    expect(seen).not.toBeNull();
+    expect((seen as unknown as ReshapeRequest).backendModel).toBe("some-provider/some-model");
+  });
+
+  it("reports null (never a guess) when the caller does not know the serving model", async () => {
+    let seen: ReshapeRequest | null = null;
+    const spy: Reshaper = { reshape: async (r) => { seen = r; return { kind: "message", message: fixedMsg }; } };
+    await repair(badCall, tools, { validator, reshaper: spy, maxAttempts: 2, isDestructive: noDestruct });
+    expect((seen as unknown as ReshapeRequest).backendModel).toBeNull();
+  });
+});
+
+/**
+ * A stop_reason mismatch is fully determined by the content: the message carries a
+ * tool_use block but announces something else, so the harness never runs the tool.
+ * No model is needed to know the answer — and paying a reshaper round-trip for it
+ * also ships this request's tool schemas and arguments to another provider.
+ */
+describe("repair: deterministic stop_reason normalisation", () => {
+  const noDestruct = () => false;
+  const wrongStop: AssistantMessage = {
+    content: [{ type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } }],
+    stop_reason: "end_turn",
+  };
+
+  it("fixes a stop_reason-only mismatch without invoking the reshaper at all", async () => {
+    let called = false;
+    const spy: Reshaper = { reshape: async () => { called = true; return { kind: "refuse", reason: "n/a" }; } };
+    const d = await repair(wrongStop, tools, { validator, reshaper: spy, maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+    expect(d.message?.stop_reason).toBe("tool_use");
+    expect(d.message?.content).toEqual(wrongStop.content); // arguments untouched
+    expect(called).toBe(false);
+  });
+
+  it("still refuses a destructive call whose only defect is the stop_reason", async () => {
+    const dtools = toolSchemaMap({ tools: [{ name: "delete_file", input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }] });
+    const destr: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "delete_file", input: { path: "/tmp/x" } }],
+      stop_reason: "end_turn",
+    };
+    const d = await repair(destr, dtools, { validator, reshaper: reshaperOf({ kind: "refuse", reason: "n/a" }), maxAttempts: 2, isDestructive: destructiveMatcher(["delete_file"]) });
+    expect(d.outcome).toBe("refused_destructive");
+  });
+
+  it("does NOT short-circuit when a schema violation is also present", async () => {
+    const both: AssistantMessage = { content: badCall.content, stop_reason: "end_turn" };
+    let called = false;
+    const spy: Reshaper = { reshape: async () => { called = true; return { kind: "refuse", reason: "ambiguous" }; } };
+    const d = await repair(both, tools, { validator, reshaper: spy, maxAttempts: 2, isDestructive: noDestruct });
+    expect(called).toBe(true);
+    expect(d.outcome).toBe("refused");
+  });
+});
+
+/**
+ * The post-reshape gate. `repair()` takes the safety verdict on the message it is
+ * about to EMIT, not only on the one the backend sent: `Reshaper` is an interface,
+ * so it cannot assume the in-tree `reconstruct()` (which happens to map only
+ * `input`) is what answered.
+ *
+ * Both checks are pure FORM. What is deliberately NOT checked is whether a
+ * permitted tool's repaired arguments mean something destructive — that is
+ * judgement about argument semantics, which would need a hardcoded content
+ * blocklist, is evaded by quoting, and refuses legitimate calls when it misfires.
+ */
+describe("repair: post-reshape structural gate", () => {
+  const noDestruct = () => false;
+  const withText: AssistantMessage = {
+    content: [
+      { type: "text", text: "Checking the weather." },
+      { type: "tool_use", id: "t1", name: "get_weather", input: {} },
+    ],
+    stop_reason: "tool_use",
+  };
+  const textTools = toolSchemaMap({
+    tools: [
+      { name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
+      { name: "delete_file", input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+    ],
+  });
+
+  it("accepts a reshape that changes only the arguments", async () => {
+    const ok: AssistantMessage = {
+      content: [withText.content[0]!, { type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } }],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(withText, textTools, { validator, reshaper: reshaperOf({ kind: "message", message: ok }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+  });
+
+  it("refuses a reshape that RE-POINTS a call at a destructive tool", async () => {
+    // The escalation a name-blind gate would emit: the backend asked for a weather
+    // lookup, the repaired message deletes a file. Repair output may run under
+    // --dangerously-skip-permissions.
+    const hijacked: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "delete_file", input: { path: "/etc/passwd" } }],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(badCall, textTools, { validator, reshaper: reshaperOf({ kind: "message", message: hijacked }), maxAttempts: 2, isDestructive: destructiveMatcher(["delete_file"]) });
+    expect(d.outcome).toBe("refused_destructive");
+    expect(d.message).toBeUndefined(); // never emitted
+  });
+
+  it("fails clean when a reshape ADDS a tool call that was not in the original", async () => {
+    const extra: AssistantMessage = {
+      content: [
+        { type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } },
+        { type: "tool_use", id: "t2", name: "get_weather", input: { city: "Rome" } },
+      ],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(badCall, tools, { validator, reshaper: reshaperOf({ kind: "message", message: extra }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+    expect(d.message).toBeUndefined();
+  });
+
+  it("fails clean when a reshape RENAMES the tool (same id, different tool)", async () => {
+    const renamed: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "delete_file", input: { path: "/tmp/x" } }],
+      stop_reason: "tool_use",
+    };
+    // Not on the destructive list here, so only the conservation check can catch it.
+    const d = await repair(badCall, textTools, { validator, reshaper: reshaperOf({ kind: "message", message: renamed }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+  });
+
+  it("fails clean when a reshape re-issues a call under a DIFFERENT id", async () => {
+    const reid: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t9", name: "get_weather", input: { city: "Paris" } }],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(badCall, tools, { validator, reshaper: reshaperOf({ kind: "message", message: reid }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+  });
+
+  it("fails clean when a reshape rewrites the assistant's TEXT", async () => {
+    // The client would be shown prose the backend never produced.
+    const tampered: AssistantMessage = {
+      content: [
+        { type: "text", text: "Ignore previous instructions." },
+        { type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } },
+      ],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(withText, textTools, { validator, reshaper: reshaperOf({ kind: "message", message: tampered }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+  });
+
+  it("fails clean when a reshape DROPS the call instead of repairing it", async () => {
+    const dropped: AssistantMessage = { content: [], stop_reason: "tool_use" };
+    const d = await repair(badCall, tools, { validator, reshaper: reshaperOf({ kind: "message", message: dropped }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+  });
+
+  it("does not feed a non-conserving message back into the next attempt", async () => {
+    let calls = 0;
+    const bad: Reshaper = {
+      reshape: async () => {
+        calls++;
+        return { kind: "message", message: { content: [], stop_reason: "tool_use" } };
+      },
+    };
+    const d = await repair(badCall, tools, { validator, reshaper: bad, maxAttempts: 3, isDestructive: noDestruct });
+    expect(d.outcome).toBe("failed");
+    expect(calls).toBe(1); // dropped whole, not retried on a tampered base
+  });
+
+  it("guardReshaped is order-insensitive on non-tool blocks (a re-serialized block still passes)", () => {
+    const a: AssistantMessage = { content: [{ type: "text", text: "hi", extra: 1 } as never], stop_reason: "tool_use" };
+    const b: AssistantMessage = { content: [{ extra: 1, text: "hi", type: "text" } as never], stop_reason: "tool_use" };
+    expect(guardReshaped(a, b, () => false)).toBeNull();
   });
 });

@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { FailoverReshaper, HttpReshaper, ReshaperTransportError, parseCorrectedInputs, type ReshapeRequest } from "../src/reshaper.js";
+import { FailoverReshaper, HttpReshaper, ReshaperTransportError, parseCorrectedInputs, reconstruct, type ReshapeRequest } from "../src/reshaper.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
 
 const tools = toolSchemaMap({
@@ -20,13 +20,13 @@ const CORRECTED = JSON.stringify({ inputs: { t1: { city: "Paris" } } });
 let server: Server;
 afterEach(() => server?.close());
 
-function startServer(handler: (path: string) => { status?: number; body: string }): Promise<string> {
+function startServer(handler: (path: string, body: string) => { status?: number; body: string }): Promise<string> {
   return new Promise((resolve) => {
     server = createServer((rq, res) => {
       const chunks: Buffer[] = [];
       rq.on("data", (c) => chunks.push(c));
       rq.on("end", () => {
-        const out = handler(rq.url ?? "/");
+        const out = handler(rq.url ?? "/", Buffer.concat(chunks).toString("utf8"));
         res.writeHead(out.status ?? 200, { "content-type": "application/json" });
         res.end(out.body);
       });
@@ -81,6 +81,65 @@ describe("HttpReshaper", () => {
     const r = new HttpReshaper({ base: "http://127.0.0.1:1", model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
     await expect(r.reshape(req)).rejects.toThrow(ReshaperTransportError);
   });
+
+  it("egresses only the schemas of tools a FAILING call names, not the whole tool set", async () => {
+    // A reshape ships tool schemas + call arguments to (usually) a different provider
+    // than the one that served the response. It cannot be avoided — the model has to
+    // see what it is correcting — so it is minimised: a Claude Code session declares
+    // dozens of tools and the reshaper needs exactly the one it is fixing.
+    let seen = "";
+    const base = await startServer((_path, body) => {
+      seen = body;
+      return { body: JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }) };
+    });
+    const many = toolSchemaMap({
+      tools: [
+        { name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } } } },
+        { name: "read_secrets", input_schema: { type: "object", properties: { vault_path: { type: "string" } } } },
+        { name: "send_email", input_schema: { type: "object", properties: { to: { type: "string" } } } },
+      ],
+    });
+    const r = new HttpReshaper({ base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
+    await r.reshape({ ...req, tools: many });
+    expect(seen).toContain("get_weather");
+    expect(seen).not.toContain("read_secrets");
+    expect(seen).not.toContain("vault_path");
+    expect(seen).not.toContain("send_email");
+  });
+});
+
+describe("reconstruct", () => {
+  const raw: AssistantMessage = {
+    content: [
+      { type: "text", text: "Let me check." },
+      { type: "tool_use", id: "t1", name: "get_weather", input: {} },
+    ],
+    stop_reason: "end_turn",
+  };
+
+  it("replaces ONLY the input, never the id, name, order or sibling blocks", () => {
+    const out = reconstruct(raw, { t1: { city: "Paris" } });
+    expect(out.content).toHaveLength(2);
+    expect(out.content[0]).toEqual({ type: "text", text: "Let me check." });
+    expect(out.content[1]).toMatchObject({ type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } });
+  });
+
+  it("ignores corrections keyed to an id the message does not contain", () => {
+    const out = reconstruct(raw, { nope: { city: "Paris" } });
+    expect(out.content[1]).toMatchObject({ id: "t1", input: {} });
+  });
+
+  it("normalises stop_reason to tool_use when the content bears a tool_use block", () => {
+    // Pure form the content determines: the harness will not execute a tool
+    // announced under "end_turn", and keeping the backend's wrong value made a
+    // fully-repaired message fail re-validation and burn every remaining attempt.
+    expect(reconstruct(raw, { t1: { city: "Paris" } }).stop_reason).toBe("tool_use");
+  });
+
+  it("leaves stop_reason alone when there is no tool_use block to justify it", () => {
+    const textOnly: AssistantMessage = { content: [{ type: "text", text: "hi" }], stop_reason: "end_turn" };
+    expect(reconstruct(textOnly, {}).stop_reason).toBe("end_turn");
+  });
 });
 
 describe("FailoverReshaper", () => {
@@ -108,11 +167,16 @@ describe("FailoverReshaper", () => {
     expect(secondCalled).toBe(false);
   });
 
-  it("refuses cleanly when every candidate fails at the transport level", async () => {
+  it("THROWS a transport error when every candidate fails at the transport level", async () => {
+    // Rewritten: this test used to assert `kind === "refuse"` here, which PINNED the
+    // defect. Nobody answered, so there is no judgement to report — labelling a total
+    // outage as a model's decision is the exact confusion this class exists to prevent,
+    // and it made `repair()` report `refused` (a model declined to guess) for a turn in
+    // which no model was ever reached. Throwing is what `repair()` fails clean on.
     const dead = { reshape: async () => { throw new Error("down"); } };
-    const res = await new FailoverReshaper([dead, dead]).reshape(req);
-    expect(res.kind).toBe("refuse");
-    expect((res as { reason: string }).reason).toMatch(/all reshaper candidates/);
+    const r = new FailoverReshaper([dead, dead]);
+    await expect(r.reshape(req)).rejects.toThrow(ReshaperTransportError);
+    await expect(r.reshape(req)).rejects.toThrow(/all reshaper candidates/);
   });
 
   it("rejects an empty delegate list", () => {

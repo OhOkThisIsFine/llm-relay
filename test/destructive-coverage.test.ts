@@ -62,6 +62,66 @@ describe("destructive-tool coverage (ARC-4e8f64b6)", () => {
   });
 });
 
+/**
+ * The assertions above enumerate example names, which is exactly how the previous
+ * gap survived: satisfying `Bash`/`Write`/`Edit` positively and `PushNotification`
+ * negatively still left `MultiEdit`, `NotebookEdit` and `BashOutput` unasserted, and
+ * a hand-written list goes stale the moment the harness ships another tool.
+ *
+ * These assert the POLICY instead, derived from `DEFAULT_DESTRUCTIVE` itself, so a
+ * name added to the list is automatically held to the same rules. `HARNESS_MUTATING`
+ * is the one list that must still be maintained by hand — it is the REQUIREMENT
+ * (what the harness can destroy), not the implementation, and it is where a new
+ * Claude Code write/execute tool gets recorded.
+ */
+describe("destructive-tool matching POLICY (not a fixed example set)", () => {
+  const isDestructive = destructiveMatcher(DEFAULT_DESTRUCTIVE);
+  /** Every Claude Code tool that writes, deletes or executes. Update when the harness adds one. */
+  const HARNESS_MUTATING = ["Bash", "BashOutput", "Write", "Edit", "MultiEdit", "NotebookEdit"];
+  /** Harness tools that only read or search — refusing these breaks working sessions. */
+  const HARNESS_READONLY = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite", "Task"];
+  const exactPatterns = DEFAULT_DESTRUCTIVE.filter((p) => !p.endsWith("*"));
+
+  it("covers the WHOLE harness mutating set, not a sample of it", () => {
+    const uncovered = HARNESS_MUTATING.filter((n) => !isDestructive(n));
+    expect(uncovered, `harness tools left unguarded: ${uncovered.join(", ")}`).toEqual([]);
+    // And the list is the mechanism, so a name can only be covered by being on it.
+    expect(HARNESS_MUTATING.every((n) => DEFAULT_DESTRUCTIVE.includes(n))).toBe(true);
+  });
+
+  it("matches EVERY configured pattern, in any case", () => {
+    for (const p of exactPatterns) {
+      expect(isDestructive(p), `${p} is configured but not matched`).toBe(true);
+      expect(isDestructive(p.toUpperCase()), `${p} must match case-insensitively`).toBe(true);
+      expect(isDestructive(p.toLowerCase())).toBe(true);
+    }
+  });
+
+  it("never matches a name that merely CONTAINS a configured pattern", () => {
+    // The property that makes PushNotification/ResetZoom safe, asserted for every
+    // entry rather than for the two names that happened to bite us.
+    const decorate = (p: string) => [`Safe${p}`, `${p}Viewer`, `my_${p}_helper`];
+    for (const p of exactPatterns) {
+      for (const name of decorate(p)) {
+        if (DEFAULT_DESTRUCTIVE.some((d) => d.toLowerCase() === name.toLowerCase())) continue;
+        expect(isDestructive(name), `${name} must not match the pattern "${p}"`).toBe(false);
+      }
+    }
+  });
+
+  it("permits every read-only harness tool", () => {
+    const wrongly = HARNESS_READONLY.filter((n) => isDestructive(n));
+    expect(wrongly, `safe tools refused: ${wrongly.join(", ")}`).toEqual([]);
+  });
+
+  it("has no implicit built-in destructive set — the config list is the only source", () => {
+    // An empty `repair.destructiveTools` must refuse nothing, so coverage is always
+    // traceable to config rather than to a hidden table in src/.
+    const none = destructiveMatcher([]);
+    for (const n of [...HARNESS_MUTATING, ...HARNESS_READONLY]) expect(none(n)).toBe(false);
+  });
+});
+
 describe("the destructive list has ONE definition", () => {
   it("the shipped config template equals DEFAULT_DESTRUCTIVE", async () => {
     // The four-way drift: config.ts had 8 entries including "remove" while
