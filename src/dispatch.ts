@@ -21,6 +21,21 @@ import type { Config, LadderRung } from "./config.js";
  *  a "try again soon", not a claim about the vendor's reset window. */
 export const DEFAULT_EXHAUSTED_MS = 15 * 60 * 1000;
 
+/**
+ * Ceiling on a host-reported cooldown (30 days). Not a policy about vendors — a bound that keeps
+ * `readyAt` a representable date. `Math.max(0, ttlMs)` alone let a caller-supplied `Infinity`
+ * (a legal JSON number: `1e999` parses to it, and `typeof Infinity === "number"` passes every
+ * numeric type guard upstream) reach `new Date(Infinity).toISOString()`, which throws
+ * `RangeError: Invalid time value`. That poisoned the cooldown map permanently: every later
+ * `buildDispatch` threw while rendering the same lane, so one bad exhaustion report took the whole
+ * ladder down until the process restarted. A cooldown is advisory, so clamping is the right
+ * response — refusing the report would lose a real "this lane is spent" signal.
+ */
+export const MAX_EXHAUSTED_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Longest caller-supplied id echoed back in a `reason`. See `describeId`. */
+const MAX_ECHOED_ID = 120;
+
 export type LaneState = "ready" | "exhausted" | "disabled";
 
 export interface DispatchLane {
@@ -65,21 +80,55 @@ export interface DispatchOptions {
   after?: string;
 }
 
-/** rung id or quota bucket → epoch ms at which it is eligible again. */
-const exhausted = new Map<string, number>();
+/**
+ * Cooldown state, scoped to the `Config` it was reported against.
+ *
+ * It used to be one module-level `Map` shared by the whole process, keyed by `rung:<id>` /
+ * `quota:<name>`. Those keys are namespaced by nothing: two `Config`s live in one process (a test
+ * file, a future reload, any library caller holding more than one) collided whenever they happened
+ * to name a rung or a quota bucket the same, so exhausting a lane in one silently parked an
+ * unrelated lane in the other — and `clearExhausted(cfg)` with no id wiped every config's state,
+ * not the caller's. Cooldowns describe *this* ladder, so they belong to it.
+ *
+ * A `WeakMap` because the state's whole lifetime is the config's: when the config is gone there is
+ * no ladder left to cool down, and nothing should keep the entry alive.
+ */
+const cooldowns = new WeakMap<Config, Map<string, number>>();
+
+/** rung id or quota bucket → epoch ms at which it is eligible again, for THIS config. */
+function cooldownsFor(cfg: Config): Map<string, number> {
+  let m = cooldowns.get(cfg);
+  if (!m) {
+    m = new Map<string, number>();
+    cooldowns.set(cfg, m);
+  }
+  return m;
+}
 
 function cooldownKey(rung: LadderRung): string {
   return rung.quota ? `quota:${rung.quota}` : `rung:${rung.id}`;
 }
 
-function cooldownUntil(rung: LadderRung, now: number): number | null {
-  const until = exhausted.get(cooldownKey(rung));
+function cooldownUntil(cfg: Config, rung: LadderRung, now: number): number | null {
+  const map = cooldownsFor(cfg);
+  const until = map.get(cooldownKey(rung));
   if (until === undefined) return null;
   if (until <= now) {
-    exhausted.delete(cooldownKey(rung));
+    map.delete(cooldownKey(rung));
     return null;
   }
   return until;
+}
+
+/**
+ * Clamp a host-reported TTL to a finite, representable window. A cooldown is advisory, so a
+ * nonsense value is corrected rather than rejected — dropping the report would discard a real
+ * "this lane is spent" signal over a bad number. See `MAX_EXHAUSTED_MS` for what an unclamped
+ * `Infinity`/`NaN` did to the ladder.
+ */
+function normalizeTtl(ttlMs: unknown): number {
+  if (typeof ttlMs !== "number" || !Number.isFinite(ttlMs)) return DEFAULT_EXHAUSTED_MS;
+  return Math.min(MAX_EXHAUSTED_MS, Math.max(0, ttlMs));
 }
 
 /**
@@ -89,28 +138,79 @@ function cooldownUntil(rung: LadderRung, now: number): number | null {
  *
  * Unknown id is not an error: a host walking a ladder it half-remembers should not get a 500.
  */
-export function markExhausted(cfg: Config, id: string, ttlMs = DEFAULT_EXHAUSTED_MS): boolean {
+export function markExhausted(cfg: Config, id: string, ttlMs: number = DEFAULT_EXHAUSTED_MS): boolean {
+  if (typeof id !== "string" || id.length === 0) return false;
   const rung = (cfg.routing.ladder ?? []).find((r) => r.id === id);
   if (!rung) return false;
-  exhausted.set(cooldownKey(rung), Date.now() + Math.max(0, ttlMs));
+  cooldownsFor(cfg).set(cooldownKey(rung), Date.now() + normalizeTtl(ttlMs));
   return true;
 }
 
-/** Clear one rung's cooldown, or every cooldown when no id is given. */
+/** Clear one rung's cooldown, or every cooldown for this config when no id is given. */
 export function clearExhausted(cfg: Config, id?: string): void {
   if (id === undefined) {
-    exhausted.clear();
+    cooldownsFor(cfg).clear();
     return;
   }
+  if (typeof id !== "string") return;
   const rung = (cfg.routing.ladder ?? []).find((r) => r.id === id);
-  if (rung) exhausted.delete(cooldownKey(rung));
+  if (rung) cooldownsFor(cfg).delete(cooldownKey(rung));
 }
 
 /** The placeholder a cli rung's args must contain; substituted with the task text. */
 export const TASK_TOKEN = "{task}";
 
+/**
+ * Normalize the caller's options. `DispatchOptions` is typed, but nothing type-checks the values
+ * that actually arrive: they come off a raw query string (`GET /dispatch?task=…&lane=…`) or a
+ * JSON body, so at runtime any field can be a number, an array, an object or null. TypeScript
+ * cannot catch that at the boundary, so this does.
+ *
+ * Deliberately narrow. It normalizes what this module OWNS — the shape of its own inputs — and
+ * nothing else:
+ *  - a non-string field is treated as absent, because a caller who sent one cannot have meant a
+ *    lane id or a task, and coercing it would invent an intent;
+ *  - a blank `task` is treated as absent, so the `{task}` placeholder stays visible instead of
+ *    rendering an argv element that asks the agent to do nothing — that is exactly the case the
+ *    substitution site already documents;
+ *  - a blank `lane`/`after` is treated as absent, because an empty override is not an override,
+ *    and reporting it as a missed lookup would blame the host for a parameter it never set.
+ *
+ * It does NOT length-bound or sanitize the task text. Bounding request input belongs to whoever
+ * accepts the request (`server.ts` already rejects an oversized `?task=`), and a second limit here
+ * would be a duplicate that can silently drift out of step with it. Shell-quoting the rendered
+ * command is the renderer's job. This module's guarantee about `task` remains the one it has
+ * always had: the substitution stays inside a single argv element.
+ */
+function normalizeOptions(opts: DispatchOptions): DispatchOptions {
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
+  const out: DispatchOptions = {};
+  const task = str(opts.task);
+  if (task !== undefined && task.trim().length > 0) out.task = task;
+  const lane = str(opts.lane);
+  if (lane !== undefined) out.lane = lane;
+  const after = str(opts.after);
+  if (after !== undefined) out.after = after;
+  return out;
+}
+
+/** C0 + C1 control characters, including ESC — never legal in a rung id, and the ANSI carrier. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+
+/**
+ * Render a caller-supplied id for a `reason` string. The reason is reflected back verbatim in the
+ * JSON response AND printed to a terminal by `llm-relay dispatch`, so echoing raw caller input let
+ * a `?lane=` carrying ESC sequences rewrite the operator's terminal, and an arbitrarily long one
+ * bloat a response about a lane that does not exist. Control characters go, and the echo is capped
+ * — enough to recognise your own typo, not a channel.
+ */
+function describeId(id: string): string {
+  const clean = id.replace(CONTROL_CHARS, "\uFFFD");
+  return clean.length > MAX_ECHOED_ID ? `${clean.slice(0, MAX_ECHOED_ID)}\u2026` : clean;
+}
+
 function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchOptions, now: number): DispatchLane {
-  const until = cooldownUntil(rung, now);
+  const until = cooldownUntil(cfg, rung, now);
   const state: LaneState = !rung.enabled ? "disabled" : until !== null ? "exhausted" : "ready";
 
   const lane: DispatchLane = { id: rung.id, kind: rung.kind, position, state };
@@ -133,7 +233,8 @@ function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchO
   return lane;
 }
 
-export function buildDispatch(cfg: Config, opts: DispatchOptions = {}): DispatchView {
+export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): DispatchView {
+  const opts = normalizeOptions(rawOpts ?? {});
   const now = Date.now();
   const rungs = cfg.routing.ladder ?? [];
   const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now));
@@ -155,7 +256,7 @@ export function buildDispatch(cfg: Config, opts: DispatchOptions = {}): Dispatch
         offload,
         ladder,
         next: null,
-        reason: `no lane "${opts.lane}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
+        reason: `no lane "${describeId(opts.lane)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
       };
     }
     // An explicit override is honoured even when the rung is cooling down or parked: the host
@@ -179,7 +280,7 @@ export function buildDispatch(cfg: Config, opts: DispatchOptions = {}): Dispatch
         offload,
         ladder,
         next: null,
-        reason: `no lane "${opts.after}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
+        reason: `no lane "${describeId(opts.after)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
       };
     }
     pool = ladder.slice(idx + 1);
@@ -193,14 +294,14 @@ export function buildDispatch(cfg: Config, opts: DispatchOptions = {}): Dispatch
       next: null,
       reason:
         opts.after !== undefined
-          ? `no ready lane after "${opts.after}" — the ladder is exhausted`
+          ? `no ready lane after "${describeId(opts.after)}" — the ladder is exhausted`
           : "every lane is exhausted or disabled",
     };
   }
 
   const why =
     opts.after !== undefined
-      ? `first ready lane after "${opts.after}"`
+      ? `first ready lane after "${describeId(opts.after)}"`
       : next.position === 1
         ? "first lane in the ladder"
         : `first ready lane (${next.position - 1} ahead of it unavailable)`;
