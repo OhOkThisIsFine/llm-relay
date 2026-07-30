@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, resolveTargets, subagentSpec } from "../src/config.js";
 
 let dir: string;
 function write(cfg: unknown): string {
@@ -75,6 +75,39 @@ describe("provider with an unset ${ENV} in base", () => {
       routing: { default: "good/m", pools: { coding: ["good/m", "typoed/m"] } },
     };
     expect(() => loadConfig(write(cfg))).toThrow(/typoed/);
+  });
+
+  /**
+   * A degraded pool must degrade to its SURVIVORS, never to routing.default. Falling through to
+   * the passthrough is the failure this whole area exists to prevent: the subagent still answers,
+   * so nothing looks wrong, while the traffic quietly lands on primary quota.
+   */
+  it("routes a subagent to the pool's surviving member, not to the default passthrough", () => {
+    const cfg = loadConfig(
+      write({
+        ...base,
+        providers: {
+          ...base.providers,
+          passthru: { base: "https://passthrough.test", kind: "anthropic" },
+        },
+        routing: {
+          default: "passthru",
+          pools: { coding: ["needsvar/m", "good/m"] },
+          subagents: { default: "pool/coding" },
+          offload: true,
+          benchmarkSort: false,
+        },
+      }),
+    );
+
+    expect((cfg.warnings ?? []).join("\n")).toContain("needsvar/m");
+    const sub = {
+      system: "cc_is_subagent=true;",
+      messages: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+    };
+    expect(subagentSpec(sub, "claude-opus-5", cfg)).toBe("pool/coding");
+    // The disabled member is gone and the survivor is used — "passthru" must not appear.
+    expect(resolveTargets("pool/coding", cfg).map((t) => t.provider)).toEqual(["good"]);
   });
 
   it("fails loudly when disabling leaves a pool with no members at all", () => {
