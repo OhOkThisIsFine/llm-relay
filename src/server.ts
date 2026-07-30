@@ -127,8 +127,14 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   };
 
   return createServer((req, res) => {
+    const started = Date.now();
     handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper, catalog, pingLoop }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
+      // Last-resort net. `handle` logs every turn it terminates itself, so reaching
+      // here means a turn ended with NO log record — the operator would see a client
+      // error with nothing at all in the log to match it against. A duplicate line
+      // in some future edge case is much cheaper than an invisible request.
+      logger.write(baseLog(started, req.url ?? "/", null, false, false, 502, "skipped", null));
     });
   });
 }
@@ -153,7 +159,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const msg = (e as Error).message;
     const status = msg.includes("too large") ? 413 : 400;
     failClosed(res, status, msg);
-    h.logger.write(baseLog(started, path, null, false, false, status, "skipped"));
+    h.logger.write(baseLog(started, path, null, false, false, status, "skipped", null));
     return;
   }
 
@@ -175,7 +181,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
     return;
   }
 
@@ -185,7 +191,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, pingMode: h.pingLoop?.getMode(), intervalMs: h.pingLoop?.getIntervalMs() }));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
     return;
   }
 
@@ -199,7 +205,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(stats));
 
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
     return;
   }
 
@@ -214,7 +220,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
     return;
   }
 
@@ -225,7 +231,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const denied = admissionFailure(req, req.method === "POST");
     if (denied) {
       failClosed(res, 403, denied);
-      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped"));
+      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped", null));
       return;
     }
     let state = offloadState(cfg);
@@ -233,14 +239,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const want = (reqJson as { enabled?: unknown } | undefined)?.enabled;
       if (typeof want !== "boolean") {
         failClosed(res, 400, `POST /offload needs a JSON body {"enabled": true|false}`);
-        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
         return;
       }
       state = setOffload(cfg, want);
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(state, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
     return;
   }
 
@@ -252,7 +258,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const deniedDispatch = admissionFailure(req, req.method === "POST");
     if (deniedDispatch) {
       failClosed(res, 403, deniedDispatch);
-      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped"));
+      h.logger.write(baseLog(started, path, model, false, false, 403, "skipped", null));
       return;
     }
     if (req.method === "POST") {
@@ -265,12 +271,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       } else if (typeof body.exhausted === "string") {
         if (!markExhausted(cfg, body.exhausted, ttlMs)) {
           failClosed(res, 400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
-          h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+          h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
           return;
         }
       } else {
         failClosed(res, 400, `POST /dispatch needs {"exhausted":"<lane>"} or {"clear":"<lane>"|true}`);
-        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+        h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
         return;
       }
     }
@@ -280,7 +286,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const rawTask = pickQuery(path, "task");
     if (typeof rawTask === "string" && rawTask.length > MAX_TASK_LEN) {
       failClosed(res, 400, `?task= exceeds ${MAX_TASK_LEN} characters`);
-      h.logger.write(baseLog(started, path, model, false, false, 400, "skipped"));
+      h.logger.write(baseLog(started, path, model, false, false, 400, "skipped", null));
       return;
     }
     const taskParam = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : undefined;
@@ -291,7 +297,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
     return;
   }
 
@@ -299,7 +305,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const report = getTelemetryReport(cfg, globalCircuitBreaker);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(report, null, 2));
-    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped"));
+    h.logger.write(baseLog(started, path, model, false, false, 200, "skipped", null));
     return;
   }
 
@@ -307,31 +313,50 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
   const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
 
-  // A SUBAGENT request may route somewhere other than its nominal model: either an explicit
-  // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it) or
-  // routing.subagents[<tier>]. Main-conversation requests are untouched, which is what lets
-  // routing.tiers stay pointed at an Anthropic passthrough.
-  const subSpec = isMessages ? subagentSpec(reqJson, model, cfg) : null;
-  const routedModel = subSpec ?? model;
-  // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson
-  // in place, and it must not reach the backend even when the spec matches the nominal model.
-  if (subSpec !== null) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
-
   // Route the request's model to a concrete provider + backend model candidates.
+  //
+  // ⚠ `subagentSpec` must run INSIDE this try. It throws `RoutingError` for an
+  // unresolvable `@relay:` directive, and while it sat outside, that throw escaped
+  // to `createProxy`'s top-level catch and surfaced as `502 llm-relay internal
+  // error: …` with NO log line — fail-closed and loud, but mislabelled as a proxy
+  // bug and invisible to the operator. A bad directive is a client routing error
+  // (400) like any other unresolvable spec.
   let targetCandidates: ResolvedTarget[];
   try {
+    // A SUBAGENT request may route somewhere other than its nominal model: either an explicit
+    // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it) or
+    // routing.subagents[<tier>]. Main-conversation requests are untouched, which is what lets
+    // routing.tiers stay pointed at an Anthropic passthrough.
+    const subSpec = isMessages ? subagentSpec(reqJson, model, cfg) : null;
+    const routedModel = subSpec ?? model;
+    // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson
+    // in place, and it must not reach the backend even when the spec matches the nominal model.
+    if (subSpec !== null) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
     targetCandidates = resolveTargets(routedModel, cfg);
   } catch (e) {
     if (e instanceof RoutingError) {
       failClosed(res, 400, `llm-relay routing: ${e.message}`);
-      h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped"));
+      h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped", null));
       return;
     }
     throw e;
   }
 
-  // Filter candidates by circuit breaker health
-  const healthyTargets = globalCircuitBreaker.getHealthyTargets(targetCandidates);
+  // Demote candidates whose breaker is open — and do NOTHING else to the order.
+  //
+  // ⚠ Deliberately NOT `getHealthyTargets()`: that filters AND re-sorts by measured
+  // stability, which is a second ranking pass competing with the capability ranking
+  // `resolveTargets` (→ `rankTargetsByBenchmark`) already applied. Two ranking passes
+  // means neither decides the order, and live health then PROMOTES on evidence that
+  // is often a single request's latency. Health is used here only to demote, never
+  // to promote: a target the breaker is cooling steps aside, everything else keeps
+  // its benchmark rank. (The re-sort was invisible for as long as an untracked target
+  // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
+  //
+  // When EVERY candidate is cooling there is nothing left to prefer, so the full
+  // ranked list is tried rather than failing the request outright.
+  const healthy = targetCandidates.filter((t) => globalCircuitBreaker.isHealthy(t));
+  const healthyTargets = healthy.length > 0 ? healthy : targetCandidates;
   let target = healthyTargets[0]!;
 
   // Context guardrail — enforced ONLY against a limit the serving provider published about its own
@@ -354,7 +379,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds the context limit ` +
             `"${target.provider}" publishes for "${target.model}" (${limits.contextLength})`,
         );
-        h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped"));
+        h.logger.write(baseLog(started, path, model, hadTools, false, 400, "skipped", null));
         return;
       }
     }
@@ -378,12 +403,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const input_tokens = estimateInputTokens(reqJson);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ input_tokens }));
-      h.logger.write(baseLog(started, path, model, hadTools, false, 200, "skipped"));
+      h.logger.write(baseLog(started, path, model, hadTools, false, 200, "skipped", null));
       return;
     }
     if (!isMessages) {
       failClosed(res, 404, `llm-relay: path not supported for an openai backend: ${pathname}`);
-      h.logger.write(baseLog(started, path, model, hadTools, false, 404, "skipped"));
+      h.logger.write(baseLog(started, path, model, hadTools, false, 404, "skipped", null));
       return;
     }
   }
@@ -415,6 +440,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       } catch (e) {
         clearTimeout(timer);
         res.off("close", onResClose);
+        if (e instanceof CredentialConfigError) {
+          // A declared-but-unset credential is a CONFIGURATION fault, not a transport
+          // one: the target is not unhealthy, so it must not be recorded as a breaker
+          // failure, and walking to the next candidate would quietly serve the request
+          // from somewhere else while the misconfiguration stayed invisible. Nothing
+          // was forwarded — buildForwardHeaders threw before returning any headers.
+          failClosed(res, 502, `llm-relay configuration: ${e.message}`);
+          h.logger.write(baseLog(started, path, model, hadTools, false, 502, "skipped", null));
+          return;
+        }
         const aborted = controller.signal.aborted;
         const status = aborted ? 504 : 502;
         globalCircuitBreaker.recordOutcome(target, { ok: false, status, elapsedMs: Date.now() - started });
@@ -426,7 +461,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         }
 
         failClosed(res, status, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
-        h.logger.write(baseLog(started, path, model, hadTools, false, status, "skipped"));
+        h.logger.write(baseLog(started, path, model, hadTools, false, status, "skipped", target));
         return;
       }
 
@@ -454,9 +489,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
 
       if (doRepair) {
-        await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, req }, h);
+        await repairPath(res, backendRes, timer, { tools, model, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, req, target }, h);
       } else {
-        await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools, req }, h);
+        await transparentPath(res, backendRes, timer, { tools, model, streamed, willValidate, started, path, hadTools, req, target }, h);
       }
       return;
     } finally {
@@ -483,12 +518,21 @@ function recordCall(target: ResolvedTarget, ok: boolean, started: number): void 
 
 interface Ctx {
   tools: Map<string, JsonSchema | null>;
+  /** The model the CLIENT asked for. Use `target` for the one that answered. */
   model: string | null;
   streamed: boolean;
   started: number;
   path: string;
   hadTools: boolean;
   req?: IncomingMessage;
+  /**
+   * The target this response actually came from — the resolved (provider, model)
+   * after tier/pool expansion, subagent redirection and failover. Every log record
+   * and the reshaper's `backendModel` read it, so a repair attributes the malformed
+   * call to the deployment that produced it rather than to whatever id the client
+   * happened to send.
+   */
+  target: ResolvedTarget;
 }
 
 /**
@@ -525,9 +569,10 @@ async function openAiFrontPath(
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
     }
-    h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, false, status, "skipped"));
+    h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, false, status, "skipped", target));
     return;
   }
+  const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
   try {
     res.writeHead(upstream.status, filterResponseHeaders(upstream.headers));
     if (upstream.body) {
@@ -536,12 +581,19 @@ async function openAiFrontPath(
       }
     }
     if (!res.writableEnded) res.end();
+  } catch (e) {
+    const message = midStreamMessage(e);
+    endMidStreamFailure(res, streamed ? openAiSseError(message) : null, message);
+    h.logger.write({
+      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped", target),
+      errorKinds: [MID_STREAM_ERROR_KIND],
+    });
+    return;
   } finally {
     clearTimeout(timer);
     res.off("close", onResClose);
   }
-  const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
-  h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped"));
+  h.logger.write(baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, streamed, upstream.status, "skipped", target));
 }
 
 /** detect/default: forward bytes unchanged, observe + log if applicable. */
@@ -575,6 +627,18 @@ async function transparentPath(
       if (!res.writableEnded) res.end(bytes);
       if (ctx.willValidate && bytes.length <= MAX_VALIDATE_BYTES) assistant = parseAssistant(bytes.toString("utf8"));
     }
+  } catch (e) {
+    // The head was committed at the top of this function, so the client is already
+    // reading a 200. Say the stream broke rather than closing on a truncated answer,
+    // and LOG the turn — this throw used to escape to the top-level catch, which
+    // could only `res.end()` and never logged.
+    const message = midStreamMessage(e);
+    endMidStreamFailure(res, ctx.streamed ? sseError(message) : null, message);
+    h.logger.write({
+      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
+      errorKinds: [MID_STREAM_ERROR_KIND],
+    });
+    return;
   } finally {
     clearTimeout(timer);
   }
@@ -591,7 +655,7 @@ async function transparentPath(
     errorKinds = dedupe(r.errors.map((e) => e.kind));
   }
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, validated),
+    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds,
   });
 }
@@ -697,6 +761,21 @@ async function repairStreamingPath(
       }
     }
     if (work.length) await processFrame(work); // trailing partial frame
+  } catch (e) {
+    // The upstream stream broke part-way. Anything withheld in `held` is a partial
+    // tool call and is DROPPED rather than flushed — half a tool_use is exactly the
+    // malformed call this proxy exists to keep out of the harness — and the client
+    // gets an explicit error event instead of a stream that simply stops. If the
+    // head has not been written yet (a failure before any text frame) this is still
+    // a clean 502. Either way the turn is logged.
+    const message = midStreamMessage(e);
+    held.length = 0;
+    endMidStreamFailure(res, sseError(message), message);
+    h.logger.write({
+      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, true, backendRes.status, "skipped", ctx.target),
+      errorKinds: [MID_STREAM_ERROR_KIND],
+    });
+    return;
   } finally {
     clearTimeout(timer);
   }
@@ -739,6 +818,7 @@ async function repairStreamingPath(
         reshaper: ctx.reshaper,
         maxAttempts: 2,
         isDestructive: h.isDestructive,
+        backendModel: ctx.target.model ?? null,
       });
       repairOutcome = decision.outcome;
       ensureHead(); // message_start + leading text already forwarded
@@ -752,7 +832,7 @@ async function repairStreamingPath(
   }
 
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, true, backendRes.status, validated),
+    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, true, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
 }
@@ -768,6 +848,17 @@ async function repairBufferedPath(
   let bytes: Buffer;
   try {
     bytes = Buffer.from(await backendRes.arrayBuffer());
+  } catch (e) {
+    // Nothing has been written yet on this path, so this is a clean 502 rather than
+    // a truncated body — but it still has to be LOGGED, which the bare finally did
+    // not do: the throw went straight to the top-level catch.
+    const message = midStreamMessage(e);
+    endMidStreamFailure(res, null, message);
+    h.logger.write({
+      ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
+      errorKinds: [MID_STREAM_ERROR_KIND],
+    });
+    return;
   } finally {
     clearTimeout(timer);
   }
@@ -802,6 +893,7 @@ async function repairBufferedPath(
         reshaper: ctx.reshaper,
         maxAttempts: 2,
         isDestructive: h.isDestructive,
+        backendModel: ctx.target.model ?? null,
       });
       repairOutcome = decision.outcome;
       if (decision.outcome === "fixed" && decision.message) {
@@ -814,7 +906,7 @@ async function repairBufferedPath(
   }
 
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, validated),
+    ...baseLog(ctx.started, ctx.path, ctx.model, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
 }
@@ -850,14 +942,33 @@ function toAnthropicMessage(msg: AssistantMessage, model: string | null): object
 }
 
 /** A provider declared an authEnv whose variable is unset — a configuration error, not a passthrough. */
-class CredentialConfigError extends Error {
+export class CredentialConfigError extends Error {
   constructor(provider: string, authEnv: string) {
     super(`provider "${provider}" declares authEnv ${authEnv} but it is unset or blank`);
     this.name = "CredentialConfigError";
   }
 }
 
-function buildForwardHeaders(inbound: IncomingMessage["headers"], target: ResolvedTarget): Record<string, string> {
+/**
+ * The headers forwarded upstream for one request (INV-HS-8).
+ *
+ * Exported so the `declared-missing` branch is directly assertable: it is meant to
+ * be unreachable through the request path (`resolveTargets` drops keyless targets),
+ * so an end-to-end test cannot reach it, and an invariant nothing can check is an
+ * invariant that quietly stops holding.
+ *
+ * The three `CredentialState`s are three different obligations:
+ *  - `not-declared`   — a real passthrough. The caller's own credential is FORWARDED;
+ *                       that is the whole point of the anthropic passthrough.
+ *  - `declared-present` — the provider's own key is attached and the caller's inbound
+ *                       `Authorization`/`x-api-key` are REMOVED, never merged.
+ *  - `declared-missing` — the caller's inbound `Authorization`/`x-api-key` are REMOVED
+ *                       *and* the request fails. "Removed" is strictly stronger than
+ *                       "we did not add one of our own": the defect this replaces
+ *                       satisfied the weaker reading while forwarding the caller's
+ *                       Anthropic token verbatim to a third-party base URL.
+ */
+export function buildForwardHeaders(inbound: IncomingMessage["headers"], target: ResolvedTarget): Record<string, string> {
   const state = credentialState(target.authEnv);
   const apiKey = state === "declared-present" ? process.env[target.authEnv!]?.trim() : undefined;
   // Containment is DECLARED, not inferred from key presence. The old
@@ -871,6 +982,10 @@ function buildForwardHeaders(inbound: IncomingMessage["headers"], target: Resolv
   for (const [k, v] of Object.entries(inbound)) {
     const key = k.toLowerCase();
     if (HOP_BY_HOP.has(key)) continue;
+    // The REMOVAL, for both declared states. It happens before the throw below so
+    // that no code path can observe a header map still carrying the caller's
+    // credential — not the throw's own error, not a future caller that decides to
+    // handle the error and reuse what was built.
     if (stripAuth && INBOUND_AUTH.includes(key)) continue;
     if (v === undefined) continue;
     out[key] = Array.isArray(v) ? v.join(", ") : v;
@@ -966,6 +1081,50 @@ function sseError(message: string): string {
   return `event: error\ndata: ${data}\n\n`;
 }
 
+/** The OpenAI-front equivalent: an error object in a plain `data:` frame. */
+function openAiSseError(message: string): string {
+  return `data: ${JSON.stringify({ error: { message, type: "api_error" } })}\n\n`;
+}
+
+/**
+ * The log `errorKinds` entry for an upstream body that failed part-way through.
+ *
+ * A distinct kind, not a validator error kind: the response was never validated,
+ * it was cut off. It is what makes a truncated turn greppable in the log at all.
+ */
+const MID_STREAM_ERROR_KIND = "backend_stream_failed";
+
+/**
+ * Terminate a response whose upstream body threw PART-WAY THROUGH.
+ *
+ * By the time a body is consumed the head is usually already committed, so
+ * `failClosed` degrades to a bare `res.end()` and the client cannot tell a
+ * truncated answer from a complete one. Where the committed response is a stream
+ * we can still say so — `errorFrame` carries the protocol-appropriate error event
+ * (Anthropic `event: error`, or an OpenAI `data:` frame on the OpenAI front) —
+ * and where it is not, closing is all that remains. Pass `null` for a committed
+ * non-stream response; inventing a frame in the wrong protocol is worse than
+ * closing.
+ *
+ * ⚠ The caller MUST also write a log record. Previously the throw propagated out
+ * of these paths past `h.logger.write` to `createProxy`'s top-level catch, so a
+ * mid-stream backend failure produced a truncated 200 AND no log line at all —
+ * invisible to the operator, and indistinguishable from success to the client.
+ */
+function endMidStreamFailure(res: ServerResponse, errorFrame: string | null, message: string): void {
+  if (res.writableEnded || res.destroyed) return;
+  if (!res.headersSent) {
+    failClosed(res, 502, message);
+    return;
+  }
+  res.end(errorFrame ?? undefined);
+}
+
+/** The client-facing description of a mid-transfer upstream failure. */
+function midStreamMessage(e: unknown): string {
+  return `llm-relay: backend stream failed mid-response: ${(e as Error).message}`;
+}
+
 function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -1033,13 +1192,32 @@ function failClosed(res: ServerResponse, status: number, message: string): void 
   res.end(JSON.stringify({ type: "error", error: { type: "api_error", message } }));
 }
 
+/**
+ * Build the metadata record for one turn.
+ *
+ * `served` is the target a backend request was actually DISPATCHED to, or `null`
+ * when none was — a guardrail rejection, a routing error, an admin endpoint, or
+ * anything answered locally. It is a required parameter, without a default, so
+ * `tsc` names every call site that has not decided which of the two it is: an
+ * absent `servedProvider`/`servedModel` is documented in `log.ts` as "this call
+ * site is unmigrated", and a default would quietly recreate exactly that state.
+ *
+ * `model` (→ the deprecated `backendModel`) is the model the CLIENT asked for and
+ * is routinely NOT the one that answered; it is still emitted only because
+ * `RequestLog.backendModel` is non-optional in `log.ts`, which this module may not
+ * edit. Deleting it there is the remaining half of OBS-b5ade458.
+ */
 function baseLog(
   started: number, path: string, model: string | null, hadTools: boolean,
   streamed: boolean, backendStatus: number, validated: RequestLog["validated"],
+  served: ResolvedTarget | null,
 ): RequestLog {
   return {
     ts: new Date(started).toISOString(),
-    path: logSafePath(path), backendModel: model, hadTools, streamed, backendStatus, validated,
+    path: logSafePath(path), backendModel: model,
+    servedProvider: served ? served.provider : null,
+    servedModel: served ? served.model ?? null : null,
+    hadTools, streamed, backendStatus, validated,
     toolUseCount: 0, uncheckableCount: 0, errorKinds: [], repair: "none",
     latencyMs: Date.now() - started,
   };
