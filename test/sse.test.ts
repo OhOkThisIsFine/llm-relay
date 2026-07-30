@@ -37,6 +37,56 @@ describe("reconstructFromSse", () => {
     expect(m.stop_reason).toBe("end_turn");
   });
 
+  it("captures the backend's own message id, model and usage off message_start", () => {
+    const raw = sse([
+      { type: "message_start", message: { id: "msg_01BackendReal", model: "z-ai/glm-5.2", usage: { input_tokens: 5 } } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9 } },
+    ]);
+    const m = reconstructFromSse(raw);
+    // Without these the repaired response can only be re-emitted under an invented id.
+    expect(m.id).toBe("msg_01BackendReal");
+    expect(m.model).toBe("z-ai/glm-5.2");
+    expect(m.usage).toEqual({ input_tokens: 5, output_tokens: 9 });
+  });
+
+  it("leaves usage ABSENT when the stream never reported any", () => {
+    const raw = sse([
+      { type: "message_start", message: { id: "m1" } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+    ]);
+    const m = reconstructFromSse(raw);
+    // undefined, not {input_tokens:0, output_tokens:0}: "not reported" is not "cost nothing".
+    expect(m.usage).toBeUndefined();
+  });
+
+  it("keeps a streamed thinking block's text AND signature instead of dropping both", () => {
+    const raw = sse([
+      { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "step one, " } },
+      { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "step two" } },
+      { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-abc" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+    ]);
+    const m = reconstructFromSse(raw);
+    // Both delta kinds were unhandled, so the whole block collapsed to `{ type: "thinking" }`.
+    expect(m.content).toEqual([{ type: "thinking", thinking: "step one, step two", signature: "sig-abc" }]);
+  });
+
+  it("keeps the fields an opaque content_block_start carries", () => {
+    const raw = sse([
+      { type: "content_block_start", index: 0, content_block: { type: "redacted_thinking", data: "EncryptedBlob==" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+    ]);
+    expect(reconstructFromSse(raw).content).toEqual([{ type: "redacted_thinking", data: "EncryptedBlob==" }]);
+  });
+
   it("surfaces malformed streamed tool JSON as a raw string (so the validator can flag it)", () => {
     const raw = sse([
       { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tu_1", name: "get_weather", input: {} } },

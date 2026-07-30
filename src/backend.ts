@@ -3,6 +3,26 @@ import { type ResolvedTarget } from "./config.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 
 /**
+ * Response header stating who produced an error status: the provider, or this proxy.
+ *
+ * Every failure out of `fetchBackend` is a synthesized `Response` — a refused document, a
+ * translation bug and a genuinely dead provider all arrived as a bare status code, so a
+ * caller counting backend failures (the circuit breaker) charged our own local bugs to the
+ * provider and failed over to a second provider that would have failed identically. The
+ * marker is what makes them separable; `fetchBackend` states it, the caller decides.
+ */
+export const ERROR_ORIGIN_HEADER = "x-llm-relay-error-origin";
+
+/** `upstream` = the provider answered with this status. `local` = the proxy produced it without asking. */
+export type ErrorOrigin = "upstream" | "local";
+
+/** Read the origin marker off a Response, when it carries one. */
+export function errorOrigin(res: Response): ErrorOrigin | null {
+  const v = res.headers.get(ERROR_ORIGIN_HEADER);
+  return v === "upstream" || v === "local" ? v : null;
+}
+
+/**
  * Fetch the resolved provider target and return an ANTHROPIC-shaped `Response`,
  * regardless of the backend's native wire format. For kind="anthropic" this is a
  * passthrough. For kind="openai" (NIM/vLLM/OpenRouter/Gemini) the request is
@@ -36,15 +56,17 @@ export async function fetchBackend(
   try {
     reqJson = await transcodeDocuments(reqJson);
   } catch (e) {
-    if (e instanceof DocumentError) return anthropicError(400, `llm-relay: ${e.message}`);
-    return anthropicError(502, `document conversion failed: ${(e as Error).message}`);
+    // Local, both of them: the provider was never asked. Charging these to the provider's
+    // failure budget fails over to a second provider that would refuse the same document.
+    if (e instanceof DocumentError) return anthropicError(400, `llm-relay: ${e.message}`, "local");
+    return anthropicError(502, `document conversion failed: ${(e as Error).message}`, "local");
   }
 
   let openaiBody: Record<string, unknown>;
   try {
     openaiBody = translateBetweenProviders("anthropic", "openai", (reqJson ?? {}) as never) as Record<string, unknown>;
   } catch (e) {
-    return anthropicError(502, `request translation failed: ${(e as Error).message}`);
+    return anthropicError(502, `request translation failed: ${(e as Error).message}`, "local");
   }
   openaiBody.model = target.model;
   openaiBody.stream = args.wantsStream;
@@ -86,7 +108,8 @@ export async function fetchBackend(
       res.status === 404
         ? ` — model "${target.model}" is not served by provider "${target.provider}" (a model can be listed in /models and still 404 here)`
         : "";
-    return anthropicError(res.status, `openai backend HTTP ${res.status}${hint}: ${body.slice(0, 300)}`);
+    // The provider really answered with this status — the body is reworded, the origin is not.
+    return anthropicError(res.status, `openai backend HTTP ${res.status}${hint}: ${body.slice(0, 300)}`, "upstream");
   }
 
   if (args.wantsStream && res.body) {
@@ -98,7 +121,9 @@ export async function fetchBackend(
   try {
     anthropicJson = openAiResponseToAnthropic((await res.json()) as Record<string, unknown>, target.model ?? "");
   } catch (e) {
-    return anthropicError(502, `response translation failed: ${(e as Error).message}`);
+    // The provider answered 200; this 502 is ours. Marked local so it is not mistaken
+    // for the provider being down — it is our mapper being wrong about a healthy one.
+    return anthropicError(502, `response translation failed: ${(e as Error).message}`, "local");
   }
   return new Response(JSON.stringify(anthropicJson), { status: 200, headers: { "content-type": "application/json" } });
 }
@@ -132,17 +157,17 @@ export function openAiResponseToAnthropic(j: Record<string, unknown>, model: str
   };
 }
 
-function anthropicError(status: number, message: string): Response {
+function anthropicError(status: number, message: string, origin: ErrorOrigin): Response {
   return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin },
   });
 }
 
-function openaiError(status: number, message: string): Response {
+function openaiError(status: number, message: string, origin: ErrorOrigin): Response {
   return new Response(JSON.stringify({ error: { message, type: "invalid_request_error" } }), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin },
   });
 }
 
@@ -163,7 +188,11 @@ export async function fetchOpenAiFront(
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
   if (target.kind !== "openai") {
-    return openaiError(400, `llm-relay: OpenAI front requires an openai-kind provider; "${target.provider}" is ${target.kind}`);
+    return openaiError(
+      400,
+      `llm-relay: OpenAI front requires an openai-kind provider; "${target.provider}" is ${target.kind}`,
+      "local",
+    );
   }
   const base = (args.reqJson ?? {}) as Record<string, unknown>;
   const body = { ...base, model: target.model, stream: args.wantsStream };

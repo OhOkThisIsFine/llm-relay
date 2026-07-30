@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { fetchBackend, openAiResponseToAnthropic } from "../src/backend.js";
+import { ERROR_ORIGIN_HEADER, errorOrigin, fetchBackend, fetchOpenAiFront, openAiResponseToAnthropic } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
 
 function openaiTarget(base: string, model = "meta/llama-3.1-70b-instruct"): ResolvedTarget {
@@ -109,6 +109,51 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const body = (await res.json()) as any;
     expect(body.error.message).toMatch(/url. source are not supported/);
     expect(JSON.stringify(body)).not.toContain(b64);
+    // ...and it says so: the provider was never asked, so this must not be charged to it.
+    expect(errorOrigin(res)).toBe("local");
+  });
+
+  it("labels a real provider failure `upstream` and a locally-synthesized one `local`", async () => {
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((_req, res) => {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "model is loading" } }));
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
+    const req = { model: "claude-x", messages: [{ role: "user", content: "hi" }] };
+
+    const upstream = await fetchBackend(target, {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
+      anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
+    });
+    expect(upstream.status).toBe(503);
+    expect(upstream.headers.get(ERROR_ORIGIN_HEADER)).toBe("upstream");
+
+    // Same fetchBackend, same shape of Response, opposite meaning: without the marker a
+    // caller counting failures records both as "the provider is unhealthy" and fails over
+    // to a second provider that would refuse this document identically.
+    const local = await fetchBackend(target, {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from("{}"),
+      reqJson: { model: "claude-x", messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x.invalid/a.pdf" } }] }] },
+      anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
+    });
+    expect(errorOrigin(local)).toBe("local");
+    expect(errorOrigin(upstream)).not.toBe(errorOrigin(local));
+  });
+
+  it("marks the OpenAI front's own kind rejection local (it never called out)", async () => {
+    const anthropicKind = { ...openaiTarget("http://127.0.0.1:1"), kind: "anthropic" as const };
+    const res = await fetchOpenAiFront(
+      anthropicKind,
+      { reqJson: { model: "m" }, wantsStream: false, signal: AbortSignal.timeout(1000) },
+      async () => { throw new Error("must not call out"); },
+    );
+    expect(res.status).toBe(400);
+    expect(errorOrigin(res)).toBe("local");
   });
 
   it("asks a streaming openai backend for usage, and carries it into message_delta", async () => {

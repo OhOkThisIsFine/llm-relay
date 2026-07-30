@@ -1,4 +1,53 @@
+import { randomUUID } from "node:crypto";
 import { type AssistantMessage, type ContentBlock, isToolUseBlock } from "./anthropic.js";
+
+/**
+ * Fallback id for a message whose source response carried none.
+ *
+ * NOT a constant: `msg_repair` was emitted for every repaired turn, so two different
+ * responses in one session were indistinguishable to anything keying off the id — and
+ * because it was emitted even when the backend HAD supplied a real id, the client's view
+ * of the conversation silently disagreed with the provider's. The prefix marks it as
+ * relay-synthesized so nobody mistakes it for something the provider can be asked about.
+ */
+function syntheticMessageId(): string {
+  return `msg_relay_${randomUUID().replace(/-/g, "")}`;
+}
+
+/**
+ * `usage` for message_start, carrying only what the backend actually reported.
+ *
+ * ⚠ Client-visible: when the source message carried no usage at all this is now `{}`
+ * rather than `{ input_tokens: 0, output_tokens: 0 }`. Those zeros were a measurement
+ * nobody made, and a consumer metering off the stream could not tell them from a call
+ * that genuinely cost nothing. Same rule the rest of the proxy follows for an unknown
+ * limit or price: absent, never guessed.
+ */
+function startUsage(msg: AssistantMessage): Record<string, number> {
+  const usage: Record<string, number> = {};
+  if (typeof msg.usage?.input_tokens === "number") usage.input_tokens = msg.usage.input_tokens;
+  // output_tokens is 0 here BY PROTOCOL, not as a guess: at message_start no output has
+  // been produced yet and Anthropic streaming fills the real figure in via message_delta.
+  // Only stated at all when the backend reported usage — otherwise it is the same
+  // invented zero, laundered through a protocol convention.
+  if (msg.usage) usage.output_tokens = 0;
+  return usage;
+}
+
+/**
+ * The `message_delta` payload. `usage` is OMITTED when the backend never reported
+ * output tokens — `{ output_tokens: 0 }` would assert the call was free, which is a
+ * claim, not an absence.
+ */
+function endDelta(msg: AssistantMessage): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: msg.stop_sequence ?? null },
+  };
+  if (typeof msg.usage?.output_tokens === "number") {
+    payload.usage = { output_tokens: msg.usage.output_tokens };
+  }
+  return payload;
+}
 
 /**
  * Serialize an AssistantMessage into an Anthropic SSE byte string — the inverse
@@ -6,6 +55,10 @@ import { type AssistantMessage, type ContentBlock, isToolUseBlock } from "./anth
  * response as a fresh stream when the client asked for streaming. Emits the
  * event choreography the Claude harness expects:
  *   message_start → (content_block_start → delta → stop)* → message_delta → message_stop
+ *
+ * The backend's own `id`, `model` and `usage` are re-emitted whenever the message
+ * carries them, so a repair does not rewrite the response's identity. Whatever it did
+ * not carry is synthesized (id) or omitted (model, usage) — never zero-filled.
  */
 export function emitSse(msg: AssistantMessage): string {
   const out: string[] = [];
@@ -13,19 +66,16 @@ export function emitSse(msg: AssistantMessage): string {
     out.push(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
   };
 
-  const outputTokens = msg.usage?.output_tokens ?? 0;
-  const inputTokens = msg.usage?.input_tokens ?? 0;
-
   push("message_start", {
     message: {
-      id: "msg_repair",
+      id: msg.id ?? syntheticMessageId(),
       type: "message",
       role: "assistant",
-      model: "",
+      model: msg.model ?? "",
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: 0 },
+      usage: startUsage(msg),
     },
   });
 
@@ -33,10 +83,7 @@ export function emitSse(msg: AssistantMessage): string {
     emitBlock(push, block, index);
   });
 
-  push("message_delta", {
-    delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: null },
-    usage: { output_tokens: outputTokens },
-  });
+  push("message_delta", endDelta(msg));
   push("message_stop", {});
 
   return out.join("");
@@ -61,10 +108,8 @@ export function emitSseTail(msg: AssistantMessage, startIndex: number): string {
     emitBlock(push, block, index);
   });
 
-  push("message_delta", {
-    delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: null },
-    usage: { output_tokens: msg.usage?.output_tokens ?? 0 },
-  });
+  // No message_start here — the client already has the backend's real one, id included.
+  push("message_delta", endDelta(msg));
   push("message_stop", {});
 
   return out.join("");
@@ -95,7 +140,10 @@ function emitBlock(
     push("content_block_stop", { index });
     return;
   }
-  // Opaque block: pass through as a start/stop with the block echoed.
+  // Opaque block (thinking, redacted_thinking, …): echo the WHOLE block on the start
+  // event rather than re-deriving deltas for it. reconstructFromSse keeps the entire
+  // content_block payload, so this round-trips every field — including a thinking
+  // block's `signature`, without which the block cannot be replayed on the next turn.
   push("content_block_start", { index, content_block: block });
   push("content_block_stop", { index });
 }
