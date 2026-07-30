@@ -126,7 +126,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
     return r;
   };
 
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
     const started = Date.now();
     handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper, catalog, pingLoop }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
@@ -137,6 +137,26 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       logger.write(baseLog(started, req.url ?? "/", false, false, 502, "skipped", null));
     });
   });
+
+  /**
+   * Actually run the background health loop.
+   *
+   * ⚠ `PingLoop.start()` was called from NOWHERE in `src/`. The class has a complete adaptive
+   * cadence — speed/normal/slow modes, idle detection, `noteUserActivity()` — and every bit of it
+   * was dead code, so the only probes ever recorded were the ones a human triggered by hitting
+   * `/ping` by hand. That is the real reason a long-running relay reported `verdict: Pending` and
+   * an empty `p95` for every model it had supposedly been monitoring for days: nothing was
+   * monitoring anything. Persisting samples (probe-cache) and rehydrating them (cadence) are both
+   * pointless without this line.
+   *
+   * Skipped under vitest: a test proxy must not start probing real providers in the background.
+   */
+  if (!process.env.VITEST) {
+    server.on("listening", () => pingLoop.start());
+    server.on("close", () => pingLoop.stop());
+  }
+
+  return server;
 }
 
 interface Handlers {
@@ -312,6 +332,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
   const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
+
+  // Real traffic is the signal the adaptive cadence was built around: probe briskly while the
+  // proxy is in use, drop to `slow` once it has been idle. `noteUserActivity()` had no callers
+  // either, so the loop could never have left its startup mode even if it had been running.
+  h.pingLoop?.noteUserActivity();
 
   // Route the request's model to a concrete provider + backend model candidates.
   //

@@ -2,7 +2,7 @@ import type { Config, ProviderConfig } from "../config.js";
 import type { ModelCatalog } from "../catalog.js";
 import { pingProviderModel, type PingResult } from "./ping.js";
 import { type PingRecord, getAvg, getP95, getJitter, getStabilityScore, getVerdict, getUptime } from "./metrics.js";
-import { recordProbeResult, getModelsDueForProbe } from "./probe-cache.js";
+import { recordProbeResult, getModelsDueForProbe, loadPersistedSamples, loadTotals } from "./probe-cache.js";
 import { readCredential } from "../authEnv.js";
 
 export type PingMode = "speed" | "normal" | "slow" | "forced";
@@ -47,7 +47,7 @@ export class PingLoop {
   constructor(
     private cfg: Config,
     private catalog: ModelCatalog,
-    private opts: { fetchFn?: typeof fetch; autoStart?: boolean } = {},
+    private opts: { fetchFn?: typeof fetch; autoStart?: boolean; probeCachePath?: string } = {},
   ) {}
 
   public getMode(): PingMode {
@@ -98,6 +98,9 @@ export class PingLoop {
 
   public recordPing(providerKey: string, modelId: string, res: PingResult, timestamp = Date.now()): void {
     const key = `${providerKey}/${modelId}`;
+    // Through the hydrating getter, so a fresh process appends to the history previous runs
+    // built instead of starting a second, shorter one beside it.
+    if (!this.pingHistory.has(key)) this.getModelPings(providerKey, modelId);
     let history = this.pingHistory.get(key);
     if (!history) {
       history = [];
@@ -110,11 +113,56 @@ export class PingLoop {
       this.latestQuota.set(providerKey, res.quotaPercent);
     }
 
-    recordProbeResult(providerKey, modelId, res);
+    recordProbeResult(providerKey, modelId, res, this.probeCacheOpts());
   }
 
+  /**
+   * Recent probes for a model — from memory, falling back to what previous runs persisted.
+   *
+   * ⚠ The fallback is the whole point. This used to read `pingHistory` alone, a Map built only
+   * during the current process's life, while `recordProbeResult` wrote every probe to
+   * `probe-cache.json` and nothing ever read it back. Every restart therefore reset every model
+   * to `Pending` with `p95: -1`, so a proxy that restarts at all — a laptop that slept, an
+   * upgrade, a crash — never accumulated latency history for anything. The disk is the long-term
+   * record this is supposed to be keeping; memory is just the hot copy.
+   */
   public getModelPings(providerKey: string, modelId: string): PingRecord[] {
-    return this.pingHistory.get(`${providerKey}/${modelId}`) ?? [];
+    const key = `${providerKey}/${modelId}`;
+    const live = this.pingHistory.get(key);
+    if (live && live.length > 0) return live;
+    const persisted = this.readPersisted(providerKey, modelId);
+    // Seed memory so the next call is hot and later probes append to the real history rather
+    // than starting a second, shorter one beside it.
+    if (persisted.length > 0) this.pingHistory.set(key, [...persisted]);
+    return persisted;
+  }
+
+  private readPersisted(providerKey: string, modelId: string): PingRecord[] {
+    try {
+      return loadPersistedSamples(providerKey, modelId, this.probeCacheOpts());
+    } catch {
+      return []; // a corrupt or unreadable cache must never break the health surface
+    }
+  }
+
+  private probeCacheOpts(): { path?: string } {
+    return this.opts.probeCachePath ? { path: this.opts.probeCachePath } : {};
+  }
+
+  /**
+   * Long-run uptime for a model across every probe ever recorded, or null if never probed.
+   *
+   * The rolling window answers "lately"; this answers "ever", and it is what keeps a model's
+   * record from being erased by one bad afternoon inside the window.
+   */
+  public getLifetimeUptimePct(providerKey: string, modelId: string): number | null {
+    try {
+      const t = loadTotals(providerKey, modelId, this.probeCacheOpts());
+      if (!t || t.probes === 0) return null;
+      return Math.round((t.ok / t.probes) * 100);
+    } catch {
+      return null;
+    }
   }
 
   public getProviderQuota(providerKey: string): number | null {
@@ -129,14 +177,13 @@ export class PingLoop {
     const stabilityScore = getStabilityScore(pings);
     const uptimePct = getUptime(pings);
     const lastPing = pings[pings.length - 1];
-    // A 401 is DOWN. It was excluded here alongside 200 on the theory that the endpoint
-    // answered, but this flag is the availability verdict: a provider with a revoked key
-    // reported "Perfect" and could be preferred over a working one. `getUptime()` already
-    // counts only "200" — this is the signal that disagreed with it.
-    const verdict = getVerdict(pings, {
-      httpCode: lastPing?.code ?? null,
-      isDown: lastPing ? lastPing.code !== "200" : false,
-    });
+    // ⚠ `isDown` is deliberately NOT passed. It used to be `lastPing.code !== "200"`, which made
+    // the verdict a function of one sample: a single transient failure — a VPN the provider
+    // blocks, a resumed laptop, one rate-limited probe — reported a model with fifty good samples
+    // as `Not Active`/`Unstable`. `getVerdict` now derives down-ness from the accumulated record
+    // (a RUN of failures AND poor uptime), which still catches a genuinely revoked key: that
+    // answers 401 every time, so the run never breaks and uptime stays at 0.
+    const verdict = getVerdict(pings, { httpCode: lastPing?.code ?? null });
 
     return {
       providerKey,
@@ -168,7 +215,11 @@ export class PingLoop {
 
       if (modelIds.length === 0) continue;
 
-      const dueIds = getModelsDueForProbe(providerName, modelIds);
+      // Same cache the results are written to and hydrated from. `probe-cache.ts` keeps a
+      // module-level cache keyed by the last path it was given, so a call that omits the path
+      // reads whatever another caller last loaded — here that meant asking a different cache
+      // whether a model was due, concluding it was not, and probing nothing at all.
+      const dueIds = getModelsDueForProbe(providerName, modelIds, this.probeCacheOpts());
       // Probe up to 3 due models per provider per tick to avoid flooding
       const toProbe = dueIds.slice(0, 3);
 

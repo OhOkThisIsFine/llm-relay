@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig, type Config, type ConfigOverrides, DEFAULT_DESTRUCTIVE } from "./config.js";
 import { loadEnvFile } from "./dotenv.js";
+import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
 import { buildDispatch, type DispatchView } from "./dispatch.js";
@@ -261,12 +262,20 @@ export function resolveConfigPath(): string {
 let envFileLoaded = false;
 
 /**
- * Merge `~/.llm-relay/.env` into the environment, once per process, before anything reads
- * a key or expands a `${ENV}` in the config. Already-set variables win.
+ * Merge every credential source into the environment, once per process, before anything reads a
+ * key or expands a `${ENV}` in the config. Already-set variables always win, at every layer.
+ *
+ * Order is least-explicit first, and both layers only ever FILL GAPS:
+ *   1. Windows User/Machine registry scopes — recovers variables the OS could not deliver to an
+ *      already-running process. A long-lived relay launched at logon otherwise never sees a key
+ *      added afterwards, while every shell the user opens does; that mismatch made six working
+ *      credentials look like `401 Wrong API Key`.
+ *   2. `~/.llm-relay/.env` — what the onboarding wizard writes.
  */
 export function ensureEnvFileLoaded(): void {
   if (envFileLoaded) return;
   envFileLoaded = true;
+  recoverWindowsEnv();
   loadEnvFile();
 }
 

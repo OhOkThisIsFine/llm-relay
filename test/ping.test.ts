@@ -11,6 +11,20 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
 
+/**
+ * A probe-cache path no other test shares.
+ *
+ * ⚠ Required now that probe results actually PERSIST. Two tests here use the same
+ * `testProv/model-1`, and with a shared cache the second one silently stopped probing at all:
+ * `getModelsDueForProbe` saw the first test's fresh `ok` entry and skipped the model, so the
+ * summary came from the first test's history instead of this test's mock. State that survives
+ * the process has to be owned per test.
+ */
+let probeCacheSeq = 0;
+function isolatedProbeCache(): string {
+  return join(tmpdir(), `llm-relay-ping-${process.pid}-${probeCacheSeq++}`, "probe-cache.json");
+}
+
 function testConfig(providers: Record<string, ProviderConfig>): Config {
   return {
     host: "127.0.0.1",
@@ -41,7 +55,15 @@ describe("Ping Metrics", () => {
 
     const score = getStabilityScore(pings);
     expect(score).toBeGreaterThan(80);
-    expect(getVerdict(pings)).toBe("Perfect");
+    // Four fast successes and then a 401 is NOT "Perfect": the latest probe is the provider
+    // stating a fact about the credential, and it will say the same thing next time. `getVerdict`
+    // now derives down-ness from the history itself rather than from a flag the caller passes, so
+    // calling it bare no longer skips that check. The latency metrics above are unaffected — a
+    // 401 still times the network path, which is why it stays in avg/p95/jitter.
+    expect(getVerdict(pings)).toBe("Unstable");
+    // ...whereas a transient 503 in the same position is weather, and must not disqualify it.
+    const blip: PingRecord[] = [...pings.slice(0, 4), { ms: 500, code: "503", timestamp: 5 }];
+    expect(getVerdict(blip)).toBe("Perfect");
   });
 
   it("returns Spiky verdict for fast avg but high p95", () => {
@@ -181,7 +203,7 @@ describe("PingLoop Cadence", () => {
 
     const mockFetch = async () => new Response(JSON.stringify({ choices: [] }), { status: 200 });
 
-    const loop = new PingLoop(testConfig({ testProv: pCfg }), mockCatalog, { fetchFn: mockFetch as any });
+    const loop = new PingLoop(testConfig({ testProv: pCfg }), mockCatalog, { fetchFn: mockFetch as any, probeCachePath: isolatedProbeCache() });
     expect(loop.getMode()).toBe("speed");
 
     await loop.tickOnce();
@@ -197,7 +219,7 @@ describe("PingLoop Cadence", () => {
     const mockCatalog: ModelCatalog = { list: async () => ["model-1"] } as any;
     const mockFetch = async () => new Response("{}", { status: 401 });
 
-    const loop = new PingLoop(testConfig({ testProv: pCfg }), mockCatalog, { fetchFn: mockFetch as any });
+    const loop = new PingLoop(testConfig({ testProv: pCfg }), mockCatalog, { fetchFn: mockFetch as any, probeCachePath: isolatedProbeCache() });
     await loop.tickOnce();
 
     const summary = loop.getModelSummary("testProv", "model-1");
