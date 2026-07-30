@@ -716,6 +716,19 @@ function fmt(v: number | null | undefined, suffix = ""): string {
 }
 
 /**
+ * Mean latency of this proxy's OWN traffic to a target, with the call count that backs it.
+ *
+ * Deliberately not merged into the `p95` column: that one is the synthetic probe loop's measured
+ * p95, and an average over real requests is a different statistic from a different sample. Shown
+ * in seconds past 10s because "62605" reads as noise where "62.6s" reads as a decision.
+ */
+function obsLatency(o: Candidate["observed"]): string {
+  if (!o || o.avgLatencyMs === null || o.totalCalls === 0) return "-";
+  const ms = o.avgLatencyMs;
+  return ms >= 10000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
+/**
  * How much to trust the strength number. A score from 5 leaderboards and a score from "nothing is
  * known, assume neutral" must never render identically.
  */
@@ -761,6 +774,11 @@ export async function runCandidates(): Promise<void> {
     "$/Mout".padEnd(8) +
     "verdict".padEnd(10) +
     "p95".padEnd(8) +
+    // Latency actually observed on this proxy's own traffic. The synthetic-probe p95 beside it is
+    // routinely blank, so the table could show a rank-1 pool member with NO latency signal at all
+    // while the proxy had already measured it at 60+ seconds per call — which is the difference
+    // between a pool that suits mechanical batch work and one that does not.
+    "obs".padEnd(8) +
     "quota".padEnd(7) +
     "breaker".padEnd(9) +
     "ctx";
@@ -770,7 +788,15 @@ export async function runCandidates(): Promise<void> {
     const tags = [...c.pools, ...c.subagentTiers.map((t) => `@${t}`)].join(",") || "-";
     const live = c.listed === null ? "?" : c.listed ? "yes" : "NO";
     const ctx = c.contextLength ? `${Math.round(c.contextLength / 1000)}k` : "-";
-    const breaker = c.breaker.open ? `OPEN ${Math.round(c.breaker.cooldownRemainingMs / 1000)}s` : "closed";
+    // A member that answers 401 on every call read "closed" here — the same as a healthy one —
+    // because a credential fault is deliberately not health data and so never reached the
+    // breaker's failure fields. It has its own axis now, and it is shown: the reason half a
+    // pool can be unusable while every row looks fine is precisely this cell.
+    const breaker = c.breaker.open
+      ? `OPEN ${Math.round(c.breaker.cooldownRemainingMs / 1000)}s`
+      : c.breaker.credentialFault
+        ? `AUTH ${c.breaker.lastCredentialStatus ?? ""}`.trim()
+        : "closed";
     process.stdout.write(
       c.spec.slice(0, 31).padEnd(32) +
         tags.slice(0, 23).padEnd(24) +
@@ -788,6 +814,7 @@ export async function runCandidates(): Promise<void> {
         ).padEnd(8) +
         (c.health?.verdict ?? "-").padEnd(10) +
         fmt(c.health?.p95Ms ?? null, "ms").padEnd(8) +
+        obsLatency(c.observed).padEnd(8) +
         fmt(c.quotaPercent, "%").padEnd(7) +
         breaker.padEnd(9) +
         // Provenance inline: "~" = another provider's figure for this model id. A NIM row must
@@ -801,10 +828,36 @@ export async function runCandidates(): Promise<void> {
 
   const fuzzy = view.candidates.filter((c) => c.capabilityMatch?.match === "fuzzy");
   const srcs = [...new Set(view.candidates.flatMap((c) => c.capabilitySources))].sort();
+
+  // Say out loud how much of the roster is currently unusable. A row-by-row table makes
+  // "5 of 14 members can actually serve" something the reader has to notice; a pool that is
+  // half dead is worth stating.
+  const noKey = view.candidates.filter((c) => !c.hasKey);
+  const authFault = view.candidates.filter((c) => c.breaker.credentialFault);
+  const cooling = view.candidates.filter((c) => c.breaker.open);
+  if (noKey.length || authFault.length || cooling.length) {
+    process.stdout.write(
+      `\nNot first choice right now (of ${view.candidates.length} targets):\n` +
+        `  ${authFault.length} auth-faulted, ${cooling.length} cooling — DEMOTED: still tried, but only\n` +
+        "    after every other candidate has failed on that request.\n" +
+        `  ${noKey.length} with no key set — DROPPED from a pool entirely (resolveTargets removes a\n` +
+        "    declared-but-unset credential), so a pool's real size is smaller than its member count.\n" +
+        "    ⚠ That includes free providers that would serve WITHOUT a key: declaring an authEnv and\n" +
+        "    leaving it unset excludes them from every pool they belong to.\n" +
+        "  `llm-relay keys` says whether a credential is good; `llm-relay pools --probe` is the\n" +
+        "  only check that proves a member can actually serve.\n",
+    );
+  }
+
   process.stdout.write(
     "\nColumns are independent — weigh them yourself. agentic/coding/BFCL/aider/arena are\n" +
       "capability from DIFFERENT leaderboards and they disagree; verdict/p95 are live behaviour;\n" +
       "quota/breaker/$ are what it costs to use right now. A blank cell means NOT MEASURED.\n" +
+      `  p95 = synthetic probe loop; obs = mean of this proxy's OWN requests. Different samples,\n` +
+      `        so they are not merged — and a high "obs" on a top-ranked member is worth seeing\n` +
+      `        before pointing bulk work at that pool (str ranks capability, never speed).\n` +
+      `  breaker: "OPEN 42s" = cooling after failures/429; "AUTH 401" = credential fault, demoted\n` +
+      `           until it is retried (expires, so a rotated key recovers with no restart).\n` +
       `  str = the one scalar pool ordering needs. "83.3/4" = 4 published signals behind it;\n` +
       `        "obs" = ranked on this proxy's own traffic, "neut" = nothing known.\n` +
       `  "~" on ctx/$ = another provider's figure for the same model id (this one publishes none);\n` +

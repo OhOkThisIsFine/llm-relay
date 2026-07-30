@@ -295,6 +295,25 @@ Claude Code subagent frontmatter (`model:`), which accepts a full model id but n
 list. A pool is the indirection that gives those callers ranking and failover. `pool` is a
 reserved provider name; configuring a provider called `pool` fails at load.
 
+**What failover actually does** (both `/v1/messages` and `/v1/chat/completions`):
+
+- **429 / 5xx / 400 / 404** → the candidate is recorded as a breaker failure and the next one is
+  tried. A `Retry-After` sets that candidate's cooldown for exactly as long as the provider asked.
+- **401 / 403** → the next candidate is tried, but the fault is recorded on its own axis rather
+  than as ill health, so `llm-relay candidates` shows it as `AUTH 401` instead of hiding it. It
+  expires after 5 minutes, so a rotated key recovers with no restart.
+- **A genuine client 4xx** (413, 422, …) → returned as-is. Every other candidate would reject it
+  identically.
+- **Every candidate failed** → the last real upstream error, not a synthesized one.
+
+Responses carry **`x-llm-relay-served-by`**: the deployment that served, or on an error every
+deployment that was tried, in order.
+
+⚠ **A pool routes to fewer members than it lists** when some declare an `authEnv` that is unset —
+those are dropped before ranking, so a 14-member pool can resolve to 7 and the config's *tenth*
+entry can legitimately be the one that answers. `llm-relay candidates` reports the count.
+Background: [docs/pool-failover.md](docs/pool-failover.md).
+
 ### Quieting the onboarding nudge (`leave_me_alone`)
 
 `llm-relay onboard` walks every known provider and prompts for the keys you are missing. For a

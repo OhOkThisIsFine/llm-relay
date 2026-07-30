@@ -1,7 +1,15 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { ERROR_ORIGIN_HEADER, errorOrigin, fetchBackend, fetchOpenAiFront, openAiResponseToAnthropic } from "../src/backend.js";
+import {
+  ERROR_ORIGIN_HEADER,
+  errorOrigin,
+  fetchBackend,
+  fetchOpenAiFront,
+  normalizeOpenAiErrorBody,
+  openAiResponseToAnthropic,
+  parseRetryAfterMs,
+} from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
 
 function openaiTarget(base: string, model = "meta/llama-3.1-70b-instruct"): ResolvedTarget {
@@ -226,5 +234,97 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(bodies[0].stream_options).toEqual({ include_usage: true });
     expect(bodies[1].stream_options).toBeUndefined();
     expect(await res.text()).toContain("content_block_delta");
+  });
+});
+
+/**
+ * The wire-shape primitives behind symptoms §3 and §4 of the 2026-07-30 report: a `Retry-After`
+ * that nothing read, and error bodies that reached an OpenAI client in whatever shape the
+ * provider chose.
+ */
+describe("parseRetryAfterMs", () => {
+  const NOW = Date.parse("2026-07-30T12:00:00Z");
+
+  it("reads delta-seconds, including the fractional form providers actually send", () => {
+    expect(parseRetryAfterMs("20", NOW)).toBe(20000);
+    expect(parseRetryAfterMs("20.4525", NOW)).toBe(20453); // groq's "try again in 20.4525s"
+    expect(parseRetryAfterMs("0", NOW)).toBe(0);
+  });
+
+  it("reads the HTTP-date form", () => {
+    expect(parseRetryAfterMs("Thu, 30 Jul 2026 12:00:30 GMT", NOW)).toBe(30000);
+  });
+
+  it("returns null — never 0 — for absent, garbage or already-past values", () => {
+    // 0 would mean "retry immediately" and would silently disable the backoff this exists for.
+    expect(parseRetryAfterMs(null, NOW)).toBeNull();
+    expect(parseRetryAfterMs("", NOW)).toBeNull();
+    expect(parseRetryAfterMs("soon", NOW)).toBeNull();
+    expect(parseRetryAfterMs("-5", NOW)).toBeNull();
+    expect(parseRetryAfterMs("Thu, 30 Jul 2026 11:59:30 GMT", NOW)).toBeNull(); // in the past
+  });
+});
+
+describe("normalizeOpenAiErrorBody", () => {
+  it("returns null for an already-conforming body, so the provider's own bytes are passed through", () => {
+    const body = JSON.stringify({ error: { message: "rate limit", type: "rate_limit_error", code: "x" } });
+    expect(normalizeOpenAiErrorBody(body, 429)).toBeNull();
+  });
+
+  it("unwraps gemini's array envelope to the error object itself, preserving its fields", () => {
+    const body = JSON.stringify([{ error: { code: 503, message: "high demand", status: "UNAVAILABLE" } }]);
+    const out = JSON.parse(normalizeOpenAiErrorBody(body, 503)!);
+    expect(out.error.message).toBe("high demand");
+    expect(out.error.status).toBe("UNAVAILABLE"); // the provider's own detail is not discarded
+    expect(Array.isArray(out)).toBe(false);
+  });
+
+  it("wraps a non-JSON body, keeping the original text as the message", () => {
+    const out = JSON.parse(normalizeOpenAiErrorBody("<html>502 Bad Gateway</html>", 502)!);
+    expect(out.error.message).toContain("502 Bad Gateway");
+    expect(out.error.code).toBe(502);
+    expect(out.error.type).toBe("upstream_error");
+  });
+
+  it("wraps an empty body with a message that at least states the status", () => {
+    const out = JSON.parse(normalizeOpenAiErrorBody("", 500)!);
+    expect(out.error.message).toContain("500");
+  });
+
+  it("wraps valid JSON that is not an error envelope at all", () => {
+    // A bare string or a naked object must not be handed to a client as if it were an envelope.
+    expect(JSON.parse(normalizeOpenAiErrorBody(JSON.stringify({ detail: "nope" }), 400)!).error.code).toBe(400);
+    expect(JSON.parse(normalizeOpenAiErrorBody(JSON.stringify("nope"), 400)!).error.message).toBe('"nope"');
+  });
+});
+
+describe("fetchBackend carries Retry-After onto its synthesized error", () => {
+  it("does not destroy the one header that says when the provider will serve again", async () => {
+    // fetchBackend builds a NEW Response for an upstream error, so the header was dropped here
+    // and neither the breaker's cooldown nor the client's backoff could ever honour it.
+    const backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(429, { "content-type": "application/json", "retry-after": "42" });
+          res.end(JSON.stringify({ error: { message: "slow down" } }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    try {
+      const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
+      const req = { model: "m", messages: [{ role: "user", content: "hi" }] };
+      const res = await fetchBackend(target, {
+        path: "/v1/messages", method: "POST",
+        reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
+        anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
+      });
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("42");
+      expect(errorOrigin(res)).toBe("upstream");
+    } finally {
+      backend.close();
+    }
   });
 });
