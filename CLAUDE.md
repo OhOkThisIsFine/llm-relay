@@ -340,13 +340,17 @@ because a finished run's ledger is just a stale to-do list. Anything that matter
 change, a test, or a paragraph in this file. The 2026-07-30 pool-failover symptoms are likewise
 fixed and closed — see [docs/pool-failover.md](docs/pool-failover.md) and the gotchas above.
 
-⚠ **One CONFIG item is outstanding, and it is the owner's call, not a code change.** `pool/coding`
-lists 14 members and routes to 7: seven providers have no key set (`llm-relay keys` → `MISSING_ENV`),
-and `resolveTargets` drops a declared-but-unset `authEnv` before ranking. Two of the dropped seven —
-`opencode/deepseek-v4-flash-free` and `kilo/nvidia/nemotron-3-ultra-550b-a55b:free` — answer HTTP 200
-**without** a key, so setting their variable to any non-empty value (or removing the `authEnv`
-declaration) adds two live free members. Of the 7 that do route, `mistral` answers 401
-(`INVALID_KEY`) and `ollama` is not running locally.
+⚠ **A CLI process's environment is NOT the running relay's environment, and confusing the two
+fabricates credential bugs.** On Windows a User-scope environment variable enters a process only at
+**process start**, so the long-running relay (launched from `Startup` at logon) predated six keys
+that a freshly launched shell had. `llm-relay keys` / `llm-relay candidates` run as new processes and
+report *their own* env; `GET /registry` and `GET /candidates` are answered by the relay and are the
+authoritative `has_key`. The two disagreed, and the whole "half the pool is dead, seven 401s" finding
+of 2026-07-30 was this — **not** bad keys. Relaunching the relay with the variables present took it
+from 6 providers without a key to **0**, and `pool/coding` from 5 live members to **11** (`llm-relay
+pools --probe`: 29/35 live overall). ⚠ **Check `curl 127.0.0.1:8791/registry | grep has_key` before
+ever concluding a key is bad.** Genuinely down now: `gemini` (real 429/quota),
+`ollama/qwen2.5-coder:7b` (local daemon not running), `nim/deepseek-ai/deepseek-v4-flash` (HTTP 529).
 
 ⚠ One durable lesson from it, because it will cost you an hour otherwise: **several tests in this
 repo were written to pin the defect they should have caught.** A correct fix here can legitimately
