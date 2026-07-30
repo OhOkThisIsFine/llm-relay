@@ -175,7 +175,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const wantsStream = pickBool(reqJson, "stream");
   const pathname = path.split("?")[0] ?? path;
 
-  // Discovery endpoint for a dispatcher (e.g. audit-tools): providers × live models
+  // Discovery endpoint for an external dispatcher: providers × live models
   // (best-effort capability) + routing + raw leaderboard scores, one coherent view.
   if (req.method === "GET" && pathname === "/registry") {
     const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
@@ -385,7 +385,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
   }
 
-  // OpenAI-compatible FRONT: a dispatcher (e.g. audit-tools) POSTs OpenAI Chat
+  // OpenAI-compatible FRONT: an external dispatcher POSTs OpenAI Chat
   // Completions with a namespaced model; route by target and reverse-proxy the
   // upstream OpenAI response straight back (OpenAI in, OpenAI out).
   if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {

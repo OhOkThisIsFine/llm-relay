@@ -177,7 +177,7 @@ function openaiError(status: number, message: string, origin: ErrorOrigin): Resp
  * openai-kind target this is a routing reverse-proxy — rewrite `model` to the backend
  * id, inject the backend key, and stream the upstream OpenAI response straight back
  * (OpenAI in, OpenAI out — no translation). This is the transport a dispatcher (e.g.
- * audit-tools) consumes to reach many backends behind one endpoint.
+ * an external dispatcher) consumes to reach many backends behind one endpoint.
  *
  * anthropic-kind targets are not served on the OpenAI front (they need OpenAI↔Anthropic
  * translation and are not the dispatcher use case) — a clean 400, never a mistranslation.

@@ -8,7 +8,7 @@ import { keyIsPresent } from "./authEnv.js";
 import type { PingLoop, ModelHealthSummary } from "./ping/cadence.js";
 
 // Raw leaderboard scores per model — kept verbatim (never collapsed to tiers) so a
-// consumer (e.g. audit-tools dispatch) can weigh them against its own quota/rate/token
+// consumer (an external dispatcher) can weigh them against its own quota/rate/token
 // state to pick a provider+model.
 export interface CapabilityScore {
   bfcl_overall: number | null;
@@ -45,7 +45,7 @@ interface RegistryProvider {
 
 export interface RegistryView {
   generated_at: string;
-  /** How to address a backend: namespace a request model "provider/model" (audit-tools names the
+  /** How to address a backend: namespace a request model "provider/model" (a dispatcher names the
    *  exact model), or let routing map by Claude tier / default (dumb-client convenience). */
   routing: { default: string | string[]; tiers: Record<string, string | string[]> };
   providers: Record<string, RegistryProvider>;
