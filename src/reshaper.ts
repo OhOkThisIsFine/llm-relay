@@ -35,11 +35,27 @@ RULES:
   {"inputs": {"<tool_use_id>": { ...corrected input satisfying the schema... }}}
   or, if you must guess: {"refuse": true, "reason": "<why>"}`;
 
-function buildUserContent(req: ReshapeRequest): string {
-  const toolList = [...req.tools.entries()].map(([name, input_schema]) => ({ name, input_schema }));
-  const failing = req.rawAssistant.content
-    .filter(isToolUseBlock)
-    .map((b) => ({ id: b.id, name: b.name, current_input: b.input }));
+/**
+ * Build the reshaper prompt body.
+ *
+ * A reshape is a cross-provider egress: the failing call's ARGUMENTS and the tool
+ * SCHEMAS leave for whatever provider `config.reshaper` names, which is often not
+ * the provider that served the response. That is inherent — a model cannot correct
+ * arguments it is not shown — so the mitigation is minimisation, not avoidance:
+ * only the schemas of tools actually NAMED by a failing call are sent, instead of
+ * the request's entire declared tool set (a Claude Code session declares dozens,
+ * none of which the reshaper needs to fix one call). Destructive calls never get
+ * here at all: `repair()` refuses them before the reshaper is asked.
+ */
+export function buildUserContent(req: ReshapeRequest): string {
+  const failingBlocks = req.rawAssistant.content.filter(isToolUseBlock);
+  const named = new Set(failingBlocks.map((b) => b.name));
+  const relevant = [...req.tools.entries()].filter(([name]) => named.has(name));
+  // Fall back to the full set only when nothing matched (e.g. a hallucinated tool
+  // name), so the reshaper still sees the contract it is being asked to satisfy.
+  const chosen = relevant.length > 0 ? relevant : [...req.tools.entries()];
+  const toolList = chosen.map(([name, input_schema]) => ({ name, input_schema }));
+  const failing = failingBlocks.map((b) => ({ id: b.id, name: b.name, current_input: b.input }));
   return JSON.stringify(
     {
       tools: toolList,
@@ -78,14 +94,25 @@ export function parseCorrectedInputs(text: string): CorrectedInputs {
   return { kind: "refuse", reason: "reshaper output was not a recognized shape" };
 }
 
-/** Rebuild the assistant message, replacing each failing tool_use's input by id. */
+/**
+ * Rebuild the assistant message, replacing each failing tool_use's input by id.
+ *
+ * Only `input` is ever taken from the reshaper — ids, names, block order and every
+ * non-tool block come from `raw`, so a reshaper cannot add, drop or re-point a call.
+ * `stop_reason` is normalised to "tool_use" whenever the rebuilt content bears a
+ * tool_use block: that is protocol form the content fully determines (the harness
+ * will not execute a tool announced under "end_turn"), and preserving the backend's
+ * wrong value here made an otherwise-repaired message fail re-validation and burn
+ * every remaining attempt.
+ */
 export function reconstruct(raw: AssistantMessage, inputs: Record<string, unknown>): AssistantMessage {
   const content = raw.content.map((b) =>
     isToolUseBlock(b) && Object.prototype.hasOwnProperty.call(inputs, b.id)
       ? { ...b, input: inputs[b.id] }
       : b,
   );
-  return { content, stop_reason: raw.stop_reason ?? "tool_use" };
+  const stop_reason = content.some(isToolUseBlock) ? "tool_use" : raw.stop_reason ?? "tool_use";
+  return { content, stop_reason };
 }
 
 /** Reshaper backed by an Anthropic- or OpenAI-compatible endpoint. */
@@ -96,6 +123,11 @@ export function reconstruct(raw: AssistantMessage, inputs: Record<string, unknow
  * is a real judgement — the model looked at the call and declined to guess — so it is returned
  * as-is. Retrying a refusal on another model would be shopping for a more compliant answer, which
  * is exactly how a fabricated tool call gets through.
+ *
+ * Exhausting every candidate THROWS `ReshaperTransportError` for the same reason: nobody answered,
+ * so there is no judgement to report. Returning `refuse` there re-crossed the one line this class
+ * exists to hold — it labelled a total outage as a model's decision, and `repair()` logged the
+ * turn as `refused` (a model declined) rather than `failed` (nothing was reachable).
  */
 export class FailoverReshaper implements Reshaper {
   constructor(private readonly delegates: Reshaper[]) {
@@ -114,10 +146,9 @@ export class FailoverReshaper implements Reshaper {
         continue;
       }
     }
-    return {
-      kind: "refuse",
-      reason: `all reshaper candidates failed to respond${lastError ? ` (last: ${lastError.message})` : ""}`,
-    };
+    throw new ReshaperTransportError(
+      `all reshaper candidates failed to respond${lastError ? ` (last: ${lastError.message})` : ""}`,
+    );
   }
 }
 
