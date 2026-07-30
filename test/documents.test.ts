@@ -91,7 +91,7 @@ describe("transcodeDocuments", () => {
   it("does not mutate the caller's body", async () => {
     const body = withDocument({ type: "base64", media_type: "application/pdf", data: PDF_B64 });
     await transcodeDocuments(body, { runner });
-    expect((body.messages[0].content[0] as any).type).toBe("document");
+    expect((body.messages[0]!.content[0] as any).type).toBe("document");
   });
 
   it("preserves cache_control on the converted block", async () => {

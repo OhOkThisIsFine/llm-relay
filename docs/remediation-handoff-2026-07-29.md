@@ -1,19 +1,16 @@
 # Audit remediation — handoff (2026-07-29 / 30)
 
-**The remediation run is COMPLETE.** All 14 planned modules landed; the state machine reached
-`close` with no blocked items.
+**The remediation run is COMPLETE, and its follow-up list is discharged (2026-07-30).**
+All 14 planned modules landed, and the seven "Immediate next" items this document used to carry
+are done. Work is on **`main`**.
 
-Work is on **`main`**. (The previous version of this document claimed branch
-`remediate/audit-2026-07-29` — that branch is 0 ahead / 8 behind `main` and holds none of the work.
-It is stale and can be deleted.)
+Gate on a clean committed tree: `npm run build && npm run check`. `check` is now
+typecheck(src) + typecheck(test) + vitest. Don't pin a test count here — it drifts every wave.
 
-Gates on a clean committed tree: `npm run build`, `npm test`, `npm run typecheck` all green.
-There is now a single `npm run check` (= typecheck + test) and CI runs it.
+Per-obligation evidence for the original run is in `.audit-tools/remediation-report.md`
+(untracked, local-only).
 
-## What this run changed
-
-Two commits are hand-authored; the rest are per-module remediation commits. Read
-`.audit-tools/remediation-report.md` for the per-obligation evidence (untracked, local-only).
+## What the run changed
 
 | Area | Substance |
 |---|---|
@@ -26,82 +23,77 @@ Two commits are hand-authored; the rest are per-module remediation commits. Read
 | wire fidelity | message id + usage survive the repair round trip; the document fence delimiter is derived from content, not from a client-supplied title |
 | catalog | a blank published price no longer becomes a hard "free"; an older-schema cache row no longer reads as "publishes something" |
 
-## Immediate next
+## The follow-up pass (2026-07-30) — closed
 
-Nothing here blocks release. These are the loose ends workers recorded rather than reaching
-outside their module scope.
+1. **`RequestLog.backendModel` deleted**, served fields now required. The model the CLIENT asked
+   for is no longer in the log at all: routing resolves a tier/pool spec, so it routinely is not
+   the model that answered, and it was the id every "which model trips the validator" reading was
+   attributed to. `baseLog()` no longer takes it, so `Ctx.model` is gone too.
+2. **Wire fidelity, both halves.** `reconstruct()` carries `id`/`model`/`stop_sequence`/`usage`
+   over from `raw`; `parseAssistant()` reads them off buffered JSON; `toAnthropicMessage()` emits
+   them instead of the constant `msg_repair` + the client's model + a zero-filled usage, and omits
+   `usage` entirely when the backend reported none. Belt and braces: `repair()` re-attaches the
+   backend's envelope via `withEnvelopeOf()` regardless of what the `Reshaper` implementation
+   returned — same reasoning `guardReshaped()` exists for.
+3. **`candidates.ts` fuzzy reference attribution.** `metadataReferenceFrom` is now
+   `openrouter:<matched-name>` when the snapshot row was a fuzzy match, so a limit or price
+   borrowed from a *different SKU* says so without the reader correlating `capabilityMatch`.
+   `buildCandidates` gained a `tierData` injection seam so this is testable against fixed rows.
+4. **`test/` is type-checked** by `tsconfig.test.json`, run by `npm run check` (hence by CI). The
+   first run found 23 errors, including hand-built `ProviderConfig`/`ReshaperConfig` literals
+   missing a required field. ⚠ A `@ts-expect-error` in a test was inert for this project's whole
+   history, so a pre-existing one proves nothing.
+5. **`npm-publish` environment**: a custom deployment branch policy now limits it to the `v*` tag
+   pattern, so the ref restriction is enforced by GitHub and not only by the workflow's `if`. No
+   required reviewer — a release stays one command, by the owner's decision.
+6. **Smaller items**: `prepublishOnly` runs `check` (not just `test`); both `repair()` call sites
+   read `cfg.repair.maxAttempts` instead of a hardcoded 2; a non-retriable 401/403 is no longer
+   recorded as a breaker SUCCESS (it is recorded as nothing — a credential fault is not health
+   data, and a failure would hide the 401 behind a "target unhealthy" skip); tier / subagent /
+   array-default / ladder specs naming a provider disabled by an unset `${ENV}` now degrade with a
+   warning instead of aborting startup, and the one remaining fatal case (a single-spec
+   `routing.default`) names the unset variable rather than accusing the operator of a typo.
+7. **`CircuitBreaker.getStabilityScore()` deleted** — its last consumer had migrated. A `number`
+   return cannot say "nothing measured", which was the whole defect; `getMeasuredStability()` +
+   `hasObservations()` are the pair that can.
 
-1. **Delete `RequestLog.backendModel`.** `server.ts` now populates `servedProvider`/`servedModel`,
-   which was the gate. `log.ts` was outside that node's scope, so the deprecated field is still
-   emitted. Make the served fields required at the same time — they are optional only because a
-   call site might not have migrated, and now they all have.
-2. **`reconstruct()` (`reshaper.ts:82-89`) still returns only `{ content, stop_reason }`.** Until it
-   forwards the untouched fields from `raw`, a message that goes *through repair* still reaches
-   `emitSse` with no id and no usage, so it gets a synthesized one. The wire-fidelity side of that
-   seam is done and proven by a round-trip test; this is the other half.
-3. **`server.ts`'s non-streaming path still hardcodes `msg_repair` and zero-fills usage**
-   (`toAnthropicMessage`), and `parseAssistant()` does not read id/model off buffered JSON. Same
-   defect as (2) on the other path.
-4. **`candidates.ts` feeds fuzzy-matched tier figures into `resolveMetadata()` as `reference`
-   without consulting whether the match was exact.** On a fuzzy match those numbers belong to a
-   different SKU and `referenceFrom` names only the host, so the substitution is visible only by
-   separately correlating `capabilityMatch`. Either carry the matched name into `from`, or skip
-   reference limits on a fuzzy match.
-5. **Nothing type-checks `test/`.** `tsconfig.json` excludes `**/*.test.ts` and `vitest.config.ts`
-   declares no `typecheck` block, so a `@ts-expect-error` in a test is never evaluated — one worker
-   had relied on exactly that. CLAUDE.md's claim that "vitest is what checks those" was corrected;
-   the gap itself is still open.
-6. **Configure the `npm-publish` environment's protection rules** in Settings → Environments.
-   GitHub auto-creates the environment with NO rules on first use, so until reviewers or a
-   protected-tag rule exist, the environment is an audit trail and the tag-ancestry check is what
-   actually holds the line.
-7. Smaller, each recorded with its reasoning in the report: `prepublishOnly` omits typecheck;
-   both `repair()` call sites hardcode `maxAttempts: 2` instead of reading `cfg.repair.maxAttempts`;
-   `server.ts`'s non-retriable branch records `ok: true` for a 401/403, which resets the breaker on
-   a revoked key; `config.ts:673-687` validates tier/subagent specs against the *post-disabling*
-   provider map, so a tier naming a provider disabled by an unset `${ENV}` aborts startup — in
-   tension with "disabling one optional provider must never be a total outage".
+Also delivered in the same pass, from "Not in this run": **`leave_me_alone`**, the onboarding-nudge
+suppression list. Entries matching no known provider are legal on purpose (the list stores the
+negative space), and it silences the nudge ONLY — suppressed providers stay visible in
+`llm-relay keys`, `/registry`, telemetry and `candidates`.
 
-## Deliberate intermediate state (not bugs)
+## Still open
 
-- `circuit-breaker.ts` keeps `isHealthy()` and `getStabilityScore()`. `getStabilityScore` is now a
-  thin `getMeasuredStability() ?? UNMEASURED_STABILITY` wrapper so it can no longer return 100 for
-  an unseen key, and telemetry no longer calls it — so it is deletable now. `isHealthy` is the
-  cooldown accessor and has no replacement yet.
-- `credentialState`'s `declared-missing` branch throws from `buildForwardHeaders`. It should be
-  unreachable now that `resolveTargets` drops keyless targets, but it is deliberately loud so a
-  future routing change fails instead of egressing whatever the caller sent.
-- Auto-update was dormant between the self-update commit and the cli commit, by design. Both have
-  landed, so it is live again — for mutating subcommands only.
-
-## Not in this run
-
-- **Two feature requests, unstarted, each owed its own commit.** (a) a `leave_me_alone` provider
-  suppression list in `~/.llm-relay/config.json`, consumed by `getOnboardingStatusList` — validation
-  must tolerate names matching no known provider, since that is the whole point of storing only the
-  negative space; suppressed providers stay visible in `llm-relay keys` and `/registry`, because
-  silencing a nudge is not hiding state. (b) `scripts/install-skill.mjs` registering llm-relay in the
-  global `~/.claude/CLAUDE.md` between markers, idempotent, one-time backup, global-only, with an
-  opt-out. Neither is required for anything to work.
-- **7 findings the operator left out of scope**, including `ping/quota.ts:28` hardcoding an
-  `openrouter.ai` URL against the provider-agnostic invariant, and `presets.ts:149` asserting
-  `x-api-key` while `authEnv.ts:33` accepts the bearer-shaped `ANTHROPIC_AUTH_TOKEN`.
-  (`publish.yml`, previously the eighth, was pulled in and is done.)
+- **7 findings the operator left out of scope.** Named examples: `ping/quota.ts:28` hardcodes an
+  `openrouter.ai` URL against the provider-agnostic invariant, `ping/ping.ts:58` hardcodes provider
+  NAMES to decide a disabled-thinking toggle (same class, found during the run), and
+  `presets.ts:149` asserts `x-api-key` while `authEnv.ts:33` accepts the bearer-shaped
+  `ANTHROPIC_AUTH_TOKEN`. These were an explicit operator decision, not an oversight — reopen them
+  deliberately or not at all.
+- **`scripts/install-skill.mjs` registering llm-relay in the global `~/.claude/CLAUDE.md`.**
+  Proposed, then **dropped by the owner (2026-07-30)**. Don't re-propose it as an oversight: the
+  cost is that every global install/upgrade writes to the user's own global instruction file.
 
 ## Residual risks, recorded rather than repaired
 
-- **Test-plan assertion polarity was assigned by a content heuristic**, and the gate checks only
-  that both polarities are PRESENT, not that each is CORRECT. An independent reviewer found 12
-  `NEGATIVE:` assertions with no failure-marker language and 5 phrased positively. Individually
-  verifying them is not something regenerating an artifact can deliver.
+- **Test-plan assertion polarity was assigned by a content heuristic**, and the gate checked only
+  that both polarities were PRESENT, not that each was CORRECT. An independent reviewer found 12
+  `NEGATIVE:` assertions with no failure-marker language and 5 phrased positively.
 - **Two mandated-independent review phases were self-performed in the PREVIOUS run** after five
-  dispatch attempts failed with API 5xx/529. This run dispatched the judge independently, which
-  partially discharges it; the earlier critique round remains self-graded.
+  dispatch attempts failed with API 5xx/529. The final run dispatched the judge independently,
+  which partially discharges it; the earlier critique round remains self-graded.
 - `CP-NODE-12-f01` is recorded `accept_failed` in the tool's ledger even though its work is on the
-  branch. The planner split that node by file list while giving both fragments identical
-  instructions, so the fragment that did the work did not own two of the files; the tool's own
-  advice for that seam is to serialise, which is what the hand-authored release commit is. It is
-  **not** unfinished work.
+  branch — the planner split that node by file list while giving both fragments identical
+  instructions. **Not** unfinished work.
+
+## Deliberate intermediate state (not bugs)
+
+- `credentialState`'s `declared-missing` branch throws from `buildForwardHeaders`. It should be
+  unreachable now that `resolveTargets` drops keyless targets, but it is deliberately loud so a
+  future routing change fails instead of egressing whatever the caller sent.
+- Several existing tests pin the defect they should catch. A correct fix in this codebase can
+  legitimately turn the suite red — read the failing test's stated reasoning before assuming the
+  change is wrong.
 
 ## Where the machine-readable state lives
 

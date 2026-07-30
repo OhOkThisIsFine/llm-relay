@@ -27,6 +27,33 @@ describe("repair orchestration", () => {
     expect(d.message).toEqual(fixedMsg);
   });
 
+  /**
+   * The response envelope belongs to the BACKEND that answered, not to the reshaper.
+   * `Reshaper` is an interface, so this is checked on what repair() RETURNS rather than
+   * trusted of the in-tree implementation — the same reasoning `guardReshaped` exists for.
+   */
+  it("re-attaches the backend's id, model and usage to the repaired message", async () => {
+    const withIdentity: AssistantMessage = { ...badCall, id: "msg_backend_abc", model: "z-ai/glm-5.2", usage: { input_tokens: 91, output_tokens: 7 } };
+    const d = await repair(withIdentity, tools, { validator, reshaper: reshaperOf({ kind: "message", message: fixedMsg }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+    expect(d.message?.id).toBe("msg_backend_abc");
+    expect(d.message?.model).toBe("z-ai/glm-5.2");
+    expect(d.message?.usage).toEqual({ input_tokens: 91, output_tokens: 7 });
+  });
+
+  it("does not let a reshaper substitute its OWN id, model or usage for the backend's", async () => {
+    // A reshaper that filled these from its own completion would make the client meter and
+    // attribute the turn to a model that never answered it.
+    const foreign: AssistantMessage = { ...fixedMsg, id: "msg_reshaper_xyz", model: "the-repair-model", usage: { input_tokens: 5000, output_tokens: 12 } };
+    const withIdentity: AssistantMessage = { ...badCall, id: "msg_backend_abc", model: "z-ai/glm-5.2" };
+    const d = await repair(withIdentity, tools, { validator, reshaper: reshaperOf({ kind: "message", message: foreign }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.message?.id).toBe("msg_backend_abc");
+    expect(d.message?.model).toBe("z-ai/glm-5.2");
+    // The backend reported no usage, so the repaired message reports none either — the
+    // reshaper's own token count is not a measurement of this turn.
+    expect(d.message?.usage).toBeUndefined();
+  });
+
   it("returns refused when the reshaper declines", async () => {
     const d = await repair(badCall, tools, { validator, reshaper: reshaperOf({ kind: "refuse", reason: "ambiguous" }), maxAttempts: 2, isDestructive: noDestruct });
     expect(d.outcome).toBe("refused");

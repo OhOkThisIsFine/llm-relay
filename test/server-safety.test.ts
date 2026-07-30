@@ -67,7 +67,7 @@ describe("server-safety features (CP-NODE-1)", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", timeoutMs: 5000 } },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
       routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
@@ -94,7 +94,7 @@ describe("server-safety features (CP-NODE-1)", () => {
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      providers: { up: { base: "http://127.0.0.1:9999", kind: "anthropic", timeoutMs: 5000 } },
+      providers: { up: { base: "http://127.0.0.1:9999", kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
       routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },

@@ -9,8 +9,12 @@ import { type AssistantMessage, type ContentBlock, isToolUseBlock } from "./anth
  * because it was emitted even when the backend HAD supplied a real id, the client's view
  * of the conversation silently disagreed with the provider's. The prefix marks it as
  * relay-synthesized so nobody mistakes it for something the provider can be asked about.
+ *
+ * Exported because the buffered (non-streamed) repair path needs the SAME fallback: it had
+ * its own hardcoded `msg_repair`, so the two paths disagreed about what an unknown id looks
+ * like. One definition, one prefix.
  */
-function syntheticMessageId(): string {
+export function syntheticMessageId(): string {
   return `msg_relay_${randomUUID().replace(/-/g, "")}`;
 }
 

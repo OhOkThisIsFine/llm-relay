@@ -16,11 +16,33 @@ export interface OnboardingStatus {
   recommendedModels: string[];
 }
 
+/**
+ * Providers the user has told the onboarding flow to stop asking about.
+ *
+ * Case- and whitespace-insensitive: config keys are lowercase by convention, and a user typing
+ * "Gemini" into a suppression list means the obvious thing. Matching is against the provider's
+ * own name only — never its authEnv or display name — so one entry cannot silence a provider
+ * the user did not name.
+ */
+function suppressed(cfg?: Config): Set<string> {
+  return new Set((cfg?.leaveMeAlone ?? []).map((n) => n.trim().toLowerCase()));
+}
+
+/**
+ * The providers onboarding should nudge about.
+ *
+ * ⚠ This is the ONLY surface `leave_me_alone` affects. Do not reuse it in `llm-relay keys`,
+ * `/registry`, telemetry or the candidates table: the user asked for silence about a provider
+ * they are not configuring, not for it to disappear from the places they go to find out what
+ * the relay actually sees.
+ */
 export function getOnboardingStatusList(cfg?: Config): OnboardingStatus[] {
   const result: OnboardingStatus[] = [];
   const providers = cfg?.providers ?? ALL_PROVIDER_PRESETS;
+  const quiet = suppressed(cfg);
 
   for (const [name, p] of Object.entries(providers)) {
+    if (quiet.has(name.toLowerCase())) continue;
     const preset = ALL_PROVIDER_PRESETS[name];
     const authEnv = p.authEnv ?? preset?.authEnv;
     // The shared presence predicate, not a local `Boolean(...)`: presence has exactly one
@@ -67,6 +89,14 @@ export function printOnboardingGuide(cfg?: Config): void {
     if (!p.hasKey && p.signupUrl) {
       console.log(`    👉 Add your subscription key: ${p.signupUrl}`);
     }
+  }
+
+  // Stated, not silent. The list is a nudge suppressor, not a secret: a user who forgot they
+  // suppressed something would otherwise wonder why a provider they configured never appears.
+  const quiet = cfg?.leaveMeAlone ?? [];
+  if (quiet.length > 0) {
+    console.log(`\n🔇 Suppressed via leave_me_alone (still visible in \`llm-relay keys\` and /registry):`);
+    console.log(`  ${quiet.join(", ")}`);
   }
 
   console.log("\n💡 QUICK START:");

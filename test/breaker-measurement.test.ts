@@ -27,9 +27,11 @@ describe("breaker records measured latency (ARC-4d706fce)", () => {
   /**
    * The measured-latency invariant is enforced by there being NO writer that can
    * invent one. `recordOutcome`'s `elapsedMs` is required, and the defaulted
-   * `recordSuccess`/`recordFailure` pair is gone — `npm run typecheck` excludes
-   * `test/**`, so a `@ts-expect-error` in this file would prove nothing; the
-   * enforcement has to be the absence of the surface, which is checkable here.
+   * `recordSuccess`/`recordFailure` pair is gone. Asserted at RUNTIME on the
+   * prototype rather than with a `@ts-expect-error`: the absence of a surface is
+   * what makes the invariant hold at every call site, including the untyped ones.
+   * (`npm run typecheck:test` does now check this file — but a type-level assertion
+   * would only prove the surface is untyped, not that it is gone.)
    */
   it("exposes no defaulted writer that could fabricate a latency", () => {
     const proto = CircuitBreaker.prototype as unknown as Record<string, unknown>;
@@ -38,15 +40,26 @@ describe("breaker records measured latency (ARC-4d706fce)", () => {
     expect(proto["recordFailure"]).toBeUndefined();
   });
 
+  /**
+   * Same argument as the writers above, one level up: the ONLY way to ask this breaker
+   * about stability is an accessor that can answer "nothing measured". `getStabilityScore`
+   * returned a bare `number` — `UNMEASURED_STABILITY` for an unseen key, and 100 before
+   * that — so no caller could tell a placeholder from an observation. It is gone.
+   */
+  it("exposes no scalar stability accessor that could pass a guess off as a measurement", () => {
+    const proto = CircuitBreaker.prototype as unknown as Record<string, unknown>;
+    expect(proto["getMeasuredStability"]).toBeTypeOf("function");
+    expect(proto["hasObservations"]).toBeTypeOf("function");
+    expect(proto["getStabilityScore"]).toBeUndefined();
+  });
+
   it("an UNTRACKED target reports unknown, never a perfect score", () => {
     const cb = new CircuitBreaker();
     const untracked = target("nim", "never-probed");
-    // The defect: getStabilityScore returned 100 for an unseen key, so a target
+    // The defect: the stability accessor returned 100 for an unseen key, so a target
     // nobody has measured was indistinguishable from a proven-healthy one.
     expect(cb.getMeasuredStability(untracked)).toBeNull();
     expect(cb.hasObservations(untracked)).toBe(false);
-    expect(cb.getStabilityScore(untracked)).toBe(UNMEASURED_STABILITY);
-    expect(cb.getStabilityScore(untracked)).not.toBe(100);
   });
 
   it("an untracked target does not compare equal to a measured-healthy one", () => {
@@ -64,9 +77,14 @@ describe("breaker records measured latency (ARC-4d706fce)", () => {
     expect(a).not.toBe(b);
     expect(b).toBeNull();
     expect(typeof a).toBe("number");
-    // …and the ordering value they are compared BY also differs, which is the
-    // half the old test could not see.
-    expect(cb.getStabilityScore(healthy)).toBeGreaterThan(cb.getStabilityScore(untracked));
+    // …and the ordering they are compared BY also separates them, which is the half
+    // the old test could not see. Asserted through the ordering itself now that the
+    // scalar accessor is gone.
+    expect(a!).toBeGreaterThan(UNMEASURED_STABILITY);
+    expect(cb.getHealthyTargets([untracked, healthy], Date.now()).map((t) => t.model)).toEqual([
+      "healthy",
+      "untracked",
+    ]);
   });
 
   /**
@@ -101,15 +119,16 @@ describe("breaker records measured latency (ARC-4d706fce)", () => {
     cb.recordOutcome(t, { ok: false, status: 500, elapsedMs: 30 });
     expect(cb.hasObservations(t)).toBe(true);
     expect(cb.getMeasuredStability(t)).toBe(0);
-    expect(cb.getStabilityScore(t)).toBe(0);
   });
 
   it("a 401 is never laundered into a success ping", () => {
     const cb = new CircuitBreaker();
     const revoked = target("nim", "revoked-key");
-    // server.ts does not classify 401 as retriable, so it arrives here as ok:true.
-    // The old writer hardcoded code "200" for any ok outcome, so a provider whose
-    // key had been revoked accumulated synthetic successes and read as available.
+    // Defence in depth. `server.ts` no longer reports a 401 to the breaker at ALL (a
+    // credential fault is not health data) — but it used to arrive here as ok:true, and
+    // the writer hardcoded code "200" for any ok outcome, so a provider whose key had
+    // been revoked accumulated synthetic successes and read as available. The breaker
+    // must stay correct for that input rather than relying on its caller.
     cb.recordOutcome(revoked, { ok: true, elapsedMs: 40, status: 401 });
     expect(cb.getState(revoked)!.pings[0]!.code).toBe("401");
     expect(cb.getState(revoked)!.lastStatus).toBe(401);

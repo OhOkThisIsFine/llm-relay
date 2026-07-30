@@ -141,18 +141,13 @@ export class CircuitBreaker {
     return !!state && state.pings.length > 0;
   }
 
-  /**
-   * The ORDERING value for a target: its measured stability, or
-   * `UNMEASURED_STABILITY` when nothing has been observed.
-   *
-   * ⚠ Retained only because `telemetry.ts` still reports a bare `number` and has
-   * not migrated (`OBS-dc5f56e7`). Prefer `getMeasuredStability()` +
-   * `hasObservations()`, which cannot present a guess as a measurement; this
-   * method is deleted once that consumer lands.
-   */
-  getStabilityScore(target: ResolvedTarget | string): number {
-    return this.getMeasuredStability(target) ?? UNMEASURED_STABILITY;
-  }
+  // `getStabilityScore(target)` — the wrapper that returned `getMeasuredStability() ??
+  // UNMEASURED_STABILITY` — is DELETED. It existed only for `telemetry.ts`, which reported a
+  // bare `number` and has since migrated, and its whole hazard was that a `number` return
+  // cannot say "nothing was measured": every caller received a plausible score and none could
+  // tell a guess from an observation. `getMeasuredStability()` + `hasObservations()` are the
+  // pair that can. The one place the mid-band placeholder is legitimate is ORDERING, where it
+  // is applied locally in `getHealthyTargets`. Don't reintroduce a scalar accessor.
 
   /** Get full state for a target. */
   getState(target: ResolvedTarget | string): CircuitState | undefined {

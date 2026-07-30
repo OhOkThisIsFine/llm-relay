@@ -1,0 +1,21 @@
+{
+  // Type-checks the SUITE — nothing else did.
+  //
+  // `tsconfig.json` is `include: ["src/**/*.ts"]` with `exclude: ["**/*.test.ts"]`, and
+  // vitest transpiles tests rather than checking them, so a test's types were never
+  // checked by anything: a `@ts-expect-error` in a test file was inert (never evaluated,
+  // so it neither passed nor failed) and a test could assert against a shape the source
+  // no longer has. `npm run check` runs this alongside the src typecheck.
+  //
+  // `noEmit` because this config exists only to check; `dist/` comes from tsconfig.json.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // The base config's rootDir is `src` (it drives dist/ layout). Widened here purely
+    // so the test files are allowed into the program; nothing is emitted from this config.
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}

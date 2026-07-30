@@ -29,7 +29,10 @@ function mockOpenAi(): Promise<{ server: Server; seen: () => { model?: string; a
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
         const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-        captured = { model: body.model, auth: req.headers["authorization"] as string | undefined };
+        captured = {
+          ...(typeof body.model === "string" ? { model: body.model } : {}),
+          ...(typeof req.headers["authorization"] === "string" ? { auth: req.headers["authorization"] } : {}),
+        };
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ id: "cmpl_1", object: "chat.completion", choices: [{ message: { role: "assistant", content: "hi from backend" }, finish_reason: "stop" }] }));
       });

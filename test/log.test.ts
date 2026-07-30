@@ -21,7 +21,6 @@ afterEach(() => {
 const record = (over: Partial<RequestLog> = {}): RequestLog => ({
   ts: "2026-07-29T00:00:00.000Z",
   path: "/v1/messages",
-  backendModel: "claude-opus-5",
   servedProvider: "nim",
   servedModel: "z-ai/glm-5.2",
   hadTools: true,
@@ -56,7 +55,6 @@ describe("metadata-only logging", () => {
     expect(Object.keys(line!)).toEqual([
       "ts",
       "path",
-      "backendModel",
       "servedProvider",
       "servedModel",
       "hadTools",
@@ -98,34 +96,35 @@ describe("metadata-only logging", () => {
     expect(line).not.toHaveProperty("responseHeaders");
   });
 
-  it("records the model that SERVED the request alongside the one the client asked for", () => {
+  /**
+   * The record identifies the deployment that ANSWERED, and nothing else. The model the
+   * client asked for used to be the only model id in the log (`backendModel`), which meant
+   * every "which model trips the validator" reading was attributed to whatever the client
+   * happened to name — routing resolves a tier/pool spec to a target, so the two routinely
+   * differ. Its absence from the allow-list above is the assertion that matters; this pins
+   * the replacement.
+   */
+  it("records the provider and model that SERVED the request", () => {
     new MetadataLogger({ level: "metadata", file }).write(
-      record({ backendModel: "claude-opus-5", servedProvider: "nim", servedModel: "z-ai/glm-5.2" }),
+      record({ servedProvider: "nim", servedModel: "z-ai/glm-5.2" }),
     );
     const [line] = linesIn(file);
     expect(line!["servedProvider"]).toBe("nim");
     expect(line!["servedModel"]).toBe("z-ai/glm-5.2");
-    expect(line!["backendModel"]).toBe("claude-opus-5");
   });
 
   /**
-   * An unmigrated call site (`server.ts`'s `baseLog()` until CP-NODE-5 lands) must
-   * not publish a confident `null` that reads as "nothing served it". Absent means
-   * not populated; `null` means genuinely nothing served.
+   * `null` is a claim — "nothing served this turn" (a guardrail rejection, a routing error,
+   * an admin endpoint answered locally). It has to survive to the line as `null` rather than
+   * being dropped, or those turns become indistinguishable from ones that never wrote a
+   * served field at all.
    */
-  it("omits the served fields entirely when a call site has not populated them", () => {
-    const partial = record();
-    delete (partial as Partial<RequestLog>).servedProvider;
-    delete (partial as Partial<RequestLog>).servedModel;
-
-    new MetadataLogger({ level: "metadata", file }).write(partial);
-    const [line] = linesIn(file);
-    expect(line).not.toHaveProperty("servedProvider");
-    expect(line).not.toHaveProperty("servedModel");
-
+  it("emits an explicit null when nothing served the request", () => {
     new MetadataLogger({ level: "metadata", file }).write(record({ servedProvider: null, servedModel: null }));
-    const lines = linesIn(file);
-    expect(lines[1]!["servedProvider"]).toBeNull();
+    const [line] = linesIn(file);
+    expect(line).toHaveProperty("servedProvider");
+    expect(line!["servedProvider"]).toBeNull();
+    expect(line!["servedModel"]).toBeNull();
   });
 
   it("writes nothing at all when the level is silent", () => {

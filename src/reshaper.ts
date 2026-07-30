@@ -104,6 +104,13 @@ export function parseCorrectedInputs(text: string): CorrectedInputs {
  * will not execute a tool announced under "end_turn"), and preserving the backend's
  * wrong value here made an otherwise-repaired message fail re-validation and burn
  * every remaining attempt.
+ *
+ * ⚠ Everything else is CARRIED OVER from `raw` — `id`, `model`, `stop_sequence`, `usage`.
+ * This function returned only `{ content, stop_reason }`, so a message that went through
+ * repair reached `emitSse` stripped of the backend's own identity and got a synthesized id
+ * and no usage, while a message that merely passed validation kept both. Repair must not be
+ * observable in the response envelope; the only field it is allowed to change is the one it
+ * repaired. Absent fields stay absent — nothing here invents an id or zero-fills usage.
  */
 export function reconstruct(raw: AssistantMessage, inputs: Record<string, unknown>): AssistantMessage {
   const content = raw.content.map((b) =>
@@ -112,7 +119,7 @@ export function reconstruct(raw: AssistantMessage, inputs: Record<string, unknow
       : b,
   );
   const stop_reason = content.some(isToolUseBlock) ? "tool_use" : raw.stop_reason ?? "tool_use";
-  return { content, stop_reason };
+  return { ...raw, content, stop_reason };
 }
 
 /** Reshaper backed by an Anthropic- or OpenAI-compatible endpoint. */

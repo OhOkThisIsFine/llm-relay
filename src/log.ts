@@ -10,39 +10,31 @@ export interface RequestLog {
   ts: string;
   path: string;
   /**
-   * The model id the CLIENT asked for — NOT necessarily the one that answered.
-   *
-   * ⚠ Kept only until `server.ts` populates `servedProvider`/`servedModel`
-   * (OBS-b5ade458). Routing resolves a tier/pool spec to a `ResolvedTarget`, so
-   * the requested id and the serving deployment routinely differ: every "which
-   * model trips the validator" conclusion drawn from this field is attributed to
-   * whatever the client happened to name. Read the served fields instead.
-   *
-   * @deprecated Use `servedProvider` + `servedModel`.
-   */
-  backendModel: string | null;
-  /**
    * The provider that actually served the request (`ResolvedTarget.provider`), or
    * `null` when the request never reached a backend (guardrail rejection, routing
-   * error) and so nothing served it. `null` means none — never a guess.
+   * error, an admin endpoint) and so nothing served it. `null` means none — never
+   * a guess.
    *
-   * ⚠ Optional ONLY for the length of the OBS-b5ade458 transition: `server.ts`'s
-   * `baseLog()` builds a `RequestLog` literal and has not been migrated yet, so
-   * requiring the field here would break that module's build from a file that is
-   * not allowed to fix it. An ABSENT field means "this call site has not been
-   * migrated" and is deliberately omitted from the log line rather than emitted
-   * as `null`, so a reader cannot mistake an unmigrated call site for a request
-   * that nothing served. It becomes required in the same change that deletes
-   * `backendModel`.
+   * REQUIRED. It was optional for the length of the OBS-b5ade458 transition, where
+   * an absent field meant "this call site has not been migrated yet"; every call
+   * site has been migrated, so `tsc` now names any new one that forgets to say
+   * which of the two it is.
+   *
+   * ⚠ There is deliberately no field for the model the CLIENT asked for. There was
+   * one (`backendModel`), and it was the only model id in the log: routing resolves
+   * a tier/pool spec to a `ResolvedTarget`, so the requested id and the serving
+   * deployment routinely differ, and every "which model trips the validator"
+   * conclusion drawn from this dataset was attributed to whatever the client
+   * happened to name. Don't reintroduce it beside these two — a reader who has both
+   * will read the wrong one.
    */
-  servedProvider?: string | null | undefined;
+  servedProvider: string | null;
   /**
    * The backend model id that actually served the request
    * (`ResolvedTarget.model`), or `null` when nothing served it. An anthropic
    * passthrough target carries no model id of its own, and that is `null` too.
-   * Optional for the same transitional reason as `servedProvider`.
    */
-  servedModel?: string | null | undefined;
+  servedModel: string | null;
   hadTools: boolean;
   streamed: boolean;
   backendStatus: number;
@@ -68,7 +60,6 @@ export interface RequestLog {
 const LOG_FIELDS = [
   "ts",
   "path",
-  "backendModel",
   "servedProvider",
   "servedModel",
   "hadTools",

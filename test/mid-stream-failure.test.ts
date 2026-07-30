@@ -51,7 +51,7 @@ function cfgFor(backendPort: number, logFile: string, mode: Config["mode"]): Con
   return {
     host: "127.0.0.1",
     port: 0,
-    providers: { up: { base: `http://127.0.0.1:${backendPort}`, kind: "anthropic", timeoutMs: 5000 } },
+    providers: { up: { base: `http://127.0.0.1:${backendPort}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
     routing: { default: "up", tiers: {} },
     mode,
     repair: { maxAttempts: 2, destructiveTools: [] },
@@ -104,7 +104,7 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     const logFile = join(dir, "log.jsonl");
     const backend = await truncatingSseBackend();
     const cfg = cfgFor(port(backend), logFile, "repair");
-    cfg.reshaper = { base: "http://127.0.0.1:1", kind: "openai", model: "stub", timeoutMs: 1000 };
+    cfg.reshaper = { base: "http://127.0.0.1:1", kind: "openai", model: "stub", authHeader: "authorization", timeoutMs: 1000 };
     const proxy = await listen(createProxy(cfg));
 
     const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {

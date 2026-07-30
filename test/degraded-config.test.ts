@@ -110,6 +110,63 @@ describe("provider with an unset ${ENV} in base", () => {
     expect(resolveTargets("pool/coding", cfg).map((t) => t.provider)).toEqual(["good"]);
   });
 
+  /**
+   * Tier and subagent specs were validated against the POST-disabling provider map, so a tier
+   * pointing at a provider whose ${ENV} was unset was reported as naming an unknown provider
+   * and aborted startup — the same total outage the pool path already avoids, reached by a
+   * different route. They degrade the same way a pool member does.
+   */
+  it("drops a tier naming a disabled provider instead of aborting startup", () => {
+    const cfg = loadConfig(
+      write({
+        ...base,
+        routing: { default: "good/m", tiers: { opus: "needsvar/m", sonnet: "good/m" } },
+      }),
+    );
+    expect(cfg.routing.tiers.opus).toBeUndefined();
+    expect(cfg.routing.tiers.sonnet).toBe("good/m");
+    expect((cfg.warnings ?? []).join("\n")).toContain("routing.tiers.opus");
+  });
+
+  it("keeps the surviving members of a multi-candidate tier", () => {
+    const cfg = loadConfig(
+      write({ ...base, routing: { default: "good/m", tiers: { opus: ["needsvar/m", "good/m"] } } }),
+    );
+    expect(cfg.routing.tiers.opus).toEqual(["good/m"]);
+  });
+
+  /**
+   * Dropping a subagent entry means that traffic falls through to routing.default — for a
+   * passthrough default, primary quota, while the dispatcher believes it offloaded. That is
+   * the hazard an unresolvable `@relay:` directive is a hard ERROR for, so the startup warning
+   * has to state the consequence and not merely the fact.
+   */
+  it("drops a subagent entry naming a disabled provider, warning what it now costs", () => {
+    const cfg = loadConfig(
+      write({
+        ...base,
+        providers: { ...base.providers, passthru: { base: "https://passthrough.test", kind: "anthropic" } },
+        routing: { default: "passthru", subagents: { opus: "needsvar/m" }, offload: true },
+      }),
+    );
+    expect(cfg.routing.subagents?.opus).toBeUndefined();
+    const joined = (cfg.warnings ?? []).join("\n");
+    expect(joined).toContain("routing.subagents.opus");
+    expect(joined).toContain("primary quota");
+  });
+
+  /**
+   * routing.default is the fall-through for everything, so there is nowhere left to fall
+   * through TO — still fatal. But it must not be reported as a typo: the provider is declared,
+   * it is disabled, and sending the operator to hunt for a misspelling wastes the one message
+   * they get.
+   */
+  it("still fails when routing.default itself names the disabled provider — naming the real cause", () => {
+    const cfg = { ...base, routing: { default: "needsvar/m" } };
+    expect(() => loadConfig(write(cfg))).toThrow(/DISABLED/);
+    expect(() => loadConfig(write(cfg))).not.toThrow(/unknown provider/);
+  });
+
   it("fails loudly when disabling leaves a pool with no members at all", () => {
     const cfg = {
       ...base,
