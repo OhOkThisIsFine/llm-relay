@@ -21,7 +21,8 @@ it does not invent intent, and it refuses to fabricate destructive-tool calls.
 npm install
 npm run build          # tsc -> dist/
 npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
-npm run typecheck      # tsc --noEmit  (excludes test/*.ts — vitest is what checks those)
+npm run typecheck      # tsc --noEmit  — src/ ONLY. See the warning below.
+npm run check          # typecheck + test. The one gate; CI runs exactly this.
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
 
@@ -31,11 +32,44 @@ llm-relay pools --probe # will each configured MODEL actually answer? (the only 
 npx vitest run test/repair.test.ts             # one file
 npx vitest run -t "refuses destructive"        # one test by name
 ```
-**Always verify green before AND after a change:** `npm run build && npm test && npm run typecheck`.
+**Always verify green before AND after a change:** `npm run build && npm run check`.
+
+⚠ **Nothing type-checks `test/`.** `tsconfig.json` is `include: ["src/**/*.ts"]` with
+`exclude: [… "**/*.test.ts"]`, and `vitest.config.ts` declares **no `typecheck` block** — vitest
+transpiles tests, it does not type-check them. So a test's types are never checked by anything, and
+a `@ts-expect-error` in a test file is inert: it is never evaluated, so it neither passes nor fails
+and proves nothing. Don't rely on one to pin a type contract; assert at runtime instead. (Two
+independent workers were misled by the old "vitest is what checks those" claim here.)
+
+⚠ **`vitest.config.ts` scopes the suite to this checkout's `test/` directory on purpose.**
+Without an explicit `include`,
+vitest's default glob walks the whole tree — including the per-node git worktrees the remediation
+tooling creates under `.audit-tools/worktrees/` — so `npm test` ran every worktree's copy of every
+test file. That breaks the gate in both directions: another worktree's half-finished edit fails this
+tree's run, and a worktree's stale copy passes one. Don't widen the glob.
+
+**CI** (`.github/workflows/ci.yml`) runs `npm ci --ignore-scripts` → `npm run build` →
+`npm run check` on every push to `main` and every PR, plus a check that the `postinstall` hook stays
+inert on a non-global install. Before this existed, `typecheck` ran in **no** workflow and the suite
+ran only inside the publish job — i.e. first at the moment a version was already shipping, so every
+"tsc clean / suite green" claim in this repo rested on somebody's unverifiable local run.
 
 **Releasing: use the `/release` skill** ([.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md)).
-Publishing happens in GitHub Actions via npm **Trusted Publishing**, triggered by pushing a `v*`
-tag — a local `npm publish` has no credentials and fails with a misleading 404.
+Publishing happens in GitHub Actions via npm **Trusted Publishing** — there is no npm token here, so
+the *trigger* is the credential. A local `npm publish` has no credentials and fails with a misleading
+404. `.github/workflows/publish.yml` now stands four gates between a tag and the registry:
+
+1. a job-level `if` — this repository only, ref under `refs/tags/v*`;
+2. `environment: npm-publish`; ⚠ its protection rules live in **repo settings** (Settings →
+   Environments → npm-publish), not in the workflow, and GitHub auto-creates the environment with
+   **no** rules on first run — **they are not configured yet**, so today the environment is an audit
+   trail, not a gate;
+3. the tag's commit must be **contained in the default branch** (this is the check actually holding
+   the line until (2) is configured);
+4. the tag must **match `package.json`'s version** — an npm mistake is permanent.
+
+The `release: published` trigger was **removed**: it was a second independent path to the registry
+that also double-fired for a release cut from a tag. Actions are pinned to commit SHAs.
 
 ## Architecture — file → responsibility (all in `src/`)
 
@@ -50,16 +84,16 @@ tag — a local `npm publish` has no credentials and fails with a misleading 404
 | `offload.ts` | The subagent-offload switch. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites only `routing.offload` in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
 | `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. Exhaustion is host-reported for every rung kind because the relay cannot see a CLI's credit balance, and a `quota` bucket cools sibling rungs together (one binary can meter two independent balances — cooling both would skip a live lane). |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
-| `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`). |
+| `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/registry`, `/telemetry`, `/ping`, `/health`, `/candidates`, `/offload`, `/dispatch`). **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → OpenAI-compatible reverse proxy. |
 | `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
-| `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai) + `FailoverReshaper` (ranked candidates from `reshaper: { pool }`; advances on transport failure only — a refusal is returned as-is, never retried elsewhere). |
-| `repair.ts` | Repair orchestrator. Destructive-refusal check → reshape ≤ maxAttempts → re-validate each attempt. |
+| `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai) + `FailoverReshaper` (ranked candidates from `reshaper: { pool }`; advances on transport failure only — a refusal is returned as-is, never retried elsewhere, and **exhausting every candidate throws `ReshaperTransportError`**, it does not return a refusal). |
+| `repair.ts` | Repair orchestrator. Destructive-refusal check → reshape ≤ maxAttempts → re-validate each attempt. `destructiveMatcher()` matches the tool name **exactly** (case-insensitively), with `name*` as an opt-in prefix form; `guardReshaped()` re-checks the reshaped message for destructive calls and for structural conservation (same block count/order, same tool_use `id`+`name`) — an added, dropped or re-pointed call is a contract violation, not a repair. |
 | `sse.ts` | `reconstructFromSse()` — rebuild an AssistantMessage from a captured SSE stream (to validate it). |
 | `emitSse.ts` | `emitSse()` / `emitSseTail()` — serialize a (repaired) message back to Anthropic SSE. `emitSseTail` re-emits only trailing blocks (streaming repair). |
 | `anthropic.ts` | Minimal Anthropic Messages shapes + `toolSchemaMap()`. Only the fields the proxy inspects. |
 | `documents.ts` | `transcodeDocuments()` — Anthropic `document` blocks → markdown text via **MarkItDown** (optional external Python CLI), applied to openai-kind targets before llm-bridge. Refuses (`DocumentError` → 400) rather than letting an unconvertible document through; llm-bridge would stringify it and inject raw base64 into the prompt. Uses a **temp file, not stdin** — pdfminer needs a seekable stream and every piped PDF dies with "No /Root object". |
-| `log.ts` | Metadata-only logger (never headers/bodies). |
+| `log.ts` | Metadata-only logger (never headers/bodies). "Metadata only" is enforced **at the sink**: `write()` projects each record through the `LOG_FIELDS` allow-list, so a caller that hands over a wider object cannot leak it and a new field is logged only when someone adds it to that list. Log-write failure is swallowed — a full disk is a logging problem, never a request failure. |
 | `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). Also harvests **per-(provider, model) limits + pricing** via `limitsFromRecord()` — a generic field-alias list (`context_window`/`max_context_length`/…), never a per-provider switch. `limits()` returns null when a provider publishes nothing (NIM), and that null must not be filled with another provider's numbers. |
 | `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Sorts targets by Stability Score. |
 | `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → observed runtime telemetry (≥5 calls, so one lucky request can't promote a model) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
@@ -93,9 +127,15 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
   the credential. `unverified` exists precisely so the check can decline to conclude — a false
   "your key is broken" sends the user to rotate a perfectly good key.
 - **Loopback only.** Startup refuses a non-loopback bind (it holds a provider key, does no auth).
-- **Logs are metadata only** — never request/response headers or bodies.
+  But **loopback is not authorization** — see the admission gotcha below.
+- **Logs are metadata only** — never request/response headers or bodies. That includes URL
+  *values*: `logSafePath()` keeps the route and each parameter's NAME and replaces its value with
+  the value's length, so a long `?task=` cannot write user prose into the log.
 - **Destructive tool calls are refused, never fabricated** (repair output may run under
   `--dangerously-skip-permissions`). Unrepairable → fail-clean (502, or a mid-stream SSE `error`).
+  The refusal set is `DEFAULT_DESTRUCTIVE` in `config.ts` — **the single definition**; the CLI
+  template spreads it, and `config.example.json` is asserted equal to it by
+  `test/destructive-coverage.test.ts`. Don't hand-copy the names anywhere.
 - **Persistent storage directory:** Local configurations, keys, and probe caches are persisted under `~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`).
 - **Hand-built `Config` objects in tests must include** `backend.kind` and
   `repair: { maxAttempts, destructiveTools }`.
@@ -137,9 +177,11 @@ test stale code.
   Losing every provider, or emptying a pool entirely, is still fatal. `Config.warnings` carries
   these so startup can print them — a degraded config that boots silently is how you end up
   running on one provider without noticing.
-- **Worktrees.** Work may happen in a git worktree under `.claude/worktrees/…`. Edit and run
-  tests **in the worktree path**, not the main checkout — they have separate working trees. vitest
-  run from the wrong root will silently pick up the other copy's `src/`.
+- **Worktrees.** Work may happen in a git worktree under `.claude/worktrees/…` or
+  `.audit-tools/worktrees/…`. Edit and run tests **in the worktree path**, not the main checkout —
+  they have separate working trees. vitest run from the wrong root will silently pick up the other
+  copy's `src/`. (`vitest.config.ts` stops the reverse case — this tree's `npm test` reaching into
+  the worktrees.)
 - **vitest reads `src/` directly; scripts read `dist/`.** Tests reflect your edits immediately;
   `scripts/*.mjs` do not until you `npm run build`.
 - **Using the `claude` CLI through the proxy needs an isolated `CLAUDE_CONFIG_DIR`.** An active
@@ -163,6 +205,42 @@ test stale code.
   distinction is what makes `FailoverReshaper` real: it advances only on throws. Converting a
   timeout/5xx into a `refuse` result (the pre-0.8 behaviour) silently disabled reshaper failover.
   `repair()` catches the throw and fails clean (`outcome: "failed"`).
+  **Exhausting every candidate throws too** — nobody answered, so there is no judgement to report.
+  Returning `refuse` there labelled a total outage as a model's decision and logged the turn as
+  `refused` (a model declined) rather than `failed` (nothing was reachable). The two outcomes must
+  stay distinguishable in the log, because they call for opposite responses.
+- **The destructive-tool match is EXACT (case-insensitive), not substring** — a trailing `*` in a
+  configured pattern is the opt-in prefix form (`git_*`). Substring matching was wrong in both
+  directions at once: none of the old fragment patterns (`rm`, `delete`, `remove`, …) occur in the
+  harness's real destructive tools, so the "never fabricate a destructive call" guard covered none
+  of the tools that can destroy anything; meanwhile `push` matched `PushNotification` and `reset`
+  matched `ResetZoom`, refusing safe calls. `DEFAULT_DESTRUCTIVE` therefore now leads with the
+  harness's own tools — `Bash`, `BashOutput`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit` —
+  before the conventional names. ⚠ **User-visible behaviour change:** repairs of malformed `Bash`/
+  `Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`BashOutput` calls that used to succeed are now refused
+  (`repair: "refused_destructive"`), and calls whose names merely *contain* a pattern
+  (`PushNotification`, `ResetZoom`, `ForceRefresh`) are now permitted. An **empty**
+  `repair.destructiveTools` refuses nothing — there is no hidden built-in set in `src/`, so
+  coverage is always traceable to config.
+- **Loopback is not authorization; the mutating endpoints have admission checks.** Any page the
+  user visits can POST cross-origin to the listener, and a `text/plain` POST is a CORS *simple
+  request* — no preflight. The attacker cannot read the response, but `/offload` rewrites
+  `config.json` and `/dispatch` steers the host's lane order, so reads are not the risk. `/offload`
+  and `/dispatch` therefore reject a present-but-non-loopback `Origin` (403), require
+  `content-type: application/json` on a mutating request (which is what forces a preflight a
+  hostile page cannot satisfy), and require a loopback `Host` (closing DNS rebinding). An **absent**
+  `Origin` is allowed on purpose — that is what a CLI sends, and the no-restart `llm-relay offload`
+  toggle depends on it. There is a test for it; don't "tighten" it into a broken CLI.
+- **Credential containment is DECLARED, not inferred from key presence.** `credentialState()` reads
+  the config declaration first: `not-declared` (a real passthrough — forward the caller's own
+  credential) / `declared-present` / `declared-missing`. The old `stripAuth = !!apiKey` was
+  identically falsy for the first and last, so a provider declaring an `authEnv` whose variable was
+  unset forwarded the caller's own Anthropic token verbatim to a third-party base URL. A
+  `declared-missing` target now throws `CredentialConfigError` rather than egressing anything.
+  Do not re-derive this from `resolveAuthEnv()` returning a name: the anthropic alias list holds
+  `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, so a provider with **no** declared `authEnv` still
+  resolves to a name whenever either is set — which would invert the one behaviour a passthrough
+  exists to provide.
 - **The breaker records failure on EVERY retriable error response (429/5xx/400/404),** including
   on the last candidate — `test/server.test.ts` "circuit breaker accounting" pins that a
   single-candidate 429 is never recorded as a success.
@@ -205,18 +283,25 @@ test stale code.
 
 ## Status & open work
 
-> ⚠ **An audit remediation is IN PROGRESS on branch `remediate/audit-2026-07-29`.**
+> ⚠ **An audit remediation is IN PROGRESS, and it lands on `main`.**
 > Read [docs/remediation-handoff-2026-07-29.md](docs/remediation-handoff-2026-07-29.md) FIRST if you
-> are continuing it. 11 of 410 approved findings have landed (both criticals); 399 remain, four
-> tightening obligations block completion, and several existing tests pin the defect they should
-> catch — a correct fix can turn the suite red. That doc also records why `phase_cut.json` must not
-> be trusted for ordering, and which findings name the wrong module.
+> are continuing it — but ⚠ **that doc's own header is stale**: it names branch
+> `remediate/audit-2026-07-29`, which is 0 ahead / 8 behind `main` and holds **none** of the work.
+> Read the branch fact from here, the rest from there. It also pins a test count in its gate line;
+> the suite grows every wave, so treat the count as historical, not a target.
+>
+> A small fraction of the 410 approved findings has landed (both criticals among them); the bulk
+> remains, several tightening obligations block completion, and **several existing tests pin the
+> defect they should catch** — a correct fix can turn the suite red. That doc also records why
+> `phase_cut.json` must not be trusted for ordering, and which findings name the wrong module.
 >
 > The audit + remediation artifacts live in `.audit-tools/`, which is **untracked and local-only** —
 > `git clean -fd` destroys them. The handoff doc is the committed source of truth.
 
-Current: **usable end-to-end**, suite green, tsc clean. A real `claude` agentic session
-completes through the proxy against NIM. Full assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
+Current: **usable end-to-end**, suite green, tsc clean — and as of this run that is verified by CI
+(`.github/workflows/ci.yml` runs `npm run check`) rather than by a local run only. A real `claude`
+agentic session completes through the proxy against NIM. Full assessment:
+[docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
 **Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code
 subagent — including built-ins like Explore, with no agent file — runs on a non-Anthropic provider
