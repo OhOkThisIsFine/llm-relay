@@ -43,10 +43,21 @@ const PRICE_OUT_FIELDS = ["completion", "output", "output_tokens"];
 function pickNumber(rec: Record<string, unknown>, fields: string[], allowZero = false): number | null {
   for (const f of fields) {
     const raw = rec[f];
+    // `Number("")` and `Number("   ")` are BOTH 0. With `allowZero` (prices, where 0 is a real free
+    // tier) a blank published field therefore read as a measured price of zero — a fabricated
+    // "this model is free", indistinguishable downstream from a provider that genuinely publishes 0.
+    // A field a provider left blank is unpublished, and unpublished stays null.
+    if (typeof raw === "string" && raw.trim() === "") continue;
     const v = typeof raw === "string" ? Number(raw) : raw;
     if (typeof v === "number" && Number.isFinite(v) && (allowZero ? v >= 0 : v > 0)) return v;
   }
   return null;
+}
+
+/** A figure we actually harvested, or null. A string, a NaN, or a field absent from an older cache
+ *  schema is NOT a published number and must never be presented as one. */
+function asNumber(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 /** Read limits + pricing out of one `/models` record, including a nested `top_provider` (OpenRouter). */
@@ -63,14 +74,42 @@ export function limitsFromRecord(rec: Record<string, unknown>): ModelLimits {
   };
 }
 
-/** True when a provider published nothing at all about a model. */
+/**
+ * True when a provider published nothing at all about a model.
+ *
+ * Tests for "not a number" rather than `=== null`: a record read back from an OLDER cache schema
+ * has the newer fields simply absent (`undefined`), and an `=== null` check called that "publishes
+ * something", so `limits()` returned an object of undefineds instead of the null its contract
+ * promises.
+ */
 function isEmpty(l: ModelLimits): boolean {
-  return (
-    l.contextLength === null &&
-    l.maxOutputTokens === null &&
-    l.pricePromptPerToken === null &&
-    l.priceCompletionPerToken === null
+  return ![l.contextLength, l.maxOutputTokens, l.pricePromptPerToken, l.priceCompletionPerToken].some(
+    (v) => typeof v === "number",
   );
+}
+
+/**
+ * Normalize the `limits` map read back off disk.
+ *
+ * The cache is a FILE — it can be stale from an older schema, half-written, or hand-edited — and
+ * `cachedLimits()` feeds the request-path context guardrail. A non-numeric ceiling arriving from
+ * disk must degrade to "unknown", never become a figure the proxy reports or enforces.
+ */
+function sanitizeLimits(raw: unknown): Record<string, ModelLimits> {
+  const out: Record<string, ModelLimits> = {};
+  if (typeof raw !== "object" || raw === null) return out;
+  for (const [id, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== "object" || v === null) continue;
+    const r = v as Record<string, unknown>;
+    const l: ModelLimits = {
+      contextLength: asNumber(r.contextLength),
+      maxOutputTokens: asNumber(r.maxOutputTokens),
+      pricePromptPerToken: asNumber(r.pricePromptPerToken),
+      priceCompletionPerToken: asNumber(r.priceCompletionPerToken),
+    };
+    if (!isEmpty(l)) out[id] = l;
+  }
+  return out;
 }
 
 /**
@@ -101,7 +140,12 @@ export class ModelCatalog {
     try {
       const j = JSON.parse(readFileSync(this.cachePath, "utf8")) as Record<string, Entry>;
       for (const [k, v] of Object.entries(j)) {
-        if (v && typeof v.fetchedAt === "number" && Array.isArray(v.models)) this.mem.set(k, v);
+        if (!v || typeof v.fetchedAt !== "number" || !Array.isArray(v.models)) continue;
+        this.mem.set(k, {
+          fetchedAt: v.fetchedAt,
+          models: v.models.filter((m): m is string => typeof m === "string"),
+          limits: sanitizeLimits(v.limits),
+        });
       }
     } catch {
       /* no cache yet — first run */
