@@ -1,173 +1,111 @@
-# Audit remediation — handoff (2026-07-29)
+# Audit remediation — handoff (2026-07-29 / 30)
 
-Branch `remediate/audit-2026-07-29`, off `main` at `f9d21ef` (v0.10.0).
-Gates at handoff: **314 tests / 35 files green, `npm run typecheck` clean, `npm run build` clean.**
+**The remediation run is COMPLETE.** All 14 planned modules landed; the state machine reached
+`close` with no blocked items.
 
-## What actually landed
+Work is on **`main`**. (The previous version of this document claimed branch
+`remediate/audit-2026-07-29` — that branch is 0 ahead / 8 behind `main` and holds none of the work.
+It is stale and can be deleted.)
 
-| Commit | Finding(s) | Sev |
-|---|---|---|
-| `30e43b1` | `ARC-a262deff`, `ARC-a262deff-2` — self-update built a `cmd.exe` command STRING from a registry-supplied version behind an unanchored semver regex | **critical** |
-| `98dd71b` | `ARC-4d706fce`, `COR-54d9134c` — breaker stability computed from parameter defaults; `-1` sentinel scored 100 | **critical** |
-| `0e5a9c2` | `ARC-c9155ca2-2`, `SEC-a5e9156b`, `COR-a5e9156b` — credential egress via a declared-but-unset `authEnv` | high |
-| `919c4c5` | `ARC-c9155ca2`, `ARC-69cc0882`, `SEC-5718c2ce` — loopback treated as authorization | high |
-| `138df90` | `ARC-4e8f64b6` — destructive-tool refusal missed `Bash`/`Write`/`Edit` | high |
+Gates on a clean committed tree: `npm run build`, `npm test`, `npm run typecheck` all green.
+There is now a single `npm run check` (= typecheck + test) and CI runs it.
 
-**Coverage: 11 of 410 approved findings (2.7%).** Both criticals, 6 high, 2 medium, 1 low.
-The 5 commits close the audit's top-5 undisputed risks; the bulk of the set is untouched.
+## What this run changed
 
-## Immediate next (highest severity first)
+Two commits are hand-authored; the rest are per-module remediation commits. Read
+`.audit-tools/remediation-report.md` for the per-obligation evidence (untracked, local-only).
 
-All 63 highs are listed in `.audit-tools/remediation/finding-closure-ledger.json`; these are the
-ones whose fix is already designed in the contracts and needs only implementation:
+| Area | Substance |
+|---|---|
+| credential containment | one trim-normalising presence predicate + `credentialState` from the DECLARATION + one `buildAuthHeaders`; `config.ts`'s untrimmed active-key filter closed, which was the surviving half of the critical |
+| target selection | untracked no longer scores a perfect 100; `recordSuccess`/`recordFailure` **deleted** so `tsc` enforces measured latency; 401 removed from every availability signal; strength provenance survives ranking |
+| release path | `publish.yml` given a ref restriction, an environment gate, tag-ancestry + tag-vs-version checks, SHA-pinned actions; `release: published` trigger removed; CI added |
+| repair boundary | full harness destructive set asserted as a policy; post-reshape check re-scoped to structural conservation of the reshaper's output; candidate exhaustion now throws instead of masquerading as a refusal |
+| http surface | served provider/model reach the log; mid-stream backend failure emits an SSE error and writes exactly one record; unresolvable `@relay:` is a clean 400 with a log line |
+| cli | rendered dispatch commands are shell-quoted (one argv element per arg); read-only subcommands can no longer trigger a global reinstall; `setup-claude` gained a real `targetPath` seam |
+| wire fidelity | message id + usage survive the repair round trip; the document fence delimiter is derived from content, not from a client-supplied title |
+| catalog | a blank published price no longer becomes a hard "free"; an older-schema cache row no longer reads as "publishes something" |
 
-1. `OBS-dc5f56e7` — `/telemetry` queries breaker state by BARE provider name while
-   `CircuitBreaker.getKey()` writes `provider/model`, and `isHealthy()`/`getStabilityScore()`
-   return `true`/`100` on a miss, so every provider reads healthy.
-   ⚠ `test/telemetry.test.ts:43-44` records with a bare string and so PINS the defect — it must be
-   rewritten in the same commit or the fix reads as a regression. `getMeasuredStability()` and
-   `hasObservations()` (added in `98dd71b`) are the accessors to migrate onto.
-2. `OBS-b5ade458` — `RequestLog.backendModel` carries the CLIENT's model. The resolved target is
-   computed at `server.ts:250-262` and never reaches any `baseLog` call site; there is no
-   `provider` field at all. A second instance is `ReshapeRequest.backendModel` (`reshaper.ts:12`),
-   hardcoded `null` at `repair.ts:52` — fixing only the log leaves the reshaper receiving null.
-3. `ARC-6a02bffc` — `cli.ts:507-511` renders `args.join(" ")` unquoted and tells the host to run
-   it verbatim. `dispatch.ts:126` is already injection-free; do NOT add a pre-joined field there.
-4. `ARC-6a02bffc-2` — every read-only subcommand can trigger a global reinstall + re-exec.
-   Needs `cli.ts` to pass a read-only/mutating classification as a RUNTIME parameter (not an
-   imported table — that was the module cycle).
-5. `REL-47acf940` — a mid-stream backend failure truncates silently with no log record.
-6. `ARC-31833353` — provenance is preserved correctly in `tier-data.ts`/`registry.ts`; the discard
-   is `benchmarks.ts:74-84` (`getStrength(spec).score` drops basis/signals). Two independent
-   reviewers reached that line from different starting scopes.
-7. `REL-b08a9327` — the EEXIST recovery path uninstalls the working global package with no
-   rollback if the reinstall then fails.
-8. `DAT-c5a3e49a` — client-supplied document title interpolated into the markdown fence delimiter
-   (`documents.ts:207,213`).
+## Immediate next
 
-## Tightening obligations (blocking on run completion)
+Nothing here blocks release. These are the loose ends workers recorded rather than reaching
+outside their module scope.
 
-Each owned by the module that owns the file, gated on its consumer landing. None are done.
-
-- `target-selection-and-health` — delete the deprecated defaulted `recordSuccess`/`recordFailure`
-  and the retained boolean/number health accessors from `circuit-breaker.ts`. **Until this runs,
-  the measured-latency invariant is enforced by convention, not by `tsc`.**
-- `observability` — delete `RequestLog.backendModel` once `server.ts` populates the served fields.
-- `credential-containment` — widen the single-auth-construction-site assertion to all of `src/`.
-  There are **eight** construction sites, not the four the audit counted; the eighth is
-  `key-checker.ts:45-51`, inside this module's own scope.
-- `http-surface` — delete `getHealthyTargets`' competing re-sort at `server.ts:261`.
+1. **Delete `RequestLog.backendModel`.** `server.ts` now populates `servedProvider`/`servedModel`,
+   which was the gate. `log.ts` was outside that node's scope, so the deprecated field is still
+   emitted. Make the served fields required at the same time — they are optional only because a
+   call site might not have migrated, and now they all have.
+2. **`reconstruct()` (`reshaper.ts:82-89`) still returns only `{ content, stop_reason }`.** Until it
+   forwards the untouched fields from `raw`, a message that goes *through repair* still reaches
+   `emitSse` with no id and no usage, so it gets a synthesized one. The wire-fidelity side of that
+   seam is done and proven by a round-trip test; this is the other half.
+3. **`server.ts`'s non-streaming path still hardcodes `msg_repair` and zero-fills usage**
+   (`toAnthropicMessage`), and `parseAssistant()` does not read id/model off buffered JSON. Same
+   defect as (2) on the other path.
+4. **`candidates.ts` feeds fuzzy-matched tier figures into `resolveMetadata()` as `reference`
+   without consulting whether the match was exact.** On a fuzzy match those numbers belong to a
+   different SKU and `referenceFrom` names only the host, so the substitution is visible only by
+   separately correlating `capabilityMatch`. Either carry the matched name into `from`, or skip
+   reference limits on a fuzzy match.
+5. **Nothing type-checks `test/`.** `tsconfig.json` excludes `**/*.test.ts` and `vitest.config.ts`
+   declares no `typecheck` block, so a `@ts-expect-error` in a test is never evaluated — one worker
+   had relied on exactly that. CLAUDE.md's claim that "vitest is what checks those" was corrected;
+   the gap itself is still open.
+6. **Configure the `npm-publish` environment's protection rules** in Settings → Environments.
+   GitHub auto-creates the environment with NO rules on first use, so until reviewers or a
+   protected-tag rule exist, the environment is an audit trail and the tag-ancestry check is what
+   actually holds the line.
+7. Smaller, each recorded with its reasoning in the report: `prepublishOnly` omits typecheck;
+   both `repair()` call sites hardcode `maxAttempts: 2` instead of reading `cfg.repair.maxAttempts`;
+   `server.ts`'s non-retriable branch records `ok: true` for a 401/403, which resets the breaker on
+   a revoked key; `config.ts:673-687` validates tier/subagent specs against the *post-disabling*
+   provider map, so a tier naming a provider disabled by an unset `${ENV}` aborts startup — in
+   tension with "disabling one optional provider must never be a total outage".
 
 ## Deliberate intermediate state (not bugs)
 
-- `circuit-breaker.ts` exposes BOTH the new `recordOutcome`/`getMeasuredStability` and the legacy
-  defaulted/100-returning accessors. Additive by design so no phase lands red; the legacy pair is
-  removed by the tightening obligation above.
-- `credentialState`'s `declared-missing` branch throws from `buildForwardHeaders`. Should be
-  unreachable — `resolveTargets` now drops keyless targets — but it is deliberately loud so a
+- `circuit-breaker.ts` keeps `isHealthy()` and `getStabilityScore()`. `getStabilityScore` is now a
+  thin `getMeasuredStability() ?? UNMEASURED_STABILITY` wrapper so it can no longer return 100 for
+  an unseen key, and telemetry no longer calls it — so it is deletable now. `isHealthy` is the
+  cooldown accessor and has no replacement yet.
+- `credentialState`'s `declared-missing` branch throws from `buildForwardHeaders`. It should be
+  unreachable now that `resolveTargets` drops keyless targets, but it is deliberately loud so a
   future routing change fails instead of egressing whatever the caller sent.
+- Auto-update was dormant between the self-update commit and the cli commit, by design. Both have
+  landed, so it is live again — for mutating subcommands only.
 
-## Awaiting operator decision
+## Not in this run
 
-`.audit-tools/remediation/disposition-ledger.json` reconciles all 471 audit findings
-(410 approved + 9 reinstated + 50 verified-noise + 0 merged + 2 scope-excluded).
+- **Two feature requests, unstarted, each owed its own commit.** (a) a `leave_me_alone` provider
+  suppression list in `~/.llm-relay/config.json`, consumed by `getOnboardingStatusList` — validation
+  must tolerate names matching no known provider, since that is the whole point of storing only the
+  negative space; suppressed providers stay visible in `llm-relay keys` and `/registry`, because
+  silencing a nudge is not hiding state. (b) `scripts/install-skill.mjs` registering llm-relay in the
+  global `~/.claude/CLAUDE.md` between markers, idempotent, one-time backup, global-only, with an
+  opt-out. Neither is required for anything to work.
+- **7 findings the operator left out of scope**, including `ping/quota.ts:28` hardcoding an
+  `openrouter.ai` URL against the provider-agnostic invariant, and `presets.ts:149` asserting
+  `x-api-key` while `authEnv.ts:33` accepts the bearer-shaped `ANTHROPIC_AUTH_TOKEN`.
+  (`publish.yml`, previously the eighth, was pulled in and is done.)
 
-- **`.github/workflows/publish.yml` has no ref restriction and no environment gate on its `v*`
-  tag trigger**, and actions are pinned to mutable major tags. Any principal able to push a tag
-  can publish any commit via Trusted Publishing. OUT OF SCOPE pending approval; highest-severity
-  item found outside the 410.
-- 7 other out-of-scope findings, incl. `ping/quota.ts:28` hardcoding an `openrouter.ai` URL
-  against the provider-agnostic invariant, and `presets.ts:149` asserting `x-api-key` while
-  `authEnv.ts:33` accepts the bearer-shaped `ANTHROPIC_AUTH_TOKEN`.
-- 9 reinstated findings are in scope but unstarted. `FND-a2c197c9` is notable: **`typecheck`
-  never runs in CI at all**, so every "tsc clean" claim rests on local runs.
+## Residual risks, recorded rather than repaired
 
-## Process notes a successor needs
-
-- **The contract pipeline livelocked** (`assessment → counterexample → assessment`) after 5 review
-  rounds. I exited deliberately and implemented from the validated artifacts. Artifacts are all
-  `status: ok`; the wave planner is no longer driving.
-- **`phase_cut.json` is WRONG** — it reports `has_cycle: true` and orders `credential-containment`
-  at phase 9, behind four of its five consumers. Execute by the acyclic graph declared in the
-  module shards (`.audit-tools/remediation/intake/contract/module-waves/`), foundations first.
-- **Two mandated-independent review phases were self-performed** after 5 subagent dispatches
-  failed with API 5xx/529. Recorded in the critique artifact; an author grading their own repair
-  is exactly what those phases exist to prevent.
-- **Four separate tests were found pinning the defect they should catch** (`telemetry` fixture,
-  `reshaper` exhaustion, `setup-claude` seam, and one assertion in the generated test plan). Assume
-  more exist. A test that goes red when a fix lands is the failure mode to expect here.
-- `test/setup-claude.test.ts` writes the developer's REAL `claude_desktop_config.json`.
-  `SetupOptions.configDir` only redirects the env VALUE written, never `targetPath`, so closing it
-  needs a source-level seam — it is not test-only work despite being filed under the tests lens.
-
-## Pending work that is NOT from the audit
-
-Two feature requests were made mid-run. Both are unstarted, both were scoped against real source,
-and both should land as their OWN commits — they touch files inside the remediation's module scopes,
-and burying a feature in a 400-finding diff makes both unreviewable.
-
-### 1. `leave_me_alone` provider-suppression list
-
-`~/.llm-relay/config.json` is npm-proof (never touched by reinstall), so it is the right home for a
-list of providers the user has told the agent to stop prompting them to configure:
-
-```json
-"leave_me_alone": ["nim", "ollama"]
-```
-
-Verified design constraints:
-
-- `config.ts` does **not** reject unknown top-level keys today, so the field is backward compatible
-  and an older binary simply ignores it.
-- Validation must **tolerate names matching no currently-known provider.** A provider can be removed
-  and re-added; erroring on an unknown name would break a working config — reintroducing exactly the
-  staleness problem that storing only the negative space avoids. This is the whole point of the
-  design: persist the suppression list, never a full roster.
-- The consumer is `getOnboardingStatusList` (`src/onboarding.ts:18-33`) and its renderer at `:42-60`,
-  which today prints `⚪ Not Configured` plus a `👉 Get your 100% FREE key here:` line for every
-  keyless free provider. That is the nagging to suppress.
-- Suppressed providers are dropped from the **prompting** output but must still appear in factual
-  surfaces (`llm-relay keys`, `/registry`). Silencing a nudge is not hiding state, and the relay's
-  honesty invariants lean that way. *(Operator has not explicitly confirmed this call.)*
-
-Files: `src/config.ts`, `src/onboarding.ts`, possibly `src/cli.ts` for a setter. Ships with a test.
-
-### 2. Skill install registers itself in the global `CLAUDE.md`
-
-Extend `scripts/install-skill.mjs` so a GLOBAL install also registers llm-relay in
-`~/.claude/CLAUDE.md`, not only `~/.claude/skills/llm-relay/SKILL.md`.
-
-Hard constraints, driven by what is actually on the operator's machine (332 hand-authored lines,
-37 existing `llm-relay` mentions, no marker blocks):
-
-- Writes MUST be delimited (`<!-- llm-relay:begin -->` / `<!-- llm-relay:end -->`) and must never
-  modify a byte outside them.
-- Idempotent — replace between markers if present, append if not. The self-updater reinstalls
-  globally on every upgrade, so this hook runs often and a naive append duplicates the block.
-- One-time backup (`CLAUDE.md.pre-llm-relay.bak`) before the first write.
-- Keep the block SHORT — a pointer plus a few commands, never a copy of the 225-line SKILL.md.
-  Duplicated prose goes stale and would sit next to the operator's own detailed sections with no
-  signal about which is authoritative.
-- Same global-only gate and same best-effort try/catch as the skill copy, so it can never fail an
-  install. Plus an opt-out (`LLM_RELAY_NO_CLAUDEMD=1`) and a documented removal path.
-- ⚠ Do NOT describe this as required for the skill to work: skills in `~/.claude/skills/` are
-  already auto-discovered via the SKILL.md `description`. This is redundancy for reliability.
-
-File: `scripts/install-skill.mjs` (scripts-and-packaging scope). Test fresh-insert,
-re-install idempotency, and never-touches-outside-markers.
+- **Test-plan assertion polarity was assigned by a content heuristic**, and the gate checks only
+  that both polarities are PRESENT, not that each is CORRECT. An independent reviewer found 12
+  `NEGATIVE:` assertions with no failure-marker language and 5 phrased positively. Individually
+  verifying them is not something regenerating an artifact can deliver.
+- **Two mandated-independent review phases were self-performed in the PREVIOUS run** after five
+  dispatch attempts failed with API 5xx/529. This run dispatched the judge independently, which
+  partially discharges it; the earlier critique round remains self-graded.
+- `CP-NODE-12-f01` is recorded `accept_failed` in the tool's ledger even though its work is on the
+  branch. The planner split that node by file list while giving both fragments identical
+  instructions, so the fragment that did the work did not own two of the files; the tool's own
+  advice for that seam is to serialise, which is what the hand-authored release commit is. It is
+  **not** unfinished work.
 
 ## Where the machine-readable state lives
 
-All under `.audit-tools/remediation/` — **untracked, local-only, 13 MB**:
-
-| File | What |
-|---|---|
-| `intake/contract/approved-findings.json` | the 410 in-scope findings (+9 reinstated merged in) |
-| `disposition-ledger.json` | reconciles all 471: 410 approved + 9 reinstated + 50 noise + 2 excluded |
-| `finding-closure-ledger.json` | per finding: owning modules, phases, `closes_at_phase` |
-| `intake/contract/finalized_module_contracts.json` | 13 module contracts with invariants + seam adjustments |
-| `intake/contract/seam_reconciliation_report.input.json` | 33 cross-module seams with agreed interfaces |
-| `intake/contract/test_validator_plan.input.json` | 164 test specs, paired positive/negative assertions |
-| `intake/contract/module-waves/module_contract_drafting/` | per-module shards carrying the ACYCLIC dependency graph — use this for ordering, not `phase_cut.json` |
-| `dropped-triage.json` | the 58 evidence-free findings triaged 8 real / 50 noise |
-| `strategic-review-digest.md` | all 72 strategic findings as presented for approval |
+`.audit-tools/` — **untracked, local-only**; `git clean -fd` destroys it. `remediation-report.md`
+holds the per-obligation evidence, `remediation/friction/run.json` the process friction. The audit
+deliverables (`audit-findings.json`, `audit-report.md`) are tracked by an explicit `.gitignore`
+allow-list. This document is the committed source of truth.
