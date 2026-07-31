@@ -1,0 +1,10 @@
+{
+  "name": "config-routing",
+  "inputs": ["Raw configuration files", "Incoming prompt / system messages"],
+  "outputs": ["Parsed configuration object", "Relay directives and subagent flags"],
+  "invariants": ["Subagent directive parsing must strictly restrict @relay: matching to explicitly authorized user prompt blocks (verification_obligation: prompt injection security tests)"],
+  "side_effects": ["Reading configuration files from disk"],
+  "validation_boundary": "Validates schema of configuration file and model routing parameters",
+  "failure_modes": ["Invalid configuration format (throws RoutingError or configuration validation error)"],
+  "neighbor_needs": []
+}

@@ -1,4 +1,5 @@
 import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bridge";
+import { buildAuthHeaders, readCredential } from "./authEnv.js";
 import { type ResolvedTarget } from "./config.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 
@@ -111,17 +112,10 @@ export async function fetchBackend(
   // off the stream undercounts. Not universally supported — see the 400 retry below.
   if (args.wantsStream) openaiBody.stream_options = { include_usage: true };
 
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const key = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
-  if (key) {
-    if (target.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
-    else headers["x-api-key"] = key;
-  }
-
   const post = (body: Record<string, unknown>) =>
     fetchFn(target.base + "/chat/completions", {
       method: "POST",
-      headers,
+      headers: buildTargetHeaders(target),
       body: JSON.stringify(body),
       signal: args.signal,
     });
@@ -271,6 +265,14 @@ export function normalizeOpenAiErrorBody(body: string, status: number): string |
   });
 }
 
+function buildTargetHeaders(target: ResolvedTarget): Record<string, string> {
+  const key = readCredential(target.authEnv, process.env, target.provider);
+  return {
+    "content-type": "application/json",
+    ...buildAuthHeaders(key, target.authHeader),
+  };
+}
+
 /**
  * OpenAI-compatible FRONT: an OpenAI `/chat/completions` request comes in, its `model`
  * has already been resolved to a provider target by namespace/tier routing. For an
@@ -296,15 +298,9 @@ export async function fetchOpenAiFront(
   }
   const base = (args.reqJson ?? {}) as Record<string, unknown>;
   const body = { ...base, model: target.model, stream: args.wantsStream };
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const key = target.authEnv ? process.env[target.authEnv]?.trim() : undefined;
-  if (key) {
-    if (target.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
-    else headers["x-api-key"] = key;
-  }
   return fetchFn(target.base + "/chat/completions", {
     method: "POST",
-    headers,
+    headers: buildTargetHeaders(target),
     body: JSON.stringify(body),
     signal: args.signal,
   });

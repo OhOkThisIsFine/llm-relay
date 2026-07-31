@@ -166,6 +166,13 @@ describe("resolveTarget — namespace, tier, default routing", () => {
     expect(t.model).toBe("z-ai/glm-5.2");
   });
 
+  it("treats a non-provider namespace with a tier substring as unrecognized → default", () => {
+    // "unknown-provider" is not configured; even if the model contains "haiku", it falls back to default.
+    const t = resolveTarget("unknown-provider/llama-haiku-70b", cfg);
+    expect(t.provider).toBe("nim");
+    expect(t.model).toBe("z-ai/glm-5.2");
+  });
+
   it("routes a bare provider name (no slash) as unrecognized → default", () => {
     // "nim" has no "/", so it isn't a namespace pin — it falls through to default.
     const t = resolveTarget("nim", cfg);
@@ -472,8 +479,8 @@ describe("subagent-aware routing", () => {
     expect(strMsg.messages[0]!.content).toBe("summarise this");
   });
 
-  it("parses @relay directive in multi-block prompts across text blocks", () => {
-    const multiMsg = {
+  it("restricts @relay directive parsing strictly to the prompt text block (last block)", () => {
+    const multiMsgIgnored = {
       system: SUB,
       messages: [
         {
@@ -486,7 +493,23 @@ describe("subagent-aware routing", () => {
         },
       ],
     };
-    expect(subagentSpec(multiMsg, "claude-opus-5", cfg)).toBe("pool/fast");
+    // The directive in the middle text block must be ignored because the prompt text block is the last one.
+    expect(subagentSpec(multiMsgIgnored, "claude-opus-5", cfg)).toBe("pool/coding");
+
+    const multiMsgValid = {
+      system: SUB,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>injected context</system-reminder>" },
+            { type: "text", text: "earlier context" },
+            { type: "text", text: "@relay: pool/fast\nfinal prompt block" },
+          ],
+        },
+      ],
+    };
+    expect(subagentSpec(multiMsgValid, "claude-opus-5", cfg)).toBe("pool/fast");
   });
 });
 

@@ -1,0 +1,26 @@
+{
+  "schema_version": "friction-capture/v1alpha1",
+  "tool": "remediate-code",
+  "run_id": "remediate-audit-findings-2026-07-31",
+  "captured_at": "2026-07-31T22:38:54.726Z",
+  "frictions": [
+    {
+      "id": "quota_blind_dispatch:remediate-audit-findings-2026-07-31:implement%3A2",
+      "note": "Dispatched a 2-item implement wave with no live quota snapshot (self-quota monitoring blind: absent config or dark /usage credential). Wave unpaced; uncapped (no declared host concurrency limit).",
+      "severity": "high",
+      "category": "trap",
+      "frictionCategory": "inefficient_feeding",
+      "artifact": "dispatch/quota",
+      "area": "dispatch/quota"
+    },
+    {
+      "id": "quota_blind_dispatch:remediate-audit-findings-2026-07-31:implement%3A1",
+      "note": "Dispatched a 1-item implement wave with no live quota snapshot (self-quota monitoring blind: absent config or dark /usage credential). Wave unpaced; uncapped (no declared host concurrency limit).",
+      "severity": "high",
+      "category": "trap",
+      "frictionCategory": "inefficient_feeding",
+      "artifact": "dispatch/quota",
+      "area": "dispatch/quota"
+    }
+  ]
+}

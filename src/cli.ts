@@ -528,7 +528,8 @@ export function parseRenderShell(value: string | undefined): RenderShell | null 
  * absent even though `sh` treats them as ordinary: `@` leads PowerShell splatting and `%` is
  * cmd.exe variable expansion, and this line gets pasted into whatever the operator is running.
  */
-const SHELL_SAFE = /^[A-Za-z0-9_+=:,.\/\\-]+$/;
+const SHELL_SAFE_PWSH = /^[A-Za-z0-9_+=:,.\/\\-]+$/;
+const SHELL_SAFE_SH = /^[A-Za-z0-9_+=:,.\/-]+$/;
 
 /** C0 + C1 control characters except tab and newline. ESC — the ANSI carrier — is among them. */
 const RENDER_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
@@ -562,8 +563,9 @@ export function quoteArg(arg: string, shell: RenderShell = shellFor()): string {
   // otherwise rewrite what the operator sees they are about to execute — the same reason
   // `dispatch.ts` scrubs an echoed lane id. Tab and newline survive: both are legal inside
   // either literal form and a multi-line task is a real thing, not an attack.
-  const clean = arg.replace(RENDER_CONTROL, "�");
-  if (clean.length > 0 && SHELL_SAFE.test(clean)) return clean;
+  const clean = arg.replace(RENDER_CONTROL, "\uFFFD");
+  const safeRegex = shell === "pwsh" ? SHELL_SAFE_PWSH : SHELL_SAFE_SH;
+  if (clean.length > 0 && safeRegex.test(clean)) return clean;
   return shell === "pwsh" ? `'${clean.replace(/'/g, "''")}'` : `'${clean.replace(/'/g, "'\\''")}'`;
 }
 

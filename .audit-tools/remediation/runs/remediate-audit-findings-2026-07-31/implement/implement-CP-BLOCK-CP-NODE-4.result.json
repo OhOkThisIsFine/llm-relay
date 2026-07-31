@@ -1,0 +1,14 @@
+{
+  "contract_version": "remediate-code-worker-result/v1alpha1",
+  "phase": "implement",
+  "item_results": [
+    {
+      "finding_id": "CP-NODE-4",
+      "status": "resolved",
+      "evidence": [
+        "Fixed backslash shell quoting in src/cli.ts by separating SHELL_SAFE into SHELL_SAFE_PWSH and SHELL_SAFE_SH so backslashes in sh mode are single-quoted to prevent POSIX sh from stripping them as escape characters.",
+        "Verified with npx vitest run test/cli.test.ts (26 tests passed) and npm run check (all 42 test suites, 554 tests passed)."
+      ]
+    }
+  ]
+}

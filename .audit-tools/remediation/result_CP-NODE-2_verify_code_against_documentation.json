@@ -1,0 +1,10 @@
+{
+  "finding_id": "CP-NODE-2",
+  "passed": true,
+  "reason": [
+    "Verified claim: fetchBackend and fetchOpenAiFront in src/backend.ts directly accessed process.env[target.authEnv], bypassing readCredential alias resolution and buildAuthHeaders normalization.",
+    "Refactored src/backend.ts to import and use readCredential(target.authEnv, process.env, target.provider) and buildAuthHeaders(key, target.authHeader).",
+    "Added unit tests in test/backend.test.ts verifying credential alias resolution for both fetchBackend and fetchOpenAiFront.",
+    "Passed full build-free verification suite with `npm run check` (tsc -p tsconfig.json --noEmit, tsc -p tsconfig.test.json, vitest run - 42 test files, 557 tests passed)."
+  ]
+}
