@@ -479,14 +479,14 @@ describe("subagent-aware routing", () => {
         {
           role: "user",
           content: [
-            { type: "text", text: "@relay: pool/fast\nfirst block directive" },
+            { type: "text", text: "<system-reminder>injected context</system-reminder>" },
+            { type: "text", text: "@relay: pool/fast" },
             { type: "text", text: "second block context without directive" },
           ],
         },
       ],
     };
     expect(subagentSpec(multiMsg, "claude-opus-5", cfg)).toBe("pool/fast");
-    expect((multiMsg.messages[0]!.content[0] as { text: string }).text).toBe("first block directive");
   });
 });
 

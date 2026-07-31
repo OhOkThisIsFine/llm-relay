@@ -161,12 +161,12 @@ export function readRelayDirective(reqJson: unknown, strip = false): string | nu
     }
     return m[1]!;
   }
-
   if (!Array.isArray(content)) return null;
 
   for (let i = content.length - 1; i >= 0; i--) {
     const block = content[i] as { type?: unknown; text?: unknown };
     if (block?.type !== "text" || typeof block.text !== "string") continue;
+    if (block.text.trim().startsWith("<system-reminder>")) continue;
     const m = RELAY_DIRECTIVE.exec(block.text);
     if (!m) continue;
     if (strip) block.text = block.text.replace(RELAY_DIRECTIVE, "").replace(/^\n+/, "");
