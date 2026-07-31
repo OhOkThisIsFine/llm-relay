@@ -163,16 +163,24 @@ export function readRelayDirective(reqJson: unknown, strip = false): string | nu
   }
   if (!Array.isArray(content)) return null;
 
+  // Locate the prompt text block — the last text block in messages[0] that is not a system-reminder.
+  let promptBlock: { type?: unknown; text?: unknown } | null = null;
   for (let i = content.length - 1; i >= 0; i--) {
     const block = content[i] as { type?: unknown; text?: unknown };
     if (block?.type !== "text" || typeof block.text !== "string") continue;
     if (block.text.trim().startsWith("<system-reminder>")) continue;
-    const m = RELAY_DIRECTIVE.exec(block.text);
-    if (!m) continue;
-    if (strip) block.text = block.text.replace(RELAY_DIRECTIVE, "").replace(/^\n+/, "");
-    return m[1]!;
+    promptBlock = block;
+    break;
   }
-  return null;
+
+  if (!promptBlock || typeof promptBlock.text !== "string") return null;
+
+  const m = RELAY_DIRECTIVE.exec(promptBlock.text);
+  if (!m) return null;
+  if (strip) {
+    promptBlock.text = promptBlock.text.replace(RELAY_DIRECTIVE, "").replace(/^\n+/, "");
+  }
+  return m[1]!;
 }
 
 /**
@@ -351,8 +359,11 @@ function pickSpecs(model: string | null, cfg: Config): string[] {
     // Pools are checked before providers so the reserved `pool/` prefix can never be
     // shadowed (config load also rejects a provider named "pool"). Expansion — and the
     // loud unknown-pool error — happens in expandPoolSpecs.
-    if (slash !== -1 && model.slice(0, slash) === POOL_PREFIX) return [model];
-    if (slash !== -1 && cfg.providers[model.slice(0, slash)]) return [model];
+    if (slash !== -1) {
+      const prefix = model.slice(0, slash);
+      if (prefix === POOL_PREFIX || cfg.providers[prefix]) return [model];
+      return Array.isArray(cfg.routing.default) ? cfg.routing.default : [cfg.routing.default];
+    }
     const tier = detectTier(model);
     if (tier && cfg.routing.tiers[tier]) {
       const val = cfg.routing.tiers[tier]!;
