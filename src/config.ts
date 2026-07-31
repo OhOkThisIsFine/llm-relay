@@ -149,14 +149,26 @@ export function readRelayDirective(reqJson: unknown, strip = false): string | nu
   if (typeof reqJson !== "object" || reqJson === null) return null;
   const messages = (reqJson as { messages?: unknown }).messages;
   if (!Array.isArray(messages) || messages.length === 0) return null;
-  const content = (messages[0] as { content?: unknown })?.content;
+  const firstMsg = messages[0] as { content?: unknown } | undefined;
+  if (!firstMsg) return null;
+  const content = firstMsg.content;
+
+  if (typeof content === "string") {
+    const m = RELAY_DIRECTIVE.exec(content);
+    if (!m) return null;
+    if (strip) {
+      firstMsg.content = content.replace(RELAY_DIRECTIVE, "").replace(/^\n+/, "");
+    }
+    return m[1]!;
+  }
+
   if (!Array.isArray(content)) return null;
 
   for (let i = content.length - 1; i >= 0; i--) {
     const block = content[i] as { type?: unknown; text?: unknown };
     if (block?.type !== "text" || typeof block.text !== "string") continue;
     const m = RELAY_DIRECTIVE.exec(block.text);
-    if (!m) return null; // last text block only — do not keep scanning earlier blocks
+    if (!m) continue;
     if (strip) block.text = block.text.replace(RELAY_DIRECTIVE, "").replace(/^\n+/, "");
     return m[1]!;
   }
@@ -180,7 +192,13 @@ function directiveUnresolvableReason(spec: string, cfg: Config): string | null {
     return `names unknown pool "${model ?? ""}" (available: ${names(cfg.routing.pools)})`;
   }
   const p = cfg.providers[provider];
-  if (!p) return `names unknown provider "${provider}" (available: ${names(cfg.providers)})`;
+  if (!p) {
+    const isDisabled = cfg.warnings?.some((w) => w.includes(`provider "${provider}" DISABLED`));
+    if (isDisabled) {
+      return `names disabled provider "${provider}" (disabled due to unset environment variable)`;
+    }
+    return `names unknown provider "${provider}" (available: ${names(cfg.providers)})`;
+  }
   if (p.kind === "openai" && !model) return `names openai provider "${provider}" but carries no model id`;
   return null;
 }
