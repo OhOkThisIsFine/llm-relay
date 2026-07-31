@@ -174,4 +174,13 @@ describe("provider with an unset ${ENV} in base", () => {
     };
     expect(() => loadConfig(write(cfg))).toThrow(/coding/);
   });
+
+  it("fails loudly on @relay directive naming a disabled provider in degraded config", () => {
+    const cfg = loadConfig(write(base));
+    const sub = {
+      system: "cc_is_subagent=true;",
+      messages: [{ role: "user", content: "@relay: needsvar/m\ngo" }],
+    };
+    expect(() => subagentSpec(sub, "claude-opus-5", cfg)).toThrow(/disabled provider "needsvar"/);
+  });
 });

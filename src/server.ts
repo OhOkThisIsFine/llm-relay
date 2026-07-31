@@ -172,6 +172,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const started = Date.now();
   const path = req.url ?? "/";
 
+  const isMutating = req.method !== "GET" && req.method !== "HEAD";
+  const admissionErr = admissionFailure(req, isMutating);
+  if (admissionErr) {
+    failClosed(res, 403, admissionErr);
+    h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
+    return;
+  }
+
   let reqBuf: Buffer;
   try {
     reqBuf = await readBody(req);
@@ -248,12 +256,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // very next subagent request is routed the new way — no restart — and is persisted back to
   // the config file so the choice survives one.
   if ((req.method === "GET" || req.method === "POST") && pathname === "/offload") {
-    const denied = admissionFailure(req, req.method === "POST");
-    if (denied) {
-      failClosed(res, 403, denied);
-      h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
-      return;
-    }
     let state = offloadState(cfg);
     if (req.method === "POST") {
       const want = (reqJson as { enabled?: unknown } | undefined)?.enabled;
@@ -275,12 +277,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // command); POST reports a rung spent so the next read walks past it. The relay decides the
   // ORDER and never executes a cli rung itself — spawning agents is the host's job.
   if ((req.method === "GET" || req.method === "POST") && pathname === "/dispatch") {
-    const deniedDispatch = admissionFailure(req, req.method === "POST");
-    if (deniedDispatch) {
-      failClosed(res, 403, deniedDispatch);
-      h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
-      return;
-    }
     if (req.method === "POST") {
       const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown };
       const ttlMs = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
@@ -377,34 +373,51 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // to promote: a target the breaker is cooling steps aside, everything else keeps
   // its benchmark rank. (The re-sort was invisible for as long as an untracked target
   // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
-  const healthyTargets = orderByUsability(targetCandidates);
-  let target = healthyTargets[0]!;
+  let healthyTargets = orderByUsability(targetCandidates);
 
   // Context guardrail — enforced ONLY against a limit the serving provider published about its own
   // deployment. An unknown limit means no guardrail: the request goes upstream and the provider
   // answers with its own (authoritative) error.
   //
-  // This deliberately does not fall back to another provider's figure for the same model id, nor to
-  // a hardcoded guess — both used to happen. Either could reject a request the backend would have
-  // accepted, and a 400 invented from a number we made up is worse than an upstream error that is
-  // actually true. `cachedLimits` never fetches, so a cold cache degrades to "no guardrail" rather
-  // than blocking the request on an upstream round-trip.
-  if (isMessages && reqJson && target.model) {
-    const limits = h.catalog.cachedLimits(target.provider, target.model);
-    if (limits?.contextLength) {
-      const estimatedTokens = estimateRequestTokens(reqJson);
-      if (estimatedTokens > limits.contextLength) {
+  // Candidates whose published context limits are exceeded by the estimated prompt tokens are pruned.
+  // If all candidates are pruned, fail closed with 400 naming the context limit.
+  if (isMessages && reqJson) {
+    const estimatedTokens = estimateRequestTokens(reqJson);
+    if (estimatedTokens > 0) {
+      const remainingTargets: ResolvedTarget[] = [];
+      let firstExceeded: { target: ResolvedTarget; limit: number } | null = null;
+
+      for (const t of healthyTargets) {
+        if (t.model) {
+          const limits = h.catalog.cachedLimits(t.provider, t.model);
+          if (limits?.contextLength && estimatedTokens > limits.contextLength) {
+            if (!firstExceeded) {
+              firstExceeded = { target: t, limit: limits.contextLength };
+            }
+            continue;
+          }
+        }
+        remainingTargets.push(t);
+      }
+
+      if (remainingTargets.length === 0 && firstExceeded) {
         failClosed(
           res,
           400,
           `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds the context limit ` +
-            `"${target.provider}" publishes for "${target.model}" (${limits.contextLength})`,
+            `"${firstExceeded.target.provider}" publishes for "${firstExceeded.target.model}" (${firstExceeded.limit})`,
         );
         h.logger.write(baseLog(started, path, hadTools, false, 400, "skipped", null));
         return;
       }
+
+      if (remainingTargets.length > 0) {
+        healthyTargets = remainingTargets;
+      }
     }
   }
+
+  let target = healthyTargets[0]!;
 
   // OpenAI-compatible FRONT: an external dispatcher POSTs OpenAI Chat
   // Completions with a namespaced model; route by target and reverse-proxy the

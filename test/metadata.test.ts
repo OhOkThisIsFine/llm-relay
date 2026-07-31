@@ -165,6 +165,68 @@ describe("context guardrail", () => {
       servers.forEach((s) => s.close());
     }
   });
+
+  it("prunes candidates whose context length limit is exceeded while keeping eligible candidates", async () => {
+    const servers: Server[] = [];
+    try {
+      const upstream1 = createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        if ((req.url ?? "").includes("/models")) {
+          res.end(JSON.stringify({ data: [{ id: "model1", context_window: 50 }] }));
+        } else {
+          res.end(JSON.stringify({ id: "m1", model: "model1", choices: [{ message: { role: "assistant", content: "hi" }, finish_reason: "stop" }] }));
+        }
+      });
+      const upstream2 = createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        if ((req.url ?? "").includes("/models")) {
+          res.end(JSON.stringify({ data: [{ id: "model2", context_window: 1000 }] }));
+        } else {
+          res.end(JSON.stringify({ id: "m2", model: "model2", choices: [{ message: { role: "assistant", content: "hi" }, finish_reason: "stop" }] }));
+        }
+      });
+      servers.push(upstream1, upstream2);
+      const upPort1 = await listen(upstream1);
+      const upPort2 = await listen(upstream2);
+
+      const catalog = new ModelCatalog({ cachePath: null });
+      const cfg = {
+        host: "127.0.0.1", port: 0,
+        providers: {
+          p1: { base: `http://127.0.0.1:${upPort1}/v1`, kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 5000 },
+          p2: { base: `http://127.0.0.1:${upPort2}/v1`, kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 5000 },
+        },
+        routing: { default: "pool/pool", pools: { pool: ["p1/model1", "p2/model2"] }, tiers: {}, benchmarkSort: false },
+        mode: "detect" as const,
+        repair: { maxAttempts: 2, destructiveTools: [] },
+        log: { level: "silent" as const, file: null },
+      };
+
+      const proxy = createProxy(cfg as never, { catalog });
+      servers.push(proxy);
+      const port = await listen(proxy);
+
+      await catalog.list("p1", cfg.providers.p1);
+      await catalog.list("p2", cfg.providers.p2);
+
+      // 400 words ~ 100+ tokens. Exceeds p1 (50), but fits p2 (1000).
+      // Should prune p1 and succeed on p2.
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "pool/pool",
+          max_tokens: 16,
+          messages: [{ role: "user", content: "lorem ipsum ".repeat(40) }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { model?: string };
+      expect(body.model).toBe("model2");
+    } finally {
+      servers.forEach((s) => s.close());
+    }
+  });
 });
 
 describe("resolveMetadata provenance", () => {
