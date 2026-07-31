@@ -136,6 +136,8 @@ describe("dispatch command rendering — shell quoting", () => {
     // `@` and `%` are allow-listed in neither: PowerShell splatting, cmd.exe expansion.
     expect(quoteArg("@args", "pwsh")).toBe("'@args'");
     expect(quoteArg("%PATH%", "pwsh")).toBe("'%PATH%'");
+    // Backslashes in sh mode must be quoted so sh does not strip them as escape characters.
+    expect(quoteArg("C:\\tools\\agy.exe", "sh")).toBe("'C:\\tools\\agy.exe'");
   });
 
   it("escapes an embedded single quote the way each shell requires", () => {
