@@ -328,3 +328,111 @@ describe("fetchBackend carries Retry-After onto its synthesized error", () => {
     }
   });
 });
+
+describe("fetchBackend & fetchOpenAiFront — credential alias resolution", () => {
+  let backend: Server;
+  afterEach(() => backend?.close());
+
+  it("resolves credential via environment alias in fetchBackend when declared authEnv is unset", async () => {
+    const keys = ["GEMINI_API_KEY", "GOOGLEAI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_GENAI_API_KEY", "GOOGLE_GEMINI_API_KEY", "GOOGLE_API_KEY"];
+    const saved: Record<string, string | undefined> = {};
+    for (const k of keys) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    process.env.GOOGLEAI_API_KEY = "sk-googleai-alias-key";
+
+    let seenAuth: string | undefined;
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        seenAuth = req.headers["authorization"] as string | undefined;
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+
+    const target: ResolvedTarget = {
+      provider: "gemini",
+      base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
+      kind: "openai",
+      model: "gemini-2.0-flash",
+      authHeader: "authorization",
+      timeoutMs: 5000,
+      authEnv: "GEMINI_API_KEY",
+    };
+
+    const req = { model: "gemini-2.0-flash", stream: false, messages: [{ role: "user", content: "hello" }] };
+    try {
+      await fetchBackend(target, {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from(JSON.stringify(req)),
+        reqJson: req,
+        anthropicHeaders: {},
+        wantsStream: false,
+        signal: AbortSignal.timeout(5000),
+      });
+
+      expect(seenAuth).toBe("Bearer sk-googleai-alias-key");
+    } finally {
+      for (const k of keys) {
+        if (saved[k] !== undefined) process.env[k] = saved[k];
+        else delete process.env[k];
+      }
+    }
+  });
+
+  it("resolves credential via environment alias in fetchOpenAiFront when declared authEnv is unset", async () => {
+    const keys = ["GEMINI_API_KEY", "GOOGLEAI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_GENAI_API_KEY", "GOOGLE_GEMINI_API_KEY", "GOOGLE_API_KEY"];
+    const saved: Record<string, string | undefined> = {};
+    for (const k of keys) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    process.env.GOOGLEAI_API_KEY = "sk-googleai-alias-key-front";
+
+    let seenAuth: string | undefined;
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        seenAuth = req.headers["authorization"] as string | undefined;
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+
+    const target: ResolvedTarget = {
+      provider: "gemini",
+      base: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`,
+      kind: "openai",
+      model: "gemini-2.0-flash",
+      authHeader: "authorization",
+      timeoutMs: 5000,
+      authEnv: "GEMINI_API_KEY",
+    };
+
+    const req = { model: "gemini-2.0-flash", messages: [{ role: "user", content: "hello" }] };
+    try {
+      await fetchOpenAiFront(target, {
+        reqJson: req,
+        wantsStream: false,
+        signal: AbortSignal.timeout(5000),
+      });
+
+      expect(seenAuth).toBe("Bearer sk-googleai-alias-key-front");
+    } finally {
+      for (const k of keys) {
+        if (saved[k] !== undefined) process.env[k] = saved[k];
+        else delete process.env[k];
+      }
+    }
+  });
+});
+
