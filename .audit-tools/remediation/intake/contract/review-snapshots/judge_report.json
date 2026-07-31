@@ -1,0 +1,419 @@
+{
+  "schema_version": "remediate-code-contract-pipeline/review-snapshot/v1alpha1",
+  "artifact_name": "judge_report",
+  "reviewed_at": "2026-07-31T22:38:41.621Z",
+  "prior_payload": {
+    "contract_version": "remediate-code-contract-pipeline/judge-report/v1alpha1",
+    "goal_id": "remediate-audit-findings-2026-07-31",
+    "verdict": "approved",
+    "classifications": [],
+    "created_at": "2026-07-31T22:38:41.617Z"
+  },
+  "reviewed_inputs": {
+    "goal_spec": {
+      "contract_version": "remediate-code-contract-pipeline/goal-spec/v1alpha1",
+      "goal_id": "remediate-audit-findings-2026-07-31",
+      "objective": "Remediate all 46 approved audit findings identified in path_a_seed across the codebase",
+      "non_goals": [
+        "Refactoring unrelated to the identified audit findings"
+      ],
+      "success_criteria": [
+        "All approved findings are resolved",
+        "Existing test suite passes cleanly"
+      ],
+      "source_type": "structured_audit"
+    },
+    "finalized_module_contracts": {
+      "contract_version": "remediate-code-contract-pipeline/finalized-module-contracts/v1alpha1",
+      "goal_id": "remediate-audit-findings-2026-07-31",
+      "module_contracts": [
+        {
+          "name": "server-core",
+          "inputs": [
+            "HTTP request payloads",
+            "Configuration state",
+            "Backend response streams"
+          ],
+          "outputs": [
+            "Proxied HTTP responses",
+            "SSE streams",
+            "Circuit breaker failure metrics"
+          ],
+          "invariants": [
+            "Mid-stream network resets or SSE truncations must report failure to circuit breaker (verification_obligation: test stream failures)"
+          ],
+          "failure_modes": [
+            "Backend socket reset or timeout (caller receives error SSE or failover to candidate)"
+          ],
+          "validation_boundary": "Validates incoming HTTP requests and SSE event structures against JSON schemas"
+        },
+        {
+          "name": "backend-auth",
+          "inputs": [
+            "Target specification",
+            "Environment credentials"
+          ],
+          "outputs": [
+            "Upstream HTTP response",
+            "Resolved auth headers"
+          ],
+          "invariants": [
+            "Env-var credential resolution must consistently use readCredential across routing and header construction (verification_obligation: unit test authEnv & backend)"
+          ],
+          "failure_modes": [
+            "Missing or invalid credential (caller receives unauthenticated error or failover)"
+          ],
+          "validation_boundary": "Validates target existence and authorization credential presence"
+        },
+        {
+          "name": "config-routing",
+          "inputs": [
+            "Raw configuration files",
+            "Incoming prompt / system messages"
+          ],
+          "outputs": [
+            "Parsed configuration object",
+            "Relay directives and subagent flags"
+          ],
+          "invariants": [
+            "Subagent directive parsing must strictly restrict @relay: matching to explicitly authorized user prompt blocks (verification_obligation: prompt injection security tests)"
+          ],
+          "failure_modes": [
+            "Invalid configuration format (throws RoutingError or configuration validation error)"
+          ],
+          "validation_boundary": "Validates schema of configuration file and model routing parameters"
+        },
+        {
+          "name": "cli-tools",
+          "inputs": [
+            "Command line arguments",
+            "Environment flags"
+          ],
+          "outputs": [
+            "Parsed CLI commands",
+            "Quoted shell arguments"
+          ],
+          "invariants": [
+            "SHELL_SAFE regex and positional argument parsing must correctly handle backslashes and flag ordering (verification_obligation: test CLI argument quoting)"
+          ],
+          "failure_modes": [
+            "Unknown command or invalid flag options"
+          ],
+          "validation_boundary": "Validates CLI option flags and command names"
+        }
+      ]
+    },
+    "obligation_ledger": {
+      "contract_version": "remediate-code-contract-pipeline/obligation-ledger/v1alpha1",
+      "goal_id": "remediate-audit-findings-2026-07-31",
+      "obligations": [
+        {
+          "id": "OBL-server-core-contract",
+          "description": "Implement module \"server-core\" per its finalized contract (inputs: HTTP request payloads, Configuration state, Backend response streams → outputs: Proxied HTTP responses, SSE streams, Circuit breaker failure metrics; validation boundary: Validates incoming HTTP requests and SSE event structures against JSON schemas).",
+          "kind": "structural",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "server-core"
+        },
+        {
+          "id": "OBL-server-core-inv-1",
+          "description": "Mid-stream network resets or SSE truncations must report failure to circuit breaker (verification_obligation: test stream failures)",
+          "kind": "invariant",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "server-core",
+          "change_classification": {
+            "change_kind": "change",
+            "touched_symbols": [
+              "sse"
+            ],
+            "determined_by": "touches_existing_symbol"
+          }
+        },
+        {
+          "id": "OBL-server-core-fail-1",
+          "description": "Handle failure mode: Backend socket reset or timeout (caller receives error SSE or failover to candidate)",
+          "kind": "behavioral",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "server-core",
+          "change_classification": {
+            "change_kind": "change",
+            "touched_symbols": [
+              "sse"
+            ],
+            "determined_by": "touches_existing_symbol"
+          }
+        },
+        {
+          "id": "OBL-backend-auth-contract",
+          "description": "Implement module \"backend-auth\" per its finalized contract (inputs: Target specification, Environment credentials → outputs: Upstream HTTP response, Resolved auth headers; validation boundary: Validates target existence and authorization credential presence).",
+          "kind": "structural",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "backend-auth"
+        },
+        {
+          "id": "OBL-backend-auth-inv-1",
+          "description": "Env-var credential resolution must consistently use readCredential across routing and header construction (verification_obligation: unit test authEnv & backend)",
+          "kind": "invariant",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "backend-auth",
+          "change_classification": {
+            "change_kind": "addition",
+            "touched_symbols": [],
+            "determined_by": "no_existing_symbol"
+          }
+        },
+        {
+          "id": "OBL-backend-auth-fail-1",
+          "description": "Handle failure mode: Missing or invalid credential (caller receives unauthenticated error or failover)",
+          "kind": "behavioral",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "backend-auth",
+          "change_classification": {
+            "change_kind": "addition",
+            "touched_symbols": [],
+            "determined_by": "no_existing_symbol"
+          }
+        },
+        {
+          "id": "OBL-config-routing-contract",
+          "description": "Implement module \"config-routing\" per its finalized contract (inputs: Raw configuration files, Incoming prompt / system messages → outputs: Parsed configuration object, Relay directives and subagent flags; validation boundary: Validates schema of configuration file and model routing parameters).",
+          "kind": "structural",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "config-routing"
+        },
+        {
+          "id": "OBL-config-routing-inv-1",
+          "description": "Subagent directive parsing must strictly restrict @relay: matching to explicitly authorized user prompt blocks (verification_obligation: prompt injection security tests)",
+          "kind": "invariant",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "config-routing",
+          "change_classification": {
+            "change_kind": "addition",
+            "touched_symbols": [],
+            "determined_by": "no_existing_symbol"
+          }
+        },
+        {
+          "id": "OBL-config-routing-fail-1",
+          "description": "Handle failure mode: Invalid configuration format (throws RoutingError or configuration validation error)",
+          "kind": "behavioral",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "config-routing",
+          "change_classification": {
+            "change_kind": "addition",
+            "touched_symbols": [],
+            "determined_by": "no_existing_symbol"
+          }
+        },
+        {
+          "id": "OBL-cli-tools-contract",
+          "description": "Implement module \"cli-tools\" per its finalized contract (inputs: Command line arguments, Environment flags → outputs: Parsed CLI commands, Quoted shell arguments; validation boundary: Validates CLI option flags and command names).",
+          "kind": "structural",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "cli-tools"
+        },
+        {
+          "id": "OBL-cli-tools-inv-1",
+          "description": "SHELL_SAFE regex and positional argument parsing must correctly handle backslashes and flag ordering (verification_obligation: test CLI argument quoting)",
+          "kind": "invariant",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "cli-tools",
+          "change_classification": {
+            "change_kind": "change",
+            "touched_symbols": [
+              "cli"
+            ],
+            "determined_by": "touches_existing_symbol"
+          }
+        },
+        {
+          "id": "OBL-cli-tools-fail-1",
+          "description": "Handle failure mode: Unknown command or invalid flag options",
+          "kind": "behavioral",
+          "depends_on": [],
+          "status": "pending",
+          "source": "design_spec",
+          "module": "cli-tools",
+          "change_classification": {
+            "change_kind": "addition",
+            "touched_symbols": [],
+            "determined_by": "no_existing_symbol"
+          }
+        }
+      ]
+    },
+    "cyclic_seam_resolution": {
+      "contract_version": "remediate-code-contract-pipeline/cyclic-seam-resolution/v1alpha1",
+      "goal_id": "remediate-audit-findings-2026-07-31",
+      "cycles": [],
+      "status": "no_cycles"
+    },
+    "test_validator_plan": {
+      "contract_version": "remediate-code-contract-pipeline/test-validator-plan/v1alpha1",
+      "goal_id": "remediate-audit-findings-2026-07-31",
+      "test_specs": [
+        {
+          "obligation_id": "OBL-server-core-inv-1",
+          "name": "Mid-stream network resets or SSE truncations must report failure",
+          "kind": "invariant",
+          "scope_anchors": [
+            "sse"
+          ],
+          "assertions": [
+            "POSITIVE: Successfully report outcome to circuit breaker when sse stream encounters mid-flight reset",
+            "NEGATIVE: Ensure sse stream truncation does not bypass circuit breaker failure logging"
+          ]
+        },
+        {
+          "obligation_id": "OBL-server-core-fail-1",
+          "name": "Handle failure mode: Backend socket reset or timeout",
+          "kind": "unit",
+          "scope_anchors": [
+            "sse"
+          ],
+          "assertions": [
+            "POSITIVE: Emit error sse event when backend socket resets",
+            "NEGATIVE: Do not leave sse stream open when backend socket times out"
+          ]
+        },
+        {
+          "obligation_id": "OBL-backend-auth-inv-1",
+          "name": "Env-var credential resolution must consistently use readCredential",
+          "kind": "invariant",
+          "scope_anchors": [
+            "authenv"
+          ],
+          "assertions": [
+            "POSITIVE: Resolve auth key successfully using readCredential in authenv",
+            "NEGATIVE: Do not directly read process.env in authenv without calling readCredential"
+          ]
+        },
+        {
+          "obligation_id": "OBL-backend-auth-fail-1",
+          "name": "Handle failure mode: Missing or invalid credential",
+          "kind": "unit",
+          "scope_anchors": [
+            "obl-backend-auth-fail-1"
+          ],
+          "assertions": [
+            "POSITIVE: Handle missing credential in obl-backend-auth-fail-1 by raising unauthenticated error",
+            "NEGATIVE: Do not issue unauthenticated request upstream when obl-backend-auth-fail-1 credential is missing"
+          ]
+        },
+        {
+          "obligation_id": "OBL-config-routing-inv-1",
+          "name": "Subagent directive parsing must strictly restrict @relay: matching",
+          "kind": "invariant",
+          "scope_anchors": [
+            "obl-config-routing-inv-1"
+          ],
+          "assertions": [
+            "POSITIVE: Parse @relay: directives successfully from user text blocks in obl-config-routing-inv-1",
+            "NEGATIVE: Do not parse @relay: directives from injected file contents in obl-config-routing-inv-1"
+          ]
+        },
+        {
+          "obligation_id": "OBL-config-routing-fail-1",
+          "name": "Handle failure mode: Invalid configuration format",
+          "kind": "unit",
+          "scope_anchors": [
+            "routingerror"
+          ],
+          "assertions": [
+            "POSITIVE: Raise routingerror when configuration format is invalid",
+            "NEGATIVE: Do not fall back to default routing on invalid routingerror configuration"
+          ]
+        },
+        {
+          "obligation_id": "OBL-cli-tools-inv-1",
+          "name": "SHELL_SAFE regex and positional argument parsing must correctly handle backslashes",
+          "kind": "invariant",
+          "scope_anchors": [
+            "cli"
+          ],
+          "assertions": [
+            "POSITIVE: Quote backslash characters correctly in cli shell argument rendering",
+            "NEGATIVE: Do not leave backslashes unquoted in cli argument output"
+          ]
+        },
+        {
+          "obligation_id": "OBL-cli-tools-fail-1",
+          "name": "Handle failure mode: Unknown command or invalid flag options",
+          "kind": "unit",
+          "scope_anchors": [
+            "obl-cli-tools-fail-1"
+          ],
+          "assertions": [
+            "POSITIVE: Reject unknown command in obl-cli-tools-fail-1 with exit code",
+            "NEGATIVE: Do not execute mutating operations for unknown options in obl-cli-tools-fail-1"
+          ]
+        }
+      ]
+    },
+    "contract_assessment_report": {
+      "contract_version": "remediate-code-contract-pipeline/contract-assessment-report/v1alpha1",
+      "goal_id": "remediate-audit-findings-2026-07-31",
+      "findings": [
+        {
+          "obligation_id": "OBL-server-core-inv-1",
+          "status": "satisfied",
+          "evidence": [
+            "Module server-core contract includes mid-stream reset reporting to circuit breaker"
+          ],
+          "rationale": "Requirement addressed in module contract and test plan"
+        },
+        {
+          "obligation_id": "OBL-backend-auth-inv-1",
+          "status": "satisfied",
+          "evidence": [
+            "Module backend-auth contract specifies readCredential usage"
+          ],
+          "rationale": "Requirement addressed in module contract and test plan"
+        },
+        {
+          "obligation_id": "OBL-config-routing-inv-1",
+          "status": "satisfied",
+          "evidence": [
+            "Module config-routing contract restricts directive parsing"
+          ],
+          "rationale": "Requirement addressed in module contract and test plan"
+        },
+        {
+          "obligation_id": "OBL-cli-tools-inv-1",
+          "status": "satisfied",
+          "evidence": [
+            "Module cli-tools contract specifies proper backslash quoting"
+          ],
+          "rationale": "Requirement addressed in module contract and test plan"
+        }
+      ],
+      "verdict": "passed"
+    },
+    "counterexample": {
+      "contract_version": "remediate-code-contract-pipeline/counterexample/v1alpha1",
+      "goal_id": "remediate-audit-findings-2026-07-31",
+      "counterexamples": []
+    }
+  }
+}

@@ -151,3 +151,30 @@ describe("CircuitBreaker — Retry-After drives the cooldown", () => {
     expect(cb2.getState(t)!.cooldownUntil).toBe(at + 1000); // 1s floor — never a busy loop
   });
 });
+
+describe("CircuitBreaker — mid-stream failures", () => {
+  const t: ResolvedTarget = { provider: "p", base: "http://p", kind: "openai", model: "m", authHeader: "authorization", timeoutMs: 1000 };
+
+  it("replaces eager 200 ping with failure ping and trips circuit after consecutive mid-stream failures", () => {
+    const cb = new CircuitBreaker();
+    const now = 100000;
+
+    // First request: 200 OK headers arrive eagerly
+    cb.recordOutcome(t, { ok: true, status: 200, elapsedMs: 10, at: now });
+    expect(cb.getState(t)!.consecutiveFailures).toBe(0);
+
+    // Stream fails mid-response
+    cb.recordMidStreamFailure(t, { elapsedMs: 50, status: 502, at: now + 50 });
+    expect(cb.getState(t)!.consecutiveFailures).toBe(1);
+    expect(cb.getState(t)!.pings[0]!.code).toBe("502");
+    expect(cb.isHealthy(t, now + 100)).toBe(true);
+
+    // Second request: 200 OK headers arrive eagerly
+    cb.recordOutcome(t, { ok: true, status: 200, elapsedMs: 10, at: now + 1000 });
+    // Stream fails mid-response again
+    cb.recordMidStreamFailure(t, { elapsedMs: 50, status: 502, at: now + 1050 });
+
+    expect(cb.getState(t)!.consecutiveFailures).toBe(2);
+    expect(cb.isHealthy(t, now + 1100)).toBe(false); // Circuit is open!
+  });
+});

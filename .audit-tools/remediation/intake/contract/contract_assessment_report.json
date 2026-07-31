@@ -1,0 +1,51 @@
+{
+  "artifact_name": "contract_assessment_report",
+  "content_hash": "68b989f0834e12e87137a21d25a5e450",
+  "dependency_hashes": {
+    "goal_spec": "321f7d0af4e8faa1845a4c6ce57215c2",
+    "finalized_module_contracts": "c08db57b1ad0e595db1d61fd074e15a4",
+    "obligation_ledger": "b2fa21e7d0e1a9be66aa72a108f11e03",
+    "cyclic_seam_resolution": "1e04bf4fd42a0c40beadb641f259b1e6",
+    "test_validator_plan": "4c50816c9c89df21ede8db713fbb8e01"
+  },
+  "payload": {
+    "contract_version": "remediate-code-contract-pipeline/contract-assessment-report/v1alpha1",
+    "goal_id": "remediate-audit-findings-2026-07-31",
+    "findings": [
+      {
+        "obligation_id": "OBL-server-core-inv-1",
+        "status": "satisfied",
+        "evidence": [
+          "Module server-core contract includes mid-stream reset reporting to circuit breaker"
+        ],
+        "rationale": "Requirement addressed in module contract and test plan"
+      },
+      {
+        "obligation_id": "OBL-backend-auth-inv-1",
+        "status": "satisfied",
+        "evidence": [
+          "Module backend-auth contract specifies readCredential usage"
+        ],
+        "rationale": "Requirement addressed in module contract and test plan"
+      },
+      {
+        "obligation_id": "OBL-config-routing-inv-1",
+        "status": "satisfied",
+        "evidence": [
+          "Module config-routing contract restricts directive parsing"
+        ],
+        "rationale": "Requirement addressed in module contract and test plan"
+      },
+      {
+        "obligation_id": "OBL-cli-tools-inv-1",
+        "status": "satisfied",
+        "evidence": [
+          "Module cli-tools contract specifies proper backslash quoting"
+        ],
+        "rationale": "Requirement addressed in module contract and test plan"
+      }
+    ],
+    "verdict": "passed",
+    "created_at": "2026-07-31T22:37:54.614Z"
+  }
+}

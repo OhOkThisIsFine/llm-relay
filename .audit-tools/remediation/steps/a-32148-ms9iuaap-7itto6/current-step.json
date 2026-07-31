@@ -1,0 +1,25 @@
+{
+  "contract_version": "remediate-code-step/v1alpha1",
+  "step_kind": "contract_pipeline",
+  "status": "ready",
+  "run_id": "CONTRACT-ms9iua9t-eq7wwq",
+  "agent_id": "a-32148-ms9iuaap-7itto6",
+  "allowed_commands": [
+    "remediate-code next-step"
+  ],
+  "stop_condition": "Stop after writing the contract-pipeline output for phase \"critique\" and running next-step.",
+  "prompt_path": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-32148-ms9iuaap-7itto6/current-prompt.md",
+  "repo_root": "C:/Code/llm-relay",
+  "artifacts_dir": "C:/Code/llm-relay/.audit-tools/remediation",
+  "artifact_paths": {
+    "output": "C:/Code/llm-relay/.audit-tools/remediation/intake/contract/conceptual_design_critique.input.json",
+    "goal_spec": "C:/Code/llm-relay/.audit-tools/remediation/intake/contract/goal_spec.input.json",
+    "context_bundle": "C:/Code/llm-relay/.audit-tools/remediation/intake/contract/context_bundle.input.json",
+    "module_decomposition": "C:/Code/llm-relay/.audit-tools/remediation/intake/contract/module_decomposition.input.json",
+    "seam_reconciliation_report": "C:/Code/llm-relay/.audit-tools/remediation/intake/contract/seam_reconciliation_report.input.json",
+    "source_manifest": "C:/Code/llm-relay/.audit-tools/remediation/intake/source-manifest.json",
+    "remediation_brief": "C:/Code/llm-relay/.audit-tools/remediation/intake/remediation-brief.md",
+    "current_step": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-32148-ms9iuaap-7itto6/current-step.json",
+    "current_prompt": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-32148-ms9iuaap-7itto6/current-prompt.md"
+  }
+}

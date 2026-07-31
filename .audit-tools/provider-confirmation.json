@@ -1,0 +1,78 @@
+{
+  "schema_version": "1.0.0",
+  "session_level": true,
+  "confirmed_at": "2026-07-31T22:24:50.405Z",
+  "provider_pool": [
+    {
+      "name": "worker-command",
+      "cost_order": 8
+    },
+    {
+      "name": "claude-code",
+      "cost_order": 4
+    },
+    {
+      "name": "codex",
+      "cost_order": 5
+    },
+    {
+      "name": "agy",
+      "cost_order": 3
+    }
+  ],
+  "source_pool_cost_order": [
+    {
+      "source_id": "codex-cli",
+      "transport": "codex",
+      "service": "codex",
+      "blended_price_usd_per_mtok": null,
+      "price_declared": false,
+      "cost_order": 7
+    },
+    {
+      "source_id": "agy-cli",
+      "transport": "agy",
+      "service": "agy",
+      "model_id": "gemini-3.6-flash-high",
+      "blended_price_usd_per_mtok": null,
+      "price_declared": false,
+      "capability_rank": 0,
+      "cost_order": 6
+    },
+    {
+      "source_id": "nim-glm-single-shot",
+      "transport": "openai-compatible",
+      "service": "nvidia_nim",
+      "model_id": "nim/z-ai/glm-5.2",
+      "blended_price_usd_per_mtok": 0,
+      "price_declared": true,
+      "capability_rank": 1,
+      "cost_order": 0
+    },
+    {
+      "source_id": "nim-deepseek-single-shot",
+      "transport": "openai-compatible",
+      "service": "nvidia_nim",
+      "model_id": "nim/deepseek-ai/deepseek-v4-pro",
+      "blended_price_usd_per_mtok": 0,
+      "price_declared": true,
+      "capability_rank": 2,
+      "cost_order": 1
+    },
+    {
+      "source_id": "nim-minimax-single-shot",
+      "transport": "openai-compatible",
+      "service": "nvidia_nim",
+      "model_id": "nim/minimaxai/minimax-m3",
+      "blended_price_usd_per_mtok": 0,
+      "price_declared": true,
+      "capability_rank": 3,
+      "cost_order": 2
+    }
+  ],
+  "policy": {
+    "capability_order": [
+      "gemini-3.6-flash-high"
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "contract_version": "remediate-code-worker-result/v1alpha1",
+  "phase": "implement",
+  "item_results": [
+    {
+      "finding_id": "CP-NODE-1-f01",
+      "status": "resolved",
+      "evidence": [
+        "Verified claim: Eager success recording on 200 OK header receipt previously cleared consecutiveFailures to 0 and mid-stream failure catch blocks logged mid-stream resets without reporting failures back to CircuitBreaker.",
+        "Added CircuitBreaker.recordMidStreamFailure in src/circuit-breaker.ts to correct eager 200 success pings to 502 failure pings and increment consecutiveFailures from pre-request count, enabling repeated mid-stream resets to trip the circuit breaker.",
+        "Refactored mid-stream catch blocks across openAiFrontPath, transparentPath, repairStreamingPath, and repairBufferedPath into handleMidStreamError in src/server.ts, eliminating duplicate mid-stream failure logic and safely handling non-Error exceptions.",
+        "Ran npm run check (tsc -p tsconfig.json, tsc -p tsconfig.test.json, npx vitest run): all 559 tests passed cleanly across 42 test files."
+      ]
+    }
+  ]
+}
