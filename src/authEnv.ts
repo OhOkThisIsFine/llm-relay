@@ -87,29 +87,52 @@ export function keyIsPresent(value: string | undefined): boolean {
  */
 export type CredentialState = "not-declared" | "declared-present" | "declared-missing";
 
+export function resolveTargetAuthEnv(
+  declaredAuthEnv: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  providerName?: string,
+): string | undefined {
+  if (!declaredAuthEnv) return undefined;
+  if (keyIsPresent(env[declaredAuthEnv])) return declaredAuthEnv;
+
+  let provider = providerName?.toLowerCase();
+  if (!provider) {
+    for (const [p, aliases] of Object.entries(PROVIDER_ENV_ALIASES)) {
+      if (aliases.includes(declaredAuthEnv)) {
+        provider = p;
+        break;
+      }
+    }
+  }
+
+  if (provider) {
+    const res = resolveAuthEnv(provider, declaredAuthEnv, env);
+    if (res.name && keyIsPresent(env[res.name])) {
+      return res.name;
+    }
+  }
+
+  return declaredAuthEnv;
+}
+
 export function credentialState(
   declaredAuthEnv: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  providerName?: string,
 ): CredentialState {
   if (!declaredAuthEnv) return "not-declared";
-  return keyIsPresent(env[declaredAuthEnv]) ? "declared-present" : "declared-missing";
+  const activeName = resolveTargetAuthEnv(declaredAuthEnv, env, providerName);
+  return activeName && keyIsPresent(env[activeName]) ? "declared-present" : "declared-missing";
 }
 
-/**
- * Read a declared provider credential, normalised.
- *
- * Returns the trimmed value when the credential is PRESENT (per `keyIsPresent`) and
- * `undefined` otherwise, so a caller cannot accidentally hold a whitespace-only
- * string that is truthy to `if (key)` but blank on the wire. Every credential read
- * should go through here rather than open-coding `env[name]?.trim()` — that
- * open-coding is what let the presence predicate drift between call sites.
- */
 export function readCredential(
   declaredAuthEnv: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  providerName?: string,
 ): string | undefined {
   if (!declaredAuthEnv) return undefined;
-  const raw = env[declaredAuthEnv];
+  const activeName = resolveTargetAuthEnv(declaredAuthEnv, env, providerName);
+  const raw = activeName ? env[activeName] : undefined;
   return keyIsPresent(raw) ? raw!.trim() : undefined;
 }
 
