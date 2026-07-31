@@ -112,6 +112,27 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     const res = await fetch(`${url}/dispatch?task=${"x".repeat(5000)}`);
     expect(res.status).toBe(400);
   });
+
+  it("rejects cross-origin requests across all proxy endpoints (/registry, /ping, /candidates, /v1/messages)", async () => {
+    const url = await boot();
+    const headers = { origin: "https://evil.example" };
+
+    const resRegistry = await fetch(`${url}/registry`, { headers });
+    expect(resRegistry.status).toBe(403);
+
+    const resPing = await fetch(`${url}/ping`, { headers });
+    expect(resPing.status).toBe(403);
+
+    const resCandidates = await fetch(`${url}/candidates`, { headers });
+    expect(resCandidates.status).toBe(403);
+
+    const resMessages = await fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ model: "anthropic/claude-3-5-sonnet", messages: [] }),
+    });
+    expect(resMessages.status).toBe(403);
+  });
 });
 
 describe("logs stay metadata-only (INV-OB-1)", () => {

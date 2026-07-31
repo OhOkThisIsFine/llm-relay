@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
-import { getOnboardingStatusList } from "../src/onboarding.js";
+import { getOnboardingStatusList, runInteractiveOnboarding } from "../src/onboarding.js";
 import { loadConfig, type Config } from "../src/config.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -118,5 +118,43 @@ describe("leave_me_alone provider suppression", () => {
     expect(() => loadConfig(write({ ...CFG, leave_me_alone: "groq" }))).toThrow(/array of provider names/);
     expect(() => loadConfig(write({ ...CFG, leave_me_alone: ["groq", 7] }))).toThrow(/non-empty provider-name strings/);
     expect(() => loadConfig(write({ ...CFG, leave_me_alone: ["  "] }))).toThrow(/non-empty provider-name strings/);
+  });
+});
+
+describe("interactive onboarding path creation and edge cases", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "relay-onboard-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("handles non-existent envPath directories cleanly", async () => {
+    const nestedEnvPath = join(dir, "nested", "sub", ".env");
+    const cfg = {
+      listen: "127.0.0.1:8791",
+      mode: "detect",
+      providers: {
+        custom: { base: "https://custom.test", kind: "openai", authEnv: "CUSTOM_TEST_KEY" },
+      },
+      routing: { default: "custom/model" },
+    } as unknown as Config;
+
+    await expect(runInteractiveOnboarding(cfg, { envPath: nestedEnvPath })).resolves.toBeUndefined();
+  });
+
+  it("filters providers with empty authEnv cleanly", () => {
+    const cfg = {
+      listen: "127.0.0.1:8791",
+      mode: "detect",
+      providers: {
+        noauth: { base: "https://noauth.test", kind: "openai", authEnv: "" },
+      },
+      routing: { default: "noauth/model" },
+    } as unknown as Config;
+
+    const list = getOnboardingStatusList(cfg);
+    expect(list.find((s) => s.provider === "noauth")?.hasKey).toBe(true);
   });
 });

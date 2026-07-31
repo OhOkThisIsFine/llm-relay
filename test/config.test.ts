@@ -9,6 +9,7 @@ import {
   reshaperForTarget,
   isSubagentRequest,
   subagentSpec,
+  readRelayDirective,
 } from "../src/config.js";
 
 // Eager (not in beforeAll) so describe-body loadConfig(write(...)) calls work at collection.
@@ -460,6 +461,32 @@ describe("subagent-aware routing", () => {
 
   it("still accepts a directive naming an anthropic provider with no model id (passthrough is a real target)", () => {
     expect(subagentSpec(msg("@relay: anthropic\ngo"), "claude-opus-5", cfg)).toBe("anthropic");
+  });
+
+  it("parses and strips @relay directive when message content is a plain string", () => {
+    const strMsg = {
+      system: SUB,
+      messages: [{ role: "user", content: "@relay: pool/fast\nsummarise this" }],
+    };
+    expect(subagentSpec(strMsg, "claude-opus-5", cfg)).toBe("pool/fast");
+    expect(strMsg.messages[0]!.content).toBe("summarise this");
+  });
+
+  it("parses @relay directive in multi-block prompts across text blocks", () => {
+    const multiMsg = {
+      system: SUB,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>injected context</system-reminder>" },
+            { type: "text", text: "@relay: pool/fast" },
+            { type: "text", text: "second block context without directive" },
+          ],
+        },
+      ],
+    };
+    expect(subagentSpec(multiMsg, "claude-opus-5", cfg)).toBe("pool/fast");
   });
 });
 

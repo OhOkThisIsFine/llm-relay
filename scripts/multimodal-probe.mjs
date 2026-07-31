@@ -207,9 +207,11 @@ console.log(`Multimodal / MCP passthrough probe -> ${PROXY}\n${"=".repeat(70)}`)
       },
       {
         role: "user",
-        content: [{ type: "mcp_tool_result", tool_use_id: "mcp_1", is_error: false, content: [{ type: "text", text: "SEVENTEEN" }] }],
+        content: [
+          { type: "mcp_tool_result", tool_use_id: "mcp_1", is_error: false, content: [{ type: "text", text: "SEVENTEEN" }] },
+          { type: "text", text: "What was the value? One word." },
+        ],
       },
-      { role: "user", content: "What was the value? One word." },
     ],
   });
   const out = textOf(r.json);
