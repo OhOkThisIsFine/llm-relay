@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "run_id": "remediate-audit-findings-2026-07-31",
+  "total_ordinals": 5,
+  "paths": [
+    {
+      "path": "src/authEnv.ts",
+      "covered_count": 0,
+      "edited_count": 1,
+      "last_ordinal": 2,
+      "lenses": []
+    },
+    {
+      "path": "src/backend.ts",
+      "covered_count": 0,
+      "edited_count": 1,
+      "last_ordinal": 2,
+      "lenses": []
+    },
+    {
+      "path": "src/cli.ts",
+      "covered_count": 0,
+      "edited_count": 1,
+      "last_ordinal": 1,
+      "lenses": []
+    },
+    {
+      "path": "src/config.ts",
+      "covered_count": 0,
+      "edited_count": 1,
+      "last_ordinal": 0,
+      "lenses": []
+    }
+  ]
+}

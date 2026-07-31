@@ -18,16 +18,13 @@ import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
 import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
-import { buildRegistry } from "./registry.js";
-import { buildCandidates } from "./candidates.js";
-import { offloadState, setOffload } from "./offload.js";
-import { buildDispatch, markExhausted, clearExhausted } from "./dispatch.js";
+import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens } from "./metadata.js";
-import { getTelemetryReport } from "./telemetry.js";
+
 
 const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -203,127 +200,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const wantsStream = pickBool(reqJson, "stream");
   const pathname = path.split("?")[0] ?? path;
 
-  // Discovery endpoint for an external dispatcher: providers × live models
-  // (best-effort capability) + routing + raw leaderboard scores, one coherent view.
-  if (req.method === "GET" && pathname === "/registry") {
-    const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(view));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return;
-  }
+  const handled = await handleAdminRoutes(req, res, pathname, path, started, reqJson, cfg, h);
+  if (handled) return;
 
-  if (req.method === "GET" && pathname === "/ping") {
-    if (h.pingLoop) {
-      await h.pingLoop.tickOnce();
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, pingMode: h.pingLoop?.getMode(), intervalMs: h.pingLoop?.getIntervalMs() }));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return;
-  }
-
-  if (req.method === "GET" && (pathname === "/health/stats" || pathname === "/health")) {
-    const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
-    const stats: Record<string, unknown> = {
-      generated_at: view.generated_at,
-      ping_mode: h.pingLoop?.getMode(),
-      providers: view.providers,
-    };
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(stats));
-
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return;
-  }
-
-  // Un-blended decision table for picking an offload target: benchmarks, live health, quota,
-  // observed traffic and breaker state side by side, in config order.
-  if (req.method === "GET" && pathname === "/candidates") {
-    const providerFilter = pickQuery(path, "provider");
-    const view = await buildCandidates(cfg, {
-      catalog: h.catalog,
-      ...(h.pingLoop ? { pingLoop: h.pingLoop } : {}),
-      ...(providerFilter ? { provider: providerFilter } : {}),
-    });
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return;
-  }
-
-  // The offload switch. POST applies to the LIVE config object the request path reads, so the
-  // very next subagent request is routed the new way — no restart — and is persisted back to
-  // the config file so the choice survives one.
-  if ((req.method === "GET" || req.method === "POST") && pathname === "/offload") {
-    let state = offloadState(cfg);
-    if (req.method === "POST") {
-      const want = (reqJson as { enabled?: unknown } | undefined)?.enabled;
-      if (typeof want !== "boolean") {
-        failClosed(res, 400, `POST /offload needs a JSON body {"enabled": true|false}`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return;
-      }
-      state = setOffload(cfg, want);
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(state, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return;
-  }
-
-  // The dispatch ladder: which lane the host should hand a delegated task to next. GET reads
-  // (with ?lane= to override, ?after= to walk past a spent rung, ?task= to get a runnable
-  // command); POST reports a rung spent so the next read walks past it. The relay decides the
-  // ORDER and never executes a cli rung itself — spawning agents is the host's job.
-  if ((req.method === "GET" || req.method === "POST") && pathname === "/dispatch") {
-    if (req.method === "POST") {
-      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown };
-      const ttlMs = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
-      if (typeof body.clear === "string") {
-        clearExhausted(cfg, body.clear);
-      } else if (body.clear === true) {
-        clearExhausted(cfg);
-      } else if (typeof body.exhausted === "string") {
-        if (!markExhausted(cfg, body.exhausted, ttlMs)) {
-          failClosed(res, 400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
-          h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-          return;
-        }
-      } else {
-        failClosed(res, 400, `POST /dispatch needs {"exhausted":"<lane>"} or {"clear":"<lane>"|true}`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return;
-      }
-    }
-    // Bound the task text: it is unauthenticated query input that ends up in a
-    // command the host is told to run, so an unbounded value is both a rendering
-    // hazard and a trivial way to bloat the response.
-    const rawTask = pickQuery(path, "task");
-    if (typeof rawTask === "string" && rawTask.length > MAX_TASK_LEN) {
-      failClosed(res, 400, `?task= exceeds ${MAX_TASK_LEN} characters`);
-      h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-      return;
-    }
-    const taskParam = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : undefined;
-    const view = buildDispatch(cfg, {
-      ...(taskParam ? { task: taskParam } : {}),
-      ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
-      ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
-    });
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return;
-  }
-
-  if (req.method === "GET" && pathname === "/telemetry") {
-    const report = getTelemetryReport(cfg, globalCircuitBreaker);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(report, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return;
-  }
 
 
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
@@ -759,12 +638,9 @@ async function openAiFrontPath(
         if (!res.writableEnded) res.end();
       }
     } catch (e) {
-      const message = midStreamMessage(e);
-      endMidStreamFailure(res, streamed ? openAiSseError(message) : null, message);
-      h.logger.write({
-        ...baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target),
-        errorKinds: [MID_STREAM_ERROR_KIND],
-      });
+      handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, target, h, (msg) =>
+        streamed ? openAiSseError(msg) : null,
+      );
       return;
     } finally {
       clearTimeout(timer);
@@ -818,12 +694,9 @@ async function transparentPath(
     // reading a 200. Say the stream broke rather than closing on a truncated answer,
     // and LOG the turn — this throw used to escape to the top-level catch, which
     // could only `res.end()` and never logged.
-    const message = midStreamMessage(e);
-    endMidStreamFailure(res, ctx.streamed ? sseError(message) : null, message);
-    h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
-      errorKinds: [MID_STREAM_ERROR_KIND],
-    });
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, h, (msg) =>
+      ctx.streamed ? sseError(msg) : null,
+    );
     return;
   } finally {
     clearTimeout(timer);
@@ -960,13 +833,8 @@ async function repairStreamingPath(
     // gets an explicit error event instead of a stream that simply stops. If the
     // head has not been written yet (a failure before any text frame) this is still
     // a clean 502. Either way the turn is logged.
-    const message = midStreamMessage(e);
     held.length = 0;
-    endMidStreamFailure(res, sseError(message), message);
-    h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, "skipped", ctx.target),
-      errorKinds: [MID_STREAM_ERROR_KIND],
-    });
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, ctx.target, h, sseError);
     return;
   } finally {
     clearTimeout(timer);
@@ -1044,12 +912,7 @@ async function repairBufferedPath(
     // Nothing has been written yet on this path, so this is a clean 502 rather than
     // a truncated body — but it still has to be LOGGED, which the bare finally did
     // not do: the throw went straight to the top-level catch.
-    const message = midStreamMessage(e);
-    endMidStreamFailure(res, null, message);
-    h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
-      errorKinds: [MID_STREAM_ERROR_KIND],
-    });
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, h, () => null);
     return;
   } finally {
     clearTimeout(timer);
@@ -1338,9 +1201,42 @@ function endMidStreamFailure(res: ServerResponse, errorFrame: string | null, mes
   res.end(errorFrame ?? undefined);
 }
 
+/**
+ * Handle a mid-stream failure (socket reset / network drop mid-response).
+ *
+ * Emits protocol-appropriate error frames (SSE event/data or none for non-stream),
+ * reports the mid-stream failure to the circuit breaker to correct any eager success,
+ * and writes a metadata log record with `MID_STREAM_ERROR_KIND`.
+ */
+function handleMidStreamError(
+  res: ServerResponse,
+  e: unknown,
+  started: number,
+  path: string,
+  hadTools: boolean,
+  streamed: boolean,
+  backendStatus: number,
+  target: ResolvedTarget,
+  h: Handlers,
+  errorFrameBuilder: (msg: string) => string | null,
+): void {
+  const message = midStreamMessage(e);
+  const errorFrame = errorFrameBuilder(message);
+  endMidStreamFailure(res, errorFrame, message);
+  globalCircuitBreaker.recordMidStreamFailure(target, { elapsedMs: Date.now() - started, status: 502 });
+  h.logger.write({
+    ...baseLog(started, path, hadTools, streamed, backendStatus, "skipped", target),
+    errorKinds: [MID_STREAM_ERROR_KIND],
+  });
+}
+
 /** The client-facing description of a mid-transfer upstream failure. */
 function midStreamMessage(e: unknown): string {
-  return `llm-relay: backend stream failed mid-response: ${(e as Error).message}`;
+  const errStr =
+    e && typeof e === "object" && "message" in e && typeof (e as { message: unknown }).message === "string"
+      ? (e as { message: string }).message
+      : String(e);
+  return `llm-relay: backend stream failed mid-response: ${errStr}`;
 }
 
 function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Buffer> {
@@ -1424,7 +1320,7 @@ function failClosed(res: ServerResponse, status: number, message: string): void 
  * routinely not the model that answered, and it was the id every "which model
  * trips the validator" reading of this log was attributed to.
  */
-function baseLog(
+export function baseLog(
   started: number, path: string, hadTools: boolean,
   streamed: boolean, backendStatus: number, validated: RequestLog["validated"],
   served: ResolvedTarget | null,

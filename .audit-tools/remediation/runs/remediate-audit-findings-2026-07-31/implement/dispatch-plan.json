@@ -1,0 +1,95 @@
+{
+  "contract_version": "remediate-code-dispatch-plan/v1alpha1",
+  "phase": "implement",
+  "run_id": "remediate-audit-findings-2026-07-31",
+  "repo_root": "C:/Code/llm-relay",
+  "artifacts_dir": "C:/Code/llm-relay/.audit-tools/remediation",
+  "items": [
+    {
+      "task_id": "implement-CP-BLOCK-CP-NODE-1-f01",
+      "block_id": "CP-BLOCK-CP-NODE-1-f01",
+      "prompt_path": "C:\\Code\\llm-relay\\.audit-tools\\remediation\\runs\\remediate-audit-findings-2026-07-31\\implement\\implement-CP-BLOCK-CP-NODE-1-f01.md",
+      "result_path": "C:\\Code\\llm-relay\\.audit-tools\\remediation\\runs\\remediate-audit-findings-2026-07-31\\implement\\implement-CP-BLOCK-CP-NODE-1-f01.result.json",
+      "model_hint": {
+        "tier": "deep",
+        "reasons": [
+          "node_model_tier"
+        ]
+      },
+      "access": {
+        "read_paths": [
+          "src/server.ts",
+          "test/breaker-measurement.test.ts",
+          "test/config.test.ts",
+          "test/credential-containment.test.ts",
+          "test/dispatch.test.ts",
+          "test/loopback-admission.test.ts",
+          "test/metadata.test.ts",
+          "test/mid-stream-failure.test.ts",
+          "test/offload.test.ts",
+          "test/openai-front.test.ts",
+          "test/ping.test.ts",
+          "test/pool-failover.test.ts",
+          "test/registry.test.ts",
+          "test/reshaper.test.ts",
+          "test/server-safety.test.ts",
+          "test/server.test.ts"
+        ],
+        "write_paths": [
+          "src/server.ts",
+          "C:\\Code\\llm-relay\\.audit-tools\\remediation\\runs\\remediate-audit-findings-2026-07-31\\implement\\implement-CP-BLOCK-CP-NODE-1-f01.result.json",
+          "test/breaker-measurement.test.ts",
+          "test/config.test.ts",
+          "test/credential-containment.test.ts",
+          "test/dispatch.test.ts",
+          "test/loopback-admission.test.ts",
+          "test/metadata.test.ts",
+          "test/mid-stream-failure.test.ts",
+          "test/offload.test.ts",
+          "test/openai-front.test.ts",
+          "test/ping.test.ts",
+          "test/pool-failover.test.ts",
+          "test/registry.test.ts",
+          "test/reshaper.test.ts",
+          "test/server-safety.test.ts",
+          "test/server.test.ts"
+        ]
+      },
+      "estimated_input_tokens": 19992
+    },
+    {
+      "task_id": "implement-CP-BLOCK-CP-NODE-1-f02",
+      "block_id": "CP-BLOCK-CP-NODE-1-f02",
+      "prompt_path": "C:\\Code\\llm-relay\\.audit-tools\\remediation\\runs\\remediate-audit-findings-2026-07-31\\implement\\implement-CP-BLOCK-CP-NODE-1-f02.md",
+      "result_path": "C:\\Code\\llm-relay\\.audit-tools\\remediation\\runs\\remediate-audit-findings-2026-07-31\\implement\\implement-CP-BLOCK-CP-NODE-1-f02.result.json",
+      "model_hint": {
+        "tier": "deep",
+        "reasons": [
+          "node_model_tier"
+        ]
+      },
+      "access": {
+        "read_paths": [
+          "src/circuit-breaker.ts",
+          "test/breaker-measurement.test.ts",
+          "test/circuit-breaker.test.ts",
+          "test/offload.test.ts",
+          "test/pool-failover.test.ts",
+          "test/server.test.ts",
+          "test/telemetry.test.ts"
+        ],
+        "write_paths": [
+          "src/circuit-breaker.ts",
+          "C:\\Code\\llm-relay\\.audit-tools\\remediation\\runs\\remediate-audit-findings-2026-07-31\\implement\\implement-CP-BLOCK-CP-NODE-1-f02.result.json",
+          "test/breaker-measurement.test.ts",
+          "test/circuit-breaker.test.ts",
+          "test/offload.test.ts",
+          "test/pool-failover.test.ts",
+          "test/server.test.ts",
+          "test/telemetry.test.ts"
+        ]
+      },
+      "estimated_input_tokens": 16878
+    }
+  ]
+}

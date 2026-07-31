@@ -1,0 +1,13 @@
+{
+  "name": "server-core",
+  "inputs": ["HTTP request payloads", "Configuration state", "Backend response streams"],
+  "outputs": ["Proxied HTTP responses", "SSE streams", "Circuit breaker failure metrics"],
+  "invariants": ["Mid-stream network resets or SSE truncations must report failure to circuit breaker (verification_obligation: test stream failures)"],
+  "side_effects": ["Circuit breaker state updates", "Logs emitted for stream failures"],
+  "validation_boundary": "Validates incoming HTTP requests and SSE event structures against JSON schemas",
+  "failure_modes": ["Backend socket reset or timeout (caller receives error SSE or failover to candidate)"],
+  "neighbor_needs": [
+    { "neighbor": "backend-auth", "needs": "Resolved credentials and target URL fetching" },
+    { "neighbor": "config-routing", "needs": "Subagent and model routing configuration" }
+  ]
+}

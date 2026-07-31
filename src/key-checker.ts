@@ -46,6 +46,18 @@ async function withBudget<T>(ms: number, work: () => Promise<T>, onExpired: () =
 /** A token safe to put in a diagnostic: an identifier, not free-form text. */
 const SAFE_TOKEN = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
 
+const KNOWN_SAFE_ERRORS = new Set([
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ECONNRESET",
+  "EPIPE",
+  "AbortError",
+  "TypeError",
+  "FetchError",
+]);
+
 /**
  * Describe a thrown error WITHOUT quoting it.
  *
@@ -60,8 +72,9 @@ const SAFE_TOKEN = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
  */
 export function describeFailure(e: unknown): string {
   const err = e as { name?: unknown; code?: unknown; cause?: { code?: unknown; name?: unknown } } | null;
-  const raw = [err?.cause?.code, err?.code, err?.cause?.name, err?.name].find(
-    (v) => typeof v === "string" && SAFE_TOKEN.test(v),
+  const candidates = [err?.cause?.code, err?.code, err?.cause?.name, err?.name];
+  const raw = candidates.find(
+    (v): v is string => typeof v === "string" && (KNOWN_SAFE_ERRORS.has(v) || SAFE_TOKEN.test(v)),
   );
   return `Network error (${raw ?? "unclassified"})`;
 }

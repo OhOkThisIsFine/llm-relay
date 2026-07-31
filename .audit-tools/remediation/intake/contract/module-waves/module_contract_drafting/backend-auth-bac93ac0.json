@@ -1,0 +1,12 @@
+{
+  "name": "backend-auth",
+  "inputs": ["Target specification", "Environment credentials"],
+  "outputs": ["Upstream HTTP response", "Resolved auth headers"],
+  "invariants": ["Env-var credential resolution must consistently use readCredential across routing and header construction (verification_obligation: unit test authEnv & backend)"],
+  "side_effects": ["Network fetch calls to upstream AI providers"],
+  "validation_boundary": "Validates target existence and authorization credential presence",
+  "failure_modes": ["Missing or invalid credential (caller receives unauthenticated error or failover)"],
+  "neighbor_needs": [
+    { "neighbor": "config-routing", "needs": "Target providers configuration" }
+  ]
+}
