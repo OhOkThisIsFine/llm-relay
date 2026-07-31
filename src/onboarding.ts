@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import type { Config } from "./config.js";
@@ -107,11 +107,11 @@ export function printOnboardingGuide(cfg?: Config): void {
 }
 
 /** Interactively prompt for missing API keys and save them to ~/.llm-relay/.env */
-export async function runInteractiveOnboarding(cfg?: Config): Promise<void> {
+export async function runInteractiveOnboarding(cfg?: Config, opts?: { envPath?: string }): Promise<void> {
   printOnboardingGuide(cfg);
 
   const statuses = getOnboardingStatusList(cfg);
-  const missing = statuses.filter((s) => !s.hasKey);
+  const missing = statuses.filter((s) => !s.hasKey && s.authEnv && s.authEnv.trim().length > 0);
 
   if (missing.length === 0) {
     console.log("🎉 All configured provider API keys are active! You are ready to run llm-relay.\n");
@@ -124,7 +124,7 @@ export async function runInteractiveOnboarding(cfg?: Config): Promise<void> {
   }
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const envPath = join(homedir(), ".llm-relay", ".env");
+  const envPath = opts?.envPath ?? join(homedir(), ".llm-relay", ".env");
   const addedKeys: Record<string, string> = {};
 
   const ask = (query: string): Promise<string> =>
@@ -135,6 +135,7 @@ export async function runInteractiveOnboarding(cfg?: Config): Promise<void> {
 
   if (proceed.toLowerCase() === "y" || proceed.toLowerCase() === "yes") {
     for (const p of missing) {
+      if (!p.authEnv || !p.authEnv.trim()) continue;
       console.log(`\nSetting up ${p.displayName}`);
       if (p.signupUrl) console.log(`Signup URL: ${p.signupUrl}`);
       const val = await ask(`Enter key for \$${p.authEnv} (leave blank to skip): `);
@@ -147,8 +148,12 @@ export async function runInteractiveOnboarding(cfg?: Config): Promise<void> {
 
     if (Object.keys(addedKeys).length > 0) {
       try {
+        const envDir = dirname(envPath);
+        if (!existsSync(envDir)) {
+          mkdirSync(envDir, { recursive: true });
+        }
         const envLines = Object.entries(addedKeys)
-          .map(([k, v]) => `${k}="${v}"`)
+          .map(([k, v]) => `${k}="${v.replace(/"/g, '\\"')}"`)
           .join("\n");
         appendFileSync(envPath, "\n" + envLines + "\n");
         console.log(`\n✅ Saved ${Object.keys(addedKeys).length} key(s) to ${envPath}\n`);
