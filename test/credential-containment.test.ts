@@ -21,6 +21,12 @@ describe("credential containment is declared, not inferred", () => {
     expect(credentialState("SOME_KEY", { SOME_KEY: "sk-live" })).toBe("declared-present");
   });
 
+  it("resolves provider env aliases when declared variable is unset", () => {
+    const env = { GOOGLE_API_KEY: "sk-google-key" };
+    expect(credentialState("GEMINI_API_KEY", env)).toBe("declared-present");
+    expect(readCredential("GEMINI_API_KEY", env)).toBe("sk-google-key");
+  });
+
   it("treats a whitespace-only key as missing, not present", () => {
     // config.ts used Boolean() with no trim while server.ts trimmed, so a blank
     // key was "active" to the target filter and absent to header construction.
