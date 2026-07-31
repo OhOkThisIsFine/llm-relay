@@ -1,0 +1,106 @@
+{
+  "contract_version": "remediate-code-contract-pipeline/implementation-dag/v1alpha1",
+  "goal_id": "remediate-audit-findings-2026-07-31",
+  "nodes": [
+    {
+      "id": "CP-NODE-1",
+      "title": "Remediate server-core module findings",
+      "description": "Fix mid-stream reset circuit breaker reporting, socket reset handling, and monolith complexity in src/server.ts and src/circuit-breaker.ts",
+      "satisfies_obligations": [
+        "OBL-server-core-contract",
+        "OBL-server-core-inv-1",
+        "OBL-server-core-fail-1"
+      ],
+      "addresses_counterexamples": [],
+      "addressed_critique_items": [],
+      "depends_on": [
+        "CP-NODE-2",
+        "CP-NODE-3"
+      ],
+      "verification_obligation_ids": [
+        "OBL-server-core-contract",
+        "OBL-server-core-inv-1",
+        "OBL-server-core-fail-1"
+      ],
+      "targeted_commands": [
+        "npm test"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "CP-NODE-2",
+      "title": "Remediate backend-auth module findings",
+      "description": "Fix auth env variable credential resolution and readCredential consistency in src/backend.ts and src/authEnv.ts",
+      "satisfies_obligations": [
+        "OBL-backend-auth-contract",
+        "OBL-backend-auth-inv-1",
+        "OBL-backend-auth-fail-1"
+      ],
+      "addresses_counterexamples": [],
+      "addressed_critique_items": [],
+      "depends_on": [
+        "CP-NODE-3"
+      ],
+      "verification_obligation_ids": [
+        "OBL-backend-auth-contract",
+        "OBL-backend-auth-inv-1",
+        "OBL-backend-auth-fail-1"
+      ],
+      "targeted_commands": [
+        "npm test"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "CP-NODE-3",
+      "title": "Remediate config-routing module findings",
+      "description": "Restrict subagent directive parsing to prompt text blocks and fix routing fallback in src/config.ts",
+      "satisfies_obligations": [
+        "OBL-config-routing-contract",
+        "OBL-config-routing-inv-1",
+        "OBL-config-routing-fail-1"
+      ],
+      "addresses_counterexamples": [],
+      "addressed_critique_items": [],
+      "depends_on": [],
+      "verification_obligation_ids": [
+        "OBL-config-routing-contract",
+        "OBL-config-routing-inv-1",
+        "OBL-config-routing-fail-1"
+      ],
+      "targeted_commands": [
+        "npm test"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "CP-NODE-4",
+      "title": "Remediate cli-tools module findings",
+      "description": "Fix backslash shell quoting and CLI flag/command parsing in src/cli.ts",
+      "satisfies_obligations": [
+        "OBL-cli-tools-contract",
+        "OBL-cli-tools-inv-1",
+        "OBL-cli-tools-fail-1"
+      ],
+      "addresses_counterexamples": [],
+      "addressed_critique_items": [
+        "CRIT-001"
+      ],
+      "depends_on": [],
+      "verification_obligation_ids": [
+        "OBL-cli-tools-contract",
+        "OBL-cli-tools-inv-1",
+        "OBL-cli-tools-fail-1"
+      ],
+      "targeted_commands": [
+        "npm test"
+      ],
+      "status": "pending"
+    }
+  ],
+  "edges": [
+    { "from": "CP-NODE-3", "to": "CP-NODE-2", "kind": "dependency" },
+    { "from": "CP-NODE-2", "to": "CP-NODE-1", "kind": "dependency" },
+    { "from": "CP-NODE-3", "to": "CP-NODE-1", "kind": "dependency" }
+  ]
+}

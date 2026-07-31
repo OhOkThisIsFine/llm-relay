@@ -1,0 +1,33 @@
+{
+  "phases": [
+    {
+      "ordinal": 0,
+      "name": "foundations",
+      "modules": [
+        "cli-tools",
+        "config-routing"
+      ]
+    },
+    {
+      "ordinal": 1,
+      "name": "consumers-1",
+      "modules": [
+        "backend-auth"
+      ]
+    },
+    {
+      "ordinal": 2,
+      "name": "integration",
+      "modules": [
+        "server-core"
+      ]
+    }
+  ],
+  "has_cycle": false,
+  "module_phase": {
+    "config-routing": 0,
+    "backend-auth": 1,
+    "cli-tools": 0,
+    "server-core": 2
+  }
+}

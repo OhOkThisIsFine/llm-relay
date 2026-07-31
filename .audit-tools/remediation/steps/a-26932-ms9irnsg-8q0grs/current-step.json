@@ -1,0 +1,22 @@
+{
+  "contract_version": "remediate-code-step/v1alpha1",
+  "step_kind": "contract_pipeline",
+  "status": "ready",
+  "run_id": "CONTRACT-ms9irns9-u5y7j2",
+  "agent_id": "a-26932-ms9irnsg-8q0grs",
+  "allowed_commands": [
+    "remediate-code next-step"
+  ],
+  "stop_condition": "Stop after writing the contract-pipeline output for phase \"context_collection\" and running next-step.",
+  "prompt_path": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-26932-ms9irnsg-8q0grs/current-prompt.md",
+  "repo_root": "C:/Code/llm-relay",
+  "artifacts_dir": "C:/Code/llm-relay/.audit-tools/remediation",
+  "artifact_paths": {
+    "output": "C:/Code/llm-relay/.audit-tools/remediation/intake/contract/context_bundle.input.json",
+    "goal_spec": "C:/Code/llm-relay/.audit-tools/remediation/intake/contract/goal_spec.input.json",
+    "source_manifest": "C:/Code/llm-relay/.audit-tools/remediation/intake/source-manifest.json",
+    "remediation_brief": "C:/Code/llm-relay/.audit-tools/remediation/intake/remediation-brief.md",
+    "current_step": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-26932-ms9irnsg-8q0grs/current-step.json",
+    "current_prompt": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-26932-ms9irnsg-8q0grs/current-prompt.md"
+  }
+}

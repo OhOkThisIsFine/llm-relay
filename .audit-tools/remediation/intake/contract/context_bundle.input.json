@@ -1,0 +1,13 @@
+{
+  "contract_version": "remediate-code-contract-pipeline/context-bundle/v1alpha1",
+  "goal_id": "remediate-audit-findings-2026-07-31",
+  "entries": [
+    { "path": "src/server.ts", "kind": "source", "relevance_reason": "Implicated in circuit breaker gaps, failure loops, and monolith complexity" },
+    { "path": "src/circuit-breaker.ts", "kind": "source", "relevance_reason": "Implicated in circuit breaker coverage gaps" },
+    { "path": "src/backend.ts", "kind": "source", "relevance_reason": "Implicated in auth environment credential resolution mismatch" },
+    { "path": "src/authEnv.ts", "kind": "source", "relevance_reason": "Implicated in credential resolution logic" },
+    { "path": "src/config.ts", "kind": "source", "relevance_reason": "Implicated in subagent directive parsing and provider routing" },
+    { "path": "src/cli.ts", "kind": "source", "relevance_reason": "Implicated in CLI argument parsing and shell quoting" }
+  ],
+  "context_summary": "Context collected for primary affected source files and tests implicated in the approved audit findings."
+}

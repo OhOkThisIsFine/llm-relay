@@ -1,0 +1,20 @@
+{
+  "contract_version": "remediate-code-step/v1alpha1",
+  "step_kind": "collect_review_approval",
+  "status": "blocked",
+  "run_id": "REVIEW-ms9iqmhg-n3ot23",
+  "agent_id": "a-8112-ms9iqmhg-jvtdco",
+  "allowed_commands": [
+    "remediate-code next-step"
+  ],
+  "stop_condition": "Stop after presenting the findings for approval and collecting the user's approve/disapprove decision, unless the decision is already recorded and the prompt told you to continue.",
+  "prompt_path": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-8112-ms9iqmhg-jvtdco/current-prompt.md",
+  "repo_root": "C:/Code/llm-relay",
+  "artifacts_dir": "C:/Code/llm-relay/.audit-tools/remediation",
+  "artifact_paths": {
+    "review_request": "C:/Code/llm-relay/.audit-tools/remediation/review_request.json",
+    "review_resolution": "C:/Code/llm-relay/.audit-tools/remediation/review_resolution.json",
+    "current_step": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-8112-ms9iqmhg-jvtdco/current-step.json",
+    "current_prompt": "C:/Code/llm-relay/.audit-tools/remediation/steps/a-8112-ms9iqmhg-jvtdco/current-prompt.md"
+  }
+}

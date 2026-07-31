@@ -759,12 +759,9 @@ async function openAiFrontPath(
         if (!res.writableEnded) res.end();
       }
     } catch (e) {
-      const message = midStreamMessage(e);
-      endMidStreamFailure(res, streamed ? openAiSseError(message) : null, message);
-      h.logger.write({
-        ...baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target),
-        errorKinds: [MID_STREAM_ERROR_KIND],
-      });
+      handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, target, h, (msg) =>
+        streamed ? openAiSseError(msg) : null,
+      );
       return;
     } finally {
       clearTimeout(timer);
@@ -818,12 +815,9 @@ async function transparentPath(
     // reading a 200. Say the stream broke rather than closing on a truncated answer,
     // and LOG the turn — this throw used to escape to the top-level catch, which
     // could only `res.end()` and never logged.
-    const message = midStreamMessage(e);
-    endMidStreamFailure(res, ctx.streamed ? sseError(message) : null, message);
-    h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
-      errorKinds: [MID_STREAM_ERROR_KIND],
-    });
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, h, (msg) =>
+      ctx.streamed ? sseError(msg) : null,
+    );
     return;
   } finally {
     clearTimeout(timer);
@@ -960,13 +954,8 @@ async function repairStreamingPath(
     // gets an explicit error event instead of a stream that simply stops. If the
     // head has not been written yet (a failure before any text frame) this is still
     // a clean 502. Either way the turn is logged.
-    const message = midStreamMessage(e);
     held.length = 0;
-    endMidStreamFailure(res, sseError(message), message);
-    h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, "skipped", ctx.target),
-      errorKinds: [MID_STREAM_ERROR_KIND],
-    });
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, ctx.target, h, sseError);
     return;
   } finally {
     clearTimeout(timer);
@@ -1044,12 +1033,7 @@ async function repairBufferedPath(
     // Nothing has been written yet on this path, so this is a clean 502 rather than
     // a truncated body — but it still has to be LOGGED, which the bare finally did
     // not do: the throw went straight to the top-level catch.
-    const message = midStreamMessage(e);
-    endMidStreamFailure(res, null, message);
-    h.logger.write({
-      ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, "skipped", ctx.target),
-      errorKinds: [MID_STREAM_ERROR_KIND],
-    });
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, h, () => null);
     return;
   } finally {
     clearTimeout(timer);
@@ -1338,9 +1322,42 @@ function endMidStreamFailure(res: ServerResponse, errorFrame: string | null, mes
   res.end(errorFrame ?? undefined);
 }
 
+/**
+ * Handle a mid-stream failure (socket reset / network drop mid-response).
+ *
+ * Emits protocol-appropriate error frames (SSE event/data or none for non-stream),
+ * reports the mid-stream failure to the circuit breaker to correct any eager success,
+ * and writes a metadata log record with `MID_STREAM_ERROR_KIND`.
+ */
+function handleMidStreamError(
+  res: ServerResponse,
+  e: unknown,
+  started: number,
+  path: string,
+  hadTools: boolean,
+  streamed: boolean,
+  backendStatus: number,
+  target: ResolvedTarget,
+  h: Handlers,
+  errorFrameBuilder: (msg: string) => string | null,
+): void {
+  const message = midStreamMessage(e);
+  const errorFrame = errorFrameBuilder(message);
+  endMidStreamFailure(res, errorFrame, message);
+  globalCircuitBreaker.recordMidStreamFailure(target, { elapsedMs: Date.now() - started, status: 502 });
+  h.logger.write({
+    ...baseLog(started, path, hadTools, streamed, backendStatus, "skipped", target),
+    errorKinds: [MID_STREAM_ERROR_KIND],
+  });
+}
+
 /** The client-facing description of a mid-transfer upstream failure. */
 function midStreamMessage(e: unknown): string {
-  return `llm-relay: backend stream failed mid-response: ${(e as Error).message}`;
+  const errStr =
+    e && typeof e === "object" && "message" in e && typeof (e as { message: unknown }).message === "string"
+      ? (e as { message: string }).message
+      : String(e);
+  return `llm-relay: backend stream failed mid-response: ${errStr}`;
 }
 
 function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Buffer> {

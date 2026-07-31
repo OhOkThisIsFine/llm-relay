@@ -5,6 +5,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createProxy, buildForwardHeaders, CredentialConfigError } from "../src/server.js";
+import { globalCircuitBreaker } from "../src/circuit-breaker.js";
 import type { Config, ResolvedTarget } from "../src/config.js";
 
 /**
@@ -123,6 +124,28 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     const lines = logLines(logFile);
     expect(lines).toHaveLength(1);
     expect(lines[0]!.errorKinds).toEqual(["backend_stream_failed"]);
+  });
+
+  it("reports mid-stream failures to circuit breaker and trips breaker on repeated failures", async () => {
+    dir = mkdtempSync(join(tmpdir(), "rp-midstream-cb-"));
+    const logFile = join(dir, "log.jsonl");
+    const backend = await truncatingSseBackend();
+    const proxy = await listen(createProxy(cfgFor(port(backend), logFile, "detect")));
+    globalCircuitBreaker.reset();
+
+    const doReq = () =>
+      fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "mock-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }).then((r) => r.text());
+
+    await doReq();
+    expect(globalCircuitBreaker.getState("up")?.consecutiveFailures).toBe(1);
+
+    await doReq();
+    expect(globalCircuitBreaker.getState("up")?.consecutiveFailures).toBe(2);
+    expect(globalCircuitBreaker.isHealthy("up")).toBe(false);
   });
 });
 

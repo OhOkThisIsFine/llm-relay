@@ -21,6 +21,8 @@ export interface CircuitState {
   lastCredentialStatus?: number | undefined;
   /** While in the future, this target is demoted (never dropped) as unusable-for-now. */
   credentialFaultUntil: number;
+  /** Failure count prior to an eager success, so a mid-stream failure can restore and increment it. */
+  prevConsecutiveFailures?: number | undefined;
 }
 
 const DEFAULT_COOLDOWN_MS = 60000; // 1 minute cooldown after consecutive failures
@@ -144,6 +146,7 @@ export class CircuitBreaker {
     if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
 
     if (outcome.ok) {
+      state.prevConsecutiveFailures = state.consecutiveFailures;
       state.consecutiveFailures = 0;
       state.cooldownUntil = 0;
       // A call that actually succeeded is proof the credential works now — that is the
@@ -170,6 +173,46 @@ export class CircuitBreaker {
       // failure rather than waiting for a second one to trip the generic cooldown.
       state.cooldownUntil = now + asked;
     } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
+      state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
+    }
+  }
+
+  /**
+   * Correct an eager 200 success outcome to a failure when a stream breaks mid-response.
+   *
+   * When HTTP status 200 headers arrive, `recordAttempt` eagerly records success (`ok: true`).
+   * If reading the response body subsequently fails (socket reset / network drop mid-stream),
+   * calling `recordMidStreamFailure` replaces the eager success ping with a 502 failure ping
+   * and increments `consecutiveFailures` from its pre-request count rather than resetting it,
+   * allowing repeated mid-stream resets to trip the breaker.
+   */
+  recordMidStreamFailure(
+    target: ResolvedTarget | string,
+    outcome: { elapsedMs: number; status?: number; at?: number },
+  ): void {
+    const key = this.getKey(target);
+    const state = this.states.get(key);
+    const now = outcome.at ?? Date.now();
+    const status = outcome.status ?? 502;
+
+    if (!state) {
+      this.recordOutcome(target, { ok: false, status, elapsedMs: outcome.elapsedMs, at: now });
+      return;
+    }
+
+    if (state.pings.length > 0 && state.pings[state.pings.length - 1]!.code === "200") {
+      state.pings.pop();
+    }
+
+    state.lastStatus = status;
+    state.pings.push({ ms: outcome.elapsedMs, code: String(status), timestamp: now });
+    if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
+
+    state.consecutiveFailures = (state.prevConsecutiveFailures ?? 0) + 1;
+    state.prevConsecutiveFailures = 0;
+    state.lastFailureTime = now;
+
+    if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
       state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
     }
   }

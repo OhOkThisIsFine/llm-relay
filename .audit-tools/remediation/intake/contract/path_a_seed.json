@@ -1,0 +1,333 @@
+{
+  "schema_version": "remediate-code-contract-pipeline/path-a-seed/v1alpha1",
+  "audit_findings_path": "C:\\Code\\llm-relay\\.audit-tools\\remediation\\intake\\contract\\approved-findings.json",
+  "finding_count": 46,
+  "findings_summary": [
+    {
+      "id": "ARC-c9155ca2",
+      "title": "Circuit Breaker Coverage Gap for Mid-Stream Network Resets and SSE Truncation",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-859ded67",
+      "title": "Credential Resolution Mismatch Between Routing Filter and Upstream Header Construction",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-c9155ca2-2",
+      "title": "Monolithic Proxy Architecture Couples Data-Plane Routing with Control-Plane Side Effects",
+      "lens": "architecture"
+    },
+    {
+      "id": "COR-c9155ca2",
+      "title": "OpenAI front failover loop continues on client disconnect due to checking writableEnded instead of destroyed",
+      "lens": "correctness"
+    },
+    {
+      "id": "ARC-36748f82",
+      "title": "Subagent Directive Parsing Vulnerable to Prompt Injection via Untrusted Message Blocks",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-36748f82-2",
+      "title": "Subagent Offload Routing Relies on Unversioned Client-Side Metadata Heuristic",
+      "lens": "architecture"
+    },
+    {
+      "id": "COR-a0dab0ad",
+      "title": "Unconfigured namespaced provider specs silently fall back to default routing instead of throwing RoutingError",
+      "lens": "correctness"
+    },
+    {
+      "id": "REL-b45d964b",
+      "title": "Unhandled backpressure drain wait causes indefinite hanging promise on client disconnect",
+      "lens": "reliability"
+    },
+    {
+      "id": "COR-79c2a509",
+      "title": "classifyCommand classifies help and version flags as mutating operations, triggering unwanted update checks",
+      "lens": "correctness"
+    },
+    {
+      "id": "ARC-c9155ca2-3",
+      "title": "Hub module: src/server.ts",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-c9155ca2-4",
+      "title": "Lack of Extensible Middleware Pipeline for Request/Response Interception",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-a8bf7dce",
+      "title": "Sensitive Credential Leakage Hazard in Failure Diagnostic Safe-Token Filtering",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-4e8f64b6",
+      "title": "Sequential Multi-Attempt Reshaper Loop Introduces Latency and Cost Amplification Risks",
+      "lens": "architecture"
+    },
+    {
+      "id": "COR-198fbd46",
+      "title": "SHELL_SAFE regex allows backslashes to remain unquoted when rendering arguments for POSIX shell",
+      "lens": "correctness"
+    },
+    {
+      "id": "COR-c9155ca2-2",
+      "title": "Single reshaper candidate is ignored when cfg.reshaper is undefined",
+      "lens": "correctness"
+    },
+    {
+      "id": "ARC-36748f82-4",
+      "title": "Unauthenticated Subagent Status Spoofing via In-Band System Prompt Marker",
+      "lens": "architecture"
+    },
+    {
+      "id": "REL-b46ebdda",
+      "title": "Unconsumed backend response stream leaked during candidate failover",
+      "lens": "reliability"
+    },
+    {
+      "id": "ARC-010dd32d",
+      "title": "Architectural seam: src/authEnv.ts ↔ test/authEnv.test.ts",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-859ded67-2",
+      "title": "Architectural seam: src/backend.ts ↔ src/documents.ts",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-eaffc6ab-2",
+      "title": "Hidden coupling: package.json ↔ src/config.ts",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-c9155ca2-5",
+      "title": "Hidden coupling: src/server.ts ↔ test/config.test.ts",
+      "lens": "architecture"
+    },
+    {
+      "id": "MNT-010dd32d",
+      "title": "High complexity: src/authEnv.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-859ded67",
+      "title": "High complexity: src/backend.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-69cc0882",
+      "title": "High complexity: src/dispatch.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-a8bf7dce",
+      "title": "High complexity: src/key-checker.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-bf2ef126",
+      "title": "High complexity: src/reshaper.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-c9155ca2",
+      "title": "High complexity: src/server.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-dd4663e3",
+      "title": "High complexity: test/cli.test.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "ARC-c9155ca2-6",
+      "title": "Unbounded Memory Accumulation During Tool Repair Loops on Event Streams",
+      "lens": "architecture"
+    },
+    {
+      "id": "COR-f6711540",
+      "title": "runDispatch positional lane argument is ignored when CLI flags precede the lane name",
+      "lens": "correctness"
+    },
+    {
+      "id": "MNT-010dd32d-2",
+      "title": "Duplicated code: src/authEnv.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-859ded67-2",
+      "title": "Duplicated code: src/backend.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-69cc0882-2",
+      "title": "Duplicated code: src/dispatch.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-bf2ef126-2",
+      "title": "Duplicated code: src/reshaper.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-c9155ca2-2",
+      "title": "Duplicated code: src/server.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-ad223996",
+      "title": "Duplicated code: test/authEnv.test.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-37ed1b2a",
+      "title": "Duplicated code: test/cli-update-gate.test.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-dd4663e3-2",
+      "title": "Duplicated code: test/cli.test.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "MNT-e6b97b7b",
+      "title": "Duplicated code: test/credential-containment.test.ts",
+      "lens": "maintainability"
+    },
+    {
+      "id": "ARC-ad223996",
+      "title": "Excessive single-file units",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-859ded67-3",
+      "title": "Behavioral cluster spans declared boundaries: 4 files",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-f687316b",
+      "title": "Behavioral cluster spans declared boundaries: 54 files",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-6b5169a2",
+      "title": "Declared purpose is behaviorally smeared: 2 files",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-859ded67-4",
+      "title": "Declared purpose is behaviorally smeared: 4 files",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-b4f75d6f",
+      "title": "Declared purpose is behaviorally smeared: 49 files",
+      "lens": "architecture"
+    },
+    {
+      "id": "ARC-6a02bffc-3",
+      "title": "Declared purpose is behaviorally smeared: 8 files",
+      "lens": "architecture"
+    }
+  ],
+  "affected_files": [
+    "src/server.ts",
+    "src/circuit-breaker.ts",
+    "src/backend.ts",
+    "src/authEnv.ts",
+    "src/offload.ts",
+    "src/ping/cadence.ts",
+    "src/config.ts",
+    "src/cli.ts",
+    "src/repair.ts",
+    "src/key-checker.ts",
+    "src/reshaper.ts",
+    "src/emitSse.ts",
+    "test/authEnv.test.ts",
+    "test/credential-containment.test.ts",
+    "src/documents.ts",
+    "package.json",
+    "test/server.test.ts",
+    "test/config.test.ts",
+    "src/dispatch.ts",
+    "test/cli.test.ts",
+    "test/cli-update-gate.test.ts",
+    "src/anthropic.ts",
+    "test/backend.test.ts",
+    "test/documents.test.ts",
+    "src/benchmarks.ts",
+    "src/candidates.ts",
+    "src/metadata.ts",
+    "src/onboarding.ts",
+    "src/ping/metrics.ts",
+    "src/ping/ping.ts",
+    "src/ping/probe-cache.ts",
+    "src/presets.ts",
+    "src/registry.ts",
+    "src/setup-claude.ts",
+    "src/sse.ts",
+    "src/telemetry.ts",
+    "src/tier-data.ts",
+    "test/benchmarks.test.ts",
+    "test/breaker-measurement.test.ts",
+    "test/circuit-breaker.test.ts",
+    "test/degraded-config.test.ts",
+    "test/destructive-coverage.test.ts",
+    "test/dispatch.test.ts",
+    "test/emitSse.test.ts",
+    "test/health-persistence.test.ts",
+    "test/key-checker.test.ts",
+    "test/loopback-admission.test.ts",
+    "test/metadata.test.ts",
+    "test/mid-stream-failure.test.ts",
+    "test/offload.test.ts",
+    "test/onboarding.test.ts",
+    "test/openai-front.test.ts",
+    "test/ping.test.ts",
+    "test/presets.test.ts",
+    "test/registry.test.ts",
+    "test/repair.test.ts",
+    "test/reshaper.test.ts",
+    "test/server-safety.test.ts",
+    "test/setup-claude.test.ts",
+    "test/sse.test.ts",
+    "test/telemetry.test.ts",
+    "test/validator.test.ts",
+    "src/catalog.ts",
+    "src/dotenv.ts",
+    "src/winenv.ts",
+    "tsconfig.json",
+    "tsconfig.test.json",
+    "test/pool-failover.test.ts",
+    ".github/workflows/ci.yml",
+    ".github/workflows/publish.yml",
+    "scripts/agentic-loop-probe.mjs",
+    "scripts/claude-proxied.ps1",
+    "scripts/claude-proxied.sh",
+    "scripts/install-skill.mjs",
+    "scripts/live-demo.mjs",
+    "scripts/multimodal-probe.mjs",
+    "scripts/nim-front.mjs",
+    "scripts/nim-probe.mjs",
+    "scripts/nim-repair.mjs",
+    "scripts/nim-trip-rate.mjs",
+    "scripts/sync-tiers.mjs",
+    "scripts/verify-live-features.mjs",
+    "src/log.ts",
+    "src/ping/quota.ts",
+    "src/ping/runtime-telemetry.ts",
+    "src/pool-health.ts",
+    "src/validator.ts",
+    "test/install-skill.test.ts",
+    "test/log.test.ts",
+    "vitest.config.ts",
+    "src/self-update.ts",
+    "test/self-update-security.test.ts",
+    "test/self-update.test.ts"
+  ],
+  "created_at": "2026-07-31T22:33:23.944Z"
+}

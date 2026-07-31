@@ -1,0 +1,15 @@
+{
+  "schema_version": "remediate-code-implement/node-dispositions/v1alpha1",
+  "run_id": "remediate-audit-findings-2026-07-31",
+  "created_at": "2026-07-31T22:42:20.917Z",
+  "dispositions": [
+    {
+      "node_id": "CP-NODE-2",
+      "block_id": "CP-BLOCK-CP-NODE-2",
+      "disposition": "verified_complete",
+      "finding_status": "resolved",
+      "reconciliation_expectations": []
+    }
+  ],
+  "sibling_red_routes": []
+}

@@ -1,0 +1,169 @@
+{
+  "artifact_name": "obligation_ledger",
+  "content_hash": "d9c91448e22ca522f954b7d6c440fab1",
+  "dependency_hashes": {
+    "goal_spec": "321f7d0af4e8faa1845a4c6ce57215c2",
+    "finalized_module_contracts": "c08db57b1ad0e595db1d61fd074e15a4"
+  },
+  "payload": {
+    "contract_version": "remediate-code-contract-pipeline/obligation-ledger/v1alpha1",
+    "goal_id": "remediate-audit-findings-2026-07-31",
+    "obligations": [
+      {
+        "id": "OBL-server-core-contract",
+        "description": "Implement module \"server-core\" per its finalized contract (inputs: HTTP request payloads, Configuration state, Backend response streams → outputs: Proxied HTTP responses, SSE streams, Circuit breaker failure metrics; validation boundary: Validates incoming HTTP requests and SSE event structures against JSON schemas).",
+        "kind": "structural",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "server-core"
+      },
+      {
+        "id": "OBL-server-core-inv-1",
+        "description": "Mid-stream network resets or SSE truncations must report failure to circuit breaker (verification_obligation: test stream failures)",
+        "kind": "invariant",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "server-core",
+        "change_classification": {
+          "change_kind": "change",
+          "touched_symbols": [
+            "sse"
+          ],
+          "determined_by": "touches_existing_symbol"
+        }
+      },
+      {
+        "id": "OBL-server-core-fail-1",
+        "description": "Handle failure mode: Backend socket reset or timeout (caller receives error SSE or failover to candidate)",
+        "kind": "behavioral",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "server-core",
+        "change_classification": {
+          "change_kind": "change",
+          "touched_symbols": [
+            "sse"
+          ],
+          "determined_by": "touches_existing_symbol"
+        }
+      },
+      {
+        "id": "OBL-backend-auth-contract",
+        "description": "Implement module \"backend-auth\" per its finalized contract (inputs: Target specification, Environment credentials → outputs: Upstream HTTP response, Resolved auth headers; validation boundary: Validates target existence and authorization credential presence).",
+        "kind": "structural",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "backend-auth"
+      },
+      {
+        "id": "OBL-backend-auth-inv-1",
+        "description": "Env-var credential resolution must consistently use readCredential across routing and header construction (verification_obligation: unit test authEnv & backend)",
+        "kind": "invariant",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "backend-auth",
+        "change_classification": {
+          "change_kind": "addition",
+          "touched_symbols": [],
+          "determined_by": "no_existing_symbol"
+        }
+      },
+      {
+        "id": "OBL-backend-auth-fail-1",
+        "description": "Handle failure mode: Missing or invalid credential (caller receives unauthenticated error or failover)",
+        "kind": "behavioral",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "backend-auth",
+        "change_classification": {
+          "change_kind": "addition",
+          "touched_symbols": [],
+          "determined_by": "no_existing_symbol"
+        }
+      },
+      {
+        "id": "OBL-config-routing-contract",
+        "description": "Implement module \"config-routing\" per its finalized contract (inputs: Raw configuration files, Incoming prompt / system messages → outputs: Parsed configuration object, Relay directives and subagent flags; validation boundary: Validates schema of configuration file and model routing parameters).",
+        "kind": "structural",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "config-routing"
+      },
+      {
+        "id": "OBL-config-routing-inv-1",
+        "description": "Subagent directive parsing must strictly restrict @relay: matching to explicitly authorized user prompt blocks (verification_obligation: prompt injection security tests)",
+        "kind": "invariant",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "config-routing",
+        "change_classification": {
+          "change_kind": "addition",
+          "touched_symbols": [],
+          "determined_by": "no_existing_symbol"
+        }
+      },
+      {
+        "id": "OBL-config-routing-fail-1",
+        "description": "Handle failure mode: Invalid configuration format (throws RoutingError or configuration validation error)",
+        "kind": "behavioral",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "config-routing",
+        "change_classification": {
+          "change_kind": "addition",
+          "touched_symbols": [],
+          "determined_by": "no_existing_symbol"
+        }
+      },
+      {
+        "id": "OBL-cli-tools-contract",
+        "description": "Implement module \"cli-tools\" per its finalized contract (inputs: Command line arguments, Environment flags → outputs: Parsed CLI commands, Quoted shell arguments; validation boundary: Validates CLI option flags and command names).",
+        "kind": "structural",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "cli-tools"
+      },
+      {
+        "id": "OBL-cli-tools-inv-1",
+        "description": "SHELL_SAFE regex and positional argument parsing must correctly handle backslashes and flag ordering (verification_obligation: test CLI argument quoting)",
+        "kind": "invariant",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "cli-tools",
+        "change_classification": {
+          "change_kind": "change",
+          "touched_symbols": [
+            "cli"
+          ],
+          "determined_by": "touches_existing_symbol"
+        }
+      },
+      {
+        "id": "OBL-cli-tools-fail-1",
+        "description": "Handle failure mode: Unknown command or invalid flag options",
+        "kind": "behavioral",
+        "depends_on": [],
+        "status": "pending",
+        "source": "design_spec",
+        "module": "cli-tools",
+        "change_classification": {
+          "change_kind": "addition",
+          "touched_symbols": [],
+          "determined_by": "no_existing_symbol"
+        }
+      }
+    ],
+    "created_at": "2026-07-31T22:36:20.343Z"
+  }
+}
