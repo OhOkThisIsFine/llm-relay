@@ -235,6 +235,50 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(bodies[1].stream_options).toBeUndefined();
     expect(await res.text()).toContain("content_block_delta");
   });
+
+  it("cancels unconsumed response body on retriable failures before retrying", async () => {
+    let canceled = false;
+    let callCount = 0;
+    const customFetch: typeof fetch = async () => {
+      callCount++;
+      if (callCount === 1) {
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(JSON.stringify({ error: { message: "unknown field: stream_options" } })));
+            controller.close();
+          },
+          cancel() {
+            canceled = true;
+          },
+        });
+        return new Response(stream, { status: 400, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const target = openaiTarget("http://127.0.0.1:9999");
+    const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
+    const res = await fetchBackend(
+      target,
+      {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from(JSON.stringify(req)),
+        reqJson: req,
+        anthropicHeaders: {},
+        wantsStream: true,
+        signal: AbortSignal.timeout(5000),
+      },
+      customFetch,
+    );
+
+    expect(callCount).toBe(2);
+    expect(canceled).toBe(true);
+    expect(res.status).toBe(200);
+  });
 });
 
 /**
