@@ -117,9 +117,9 @@ export interface KeyCheckResult {
  * Anything else means the endpoint is public and tells us nothing.
  * On a network error we assume it IS gated — never downgrade a working key on a blip.
  */
-async function isAuthGated(url: string, fetchFn: typeof fetch): Promise<boolean> {
+async function isAuthGated(p: ProviderConfig, url: string, fetchFn: typeof fetch): Promise<boolean> {
   try {
-    const bare = await fetchFn(url, { method: "GET", headers: { "Content-Type": "application/json" }, ...withTimeout() });
+    const bare = await fetchFn(url, { method: "GET", headers: probeHeaders(p, undefined), ...withTimeout() });
     return bare.status === 401 || bare.status === 403;
   } catch {
     return true;
@@ -168,7 +168,7 @@ async function probeAuthenticated(
     // rather than accuse a working key.
     const anon = await fetchFn(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: probeHeaders(p, undefined),
       body,
       ...withTimeout(),
     });
@@ -306,7 +306,7 @@ export async function validateProviderKeys(
         // likely to be reachable on their plan.
         const probeModel = routed.get(name) ?? firstModelId;
         if (resp.ok && apiKey && url.endsWith("/models") && probeModel) {
-          const gated = await isAuthGated(url, fetchFn);
+          const gated = await isAuthGated(p, url, fetchFn);
           if (!gated) {
             const verdict = await probeAuthenticated(p, apiKey, fetchFn, probeModel);
             return {
