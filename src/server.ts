@@ -328,6 +328,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   // Candidate execution loop with failover across healthyTargets
   for (let i = 0; i < healthyTargets.length; i++) {
+    if (res.destroyed) break;
     target = healthyTargets[i]!;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
@@ -369,7 +370,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         recordCall(target, false, started);
 
         // Failover if additional candidates exist
-        if (i < healthyTargets.length - 1) {
+        if (!res.destroyed && i < healthyTargets.length - 1) {
           continue;
         }
 
@@ -391,7 +392,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const cls = classifyStatus(backendRes.status);
       const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
       const tryNext = recordAttempt(target, cls, backendRes.status, started, retryAfterMs);
-      if (tryNext && i < healthyTargets.length - 1) {
+      if (tryNext && !res.destroyed && i < healthyTargets.length - 1) {
         clearTimeout(timer);
         res.off("close", onResClose);
         continue; // Failover to next target
@@ -567,6 +568,7 @@ async function openAiFrontPath(
   const tried: string[] = [];
 
   for (let i = 0; i < candidates.length; i++) {
+    if (res.destroyed) break;
     const target = candidates[i]!;
     const isLast = i === candidates.length - 1;
     tried.push(specOf(target));
@@ -590,7 +592,7 @@ async function openAiFrontPath(
       recordCall(target, false, ctx.started);
       // The client hanging up aborts every candidate; walking the rest would be pointless work
       // against a socket nobody is reading.
-      if (!isLast && !res.writableEnded) continue;
+      if (!isLast && !res.writableEnded && !res.destroyed) continue;
       if (!res.headersSent) {
         res.writeHead(status, { "content-type": "application/json", [SERVED_BY_HEADER]: tried.join(", ") });
         res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
@@ -603,7 +605,7 @@ async function openAiFrontPath(
     const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
     const tryNext = recordAttempt(target, cls, upstream.status, ctx.started, retryAfterMs);
 
-    if (tryNext && !isLast && !res.writableEnded) {
+    if (tryNext && !isLast && !res.writableEnded && !res.destroyed) {
       clearTimeout(timer);
       res.off("close", onResClose);
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
@@ -1289,7 +1291,20 @@ async function writeChunk(res: ServerResponse, chunk: Buffer): Promise<boolean> 
   try {
     const ok = res.write(chunk);
     if (!ok && !res.destroyed && !res.writableEnded) {
-      await once(res, "drain");
+      await new Promise<void>((resolve) => {
+        const cleanup = () => {
+          res.removeListener("drain", onEvent);
+          res.removeListener("close", onEvent);
+          res.removeListener("error", onEvent);
+        };
+        const onEvent = () => {
+          cleanup();
+          resolve();
+        };
+        res.once("drain", onEvent);
+        res.once("close", onEvent);
+        res.once("error", onEvent);
+      });
     }
     return !res.destroyed && !res.writableEnded;
   } catch {

@@ -125,6 +125,7 @@ export async function fetchBackend(
   // A backend that doesn't know `stream_options` rejects the whole request (400/422).
   // Drop the hint and retry once rather than failing a request over telemetry.
   if (!res.ok && openaiBody.stream_options && (res.status === 400 || res.status === 422)) {
+    await res.body?.cancel().catch(() => {});
     const { stream_options: _omit, ...withoutUsage } = openaiBody;
     res = await post(withoutUsage);
   }

@@ -59,6 +59,45 @@ export function hasFlag(...flags: string[]): boolean {
   return false;
 }
 
+const VALUE_FLAGS = new Set<string>([
+  '--config', '-config', '-c',
+  '--provider', '-provider', '-p',
+  '--default', '-default', '-d',
+  '--mode', '-mode', '-m',
+  '--listen', '-listen', '-l',
+  '--task', '-task', '-t',
+  '--exhausted', '-exhausted', '-x',
+  '--after', '-after',
+  '--lane', '-lane',
+  '--shell', '-shell',
+]);
+
+/** Extract non-flag positional arguments from an argv array, skipping flags and their values. */
+export function getPositionalArgs(argv: string[] = process.argv): string[] {
+  const positionals: string[] = [];
+  let i = 2;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (!arg) {
+      i++;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      if (arg.includes('=')) {
+        i += 1;
+      } else if (VALUE_FLAGS.has(arg)) {
+        i += 2;
+      } else {
+        i += 1;
+      }
+    } else {
+      positionals.push(arg);
+      i += 1;
+    }
+  }
+  return positionals;
+}
+
 const HELP = `llm-relay — loopback Anthropic-Messages proxy that validates/repairs tool calls.
 
 Multi-provider: config declares a providers{} registry; a request's model picks the
@@ -428,7 +467,7 @@ export async function runPingCommand(): Promise<void> {
     }
 
     const quota = pingLoop.getProviderQuota(name);
-    const quotaStr = quota !== null ? `${quota}% remaining` : "N/A";
+    const quotaStr = quota !== null && quota !== undefined ? `${quota}% remaining` : "N/A";
     process.stdout.write(`\nProvider: ${name} (quota: ${quotaStr})\n`);
     if (models.length === 0) {
       process.stdout.write("  (no models listed or reachable)\n");
@@ -819,7 +858,7 @@ export async function runCandidates(): Promise<void> {
         fmt(c.scores.bfclOverall).padEnd(7) +
         fmt(c.scores.aiderPassRate).padEnd(7) +
         (c.scores.arenaRating ? String(Math.round(c.scores.arenaRating)) : "-").padEnd(7) +
-        (c.pricePerMTokOut !== null
+        (c.pricePerMTokOut !== null && c.pricePerMTokOut !== undefined
           ? `$${c.pricePerMTokOut}${c.priceSource === "reference" ? "~" : ""}`
           : "-"
         ).padEnd(8) +
@@ -951,8 +990,9 @@ import { getTelemetryReport } from "./telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
 
 export function main(): void {
-  const arg2 = process.argv[2];
-  const arg3 = process.argv[3];
+  const positionals = getPositionalArgs(process.argv);
+  const arg2 = positionals[0];
+  const arg3 = positionals[1];
 
   if (hasFlag("--help", "-h") || arg2 === "help") {
     process.stdout.write(HELP);
@@ -1061,13 +1101,14 @@ export function classifyCommand(argv: string[]): CommandEffect {
     .some((a) => a === "--ping" || a === "-ping" || a.startsWith("--ping=") || a.startsWith("-ping="));
   if (isPing) return "read-only";
 
-  const sub = argv[2];
+  const positionals = getPositionalArgs(argv);
+  const sub = positionals[0];
   // No subcommand (or flags only) starts the proxy. That start already writes this machine's
   // config when none exists (`resolveConfigPath`), it is the long-lived process, and it is the
   // one moment a re-exec costs nothing because nothing has been served yet.
-  if (sub === undefined || sub.startsWith("-")) return "mutating";
+  if (sub === undefined) return "mutating";
 
-  const arg3 = argv[3];
+  const arg3 = positionals[1];
   switch (sub) {
     // Writes ~/.llm-relay/.env.
     case "onboard":

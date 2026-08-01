@@ -278,6 +278,57 @@ describe("key-checker", () => {
       await validateProviderKeys(anthropicKind, mockFetch);
       expect(seen["authorization"]).toBe("Bearer sk-live");
     });
+
+    it("includes mandatory protocol headers in anonymous auth probe requests", async () => {
+      process.env.MOCK_PROV_KEY = "sk-live";
+      const headersSeen: Record<string, string>[] = [];
+      const mockFetch = (async (url: string, init?: RequestInit) => {
+        headersSeen.push((init?.headers ?? {}) as Record<string, string>);
+        if (url.endsWith("/models")) {
+          return new Response(JSON.stringify({ data: [{ id: "model-1" }] }), { status: 200 });
+        }
+        return new Response("{}", { status: 401 });
+      }) as unknown as typeof fetch;
+
+      const openAiAnthropicConfig: Config = {
+        ...baseConfig,
+        providers: {
+          mockProv: {
+            base: "http://mock.provider",
+            kind: "anthropic",
+            authEnv: "MOCK_PROV_KEY",
+            authHeader: "x-api-key",
+            timeoutMs: 1000,
+          },
+        },
+      };
+
+      await validateProviderKeys(openAiAnthropicConfig, mockFetch);
+      expect(headersSeen.length).toBeGreaterThan(0);
+      expect(headersSeen[0]?.["anthropic-version"]).toBe("2023-06-01");
+
+      headersSeen.length = 0;
+      const openAiConfig: Config = {
+        ...baseConfig,
+        providers: {
+          mockProv: {
+            base: "http://mock.provider",
+            kind: "openai",
+            authEnv: "MOCK_PROV_KEY",
+            authHeader: "authorization",
+            timeoutMs: 1000,
+          },
+        },
+      };
+      await validateProviderKeys(openAiConfig, mockFetch);
+      // 1 initial GET /models (auth), 1 isAuthGated GET /models (anon), 1 POST /chat/completions (auth), 1 POST /chat/completions (anon)
+      expect(headersSeen.length).toBe(4);
+      // Verify anonymous requests (index 1 and 3) include Content-Type
+      expect(headersSeen[1]?.["Content-Type"]).toBe("application/json");
+      expect(headersSeen[1]?.["authorization"]).toBeUndefined();
+      expect(headersSeen[3]?.["Content-Type"]).toBe("application/json");
+      expect(headersSeen[3]?.["authorization"]).toBeUndefined();
+    });
   });
 
   /**
