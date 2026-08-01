@@ -139,6 +139,21 @@ llm-relay pools --probe
 handed straight to an AI assistant ("set this up for me"), covering free providers, the offload
 switch, local models, and using your other CLI subscriptions as fallback lanes.
 
+### Release publishing
+
+Releases publish through npm Trusted Publishing (GitHub Actions OIDC); no `NPM_TOKEN` is stored in
+the repository. After merging a version bump to `main`, push the matching tag:
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+`.github/workflows/publish.yml` accepts only `v*` tags from this repository, verifies that the tag
+is contained in the default branch and matches `package.json`, then publishes with npm 11.5.1+.
+The one-time setup also requires the npm trusted publisher to reference this repository and
+workflow, plus the protected GitHub `npm-publish` environment to carry its approval rules.
+
 ### Verifying a setup — two checks, two different questions
 
 `keys` answers *are my credentials good?* `pools --probe` answers *will the models I configured
