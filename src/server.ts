@@ -16,7 +16,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -300,11 +300,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   let target = healthyTargets[0]!;
 
-  // OpenAI-compatible FRONT: an external dispatcher POSTs OpenAI Chat
-  // Completions with a namespaced model; route by target and reverse-proxy the
-  // upstream OpenAI response straight back (OpenAI in, OpenAI out).
-  if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
-    await openAiFrontPath(res, healthyTargets, { reqJson, wantsStream, started, path, hadTools, req }, h);
+  // OpenAI-compatible FRONT: route both Chat Completions and Responses requests through the
+  // resolved target. The adapter supports OpenAI-compatible and Anthropic backends, so Codex and
+  // OpenAI-native IDEs can use the same relay that Claude clients use in the other direction.
+  const openAiFrontProtocol = detectOpenAiFrontProtocol(req.method, pathname);
+  if (openAiFrontProtocol) {
+    await openAiFrontPath(res, healthyTargets, {
+      reqJson,
+      wantsStream,
+      protocol: openAiFrontProtocol,
+      inboundHeaders: req.headers,
+      started,
+      path,
+      hadTools,
+      req,
+    }, h);
     return;
   }
 
@@ -546,10 +556,18 @@ interface Ctx {
   target: ResolvedTarget;
 }
 
+function detectOpenAiFrontProtocol(method: string | undefined, pathname: string): OpenAiFrontProtocol | null {
+  if (method !== "POST") return null;
+  if (pathname === "/v1/chat/completions" || pathname === "/chat/completions") return "chat";
+  if (pathname === "/v1/responses" || pathname === "/responses") return "responses";
+  return null;
+}
+
 /**
- * OpenAI front: reverse-proxy a resolved candidate's /chat/completions to the client,
- * verbatim (streaming or buffered). No Anthropic translation, no tool-call repair —
- * this is the multiplexer path a dispatcher uses to reach many backends by namespace.
+ * OpenAI front: serve a resolved candidate's Chat Completions or Responses request, preserving
+ * the OpenAI wire contract. Direct OpenAI Chat Completions remain verbatim; translated paths use
+ * the backend adapter, which keeps the internal Anthropic-shaped seam but does not run the
+ * Anthropic tool-repair layer for OpenAI callers.
  *
  * ⚠ This path failed over across candidates for exactly as long as this comment has existed,
  * which is to say it never did. It was handed `healthyTargets[0]` and returned before the
@@ -564,7 +582,16 @@ interface Ctx {
 async function openAiFrontPath(
   res: ServerResponse,
   candidates: ResolvedTarget[],
-  ctx: { reqJson: unknown; wantsStream: boolean; started: number; path: string; hadTools: boolean; req?: IncomingMessage },
+  ctx: {
+    reqJson: unknown;
+    wantsStream: boolean;
+    protocol: OpenAiFrontProtocol;
+    inboundHeaders: IncomingMessage["headers"];
+    started: number;
+    path: string;
+    hadTools: boolean;
+    req?: IncomingMessage;
+  },
   h: Handlers,
 ): Promise<void> {
   const tried: string[] = [];
@@ -584,7 +611,13 @@ async function openAiFrontPath(
 
     let upstream: Response;
     try {
-      upstream = await fetchOpenAiFront(target, { reqJson: ctx.reqJson, wantsStream: ctx.wantsStream, signal: controller.signal });
+      upstream = await fetchOpenAiFront(target, {
+        reqJson: ctx.reqJson,
+        wantsStream: ctx.wantsStream,
+        protocol: ctx.protocol,
+        anthropicHeaders: buildForwardHeaders(ctx.inboundHeaders, target),
+        signal: controller.signal,
+      });
     } catch (e) {
       clearTimeout(timer);
       res.off("close", onResClose);
@@ -603,9 +636,13 @@ async function openAiFrontPath(
       return;
     }
 
+    // A local translation/configuration failure is deterministic for the request and should not
+    // make every other candidate repeat the same failure. Provider responses still use the shared
+    // breaker/failover policy.
+    const localFailure = errorOrigin(upstream) === "local";
     const cls = classifyStatus(upstream.status);
     const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
-    const tryNext = recordAttempt(target, cls, upstream.status, ctx.started, retryAfterMs);
+    const tryNext = localFailure ? false : recordAttempt(target, cls, upstream.status, ctx.started, retryAfterMs);
 
     if (tryNext && !isLast && !res.writableEnded && !res.destroyed) {
       clearTimeout(timer);
