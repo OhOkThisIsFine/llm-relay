@@ -218,6 +218,147 @@ function openaiError(status: number, message: string, origin: ErrorOrigin): Resp
   });
 }
 
+export type OpenAiFrontProtocol = "chat" | "responses";
+
+/**
+ * Turn an Anthropic Message response into the response envelope expected by an OpenAI client.
+ *
+ * This is deliberately separate from llm-bridge's request translation. Provider request bodies
+ * and provider response bodies are different contracts, and treating a response as a request
+ * loses tool calls, stop reasons and usage on the way back to the caller.
+ */
+export function anthropicMessageToOpenAi(
+  body: Record<string, unknown>,
+  protocol: OpenAiFrontProtocol,
+  fallbackModel = "",
+): Record<string, unknown> {
+  const content = Array.isArray(body.content) ? body.content : [];
+  const textParts: string[] = [];
+  const toolCalls: Array<Record<string, unknown>> = [];
+
+  for (const raw of content) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const block = raw as Record<string, unknown>;
+    if (block.type === "text" && typeof block.text === "string") {
+      textParts.push(block.text);
+    } else if (block.type === "tool_use") {
+      const input = block.input ?? {};
+      toolCalls.push({
+        id: typeof block.id === "string" ? block.id : `tool_call_${toolCalls.length}`,
+        type: "function",
+        function: {
+          name: typeof block.name === "string" ? block.name : "",
+          arguments: typeof input === "string" ? input : JSON.stringify(input),
+        },
+      });
+    }
+  }
+
+  const text = textParts.join("");
+  const model = typeof body.model === "string" && body.model ? body.model : fallbackModel;
+  const usage = openAiUsage(body.usage);
+  if (protocol === "chat") {
+    const message: Record<string, unknown> = {
+      role: "assistant",
+      content: text || null,
+    };
+    if (toolCalls.length > 0) message.tool_calls = toolCalls;
+    const out: Record<string, unknown> = {
+      id: typeof body.id === "string" ? body.id : "chatcmpl_relay",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{
+        index: 0,
+        message,
+        finish_reason: openAiFinishReason(body.stop_reason, toolCalls.length > 0),
+      }],
+    };
+    if (usage) out.usage = withOpenAiTotal(usage);
+    return out;
+  }
+
+  const output: Array<Record<string, unknown>> = [];
+  if (text) {
+    output.push({
+      type: "message",
+      id: `msg_${typeof body.id === "string" ? body.id : "relay"}`,
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    });
+  }
+  for (const call of toolCalls) {
+    const fn = call.function as Record<string, unknown>;
+    output.push({
+      type: "function_call",
+      id: `fc_${call.id}`,
+      call_id: call.id,
+      name: fn.name,
+      arguments: fn.arguments,
+      status: "completed",
+    });
+  }
+  const out: Record<string, unknown> = {
+    id: typeof body.id === "string" ? body.id : "resp_relay",
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model,
+    output,
+    output_text: text,
+  };
+  if (usage) out.usage = withOpenAiTotal(usage);
+  return out;
+}
+
+function openAiUsage(raw: unknown): { prompt_tokens?: number; completion_tokens?: number } | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const usage = raw as Record<string, unknown>;
+  // A usage object with no numeric fields is not a measurement. Keep the relay's unknown-vs-zero
+  // convention instead of manufacturing a cost report for an upstream that omitted usage.
+  if (typeof usage.input_tokens !== "number" && typeof usage.output_tokens !== "number") return null;
+  return {
+    ...(typeof usage.input_tokens === "number" ? { prompt_tokens: usage.input_tokens } : {}),
+    ...(typeof usage.output_tokens === "number" ? { completion_tokens: usage.output_tokens } : {}),
+  };
+}
+
+function withOpenAiTotal(usage: { prompt_tokens?: number; completion_tokens?: number }): Record<string, unknown> {
+  if (typeof usage.prompt_tokens === "number" && typeof usage.completion_tokens === "number") {
+    return { ...usage, total_tokens: usage.prompt_tokens + usage.completion_tokens };
+  }
+  return { ...usage };
+}
+
+function openAiFinishReason(stopReason: unknown, hasToolCalls: boolean): string {
+  if (hasToolCalls || stopReason === "tool_use") return "tool_calls";
+  if (stopReason === "max_tokens") return "length";
+  if (stopReason === "content_filter") return "content_filter";
+  return "stop";
+}
+
+/** Map an Anthropic error envelope to a client-readable OpenAI error envelope. */
+function anthropicErrorToOpenAi(body: string, status: number): string {
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (typeof parsed === "object" && parsed !== null) {
+      const top = parsed as Record<string, unknown>;
+      const nested = typeof top.error === "object" && top.error !== null ? top.error as Record<string, unknown> : null;
+      if (nested && typeof nested.message === "string") {
+        return JSON.stringify({ error: {
+          message: nested.message,
+          type: typeof nested.type === "string" ? nested.type : "upstream_error",
+          ...(nested.code !== undefined ? { code: nested.code } : {}),
+        } });
+      }
+    }
+  } catch {
+    // Fall through to the normalizer, which preserves a useful bounded text message.
+  }
+  return normalizeOpenAiErrorBody(body, status) ?? body;
+}
+
 /**
  * Coerce an upstream error body into the OpenAI error envelope — WITHOUT rewriting one that
  * already conforms.
@@ -275,34 +416,86 @@ function buildTargetHeaders(target: ResolvedTarget): Record<string, string> {
 }
 
 /**
- * OpenAI-compatible FRONT: an OpenAI `/chat/completions` request comes in, its `model`
- * has already been resolved to a provider target by namespace/tier routing. For an
- * openai-kind target this is a routing reverse-proxy — rewrite `model` to the backend
- * id, inject the backend key, and stream the upstream OpenAI response straight back
- * (OpenAI in, OpenAI out — no translation). This is the transport a dispatcher (e.g.
- * an external dispatcher) consumes to reach many backends behind one endpoint.
+ * OpenAI-compatible FRONT: an OpenAI Chat Completions or Responses request comes in, its
+ * `model` has already been resolved to a provider target by namespace/tier routing.
  *
- * anthropic-kind targets are not served on the OpenAI front (they need OpenAI↔Anthropic
- * translation and are not the dispatcher use case) — a clean 400, never a mistranslation.
+ * The common case remains a byte-transparent OpenAI→OpenAI Chat Completions proxy. The other
+ * combinations use the same Anthropic-shaped internal seam as the Messages front:
+ * OpenAI request → Anthropic request → resolved backend → Anthropic response → OpenAI response.
+ * That makes an Anthropic passthrough usable from Codex and OpenAI-native IDEs without changing
+ * the existing Claude client path.
  */
 export async function fetchOpenAiFront(
   target: ResolvedTarget,
-  args: { reqJson: unknown; wantsStream: boolean; signal: AbortSignal },
+  args: {
+    reqJson: unknown;
+    wantsStream: boolean;
+    signal: AbortSignal;
+    protocol?: OpenAiFrontProtocol;
+    anthropicHeaders?: Record<string, string>;
+  },
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
-  if (target.kind !== "openai") {
-    return openaiError(
-      400,
-      `llm-relay: OpenAI front requires an openai-kind provider; "${target.provider}" is ${target.kind}`,
-      "local",
-    );
-  }
+  const protocol = args.protocol ?? "chat";
   const base = (args.reqJson ?? {}) as Record<string, unknown>;
-  const body = { ...base, model: target.model, stream: args.wantsStream };
-  return fetchFn(target.base + "/chat/completions", {
+  // Preserve the existing direct path for the protocol/backend pair that already speaks the
+  // same wire format. It keeps provider-specific OpenAI fields byte-for-byte intact.
+  if (target.kind === "openai" && protocol === "chat") {
+    const body = { ...base, model: target.model, stream: args.wantsStream };
+    return fetchFn(target.base + "/chat/completions", {
+      method: "POST",
+      headers: buildTargetHeaders(target),
+      body: JSON.stringify(body),
+      signal: args.signal,
+    });
+  }
+
+  let anthropicBody: Record<string, unknown>;
+  try {
+    const source = protocol === "responses" ? "openai-responses" : "openai";
+    anthropicBody = translateBetweenProviders(source, "anthropic", base as never) as Record<string, unknown>;
+    if (target.model !== undefined) anthropicBody.model = target.model;
+    anthropicBody.stream = args.wantsStream;
+  } catch (e) {
+    return openaiError(400, `llm-relay: request translation failed: ${(e as Error).message}`, "local");
+  }
+
+  const reqBuf = Buffer.from(JSON.stringify(anthropicBody), "utf8");
+  const backendRes = await fetchBackend(target, {
+    path: "/v1/messages",
     method: "POST",
-    headers: buildTargetHeaders(target),
-    body: JSON.stringify(body),
+    reqBuf,
+    reqJson: anthropicBody,
+    anthropicHeaders: args.anthropicHeaders ?? {},
+    wantsStream: args.wantsStream,
     signal: args.signal,
-  });
+  }, fetchFn);
+
+  if (!backendRes.ok) {
+    const raw = await backendRes.text().catch(() => "");
+    const origin = errorOrigin(backendRes) ?? "upstream";
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      [ERROR_ORIGIN_HEADER]: origin,
+      ...retryAfterHeader(backendRes.headers),
+    };
+    return new Response(anthropicErrorToOpenAi(raw, backendRes.status), { status: backendRes.status, headers });
+  }
+
+  const streamed = args.wantsStream || (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
+  if (streamed && backendRes.body) {
+    const targetProtocol = protocol === "responses" ? "openai-responses" : "openai";
+    const output = handleUniversalStreamRequest(backendRes.body, "anthropic", targetProtocol);
+    return new Response(output, { status: backendRes.status, headers: { "content-type": "text/event-stream" } });
+  }
+
+  try {
+    const body = (await backendRes.json()) as Record<string, unknown>;
+    return new Response(JSON.stringify(anthropicMessageToOpenAi(body, protocol, target.model ?? String(base.model ?? ""))), {
+      status: backendRes.status,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (e) {
+    return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local");
+  }
 }

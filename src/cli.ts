@@ -200,7 +200,8 @@ For 1M, launch with a [1m] model suffix:  ANTHROPIC_MODEL='claude-opus-5[1m]' cl
 Proxy Server Endpoints:
   POST /v1/messages                                Anthropic Messages proxy with tool repair
   POST /v1/messages/count_tokens                   Local token estimation for OpenAI backends
-  POST /v1/chat/completions                        OpenAI-compatible front (OpenAI in, OpenAI out)
+  POST /v1/chat/completions                        OpenAI-compatible Chat Completions front
+  POST /v1/responses                              OpenAI-compatible Responses front (Codex/IDE)
   GET /registry                                    Full JSON view of providers, routing & capabilities
   GET /candidates [?provider=]                     Per-target raw benchmarks, health, quota, breaker state
   GET|POST /offload                                Read or set the subagent-offload switch {"enabled":bool}
