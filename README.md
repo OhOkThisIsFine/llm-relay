@@ -157,10 +157,12 @@ direction:
 Keys are read from the environment and, if present, from `~/.llm-relay/.env` (one `KEY=value`
 per line). **A variable already set in the environment always wins over the file.**
 
-A global install also drops a **Claude Code skill** at `~/.claude/skills/llm-relay/SKILL.md` — an
-operating guide (addressing pools/models, the offload switch, `@relay:` directives, reading the
-candidates table, failure modes) that Claude loads on demand. It refreshes automatically on every
-upgrade; local/dev installs never touch `~/.claude`.
+A global install drops the same generated **llm-relay skill description** into both host skill
+directories: `~/.claude/skills/llm-relay/SKILL.md` for Claude Code and
+`~/.codex/skills/llm-relay/SKILL.md` for Codex. Both are copied from the package's single
+`skills/llm-relay/SKILL.md` source, so the operating guide (addressing pools/models, the offload
+switch, `@relay:` directives, reading the candidates table, failure modes) cannot drift between
+hosts. Both refresh automatically on every upgrade; local/dev installs touch neither directory.
 
 If your npm blocks unknown install scripts (`npm warn install-scripts … blocked`), allow this one —
 `npm config set allow-scripts=llm-relay --location=user` — or install the skill by hand:

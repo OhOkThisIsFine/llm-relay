@@ -156,10 +156,12 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
 
 Offline / unit-test-safe (no external creds):
 - `live-demo.mjs` — runs the compiled CLI against a local flaky backend + stub reshaper. Good smoke test.
-- `install-skill.mjs` — npm `postinstall` hook: copies `skills/llm-relay/SKILL.md` to
-  `~/.claude/skills/llm-relay/` on GLOBAL installs only (env var or global-tree path detection);
-  a repo-local `npm install` never touches `~/.claude`. `--force` overrides for manual runs.
-  Ships in the package, so the self-updater refreshes the skill on every upgrade.
+- `install-skill.mjs` — npm `postinstall` hook: copies the single
+  `skills/llm-relay/SKILL.md` source to both `~/.claude/skills/llm-relay/` and
+  `~/.codex/skills/llm-relay/` on GLOBAL installs only (env var or global-tree path detection);
+  a repo-local `npm install` touches neither host directory. `--force` overrides for manual runs.
+  Host failures are independent. Ships in the package, so the self-updater refreshes both skill
+  descriptions on every upgrade.
 
 Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compatible provider):
 - `nim-front.mjs` — run the compiled proxy fronting a live backend end-to-end.
