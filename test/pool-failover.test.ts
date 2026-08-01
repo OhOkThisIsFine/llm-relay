@@ -294,4 +294,30 @@ describe("Anthropic path — failover past a credential fault", () => {
     expect(globalCircuitBreaker.getState("p1/m1")?.credentialFailures).toBe(1);
     expect(globalCircuitBreaker.getState("p1/m1")?.consecutiveFailures).toBe(0);
   });
+
+  it("does not failover to subsequent candidates if client socket is destroyed (res.destroyed)", async () => {
+    const a = await scripted(() => ({ status: 500, body: JSON.stringify({ type: "error", error: { message: "server error" } }) }));
+    const b = await scripted(() => ({ body: ANTHROPIC_OK }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`], "anthropic");
+    const p = port(await startProxy(cfg));
+
+    const controller = new AbortController();
+    const fetchPromise = fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", messages: [{ role: "user", content: "hi" }] }),
+      signal: controller.signal,
+    }).catch(() => {});
+
+    // Abort client request immediately
+    controller.abort();
+    await fetchPromise;
+
+    // Allow async turn to resolve
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Candidate B should NOT be called if socket was destroyed/aborted
+    expect(b.calls()).toBe(0);
+  });
 });
+
