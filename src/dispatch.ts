@@ -62,6 +62,8 @@ export interface DispatchLane {
 }
 
 export interface DispatchView {
+  /** Selected tier-specific ladder, or null when using the legacy single ladder. */
+  tier: string | null;
   /** State of the subagent-offload switch, which governs relay rungs. */
   offload: boolean;
   ladder: DispatchLane[];
@@ -72,6 +74,8 @@ export interface DispatchView {
 }
 
 export interface DispatchOptions {
+  /** Select a named tier-specific ladder (for example reasoning, coding, or fast). */
+  tier?: string;
   /** Substituted for the `{task}` placeholder in a cli rung's args. */
   task?: string;
   /** Host override: return THIS lane as `next`, whatever the order says. */
@@ -138,22 +142,27 @@ function normalizeTtl(ttlMs: unknown): number {
  *
  * Unknown id is not an error: a host walking a ladder it half-remembers should not get a 500.
  */
-export function markExhausted(cfg: Config, id: string, ttlMs: number = DEFAULT_EXHAUSTED_MS): boolean {
+export function markExhausted(
+  cfg: Config,
+  id: string,
+  ttlMs: number = DEFAULT_EXHAUSTED_MS,
+  tier?: string,
+): boolean {
   if (typeof id !== "string" || id.length === 0) return false;
-  const rung = (cfg.routing.ladder ?? []).find((r) => r.id === id);
+  const rung = selectLadder(cfg, tier).rungs.find((r) => r.id === id);
   if (!rung) return false;
   cooldownsFor(cfg).set(cooldownKey(rung), Date.now() + normalizeTtl(ttlMs));
   return true;
 }
 
 /** Clear one rung's cooldown, or every cooldown for this config when no id is given. */
-export function clearExhausted(cfg: Config, id?: string): void {
+export function clearExhausted(cfg: Config, id?: string, tier?: string): void {
   if (id === undefined) {
     cooldownsFor(cfg).clear();
     return;
   }
   if (typeof id !== "string") return;
-  const rung = (cfg.routing.ladder ?? []).find((r) => r.id === id);
+  const rung = selectLadder(cfg, tier).rungs.find((r) => r.id === id);
   if (rung) cooldownsFor(cfg).delete(cooldownKey(rung));
 }
 
@@ -191,7 +200,25 @@ function normalizeOptions(opts: DispatchOptions): DispatchOptions {
   if (lane !== undefined) out.lane = lane;
   const after = str(opts.after);
   if (after !== undefined) out.after = after;
+  const tier = str(opts.tier);
+  if (tier !== undefined) out.tier = tier;
   return out;
+}
+
+function inferredTier(cfg: Config): string | undefined {
+  const ladders = cfg.routing.ladders;
+  if (!ladders) return undefined;
+  const dflt = cfg.routing.subagents?.default;
+  if (dflt?.startsWith("pool/") && ladders[dflt.slice("pool/".length)]) return dflt.slice("pool/".length);
+  if (ladders.coding) return "coding";
+  return Object.keys(ladders)[0];
+}
+
+function selectLadder(cfg: Config, requested?: string): { tier: string | null; rungs: LadderRung[]; missing?: string } {
+  if (!cfg.routing.ladders) return { tier: null, rungs: cfg.routing.ladder ?? [] };
+  const tier = requested ?? inferredTier(cfg);
+  if (!tier || !cfg.routing.ladders[tier]) return { tier: tier ?? null, rungs: [], ...(tier ? { missing: tier } : {}) };
+  return { tier, rungs: cfg.routing.ladders[tier] };
 }
 
 /** C0 + C1 control characters, including ESC — never legal in a rung id, and the ANSI carrier. */
@@ -236,12 +263,24 @@ function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchO
 export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): DispatchView {
   const opts = normalizeOptions(rawOpts ?? {});
   const now = Date.now();
-  const rungs = cfg.routing.ladder ?? [];
+  const selected = selectLadder(cfg, opts.tier);
+  const rungs = selected.rungs;
   const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now));
   const offload = cfg.routing.offload === true;
 
+  if (selected.missing) {
+    return {
+      tier: selected.tier,
+      offload,
+      ladder,
+      next: null,
+      reason: `no dispatch tier "${describeId(selected.missing)}" configured (have: ${Object.keys(cfg.routing.ladders ?? {}).join(", ")})`,
+    };
+  }
+
   if (ladder.length === 0) {
     return {
+      tier: selected.tier,
       offload,
       ladder,
       next: null,
@@ -253,6 +292,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
     const forced = ladder.find((l) => l.id === opts.lane);
     if (!forced) {
       return {
+        tier: selected.tier,
         offload,
         ladder,
         next: null,
@@ -262,6 +302,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
     // An explicit override is honoured even when the rung is cooling down or parked: the host
     // asked for THIS target, and second-guessing it would defeat the point of an override.
     return {
+      tier: selected.tier,
       offload,
       ladder,
       next: forced,
@@ -277,6 +318,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
     const idx = ladder.findIndex((l) => l.id === opts.after);
     if (idx < 0) {
       return {
+        tier: selected.tier,
         offload,
         ladder,
         next: null,
@@ -289,6 +331,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
   const next = pool.find((l) => l.state === "ready") ?? null;
   if (!next) {
     return {
+      tier: selected.tier,
       offload,
       ladder,
       next: null,
@@ -305,5 +348,5 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
       : next.position === 1
         ? "first lane in the ladder"
         : `first ready lane (${next.position - 1} ahead of it unavailable)`;
-  return { offload, ladder, next, reason: why };
+  return { tier: selected.tier, offload, ladder, next, reason: why };
 }

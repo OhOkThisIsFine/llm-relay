@@ -2,14 +2,14 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } fr
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
-import type { Config } from "./config.js";
+import type { Config, ProviderTierType } from "./config.js";
 import { ALL_PROVIDER_PRESETS, FREE_PROVIDER_PRESETS, SUBSCRIPTION_PROVIDER_PRESETS } from "./presets.js";
 import { keyIsPresent } from "./authEnv.js";
 
 export interface OnboardingStatus {
   provider: string;
   displayName: string;
-  tierType: "free" | "subscription";
+  tierType: ProviderTierType;
   authEnv: string;
   hasKey: boolean;
   signupUrl?: string | undefined;
@@ -67,6 +67,7 @@ export function getOnboardingStatusList(cfg?: Config): OnboardingStatus[] {
 export function printOnboardingGuide(cfg?: Config): void {
   const statuses = getOnboardingStatusList(cfg);
   const freeProviders = statuses.filter((s) => s.tierType === "free");
+  const mixedProviders = statuses.filter((s) => s.tierType === "mixed");
   const subProviders = statuses.filter((s) => s.tierType === "subscription");
 
   console.log("\n=== llm-relay: Free Models & Subscription Pooling Onboarding ===\n");
@@ -78,6 +79,16 @@ export function printOnboardingGuide(cfg?: Config): void {
     console.log(`    Env: ${p.authEnv ? `$${p.authEnv}` : "(none required)"}`);
     if (!p.hasKey && p.signupUrl) {
       console.log(`    👉 Get your 100% FREE key here: ${p.signupUrl}`);
+    }
+  }
+
+  console.log("\n🟡 MIXED CATALOGS (Free Models + Paid Models):");
+  for (const p of mixedProviders) {
+    const statusTag = p.hasKey ? "✅ Ready" : "❌ Missing Key";
+    console.log(`  • ${p.displayName} [${statusTag}]`);
+    console.log(`    Env: ${p.authEnv ? `$${p.authEnv}` : "(none required)"}`);
+    if (!p.hasKey && p.signupUrl) {
+      console.log(`    👉 Get a key for the provider's free models: ${p.signupUrl}`);
     }
   }
 

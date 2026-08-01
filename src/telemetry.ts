@@ -1,4 +1,4 @@
-import type { Config } from "./config.js";
+import type { Config, ProviderTierType } from "./config.js";
 import type { CircuitBreaker, CircuitState } from "./circuit-breaker.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
 
@@ -6,7 +6,7 @@ export interface ProviderTelemetry {
   provider: string;
   displayName: string;
   kind: string;
-  tierType: "free" | "subscription";
+  tierType: ProviderTierType;
   signupUrl?: string | undefined;
   hasKey: boolean;
   /**
@@ -47,6 +47,7 @@ export interface TelemetryReport {
   /** Providers with a credential but no observations at all: health unknown, not unhealthy. */
   unmeasuredProvidersCount: number;
   freeProvidersCount: number;
+  mixedProvidersCount: number;
   subscriptionProvidersCount: number;
   providers: ProviderTelemetry[];
   routingTiers: Record<string, string | string[]>;
@@ -138,6 +139,7 @@ export function getTelemetryReport(cfg: Config, cb: CircuitBreaker, now = Date.n
   const healthyProvidersCount = providers.filter((p) => p.isHealthy === true).length;
   const unmeasuredProvidersCount = providers.filter((p) => p.isHealthy === null).length;
   const freeProvidersCount = providers.filter((p) => p.tierType === "free" && p.hasKey).length;
+  const mixedProvidersCount = providers.filter((p) => p.tierType === "mixed" && p.hasKey).length;
   const subscriptionProvidersCount = providers.filter((p) => p.tierType === "subscription" && p.hasKey).length;
 
   return {
@@ -146,6 +148,7 @@ export function getTelemetryReport(cfg: Config, cb: CircuitBreaker, now = Date.n
     healthyProvidersCount,
     unmeasuredProvidersCount,
     freeProvidersCount,
+    mixedProvidersCount,
     subscriptionProvidersCount,
     providers,
     routingTiers: cfg.routing.tiers,

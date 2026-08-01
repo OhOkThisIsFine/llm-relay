@@ -170,6 +170,11 @@ export class ModelCatalog {
     return this.mem.get(name)?.models;
   }
 
+  /** Already-cached model ids for synchronous routing decisions. Never performs network I/O. */
+  cachedModels(name: string): string[] {
+    return [...(this.cached(name) ?? [])];
+  }
+
   /**
    * Live model ids for a provider, cached with TTL. `force` bypasses the TTL.
    *

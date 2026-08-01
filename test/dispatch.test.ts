@@ -86,6 +86,21 @@ describe("dispatch ladder — config", () => {
 });
 
 describe("dispatch ladder — ordering", () => {
+  it("selects tier-specific ladders and infers coding from the default subagent pool", () => {
+    const ladders = {
+      reasoning: [{ id: "agy", kind: "cli", command: "agy", args: ["{task}", "--model", "gemini-high"] }],
+      coding: [{ id: "codex", kind: "cli", command: "codex", args: ["exec", "--model", "luna", "{task}"] }],
+      fast: [{ id: "agy", kind: "cli", command: "agy", args: ["{task}", "--model", "gemini-low"] }],
+    };
+    const cfg = cfgWith({ ladders, subagents: { default: "pool/coding" } });
+
+    expect(buildDispatch(cfg).tier).toBe("coding");
+    expect(buildDispatch(cfg).next?.id).toBe("codex");
+    expect(buildDispatch(cfg, { tier: "reasoning" }).next?.invoke?.args).toContain("gemini-high");
+    expect(buildDispatch(cfg, { tier: "fast" }).next?.invoke?.args).toContain("gemini-low");
+    expect(buildDispatch(cfg, { tier: "missing" }).reason).toContain("have: reasoning, coding, fast");
+  });
+
   it("picks the first rung and renders its command with the task substituted", () => {
     const view = buildDispatch(cfgWith({ ladder: LADDER }), { task: "trace parseConfig" });
     expect(view.next?.id).toBe("agy-gemini");

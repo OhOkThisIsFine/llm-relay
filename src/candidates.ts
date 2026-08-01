@@ -9,6 +9,7 @@ import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
 import { loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { loadTierData } from "./registry.js";
+import { materializeDynamicPools } from "./dynamic-pools.js";
 
 /**
  * Everything known about one offload destination, kept as SEPARATE raw dimensions.
@@ -138,7 +139,7 @@ export interface CandidatesView {
 
 const NOTE =
   "Raw per-dimension data for choosing an offload target. Nothing here is ranked or averaged — " +
-  "order is config order (pools, then subagent targets), and every source's score is kept " +
+  "order is the materialized pool order (fixed preferences, then discovered free models), and every source's score is kept " +
   "separately under `scores`. `sortInputs` reports the ONE scalar the proxy needs for pool " +
   "ordering, with the basis and signal list that produced it; it is not a recommendation.";
 
@@ -152,9 +153,9 @@ function expandSpec(spec: string, cfg: Config): string[] {
 }
 
 /**
- * The set of specs a subagent could actually be sent to: every pool member plus anything
- * `routing.subagents` points at. That is the real choice set — listing all ~470 live models
- * would bury it.
+ * The set of specs a subagent could actually be sent to: every materialized pool member plus
+ * anything `routing.subagents` points at. Dynamic pools intentionally make the free catalog part
+ * of that real choice set rather than hiding it behind a hand-maintained shortlist.
  */
 function collectSpecs(cfg: Config): Map<string, { pools: string[]; subagentTiers: string[] }> {
   const out = new Map<string, { pools: string[]; subagentTiers: string[] }>();
@@ -197,6 +198,7 @@ export async function buildCandidates(
     tierData?: TierData | null;
   } = {},
 ): Promise<CandidatesView> {
+  if (opts.catalog) materializeDynamicPools(cfg, opts.catalog);
   const breaker = opts.breaker ?? globalCircuitBreaker;
   const nowMs = opts.nowMs ?? Date.now();
   const byNorm = (opts.tierData === undefined ? loadTierData() : opts.tierData)?.byNorm ?? [];
