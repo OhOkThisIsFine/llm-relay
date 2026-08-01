@@ -1,14 +1,14 @@
-import type { ProviderConfig } from "./config.js";
+import type { ProviderConfig, ProviderTierType } from "./config.js";
 
 export interface PresetProvider extends ProviderConfig {
   name: string;
   displayName: string;
   signupUrl?: string;
-  tierType: "free" | "subscription";
+  tierType: ProviderTierType;
   recommendedModels: string[];
 }
 
-/** 100%-Free provider presets with direct signup URLs and recommended models. */
+/** Providers offering free models or free-tier quota, with direct signup URLs. */
 export const FREE_PROVIDER_PRESETS: Record<string, PresetProvider> = {
   nim: {
     name: "nim",
@@ -67,7 +67,7 @@ export const FREE_PROVIDER_PRESETS: Record<string, PresetProvider> = {
     authEnv: "OPENROUTER_API_KEY",
     authHeader: "authorization",
     timeoutMs: 120000,
-    tierType: "free",
+    tierType: "mixed",
     signupUrl: "https://openrouter.ai/keys",
     recommendedModels: [
       "openrouter/free",

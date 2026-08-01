@@ -10,6 +10,7 @@ import { buildCandidates, type CandidatesView, type Candidate } from "./candidat
 import { buildDispatch, type DispatchView } from "./dispatch.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
+import { materializeDynamicPools } from "./dynamic-pools.js";
 import { currentVersion, ensureUpToDate, shouldCheckUpdates, type CommandEffect } from "./self-update.js";
 
 export function argValue(...flags: string[]): string | undefined {
@@ -69,6 +70,7 @@ const VALUE_FLAGS = new Set<string>([
   '--exhausted', '-exhausted', '-x',
   '--after', '-after',
   '--lane', '-lane',
+  '--tier', '-tier',
   '--shell', '-shell',
 ]);
 
@@ -151,7 +153,7 @@ Usage:
   llm-relay pools [--probe]                        List pool members; --probe tests each for real
   llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
   llm-relay offload [on|off|status]                Turn subagent offload on/off (default: off)
-  llm-relay dispatch [lane] [-t <task>]            Which lane to hand a delegated task to next
+  llm-relay dispatch [lane] [-t <task>] [--tier]   Which tier-specific lane to use next
   llm-relay candidates [-p <name>]                 Un-blended decision table for offload targets
   llm-relay help | --help | -h                     Show this help documentation
   llm-relay version | --version | -v               Show version number
@@ -166,7 +168,7 @@ Commands:
   models                                           Query live /models catalog across providers
   ping                                             Probe model latency, stability & quota metrics
   offload on | off | status                        Master switch for subagent offload (off by default)
-  dispatch [lane]                                  Next lane from routing.ladder; -t/--task to render
+  dispatch [lane]                                  Next lane; --tier reasoning|coding|fast selects ladder
                                                    the command, --after <lane> to walk past a spent
                                                    rung, -x/--exhausted <lane> to report one spent,
                                                    --shell sh|pwsh to quote for another shell,
@@ -202,7 +204,7 @@ Proxy Server Endpoints:
   GET /registry                                    Full JSON view of providers, routing & capabilities
   GET /candidates [?provider=]                     Per-target raw benchmarks, health, quota, breaker state
   GET|POST /offload                                Read or set the subagent-offload switch {"enabled":bool}
-  GET|POST /dispatch [?lane=&after=&task=]         Next dispatch lane; POST {"exhausted":"<lane>"} to walk on
+  GET|POST /dispatch [?tier=&lane=&after=&task=]   Next dispatch lane; POST {"exhausted":"<lane>"} to walk on
   GET /telemetry                                   Live JSON telemetry, quota & stability scores for Claude
   GET /ping                                        Trigger health probe pass & query ping mode summary
   GET /health                                      Diagnostic JSON summary of provider availability & health
@@ -383,6 +385,15 @@ export async function runModels(): Promise<void> {
  * does not serve — non-blocking (fire-and-forget) so it never delays listen().
  */
 export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void> {
+  // Dynamic pools make the catalog routing input, not just validation metadata. Warm every
+  // configured OpenAI provider so the discovered free tail requires no hand maintenance.
+  await Promise.all(
+    Object.entries(cfg.providers).map(async ([name, p]) => {
+      if (p.kind === "openai") await catalog.list(name, p);
+    }),
+  );
+  materializeDynamicPools(cfg, catalog);
+
   // Pools and subagent targets are the offload path — they need this warning at least as
   // much as tiers do. `pool/<name>` refs skip harmlessly below (no provider named "pool");
   // their members are covered via routing.pools.
@@ -638,12 +649,13 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const spent = argValue("--exhausted", "-x");
   const after = argValue("--after");
   const lane = arg && !arg.startsWith("-") ? arg : argValue("--lane");
+  const tier = argValue("--tier");
 
   if (spent) {
     const live = await tryServer(cfg, "/dispatch", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ exhausted: spent }),
+      body: JSON.stringify({ exhausted: spent, ...(tier ? { tier } : {}) }),
     });
     // Cooldowns are runtime state held by the proxy; with nothing listening there is no
     // process to remember it, and pretending otherwise would silently lose the report.
@@ -657,6 +669,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (task) qs.set("task", task);
   if (lane) qs.set("lane", lane);
   if (after) qs.set("after", after);
+  if (tier) qs.set("tier", tier);
   const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
 
   const live = (await tryServer(cfg, path)) as DispatchView | null;
@@ -666,6 +679,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
       ...(task ? { task } : {}),
       ...(lane ? { lane } : {}),
       ...(after ? { after } : {}),
+      ...(tier ? { tier } : {}),
     });
 
   if (hasFlag("--json")) {
@@ -674,6 +688,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   }
 
   process.stdout.write(`subagent offload: ${view.offload ? "ON" : "OFF"}\n`);
+  if (view.tier) process.stdout.write(`dispatch tier: ${view.tier}\n`);
   if (!live) process.stdout.write(`(no proxy running — live exhaustion state unknown)\n`);
   process.stdout.write("\n");
 

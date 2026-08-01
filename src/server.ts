@@ -24,6 +24,7 @@ import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens } from "./metadata.js";
+import { materializeDynamicPools } from "./dynamic-pools.js";
 
 
 const HOP_BY_HOP = new Set([
@@ -229,6 +230,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     // routing.tiers stay pointed at an Anthropic passthrough.
     const subSpec = isMessages ? subagentSpec(reqJson, model, cfg) : null;
     const routedModel = subSpec ?? model;
+    materializeDynamicPools(cfg, h.catalog);
     // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson
     // in place, and it must not reach the backend even when the spec matches the nominal model.
     if (subSpec !== null) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");

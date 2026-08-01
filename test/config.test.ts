@@ -64,6 +64,27 @@ describe("loadConfig — listen + providers", () => {
     expect(c.providers.nim!.timeoutMs).toBe(120000);
   });
 
+  it("preserves provider tier metadata used by automatic free-model pools", () => {
+    const c = loadConfig(write("provider-tier.json", base({
+      providers: {
+        nim: {
+          base: "https://nim.test/v1",
+          kind: "openai",
+          tierType: "free",
+          signupUrl: "https://build.nvidia.com",
+        },
+        openrouter: {
+          base: "https://openrouter.test/v1",
+          kind: "openai",
+          tierType: "mixed",
+        },
+      },
+    })));
+    expect(c.providers.nim?.tierType).toBe("free");
+    expect(c.providers.nim?.signupUrl).toBe("https://build.nvidia.com");
+    expect(c.providers.openrouter?.tierType).toBe("mixed");
+  });
+
   it("defaults an anthropic provider's authHeader to x-api-key", () => {
     const c = loadConfig(write("anth.json", {
       listen: "127.0.0.1:8791",

@@ -8,6 +8,8 @@ export type AuthHeader = "x-api-key" | "authorization";
 
 export type Kind = "anthropic" | "openai";
 
+export type ProviderTierType = "free" | "mixed" | "subscription";
+
 export interface ReshaperConfig {
   base: string;
   model: string;
@@ -32,8 +34,8 @@ export interface ProviderConfig {
   authHeader: AuthHeader;
   /** Backend request deadline in ms. Default 120000. */
   timeoutMs: number;
-  /** "free": 100% free model endpoint. "subscription": user paid subscription quota endpoint. */
-  tierType?: "free" | "subscription";
+  /** "free": wholly free/free-tier catalog. "mixed": catalog contains free and paid models. */
+  tierType?: ProviderTierType;
   /** Web URL where users can sign up or obtain API keys. */
   signupUrl?: string;
 }
@@ -54,6 +56,8 @@ export interface Routing {
   default: string | string[];
   tiers: Record<string, string | string[]>;
   pools?: Record<string, string[]>;
+  /** Dynamic pool policies are normalized separately from their materialized target arrays. */
+  poolPolicies?: Record<string, PoolPolicy>;
   /**
    * Tier → spec for SUBAGENT requests only (`cc_is_subagent=true`). Lets the dispatcher pick a
    * destination with the one per-call knob it actually has — the Agent tool's `model` enum
@@ -82,6 +86,14 @@ export interface Routing {
    * Absent means the relay expresses no opinion and dispatch order stays the host's to choose.
    */
   ladder?: LadderRung[];
+  /** Tier-specific dispatch ladders. `dispatch --tier <name>` selects one. */
+  ladders?: Record<string, LadderRung[]>;
+}
+
+/** A fixed preferred prefix followed by automatically discovered free models. */
+export interface PoolPolicy {
+  preferred: string[];
+  include: "free";
 }
 
 /**
@@ -434,7 +446,8 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
  * Resolve an inbound `model` to an array of concrete targets (primary + fallbacks).
  */
 export function resolveTargets(model: string | null, cfg: Config): ResolvedTarget[] {
-  const specs = expandPoolSpecs(pickSpecs(model, cfg), cfg);
+  const picked = pickSpecs(model, cfg);
+  const specs = expandPoolSpecs(picked, cfg);
   let targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
 
   // Prioritize targets whose credential is usable: no authEnv declared (a real passthrough or a
@@ -452,7 +465,12 @@ export function resolveTargets(model: string | null, cfg: Config): ResolvedTarge
     targets = activeTargets;
   }
 
-  if (cfg.routing.benchmarkSort !== false && targets.length > 1) {
+  // Dynamic pools are already materialized as an invariant fixed prefix followed by a ranked
+  // discovery tail. Sorting the entire result again would destroy the user's preferred order.
+  const pickedPool = picked.length === 1 && picked[0]?.startsWith(`${POOL_PREFIX}/`) ? picked[0] : undefined;
+  const dynamicPool =
+    pickedPool !== undefined && cfg.routing.poolPolicies?.[pickedPool.slice(POOL_PREFIX.length + 1)] !== undefined;
+  if (!dynamicPool && cfg.routing.benchmarkSort !== false && targets.length > 1) {
     targets = rankTargetsByBenchmark(targets);
   }
   return targets;
@@ -658,7 +676,15 @@ function parseProviders(
     if (typeof v !== "object" || v === null) {
       throw new Error(`config.providers.${name} must be an object`);
     }
-    const p = v as { base?: unknown; kind?: unknown; authEnv?: unknown; authHeader?: unknown; timeoutMs?: unknown };
+    const p = v as {
+      base?: unknown;
+      kind?: unknown;
+      authEnv?: unknown;
+      authHeader?: unknown;
+      timeoutMs?: unknown;
+      tierType?: unknown;
+      signupUrl?: unknown;
+    };
     if (typeof p.base !== "string") {
       throw new Error(`config.providers.${name}.base (string URL) is required`);
     }
@@ -686,6 +712,10 @@ function parseProviders(
       ...(typeof p.authEnv === "string"
         ? { authEnv: resolveAuthEnv(name, p.authEnv).name ?? p.authEnv }
         : {}),
+      ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
+        ? { tierType: p.tierType }
+        : {}),
+      ...(typeof p.signupUrl === "string" && p.signupUrl.length > 0 ? { signupUrl: p.signupUrl } : {}),
     };
   }
   if (Object.keys(out).length === 0) {
@@ -709,6 +739,7 @@ function parseRouting(
     subagents?: unknown;
     benchmarkSort?: unknown;
     ladder?: unknown;
+    ladders?: unknown;
   };
   // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
   if (providers[POOL_PREFIX]) {
@@ -741,12 +772,27 @@ function parseRouting(
   }
 
   const pools: Record<string, string[]> = {};
+  const poolPolicies: Record<string, PoolPolicy> = {};
   if (typeof r.pools === "object" && r.pools !== null) {
     for (const [k, v] of Object.entries(r.pools as Record<string, unknown>)) {
-      if (!Array.isArray(v)) {
-        throw new Error(`config.routing.pools.${k} must be an array of "provider/model" specs`);
+      let declared: string[];
+      if (Array.isArray(v)) {
+        declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+      } else if (typeof v === "object" && v !== null) {
+        const policy = v as { preferred?: unknown; include?: unknown };
+        if (!Array.isArray(policy.preferred) || policy.preferred.some((s) => typeof s !== "string" || s.length === 0)) {
+          throw new Error(`config.routing.pools.${k}.preferred must be an array of non-empty "provider/model" specs`);
+        }
+        if (policy.include !== "free") {
+          throw new Error(`config.routing.pools.${k}.include must be "free"`);
+        }
+        declared = [...(policy.preferred as string[])];
+        poolPolicies[k] = { preferred: declared, include: "free" };
+      } else {
+        throw new Error(
+          `config.routing.pools.${k} must be an array of specs or {"preferred":[...],"include":"free"}`,
+        );
       }
-      const declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
       // Members of a DISABLED provider are dropped, not fatal — the pool's whole purpose is
       // surviving the loss of one candidate. A member naming a provider that simply doesn't
       // exist is still an error below: that's a typo, and silently dropping it would spend
@@ -757,7 +803,7 @@ function parseRouting(
         warnings.push(`routing.pools.${k}: dropped "${s}" — provider "${provider}" is disabled`);
         return false;
       });
-      if (arr.length === 0) {
+      if (arr.length === 0 && !poolPolicies[k]) {
         throw new Error(`config.routing.pools.${k} must contain at least one valid spec string`);
       }
       // Members are provider specs only — pool-in-pool would make expansion recursive.
@@ -766,6 +812,7 @@ function parseRouting(
         throw new Error(`config.routing.pools.${k} member "${nested}" — a pool cannot reference another pool`);
       }
       pools[k] = arr;
+      if (poolPolicies[k]) poolPolicies[k] = { preferred: arr, include: "free" };
     }
   }
 
@@ -782,9 +829,20 @@ function parseRouting(
   const offload = r.offload === true;
   const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
   if (Object.keys(pools).length > 0) routing.pools = pools;
+  if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
-  const ladder = parseLadder(r.ladder);
+  const ladder = parseLadder(r.ladder, "config.routing.ladder");
   if (ladder.length > 0) routing.ladder = ladder;
+  if (r.ladders !== undefined && (typeof r.ladders !== "object" || r.ladders === null || Array.isArray(r.ladders))) {
+    throw new Error(`config.routing.ladders must be an object of named ladder arrays`);
+  }
+  const ladders: Record<string, LadderRung[]> = {};
+  for (const [tier, rawLadder] of Object.entries((r.ladders ?? {}) as Record<string, unknown>)) {
+    const parsed = parseLadder(rawLadder, `config.routing.ladders.${tier}`);
+    if (parsed.length === 0) throw new Error(`config.routing.ladders.${tier} must contain at least one rung`);
+    ladders[tier] = parsed;
+  }
+  if (Object.keys(ladders).length > 0) routing.ladders = ladders;
 
   // A spec naming a DISABLED provider is dropped with a warning, exactly like a pool member;
   // a spec naming a provider that was never declared is still fatal below. Doing this before
@@ -815,6 +873,15 @@ function parseRouting(
     return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `routing.ladder[${rung.id}].spec`) !== null;
   });
   if (routing.ladder.length === 0) delete routing.ladder;
+  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
+    const kept = tierLadder.filter((rung) => {
+      if (rung.kind !== "relay" || !rung.spec) return true;
+      return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `routing.ladders.${tier}[${rung.id}].spec`) !== null;
+    });
+    if (kept.length === 0) delete routing.ladders![tier];
+    else routing.ladders![tier] = kept;
+  }
+  if (routing.ladders && Object.keys(routing.ladders).length === 0) delete routing.ladders;
 
   // Fail loudly at load time if any spec names an unknown provider or pool. Only
   // `routing.default` can still trip on a DISABLED provider — everything else degraded
@@ -833,6 +900,13 @@ function parseRouting(
   for (const rung of routing.ladder ?? []) {
     if (rung.kind === "relay" && rung.spec) {
       assertSpecResolvable(rung.spec, providers, pools, `routing.ladder[${rung.id}].spec`);
+    }
+  }
+  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
+    for (const rung of tierLadder) {
+      if (rung.kind === "relay" && rung.spec) {
+        assertSpecResolvable(rung.spec, providers, pools, `routing.ladders.${tier}[${rung.id}].spec`);
+      }
     }
   }
   return routing;
@@ -881,14 +955,14 @@ const LADDER_TASK_TOKEN = "{task}";
  * is a configuration mistake, and discovering it only when the host is mid-fallback is exactly
  * when it is least useful. Absent/empty is legal and simply means "no opinion".
  */
-function parseLadder(raw: unknown): LadderRung[] {
+function parseLadder(raw: unknown, root: string): LadderRung[] {
   if (raw === undefined || raw === null) return [];
-  if (!Array.isArray(raw)) throw new Error(`config.routing.ladder must be an array of rungs`);
+  if (!Array.isArray(raw)) throw new Error(`${root} must be an array of rungs`);
 
   const out: LadderRung[] = [];
   const seen = new Set<string>();
   for (const [i, entry] of raw.entries()) {
-    const where = `config.routing.ladder[${i}]`;
+    const where = `${root}[${i}]`;
     if (typeof entry !== "object" || entry === null) throw new Error(`${where} must be an object`);
     const e = entry as Record<string, unknown>;
 

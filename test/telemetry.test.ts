@@ -1,14 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { getTelemetryReport } from "../src/telemetry.js";
 import { CircuitBreaker, UNMEASURED_STABILITY } from "../src/circuit-breaker.js";
-import type { Config, ResolvedTarget } from "../src/config.js";
+import type { Config, ProviderTierType, ResolvedTarget } from "../src/config.js";
 
 const NOW = 100000;
 
 /** Every env var any provider in these fixtures declares. */
 const ENV_KEYS = ["NVIDIA_API_KEY", "OPENAI_API_KEY", "OPEN_API_KEY"] as const;
 
-const provider = (authEnv: string, tierType: "free" | "subscription", signupUrl?: string) => ({
+const provider = (authEnv: string, tierType: ProviderTierType, signupUrl?: string) => ({
   base: "https://example.invalid/v1",
   kind: "openai" as const,
   authEnv,

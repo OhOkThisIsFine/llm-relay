@@ -132,7 +132,9 @@ llm-relay dispatch -t "<the task>"     # ordered ladder + the exact command to r
 llm-relay dispatch --json              # same, machine-readable
 ```
 
-`next` is the lane to use and `reason` says why. Then:
+Use `--tier reasoning|coding|fast` when the task class matters; tier-specific configurations live
+under `routing.ladders.<tier>`. Without it, the ladder matching `subagents.default` is selected
+(normally `coding`). `next` is the lane to use and `reason` says why. Then:
 
 - **Override with a specific target:** `llm-relay dispatch <lane> -t "<task>"` (or
   `GET /dispatch?lane=<id>`). Honoured even if that rung is cooling down — you asked for it.
@@ -175,8 +177,9 @@ Rules for walking it:
 
 Ordering exists at three levels; change the right one:
 
-- **Which lane is tried first** (`routing.ladder` in `~/.llm-relay/config.json`): reorder the
-  array; rung order *is* the ladder. Add `"enabled": false` to park a rung without deleting it.
+- **Which lane is tried first** (`routing.ladders.<tier>`, or legacy `routing.ladder`, in
+  `~/.llm-relay/config.json`): reorder the array; rung order *is* the ladder. Add
+  `"enabled": false` to park a rung without deleting it.
   Validated at load — a bad spec, a duplicate id, or a `cli` rung whose `args` lack `{task}`
   fails at startup, not mid-fallback. ⚠ Never put a personal ordering in the installed
   `~/.claude/skills/llm-relay/SKILL.md` or `~/.codex/skills/llm-relay/SKILL.md` copies:
@@ -184,8 +187,11 @@ Ordering exists at three levels; change the right one:
 - **Which pool a tier lands on** (`routing.subagents` in `~/.llm-relay/config.json`): maps the
   Agent tool's `model` param (opus/sonnet/haiku/…) to a pool or pinned spec. Takes effect on the
   next request; no restart.
-- **Candidate order inside a pool** (`routing.pools`): with `"benchmarkSort": true` (default
-  setup) failover order is by synced benchmark strength and the config array only breaks ties.
+- **Candidate order inside a pool** (`routing.pools`): prefer the automatic form
+  `{ "preferred": [...], "include": "free" }`. It keeps the preferred prefix fixed, then appends
+  every catalog-discovered free target in benchmark order; mixed catalogs contribute only models
+  with zero pricing or an explicit free label. Catalog refreshes update the tail with no manual
+  edits. Legacy arrays with `"benchmarkSort": true` rank the whole array.
   To make the array order authoritative, set `"benchmarkSort": false`. Either way the circuit
   breaker still demotes unhealthy targets — that is live health, not preference, and it is what
   you want. For an absolutely fixed destination, pin `<provider>/<model>`; a pin is never

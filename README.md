@@ -297,6 +297,22 @@ Claude Code subagent frontmatter (`model:`), which accepts a full model id but n
 list. A pool is the indirection that gives those callers ranking and failover. `pool` is a
 reserved provider name; configuring a provider called `pool` fails at load.
 
+Pools can be static arrays, or automatic free-model pools:
+
+```jsonc
+"coding": {
+  "preferred": ["nim/z-ai/glm-5.2", "gemini/gemini-2.5-flash"],
+  "include": "free"
+}
+```
+
+The preferred targets remain first in exactly the written order. The relay then appends every
+model discovered from a `tierType: "free"` provider (excluding a model when its catalog publishes
+a positive price), plus zero-priced or explicitly free-labelled models from `tierType: "mixed"`
+providers, and benchmark-ranks that tail.
+Catalog refreshes re-materialize the pool automatically; adding new free models never requires a
+config edit. Legacy array pools keep their existing whole-array `benchmarkSort` behaviour.
+
 **What failover actually does** (both `/v1/messages` and `/v1/chat/completions`):
 
 - **429 / 5xx / 400 / 404** → the candidate is recorded as a breaker failure and the next one is
@@ -425,6 +441,11 @@ subagent happens to read redirect its own routing. Both cases are covered by tes
 Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` →
 `subagents.default` → normal routing. The middle two apply only while `routing.offload` is on; omit
 `routing.subagents` entirely and nothing changes either way.
+
+Whole-task CLI dispatch can likewise vary by tier with `routing.ladders.{reasoning,coding,fast}`.
+Use `llm-relay dispatch --tier reasoning -t "..."`; without `--tier`, the ladder matching
+`subagents.default` is selected (normally `coding`). The legacy single `routing.ladder` remains
+supported for configurations that do not need tier-specific CLI models.
 
 ### Choosing where to offload (`llm-relay candidates`)
 

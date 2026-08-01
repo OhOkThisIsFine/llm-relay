@@ -108,15 +108,17 @@ export async function handleAdminRoutes(
   }
 
   if ((req.method === "GET" || req.method === "POST") && pathname === "/dispatch") {
+    let bodyTier: string | undefined;
     if (req.method === "POST") {
-      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown };
+      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown; tier?: unknown };
       const ttlMs = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
+      bodyTier = typeof body.tier === "string" ? body.tier : undefined;
       if (typeof body.clear === "string") {
-        clearExhausted(cfg, body.clear);
+        clearExhausted(cfg, body.clear, bodyTier);
       } else if (body.clear === true) {
         clearExhausted(cfg);
       } else if (typeof body.exhausted === "string") {
-        if (!markExhausted(cfg, body.exhausted, ttlMs)) {
+        if (!markExhausted(cfg, body.exhausted, ttlMs, bodyTier)) {
           failClosed(res, 400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
           h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
           return true;
@@ -138,6 +140,7 @@ export async function handleAdminRoutes(
       ...(taskParam ? { task: taskParam } : {}),
       ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
       ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
+      ...((pickQuery(path, "tier") ?? bodyTier) ? { tier: (pickQuery(path, "tier") ?? bodyTier) as string } : {}),
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view, null, 2));
