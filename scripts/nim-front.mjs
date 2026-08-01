@@ -38,13 +38,32 @@ writeFileSync(cfgPath, JSON.stringify({
 }));
 
 const proc = spawn(process.execPath, ["dist/cli.js", "--config", cfgPath], { stdio: ["ignore", "pipe", "pipe"] });
-await new Promise((resolve) => {
+await new Promise((resolve, reject) => {
+  const cleanup = () => {
+    proc.stdout?.removeListener("data", check);
+    proc.stderr?.removeListener("data", check);
+    proc.removeListener("error", onError);
+    proc.removeListener("exit", onExit);
+  };
   const check = (d) => {
     const s = d.toString();
-    if (/listening on/.test(s)) resolve();
+    if (/listening on/.test(s)) {
+      cleanup();
+      resolve();
+    }
+  };
+  const onError = (err) => {
+    cleanup();
+    reject(new Error(`Proxy child process startup error: ${err.message}`));
+  };
+  const onExit = (code, signal) => {
+    cleanup();
+    reject(new Error(`Proxy child process exited prematurely before listening (code: ${code}, signal: ${signal})`));
   };
   proc.stdout.on("data", check);
   proc.stderr.on("data", check);
+  proc.on("error", onError);
+  proc.on("exit", onExit);
 });
 
 const anthropicRequest = (stream) => ({
@@ -79,6 +98,8 @@ console.log(`\nrepair-proxy fronting NIM (${MODEL}), mode=detect\n${"=".repeat(7
   console.log("            log:", await readLog(logPath));
 }
 
-proc.kill();
-await once(proc, "exit");
+if (proc.exitCode === null) {
+  proc.kill();
+  await once(proc, "exit");
+}
 console.log("\ndone.\n");
