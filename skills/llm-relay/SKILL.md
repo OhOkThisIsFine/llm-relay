@@ -11,11 +11,12 @@ description: >-
 
 # llm-relay — operating guide
 
-llm-relay is a **loopback-only** reverse proxy for the Anthropic `/v1/messages` API. It routes
-each request to a configured provider (Anthropic passthrough, NIM, OpenRouter, Gemini, Groq,
-Mistral, …), translating to/from OpenAI-compatible backends, and **validates + repairs malformed
-tool calls** so agent harnesses can run on models that are weaker at tool use. Config, keys and
-caches live in `~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`, …).
+llm-relay is a **loopback-only** bidirectional proxy for Anthropic `/v1/messages` and OpenAI
+`/v1/chat/completions` / `/v1/responses`. It routes each request to a configured provider
+(Anthropic passthrough, NIM, OpenRouter, Gemini, Groq, Mistral, …), translating protocols where
+needed, and **validates + repairs malformed tool calls** on the Anthropic-shaped response seam
+so agent harnesses can run on models that are weaker at tool use. Config, keys and caches live in
+`~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`, …).
 
 One boundary governs everything it does: the proxy fixes **protocol form** (tool-call args that
 violate the schema), never **judgment**. It refuses to fabricate destructive tool calls, and an

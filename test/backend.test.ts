@@ -6,6 +6,7 @@ import {
   errorOrigin,
   fetchBackend,
   fetchOpenAiFront,
+  anthropicMessageToOpenAi,
   normalizeOpenAiErrorBody,
   openAiResponseToAnthropic,
   parseRetryAfterMs,
@@ -44,6 +45,44 @@ describe("openAiResponseToAnthropic", () => {
     }, "m") as any;
     expect(anth.content).toEqual([{ type: "text", text: "hello there" }]);
     expect(anth.stop_reason).toBe("end_turn");
+  });
+});
+
+describe("anthropicMessageToOpenAi", () => {
+  const message = {
+    id: "msg_1",
+    model: "claude-sonnet",
+    content: [
+      { type: "text", text: "hello" },
+      { type: "tool_use", id: "call_1", name: "get_weather", input: { city: "Paris" } },
+    ],
+    stop_reason: "tool_use",
+    usage: { input_tokens: 10, output_tokens: 5 },
+  };
+
+  it("maps text, tool calls, stop reason and usage to Chat Completions", () => {
+    const out = anthropicMessageToOpenAi(message, "chat") as any;
+    expect(out.object).toBe("chat.completion");
+    expect(out.choices[0].message).toEqual({
+      role: "assistant",
+      content: "hello",
+      tool_calls: [{
+        id: "call_1",
+        type: "function",
+        function: { name: "get_weather", arguments: '{"city":"Paris"}' },
+      }],
+    });
+    expect(out.choices[0].finish_reason).toBe("tool_calls");
+    expect(out.usage).toEqual({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
+  });
+
+  it("maps the same message to a Responses output", () => {
+    const out = anthropicMessageToOpenAi(message, "responses") as any;
+    expect(out.object).toBe("response");
+    expect(out.output[0].content[0]).toEqual({ type: "output_text", text: "hello", annotations: [] });
+    expect(out.output[1]).toMatchObject({ type: "function_call", call_id: "call_1", name: "get_weather" });
+    expect(out.output_text).toBe("hello");
+    expect(out.usage.total_tokens).toBe(15);
   });
 });
 
@@ -153,15 +192,99 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(errorOrigin(upstream)).not.toBe(errorOrigin(local));
   });
 
-  it("marks the OpenAI front's own kind rejection local (it never called out)", async () => {
-    const anthropicKind = { ...openaiTarget("http://127.0.0.1:1"), kind: "anthropic" as const };
+  it("translates an OpenAI front request for an Anthropic target", async () => {
+    let seen: any;
+    const anthropicKind = {
+      ...openaiTarget("https://api.anthropic.test"),
+      kind: "anthropic" as const,
+    };
+    delete anthropicKind.model;
+    delete anthropicKind.authEnv;
     const res = await fetchOpenAiFront(
       anthropicKind,
-      { reqJson: { model: "m" }, wantsStream: false, signal: AbortSignal.timeout(1000) },
-      async () => { throw new Error("must not call out"); },
+      {
+        reqJson: { model: "m", messages: [{ role: "user", content: "hello" }] },
+        wantsStream: false,
+        signal: AbortSignal.timeout(1000),
+        anthropicHeaders: { "x-api-key": "sk-anthropic" },
+      },
+      async (_url, init) => {
+        seen = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({
+          id: "msg_1",
+          model: "claude-sonnet",
+          content: [{ type: "text", text: "hello from Claude" }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 2, output_tokens: 3 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
     );
-    expect(res.status).toBe(400);
-    expect(errorOrigin(res)).toBe("local");
+    expect(res.status).toBe(200);
+    expect(seen.max_tokens).toBe(1024);
+    expect(seen.messages[0].content[0].text).toBe("hello");
+    expect((await res.json() as any).choices[0].message.content).toBe("hello from Claude");
+  });
+
+  it("translates an Anthropic SSE response to an OpenAI Responses SSE response", async () => {
+    const anthropicSse = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_stream", model: "claude-sonnet", usage: { input_tokens: 2, output_tokens: 0 } } })}\n\n`,
+      `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "streamed" } })}\n\n`,
+      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const anthropicKind = {
+      ...openaiTarget("https://api.anthropic.test"),
+      kind: "anthropic" as const,
+    };
+    delete anthropicKind.model;
+    delete anthropicKind.authEnv;
+    const res = await fetchOpenAiFront(
+      anthropicKind,
+      {
+        reqJson: { model: "claude", input: "hello", stream: true },
+        wantsStream: true,
+        protocol: "responses",
+        anthropicHeaders: { "x-api-key": "sk-anthropic" },
+        signal: AbortSignal.timeout(1000),
+      },
+      async () => new Response(anthropicSse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const out = await res.text();
+    expect(res.status).toBe(200);
+    expect(out).toContain("response.output_text.delta");
+    expect(out).toContain("streamed");
+    expect(out).toContain("response.completed");
+  });
+
+  it("adapts an OpenAI-compatible SSE backend to the Responses SSE envelope", async () => {
+    const openAiSse = [
+      `data: ${JSON.stringify({ id: "cmpl_stream", model: "target", choices: [{ index: 0, delta: { role: "assistant", content: "streamed" }, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ id: "cmpl_stream", model: "target", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+      `data: ${JSON.stringify({ id: "cmpl_stream", model: "target", choices: [], usage: { prompt_tokens: 2, completion_tokens: 3 } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("");
+    const target = openaiTarget("https://openai-backend.test", "target");
+    const res = await fetchOpenAiFront(
+      target,
+      {
+        reqJson: { model: "target", input: "hello", stream: true },
+        wantsStream: true,
+        protocol: "responses",
+        signal: AbortSignal.timeout(1000),
+      },
+      async (_url, init) => {
+        const request = JSON.parse(String(init?.body));
+        expect(request.messages[0].content).toBe("hello");
+        expect(request.stream_options).toEqual({ include_usage: true });
+        return new Response(openAiSse, { status: 200, headers: { "content-type": "text/event-stream" } });
+      },
+    );
+    const out = await res.text();
+    expect(res.status).toBe(200);
+    expect(out).toContain("response.output_text.delta");
+    expect(out).toContain("response.completed");
   });
 
   it("asks a streaming openai backend for usage, and carries it into message_delta", async () => {
@@ -479,4 +602,3 @@ describe("fetchBackend & fetchOpenAiFront — credential alias resolution", () =
     }
   });
 });
-

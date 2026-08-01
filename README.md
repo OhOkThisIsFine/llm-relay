@@ -1,6 +1,6 @@
 # llm-relay
 
-A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v1/messages` to any backend model and **validates tool-call responses** against the request's `tools[].input_schema`, so the Claude Code harness (or any `ANTHROPIC_BASE_URL` client) can run on non-Anthropic models without pre-filtering them by tool competence.
+A standalone, **loopback** bidirectional LLM API proxy. It forwards Anthropic `/v1/messages` and OpenAI `/v1/chat/completions` or `/v1/responses` requests to any configured backend, translating protocols where needed. Anthropic responses still pass through the relay's **tool-call validation/repair** layer, so Claude Code and OpenAI-native clients can share the same routed providers.
 
 **The one boundary:** it fixes/flags *protocol form* (malformed tool calls), never *judgment* (bad reasoning).
 
@@ -10,6 +10,7 @@ A standalone, **loopback** Anthropic-Messages-API reverse proxy. It forwards `/v
 - **`detect` mode** — deterministic tool_use validation (Ajv2020) with metadata-only logging of pass/fail/uncheckable. Behavior is unchanged; it only observes.
 - **`repair` mode** — on a validation failure, a cheap reshaper model corrects the call, the result is **re-validated**, and the corrected response is re-emitted (JSON or freshly-serialized SSE). Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail-clean** (502). Valid calls pass through untouched. The refusal matches the tool **name exactly** (case-insensitively) — see [Destructive-tool refusal](#destructive-tool-refusal-repairdestructivetools) for which tools that now covers.
 - **OpenAI-compatible backends** (`backend.kind:"openai"`) — front NIM / vLLM / OpenRouter / LM Studio. Requests are translated Anthropic→OpenAI and responses back (streaming SSE + non-streaming) via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge) (zero-dep). The validate/repair layer always sees Anthropic Messages, regardless of backend. Verified live end-to-end.
+- **Bidirectional OpenAI front** — `POST /v1/chat/completions` and `POST /v1/responses` work against both `kind:"openai"` and `kind:"anthropic"` targets. OpenAI Chat Completions remains byte-transparent to OpenAI backends; Responses and Anthropic targets use the same Anthropic-shaped translation seam, including streaming SSE and tool calls.
 - **Streaming repair** — text-block SSE frames stream to the client **as they arrive**; the proxy only withholds from the first `tool_use` block. A pure-text response is byte-for-byte passthrough with zero added latency; a valid tool call flushes the withheld frames verbatim; an invalid one is repaired with only the corrected trailing blocks re-emitted (`message_start` + leading text already delivered). A mid-stream repair failure surfaces as an SSE `error` event, never a fabricated call. Handles LF and CRLF frame delimiters and multibyte UTF-8 across chunk boundaries.
 
 ### Live demo (no external creds)
@@ -137,6 +138,21 @@ llm-relay pools --probe
 **New here?** [docs/QUICKSTART.md](docs/QUICKSTART.md) is a staged setup guide written to be
 handed straight to an AI assistant ("set this up for me"), covering free providers, the offload
 switch, local models, and using your other CLI subscriptions as fallback lanes.
+
+### Release publishing
+
+Releases publish through npm Trusted Publishing (GitHub Actions OIDC); no `NPM_TOKEN` is stored in
+the repository. After merging a version bump to `main`, push the matching tag:
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+`.github/workflows/publish.yml` accepts only `v*` tags from this repository, verifies that the tag
+is contained in the default branch and matches `package.json`, then publishes with npm 11.5.1+.
+The one-time setup also requires the npm trusted publisher to reference this repository and
+workflow, plus the protected GitHub `npm-publish` environment to carry its approval rules.
 
 ### Verifying a setup — two checks, two different questions
 
@@ -575,12 +591,21 @@ coherent JSON view:
 The consumer then dispatches by pointing its OpenAI-compatible pool at :8791 and
 setting each packet's model to a **namespaced** `provider/model` (it picked the exact
 backend). llm-relay exposes an **OpenAI-compatible front** for exactly this —
-`POST /v1/chat/completions` (and `/chat/completions`): the request's `model` is routed
-by namespace/tier, rewritten to the backend id, and the upstream OpenAI response is
-returned verbatim (OpenAI in, OpenAI out — the Anthropic `/v1/messages` front with
-tool-call repair stays available in parallel for a Claude-harness client). Meanwhile a plain `claude` client that sends `claude-sonnet-…` still gets the
-**dumb tier/default routing** — both coexist, no mode switch. So the tier map stays the
-default, and dispatcher-style usage is just "send namespaced ids + read `/registry`".
+`POST /v1/chat/completions` (and `/chat/completions`) plus `POST /v1/responses`: the
+request's `model` is routed by namespace/tier. OpenAI-compatible targets receive the
+backend model id directly; Anthropic targets receive a translated `/v1/messages` request
+and their response is translated back to the caller's OpenAI envelope. Responses streaming,
+tool calls and usage are supported. The Anthropic `/v1/messages` front with tool-call repair
+stays available in parallel for a Claude-harness client. Meanwhile a plain `claude` client
+that sends `claude-sonnet-…` still gets the **dumb tier/default routing** — both coexist,
+no mode switch. So the tier map stays the default, and dispatcher-style usage is just
+"send namespaced ids + read `/registry`".
+
+OpenAI-native clients can point their base URL at `http://127.0.0.1:8791/v1` and use a
+namespaced model such as `anthropic/claude-sonnet-4-20250514` or `pool/coding`. Codex uses
+`/v1/responses`; other IDEs commonly use `/v1/chat/completions`. Configure the Anthropic
+provider with `kind: "anthropic"` and `authEnv: "ANTHROPIC_API_KEY"` when the relay should
+use its own key, or omit `authEnv` for an intentional caller-credential passthrough.
 
 ### Model tiers from leaderboards (never a hand-maintained table)
 
@@ -656,9 +681,9 @@ credentials byte-for-byte (`authorization`/`x-api-key` *and* `anthropic-beta`). 
 model you pick therefore reaches real Anthropic untouched, while anything addressed as
 `pool/<name>` goes to another provider. One instance, both behaviours.
 
-⚠ **Do not route Codex through this.** headroom has a single OpenAI upstream covering both
-`/v1/chat/completions` and `/v1/responses`; Codex uses `/v1/responses` and must reach
-api.openai.com. Point `--anthropic-api-url` at llm-relay and leave `--openai-api-url` alone.
+⚠ **Do not route Codex through headroom.** headroom has a single OpenAI upstream covering both
+`/v1/chat/completions` and `/v1/responses`; when using headroom, Codex must reach api.openai.com.
+Codex can instead point directly at llm-relay, whose OpenAI front supports `/v1/responses`.
 
 Note the `claude-proxied` wrappers set `ANTHROPIC_BASE_URL` straight to :8791 with a dummy
 token and an isolated `CLAUDE_CONFIG_DIR`, so **they bypass headroom entirely** — they are for
