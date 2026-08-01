@@ -7,6 +7,7 @@ import {
   argValue,
   hasFlag,
   splitSpec,
+  getPositionalArgs,
   main,
   quoteArg,
   renderCommand,
@@ -26,6 +27,13 @@ describe("cli helper utilities", () => {
 
   afterEach(() => {
     process.argv = origArgv;
+  });
+
+  it("getPositionalArgs extracts non-flag positional arguments correctly", () => {
+    expect(getPositionalArgs(["node", "cli.ts", "--config", "custom.json", "offload", "status"])).toEqual(["offload", "status"]);
+    expect(getPositionalArgs(["node", "cli.ts", "-c=custom.json", "dispatch", "-t", "task", "lane1"])).toEqual(["dispatch", "lane1"]);
+    expect(getPositionalArgs(["node", "cli.ts", "--refresh", "models"])).toEqual(["models"]);
+    expect(getPositionalArgs(["node", "cli.ts", "--config", "custom.json"])).toEqual([]);
   });
 
   it("splitSpec correctly parses provider and model", () => {
@@ -88,6 +96,20 @@ describe("cli helper utilities", () => {
     process.argv = ["node", "cli.ts", "help"];
     expect(() => main()).toThrow("exit:0");
     expect(stdoutSpy).toHaveBeenCalledWith(expect.stringContaining("llm-relay — loopback Anthropic-Messages proxy"));
+
+    stdoutSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("main routes subcommands correctly even when flags precede the subcommand", () => {
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    process.argv = ["node", "cli.ts", "--config", "custom.json", "version"];
+    expect(() => main()).toThrow("exit:0");
+    expect(stdoutSpy).toHaveBeenCalledWith(expect.stringMatching(/\d+\.\d+\.\d+/));
 
     stdoutSpy.mockRestore();
     exitSpy.mockRestore();
@@ -332,6 +354,11 @@ describe("classifyCommand — the update-check gate", () => {
   it("classifies a bare proxy start mutating", () => {
     expect(classifyCommand(argv())).toBe("mutating");
     expect(classifyCommand(argv("--config", "c.json"))).toBe("mutating");
+  });
+
+  it("classifies subcommands correctly even when flags precede them", () => {
+    expect(classifyCommand(argv("--config", "c.json", "offload", "status"))).toBe("read-only");
+    expect(classifyCommand(argv("--config", "c.json", "offload", "on"))).toBe("mutating");
   });
 
   it("splits setup and offload by what the invocation actually writes", () => {
