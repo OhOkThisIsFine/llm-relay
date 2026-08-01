@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Install/refresh the Claude Code skill that ships with llm-relay into the user's
- * global skills directory (~/.claude/skills/llm-relay/SKILL.md).
+ * Install/refresh the llm-relay skill for Claude Code and Codex from the same
+ * shipped source (skills/llm-relay/SKILL.md).
  *
  * Runs from npm `postinstall`, but only acts on GLOBAL installs (`npm i -g llm-relay`)
  * so that a repo-local `npm install` (dev checkout, CI) never touches the developer's
- * ~/.claude. Because the self-updater reinstalls the global package on a new version,
- * the skill refreshes itself on every upgrade with no extra step.
+ * ~/.claude or ~/.codex. Because the self-updater reinstalls the global package on a new
+ * version, both skill descriptions refresh on every upgrade with no extra step.
  *
  * `--force` installs regardless of install context (for manual runs and tests).
  *
@@ -23,9 +23,9 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
-/** Report why the skill is not there, and leave the install itself alone. */
-function skip(reason) {
-  process.stderr.write(`llm-relay: Claude Code skill not installed — ${reason}\n`);
+/** Report why neither skill can be installed, and leave the package install itself alone. */
+function skipAll(reason) {
+  process.stderr.write(`llm-relay: Claude Code and Codex skills not installed — ${reason}\n`);
   process.exit(0);
 }
 
@@ -41,18 +41,31 @@ try {
   const isGlobal = process.env.npm_config_global === "true" || inGlobalTree;
 
   if (!isGlobal && !force) {
-    process.exit(0); // local/dev install — leave the user's ~/.claude alone
+    process.exit(0); // local/dev install — leave the user's host skill directories alone
   }
 
   const src = join(here, "..", "skills", "llm-relay", "SKILL.md");
-  if (!existsSync(src)) skip(`this package does not contain ${src}`);
+  if (!existsSync(src)) skipAll(`this package does not contain ${src}`);
 
-  const dest = join(homedir(), ".claude", "skills", "llm-relay", "SKILL.md");
-  mkdirSync(dirname(dest), { recursive: true });
-  copyFileSync(src, dest);
-  process.stderr.write(`llm-relay: installed Claude Code skill at ${dest}\n`);
+  const home = homedir();
+  const targets = [
+    { host: "Claude Code", dest: join(home, ".claude", "skills", "llm-relay", "SKILL.md") },
+    { host: "Codex", dest: join(home, ".codex", "skills", "llm-relay", "SKILL.md") },
+  ];
+
+  // Keep host failures independent: a broken ~/.claude must not prevent Codex from receiving
+  // the same canonical description, or vice versa.
+  for (const { host, dest } of targets) {
+    try {
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(src, dest);
+      process.stderr.write(`llm-relay: installed ${host} skill at ${dest}\n`);
+    } catch (e) {
+      process.stderr.write(`llm-relay: ${host} skill not installed — ${e?.message ?? e}\n`);
+    }
+  }
 } catch (e) {
-  // Never fail the install over the skill — but always say why it did not happen.
-  process.stderr.write(`llm-relay: Claude Code skill not installed — ${e?.message ?? e}\n`);
+  // Never fail the install over the skills — but always say why neither could be attempted.
+  process.stderr.write(`llm-relay: Claude Code and Codex skills not installed — ${e?.message ?? e}\n`);
   process.exit(0);
 }

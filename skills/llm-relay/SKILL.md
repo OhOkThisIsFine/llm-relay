@@ -178,8 +178,9 @@ Ordering exists at three levels; change the right one:
 - **Which lane is tried first** (`routing.ladder` in `~/.llm-relay/config.json`): reorder the
   array; rung order *is* the ladder. Add `"enabled": false` to park a rung without deleting it.
   Validated at load — a bad spec, a duplicate id, or a `cli` rung whose `args` lack `{task}`
-  fails at startup, not mid-fallback. ⚠ Never put a personal ordering in
-  `~/.claude/skills/llm-relay/SKILL.md`: `postinstall` overwrites it on every global install.
+  fails at startup, not mid-fallback. ⚠ Never put a personal ordering in the installed
+  `~/.claude/skills/llm-relay/SKILL.md` or `~/.codex/skills/llm-relay/SKILL.md` copies:
+  `postinstall` generates both from this package source on every global install.
 - **Which pool a tier lands on** (`routing.subagents` in `~/.llm-relay/config.json`): maps the
   Agent tool's `model` param (opus/sonnet/haiku/…) to a pool or pinned spec. Takes effect on the
   next request; no restart.
