@@ -12,6 +12,14 @@ import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { currentVersion, ensureUpToDate, shouldCheckUpdates, type CommandEffect } from "./self-update.js";
+import {
+  deleteConfigPath,
+  parseConfigValue,
+  readConfigDocument,
+  readConfigPath,
+  updateConfigDocument,
+  writeConfigPath,
+} from "./config-edit.js";
 
 export function argValue(...flags: string[]): string | undefined {
   const allFlags = new Set<string>();
@@ -73,6 +81,7 @@ const VALUE_FLAGS = new Set<string>([
   '--tier', '-tier',
   '--client', '-client',
   '--scope', '-scope',
+  '--include', '-include',
   '--shell', '-shell',
 ]);
 
@@ -157,6 +166,14 @@ Usage:
   llm-relay telemetry                              Programmatic JSON metrics and quota report
   llm-relay models [-p <name>] [-r]               List live models per provider
   llm-relay pools [--probe]                        List pool members; --probe tests each for real
+  llm-relay pools set <name> <spec...> [--free]    Create/replace a static or dynamic free pool
+  llm-relay pools add|remove <name> <spec...>     Edit pool membership; pools delete <name> removes one
+  llm-relay routing                                   Show routing configuration
+  llm-relay routing default <spec...>                 Set the fallback target list
+  llm-relay routing tier <name> <spec...>             Set or clear a Claude tier target list
+  llm-relay routing subagent <tier> <spec>            Set or clear a subagent target
+  llm-relay routing sort on|off                       Enable/disable benchmark sorting
+  llm-relay config show|get|set|unset <path> ...      Read or edit any JSON config path
   llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
   llm-relay offload [client] [on|off|status]       Configure client offload; --scope subagents|all
   llm-relay dispatch [lane] [-t <task>] [--tier] [--client]  Which client-specific lane to use next
@@ -188,6 +205,9 @@ Options:
   -c, --config <path>                              Config file (default: ~/.llm-relay/config.json)
   -p, --provider <name>                            Filter models/ping command to a specific provider
   -r, --refresh                                    Force cache refresh when querying provider models
+  --free / --include free                          Make a pool discover free catalog models after its preferred members
+  --clear                                          Remove a routing tier/subagent mapping
+  --json                                           Print machine-readable output where supported
 
 Version currency:
   Every run (except help/version) checks the npm registry — cached 6h, 2.5s timeout, fail-open.
@@ -989,6 +1009,170 @@ export async function runCandidates(): Promise<void> {
   );
 }
 
+function configSourcePath(cfg: Config): string {
+  if (!cfg.sourcePath) throw new Error("loaded config has no source path");
+  return cfg.sourcePath;
+}
+
+function routingDocument(document: Record<string, unknown>): Record<string, unknown> {
+  const current = document.routing;
+  if (typeof current === "object" && current !== null && !Array.isArray(current)) {
+    return current as Record<string, unknown>;
+  }
+  const routing: Record<string, unknown> = {};
+  document.routing = routing;
+  return routing;
+}
+
+function outputJson(value: unknown): void {
+  process.stdout.write(JSON.stringify(value, null, 2) + "\n");
+}
+
+function changedConfig(path: string): void {
+  process.stdout.write(`Updated ${path}\n`);
+  process.stdout.write("Restart the running proxy for routing changes to take effect.\n");
+}
+
+function configCommandError(message: string): never {
+  throw new Error(message);
+}
+
+const UNSAFE_CONFIG_NAMES = new Set(["__proto__", "prototype", "constructor"]);
+
+function requireSimpleConfigName(name: string | undefined, command: string): string {
+  if (!name || !/^[A-Za-z0-9_-]+$/.test(name) || UNSAFE_CONFIG_NAMES.has(name)) {
+    configCommandError(`${command}: expected a simple name`);
+  }
+  return name;
+}
+
+function requireSpecs(command: string, specs: string[]): string[] {
+  if (specs.length === 0 || specs.some((spec) => spec.length === 0)) {
+    configCommandError(`${command}: expected at least one provider/model or pool/<name> spec`);
+  }
+  return specs;
+}
+
+function scalarOrArray(values: string[]): string | string[] {
+  return values.length === 1 ? values[0]! : values;
+}
+
+/** `llm-relay config show|get|set|unset` — generic, scriptable JSON configuration editing. */
+export function runConfigCommand(): void {
+  const cfg = loadOrExit();
+  const path = configSourcePath(cfg);
+  const positionals = getPositionalArgs(process.argv);
+  const action = positionals[1] ?? "show";
+  const target = positionals[2];
+
+  if (action === "show" || action === "get") {
+    const document = readConfigDocument(path);
+    const value = target ? readConfigPath(document, target) : document;
+    if (target && value === undefined) configCommandError(`config ${action}: no value at "${target}"`);
+    outputJson(value);
+    return;
+  }
+
+  if (action === "set") {
+    const valueArg = positionals[3];
+    if (!target || valueArg === undefined || positionals.length > 4) {
+      configCommandError("config set: expected exactly <path> <value>; values may be JSON");
+    }
+    updateConfigDocument(path, (document) => writeConfigPath(document, target, parseConfigValue(valueArg)));
+    changedConfig(path);
+    return;
+  }
+
+  if (action === "unset") {
+    if (!target || positionals.length > 3) configCommandError("config unset: expected exactly <path>");
+    const before = readConfigDocument(path);
+    if (readConfigPath(before, target) === undefined) configCommandError(`config unset: no value at "${target}"`);
+    let removed = false;
+    updateConfigDocument(path, (document) => {
+      removed = deleteConfigPath(document, target);
+    });
+    if (!removed) configCommandError(`config unset: no value at "${target}"`);
+    changedConfig(path);
+    return;
+  }
+
+  configCommandError(`config: expected show|get|set|unset (got "${action}")`);
+}
+
+/** `llm-relay routing ...` — convenient typed commands for the fields operators edit most. */
+export function runRoutingCommand(): void {
+  const cfg = loadOrExit();
+  const path = configSourcePath(cfg);
+  const positionals = getPositionalArgs(process.argv);
+  const action = positionals[1] ?? "show";
+
+  if (action === "show" || action === "get") {
+    outputJson(cfg.routing);
+    return;
+  }
+
+  if (action === "default") {
+    const specs = requireSpecs("routing default", positionals.slice(2));
+    updateConfigDocument(path, (document) => {
+      routingDocument(document).default = scalarOrArray(specs);
+    });
+    changedConfig(path);
+    return;
+  }
+
+  if (action === "tier" || action === "subagent") {
+    const name = requireSimpleConfigName(positionals[2], `routing ${action}`);
+    const clear = hasFlag("--clear");
+    const specs = positionals.slice(3);
+    if (action === "subagent" && specs.length > 1) configCommandError("routing subagent: expected exactly one target spec");
+    if (!clear) requireSpecs(`routing ${action}`, specs);
+    if (clear && specs.length > 0) configCommandError(`routing ${action}: --clear cannot be combined with a spec`);
+    updateConfigDocument(path, (document) => {
+      const routing = routingDocument(document);
+      const field = action === "tier" ? "tiers" : "subagents";
+      const current = routing[field];
+      const map: Record<string, unknown> =
+        typeof current === "object" && current !== null && !Array.isArray(current)
+          ? (current as Record<string, unknown>)
+          : {};
+      if (clear) delete map[name];
+      else map[name] = action === "subagent" ? specs[0]! : scalarOrArray(specs);
+      routing[field] = map;
+    });
+    changedConfig(path);
+    return;
+  }
+
+  if (action === "sort" || action === "benchmark") {
+    const value = positionals[2]?.toLowerCase();
+    if (value !== "on" && value !== "off") configCommandError(`routing ${action}: expected on or off`);
+    updateConfigDocument(path, (document) => {
+      routingDocument(document).benchmarkSort = value === "on";
+    });
+    changedConfig(path);
+    return;
+  }
+
+  if (action === "set" || action === "unset") {
+    const key = positionals[2];
+    if (!key || key.startsWith("routing.")) configCommandError(`routing ${action}: expected a path relative to routing`);
+    if (action === "set") {
+      const valueArg = positionals[3];
+      if (valueArg === undefined || positionals.length > 4) configCommandError("routing set: expected <path> <value>");
+      updateConfigDocument(path, (document) => writeConfigPath(document, `routing.${key}`, parseConfigValue(valueArg)));
+    } else {
+      if (positionals.length > 3) configCommandError("routing unset: expected exactly <path>");
+      updateConfigDocument(path, (document) => {
+        if (!deleteConfigPath(document, `routing.${key}`)) configCommandError(`routing unset: no value at "${key}"`);
+      });
+    }
+    changedConfig(path);
+    return;
+  }
+
+  configCommandError(`routing: unknown action "${action}"`);
+}
+
 /**
  * `llm-relay pools` — list pool members; `--probe` sends a real completion to each.
  *
@@ -997,6 +1181,89 @@ export async function runCandidates(): Promise<void> {
  */
 export async function runPools(): Promise<void> {
   const cfg = loadOrExit();
+  const path = configSourcePath(cfg);
+  const positionals = getPositionalArgs(process.argv);
+  const action = positionals[1];
+
+  if (action === "set" || action === "add" || action === "remove" || action === "delete" || action === "rm") {
+    const name = requireSimpleConfigName(positionals[2], `pools ${action}`);
+    const specs = positionals.slice(3);
+    const include = argValue("--include") ?? (hasFlag("--free") ? "free" : undefined);
+    if (include !== undefined && include !== "free") configCommandError('pools: --include expects "free"');
+
+    if (action === "delete" || action === "rm") {
+      if (specs.length > 0 || include !== undefined) configCommandError(`pools ${action}: expected only <name>`);
+      updateConfigDocument(path, (document) => {
+        const routing = routingDocument(document);
+        const pools = routing.pools;
+        if (typeof pools !== "object" || pools === null || Array.isArray(pools) || !(name in pools)) {
+          configCommandError(`pools ${action}: no pool named "${name}"`);
+        }
+        delete (pools as Record<string, unknown>)[name];
+      });
+      changedConfig(path);
+      return;
+    }
+
+    if (specs.length === 0 && !(action === "set" && include === "free")) {
+      configCommandError(`pools ${action}: expected at least one member spec`);
+    }
+    updateConfigDocument(path, (document) => {
+      const routing = routingDocument(document);
+      const pools =
+        typeof routing.pools === "object" && routing.pools !== null && !Array.isArray(routing.pools)
+          ? (routing.pools as Record<string, unknown>)
+          : {};
+      routing.pools = pools;
+      const existing = pools[name];
+      const dynamic = typeof existing === "object" && existing !== null && !Array.isArray(existing)
+        ? existing as Record<string, unknown>
+        : null;
+      const oldMembers = dynamic
+        ? Array.isArray(dynamic.preferred) ? dynamic.preferred.filter((v): v is string => typeof v === "string") : []
+        : Array.isArray(existing) ? existing.filter((v): v is string => typeof v === "string") : [];
+      let next: string[];
+      if (action === "set") next = [...new Set(specs)];
+      else if (action === "add") next = [...new Set([...oldMembers, ...specs])];
+      else next = oldMembers.filter((member) => !specs.includes(member));
+
+      if (next.length === 0 && include !== "free" && dynamic === null) {
+        configCommandError("pools remove: the pool would be empty; use pools delete instead");
+      }
+      if (include === "free" || (dynamic !== null && action !== "set")) {
+        pools[name] = { preferred: next, include: "free" };
+      } else {
+        pools[name] = next;
+      }
+    });
+    changedConfig(path);
+    return;
+  }
+
+  if (action === "show") {
+    const name = requireSimpleConfigName(positionals[2], "pools show");
+    const pool = cfg.routing.pools?.[name];
+    if (!pool) configCommandError(`pools show: no pool named "${name}"`);
+    if (hasFlag("--json")) outputJson(pool);
+    else {
+      process.stdout.write(`pool/${name} — ${pool.length} members\n`);
+      for (const spec of pool) process.stdout.write(`  ${spec}\n`);
+    }
+    return;
+  }
+
+  if (action && action !== "list") {
+    // `pools <name>` is a useful shorthand for showing one pool; everything else is a typo.
+    const pool = cfg.routing.pools?.[action];
+    if (!pool) configCommandError(`pools: unknown action or pool "${action}"`);
+    if (hasFlag("--json")) outputJson(pool);
+    else {
+      process.stdout.write(`pool/${action} — ${pool.length} members\n`);
+      for (const spec of pool) process.stdout.write(`  ${spec}\n`);
+    }
+    return;
+  }
+
   const pools = cfg.routing.pools ?? {};
   const names = Object.keys(pools);
   if (names.length === 0) {
@@ -1005,6 +1272,10 @@ export async function runPools(): Promise<void> {
   }
 
   if (!hasFlag("--probe")) {
+    if (hasFlag("--json")) {
+      outputJson(pools);
+      return;
+    }
     for (const name of names) {
       process.stdout.write(`\npool/${name} — ${pools[name]!.length} members\n`);
       for (const spec of pools[name]!) process.stdout.write(`  ${spec}\n`);
@@ -1131,6 +1402,24 @@ export function main(): void {
     });
     return;
   }
+  if (arg2 === "routing" || arg2 === "route") {
+    try {
+      runRoutingCommand();
+    } catch (e) {
+      process.stderr.write(`llm-relay routing: ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+    return;
+  }
+  if (arg2 === "config") {
+    try {
+      runConfigCommand();
+    } catch (e) {
+      process.stderr.write(`llm-relay config: ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+    return;
+  }
   if (arg2 === "ping" || hasFlag("--ping")) {
     runPingCommand().catch((e) => {
       process.stderr.write(`llm-relay ping: ${(e as Error).message}\n`);
@@ -1185,6 +1474,18 @@ export function classifyCommand(argv: string[]): CommandEffect {
     case "offload":
       return arg3 === "on" || arg3 === "enable" || arg3 === "off" || arg3 === "disable" ||
         arg4 === "on" || arg4 === "enable" || arg4 === "off" || arg4 === "disable"
+        ? "mutating"
+        : "read-only";
+    case "config":
+      return arg3 === "set" || arg3 === "unset" ? "mutating" : "read-only";
+    case "routing":
+    case "route":
+      return arg3 === "set" || arg3 === "unset" || arg3 === "default" || arg3 === "tier" ||
+        arg3 === "subagent" || arg3 === "sort" || arg3 === "benchmark"
+        ? "mutating"
+        : "read-only";
+    case "pools":
+      return arg3 === "set" || arg3 === "add" || arg3 === "remove" || arg3 === "delete" || arg3 === "rm"
         ? "mutating"
         : "read-only";
     // keys, check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
