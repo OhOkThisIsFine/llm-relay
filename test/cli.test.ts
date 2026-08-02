@@ -98,7 +98,40 @@ describe("cli helper utilities", () => {
 
     process.argv = ["node", "cli.ts", "help"];
     expect(() => main()).toThrow("exit:0");
-    expect(stdoutSpy).toHaveBeenCalledWith(expect.stringContaining("llm-relay — loopback Anthropic-Messages proxy"));
+    expect(stdoutSpy).toHaveBeenCalledWith(expect.stringContaining("llm-relay — loopback Anthropic/OpenAI proxy"));
+
+    stdoutSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("keeps help commands and explanations in aligned columns", () => {
+    const out: string[] = [];
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    process.argv = ["node", "cli.ts", "help"];
+    expect(() => main()).toThrow("exit:0");
+    const help = out.join("");
+
+    const aligned = [
+      { label: "llm-relay [options]", description: "Start the proxy server" },
+      { label: "llm-relay setup [claude-cli|claude-desktop]", description: "Configure Claude CLI wrappers" },
+      { label: "llm-relay dispatch [lane] [options]", description: "Show the next whole-task dispatch lane" },
+    ].map(({ label, description }) => {
+      const line = help.split("\n").find((candidate) => candidate.includes(label) && candidate.includes(description));
+      expect(line).toBeDefined();
+      return line!.indexOf(description);
+    });
+
+    expect(new Set(aligned).size).toBe(1);
+    expect(help).toContain("GET|POST /dispatch");
+    expect(help).toContain('POST {"exhausted":"<lane>"}');
+    expect(help).not.toContain("                                                   the command");
 
     stdoutSpy.mockRestore();
     exitSpy.mockRestore();
@@ -331,7 +364,7 @@ describe("llm-relay dispatch — printed ladder", () => {
 
     // Quoting agrees between sh and pwsh for a task with no single quote in it, so this
     // assertion is exact on every platform.
-    expect(printed).toContain(`agy -p '${task}' --model g-flash`);
+    expect(printed).toContain(`run: agy -p '${task}' --model g-flash`);
     // The defect: the raw join put `; report` outside the quotes as its own shell command.
     expect(printed).not.toContain(`agy -p ${task} --model g-flash`);
     expect(printed).toMatch(/quoted for (PowerShell 7\+ \(pwsh\)|sh\/bash)/);
