@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -16,6 +16,9 @@ import {
   SHELL_LABEL,
   classifyCommand,
   runDispatch,
+  runConfigCommand,
+  runPools,
+  runRoutingCommand,
 } from "../src/cli.js";
 
 describe("cli helper utilities", () => {
@@ -376,6 +379,17 @@ describe("classifyCommand — the update-check gate", () => {
     expect(classifyCommand(argv("onboard"))).toBe("mutating");
   });
 
+  it("classifies routing editors as mutating and their views as read-only", () => {
+    expect(classifyCommand(argv("routing"))).toBe("read-only");
+    expect(classifyCommand(argv("routing", "show"))).toBe("read-only");
+    expect(classifyCommand(argv("routing", "tier", "opus", "pool/reasoning"))).toBe("mutating");
+    expect(classifyCommand(argv("route", "sort", "off"))).toBe("mutating");
+    expect(classifyCommand(argv("pools", "set", "coding", "nim/model"))).toBe("mutating");
+    expect(classifyCommand(argv("pools", "--probe"))).toBe("read-only");
+    expect(classifyCommand(argv("config", "get", "routing.pools"))).toBe("read-only");
+    expect(classifyCommand(argv("config", "set", "routing.default", "nim/model"))).toBe("mutating");
+  });
+
   it("treats --ping as the ping command, not as a proxy start", () => {
     expect(classifyCommand(argv("--ping"))).toBe("read-only");
     expect(classifyCommand(argv("--config", "c.json", "--ping"))).toBe("read-only");
@@ -385,5 +399,94 @@ describe("classifyCommand — the update-check gate", () => {
     // The failure mode of an unlisted command is "no update check", never "surprise reinstall".
     expect(classifyCommand(argv("some-future-subcommand"))).toBe("read-only");
     expect(classifyCommand(argv("keys", "--json"))).toBe("read-only");
+  });
+});
+
+describe("CLI configuration editing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-cli-config-"));
+  const configPath = join(dir, "config.json");
+  const baseConfig = {
+    listen: "127.0.0.1:8791",
+    providers: {
+      test: { base: "http://127.0.0.1:1/v1", kind: "openai" },
+      other: { base: "http://127.0.0.1:2/v1", kind: "openai" },
+    },
+    routing: {
+      default: "test/base",
+      tiers: {},
+      benchmarkSort: false,
+    },
+    mode: "detect",
+    log: { level: "silent", file: null },
+  };
+  const originalArgv = process.argv;
+
+  beforeEach(() => {
+    writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+    process.argv = ["node", "cli.ts", "--config", configPath];
+  });
+
+  afterEach(() => {
+    process.argv = originalArgv;
+    vi.restoreAllMocks();
+  });
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  function document(): Record<string, any> {
+    return JSON.parse(readFileSync(configPath, "utf8"));
+  }
+
+  it("creates, edits, and deletes static and dynamic pools", async () => {
+    process.argv.push("pools", "set", "coding", "test/coder", "other/coder");
+    await runPools();
+    expect(document().routing.pools.coding).toEqual(["test/coder", "other/coder"]);
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "add", "coding", "test/fast"];
+    await runPools();
+    expect(document().routing.pools.coding).toEqual(["test/coder", "other/coder", "test/fast"]);
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "set", "coding", "test/coder", "--free"];
+    await runPools();
+    expect(document().routing.pools.coding).toEqual({ preferred: ["test/coder"], include: "free" });
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "set", "coding", "other/coder"];
+    await runPools();
+    expect(document().routing.pools.coding).toEqual(["other/coder"]);
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "delete", "coding"];
+    await runPools();
+    expect(document().routing.pools).toEqual({});
+  });
+
+  it("configures fallback, tiers, subagents, sorting, and arbitrary routing fields", async () => {
+    process.argv.push("routing", "default", "test/strong", "other/fallback");
+    runRoutingCommand();
+    expect(document().routing.default).toEqual(["test/strong", "other/fallback"]);
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "routing", "tier", "sonnet", "test/sonnet"];
+    runRoutingCommand();
+    expect(document().routing.tiers.sonnet).toBe("test/sonnet");
+
+    // The pool must exist before a subagent mapping can reference it.
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "set", "coding", "test/cheap"];
+    await runPools();
+    process.argv = ["node", "cli.ts", "--config", configPath, "routing", "subagent", "default", "pool/coding"];
+    runRoutingCommand();
+    expect(document().routing.subagents.default).toBe("pool/coding");
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "routing", "sort", "on"];
+    runRoutingCommand();
+    expect(document().routing.benchmarkSort).toBe(true);
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "config", "set", "routing.ladder", "[]"];
+    runConfigCommand();
+    expect(document().routing.ladder).toEqual([]);
+  });
+
+  it("rejects edits that would make the config unloadable", () => {
+    process.argv = ["node", "cli.ts", "--config", configPath, "routing", "default", "missing/model"];
+    expect(() => runRoutingCommand()).toThrow(/unknown provider/);
+    expect(document().routing.default).toBe("test/base");
   });
 });
