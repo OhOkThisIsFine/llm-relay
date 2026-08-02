@@ -5,6 +5,7 @@ import {
   resolveTargets,
   reshaperForTarget,
   subagentSpec,
+  clientForPath,
   RoutingError,
   type Config,
   type ResolvedTarget,
@@ -228,8 +229,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     // A SUBAGENT request may route somewhere other than its nominal model: either an explicit
     // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it),
     // Claude's cc_is_subagent marker, or Codex's request metadata header. Main-conversation
-    // requests are untouched, which is what lets routing.tiers stay pointed at a passthrough.
-    const subSpec = subagentSpec(reqJson, model, cfg, req.headers);
+    // requests remain untouched unless that front door's rule explicitly uses scope "all".
+    const subSpec = subagentSpec(reqJson, model, cfg, req.headers, clientForPath(pathname));
     const routedModel = subSpec ?? model;
     materializeDynamicPools(cfg, h.catalog);
     // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson

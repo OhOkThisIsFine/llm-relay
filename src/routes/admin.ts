@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Config } from "../config.js";
+import type { Config, OffloadScope } from "../config.js";
 import type { ModelCatalog } from "../catalog.js";
 import type { PingLoop } from "../ping/cadence.js";
 import type { MetadataLogger } from "../log.js";
@@ -170,15 +170,34 @@ export async function handleAdminRoutes(
   }
 
   if ((req.method === "GET" || req.method === "POST") && pathname === "/offload") {
-    let state = offloadState(cfg);
+    const queryClient = pickQuery(path, "client");
+    let state = offloadState(cfg, queryClient);
     if (req.method === "POST") {
-      const want = (reqJson as { enabled?: unknown } | undefined)?.enabled;
-      if (typeof want !== "boolean") {
-        failClosed(res, 400, `POST /offload needs a JSON body {"enabled": true|false}`);
+      const body = (reqJson ?? {}) as { enabled?: unknown; client?: unknown; scope?: unknown };
+      const client = typeof body.client === "string" && body.client.length > 0 ? body.client : queryClient;
+      const scope = body.scope === undefined ? undefined : body.scope;
+      if (body.client !== undefined && (typeof body.client !== "string" || body.client.length === 0)) {
+        failClosed(res, 400, `POST /offload client must be a non-empty string`);
         h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
         return true;
       }
-      state = setOffload(cfg, want);
+      if (scope !== undefined && scope !== "subagents" && scope !== "all") {
+        failClosed(res, 400, `POST /offload scope must be "subagents" or "all"`);
+        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
+        return true;
+      }
+      if (scope !== undefined && client === undefined) {
+        failClosed(res, 400, `POST /offload scope requires a client`);
+        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
+        return true;
+      }
+      const want = body.enabled;
+      if (typeof want !== "boolean") {
+        failClosed(res, 400, `POST /offload needs {"enabled": true|false, "client"?: string, "scope"?: "subagents"|"all"}`);
+        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
+        return true;
+      }
+      state = setOffload(cfg, want, client, scope as OffloadScope | undefined);
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(state, null, 2));
@@ -188,10 +207,17 @@ export async function handleAdminRoutes(
 
   if ((req.method === "GET" || req.method === "POST") && pathname === "/dispatch") {
     let bodyTier: string | undefined;
+    let bodyClient: string | undefined = pickQuery(path, "client");
     if (req.method === "POST") {
-      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown; tier?: unknown };
+      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown; tier?: unknown; client?: unknown };
       const ttlMs = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
       bodyTier = typeof body.tier === "string" ? body.tier : undefined;
+      if (body.client !== undefined && (typeof body.client !== "string" || body.client.length === 0)) {
+        failClosed(res, 400, `POST /dispatch client must be a non-empty string`);
+        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
+        return true;
+      }
+      if (typeof body.client === "string") bodyClient = body.client;
       if (typeof body.clear === "string") {
         clearExhausted(cfg, body.clear, bodyTier);
       } else if (body.clear === true) {
@@ -220,6 +246,7 @@ export async function handleAdminRoutes(
       ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
       ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
       ...((pickQuery(path, "tier") ?? bodyTier) ? { tier: (pickQuery(path, "tier") ?? bodyTier) as string } : {}),
+      ...(bodyClient ? { client: bodyClient } : {}),
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(view, null, 2));

@@ -2,9 +2,10 @@
 name: llm-relay
 description: >-
   Operate llm-relay, the loopback multi-provider LLM proxy (default 127.0.0.1:8791) that
-  validates/repairs tool calls and can offload Claude Code subagents to non-Anthropic
-  providers. Use when offloading bulk work to a subagent on another provider, choosing an
-  offload target, addressing a pool or model through the relay, toggling subagent offload,
+  validates/repairs tool calls and can independently offload Claude, Codex, and future client
+  requests to non-Anthropic providers. Use when offloading bulk work to a subagent on another
+  provider, choosing an offload target, addressing a pool or model through the relay, toggling
+  client-specific offload,
   dispatching to peer agent CLIs (Antigravity/Codex) as fallback lanes, reordering dispatch,
   or diagnosing a request that failed at or behind the relay.
 ---
@@ -42,17 +43,33 @@ An unnamespaced/unknown model id lands on `routing.default` — in the standard 
 Anthropic passthrough, so it reaches real Anthropic (spending real quota), never a silently weaker
 model.
 
-## Subagent offload (OPT-IN — off by default)
+## Client-specific offload (OPT-IN — off by default)
 
 Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests. Local Codex
 stamps `{"request_kind":"subagent"}` into the `x-codex-turn-metadata` header on child-agent
-Responses turns. When the offload switch is ON, those marked requests (and only those) route
-through `routing.subagents` (tier → spec); the main conversation never consults that map.
+Responses turns. When that client's rule is enabled with `scope: "subagents"`, marked requests
+route through `routing.subagents` (tier → spec); with `scope: "all"`, the client's main
+conversation consults that map too.
 
 ```bash
-llm-relay offload status     # where things stand
-llm-relay offload on         # takes effect on the next request, no restart, persisted
-llm-relay offload off
+llm-relay offload status
+llm-relay offload claude on --scope subagents
+llm-relay offload codex on --scope all
+llm-relay offload claude off
+```
+
+`routing.offload` is keyed by originating client. Claude is `/v1/messages` and Codex is
+`/v1/responses`; arbitrary future names and an explicit `default` rule are valid. The legacy
+boolean form remains supported and means one global subagents-only rule.
+
+```jsonc
+"routing": {
+  "offload": {
+    "claude": { "enabled": true, "scope": "subagents" },
+    "codex": { "enabled": false, "scope": "all" }
+  },
+  "subagents": { "opus": "pool/reasoning", "sonnet": "pool/coding", "default": "pool/coding" }
+}
 ```
 
 Three ways to steer a subagent, in precedence order:
@@ -60,12 +77,12 @@ Three ways to steer a subagent, in precedence order:
 1. **`@relay: <spec>` directive** — put it on its own line at the START of the subagent's prompt
    (`@relay: pool/coding` or `@relay: nim/z-ai/glm-5.2`). Stripped before forwarding, so the model
    never sees it. **Works with the switch OFF** — this is the per-call opt-in.
-2. **Tier** *(switch must be on)* — the Agent tool's `model` param maps through
+2. **Tier** *(client rule must be on)* — the Agent tool's `model` param maps through
    `routing.subagents` (e.g. opus→`pool/reasoning`, sonnet→`pool/coding`, haiku→`pool/fast`).
-3. **Nothing** *(switch on)* — the inherited model id matches a tier, else `subagents.default`.
+3. **Nothing** *(client rule on)* — the inherited model id matches a tier, else `subagents.default`.
 
-⚠ Dispatching a subagent does NOT offload it by itself. With the switch off, a subagent runs on
-Anthropic like any other request. Check with `llm-relay offload status`, don't assume.
+⚠ Dispatching a subagent does NOT offload it by itself. With that client's rule off, a subagent
+runs on its normal route. Check `llm-relay offload status`, don't assume.
 
 Offloaded output is **advisory** — verify claims against source files before acting on them.
 
@@ -135,7 +152,7 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
 ### The lanes, and how to drive each
 
 - **Relay pools** — `@relay: pool/coding` on a subagent prompt, or the tier mapping in
-  `routing.subagents` when offload is on. Spends provider API keys. *Exhausted when:* the pool
+  `routing.subagents` when the originating client's offload rule is on. Spends provider API keys. *Exhausted when:* the pool
   4xx/5xxs after failover walks every candidate, or `llm-relay candidates` shows the breaker open
   / quota drained across the pool.
 - **Antigravity (`agy`)** — `agy -p "<task>" --model <id> --output-format json`. Ask
@@ -179,9 +196,10 @@ under `routing.ladders.<tier>`. Without it, the ladder matching `subagents.defau
   `POST /dispatch {"exhausted":"<lane>","ttlMs":…}`. Rungs sharing a `quota` bucket cool down
   together; rungs that merely share a binary do not. `{"clear":true}` resets.
 - **Walk manually:** `GET /dispatch?after=<lane>` for the first ready rung past one.
-- **Turn subagent routing on/off:** `llm-relay offload on|off` — `/dispatch` reports the switch
-  state, and flags relay rungs `requiresDirective: true` while it is off, meaning a bare subagent
-  will *not* offload and you must put `@relay: <spec>` in its prompt or flip the switch.
+- **Turn client routing on/off:** `llm-relay offload <client> on|off [--scope subagents|all]` —
+  `/dispatch?client=<client>` reports that rule, and flags relay rungs `requiresDirective: true`
+  while it is off, meaning a bare subagent will *not* offload and you must put `@relay: <spec>` in
+  its prompt or enable the client rule.
 
 The relay decides order and remembers what is spent; **it never runs a `cli` rung for you** — it
 hands you the command and you execute it. That boundary is deliberate: a CLI agent runs its own
@@ -243,7 +261,7 @@ llm-relay ping               # latency/stability probe across providers
 llm-relay telemetry          # JSON health/quota report
 ```
 
-Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload` (GET/POST),
+Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload?client=<name>` (GET/POST),
 `/dispatch` (GET/POST), `/telemetry`, `/ping`, `/health`.
 
 ⚠ **`/offload` and `/dispatch` are admission-checked — loopback is not authorization.** They flip

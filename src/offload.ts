@@ -1,45 +1,106 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import type { Config } from "./config.js";
+import {
+  DEFAULT_CLIENT,
+  offloadRule,
+  type Config,
+  type OffloadConfig,
+  type OffloadRule,
+  type OffloadScope,
+} from "./config.js";
 
-/**
- * Runtime state of the subagent-offload switch.
- *
- * `enabled` is authoritative for routing decisions and lives on the in-memory Config, so a
- * toggle takes effect on the very next request without restarting the proxy. `persisted` says
- * whether that decision also reached disk — an in-memory-only flip is legitimate (a test config,
- * a read-only file) but silently forgetting it on restart would be a nasty surprise, so the
- * caller is told and can say so.
- */
+/** Runtime view of one or all client-specific offload rules. */
 export interface OffloadState {
+  /** Selected client's state, or true when any client rule is enabled in aggregate status. */
   enabled: boolean;
-  /** Tier → spec map consulted while enabled. Empty means offload is on but routes nowhere. */
+  /** Selected scope; aggregate status reports `mixed` when rules disagree. */
+  scope: OffloadScope | "mixed";
+  /** Originating harness selected by the caller, when this is a targeted view. */
+  client?: string;
+  /** Tier → spec map consulted when the selected rule applies. */
   subagents: Record<string, string>;
+  /** All independently configurable client rules. Empty for the legacy boolean form. */
+  clients: Record<string, OffloadRule>;
   persisted: boolean;
   configPath?: string;
   /** Why persistence failed, when it did. */
   persistError?: string;
 }
 
-export function offloadState(cfg: Config): OffloadState {
+function normalizedClients(cfg: Config): Record<string, OffloadRule> {
+  const configured = cfg.routing.offload;
+  if (typeof configured === "boolean" || configured === undefined) return {};
+  return { ...configured };
+}
+
+function aggregateScope(clients: Record<string, OffloadRule>): OffloadScope | "mixed" {
+  const scopes = [...new Set(Object.values(clients).map((rule) => rule.scope))];
+  if (scopes.length === 0) return "subagents";
+  return scopes.length === 1 ? scopes[0]! : "mixed";
+}
+
+export function offloadState(cfg: Config, client?: string): OffloadState {
+  const configured = cfg.routing.offload;
+  const clients = normalizedClients(cfg);
+  const targeted = client !== undefined ? offloadRule(cfg, client) : null;
+  const enabled = targeted?.enabled ??
+    (typeof configured === "boolean" || configured === undefined
+      ? configured === true
+      : Object.values(configured).some((rule) => rule.enabled));
+  const scope = targeted?.scope ??
+    (typeof configured === "boolean" || configured === undefined ? "subagents" : aggregateScope(clients));
+
   return {
-    enabled: cfg.routing.offload === true,
+    enabled,
+    scope,
+    ...(client !== undefined ? { client } : {}),
     subagents: cfg.routing.subagents ?? {},
+    clients,
     persisted: true,
     ...(cfg.sourcePath ? { configPath: cfg.sourcePath } : {}),
   };
 }
 
+function ruleFor(configured: OffloadConfig | undefined, client: string): OffloadRule {
+  if (typeof configured === "boolean" || configured === undefined) {
+    return { enabled: configured === true, scope: "subagents" };
+  }
+  return configured[client] ?? configured[DEFAULT_CLIENT] ?? { enabled: false, scope: "subagents" };
+}
+
+function setInMemory(cfg: Config, enabled: boolean, client?: string, scope?: OffloadScope): void {
+  const configured = cfg.routing.offload;
+  if (client === undefined) {
+    if (typeof configured === "boolean" || configured === undefined) {
+      cfg.routing.offload = enabled;
+      return;
+    }
+    const next = { ...configured };
+    for (const [name, rule] of Object.entries(next)) next[name] = { ...rule, enabled };
+    cfg.routing.offload = next;
+    return;
+  }
+
+  const next: Record<string, OffloadRule> =
+    typeof configured === "object" && configured !== null ? { ...configured } :
+      { [DEFAULT_CLIENT]: ruleFor(configured, client) };
+  const existing = next[client] ?? ruleFor(configured, client);
+  next[client] = { enabled, scope: scope ?? existing.scope };
+  cfg.routing.offload = next;
+}
+
 /**
- * Flip the switch on a live Config and write it back to the file it came from.
- *
- * Rewrites only `routing.offload`, by parsing the on-disk JSON and re-serializing it — the file
- * is the user's, and this must not reformat or drop anything it doesn't understand. Never throws:
- * routing is already updated in memory by the time persistence is attempted, and failing the
- * whole call because the file is read-only would leave the caller unsure which half applied.
+ * Flip one client rule, or the legacy/global set when no client is supplied, on the live Config.
+ * A scope may be supplied when setting a targeted rule; existing scopes are preserved otherwise.
+ * The next request sees the in-memory change without a restart.
  */
-export function setOffload(cfg: Config, enabled: boolean): OffloadState {
-  cfg.routing.offload = enabled;
-  const state = offloadState(cfg);
+export function setOffload(
+  cfg: Config,
+  enabled: boolean,
+  client?: string,
+  scope?: OffloadScope,
+): OffloadState {
+  setInMemory(cfg, enabled, client, scope);
+  const state = offloadState(cfg, client);
 
   if (!cfg.sourcePath) {
     return { ...state, persisted: false, persistError: "config was not loaded from a file" };
@@ -50,7 +111,34 @@ export function setOffload(cfg: Config, enabled: boolean): OffloadState {
       string,
       unknown
     >;
-    routing.offload = enabled;
+    const configured = routing.offload;
+    if (client === undefined) {
+      if (typeof configured === "object" && configured !== null && !Array.isArray(configured)) {
+        const next = { ...(configured as Record<string, unknown>) };
+        for (const [name, value] of Object.entries(next)) {
+          if (typeof value === "boolean") next[name] = { enabled, scope: "subagents" };
+          else if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+            next[name] = { ...(value as Record<string, unknown>), enabled };
+          }
+        }
+        routing.offload = next;
+      } else {
+        routing.offload = enabled;
+      }
+    } else {
+      const next: Record<string, unknown> =
+        typeof configured === "object" && configured !== null && !Array.isArray(configured)
+          ? { ...(configured as Record<string, unknown>) }
+          : { [DEFAULT_CLIENT]: { enabled: typeof configured === "boolean" ? configured : false, scope: "subagents" } };
+      const existing = next[client];
+      const existingScope =
+        typeof existing === "object" && existing !== null && !Array.isArray(existing) &&
+        ((existing as Record<string, unknown>).scope === "subagents" || (existing as Record<string, unknown>).scope === "all")
+          ? (existing as Record<string, unknown>).scope
+          : "subagents";
+      next[client] = { ...(typeof existing === "object" && existing !== null && !Array.isArray(existing) ? existing : {}), enabled, scope: scope ?? existingScope };
+      routing.offload = next;
+    }
     raw.routing = routing;
     writeFileSync(cfg.sourcePath, JSON.stringify(raw, null, 2) + "\n", "utf8");
     return state;

@@ -1,4 +1,4 @@
-import type { Config, ProviderConfig } from "./config.js";
+import { anyOffloadEnabled, type Config, type OffloadRule, type ProviderConfig } from "./config.js";
 import { POOL_PREFIX } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
@@ -132,7 +132,10 @@ export interface Candidate {
 
 export interface CandidatesView {
   generated_at: string;
+  /** True when at least one client-specific rule is enabled. */
   offload_enabled: boolean;
+  /** The per-originating-client rules; empty for the legacy boolean form. */
+  offload_clients: Record<string, OffloadRule>;
   note: string;
   candidates: Candidate[];
 }
@@ -327,7 +330,10 @@ export async function buildCandidates(
 
   return {
     generated_at: opts.now ?? new Date(nowMs).toISOString(),
-    offload_enabled: cfg.routing.offload === true,
+    offload_enabled: anyOffloadEnabled(cfg),
+    offload_clients: typeof cfg.routing.offload === "object" && cfg.routing.offload !== null
+      ? cfg.routing.offload
+      : {},
     note: NOTE,
     candidates,
   };

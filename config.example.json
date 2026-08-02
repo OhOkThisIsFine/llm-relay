@@ -88,7 +88,10 @@
       "fable": "pool/fast",
       "default": "pool/coding"
     },
-    "offload": false
+    "offload": {
+      "claude": { "enabled": false, "scope": "subagents" },
+      "codex": { "enabled": false, "scope": "subagents" }
+    }
   },
   "mode": "repair",
   "repair": {

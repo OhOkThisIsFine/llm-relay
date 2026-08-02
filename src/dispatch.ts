@@ -1,4 +1,4 @@
-import type { Config, LadderRung } from "./config.js";
+import { offloadRule, type Config, type LadderRung } from "./config.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -54,9 +54,9 @@ export interface DispatchLane {
   /** relay rungs: the spec to address (`pool/<name>`, `<provider>/<model>`, …). */
   spec?: string;
   /**
-   * relay rungs only: with subagent offload OFF, a bare subagent will NOT route to this spec —
-   * the host must put `@relay: <spec>` in the subagent's prompt (the per-call opt-in) or turn
-   * the switch on. Surfaced so a host never silently spends primary quota believing it offloaded.
+   * relay rungs only: with this client's subagent offload OFF, a bare subagent will NOT route to
+   * this spec — the host must put `@relay: <spec>` in the prompt or turn the client rule on.
+   * Surfaced so a host never silently spends primary quota believing it offloaded.
    */
   requiresDirective?: boolean;
 }
@@ -64,8 +64,10 @@ export interface DispatchLane {
 export interface DispatchView {
   /** Selected tier-specific ladder, or null when using the legacy single ladder. */
   tier: string | null;
-  /** State of the subagent-offload switch, which governs relay rungs. */
+  /** State of the selected client's offload rule, which governs relay-rung hints. */
   offload: boolean;
+  /** Originating harness whose rule controls relay-rung directive hints. */
+  client: string;
   ladder: DispatchLane[];
   /** The lane the host should use now, or null when every rung is spent or none configured. */
   next: DispatchLane | null;
@@ -74,6 +76,8 @@ export interface DispatchView {
 }
 
 export interface DispatchOptions {
+  /** Originating harness (`claude`, `codex`, or a future configured client). */
+  client?: string;
   /** Select a named tier-specific ladder (for example reasoning, coding, or fast). */
   tier?: string;
   /** Substituted for the `{task}` placeholder in a cli rung's args. */
@@ -202,6 +206,8 @@ function normalizeOptions(opts: DispatchOptions): DispatchOptions {
   if (after !== undefined) out.after = after;
   const tier = str(opts.tier);
   if (tier !== undefined) out.tier = tier;
+  const client = str(opts.client);
+  if (client !== undefined) out.client = client;
   return out;
 }
 
@@ -236,7 +242,7 @@ function describeId(id: string): string {
   return clean.length > MAX_ECHOED_ID ? `${clean.slice(0, MAX_ECHOED_ID)}\u2026` : clean;
 }
 
-function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchOptions, now: number): DispatchLane {
+function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchOptions, now: number, client: string): DispatchLane {
   const until = cooldownUntil(cfg, rung, now);
   const state: LaneState = !rung.enabled ? "disabled" : until !== null ? "exhausted" : "ready";
 
@@ -255,23 +261,25 @@ function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchO
   }
   if (rung.kind === "relay" && rung.spec) {
     lane.spec = rung.spec;
-    lane.requiresDirective = cfg.routing.offload !== true;
+    lane.requiresDirective = !offloadRule(cfg, client).enabled;
   }
   return lane;
 }
 
 export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): DispatchView {
   const opts = normalizeOptions(rawOpts ?? {});
+  const client = opts.client ?? "default";
   const now = Date.now();
   const selected = selectLadder(cfg, opts.tier);
   const rungs = selected.rungs;
-  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now));
-  const offload = cfg.routing.offload === true;
+  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client));
+  const offload = offloadRule(cfg, client).enabled;
 
   if (selected.missing) {
     return {
       tier: selected.tier,
       offload,
+      client,
       ladder,
       next: null,
       reason: `no dispatch tier "${describeId(selected.missing)}" configured (have: ${Object.keys(cfg.routing.ladders ?? {}).join(", ")})`,
@@ -282,6 +290,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
     return {
       tier: selected.tier,
       offload,
+      client,
       ladder,
       next: null,
       reason: "no routing.ladder configured — dispatch order is the host's to choose",
@@ -294,6 +303,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
       return {
         tier: selected.tier,
         offload,
+        client,
         ladder,
         next: null,
         reason: `no lane "${describeId(opts.lane)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
@@ -304,6 +314,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
     return {
       tier: selected.tier,
       offload,
+      client,
       ladder,
       next: forced,
       reason:
@@ -320,6 +331,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
       return {
         tier: selected.tier,
         offload,
+        client,
         ladder,
         next: null,
         reason: `no lane "${describeId(opts.after)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
@@ -333,6 +345,7 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
     return {
       tier: selected.tier,
       offload,
+      client,
       ladder,
       next: null,
       reason:
@@ -348,5 +361,5 @@ export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): Dispa
       : next.position === 1
         ? "first lane in the ladder"
         : `first ready lane (${next.position - 1} ahead of it unavailable)`;
-  return { tier: selected.tier, offload, ladder, next, reason: why };
+  return { tier: selected.tier, offload, client, ladder, next, reason: why };
 }
