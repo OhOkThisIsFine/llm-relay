@@ -105,12 +105,50 @@ llm-relay
 | `llm-relay setup claude-cli` | Display & verify Claude CLI wrapper configuration |
 | `llm-relay keys` (or `check-keys`) | Validate provider API **credentials** (escalates past a public `/models` to an authenticated probe) |
 | `llm-relay pools [--probe]` | List pool members; `--probe` sends a real completion to each — the only check that catches a listed-but-dead **model** |
+| `llm-relay pools set|add|remove <name> <spec...>` | Create or edit pool membership; add `--free` (or `--include free`) for a dynamic free-model pool; `pools delete <name>` removes one |
+| `llm-relay routing ...` | Show or edit `routing.default`, Claude tiers, subagent destinations, benchmark sorting, and other routing fields |
+| `llm-relay config show|get|set|unset <path>` | Read or edit any JSON config path; values can be JSON, for example `config set routing.ladder '[...]'` |
 | `llm-relay telemetry` | Output live JSON telemetry, stability scores, and quota metrics |
 | `llm-relay models [-p <name>] [-r]` | Query live `/models` catalog per provider (`-p` filter, `-r` force refresh) |
 | `llm-relay ping [-p <name>]` | Perform live health, latency & quota probe across providers |
 | `llm-relay offload [client] [on\|off\|status] [--scope subagents\|all]` | Read or change one client's offload rule; changes apply to the next request, no restart |
 | `llm-relay candidates [-p <name>]` | The un-blended offload decision table (capability, cost, live health, quota, breaker state) |
 | `llm-relay dispatch [lane] [-t <task>] [--client <name>]` | Which lane to hand a whole delegated task to next; it returns the command, **you** run it (`-x <lane>` reports one spent) |
+
+---
+
+### Configure pools and routing from the CLI
+
+The configuration commands edit the selected JSON file (`--config` or the normal global config)
+and validate the complete result before writing it. Restart a running proxy after a routing edit.
+
+```bash
+# Static pool: members are tried/ranked according to the normal pool rules.
+llm-relay pools set coding nim/z-ai/glm-5.2 openrouter/openai/gpt-5.2-codex
+llm-relay pools add coding gemini/gemini-2.5-flash
+llm-relay pools remove coding gemini/gemini-2.5-flash
+llm-relay pools delete coding
+
+# Dynamic pool: keep preferred members, then append discovered free models.
+llm-relay pools set coding nim/z-ai/glm-5.2 --free
+
+# Main fallback, Claude tier maps, subagent destinations, and ranking.
+llm-relay routing default nim/z-ai/glm-5.2 openrouter/openai/gpt-5.2-codex
+llm-relay routing tier sonnet pool/coding
+llm-relay routing subagent default pool/fast
+llm-relay routing sort off
+llm-relay routing tier opus --clear
+
+# Inspect or change any less-common routing field using a JSON value.
+llm-relay routing show
+llm-relay config get routing.pools
+llm-relay config set routing.ladder '[{"id":"fast","kind":"relay","spec":"pool/fast"}]'
+llm-relay config unset routing.ladder
+```
+
+`routing set <path> <value>` and `routing unset <path>` are shorter forms for paths below
+`routing`. `llm-relay pools --probe` remains the liveness check to run after changing membership;
+editing a pool does not imply that every model is usable.
 
 ---
 
