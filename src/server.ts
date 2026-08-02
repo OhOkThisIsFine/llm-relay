@@ -31,6 +31,7 @@ const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-encoding", "host",
 ]);
+const INTERNAL_REQUEST_HEADERS = new Set(["x-codex-turn-metadata"]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
 
 /** Loopback names a Host header may legitimately carry (see config.ts's bind check). */
@@ -225,10 +226,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   let targetCandidates: ResolvedTarget[];
   try {
     // A SUBAGENT request may route somewhere other than its nominal model: either an explicit
-    // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it) or
-    // routing.subagents[<tier>]. Main-conversation requests are untouched, which is what lets
-    // routing.tiers stay pointed at an Anthropic passthrough.
-    const subSpec = isMessages ? subagentSpec(reqJson, model, cfg) : null;
+    // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it),
+    // Claude's cc_is_subagent marker, or Codex's request metadata header. Main-conversation
+    // requests are untouched, which is what lets routing.tiers stay pointed at a passthrough.
+    const subSpec = subagentSpec(reqJson, model, cfg, req.headers);
     const routedModel = subSpec ?? model;
     materializeDynamicPools(cfg, h.catalog);
     // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson
@@ -1089,6 +1090,7 @@ export function buildForwardHeaders(inbound: IncomingMessage["headers"], target:
   for (const [k, v] of Object.entries(inbound)) {
     const key = k.toLowerCase();
     if (HOP_BY_HOP.has(key)) continue;
+    if (INTERNAL_REQUEST_HEADERS.has(key)) continue;
     // The REMOVAL, for both declared states. It happens before the throw below so
     // that no code path can observe a header map still carrying the caller's
     // credential — not the throw's own error, not a future caller that decides to

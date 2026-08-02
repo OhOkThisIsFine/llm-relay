@@ -44,9 +44,10 @@ model.
 
 ## Subagent offload (OPT-IN — off by default)
 
-Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests. When the
-offload switch is ON, those requests (and only those) route through `routing.subagents`
-(tier → spec); the human's own conversation never consults that map.
+Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests. Local Codex
+stamps `{"request_kind":"subagent"}` into the `x-codex-turn-metadata` header on child-agent
+Responses turns. When the offload switch is ON, those marked requests (and only those) route
+through `routing.subagents` (tier → spec); the main conversation never consults that map.
 
 ```bash
 llm-relay offload status     # where things stand
@@ -67,6 +68,40 @@ Three ways to steer a subagent, in precedence order:
 Anthropic like any other request. Check with `llm-relay offload status`, don't assume.
 
 Offloaded output is **advisory** — verify claims against source files before acting on them.
+
+### Native Codex parent with relay children
+
+Keep the parent on its normal Codex provider and define a named child agent under
+`~/.codex/agents/` whose `model_provider` is `llm-relay` and whose `model` is a relay pool such as
+`pool/coding`. Ask the parent to spawn that agent by name. This is the reliable split setup for
+local Codex clients: the parent retains native Codex orchestration, while the child spends the
+configured provider pool. The `llm-relay` profile is an all-relay mode and routes the parent too.
+
+A global npm install provisions the `llm-relay` Responses provider in `~/.codex/config.toml` and
+creates the relay-backed `default` and `relay_coding` agents under `~/.codex/agents/` when they are
+absent. It preserves existing Codex config and agent files; use the manual snippets below if the
+install script was blocked.
+
+Codex clients may additionally mark child Responses turns with
+`x-codex-turn-metadata: {"request_kind":"subagent"}`; the relay recognizes that marker and can
+retarget a nominal child model through `routing.subagents`. A named child whose model is already a
+`pool/*` reference does not depend on that private header being present.
+
+For generic, unqualified child dispatches, override Codex's built-in `default` agent with
+`~/.codex/agents/default.toml`:
+
+```toml
+name = "default"
+description = "General-purpose read-only child routed through llm-relay."
+developer_instructions = "Work read-only. Return a concise result to the parent and do not modify files."
+
+model_provider = "llm-relay"
+model = "pool/coding"
+model_reasoning_effort = "medium"
+```
+
+This keeps the parent native while generic children use `pool/coding`; named agents can still select a
+different relay pool explicitly.
 
 ## Choosing a target
 

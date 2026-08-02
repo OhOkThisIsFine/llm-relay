@@ -148,8 +148,10 @@ describe("OpenAI front (/chat/completions)", () => {
 
   it("serves Codex-style Responses requests through an Anthropic target", async () => {
     let seen: any;
+    let seenCodexMetadata: string | string[] | undefined;
     backend = await new Promise<Server>((resolve) => {
       const s = createServer((req, res) => {
+        seenCodexMetadata = req.headers["x-codex-turn-metadata"];
         const chunks: Buffer[] = [];
         req.on("data", (c) => chunks.push(c));
         req.on("end", () => {
@@ -173,7 +175,10 @@ describe("OpenAI front (/chat/completions)", () => {
     } }, "claude");
     proxy = await startProxy(c);
     const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers: {
+        "content-type": "application/json",
+        "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn" }),
+      },
       body: JSON.stringify({
         model: "claude",
         input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
@@ -184,6 +189,7 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(resp.status).toBe(200);
     expect(seen.messages[0].content[0].text).toBe("hello");
     expect(seen.max_tokens).toBe(64);
+    expect(seenCodexMetadata).toBeUndefined();
     expect(j.object).toBe("response");
     expect(j.output_text).toBe("response from Claude");
   });
@@ -233,6 +239,54 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(j.object).toBe("response");
     expect(j.output_text).toBe("response from OpenAI");
     expect(j.usage.total_tokens).toBe(10);
+  });
+
+  it("routes a Codex child Responses turn through routing.subagents", async () => {
+    const seenModels: string[] = [];
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString()) as { model?: unknown };
+          if (typeof body.model === "string") seenModels.push(body.model);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            id: "cmpl_codex_subagent",
+            model: "coding-model",
+            choices: [{ finish_reason: "stop", message: { role: "assistant", content: "from coding pool" } }],
+          }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+
+    const c = cfg({ up: {
+      base: `http://127.0.0.1:${port(backend)}`,
+      kind: "openai",
+      authHeader: "authorization",
+      timeoutMs: 5000,
+    } }, "up/main-model");
+    c.routing.pools = { coding: ["up/coding-model"] };
+    c.routing.subagents = { default: "pool/coding" };
+    c.routing.offload = true;
+    proxy = await startProxy(c);
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-codex-turn-metadata": JSON.stringify({ request_kind: "subagent" }),
+      },
+      body: JSON.stringify({
+        model: "up/main-model",
+        input: [{ role: "user", content: [{ type: "input_text", text: "inspect this" }] }],
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(seenModels).toEqual(["coding-model"]);
+    expect((await resp.json() as { output_text?: string }).output_text).toBe("from coding pool");
   });
 
   it("passes a backend 429 through with its status and body — the client's backoff owns the retry", async () => {

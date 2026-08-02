@@ -133,6 +133,13 @@ export const POOL_PREFIX = "pool";
  */
 const SUBAGENT_MARKER = "cc_is_subagent=true";
 
+/** The request headers needed for protocol-specific subagent markers. */
+export type RequestHeaders = Readonly<Record<string, string | string[] | undefined>>;
+
+/** Codex's local Responses client marks child-agent turns in this JSON header. */
+const CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata";
+const CODEX_SUBAGENT_REQUEST_KIND = "subagent";
+
 /** Routing directive the dispatcher may put on its own line in a subagent prompt. */
 const RELAY_DIRECTIVE = /^[ \t]*@relay:[ \t]*(\S+)[ \t]*$/m;
 
@@ -143,10 +150,25 @@ function systemText(system: unknown): string {
   return system.map((b) => (typeof b === "string" ? b : ((b as { text?: unknown }).text ?? ""))).join("\n");
 }
 
-/** True when this request is a Claude Code SUBAGENT rather than a main conversation. */
-export function isSubagentRequest(reqJson: unknown): boolean {
-  if (typeof reqJson !== "object" || reqJson === null) return false;
-  return systemText((reqJson as { system?: unknown }).system).includes(SUBAGENT_MARKER);
+/** True when this request is a marked Claude Code or local Codex child turn. */
+export function isSubagentRequest(reqJson: unknown, headers?: RequestHeaders): boolean {
+  if (typeof reqJson === "object" && reqJson !== null) {
+    if (systemText((reqJson as { system?: unknown }).system).includes(SUBAGENT_MARKER)) return true;
+  }
+
+  // Codex's Responses requests do not have an Anthropic `system` field. Its local clients identify
+  // child-agent turns in `x-codex-turn-metadata`; parse it defensively and fail open for ordinary
+  // turns or metadata we do not recognize. This header is intentionally not forwarded upstream.
+  const raw = Object.entries(headers ?? {}).find(([name]) => name.toLowerCase() === CODEX_TURN_METADATA_HEADER)?.[1];
+  const metadataText = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof metadataText !== "string") return false;
+  try {
+    const metadata = JSON.parse(metadataText) as unknown;
+    return typeof metadata === "object" && metadata !== null &&
+      (metadata as { request_kind?: unknown }).request_kind === CODEX_SUBAGENT_REQUEST_KIND;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -238,8 +260,8 @@ function directiveUnresolvableReason(spec: string, cfg: Config): string | null {
  * believes it offloaded, and nothing in the response says otherwise. Same rule as an unknown pool:
  * fail and name what IS configured.
  */
-export function subagentSpec(reqJson: unknown, model: string | null, cfg: Config): string | null {
-  if (!isSubagentRequest(reqJson)) return null;
+export function subagentSpec(reqJson: unknown, model: string | null, cfg: Config, headers?: RequestHeaders): string | null {
+  if (!isSubagentRequest(reqJson, headers)) return null;
   const directive = readRelayDirective(reqJson, true);
   if (directive) {
     const why = directiveUnresolvableReason(directive, cfg);
