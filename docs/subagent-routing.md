@@ -1,14 +1,15 @@
-# Subagent-aware routing
+# Client-specific offload routing
 
-How llm-relay sends Claude Code **subagents** to non-Anthropic providers while the human's own
-conversation keeps reaching real Anthropic — with no agent files and no model ids in prompts.
+How llm-relay independently sends Claude and Codex **subagents** to non-Anthropic providers, and
+optionally routes either client's main conversation through the same destination map.
 
-Shipped in **0.3.0**; **off by default since 0.4.0**. Config: `routing.subagents` gated by
-`routing.offload`. Code: `isSubagentRequest()`, `readRelayDirective()`, `subagentSpec()` in
+Shipped in **0.3.0**; **off by default since 0.4.0**. Config: `routing.subagents` gated by the
+client rules in `routing.offload`. Code: `isSubagentRequest()`, `readRelayDirective()`,
+`subagentSpec()` in
 [`src/config.ts`](../src/config.ts), applied in `handle()` in [`src/server.ts`](../src/server.ts).
 
-> **Offload is opt-in.** With `routing.offload` false (the default) a subagent routes exactly like
-> the human's own conversation. Turn it on with `llm-relay offload on`; pick a destination with
+> **Offload is opt-in.** Existing boolean configs remain supported. New configs should use one rule
+> per originating client: `claude`, `codex`, or any future client name. Pick destinations with
 > `llm-relay candidates`. See [The switch](#the-switch).
 
 ---
@@ -76,32 +77,47 @@ to normal routing — which is *safe* (passthrough) but **silent**, so nothing w
 
 ## Design
 
-For a request carrying the marker, the destination resolves in this order:
+For a marked subagent request, the destination resolves in this order:
 
 1. **`@relay: <spec>`** on its own line in the dispatcher's prompt. `<spec>` is any normal spec —
    `pool/<name>` or `<provider>/<model>`. The line is **stripped before forwarding**, so the model
    never sees it. Works whether or not the switch is on: it is the per-call opt-in.
-2. **`routing.subagents[<tier>]`** — tier substring-matched from the inbound Claude model id.
-   *Requires `routing.offload`.*
-3. **`routing.subagents.default`**. *Requires `routing.offload`.*
+2. **`routing.subagents[<tier>]`** — tier substring-matched from the inbound model id.
+   *Requires the originating client's rule to be enabled.*
+3. **`routing.subagents.default`**. *Requires the originating client's rule to be enabled.*
 4. Otherwise unchanged — normal tier/default routing.
 
-Requests **without** the marker never consult any of this. That is the invariant the whole feature
-rests on.
+Requests without the marker never consult any of this when the rule's scope is `"subagents"`.
+With scope `"all"`, ordinary requests from that client also use the map. The relay identifies
+Claude by `/v1/messages`, Codex by `/v1/responses`, and OpenAI-compatible chat by
+`/v1/chat/completions`; a future front door can use its own rule name or the explicit `default`
+rule.
 
 ```jsonc
 "routing": {
-  "offload":   false,   // master switch — subagents behave normally until this is on
   "tiers":     { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
   "subagents": { "opus": "pool/reasoning", "sonnet": "pool/coding", "haiku": "pool/fast", "default": "pool/coding" },
-  "pools":     { "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"] }
+  "pools":     { "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"] },
+  "offload": {
+    "claude": { "enabled": true, "scope": "subagents" },
+    "codex":  { "enabled": false, "scope": "all" }
+  }
 }
 ```
 
 ## The switch
 
-`routing.offload` defaults to **false**, and an absent key is false — a config written before 0.4.0
-does not start offloading on upgrade.
+The object form of `routing.offload` has one entry per originating client:
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Whether this client's offload rule is active. |
+| `scope: "subagents"` | Only marked Claude/Codex child requests use `routing.subagents`. |
+| `scope: "all"` | Marked children and the client's ordinary conversation use `routing.subagents`. |
+
+An absent key and the legacy boolean `false` are off. A legacy boolean `true` remains a global,
+subagents-only rule for backward compatibility. A `default` object rule is an explicit catch-all;
+named client rules take precedence over it.
 
 Offloading every subagent the moment a `subagents` map exists was the 0.3.x behaviour, and it is the
 wrong default: it silently changes *who is answering* for every built-in agent (Explore,
@@ -110,12 +126,17 @@ answers your reconnaissance is a decision worth making on purpose, so it is now 
 
 ```bash
 llm-relay offload status
+llm-relay offload claude on --scope subagents
+llm-relay offload codex on --scope all
+llm-relay offload claude off
 ```
 
-`on` / `off` reach the running proxy over loopback (`POST /offload`), so the change applies to the
-**next request with no restart**, and are persisted back to `config.json` so they survive one. With
-no proxy listening the CLI writes the file and says so. `GET /offload` reports state without
-changing it.
+Targeted `on` / `off` reach the running proxy over loopback (`POST /offload`), so the change applies
+to the **next request with no restart**, and is persisted back to `config.json`. The API body is
+`{"client":"codex","enabled":true,"scope":"all"}`; `GET /offload?client=codex` reads one
+rule, while `GET /offload` returns the aggregate and all configured rules. With no proxy listening
+the CLI writes the file and says so. `llm-relay dispatch --client codex` makes dispatch hints use
+the same client rule.
 
 ⚠ **Binding to loopback is not authorization**, and `/offload` no longer treats it as such. Flipping
 this switch decides which vendor answers every subagent and rewrites `config.json` on disk, so any
@@ -127,7 +148,7 @@ in [`src/server.ts`](../src/server.ts) rejects (403) any request to `/offload` o
 rebinding, where a hostile name resolves to `127.0.0.1` and so looks local to the socket); a
 mutating `POST` must additionally declare `content-type: application/json`, which is exactly what
 forces a preflight a hostile page cannot satisfy. A CLI sends no `Origin`, so an **absent** one is
-allowed — `llm-relay offload on` keeps working unchanged, and so does a hand-written `curl` that
+allowed — targeted `llm-relay offload <client> on` keeps working, as does a hand-written `curl` that
 sets the JSON content type. The proxy still does no authentication: this closes the browser-driven
 path, it does not make the endpoint safe to expose off-loopback.
 
@@ -257,8 +278,8 @@ curl -s localhost:8791/v1/messages -H 'content-type: application/json' \
 # without marker: identical body, directive ignored, goes to the passthrough
 ```
 
-The directive path is used here on purpose: it works with the switch off, so this check tests the
-marker rather than the switch. To exercise the switch itself, `llm-relay offload on` first and drop
+The directive path is used here on purpose: it works with the client rule off, so this check tests the
+marker rather than the rule. To exercise the rule itself, `llm-relay offload claude on` first and drop
 the `@relay:` line — the same bogus-pool 400 then proves `routing.subagents` is being consulted.
 
 (`/v1/messages` is a proxy path, not a control path, so the admission check described under

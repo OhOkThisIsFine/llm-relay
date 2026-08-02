@@ -84,17 +84,17 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 
 | File | Responsibility |
 |---|---|
-| `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`, `offload`, `candidates`). `offload`/`candidates` talk to a **running** proxy over loopback when there is one, so a toggle takes effect without a restart and the table gets warm health data. |
+| `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`, `--client`, `--scope`) and dispatches commands (`onboard`, `setup`, `keys`, `telemetry`, `models`, `ping`, `offload`, `candidates`). Targeted offload/candidates/dispatch queries talk to a **running** proxy over loopback when there is one, so a client rule takes effect without a restart and status gets warm health data. |
 | `dotenv.ts` | Loads `~/.llm-relay/.env` into `process.env` at startup, **never overwriting an already-set variable**. `onboard` always wrote this file and nothing ever read it, so a wizard-saved key worked for one shell and then "stopped working". The real environment wins because it is the more explicit signal. |
 | `pool-health.ts` | `llm-relay pools --probe` — sends a REAL completion to every pool member. Config-time validation cannot see a model that is listed and still dead (de-listed behind the scenes, gated to a paid tier, routed to a missing function), and that is exactly how a pool ends up with one live member and paper failover. Probes at 400 max_tokens because reasoning models return an empty 200 at a low cap — `empty` is a distinct verdict from `missing`, not a synonym. |
 | `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
-| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **subagent-aware routing** (`isSubagentRequest` reads the `cc_is_subagent=true` marker Claude Code stamps into `system`; `subagentSpec` applies `routing.subagents` — **only when `routing.offload` is on, default false** — or an `@relay:` directive read ONLY from the last text block of `messages[0]`, which works with the switch off), reshaper auto-synthesis. Also `leave_me_alone` — the onboarding-nudge suppression list, whose entries are deliberately NOT validated against the known providers (see `onboarding.ts`). |
-| `offload.ts` | The subagent-offload switch. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites only `routing.offload` in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
+| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **client-specific offload routing** (`isSubagentRequest` reads Claude/Codex child markers; `subagentSpec` applies `routing.subagents` through the originating client's `routing.offload` rule, with `scope: "subagents" | "all"`, or an `@relay:` directive read ONLY from the last text block of `messages[0]`), reshaper auto-synthesis. Also `leave_me_alone` — the onboarding-nudge suppression list, whose entries are deliberately NOT validated against the known providers (see `onboarding.ts`). |
+| `offload.ts` | Client-specific offload state. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites the targeted `routing.offload.<client>` rule in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
 | `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with tier selection (`?tier=`), host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). `routing.ladders.<tier>` supports different CLI models for reasoning/coding/fast; the legacy `routing.ladder` remains valid. Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. |
 | `dynamic-pools.ts` | Materializes `{ preferred: [...], include: "free" }` pools as an invariant fixed prefix plus every catalog-discovered free target in benchmark order. Free-provider unknown prices are admitted unless known paid; mixed providers contribute only zero-priced or explicitly free-labelled models. Replaces the tail after catalog refresh so new models need no manual config edits. |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
-| `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, `/registry`, `/telemetry`, `/ping`, `/health`, `/candidates`, `/offload`, `/dispatch`). **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
+| `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, `/registry`, `/telemetry`, `/ping`, `/health`, `/candidates`, `/offload`, `/dispatch`). Front-door paths identify the originating client for offload. **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → bidirectional OpenAI Chat/Responses adapter: direct OpenAI Chat passthrough, or OpenAI↔Anthropic request/response/SSE translation for the other combinations. Also the wire-shape helpers both paths share: `parseRetryAfterMs()` (both RFC 9110 forms; null, never 0, for garbage) and `normalizeOpenAiErrorBody()` (passes a conforming `{error:{…}}` through byte-exact, unwraps gemini's array envelope, wraps everything else). |
 | `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
 | `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai) + `FailoverReshaper` (ranked candidates from `reshaper: { pool }`; advances on transport failure only — a refusal is returned as-is, never retried elsewhere, and **exhausting every candidate throws `ReshaperTransportError`**, it does not return a refusal). |
@@ -299,10 +299,10 @@ test stale code.
   `authEnv` is unset, so a 14-member pool can resolve to 7 — and `benchmarkSort` then ranks that
   smaller list, which is why a pool's *tenth* config entry can legitimately be the one that answers.
   ⚠ This also excludes free providers that would serve WITHOUT a key but declare an unset `authEnv`.
-- **Offload is off by default and an absent `routing.offload` is false.** Don't "helpfully" default
-  it on when a `subagents` map exists — that was the 0.3.x behaviour and it silently changed which
-  vendor answered every built-in subagent. Two tests pin this (`test/config.test.ts` "offload
-  defaults to OFF", `test/offload.test.ts` "flips routing for the NEXT request").
+- **Offload is off by default.** An absent `routing.offload` and legacy `false` are off; the object
+  form is independently keyed by client and each rule defaults to subagents-only. Never infer
+  enabled state from the presence of a `subagents` map. Tests pin legacy and client-specific state
+  (`test/config.test.ts`, `test/offload.test.ts`).
 - **Don't add a blended "best target" score to `candidates.ts`.** The dimensions are deliberately
   separate; averaging them buries the judgement the reader is there to make. Tests assert no
   `score`/`rank` field, that every source keeps its own key under `scores`, and that the one
@@ -331,10 +331,10 @@ test stale code.
   own tool loop, and they return only final text — so a relay that shelled out could never return
   the `tool_use` blocks an HTTP turn owes its caller, and the subagent's granted tools would go
   silently unused. `/dispatch` hands the host a command; the host runs it. Keep it that way.
-- **Never route subagents by editing `routing.tiers`.** A subagent asking for `haiku` and a human
-  picking Haiku are byte-identical requests, so a tier→provider mapping silently drops the human's
-  own conversation onto a weak model. Tiers stay on the passthrough; `routing.subagents` is the
-  only correct place. Full reasoning: [docs/subagent-routing.md](docs/subagent-routing.md).
+- **Never use `routing.tiers` as an accidental subagent switch.** A subagent asking for `haiku` and a
+  human picking Haiku are byte-identical requests. Keep the destination map in `routing.subagents`
+  and use the originating client's explicit `routing.offload` scope; `scope: "all"` is the deliberate
+  choice when a full conversation should move too. Full reasoning: [docs/subagent-routing.md](docs/subagent-routing.md).
 
 ## Status & open work
 
@@ -378,11 +378,11 @@ Current: **usable end-to-end**, suite green, tsc clean — and verified by CI
 by a local run only. A real `claude` agentic session completes through the proxy against NIM. Full
 assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
 
-**Subagent offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): a Claude Code
-subagent — including built-ins like Explore, with no agent file — runs on a non-Anthropic provider
-while the human's own conversation stays on an Anthropic passthrough. Verified end-to-end on the
-wire. Turn it on with `llm-relay offload on` (no restart); choose a target with `llm-relay
-candidates`. Design + evidence: [docs/subagent-routing.md](docs/subagent-routing.md).
+**Client-specific offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): Claude
+and Codex rules can independently route marked children, or their full conversations with
+`scope: "all"`, to non-Anthropic providers. Verified end-to-end on the wire. Use
+`llm-relay offload <client> on --scope subagents|all` (no restart); choose a target with
+`llm-relay candidates`. Design + evidence: [docs/subagent-routing.md](docs/subagent-routing.md).
 
 Every script in `scripts/` and every proxy endpoint has been exercised live against NIM;
 `multimodal-probe.mjs` is 5/5 green.

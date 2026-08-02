@@ -102,6 +102,31 @@ describe("offload switch", () => {
     expect(state.persisted).toBe(false);
     expect(state.persistError).toMatch(/not loaded from a file/);
   });
+
+  it("persists one client's enabled state and scope without changing another client", () => {
+    const path = join(dir, "client.json");
+    writeFileSync(path, JSON.stringify({
+      ...CONFIG,
+      routing: {
+        ...CONFIG.routing,
+        offload: {
+          claude: { enabled: false, scope: "subagents" },
+          codex: { enabled: false, scope: "subagents" },
+        },
+      },
+    }, null, 2));
+    const cfg = loadConfig(path);
+
+    const state = setOffload(cfg, true, "claude", "all");
+    expect(state.client).toBe("claude");
+    expect(state.enabled).toBe(true);
+    expect(state.scope).toBe("all");
+    expect(offloadState(cfg, "codex").enabled).toBe(false);
+    expect(JSON.parse(readFileSync(path, "utf8")).routing.offload).toEqual({
+      claude: { enabled: true, scope: "all" },
+      codex: { enabled: false, scope: "subagents" },
+    });
+  });
 });
 
 describe("/offload endpoint", () => {
@@ -279,6 +304,42 @@ describe("/offload endpoint", () => {
     });
     expect(res.status).toBe(400);
     expect(cfg.routing.offload).toBe(false);
+  });
+
+  it("supports targeted /offload updates with an independent scope", async () => {
+    const path = join(dir, "targeted-endpoint.json");
+    writeFileSync(path, JSON.stringify({
+      ...CONFIG,
+      routing: {
+        ...CONFIG.routing,
+        offload: {
+          claude: { enabled: false, scope: "subagents" },
+          codex: { enabled: false, scope: "subagents" },
+        },
+      },
+    }));
+    const cfg = loadConfig(path);
+    const proxy = createProxy(cfg);
+    const port = await listen(proxy);
+
+    const res = await fetch(`http://127.0.0.1:${port}/offload`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client: "claude", enabled: true, scope: "all" }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json() as { client?: string; enabled?: boolean; scope?: string })).toMatchObject({
+      client: "claude",
+      enabled: true,
+      scope: "all",
+    });
+    expect(JSON.parse(readFileSync(path, "utf8")).routing.offload.codex).toEqual({
+      enabled: false,
+      scope: "subagents",
+    });
+
+    const codex = await (await fetch(`http://127.0.0.1:${port}/offload?client=codex`)).json() as { enabled?: boolean };
+    expect(codex.enabled).toBe(false);
   });
 });
 

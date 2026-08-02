@@ -71,6 +71,8 @@ const VALUE_FLAGS = new Set<string>([
   '--after', '-after',
   '--lane', '-lane',
   '--tier', '-tier',
+  '--client', '-client',
+  '--scope', '-scope',
   '--shell', '-shell',
 ]);
 
@@ -115,14 +117,17 @@ A provider with kind:"anthropic" and NO authEnv is a passthrough: the caller's o
 credentials are forwarded untouched. Point the tiers at one to keep real Claude
 traffic on real Anthropic while pool/* requests go to other providers.
 
-Claude Code SUBAGENTS (flagged cc_is_subagent=true on the wire) and local Codex child
-turns (flagged request_kind=subagent in x-codex-turn-metadata) may be OFFLOADED to
-other providers while the main conversation stays on normal routing. This is OFF by
-default and is a deliberate choice, not a background behaviour:
+Claude Code requests (the /v1/messages front door) and Codex requests (the /v1/responses
+front door) have independent offload rules. Each can be disabled, limited to marked
+subagents, or applied to the whole conversation:
 
-  llm-relay offload on         routing.subagents{} (a tier -> spec map) starts applying
-  llm-relay offload off        subagents route like any other request (the default)
-  llm-relay offload status     current switch state and where each tier goes
+  llm-relay offload status
+  llm-relay offload claude on --scope subagents
+  llm-relay offload codex on --scope all
+  llm-relay offload claude off
+
+The old "llm-relay offload on|off" form remains a global compatibility switch. Changes
+take effect on the next request without a restart and are persisted to the config file.
   llm-relay candidates         every dimension of every target, side by side, unranked
 
 The toggle reaches a running proxy over loopback, so it takes effect on the next
@@ -153,8 +158,8 @@ Usage:
   llm-relay models [-p <name>] [-r]               List live models per provider
   llm-relay pools [--probe]                        List pool members; --probe tests each for real
   llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
-  llm-relay offload [on|off|status]                Turn subagent offload on/off (default: off)
-  llm-relay dispatch [lane] [-t <task>] [--tier]   Which tier-specific lane to use next
+  llm-relay offload [client] [on|off|status]       Configure client offload; --scope subagents|all
+  llm-relay dispatch [lane] [-t <task>] [--tier] [--client]  Which client-specific lane to use next
   llm-relay candidates [-p <name>]                 Un-blended decision table for offload targets
   llm-relay help | --help | -h                     Show this help documentation
   llm-relay version | --version | -v               Show version number
@@ -168,8 +173,9 @@ Commands:
   telemetry                                        Output JSON telemetry & quota report
   models                                           Query live /models catalog across providers
   ping                                             Probe model latency, stability & quota metrics
-  offload on | off | status                        Master switch for subagent offload (off by default)
-  dispatch [lane]                                  Next lane; --tier reasoning|coding|fast selects ladder
+  offload [client] on|off|status                  Per-client offload; client is claude, codex, or future name
+  dispatch [lane]                                  Next lane; --client claude|codex selects offload hints;
+                                                   --tier reasoning|coding|fast selects ladder
                                                    the command, --after <lane> to walk past a spent
                                                    rung, -x/--exhausted <lane> to report one spent,
                                                    --shell sh|pwsh to quote for another shell,
@@ -205,8 +211,8 @@ Proxy Server Endpoints:
   POST /v1/responses                              OpenAI-compatible Responses front (Codex/IDE)
   GET /registry                                    Full JSON view of providers, routing & capabilities
   GET /candidates [?provider=]                     Per-target raw benchmarks, health, quota, breaker state
-  GET|POST /offload                                Read or set the subagent-offload switch {"enabled":bool}
-  GET|POST /dispatch [?tier=&lane=&after=&task=]   Next dispatch lane; POST {"exhausted":"<lane>"} to walk on
+  GET|POST /offload [?client=]                     Read/set {"enabled":bool,"scope":"subagents"|"all"}
+  GET|POST /dispatch [?client=&tier=&lane=&after=&task=]  Next dispatch lane; POST {"exhausted":"<lane>"} to walk on
   GET /telemetry                                   Live JSON telemetry, quota & stability scores for Claude
   GET /ping                                        Trigger health probe pass & query ping mode summary
   GET /health                                      Diagnostic JSON summary of provider availability & health
@@ -259,11 +265,14 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
         coding: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"],
         fast: ["nim/meta/llama-3.1-8b-instruct", "nim/openai/gpt-oss-20b"],
       },
-      // Where subagents go WHEN offload is on. Inert while `offload` is false.
+      // Where marked subagents (and, with scope "all", conversations) go when offload is on.
       subagents: { opus: "pool/coding", sonnet: "pool/coding", haiku: "pool/fast", default: "pool/coding" },
-      // Master switch, off by default: subagents route like everything else until you run
-      // `llm-relay offload on`. Silently answering as a different vendor's model has to be chosen.
-      offload: false,
+      // Per-originating-harness switches, all off by default. `scope: "all"` also reroutes the
+      // main conversation; omit it or use "subagents" to preserve the current topology.
+      offload: {
+        claude: { enabled: false, scope: "subagents" },
+        codex: { enabled: false, scope: "subagents" },
+      },
     },
     mode: "repair",
     repair: {
@@ -652,12 +661,13 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const after = argValue("--after");
   const lane = arg && !arg.startsWith("-") ? arg : argValue("--lane");
   const tier = argValue("--tier");
+  const client = argValue("--client");
 
   if (spent) {
     const live = await tryServer(cfg, "/dispatch", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ exhausted: spent, ...(tier ? { tier } : {}) }),
+      body: JSON.stringify({ exhausted: spent, ...(tier ? { tier } : {}), ...(client ? { client } : {}) }),
     });
     // Cooldowns are runtime state held by the proxy; with nothing listening there is no
     // process to remember it, and pretending otherwise would silently lose the report.
@@ -672,6 +682,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (lane) qs.set("lane", lane);
   if (after) qs.set("after", after);
   if (tier) qs.set("tier", tier);
+  if (client) qs.set("client", client);
   const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
 
   const live = (await tryServer(cfg, path)) as DispatchView | null;
@@ -682,6 +693,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
       ...(lane ? { lane } : {}),
       ...(after ? { after } : {}),
       ...(tier ? { tier } : {}),
+      ...(client ? { client } : {}),
     });
 
   if (hasFlag("--json")) {
@@ -689,7 +701,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     return;
   }
 
-  process.stdout.write(`subagent offload: ${view.offload ? "ON" : "OFF"}\n`);
+  process.stdout.write(`${view.client === "default" ? "subagent" : view.client} offload: ${view.offload ? "ON" : "OFF"}\n`);
   if (view.tier) process.stdout.write(`dispatch tier: ${view.tier}\n`);
   if (!live) process.stdout.write(`(no proxy running — live exhaustion state unknown)\n`);
   process.stdout.write("\n");
@@ -727,30 +739,58 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   process.stdout.write(`\n${view.next ? `use: ${view.next.id}` : "no lane available"} — ${view.reason}\n`);
 }
 
-/** `llm-relay offload [on|off|status]` — the subagent-offload master switch. */
-export async function runOffload(arg: string | undefined): Promise<void> {
+/** `llm-relay offload [client] [on|off|status]` — configure one client or the legacy global rule. */
+export async function runOffload(arg: string | undefined, nextArg?: string): Promise<void> {
   const cfg = loadOrExit();
-  const want = arg === "on" || arg === "enable" ? true : arg === "off" || arg === "disable" ? false : null;
+  const actions = new Set(["on", "enable", "off", "disable", "status"]);
+  const legacy = arg === undefined || actions.has(arg);
+  const client = legacy ? undefined : arg;
+  const action = legacy ? (arg ?? "status") : (nextArg ?? "status");
+  const want = action === "on" || action === "enable" ? true : action === "off" || action === "disable" ? false : null;
+  const scopeArg = argValue("--scope", "-scope");
+  const scope = scopeArg === "all" || scopeArg === "subagents" ? scopeArg : undefined;
 
-  if (want === null && arg !== undefined && arg !== "status") {
-    process.stderr.write(`llm-relay offload: expected "on", "off" or "status" (got "${arg}")\n`);
+  if (!legacy && (!client || !/^[A-Za-z0-9_.-]+$/.test(client))) {
+    process.stderr.write(`llm-relay offload: client must be a simple name such as "claude" or "codex"\n`);
+    process.exit(1);
+  }
+  if (!["on", "enable", "off", "disable", "status"].includes(action)) {
+    process.stderr.write(`llm-relay offload: expected [client] on|off|status (got "${action}")\n`);
+    process.exit(1);
+  }
+  if (scopeArg !== undefined && scope === undefined) {
+    process.stderr.write(`llm-relay offload: --scope expects "subagents" or "all"\n`);
+    process.exit(1);
+  }
+  if (scope !== undefined && client === undefined) {
+    process.stderr.write(`llm-relay offload: --scope requires a client name (claude, codex, or another configured client)\n`);
+    process.exit(1);
+  }
+  if (scope !== undefined && want === null) {
+    process.stderr.write(`llm-relay offload: --scope may be used when enabling/disabling a client\n`);
     process.exit(1);
   }
 
+  const query = client ? `?client=${encodeURIComponent(client)}` : "";
   const live = (await tryServer(
     cfg,
-    "/offload",
+    `/offload${query}`,
     want === null
       ? undefined
-      : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: want }) },
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled: want, ...(client ? { client } : {}), ...(scope ? { scope } : {}) }),
+        },
   )) as OffloadState | null;
 
   // No proxy listening: still honour the change by writing the file, but say plainly that
-  // nothing is running to apply it to.
-  const state = live ?? (want === null ? offloadState(cfg) : setOffload(cfg, want));
-
-  process.stdout.write(`subagent offload: ${state.enabled ? "ON" : "OFF"}\n`);
-  // Only a real change reports where it went; a status read must not imply it wrote anything.
+  // nothing is running to apply it.
+  const state = live ?? (want === null ? offloadState(cfg, client) : setOffload(cfg, want, client, scope));
+  const label = client ?? "global";
+  const configuredClients = state.clients ?? {};
+  const effectiveScope = state.scope ?? "subagents";
+  process.stdout.write(`${label} offload: ${state.enabled ? "ON" : "OFF"}${client ? ` (${effectiveScope})` : ""}\n`);
   if (want !== null) {
     process.stdout.write(
       live ? "  applied to the running proxy (effective now)\n" : "  no proxy listening — config file only\n",
@@ -764,17 +804,20 @@ export async function runOffload(arg: string | undefined): Promise<void> {
     process.stdout.write(`  source: ${live ? "running proxy" : `${state.configPath ?? "config"} (no proxy listening)`}\n`);
   }
 
-  if (state.enabled) {
-    const entries = Object.entries(state.subagents);
-    if (entries.length === 0) {
+  if (client) {
+    if (state.enabled && Object.keys(state.subagents).length === 0) {
       process.stdout.write("  ⚠ routing.subagents is empty — offload is on but routes nowhere\n");
-    } else {
-      process.stdout.write("\n  tier      -> target\n");
-      for (const [tier, spec] of entries) process.stdout.write(`  ${tier.padEnd(9)} -> ${spec}\n`);
     }
+    process.stdout.write(`  scope: ${effectiveScope} (subagents only, or the full ${client} conversation)\n`);
+  } else if (Object.keys(configuredClients).length > 0) {
+    process.stdout.write("\n  client    enabled  scope\n");
+    for (const [name, rule] of Object.entries(configuredClients)) {
+      process.stdout.write(`  ${name.padEnd(9)} ${(rule.enabled ? "ON" : "OFF").padEnd(8)} ${rule.scope}\n`);
+    }
+  } else if (state.enabled) {
+    process.stdout.write("  legacy global rule applies to marked subagents for every front door\n");
   } else {
-    process.stdout.write("\n  Subagents route like any other request (Anthropic passthrough).\n");
-    process.stdout.write("  An `@relay: <spec>` line in a subagent prompt still offloads that one call.\n");
+    process.stdout.write("  offload is disabled; an `@relay: <spec>` line still offloads one marked subagent call\n");
   }
 }
 
@@ -826,7 +869,10 @@ export async function runCandidates(): Promise<void> {
     return;
   }
 
-  process.stdout.write(`Offload targets — offload is ${view.offload_enabled ? "ON" : "OFF"}\n`);
+  const clientState = Object.entries(view.offload_clients ?? {})
+    .map(([name, rule]) => `${name}:${rule.enabled ? "on" : "off"}/${rule.scope}`)
+    .join(", ");
+  process.stdout.write(`Offload targets — ${clientState || `legacy/global: ${view.offload_enabled ? "on" : "off"}`}\n`);
   process.stdout.write(`${view.note}\n\n`);
 
   const head =
@@ -1010,6 +1056,7 @@ export function main(): void {
   const positionals = getPositionalArgs(process.argv);
   const arg2 = positionals[0];
   const arg3 = positionals[1];
+  const arg4 = positionals[2];
 
   if (hasFlag("--help", "-h") || arg2 === "help") {
     process.stdout.write(HELP);
@@ -1057,7 +1104,7 @@ export function main(): void {
     return;
   }
   if (arg2 === "offload") {
-    runOffload(arg3).catch((e) => {
+    runOffload(arg3, arg4).catch((e) => {
       process.stderr.write(`llm-relay offload: ${(e as Error).message}\n`);
       process.exit(1);
     });
@@ -1126,6 +1173,7 @@ export function classifyCommand(argv: string[]): CommandEffect {
   if (sub === undefined) return "mutating";
 
   const arg3 = positionals[1];
+  const arg4 = positionals[2];
   switch (sub) {
     // Writes ~/.llm-relay/.env.
     case "onboard":
@@ -1133,9 +1181,12 @@ export function classifyCommand(argv: string[]): CommandEffect {
     // `setup claude-desktop` writes claude_desktop_config.json; bare `setup` only prints.
     case "setup":
       return arg3 === "claude-desktop" || arg3 === "desktop" ? "mutating" : "read-only";
-    // `offload on|off` rewrites config.json; `offload` / `offload status` only report.
+    // `offload [client] on|off` rewrites config.json; status forms only report.
     case "offload":
-      return arg3 === "on" || arg3 === "enable" || arg3 === "off" || arg3 === "disable" ? "mutating" : "read-only";
+      return arg3 === "on" || arg3 === "enable" || arg3 === "off" || arg3 === "disable" ||
+        arg4 === "on" || arg4 === "enable" || arg4 === "off" || arg4 === "disable"
+        ? "mutating"
+        : "read-only";
     // keys, check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
     // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a
     // running proxy's in-memory cooldowns and changes nothing on this machine.

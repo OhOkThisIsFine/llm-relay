@@ -10,6 +10,22 @@ export type Kind = "anthropic" | "openai";
 
 export type ProviderTierType = "free" | "mixed" | "subscription";
 
+/** Which requests a client-specific offload rule may reroute. */
+export type OffloadScope = "subagents" | "all";
+
+/** One independently controlled offload rule. */
+export interface OffloadRule {
+  enabled: boolean;
+  scope: OffloadScope;
+}
+
+/**
+ * `false`/`true` is the backwards-compatible global switch. The object form is keyed by
+ * originating harness (`claude`, `codex`, or a future client name), with `default` available as
+ * an explicit catch-all for a client that has not got a dedicated rule yet.
+ */
+export type OffloadConfig = boolean | Record<string, OffloadRule>;
+
 export interface ReshaperConfig {
   base: string;
   model: string;
@@ -67,15 +83,12 @@ export interface Routing {
    */
   subagents?: Record<string, string>;
   /**
-   * Master switch for subagent offload. **Default false** — subagents route exactly like the
-   * human's own conversation (i.e. straight to the Anthropic passthrough) until offload is
-   * deliberately turned on. Offloading every subagent by default is a surprising, invisible
-   * change of who is answering; it has to be a decision.
-   *
-   * Gates `subagents` ONLY. An explicit `@relay:` directive in a subagent prompt is a per-call
-   * opt-in and is honoured whether or not this is on.
+   * Offload admission. The legacy boolean is a global subagent-only switch. The object form is
+   * independently keyed by originating client (`claude`, `codex`, or a future name), and each
+   * rule chooses whether it applies to marked subagents only or to every conversation from that
+   * client. **Default false** in either form.
    */
-  offload?: boolean;
+  offload?: OffloadConfig;
   benchmarkSort?: boolean;
   /**
    * Ordered dispatch ladder consulted by `/dispatch` — which LANE a host agent should hand a
@@ -246,12 +259,45 @@ function directiveUnresolvableReason(spec: string, cfg: Config): string | null {
 }
 
 /**
- * The spec a subagent request should route to, or null to leave routing unchanged.
+ * The client names used by the built-in front doors. Other clients may use their own key in the
+ * object form of `routing.offload`, or fall back to the explicit `default` rule.
+ */
+export const CLAUDE_CLIENT = "claude";
+export const CODEX_CLIENT = "codex";
+export const OPENAI_CLIENT = "openai";
+export const DEFAULT_CLIENT = "default";
+
+/** Map a relay front-door path to the originating harness name used by offload settings. */
+export function clientForPath(pathname: string): string {
+  if (pathname === "/v1/messages" || pathname.startsWith("/v1/messages/")) return CLAUDE_CLIENT;
+  if (pathname === "/v1/responses" || pathname === "/responses") return CODEX_CLIENT;
+  if (pathname === "/v1/chat/completions" || pathname === "/chat/completions") return OPENAI_CLIENT;
+  return DEFAULT_CLIENT;
+}
+
+/** Return the effective rule for one originating client. Legacy booleans apply everywhere. */
+export function offloadRule(cfg: Pick<Config, "routing">, client = CLAUDE_CLIENT): OffloadRule {
+  const configured = cfg.routing.offload;
+  if (typeof configured === "boolean" || configured === undefined) {
+    return { enabled: configured === true, scope: "subagents" };
+  }
+  return configured[client] ?? configured[DEFAULT_CLIENT] ?? { enabled: false, scope: "subagents" };
+}
+
+/** Whether any named client rule is active; used by aggregate status surfaces. */
+export function anyOffloadEnabled(cfg: Pick<Config, "routing">): boolean {
+  const configured = cfg.routing.offload;
+  if (typeof configured === "boolean" || configured === undefined) return configured === true;
+  return Object.values(configured).some((rule) => rule.enabled);
+}
+
+/**
+ * The spec a request should route to, or null to leave routing unchanged.
  *
- * Precedence: an explicit `@relay:` directive (per-call opt-in, works even with offload off) >
+ * Precedence: an explicit `@relay:` directive (per-call opt-in, works even with the client rule off) >
  * `routing.subagents[<tier>]` > `routing.subagents.default` — the last two only when
- * `routing.offload` is on. Offload off is the default, so a subagent behaves like any other
- * request until someone turns it on.
+ * the effective client rule is enabled. A `scope: "subagents"` rule only applies to marked child
+ * requests; `scope: "all"` also applies to the client's main conversation.
  *
  * ⚠ An unresolvable directive is a loud `RoutingError`, never a quiet fall-through. The map forms
  * are validated at config load (`assertSpecResolvable`), but a directive arrives per request and
@@ -260,9 +306,17 @@ function directiveUnresolvableReason(spec: string, cfg: Config): string | null {
  * believes it offloaded, and nothing in the response says otherwise. Same rule as an unknown pool:
  * fail and name what IS configured.
  */
-export function subagentSpec(reqJson: unknown, model: string | null, cfg: Config, headers?: RequestHeaders): string | null {
-  if (!isSubagentRequest(reqJson, headers)) return null;
-  const directive = readRelayDirective(reqJson, true);
+export function subagentSpec(
+  reqJson: unknown,
+  model: string | null,
+  cfg: Config,
+  headers?: RequestHeaders,
+  client = CLAUDE_CLIENT,
+): string | null {
+  const isSubagent = isSubagentRequest(reqJson, headers);
+  // An explicit directive remains a subagent-only, per-call opt-in. A human conversation must
+  // never be able to reroute itself by having matching text in its own prompt.
+  const directive = isSubagent ? readRelayDirective(reqJson, true) : null;
   if (directive) {
     const why = directiveUnresolvableReason(directive, cfg);
     if (why !== null) {
@@ -273,7 +327,8 @@ export function subagentSpec(reqJson: unknown, model: string | null, cfg: Config
     }
     return directive;
   }
-  if (!cfg.routing.offload) return null;
+  const rule = offloadRule(cfg, client);
+  if (!rule.enabled || (!isSubagent && rule.scope !== "all")) return null;
   const map = cfg.routing.subagents;
   if (!map) return null;
   const tier = model ? detectTier(model) : null;
@@ -846,9 +901,7 @@ function parseRouting(
   }
 
   const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
-  // Absent => false. Offload is opt-in: a missing key must never mean "send every subagent
-  // to another provider", which is what an implicit-on default would do to an existing config.
-  const offload = r.offload === true;
+  const offload = parseOffload(r.offload);
   const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
@@ -932,6 +985,39 @@ function parseRouting(
     }
   }
   return routing;
+}
+
+/** Parse the legacy global switch or the independently keyed client-rule form. */
+function parseOffload(raw: unknown): OffloadConfig {
+  // Absent => false. Offload is opt-in: a missing key must never mean "send every request to
+  // another provider", which is what an implicit-on default would do to an existing config.
+  if (raw === undefined) return false;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config.routing.offload must be a boolean or an object keyed by client`);
+  }
+
+  const out: Record<string, OffloadRule> = {};
+  for (const [client, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (client.length === 0) throw new Error(`config.routing.offload client name must not be empty`);
+    if (typeof value === "boolean") {
+      out[client] = { enabled: value, scope: "subagents" };
+      continue;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`config.routing.offload.${client} must be a boolean or {"enabled":bool,"scope":...}`);
+    }
+    const rule = value as { enabled?: unknown; scope?: unknown };
+    if (typeof rule.enabled !== "boolean") {
+      throw new Error(`config.routing.offload.${client}.enabled must be true or false`);
+    }
+    const scope = rule.scope === undefined ? "subagents" : rule.scope;
+    if (scope !== "subagents" && scope !== "all") {
+      throw new Error(`config.routing.offload.${client}.scope must be "subagents" or "all"`);
+    }
+    out[client] = { enabled: rule.enabled, scope };
+  }
+  return out;
 }
 
 /**

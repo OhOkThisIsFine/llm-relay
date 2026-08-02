@@ -10,6 +10,8 @@ import {
   isSubagentRequest,
   subagentSpec,
   readRelayDirective,
+  offloadRule,
+  clientForPath,
 } from "../src/config.js";
 
 // Eager (not in beforeAll) so describe-body loadConfig(write(...)) calls work at collection.
@@ -547,6 +549,80 @@ describe("subagent-aware routing", () => {
       ],
     };
     expect(subagentSpec(multiMsgValid, "claude-opus-5", cfg)).toBe("pool/fast");
+  });
+});
+
+describe("client-specific offload routing", () => {
+  const SUB = "x-anthropic-billing-header: cc_is_subagent=true;";
+  const MAIN = "x-anthropic-billing-header: cc_entrypoint=sdk-cli;";
+  const request = (system: string) => ({
+    system,
+    messages: [{ role: "user", content: [{ type: "text", text: "do the task" }] }],
+  });
+
+  it("parses independent client rules and identifies built-in front doors", () => {
+    const cfg = loadConfig(write("client-offload.json", base({
+      routing: {
+        default: "nim/model",
+        tiers: { opus: "nim/model" },
+        pools: { coding: ["nim/model"] },
+        subagents: { default: "pool/coding" },
+        offload: {
+          claude: { enabled: true, scope: "all" },
+          codex: { enabled: false, scope: "subagents" },
+        },
+      },
+    })));
+
+    expect(cfg.routing.offload).toEqual({
+      claude: { enabled: true, scope: "all" },
+      codex: { enabled: false, scope: "subagents" },
+    });
+    expect(offloadRule(cfg, "claude")).toEqual({ enabled: true, scope: "all" });
+    expect(offloadRule(cfg, "codex")).toEqual({ enabled: false, scope: "subagents" });
+    expect(clientForPath("/v1/messages")).toBe("claude");
+    expect(clientForPath("/v1/responses")).toBe("codex");
+    expect(clientForPath("/v1/chat/completions")).toBe("openai");
+  });
+
+  it("can reroute a Claude main conversation while leaving Codex disabled", () => {
+    const cfg = loadConfig(write("client-scope.json", base({
+      routing: {
+        default: "nim/model",
+        tiers: { opus: "nim/model" },
+        pools: { coding: ["nim/model"] },
+        subagents: { default: "pool/coding" },
+        offload: {
+          claude: { enabled: true, scope: "all" },
+          codex: { enabled: false, scope: "all" },
+        },
+      },
+    })));
+
+    expect(subagentSpec(request(MAIN), "claude-opus-5", cfg, undefined, "claude")).toBe("pool/coding");
+    expect(subagentSpec(request(SUB), "codex-model", cfg, undefined, "codex")).toBeNull();
+    // A subagents-only rule leaves a main conversation on its normal route.
+    cfg.routing.offload = { claude: { enabled: true, scope: "subagents" } };
+    expect(subagentSpec(request(MAIN), "claude-opus-5", cfg, undefined, "claude")).toBeNull();
+    expect(subagentSpec(request(SUB), "claude-opus-5", cfg, undefined, "claude")).toBe("pool/coding");
+  });
+
+  it("accepts an explicit default rule for future front doors", () => {
+    const cfg = loadConfig(write("client-default.json", base({
+      routing: {
+        default: "nim/model",
+        pools: { coding: ["nim/model"] },
+        subagents: { default: "pool/coding" },
+        offload: { default: { enabled: true, scope: "all" } },
+      },
+    })));
+    expect(subagentSpec(request(MAIN), "future-model", cfg, undefined, "future-client")).toBe("pool/coding");
+  });
+
+  it("rejects an invalid client offload scope", () => {
+    expect(() => loadConfig(write("client-offload-invalid.json", base({
+      routing: { default: "nim/model", offload: { claude: { enabled: true, scope: "conversation" } } },
+    })))).toThrow(/scope must be "subagents" or "all"/);
   });
 });
 

@@ -368,6 +368,8 @@ describe("classifyCommand — the update-check gate", () => {
 
     expect(classifyCommand(argv("offload", "on"))).toBe("mutating");
     expect(classifyCommand(argv("offload", "off"))).toBe("mutating");
+    expect(classifyCommand(argv("offload", "claude", "on", "--scope", "all"))).toBe("mutating");
+    expect(classifyCommand(argv("offload", "codex", "status"))).toBe("read-only");
     expect(classifyCommand(argv("offload", "status"))).toBe("read-only");
     expect(classifyCommand(argv("offload"))).toBe("read-only");
 

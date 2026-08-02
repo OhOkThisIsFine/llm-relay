@@ -64,7 +64,7 @@ llm-relay
 - **Multi-Candidate Failover**: `routing.default` and every `routing.tiers` entry accept an **array** of target specs (e.g. `["nim/z-ai/glm-5.2", "groq/llama-3.3-70b"]`) for continuous fallback. ⚠ Ranking and failover both require **more than one** candidate — a single pinned model silently disables both, and on providers where a listed model may not actually be servable that turns one dead backend into a dead relay. Prefer arrays.
 - **Named pools** (`routing.pools`, addressed as `model: "pool/<name>"`): the same ranked-candidate behaviour for callers that can only send **one model string** — notably Claude Code subagent frontmatter. Lets an agent ask for *the best available coding model* instead of naming one. An unknown pool is a loud 400, never a silent fall-through.
 - **Passthrough targets**: a provider with `kind:"anthropic"` and **no `authEnv`** forwards the caller's own credentials untouched, so real Claude traffic stays on real Anthropic while `pool/*` requests route elsewhere — from the same proxy.
-- **Subagent offload** (`routing.offload` + `routing.subagents`): route Claude Code *subagents* to other providers while the human's own conversation stays on passthrough — with no agent files and no model ids in the prompt. **Off by default**; `llm-relay offload on` flips it without a restart, `llm-relay candidates` shows what to point it at. See below.
+- **Granular offload** (`routing.offload` + `routing.subagents`): independently route Claude, Codex, and future client requests to other providers. Each client can be limited to subagents or set to `scope: "all"` to reroute its main conversation too. **Off by default**; `llm-relay candidates` shows what to point it at. See below.
 
 ### 3. Prompt Token & Context Length Guardrails
 - Estimates the request's prompt token count (`estimateRequestTokens`) against the target model's context limit, read from the warm catalog cache (`cachedLimits()` — it never fetches, so a cold cache costs no round-trip on the request path).
@@ -89,7 +89,7 @@ llm-relay
 
 ### 6. Programmatic Telemetry & Quota Access for Claude
 - **Read-only HTTP endpoints**: `GET /telemetry` (live JSON metrics), `GET /registry` (full provider/routing/model catalog with quality scores), `GET /ping` (trigger health probe pass & mode summary), `GET /health` (diagnostic status), `GET /candidates` (the un-blended offload decision table).
-- **Mutating HTTP endpoints**: `GET|POST /offload` (read/flip the subagent-offload switch), `GET|POST /dispatch` (the dispatch ladder). ⚠ **Loopback is not authorization** — any page you visit can POST cross-origin to a loopback listener without a preflight, and these two write your `config.json` and steer lane order. They therefore reject a present-but-non-loopback `Origin` with 403, require `content-type: application/json` on a mutating request, and require a loopback `Host` (closing DNS rebinding). An **absent** `Origin` is allowed on purpose — that is what a CLI sends, and it is what keeps `llm-relay offload on` working against a running proxy with no restart.
+- **Mutating HTTP endpoints**: `GET|POST /offload` (read/set per-client offload rules), `GET|POST /dispatch` (the dispatch ladder). ⚠ **Loopback is not authorization** — any page you visit can POST cross-origin to a loopback listener without a preflight, and these two write your `config.json` and steer lane order. They therefore reject a present-but-non-loopback `Origin` with 403, require `content-type: application/json` on a mutating request, and require a loopback `Host` (closing DNS rebinding). An **absent** `Origin` is allowed on purpose — that is what a CLI sends, and it is what keeps targeted offload changes working against a running proxy with no restart.
 - **CLI Commands**: `llm-relay telemetry` outputs live telemetry metrics; `llm-relay models` lists live model catalogs with SWE-bench & quality scores; `llm-relay ping` performs live health & latency probes.
 - **Response Headers**: Proxy responses include `x-llm-relay-quota-percent`, `x-llm-relay-stability-score`, and `x-llm-relay-target`.
 
@@ -108,9 +108,9 @@ llm-relay
 | `llm-relay telemetry` | Output live JSON telemetry, stability scores, and quota metrics |
 | `llm-relay models [-p <name>] [-r]` | Query live `/models` catalog per provider (`-p` filter, `-r` force refresh) |
 | `llm-relay ping [-p <name>]` | Perform live health, latency & quota probe across providers |
-| `llm-relay offload [on\|off\|status]` | Read or flip the subagent-offload switch — applies to the next request, no restart |
+| `llm-relay offload [client] [on\|off\|status] [--scope subagents\|all]` | Read or change one client's offload rule; changes apply to the next request, no restart |
 | `llm-relay candidates [-p <name>]` | The un-blended offload decision table (capability, cost, live health, quota, breaker state) |
-| `llm-relay dispatch [lane] [-t <task>]` | Which lane to hand a whole delegated task to next; it returns the command, **you** run it (`-x <lane>` reports one spent) |
+| `llm-relay dispatch [lane] [-t <task>] [--client <name>]` | Which lane to hand a whole delegated task to next; it returns the command, **you** run it (`-x <lane>` reports one spent) |
 
 ---
 
@@ -406,47 +406,51 @@ refusing safe calls. So:
 There is no built-in list inside the proxy: an empty `repair.destructiveTools` refuses nothing, so
 coverage is always traceable to your config.
 
-### Subagent offload (`routing.offload` + `routing.subagents`)
+### Granular offload (`routing.offload` + `routing.subagents`)
 
-Send Claude Code **subagents** to other providers while the human's own conversation stays on the
-Anthropic passthrough — without writing agent files and without naming a model. The same routing
-map also works for local Codex child-agent turns arriving through the OpenAI Responses front.
-
-**Off by default.** Until you turn it on, subagents route exactly like everything else:
-
-```bash
-llm-relay offload on
-```
-
-That reaches the running proxy over loopback, so it applies to the next request without a restart,
-and is persisted to `config.json` so it survives one. `llm-relay offload status` shows the state and
-where each tier goes; `off` reverts.
+Offload rules are keyed by the originating harness. Claude requests use the `/v1/messages` front
+door; Codex requests use `/v1/responses`. Each rule is independent and chooses whether it applies
+to marked subagents only (the current behavior) or to the whole conversation:
 
 ```jsonc
 "routing": {
-  "offload":   false,   // master switch (default). `subagents` is inert until this is true.
   "tiers":     { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
-  "subagents": { "opus": "pool/reasoning", "haiku": "pool/fast", "default": "pool/coding" }
+  "subagents": { "opus": "pool/reasoning", "haiku": "pool/fast", "default": "pool/coding" },
+  "offload": {
+    "claude": { "enabled": true,  "scope": "subagents" },
+    "codex":  { "enabled": false, "scope": "all" }
+  }
 }
 ```
 
-Why opt-in: offloading silently changes *which model answers* for every built-in agent (Explore,
-general-purpose, every one-off dispatch). That is worth deciding on purpose rather than inheriting
-from the presence of a config key.
+`scope: "subagents"` preserves the existing topology. `scope: "all"` also applies the same
+`routing.subagents` tier/default map to the client's main conversation, which is useful when a
+Claude or Codex quota is exhausted. Rules may use any future client name; an explicit `default`
+rule is the opt-in catch-all for otherwise unnamed front doors. All rules are off by default.
+
+The CLI changes one client without restarting the proxy:
+
+```bash
+llm-relay offload status
+llm-relay offload claude on --scope subagents
+llm-relay offload codex on --scope all
+llm-relay offload claude off
+```
+
+The old `llm-relay offload on|off` command remains a global compatibility switch for configs that
+still use the boolean form (`"offload": false`). `GET /offload?client=claude` reads one rule;
+`POST /offload` accepts `{"client":"claude","enabled":true,"scope":"all"}`. Changes are
+persisted and take effect on the next request.
 
 Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests (built-in
-agents like Explore included — verified on the wire, Claude Code 2.1.220). llm-relay reads that flag
-and only then consults `routing.subagents`. Local Codex instead stamps
-`x-codex-turn-metadata: {"request_kind":"subagent",...}` on child-agent turns; ordinary
-`request_kind: "turn"` requests stay on normal routing. **This explicit marker is the entire reason
-the feature is safe.**
-Without the flag, a subagent asking for `haiku` and a human picking Haiku are byte-identical
-requests, so any tier→provider mapping silently drops the human's own conversation onto a weak
-model. `routing.tiers` therefore stays free to point at a passthrough.
+agents like Explore included — verified on the wire, Claude Code 2.1.220). Local Codex stamps
+`x-codex-turn-metadata: {"request_kind":"subagent",...}` on child-agent turns. A subagents-only
+rule requires that marker; an all-scope rule also accepts ordinary main-conversation requests.
+An explicit `@relay:` directive remains a subagent-only per-call opt-in, even when a client has an
+all-scope rule, so text in a human conversation cannot self-reroute it.
 
-A dispatcher then chooses a destination with the one per-call knob it already has — the Agent tool's
-`model` parameter (`sonnet|opus|haiku|fable`) — or by not choosing at all, in which case
-`subagents.default` applies and the pool's ranking picks the model.
+A dispatcher chooses a destination with the Agent tool's `model` parameter (`sonnet|opus|haiku|fable`)
+or, when it does not choose, `subagents.default` applies and the pool's ranking picks the model.
 
 **To pin an exact model for one call**, put a directive on its own line in the subagent's prompt:
 
@@ -464,9 +468,9 @@ authored prompt. Block 0 is Claude Code's injected `<system-reminder>` (your CLA
 …), and later messages carry tool results, i.e. file contents. Reading either would let any file a
 subagent happens to read redirect its own routing. Both cases are covered by tests.
 
-Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` →
-`subagents.default` → normal routing. The middle two apply only while `routing.offload` is on; omit
-`routing.subagents` entirely and nothing changes either way.
+Precedence for a marked subagent request: `@relay:` directive → `subagents[<tier>]` →
+`subagents.default` → normal routing. The map applies only when that request's client rule is
+enabled and its scope admits the request; omit `routing.subagents` entirely and nothing changes.
 
 #### Local Codex setup
 
@@ -515,11 +519,14 @@ Run Codex normally, without the `llm-relay` profile. Ask the parent to use exact
 type `relay_coding`; Codex keeps the parent on its normal provider and starts the child through the
 relay. The relay pool then chooses the configured provider and can fail over normally.
 
-Keep `routing.offload` enabled in `~/.llm-relay/config.json`:
+Enable only Codex child offload in `~/.llm-relay/config.json`:
 
 ```bash
-llm-relay offload on
+llm-relay offload codex on --scope subagents
 ```
+
+To redirect the parent Codex conversation through the same relay as well, use
+`llm-relay offload codex on --scope all`. Claude's rule is unaffected.
 
 The `llm-relay` profile remains available as an explicit all-relay mode, but it routes the parent
 through the relay too and is not the split setup described above. The automatic

@@ -289,6 +289,54 @@ describe("OpenAI front (/chat/completions)", () => {
     expect((await resp.json() as { output_text?: string }).output_text).toBe("from coding pool");
   });
 
+  it("routes a Codex main Responses conversation only when codex scope is all", async () => {
+    const seenModels: string[] = [];
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString()) as { model?: unknown };
+          if (typeof body.model === "string") seenModels.push(body.model);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            id: "cmpl_codex_main",
+            model: "coding-model",
+            choices: [{ finish_reason: "stop", message: { role: "assistant", content: "from coding pool" } }],
+          }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+
+    const c = cfg({ up: {
+      base: `http://127.0.0.1:${port(backend)}`,
+      kind: "openai",
+      authHeader: "authorization",
+      timeoutMs: 5000,
+    } }, "up/main-model");
+    c.routing.pools = { coding: ["up/coding-model"] };
+    c.routing.subagents = { default: "pool/coding" };
+    c.routing.offload = {
+      claude: { enabled: false, scope: "subagents" },
+      codex: { enabled: true, scope: "all" },
+    };
+    proxy = await startProxy(c);
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "up/main-model",
+        input: [{ role: "user", content: [{ type: "input_text", text: "continue here" }] }],
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(seenModels).toEqual(["coding-model"]);
+    expect((await resp.json() as { output_text?: string }).output_text).toBe("from coding pool");
+  });
+
   it("passes a backend 429 through with its status and body — the client's backoff owns the retry", async () => {
     // The front is a reverse proxy: rewriting a rate limit into a 502 would strip the
     // Retry-After semantics the caller needs, and hide a quota problem as a proxy fault.

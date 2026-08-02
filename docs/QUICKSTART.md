@@ -125,21 +125,26 @@ provider, and nonetheless dead. Anything reported `DEAD` or `AUTH` should be rem
 
 ---
 
-## Stage 3 — turn on subagent offload
+## Stage 3 — choose client-specific offload
 
-This is the switch that actually saves quota. It is **off by default**, deliberately.
+Offload is **off by default**, deliberately. Enable only the harnesses and request scope you want:
 
 ```bash
-llm-relay offload on
+llm-relay offload claude on --scope subagents
+llm-relay offload codex on --scope all
 ```
 
-Now Claude Code subagents (Explore, general-purpose, custom agents) route to your free pools,
-while your own conversation stays on your subscription. Takes effect on the next request; no
-restart.
+Claude Code subagents (Explore, general-purpose, custom agents) now route to your free pools while
+the Claude conversation stays on its normal route. Codex is independently configured; `--scope all`
+also routes the Codex parent conversation through the pool. Changes take effect on the next request;
+no restart.
 
 ```bash
 llm-relay offload status
 ```
+
+Use `llm-relay offload claude off` or `llm-relay offload codex off` to disable one harness. The old
+`llm-relay offload on|off` form remains a global compatibility switch.
 
 To offload a **single** dispatch without turning the switch on globally, put this as the first
 line of that subagent's prompt:
