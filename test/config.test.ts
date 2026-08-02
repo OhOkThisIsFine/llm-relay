@@ -373,6 +373,22 @@ describe("subagent-aware routing", () => {
     expect(isSubagentRequest({})).toBe(false);
   });
 
+  it("detects Codex child turns from explicit request metadata only", () => {
+    const childHeaders = { "x-codex-turn-metadata": JSON.stringify({ request_kind: "subagent" }) };
+    const mainHeaders = { "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn" }) };
+    expect(isSubagentRequest({}, childHeaders)).toBe(true);
+    expect(isSubagentRequest({}, mainHeaders)).toBe(false);
+    expect(isSubagentRequest({}, { "x-codex-turn-metadata": "not-json" })).toBe(false);
+    expect(isSubagentRequest({}, { "x-codex-turn-metadata": JSON.stringify({ request_kind: "other" }) })).toBe(false);
+  });
+
+  it("routes a Codex child turn through the same subagent map", () => {
+    const childHeaders = { "x-codex-turn-metadata": JSON.stringify({ request_kind: "subagent" }) };
+    const mainHeaders = { "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn" }) };
+    expect(subagentSpec({ model: "pool/reasoning" }, "pool/reasoning", cfg, childHeaders)).toBe("pool/coding");
+    expect(subagentSpec({ model: "pool/reasoning" }, "pool/reasoning", cfg, mainHeaders)).toBeNull();
+  });
+
   it("leaves MAIN-conversation requests entirely alone (tiers stay on passthrough)", () => {
     const main = { system: MAIN, messages: [{ role: "user", content: [{ type: "text", text: "@relay: pool/coding" }] }] };
     // Even a literal directive must not reroute a human's own conversation.

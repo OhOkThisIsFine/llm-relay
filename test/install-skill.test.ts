@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
  *     package.json as `|| exit 0`, which also swallowed the reason);
  *   - it must never be silent about a failure, and must never touch ~/.claude or ~/.codex on a
  *     local install;
- *   - Claude and Codex must receive byte-for-byte identical descriptions from the shipped source.
+ *   - Claude and Codex must receive byte-for-byte identical descriptions from the shipped source;
+ *     global installs also provision the Codex provider and relay child agents.
  *
  * HOME and USERPROFILE are both redirected at a temp dir so the real developer machine is never
  * written to — `os.homedir()` reads USERPROFILE on Windows and HOME elsewhere.
@@ -35,6 +36,9 @@ function run(args: string[], home: string, extraEnv: Record<string, string> = {}
 const installedPaths = (home: string) => ({
   claude: join(home, ".claude", "skills", "llm-relay", "SKILL.md"),
   codex: join(home, ".codex", "skills", "llm-relay", "SKILL.md"),
+  codexConfig: join(home, ".codex", "config.toml"),
+  defaultAgent: join(home, ".codex", "agents", "default.toml"),
+  codingAgent: join(home, ".codex", "agents", "relay_coding.toml"),
 });
 
 describe("install-skill postinstall hook", () => {
@@ -66,6 +70,12 @@ describe("install-skill postinstall hook", () => {
     expect(readFileSync(paths.claude, "utf8")).toBe(readFileSync(paths.codex, "utf8"));
     expect(r.stderr).toContain("installed Claude Code skill");
     expect(r.stderr).toContain("installed Codex skill");
+    expect(readFileSync(paths.codexConfig, "utf8")).toContain("[model_providers.llm-relay]");
+    expect(readFileSync(paths.codexConfig, "utf8")).toContain('base_url = "http://127.0.0.1:8791/v1"');
+    expect(readFileSync(paths.defaultAgent, "utf8")).toContain('model = "pool/coding"');
+    expect(readFileSync(paths.codingAgent, "utf8")).toContain('model_provider = "llm-relay"');
+    expect(r.stderr).toContain("Codex provider configured");
+    expect(r.stderr).toContain("Codex agent installed");
   });
 
   it("--force installs regardless of install context", () => {
@@ -74,6 +84,34 @@ describe("install-skill postinstall hook", () => {
     expect(r.status).toBe(0);
     expect(existsSync(paths.claude)).toBe(true);
     expect(existsSync(paths.codex)).toBe(true);
+    expect(existsSync(paths.codexConfig)).toBe(true);
+    expect(existsSync(paths.defaultAgent)).toBe(true);
+    expect(existsSync(paths.codingAgent)).toBe(true);
+  });
+
+  it("preserves existing Codex config and agent files and stays idempotent", () => {
+    const paths = installedPaths(home);
+    mkdirSync(join(home, ".codex", "agents"), { recursive: true });
+    const existingConfig = "model = \"gpt-5\"\n\n[model_providers.openai]\nname = \"openai\"\n";
+    const existingDefault = "name = \"default\"\ndescription = \"user choice\"\n";
+    writeFileSync(paths.codexConfig, existingConfig);
+    writeFileSync(paths.defaultAgent, existingDefault);
+
+    const first = run([], home, { npm_config_global: "true" });
+    const afterFirstConfig = readFileSync(paths.codexConfig, "utf8");
+    const afterFirstDefault = readFileSync(paths.defaultAgent, "utf8");
+    const second = run([], home, { npm_config_global: "true" });
+    const afterSecondConfig = readFileSync(paths.codexConfig, "utf8");
+
+    expect(first.status).toBe(0);
+    expect(second.status).toBe(0);
+    expect(afterFirstConfig).toContain(existingConfig);
+    expect(afterFirstConfig.match(/\[model_providers\.llm-relay\]/g)).toHaveLength(1);
+    expect(afterSecondConfig).toBe(afterFirstConfig);
+    expect(afterFirstDefault).toBe(existingDefault);
+    expect(readFileSync(paths.codingAgent, "utf8")).toContain('model = "pool/coding"');
+    expect(second.stderr).toContain("Codex provider already configured");
+    expect(second.stderr).toContain("Codex agent already exists");
   });
 
   it("exits 0 AND explains itself when the copy cannot happen", () => {

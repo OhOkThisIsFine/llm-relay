@@ -180,8 +180,14 @@ directories: `~/.claude/skills/llm-relay/SKILL.md` for Claude Code and
 switch, `@relay:` directives, reading the candidates table, failure modes) cannot drift between
 hosts. Both refresh automatically on every upgrade; local/dev installs touch neither directory.
 
+The same global install also provisions local Codex: it adds the `llm-relay` Responses provider to
+`~/.codex/config.toml` and creates relay-backed `default` and `relay_coding` child agents under
+`~/.codex/agents/` when those files are absent. Existing Codex config and agent files are preserved.
+This keeps the parent on its normal provider while making generic or named child dispatches use the
+relay automatically.
+
 If your npm blocks unknown install scripts (`npm warn install-scripts … blocked`), allow this one —
-`npm config set allow-scripts=llm-relay --location=user` — or install the skill by hand:
+`npm config set allow-scripts=llm-relay --location=user` — or install the host integrations by hand:
 `node "$(npm root -g)/llm-relay/scripts/install-skill.mjs" --force`.
 
 ### Staying current
@@ -403,7 +409,8 @@ coverage is always traceable to your config.
 ### Subagent offload (`routing.offload` + `routing.subagents`)
 
 Send Claude Code **subagents** to other providers while the human's own conversation stays on the
-Anthropic passthrough — without writing agent files and without naming a model.
+Anthropic passthrough — without writing agent files and without naming a model. The same routing
+map also works for local Codex child-agent turns arriving through the OpenAI Responses front.
 
 **Off by default.** Until you turn it on, subagents route exactly like everything else:
 
@@ -429,7 +436,10 @@ from the presence of a config key.
 
 Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests (built-in
 agents like Explore included — verified on the wire, Claude Code 2.1.220). llm-relay reads that flag
-and only then consults `routing.subagents`. **This is the entire reason the feature is safe.**
+and only then consults `routing.subagents`. Local Codex instead stamps
+`x-codex-turn-metadata: {"request_kind":"subagent",...}` on child-agent turns; ordinary
+`request_kind: "turn"` requests stay on normal routing. **This explicit marker is the entire reason
+the feature is safe.**
 Without the flag, a subagent asking for `haiku` and a human picking Haiku are byte-identical
 requests, so any tier→provider mapping silently drops the human's own conversation onto a weak
 model. `routing.tiers` therefore stays free to point at a passthrough.
@@ -457,6 +467,69 @@ subagent happens to read redirect its own routing. Both cases are covered by tes
 Precedence for a subagent request: `@relay:` directive → `subagents[<tier>]` →
 `subagents.default` → normal routing. The middle two apply only while `routing.offload` is on; omit
 `routing.subagents` entirely and nothing changes either way.
+
+#### Local Codex setup
+
+For the intended split, keep the parent Codex session on its normal provider and define a named
+child agent whose own Responses requests use llm-relay. A global `llm-relay` install creates the
+provider and agents below automatically. If npm lifecycle scripts were blocked, run the bundled
+installer manually with `--force`, or create the files yourself as follows.
+
+```toml
+[model_providers.llm-relay]
+name = "llm-relay"
+base_url = "http://127.0.0.1:8791/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+Then create `~/.codex/agents/relay_coding.toml`:
+
+```toml
+name = "relay_coding"
+description = "Read-only coding child routed through llm-relay."
+developer_instructions = "Work read-only. Return a concise result to the parent and do not modify files."
+
+model_provider = "llm-relay"
+model = "pool/coding"
+model_reasoning_effort = "medium"
+```
+
+To make an unqualified child dispatch use the relay automatically, override Codex's built-in
+`default` agent with `~/.codex/agents/default.toml`:
+
+```toml
+name = "default"
+description = "General-purpose read-only child routed through llm-relay."
+developer_instructions = "Work read-only. Return a concise result to the parent and do not modify files."
+
+model_provider = "llm-relay"
+model = "pool/coding"
+model_reasoning_effort = "medium"
+```
+
+With that override, a normal “use a subagent” request keeps the parent native while the generic child
+goes through `pool/coding`; named agents can still select a different pool explicitly.
+
+Run Codex normally, without the `llm-relay` profile. Ask the parent to use exactly one subagent of
+type `relay_coding`; Codex keeps the parent on its normal provider and starts the child through the
+relay. The relay pool then chooses the configured provider and can fail over normally.
+
+Keep `routing.offload` enabled in `~/.llm-relay/config.json`:
+
+```bash
+llm-relay offload on
+```
+
+The `llm-relay` profile remains available as an explicit all-relay mode, but it routes the parent
+through the relay too and is not the split setup described above. The automatic
+`x-codex-turn-metadata` marker is still recognized when a Codex client sends it; using a relay pool
+as the named child model keeps the split setup reliable even when a custom-agent request omits that
+private marker.
+
+This applies to local Codex clients that can reach `127.0.0.1`. Hosted ChatGPT/Cloud tasks cannot
+reach a loopback relay, and the relay cannot spend a ChatGPT subscription on behalf of an upstream
+request; those remain separate CLI/client-bound dispatch lanes.
 
 Whole-task CLI dispatch can likewise vary by tier with `routing.ladders.{reasoning,coding,fast}`.
 Use `llm-relay dispatch --tier reasoning -t "..."`; without `--tier`, the ladder matching

@@ -115,9 +115,10 @@ A provider with kind:"anthropic" and NO authEnv is a passthrough: the caller's o
 credentials are forwarded untouched. Point the tiers at one to keep real Claude
 traffic on real Anthropic while pool/* requests go to other providers.
 
-Claude Code SUBAGENTS (flagged cc_is_subagent=true on the wire) may be OFFLOADED to
-other providers while the human's own conversation stays on passthrough. This is OFF
-by default and is a deliberate choice, not a background behaviour:
+Claude Code SUBAGENTS (flagged cc_is_subagent=true on the wire) and local Codex child
+turns (flagged request_kind=subagent in x-codex-turn-metadata) may be OFFLOADED to
+other providers while the main conversation stays on normal routing. This is OFF by
+default and is a deliberate choice, not a background behaviour:
 
   llm-relay offload on         routing.subagents{} (a tier -> spec map) starts applying
   llm-relay offload off        subagents route like any other request (the default)

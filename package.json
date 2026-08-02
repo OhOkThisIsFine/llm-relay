@@ -34,7 +34,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "check": "npm run typecheck && npm run typecheck:test && npm test",
-    "postinstall": "node scripts/install-skill.mjs || node -e \"process.stderr.write('llm-relay: the postinstall hook crashed, so the bundled Claude Code and Codex skills were NOT installed. The package itself is fine. Retry with: node scripts/install-skill.mjs --force\\n')\"",
+    "postinstall": "node scripts/install-skill.mjs || node -e \"process.stderr.write('llm-relay: the postinstall hook crashed, so the bundled host skills and Codex setup were NOT fully installed. The package itself is fine. Retry with: node scripts/install-skill.mjs --force\\n')\"",
     "prepublishOnly": "npm run build && npm run check"
   },
   "dependencies": {
