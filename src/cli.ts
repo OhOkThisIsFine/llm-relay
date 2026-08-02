@@ -102,120 +102,188 @@ export function getPositionalArgs(argv: string[] = process.argv): string[] {
   return positionals;
 }
 
-const HELP = `llm-relay — loopback Anthropic-Messages proxy that validates/repairs tool calls.
+type HelpRow = {
+  label: string;
+  description: string | readonly string[];
+};
 
-Multi-provider: config declares a providers{} registry; a request's model picks the
-route, in this order:
-  pool/<name>          routing.pools[<name>] — ALL its candidates, benchmark-ranked
-                       with failover. Use to ask for the best available model rather
-                       than naming one. An unknown pool is a 400, never a fallback.
-  provider/model       verbatim, e.g. "nim/z-ai/glm-5.2". Never re-ranked.
-  a Claude model id    substring-matched against routing.tiers (opus|sonnet|haiku|fable).
+/** Render the help tables from their content instead of hand-counted spaces. */
+function formatHelpRows(rows: readonly HelpRow[]): string {
+  const labelWidth = Math.max(...rows.map((row) => row.label.length));
+  return rows
+    .map(({ label, description }) => {
+      const lines = typeof description === "string" ? [description] : description;
+      return lines
+        .map((line, index) => {
+          const labelColumn = index === 0 ? label.padEnd(labelWidth) : " ".repeat(labelWidth);
+          return `  ${labelColumn}  ${line}`;
+        })
+        .join("\n");
+    })
+    .join("\n");
+}
+
+/** Keep a long provider/model name from pushing the rest of a terminal row sideways. */
+function fitCell(value: string, width: number): string {
+  if (value.length <= width) return value.padEnd(width);
+  if (width <= 1) return value.slice(0, width);
+  return `${value.slice(0, width - 1)}…`;
+}
+
+function formatTextTable(rows: readonly (readonly string[])[], indent = ""): string {
+  if (rows.length === 0) return "";
+  const widths = rows[0]!.map((_, column) =>
+    Math.max(...rows.map((row) => row[column]?.length ?? 0)),
+  );
+  return rows
+    .map((row) => `${indent}${row.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd()}`)
+    .join("\n");
+}
+
+const HELP = `llm-relay — loopback Anthropic/OpenAI proxy with tool-call validation and repair.
+
+Routing:
+  A request's model is resolved in this order:
+  pool/<name>          routing.pools[<name>] — benchmark-ranked candidates with failover.
+                       Use a pool when you want the best available model, not a fixed one.
+                       An unknown pool is a 400; it never falls back silently.
+  provider/model       Verbatim target, for example "nim/z-ai/glm-5.2". Never re-ranked.
+  Claude model id      Matched against routing.tiers (opus|sonnet|haiku|fable).
   anything else        routing.default.
 
-A provider with kind:"anthropic" and NO authEnv is a passthrough: the caller's own
-credentials are forwarded untouched. Point the tiers at one to keep real Claude
-traffic on real Anthropic while pool/* requests go to other providers.
+A provider with kind:"anthropic" and no authEnv is a passthrough: the caller's credentials
+are forwarded untouched. Point tiers at it to keep real Claude traffic on Anthropic while
+pool/* requests use other providers.
 
-Claude Code requests (the /v1/messages front door) and Codex requests (the /v1/responses
-front door) have independent offload rules. Each can be disabled, limited to marked
-subagents, or applied to the whole conversation:
+Offload:
+  Claude Code (/v1/messages) and Codex (/v1/responses) have independent offload rules.
+  Each rule can be disabled, limited to marked subagents, or applied to the full conversation:
 
-  llm-relay offload status
-  llm-relay offload claude on --scope subagents
-  llm-relay offload codex on --scope all
-  llm-relay offload claude off
+${formatHelpRows([
+  { label: "llm-relay offload status", description: "Show the current client rules." },
+  { label: "llm-relay offload claude on --scope subagents", description: "Offload marked Claude subagents." },
+  { label: "llm-relay offload codex on --scope all", description: "Offload the full Codex conversation." },
+  { label: "llm-relay offload claude off", description: "Disable Claude offload." },
+  { label: "llm-relay candidates", description: "Show the un-blended target decision table." },
+])}
 
-The old "llm-relay offload on|off" form remains a global compatibility switch. Changes
-take effect on the next request without a restart and are persisted to the config file.
-  llm-relay candidates         every dimension of every target, side by side, unranked
+The legacy "llm-relay offload on|off" form remains a global compatibility switch. Changes
+apply to the next request, do not require a restart, and are persisted to the config file.
 
-The toggle reaches a running proxy over loopback, so it takes effect on the next
-request without a restart, and is persisted to the config file.
+For a one-off dispatch, put "@relay: <spec>" on its own line in the subagent prompt. The
+relay strips that directive before forwarding, so the model never sees it.
 
-Independently of the switch, a dispatcher may offload ONE call by putting
-"@relay: <spec>" on its own line in that subagent's prompt; the line is stripped
-before forwarding, so the model never sees it.
+Setup checks:
+  These checks answer different questions:
+${formatHelpRows([
+  { label: "llm-relay keys", description: "Are the provider credentials good?" },
+  {
+    label: "llm-relay pools --probe",
+    description: "Will each configured model actually answer?",
+  },
+])}
+  keys escalates past a public /models endpoint to an authenticated probe when possible.
+  pools --probe sends a real completion to each member and catches listed-but-dead models.
 
-VERIFYING A SETUP — the two checks answer different questions, and the cheap one
-can be confidently wrong:
-  llm-relay keys           are the CREDENTIALS good? Where a provider serves its
-                           /models list publicly, this escalates to an authenticated
-                           probe, because a public 200 says nothing about the key.
-  llm-relay pools --probe  will each configured MODEL actually answer? The only way
-                           to catch a member that is listed and still dead. Run it
-                           after editing routing.pools — nothing else detects this.
-
-Keys are read from the environment, and from ~/.llm-relay/.env if present. A variable
-already set in the environment always wins over the file.
+Keys are read from the environment and from ~/.llm-relay/.env. An environment variable always
+wins over the value in the file.
 
 Usage:
-  llm-relay [options]                              Start the proxy server (default)
-  llm-relay onboard                                Guided setup for 100%-free providers & subscriptions
-  llm-relay setup [claude-cli|claude-desktop]     Configure Claude CLI wrappers or Claude Desktop
-  llm-relay keys | check-keys                      Check status of all free & subscription keys
-  llm-relay telemetry                              Programmatic JSON metrics and quota report
-  llm-relay models [-p <name>] [-r]               List live models per provider
-  llm-relay pools [--probe]                        List pool members; --probe tests each for real
-  llm-relay ping [-p <name>]                       Probe model latency, stability & quota across providers
-  llm-relay offload [client] [on|off|status]       Configure client offload; --scope subagents|all
-  llm-relay dispatch [lane] [-t <task>] [--tier] [--client]  Which client-specific lane to use next
-  llm-relay candidates [-p <name>]                 Un-blended decision table for offload targets
-  llm-relay help | --help | -h                     Show this help documentation
-  llm-relay version | --version | -v               Show version number
+${formatHelpRows([
+  { label: "llm-relay [options]", description: "Start the proxy server (default)." },
+  { label: "llm-relay onboard", description: "Run guided provider-key setup." },
+  { label: "llm-relay setup [claude-cli|claude-desktop]", description: "Configure Claude CLI wrappers or Claude Desktop." },
+  { label: "llm-relay keys | check-keys", description: "Check provider credentials and signup links." },
+  { label: "llm-relay telemetry", description: "Print JSON telemetry and quota metrics." },
+  { label: "llm-relay models [-p <name>] [-r]", description: "List live models per provider." },
+  { label: "llm-relay pools [--probe]", description: "List pool members; optionally test each one." },
+  { label: "llm-relay ping [-p <name>]", description: "Probe latency, stability, and quota." },
+  { label: "llm-relay offload [client] [on|off|status]", description: "Read or change a client's offload rule." },
+  { label: "llm-relay dispatch [lane] [options]", description: "Show the next whole-task dispatch lane." },
+  { label: "llm-relay candidates [-p <name>]", description: "Show the offload target decision table." },
+  { label: "llm-relay help | --help | -h", description: "Show this help." },
+  { label: "llm-relay version | --version | -v", description: "Show the package version." },
+])}
 
 Commands:
-  (default)                                        Start loopback HTTP proxy server
-  onboard                                          Run 100%-free provider onboarding wizard
-  setup claude-cli                                 Verify & configure Claude CLI wrapper scripts
-  setup claude-desktop | setup desktop             Auto-patch Claude Desktop config (claude_desktop_config.json)
-  keys | check-keys                                Validate provider API keys & display signup links
-  telemetry                                        Output JSON telemetry & quota report
-  models                                           Query live /models catalog across providers
-  ping                                             Probe model latency, stability & quota metrics
-  offload [client] on|off|status                  Per-client offload; client is claude, codex, or future name
-  dispatch [lane]                                  Next lane; --client claude|codex selects offload hints;
-                                                   --tier reasoning|coding|fast selects ladder
-                                                   the command, --after <lane> to walk past a spent
-                                                   rung, -x/--exhausted <lane> to report one spent,
-                                                   --shell sh|pwsh to quote for another shell,
-                                                   --json for the raw view
-  candidates                                       Benchmarks, health, quota & breaker state per target
-  help                                             Show help documentation
-  version                                          Print package version
+${formatHelpRows([
+  { label: "(default)", description: "Start the loopback HTTP proxy." },
+  { label: "onboard", description: "Run the free-provider and subscription-key wizard." },
+  { label: "setup claude-cli", description: "Show and verify Claude CLI wrapper configuration." },
+  { label: "setup claude-desktop | desktop", description: "Patch claude_desktop_config.json." },
+  { label: "keys | check-keys", description: "Validate provider credentials and show signup links." },
+  { label: "telemetry", description: "Print JSON telemetry, quota, and stability data." },
+  { label: "models", description: "Query the live /models catalog." },
+  { label: "pools", description: "List configured pool members." },
+  { label: "ping", description: "Probe model latency, stability, and quota." },
+  { label: "offload [client] on|off|status", description: "Configure one client's rule; use --scope for subagents or all." },
+  {
+    label: "dispatch [lane]",
+    description: [
+      "Show the selected client's and tier's dispatch ladder.",
+      "The relay selects the lane; you run the returned command.",
+    ],
+  },
+  { label: "candidates", description: "Show benchmarks, health, quota, and breaker state." },
+  { label: "help", description: "Show this help." },
+  { label: "version", description: "Print the package version." },
+])}
 
-Options:
-  -c, --config <path>                              Config file (default: ~/.llm-relay/config.json)
-  -p, --provider <name>                            Filter models/ping command to a specific provider
-  -r, --refresh                                    Force cache refresh when querying provider models
+Dispatch options:
+${formatHelpRows([
+  { label: "--client <name>", description: "Choose the client whose offload rule supplies hints." },
+  { label: "--tier <name>", description: "Select a reasoning, coding, or fast ladder." },
+  { label: "-t, --task <task>", description: "Substitute task text into a CLI lane's command." },
+  { label: "--after <lane>", description: "Skip past a spent lane and choose the next ready one." },
+  { label: "-x, --exhausted <lane>", description: "Report a spent lane to the running proxy." },
+  { label: "--shell sh|pwsh", description: "Quote returned CLI commands for sh/bash or PowerShell 7+." },
+  { label: "--json", description: "Print the raw dispatch view as JSON." },
+])}
 
-Version currency:
-  Every run (except help/version) checks the npm registry — cached 6h, 2.5s timeout, fail-open.
-  A globally-installed copy updates itself, prunes stale bin shims, and restarts on the new
-  version; any other copy just prints the upgrade command. Set LLM_RELAY_NO_SELF_UPDATE=1 to
-  skip the check entirely.
+General options:
+${formatHelpRows([
+  { label: "-c, --config <path>", description: "Config file (default: ~/.llm-relay/config.json)." },
+  { label: "-p, --provider <name>", description: "Filter models, ping, or candidates to one provider." },
+  { label: "-r, --refresh", description: "Force a refresh when querying provider models." },
+])}
 
-Proxy Startup Overrides (win over config file values):
-  -d, --default <provider/model>                   Override routing.default fallback spec
-  -m, --mode <detect|repair|strict>                Override mode (detect | repair | strict)
-  -l, --listen <host:port>                         Override listen address (loopback only)
+Proxy startup overrides (take precedence over the config file):
+${formatHelpRows([
+  { label: "-d, --default <provider/model>", description: "Override routing.default." },
+  { label: "-m, --mode <detect|repair|strict>", description: "Override the validation mode." },
+  { label: "-l, --listen <host:port>", description: "Override the listen address (loopback only)." },
+])}
 
-Behind a custom ANTHROPIC_BASE_URL, Claude Code drops the 1M-context beta header and
-disables Remote Control. Neither is caused by this proxy and neither can be fixed here.
-For 1M, launch with a [1m] model suffix:  ANTHROPIC_MODEL='claude-opus-5[1m]' claude
+Version checks:
+  Every run except help and version checks npm (cached for 6h, with a 2.5s timeout, fail-open).
+  A global install updates itself and restarts on the new version. Other copies print the upgrade
+  command. Set LLM_RELAY_NO_SELF_UPDATE=1 to skip the check.
 
-Proxy Server Endpoints:
-  POST /v1/messages                                Anthropic Messages proxy with tool repair
-  POST /v1/messages/count_tokens                   Local token estimation for OpenAI backends
-  POST /v1/chat/completions                        OpenAI-compatible Chat Completions front
-  POST /v1/responses                              OpenAI-compatible Responses front (Codex/IDE)
-  GET /registry                                    Full JSON view of providers, routing & capabilities
-  GET /candidates [?provider=]                     Per-target raw benchmarks, health, quota, breaker state
-  GET|POST /offload [?client=]                     Read/set {"enabled":bool,"scope":"subagents"|"all"}
-  GET|POST /dispatch [?client=&tier=&lane=&after=&task=]  Next dispatch lane; POST {"exhausted":"<lane>"} to walk on
-  GET /telemetry                                   Live JSON telemetry, quota & stability scores for Claude
-  GET /ping                                        Trigger health probe pass & query ping mode summary
-  GET /health                                      Diagnostic JSON summary of provider availability & health
+Claude Code notes:
+  With a custom ANTHROPIC_BASE_URL, Claude Code drops the 1M-context beta header and disables
+  Remote Control. Neither behaviour is caused by this proxy. For 1M context, launch with:
+    ANTHROPIC_MODEL='claude-opus-5[1m]' claude
+
+Proxy server endpoints:
+${formatHelpRows([
+  { label: "POST /v1/messages", description: "Anthropic Messages proxy with tool repair." },
+  { label: "POST /v1/messages/count_tokens", description: "Local token estimation for OpenAI backends." },
+  { label: "POST /v1/chat/completions", description: "OpenAI-compatible Chat Completions front door." },
+  { label: "POST /v1/responses", description: "OpenAI-compatible Responses front door (Codex/IDE)." },
+  { label: "GET /registry", description: "Full provider, routing, and capability view." },
+  { label: "GET /candidates", description: "Raw per-target benchmarks, health, quota, and breaker state." },
+  { label: "GET|POST /offload", description: "Read or set the offload rule; accepts ?client=<name>." },
+  {
+    label: "GET|POST /dispatch",
+    description: [
+      "Return the next dispatch lane; query values: client, tier, lane, after, task.",
+      "POST {\"exhausted\":\"<lane>\"} to report a spent lane and walk on.",
+    ],
+  },
+  { label: "GET /telemetry", description: "Live telemetry, quota, and stability scores." },
+  { label: "GET /ping", description: "Trigger a health probe and return the ping summary." },
+  { label: "GET /health", description: "Diagnostic provider availability and health summary." },
+])}
 `;
 
 
@@ -386,7 +454,7 @@ export async function runModels(): Promise<void> {
       const lim = await catalog.limits(name, p, m).catch(() => null);
       const ctx = lim?.contextLength ? `  ctx ${Math.round(lim.contextLength / 1000)}k` : "";
       const out = lim?.maxOutputTokens ? `  max_out ${lim.maxOutputTokens}` : "";
-      process.stdout.write(`  ${m.padEnd(50)}${str}${ctx}${out}\n`);
+      process.stdout.write(`  ${fitCell(m, 50)}${str}${ctx}${out}\n`);
     }
   }
 }
@@ -502,7 +570,7 @@ export async function runPingCommand(): Promise<void> {
       const p95Str = summary.p95Ms >= 0 ? `${summary.p95Ms}ms` : "pending";
       const scoreStr = summary.stabilityScore >= 0 ? `${summary.stabilityScore}/100` : "N/A";
       process.stdout.write(
-        `  ${mId.padEnd(45)} | verdict: ${summary.verdict.padEnd(10)} | avg: ${avgStr.padEnd(8)} | p95: ${p95Str.padEnd(8)} | stability: ${scoreStr}\n`,
+        `  ${fitCell(mId, 45)} | verdict: ${fitCell(summary.verdict, 10)} | avg: ${fitCell(avgStr, 8)} | p95: ${fitCell(p95Str, 8)} | stability: ${scoreStr}\n`,
       );
     }
   }
@@ -517,23 +585,16 @@ export async function runCheckKeys(): Promise<void> {
   process.stdout.write("🔑 Validating configured provider API keys...\n\n");
   const results = await validateProviderKeys(cfg);
 
-  process.stdout.write(
-    `Provider`.padEnd(16) +
-      `Env Var`.padEnd(24) +
-      `Status`.padEnd(16) +
-      `Details\n`,
-  );
-  process.stdout.write("-".repeat(80) + "\n");
-
-  for (const r of results) {
-    const envStr = r.authEnv ?? "(none)";
-    const quotaStr = r.quotaPercent !== undefined && r.quotaPercent !== null ? ` | Quota: ${r.quotaPercent}%` : "";
-    const modelsStr = r.modelsFound !== undefined ? ` | Models: ${r.modelsFound}` : "";
-
-    process.stdout.write(
-      `${r.provider.padEnd(16)}${envStr.padEnd(24)}${r.status.toUpperCase().padEnd(16)}${r.message}${quotaStr}${modelsStr}\n`,
-    );
-  }
+  const rows = [
+    ["Provider", "Env var", "Status", "Details"],
+    ...results.map((r) => {
+      const envStr = r.authEnv ?? "(none)";
+      const quotaStr = r.quotaPercent !== undefined && r.quotaPercent !== null ? ` | Quota: ${r.quotaPercent}%` : "";
+      const modelsStr = r.modelsFound !== undefined ? ` | Models: ${r.modelsFound}` : "";
+      return [r.provider, envStr, r.status.toUpperCase(), `${r.message}${quotaStr}${modelsStr}`];
+    }),
+  ];
+  process.stdout.write(formatTextTable(rows) + "\n");
 }
 
 /**
@@ -701,7 +762,8 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     return;
   }
 
-  process.stdout.write(`${view.client === "default" ? "subagent" : view.client} offload: ${view.offload ? "ON" : "OFF"}\n`);
+  const clientLabel = view.client ?? "default";
+  process.stdout.write(`${clientLabel === "default" ? "subagent" : clientLabel} offload: ${view.offload ? "ON" : "OFF"}\n`);
   if (view.tier) process.stdout.write(`dispatch tier: ${view.tier}\n`);
   if (!live) process.stdout.write(`(no proxy running — live exhaustion state unknown)\n`);
   process.stdout.write("\n");
@@ -720,11 +782,12 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     } else {
       target = l.spec ?? "";
     }
-    process.stdout.write(`${mark} ${l.position}. ${l.id}${state}\n     ${target}\n`);
+    process.stdout.write(`${mark} ${l.position}. ${l.id}${state}\n`);
+    if (target) process.stdout.write(`   ${l.kind === "cli" ? "run" : "target"}: ${target}\n`);
     if (l.requiresDirective) {
-      process.stdout.write(`     needs "@relay: ${l.spec}" in the subagent prompt (offload is off)\n`);
+      process.stdout.write(`   hint: add "@relay: ${l.spec}" to the subagent prompt (offload is off)\n`);
     }
-    if (l.note) process.stdout.write(`     ${l.note}\n`);
+    if (l.note) process.stdout.write(`   note: ${l.note}\n`);
   }
 
   // Say which shell the quoting is for. A command line that is safe in one shell and not in
@@ -808,12 +871,23 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
     if (state.enabled && Object.keys(state.subagents).length === 0) {
       process.stdout.write("  ⚠ routing.subagents is empty — offload is on but routes nowhere\n");
     }
-    process.stdout.write(`  scope: ${effectiveScope} (subagents only, or the full ${client} conversation)\n`);
+    process.stdout.write(
+      effectiveScope === "all"
+        ? `  scope: all (the full ${client} conversation, including subagents)\n`
+        : "  scope: subagents (marked child requests only)\n",
+    );
   } else if (Object.keys(configuredClients).length > 0) {
-    process.stdout.write("\n  client    enabled  scope\n");
-    for (const [name, rule] of Object.entries(configuredClients)) {
-      process.stdout.write(`  ${name.padEnd(9)} ${(rule.enabled ? "ON" : "OFF").padEnd(8)} ${rule.scope}\n`);
-    }
+    process.stdout.write(
+      "\n" +
+        formatTextTable(
+          [
+            ["client", "enabled", "scope"],
+            ...Object.entries(configuredClients).map(([name, rule]) => [name, rule.enabled ? "ON" : "OFF", rule.scope]),
+          ],
+          "  ",
+        ) +
+        "\n",
+    );
   } else if (state.enabled) {
     process.stdout.write("  legacy global rule applies to marked subagents for every front door\n");
   } else {
@@ -1030,7 +1104,7 @@ export async function runPools(): Promise<void> {
       if (DEAD_VERDICTS.has(r.verdict)) dead++;
       const lat = r.latencyMs !== undefined ? `${r.latencyMs}ms` : "";
       process.stdout.write(
-        `  ${icon[r.verdict].padEnd(6)} ${r.spec.padEnd(50)} ${lat.padEnd(8)} ${r.detail ?? ""}\n`,
+        `  ${fitCell(icon[r.verdict], 6)} ${fitCell(r.spec, 50)} ${fitCell(lat, 8)} ${r.detail ?? ""}\n`,
       );
     }
     process.stdout.write("\n");
