@@ -54,8 +54,16 @@ export async function repair(
     return { outcome: "refused_destructive" };
   }
 
-  let errors = deps.validator.validate(assistant, tools).errors;
+  const initialValidation = deps.validator.validate(assistant, tools);
+  let errors = initialValidation.errors;
   let current = assistant;
+
+  // A reshaper cannot make an uncheckable schema checkable. Sending arguments
+  // to another model here would spend a repair attempt whose output can never
+  // cross the validation boundary, so fail closed without any delegate egress.
+  if (initialValidation.uncheckableCount > 0) {
+    return { outcome: "failed" };
+  }
 
   // A stop_reason mismatch is PURE protocol form: the message carries tool_use
   // blocks but announces some other stop_reason, so the harness never runs the

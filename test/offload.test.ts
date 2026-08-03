@@ -9,6 +9,14 @@ import { createProxy } from "../src/server.js";
 import { offloadState, setOffload } from "../src/offload.js";
 import { buildCandidates } from "../src/candidates.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
+import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
+
+const CONTROL_TOKEN = "offload-test-control-token";
+const CONTROL_AUTHORIZATION = { validate: (candidate: unknown) => candidate === CONTROL_TOKEN };
+const CONTROL_JSON_HEADERS = {
+  "content-type": "application/json",
+  [CONTROL_AUTHORIZATION_HEADER]: CONTROL_TOKEN,
+};
 
 const dir = mkdtempSync(join(tmpdir(), "rp-offload-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -179,7 +187,7 @@ describe("/offload endpoint", () => {
       }),
     );
     const cfg = loadConfig(path);
-    const proxy = createProxy(cfg);
+    const proxy = createProxy(cfg, { controlAuthorization: CONTROL_AUTHORIZATION });
     const port = await listen(proxy);
 
     const subagentCall = () =>
@@ -200,7 +208,7 @@ describe("/offload endpoint", () => {
 
     const on = await fetch(`http://127.0.0.1:${port}/offload`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: CONTROL_JSON_HEADERS,
       body: JSON.stringify({ enabled: true }),
     });
     expect(on.status).toBe(200);
@@ -295,11 +303,11 @@ describe("/offload endpoint", () => {
 
   it("rejects a POST without an explicit boolean", async () => {
     const cfg = freshConfig("reject.json");
-    const proxy = createProxy(cfg);
+    const proxy = createProxy(cfg, { controlAuthorization: CONTROL_AUTHORIZATION });
     const port = await listen(proxy);
     const res = await fetch(`http://127.0.0.1:${port}/offload`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: CONTROL_JSON_HEADERS,
       body: JSON.stringify({ enabled: "yes" }),
     });
     expect(res.status).toBe(400);
@@ -319,12 +327,12 @@ describe("/offload endpoint", () => {
       },
     }));
     const cfg = loadConfig(path);
-    const proxy = createProxy(cfg);
+    const proxy = createProxy(cfg, { controlAuthorization: CONTROL_AUTHORIZATION });
     const port = await listen(proxy);
 
     const res = await fetch(`http://127.0.0.1:${port}/offload`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: CONTROL_JSON_HEADERS,
       body: JSON.stringify({ client: "claude", enabled: true, scope: "all" }),
     });
     expect(res.status).toBe(200);

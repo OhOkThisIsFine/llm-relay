@@ -1,7 +1,0 @@
-{
-  "schema_version": "remediate-code-implement/node-accept-outcome/v1alpha1",
-  "block_id": "CP-BLOCK-CP-NODE-1-f02",
-  "outcome": "success",
-  "verify_passed": false,
-  "merged": false
-}

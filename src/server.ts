@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import {
   DEFAULT_ANTHROPIC_VERSION,
@@ -23,22 +23,53 @@ import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
-import { globalCircuitBreaker } from "./circuit-breaker.js";
+import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens } from "./metadata.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
+import { baseLog, logSafePath } from "./request-log.js";
+import type {
+  AttemptFailed,
+  AttemptHandle,
+  OutcomeProvenance,
+  ProviderTargetIdentity,
+} from "./kernel/contracts.js";
+import {
+  CONTROL_AUTHORIZATION_HEADER,
+  createControlAuthorization,
+  resolveControlAuthorizationConfigDir,
+  validateControlAuthorization,
+  type ControlAuthorizationPort,
+} from "./control-authorization.js";
+
+export { baseLog, logSafePath } from "./request-log.js";
 
 
 const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-encoding", "host",
 ]);
-const INTERNAL_REQUEST_HEADERS = new Set(["x-codex-turn-metadata"]);
+const INTERNAL_REQUEST_HEADERS = new Set(["x-codex-turn-metadata", CONTROL_AUTHORIZATION_HEADER]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
 
-/** Loopback names a Host header may legitimately carry (see config.ts's bind check). */
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 /** A task string long enough to be an abuse attempt rather than a task. */
 const MAX_TASK_LEN = 4096;
+
+const TOKENLESS_CONTROL_READS = new Set([
+  "/v1/models",
+  "/models",
+  "/offload",
+  "/dispatch",
+  "/telemetry",
+]);
+
+const CONTROL_ROUTES = new Set([
+  ...TOKENLESS_CONTROL_READS,
+  "/registry",
+  "/ping",
+  "/health/stats",
+  "/health",
+  "/candidates",
+]);
 
 /**
  * Request admission for mutating and command-rendering routes.
@@ -56,22 +87,34 @@ const MAX_TASK_LEN = 4096;
  * one is not. Host is checked against the loopback names to close DNS rebinding,
  * where a hostile name resolves to 127.0.0.1 and thus looks local to the socket.
  */
-function admissionFailure(req: IncomingMessage, mutating: boolean): string | null {
-  const origin = req.headers.origin;
-  if (typeof origin === "string" && origin.length > 0) {
-    try {
-      const host = new URL(origin).hostname;
-      if (!LOOPBACK_HOSTS.has(host)) return `cross-origin request from ${origin} is not allowed`;
-    } catch {
-      return "malformed Origin header";
+function admissionFailure(
+  req: IncomingMessage,
+  pathname: string,
+  server: Server,
+  cfg: Config,
+  authorization: ControlAuthorizationPort | undefined,
+): string | null {
+  const expected = listenerAuthority(server, cfg);
+  if (!expected) return "listener authority is unavailable";
+
+  const rawHostValues = req.rawHeaders
+    .filter((_, index) => index % 2 === 0)
+    .filter((name) => name.toLowerCase() === "host");
+  const host = parseAuthority(req.headers.host, "http:");
+  if (rawHostValues.length !== 1 || !host || host.hostname !== expected.hostname || host.port !== expected.port) {
+    return "Host authority does not match the bound listener";
+  }
+
+  // Header presence is significant: Origin: null and Origin: "" are present-invalid,
+  // rather than falling into the trusted non-browser/CLI path.
+  if (Object.hasOwn(req.headers, "origin")) {
+    const origin = parseOrigin(req.headers.origin);
+    if (!origin || origin.scheme !== "http:" || origin.hostname !== expected.hostname || origin.port !== expected.port) {
+      return "Origin does not match the bound listener";
     }
   }
 
-  const hostHeader = req.headers.host;
-  if (typeof hostHeader === "string" && hostHeader.length > 0) {
-    const bare = hostHeader.replace(/:\d+$/, "");
-    if (!LOOPBACK_HOSTS.has(bare)) return `Host ${hostHeader} is not a loopback address`;
-  }
+  const mutating = req.method !== "GET" && req.method !== "HEAD";
 
   if (mutating) {
     const ct = (req.headers["content-type"] ?? "").toString().split(";")[0]?.trim().toLowerCase();
@@ -81,7 +124,57 @@ function admissionFailure(req: IncomingMessage, mutating: boolean): string | nul
       return `mutating requests require content-type: application/json (got ${ct || "none"})`;
     }
   }
+
+  const isControlRoute = CONTROL_ROUTES.has(pathname);
+  const isTokenlessRead = req.method === "GET" && TOKENLESS_CONTROL_READS.has(pathname);
+  if (isControlRoute && !isTokenlessRead && !validateControlAuthorization(authorization, req.headers)) {
+    return "control authorization required";
+  }
   return null;
+}
+
+interface NormalizedAuthority {
+  hostname: string;
+  port: number;
+}
+
+function normalizeHostname(hostname: string): string {
+  const lower = hostname.toLowerCase();
+  return lower.startsWith("[") && lower.endsWith("]") ? lower.slice(1, -1) : lower;
+}
+
+function parseAuthority(raw: string | undefined, scheme: "http:" | "https:"): NormalizedAuthority | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw.includes(",")) return null;
+  try {
+    const url = new URL(`${scheme}//${raw}`);
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) return null;
+    const port = url.port ? Number(url.port) : scheme === "https:" ? 443 : 80;
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) return null;
+    return { hostname: normalizeHostname(url.hostname), port };
+  } catch {
+    return null;
+  }
+}
+
+function parseOrigin(raw: string | string[] | undefined): (NormalizedAuthority & { scheme: string }) | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw === "null" || raw.includes(",")) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) return null;
+    const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) return null;
+    return { scheme: url.protocol, hostname: normalizeHostname(url.hostname), port };
+  } catch {
+    return null;
+  }
+}
+
+function listenerAuthority(server: Server, cfg: Config): NormalizedAuthority | null {
+  const address = server.address();
+  if (!address || typeof address === "string") return null;
+  const configuredHost = typeof cfg.host === "string" && cfg.host.length > 0 ? cfg.host : address.address;
+  return { hostname: normalizeHostname(configuredHost), port: address.port };
 }
 
 const MAX_VALIDATE_BYTES = 8 * 1024 * 1024;
@@ -91,6 +184,9 @@ export interface ProxyDeps {
   reshaper?: Reshaper;
   catalog?: ModelCatalog;
   pingLoop?: PingLoop;
+  breaker?: CircuitBreaker;
+  /** null deliberately exercises fail-closed control authorization. */
+  controlAuthorization?: ControlAuthorizationPort | null;
 }
 
 export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
@@ -99,6 +195,19 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
   const catalog = deps.catalog ?? new ModelCatalog();
   const pingLoop = deps.pingLoop ?? new PingLoop(cfg, catalog);
+  const breaker = deps.breaker ?? new CircuitBreaker();
+  let controlAuthorization: ControlAuthorizationPort | undefined;
+  if (deps.controlAuthorization !== undefined) {
+    controlAuthorization = deps.controlAuthorization ?? undefined;
+  } else if (!process.env.VITEST || cfg.sourcePath) {
+    try {
+      controlAuthorization = createControlAuthorization(resolveControlAuthorizationConfigDir(cfg.sourcePath));
+    } catch {
+      // Data-plane and tokenless status reads remain available. Protected control
+      // work fails closed through the absent port instead of preventing startup.
+      controlAuthorization = undefined;
+    }
+  }
 
   // Reshaper selection is per-resolved-target: an explicit global reshaper (or an
   // injected one) wins for every request; otherwise an openai target reshapes on
@@ -128,7 +237,17 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
 
   const server = createServer((req, res) => {
     const started = Date.now();
-    handle(req, res, cfg, { validator, logger, isDestructive, resolveReshaper, catalog, pingLoop }).catch((e) => {
+    handle(req, res, cfg, {
+      validator,
+      logger,
+      isDestructive,
+      resolveReshaper,
+      catalog,
+      pingLoop,
+      breaker,
+      server,
+      ...(controlAuthorization ? { controlAuthorization } : {}),
+    }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
       // Last-resort net. `handle` logs every turn it terminates itself, so reaching
       // here means a turn ended with NO log record — the operator would see a client
@@ -166,14 +285,17 @@ interface Handlers {
   resolveReshaper: (target: ResolvedTarget) => Reshaper | undefined;
   catalog: ModelCatalog;
   pingLoop?: PingLoop;
+  breaker: CircuitBreaker;
+  controlAuthorization?: ControlAuthorizationPort;
+  server: Server;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
   const started = Date.now();
   const path = req.url ?? "/";
+  const pathname = path.split("?")[0] ?? path;
 
-  const isMutating = req.method !== "GET" && req.method !== "HEAD";
-  const admissionErr = admissionFailure(req, isMutating);
+  const admissionErr = admissionFailure(req, pathname, h.server, cfg, h.controlAuthorization);
   if (admissionErr) {
     failClosed(res, 403, admissionErr);
     h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
@@ -201,8 +323,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const hadTools = tools.size > 0;
   const model = pickString(reqJson, "model");
   const wantsStream = pickBool(reqJson, "stream");
-  const pathname = path.split("?")[0] ?? path;
-
   const handled = await handleAdminRoutes(req, res, pathname, path, started, reqJson, cfg, h);
   if (handled) return;
 
@@ -256,7 +376,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // to promote: a target the breaker is cooling steps aside, everything else keeps
   // its benchmark rank. (The re-sort was invisible for as long as an untracked target
   // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
-  let healthyTargets = orderByUsability(targetCandidates);
+  let healthyTargets = orderByUsability(targetCandidates, h.breaker);
 
   // Context guardrail — enforced ONLY against a limit the serving provider published about its own
   // deployment. An unknown limit means no guardrail: the request goes upstream and the provider
@@ -352,8 +472,30 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       }
     };
     res.on("close", onResClose);
+    let attempt: HealthAttempt | undefined;
 
     try {
+      let forwardHeaders: Record<string, string>;
+      try {
+        // Credential/header validation precedes beginAttempt: it performs no provider
+        // egress and therefore creates no terminal health obligation on rejection.
+        forwardHeaders = buildForwardHeaders(req.headers, target);
+      } catch (e) {
+        if (e instanceof CredentialConfigError) {
+          failClosed(res, 502, `llm-relay configuration: ${e.message}`);
+          h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null));
+          return;
+        }
+        throw e;
+      }
+
+      attempt = beginHealthAttempt(h, target, Date.now()) ?? undefined;
+      if (!attempt) {
+        failClosed(res, 502, "llm-relay: could not begin provider attempt");
+        h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null));
+        return;
+      }
+
       let backendRes: Response;
       try {
         backendRes = await fetchBackend(target, {
@@ -361,27 +503,24 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           method: req.method ?? "POST",
           reqBuf,
           reqJson,
-          anthropicHeaders: buildForwardHeaders(req.headers, target),
+          anthropicHeaders: forwardHeaders,
           wantsStream,
           signal: controller.signal,
         });
       } catch (e) {
         clearTimeout(timer);
         res.off("close", onResClose);
-        if (e instanceof CredentialConfigError) {
-          // A declared-but-unset credential is a CONFIGURATION fault, not a transport
-          // one: the target is not unhealthy, so it must not be recorded as a breaker
-          // failure, and walking to the next candidate would quietly serve the request
-          // from somewhere else while the misconfiguration stayed invisible. Nothing
-          // was forwarded — buildForwardHeaders threw before returning any headers.
-          failClosed(res, 502, `llm-relay configuration: ${e.message}`);
-          h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null));
-          return;
-        }
         const aborted = controller.signal.aborted;
         const status = aborted ? 504 : 502;
-        globalCircuitBreaker.recordOutcome(target, { ok: false, status, elapsedMs: Date.now() - started });
-        recordCall(target, false, started);
+        if (res.destroyed) {
+          completeAttemptCancelled(h, attempt, "client disconnected");
+        } else {
+          completeAttemptFailure(h, attempt, {
+            failure: "transport",
+            provenance: aborted ? "deadline" : "upstream",
+            status,
+          });
+        }
 
         // Failover if additional candidates exist
         if (!res.destroyed && i < healthyTargets.length - 1) {
@@ -393,7 +532,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         return;
       }
 
-      // One shared policy with the OpenAI front — see `classifyStatus` / `recordAttempt`.
+      // One shared policy with the OpenAI front — see `classifyStatus` / `shouldTryNext`.
       //
       // A 401/403 now fails over WHEN ANOTHER CANDIDATE EXISTS. It did not before, so a pool
       // whose top-ranked member had a revoked key returned that 401 to the client with the
@@ -405,10 +544,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       // returned exactly as before.
       const cls = classifyStatus(backendRes.status);
       const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
-      const tryNext = recordAttempt(target, cls, backendRes.status, started, retryAfterMs);
+      observeAttemptHeaders(h, attempt, backendRes.status, retryAfterMs);
+      const localFailure = errorOrigin(backendRes) === "local";
+      const tryNext = !localFailure && shouldTryNext(cls);
       if (tryNext && !res.destroyed && i < healthyTargets.length - 1) {
         clearTimeout(timer);
         res.off("close", onResClose);
+        await backendRes.body?.cancel().catch(() => {});
+        completeAttemptFailure(h, attempt, {
+          failure: "http",
+          provenance: localFailure ? "relay-mapper-defect" : "upstream",
+          status: backendRes.status,
+          retryAfterMs,
+        });
         continue; // Failover to next target
       }
 
@@ -418,12 +566,22 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
 
       if (doRepair) {
-        await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target }, h);
+        await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal }, h);
       } else {
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target }, h);
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal }, h);
       }
       return;
     } finally {
+      if (attempt && !attempt.completed) {
+        if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
+        else {
+          completeAttemptFailure(h, attempt, {
+            failure: "mapping",
+            provenance: "relay-mapper-defect",
+            status: 502,
+          });
+        }
+      }
       clearTimeout(timer);
       res.off("close", onResClose);
     }
@@ -485,45 +643,9 @@ export function classifyStatus(status: number): OutcomeClass {
   return "client";
 }
 
-/**
- * Apply one attempt's outcome to the breaker and to runtime telemetry, per `classifyStatus`.
- * Returns true when another candidate should be tried.
- */
-function recordAttempt(
-  target: ResolvedTarget,
-  cls: OutcomeClass,
-  status: number,
-  started: number,
-  retryAfterMs: number | null,
-): boolean {
-  const elapsedMs = Date.now() - started;
-  if (cls === "ok") {
-    globalCircuitBreaker.recordOutcome(target, { ok: true, status, elapsedMs });
-    recordCall(target, true, started);
-    return false;
-  }
-  if (cls === "retriable") {
-    // A failing response is a breaker failure whether or not another candidate exists —
-    // recording "success" on a last-candidate 429/5xx (the common single-candidate case)
-    // resets the breaker on every error and it never trips.
-    globalCircuitBreaker.recordOutcome(target, {
-      ok: false,
-      status,
-      elapsedMs,
-      ...(retryAfterMs !== null ? { retryAfterMs } : {}),
-    });
-    recordCall(target, false, started);
-    return true;
-  }
-  if (cls === "credential") {
-    // Neither a success nor a health failure — see `CircuitState.credentialFailures`. Telemetry
-    // still records the call as unsuccessful; that dataset is about outcomes, not about routing.
-    globalCircuitBreaker.recordCredentialFault(target, status);
-    recordCall(target, false, started);
-    return true;
-  }
-  recordCall(target, false, started);
-  return false;
+/** Whether another pool candidate is useful; health mutation occurs only at terminal completion. */
+function shouldTryNext(cls: OutcomeClass): boolean {
+  return cls === "retriable" || cls === "credential";
 }
 
 /**
@@ -556,6 +678,106 @@ interface Ctx {
    * happened to send.
    */
   target: ResolvedTarget;
+  attempt: HealthAttempt;
+  signal: AbortSignal;
+}
+
+interface HealthAttempt {
+  readonly handle: AttemptHandle;
+  readonly identity: ProviderTargetIdentity;
+  readonly target: ResolvedTarget;
+  readonly started: number;
+  completed: boolean;
+}
+
+function targetIdentity(target: ResolvedTarget): ProviderTargetIdentity {
+  return Object.freeze({
+    provider: target.provider,
+    model: target.model ?? null,
+    kind: target.kind,
+  });
+}
+
+function beginHealthAttempt(h: Handlers, target: ResolvedTarget, started: number): HealthAttempt | null {
+  const identity = targetIdentity(target);
+  const begun = h.breaker.beginAttempt(identity);
+  if (!begun.ok) return null;
+  return { handle: begun.value, identity, target, started, completed: false };
+}
+
+function observeAttemptHeaders(
+  h: Handlers,
+  attempt: HealthAttempt,
+  status: number,
+  retryAfterMs: number | null,
+): void {
+  const observedAt = Date.now();
+  const result = h.breaker.observeHeaders(attempt.handle, {
+    target: attempt.identity,
+    status,
+    observedAt,
+    elapsedMs: observedAt - attempt.started,
+    ...(retryAfterMs !== null ? { retryAfterMs } : {}),
+  });
+  if (!result.ok) throw new Error(`attempt header observation rejected: ${result.error.kind}`);
+}
+
+function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: number): void {
+  if (attempt.completed) return;
+  const completedAt = Date.now();
+  const result = h.breaker.completeAttempt(attempt.handle, {
+    terminal: "succeeded",
+    target: attempt.identity,
+    provenance: "upstream",
+    completedAt,
+    elapsedMs: completedAt - attempt.started,
+    status,
+  });
+  if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
+  attempt.completed = true;
+  recordCall(attempt.target, true, attempt.started);
+}
+
+function completeAttemptFailure(
+  h: Handlers,
+  attempt: HealthAttempt,
+  options: {
+    failure: AttemptFailed["failure"];
+    provenance: OutcomeProvenance;
+    status: number | null;
+    retryAfterMs?: number | null;
+  },
+): void {
+  if (attempt.completed) return;
+  const completedAt = Date.now();
+  const result = h.breaker.completeAttempt(attempt.handle, {
+    terminal: "failed",
+    target: attempt.identity,
+    provenance: options.provenance,
+    completedAt,
+    elapsedMs: completedAt - attempt.started,
+    failure: options.failure,
+    status: options.status,
+    retryAfterMs: options.retryAfterMs ?? null,
+  });
+  if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
+  attempt.completed = true;
+  recordCall(attempt.target, false, attempt.started);
+}
+
+function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: string | null): void {
+  if (attempt.completed) return;
+  const completedAt = Date.now();
+  const result = h.breaker.completeAttempt(attempt.handle, {
+    terminal: "cancelled",
+    target: attempt.identity,
+    provenance: "client-cancellation",
+    completedAt,
+    elapsedMs: completedAt - attempt.started,
+    reason,
+  });
+  if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
+  attempt.completed = true;
 }
 
 function detectOpenAiFrontProtocol(method: string | undefined, pathname: string): OpenAiFrontProtocol | null {
@@ -611,13 +833,36 @@ async function openAiFrontPath(
     };
     res.on("close", onResClose);
 
+    let forwardHeaders: Record<string, string>;
+    try {
+      forwardHeaders = buildForwardHeaders(ctx.inboundHeaders, target);
+    } catch (e) {
+      clearTimeout(timer);
+      res.off("close", onResClose);
+      if (e instanceof CredentialConfigError) {
+        failClosed(res, 502, `llm-relay configuration: ${e.message}`);
+        h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null));
+        return;
+      }
+      throw e;
+    }
+
+    const attempt = beginHealthAttempt(h, target, Date.now());
+    if (!attempt) {
+      clearTimeout(timer);
+      res.off("close", onResClose);
+      failClosed(res, 502, "llm-relay: could not begin provider attempt");
+      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null));
+      return;
+    }
+
     let upstream: Response;
     try {
       upstream = await fetchOpenAiFront(target, {
         reqJson: ctx.reqJson,
         wantsStream: ctx.wantsStream,
         protocol: ctx.protocol,
-        anthropicHeaders: buildForwardHeaders(ctx.inboundHeaders, target),
+        anthropicHeaders: forwardHeaders,
         signal: controller.signal,
       });
     } catch (e) {
@@ -625,8 +870,14 @@ async function openAiFrontPath(
       res.off("close", onResClose);
       const aborted = controller.signal.aborted;
       const status = aborted ? 504 : 502;
-      globalCircuitBreaker.recordOutcome(target, { ok: false, status, elapsedMs: Date.now() - ctx.started });
-      recordCall(target, false, ctx.started);
+      if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
+      else {
+        completeAttemptFailure(h, attempt, {
+          failure: "transport",
+          provenance: aborted ? "deadline" : "upstream",
+          status,
+        });
+      }
       // The client hanging up aborts every candidate; walking the rest would be pointless work
       // against a socket nobody is reading.
       if (!isLast && !res.writableEnded && !res.destroyed) continue;
@@ -644,13 +895,20 @@ async function openAiFrontPath(
     const localFailure = errorOrigin(upstream) === "local";
     const cls = classifyStatus(upstream.status);
     const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
-    const tryNext = localFailure ? false : recordAttempt(target, cls, upstream.status, ctx.started, retryAfterMs);
+    observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs);
+    const tryNext = localFailure ? false : shouldTryNext(cls);
 
     if (tryNext && !isLast && !res.writableEnded && !res.destroyed) {
       clearTimeout(timer);
       res.off("close", onResClose);
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
       await upstream.body?.cancel().catch(() => {});
+      completeAttemptFailure(h, attempt, {
+        failure: "http",
+        provenance: "upstream",
+        status: upstream.status,
+        retryAfterMs,
+      });
       continue;
     }
 
@@ -671,6 +929,12 @@ async function openAiFrontPath(
         const out = Buffer.from(normalized ?? raw, "utf8");
         res.writeHead(upstream.status, { ...headers, "content-type": "application/json" });
         res.end(out);
+        completeAttemptFailure(h, attempt, {
+          failure: "http",
+          provenance: localFailure ? "relay-mapper-defect" : "upstream",
+          status: upstream.status,
+          retryAfterMs,
+        });
       } else {
         res.writeHead(upstream.status, headers);
         if (upstream.body) {
@@ -679,10 +943,14 @@ async function openAiFrontPath(
           }
         }
         if (!res.writableEnded) res.end();
+        if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
+        else completeAttemptSuccess(h, attempt, upstream.status);
       }
     } catch (e) {
-      handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, target, h, (msg) =>
-        streamed ? openAiSseError(msg) : null,
+      handleMidStreamError(
+        res, e, ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, target, attempt, h,
+        (msg) => streamed ? openAiSseError(msg) : null,
+        controller.signal.aborted,
       );
       return;
     } finally {
@@ -737,13 +1005,21 @@ async function transparentPath(
     // reading a 200. Say the stream broke rather than closing on a truncated answer,
     // and LOG the turn — this throw used to escape to the top-level catch, which
     // could only `res.end()` and never logged.
-    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, h, (msg) =>
-      ctx.streamed ? sseError(msg) : null,
+    handleMidStreamError(
+      res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status,
+      ctx.target, ctx.attempt, h,
+      (msg) => ctx.streamed ? sseError(msg) : null,
+      ctx.signal.aborted,
     );
     return;
   } finally {
     clearTimeout(timer);
   }
+
+  // A client disconnect can make writeChunk stop without throwing. Leave the handle pending so
+  // the routing-level finally records cancellation instead of validating a partial response and
+  // charging it to provider health.
+  if (res.destroyed) return;
 
   let validated: RequestLog["validated"] = "skipped";
   let toolUseCount = 0;
@@ -755,6 +1031,22 @@ async function transparentPath(
     toolUseCount = r.toolUseCount;
     uncheckableCount = r.uncheckableCount;
     errorKinds = dedupe(r.errors.map((e) => e.kind));
+  }
+  if (backendRes.status >= 400) {
+    completeAttemptFailure(h, ctx.attempt, {
+      failure: "http",
+      provenance: errorOrigin(backendRes) === "local" ? "relay-mapper-defect" : "upstream",
+      status: backendRes.status,
+      retryAfterMs: parseRetryAfterMs(backendRes.headers.get("retry-after")),
+    });
+  } else if (ctx.willValidate && (!assistant || validated !== "pass")) {
+    completeAttemptFailure(h, ctx.attempt, {
+      failure: "protocol",
+      provenance: "invalid-upstream-envelope",
+      status: 502,
+    });
+  } else {
+    completeAttemptSuccess(h, ctx.attempt, backendRes.status);
   }
   h.logger.write({
     ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
@@ -877,11 +1169,13 @@ async function repairStreamingPath(
     // head has not been written yet (a failure before any text frame) this is still
     // a clean 502. Either way the turn is logged.
     held.length = 0;
-    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, ctx.target, h, sseError);
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, ctx.target, ctx.attempt, h, sseError, ctx.signal.aborted);
     return;
   } finally {
     clearTimeout(timer);
   }
+
+  if (res.destroyed) return;
 
   let validated: RequestLog["validated"] = "skipped";
   let toolUseCount = 0;
@@ -934,6 +1228,25 @@ async function repairStreamingPath(
     }
   }
 
+  if (backendRes.status >= 400) {
+    completeAttemptFailure(h, ctx.attempt, {
+      failure: "http",
+      provenance: errorOrigin(backendRes) === "local" ? "relay-mapper-defect" : "upstream",
+      status: backendRes.status,
+      retryAfterMs: parseRetryAfterMs(backendRes.headers.get("retry-after")),
+    });
+  } else if (
+    (validated === "fail" && repairOutcome !== "fixed") ||
+    (repairOutcome !== "none" && repairOutcome !== "fixed")
+  ) {
+    completeAttemptFailure(h, ctx.attempt, {
+      failure: "protocol",
+      provenance: "invalid-upstream-envelope",
+      status: 502,
+    });
+  } else {
+    completeAttemptSuccess(h, ctx.attempt, backendRes.status);
+  }
   h.logger.write({
     ...baseLog(ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
@@ -955,11 +1268,12 @@ async function repairBufferedPath(
     // Nothing has been written yet on this path, so this is a clean 502 rather than
     // a truncated body — but it still has to be LOGGED, which the bare finally did
     // not do: the throw went straight to the top-level catch.
-    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, h, () => null);
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, ctx.attempt, h, () => null, ctx.signal.aborted);
     return;
   } finally {
     clearTimeout(timer);
   }
+  if (res.destroyed) return;
   const assistant = ctx.streamed
     ? reconstructFromSse(bytes.toString("utf8"))
     : parseAssistant(bytes.toString("utf8"));
@@ -972,9 +1286,16 @@ async function repairBufferedPath(
   let errorKinds: string[] = [];
 
   if (!assistant) {
-    // Couldn't parse — forward unchanged.
-    res.writeHead(backendRes.status, filtered);
-    if (!res.writableEnded) res.end(bytes);
+    if (backendRes.status < 400) {
+      // A successful status with no Anthropic message is not a successful provider attempt.
+      // Nothing has been committed yet on this buffered path, so return a bounded clean 502.
+      validated = "fail";
+      errorKinds = ["invalid_upstream_envelope"];
+      failClosed(res, 502, "llm-relay: invalid Anthropic upstream envelope");
+    } else {
+      res.writeHead(backendRes.status, filtered);
+      if (!res.writableEnded) res.end(bytes);
+    }
   } else {
     const r = h.validator.validate(assistant, ctx.tools);
     toolUseCount = r.toolUseCount;
@@ -1003,6 +1324,25 @@ async function repairBufferedPath(
     }
   }
 
+  if (backendRes.status >= 400) {
+    completeAttemptFailure(h, ctx.attempt, {
+      failure: "http",
+      provenance: errorOrigin(backendRes) === "local" ? "relay-mapper-defect" : "upstream",
+      status: backendRes.status,
+      retryAfterMs: parseRetryAfterMs(backendRes.headers.get("retry-after")),
+    });
+  } else if (
+    (validated === "fail" && repairOutcome !== "fixed") ||
+    (repairOutcome !== "none" && repairOutcome !== "fixed")
+  ) {
+    completeAttemptFailure(h, ctx.attempt, {
+      failure: "protocol",
+      provenance: "invalid-upstream-envelope",
+      status: 502,
+    });
+  } else {
+    completeAttemptSuccess(h, ctx.attempt, backendRes.status);
+  }
   h.logger.write({
     ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
@@ -1249,8 +1589,8 @@ function endMidStreamFailure(res: ServerResponse, errorFrame: string | null, mes
  * Handle a mid-stream failure (socket reset / network drop mid-response).
  *
  * Emits protocol-appropriate error frames (SSE event/data or none for non-stream),
- * reports the mid-stream failure to the circuit breaker to correct any eager success,
- * and writes a metadata log record with `MID_STREAM_ERROR_KIND`.
+ * completes the attempt's still-provisional health handle as a failure and writes a
+ * metadata log record with `MID_STREAM_ERROR_KIND`.
  */
 function handleMidStreamError(
   res: ServerResponse,
@@ -1261,13 +1601,23 @@ function handleMidStreamError(
   streamed: boolean,
   backendStatus: number,
   target: ResolvedTarget,
+  attempt: HealthAttempt,
   h: Handlers,
   errorFrameBuilder: (msg: string) => string | null,
+  deadlineAborted = false,
 ): void {
   const message = midStreamMessage(e);
   const errorFrame = errorFrameBuilder(message);
   endMidStreamFailure(res, errorFrame, message);
-  globalCircuitBreaker.recordMidStreamFailure(target, { elapsedMs: Date.now() - started, status: 502 });
+  if (res.destroyed) {
+    completeAttemptCancelled(h, attempt, "client disconnected");
+  } else {
+    completeAttemptFailure(h, attempt, {
+      failure: deadlineAborted ? "transport" : "protocol",
+      provenance: deadlineAborted ? "deadline" : "upstream",
+      status: deadlineAborted ? 504 : 502,
+    });
+  }
   h.logger.write({
     ...baseLog(started, path, hadTools, streamed, backendStatus, "skipped", target),
     errorKinds: [MID_STREAM_ERROR_KIND],
@@ -1377,37 +1727,6 @@ function failClosed(res: ServerResponse, status: number, message: string): void 
  * routinely not the model that answered, and it was the id every "which model
  * trips the validator" reading of this log was attributed to.
  */
-export function baseLog(
-  started: number, path: string, hadTools: boolean,
-  streamed: boolean, backendStatus: number, validated: RequestLog["validated"],
-  served: ResolvedTarget | null,
-): RequestLog {
-  return {
-    ts: new Date(started).toISOString(),
-    path: logSafePath(path),
-    servedProvider: served ? served.provider : null,
-    servedModel: served ? served.model ?? null : null,
-    hadTools, streamed, backendStatus, validated,
-    toolUseCount: 0, uncheckableCount: 0, errorKinds: [], repair: "none",
-    latencyMs: Date.now() - started,
-  };
-}
-
-/**
- * A request path is metadata; the VALUES in its query string are not. `?task=`
- * carries user prose, so logging the raw path put request content into a log this
- * project promises is metadata-only. Keep the route and the parameter NAMES,
- * replace each value with its length.
- */
-export function logSafePath(path: string): string {
-  const q = path.indexOf("?");
-  if (q === -1) return path;
-  const route = path.slice(0, q);
-  const params = new URLSearchParams(path.slice(q + 1));
-  const shape = [...params.keys()].map((k) => `${k}=<${params.get(k)?.length ?? 0}c>`).join("&");
-  return shape ? `${route}?${shape}` : route;
-}
-
 /**
  * Cheap local token estimate for a /v1/messages/count_tokens request against an
  * OpenAI backend (which has no native count_tokens). ~4 chars/token over all

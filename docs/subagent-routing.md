@@ -138,19 +138,15 @@ rule, while `GET /offload` returns the aggregate and all configured rules. With 
 the CLI writes the file and says so. `llm-relay dispatch --client codex` makes dispatch hints use
 the same client rule.
 
-⚠ **Binding to loopback is not authorization**, and `/offload` no longer treats it as such. Flipping
-this switch decides which vendor answers every subagent and rewrites `config.json` on disk, so any
-page the user happens to be visiting could otherwise have flipped it: a cross-origin `POST` to
-`127.0.0.1` with a `text/plain` body is a CORS *simple request*, needs no preflight, and succeeds —
-the attacker never reads the response, but the write has already happened. So `admissionFailure()`
-in [`src/server.ts`](../src/server.ts) rejects (403) any request to `/offload` or `/dispatch` whose
-`Origin` is present and non-loopback, or whose `Host` is not a loopback name (closing DNS
-rebinding, where a hostile name resolves to `127.0.0.1` and so looks local to the socket); a
-mutating `POST` must additionally declare `content-type: application/json`, which is exactly what
-forces a preflight a hostile page cannot satisfy. A CLI sends no `Origin`, so an **absent** one is
-allowed — targeted `llm-relay offload <client> on` keeps working, as does a hand-written `curl` that
-sets the JSON content type. The proxy still does no authentication: this closes the browser-driven
-path, it does not make the endpoint safe to expose off-loopback.
+⚠ **Binding to loopback is not authorization.** Flipping this switch decides which vendor answers
+every subagent and rewrites `config.json`, so protected control requests require the per-install
+256-bit capability in `~/.llm-relay/control-token`. The CLI attaches it automatically and the
+proxy never forwards it to a provider. Admission also requires `Host` to exactly match the bound
+listener authority; a present `Origin` must match its exact scheme, host, and effective port
+(`Origin: null` is invalid); and a mutating POST must declare `content-type: application/json`.
+Missing or invalid capability material returns 403 before any control action. Tokenless GETs are
+limited to the side-effect-free status set. Keep using the CLI rather than copying the capability,
+and never expose the listener off-loopback.
 
 ## Choosing a destination
 
@@ -282,7 +278,6 @@ The directive path is used here on purpose: it works with the client rule off, s
 marker rather than the rule. To exercise the rule itself, `llm-relay offload claude on` first and drop
 the `@relay:` line — the same bogus-pool 400 then proves `routing.subagents` is being consulted.
 
-(`/v1/messages` is a proxy path, not a control path, so the admission check described under
-[The switch](#the-switch) does not apply to it — these probes need no extra headers. A 403 rather
-than the expected 400 means you hit `/offload` or `/dispatch` from a non-loopback `Origin`/`Host`,
-or POSTed without `content-type: application/json`.)
+(`/v1/messages` is a proxy path, not a control path, so these probes need no control-capability
+header. A 403 rather than the expected 400 usually means a control request lacked the installed
+capability, its `Host`/present `Origin` did not exactly match the listener, or its POST was not JSON.)

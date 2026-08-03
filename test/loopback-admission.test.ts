@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
-import { createProxy, logSafePath } from "../src/server.js";
+import { buildForwardHeaders, createProxy, logSafePath } from "../src/server.js";
 import type { Config } from "../src/config.js";
+import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
+
+const CONTROL_TOKEN = "test-control-capability";
+const CONTROL_HEADERS = { [CONTROL_AUTHORIZATION_HEADER]: CONTROL_TOKEN };
 
 /**
  * Pins ARC-c9155ca2: binding to loopback was doing the job of authorization.
@@ -31,7 +35,9 @@ afterEach(async () => {
 });
 
 async function boot(): Promise<string> {
-  server = createProxy(baseConfig());
+  server = createProxy(baseConfig(), {
+    controlAuthorization: { validate: (candidate) => candidate === CONTROL_TOKEN },
+  });
   await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
   const { port } = server!.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
@@ -42,7 +48,7 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     const url = await boot();
     const res = await fetch(`${url}/offload`, {
       method: "POST",
-      headers: { origin: "https://evil.example", "content-type": "application/json" },
+      headers: { origin: "https://evil.example", "content-type": "application/json", ...CONTROL_HEADERS },
       body: JSON.stringify({ enabled: true }),
     });
     expect(res.status).toBe(403);
@@ -53,7 +59,7 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     // This is the exact shape that needed no preflight and therefore succeeded.
     const res = await fetch(`${url}/offload`, {
       method: "POST",
-      headers: { "content-type": "text/plain" },
+      headers: { "content-type": "text/plain", ...CONTROL_HEADERS },
       body: JSON.stringify({ enabled: true }),
     });
     expect(res.status).toBe(403);
@@ -63,7 +69,7 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     const url = await boot();
     const res = await fetch(`${url}/dispatch`, {
       method: "POST",
-      headers: { origin: "https://evil.example", "content-type": "application/json" },
+      headers: { origin: "https://evil.example", "content-type": "application/json", ...CONTROL_HEADERS },
       body: JSON.stringify({ exhausted: "pools" }),
     });
     expect(res.status).toBe(403);
@@ -82,10 +88,50 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     const url = await boot();
     const res = await fetch(`${url}/offload`, {
       method: "POST",
-      headers: { origin: url, "content-type": "application/json" },
+      headers: { origin: url, "content-type": "application/json", ...CONTROL_HEADERS },
       body: JSON.stringify({ enabled: false }),
     });
     expect(res.status).toBe(200);
+  });
+
+  it("requires the independent capability even for a same-origin control POST", async () => {
+    const url = await boot();
+    const missing = await fetch(`${url}/offload`, {
+      method: "POST",
+      headers: { origin: url, "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+    const wrong = await fetch(`${url}/offload`, {
+      method: "POST",
+      headers: {
+        origin: url,
+        "content-type": "application/json",
+        [CONTROL_AUTHORIZATION_HEADER]: "wrong",
+      },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(missing.status).toBe(403);
+    expect(wrong.status).toBe(403);
+  });
+
+  it("rejects Origin: null, cross-port, and cross-scheme with a valid capability", async () => {
+    const url = await boot();
+    const crossPort = new URL(url);
+    crossPort.port = String(Number(crossPort.port) + 1);
+    for (const origin of ["null", crossPort.origin, url.replace("http:", "https:")]) {
+      const res = await fetch(`${url}/offload`, {
+        method: "POST",
+        headers: { origin, "content-type": "application/json", ...CONTROL_HEADERS },
+        body: JSON.stringify({ enabled: false }),
+      });
+      expect(res.status, origin).toBe(403);
+    }
+  });
+
+  it("requires capability authorization before a probing GET", async () => {
+    const url = await boot();
+    const missing = await fetch(`${url}/ping`);
+    expect(missing.status).toBe(403);
   });
 
   it("rejects a non-loopback Host header (DNS rebinding)", async () => {
@@ -96,6 +142,23 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     const status = await new Promise<number>((resolve, reject) => {
       const req = httpRequest(
         { host: "127.0.0.1", port, path: "/offload", method: "GET", headers: { Host: "attacker.example" } },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    expect(status).toBe(403);
+  });
+
+  it("requires the exact listener authority, not another loopback spelling", async () => {
+    await boot();
+    const { port } = server!.address() as AddressInfo;
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest(
+        { host: "127.0.0.1", port, path: "/offload", method: "GET", headers: { Host: `localhost:${port}` } },
         (res) => {
           res.resume();
           resolve(res.statusCode ?? 0);
@@ -136,6 +199,20 @@ describe("loopback admission (ARC-c9155ca2)", () => {
 });
 
 describe("logs stay metadata-only (INV-OB-1)", () => {
+  it("never forwards the local control capability to a provider", () => {
+    const forwarded = buildForwardHeaders(
+      { [CONTROL_AUTHORIZATION_HEADER]: CONTROL_TOKEN, "content-type": "application/json" },
+      {
+        provider: "anthropic",
+        base: "https://api.anthropic.com",
+        kind: "anthropic",
+        authHeader: "x-api-key",
+        timeoutMs: 1000,
+      },
+    );
+    expect(forwarded[CONTROL_AUTHORIZATION_HEADER]).toBeUndefined();
+  });
+
   it("never writes a query-parameter VALUE into a log line", () => {
     // A ?task= carries user prose. The route and parameter names are metadata;
     // the values are content, and this project promises metadata-only logs.

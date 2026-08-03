@@ -1,7 +1,21 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
   DEFAULT_CLIENT,
   offloadRule,
+  parseOffload,
   type Config,
   type OffloadConfig,
   type OffloadRule,
@@ -88,6 +102,59 @@ function setInMemory(cfg: Config, enabled: boolean, client?: string, scope?: Off
   cfg.routing.offload = next;
 }
 
+function setInFile(
+  raw: Record<string, unknown>,
+  enabled: boolean,
+  client?: string,
+  scope?: OffloadScope,
+): void {
+  const routing = (typeof raw.routing === "object" && raw.routing !== null ? raw.routing : {}) as Record<
+    string,
+    unknown
+  >;
+  const configured = routing.offload;
+  if (client === undefined) {
+    if (typeof configured === "object" && configured !== null && !Array.isArray(configured)) {
+      const next = { ...(configured as Record<string, unknown>) };
+      for (const [name, value] of Object.entries(next)) {
+        if (typeof value === "boolean") next[name] = { enabled, scope: "subagents" };
+        else if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+          next[name] = { ...(value as Record<string, unknown>), enabled };
+        }
+      }
+      routing.offload = next;
+    } else {
+      routing.offload = enabled;
+    }
+  } else {
+    const next: Record<string, unknown> =
+      typeof configured === "object" && configured !== null && !Array.isArray(configured)
+        ? { ...(configured as Record<string, unknown>) }
+        : { [DEFAULT_CLIENT]: { enabled: typeof configured === "boolean" ? configured : false, scope: "subagents" } };
+    const existing = next[client];
+    const existingScope =
+      typeof existing === "object" && existing !== null && !Array.isArray(existing) &&
+      ((existing as Record<string, unknown>).scope === "subagents" || (existing as Record<string, unknown>).scope === "all")
+        ? (existing as Record<string, unknown>).scope
+        : "subagents";
+    next[client] = {
+      ...(typeof existing === "object" && existing !== null && !Array.isArray(existing) ? existing : {}),
+      enabled,
+      scope: scope ?? existingScope,
+    };
+    routing.offload = next;
+  }
+  raw.routing = routing;
+}
+
+let tempSequence = 0;
+
+function tempConfigPath(configPath: string): string {
+  const directory = dirname(configPath);
+  const name = `.${basename(configPath)}.${process.pid}.${Date.now()}.${tempSequence++}.tmp`;
+  return join(directory, name);
+}
+
 /**
  * Flip one client rule, or the legacy/global set when no client is supplied, on the live Config.
  * A scope may be supplied when setting a targeted rule; existing scopes are preserved otherwise.
@@ -99,50 +166,73 @@ export function setOffload(
   client?: string,
   scope?: OffloadScope,
 ): OffloadState {
-  setInMemory(cfg, enabled, client, scope);
-  const state = offloadState(cfg, client);
+  const nextCfg = structuredClone(cfg);
+  setInMemory(nextCfg, enabled, client, scope);
 
   if (!cfg.sourcePath) {
+    cfg.routing.offload = nextCfg.routing.offload!;
+    const state = offloadState(cfg, client);
     return { ...state, persisted: false, persistError: "config was not loaded from a file" };
   }
+
+  let temporaryPath: string | undefined;
   try {
-    const raw = JSON.parse(readFileSync(cfg.sourcePath, "utf8")) as Record<string, unknown>;
-    const routing = (typeof raw.routing === "object" && raw.routing !== null ? raw.routing : {}) as Record<
-      string,
-      unknown
-    >;
-    const configured = routing.offload;
-    if (client === undefined) {
-      if (typeof configured === "object" && configured !== null && !Array.isArray(configured)) {
-        const next = { ...(configured as Record<string, unknown>) };
-        for (const [name, value] of Object.entries(next)) {
-          if (typeof value === "boolean") next[name] = { enabled, scope: "subagents" };
-          else if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-            next[name] = { ...(value as Record<string, unknown>), enabled };
-          }
-        }
-        routing.offload = next;
-      } else {
-        routing.offload = enabled;
-      }
-    } else {
-      const next: Record<string, unknown> =
-        typeof configured === "object" && configured !== null && !Array.isArray(configured)
-          ? { ...(configured as Record<string, unknown>) }
-          : { [DEFAULT_CLIENT]: { enabled: typeof configured === "boolean" ? configured : false, scope: "subagents" } };
-      const existing = next[client];
-      const existingScope =
-        typeof existing === "object" && existing !== null && !Array.isArray(existing) &&
-        ((existing as Record<string, unknown>).scope === "subagents" || (existing as Record<string, unknown>).scope === "all")
-          ? (existing as Record<string, unknown>).scope
-          : "subagents";
-      next[client] = { ...(typeof existing === "object" && existing !== null && !Array.isArray(existing) ? existing : {}), enabled, scope: scope ?? existingScope };
-      routing.offload = next;
+    // Publish beside the canonical target. Renaming over cfg.sourcePath directly would replace a
+    // symlink instead of atomically updating the file it intentionally points at.
+    const persistencePath = realpathSync(cfg.sourcePath);
+    const raw = JSON.parse(readFileSync(persistencePath, "utf8")) as Record<string, unknown>;
+    const existingMode = statSync(persistencePath).mode & 0o777;
+    setInFile(raw, enabled, client, scope);
+    const routing = raw.routing as Record<string, unknown>;
+    // Parse the exact value about to be published. This both rejects a concurrently corrupted
+    // offload section and keeps live memory aligned with valid edits made since cfg was loaded.
+    const persistedOffload = parseOffload(routing.offload);
+
+    const directory = dirname(persistencePath);
+    mkdirSync(directory, { recursive: true });
+    temporaryPath = tempConfigPath(persistencePath);
+    writeFileSync(temporaryPath, JSON.stringify(raw, null, 2) + "\n", {
+      encoding: "utf8",
+      flag: "wx",
+      mode: existingMode,
+    });
+    // Creation mode is filtered through the process umask. Apply the original bits explicitly,
+    // then flush complete contents before making the temporary inode visible as the config.
+    if (process.platform !== "win32") chmodSync(temporaryPath, existingMode);
+    // Windows requires a writable handle for FlushFileBuffers/fsync.
+    const descriptor = openSync(temporaryPath, "r+");
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
     }
-    raw.routing = routing;
-    writeFileSync(cfg.sourcePath, JSON.stringify(raw, null, 2) + "\n", "utf8");
-    return state;
+    renameSync(temporaryPath, persistencePath);
+    temporaryPath = undefined;
+    // POSIX requires the containing directory to be flushed for the rename itself to survive a
+    // crash. Directory fsync is unavailable on Windows and can be unsupported on some filesystems,
+    // so this durability enhancement is best-effort after the atomic publication succeeds.
+    if (process.platform !== "win32") {
+      let directoryDescriptor: number | undefined;
+      try {
+        directoryDescriptor = openSync(directory, "r");
+        fsyncSync(directoryDescriptor);
+      } catch {
+        // The file is already atomically published; do not report a false failed transaction.
+      } finally {
+        if (directoryDescriptor !== undefined) closeSync(directoryDescriptor);
+      }
+    }
+
+    cfg.routing.offload = persistedOffload;
+    return offloadState(cfg, client);
   } catch (e) {
-    return { ...state, persisted: false, persistError: (e as Error).message };
+    if (temporaryPath !== undefined) {
+      try {
+        rmSync(temporaryPath, { force: true });
+      } catch {
+        // Best effort only: preserve the persistence error that prevented the commit.
+      }
+    }
+    return { ...offloadState(cfg, client), persisted: false, persistError: (e as Error).message };
   }
 }

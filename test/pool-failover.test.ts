@@ -7,6 +7,7 @@ import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js"
 import { SERVED_BY_HEADER } from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
 import type { Config, ProviderConfig, ResolvedTarget } from "../src/config.js";
+import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
 
 /**
  * Pool failover, measured end to end.
@@ -89,7 +90,7 @@ function poolCfg(bases: string[], kind: "openai" | "anthropic" = "openai"): Conf
 }
 
 function startProxy(c: Config): Promise<Server> {
-  const s = createProxy(c, { catalog: new ModelCatalog({ cachePath: null }) });
+  const s = createProxy(c, { catalog: new ModelCatalog({ cachePath: null }), breaker: globalCircuitBreaker });
   return new Promise((r) => s.listen(0, "127.0.0.1", () => r(track(s))));
 }
 
@@ -196,6 +197,36 @@ describe("OpenAI front — failover across pool candidates", () => {
 
     expect((await chat(p)).status).toBe(422);
     expect(b.calls()).toBe(0); // the second candidate is never asked
+  });
+});
+
+describe("Anthropic front — local failures do not walk the provider pool", () => {
+  it("does not create another target attempt for a deterministic relay-local failure", async () => {
+    class CountingBreaker extends CircuitBreaker {
+      begins = 0;
+      override beginAttempt(target: ProviderTargetIdentity) {
+        this.begins += 1;
+        return super.beginAttempt(target);
+      }
+    }
+    const breaker = new CountingBreaker();
+    const cfg = poolCfg(["https://first.invalid", "https://second.invalid"]);
+    const proxy = createProxy(cfg, { catalog: new ModelCatalog({ cachePath: null }), breaker });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
+    track(proxy);
+
+    const response = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "pool/coding",
+        messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://example.invalid/a.pdf" } }] }],
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(breaker.begins).toBe(1);
+    expect(breaker.getAllStates().size).toBe(0);
   });
 });
 
@@ -320,4 +351,3 @@ describe("Anthropic path — failover past a credential fault", () => {
     expect(b.calls()).toBe(0);
   });
 });
-

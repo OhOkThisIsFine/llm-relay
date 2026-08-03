@@ -95,7 +95,7 @@ function catalogWithLimits(dir: string, seed: Record<string, Record<string, Part
 
 /** Boot a proxy with a hermetic catalog unless the test supplies its own. */
 function startProxy(cfg: Config, deps: ProxyDeps = {}): Promise<Server> {
-  const s = createProxy(cfg, { catalog: hermeticCatalog(), ...deps });
+  const s = createProxy(cfg, { catalog: hermeticCatalog(), breaker: globalCircuitBreaker, ...deps });
   return new Promise((resolve) => s.listen(0, "127.0.0.1", () => resolve(track(s))));
 }
 
@@ -230,7 +230,8 @@ describe("repair-proxy end-to-end (detect mode)", () => {
       body: JSON.stringify({ model: "m", messages: [], tools: [{ type: "bash_20250124", name: "bash" }] }),
     });
     const rec = lastLogLine(logFile);
-    expect(rec.validated).toBe("uncheckable"); // known tool, no schema — not a fail
+    expect(rec.validated).toBe("fail"); // known tool, but no executable schema — fail closed
+    expect(rec.errorKinds).toContain("schema_uncheckable");
     expect(rec.errorKinds).not.toContain("unknown_tool");
   });
 

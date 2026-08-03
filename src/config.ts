@@ -648,7 +648,8 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     throw new Error(`config.listen has invalid port: "${listen}"`);
   }
-  // This tool holds provider keys and does no auth of its own — loopback only.
+  // The data plane carries provider credentials, while the separate control capability protects
+  // stateful/costly administrative work. Neither boundary makes a non-loopback bind acceptable.
   if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
     throw new Error(
       `config.listen must bind loopback (127.0.0.1/localhost/::1), got "${host}". ` +
@@ -988,7 +989,7 @@ function parseRouting(
 }
 
 /** Parse the legacy global switch or the independently keyed client-rule form. */
-function parseOffload(raw: unknown): OffloadConfig {
+export function parseOffload(raw: unknown): OffloadConfig {
   // Absent => false. Offload is opt-in: a missing key must never mean "send every request to
   // another provider", which is what an implicit-on default would do to an existing config.
   if (raw === undefined) return false;

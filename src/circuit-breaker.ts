@@ -1,4 +1,16 @@
 import type { ResolvedTarget } from "./config.js";
+import type {
+  AttemptBeginFailure,
+  AttemptCompletionFailure,
+  AttemptHandle,
+  AttemptId,
+  AttemptLifecyclePort,
+  AttemptOutcome,
+  CompletedAttempt,
+  ProviderTargetIdentity,
+  TransitionResult,
+} from "./kernel/contracts.js";
+import { AttemptLifecycle } from "./kernel/request-lifecycle.js";
 import { getStabilityScore, type PingRecord } from "./ping/metrics.js";
 
 export interface CircuitState {
@@ -21,9 +33,46 @@ export interface CircuitState {
   lastCredentialStatus?: number | undefined;
   /** While in the future, this target is demoted (never dropped) as unusable-for-now. */
   credentialFaultUntil: number;
-  /** Failure count prior to an eager success, so a mid-stream failure can restore and increment it. */
-  prevConsecutiveFailures?: number | undefined;
 }
+
+/**
+ * Response metadata observed before an attempt reaches its terminal state.
+ *
+ * An observation is deliberately provisional. In particular, a 2xx status does not prove a
+ * streamed response reached EOF or passed validation, so observing it never changes circuit
+ * health. Metadata which remains meaningful at completion is committed with the terminal
+ * outcome.
+ */
+export interface HeaderObservation {
+  readonly target: ProviderTargetIdentity;
+  readonly status: number;
+  readonly elapsedMs: number;
+  readonly observedAt: number;
+  readonly quotaPercent?: number | null | undefined;
+  readonly retryAfterMs?: number | null | undefined;
+}
+
+export type HeaderObservationFailure =
+  | AttemptCompletionFailure
+  | { readonly kind: "duplicate-observation" };
+
+interface BreakerAttemptRecord {
+  readonly generation: number;
+  readonly target: ProviderTargetIdentity;
+  observation?: HeaderObservation;
+  completedId?: AttemptId;
+}
+
+interface HealthOutcome {
+  readonly ok: boolean;
+  readonly elapsedMs: number;
+  readonly status?: number | undefined;
+  readonly quotaPercent?: number | null | undefined;
+  readonly at: number;
+  readonly retryAfterMs?: number | undefined;
+}
+
+type CircuitTarget = ResolvedTarget | ProviderTargetIdentity | string;
 
 const DEFAULT_COOLDOWN_MS = 60000; // 1 minute cooldown after consecutive failures
 const RATE_LIMIT_COOLDOWN_MS = 120000; // 2 minutes cooldown on 429
@@ -67,16 +116,28 @@ export const UNMEASURED_STABILITY = 50;
  * revoked key had a wall of synthetic "200" pings and read as available. A 401 is
  * never an availability signal.
  */
-function outcomeCode(outcome: { ok: boolean; status?: number }): string {
+function outcomeCode(outcome: { ok: boolean; status?: number | undefined }): string {
   if (outcome.status === undefined) return outcome.ok ? "200" : "500";
   if (outcome.status >= 200 && outcome.status < 300) return "200";
   return String(outcome.status);
 }
 
-export class CircuitBreaker {
-  private states = new Map<string, CircuitState>();
+function sameTarget(a: ProviderTargetIdentity, b: ProviderTargetIdentity): boolean {
+  return a.provider === b.provider && a.model === b.model && a.kind === b.kind;
+}
 
-  private getKey(target: ResolvedTarget | string): string {
+// Shared only to distinguish a genuine handle issued by another breaker from an arbitrary or
+// expired object. Weak keys keep ownership per instance without extending a handle's lifetime.
+const breakerHandleOwners = new WeakMap<object, object>();
+
+export class CircuitBreaker implements AttemptLifecyclePort {
+  private states = new Map<string, CircuitState>();
+  readonly #owner = Object.freeze({});
+  #generation = 1;
+  #lifecycle = new AttemptLifecycle(this.#generation);
+  #attempts = new WeakMap<object, BreakerAttemptRecord>();
+
+  private getKey(target: CircuitTarget): string {
     if (typeof target === "string") return target;
     return target.model ? `${target.provider}/${target.model}` : target.provider;
   }
@@ -96,8 +157,181 @@ export class CircuitBreaker {
     return fresh;
   }
 
+  /** Begin one target-bound health lifecycle owned by this breaker instance. */
+  beginAttempt(
+    target: ProviderTargetIdentity,
+  ): TransitionResult<AttemptHandle, AttemptBeginFailure> {
+    const begun = this.#lifecycle.beginAttempt(target);
+    if (!begun.ok) return begun;
+
+    const handle = begun.value;
+    const stableTarget = Object.freeze({ ...target });
+    this.#attempts.set(handle as object, {
+      generation: this.#generation,
+      target: stableTarget,
+    });
+    breakerHandleOwners.set(handle as object, this.#owner);
+    return begun;
+  }
+
+  /**
+   * Attach provisional response metadata to an attempt without changing circuit health.
+   *
+   * This is intentionally one-shot. Rejected observations do not create a circuit state or
+   * alter the accepted observation, so stale/foreign/cross-target/duplicate calls are inert.
+   */
+  observeHeaders(
+    handle: AttemptHandle,
+    observation: HeaderObservation,
+  ): TransitionResult<HeaderObservation, HeaderObservationFailure> {
+    const record = this.getAttemptRecord(handle);
+    if (!record.ok) return record;
+    if (record.value.completedId !== undefined) {
+      return {
+        ok: false,
+        error: { kind: "duplicate-completion", id: record.value.completedId },
+      };
+    }
+    if (!sameTarget(record.value.target, observation.target)) {
+      return {
+        ok: false,
+        error: {
+          kind: "cross-target",
+          expected: record.value.target,
+          received: observation.target,
+        },
+      };
+    }
+    if (record.value.observation !== undefined) {
+      return { ok: false, error: { kind: "duplicate-observation" } };
+    }
+
+    const stableObservation = Object.freeze({
+      ...observation,
+      target: Object.freeze({ ...observation.target }),
+    });
+    record.value.observation = stableObservation;
+    return { ok: true, value: stableObservation };
+  }
+
+  /**
+   * Commit exactly one terminal result for an attempt.
+   *
+   * `AttemptLifecycle` performs the authoritative one-shot transition. Circuit health is
+   * mutated only after that transition succeeds, synchronously preserving call order for all
+   * completions of the same target.
+   */
+  completeAttempt(
+    handle: AttemptHandle,
+    outcome: AttemptOutcome,
+  ): TransitionResult<CompletedAttempt, AttemptCompletionFailure> {
+    const record = this.getAttemptRecord(handle);
+    if (!record.ok) return record;
+    if (record.value.completedId !== undefined) {
+      return {
+        ok: false,
+        error: { kind: "duplicate-completion", id: record.value.completedId },
+      };
+    }
+    if (!sameTarget(record.value.target, outcome.target)) {
+      return {
+        ok: false,
+        error: {
+          kind: "cross-target",
+          expected: record.value.target,
+          received: outcome.target,
+        },
+      };
+    }
+
+    const completed = this.#lifecycle.completeAttempt(handle, outcome);
+    if (!completed.ok) return completed;
+
+    record.value.completedId = completed.value.id;
+    this.applyTerminalOutcome(record.value.target, outcome, record.value.observation);
+    return completed;
+  }
+
+  private getAttemptRecord(
+    handle: AttemptHandle,
+  ): TransitionResult<BreakerAttemptRecord, AttemptCompletionFailure> {
+    if ((typeof handle !== "object" && typeof handle !== "function") || handle === null) {
+      return { ok: false, error: { kind: "stale-handle" } };
+    }
+
+    const objectHandle = handle as object;
+    const record = this.#attempts.get(objectHandle);
+    if (!record) {
+      return {
+        ok: false,
+        error:
+          breakerHandleOwners.has(objectHandle) &&
+          breakerHandleOwners.get(objectHandle) !== this.#owner
+            ? { kind: "foreign-handle" }
+            : { kind: "stale-handle" },
+      };
+    }
+    if (record.generation !== this.#generation) {
+      return { ok: false, error: { kind: "stale-handle" } };
+    }
+    return { ok: true, value: record };
+  }
+
+  private applyTerminalOutcome(
+    target: ProviderTargetIdentity,
+    outcome: AttemptOutcome,
+    observation?: HeaderObservation,
+  ): void {
+    if (outcome.terminal === "cancelled") return;
+
+    // Relay translation/configuration failures are local defects. The provider may have
+    // returned a valid response, so poisoning its health from our own failure would route
+    // around the wrong component and hide the bug operators need to fix.
+    if (outcome.provenance === "relay-mapper-defect") return;
+
+    if (outcome.terminal === "succeeded") {
+      this.applyHealthOutcome(target, {
+        ok: true,
+        status: outcome.status,
+        elapsedMs: outcome.elapsedMs,
+        at: outcome.completedAt,
+        quotaPercent: observation?.quotaPercent,
+      });
+      return;
+    }
+
+    if (outcome.status === 401 || outcome.status === 403) {
+      this.applyCredentialFault(target, outcome.status, outcome.completedAt);
+      return;
+    }
+
+    // A genuine client-side 4xx says nothing about deployment health. The request lifecycle
+    // still reaches its one terminal state, but it must not manufacture a failure ping. The
+    // historically retriable 400/404/429 statuses remain health failures.
+    if (
+      outcome.status !== null &&
+      outcome.status >= 400 &&
+      outcome.status < 500 &&
+      outcome.status !== 400 &&
+      outcome.status !== 404 &&
+      outcome.status !== 429
+    ) {
+      return;
+    }
+
+    this.applyHealthOutcome(target, {
+      ok: false,
+      status: outcome.status ?? undefined,
+      elapsedMs: outcome.elapsedMs,
+      at: outcome.completedAt,
+      quotaPercent: observation?.quotaPercent,
+      retryAfterMs:
+        outcome.retryAfterMs ?? observation?.retryAfterMs ?? undefined,
+    });
+  }
+
   /** Check if a target spec or ResolvedTarget is healthy to receive traffic. */
-  isHealthy(target: ResolvedTarget | string, now = Date.now()): boolean {
+  isHealthy(target: CircuitTarget, now = Date.now()): boolean {
     const key = this.getKey(target);
     const state = this.states.get(key);
     if (!state) return true;
@@ -110,18 +344,14 @@ export class CircuitBreaker {
   }
 
   /**
-   * Record one request outcome with its MEASURED elapsed time.
+   * Compatibility adapter for probes and other non-request callers.
    *
-   * ⚠ This is the ONLY writer, and `elapsedMs` is required, so a caller cannot
-   * fall back to a fabricated constant. The deleted `recordSuccess`/
-   * `recordFailure` pair defaulted `ms` to 500/1000 and every real call site in
-   * `server.ts` omitted it, so p95/jitter/spike-rate — the numbers that decide
-   * which backend serves a request — were computed over parameter defaults
-   * rather than over measurements. Do not reintroduce a defaulted entry point:
-   * `tsc` over `src/` is what now enforces the measured-latency invariant.
+   * Request traffic must use the attempt lifecycle above. `elapsedMs` remains required so a
+   * compatibility caller cannot fall back to a fabricated latency; both paths converge on
+   * `applyHealthOutcome`, the sole health-state writer.
    */
   recordOutcome(
-    target: ResolvedTarget | string,
+    target: CircuitTarget,
     outcome: {
       ok: boolean;
       elapsedMs: number;
@@ -137,7 +367,15 @@ export class CircuitBreaker {
       retryAfterMs?: number | undefined;
     },
   ): void {
-    const now = outcome.at ?? Date.now();
+    this.applyHealthOutcome(target, {
+      ...outcome,
+      at: outcome.at ?? Date.now(),
+    });
+  }
+
+  /** The single circuit/quota/latency transition shared by lifecycle and compatibility calls. */
+  private applyHealthOutcome(target: CircuitTarget, outcome: HealthOutcome): void {
+    const now = outcome.at;
     const state = this.getOrCreate(this.getKey(target));
 
     if (outcome.quotaPercent !== undefined) state.quotaPercent = outcome.quotaPercent;
@@ -146,7 +384,6 @@ export class CircuitBreaker {
     if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
 
     if (outcome.ok) {
-      state.prevConsecutiveFailures = state.consecutiveFailures;
       state.consecutiveFailures = 0;
       state.cooldownUntil = 0;
       // A call that actually succeeded is proof the credential works now — that is the
@@ -178,46 +415,6 @@ export class CircuitBreaker {
   }
 
   /**
-   * Correct an eager 200 success outcome to a failure when a stream breaks mid-response.
-   *
-   * When HTTP status 200 headers arrive, `recordAttempt` eagerly records success (`ok: true`).
-   * If reading the response body subsequently fails (socket reset / network drop mid-stream),
-   * calling `recordMidStreamFailure` replaces the eager success ping with a 502 failure ping
-   * and increments `consecutiveFailures` from its pre-request count rather than resetting it,
-   * allowing repeated mid-stream resets to trip the breaker.
-   */
-  recordMidStreamFailure(
-    target: ResolvedTarget | string,
-    outcome: { elapsedMs: number; status?: number; at?: number },
-  ): void {
-    const key = this.getKey(target);
-    const state = this.states.get(key);
-    const now = outcome.at ?? Date.now();
-    const status = outcome.status ?? 502;
-
-    if (!state) {
-      this.recordOutcome(target, { ok: false, status, elapsedMs: outcome.elapsedMs, at: now });
-      return;
-    }
-
-    if (state.pings.length > 0 && state.pings[state.pings.length - 1]!.code === "200") {
-      state.pings.pop();
-    }
-
-    state.lastStatus = status;
-    state.pings.push({ ms: outcome.elapsedMs, code: String(status), timestamp: now });
-    if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
-
-    state.consecutiveFailures = (state.prevConsecutiveFailures ?? 0) + 1;
-    state.prevConsecutiveFailures = 0;
-    state.lastFailureTime = now;
-
-    if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
-      state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
-    }
-  }
-
-  /**
    * Record a 401/403 — a credential fault, which is NOT health data.
    *
    * This deliberately does not touch `consecutiveFailures`, `cooldownUntil` or the ping
@@ -227,7 +424,16 @@ export class CircuitBreaker {
    * so a pool stops paying a round-trip per request for a member that cannot authenticate,
    * while `/candidates` still shows the operator the 401 and its count.
    */
-  recordCredentialFault(target: ResolvedTarget | string, status: number, at = Date.now()): void {
+  /** Compatibility adapter for non-request credential checks. */
+  recordCredentialFault(target: CircuitTarget, status: number, at = Date.now()): void {
+    this.applyCredentialFault(target, status, at);
+  }
+
+  private applyCredentialFault(
+    target: CircuitTarget,
+    status: number,
+    at: number,
+  ): void {
     const state = this.getOrCreate(this.getKey(target));
     state.credentialFailures += 1;
     state.lastCredentialStatus = status;
@@ -235,7 +441,7 @@ export class CircuitBreaker {
   }
 
   /** True while a recent 401/403 makes this target a last resort. Expires, so a fixed key recovers. */
-  hasCredentialFault(target: ResolvedTarget | string, now = Date.now()): boolean {
+  hasCredentialFault(target: CircuitTarget, now = Date.now()): boolean {
     const state = this.states.get(this.getKey(target));
     return !!state && state.credentialFaultUntil > now;
   }
@@ -249,7 +455,7 @@ export class CircuitBreaker {
    * 0, not null — that is evidence, and conflating it with "unknown" is what let
    * a target whose every probe failed sort level with a proven-healthy one.
    */
-  getMeasuredStability(target: ResolvedTarget | string): number | null {
+  getMeasuredStability(target: CircuitTarget): number | null {
     const state = this.states.get(this.getKey(target));
     if (!state || state.pings.length === 0) return null;
     const score = getStabilityScore(state.pings);
@@ -257,7 +463,7 @@ export class CircuitBreaker {
   }
 
   /** True only when this target has at least one recorded observation. */
-  hasObservations(target: ResolvedTarget | string): boolean {
+  hasObservations(target: CircuitTarget): boolean {
     const state = this.states.get(this.getKey(target));
     return !!state && state.pings.length > 0;
   }
@@ -271,7 +477,7 @@ export class CircuitBreaker {
   // is applied locally in `getHealthyTargets`. Don't reintroduce a scalar accessor.
 
   /** Get full state for a target. */
-  getState(target: ResolvedTarget | string): CircuitState | undefined {
+  getState(target: CircuitTarget): CircuitState | undefined {
     return this.states.get(this.getKey(target));
   }
 
@@ -309,6 +515,9 @@ export class CircuitBreaker {
   /** Reset all circuit states. */
   reset(): void {
     this.states.clear();
+    this.#lifecycle.close();
+    this.#generation += 1;
+    this.#lifecycle = new AttemptLifecycle(this.#generation);
   }
 }
 

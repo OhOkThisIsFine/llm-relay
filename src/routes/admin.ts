@@ -8,8 +8,8 @@ import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { buildDispatch, markExhausted, clearExhausted } from "../dispatch.js";
 import { getTelemetryReport } from "../telemetry.js";
-import { globalCircuitBreaker } from "../circuit-breaker.js";
-import { baseLog } from "../server.js";
+import type { CircuitBreaker } from "../circuit-breaker.js";
+import { baseLog } from "../request-log.js";
 
 const MAX_TASK_LEN = 4096;
 
@@ -86,6 +86,7 @@ export interface AdminHandlers {
   catalog: ModelCatalog;
   pingLoop?: PingLoop;
   logger: MetadataLogger;
+  breaker: CircuitBreaker;
 }
 
 function failClosed(res: ServerResponse, status: number, message: string): void {
@@ -160,6 +161,7 @@ export async function handleAdminRoutes(
     const providerFilter = pickQuery(path, "provider");
     const view = await buildCandidates(cfg, {
       catalog: h.catalog,
+      breaker: h.breaker,
       ...(h.pingLoop ? { pingLoop: h.pingLoop } : {}),
       ...(providerFilter ? { provider: providerFilter } : {}),
     });
@@ -255,7 +257,7 @@ export async function handleAdminRoutes(
   }
 
   if (req.method === "GET" && pathname === "/telemetry") {
-    const report = getTelemetryReport(cfg, globalCircuitBreaker);
+    const report = getTelemetryReport(cfg, h.breaker);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(report, null, 2));
     h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));

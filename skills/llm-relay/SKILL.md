@@ -155,13 +155,20 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
   `routing.subagents` when the originating client's offload rule is on. Spends provider API keys. *Exhausted when:* the pool
   4xx/5xxs after failover walks every candidate, or `llm-relay candidates` shows the breaker open
   / quota drained across the pool.
-- **Antigravity (`agy`)** — `agy -p "<task>" --model <id> --output-format json`. Ask
-  `agy models` for the roster; ids may carry a reasoning-level suffix (`…-high|-medium|-low`),
+- **Antigravity (`agy`)** — `agy -p "<task>" --model <id> --output-format json` (`agy.exe` on
+  Windows). The dispatch API automatically changes a configured bare `agy` to `agy.exe` on
+  Windows so a same-named PowerShell function cannot open the IDE instead of the headless CLI.
+  Explicit command paths are preserved. Ask `agy models` (`agy.exe models` on Windows) for the
+  roster; ids may carry a reasoning-level suffix (`…-high|-medium|-low`),
   and `--effort low|medium|high` tunes ids that don't. Other flags: `--add-dir <path>` to scope
   the workspace, `--json-schema` for structured output, `--print-timeout` (default 5m),
   `--mode plan` for analysis-only runs. ⚠ **AGY meters its Gemini and its Claude models against
   two independent credit balances** — exhausting one leaves the other fully available, so they
   are two distinct rungs, not one.
+  For unattended read-only agent work, combine `--mode plan --sandbox` with
+  `--dangerously-skip-permissions`; otherwise print mode can stop after emitting an internal tool
+  action instead of finishing the delegated review. Use permission skipping only with a task whose
+  write authority is constrained by plan mode and sandboxing.
 - **Codex** — `codex exec --model <id> "<task>"`, spending the ChatGPT subscription. Reasoning
   level is a config override, not a flag (there is no `--effort`):
   `-c model_reasoning_effort="minimal|low|medium|high|xhigh"`, defaulting to whatever
@@ -214,7 +221,9 @@ the user's `CLAUDE.md`, or to relay pools first and primary quota last.
 
 Rules for walking it:
 
-- **Skip a rung whose CLI is not installed** (`Get-Command agy` / `codex` or `command -v`) — this
+- **Skip a rung whose CLI is not installed** (`Get-Command agy.exe` / `codex` on Windows,
+  `command -v agy` / `codex` on POSIX). `Get-Command agy -All` can diagnose a shadowing
+  PowerShell function, but it is not proof that the headless executable is installed. This
   ladder degrades gracefully to "relay pools, then Anthropic" on machines without the peer CLIs.
 - Both CLIs are **full agents with their own tool loops** — hand them a self-contained prompt with
   file paths, run long tasks in the background, and treat output as advisory (verify against
@@ -264,13 +273,15 @@ llm-relay telemetry          # JSON health/quota report
 Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload?client=<name>` (GET/POST),
 `/dispatch` (GET/POST), `/telemetry`, `/ping`, `/health`.
 
-⚠ **`/offload` and `/dispatch` are admission-checked — loopback is not authorization.** They flip
-routing and rewrite `~/.llm-relay/config.json`, and any web page can POST to `127.0.0.1`, so the
-proxy rejects with **403** when the `Origin` header is present and not loopback, or when `Host` is
-not a loopback name (DNS rebinding). A `POST` must also send `content-type: application/json`. The
-CLI and a normal `curl -H 'content-type: application/json'` are unaffected — a missing `Origin` is
-allowed. A surprise 403 from these two paths is this check, not a broken proxy. This closes the
-browser-driven write path only; the proxy still does no authentication, so never bind it off-loopback.
+⚠ **Control work is capability-authorized — loopback is not authorization.** The proxy creates a
+256-bit per-install capability in `~/.llm-relay/control-token`; the CLI attaches it automatically
+and the proxy strips it before provider forwarding. `POST /offload`, `POST /dispatch`, and costly
+reads that probe or materialize provider state (`/ping`, `/registry`, `/health`, `/candidates`)
+return **403** without it. Side-effect-free `GET /models`, `/telemetry`, `/offload`, and `/dispatch`
+remain tokenless. Every request requires a `Host` exactly equal to the bound listener authority;
+a present `Origin` must also match its exact scheme, host, and effective port, and `Origin: null`
+is rejected. A `POST` must send `content-type: application/json`. Use the CLI for control work;
+do not copy or log the capability.
 
 `llm-relay telemetry` reports health as a tri-state: `true`, `false`, or **`null` = nothing has been
 observed yet**. `null` is not `false` — an unmeasured provider is unknown, not unhealthy, and
@@ -325,9 +336,9 @@ observed yet**. `null` is not `false` — an unmeasured provider is unknown, not
 
 ## Safety invariants (do not work around these)
 
-- Loopback bind only — it holds provider keys and does no auth. Loopback is not authorization
-  either: the control routes (`/offload`, `/dispatch`) admission-check `Origin`, `Host` and (on
-  POST) the content type, and that check is not a workaround target.
+- Loopback bind only — it holds provider keys. Control work independently validates the per-install
+  capability plus exact `Host`/present-`Origin` authority and, on POST, the content type. These
+  checks are not workaround targets; capability material must never enter logs or provider headers.
 - Logs are metadata-only; never ask it to log request/response bodies.
 - Destructive tool calls are refused, never fabricated — repair output may run under
   `--dangerously-skip-permissions`. The set is `repair.destructiveTools`, matched exactly by name

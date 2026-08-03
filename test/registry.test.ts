@@ -5,6 +5,7 @@ import { buildRegistry, loadTierData, joinCapability } from "../src/registry.js"
 import { createProxy } from "../src/server.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
+import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 
 /** Stub catalog: returns canned model ids per provider, no network. */
 function stubCatalog(byProvider: Record<string, string[]>): ModelCatalog {
@@ -116,10 +117,16 @@ describe("GET /registry endpoint", () => {
   afterAll(() => proxy?.close());
 
   it("serves the registry view as JSON", async () => {
+    const controlToken = "registry-test-control-token";
     const c = cfg({ nim }, { default: "nim/z-ai/glm-5.2", tiers: {} });
-    proxy = createProxy(c, { catalog: stubCatalog({ nim: ["z-ai/glm-5.2"] }) });
+    proxy = createProxy(c, {
+      catalog: stubCatalog({ nim: ["z-ai/glm-5.2"] }),
+      controlAuthorization: { validate: (candidate) => candidate === controlToken },
+    });
     const p: number = await new Promise((resolve) => proxy.listen(0, "127.0.0.1", () => resolve((proxy.address() as AddressInfo).port)));
-    const resp = await fetch(`http://127.0.0.1:${p}/registry`);
+    const resp = await fetch(`http://127.0.0.1:${p}/registry`, {
+      headers: { [CONTROL_AUTHORIZATION_HEADER]: controlToken },
+    });
     expect(resp.status).toBe(200);
     const view = (await resp.json()) as { providers: Record<string, { models: unknown[] }>; routing: unknown };
     expect(view.providers.nim!.models.length).toBe(1);
