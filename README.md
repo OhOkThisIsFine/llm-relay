@@ -88,8 +88,8 @@ llm-relay
   the prompt.
 
 ### 6. Programmatic Telemetry & Quota Access for Claude
-- **Read-only HTTP endpoints**: `GET /telemetry` (live JSON metrics), `GET /registry` (full provider/routing/model catalog with quality scores), `GET /ping` (trigger health probe pass & mode summary), `GET /health` (diagnostic status), `GET /candidates` (the un-blended offload decision table).
-- **Mutating HTTP endpoints**: `GET|POST /offload` (read/set per-client offload rules), `GET|POST /dispatch` (the dispatch ladder). ⚠ **Loopback is not authorization** — any page you visit can POST cross-origin to a loopback listener without a preflight, and these two write your `config.json` and steer lane order. They therefore reject a present-but-non-loopback `Origin` with 403, require `content-type: application/json` on a mutating request, and require a loopback `Host` (closing DNS rebinding). An **absent** `Origin` is allowed on purpose — that is what a CLI sends, and it is what keeps targeted offload changes working against a running proxy with no restart.
+- **Tokenless status endpoints**: `GET /models`, `GET /telemetry`, `GET /offload`, and `GET /dispatch` are side-effect-free status reads.
+- **Capability-protected control endpoints**: `POST /offload`, `POST /dispatch`, `GET /ping`, `GET /registry`, `GET /health`, and `GET /candidates`. The CLI automatically carries the per-install 256-bit capability stored in `~/.llm-relay/control-token`; it is never forwarded to providers. ⚠ **Loopback is not authorization** — every request also requires a `Host` exactly matching the bound listener authority, a present `Origin` must match its exact scheme/host/effective port, and `Origin: null` is rejected. Mutating requests additionally require `content-type: application/json`.
 - **CLI Commands**: `llm-relay telemetry` outputs live telemetry metrics; `llm-relay models` lists live model catalogs with SWE-bench & quality scores; `llm-relay ping` performs live health & latency probes.
 - **Response Headers**: Proxy responses include `x-llm-relay-quota-percent`, `x-llm-relay-stability-score`, and `x-llm-relay-target`.
 

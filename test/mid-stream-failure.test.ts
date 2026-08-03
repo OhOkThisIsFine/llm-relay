@@ -5,7 +5,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createProxy, buildForwardHeaders, CredentialConfigError } from "../src/server.js";
-import { globalCircuitBreaker } from "../src/circuit-breaker.js";
+import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
 import type { Config, ResolvedTarget } from "../src/config.js";
 
 /**
@@ -48,6 +48,22 @@ function truncatingSseBackend(): Promise<Server> {
   );
 }
 
+/** A valid stream that stays open until the client disconnects. */
+function slowSseBackend(): Promise<Server> {
+  return listen(
+    createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+      );
+      const cadence = setInterval(() => {
+        res.write('event: ping\ndata: {"type":"ping"}\n\n');
+      }, 10);
+      res.on("close", () => clearInterval(cadence));
+    }),
+  );
+}
+
 function cfgFor(backendPort: number, logFile: string, mode: Config["mode"]): Config {
   return {
     host: "127.0.0.1",
@@ -80,7 +96,7 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     dir = mkdtempSync(join(tmpdir(), "rp-midstream-"));
     const logFile = join(dir, "log.jsonl");
     const backend = await truncatingSseBackend();
-    const proxy = await listen(createProxy(cfgFor(port(backend), logFile, "detect")));
+    const proxy = await listen(createProxy(cfgFor(port(backend), logFile, "detect"), { breaker: globalCircuitBreaker }));
 
     const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
       method: "POST",
@@ -106,7 +122,7 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     const backend = await truncatingSseBackend();
     const cfg = cfgFor(port(backend), logFile, "repair");
     cfg.reshaper = { base: "http://127.0.0.1:1", kind: "openai", model: "stub", authHeader: "authorization", timeoutMs: 1000 };
-    const proxy = await listen(createProxy(cfg));
+    const proxy = await listen(createProxy(cfg, { breaker: globalCircuitBreaker }));
 
     const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
       method: "POST",
@@ -130,7 +146,7 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     dir = mkdtempSync(join(tmpdir(), "rp-midstream-cb-"));
     const logFile = join(dir, "log.jsonl");
     const backend = await truncatingSseBackend();
-    const proxy = await listen(createProxy(cfgFor(port(backend), logFile, "detect")));
+    const proxy = await listen(createProxy(cfgFor(port(backend), logFile, "detect"), { breaker: globalCircuitBreaker }));
     globalCircuitBreaker.reset();
 
     const doReq = () =>
@@ -146,6 +162,26 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     await doReq();
     expect(globalCircuitBreaker.getState("up")?.consecutiveFailures).toBe(2);
     expect(globalCircuitBreaker.isHealthy("up")).toBe(false);
+  });
+
+  it("treats a post-header client disconnect as cancellation, not provider failure", async () => {
+    dir = mkdtempSync(join(tmpdir(), "rp-midstream-cancel-"));
+    const backend = await slowSseBackend();
+    const breaker = new CircuitBreaker();
+    const proxy = await listen(createProxy(cfgFor(port(backend), join(dir, "log.jsonl"), "detect"), { breaker }));
+    const controller = new AbortController();
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
+      signal: controller.signal,
+    });
+    await resp.body?.getReader().read();
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(breaker.getState("up")).toBeUndefined();
   });
 });
 

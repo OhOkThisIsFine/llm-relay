@@ -64,6 +64,29 @@ describe("repair orchestration", () => {
     expect(d.outcome).toBe("failed");
   });
 
+  it("fails without reshaper egress when the tool schema is unavailable", async () => {
+    const schemaLess = toolSchemaMap({ tools: [{ name: "built_in" }] });
+    const call: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "built_in", input: {} }],
+      stop_reason: "tool_use",
+    };
+    let called = false;
+    const spy: Reshaper = {
+      reshape: async () => {
+        called = true;
+        return { kind: "message", message: call };
+      },
+    };
+    const d = await repair(call, schemaLess, {
+      validator,
+      reshaper: spy,
+      maxAttempts: 2,
+      isDestructive: noDestruct,
+    });
+    expect(d.outcome).toBe("failed");
+    expect(called).toBe(false);
+  });
+
   it("returns failed (fail-clean, no crash) when the reshaper dies at the transport level", async () => {
     const dead: Reshaper = { reshape: async () => { throw new ReshaperTransportError("connection refused"); } };
     const d = await repair(badCall, tools, { validator, reshaper: dead, maxAttempts: 2, isDestructive: noDestruct });

@@ -192,6 +192,92 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(errorOrigin(upstream)).not.toBe(errorOrigin(local));
   });
 
+  it("rejects a malformed buffered OpenAI 2xx as an upstream envelope failure", async () => {
+    const target = openaiTarget("https://openai-backend.test");
+    const req = { model: "claude-x", messages: [{ role: "user", content: "hi" }] };
+    const res = await fetchBackend(target, {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
+      anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(1000),
+    }, async () => new Response("{}", { status: 200, headers: { "content-type": "application/json", "retry-after": "7" } }));
+
+    expect(res.status).toBe(502);
+    expect(errorOrigin(res)).toBe("upstream");
+    expect(res.headers.get("retry-after")).toBe("7");
+    const body = await res.json() as any;
+    expect(body.error.type).toBe("invalid_upstream_envelope");
+    expect(body.error.message).toContain("missing choices array");
+    expect(body.error.message.length).toBeLessThan(300);
+  });
+
+  it("rejects the equivalent malformed OpenAI SSE 2xx before stream translation", async () => {
+    const target = openaiTarget("https://openai-backend.test");
+    const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
+    const res = await fetchBackend(target, {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
+      anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(1000),
+    }, async () => new Response("data: {}\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }));
+
+    expect(res.status).toBe(502);
+    expect(errorOrigin(res)).toBe("upstream");
+    expect((await res.json() as any).error.type).toBe("invalid_upstream_envelope");
+  });
+
+  it("rejects malformed native Anthropic buffered and streamed 2xx passthrough envelopes", async () => {
+    const target: ResolvedTarget = {
+      provider: "anthropic",
+      base: "https://anthropic-backend.test",
+      kind: "anthropic",
+      authHeader: "x-api-key",
+      timeoutMs: 1000,
+    };
+    for (const wantsStream of [false, true]) {
+      const raw = wantsStream ? "event: message_start\ndata: {}\n\n" : "{}";
+      const res = await fetchBackend(target, {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from("{}"),
+        reqJson: {},
+        anthropicHeaders: {},
+        wantsStream,
+        signal: AbortSignal.timeout(1000),
+      }, async () => new Response(raw, {
+        status: 200,
+        headers: { "content-type": wantsStream ? "text/event-stream" : "application/json" },
+      }));
+
+      expect(res.status).toBe(502);
+      expect(errorOrigin(res)).toBe("upstream");
+      expect((await res.json() as any).error.type).toBe("invalid_upstream_envelope");
+    }
+  });
+
+  it("rejects malformed direct OpenAI-front buffered and streamed 2xx envelopes", async () => {
+    process.env.RP_BACKEND_KEY = "sk-nim";
+    try {
+      const target = openaiTarget("https://openai-backend.test");
+      for (const wantsStream of [false, true]) {
+        const raw = wantsStream ? "data: {}\n\n" : "{}";
+        const res = await fetchOpenAiFront(target, {
+          reqJson: { model: "requested", messages: [{ role: "user", content: "hi" }] },
+          wantsStream,
+          signal: AbortSignal.timeout(1000),
+          protocol: "chat",
+        }, async () => new Response(raw, {
+          status: 200,
+          headers: { "content-type": wantsStream ? "text/event-stream" : "application/json" },
+        }));
+
+        expect(res.status).toBe(502);
+        expect(errorOrigin(res)).toBe("upstream");
+        expect((await res.json() as any).error.type).toBe("invalid_upstream_envelope");
+      }
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  });
+
   it("translates an OpenAI front request for an Anthropic target", async () => {
     let seen: any;
     const anthropicKind = {
@@ -223,6 +309,49 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(seen.max_tokens).toBe(1024);
     expect(seen.messages[0].content[0].text).toBe("hello");
     expect((await res.json() as any).choices[0].message.content).toBe("hello from Claude");
+  });
+
+  it("rejects malformed buffered and streamed Anthropic 2xx envelopes before translation", async () => {
+    const anthropicKind = { ...openaiTarget("https://api.anthropic.test"), kind: "anthropic" as const };
+    delete anthropicKind.model;
+    delete anthropicKind.authEnv;
+    for (const wantsStream of [false, true]) {
+      const raw = wantsStream ? "event: message_start\ndata: {}\n\n" : "{}";
+      const res = await fetchOpenAiFront(anthropicKind, {
+        reqJson: { model: "m", messages: [{ role: "user", content: "hello" }], stream: wantsStream },
+        wantsStream,
+        signal: AbortSignal.timeout(1000),
+      }, async () => new Response(raw, {
+        status: 200,
+        headers: { "content-type": wantsStream ? "text/event-stream" : "application/json" },
+      }));
+
+      expect(res.status).toBe(502);
+      expect(errorOrigin(res)).toBe("upstream");
+      expect((await res.json() as any).error.type).toBe("invalid_upstream_envelope");
+    }
+  });
+
+  it("attributes a post-validation mapper defect to the relay", async () => {
+    const anthropicKind = { ...openaiTarget("https://api.anthropic.test"), kind: "anthropic" as const };
+    delete anthropicKind.model;
+    delete anthropicKind.authEnv;
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const upstream = new Response('{"content":[]}', { status: 200, headers: { "content-type": "application/json" } });
+    Object.defineProperty(upstream, "json", {
+      value: async () => ({ content: [{ type: "tool_use", id: "call_1", name: "tool", input: circular }] }),
+    });
+
+    const res = await fetchOpenAiFront(anthropicKind, {
+      reqJson: { model: "m", messages: [{ role: "user", content: "hello" }] },
+      wantsStream: false,
+      signal: AbortSignal.timeout(1000),
+    }, async () => upstream);
+
+    expect(res.status).toBe(502);
+    expect(errorOrigin(res)).toBe("local");
+    expect((await res.json() as any).error.type).toBe("relay_mapper_defect");
   });
 
   it("translates an Anthropic SSE response to an OpenAI Responses SSE response", async () => {

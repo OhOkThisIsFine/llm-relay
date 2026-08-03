@@ -7,7 +7,7 @@ import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
-import { buildDispatch, type DispatchView } from "./dispatch.js";
+import { buildDispatch, normalizeCliCommand, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
@@ -20,6 +20,7 @@ import {
   updateConfigDocument,
   writeConfigPath,
 } from "./config-edit.js";
+import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
 
 export function argValue(...flags: string[]): string | undefined {
   const allFlags = new Set<string>();
@@ -619,8 +620,18 @@ export async function runCheckKeys(): Promise<void> {
  */
 async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise<unknown | null> {
   try {
-    const res = await fetch(`http://${cfg.host}:${cfg.port}${path}`, {
+    const headers = new Headers(init?.headers);
+    try {
+      const authorization = createControlAuthorization(resolveControlAuthorizationConfigDir(cfg.sourcePath));
+      const attached = authorization.attach(Object.fromEntries(headers.entries()));
+      for (const [name, value] of Object.entries(attached)) headers.set(name, value);
+    } catch {
+      // Tokenless status routes remain reachable. Protected routes fail closed at
+      // the server, and the caller's existing no-live-proxy fallback remains intact.
+    }
+    const res = await fetch(proxyUrl(cfg, path), {
       ...init,
+      headers,
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return null;
@@ -628,6 +639,28 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
   } catch {
     return null;
   }
+}
+
+/** Render a normalized listener address as an HTTP URL, including required IPv6 brackets. */
+export function proxyUrl(cfg: Pick<Config, "host" | "port">, path: string): string {
+  const host = cfg.host.includes(":") ? `[${cfg.host}]` : cfg.host;
+  return `http://${host}:${cfg.port}${path}`;
+}
+
+/** Normalize structured output from an older live proxy before exposing it to this host. */
+export function normalizeDispatchCommands(
+  view: DispatchView,
+  platform: NodeJS.Platform = process.platform,
+): DispatchView {
+  const normalizeLane = (lane: DispatchLane): DispatchLane =>
+    lane.invoke
+      ? { ...lane, invoke: { ...lane.invoke, command: normalizeCliCommand(lane.invoke.command, platform) } }
+      : { ...lane };
+  return {
+    ...view,
+    ladder: view.ladder.map(normalizeLane),
+    next: view.next ? normalizeLane(view.next) : null,
+  };
 }
 
 /** Which shell's literal-quoting rules a rendered command line is written for. */
@@ -718,8 +751,12 @@ export function renderCommand(
   shell: RenderShell = shellFor(),
 ): string {
   if (!invoke) return "";
-  const cmd = quoteArg(invoke.command, shell);
-  const head = cmd === invoke.command || shell === "sh" ? cmd : `& ${cmd}`;
+  // A live proxy may be older than this CLI and still return bare `agy` in structured output.
+  // Normalize for the target shell as a second line of defence; dispatch.ts owns the primary
+  // platform-aware normalization so JSON consumers receive the safe executable name too.
+  const command = normalizeCliCommand(invoke.command, shell === "pwsh" ? "win32" : "linux");
+  const cmd = quoteArg(command, shell);
+  const head = cmd === command || shell === "sh" ? cmd : `& ${cmd}`;
   return [head, ...invoke.args.map((a) => quoteArg(a, shell))].join(" ");
 }
 
@@ -762,15 +799,16 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
 
   const live = (await tryServer(cfg, path)) as DispatchView | null;
-  const view =
+  const view = normalizeDispatchCommands(
     live ??
-    buildDispatch(cfg, {
+      buildDispatch(cfg, {
       ...(task ? { task } : {}),
       ...(lane ? { lane } : {}),
       ...(after ? { after } : {}),
       ...(tier ? { tier } : {}),
       ...(client ? { client } : {}),
-    });
+      }),
+  );
 
   if (hasFlag("--json")) {
     process.stdout.write(JSON.stringify(view, null, 2) + "\n");

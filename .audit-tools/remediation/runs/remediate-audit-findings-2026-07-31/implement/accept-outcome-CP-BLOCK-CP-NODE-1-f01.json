@@ -1,9 +1,0 @@
-{
-  "schema_version": "remediate-code-implement/node-accept-outcome/v1alpha1",
-  "block_id": "CP-BLOCK-CP-NODE-1-f01",
-  "outcome": "error",
-  "verify_passed": true,
-  "merged": false,
-  "diagnostic": "Node edited files owned by another block (seam conflict): src/circuit-breaker.ts owned by CP-BLOCK-CP-NODE-1-f02; test/circuit-breaker.test.ts owned by CP-BLOCK-CP-NODE-1-f02. Resolve via the seam protocol (re-scope contracts or serialise the nodes) before this node can land.",
-  "committed_oid": "afa555c19274dd102a3b90cf8c2aad24b0275336"
-}

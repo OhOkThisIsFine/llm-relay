@@ -15,6 +15,8 @@ import {
   parseRenderShell,
   SHELL_LABEL,
   classifyCommand,
+  normalizeDispatchCommands,
+  proxyUrl,
   runDispatch,
   runConfigCommand,
   runPools,
@@ -30,6 +32,26 @@ describe("cli helper utilities", () => {
 
   afterEach(() => {
     process.argv = origArgv;
+  });
+
+  it("formats IPv4, hostnames, and IPv6 listener URLs", () => {
+    expect(proxyUrl({ host: "127.0.0.1", port: 8791 }, "/health")).toBe("http://127.0.0.1:8791/health");
+    expect(proxyUrl({ host: "localhost", port: 8791 }, "/health")).toBe("http://localhost:8791/health");
+    expect(proxyUrl({ host: "::1", port: 8791 }, "/health")).toBe("http://[::1]:8791/health");
+  });
+
+  it("normalizes AGY in structured output returned by an older live proxy", () => {
+    const oldView = {
+      tier: "coding",
+      offload: true,
+      client: "default",
+      ladder: [{ id: "agy", kind: "cli" as const, position: 1, state: "ready" as const, invoke: { command: "agy", args: ["-p", "task"] } }],
+      next: { id: "agy", kind: "cli" as const, position: 1, state: "ready" as const, invoke: { command: "agy", args: ["-p", "task"] } },
+      reason: "first lane",
+    };
+
+    expect(normalizeDispatchCommands(oldView, "win32").next?.invoke?.command).toBe("agy.exe");
+    expect(normalizeDispatchCommands(oldView, "linux").next?.invoke?.command).toBe("agy");
   });
 
   it("getPositionalArgs extracts non-flag positional arguments correctly", () => {
@@ -221,9 +243,17 @@ describe("dispatch command rendering — shell quoting", () => {
       expect(line).not.toBe(`${invoke.command} ${invoke.args.join(" ")}`);
       expect(line).not.toContain(`-p ${NASTY}`);
       // The flags stay bare and readable; only the task is wrapped.
-      expect(line.startsWith("agy -p '")).toBe(true);
+      expect(line.startsWith(`${shell === "pwsh" ? "agy.exe" : "agy"} -p '`)).toBe(true);
       expect(line.endsWith("' --model g-flash")).toBe(true);
     }
+  });
+
+  it("bypasses a same-named PowerShell function for the AGY headless CLI", () => {
+    const invoke = { command: "agy", args: ["-p", "inspect"] };
+    expect(renderCommand(invoke, "pwsh")).toBe("agy.exe -p inspect");
+    expect(renderCommand(invoke, "sh")).toBe("agy -p inspect");
+    expect(renderCommand({ command: "C:\\tools\\agy", args: ["inspect"] }, "pwsh")).toBe("C:\\tools\\agy inspect");
+    expect(renderCommand({ command: "codex", args: ["exec", "inspect"] }, "pwsh")).toBe("codex exec inspect");
   });
 
   it("puts PowerShell's call operator in front of a command name that needed quoting", () => {
@@ -362,11 +392,12 @@ describe("llm-relay dispatch — printed ladder", () => {
     await runDispatch(undefined);
     const printed = out.join("");
 
-    // Quoting agrees between sh and pwsh for a task with no single quote in it, so this
-    // assertion is exact on every platform.
-    expect(printed).toContain(`run: agy -p '${task}' --model g-flash`);
+    // Quoting agrees between sh and pwsh for a task with no single quote in it. On Windows the
+    // package names the executable explicitly so a same-named PowerShell function cannot win.
+    const command = process.platform === "win32" ? "agy.exe" : "agy";
+    expect(printed).toContain(`run: ${command} -p '${task}' --model g-flash`);
     // The defect: the raw join put `; report` outside the quotes as its own shell command.
-    expect(printed).not.toContain(`agy -p ${task} --model g-flash`);
+    expect(printed).not.toContain(`${command} -p ${task} --model g-flash`);
     expect(printed).toMatch(/quoted for (PowerShell 7\+ \(pwsh\)|sh\/bash)/);
   });
 });

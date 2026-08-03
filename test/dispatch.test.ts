@@ -5,11 +5,18 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "../src/config.js";
 import { createProxy } from "../src/server.js";
-import { buildDispatch, markExhausted, clearExhausted, MAX_EXHAUSTED_MS } from "../src/dispatch.js";
+import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
+import {
+  buildDispatch,
+  markExhausted,
+  clearExhausted,
+  MAX_EXHAUSTED_MS,
+  normalizeCliCommand,
+} from "../src/dispatch.js";
 
 /** Just enough of the `/dispatch` payload for the assertions below — `Response.json()` is
  *  `unknown`, and an untyped `any` here would let a renamed field pass silently. */
-type DispatchBody = { next: { id: string; invoke: { args: string[] } } };
+type DispatchBody = { next: { id: string; invoke: { command: string; args: string[] } } };
 
 const dir = mkdtempSync(join(tmpdir(), "rp-dispatch-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -104,7 +111,26 @@ describe("dispatch ladder — ordering", () => {
   it("picks the first rung and renders its command with the task substituted", () => {
     const view = buildDispatch(cfgWith({ ladder: LADDER }), { task: "trace parseConfig" });
     expect(view.next?.id).toBe("agy-gemini");
-    expect(view.next?.invoke).toEqual({ command: "agy", args: ["-p", "trace parseConfig", "--model", "g-flash"] });
+    expect(view.next?.invoke).toEqual({
+      command: process.platform === "win32" ? "agy.exe" : "agy",
+      args: ["-p", "trace parseConfig", "--model", "g-flash"],
+    });
+  });
+
+  it("names the headless AGY executable in structured Windows dispatch output", () => {
+    const cfg = cfgWith({ ladder: LADDER });
+    expect(buildDispatch(cfg, { task: "inspect" }, "win32").next?.invoke?.command).toBe("agy.exe");
+    expect(buildDispatch(cfg, { task: "inspect" }, "linux").next?.invoke?.command).toBe("agy");
+  });
+
+  it("normalizes only a bare AGY command on Windows", () => {
+    expect(normalizeCliCommand("agy", "win32")).toBe("agy.exe");
+    expect(normalizeCliCommand("AGY", "win32")).toBe("AGY.exe");
+    expect(normalizeCliCommand("agy.exe", "win32")).toBe("agy.exe");
+    expect(normalizeCliCommand("C:\\tools\\agy", "win32")).toBe("C:\\tools\\agy");
+    expect(normalizeCliCommand("./agy", "win32")).toBe("./agy");
+    expect(normalizeCliCommand("codex", "win32")).toBe("codex");
+    expect(normalizeCliCommand("agy", "darwin")).toBe("agy");
   });
 
   it("leaves the placeholder visible when no task is given", () => {
@@ -316,8 +342,9 @@ describe("dispatch ladder — order, never execution", () => {
 });
 
 describe("dispatch ladder — endpoint", () => {
+  const controlToken = "dispatch-test-control-token";
   async function withProxy<T>(cfg: Config, fn: (base: string) => Promise<T>): Promise<T> {
-    const proxy = createProxy(cfg);
+    const proxy = createProxy(cfg, { controlAuthorization: { validate: (candidate) => candidate === controlToken } });
     await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
     const { port } = proxy.address() as { port: number };
     try {
@@ -332,12 +359,13 @@ describe("dispatch ladder — endpoint", () => {
     await withProxy(cfg, async (base) => {
       const first = (await (await fetch(`${base}/dispatch?task=go`)).json()) as DispatchBody;
       expect(first.next.id).toBe("agy-gemini");
+      expect(first.next.invoke.command).toBe(process.platform === "win32" ? "agy.exe" : "agy");
       expect(first.next.invoke.args).toContain("go");
 
       const walked = (await (
         await fetch(`${base}/dispatch`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", [CONTROL_AUTHORIZATION_HEADER]: controlToken },
           body: JSON.stringify({ exhausted: "agy-gemini" }),
         })
       ).json()) as DispatchBody;
@@ -346,7 +374,7 @@ describe("dispatch ladder — endpoint", () => {
       const cleared = (await (
         await fetch(`${base}/dispatch`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", [CONTROL_AUTHORIZATION_HEADER]: controlToken },
           body: JSON.stringify({ clear: true }),
         })
       ).json()) as DispatchBody;
@@ -358,7 +386,7 @@ describe("dispatch ladder — endpoint", () => {
     await withProxy(cfgWith({ ladder: LADDER }), async (base) => {
       const res = await fetch(`${base}/dispatch`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", [CONTROL_AUTHORIZATION_HEADER]: controlToken },
         body: JSON.stringify({ exhausted: "ghost" }),
       });
       expect(res.status).toBe(400);

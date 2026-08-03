@@ -5,6 +5,7 @@ import { loadProbeCache, flushProbeCache, recordProbeResult, getModelsDueForProb
 import { recordModelCall, getRealWorldScore, loadRuntimeTelemetry } from "../src/ping/runtime-telemetry.js";
 import { PingLoop } from "../src/ping/cadence.js";
 import { createProxy } from "../src/server.js";
+import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import { join } from "node:path";
@@ -231,6 +232,7 @@ describe("PingLoop Cadence", () => {
 
 describe("Proxy Health Endpoints", () => {
   it("exposes /ping and /health/stats on proxy server", async () => {
+    const controlToken = "ping-test-control-token";
     // Probe timeout must be well under the test timeout: /ping probes this fake
     // host live, and how fast the connect fails depends on the machine's DNS.
     const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 1000 };
@@ -238,7 +240,10 @@ describe("Proxy Health Endpoints", () => {
       list: async () => ["m1"],
     } as any;
 
-    const proxy = createProxy(testConfig({ testProv: pCfg }), { catalog: mockCatalog });
+    const proxy = createProxy(testConfig({ testProv: pCfg }), {
+      catalog: mockCatalog,
+      controlAuthorization: { validate: (candidate) => candidate === controlToken },
+    });
     
     // Start listening on dynamic port
     await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
@@ -246,12 +251,12 @@ describe("Proxy Health Endpoints", () => {
     const baseUrl = `http://127.0.0.1:${address.port}`;
 
     try {
-      const pingResp = await fetch(`${baseUrl}/ping`);
+      const pingResp = await fetch(`${baseUrl}/ping`, { headers: { [CONTROL_AUTHORIZATION_HEADER]: controlToken } });
       expect(pingResp.status).toBe(200);
       const pingData = (await pingResp.json()) as { ok: boolean };
       expect(pingData.ok).toBe(true);
 
-      const healthResp = await fetch(`${baseUrl}/health/stats`);
+      const healthResp = await fetch(`${baseUrl}/health/stats`, { headers: { [CONTROL_AUTHORIZATION_HEADER]: controlToken } });
       expect(healthResp.status).toBe(200);
       const healthData = (await healthResp.json()) as { providers?: unknown };
       expect(healthData.providers).toBeDefined();

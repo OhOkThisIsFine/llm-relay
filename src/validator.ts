@@ -20,6 +20,7 @@ export interface ValidationError {
     | "unknown_tool"
     | "input_not_object"
     | "schema_violation"
+    | "schema_uncheckable"
     | "stop_reason_mismatch";
   blockIndex: number | null;
   tool: string | null;
@@ -34,9 +35,9 @@ export interface ValidationResult {
   toolUseCount: number;
   /**
    * tool_use blocks that could not be schema-checked (declared tool with no
-   * input_schema, or a schema Ajv could not compile). NOT a failure and NOT a
-   * clean pass — surfaced as its own verdict so "uncompilable schema" is never
-   * silently counted as valid.
+   * input_schema, or a schema Ajv could not compile). These are failures: without
+   * an executable schema neither the backend call nor a proposed repair can be
+   * proven valid.
    */
   uncheckableCount: number;
 }
@@ -114,13 +115,25 @@ export class ToolUseValidator {
 
       const schema = tools.get(name) ?? null;
       if (schema === null) {
-        uncheckableCount++; // declared built-in/typed tool, no schema to check
+        uncheckableCount++;
+        errors.push({
+          kind: "schema_uncheckable",
+          blockIndex,
+          tool: name,
+          message: `tool "${name}" has no executable input schema`,
+        });
         return;
       }
 
       const validate = this.compiledFor(name, schema);
       if (validate === null) {
-        uncheckableCount++; // schema would not compile
+        uncheckableCount++;
+        errors.push({
+          kind: "schema_uncheckable",
+          blockIndex,
+          tool: name,
+          message: `tool "${name}" has an input schema that could not be compiled`,
+        });
         return;
       }
 
@@ -148,7 +161,7 @@ export class ToolUseValidator {
       });
     }
 
-    return { valid: errors.length === 0, errors, toolUseCount, uncheckableCount };
+    return { valid: errors.length === 0 && uncheckableCount === 0, errors, toolUseCount, uncheckableCount };
   }
 }
 

@@ -59,6 +59,184 @@ export function parseRetryAfterMs(value: string | null | undefined, now = Date.n
   return delta > 0 ? delta : null;
 }
 
+type ResponseProtocol = "openai-chat" | "anthropic-messages";
+
+const STREAM_PREFLIGHT_LIMIT = 64 * 1024;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validate only the protocol structure the response mappers rely on. Optional identifiers,
+ * model names and usage remain optional because several compatible providers legitimately omit
+ * them; the required response discriminator must not be optional, or `{}` becomes a successful
+ * empty assistant message.
+ */
+function invalidEnvelopeReason(value: unknown, protocol: ResponseProtocol, streamed: boolean): string | null {
+  if (!isRecord(value)) return "expected a JSON object";
+
+  // An error delivered inside a 2xx SSE stream is still a real protocol envelope. Leave it to
+  // the stream adapter to forward rather than reclassifying it as malformed transport data.
+  if (streamed && isRecord(value.error)) return null;
+
+  if (protocol === "openai-chat") {
+    if (!Array.isArray(value.choices)) return "missing choices array";
+    if (streamed && value.choices.length === 0) {
+      return isRecord(value.usage) ? null : "empty choices without usage";
+    }
+    if (value.choices.length === 0) return "empty choices array";
+    for (const rawChoice of value.choices) {
+      if (!isRecord(rawChoice)) return "choice is not an object";
+      const message = streamed ? rawChoice.delta : rawChoice.message;
+      if (!isRecord(message)) return streamed ? "choice is missing delta" : "choice is missing message";
+      if (!streamed && message.tool_calls !== undefined && message.tool_calls !== null) {
+        if (!Array.isArray(message.tool_calls)) return "message tool_calls is not an array";
+        for (const rawCall of message.tool_calls) {
+          if (!isRecord(rawCall) || !isRecord(rawCall.function)) return "invalid tool call";
+          if (typeof rawCall.function.name !== "string" || typeof rawCall.function.arguments !== "string") {
+            return "invalid tool function";
+          }
+        }
+      }
+      if (!streamed) {
+        const hasContent = message.content === null || typeof message.content === "string";
+        const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+        if (!hasContent && !hasToolCalls) return "message has neither content nor tool calls";
+      }
+    }
+    return null;
+  }
+
+  if (!streamed) {
+    if (!Array.isArray(value.content)) return "missing content array";
+    for (const rawBlock of value.content) {
+      if (!isRecord(rawBlock) || typeof rawBlock.type !== "string") return "invalid content block";
+      if (rawBlock.type === "text" && typeof rawBlock.text !== "string") return "text block is missing text";
+      if (rawBlock.type === "tool_use" && typeof rawBlock.name !== "string") return "tool_use block is missing name";
+    }
+    return null;
+  }
+
+  switch (value.type) {
+    case "ping":
+    case "message_stop":
+    case "content_block_stop":
+      return null;
+    case "message_start":
+      return isRecord(value.message) ? null : "message_start is missing message";
+    case "content_block_start":
+      return isRecord(value.content_block) ? null : "content_block_start is missing content_block";
+    case "content_block_delta":
+    case "message_delta":
+      return isRecord(value.delta) ? null : `${String(value.type)} is missing delta`;
+    case "error":
+      return isRecord(value.error) ? null : "error event is missing error";
+    default:
+      return "missing or unknown Anthropic event type";
+  }
+}
+
+type StreamPreflight =
+  | { ok: true; body: ReadableStream<Uint8Array> }
+  | { ok: false; reason: string };
+
+/** Inspect the first data event before handing a provider stream to llm-bridge. */
+async function preflightResponseStream(
+  body: ReadableStream<Uint8Array>,
+  protocol: ResponseProtocol,
+): Promise<StreamPreflight> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let byteLength = 0;
+
+  const replay = (): StreamPreflight => {
+    let prefixIndex = 0;
+    return { ok: true, body: new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (prefixIndex < chunks.length) {
+          controller.enqueue(chunks[prefixIndex++]!);
+          return;
+        }
+        try {
+          const more = await reader.read();
+          if (more.done) controller.close();
+          else controller.enqueue(more.value);
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      async cancel(reasonToCancel) {
+        await reader.cancel(reasonToCancel).catch(() => {});
+      },
+    }) };
+  };
+
+  const fail = async (reason: string): Promise<StreamPreflight> => {
+    await reader.cancel().catch(() => {});
+    return { ok: false, reason };
+  };
+
+  const inspectEvent = (event: string): string | null | undefined => {
+    const data = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data) return undefined;
+    if (data === "[DONE]") return "stream ended before a response event";
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return "data event is not valid JSON";
+    }
+    return invalidEnvelopeReason(parsed, protocol, true);
+  };
+
+  while (byteLength <= STREAM_PREFLIGHT_LIMIT) {
+    const next = await reader.read().catch(() => null);
+    if (next === null) return fail("stream failed during preflight");
+    if (next.done) {
+      buffered += decoder.decode();
+      let finalReason = buffered.trim() ? inspectEvent(buffered) : undefined;
+      // A few compatible providers ignore `stream: true` and return one valid buffered
+      // completion. Preserve the old adapter behaviour for that genuine envelope.
+      if (finalReason === undefined && buffered.trim()) {
+        try {
+          finalReason = invalidEnvelopeReason(JSON.parse(buffered), protocol, false);
+        } catch {
+          // The SSE-specific reason below remains more useful.
+        }
+      }
+      if (finalReason === null) return replay();
+      return fail(finalReason ?? "stream ended before a response event");
+    }
+    chunks.push(next.value);
+    byteLength += next.value.byteLength;
+    if (byteLength > STREAM_PREFLIGHT_LIMIT) return fail("no response event within preflight limit");
+    buffered += decoder.decode(next.value, { stream: true });
+
+    let boundary: RegExpExecArray | null;
+    const separator = /\r?\n\r?\n/g;
+    while ((boundary = separator.exec(buffered)) !== null) {
+      const event = buffered.slice(0, boundary.index);
+      buffered = buffered.slice(boundary.index + boundary[0].length);
+      separator.lastIndex = 0;
+      const reason = inspectEvent(event);
+      if (reason === undefined) continue;
+      if (reason !== null) return fail(reason);
+
+      return replay();
+    }
+  }
+
+  return fail("no response event within preflight limit");
+}
+
 /**
  * Fetch the resolved provider target and return an ANTHROPIC-shaped `Response`,
  * regardless of the backend's native wire format. For kind="anthropic" this is a
@@ -83,7 +261,42 @@ export async function fetchBackend(
   if (target.kind === "anthropic") {
     const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
     if (args.reqBuf.length) init.body = args.reqBuf;
-    return fetchFn(target.base + args.path, init);
+    const res = await fetchFn(target.base + args.path, init);
+    // Preserve passthrough bytes, but do not preserve a successful status for a malformed
+    // Messages envelope. Inspecting a clone leaves the original buffered body byte-exact.
+    const messagesPath = args.path.split("?", 1)[0] === "/v1/messages";
+    if (!res.ok || !messagesPath) return res;
+    const streamed = args.wantsStream || (res.headers.get("content-type") ?? "").includes("text/event-stream");
+    if (streamed) {
+      if (!res.body) {
+        return anthropicError(502, "llm-relay: invalid Anthropic upstream envelope: empty stream", "upstream", {
+          ...retryAfterHeader(res.headers),
+        }, "invalid_upstream_envelope");
+      }
+      const preflight = await preflightResponseStream(res.body, "anthropic-messages");
+      if (!preflight.ok) {
+        return anthropicError(502, `llm-relay: invalid Anthropic upstream envelope: ${preflight.reason}`, "upstream", {
+          ...retryAfterHeader(res.headers),
+        }, "invalid_upstream_envelope");
+      }
+      return new Response(preflight.body, { status: res.status, headers: res.headers });
+    }
+
+    let body: unknown;
+    try {
+      body = await res.clone().json();
+    } catch {
+      return anthropicError(502, "llm-relay: invalid Anthropic upstream envelope: body is not valid JSON", "upstream", {
+        ...retryAfterHeader(res.headers),
+      }, "invalid_upstream_envelope");
+    }
+    const invalidReason = invalidEnvelopeReason(body, "anthropic-messages", false);
+    if (invalidReason) {
+      return anthropicError(502, `llm-relay: invalid Anthropic upstream envelope: ${invalidReason}`, "upstream", {
+        ...retryAfterHeader(res.headers),
+      }, "invalid_upstream_envelope");
+    }
+    return res;
   }
 
   // kind === "openai"
@@ -148,18 +361,48 @@ export async function fetchBackend(
     });
   }
 
-  if (args.wantsStream && res.body) {
-    const anthStream = handleUniversalStreamRequest(res.body, "openai", "anthropic");
-    return new Response(anthStream, { status: res.status, headers: { "content-type": "text/event-stream" } });
+  if (args.wantsStream) {
+    if (!res.body) {
+      return anthropicError(502, "llm-relay: invalid OpenAI upstream envelope: empty stream", "upstream", {
+        ...retryAfterHeader(res.headers),
+      }, "invalid_upstream_envelope");
+    }
+    const preflight = await preflightResponseStream(res.body, "openai-chat");
+    if (!preflight.ok) {
+      return anthropicError(502, `llm-relay: invalid OpenAI upstream envelope: ${preflight.reason}`, "upstream", {
+        ...retryAfterHeader(res.headers),
+      }, "invalid_upstream_envelope");
+    }
+    try {
+      const anthStream = handleUniversalStreamRequest(preflight.body, "openai", "anthropic");
+      return new Response(anthStream, { status: res.status, headers: { "content-type": "text/event-stream" } });
+    } catch (e) {
+      return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
+    }
+  }
+
+  let upstreamJson: unknown;
+  try {
+    upstreamJson = await res.json();
+  } catch {
+    return anthropicError(502, "llm-relay: invalid OpenAI upstream envelope: body is not valid JSON", "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
+  }
+  const invalidReason = invalidEnvelopeReason(upstreamJson, "openai-chat", false);
+  if (invalidReason) {
+    return anthropicError(502, `llm-relay: invalid OpenAI upstream envelope: ${invalidReason}`, "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
   }
 
   let anthropicJson: object;
   try {
-    anthropicJson = openAiResponseToAnthropic((await res.json()) as Record<string, unknown>, target.model ?? "");
+    anthropicJson = openAiResponseToAnthropic(upstreamJson as Record<string, unknown>, target.model ?? "");
   } catch (e) {
-    // The provider answered 200; this 502 is ours. Marked local so it is not mistaken
-    // for the provider being down — it is our mapper being wrong about a healthy one.
-    return anthropicError(502, `response translation failed: ${(e as Error).message}`, "local");
+    // The provider returned a valid source envelope, so a failure after this point belongs to
+    // the relay mapper rather than the provider or its failure budget.
+    return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
   }
   return new Response(JSON.stringify(anthropicJson), { status: 200, headers: { "content-type": "application/json" } });
 }
@@ -204,17 +447,24 @@ function anthropicError(
   message: string,
   origin: ErrorOrigin,
   extra: Record<string, string> = {},
+  type = "api_error",
 ): Response {
-  return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), {
+  return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
     status,
     headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin, ...extra },
   });
 }
 
-function openaiError(status: number, message: string, origin: ErrorOrigin): Response {
-  return new Response(JSON.stringify({ error: { message, type: "invalid_request_error" } }), {
+function openaiError(
+  status: number,
+  message: string,
+  origin: ErrorOrigin,
+  type = "invalid_request_error",
+  extra: Record<string, string> = {},
+): Response {
+  return new Response(JSON.stringify({ error: { message, type } }), {
     status,
-    headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin },
+    headers: { "content-type": "application/json", [ERROR_ORIGIN_HEADER]: origin, ...extra },
   });
 }
 
@@ -442,12 +692,36 @@ export async function fetchOpenAiFront(
   // same wire format. It keeps provider-specific OpenAI fields byte-for-byte intact.
   if (target.kind === "openai" && protocol === "chat") {
     const body = { ...base, model: target.model, stream: args.wantsStream };
-    return fetchFn(target.base + "/chat/completions", {
+    const res = await fetchFn(target.base + "/chat/completions", {
       method: "POST",
       headers: buildTargetHeaders(target),
       body: JSON.stringify(body),
       signal: args.signal,
     });
+    if (!res.ok) return res;
+    const streamed = args.wantsStream || (res.headers.get("content-type") ?? "").includes("text/event-stream");
+    if (streamed) {
+      if (!res.body) {
+        return openaiError(502, "llm-relay: invalid OpenAI upstream envelope: empty stream", "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+      }
+      const preflight = await preflightResponseStream(res.body, "openai-chat");
+      if (!preflight.ok) {
+        return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${preflight.reason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+      }
+      return new Response(preflight.body, { status: res.status, headers: res.headers });
+    }
+
+    let responseBody: unknown;
+    try {
+      responseBody = await res.clone().json();
+    } catch {
+      return openaiError(502, "llm-relay: invalid OpenAI upstream envelope: body is not valid JSON", "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+    }
+    const invalidReason = invalidEnvelopeReason(responseBody, "openai-chat", false);
+    if (invalidReason) {
+      return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${invalidReason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+    }
+    return res;
   }
 
   let anthropicBody: Record<string, unknown>;
@@ -483,19 +757,72 @@ export async function fetchOpenAiFront(
   }
 
   const streamed = args.wantsStream || (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
-  if (streamed && backendRes.body) {
+  if (streamed) {
+    if (!backendRes.body) {
+      const generated = target.kind !== "anthropic";
+      return openaiError(
+        502,
+        generated ? "llm-relay: response mapper produced an empty stream" : "llm-relay: invalid Anthropic upstream envelope: empty stream",
+        generated ? "local" : "upstream",
+        generated ? "relay_mapper_defect" : "invalid_upstream_envelope",
+        retryAfterHeader(backendRes.headers),
+      );
+    }
+    const preflight = await preflightResponseStream(backendRes.body, "anthropic-messages");
+    if (!preflight.ok) {
+      const generated = target.kind !== "anthropic";
+      return openaiError(
+        502,
+        generated
+          ? `llm-relay: response mapper produced an invalid Anthropic envelope: ${preflight.reason}`
+          : `llm-relay: invalid Anthropic upstream envelope: ${preflight.reason}`,
+        generated ? "local" : "upstream",
+        generated ? "relay_mapper_defect" : "invalid_upstream_envelope",
+        retryAfterHeader(backendRes.headers),
+      );
+    }
     const targetProtocol = protocol === "responses" ? "openai-responses" : "openai";
-    const output = handleUniversalStreamRequest(backendRes.body, "anthropic", targetProtocol);
-    return new Response(output, { status: backendRes.status, headers: { "content-type": "text/event-stream" } });
+    try {
+      const output = handleUniversalStreamRequest(preflight.body, "anthropic", targetProtocol);
+      return new Response(output, { status: backendRes.status, headers: { "content-type": "text/event-stream" } });
+    } catch (e) {
+      return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", "relay_mapper_defect");
+    }
+  }
+
+  let body: unknown;
+  try {
+    body = await backendRes.json();
+  } catch {
+    const generated = target.kind !== "anthropic";
+    return openaiError(
+      502,
+      generated ? "llm-relay: response mapper produced non-JSON output" : "llm-relay: invalid Anthropic upstream envelope: body is not valid JSON",
+      generated ? "local" : "upstream",
+      generated ? "relay_mapper_defect" : "invalid_upstream_envelope",
+      retryAfterHeader(backendRes.headers),
+    );
+  }
+  const invalidReason = invalidEnvelopeReason(body, "anthropic-messages", false);
+  if (invalidReason) {
+    const generated = target.kind !== "anthropic";
+    return openaiError(
+      502,
+      generated
+        ? `llm-relay: response mapper produced an invalid Anthropic envelope: ${invalidReason}`
+        : `llm-relay: invalid Anthropic upstream envelope: ${invalidReason}`,
+      generated ? "local" : "upstream",
+      generated ? "relay_mapper_defect" : "invalid_upstream_envelope",
+      retryAfterHeader(backendRes.headers),
+    );
   }
 
   try {
-    const body = (await backendRes.json()) as Record<string, unknown>;
-    return new Response(JSON.stringify(anthropicMessageToOpenAi(body, protocol, target.model ?? String(base.model ?? ""))), {
+    return new Response(JSON.stringify(anthropicMessageToOpenAi(body as Record<string, unknown>, protocol, target.model ?? String(base.model ?? ""))), {
       status: backendRes.status,
       headers: { "content-type": "application/json" },
     });
   } catch (e) {
-    return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local");
+    return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", "relay_mapper_defect");
   }
 }

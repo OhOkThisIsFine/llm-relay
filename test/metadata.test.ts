@@ -127,7 +127,13 @@ describe("context guardrail", () => {
             data: [{ id: "small/model", ...(publishLimits ? { context_window: 50 } : {}) }],
           }));
         } else {
-          res.end(JSON.stringify({ id: "m", type: "message", role: "assistant", content: [], model: "small/model" }));
+          res.end(JSON.stringify({
+            id: "m",
+            object: "chat.completion",
+            model: "small/model",
+            choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }));
         }
       });
       servers.push(upstream);

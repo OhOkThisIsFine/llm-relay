@@ -174,6 +174,19 @@ export function clearExhausted(cfg: Config, id?: string, tier?: string): void {
 export const TASK_TOKEN = "{task}";
 
 /**
+ * Resolve command names whose Windows shell semantics differ from their POSIX spelling.
+ *
+ * PowerShell resolves functions and aliases before external applications. Antigravity commonly
+ * installs a PowerShell function named `agy` for opening the IDE alongside the headless
+ * `agy.exe` CLI, so handing a Windows host the bare name can launch the GUI instead of running
+ * the delegated task. Naming the executable extension bypasses that shadowing. Keep the rule
+ * deliberately narrow: explicit paths and every other configured command remain authoritative.
+ */
+export function normalizeCliCommand(command: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" && /^agy$/i.test(command) ? `${command}.exe` : command;
+}
+
+/**
  * Normalize the caller's options. `DispatchOptions` is typed, but nothing type-checks the values
  * that actually arrive: they come off a raw query string (`GET /dispatch?task=…&lane=…`) or a
  * JSON body, so at runtime any field can be a number, an array, an object or null. TypeScript
@@ -242,7 +255,15 @@ function describeId(id: string): string {
   return clean.length > MAX_ECHOED_ID ? `${clean.slice(0, MAX_ECHOED_ID)}\u2026` : clean;
 }
 
-function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchOptions, now: number, client: string): DispatchLane {
+function toLane(
+  rung: LadderRung,
+  position: number,
+  cfg: Config,
+  opts: DispatchOptions,
+  now: number,
+  client: string,
+  platform: NodeJS.Platform,
+): DispatchLane {
   const until = cooldownUntil(cfg, rung, now);
   const state: LaneState = !rung.enabled ? "disabled" : until !== null ? "exhausted" : "ready";
 
@@ -253,7 +274,7 @@ function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchO
 
   if (rung.kind === "cli" && rung.command && rung.args) {
     lane.invoke = {
-      command: rung.command,
+      command: normalizeCliCommand(rung.command, platform),
       // No task given => leave the placeholder visible, so the caller can see where it goes
       // rather than receiving a command that silently asks the agent to do nothing.
       args: opts.task === undefined ? [...rung.args] : rung.args.map((a) => a.split(TASK_TOKEN).join(opts.task!)),
@@ -266,13 +287,17 @@ function toLane(rung: LadderRung, position: number, cfg: Config, opts: DispatchO
   return lane;
 }
 
-export function buildDispatch(cfg: Config, rawOpts: DispatchOptions = {}): DispatchView {
+export function buildDispatch(
+  cfg: Config,
+  rawOpts: DispatchOptions = {},
+  platform: NodeJS.Platform = process.platform,
+): DispatchView {
   const opts = normalizeOptions(rawOpts ?? {});
   const client = opts.client ?? "default";
   const now = Date.now();
   const selected = selectLadder(cfg, opts.tier);
   const rungs = selected.rungs;
-  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client));
+  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client, platform));
   const offload = offloadRule(cfg, client).enabled;
 
   if (selected.missing) {

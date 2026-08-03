@@ -48,7 +48,8 @@ llm-relay
 ```
 
 It listens on `127.0.0.1:8791` and refuses to bind anything non-loopback — it holds provider
-keys and does no authentication of its own.
+keys. Its data plane relies on the configured client/provider credentials; stateful and costly
+control routes independently require the per-install capability that the CLI manages automatically.
 
 **Point Claude Code at it** by adding to the `env` block of `~/.claude/settings.json`:
 

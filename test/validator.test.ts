@@ -72,4 +72,28 @@ describe("ToolUseValidator", () => {
     expect(r.valid).toBe(true);
     expect(r.toolUseCount).toBe(0);
   });
+
+  it("fails closed when a declared tool has no schema", () => {
+    const schemaLess = toolSchemaMap({ tools: [{ name: "built_in" }] });
+    const r = v.validate(
+      msg([{ type: "tool_use", id: "t1", name: "built_in", input: {} }], "tool_use"),
+      schemaLess,
+    );
+    expect(r.valid).toBe(false);
+    expect(r.uncheckableCount).toBe(1);
+    expect(r.errors.map((error) => error.kind)).toContain("schema_uncheckable");
+  });
+
+  it("fails closed when a declared schema cannot compile", () => {
+    const uncompilable = toolSchemaMap({
+      tools: [{ name: "broken", input_schema: { type: "definitely-not-a-json-schema-type" } }],
+    });
+    const r = v.validate(
+      msg([{ type: "tool_use", id: "t1", name: "broken", input: {} }], "tool_use"),
+      uncompilable,
+    );
+    expect(r.valid).toBe(false);
+    expect(r.uncheckableCount).toBe(1);
+    expect(r.errors.map((error) => error.kind)).toContain("schema_uncheckable");
+  });
 });
