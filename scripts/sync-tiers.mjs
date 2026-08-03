@@ -23,6 +23,12 @@
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  CAPABILITY_DIMENSIONS,
+  TASK_FIT_SIGNALS,
+  resolveCalibration,
+  scoreModels,
+} from "./tier-scoring.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = join(ROOT, "docs", "tier-data.json");
@@ -219,32 +225,6 @@ async function fetchAider() {
   return [...best.values()].map(({ dirname, ...rest }) => ({ ...rest, aider_run: dirname }));
 }
 
-/** Rank-normalize a field to [0,1] (1 = best) across models that have it; null-safe. */
-function rankNormalize(models, field) {
-  const scored = models.filter((m) => m[field] != null).sort((a, b) => b[field] - a[field]);
-  const map = new Map();
-  scored.forEach((m, i) => map.set(m, scored.length === 1 ? 1 : 1 - i / (scored.length - 1)));
-  return map;
-}
-
-/**
- * Weighted signals for the strength score. Weights encode what THIS proxy cares about: it drives
- * tool-calling subagents, so tool-use and agentic ability outrank general chat preference.
- * Everything is rank-normalized first, because the raw units (a 0-100 accuracy, a 1500-ish Elo,
- * a 0-70 index) are not comparable.
- */
-const SIGNALS = [
-  { field: "bfcl_overall", weight: 2.0, note: "tool-call accuracy (direct)" },
-  { field: "aa_agentic", weight: 2.0, note: "agentic index (drives a tool loop)" },
-  { field: "aa_coding", weight: 1.5, note: "coding index" },
-  { field: "bfcl_irrelevance", weight: 1.0, note: "declines when no tool fits" },
-  { field: "aider_pass_rate", weight: 1.0, note: "polyglot edit benchmark" },
-  { field: "aider_well_formed", weight: 1.0, note: "edit-format compliance" },
-  { field: "design_arena_agents_elo_mean", weight: 1.0, note: "agent-arena Elo (mean)" },
-  { field: "arena_rating", weight: 1.0, note: "general preference" },
-  { field: "aa_intelligence", weight: 1.0, note: "general intelligence index" },
-];
-
 async function main() {
   const warnings = [];
   const sources = {};
@@ -292,40 +272,29 @@ async function main() {
   absorb(aider, "aider");
   const models = [...byNorm.values()];
 
-  // Strength = weighted mean of whatever rank-normalized signals a model actually has. Models are
-  // NOT penalised for signals nobody publishes about them; instead `signal_count`/`signals` travel
-  // with the score so a 1-source guess never looks like a 5-source consensus.
-  const normalized = Object.fromEntries(SIGNALS.map((s) => [s.field, rankNormalize(models, s.field)]));
-  for (const m of models) {
-    let sum = 0, weight = 0;
-    const used = [];
-    for (const s of SIGNALS) {
-      const v = normalized[s.field].get(m);
-      if (v === undefined) continue;
-      sum += v * s.weight;
-      weight += s.weight;
-      used.push(s.field);
-    }
-    m.strength = weight > 0 ? Math.round((sum / weight) * 1000) / 1000 : null;
-    m.signals = used;
-    m.signal_count = used.length;
-  }
+  const prev = existsSync(OUT) ? JSON.parse(readFileSync(OUT, "utf8")) : null;
+  const generatedAt = new Date().toISOString();
+  const calibration = resolveCalibration(models, prev?.calibration, generatedAt);
+  scoreModels(models, calibration, prev?.models ?? []);
   models.sort((a, b) => (b.strength ?? -1) - (a.strength ?? -1));
   models.forEach((m, i) => { m.strength_rank = m.strength != null ? i + 1 : null; });
   // Back-compat: consumers pinned to the old field names keep working.
   for (const m of models) { m.composite = m.strength; m.composite_rank = m.strength_rank; }
 
   if (!existsSync(dirname(OUT))) mkdirSync(dirname(OUT), { recursive: true });
-  const prev = existsSync(OUT) ? JSON.parse(readFileSync(OUT, "utf8")) : null;
   const snapshot = {
-    synced_at: new Date().toISOString(),
+    synced_at: generatedAt,
     sources,
     warnings,
-    signals: SIGNALS,
+    calibration,
+    dimensions: CAPABILITY_DIMENSIONS,
+    task_fit_signals: TASK_FIT_SIGNALS,
     composite_note:
-      "strength = weighted mean of available rank-normalized signals (see `signals`). Relative only, " +
-      "never an absolute score. Check signal_count before trusting a rank: a model scored by one " +
-      "source is a guess, not a consensus. Raw per-source values are kept alongside and never collapsed.",
+      "strength = fixed 40% agentic + 35% coding + 25% general capability. Raw measurements use " +
+      "persisted calibration anchors; missing dimensions are estimated from overlap instead of " +
+      "disappearing from the denominator. capability_confidence records evidence quality but does " +
+      "not gate effort membership. Specialized task/behavior signals are separate and affect " +
+      "deployment fitness only.",
     models,
   };
   writeFileSync(OUT, JSON.stringify(snapshot, null, 2) + "\n");
@@ -334,7 +303,7 @@ async function main() {
   const fmt = (m, i) =>
     `${String(i + 1).padStart(3)}. ${(m.name ?? m.norm).padEnd(38).slice(0, 38)}  ` +
     `str=${m.strength != null ? m.strength.toFixed(3) : "  —  "} ` +
-    `n=${String(m.signal_count).padStart(2)}  ` +
+    `n=${String(m.signal_count).padStart(2)} d=${String(m.direct_dimensions.length).padStart(1)}  ` +
     `bfcl=${m.bfcl_overall != null ? String(m.bfcl_overall).padStart(5) : "   — "}  ` +
     `agentic=${m.aa_agentic != null ? String(m.aa_agentic).padStart(5) : "   — "}  ` +
     `arena=${m.arena_rating != null ? String(Math.round(m.arena_rating)).padStart(4) : "  — "}`;
@@ -346,8 +315,8 @@ async function main() {
   if (warnings.length) console.log(warnings.map((w) => `  ⚠ ${w}`).join("\n"));
   if (prev) console.log(`  (previous snapshot: ${prev.synced_at}, ${prev.models?.length ?? "?"} models)`);
 
-  const multi = models.filter((m) => m.signal_count >= 3);
-  console.log(`\nTop 15 by strength (>=3 signals — ${multi.length} of ${models.length} qualify):`);
+  const multi = models.filter((m) => m.published_signal_count >= 3);
+  console.log(`\nTop 15 by strength (>=3 published signals — ${multi.length} of ${models.length} qualify):`);
   console.log(multi.slice(0, 15).map(fmt).join("\n"));
 }
 

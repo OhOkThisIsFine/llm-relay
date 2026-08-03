@@ -21,6 +21,8 @@ import {
   writeConfigPath,
 } from "./config-edit.js";
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
+import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
+import { flushProbeCache } from "./ping/probe-cache.js";
 
 export function argValue(...flags: string[]): string | undefined {
   const allFlags = new Set<string>();
@@ -83,6 +85,7 @@ const VALUE_FLAGS = new Set<string>([
   '--client', '-client',
   '--scope', '-scope',
   '--include', '-include',
+  '--effort', '-effort',
   '--shell', '-shell',
 ]);
 
@@ -112,26 +115,8 @@ export function getPositionalArgs(argv: string[] = process.argv): string[] {
   return positionals;
 }
 
-type HelpRow = {
-  label: string;
-  description: string | readonly string[];
-};
-
-/** Render the help tables from their content instead of hand-counted spaces. */
-function formatHelpRows(rows: readonly HelpRow[]): string {
-  const labelWidth = Math.max(...rows.map((row) => row.label.length));
-  return rows
-    .map(({ label, description }) => {
-      const lines = typeof description === "string" ? [description] : description;
-      return lines
-        .map((line, index) => {
-          const labelColumn = index === 0 ? label.padEnd(labelWidth) : " ".repeat(labelWidth);
-          return `  ${labelColumn}  ${line}`;
-        })
-        .join("\n");
-    })
-    .join("\n");
-}
+type TableCell = string | readonly string[];
+type TableRow = readonly TableCell[];
 
 /** Keep a long provider/model name from pushing the rest of a terminal row sideways. */
 function fitCell(value: string, width: number): string {
@@ -140,166 +125,145 @@ function fitCell(value: string, width: number): string {
   return `${value.slice(0, width - 1)}…`;
 }
 
-function formatTextTable(rows: readonly (readonly string[])[], indent = ""): string {
+function formatTextTable(rows: readonly TableRow[], indent = ""): string {
   if (rows.length === 0) return "";
-  const widths = rows[0]!.map((_, column) =>
-    Math.max(...rows.map((row) => row[column]?.length ?? 0)),
+  const columnCount = Math.max(...rows.map((row) => row.length));
+  const linesFor = (cell: TableCell | undefined): readonly string[] =>
+    cell === undefined ? [""] : typeof cell === "string" ? [cell] : cell;
+  const widths = Array.from({ length: columnCount }, (_, column) =>
+    Math.max(...rows.map((row) => Math.max(...linesFor(row[column]).map((line) => line.length), 0))),
   );
+
   return rows
-    .map((row) => `${indent}${row.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd()}`)
+    .flatMap((row) => {
+      const cells = Array.from({ length: columnCount }, (_, column) => linesFor(row[column]));
+      const lineCount = Math.max(...cells.map((cell) => cell.length));
+      return Array.from({ length: lineCount }, (_, line) =>
+        `${indent}${cells
+          .map((cell, column) => {
+            const value = cell[line] ?? "";
+            return column === columnCount - 1 ? value : value.padEnd(widths[column]!);
+          })
+          .join("  ")
+          .trimEnd()}`,
+      );
+    })
     .join("\n");
 }
 
 const HELP = `llm-relay — loopback Anthropic/OpenAI proxy with tool-call validation and repair.
 
 Routing:
-  A request's model is resolved in this order:
-  pool/<name>          routing.pools[<name>] — benchmark-ranked candidates with failover.
-                       Use a pool when you want the best available model, not a fixed one.
-                       An unknown pool is a 400; it never falls back silently.
-  provider/model       Verbatim target, for example "nim/z-ai/glm-5.2". Never re-ranked.
-  Claude model id      Matched against routing.tiers (opus|sonnet|haiku|fable).
-  anything else        routing.default.
+  Model routing order:
+${formatTextTable([
+  ["pool/<name>", "Fitness-ranked pool with failover."],
+  ["provider/model", "Exact target; no reranking."],
+  ["Claude model id", "Matches opus|sonnet|haiku|fable tiers."],
+  ["anything else", "Uses routing.default."],
+], "  ")}
 
-A provider with kind:"anthropic" and no authEnv is a passthrough: the caller's credentials
-are forwarded untouched. Point tiers at it to keep real Claude traffic on Anthropic while
+Anthropic providers without authEnv forward caller credentials. Use them for Claude traffic while
 pool/* requests use other providers.
 
 Offload:
-  Claude Code (/v1/messages) and Codex (/v1/responses) have independent offload rules.
-  Each rule can be disabled, limited to marked subagents, or applied to the full conversation:
+${formatTextTable([
+  ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Set one harness's rule."],
+  ["llm-relay offload [status]", "Show current rules."],
+  ["harness", "claude | codex | <configured client>"],
+  ["scope", "subagents | all (default: subagents)"],
+  ["llm-relay candidates", "Show offload target data."],
+], "  ")}
 
-${formatHelpRows([
-  { label: "llm-relay offload status", description: "Show the current client rules." },
-  { label: "llm-relay offload claude on --scope subagents", description: "Offload marked Claude subagents." },
-  { label: "llm-relay offload codex on --scope all", description: "Offload the full Codex conversation." },
-  { label: "llm-relay offload claude off", description: "Disable Claude offload." },
-  { label: "llm-relay candidates", description: "Show the un-blended target decision table." },
-])}
-
-The legacy "llm-relay offload on|off" form remains a global compatibility switch. Changes
-apply to the next request, do not require a restart, and are persisted to the config file.
-
-For a one-off dispatch, put "@relay: <spec>" on its own line in the subagent prompt. The
-relay strips that directive before forwarding, so the model never sees it.
+One-off: put "@relay: <spec>" on its own line in the subagent prompt; the relay strips it.
 
 Setup checks:
-  These checks answer different questions:
-${formatHelpRows([
-  { label: "llm-relay keys", description: "Are the provider credentials good?" },
-  {
-    label: "llm-relay pools --probe",
-    description: "Will each configured model actually answer?",
-  },
-])}
-  keys escalates past a public /models endpoint to an authenticated probe when possible.
-  pools --probe sends a real completion to each member and catches listed-but-dead models.
+${formatTextTable([
+  ["llm-relay keys", "Check provider keys."],
+  ["llm-relay pools --probe", "Test every pool model."],
+], "  ")}
+  keys uses an authenticated probe when possible; --probe sends a real completion per model.
 
-Keys are read from the environment and from ~/.llm-relay/.env. An environment variable always
-wins over the value in the file.
+Keys: environment variables override ~/.llm-relay/.env.
 
 Usage:
-${formatHelpRows([
-  { label: "llm-relay [options]", description: "Start the proxy server (default)." },
-  { label: "llm-relay onboard", description: "Run guided provider-key setup." },
-  { label: "llm-relay setup [claude-cli|claude-desktop]", description: "Configure Claude CLI wrappers or Claude Desktop." },
-  { label: "llm-relay keys | check-keys", description: "Check provider credentials and signup links." },
-  { label: "llm-relay telemetry", description: "Print JSON telemetry and quota metrics." },
-  { label: "llm-relay models [-p <name>] [-r]", description: "List live models per provider." },
-  { label: "llm-relay pools [--probe]", description: "List pool members; optionally test each one." },
-  { label: "llm-relay pools set|add|remove <name> <spec...>", description: "Create or edit pools; use --free for dynamic free-model pools." },
-  { label: "llm-relay routing ...", description: "Show or edit default, tiers, subagents, and ranking." },
-  { label: "llm-relay config show|get|set|unset <path>", description: "Read or edit any JSON config path." },
-  { label: "llm-relay ping [-p <name>]", description: "Probe latency, stability, and quota." },
-  { label: "llm-relay offload [client] [on|off|status]", description: "Read or change a client's offload rule." },
-  { label: "llm-relay dispatch [lane] [options]", description: "Show the next whole-task dispatch lane." },
-  { label: "llm-relay candidates [-p <name>]", description: "Show the offload target decision table." },
-  { label: "llm-relay help | --help | -h", description: "Show this help." },
-  { label: "llm-relay version | --version | -v", description: "Show the package version." },
-])}
-
-Commands:
-${formatHelpRows([
-  { label: "(default)", description: "Start the loopback HTTP proxy." },
-  { label: "onboard", description: "Run the free-provider and subscription-key wizard." },
-  { label: "setup claude-cli", description: "Show and verify Claude CLI wrapper configuration." },
-  { label: "setup claude-desktop | desktop", description: "Patch claude_desktop_config.json." },
-  { label: "keys | check-keys", description: "Validate provider credentials and show signup links." },
-  { label: "telemetry", description: "Print JSON telemetry, quota, and stability data." },
-  { label: "models", description: "Query the live /models catalog." },
-  { label: "pools", description: "List configured pool members." },
-  { label: "ping", description: "Probe model latency, stability, and quota." },
-  { label: "offload [client] on|off|status", description: "Configure one client's rule; use --scope for subagents or all." },
-  {
-    label: "dispatch [lane]",
-    description: [
-      "Show the selected client's and tier's dispatch ladder.",
-      "The relay selects the lane; you run the returned command.",
-    ],
-  },
-  { label: "candidates", description: "Show benchmarks, health, quota, and breaker state." },
-  { label: "help", description: "Show this help." },
-  { label: "version", description: "Print the package version." },
-])}
+${formatTextTable([
+  ["llm-relay [options]", "Start proxy."],
+  ["llm-relay onboard", "Set up provider keys."],
+  ["llm-relay setup [target]", "target: claude-cli | claude-desktop."],
+  ["llm-relay keys | check-keys", "Check provider keys."],
+  ["llm-relay telemetry", "Print telemetry/quota JSON."],
+  ["llm-relay models [-p <name>] [-r]", "List provider models."],
+  ["llm-relay pools [--probe]", "List pool members; --probe tests each."],
+  ["llm-relay pools <action> <name> [<spec>...]", "action: set|add|remove|delete."],
+  ["llm-relay routing <action> ...", "action: show|get|default|tier|subagent|sort|benchmark|set|unset."],
+  ["llm-relay config <action> [<path>] [<value>]", "action: show|get|set|unset."],
+  ["llm-relay ping [-p <name>]", "Probe providers."],
+  ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Set one harness's rule."],
+  ["llm-relay offload [status]", "Show current rules."],
+  ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane."],
+  ["llm-relay candidates [-p <name>]", "Show offload target data."],
+  ["llm-relay help | --help | -h", "Show help."],
+  ["llm-relay version | --version | -v", "Print version."],
+], "  ")}
 
 Dispatch options:
-${formatHelpRows([
-  { label: "--client <name>", description: "Choose the client whose offload rule supplies hints." },
-  { label: "--tier <name>", description: "Select a reasoning, coding, or fast ladder." },
-  { label: "-t, --task <task>", description: "Substitute task text into a CLI lane's command." },
-  { label: "--after <lane>", description: "Skip past a spent lane and choose the next ready one." },
-  { label: "-x, --exhausted <lane>", description: "Report a spent lane to the running proxy." },
-  { label: "--shell sh|pwsh", description: "Quote returned CLI commands for sh/bash or PowerShell 7+." },
-  { label: "--json", description: "Print the raw dispatch view as JSON." },
-])}
+${formatTextTable([
+  ["--client <name>", "Offload client for routing hints."],
+  ["--tier <name>", "Ladder: low|medium|high|xhigh."],
+  ["-t, --task <task>", "Task text for the selected lane."],
+  ["--after <lane>", "Skip past this lane."],
+  ["-x, --exhausted <lane>", "Mark this lane spent."],
+  ["--shell sh|pwsh", "Quote for sh or PowerShell."],
+  ["--json", "Print JSON."],
+], "  ")}
 
 General options:
-${formatHelpRows([
-  { label: "-c, --config <path>", description: "Config file (default: ~/.llm-relay/config.json)." },
-  { label: "-p, --provider <name>", description: "Filter models, ping, or candidates to one provider." },
-  { label: "-r, --refresh", description: "Force a refresh when querying provider models." },
-  { label: "--free / --include free", description: "Add discovered free catalog models after a pool's preferred members." },
-  { label: "--clear", description: "Remove a routing tier or subagent mapping." },
-  { label: "--json", description: "Print machine-readable output where supported." },
-])}
+${formatTextTable([
+  ["-c, --config <path>", "Config path."],
+  ["-p, --provider <name>", "Filter provider."],
+  ["-r, --refresh", "Refresh catalog."],
+  ["--json", "Print JSON where supported."],
+], "  ")}
 
-Proxy startup overrides (take precedence over the config file):
-${formatHelpRows([
-  { label: "-d, --default <provider/model>", description: "Override routing.default." },
-  { label: "-m, --mode <detect|repair|strict>", description: "Override the validation mode." },
-  { label: "-l, --listen <host:port>", description: "Override the listen address (loopback only)." },
-])}
+Pool options:
+${formatTextTable([
+  ["--probe", "Test each pool member."],
+  ["--free | --include free", "Append discovered free models."],
+  ["--effort <level>", "Floor: low|medium|high|xhigh."],
+], "  ")}
 
-Version checks:
-  Every run except help and version checks npm (cached for 6h, with a 2.5s timeout, fail-open).
-  A global install updates itself and restarts on the new version. Other copies print the upgrade
-  command. Set LLM_RELAY_NO_SELF_UPDATE=1 to skip the check.
+Routing options:
+${formatTextTable([
+  ["--clear", "Remove a tier or subagent."],
+], "  ")}
 
-Claude Code notes:
-  With a custom ANTHROPIC_BASE_URL, Claude Code drops the 1M-context beta header and disables
-  Remote Control. Neither behaviour is caused by this proxy. For 1M context, launch with:
-    ANTHROPIC_MODEL='claude-opus-5[1m]' claude
+Startup overrides:
+${formatTextTable([
+  ["-d, --default <provider/model>", "Override routing.default."],
+  ["-m, --mode <detect|repair|strict>", "Validation mode."],
+  ["-l, --listen <host:port>", "Loopback address."],
+], "  ")}
+
+Self-update: npm check except help/version; cached 6h, timeout 2.5s. Set
+LLM_RELAY_NO_SELF_UPDATE=1 to disable.
+
+Claude Code: custom ANTHROPIC_BASE_URL disables the 1M beta header and Remote Control. For 1M:
+  ANTHROPIC_MODEL='claude-opus-5[1m]' claude
 
 Proxy server endpoints:
-${formatHelpRows([
-  { label: "POST /v1/messages", description: "Anthropic Messages proxy with tool repair." },
-  { label: "POST /v1/messages/count_tokens", description: "Local token estimation for OpenAI backends." },
-  { label: "POST /v1/chat/completions", description: "OpenAI-compatible Chat Completions front door." },
-  { label: "POST /v1/responses", description: "OpenAI-compatible Responses front door (Codex/IDE)." },
-  { label: "GET /registry", description: "Full provider, routing, and capability view." },
-  { label: "GET /candidates", description: "Raw per-target benchmarks, health, quota, and breaker state." },
-  { label: "GET|POST /offload", description: "Read or set the offload rule; accepts ?client=<name>." },
-  {
-    label: "GET|POST /dispatch",
-    description: [
-      "Return the next dispatch lane; query values: client, tier, lane, after, task.",
-      "POST {\"exhausted\":\"<lane>\"} to report a spent lane and walk on.",
-    ],
-  },
-  { label: "GET /telemetry", description: "Live telemetry, quota, and stability scores." },
-  { label: "GET /ping", description: "Trigger a health probe and return the ping summary." },
-  { label: "GET /health", description: "Diagnostic provider availability and health summary." },
-])}
+${formatTextTable([
+  ["POST /v1/messages", "Anthropic API; validates/repairs tool calls."],
+  ["POST /v1/messages/count_tokens", "Local token count."],
+  ["POST /v1/chat/completions", "OpenAI Chat API."],
+  ["POST /v1/responses", "OpenAI Responses API."],
+  ["GET /registry", "Provider/routing metadata."],
+  ["GET /candidates", "Offload target data."],
+  ["GET|POST /offload", "Read/set rules; accepts ?client=<name>."],
+  ["GET|POST /dispatch", "Read/set next lane; POST {\"exhausted\":\"<lane>\"}."],
+  ["GET /telemetry", "Telemetry and quota."],
+  ["GET /ping", "Run health probe."],
+  ["GET /health", "Provider health."],
+], "  ")}
 `;
 
 
@@ -334,23 +298,29 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
       },
     },
     routing: {
-      // Candidate ARRAYS, never a single pinned model. A one-element spec silently disables both
-      // benchmarkSort (it only ranks when >1 candidate) and failover — and on NIM "listed" does not
-      // mean "servable", so a lone pinned model turns one dead backend into a dead relay.
-      default: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"],
+      default: "pool/medium",
       tiers: {
-        opus: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"],
-        sonnet: ["nim/z-ai/glm-5.2", "nim/moonshotai/kimi-k2.6"],
-        haiku: ["nim/meta/llama-3.1-8b-instruct", "nim/openai/gpt-oss-20b"],
+        opus: "pool/xhigh",
+        fable: "pool/xhigh",
+        sonnet: "pool/high",
+        haiku: "pool/medium",
       },
       // Addressable as `model: pool/<name>` — including from subagent frontmatter, which only
       // accepts a single string and so cannot express a candidate list on its own.
       pools: {
-        coding: ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"],
-        fast: ["nim/meta/llama-3.1-8b-instruct", "nim/openai/gpt-oss-20b"],
+        low: { preferred: [], include: "free", effort: "low" },
+        medium: { preferred: [], include: "free", effort: "medium" },
+        high: { preferred: [], include: "free", effort: "high" },
+        xhigh: { preferred: [], include: "free", effort: "xhigh" },
       },
       // Where marked subagents (and, with scope "all", conversations) go when offload is on.
-      subagents: { opus: "pool/coding", sonnet: "pool/coding", haiku: "pool/fast", default: "pool/coding" },
+      subagents: {
+        opus: "pool/xhigh",
+        fable: "pool/xhigh",
+        sonnet: "pool/high",
+        haiku: "pool/medium",
+        default: "pool/medium",
+      },
       // Per-originating-harness switches, all off by default. `scope: "all"` also reroutes the
       // main conversation; omit it or use "subagents" to preserve the current topology.
       offload: {
@@ -466,7 +436,9 @@ export async function runModels(): Promise<void> {
     for (const m of models) {
       const s = getStrength(`${name}/${m}`);
       // Only say something when there is evidence; a neutral placeholder is not information.
-      const str = s.basis === "snapshot" ? ` str ${s.score.toFixed(1)} (${s.signalCount} signals)` : "";
+      const str = s.basis === "snapshot"
+        ? ` capability ${s.score.toFixed(1)} (raw ${s.rawScore.toFixed(1)}, ${s.signalCount} signals)`
+        : "";
       const lim = await catalog.limits(name, p, m).catch(() => null);
       const ctx = lim?.contextLength ? `  ctx ${Math.round(lim.contextLength / 1000)}k` : "";
       const out = lim?.maxOutputTokens ? `  max_out ${lim.maxOutputTokens}` : "";
@@ -480,11 +452,38 @@ export async function runModels(): Promise<void> {
  * does not serve — non-blocking (fire-and-forget) so it never delays listen().
  */
 export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promise<void> {
-  // Dynamic pools make the catalog routing input, not just validation metadata. Warm every
-  // configured OpenAI provider so the discovered free tail requires no hand maintenance.
+  // Start from the persisted catalog so routing/probing has a concrete roster immediately.
+  materializeDynamicPools(cfg, catalog);
+
+  const warm = new Set<string>();
+  const addSpec = (spec: string) => {
+    if (spec.startsWith("pool/")) {
+      for (const member of cfg.routing.pools?.[spec.slice("pool/".length)] ?? []) addSpec(member);
+      return;
+    }
+    const { provider } = splitSpec(spec);
+    if (cfg.providers[provider]?.kind === "openai") warm.add(provider);
+  };
+  for (const value of [
+    cfg.routing.default,
+    ...Object.values(cfg.routing.tiers),
+    ...Object.values(cfg.routing.pools ?? {}),
+    ...Object.values(cfg.routing.subagents ?? {}),
+  ]) {
+    for (const spec of Array.isArray(value) ? value : [value]) addSpec(spec);
+  }
+  // Only free/mixed catalogs can contribute a dynamic tail without already being explicitly
+  // routed. Subscription providers are warmed when a static target actually references them.
+  if (Object.keys(cfg.routing.poolPolicies ?? {}).length > 0) {
+    for (const [name, p] of Object.entries(cfg.providers)) {
+      if (p.kind === "openai" && (p.tierType === "free" || p.tierType === "mixed")) warm.add(name);
+    }
+  }
+
   await Promise.all(
-    Object.entries(cfg.providers).map(async ([name, p]) => {
-      if (p.kind === "openai") await catalog.list(name, p);
+    [...warm].map(async (name) => {
+      const p = cfg.providers[name]!;
+      await catalog.list(name, p);
     }),
   );
   materializeDynamicPools(cfg, catalog);
@@ -540,7 +539,14 @@ export function runProxy() {
     if (typeof server.closeIdleConnections === "function") {
       server.closeIdleConnections();
     }
-    server.close(() => process.exit(0));
+    server.close(() => {
+      // Write-behind caches trade a bounded crash window for a quiet request path. Graceful
+      // shutdown closes that window explicitly.
+      catalog.flushPersistence();
+      flushRuntimeTelemetry();
+      flushProbeCache();
+      process.exit(0);
+    });
   };
 
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -855,18 +861,25 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   process.stdout.write(`\n${view.next ? `use: ${view.next.id}` : "no lane available"} — ${view.reason}\n`);
 }
 
-/** `llm-relay offload [client] [on|off|status]` — configure one client or the legacy global rule. */
+/** `llm-relay offload [status]` or `llm-relay offload <client> [on|off|status]`. */
 export async function runOffload(arg: string | undefined, nextArg?: string): Promise<void> {
   const cfg = loadOrExit();
   const actions = new Set(["on", "enable", "off", "disable", "status"]);
-  const legacy = arg === undefined || actions.has(arg);
-  const client = legacy ? undefined : arg;
-  const action = legacy ? (arg ?? "status") : (nextArg ?? "status");
+  if (arg !== undefined && arg !== "status" && actions.has(arg)) {
+    process.stderr.write("llm-relay offload: expected [status] or <client> on|off|status\n");
+    process.exit(1);
+  }
+  if (arg === "status" && nextArg !== undefined) {
+    process.stderr.write("llm-relay offload: status does not accept a client action\n");
+    process.exit(1);
+  }
+  const client = arg === undefined || arg === "status" ? undefined : arg;
+  const action = client === undefined ? "status" : (nextArg ?? "status");
   const want = action === "on" || action === "enable" ? true : action === "off" || action === "disable" ? false : null;
   const scopeArg = argValue("--scope", "-scope");
   const scope = scopeArg === "all" || scopeArg === "subagents" ? scopeArg : undefined;
 
-  if (!legacy && (!client || !/^[A-Za-z0-9_.-]+$/.test(client))) {
+  if (client !== undefined && !/^[A-Za-z0-9_.-]+$/.test(client)) {
     process.stderr.write(`llm-relay offload: client must be a simple name such as "claude" or "codex"\n`);
     process.exit(1);
   }
@@ -903,7 +916,7 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   // No proxy listening: still honour the change by writing the file, but say plainly that
   // nothing is running to apply it.
   const state = live ?? (want === null ? offloadState(cfg, client) : setOffload(cfg, want, client, scope));
-  const label = client ?? "global";
+  const label = client ?? "all";
   const configuredClients = state.clients ?? {};
   const effectiveScope = state.scope ?? "subagents";
   process.stdout.write(`${label} offload: ${state.enabled ? "ON" : "OFF"}${client ? ` (${effectiveScope})` : ""}\n`);
@@ -942,7 +955,7 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
         "\n",
     );
   } else if (state.enabled) {
-    process.stdout.write("  legacy global rule applies to marked subagents for every front door\n");
+    process.stdout.write("  offload is enabled for marked subagents across all front doors\n");
   } else {
     process.stdout.write("  offload is disabled; an `@relay: <spec>` line still offloads one marked subagent call\n");
   }
@@ -972,9 +985,7 @@ function obsLatency(o: Candidate["observed"]): string {
 function strengthTag(c: Candidate): string {
   switch (c.sortInputs.strengthBasis) {
     case "snapshot":
-      return `/${c.sortInputs.strengthSignals.length}`;
-    case "telemetry":
-      return " obs";
+      return `/${c.sortInputs.strengthSignals.length}c${c.sortInputs.publishedSignalCount}p`;
     default:
       return " neut";
   }
@@ -1005,7 +1016,9 @@ export async function runCandidates(): Promise<void> {
   const head =
     "target".padEnd(32) +
     "pools / tiers".padEnd(24) +
-    "str".padEnd(11) +
+    "fit".padEnd(7) +
+    "raw".padEnd(7) +
+    "cap".padEnd(11) +
     "agentic".padEnd(9) +
     "coding".padEnd(8) +
     "BFCL".padEnd(7) +
@@ -1015,7 +1028,7 @@ export async function runCandidates(): Promise<void> {
     "verdict".padEnd(10) +
     "p95".padEnd(8) +
     // Latency actually observed on this proxy's own traffic. The synthetic-probe p95 beside it is
-    // routinely blank, so the table could show a rank-1 pool member with NO latency signal at all
+    // routinely blank, so the table could show the first pool member with NO latency signal at all
     // while the proxy had already measured it at 60+ seconds per call — which is the difference
     // between a pool that suits mechanical batch work and one that does not.
     "obs".padEnd(8) +
@@ -1040,7 +1053,9 @@ export async function runCandidates(): Promise<void> {
     process.stdout.write(
       c.spec.slice(0, 31).padEnd(32) +
         tags.slice(0, 23).padEnd(24) +
-        // The scalar plus how well-evidenced it is: "83.3/4" = 4 published signals behind it,
+        c.sortInputs.fitness.toFixed(1).padEnd(7) +
+        c.sortInputs.rawStrength.toFixed(1).padEnd(7) +
+        // Capability plus how well-evidenced it is: "76.6/4" = 4 published signals behind it,
         // "50.0 neut" = nothing known. Never show the number alone.
         `${c.sortInputs.strength.toFixed(1)}${strengthTag(c)}`.padEnd(11) +
         fmt(c.scores.aaAgentic).padEnd(9) +
@@ -1095,11 +1110,17 @@ export async function runCandidates(): Promise<void> {
       "quota/breaker/$ are what it costs to use right now. A blank cell means NOT MEASURED.\n" +
       `  p95 = synthetic probe loop; obs = mean of this proxy's OWN requests. Different samples,\n` +
       `        so they are not merged — and a high "obs" on a top-ranked member is worth seeing\n` +
-      `        before pointing bulk work at that pool (str ranks capability, never speed).\n` +
+      `        before pointing bulk work at that pool.\n` +
       `  breaker: "OPEN 42s" = cooling after failures/429; "AUTH 401" = credential fault, demoted\n` +
       `           until it is retried (expires, so a rotated key recovers with no restart).\n` +
-      `  str = the one scalar pool ordering needs. "83.3/4" = 4 published signals behind it;\n` +
-      `        "obs" = ranked on this proxy's own traffic, "neut" = nothing known.\n` +
+      `  fit = pool order: 75% capability + 20% measured operations + 5% task-fit metadata.\n` +
+      `        Unknown operations/metadata are neutral, never zero; hard faults are demoted.\n` +
+      `  raw = fixed 40% agentic + 35% coding + 25% general capability. Missing dimensions\n` +
+      `        are overlap-estimated instead of dropped; confidence affects ordering only.\n` +
+      `        Floors use whole points, retain members through a 2-point exit band, and require\n` +
+      `        an exact SKU match plus at least 3 published capability/task-fit signals.\n` +
+      `  cap = confidence-adjusted capability used in fit ordering. "/4c5p" = four direct\n` +
+      `        capability signals, five total publications; "neut" = no capability evidence.\n` +
       `  "~" on ctx/$ = another provider's figure for the same model id (this one publishes none);\n` +
       `                 unmarked = the serving provider published it; blank = nobody publishes it.\n` +
       (srcs.length ? `Sources contributing: ${srcs.join(", ")} (refresh: npm run sync:tiers)\n` : ""),
@@ -1286,7 +1307,12 @@ export function runRoutingCommand(): void {
  * The listing is cheap and offline. The probe is the only thing that can actually catch a
  * member that is configured, catalogued, and nonetheless dead — see pool-health.ts.
  */
-export async function runPools(): Promise<void> {
+export async function runPools(
+  deps: {
+    catalog?: ModelCatalog;
+    probeAll?: typeof probeAllPools;
+  } = {},
+): Promise<void> {
   const cfg = loadOrExit();
   const path = configSourcePath(cfg);
   const positionals = getPositionalArgs(process.argv);
@@ -1296,10 +1322,17 @@ export async function runPools(): Promise<void> {
     const name = requireSimpleConfigName(positionals[2], `pools ${action}`);
     const specs = positionals.slice(3);
     const include = argValue("--include") ?? (hasFlag("--free") ? "free" : undefined);
+    const effort = argValue("--effort");
     if (include !== undefined && include !== "free") configCommandError('pools: --include expects "free"');
+    if (effort !== undefined && !["low", "medium", "high", "xhigh"].includes(effort)) {
+      configCommandError("pools: --effort expects low, medium, high, or xhigh");
+    }
+    if (effort !== undefined && include !== "free") {
+      configCommandError("pools: --effort requires --free or --include free");
+    }
 
     if (action === "delete" || action === "rm") {
-      if (specs.length > 0 || include !== undefined) configCommandError(`pools ${action}: expected only <name>`);
+      if (specs.length > 0 || include !== undefined || effort !== undefined) configCommandError(`pools ${action}: expected only <name>`);
       updateConfigDocument(path, (document) => {
         const routing = routingDocument(document);
         const pools = routing.pools;
@@ -1329,6 +1362,7 @@ export async function runPools(): Promise<void> {
       const oldMembers = dynamic
         ? Array.isArray(dynamic.preferred) ? dynamic.preferred.filter((v): v is string => typeof v === "string") : []
         : Array.isArray(existing) ? existing.filter((v): v is string => typeof v === "string") : [];
+      const oldEffort = dynamic && typeof dynamic.effort === "string" ? dynamic.effort : undefined;
       let next: string[];
       if (action === "set") next = [...new Set(specs)];
       else if (action === "add") next = [...new Set([...oldMembers, ...specs])];
@@ -1338,7 +1372,13 @@ export async function runPools(): Promise<void> {
         configCommandError("pools remove: the pool would be empty; use pools delete instead");
       }
       if (include === "free" || (dynamic !== null && action !== "set")) {
-        pools[name] = { preferred: next, include: "free" };
+        pools[name] = {
+          preferred: next,
+          include: "free",
+          ...(effort ?? (action !== "set" ? oldEffort : undefined)
+            ? { effort: effort ?? oldEffort }
+            : {}),
+        };
       } else {
         pools[name] = next;
       }
@@ -1346,6 +1386,13 @@ export async function runPools(): Promise<void> {
     changedConfig(path);
     return;
   }
+
+  // Read-only pool commands must inspect the same effective membership used by live routing:
+  // the configured prefix followed by the discovered free-model tail. ModelCatalog reads the
+  // on-disk cache synchronously here, so ordinary listing stays offline and cheap. Previously
+  // only the server request path materialized this tail, which made `pools` and `pools --probe`
+  // report and test only the configured prefixes while claiming to cover every pool member.
+  materializeDynamicPools(cfg, deps.catalog ?? new ModelCatalog());
 
   if (action === "show") {
     const name = requireSimpleConfigName(positionals[2], "pools show");
@@ -1392,7 +1439,7 @@ export async function runPools(): Promise<void> {
   }
 
   process.stdout.write("Probing every pool member with a real completion...\n\n");
-  const results = await probeAllPools(cfg);
+  const results = await (deps.probeAll ?? probeAllPools)(cfg);
   const icon: Record<MemberVerdict, string> = {
     live: "LIVE",
     empty: "EMPTY",
@@ -1419,7 +1466,7 @@ export async function runPools(): Promise<void> {
   if (dead > 0) {
     process.stdout.write(
       `⚠ ${dead} member(s) will never answer (DEAD/AUTH). Remove them from routing.pools — a pool\n` +
-        `  ranked by strength can otherwise put a dead model first and burn a failover hop on every call.\n`,
+        `  ranked by fitness can otherwise put a dead model first and burn a failover hop on every call.\n`,
     );
   }
 }
@@ -1577,10 +1624,9 @@ export function classifyCommand(argv: string[]): CommandEffect {
     // `setup claude-desktop` writes claude_desktop_config.json; bare `setup` only prints.
     case "setup":
       return arg3 === "claude-desktop" || arg3 === "desktop" ? "mutating" : "read-only";
-    // `offload [client] on|off` rewrites config.json; status forms only report.
+    // Only client-scoped `offload <client> on|off` rewrites config.json; status forms only report.
     case "offload":
-      return arg3 === "on" || arg3 === "enable" || arg3 === "off" || arg3 === "disable" ||
-        arg4 === "on" || arg4 === "enable" || arg4 === "off" || arg4 === "disable"
+      return arg4 === "on" || arg4 === "enable" || arg4 === "off" || arg4 === "disable"
         ? "mutating"
         : "read-only";
     case "config":

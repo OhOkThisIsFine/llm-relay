@@ -2,24 +2,21 @@ import { anyOffloadEnabled, type Config, type OffloadRule, type ProviderConfig }
 import { POOL_PREFIX } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
-import { getStrength, type StrengthBasis } from "./benchmarks.js";
+import { deploymentFitness, getStrength, type StrengthBasis } from "./benchmarks.js";
 import { findTierModel, type TierData } from "./tier-data.js";
 import { keyIsPresent } from "./authEnv.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
-import { loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
+import { getRealWorldScore, loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { loadTierData } from "./registry.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 
 /**
  * Everything known about one offload destination, kept as SEPARATE raw dimensions.
  *
- * Deliberately un-blended: each leaderboard, live stability, cost, quota and observed traffic
- * measure different things and trade off against each other differently per task ("cheapest that
- * can do it" vs "best available"). Averaging them into one number would bury exactly the judgement
- * the reader is here to make. The one scalar that does exist lives under `sortInputs` with the
- * basis and signals that produced it — because ordering a pool requires an order, not because it
- * is a recommendation.
+ * Every raw dimension remains visible. Pool ordering additionally exposes one transparent
+ * deployment-fitness scalar and its capability/operations/metadata components; it is necessary
+ * to order candidates, not a claim that the underlying measurements are interchangeable.
  */
 export interface Candidate {
   spec: string;
@@ -113,14 +110,30 @@ export interface Candidate {
     arenaRating: number | null;
     arenaRank: number | null;
   };
-  /** What the proxy itself sorts by — the ONE place a scalar exists, with its provenance. */
+  /** What the proxy itself sorts by, with the component scores and provenance beside it. */
   sortInputs: {
-    /** Drives `routing.benchmarkSort` ordering within a pool. */
+    /** Drives pool ordering: 75% capability, 20% operations, 5% task-fit metadata. */
+    fitness: number;
+    capability: number;
+    operational: number;
+    metadata: number;
+    /** Confidence-adjusted capability used in deployment-fitness ordering. */
     strength: number;
-    /** snapshot | telemetry | neutral. A telemetry score is not a capability score. */
+    /** Raw dimension-balanced capability used for effort floors. */
+    rawStrength: number;
+    /** 0-1 evidence confidence applied to rawStrength. */
+    strengthConfidence: number;
+    /** snapshot | neutral. Operational telemetry never stands in for capability. */
     strengthBasis: StrengthBasis;
-    /** How many published signals backed it. 1 is a guess; 5 is a consensus. */
+    /** Direct capability signals behind the estimate. */
     strengthSignals: string[];
+    /** Capability plus separate task-fit publications used by the admission evidence gate. */
+    publishedSignalCount: number;
+    capabilityDimensions: Partial<Record<"agentic" | "coding" | "general", number>>;
+    directDimensions: string[];
+    imputedDimensions: string[];
+    /** Specialized benchmark fit input, kept separate from raw capability. */
+    benchmarkTaskFit: number | null;
     /**
      * Drives circuit-breaker candidate ordering. **null when nothing has been measured** —
      * it used to report 100 for an untracked target, which made "never probed" and "proven
@@ -141,10 +154,10 @@ export interface CandidatesView {
 }
 
 const NOTE =
-  "Raw per-dimension data for choosing an offload target. Nothing here is ranked or averaged — " +
+  "Raw per-dimension data for choosing an offload target. Leaderboards remain separate — " +
   "order is the materialized pool order (fixed preferences, then discovered free models), and every source's score is kept " +
-  "separately under `scores`. `sortInputs` reports the ONE scalar the proxy needs for pool " +
-  "ordering, with the basis and signal list that produced it; it is not a recommendation.";
+  "under `scores`. `sortInputs` shows the capability-led deployment fitness used for pool " +
+  "ordering and its full breakdown; it is not a universal recommendation.";
 
 /** Expand a spec that may itself be `pool/<name>` into concrete "provider/model" specs. */
 function expandSpec(spec: string, cfg: Config): string[] {
@@ -204,29 +217,55 @@ export async function buildCandidates(
   if (opts.catalog) materializeDynamicPools(cfg, opts.catalog);
   const breaker = opts.breaker ?? globalCircuitBreaker;
   const nowMs = opts.nowMs ?? Date.now();
-  const byNorm = (opts.tierData === undefined ? loadTierData() : opts.tierData)?.byNorm ?? [];
+  const tierData = opts.tierData === undefined ? loadTierData() : opts.tierData;
+  const byNorm = tierData?.byNorm ?? [];
   const telemetry = loadRuntimeTelemetry();
+  const memberships = collectSpecs(cfg);
+
+  // Hydrate each provider once. `has()` + `limits()` per row both call `list()`, which turned a
+  // candidates view into 2N sequential catalog operations even though every row shares a small
+  // provider-level snapshot.
+  const listedByProvider = new Map<string, Set<string> | null>();
+  if (opts.catalog) {
+    const providers = new Set<string>();
+    for (const spec of memberships.keys()) {
+      const { provider } = splitSpec(spec);
+      if (!opts.provider || provider === opts.provider) providers.add(provider);
+    }
+    await Promise.all([...providers].map(async (provider) => {
+      const p = cfg.providers[provider];
+      if (!p || p.kind !== "openai") {
+        listedByProvider.set(provider, null);
+        return;
+      }
+      try {
+        const models = await opts.catalog!.list(provider, p);
+        listedByProvider.set(
+          provider,
+          models.length > 0 || opts.catalog!.hasCachedCatalog(provider) ? new Set(models) : null,
+        );
+      } catch {
+        listedByProvider.set(provider, null);
+      }
+    }));
+  }
 
   const candidates: Candidate[] = [];
-  for (const [spec, membership] of collectSpecs(cfg)) {
+  for (const [spec, membership] of memberships) {
     const { provider, model } = splitSpec(spec);
     if (opts.provider && provider !== opts.provider) continue;
     const p: ProviderConfig | undefined = cfg.providers[provider];
 
-    let listed: boolean | null = null;
-    if (p && p.kind === "openai" && model && opts.catalog) {
-      try {
-        listed = await opts.catalog.has(provider, p, model);
-      } catch {
-        listed = null;
-      }
-    }
+    const providerModels = listedByProvider.get(provider) ?? null;
+    const listed = p && p.kind === "openai" && model && opts.catalog
+      ? providerModels?.has(model) ?? null
+      : null;
 
     const summary = opts.pingLoop && model ? opts.pingLoop.getModelSummary(provider, model) : null;
     const state = breaker.getState(spec);
     const obs = model ? telemetry.models[`${provider}/${model}`] : undefined;
-    const strength = getStrength(spec);
-    const matched = findTierModel(model ?? spec, byNorm);
+    const strength = getStrength(spec, tierData);
+    const matched = findTierModel(model ?? spec, byNorm, tierData?.exactByNorm);
     const tier = matched?.rec;
     const num = (k: string) => (typeof tier?.[k] === "number" ? (tier[k] as number) : null);
 
@@ -235,7 +274,7 @@ export async function buildCandidates(
     // NIM target they are a different deployment's figures and are labelled `reference`, never
     // presented as this provider's own.
     const providerLimits = p && p.kind === "openai" && model && opts.catalog
-      ? await opts.catalog.limits(provider, p, model).catch(() => null)
+      ? opts.catalog.cachedLimits(provider, model)
       : null;
     // ⚠ On a FUZZY snapshot match these figures describe a similarly-named but different
     // SKU (`glm-5.2` → `glm-5.2-max`), and `from` named only the host — so a borrowed
@@ -253,6 +292,31 @@ export async function buildCandidates(
         priceCompletionPerToken: num("price_completion"),
         from: referenceFrom,
       },
+    });
+    const exactTier = matched?.match === "exact" ? tier : undefined;
+    const supportsTools = typeof exactTier?.supports_tools === "boolean" ? exactTier.supports_tools : null;
+    const breakerStability = breaker.getMeasuredStability(spec);
+    const stabilityScore = summary && summary.stabilityScore >= 0
+      ? summary.stabilityScore
+      : breakerStability;
+    const stabilitySamples = summary && opts.pingLoop && model
+      ? opts.pingLoop.getModelPings(provider, model).length
+      : state?.pings.length ?? 0;
+    const fitness = deploymentFitness(strength, {
+      stabilityScore,
+      stabilityConfidence: Math.min(1, stabilitySamples / 5),
+      runtimeScore: model ? getRealWorldScore(provider, model, { telemetry, now: nowMs }) : null,
+      supportsTools,
+      contextLength: meta.contextLength,
+      contextConfidence: meta.contextLengthSource === "provider"
+        ? 1
+        : meta.contextLengthSource === "reference" && matched?.match === "exact" ? 0.5 : 0,
+      maxOutputTokens: meta.maxOutputTokens,
+      maxOutputConfidence: meta.maxOutputTokensSource === "provider"
+        ? 1
+        : meta.maxOutputTokensSource === "reference" && matched?.match === "exact" ? 0.5 : 0,
+      benchmarkTaskFitScore: typeof exactTier?.task_fit_score === "number" ? exactTier.task_fit_score * 100 : null,
+      benchmarkTaskFitConfidence: Math.min(1, (exactTier?.task_fit_signal_count ?? 0) / 3),
     });
 
     candidates.push({
@@ -303,7 +367,7 @@ export async function buildCandidates(
       pricePerMTokIn: meta.pricePerMTokIn,
       pricePerMTokOut: meta.pricePerMTokOut,
       priceSource: meta.priceSource,
-      supportsTools: typeof tier?.supports_tools === "boolean" ? tier.supports_tools : null,
+      supportsTools,
       capabilitySources: Array.isArray(tier?.sources) ? (tier.sources as string[]) : [],
       scores: {
         bfclOverall: num("bfcl_overall"),
@@ -320,10 +384,21 @@ export async function buildCandidates(
         arenaRank: num("arena_rank"),
       },
       sortInputs: {
+        fitness: fitness.score,
+        capability: fitness.capability,
+        operational: fitness.operational,
+        metadata: fitness.metadata,
         strength: strength.score,
+        rawStrength: strength.rawScore,
+        strengthConfidence: strength.confidence,
         strengthBasis: strength.basis,
         strengthSignals: strength.signals ?? [],
-        breakerStability: breaker.getMeasuredStability(spec),
+        publishedSignalCount: strength.publishedSignalCount ?? strength.signalCount ?? 0,
+        capabilityDimensions: strength.dimensions ?? {},
+        directDimensions: strength.directDimensions ?? [],
+        imputedDimensions: strength.imputedDimensions ?? [],
+        benchmarkTaskFit: typeof exactTier?.task_fit_score === "number" ? exactTier.task_fit_score * 100 : null,
+        breakerStability,
       },
     });
   }

@@ -10,6 +10,11 @@ export type Kind = "anthropic" | "openai";
 
 export type ProviderTierType = "free" | "mixed" | "subscription";
 
+/** Requested reasoning/capability band for an automatically discovered pool. */
+export type EffortLevel = "low" | "medium" | "high" | "xhigh";
+
+const EFFORT_LEVELS = new Set<EffortLevel>(["low", "medium", "high", "xhigh"]);
+
 /** Which requests a client-specific offload rule may reroute. */
 export type OffloadScope = "subagents" | "all";
 
@@ -103,10 +108,12 @@ export interface Routing {
   ladders?: Record<string, LadderRung[]>;
 }
 
-/** A fixed preferred prefix followed by automatically discovered free models. */
+/** A fixed configured prefix followed by automatically discovered free models. */
 export interface PoolPolicy {
   preferred: string[];
   include: "free";
+  /** Optional evidence-aware effort band for the discovered tail. */
+  effort?: EffortLevel;
 }
 
 /**
@@ -361,6 +368,8 @@ export interface Config {
    * `reshaper` is candidates[0] so every existing single-reshaper path keeps working unchanged.
    */
   reshaperCandidates?: ReshaperConfig[];
+  /** Dynamic reshaper pool resolved lazily after its catalog-backed tail is materialized. */
+  reshaperPool?: { name: string; timeoutMs?: number };
   repair: { maxAttempts: number; destructiveTools: string[] };
   log: { level: "metadata" | "silent"; file: string | null };
   /**
@@ -542,7 +551,7 @@ export function resolveTargets(model: string | null, cfg: Config): ResolvedTarge
     targets = activeTargets;
   }
 
-  // Dynamic pools are already materialized as an invariant fixed prefix followed by a ranked
+  // Dynamic pools are already materialized as an invariant fixed prefix followed by a fitness-ranked
   // discovery tail. Sorting the entire result again would destroy the user's preferred order.
   const pickedPool = picked.length === 1 && picked[0]?.startsWith(`${POOL_PREFIX}/`) ? picked[0] : undefined;
   const dynamicPool =
@@ -672,7 +681,18 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   // works but is fragile — the provider dropping that id silently disables repair.
   const reshaperCandidates = resolveReshaperPool(c.reshaper, routing, providers);
   const reshaper = reshaperCandidates?.[0] ?? parseReshaper(c.reshaper);
-  if (mode === "repair" && !reshaper) {
+  const reshaperPoolRaw = typeof c.reshaper === "object" && c.reshaper !== null
+    ? c.reshaper as Record<string, unknown>
+    : null;
+  const dynamicReshaperPool = reshaperCandidates?.length === 0 && typeof reshaperPoolRaw?.pool === "string"
+    ? {
+        name: reshaperPoolRaw.pool,
+        ...(typeof reshaperPoolRaw.timeoutMs === "number" && Number.isFinite(reshaperPoolRaw.timeoutMs) && reshaperPoolRaw.timeoutMs > 0
+          ? { timeoutMs: reshaperPoolRaw.timeoutMs }
+          : {}),
+      }
+    : undefined;
+  if (mode === "repair" && !reshaper && !dynamicReshaperPool) {
     const anthropicProvider = Object.entries(providers).find(([, p]) => p.kind === "anthropic");
     if (anthropicProvider) {
       throw new Error(
@@ -706,6 +726,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     mode,
     ...(reshaper ? { reshaper } : {}),
     ...(reshaperCandidates && reshaperCandidates.length > 1 ? { reshaperCandidates } : {}),
+    ...(dynamicReshaperPool ? { reshaperPool: dynamicReshaperPool } : {}),
     repair: { maxAttempts, destructiveTools },
     log: { level, file },
     ...(leaveMeAlone.length > 0 ? { leaveMeAlone } : {}),
@@ -857,15 +878,22 @@ function parseRouting(
       if (Array.isArray(v)) {
         declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
       } else if (typeof v === "object" && v !== null) {
-        const policy = v as { preferred?: unknown; include?: unknown };
+        const policy = v as { preferred?: unknown; include?: unknown; effort?: unknown };
         if (!Array.isArray(policy.preferred) || policy.preferred.some((s) => typeof s !== "string" || s.length === 0)) {
           throw new Error(`config.routing.pools.${k}.preferred must be an array of non-empty "provider/model" specs`);
         }
         if (policy.include !== "free") {
           throw new Error(`config.routing.pools.${k}.include must be "free"`);
         }
+        if (policy.effort !== undefined && !EFFORT_LEVELS.has(policy.effort as EffortLevel)) {
+          throw new Error(`config.routing.pools.${k}.effort must be low, medium, high, or xhigh`);
+        }
         declared = [...(policy.preferred as string[])];
-        poolPolicies[k] = { preferred: declared, include: "free" };
+        poolPolicies[k] = {
+          preferred: declared,
+          include: "free",
+          ...(policy.effort ? { effort: policy.effort as EffortLevel } : {}),
+        };
       } else {
         throw new Error(
           `config.routing.pools.${k} must be an array of specs or {"preferred":[...],"include":"free"}`,
@@ -890,7 +918,7 @@ function parseRouting(
         throw new Error(`config.routing.pools.${k} member "${nested}" — a pool cannot reference another pool`);
       }
       pools[k] = arr;
-      if (poolPolicies[k]) poolPolicies[k] = { preferred: arr, include: "free" };
+      if (poolPolicies[k]) poolPolicies[k] = { ...poolPolicies[k]!, preferred: arr, include: "free" };
     }
   }
 
@@ -1192,6 +1220,13 @@ function resolveReshaperPool(
     });
   }
   if (out.length === 0) {
+    // A catalog-backed pool can legitimately have an empty configured prefix. Its discovered
+    // tail is materialized after load, so remember the pool and resolve it lazily in server.ts.
+    // This is allowed only when an OpenAI provider could actually contribute a reshaper; an
+    // all-Anthropic config would otherwise defer a deterministic startup error until first use.
+    if (routing.poolPolicies?.[poolName] && Object.values(providers).some((p) => p.kind === "openai")) {
+      return [];
+    }
     throw new Error(`config.reshaper.pool "${poolName}" contains no openai-kind target that can reshape`);
   }
   return out;

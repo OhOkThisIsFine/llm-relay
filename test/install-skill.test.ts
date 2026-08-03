@@ -72,7 +72,7 @@ describe("install-skill postinstall hook", () => {
     expect(r.stderr).toContain("installed Codex skill");
     expect(readFileSync(paths.codexConfig, "utf8")).toContain("[model_providers.llm-relay]");
     expect(readFileSync(paths.codexConfig, "utf8")).toContain('base_url = "http://127.0.0.1:8791/v1"');
-    expect(readFileSync(paths.defaultAgent, "utf8")).toContain('model = "pool/coding"');
+    expect(readFileSync(paths.defaultAgent, "utf8")).toContain('model = "pool/medium"');
     expect(readFileSync(paths.codingAgent, "utf8")).toContain('model_provider = "llm-relay"');
     expect(r.stderr).toContain("Codex provider configured");
     expect(r.stderr).toContain("Codex agent installed");
@@ -109,7 +109,7 @@ describe("install-skill postinstall hook", () => {
     expect(afterFirstConfig.match(/\[model_providers\.llm-relay\]/g)).toHaveLength(1);
     expect(afterSecondConfig).toBe(afterFirstConfig);
     expect(afterFirstDefault).toBe(existingDefault);
-    expect(readFileSync(paths.codingAgent, "utf8")).toContain('model = "pool/coding"');
+    expect(readFileSync(paths.codingAgent, "utf8")).toContain('model = "pool/medium"');
     expect(second.stderr).toContain("Codex provider already configured");
     expect(second.stderr).toContain("Codex agent already exists");
   });

@@ -18,10 +18,13 @@ import {
   normalizeDispatchCommands,
   proxyUrl,
   runDispatch,
+  runOffload,
   runConfigCommand,
   runPools,
   runRoutingCommand,
 } from "../src/cli.js";
+import { loadConfig } from "../src/config.js";
+import { ModelCatalog } from "../src/catalog.js";
 
 describe("cli helper utilities", () => {
   const origArgv = process.argv;
@@ -141,9 +144,9 @@ describe("cli helper utilities", () => {
     const help = out.join("");
 
     const aligned = [
-      { label: "llm-relay [options]", description: "Start the proxy server" },
-      { label: "llm-relay setup [claude-cli|claude-desktop]", description: "Configure Claude CLI wrappers" },
-      { label: "llm-relay dispatch [lane] [options]", description: "Show the next whole-task dispatch lane" },
+      { label: "llm-relay [options]", description: "Start proxy" },
+      { label: "llm-relay setup [target]", description: "target: claude-cli" },
+      { label: "llm-relay dispatch [lane] [options]", description: "Choose next dispatch lane" },
     ].map(({ label, description }) => {
       const line = help.split("\n").find((candidate) => candidate.includes(label) && candidate.includes(description));
       expect(line).toBeDefined();
@@ -153,6 +156,8 @@ describe("cli helper utilities", () => {
     expect(new Set(aligned).size).toBe(1);
     expect(help).toContain("GET|POST /dispatch");
     expect(help).toContain('POST {"exhausted":"<lane>"}');
+    expect(help).not.toContain("Commands:");
+    expect(help).not.toContain("llm-relay offload on|off");
     expect(help).not.toContain("                                                   the command");
 
     stdoutSpy.mockRestore();
@@ -425,7 +430,7 @@ describe("classifyCommand — the update-check gate", () => {
 
   it("classifies subcommands correctly even when flags precede them", () => {
     expect(classifyCommand(argv("--config", "c.json", "offload", "status"))).toBe("read-only");
-    expect(classifyCommand(argv("--config", "c.json", "offload", "on"))).toBe("mutating");
+    expect(classifyCommand(argv("--config", "c.json", "offload", "on"))).toBe("read-only");
   });
 
   it("splits setup and offload by what the invocation actually writes", () => {
@@ -433,8 +438,8 @@ describe("classifyCommand — the update-check gate", () => {
     expect(classifyCommand(argv("setup", "desktop"))).toBe("mutating");
     expect(classifyCommand(argv("setup"))).toBe("read-only");
 
-    expect(classifyCommand(argv("offload", "on"))).toBe("mutating");
-    expect(classifyCommand(argv("offload", "off"))).toBe("mutating");
+    expect(classifyCommand(argv("offload", "on"))).toBe("read-only");
+    expect(classifyCommand(argv("offload", "off"))).toBe("read-only");
     expect(classifyCommand(argv("offload", "claude", "on", "--scope", "all"))).toBe("mutating");
     expect(classifyCommand(argv("offload", "codex", "status"))).toBe("read-only");
     expect(classifyCommand(argv("offload", "status"))).toBe("read-only");
@@ -501,6 +506,21 @@ describe("CLI configuration editing", () => {
     return JSON.parse(readFileSync(configPath, "utf8"));
   }
 
+  it("rejects the removed global offload toggle", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+    process.argv.push("offload", "on");
+
+    await expect(runOffload("on")).rejects.toThrow("exit:1");
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("expected [status] or <client> on|off|status"));
+    expect(document().routing.offload).toBeUndefined();
+
+    stderrSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
   it("creates, edits, and deletes static and dynamic pools", async () => {
     process.argv.push("pools", "set", "coding", "test/coder", "other/coder");
     await runPools();
@@ -521,6 +541,52 @@ describe("CLI configuration editing", () => {
     process.argv = ["node", "cli.ts", "--config", configPath, "pools", "delete", "coding"];
     await runPools();
     expect(document().routing.pools).toEqual({});
+  });
+
+  it("materializes the discovered free tail before probing pools", async () => {
+    const configured = {
+      ...baseConfig,
+      routing: {
+        ...baseConfig.routing,
+        pools: { coding: { preferred: ["test/coder"], include: "free" } },
+      },
+    };
+    writeFileSync(configPath, JSON.stringify(configured, null, 2));
+
+    const loaded = loadConfig(configPath);
+    const catalog = new ModelCatalog({ cachePath: null });
+    await catalog.list("test", loaded.providers.test!, {
+      fetchFn: (async () => new Response(JSON.stringify({
+        data: [{ id: "coder" }, { id: "catalog-model:free" }],
+      }), { status: 200 })) as unknown as typeof fetch,
+    });
+
+    let probedMembers: string[] = [];
+    const probeAll = vi.fn(async (cfg) => {
+      probedMembers = [...(cfg.routing.pools?.coding ?? [])];
+      return [];
+    });
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "--probe"];
+
+    await runPools({ catalog, probeAll: probeAll as typeof import("../src/pool-health.js").probeAllPools });
+
+    expect(probeAll).toHaveBeenCalledOnce();
+    expect(probedMembers).toEqual(["test/coder", "test/catalog-model:free"]);
+  });
+
+  it("creates and preserves evidence-aware effort policies", async () => {
+    process.argv.push("pools", "set", "medium", "--free", "--effort", "medium");
+    await runPools();
+    expect(document().routing.pools.medium).toEqual({
+      preferred: [], include: "free", effort: "medium",
+    });
+
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "add", "medium", "test/coder"];
+    await runPools();
+    expect(document().routing.pools.medium).toEqual({
+      preferred: ["test/coder"], include: "free", effort: "medium",
+    });
   });
 
   it("configures fallback, tiers, subagents, sorting, and arbitrary routing fields", async () => {

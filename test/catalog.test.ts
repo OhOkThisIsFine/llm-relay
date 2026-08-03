@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ModelCatalog } from "../src/catalog.js";
@@ -76,6 +76,17 @@ describe("ModelCatalog", () => {
     // fresh instance, within TTL → served from disk, no network
     const models = await c2.list("p", provider, { now: 2000, fetchFn: throwFetch() });
     expect(models).toEqual(["disk-model"]);
+  });
+
+  it("can defer and coalesce persistence while still supporting an explicit shutdown flush", async () => {
+    const cachePath = join(dir, "models-cache-write-behind.json");
+    const c = new ModelCatalog({ cachePath, writeBehind: true });
+    await c.list("p", provider, { fetchFn: okFetch(["lazy-write"]) });
+    expect(existsSync(cachePath)).toBe(false);
+    c.flushPersistence();
+    expect(existsSync(cachePath)).toBe(true);
+    const persisted = JSON.parse(readFileSync(cachePath, "utf8")) as Record<string, { models: string[] }>;
+    expect(persisted.p?.models).toEqual(["lazy-write"]);
   });
 
   it("returns [] for an anthropic provider (no /models consumed)", async () => {

@@ -29,7 +29,7 @@ Three forms in a request's `model` field, resolved in this order:
 
 | Form | Goes to | Ranked / failover? |
 |---|---|---|
-| `pool/<name>` | every candidate in `routing.pools[<name>]` | yes — benchmark-ranked, walks candidates on failure |
+| `pool/<name>` | every candidate in `routing.pools[<name>]` | yes — fitness-ranked, walks candidates on failure |
 | `<provider>/<model>` (e.g. `nim/z-ai/glm-5.2`) | that exact deployment, verbatim | no — deliberately pinned |
 | a Claude model id (`claude-opus-5`, …) | `routing.tiers` → Anthropic passthrough | n/a |
 
@@ -68,17 +68,20 @@ boolean form remains supported and means one global subagents-only rule.
     "claude": { "enabled": true, "scope": "subagents" },
     "codex": { "enabled": false, "scope": "all" }
   },
-  "subagents": { "opus": "pool/reasoning", "sonnet": "pool/coding", "default": "pool/coding" }
+  "subagents": {
+    "opus": "pool/xhigh", "fable": "pool/xhigh",
+    "sonnet": "pool/high", "haiku": "pool/medium", "default": "pool/medium"
+  }
 }
 ```
 
 Three ways to steer a subagent, in precedence order:
 
 1. **`@relay: <spec>` directive** — put it on its own line at the START of the subagent's prompt
-   (`@relay: pool/coding` or `@relay: nim/z-ai/glm-5.2`). Stripped before forwarding, so the model
+   (`@relay: pool/medium` or `@relay: nim/z-ai/glm-5.2`). Stripped before forwarding, so the model
    never sees it. **Works with the switch OFF** — this is the per-call opt-in.
 2. **Tier** *(client rule must be on)* — the Agent tool's `model` param maps through
-   `routing.subagents` (e.g. opus→`pool/reasoning`, sonnet→`pool/coding`, haiku→`pool/fast`).
+   `routing.subagents` (e.g. opus/fable→`pool/xhigh`, sonnet→`pool/high`, haiku→`pool/medium`).
 3. **Nothing** *(client rule on)* — the inherited model id matches a tier, else `subagents.default`.
 
 ⚠ Dispatching a subagent does NOT offload it by itself. With that client's rule off, a subagent
@@ -90,7 +93,7 @@ Offloaded output is **advisory** — verify claims against source files before a
 
 Keep the parent on its normal Codex provider and define a named child agent under
 `~/.codex/agents/` whose `model_provider` is `llm-relay` and whose `model` is a relay pool such as
-`pool/coding`. Ask the parent to spawn that agent by name. This is the reliable split setup for
+`pool/medium`. Ask the parent to spawn that agent by name. This is the reliable split setup for
 local Codex clients: the parent retains native Codex orchestration, while the child spends the
 configured provider pool. The `llm-relay` profile is an all-relay mode and routes the parent too.
 
@@ -113,11 +116,11 @@ description = "General-purpose read-only child routed through llm-relay."
 developer_instructions = "Work read-only. Return a concise result to the parent and do not modify files."
 
 model_provider = "llm-relay"
-model = "pool/coding"
+model = "pool/medium"
 model_reasoning_effort = "medium"
 ```
 
-This keeps the parent native while generic children use `pool/coding`; named agents can still select a
+This keeps the parent native while generic children use `pool/medium`; named agents can still select a
 different relay pool explicitly.
 
 ## Choosing a target
@@ -126,13 +129,27 @@ different relay pool explicitly.
 llm-relay candidates         # one row per offload target, all dimensions side by side
 ```
 
-The table is deliberately **un-blended** — capability from each leaderboard separately (AA
+The table keeps every raw dimension visible — capability from each leaderboard separately (AA
 agentic/coding, BFCL tool-use, Aider polyglot, LMArena), price, context, live health (verdict,
-p95), quota, breaker state, and traffic observed through this proxy. Weigh the columns yourself:
+p95), quota, breaker state, and traffic observed through this proxy. Pool ordering is transparent:
 
-- `str` is the one scalar (pool ordering needs an order) and always carries provenance:
-  `83.3/4` = four published signals; `obs` = ranked on this proxy's own traffic; `neut` = nothing
-  known. A blank cell means **not measured**, never "bad".
+- `raw` is fixed at 40% agentic/tool use, 35% coding, and 25% general reasoning. Source values use
+  persisted calibration anchors; a wholly missing dimension is estimated from overlapping models
+  instead of disappearing from the denominator. Specialized Design Arena categories, BFCL
+  irrelevance, and Aider formatting are task-fit signals, not capability.
+- Automatic membership uses whole-point capability floors, an exact SKU match, and at least three
+  published capability/task-fit signals. A member is retained until two points below its floor to
+  prevent refresh flapping. Confidence never lowers a strong model below a floor.
+- `cap` is the confidence-adjusted capability used for ordering. Direct dimension coverage,
+  published capability signals, and imputation quality determine confidence; fuzzy matches get
+  half confidence. `/4c5p` means four direct capability signals and five total publications;
+  `neut` means no capability evidence.
+- `fit` orders a pool: 75% `cap`, 20% deployment operations, 5% task-fit metadata. Operations use
+  measured probe stability plus success/speed/recency from at least five real calls. Metadata uses
+  exact-SKU tool support, the separate task-fit benchmark score, and provider/reference
+  context/output limits. Unknown inputs are neutral, never zero. Known tool incompatibility is
+  excluded from automatic effort pools; breaker-open and credential-faulted targets are demoted
+  rather than averaged away.
 - `~` on ctx/$ means the figure belongs to a **different host** serving the same model id
   (e.g. NIM publishes nothing, so OpenRouter's numbers are shown as reference). Never quote a `~`
   figure as the serving provider's real ceiling or rate.
@@ -151,7 +168,7 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
 
 ### The lanes, and how to drive each
 
-- **Relay pools** — `@relay: pool/coding` on a subagent prompt, or the tier mapping in
+- **Relay pools** — `@relay: pool/medium` on a subagent prompt, or the tier mapping in
   `routing.subagents` when the originating client's offload rule is on. Spends provider API keys. *Exhausted when:* the pool
   4xx/5xxs after failover walks every candidate, or `llm-relay candidates` shows the breaker open
   / quota drained across the pool.
@@ -192,9 +209,9 @@ llm-relay dispatch -t "<the task>"     # ordered ladder + the exact command to r
 llm-relay dispatch --json              # same, machine-readable
 ```
 
-Use `--tier reasoning|coding|fast` when the task class matters; tier-specific configurations live
+Use `--tier low|medium|high|xhigh` when task effort matters; tier-specific configurations live
 under `routing.ladders.<tier>`. Without it, the ladder matching `subagents.default` is selected
-(normally `coding`). `next` is the lane to use and `reason` says why. Then:
+(normally `medium`). `next` is the lane to use and `reason` says why. Then:
 
 - **Override with a specific target:** `llm-relay dispatch <lane> -t "<task>"` (or
   `GET /dispatch?lane=<id>`). Honoured even if that rung is cooling down — you asked for it.
@@ -251,10 +268,19 @@ Ordering exists at three levels; change the right one:
   Agent tool's `model` param (opus/sonnet/haiku/…) to a pool or pinned spec. Takes effect on the
   next request; no restart.
 - **Candidate order inside a pool** (`routing.pools`): prefer the automatic form
-  `{ "preferred": [...], "include": "free" }`. It keeps the preferred prefix fixed, then appends
-  every catalog-discovered free target in benchmark order; mixed catalogs contribute only models
-  with zero pricing or an explicit free label. Catalog refreshes update the tail with no manual
-  edits. Legacy arrays with `"benchmarkSort": true` rank the whole array.
+  `{ "preferred": [], "include": "free", "effort": "medium" }`. `effort` may be
+  `low|medium|high|xhigh`; these are cumulative raw-capability floors (50/60/70/80), not ceilings.
+  Floors compare whole-point capability, and an existing member leaves only after falling two
+  points below its floor. Every automatic member must also be an exact SKU match backed by at least
+  three published capability/task-fit signals. Confidence, stability, and metadata order eligible
+  deployments but never gate them.
+  A strong free model remains eligible for `low`, while higher effort narrows upward:
+  `xhigh ⊆ high ⊆ medium ⊆ low`. Models without sufficient capability evidence and exact SKUs
+  known not to support tools stay out of automatic effort pools. A non-empty `preferred` array is an
+  explicit fixed prefix and bypasses the band, while mixed catalogs contribute only zero-priced or
+  explicitly free models. Catalog refreshes update the tail with no manual edits. Legacy dynamic
+  pools without `effort` retain the full discovered tail; legacy arrays with `benchmarkSort: true`
+  rank the whole array.
   To make the array order authoritative, set `"benchmarkSort": false`. Either way the circuit
   breaker still demotes unhealthy targets — that is live health, not preference, and it is what
   you want. For an absolutely fixed destination, pin `<provider>/<model>`; a pin is never
@@ -298,7 +324,7 @@ observed yet**. `null` is not `false` — an unmeasured provider is unknown, not
   as "unknown", never as "broken", and do not tell the user to rotate a key on that basis.
 - `pools --probe` is the ground truth for whether a *model* works, and the only thing that
   catches a member that is configured, catalogued, and dead. **Run it after editing
-  `routing.pools`.** A `DEAD`/`AUTH` member should be removed: pools are strength-ranked, so a
+  `routing.pools`.** A `DEAD`/`AUTH` member should be removed: pools are fitness-ranked, so a
   dead model can sit at the top and burn a failover hop on every request. `EMPTY` is NOT dead —
   that is a reasoning model that spent its token budget thinking.
 - Never add a spec to a pool without probing that exact spec first.

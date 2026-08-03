@@ -4,6 +4,8 @@ import { pingProviderModel, type PingResult } from "./ping.js";
 import { type PingRecord, getAvg, getP95, getJitter, getStabilityScore, getVerdict, getUptime } from "./metrics.js";
 import { recordProbeResult, getModelsDueForProbe, loadPersistedSamples, loadTotals } from "./probe-cache.js";
 import { readCredential } from "../authEnv.js";
+import { getLastSuccessfulCallAt, loadRuntimeTelemetry } from "./runtime-telemetry.js";
+import { materializeDynamicPools } from "../dynamic-pools.js";
 
 export type PingMode = "speed" | "normal" | "slow" | "forced";
 
@@ -29,6 +31,54 @@ export interface ModelHealthSummary {
   quotaPercent: number | null;
   lastPingCode: string | null;
   lastPingMs: number | null;
+}
+
+function values(value: string | string[] | undefined): string[] {
+  return Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+}
+
+/**
+ * Concrete deployments that routing can currently select, ordered for useful early coverage.
+ * Pool leaders come first, then pinned routes/subagent choices, then the remaining pool members.
+ */
+export function collectRoutableModels(cfg: Config): Map<string, string[]> {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const touchConcrete = (spec: string) => {
+    if (spec.startsWith("pool/")) {
+      for (const member of cfg.routing.pools?.[spec.slice("pool/".length)] ?? []) touchConcrete(member);
+      return;
+    }
+    const slash = spec.indexOf("/");
+    if (slash <= 0 || slash === spec.length - 1 || seen.has(spec)) return;
+    seen.add(spec);
+    ordered.push(spec);
+  };
+
+  // Cover the head of every failover lane before spending probes on deep fallbacks.
+  for (const members of Object.values(cfg.routing.pools ?? {})) {
+    if (members[0]) touchConcrete(members[0]);
+  }
+  for (const spec of [
+    ...values(cfg.routing.default),
+    ...Object.values(cfg.routing.tiers).flatMap(values),
+    ...Object.values(cfg.routing.subagents ?? {}),
+  ]) touchConcrete(spec);
+  for (const members of Object.values(cfg.routing.pools ?? {})) {
+    for (const member of members) touchConcrete(member);
+  }
+
+  const byProvider = new Map<string, string[]>();
+  for (const spec of ordered) {
+    const slash = spec.indexOf("/");
+    const provider = spec.slice(0, slash);
+    const model = spec.slice(slash + 1);
+    if (cfg.providers[provider]?.kind !== "openai") continue;
+    const bucket = byProvider.get(provider) ?? [];
+    bucket.push(model);
+    byProvider.set(provider, bucket);
+  }
+  return byProvider;
 }
 
 export class PingLoop {
@@ -200,18 +250,42 @@ export class PingLoop {
     };
   }
 
-  public async tickOnce(): Promise<void> {
+  public async tickOnce(scope: "catalog" | "routable" = "catalog"): Promise<void> {
     this.refreshAutoPingMode();
+    if (scope === "routable") materializeDynamicPools(this.cfg, this.catalog);
+    const providers = Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>;
+    const beforeRefresh = scope === "routable" ? collectRoutableModels(this.cfg) : null;
+    const hasDynamicPools = Object.keys(this.cfg.routing.poolPolicies ?? {}).length > 0;
+    const listedByProvider = new Map<string, string[]>();
 
-    for (const [providerName, pCfg] of Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>) {
+    // Refresh each relevant provider once and in parallel. Dynamic contributors still need their
+    // catalog refreshed when a cold cache has no routable members yet; only the resulting
+    // materialized members are probed.
+    await Promise.all(providers.map(async ([providerName, pCfg]) => {
+      const contributesDynamic = hasDynamicPools &&
+        (pCfg.tierType === "free" || pCfg.tierType === "mixed");
+      if (scope === "routable" && !beforeRefresh?.has(providerName) && !contributesDynamic) return;
+      try {
+        listedByProvider.set(
+          providerName,
+          await this.catalog.list(providerName, pCfg, optsObj(this.opts.fetchFn)),
+        );
+      } catch {
+        listedByProvider.set(providerName, []);
+      }
+    }));
+
+    if (scope === "routable") materializeDynamicPools(this.cfg, this.catalog);
+    const routable = scope === "routable" ? collectRoutableModels(this.cfg) : null;
+    const telemetry = loadRuntimeTelemetry();
+
+    for (const [providerName, pCfg] of providers) {
       // Via the shared reader, not `process.env[...]` — a whitespace-only value is absent,
       // and open-coding the presence test is what let three call sites drift apart.
       const apiKey = readCredential(pCfg.authEnv);
-      let modelIds: string[] = [];
-
-      try {
-        modelIds = await this.catalog.list(providerName, pCfg, optsObj(this.opts.fetchFn));
-      } catch {}
+      const modelIds = scope === "catalog"
+        ? listedByProvider.get(providerName) ?? []
+        : routable?.get(providerName) ?? [];
 
       if (modelIds.length === 0) continue;
 
@@ -219,7 +293,10 @@ export class PingLoop {
       // module-level cache keyed by the last path it was given, so a call that omits the path
       // reads whatever another caller last loaded — here that meant asking a different cache
       // whether a model was due, concluding it was not, and probing nothing at all.
-      const dueIds = getModelsDueForProbe(providerName, modelIds, this.probeCacheOpts());
+      const dueIds = getModelsDueForProbe(providerName, modelIds, {
+        ...this.probeCacheOpts(),
+        lastSuccessfulCallAt: (modelId) => getLastSuccessfulCallAt(providerName, modelId, { telemetry }),
+      });
       // Probe up to 3 due models per provider per tick to avoid flooding
       const toProbe = dueIds.slice(0, 3);
 
@@ -239,7 +316,7 @@ export class PingLoop {
 
     const loop = async () => {
       if (!this.running) return;
-      await this.tickOnce().catch(() => {});
+      await this.tickOnce("routable").catch(() => {});
       if (this.running) {
         this.timerObj = setTimeout(loop, this.intervalMs);
       }
@@ -260,4 +337,3 @@ export class PingLoop {
 function optsObj(fetchFn?: typeof fetch): { fetchFn?: typeof fetch } {
   return fetchFn ? { fetchFn } : {};
 }
-

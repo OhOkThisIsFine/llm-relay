@@ -107,10 +107,21 @@ describe("probeAllPools", () => {
   });
 
   it("covers every member of every pool", async () => {
-    const c = cfg({ coding: ["p1/a", "p1/b"], fast: ["p1/c"] });
-    const res = await probeAllPools(c, respond(200, okBody));
-    expect(res).toHaveLength(3);
-    expect(res.map((r) => r.spec).sort()).toEqual(["p1/a", "p1/b", "p1/c"]);
+    const c = cfg({ coding: ["p1/a", "p1/b"], fast: ["p1/a", "p1/c"] });
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls += 1;
+      return new Response(okBody, { status: 200 });
+    }) as unknown as typeof fetch;
+    const res = await probeAllPools(c, fetchFn);
+    expect(res).toHaveLength(4);
+    expect(res.map((r) => `${r.pool}:${r.spec}`)).toEqual([
+      "coding:p1/a",
+      "coding:p1/b",
+      "fast:p1/a",
+      "fast:p1/c",
+    ]);
+    expect(calls).toBe(3);
     expect(res.every((r) => r.verdict === "live")).toBe(true);
   });
 

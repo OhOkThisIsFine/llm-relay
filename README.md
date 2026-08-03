@@ -73,7 +73,8 @@ llm-relay
 
 ### 4. Background Adaptive Health Monitoring & Persistent Caching
 - **Adaptive Cadence Loop**: Background `PingLoop` dynamically adjusts probe frequency across 4 operational modes: `speed` (2s interval at startup/activity), `normal` (10s), `slow` (30s after 5m idle), and `forced` (4s).
-- **Persistent State**: Background probes, real-world proxy calls, dynamic catalogs, and local keys persist under `~/.llm-relay/` (`models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `.env`).
+- **Selective probes**: The background loop probes only deployments present in materialized routing, with pool leaders first. A recent successful real request satisfies freshness; broken targets retry with exponential backoff instead of being hammered every tick. Explicit `llm-relay ping` remains a full-catalog diagnostic.
+- **Persistent State**: Background probes, real-world proxy calls, dynamic catalogs, and local keys persist under `~/.llm-relay/` (`models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `.env`). JSON caches use bounded write-behind and flush during graceful shutdown, keeping whole-file rewrites out of request/probe hot paths.
 
 ### 5. Document (PDF/Office) Attachments on Non-Anthropic Backends
 - Anthropic `document` content blocks are converted to markdown **before** the request reaches an
@@ -99,21 +100,21 @@ llm-relay
 
 | Command | Description |
 | :--- | :--- |
-| `llm-relay` | Start loopback HTTP proxy server on `127.0.0.1:8791` |
-| `llm-relay onboard` | Run guided setup wizard for 100%-free providers & subscription keys |
-| `llm-relay setup claude-desktop` (or `desktop`) | Auto-patch `claude_desktop_config.json` for Claude Desktop |
-| `llm-relay setup claude-cli` | Display & verify Claude CLI wrapper configuration |
-| `llm-relay keys` (or `check-keys`) | Validate provider API **credentials** (escalates past a public `/models` to an authenticated probe) |
-| `llm-relay pools [--probe]` | List pool members; `--probe` sends a real completion to each — the only check that catches a listed-but-dead **model** |
-| `llm-relay pools set|add|remove <name> <spec...>` | Create or edit pool membership; add `--free` (or `--include free`) for a dynamic free-model pool; `pools delete <name>` removes one |
-| `llm-relay routing ...` | Show or edit `routing.default`, Claude tiers, subagent destinations, benchmark sorting, and other routing fields |
-| `llm-relay config show|get|set|unset <path>` | Read or edit any JSON config path; values can be JSON, for example `config set routing.ladder '[...]'` |
-| `llm-relay telemetry` | Output live JSON telemetry, stability scores, and quota metrics |
-| `llm-relay models [-p <name>] [-r]` | Query live `/models` catalog per provider (`-p` filter, `-r` force refresh) |
-| `llm-relay ping [-p <name>]` | Perform live health, latency & quota probe across providers |
-| `llm-relay offload [client] [on\|off\|status] [--scope subagents\|all]` | Read or change one client's offload rule; changes apply to the next request, no restart |
-| `llm-relay candidates [-p <name>]` | The un-blended offload decision table (capability, cost, live health, quota, breaker state) |
-| `llm-relay dispatch [lane] [-t <task>] [--client <name>]` | Which lane to hand a whole delegated task to next; it returns the command, **you** run it (`-x <lane>` reports one spent) |
+| `llm-relay` | Start proxy |
+| `llm-relay onboard` | Set up provider keys |
+| `llm-relay setup [target]` | `target`: `claude-cli` | `claude-desktop` |
+| `llm-relay keys | check-keys` | Check provider keys |
+| `llm-relay pools [--probe]` | List pool members; `--probe` tests each |
+| `llm-relay pools <action> <name> [<spec>...]` | `action`: `set` | `add` | `remove` | `delete` |
+| `llm-relay routing <action> ...` | `action`: `show` | `get` | `default` | `tier` | `subagent` | `sort` | `benchmark` | `set` | `unset` |
+| `llm-relay config <action> [<path>] [<value>]` | `action`: `show` | `get` | `set` | `unset` |
+| `llm-relay telemetry` | Print telemetry/quota JSON |
+| `llm-relay models [-p <name>] [-r]` | List provider models |
+| `llm-relay ping [-p <name>]` | Probe providers |
+| `llm-relay offload [status]` | Show aggregate offload state |
+| `llm-relay offload <harness> <on\|off> [--scope <scope>]` | Set one harness's rule |
+| `llm-relay candidates [-p <name>]` | Show offload target data |
+| `llm-relay dispatch [lane] [options]` | Choose next dispatch lane |
 
 ---
 
@@ -124,25 +125,25 @@ and validate the complete result before writing it. Restart a running proxy afte
 
 ```bash
 # Static pool: members are tried/ranked according to the normal pool rules.
-llm-relay pools set coding nim/z-ai/glm-5.2 openrouter/openai/gpt-5.2-codex
-llm-relay pools add coding gemini/gemini-2.5-flash
-llm-relay pools remove coding gemini/gemini-2.5-flash
-llm-relay pools delete coding
+llm-relay pools set medium nim/z-ai/glm-5.2 openrouter/openai/gpt-5.2-codex
+llm-relay pools add medium gemini/gemini-2.5-flash
+llm-relay pools remove medium gemini/gemini-2.5-flash
+llm-relay pools delete medium
 
-# Dynamic pool: keep preferred members, then append discovered free models.
-llm-relay pools set coding nim/z-ai/glm-5.2 --free
+# Dynamic effort pool: an empty configured prefix, then evidence-ranked free models.
+llm-relay pools set medium --free --effort medium
 
 # Main fallback, Claude tier maps, subagent destinations, and ranking.
 llm-relay routing default nim/z-ai/glm-5.2 openrouter/openai/gpt-5.2-codex
-llm-relay routing tier sonnet pool/coding
-llm-relay routing subagent default pool/fast
+llm-relay routing tier sonnet pool/high
+llm-relay routing subagent default pool/medium
 llm-relay routing sort off
 llm-relay routing tier opus --clear
 
 # Inspect or change any less-common routing field using a JSON value.
 llm-relay routing show
 llm-relay config get routing.pools
-llm-relay config set routing.ladder '[{"id":"fast","kind":"relay","spec":"pool/fast"}]'
+llm-relay config set routing.ladder '[{"id":"medium","kind":"relay","spec":"pool/medium"}]'
 llm-relay config unset routing.ladder
 ```
 
@@ -315,17 +316,18 @@ a `routing` block that maps each request's `model` to one provider + backend mod
     "gemini":     { "base": "https://generativelanguage.googleapis.com/v1beta/openai", "kind": "openai", "authEnv": "GEMINI_API_KEY" }
   },
   "routing": {
-    // Any spec may be an ARRAY of candidates — that is what turns on benchmark ranking
-    // (it only sorts when there is more than one) AND failover. A lone pinned model disables both.
-    "default": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"],
+    "default": "pool/medium",
     "tiers": {                                // Claude tier (substring match) → provider/model
-      "opus":   ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"],
-      "sonnet": "nim/z-ai/glm-5.2",
-      "haiku":  "nim/openai/gpt-oss-20b",     // cheap/fast — also catches Claude's haiku side-calls
-      "fable":  "nim/openai/gpt-oss-20b"
+      "opus":  "pool/xhigh",
+      "fable": "pool/xhigh",
+      "sonnet": "pool/high",
+      "haiku": "pool/medium"
     },
     "pools": {                                // addressable as model "pool/<name>"
-      "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro", "nim/moonshotai/kimi-k2.6"]
+      "low":    { "preferred": [], "include": "free", "effort": "low" },
+      "medium": { "preferred": [], "include": "free", "effort": "medium" },
+      "high":   { "preferred": [], "include": "free", "effort": "high" },
+      "xhigh":  { "preferred": [], "include": "free", "effort": "xhigh" }
     }
   },
   "mode": "repair",                          // detect | repair (strict accepted, aliases detect)
@@ -340,7 +342,7 @@ a `routing` block that maps each request's `model` to one provider + backend mod
 
 **Routing (lifted from free-claude-code's proven scheme — split on the first `/` only):**
 1. **Pool** — a request `model` of `pool/<name>` expands to that pool's whole candidate list,
-   which is then benchmark-ranked and failed over. Use this to ask for *the best available*
+   which is then fitness-ranked and failed over. Use this to ask for *the best available*
    model instead of naming one. An unknown pool is a **400, never a silent fallback** to the
    default — a typo must not quietly succeed against a different model.
 2. **Namespaced** — a request `model` of `provider/rest` where `provider` is a configured
@@ -360,18 +362,28 @@ reserved provider name; configuring a provider called `pool` fails at load.
 Pools can be static arrays, or automatic free-model pools:
 
 ```jsonc
-"coding": {
-  "preferred": ["nim/z-ai/glm-5.2", "gemini/gemini-2.5-flash"],
-  "include": "free"
+"medium": {
+  "preferred": [],
+  "include": "free",
+  "effort": "medium"
 }
 ```
 
-The preferred targets remain first in exactly the written order. The relay then appends every
+The configured prefix remains first in exactly the written order. The relay then appends every
 model discovered from a `tierType: "free"` provider (excluding a model when its catalog publishes
 a positive price), plus zero-priced or explicitly free-labelled models from `tierType: "mixed"`
-providers, and benchmark-ranks that tail.
+providers. `effort` may be `low`, `medium`, `high`, or `xhigh`. These are cumulative raw-capability
+floors (50/60/70/80), not ceilings. Admission compares a whole-point capability score; an existing
+member remains until it falls two points below its floor, preventing refresh noise from flapping the
+pool. Automatic membership also requires an exact SKU match and at least three published capability
+or task-fit signals; confidence, stability, and metadata affect ordering, not eligibility.
+A strong free model remains eligible for `low`, while higher effort narrows upward
+(`xhigh ⊆ high ⊆ medium ⊆ low`). Exact SKUs known not to support tools are excluded.
 Catalog refreshes re-materialize the pool automatically; adding new free models never requires a
-config edit. Legacy array pools keep their existing whole-array `benchmarkSort` behaviour.
+config edit. Materialization builds and ranks one common discovered roster, then filters that
+snapshot into all effort pools; the result is reused for a 30-second ranking epoch and invalidated
+immediately by a catalog revision. Legacy array pools keep their existing whole-array
+`benchmarkSort` behaviour, with their ranking likewise reused within a short epoch.
 
 **What failover actually does** (both `/v1/messages` and `/v1/chat/completions`):
 
@@ -453,7 +465,10 @@ to marked subagents only (the current behavior) or to the whole conversation:
 ```jsonc
 "routing": {
   "tiers":     { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
-  "subagents": { "opus": "pool/reasoning", "haiku": "pool/fast", "default": "pool/coding" },
+  "subagents": {
+    "opus": "pool/xhigh", "fable": "pool/xhigh",
+    "sonnet": "pool/high", "haiku": "pool/medium", "default": "pool/medium"
+  },
   "offload": {
     "claude": { "enabled": true,  "scope": "subagents" },
     "codex":  { "enabled": false, "scope": "all" }
@@ -466,17 +481,18 @@ to marked subagents only (the current behavior) or to the whole conversation:
 Claude or Codex quota is exhausted. Rules may use any future client name; an explicit `default`
 rule is the opt-in catch-all for otherwise unnamed front doors. All rules are off by default.
 
-The CLI changes one client without restarting the proxy:
+The CLI changes one harness without restarting the proxy:
 
 ```bash
 llm-relay offload status
-llm-relay offload claude on --scope subagents
-llm-relay offload codex on --scope all
-llm-relay offload claude off
+llm-relay offload <harness> <on|off> [--scope <scope>]
 ```
 
-The old `llm-relay offload on|off` command remains a global compatibility switch for configs that
-still use the boolean form (`"offload": false`). `GET /offload?client=claude` reads one rule;
+`<harness>` is `claude`, `codex`, or another configured client. `<scope>` is `subagents` or
+`all` (default: `subagents`).
+
+The legacy boolean form remains supported in config files as a global subagents-only rule
+(`"offload": false`). The CLI requires a harness name for changes. `GET /offload?client=claude` reads one rule;
 `POST /offload` accepts `{"client":"claude","enabled":true,"scope":"all"}`. Changes are
 persisted and take effect on the next request.
 
@@ -533,7 +549,7 @@ description = "Read-only coding child routed through llm-relay."
 developer_instructions = "Work read-only. Return a concise result to the parent and do not modify files."
 
 model_provider = "llm-relay"
-model = "pool/coding"
+model = "pool/medium"
 model_reasoning_effort = "medium"
 ```
 
@@ -546,12 +562,12 @@ description = "General-purpose read-only child routed through llm-relay."
 developer_instructions = "Work read-only. Return a concise result to the parent and do not modify files."
 
 model_provider = "llm-relay"
-model = "pool/coding"
+model = "pool/medium"
 model_reasoning_effort = "medium"
 ```
 
 With that override, a normal “use a subagent” request keeps the parent native while the generic child
-goes through `pool/coding`; named agents can still select a different pool explicitly.
+goes through `pool/medium`; named agents can still select a different pool explicitly.
 
 Run Codex normally, without the `llm-relay` profile. Ask the parent to use exactly one subagent of
 type `relay_coding`; Codex keeps the parent on its normal provider and starts the child through the
@@ -560,11 +576,11 @@ relay. The relay pool then chooses the configured provider and can fail over nor
 Enable only Codex child offload in `~/.llm-relay/config.json`:
 
 ```bash
-llm-relay offload codex on --scope subagents
+llm-relay offload <harness> on --scope <scope>
 ```
 
-To redirect the parent Codex conversation through the same relay as well, use
-`llm-relay offload codex on --scope all`. Claude's rule is unaffected.
+For Codex, use `harness=codex` with `scope=subagents`; use `scope=all` to include the parent
+conversation. Claude's rule is unaffected.
 
 The `llm-relay` profile remains available as an explicit all-relay mode, but it routes the parent
 through the relay too and is not the split setup described above. The automatic
@@ -576,18 +592,18 @@ This applies to local Codex clients that can reach `127.0.0.1`. Hosted ChatGPT/C
 reach a loopback relay, and the relay cannot spend a ChatGPT subscription on behalf of an upstream
 request; those remain separate CLI/client-bound dispatch lanes.
 
-Whole-task CLI dispatch can likewise vary by tier with `routing.ladders.{reasoning,coding,fast}`.
-Use `llm-relay dispatch --tier reasoning -t "..."`; without `--tier`, the ladder matching
-`subagents.default` is selected (normally `coding`). The legacy single `routing.ladder` remains
+Whole-task CLI dispatch can likewise vary by tier with `routing.ladders.{low,medium,high,xhigh}`.
+Use `llm-relay dispatch --tier high -t "..."`; without `--tier`, the ladder matching
+`subagents.default` is selected (normally `medium`). The legacy single `routing.ladder` remains
 supported for configurations that do not need tier-specific CLI models.
 
 ### Choosing where to offload (`llm-relay candidates`)
 
 ```
-target                          pools / tiers      str      agentic coding BFCL   arena  $/Mout  verdict  p95    quota  breaker  ctx
-nim/z-ai/glm-5.2                coding,@opus       83.3/4   43.1    68.8   -      -      $2.402~ Perfect  310ms  84%    closed   1049k~
-nim/moonshotai/kimi-k2.6        coding,@sonnet     77.4/5   30.3    61.8   -      1461   $2.72~  Perfect  280ms  84%    closed   262k~
-nim/meta/llama-3.1-8b-instruct  fast,@haiku,@fable  9.7/6    0.5     5.4   25.83  1211   $0.08~  Perfect  120ms  84%    closed   131k~
+target                          pools / tiers      fit    raw    cap        agentic coding BFCL   arena  $/Mout  verdict  p95    quota  breaker  ctx
+ollama-cloud/kimi-k3            low,medium,high... 79.9   96.6   87.3/4     50.1     76.2   -      -      -        Pending  -      -      closed   1049k~
+nim/z-ai/glm-5.2                low,medium,high... 71.8   83.3   76.6/4     43.1     68.8   -      -      $2.402~ Pending  -      -      closed   1049k~
+nim/deepseek-ai/deepseek-v4-pro low,medium,@haiku  64.9   67.4   67.4/5     36.4     59.4   -      1457   $0.87~  Pending  -      -      closed   1049k~
 ```
 
 Every offload target with its dimensions side by side: capability from each leaderboard separately,
@@ -609,15 +625,34 @@ They **disagree** — the agentic index puts deepseek above kimi while the codin
 above deepseek — which is exactly why each keeps its own column, and why a blank cell means *not
 measured*, never *bad*.
 
-**Nothing is ranked or averaged across dimensions** — capability, latency and remaining quota trade
-off differently per task, and one blended number answers neither "cheapest that can do it" nor "best
-available".
+The raw dimensions remain separate — capability, latency and remaining quota answer different
+questions. Pool ordering uses three explicit derived scores:
 
-`str` is the single exception, and it exists only because ordering a pool requires an order. It is a
-weighted mean of whatever rank-normalized signals a model actually has (tool-use and agentic ability
-weighted highest — this proxy drives tool loops), and it never appears without its provenance:
-`83.3/4` means four published signals backed it, while `obs` (ranked on this proxy's own traffic,
-≥5 calls) and `neut` (nothing known) mark the fallbacks.
+- `raw` is fixed at 40% agentic/tool use, 35% coding, and 25% general reasoning. Each source is
+  mapped through persisted raw-value calibration anchors, so an unrelated leaderboard addition
+  cannot silently move every model. If an entire dimension is missing, it is estimated by ridge
+  regression from models with overlapping dimensions rather than disappearing from the denominator.
+  Artificial Analysis Agentic and BFCL Overall feed agentic capability; AA Coding and Aider pass
+  rate feed coding; AA Intelligence and LMArena feed general reasoning.
+- Design Arena's differently covered specialist categories, BFCL irrelevance, and Aider formatting
+  compliance are task-fit signals, not raw capability. This prevents a model measured on a favorable
+  specialized subset from gaining an effort tier.
+- `cap` is `raw` shrunk toward neutral by capability evidence confidence. Direct dimension coverage,
+  published capability signals, and imputation quality determine confidence; fuzzy model-name
+  matches get half confidence. It affects ordering, never effort eligibility. `/4c5p` means four
+  direct capability signals and five total publications; `neut` means no capability evidence.
+  Operational telemetry never substitutes for capability.
+- `fit` is 75% `cap`, 20% deployment operations, and 5% task-fit metadata. Operations combine
+  synthetic probe stability with success/speed/recency from at least five real calls. Metadata
+  uses the separate specialist/behavior score, exact-SKU tool support, and provider/reference
+  context and output limits. Missing inputs are neutral (50), not zero. A known tool-incompatible
+  SKU is excluded from automatic effort pools; breaker-open and credential-faulted deployments are
+  demoted after scoring.
+
+Only coarse `raw` capability plus the exact-match/three-publication gate decides whether a model
+clears an effort floor. The generated snapshot persists the two-point exit band. `fit` decides the
+order among eligible deployments. The JSON view exposes dimensions, direct/imputed coverage, task
+fit, and confidence.
 
 **Limits and prices are per-(provider, model), and labelled.** The same model id on two providers is
 two deployments — different context ceilings, different output caps, and possibly free on one and
@@ -644,7 +679,7 @@ an anthropic provider has no fixed model id to reshape on, so it needs an explic
 **Prefer the pool form — do not pin one reshaper model:**
 
 ```jsonc
-"reshaper": { "pool": "coding" }     // ranked candidates, tried in order
+"reshaper": { "pool": "medium" }     // ranked candidates, tried in order
 ```
 
 A pinned `{ "base": …, "model": … }` still works, but if the provider stops serving that exact id
@@ -684,9 +719,10 @@ llm-relay models --provider nim       # one provider
 llm-relay models --provider nim --refresh   # force a re-fetch
 ```
 
-On startup the proxy warms the cache and **warns about any routing target its
-provider doesn't serve** — so a stale/typo'd tier model is caught at boot, not
-silently at request time.
+On startup the proxy warms providers referenced by routing plus free/mixed providers that can
+contribute to dynamic pools, then **warns about any routing target its provider doesn't serve**.
+Unrelated subscription catalogs stay lazy until first use, while a stale/typo'd routed model is
+still caught at boot rather than silently failing on its first request.
 
 > Provider notes: **Groq** returns `403 "check your network settings"` from some
 > IPs/regions (a network-side block, not a key issue) — it works once your network
@@ -720,7 +756,7 @@ no mode switch. So the tier map stays the default, and dispatcher-style usage is
 "send namespaced ids + read `/registry`".
 
 OpenAI-native clients can point their base URL at `http://127.0.0.1:8791/v1` and use a
-namespaced model such as `anthropic/claude-sonnet-4-20250514` or `pool/coding`. Codex uses
+namespaced model such as `anthropic/claude-sonnet-4-20250514` or `pool/medium`. Codex uses
 `/v1/responses`; other IDEs commonly use `/v1/chat/completions`. Configure the Anthropic
 provider with `kind: "anthropic"` and `authEnv: "ANTHROPIC_API_KEY"` when the relay should
 use its own key, or omit `authEnv` for an intentional caller-credential passthrough.
@@ -790,7 +826,7 @@ provider and point every tier at it:
 "routing": {
   "default": "anthropic",
   "tiers": { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
-  "pools":  { "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"] }
+  "pools":  { "medium": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"] }
 }
 ```
 

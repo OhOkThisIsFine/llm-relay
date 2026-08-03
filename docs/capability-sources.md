@@ -54,6 +54,23 @@ Coding index ranks kimi above deepseek; agentic index ranks deepseek above kimi.
 merged snapshot keeps **every source's raw value** and why the ranking scalar reports how many
 signals backed it — a one-source score and a four-source consensus must not look alike.
 
+## How routing avoids coverage bias
+
+The snapshot does not average whichever columns happen to exist. Raw values are mapped through
+persisted quantile anchors, then combined into fixed dimensions: 40% agentic/tool use (AA Agentic
+and BFCL Overall), 35% coding (AA Coding and Aider pass rate), and 25% general reasoning (AA
+Intelligence and LMArena). A wholly missing dimension is estimated by ridge regression over models
+with overlapping dimensions, and imputation quality is reported in capability confidence.
+
+Design Arena's agent-category mean is not globally comparable when one model has three categories
+and another has thirteen. It therefore joins BFCL irrelevance and Aider well-formed as a separate,
+confidence-adjusted task-fit input. Those signals can order otherwise close deployments but cannot
+inflate raw capability or grant an effort tier.
+
+Calibration anchors persist across routine syncs, so adding unrelated leaderboard rows does not
+rerank the existing roster. Effort admission compares whole-point capability against 50/60/70/80;
+an existing member has a two-point exit band to prevent snapshot noise from flapping membership.
+
 ## Rejected, with reasons
 
 - **EvalPlus** — 125 models, none of them ours. It scores HumanEval/MBPP for 2024-era open code

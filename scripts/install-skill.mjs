@@ -36,11 +36,11 @@ const CODEX_PROVIDER_BLOCK = `${CODEX_PROVIDER_SECTION}\nname = "llm-relay"\nbas
 const CODEX_AGENTS = [
   {
     name: "default",
-    contents: `name = "default"\ndescription = "General-purpose read-only child routed through llm-relay."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/coding"\nmodel_reasoning_effort = "medium"\n`,
+    contents: `name = "default"\ndescription = "General-purpose read-only child routed through llm-relay."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/medium"\nmodel_reasoning_effort = "medium"\n`,
   },
   {
     name: "relay_coding",
-    contents: `name = "relay_coding"\ndescription = "Read-only coding child routed through llm-relay to the configured non-OpenAI pool."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/coding"\nmodel_reasoning_effort = "medium"\n`,
+    contents: `name = "relay_coding"\ndescription = "Read-only medium-effort child routed through llm-relay to the configured non-OpenAI pool."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/medium"\nmodel_reasoning_effort = "medium"\n`,
   },
 ];
 
