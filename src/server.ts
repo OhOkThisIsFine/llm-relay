@@ -222,8 +222,32 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
         ? new HttpReshaper(cfg.reshaper)
         : undefined);
   const reshaperCache = new Map<string, Reshaper>();
+  let dynamicPoolCache: { signature: string; reshaper: Reshaper } | null = null;
+  const unavailableDynamicPool: Reshaper = {
+    async reshape() {
+      throw new Error(`dynamic reshaper pool "${cfg.reshaperPool?.name ?? "unknown"}" has no materialized OpenAI target`);
+    },
+  };
   const resolveReshaper = (target: ResolvedTarget): Reshaper | undefined => {
     if (explicitReshaper) return explicitReshaper;
+    if (cfg.reshaperPool) {
+      const candidates = resolveTargets(`pool/${cfg.reshaperPool.name}`, cfg)
+        .filter((candidate) => candidate.kind === "openai" && candidate.model);
+      if (candidates.length === 0) return unavailableDynamicPool;
+      const signature = candidates.map((candidate) => `${candidate.provider}/${candidate.model}`).join("\n");
+      if (dynamicPoolCache?.signature === signature) return dynamicPoolCache.reshaper;
+      const delegates = candidates.map((candidate) => new HttpReshaper({
+        base: candidate.base,
+        model: candidate.model!,
+        kind: "openai",
+        authHeader: candidate.authHeader,
+        timeoutMs: cfg.reshaperPool?.timeoutMs ?? Math.min(candidate.timeoutMs, 60_000),
+        ...(candidate.authEnv ? { authEnv: candidate.authEnv } : {}),
+      }));
+      const reshaper = delegates.length > 1 ? new FailoverReshaper(delegates) : delegates[0]!;
+      dynamicPoolCache = { signature, reshaper };
+      return reshaper;
+    }
     const spec = reshaperForTarget(target);
     if (!spec) return undefined;
     const key = `${target.provider}::${target.model ?? ""}`;
@@ -271,7 +295,12 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
    * Skipped under vitest: a test proxy must not start probing real providers in the background.
    */
   if (!process.env.VITEST) {
-    server.on("listening", () => pingLoop.start());
+    server.on("listening", () => {
+      // Give the probe loop a concrete routing roster before its first tick. On a warm restart
+      // this is immediate from the catalog cache; a cold network refresh expands it later.
+      materializeDynamicPools(cfg, catalog);
+      pingLoop.start();
+    });
     server.on("close", () => pingLoop.stop());
   }
 
@@ -369,12 +398,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Demote unusable candidates — and do NOTHING else to the order.
   //
   // ⚠ Deliberately NOT `getHealthyTargets()`: that filters AND re-sorts by measured
-  // stability, which is a second ranking pass competing with the capability ranking
-  // `resolveTargets` (→ `rankTargetsByBenchmark`) already applied. Two ranking passes
+  // stability, which is a second ranking pass competing with the deployment-fitness ranking
+  // `resolveTargets` already applied. Two ranking passes
   // means neither decides the order, and live health then PROMOTES on evidence that
   // is often a single request's latency. Health is used here only to demote, never
   // to promote: a target the breaker is cooling steps aside, everything else keeps
-  // its benchmark rank. (The re-sort was invisible for as long as an untracked target
+  // its fitness order. (The re-sort was invisible for as long as an untracked target
   // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
   let healthyTargets = orderByUsability(targetCandidates, h.breaker);
 
@@ -592,7 +621,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
  * Order candidates worst-last WITHOUT dropping any: live, then credential-faulted, then cooling.
  *
  * Three states, and the distinction between them is the whole point:
- *   - live               — breaker closed, no standing 401/403. Keeps its benchmark rank.
+ *   - live               — breaker closed, no standing 401/403. Keeps its fitness order.
  *   - credential-faulted — answered 401/403 recently. It is not sick, it is unusable, and it
  *                          must not cost a round-trip per request ahead of a working member.
  *   - cooling            — breaker open (rate-limited or repeatedly failing).
@@ -603,7 +632,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
  * Ordering is strictly better: a demoted target is only ever reached after every better one has
  * actually failed on this request, and a pool with 14 members always has 14 chances.
  *
- * Stable within each band, so capability rank still decides among equals.
+ * Stable within each band, so the already-computed deployment fitness still decides among equals.
  */
 export function orderByUsability(
   targets: ResolvedTarget[],

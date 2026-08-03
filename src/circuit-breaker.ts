@@ -495,7 +495,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
    * (INV-TS-7). On an exact tie the measured target wins, because a real
    * observation beats a mid-band placeholder that happens to land on the same
    * number. Untracked targets tie with each other, so a fully cold breaker leaves
-   * the incoming (benchmark-ranked) order untouched — that is the intended
+   * the incoming fitness order untouched — that is the intended
    * behaviour, not the accident the old all-100 comparator produced.
    */
   getHealthyTargets(targets: ResolvedTarget[], now = Date.now()): ResolvedTarget[] {

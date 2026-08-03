@@ -4,6 +4,9 @@ import { homedir, tmpdir } from "node:os";
 import type { PingRecord } from "./metrics.js";
 
 export const DEFAULT_PROBE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const BROKEN_PROBE_BACKOFF_BASE_MS = 60_000;
+export const DEFAULT_PROBE_FLUSH_DELAY_MS = 250;
+export const MAX_PROBE_FLUSH_DELAY_MS = 2_000;
 /**
  * Bumped to 2 when entries gained a sample HISTORY. A version mismatch marks a model due for
  * probing (see `getModelsDueForProbe`), so v1 single-sample entries re-probe and refill naturally
@@ -69,9 +72,12 @@ function emptyCache(): ProbeCacheData {
 
 let _cache: ProbeCacheData | null = null;
 let _cachePath: string | null = null;
+let _flushTimer: NodeJS.Timeout | null = null;
+let _dirtySince: number | null = null;
 
-export function loadProbeCache(opts: { path?: string } = {}): ProbeCacheData {
+export function loadProbeCache(opts: { path?: string; reload?: boolean } = {}): ProbeCacheData {
   const target = opts.path ?? getProbeCachePath();
+  if (!opts.reload && _cache && _cachePath === target) return _cache;
   _cachePath = target;
 
   try {
@@ -92,6 +98,11 @@ export function loadProbeCache(opts: { path?: string } = {}): ProbeCacheData {
 export function flushProbeCache(opts: { path?: string; cache?: ProbeCacheData } = {}): void {
   const target = opts.path ?? _cachePath ?? getProbeCachePath();
   const cacheData = opts.cache ?? _cache ?? emptyCache();
+  if (_flushTimer && !opts.path) {
+    clearTimeout(_flushTimer);
+    _flushTimer = null;
+  }
+  if (!opts.path) _dirtySince = null;
 
   try {
     mkdirSync(dirname(target), { recursive: true });
@@ -103,10 +114,42 @@ export function flushProbeCache(opts: { path?: string; cache?: ProbeCacheData } 
   }
 }
 
+function scheduleProbeCacheFlush(): void {
+  const now = Date.now();
+  _dirtySince ??= now;
+  if (_flushTimer) clearTimeout(_flushTimer);
+  const remaining = Math.max(0, MAX_PROBE_FLUSH_DELAY_MS - (now - _dirtySince));
+  const target = _cachePath ?? getProbeCachePath();
+  const cache = _cache ?? emptyCache();
+  _flushTimer = setTimeout(
+    () => {
+      _flushTimer = null;
+      _dirtySince = null;
+      flushProbeCache({ path: target, cache });
+    },
+    Math.min(DEFAULT_PROBE_FLUSH_DELAY_MS, remaining),
+  );
+}
+
+function trailingBrokenSamples(entry: ProbeEntry): number {
+  let count = 0;
+  for (let i = (entry.samples?.length ?? 0) - 1; i >= 0; i--) {
+    if (entry.samples?.[i]?.code === "200") break;
+    count++;
+  }
+  return Math.max(1, count);
+}
+
 export function getModelsDueForProbe(
   providerKey: string,
   modelIds: string[],
-  opts: { ttlMs?: number; now?: number; probeVersion?: number; path?: string } = {},
+  opts: {
+    ttlMs?: number;
+    now?: number;
+    probeVersion?: number;
+    path?: string;
+    lastSuccessfulCallAt?: (modelId: string) => number | null;
+  } = {},
 ): string[] {
   const ttlMs = opts.ttlMs ?? DEFAULT_PROBE_TTL_MS;
   const now = opts.now ?? Date.now();
@@ -119,16 +162,27 @@ export function getModelsDueForProbe(
   const due: string[] = [];
   for (const id of modelIds) {
     const entry = models[id];
+    const passiveSuccessAt = opts.lastSuccessfulCallAt?.(id) ?? null;
     if (!entry) {
-      due.push(id);
+      // A real successful call proves availability even before the first synthetic probe. The
+      // probe can wait until that passive observation becomes stale.
+      if (passiveSuccessAt === null || now - passiveSuccessAt >= ttlMs) due.push(id);
       continue;
     }
     if (entry.probeVersion !== probeVersion) {
       due.push(id);
       continue;
     }
+    // A successful real request after the last synthetic failure is stronger evidence than the
+    // probe. It resets freshness without needing a redundant write to the probe cache.
+    if (passiveSuccessAt !== null && passiveSuccessAt > entry.lastProbedAt) {
+      if (now - passiveSuccessAt >= ttlMs) due.push(id);
+      continue;
+    }
     if (entry.status === "broken") {
-      due.push(id);
+      const failures = trailingBrokenSamples(entry);
+      const delay = Math.min(ttlMs, BROKEN_PROBE_BACKOFF_BASE_MS * 2 ** Math.min(10, failures - 1));
+      if (now - entry.lastProbedAt >= delay) due.push(id);
       continue;
     }
     if (now - entry.lastProbedAt >= ttlMs) {
@@ -188,7 +242,8 @@ export function recordProbeResult(
   };
 
   cache.providers[providerKey]!.models[modelId] = entry;
-  flushProbeCache({ ...(opts.path ? { path: opts.path } : {}), cache });
+  if (opts.path) flushProbeCache({ path: opts.path, cache });
+  else scheduleProbeCacheFlush();
   return entry;
 }
 
@@ -229,4 +284,3 @@ export function persistedModels(opts: { path?: string } = {}): Array<{ provider:
   }
   return out;
 }
-

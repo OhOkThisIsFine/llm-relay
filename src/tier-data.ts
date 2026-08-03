@@ -17,13 +17,29 @@ export interface TierModel extends Record<string, unknown> {
   strength_rank?: number | null;
   signals?: string[];
   signal_count?: number;
+  /** Fixed-weight capability dimensions, already calibrated to 0-1. */
+  dimensions?: Partial<Record<"agentic" | "coding" | "general", number>>;
+  direct_dimensions?: string[];
+  imputed_dimensions?: string[];
+  capability_confidence?: number;
+  task_fit_score?: number | null;
+  task_fit_signals?: string[];
+  task_fit_signal_count?: number;
+  /** Capability and behavioral publications combined; used only for the evidence minimum. */
+  published_signal_count?: number;
+  /** Capability-floor bands materialized by sync, including persisted exit hysteresis. */
+  effort_eligibility?: string[];
 }
 
 export interface TierData {
   synced_at?: string;
   models: TierModel[];
-  /** Lower-cased `norm` index, built once per load — lookups are a scan over this. */
+  /** Lower-cased rows used only for fuzzy containment misses. */
   byNorm: Array<{ norm: string; rec: TierModel }>;
+  /** Exact lower-cased SKU lookup. Optional so injected legacy snapshots remain valid. */
+  exactByNorm?: ReadonlyMap<string, TierModel>;
+  /** File revision behind this snapshot, for routing-cache invalidation. */
+  revision?: string;
 }
 
 /**
@@ -31,35 +47,54 @@ export interface TierData {
  * ~770 rows and three endpoints need it per request; re-reading and re-indexing each time is pure
  * waste. Negative results are cached too, so a missing file is not a stat+throw per request.
  */
-let _cache: { mtimeMs: number | null; data: TierData | null } | null = null;
+export const DEFAULT_TIER_RECHECK_MS = 30_000;
 
-export function loadTierData(): TierData | null {
+let _cache: { mtimeMs: number | null; checkedAt: number; data: TierData | null } | null = null;
+
+export function loadTierData(
+  opts: { now?: number; force?: boolean; recheckMs?: number } = {},
+): TierData | null {
+  const now = opts.now ?? Date.now();
+  const recheckMs = opts.recheckMs ?? DEFAULT_TIER_RECHECK_MS;
+  // `sync:tiers` is an operator action, not request traffic. A bounded recheck keeps that action
+  // visible without paying a synchronous stat on every routing/candidates/registry call.
+  if (!opts.force && _cache && now - _cache.checkedAt < recheckMs) return _cache.data;
+
   let mtimeMs: number | null = null;
   let path: string;
   try {
     path = fileURLToPath(new URL("../docs/tier-data.json", import.meta.url));
     mtimeMs = statSync(path).mtimeMs;
   } catch {
-    if (_cache && _cache.mtimeMs === null) return _cache.data;
-    _cache = { mtimeMs: null, data: null };
+    if (_cache && _cache.mtimeMs === null) {
+      _cache.checkedAt = now;
+      return _cache.data;
+    }
+    _cache = { mtimeMs: null, checkedAt: now, data: null };
     return null;
   }
-  if (_cache && _cache.mtimeMs === mtimeMs) return _cache.data;
+  if (_cache && _cache.mtimeMs === mtimeMs) {
+    _cache.checkedAt = now;
+    return _cache.data;
+  }
 
   try {
     const j = JSON.parse(readFileSync(path, "utf8")) as { synced_at?: string; models?: TierModel[] };
     const models = Array.isArray(j.models) ? j.models : [];
+    const byNorm = models
+      .filter((r) => typeof r.norm === "string")
+      .map((r) => ({ norm: r.norm.toLowerCase(), rec: r }));
     const data: TierData = {
       ...(j.synced_at ? { synced_at: j.synced_at } : {}),
       models,
-      byNorm: models
-        .filter((r) => typeof r.norm === "string")
-        .map((r) => ({ norm: r.norm.toLowerCase(), rec: r })),
+      byNorm,
+      exactByNorm: new Map(byNorm.map(({ norm, rec }) => [norm, rec])),
+      revision: `${mtimeMs}`,
     };
-    _cache = { mtimeMs, data };
+    _cache = { mtimeMs, checkedAt: now, data };
     return data;
   } catch {
-    _cache = { mtimeMs, data: null };
+    _cache = { mtimeMs, checkedAt: now, data: null };
     return null;
   }
 }
@@ -82,6 +117,7 @@ export interface TierMatch {
 export function findTierModel<T = TierModel>(
   modelId: string,
   byNorm: Array<{ norm: string; rec: T }>,
+  exactByNorm?: ReadonlyMap<string, T>,
 ): { rec: T; match: "exact" | "fuzzy" } | null {
   const seg = (modelId.split("/").pop() ?? modelId).toLowerCase().trim();
   if (!seg) return null;
@@ -90,8 +126,8 @@ export function findTierModel<T = TierModel>(
   // the floor exists to protect the containment path, not this one. Gating it here silently threw
   // away measurements we hold: `o3` and `o1` are real snapshot rows carrying real published
   // signals, and every spec ending in one resolved to "nothing known" instead.
-  const exact = byNorm.find((e) => e.norm === seg);
-  if (exact) return { rec: exact.rec, match: "exact" };
+  const exact = exactByNorm?.get(seg) ?? byNorm.find((e) => e.norm === seg)?.rec;
+  if (exact) return { rec: exact, match: "exact" };
   // Containment only: a short fragment matches promiscuously (`gpt` would land on whichever
   // `gpt-*` row happens to come first), so below the floor a miss beats a wrong SKU's scores.
   if (seg.length < 5) return null;

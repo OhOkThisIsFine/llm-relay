@@ -5,6 +5,8 @@ import type { ProviderConfig } from "./config.js";
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
 const DEFAULT_CACHE = join(homedir(), ".llm-relay", "models-cache.json");
+const DEFAULT_FLUSH_DELAY_MS = 250;
+const MAX_FLUSH_DELAY_MS = 2_000;
 
 /**
  * Limits a provider publishes about its OWN deployment of a model.
@@ -127,10 +129,16 @@ export class ModelCatalog {
   private refreshing = new Set<string>();
   /** In-flight blocking fetches (cold start / forced) — dedups concurrent requests. */
   private pending = new Map<string, Promise<string[]>>();
+  private revision = 0;
+  private readonly writeBehind: boolean;
+  private flushTimer: NodeJS.Timeout | null = null;
+  private dirtySince: number | null = null;
 
-  constructor(opts: { ttlMs?: number; cachePath?: string | null } = {}) {
+  constructor(opts: { ttlMs?: number; cachePath?: string | null; writeBehind?: boolean } = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
     this.cachePath = opts.cachePath === undefined ? DEFAULT_CACHE : opts.cachePath;
+    // Custom paths are normally tests/diagnostics whose callers expect durability on return.
+    this.writeBehind = opts.writeBehind ?? opts.cachePath === undefined;
   }
 
   private loadDisk(): void {
@@ -146,6 +154,7 @@ export class ModelCatalog {
           models: v.models.filter((m): m is string => typeof m === "string"),
           limits: sanitizeLimits(v.limits),
         });
+        this.revision++;
       }
     } catch {
       /* no cache yet — first run */
@@ -154,6 +163,11 @@ export class ModelCatalog {
 
   private saveDisk(): void {
     if (!this.cachePath) return;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.dirtySince = null;
     try {
       mkdirSync(dirname(this.cachePath), { recursive: true });
       const obj: Record<string, Entry> = {};
@@ -162,6 +176,30 @@ export class ModelCatalog {
     } catch {
       /* best-effort cache; never fatal */
     }
+  }
+
+  private persistSoon(): void {
+    if (!this.cachePath) return;
+    if (!this.writeBehind) {
+      this.saveDisk();
+      return;
+    }
+    const now = Date.now();
+    this.dirtySince ??= now;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    const remaining = Math.max(0, MAX_FLUSH_DELAY_MS - (now - this.dirtySince));
+    this.flushTimer = setTimeout(() => this.saveDisk(), Math.min(DEFAULT_FLUSH_DELAY_MS, remaining));
+  }
+
+  /** Monotonic in-memory catalog revision used to invalidate routing snapshots cheaply. */
+  getRevision(): number {
+    this.loadDisk();
+    return this.revision;
+  }
+
+  /** Force any write-behind catalog update to disk (graceful shutdown / explicit durability). */
+  flushPersistence(): void {
+    if (this.dirtySince !== null) this.saveDisk();
   }
 
   /** Cached model ids for a provider; empty array if fetch fails and no prior cache. */
@@ -173,6 +211,12 @@ export class ModelCatalog {
   /** Already-cached model ids for synchronous routing decisions. Never performs network I/O. */
   cachedModels(name: string): string[] {
     return [...(this.cached(name) ?? [])];
+  }
+
+  /** Whether a provider has a successfully loaded catalog, including a legitimately empty one. */
+  hasCachedCatalog(name: string): boolean {
+    this.loadDisk();
+    return this.mem.has(name);
   }
 
   /**
@@ -208,7 +252,8 @@ export class ModelCatalog {
       try {
         const { models, limits } = await this.fetch(cfg, opts.fetchFn ?? fetch);
         this.mem.set(name, { fetchedAt: now, models, limits });
-        this.saveDisk();
+        this.revision++;
+        this.persistSoon();
         return models;
       } catch {
         return prior?.models ?? [];
@@ -232,7 +277,8 @@ export class ModelCatalog {
       try {
         const { models, limits } = await this.fetch(cfg, fetchFn ?? fetch);
         this.mem.set(name, { fetchedAt: Date.now(), models, limits });
-        this.saveDisk();
+        this.revision++;
+        this.persistSoon();
       } catch {
         /* keep the stale entry; next list retries */
       } finally {

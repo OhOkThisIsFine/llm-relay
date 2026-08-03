@@ -244,6 +244,25 @@ describe("resolveTargets — pool/<name> ranked routing", () => {
     expect(ts[0]!.model).toBe("openai/gpt-oss-20b");
   });
 
+  it("preserves valid dynamic-pool effort policies and rejects unknown levels", () => {
+    const valid = loadConfig(write("effort-pool.json", base({
+      routing: {
+        default: "nim/m",
+        pools: { medium: { preferred: [], include: "free", effort: "medium" } },
+      },
+    })));
+    expect(valid.routing.poolPolicies?.medium).toEqual({
+      preferred: [], include: "free", effort: "medium",
+    });
+
+    expect(() => loadConfig(write("bad-effort-pool.json", base({
+      routing: {
+        default: "nim/m",
+        pools: { medium: { preferred: [], include: "free", effort: "turbo" } },
+      },
+    })))).toThrow(/effort must be low, medium, high, or xhigh/);
+  });
+
   it("FAILS LOUDLY on an unknown pool instead of silently using routing.default", () => {
     // The whole point: a typo'd pool must not quietly succeed against a different model.
     expect(() => resolveTargets("pool/nope", poolCfg)).toThrow(/no pool "nope" configured/);
@@ -654,6 +673,25 @@ describe("reshaper: { pool } — no single pinned model", () => {
   it("satisfies repair-mode validation against an anthropic passthrough provider", () => {
     // The pinned-model form is what used to be required here; the pool form must also satisfy it.
     expect(() => loadConfig(write("resh-pool-ok.json", poolReshaperCfg))).not.toThrow();
+  });
+
+  it("defers an empty catalog-backed reshaper pool until its free tail is materialized", () => {
+    const c = loadConfig(write("resh-dynamic-pool.json", {
+      ...poolReshaperCfg,
+      providers: {
+        ...poolReshaperCfg.providers,
+        nim: { ...poolReshaperCfg.providers.nim, tierType: "free" },
+      },
+      routing: {
+        ...poolReshaperCfg.routing,
+        pools: { medium: { preferred: [], include: "free", effort: "medium" } },
+      },
+      reshaper: { pool: "medium", timeoutMs: 45_000 },
+    }));
+
+    expect(c.reshaper).toBeUndefined();
+    expect(c.reshaperCandidates).toBeUndefined();
+    expect(c.reshaperPool).toEqual({ name: "medium", timeoutMs: 45_000 });
   });
 
   it("throws on an undefined pool name rather than silently having no reshaper", () => {

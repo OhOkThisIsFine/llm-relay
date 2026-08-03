@@ -126,27 +126,39 @@ export function extractContent(raw: string): string {
   return "";
 }
 
-/** Probe every member of every pool. Concurrency-limited so a wide config can't fan out unbounded. */
+/**
+ * Probe every member of every pool. Concurrency-limited so a wide config can't fan out unbounded.
+ *
+ * A dynamic catalog target commonly belongs to several pools. Probe each unique provider/model
+ * deployment once, then project that result back onto every pool membership. Membership reporting
+ * remains complete without charging the provider for duplicate completions in the same command.
+ */
 export async function probeAllPools(
   cfg: Config,
   fetchFn: typeof fetch = fetch,
   concurrency = 4,
 ): Promise<MemberHealth[]> {
   const jobs: { pool: string; spec: string }[] = [];
+  const uniqueJobs = new Map<string, { pool: string; spec: string }>();
   for (const [pool, members] of Object.entries(cfg.routing.pools ?? {})) {
-    for (const spec of members) jobs.push({ pool, spec });
+    for (const spec of members) {
+      const job = { pool, spec };
+      jobs.push(job);
+      if (!uniqueJobs.has(spec)) uniqueJobs.set(spec, job);
+    }
   }
 
-  const out: MemberHealth[] = new Array(jobs.length);
+  const probes = [...uniqueJobs.values()];
+  const bySpec = new Map<string, MemberHealth>();
   let next = 0;
-  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, jobs.length)) }, async () => {
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, probes.length)) }, async () => {
     for (;;) {
       const i = next++;
-      if (i >= jobs.length) return;
-      const job = jobs[i]!;
-      out[i] = await probeMember(job.pool, job.spec, cfg, fetchFn);
+      if (i >= probes.length) return;
+      const job = probes[i]!;
+      bySpec.set(job.spec, await probeMember(job.pool, job.spec, cfg, fetchFn));
     }
   });
   await Promise.all(workers);
-  return out;
+  return jobs.map((job) => ({ ...bySpec.get(job.spec)!, pool: job.pool }));
 }

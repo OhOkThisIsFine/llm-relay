@@ -155,24 +155,25 @@ dimensions **side by side and un-blended**:
 
 | Group | Columns |
 |---|---|
-| Capability (per source) | AA intelligence / coding / agentic, BFCL overall + multi-turn + irrelevance, Aider pass-rate + well-formed, Design Arena Elo, LMArena rating + rank |
+| Capability (per source) | AA intelligence / coding / agentic, BFCL overall + multi-turn, Aider pass-rate, LMArena rating + rank |
+| Specialized task fit | Design Arena agent Elo, BFCL irrelevance, Aider well-formed |
 | Cost / shape | context window, price per M tokens in + out, declares tool support |
 | Live behaviour | verdict, avg / p95 latency, jitter, uptime %, last ping code |
 | Availability now | provider quota %, circuit-breaker open/closed + cooldown, listed in live catalog |
 | Observed traffic | calls, successes, average latency through this proxy |
 
-Nothing is ranked or averaged across dimensions and the order is config order. Capability, latency
-and remaining quota trade off differently per task — "cheapest thing that can do it" and "best
-available" are different questions, and one blended number answers neither. Each leaderboard keeps
-its own field under `scores`; they disagree, and that disagreement is information.
+Every leaderboard keeps its own field under `scores`; they disagree, and that disagreement remains
+visible. The routing scalar is deliberately structured rather than an available-signal average:
+`rawStrength` is fixed at 40% agentic, 35% coding, and 25% general capability, with persisted
+calibration anchors and overlap-estimated missing dimensions. `fitness` then combines 75% confidence-
+adjusted capability, 20% deployment operations, and 5% task-fit metadata. Latency, quota, and every
+raw source value remain separately inspectable.
 
-The one scalar is `sortInputs.strength`, and it exists only because `benchmarkSort` has to put a
-pool in *some* order. It never travels without `strengthBasis` and `strengthSignals`, so a
-five-source consensus and a "nothing is known, assume neutral" placeholder can't be confused.
-`StrengthBasis` has exactly three values — `snapshot` | `telemetry` | `neutral` (see
-[`src/benchmarks.ts`](../src/benchmarks.ts)). There is no `static-table` basis: the hardcoded table
-that produced one was deleted in 0.6.0, and a score can now only come from published capability,
-from this deployment's own observed traffic, or from nowhere at all.
+The scalar never travels without `strengthBasis`, `strengthSignals`, `capabilityDimensions`, and
+`directDimensions`/`imputedDimensions`, so an estimate cannot masquerade as direct coverage.
+`StrengthBasis` has two values — `snapshot` | `neutral` (see
+[`src/benchmarks.ts`](../src/benchmarks.ts)). Runtime telemetry is operational evidence only; it can
+order deployments but never impersonates model capability. There is no `static-table` basis.
 
 The CLI prefers a running proxy so it can use warm ping history and real breaker state; run it cold
 and the live-behaviour columns are empty because nothing has been measured yet.

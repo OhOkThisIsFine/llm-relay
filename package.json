@@ -1,6 +1,6 @@
 {
   "name": "llm-relay",
-  "version": "0.15.3",
+  "version": "0.15.4",
   "description": "Loopback bidirectional Anthropic/OpenAI API proxy with tool-call validation and multi-provider routing.",
   "type": "module",
   "engines": {
@@ -22,6 +22,9 @@
     "docs/tier-data.json",
     "skills",
     "scripts/install-skill.mjs",
+    "scripts/sync-tiers.mjs",
+    "scripts/tier-scoring.mjs",
+    "scripts/tier-scoring.d.mts",
     "README.md",
     "config.example.json"
   ],

@@ -131,9 +131,11 @@ provider, and nonetheless dead. Anything reported `DEAD` or `AUTH` should be rem
 Offload is **off by default**, deliberately. Enable only the harnesses and request scope you want:
 
 ```bash
-llm-relay offload claude on --scope subagents
-llm-relay offload codex on --scope all
+llm-relay offload <harness> <on|off> [--scope <scope>]
 ```
+
+`<harness>`: `claude` | `codex` | another configured client. `<scope>`: `subagents` | `all`
+(default: `subagents`).
 
 Claude Code subagents (Explore, general-purpose, custom agents) now route to your free pools while
 the Claude conversation stays on its normal route. Codex is independently configured; `--scope all`
@@ -144,8 +146,8 @@ no restart.
 llm-relay offload status
 ```
 
-Use `llm-relay offload claude off` or `llm-relay offload codex off` to disable one harness. The old
-`llm-relay offload on|off` form remains a global compatibility switch.
+Use `llm-relay offload <harness> off` to disable one harness. The legacy boolean form remains
+supported in config files as a global subagents-only rule, but CLI changes require a harness name.
 
 To offload a **single** dispatch without turning the switch on globally, put this as the first
 line of that subagent's prompt:

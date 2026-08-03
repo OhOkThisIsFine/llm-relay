@@ -38,55 +38,41 @@
     }
   },
   "routing": {
-    "default": [
-      "groq/llama-3.3-70b-versatile",
-      "openrouter/openrouter/free",
-      "nim/z-ai/glm-5.2",
-      "gemini/gemini-2.5-flash",
-      "ollama/qwen2.5-coder:32b"
-    ],
+    "default": "pool/medium",
     "tiers": {
-      "opus": [
-        "nim/nvidia/nemotron-3-super-120b-a12b",
-        "gemini/gemini-2.5-pro"
-      ],
-      "sonnet": [
-        "groq/llama-3.3-70b-versatile",
-        "nim/z-ai/glm-5.2",
-        "gemini/gemini-2.5-flash",
-        "ollama/qwen2.5-coder:32b"
-      ],
-      "haiku": [
-        "groq/llama-3.1-8b-instant",
-        "nim/meta/llama-3.1-8b-instruct",
-        "openrouter/openrouter/free",
-        "ollama/deepseek-r1:14b"
-      ],
-      "fable": [
-        "groq/llama-3.1-8b-instant",
-        "ollama/deepseek-r1:14b"
-      ]
+      "opus": "pool/xhigh",
+      "fable": "pool/xhigh",
+      "sonnet": "pool/high",
+      "haiku": "pool/medium"
     },
     "pools": {
-      "coding": {
-        "preferred": ["nim/z-ai/glm-5.2", "groq/llama-3.3-70b-versatile"],
-        "include": "free"
+      "low": {
+        "preferred": [],
+        "include": "free",
+        "effort": "low"
       },
-      "reasoning": {
-        "preferred": ["nim/nvidia/nemotron-3-super-120b-a12b", "gemini/gemini-2.5-pro"],
-        "include": "free"
+      "medium": {
+        "preferred": [],
+        "include": "free",
+        "effort": "medium"
       },
-      "fast": {
-        "preferred": ["groq/llama-3.1-8b-instant", "nim/meta/llama-3.1-8b-instruct"],
-        "include": "free"
+      "high": {
+        "preferred": [],
+        "include": "free",
+        "effort": "high"
+      },
+      "xhigh": {
+        "preferred": [],
+        "include": "free",
+        "effort": "xhigh"
       }
     },
     "subagents": {
-      "opus": "pool/reasoning",
-      "sonnet": "pool/coding",
-      "haiku": "pool/fast",
-      "fable": "pool/fast",
-      "default": "pool/coding"
+      "opus": "pool/xhigh",
+      "sonnet": "pool/high",
+      "haiku": "pool/medium",
+      "fable": "pool/xhigh",
+      "default": "pool/medium"
     },
     "offload": {
       "claude": { "enabled": false, "scope": "subagents" },

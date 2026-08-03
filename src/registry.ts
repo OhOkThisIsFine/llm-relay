@@ -84,8 +84,9 @@ function toScore(r: Record<string, unknown>, match: "exact" | "fuzzy"): Capabili
 export function joinCapability(
   modelId: string,
   byNorm: Array<{ norm: string; rec: Record<string, unknown> }>,
+  exactByNorm?: ReadonlyMap<string, Record<string, unknown>>,
 ): CapabilityScore | null {
-  const m = findTierModel(modelId, byNorm);
+  const m = findTierModel(modelId, byNorm, exactByNorm);
   return m ? toScore(m.rec, m.match) : null;
 }
 
@@ -110,7 +111,7 @@ export async function buildRegistry(
       const ids = await catalog.list(name, p);
       reachable = ids.length > 0;
       models = ids.map((id) => {
-        const capability = joinCapability(id, byNorm);
+        const capability = joinCapability(id, byNorm, tierData?.exactByNorm);
         const health = opts.pingLoop ? opts.pingLoop.getModelSummary(name, id) : undefined;
         return { id, capability, ...(health ? { health } : {}) };
       });
@@ -143,4 +144,3 @@ export async function buildRegistry(
     },
   };
 }
-

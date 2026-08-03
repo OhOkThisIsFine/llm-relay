@@ -10,6 +10,7 @@ import { offloadState, setOffload } from "../src/offload.js";
 import { buildCandidates } from "../src/candidates.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
+import type { ModelCatalog } from "../src/catalog.js";
 
 const CONTROL_TOKEN = "offload-test-control-token";
 const CONTROL_AUTHORIZATION = { validate: (candidate: unknown) => candidate === CONTROL_TOKEN };
@@ -352,6 +353,27 @@ describe("/offload endpoint", () => {
 });
 
 describe("candidates view", () => {
+  it("hydrates a provider catalog once and uses local membership/limits for every row", async () => {
+    const cfg = freshConfig("batched.json");
+    let lists = 0;
+    const catalog = {
+      getRevision: () => 0,
+      cachedModels: () => [],
+      cachedLimits: () => null,
+      hasCachedCatalog: () => true,
+      list: async () => {
+        lists++;
+        return ["z-ai/glm-5.2", "openai/gpt-oss-20b"];
+      },
+      has: async () => { throw new Error("per-row has() must not be called"); },
+      limits: async () => { throw new Error("per-row limits() must not be called"); },
+    } as unknown as ModelCatalog;
+
+    const view = await buildCandidates(cfg, { breaker: new CircuitBreaker(), catalog });
+    expect(lists).toBe(1);
+    expect(view.candidates.every((candidate) => candidate.listed === true)).toBe(true);
+  });
+
   it("lists every pool member and subagent target, in config order, unranked", async () => {
     const cfg = freshConfig("f.json");
     const view = await buildCandidates(cfg, { breaker: new CircuitBreaker() });
@@ -366,7 +388,7 @@ describe("candidates view", () => {
     expect(view.candidates[1]!.subagentTiers).toEqual(["haiku"]);
   });
 
-  it("keeps the dimensions separate — no blended score stands in for them", async () => {
+  it("keeps raw dimensions separate and makes every derived routing component explicit", async () => {
     const cfg = freshConfig("g.json");
     const view = await buildCandidates(cfg, { breaker: new CircuitBreaker() });
     const c = view.candidates[0]!;
@@ -394,10 +416,13 @@ describe("candidates view", () => {
       "designArenaAgentsEloMean", "designArenaModelsEloMean",
     ]);
 
-    // Exactly one scalar exists, because pool ordering needs one — and it never travels without
-    // the basis and signal list that say how much to trust it.
+    // The ordering scalar never travels without its components, calibrated dimensions, coverage,
+    // basis, and task-fit input, so an estimate cannot masquerade as direct capability evidence.
     expect(Object.keys(c.sortInputs).sort()).toEqual([
-      "breakerStability", "strength", "strengthBasis", "strengthSignals",
+      "benchmarkTaskFit", "breakerStability", "capability", "capabilityDimensions",
+      "directDimensions", "fitness", "imputedDimensions", "metadata", "operational",
+      "publishedSignalCount", "rawStrength", "strength", "strengthBasis", "strengthConfidence",
+      "strengthSignals",
     ]);
     expect(c).not.toHaveProperty("score");
     expect(c).not.toHaveProperty("rank");

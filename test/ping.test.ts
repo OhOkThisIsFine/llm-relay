@@ -1,9 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { getAvg, getP95, getJitter, getSpikeRate, getUptime, getStabilityScore, getVerdict, type PingRecord } from "../src/ping/metrics.js";
 import { extractQuotaPercent, buildPingRequest, pingProviderModel } from "../src/ping/ping.js";
-import { loadProbeCache, flushProbeCache, recordProbeResult, getModelsDueForProbe } from "../src/ping/probe-cache.js";
+import {
+  BROKEN_PROBE_BACKOFF_BASE_MS,
+  loadProbeCache,
+  flushProbeCache,
+  recordProbeResult,
+  getModelsDueForProbe,
+} from "../src/ping/probe-cache.js";
 import { recordModelCall, getRealWorldScore, loadRuntimeTelemetry } from "../src/ping/runtime-telemetry.js";
-import { PingLoop } from "../src/ping/cadence.js";
+import { PingLoop, collectRoutableModels } from "../src/ping/cadence.js";
 import { createProxy } from "../src/server.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { Config, ProviderConfig } from "../src/config.js";
@@ -141,8 +147,12 @@ describe("Probe Cache Persistence", () => {
     recordProbeResult("prov1", "m2", { code: "500", ms: 500, quotaPercent: null }, { now, path: tmpPath });
 
     const due = getModelsDueForProbe("prov1", ["m1", "m2", "m3"], { now, path: tmpPath });
-    // m1 is fresh + ok (skipped), m2 is broken (always due), m3 is missing (due)
-    expect(due).toEqual(["m2", "m3"]);
+    // m1 is fresh + ok, m2 is broken but in backoff, and m3 has never been measured.
+    expect(due).toEqual(["m3"]);
+    expect(getModelsDueForProbe("prov1", ["m2"], {
+      now: now + BROKEN_PROBE_BACKOFF_BASE_MS,
+      path: tmpPath,
+    })).toEqual(["m2"]);
   });
 
   // A 401 used to be recorded as `ok` here on the theory that the endpoint answered. It made a
@@ -154,8 +164,44 @@ describe("Probe Cache Persistence", () => {
     const entry = recordProbeResult("prov1", "unauthorised", { code: "401", ms: 40, quotaPercent: null }, { now, path: tmpPath });
     expect(entry.status).toBe("broken");
 
-    const due = getModelsDueForProbe("prov1", ["unauthorised"], { now, path: tmpPath });
-    expect(due).toEqual(["unauthorised"]);
+    expect(getModelsDueForProbe("prov1", ["unauthorised"], { now, path: tmpPath })).toEqual([]);
+    expect(getModelsDueForProbe("prov1", ["unauthorised"], {
+      now: now + BROKEN_PROBE_BACKOFF_BASE_MS,
+      path: tmpPath,
+    })).toEqual(["unauthorised"]);
+  });
+
+  it("backs repeated failures off exponentially and lets passive success reset freshness", () => {
+    loadProbeCache({ path: tmpPath });
+    const now = Date.now();
+    recordProbeResult("prov1", "flaky", { code: "500", ms: 10, quotaPercent: null }, { now, path: tmpPath });
+    recordProbeResult("prov1", "flaky", { code: "500", ms: 10, quotaPercent: null }, {
+      now: now + BROKEN_PROBE_BACKOFF_BASE_MS,
+      path: tmpPath,
+    });
+
+    const secondFailureAt = now + BROKEN_PROBE_BACKOFF_BASE_MS;
+    expect(getModelsDueForProbe("prov1", ["flaky"], {
+      now: secondFailureAt + BROKEN_PROBE_BACKOFF_BASE_MS,
+      path: tmpPath,
+    })).toEqual([]);
+    expect(getModelsDueForProbe("prov1", ["flaky"], {
+      now: secondFailureAt + 2 * BROKEN_PROBE_BACKOFF_BASE_MS,
+      path: tmpPath,
+    })).toEqual(["flaky"]);
+
+    const passiveAt = secondFailureAt + 1;
+    expect(getModelsDueForProbe("prov1", ["flaky"], {
+      now: passiveAt + 1_000,
+      path: tmpPath,
+      lastSuccessfulCallAt: () => passiveAt,
+    })).toEqual([]);
+
+    expect(getModelsDueForProbe("prov1", ["never-probed"], {
+      now: passiveAt + 1_000,
+      path: tmpPath,
+      lastSuccessfulCallAt: () => passiveAt,
+    })).toEqual([]);
   });
 });
 
@@ -227,6 +273,33 @@ describe("PingLoop Cadence", () => {
     expect(summary.lastPingCode).toBe("401");
     expect(summary.verdict).not.toBe("Perfect");
     expect(summary.uptimePct).toBe(0);
+  });
+
+  it("background scope probes only materialized routes, with pool leaders first", async () => {
+    const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+    const cfg = testConfig({ testProv: pCfg });
+    cfg.routing.default = "testProv/routed-second";
+    cfg.routing.pools = {
+      useful: ["testProv/pool-leader", "testProv/routed-second"],
+    };
+    const mockCatalog: ModelCatalog = {
+      list: async () => ["pool-leader", "routed-second", "catalog-only"],
+    } as any;
+    const probed: string[] = [];
+    const mockFetch = async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { model: string };
+      probed.push(body.model);
+      return new Response(JSON.stringify({ choices: [] }), { status: 200 });
+    };
+
+    expect(collectRoutableModels(cfg).get("testProv")).toEqual(["pool-leader", "routed-second"]);
+    const loop = new PingLoop(cfg, mockCatalog, {
+      fetchFn: mockFetch as typeof fetch,
+      probeCachePath: isolatedProbeCache(),
+    });
+    await loop.tickOnce("routable");
+    expect(probed).toEqual(["pool-leader", "routed-second"]);
+    expect(probed).not.toContain("catalog-only");
   });
 });
 

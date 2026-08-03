@@ -78,7 +78,7 @@ export interface DispatchView {
 export interface DispatchOptions {
   /** Originating harness (`claude`, `codex`, or a future configured client). */
   client?: string;
-  /** Select a named tier-specific ladder (for example reasoning, coding, or fast). */
+  /** Select a named tier-specific ladder (for example low, medium, high, or xhigh). */
   tier?: string;
   /** Substituted for the `{task}` placeholder in a cli rung's args. */
   task?: string;
@@ -229,6 +229,8 @@ function inferredTier(cfg: Config): string | undefined {
   if (!ladders) return undefined;
   const dflt = cfg.routing.subagents?.default;
   if (dflt?.startsWith("pool/") && ladders[dflt.slice("pool/".length)]) return dflt.slice("pool/".length);
+  if (ladders.medium) return "medium";
+  // Backwards compatibility for configurations created before effort-named ladders.
   if (ladders.coding) return "coding";
   return Object.keys(ladders)[0];
 }

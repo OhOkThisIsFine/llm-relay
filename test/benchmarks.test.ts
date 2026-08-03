@@ -2,7 +2,15 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { rankTargetsByBenchmark, rankTargetsWithProvenance, getStrength } from "../src/benchmarks.js";
+import {
+  confidenceAdjustedScore,
+  deploymentFitness,
+  evidenceConfidence,
+  getStrength,
+  rankTargetsByBenchmark,
+  rankTargetsWithProvenance,
+  strengthAllowedForEffort,
+} from "../src/benchmarks.js";
 import { recordModelCall } from "../src/ping/runtime-telemetry.js";
 import type { ResolvedTarget } from "../src/config.js";
 
@@ -68,6 +76,71 @@ describe("ranking keeps the provenance that produced the order", () => {
 });
 
 describe("strength — evidence hierarchy", () => {
+  it("shrinks thin and fuzzy evidence toward neutral before it can steer routing", () => {
+    expect(evidenceConfidence("snapshot", 1, "exact")).toBe(0.2);
+    expect(evidenceConfidence("snapshot", 5, "exact")).toBe(1);
+    expect(evidenceConfidence("snapshot", 2, "fuzzy")).toBe(0.2);
+    expect(confidenceAdjustedScore(90, 0.2)).toBe(58);
+    expect(confidenceAdjustedScore(80, 1)).toBe(80);
+  });
+
+  it("builds cumulative capability floors without excluding stronger models from lower effort", () => {
+    const strength = (rawScore: number, score = rawScore) => ({
+      score, rawScore, confidence: 1, basis: "snapshot" as const,
+      match: "exact" as const, signalCount: 3,
+    });
+    expect(strengthAllowedForEffort(strength(49.5), "low")).toBe(true);
+    expect(strengthAllowedForEffort(strength(49.4), "low")).toBe(false);
+    expect(strengthAllowedForEffort(strength(65), "low")).toBe(true);
+    expect(strengthAllowedForEffort(strength(65), "medium")).toBe(true);
+    expect(strengthAllowedForEffort(strength(75), "high")).toBe(true);
+    expect(strengthAllowedForEffort(strength(85), "high")).toBe(true);
+    expect(strengthAllowedForEffort(strength(85), "xhigh")).toBe(true);
+    expect(strengthAllowedForEffort(strength(75), "xhigh")).toBe(false);
+    expect(strengthAllowedForEffort({ ...strength(90), basis: "neutral" }, "low")).toBe(false);
+    expect(strengthAllowedForEffort({ ...strength(90), match: "fuzzy" }, "low")).toBe(false);
+    expect(strengthAllowedForEffort({ ...strength(90), signalCount: 2 }, "low")).toBe(false);
+    // Confidence affects ordering, not membership: raw 83 clears xhigh even if adjusted to 76.
+    expect(strengthAllowedForEffort(strength(83, 76), "xhigh")).toBe(true);
+
+    const fable = getStrength("openrouter/anthropic/claude-fable-5");
+    expect(fable.rawScore).toBeGreaterThan(95);
+    expect(strengthAllowedForEffort(fable, "low")).toBe(true);
+    expect(strengthAllowedForEffort(fable, "xhigh")).toBe(true);
+  });
+
+  it("keeps the Gemini family in capability order and excludes 2.5 from xhigh", () => {
+    const gemini36 = getStrength("gemini/models/gemini-3.6-flash");
+    const gemini35 = getStrength("gemini/models/gemini-3.5-flash");
+    const gemini25 = getStrength("gemini/models/gemini-2.5-flash");
+
+    expect(gemini36.rawScore).toBeGreaterThan(gemini35.rawScore);
+    expect(gemini35.rawScore).toBeGreaterThan(gemini25.rawScore);
+    expect(strengthAllowedForEffort(gemini36, "xhigh")).toBe(true);
+    expect(strengthAllowedForEffort(gemini35, "xhigh")).toBe(true);
+    expect(strengthAllowedForEffort(gemini25, "high")).toBe(true);
+    expect(strengthAllowedForEffort(gemini25, "xhigh")).toBe(false);
+    expect(gemini25.imputedDimensions).toContain("coding");
+  });
+
+  it("orders by capability-led deployment fitness and treats missing metadata as neutral", () => {
+    const strong = { score: 82, rawScore: 82, confidence: 1, basis: "snapshot" as const };
+    const cold = deploymentFitness(strong);
+    expect(cold.operational).toBe(50);
+    expect(cold.metadata).toBe(50);
+
+    const proven = deploymentFitness(strong, {
+      stabilityScore: 95,
+      stabilityConfidence: 1,
+      runtimeScore: 90,
+      supportsTools: true,
+      contextLength: 1_048_576,
+      contextConfidence: 1,
+    });
+    expect(proven.score).toBeGreaterThan(cold.score);
+    expect(proven.capability).toBe(cold.capability);
+  });
+
   it("prefers the synced snapshot, and says how many signals backed it", () => {
     const s = getStrength("nim/z-ai/glm-5.2");
     expect(s.basis).toBe("snapshot");
@@ -78,26 +151,34 @@ describe("strength — evidence hierarchy", () => {
     expect(s.score).toBeLessThanOrEqual(100);
   });
 
-  it("falls back to observed traffic before giving up, and never silently calls it a benchmark", () => {
+  it("keeps observed traffic operational and never lets it impersonate capability", () => {
     const dir = mkdtempSync(join(tmpdir(), "rp-strength-"));
     const path = join(dir, "telemetry.json");
     try {
       // A model no leaderboard and no hardcoded row has ever heard of.
       const spec = "nim/private/unpublished-model-v1";
-      expect(getStrength(spec, { telemetryPath: path }).basis).toBe("neutral");
+      expect(getStrength(spec).basis).toBe("neutral");
 
       // getRealWorldScore needs >=5 calls, so one lucky request cannot promote a model.
       for (let i = 0; i < 4; i++) {
         recordModelCall("nim", "private/unpublished-model-v1", { ok: true, latencyMs: 200 }, { path });
       }
-      expect(getStrength(spec, { telemetryPath: path }).basis).toBe("neutral");
+      expect(getStrength(spec).basis).toBe("neutral");
 
       recordModelCall("nim", "private/unpublished-model-v1", { ok: true, latencyMs: 200 }, { path });
-      const observed = getStrength(spec, { telemetryPath: path });
-      expect(observed.basis).toBe("telemetry");
-      expect(observed.score).toBeGreaterThan(0);
-      // Basis is what stops an availability measurement being read as a capability one.
-      expect(observed.signals).toBeUndefined();
+      const observed = rankTargetsWithProvenance([{
+        provider: "nim",
+        base: "http://x",
+        kind: "openai",
+        model: "private/unpublished-model-v1",
+        authHeader: "authorization",
+        timeoutMs: 1000,
+      }], {
+        telemetryPath: path,
+      })[0]!;
+      expect(observed.strength.basis).toBe("neutral");
+      expect(observed.strength.score).toBe(50);
+      expect(observed.fitness.operational).toBeGreaterThan(50);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
