@@ -98,7 +98,8 @@ function setInMemory(cfg: Config, enabled: boolean, client?: string, scope?: Off
     typeof configured === "object" && configured !== null ? { ...configured } :
       { [DEFAULT_CLIENT]: ruleFor(configured, client) };
   const existing = next[client] ?? ruleFor(configured, client);
-  next[client] = { enabled, scope: scope ?? existing.scope };
+  // Spread first: a toggle must not strip rule details it was not asked about (freeOnly).
+  next[client] = { ...existing, enabled, scope: scope ?? existing.scope };
   cfg.routing.offload = next;
 }
 

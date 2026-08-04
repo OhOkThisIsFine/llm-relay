@@ -16,7 +16,10 @@ import {
 
 /** Just enough of the `/dispatch` payload for the assertions below — `Response.json()` is
  *  `unknown`, and an untyped `any` here would let a renamed field pass silently. */
-type DispatchBody = { next: { id: string; invoke: { command: string; args: string[] } } };
+type DispatchBody = {
+  next: { id: string; invoke: { command: string; args: string[] } };
+  ladder: Array<{ id: string; state: string; readyAt?: string }>;
+};
 
 const dir = mkdtempSync(join(tmpdir(), "rp-dispatch-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -390,6 +393,56 @@ describe("dispatch ladder — endpoint", () => {
         body: JSON.stringify({ exhausted: "ghost" }),
       });
       expect(res.status).toBe(400);
+    });
+  });
+
+  // A rate limit and a spent quota reset on different clocks, so the host can now say WHICH
+  // happened. The relay still never invents the signal — outcome only picks the default wait,
+  // and an explicit retryAfterMs (the vendor's own number) beats it.
+  it("quota_exhausted cools the lane for ~1h, not the 15m rate-limit default", async () => {
+    await withProxy(cfgWith({ ladder: LADDER }), async (base) => {
+      const before = Date.now();
+      const walked = (await (
+        await fetch(`${base}/dispatch`, {
+          method: "POST",
+          headers: { "content-type": "application/json", [CONTROL_AUTHORIZATION_HEADER]: controlToken },
+          body: JSON.stringify({ exhausted: "agy-gemini", outcome: "quota_exhausted" }),
+        })
+      ).json()) as DispatchBody;
+      const lane = walked.ladder.find((l) => l.id === "agy-gemini")!;
+      expect(lane.state).toBe("exhausted");
+      const waitMs = new Date(lane.readyAt!).getTime() - before;
+      expect(waitMs).toBeGreaterThan(55 * 60 * 1000);
+      expect(waitMs).toBeLessThan(65 * 60 * 1000);
+    });
+  });
+
+  it("an explicit retryAfterMs beats the outcome default — the vendor knows its own reset", async () => {
+    await withProxy(cfgWith({ ladder: LADDER }), async (base) => {
+      const before = Date.now();
+      const walked = (await (
+        await fetch(`${base}/dispatch`, {
+          method: "POST",
+          headers: { "content-type": "application/json", [CONTROL_AUTHORIZATION_HEADER]: controlToken },
+          body: JSON.stringify({ exhausted: "agy-gemini", outcome: "quota_exhausted", retryAfterMs: 120_000 }),
+        })
+      ).json()) as DispatchBody;
+      const lane = walked.ladder.find((l) => l.id === "agy-gemini")!;
+      const waitMs = new Date(lane.readyAt!).getTime() - before;
+      expect(waitMs).toBeGreaterThan(60_000);
+      expect(waitMs).toBeLessThan(180_000);
+    });
+  });
+
+  it("400s an unknown outcome instead of guessing a cooldown for it", async () => {
+    await withProxy(cfgWith({ ladder: LADDER }), async (base) => {
+      const res = await fetch(`${base}/dispatch`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [CONTROL_AUTHORIZATION_HEADER]: controlToken },
+        body: JSON.stringify({ exhausted: "agy-gemini", outcome: "vibes_off" }),
+      });
+      expect(res.status).toBe(400);
+      expect((await res.text())).toContain("rate_limited");
     });
   });
 });

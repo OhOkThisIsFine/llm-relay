@@ -351,3 +351,56 @@ describe("Anthropic path — failover past a credential fault", () => {
     expect(b.calls()).toBe(0);
   });
 });
+
+describe("all-429 exhaustion serves the pool's earliest reset, not the last candidate's", () => {
+  // The served error body stays the LAST candidate's real 429 (a true upstream error beats a
+  // synthesized one) — but its Retry-After is one deployment's answer. When every candidate
+  // 429'd, the earliest reset among them is when the POOL next has capacity, and that is the
+  // number an honest backoff needs. ≥2 candidates throughout, per this file's header warning.
+  const RATE_BODY = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } });
+
+  it("anthropic front: min Retry-After across an all-429 walk", async () => {
+    const a = await scripted(() => ({ status: 429, headers: { "retry-after": "60" }, body: RATE_BODY }));
+    const b = await scripted(() => ({ status: 429, headers: { "retry-after": "7" }, body: RATE_BODY }));
+    const c = await scripted(() => ({ status: 429, headers: { "retry-after": "120" }, body: RATE_BODY }));
+    const bases = [a, b, c].map((x) => `http://127.0.0.1:${port(x.server)}`);
+    const p = port(await startProxy(poolCfg(bases, "anthropic")));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(429);
+    expect([a, b, c].map((x) => x.calls())).toEqual([1, 1, 1]);
+    // The last candidate said 120s; the pool frees up in 7s.
+    expect(resp.headers.get("retry-after")).toBe("7");
+  });
+
+  it("openai front: min Retry-After across an all-429 walk", async () => {
+    const a = await scripted(() => ({ status: 429, headers: { "retry-after": "45" }, body: RATE_BODY }));
+    const b = await scripted(() => ({ status: 429, headers: { "retry-after": "90" }, body: RATE_BODY }));
+    const bases = [a, b].map((x) => `http://127.0.0.1:${port(x.server)}`);
+    const p = port(await startProxy(poolCfg(bases)));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(429);
+    expect(resp.headers.get("retry-after")).toBe("45");
+  });
+
+  it("a mixed walk does NOT override — a 500 in the middle says nothing about pool capacity", async () => {
+    const a = await scripted(() => ({ status: 500, body: JSON.stringify({ type: "error", error: { type: "api_error", message: "boom" } }) }));
+    const b = await scripted(() => ({ status: 429, headers: { "retry-after": "300" }, body: RATE_BODY }));
+    const bases = [a, b].map((x) => `http://127.0.0.1:${port(x.server)}`);
+    const p = port(await startProxy(poolCfg(bases, "anthropic")));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(429);
+    // The last candidate's own header passes through untouched.
+    expect(resp.headers.get("retry-after")).toBe("300");
+  });
+});

@@ -6,6 +6,7 @@ import {
   reshaperForTarget,
   subagentSpec,
   clientForPath,
+  offloadRule,
   RoutingError,
   type Config,
   type ResolvedTarget,
@@ -24,7 +25,7 @@ import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthrop
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
-import { estimateRequestTokens } from "./metadata.js";
+import { estimateRequestTokens, assessCost } from "./metadata.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog, logSafePath } from "./request-log.js";
 import type {
@@ -379,13 +380,46 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it),
     // Claude's cc_is_subagent marker, or Codex's request metadata header. Main-conversation
     // requests remain untouched unless that front door's rule explicitly uses scope "all".
-    const subSpec = subagentSpec(reqJson, model, cfg, req.headers, clientForPath(pathname));
+    const requestClient = clientForPath(pathname);
+    const subSpec = subagentSpec(reqJson, model, cfg, req.headers, requestClient);
     const routedModel = subSpec ?? model;
     materializeDynamicPools(cfg, h.catalog);
     // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson
     // in place, and it must not reach the backend even when the spec matches the nominal model.
     if (subSpec !== null) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
     targetCandidates = resolveTargets(routedModel, cfg);
+
+    // The freeOnly guard: rerouted-by-offload traffic must not spend money. Enforced on the
+    // RESOLVED candidates, not the spec — a pool lists free and paid members side by side, and
+    // "the pool is mostly free" is exactly the assumption this exists to not rely on. Refusal is
+    // loud (a clean 503 naming the rule), never a fall-through: falling through to
+    // `routing.default` is the Anthropic passthrough, i.e. the very spend being guarded against.
+    if (subSpec !== null && offloadRule(cfg, requestClient).freeOnly === true) {
+      const kept: ResolvedTarget[] = [];
+      let blocked: { spec: string; why: string } | null = null;
+      for (const t of targetCandidates) {
+        const assessment = t.kind === "openai" && t.model
+          ? assessCost(t.model, h.catalog.cachedLimits(t.provider, t.model), cfg.providers[t.provider]?.tierType)
+          : null; // anthropic passthrough — primary quota, definitionally not free
+        if (assessment?.costClass === "free") kept.push(t);
+        else if (!blocked) {
+          blocked = {
+            spec: t.model ? `${t.provider}/${t.model}` : t.provider,
+            why: assessment ? `${assessment.costClass} (${assessment.basis})` : "anthropic passthrough (primary quota)",
+          };
+        }
+      }
+      if (kept.length === 0) {
+        failClosed(
+          res, 503,
+          `llm-relay: routing.offload.${requestClient}.freeOnly is on and "${routedModel}" resolved no free candidate` +
+            (blocked ? ` — first blocked: ${blocked.spec}, assessed ${blocked.why}` : ""),
+        );
+        h.logger.write(baseLog(started, path, hadTools, false, 503, "skipped", null));
+        return;
+      }
+      targetCandidates = kept;
+    }
   } catch (e) {
     if (e instanceof RoutingError) {
       failClosed(res, 400, `llm-relay routing: ${e.message}`);
@@ -476,7 +510,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // For an Anthropic backend everything forwards as before (it speaks these).
   if (target.kind === "openai") {
     if (isCountTokens) {
-      const input_tokens = estimateInputTokens(reqJson);
+      const input_tokens = Math.max(1, estimateRequestTokens(reqJson));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ input_tokens }));
       h.logger.write(baseLog(started, path, hadTools, false, 200, "skipped", null));
@@ -490,6 +524,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   }
 
   // Candidate execution loop with failover across healthyTargets
+  //
+  // When the whole pool is rate-limited, the client is served the LAST candidate's real 429 —
+  // but that candidate's Retry-After may be the pool's worst. Track the earliest reset among
+  // the 429s failed over past, and only when every skipped response was a 429 (a mixed walk
+  // says nothing about when the POOL frees up) surface the minimum on the returned error.
+  let pool429RetryAfterMs: number | null = null;
+  let failedOverOnly429 = true;
   for (let i = 0; i < healthyTargets.length; i++) {
     if (res.destroyed) break;
     target = healthyTargets[i]!;
@@ -580,6 +621,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         clearTimeout(timer);
         res.off("close", onResClose);
         await backendRes.body?.cancel().catch(() => {});
+        if (backendRes.status === 429) {
+          if (retryAfterMs !== null) {
+            pool429RetryAfterMs = pool429RetryAfterMs === null ? retryAfterMs : Math.min(pool429RetryAfterMs, retryAfterMs);
+          }
+        } else {
+          failedOverOnly429 = false;
+        }
         completeAttemptFailure(h, attempt, {
           failure: "http",
           provenance: localFailure ? "relay-mapper-defect" : "upstream",
@@ -597,7 +645,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       if (doRepair) {
         await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal }, h);
       } else {
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal }, h);
+        const poolRetryAfterMs =
+          backendRes.status === 429 && failedOverOnly429 && pool429RetryAfterMs !== null
+            ? Math.min(pool429RetryAfterMs, retryAfterMs ?? Infinity)
+            : undefined;
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs }, h);
       }
       return;
     } finally {
@@ -699,6 +751,13 @@ interface Ctx {
   path: string;
   hadTools: boolean;
   req?: IncomingMessage;
+  /**
+   * Earliest reset (ms) among the 429s this request failed over past, set only when the
+   * response being served is itself a 429 and every skipped response was one too. Overrides
+   * the served Retry-After: the last candidate's figure is one deployment's answer, but the
+   * earliest reset is when the POOL next has capacity — the honest number for a client backoff.
+   */
+  retryAfterOverrideMs?: number | undefined;
   /**
    * The target this response actually came from — the resolved (provider, model)
    * after tier/pool expansion, subagent redirection and failover. Every log record
@@ -848,6 +907,10 @@ async function openAiFrontPath(
   h: Handlers,
 ): Promise<void> {
   const tried: string[] = [];
+  // Same earliest-reset policy as the Anthropic path's loop: on an all-429 walk, the served
+  // Retry-After is the pool's minimum, not the last candidate's. One policy, both fronts.
+  let pool429RetryAfterMs: number | null = null;
+  let failedOverOnly429 = true;
 
   for (let i = 0; i < candidates.length; i++) {
     if (res.destroyed) break;
@@ -932,6 +995,13 @@ async function openAiFrontPath(
       res.off("close", onResClose);
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
       await upstream.body?.cancel().catch(() => {});
+      if (upstream.status === 429) {
+        if (retryAfterMs !== null) {
+          pool429RetryAfterMs = pool429RetryAfterMs === null ? retryAfterMs : Math.min(pool429RetryAfterMs, retryAfterMs);
+        }
+      } else {
+        failedOverOnly429 = false;
+      }
       completeAttemptFailure(h, attempt, {
         failure: "http",
         provenance: "upstream",
@@ -950,7 +1020,11 @@ async function openAiFrontPath(
     const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
     try {
       const servedBy = upstream.status >= 400 ? tried.join(", ") : specOf(target);
-      const headers = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
+      const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
+      if (upstream.status === 429 && failedOverOnly429 && pool429RetryAfterMs !== null) {
+        const effective = Math.min(pool429RetryAfterMs, retryAfterMs ?? Infinity);
+        headers["retry-after"] = String(Math.max(1, Math.ceil(effective / 1000)));
+      }
       if (upstream.status >= 400) {
         // Error bodies are small and are never streamed: buffer, normalize the envelope, send.
         const raw = await upstream.text().catch(() => "");
@@ -1006,7 +1080,11 @@ async function transparentPath(
   ctx: Ctx & { willValidate: boolean },
   h: Handlers,
 ): Promise<void> {
-  res.writeHead(backendRes.status, filterResponseHeaders(backendRes.headers));
+  const responseHeaders = filterResponseHeaders(backendRes.headers);
+  if (ctx.retryAfterOverrideMs !== undefined && Number.isFinite(ctx.retryAfterOverrideMs)) {
+    responseHeaders["retry-after"] = String(Math.max(1, Math.ceil(ctx.retryAfterOverrideMs / 1000)));
+  }
+  res.writeHead(backendRes.status, responseHeaders);
   let assistant: AssistantMessage | null = null;
   try {
     if (!backendRes.body) {
@@ -1756,27 +1834,6 @@ function failClosed(res: ServerResponse, status: number, message: string): void 
  * routinely not the model that answered, and it was the id every "which model
  * trips the validator" reading of this log was attributed to.
  */
-/**
- * Cheap local token estimate for a /v1/messages/count_tokens request against an
- * OpenAI backend (which has no native count_tokens). ~4 chars/token over all
- * string content in system+messages+tools. Advisory only — the harness uses this
- * for context-budget bookkeeping, not correctness.
- */
-function estimateInputTokens(body: unknown): number {
-  if (typeof body !== "object" || body === null) return 0;
-  let chars = 0;
-  const walk = (v: unknown): void => {
-    if (typeof v === "string") chars += v.length;
-    else if (Array.isArray(v)) for (const x of v) walk(x);
-    else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x);
-  };
-  const b = body as Record<string, unknown>;
-  walk(b.system);
-  walk(b.messages);
-  walk(b.tools);
-  return Math.max(1, Math.ceil(chars / 4));
-}
-
 function pickString(obj: unknown, key: string): string | null {
   if (typeof obj === "object" && obj !== null) {
     const v = (obj as Record<string, unknown>)[key];

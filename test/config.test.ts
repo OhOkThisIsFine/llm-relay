@@ -638,6 +638,23 @@ describe("client-specific offload routing", () => {
     expect(subagentSpec(request(MAIN), "future-model", cfg, undefined, "future-client")).toBe("pool/coding");
   });
 
+  it("parses freeOnly on a client rule and rejects a non-boolean one", () => {
+    const cfg = loadConfig(write("client-offload-freeonly.json", base({
+      routing: {
+        default: "nim/model",
+        pools: { coding: ["nim/model"] },
+        subagents: { default: "pool/coding" },
+        offload: { claude: { enabled: true, scope: "subagents", freeOnly: true } },
+      },
+    })));
+    expect(offloadRule(cfg, "claude")).toEqual({ enabled: true, scope: "subagents", freeOnly: true });
+    // Absent stays absent — the guard is opt-in like offload itself.
+    expect(offloadRule(cfg, "codex").freeOnly).toBeUndefined();
+    expect(() => loadConfig(write("client-offload-freeonly-bad.json", base({
+      routing: { default: "nim/model", offload: { claude: { enabled: true, freeOnly: "yes" } } },
+    })))).toThrow(/freeOnly must be true or false/);
+  });
+
   it("rejects an invalid client offload scope", () => {
     expect(() => loadConfig(write("client-offload-invalid.json", base({
       routing: { default: "nim/model", offload: { claude: { enabled: true, scope: "conversation" } } },

@@ -6,6 +6,7 @@ import { loadTierData, findTierModel, type TierData } from "./tier-data.js";
 import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./ping/runtime-telemetry.js";
 import { loadPersistedSamples, loadProbeCache, type ProbeCacheData } from "./ping/probe-cache.js";
 import { getStabilityScore } from "./ping/metrics.js";
+import { assessCost } from "./metadata.js";
 
 export const DYNAMIC_POOL_RANKING_EPOCH_MS = 30_000;
 
@@ -102,18 +103,12 @@ export function materializeDynamicPools(
       const spec = `${provider}/${model}`;
       if (discoveredSpecs.has(spec)) continue;
 
-      const limits = catalog.cachedLimits(provider, model);
-      const inPrice = limits?.pricePromptPerToken;
-      const outPrice = limits?.priceCompletionPerToken;
-      const explicitlyZeroPriced = inPrice === 0 && outPrice === 0;
-      const explicitlyFreeNamed = /(?:^|[/:_-])free(?:$|[/:_-])/i.test(model);
-      const knownPaid = (typeof inPrice === "number" && inPrice > 0) || (typeof outPrice === "number" && outPrice > 0);
-
-      // A known positive price always wins. Mixed catalogs (OpenRouter/OpenCode/Kilo) otherwise
-      // contribute only zero-priced or explicitly `free`-named models; genuinely free-tier
-      // providers may contribute unknown-priced models because many publish no prices at all.
-      if (knownPaid) continue;
-      if (!explicitlyZeroPriced && !explicitlyFreeNamed && p.tierType !== "free") continue;
+      // Admission is `assessCost` — the same definition the freeOnly offload guard enforces.
+      // Mixed catalogs (OpenRouter/OpenCode/Kilo) contribute only zero-priced or explicitly
+      // `free`-named models; genuinely free-tier providers (`tierType: "free"`) may contribute
+      // unknown-priced models because many publish no prices at all — assessCost folds that
+      // rule in via the provider-tier basis.
+      if (assessCost(model, catalog.cachedLimits(provider, model), p.tierType).costClass !== "free") continue;
 
       discovered.push({
         provider,

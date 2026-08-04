@@ -93,39 +93,70 @@ export function resolveMetadata(
   };
 }
 
-/** Estimate input prompt token count from Anthropic messages request object. */
+/**
+ * What serving one request on a deployment costs, with the evidence class attached.
+ *
+ * The SINGLE definition of "free" — dynamic pool admission and the `freeOnly` offload guard
+ * both resolve through it, so "a pool admits it as free" and "the guard lets offloaded traffic
+ * reach it" can never disagree. `unknown` is deliberately its own class: the guard treats it as
+ * paid (a guess must not spend money), and the basis field says which evidence produced the
+ * verdict, same contract as every other number here.
+ */
+export type CostClass = "free" | "paid" | "unknown";
+
+export interface CostAssessment {
+  costClass: CostClass;
+  basis: "published-price" | "free-labelled" | "provider-tier" | "unpublished";
+}
+
+export function assessCost(
+  model: string | null | undefined,
+  limits: { pricePromptPerToken: number | null; priceCompletionPerToken: number | null } | null,
+  providerTierType?: string,
+): CostAssessment {
+  const inPrice = limits?.pricePromptPerToken;
+  const outPrice = limits?.priceCompletionPerToken;
+  // A known positive price always wins — a ":free"-suffixed id with a published price is priced.
+  if ((typeof inPrice === "number" && inPrice > 0) || (typeof outPrice === "number" && outPrice > 0)) {
+    return { costClass: "paid", basis: "published-price" };
+  }
+  if (inPrice === 0 && outPrice === 0) return { costClass: "free", basis: "published-price" };
+  if (typeof model === "string" && /(?:^|[/:_-])free(?:$|[/:_-])/i.test(model)) {
+    return { costClass: "free", basis: "free-labelled" };
+  }
+  if (providerTierType === "free") return { costClass: "free", basis: "provider-tier" };
+  return { costClass: "unknown", basis: "unpublished" };
+}
+
+/**
+ * Estimate input prompt token count from an Anthropic messages request object.
+ *
+ * The ONE estimator — the context guardrail and the local `count_tokens` answer
+ * for OpenAI backends both use it (there used to be two, which disagreed: one
+ * ignored tools, the other counted base64 payloads as text). ~4 chars/token
+ * over every string in system+messages+tools — tool schemas and tool_use
+ * inputs genuinely consume context upstream, so they count. Binary payloads
+ * (the `data` field of base64 image/document sources) are excluded: a base64
+ * blob's byte length says nothing about its token cost, and a wildly inflated
+ * guess must not masquerade as a measurement. Undercounting media is safe in
+ * both call sites — the guardrail only prunes on published limits and the
+ * provider stays authoritative; count_tokens is advisory bookkeeping.
+ */
 export function estimateRequestTokens(reqJson: unknown): number {
   if (typeof reqJson !== "object" || reqJson === null) return 0;
+  let chars = 0;
+  const walk = (v: unknown, key?: string): void => {
+    if (typeof v === "string") {
+      if (key !== "data") chars += v.length;
+    } else if (Array.isArray(v)) {
+      for (const x of v) walk(x);
+    } else if (v && typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) walk(x, k);
+    }
+  };
   const obj = reqJson as Record<string, unknown>;
-  let text = "";
-
-  if (typeof obj.system === "string") {
-    text += obj.system;
-  } else if (Array.isArray(obj.system)) {
-    for (const sys of obj.system) {
-      if (typeof sys === "object" && sys !== null && "text" in sys && typeof sys.text === "string") {
-        text += sys.text;
-      }
-    }
-  }
-
-  if (Array.isArray(obj.messages)) {
-    for (const msg of obj.messages) {
-      if (typeof msg === "object" && msg !== null && "content" in msg) {
-        const content = (msg as { content: unknown }).content;
-        if (typeof content === "string") {
-          text += content;
-        } else if (Array.isArray(content)) {
-          for (const block of content) {
-            if (typeof block === "object" && block !== null && "text" in block && typeof block.text === "string") {
-              text += block.text;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Rough estimation: ~4 chars per token for English/code
-  return Math.ceil(text.length / 4);
+  walk(obj.system);
+  walk(obj.messages);
+  walk(obj.tools);
+  return Math.ceil(chars / 4);
 }

@@ -492,3 +492,146 @@ describe("candidates view", () => {
     });
   });
 });
+
+describe("freeOnly offload guard", () => {
+  const servers: Server[] = [];
+  afterAll(() => servers.forEach((s) => s.close()));
+
+  const listen = async (s: Server): Promise<number> => {
+    servers.push(s);
+    return new Promise((resolve) => s.listen(0, "127.0.0.1", () => resolve((s.address() as AddressInfo).port)));
+  };
+
+  const OPENAI_OK = (marker: string) =>
+    JSON.stringify({
+      id: "cmpl_1",
+      choices: [{ message: { role: "assistant", content: marker }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    });
+
+  const counting = async (marker: string): Promise<{ port: number; calls: () => number }> => {
+    let n = 0;
+    const s = createServer((_req, res) => {
+      n++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(OPENAI_OK(marker));
+    });
+    const port = await listen(s);
+    return { port, calls: () => n };
+  };
+
+  /**
+   * A pool listing a paid-looking member FIRST and a free one second, benchmarkSort off so
+   * config order is preserved — if the free one answers, the guard filtered, not luck.
+   * "paidp" declares no tierType and the test catalog has no prices, so it assesses `unknown`
+   * — which the guard must treat as paid (a guess must not spend money).
+   */
+  async function guardSetup(name: string, opts: { offload: unknown; pool?: string[] }) {
+    const paid = await counting("from-paid");
+    const free = await counting("from-free");
+    const path = join(dir, name);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: {
+          anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+          paidp: { base: `http://127.0.0.1:${paid.port}`, kind: "openai" },
+          freep: { base: `http://127.0.0.1:${free.port}`, kind: "openai", tierType: "free" },
+        },
+        routing: {
+          default: "anthropic",
+          tiers: { opus: "anthropic" },
+          benchmarkSort: false,
+          pools: { offloaded: opts.pool ?? ["paidp/model-x", "freep/model-y"] },
+          subagents: { default: "pool/offloaded" },
+          offload: opts.offload,
+        },
+        mode: "detect",
+        log: { level: "silent", file: null },
+      }),
+    );
+    const cfg = loadConfig(path);
+    const proxy = createProxy(cfg, { controlAuthorization: CONTROL_AUTHORIZATION });
+    const port = await listen(proxy);
+    return { paid, free, port, cfg };
+  }
+
+  const subagentCall = (port: number, system = SUB) =>
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-opus-5",
+        max_tokens: 32,
+        system,
+        messages: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+      }),
+    });
+
+  it("filters offloaded traffic to free-assessed candidates only", async () => {
+    const { paid, free, port } = await guardSetup("freeonly-filter.json", {
+      offload: { claude: { enabled: true, scope: "subagents", freeOnly: true } },
+    });
+    const resp = await subagentCall(port);
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { content: Array<{ text?: string }> };
+    expect(JSON.stringify(body)).toContain("from-free");
+    expect(paid.calls()).toBe(0); // never egressed to the unknown-cost member
+    expect(free.calls()).toBe(1);
+  });
+
+  it("refuses loudly — clean 503, zero egress — when nothing free resolves", async () => {
+    const { paid, free, port } = await guardSetup("freeonly-refuse.json", {
+      offload: { claude: { enabled: true, scope: "subagents", freeOnly: true } },
+      pool: ["paidp/model-x"],
+    });
+    const resp = await subagentCall(port);
+    expect(resp.status).toBe(503);
+    const body = (await resp.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("freeOnly");
+    expect(body.error.message).toContain("paidp/model-x");
+    expect(paid.calls()).toBe(0); // refusal means NO request went anywhere
+    expect(free.calls()).toBe(0);
+  });
+
+  it("a per-call @relay: directive cannot outrank the owner's freeOnly flag", async () => {
+    // Rule disabled: only the directive reroutes. The flag still binds — it is the owner's
+    // standing "this lane never spends money", and a subagent prompt must not override it.
+    const { paid, port } = await guardSetup("freeonly-directive.json", {
+      offload: { claude: { enabled: false, scope: "subagents", freeOnly: true } },
+    });
+    const resp = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-opus-5",
+        max_tokens: 32,
+        system: SUB,
+        messages: [{ role: "user", content: [{ type: "text", text: "@relay: paidp/model-x\ngo" }] }],
+      }),
+    });
+    expect(resp.status).toBe(503);
+    expect(paid.calls()).toBe(0);
+  });
+
+  it("without freeOnly, the same pool serves its first (unknown-cost) member — the guard is opt-in", async () => {
+    const { paid, free, port } = await guardSetup("freeonly-off.json", {
+      offload: { claude: { enabled: true, scope: "subagents" } },
+    });
+    const resp = await subagentCall(port);
+    expect(resp.status).toBe(200);
+    expect(paid.calls()).toBe(1);
+    expect(free.calls()).toBe(0);
+  });
+
+  it("setOffload toggles do not strip freeOnly from the rule", async () => {
+    const { cfg } = await guardSetup("freeonly-preserve.json", {
+      offload: { claude: { enabled: true, scope: "subagents", freeOnly: true } },
+    });
+    setOffload(cfg, false, "claude");
+    setOffload(cfg, true, "claude");
+    const rules = offloadState(cfg, "claude").clients;
+    expect(rules["claude"]).toEqual({ enabled: true, scope: "subagents", freeOnly: true });
+  });
+});

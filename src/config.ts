@@ -22,6 +22,14 @@ export type OffloadScope = "subagents" | "all";
 export interface OffloadRule {
   enabled: boolean;
   scope: OffloadScope;
+  /**
+   * Refuse — loudly — rather than let this client's rerouted traffic reach a deployment that
+   * is not assessed `free` (see `assessCost`; `unknown` counts as paid on purpose). Applies to
+   * everything `subagentSpec` reroutes for this client, INCLUDING a per-call `@relay:` directive:
+   * the flag is the owner's standing "this lane never spends money", and a subagent prompt must
+   * not be able to out-rank it. The Anthropic passthrough is primary quota and is never free.
+   */
+  freeOnly?: boolean;
 }
 
 /**
@@ -1036,7 +1044,7 @@ export function parseOffload(raw: unknown): OffloadConfig {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
       throw new Error(`config.routing.offload.${client} must be a boolean or {"enabled":bool,"scope":...}`);
     }
-    const rule = value as { enabled?: unknown; scope?: unknown };
+    const rule = value as { enabled?: unknown; scope?: unknown; freeOnly?: unknown };
     if (typeof rule.enabled !== "boolean") {
       throw new Error(`config.routing.offload.${client}.enabled must be true or false`);
     }
@@ -1044,7 +1052,10 @@ export function parseOffload(raw: unknown): OffloadConfig {
     if (scope !== "subagents" && scope !== "all") {
       throw new Error(`config.routing.offload.${client}.scope must be "subagents" or "all"`);
     }
-    out[client] = { enabled: rule.enabled, scope };
+    if (rule.freeOnly !== undefined && typeof rule.freeOnly !== "boolean") {
+      throw new Error(`config.routing.offload.${client}.freeOnly must be true or false`);
+    }
+    out[client] = { enabled: rule.enabled, scope, ...(rule.freeOnly !== undefined ? { freeOnly: rule.freeOnly } : {}) };
   }
   return out;
 }

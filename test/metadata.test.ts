@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { estimateRequestTokens, resolveMetadata } from "../src/metadata.js";
+import { assessCost, estimateRequestTokens, resolveMetadata } from "../src/metadata.js";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { limitsFromRecord, ModelCatalog } from "../src/catalog.js";
@@ -18,6 +18,73 @@ describe("metadata", () => {
     const tokens = estimateRequestTokens(req);
     expect(tokens).toBeGreaterThan(15);
     expect(tokens).toBeLessThan(50);
+  });
+
+  it("counts tool schemas and tool_use inputs — they consume real upstream context", () => {
+    // Before unification the guardrail's estimator ignored `tools` entirely, so a
+    // Claude-Code-sized tool roster (tens of kilotokens) was invisible to pruning.
+    const bare = { messages: [{ role: "user", content: "hi" }] };
+    const withTools = {
+      ...bare,
+      tools: [{ name: "search", description: "d".repeat(4000), input_schema: { type: "object" } }],
+    };
+    expect(estimateRequestTokens(withTools)).toBeGreaterThan(estimateRequestTokens(bare) + 900);
+
+    const withToolUse = {
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "search", input: { q: "x".repeat(2000) } }] },
+      ],
+    };
+    expect(estimateRequestTokens(withToolUse)).toBeGreaterThan(400);
+  });
+
+  it("excludes base64 payloads — a blob's byte length says nothing about its token cost", () => {
+    // The old count_tokens-side walker counted image data as text, so a 1MB image
+    // read as ~350k "tokens" and would have pruned every candidate had the
+    // guardrail used it. The `data` field is skipped; surrounding text still counts.
+    const text = "Describe this image for me please.";
+    const withImage = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(100_000) } },
+            { type: "text", text },
+          ],
+        },
+      ],
+    };
+    const est = estimateRequestTokens(withImage);
+    expect(est).toBeLessThan(100); // nowhere near 25k — the blob did not count
+    expect(est).toBeGreaterThan(Math.floor(text.length / 4) - 1); // the text did
+  });
+});
+
+describe("assessCost — the one definition of free", () => {
+  it("a published positive price is paid, and beats a free-sounding name", () => {
+    expect(assessCost("some/model:free", { pricePromptPerToken: 1e-7, priceCompletionPerToken: null }))
+      .toEqual({ costClass: "paid", basis: "published-price" });
+  });
+
+  it("a published zero/zero price is free", () => {
+    expect(assessCost("m", { pricePromptPerToken: 0, priceCompletionPerToken: 0 }))
+      .toEqual({ costClass: "free", basis: "published-price" });
+  });
+
+  it("a free-labelled id is free when nothing priced contradicts it", () => {
+    expect(assessCost("deepseek/deepseek-r1:free", null))
+      .toEqual({ costClass: "free", basis: "free-labelled" });
+    // "free" must be a separated token, not a substring — "freeform" is not a price claim.
+    expect(assessCost("freeform-model", null).costClass).toBe("unknown");
+  });
+
+  it("a free-tier provider vouches for its unpriced models", () => {
+    expect(assessCost("anything", null, "free")).toEqual({ costClass: "free", basis: "provider-tier" });
+  });
+
+  it("no evidence is UNKNOWN — its own class, never silently free", () => {
+    expect(assessCost("m", { pricePromptPerToken: null, priceCompletionPerToken: null }))
+      .toEqual({ costClass: "unknown", basis: "unpublished" });
   });
 });
 
