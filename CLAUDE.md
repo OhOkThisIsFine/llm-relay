@@ -74,23 +74,12 @@ inert on a non-global install. Before this existed, `typecheck` ran in **no** wo
 ran only inside the publish job — i.e. first at the moment a version was already shipping, so every
 "tsc clean / suite green" claim in this repo rested on somebody's unverifiable local run.
 
-**Releasing: use the `/release` skill** ([.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md)).
-Publishing happens in GitHub Actions via npm **Trusted Publishing** — there is no npm token here, so
-the *trigger* is the credential. A local `npm publish` has no credentials and fails with a misleading
-404. `.github/workflows/publish.yml` now stands four gates between a tag and the registry:
-
-1. a job-level `if` — this repository only, ref under `refs/tags/v*`;
-2. `environment: npm-publish`; its protection rules live in **repo settings** (Settings →
-   Environments → npm-publish), not in the workflow, and GitHub auto-creates the environment with
-   **no** rules. It now carries a **custom deployment branch policy limiting it to the `v*` tag
-   pattern** (`gh api repos/OhOkThisIsFine/llm-relay/environments/npm-publish/deployment-branch-policies`
-   to inspect), so the ref restriction is enforced by the platform and not only by the workflow's
-   own `if`. No required reviewer — a release stays one command, by the owner's decision;
-3. the tag's commit must be **contained in the default branch**;
-4. the tag must **match `package.json`'s version** — an npm mistake is permanent.
-
-The `release: published` trigger was **removed**: it was a second independent path to the registry
-that also double-fired for a release cut from a tag. Actions are pinned to commit SHAs.
+**Releasing: use the `/release` skill** ([.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md)),
+which carries the full publish mechanics. Two facts worth knowing before you get there: publishing is
+npm **Trusted Publishing** from GitHub Actions — no npm token exists here, the tag push IS the
+credential, and a local `npm publish` fails with a misleading 404; and one of the four tag→registry
+gates (the `npm-publish` environment's `v*` deployment-branch policy) lives in **repo settings**, not
+in the workflow YAML, so don't judge the protection by the YAML alone.
 
 ## Architecture — file → responsibility (all in `src/`)
 
@@ -175,31 +164,9 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
 
 ## Scripts inventory (`scripts/`)
 
-Offline / unit-test-safe (no external creds):
-- `live-demo.mjs` — runs the compiled CLI against a local flaky backend + stub reshaper. Good smoke test.
-- `install-skill.mjs` — npm `postinstall` hook: copies the single
-  `skills/llm-relay/SKILL.md` source to both `~/.claude/skills/llm-relay/` and
-  `~/.codex/skills/llm-relay/` on GLOBAL installs only (env var or global-tree path detection);
-  a repo-local `npm install` touches neither host directory. `--force` overrides for manual runs.
-  Host failures are independent. Ships in the package, so the self-updater refreshes both skill
-  descriptions on every upgrade.
-
-Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compatible provider):
-- `nim-front.mjs` — run the compiled proxy fronting a live backend end-to-end.
-- `nim-probe.mjs` / `nim-repair.mjs` — one-off tool-call fidelity + repair probes.
-- `nim-trip-rate.mjs` — the trip-rate dataset harness (models × schemas × trials → `docs/nim-trip-rate.*`).
-- `agentic-loop-probe.mjs` — drives a full agentic STEP (tool_use → tool_result → answer) through a **running** proxy. The end-to-end proof.
-- `verify-live-features.mjs` — boots the proxy on a temp config against live NIM and exercises the runtime endpoints (`/registry`, `/telemetry`, `/ping`, …).
-- `multimodal-probe.mjs` — image / PDF / MCP-block passthrough through the Anthropic→OpenAI translation. Needs a **running** proxy pointed at a vision model (`PROXY=... node scripts/multimodal-probe.mjs`).
-
-Needs network (no provider key):
-- `sync-tiers.mjs` (`npm run sync:tiers`) — snapshots **OpenRouter** (Artificial Analysis intelligence/coding/agentic indices, Design Arena Elo, context length, pricing, tool support — and the only source whose ids match our routing specs exactly), **BFCL** (tool-use accuracy), **LMArena** (general) and **Aider polyglot** (edit benchmark + edit-format compliance) into `docs/tier-data.json` (~770 models). Each source is independently failable and records a warning; schema drift inside a source still throws loudly — don't "fix" that by softening the check. Zero working sources is fatal.
-
-Usage wrappers (for pointing a real `claude` CLI at a running proxy):
-- `claude-proxied.ps1` / `claude-proxied.sh` — see README "Use it from your projects".
-
-`scripts/*.mjs` import from `dist/` — **rebuild (`npm run build`) before running them** or you'll
-test stale code.
+Per-script purposes and prerequisites: [scripts/CLAUDE.md](scripts/CLAUDE.md) (loads when working
+under `scripts/`). The one thing to know from outside that directory: `scripts/*.mjs` import from
+`dist/` — **rebuild (`npm run build`) before running any of them** or you'll test stale code.
 
 ## Gotchas (things that will bite you)
 
