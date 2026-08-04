@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Config, OffloadScope } from "../config.js";
+import { unroutableOffloadClient, type Config, type OffloadScope } from "../config.js";
 import type { ModelCatalog } from "../catalog.js";
 import type { PingLoop } from "../ping/cadence.js";
 import type { MetadataLogger } from "../log.js";
@@ -198,6 +198,17 @@ export async function handleAdminRoutes(
         failClosed(res, 400, `POST /offload needs {"enabled": true|false, "client"?: string, "scope"?: "subagents"|"all"}`);
         h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
         return true;
+      }
+      // A toggle keyed to a name no front door produces would be dead config that silently does
+      // nothing — refuse it like an unknown pool. An already-configured key stays togglable (an
+      // operator must be able to turn a dead rule OFF); offloadState carries the warning for it.
+      if (client !== undefined) {
+        const unroutable = unroutableOffloadClient(client, cfg);
+        if (unroutable?.fatal) {
+          failClosed(res, 400, `POST /offload: ${unroutable.message}`);
+          h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
+          return true;
+        }
       }
       state = setOffload(cfg, want, client, scope as OffloadScope | undefined);
     }

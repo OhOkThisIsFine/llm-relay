@@ -2,7 +2,14 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { loadConfig, type Config, type ConfigOverrides, DEFAULT_DESTRUCTIVE } from "./config.js";
+import {
+  loadConfig,
+  unroutableOffloadClient,
+  type Config,
+  type ConfigOverrides,
+  DEFAULT_DESTRUCTIVE,
+  FRONT_DOOR_CLIENTS,
+} from "./config.js";
 import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
@@ -917,6 +924,18 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
     process.stderr.write(`llm-relay offload: --scope may be used when enabling/disabling a client\n`);
     process.exit(1);
   }
+  // Refuse to CREATE a rule under a name no front door produces — the toggle would succeed,
+  // status would show it ON, and no request would ever consult it ("claude-desktop" was the real
+  // case). This must happen here, not only server-side: tryServer treats the proxy's 400 as "no
+  // proxy" and falls back to writing the file. An already-configured key stays togglable (turning
+  // a dead rule OFF must work) and gets the warning from the returned state instead.
+  if (client !== undefined && want !== null) {
+    const unroutable = unroutableOffloadClient(client, cfg);
+    if (unroutable?.fatal) {
+      process.stderr.write(`llm-relay offload: ${unroutable.message}\n`);
+      process.exit(1);
+    }
+  }
 
   const query = client ? `?client=${encodeURIComponent(client)}` : "";
   const live = (await tryServer(
@@ -952,6 +971,10 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   }
 
   if (client) {
+    // A live proxy's state carries the dead-rule warning itself; an older proxy's won't, so
+    // fall back to the same local check rather than letting the gap read as "all fine".
+    const deadRule = state.warning ?? unroutableOffloadClient(client, cfg)?.message;
+    if (deadRule) process.stdout.write(`  ⚠ ${deadRule}\n`);
     if (state.enabled && Object.keys(state.subagents).length === 0) {
       process.stdout.write("  ⚠ routing.subagents is empty — offload is on but routes nowhere\n");
     }
@@ -966,12 +989,24 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
         formatTextTable(
           [
             ["client", "enabled", "scope"],
-            ...Object.entries(configuredClients).map(([name, rule]) => [name, rule.enabled ? "ON" : "OFF", rule.scope]),
+            ...Object.entries(configuredClients).map(([name, rule]) => [
+              FRONT_DOOR_CLIENTS.includes(name) ? name : `${name} ⚠`,
+              rule.enabled ? "ON" : "OFF",
+              rule.scope,
+            ]),
           ],
           "  ",
         ) +
         "\n",
     );
+    for (const name of Object.keys(configuredClients)) {
+      if (!FRONT_DOOR_CLIENTS.includes(name)) {
+        process.stdout.write(
+          `  ⚠ "${name}": no front door produces this client name — the rule is never consulted ` +
+            `(front doors: ${FRONT_DOOR_CLIENTS.join(", ")})\n`,
+        );
+      }
+    }
   } else if (state.enabled) {
     process.stdout.write("  offload is enabled for marked subagents across all front doors\n");
   } else {

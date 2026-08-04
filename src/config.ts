@@ -290,6 +290,41 @@ export function clientForPath(pathname: string): string {
   return DEFAULT_CLIENT;
 }
 
+/** Every client name `clientForPath` can produce — the complete set of rule keys a request consults. */
+export const FRONT_DOOR_CLIENTS: readonly string[] = [CLAUDE_CLIENT, CODEX_CLIENT, OPENAI_CLIENT, DEFAULT_CLIENT];
+
+/**
+ * Why a targeted offload rule for `client` could never affect a request, or null when it can.
+ *
+ * The request path looks up ONLY the name `clientForPath()` derived from the front-door path. A
+ * rule keyed anything else ("claude-desktop" was the real case) is dead config: the toggle
+ * succeeds, status shows it ON, and every request falls through to the `default` rule — so the
+ * operator's `--scope all` silently did nothing. Same principle as an unknown pool: refuse loudly
+ * and name what IS valid. A key that already exists in the config stays legal (`fatal: false`) so
+ * state remains visible and an operator can still turn a dead rule off — callers surface the
+ * message as a prominent warning instead.
+ */
+export function unroutableOffloadClient(
+  client: string,
+  cfg: Pick<Config, "routing">,
+): { fatal: boolean; message: string } | null {
+  if (FRONT_DOOR_CLIENTS.includes(client)) return null;
+  const doors = FRONT_DOOR_CLIENTS.join(", ");
+  const configured = cfg.routing.offload;
+  if (typeof configured === "object" && configured !== null && client in configured) {
+    return {
+      fatal: false,
+      message: `rule "${client}" matches no front door — no request ever consults it (front doors: ${doors})`,
+    };
+  }
+  return {
+    fatal: true,
+    message:
+      `no request ever identifies as client "${client}" — the front doors resolve to ${doors}, ` +
+      `so this rule would be dead config that silently changes nothing`,
+  };
+}
+
 /** Return the effective rule for one originating client. Legacy booleans apply everywhere. */
 export function offloadRule(cfg: Pick<Config, "routing">, client = CLAUDE_CLIENT): OffloadRule {
   const configured = cfg.routing.offload;
