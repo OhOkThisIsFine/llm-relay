@@ -65,7 +65,7 @@ boolean form remains supported and means one global subagents-only rule.
 ```jsonc
 "routing": {
   "offload": {
-    "claude": { "enabled": true, "scope": "subagents" },
+    "claude": { "enabled": true, "scope": "subagents", "freeOnly": true },
     "codex": { "enabled": false, "scope": "all" }
   },
   "subagents": {
@@ -74,6 +74,12 @@ boolean form remains supported and means one global subagents-only rule.
   }
 }
 ```
+
+`freeOnly: true` on a rule means that client's rerouted traffic only reaches deployments assessed
+free (zero published price / `:free`-labelled / free-tier provider); unknown cost counts as paid,
+the Anthropic passthrough never qualifies, and nothing-free-resolving is a clean 503 — never a
+silent fall-through that spends money. It binds `@relay:` directives too. A 503 naming freeOnly
+means the pool currently has no free member: pick another pool or turn the flag off deliberately.
 
 Three ways to steer a subagent, in precedence order:
 
@@ -217,8 +223,11 @@ under `routing.ladders.<tier>`. Without it, the ladder matching `subagents.defau
   `GET /dispatch?lane=<id>`). Honoured even if that rung is cooling down — you asked for it.
 - **A lane failed on availability** (quota gone, rate-limited, CLI missing): report it and get
   the next one — `llm-relay dispatch -x <lane>`, or
-  `POST /dispatch {"exhausted":"<lane>","ttlMs":…}`. Rungs sharing a `quota` bucket cool down
-  together; rungs that merely share a binary do not. `{"clear":true}` resets.
+  `POST /dispatch {"exhausted":"<lane>","ttlMs":…}`. Say WHICH way it was spent when you know:
+  `--outcome rate_limited` (15m cooldown) vs `--outcome quota_exhausted` (1h), and
+  `--retry-after-ms <n>` when the vendor stated its reset — that beats both defaults. Rungs
+  sharing a `quota` bucket cool down together; rungs that merely share a binary do not.
+  `{"clear":true}` resets.
 - **Walk manually:** `GET /dispatch?after=<lane>` for the first ready rung past one.
 - **Turn client routing on/off:** `llm-relay offload <client> on|off [--scope subagents|all]` —
   `/dispatch?client=<client>` reports that rule, and flags relay rungs `requiresDirective: true`

@@ -6,14 +6,26 @@ Read this first. It's the map; [README.md](README.md) is the user-facing usage g
 
 ## What this is
 
-A standalone, **loopback-only** reverse proxy for the Anthropic `/v1/messages` API. A client
-(the `claude` CLI, or anything that honors `ANTHROPIC_BASE_URL`) points at it; it forwards to a
-configured backend model and **validates + repairs the model's tool calls**, so the Claude Code
-harness can run on non-Anthropic models that are weaker at tool-use.
+A standalone, **loopback-only** LLM traffic control plane: it steers one person's LLM traffic
+across providers and quotas — **reliably** (benchmark-ranked pools, failover, circuit breaking,
+health that survives restarts), **transparently** (things just work in operation, and the
+metadata, logs and metrics answer "what happened" with provenance when you look), and
+**lightweight** (only what is necessary; two runtime deps; no second implementation of
+anything). A client (the `claude` CLI, Codex, or anything that honors `ANTHROPIC_BASE_URL`)
+points at it; the relay resolves the requested model through pools/tiers/offload rules to a
+concrete deployment and forwards. Owner-stated goals and the rubric for judging proposed
+changes: [docs/project-goals.md](docs/project-goals.md).
 
-**The one boundary — do not cross it:** the proxy fixes/flags *protocol form* (malformed tool
+**Tool-call repair is one component, not the identity.** (Earlier revisions of this file called
+it the heart of the project; that was an agent's drift, corrected 2026-08-04.) For requests
+carrying tools, the relay validates the backend's tool calls and can repair malformed ones, so
+the Claude Code harness can run on models that are weaker at tool-use.
+
+**The repair boundary — do not cross it:** the proxy fixes/flags *protocol form* (malformed tool
 calls), never *judgment* (bad reasoning). It repairs a tool call whose args violate the schema;
-it does not invent intent, and it refuses to fabricate destructive-tool calls.
+it does not invent intent, and it refuses to fabricate destructive-tool calls. The same line
+bounds the whole project: routing decisions come from config and deterministic classification,
+never from an LLM's opinion inserted into the request path.
 
 ## Build / test / run
 
@@ -90,9 +102,9 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `pool-health.ts` | `llm-relay pools --probe` — sends a REAL completion to every pool member. Config-time validation cannot see a model that is listed and still dead (de-listed behind the scenes, gated to a paid tier, routed to a missing function), and that is exactly how a pool ends up with one live member and paper failover. Probes at 400 max_tokens because reasoning models return an empty 200 at a low cap — `empty` is a distinct verdict from `missing`, not a synonym. |
 | `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
-| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **client-specific offload routing** (`isSubagentRequest` reads Claude/Codex child markers; `subagentSpec` applies `routing.subagents` through the originating client's `routing.offload` rule, with `scope: "subagents" | "all"`, or an `@relay:` directive read ONLY from the last text block of `messages[0]`), reshaper auto-synthesis. Also `leave_me_alone` — the onboarding-nudge suppression list, whose entries are deliberately NOT validated against the known providers (see `onboarding.ts`). |
+| `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **client-specific offload routing** (`isSubagentRequest` reads Claude/Codex child markers; `subagentSpec` applies `routing.subagents` through the originating client's `routing.offload` rule, with `scope: "subagents" | "all"`, or an `@relay:` directive read ONLY from the last text block of `messages[0]`; a rule may carry `freeOnly: true` — see the gotcha), reshaper auto-synthesis. Also `leave_me_alone` — the onboarding-nudge suppression list, whose entries are deliberately NOT validated against the known providers (see `onboarding.ts`). |
 | `offload.ts` | Client-specific offload state. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites the targeted `routing.offload.<client>` rule in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
-| `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with tier selection (`?tier=`), host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). `routing.ladders.<tier>` supports different CLI models for reasoning/coding/fast; the legacy `routing.ladder` remains valid. Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. |
+| `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with tier selection (`?tier=`), host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). `routing.ladders.<tier>` supports different CLI models for reasoning/coding/fast; the legacy `routing.ladder` remains valid. An exhaustion report may carry `outcome: "rate_limited"` (15m default) or `"quota_exhausted"` (1h default) and a vendor-stated `retryAfterMs` that beats both (`OUTCOME_DEFAULT_MS`); the relay still never invents the signal. Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. |
 | `dynamic-pools.ts` | Materializes `{ preferred: [...], include: "free" }` pools as an invariant fixed prefix plus every catalog-discovered free target in benchmark order. Free-provider unknown prices are admitted unless known paid; mixed providers contribute only zero-priced or explicitly free-labelled models. Replaces the tail after catalog refresh so new models need no manual config edits. |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
 | `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, `/registry`, `/telemetry`, `/ping`, `/health`, `/candidates`, `/offload`, `/dispatch`). Front-door paths identify the originating client for offload. **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
@@ -110,7 +122,12 @@ that also double-fired for a release cut from a tag. Actions are pinned to commi
 | `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → observed runtime telemetry (≥5 calls, so one lucky request can't promote a model) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
 | `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
-| `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value (`provider`) → another provider's figure for the same id (`reference`, indicative only) → **null**. There is no hardcoded-table rung: the old blanket 128k/4096 guess was deleted in 0.7.0 because a caller cannot tell a guess from a measurement. Plus `estimateRequestTokens()`. |
+| `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value (`provider`) → another provider's figure for the same id (`reference`, indicative only) → **null**. There is no hardcoded-table rung: the old blanket 128k/4096 guess was deleted in 0.7.0 because a caller cannot tell a guess from a measurement. Also `estimateRequestTokens()` — the ONE token estimator (guardrail + local `count_tokens`; counts tools, skips base64 `data`) — and `assessCost()` — the ONE definition of free/paid/unknown (dynamic pool admission + the `freeOnly` guard both resolve through it; `unknown` is its own class and the guard treats it as paid). |
+| `kernel/` | Pure contracts + implementation for the **attempt lifecycle** — the typed begin/complete handshake (`AttemptLifecyclePort`, branded `AttemptHandle`, outcome shapes) that `CircuitBreaker` implements and both request paths account through. Depends only on ECMAScript types; `test/kernel-architecture.test.ts` enforces purity and acyclicity. ⚠ A much larger aspirational contract surface (canonical IR, transport/credential/transcoder ports, lease budgets, `tier-snapshot`) lived here unadopted and was **deleted 2026-08-04** — do not rebuild it; see the history note in `contracts.ts` and [docs/suggestion-review-2026-08-04.md](docs/suggestion-review-2026-08-04.md). |
+| `routes/admin.ts` | The control-plane endpoints (`/v1/models`, `/registry`, `/ping`, `/health`, `/candidates`, `/offload`, `/dispatch`, `/telemetry`), factored out of `server.ts`. `handleAdminRoutes()` returns true when it handled the request; mutating routes go through the admission checks + control authorization. |
+| `control-authorization.ts` | Per-install capability token for control-plane mutations (`POST /offload`, `POST /dispatch`): 256-bit token at `~/.llm-relay/control-token`, timing-safe comparison, atomic single-token convergence for concurrent starters, nothing secret in errors or logs. |
+| `request-log.ts` | `baseLog()` (metadata-only log record construction) and `logSafePath()` (query param names + value lengths, never values) — shared by the data plane and admin routes. |
+| `self-update.ts` | Version currency: checks npm (cached 6h, 2.5s timeout) before mutating commands; a stale GLOBAL install downloads and replaces itself and re-execs (with a suppression marker against loops); dev/managed installs just get told the upgrade command. |
 | `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. Re-exports `loadTierData` from `tier-data.ts`. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
 | `key-checker.ts` | Pre-flight key validator. Providers are checked **concurrently** (a dozen-plus providers checked serially, one of them a dead local daemon, turns a status command into a multi-minute one). A 200 from `/models` is NOT accepted as proof: several providers serve that endpoint publicly, so it is re-probed anonymously, and only a genuine 401/403 there makes it evidence. Otherwise it escalates to an authenticated completion **on a model this config actually routes to that provider** — a catalogue's first entry is often a premium SKU the key legitimately cannot touch. A 401/403 on that probe is compared against the same request sent anonymously: a *different* status proves the key authenticated (the wall is the model's plan), an *identical* one proves nothing and reports `unverified` rather than accusing a working key. |
 | `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). Honours `leave_me_alone` — and ONLY here: a suppressed provider stays visible in `llm-relay keys`, `/registry`, telemetry and `candidates`, because silencing a nudge is not hiding state. Entries matching no known provider are legal on purpose; the list stores the negative space, so validating it against the configured providers would reject its main use case. |
@@ -152,7 +169,8 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
 - **Persistent storage directory:** Local configurations, keys, and probe caches are persisted under `~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`).
 - **Hand-built `Config` objects in tests must include** `backend.kind` and
   `repair: { maxAttempts, destructiveTools }`.
-- **Commit trailer:** `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
+- **Commit trailer:** `Co-Authored-By: <the model doing the work> <noreply@anthropic.com>`
+  (e.g. `Claude Fable 5`). Name the model that actually authored the change.
 
 ## Scripts inventory (`scripts/`)
 
@@ -304,6 +322,21 @@ test stale code.
   form is independently keyed by client and each rule defaults to subagents-only. Never infer
   enabled state from the presence of a `subagents` map. Tests pin legacy and client-specific state
   (`test/config.test.ts`, `test/offload.test.ts`).
+- **`freeOnly` binds RESOLVED candidates, refuses loudly, and outranks `@relay:`.** A rule with
+  `freeOnly: true` filters what `subagentSpec`-rerouted traffic may reach down to deployments
+  `assessCost()` calls `free` — enforced after pool expansion, because a pool lists free and paid
+  members side by side. `unknown` cost counts as paid (a guess must not spend money), the
+  Anthropic passthrough is never free, and nothing free resolving is a clean 503 with zero
+  egress — never a fall-through to `routing.default`, which is exactly the spend being guarded.
+  It applies to a per-call `@relay:` directive too, even with the rule disabled: the flag is the
+  owner's standing "this lane never spends money", and a subagent prompt must not outrank it.
+  A toggle (`setOffload`) must not strip rule fields it was not asked about — that was a real bug.
+- **All-429 exhaustion serves the pool's EARLIEST `Retry-After`, and only then.** The body stays
+  the last candidate's real error (a true upstream error beats a synthesized one — same maxim as
+  the context guardrail), but when every walked candidate 429'd, the served `Retry-After` is the
+  minimum across them: the earliest reset is when the POOL next has capacity. A mixed walk (any
+  non-429 among the failures) never overrides. Both fronts, one policy
+  (`test/pool-failover.test.ts`).
 - **Don't add a blended "best target" score to `candidates.ts`.** The dimensions are deliberately
   separate; averaging them buries the judgement the reader is there to make. Tests assert no
   `score`/`rank` field, that every source keeps its own key under `scores`, and that the one
@@ -339,11 +372,22 @@ test stale code.
 
 ## Status & open work
 
-**Nothing is pending in the code.** A full audit was remediated to completion and its follow-up list
-closed in v0.12.0; the audit apparatus, its artifacts and its handoff doc have all been deleted,
-because a finished run's ledger is just a stale to-do list. Anything that mattered from it is a code
-change, a test, or a paragraph in this file. The 2026-07-30 pool-failover symptoms are likewise
-fixed and closed — see [docs/pool-failover.md](docs/pool-failover.md) and the gotchas above.
+**Nothing is pending in the code.** (Re-verified 2026-08-04 after the goals review: the
+half-adopted kernel contract surface — the one open item this line previously missed — was
+resolved by deletion; what remains of `src/kernel/` is fully adopted.) A full audit was
+remediated to completion and its follow-up list closed in v0.12.0; the audit apparatus, its
+artifacts and its handoff doc have all been deleted, because a finished run's ledger is just a
+stale to-do list. Anything that mattered from it is a code change, a test, or a paragraph in
+this file. The 2026-07-30 pool-failover symptoms are likewise fixed and closed — see
+[docs/pool-failover.md](docs/pool-failover.md) and the gotchas above.
+
+**Project goals are written down** — [docs/project-goals.md](docs/project-goals.md): personal
+tool first (shared with friends; README + `llm-relay onboard` must suffice for a stranger),
+traffic steering as the mission, stabilize-and-harden as the trajectory, and a five-test rubric
+for judging proposed changes. An external proposal was reviewed against it 2026-08-04
+([docs/suggestion-review-2026-08-04.md](docs/suggestion-review-2026-08-04.md)): four small
+pieces harvested (all landed), the enterprise-shaped remainder rejected with reasons — read it
+before proposing routing refactors, budgets, tracing stores, or LLM-assisted classification.
 
 ⚠ **A CLI process's environment is NOT the running relay's environment, and confusing the two
 fabricates credential bugs.** On Windows a User-scope environment variable enters a process only at
@@ -376,8 +420,9 @@ and change the test in the SAME commit as the source fix.
 
 Current: **usable end-to-end**, suite green, tsc clean — and verified by CI
 (`.github/workflows/ci.yml` runs `npm run check`, which type-checks `src/` AND `test/`) rather than
-by a local run only. A real `claude` agentic session completes through the proxy against NIM. Full
-assessment: [docs/fcc-replacement-assessment.md](docs/fcc-replacement-assessment.md).
+by a local run only. A real `claude` agentic session completes through the proxy against NIM.
+(The point-in-time assessment doc that used to back this claim was deleted 2026-08-04 as a stale
+snapshot — CI and the suite are the living evidence.)
 
 **Client-specific offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): Claude
 and Codex rules can independently route marked children, or their full conversations with

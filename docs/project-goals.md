@@ -79,8 +79,8 @@ consistent with the repo's existing philosophy.
 - CLAUDE.md "What this is" mis-centers repair (confirmed by owner as drift).
 - CLAUDE.md "Nothing is pending in the code" predates the half-adopted kernel.
 - README: essentially current (only `help`/`version` missing from the command table).
-- `docs/fcc-replacement-assessment.md` is a snapshot at commit 799eed3 (13 commits stale) with
-  open items nobody is tracking; refresh or delete.
+- `docs/fcc-replacement-assessment.md` was a snapshot at commit 799eed3 with open items nobody
+  was tracking; deleted 2026-08-04.
 
 ## Friend-install standard (owner decision 2026-08-04)
 
