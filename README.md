@@ -22,32 +22,46 @@ Runs the compiled CLI as a real process against a local flaky-model backend + st
 
 ## Quick Start & Free Model Onboarding
 
-`llm-relay` comes pre-configured with **100%-free model presets** (NVIDIA NIM, Groq, Gemini Free, OpenRouter Free, Cerebras, SambaNova) and supports **pooling your existing subscriptions** (ChatGPT / OpenAI API, AGY, Anthropic).
+`llm-relay` comes pre-configured with **100%-free model presets** (NVIDIA NIM, Groq, Gemini Free, OpenRouter Free, Cerebras, SambaNova) and supports **pooling your existing subscriptions** (ChatGPT / OpenAI API, AGY, Anthropic). This section is the whole install; the staged, hand-it-to-an-AI version with more depth is [docs/QUICKSTART.md](docs/QUICKSTART.md).
 
-### Step 1: Run Guided Free Key Setup
+### Step 1: Get keys
 ```bash
 npx llm-relay onboard
 ```
-Scans your environment for active keys and provides direct links to acquire 100%-free API keys from NVIDIA, Groq, Google Gemini, OpenRouter, Cerebras, and SambaNova.
+Creates `~/.llm-relay/config.json` (first run), scans your environment for keys you already have, and walks the free providers with direct signup links. **The part only you can do:** open the links, create the accounts, and paste each API key when prompted — onboarding saves them to `~/.llm-relay/.env`. One or two providers is enough to start; you can rerun `onboard` any time to add more. (A key added *while the relay is running* is picked up on the next relay restart, not instantly.)
 
-### Step 2: Configure Claude CLI or Claude Desktop
+### Step 2: Point your client at the relay
 
 **For Claude Desktop:**
 ```bash
 llm-relay setup claude-desktop
 ```
-Auto-patches `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) to route Claude Desktop through `llm-relay` (`http://127.0.0.1:8791`).
+Auto-patches `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) to route Claude Desktop through `llm-relay` (`http://127.0.0.1:8791`), with an isolated `CLAUDE_CONFIG_DIR` so it never conflicts with your claude.ai login. **Restart Claude Desktop afterwards** — it reads this file only at launch.
 
 **For Claude CLI (`claude`):**
 ```bash
 llm-relay setup claude-cli
 ```
-Verifies wrapper scripts (`scripts/claude-proxied.ps1` and `scripts/claude-proxied.sh`) that use an isolated `CLAUDE_CONFIG_DIR` so your proxy setup never conflicts with local login tokens.
+Prints the two ready-made wrapper scripts (`claude-proxied.ps1` / `claude-proxied.sh`) and what they set. Nothing is modified: run `claude` through a wrapper when you want the relay in the path — see [Use it from your projects](#use-it-from-your-projects) for the wrapper vs inline-env choice.
 
-### Step 3: Start the Proxy
+### Step 3: Start it and prove it works
 ```bash
-llm-relay
+llm-relay          # starts the proxy on 127.0.0.1:8791 (leave it running)
+llm-relay keys     # are the credentials good?
+llm-relay pools --probe   # does each configured model actually answer?
 ```
+`keys` and `pools --probe` are the two checks worth running before blaming anything else — see [Verifying a setup](#verifying-a-setup--two-checks-two-different-questions) for what each can and cannot prove.
+
+### Step 4: Keep it running
+
+The relay is a foreground process; if you close the terminal, everything you pointed at it stops working. Have your OS start it at login:
+
+- **Windows** — save this as `llm-relay.vbs` in `shell:startup` (Win+R → `shell:startup`):
+  ```vbs
+  CreateObject("WScript.Shell").Run "llm-relay", 0
+  ```
+- **macOS** — `brew services` has no formula for this; use a LaunchAgent: save as `~/Library/LaunchAgents/com.llm-relay.plist` with `ProgramArguments` = the full path from `which llm-relay`, `RunAtLoad` = true, then `launchctl load` it.
+- **Linux** — a user systemd unit: `systemd-run --user --unit=llm-relay $(which llm-relay)` to try it, or write `~/.config/systemd/user/llm-relay.service` and `systemctl --user enable --now llm-relay`.
 
 ---
 
@@ -56,7 +70,7 @@ llm-relay
 ### 1. 100%-Free Presets & Subscription Pooling
 - **100%-Free Tier**: NVIDIA NIM (`build.nvidia.com`), Groq (`console.groq.com/keys`), Gemini Free (`aistudio.google.com/app/apikey`), OpenRouter Free (`openrouter.ai/keys`), Cerebras, SambaNova.
 - **Subscription Tier**: Mapped as `subscription` in config (e.g. OpenAI `OPENAI_API_KEY`, Anthropic `ANTHROPIC_API_KEY`).
-- **Priority Cascade**: `llm-relay` prioritizes high-capability subscriptions first, automatically falling back to high-stability free tier targets if 429 rate limits occur.
+- **Priority Cascade**: within a multi-candidate route (an array or a pool), higher-ranked targets are tried first with automatic failover to the rest on 429s. (This is in-route failover — it does not reroute traffic between clients or tiers by itself; that is the opt-in offload switch below.)
 
 ### 2. Stability-Aware Dynamic Routing & Auto-Failover
 - `CircuitBreaker` tracks latency, jitter, spike rates, and remaining rate-limit quota headers (`x-ratelimit-remaining`), computing a live **Stability Score (0–100)** for every provider target.
@@ -115,6 +129,8 @@ llm-relay
 | `llm-relay offload <harness> <on\|off> [--scope <scope>]` | Set one harness's rule |
 | `llm-relay candidates [-p <name>]` | Show offload target data |
 | `llm-relay dispatch [lane] [options]` | Choose next dispatch lane |
+| `llm-relay help \| --help \| -h` | Full flag/endpoint reference |
+| `llm-relay version \| --version \| -v` | Print version |
 
 ---
 
@@ -470,7 +486,7 @@ to marked subagents only (the current behavior) or to the whole conversation:
     "sonnet": "pool/high", "haiku": "pool/medium", "default": "pool/medium"
   },
   "offload": {
-    "claude": { "enabled": true,  "scope": "subagents" },
+    "claude": { "enabled": true,  "scope": "subagents", "freeOnly": true },
     "codex":  { "enabled": false, "scope": "all" }
   }
 }
@@ -480,6 +496,14 @@ to marked subagents only (the current behavior) or to the whole conversation:
 `routing.subagents` tier/default map to the client's main conversation, which is useful when a
 Claude or Codex quota is exhausted. Rules may use any future client name; an explicit `default`
 rule is the opt-in catch-all for otherwise unnamed front doors. All rules are off by default.
+
+`"freeOnly": true` is the money guard: this client's rerouted traffic may only reach deployments
+assessed **free** (published zero price, an explicitly `:free`-labelled id, or a `tierType: "free"`
+provider). Anything else — including *unknown* cost, and the Anthropic passthrough — is filtered
+out after pool expansion, and if nothing free remains the request is **refused with a clean 503**
+naming the rule, never silently sent somewhere that bills. It also binds per-call `@relay:`
+directives, so a subagent prompt cannot spend money past it. Set it in the config file or with
+`llm-relay config set routing.offload.claude.freeOnly true` (restart applies it).
 
 The CLI changes one harness without restarting the proxy:
 
@@ -596,6 +620,11 @@ Whole-task CLI dispatch can likewise vary by tier with `routing.ladders.{low,med
 Use `llm-relay dispatch --tier high -t "..."`; without `--tier`, the ladder matching
 `subagents.default` is selected (normally `medium`). The legacy single `routing.ladder` remains
 supported for configurations that do not need tier-specific CLI models.
+
+When a lane turns out to be spent, say **which way**: `llm-relay dispatch -x <lane> --outcome
+rate_limited` cools it briefly (15 min default — rate limits reset on a fast clock) while
+`--outcome quota_exhausted` cools it for an hour; `--retry-after-ms <n>` passes the vendor's own
+stated reset and beats both defaults. A plain `-x <lane>` keeps its old 15-minute behaviour.
 
 ### Choosing where to offload (`llm-relay candidates`)
 
