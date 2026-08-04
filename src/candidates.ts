@@ -193,6 +193,16 @@ function collectSpecs(cfg: Config): Map<string, { pools: string[]; subagentTiers
   return out;
 }
 
+/**
+ * Confidence in a resolved limit for fitness scoring: the serving provider's own published
+ * figure is authoritative; another provider's `reference` figure counts half, and only when
+ * the tier join was exact (a fuzzy join may describe a different SKU); otherwise nothing.
+ */
+function metadataConfidence(source: MetadataSource | null, exactMatch: boolean): number {
+  if (source === "provider") return 1;
+  return source === "reference" && exactMatch ? 0.5 : 0;
+}
+
 function splitSpec(spec: string): { provider: string; model?: string } {
   const i = spec.indexOf("/");
   return i === -1 ? { provider: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
@@ -308,13 +318,9 @@ export async function buildCandidates(
       runtimeScore: model ? getRealWorldScore(provider, model, { telemetry, now: nowMs }) : null,
       supportsTools,
       contextLength: meta.contextLength,
-      contextConfidence: meta.contextLengthSource === "provider"
-        ? 1
-        : meta.contextLengthSource === "reference" && matched?.match === "exact" ? 0.5 : 0,
+      contextConfidence: metadataConfidence(meta.contextLengthSource, matched?.match === "exact"),
       maxOutputTokens: meta.maxOutputTokens,
-      maxOutputConfidence: meta.maxOutputTokensSource === "provider"
-        ? 1
-        : meta.maxOutputTokensSource === "reference" && matched?.match === "exact" ? 0.5 : 0,
+      maxOutputConfidence: metadataConfidence(meta.maxOutputTokensSource, matched?.match === "exact"),
       benchmarkTaskFitScore: typeof exactTier?.task_fit_score === "number" ? exactTier.task_fit_score * 100 : null,
       benchmarkTaskFitConfidence: Math.min(1, (exactTier?.task_fit_signal_count ?? 0) / 3),
     });

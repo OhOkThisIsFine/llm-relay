@@ -2,11 +2,10 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import type { PingRecord } from "./metrics.js";
+import { WriteBehindTimer } from "../write-behind.js";
 
 export const DEFAULT_PROBE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export const BROKEN_PROBE_BACKOFF_BASE_MS = 60_000;
-export const DEFAULT_PROBE_FLUSH_DELAY_MS = 250;
-export const MAX_PROBE_FLUSH_DELAY_MS = 2_000;
 /**
  * Bumped to 2 when entries gained a sample HISTORY. A version mismatch marks a model due for
  * probing (see `getModelsDueForProbe`), so v1 single-sample entries re-probe and refill naturally
@@ -72,8 +71,7 @@ function emptyCache(): ProbeCacheData {
 
 let _cache: ProbeCacheData | null = null;
 let _cachePath: string | null = null;
-let _flushTimer: NodeJS.Timeout | null = null;
-let _dirtySince: number | null = null;
+const _writeBehind = new WriteBehindTimer();
 
 export function loadProbeCache(opts: { path?: string; reload?: boolean } = {}): ProbeCacheData {
   const target = opts.path ?? getProbeCachePath();
@@ -98,11 +96,7 @@ export function loadProbeCache(opts: { path?: string; reload?: boolean } = {}): 
 export function flushProbeCache(opts: { path?: string; cache?: ProbeCacheData } = {}): void {
   const target = opts.path ?? _cachePath ?? getProbeCachePath();
   const cacheData = opts.cache ?? _cache ?? emptyCache();
-  if (_flushTimer && !opts.path) {
-    clearTimeout(_flushTimer);
-    _flushTimer = null;
-  }
-  if (!opts.path) _dirtySince = null;
+  if (!opts.path) _writeBehind.clear();
 
   try {
     mkdirSync(dirname(target), { recursive: true });
@@ -115,20 +109,9 @@ export function flushProbeCache(opts: { path?: string; cache?: ProbeCacheData } 
 }
 
 function scheduleProbeCacheFlush(): void {
-  const now = Date.now();
-  _dirtySince ??= now;
-  if (_flushTimer) clearTimeout(_flushTimer);
-  const remaining = Math.max(0, MAX_PROBE_FLUSH_DELAY_MS - (now - _dirtySince));
   const target = _cachePath ?? getProbeCachePath();
   const cache = _cache ?? emptyCache();
-  _flushTimer = setTimeout(
-    () => {
-      _flushTimer = null;
-      _dirtySince = null;
-      flushProbeCache({ path: target, cache });
-    },
-    Math.min(DEFAULT_PROBE_FLUSH_DELAY_MS, remaining),
-  );
+  _writeBehind.touch(() => flushProbeCache({ path: target, cache }));
 }
 
 function trailingBrokenSamples(entry: ProbeEntry): number {

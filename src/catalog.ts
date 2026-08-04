@@ -2,11 +2,10 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { ProviderConfig } from "./config.js";
+import { WriteBehindTimer } from "./write-behind.js";
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
 const DEFAULT_CACHE = join(homedir(), ".llm-relay", "models-cache.json");
-const DEFAULT_FLUSH_DELAY_MS = 250;
-const MAX_FLUSH_DELAY_MS = 2_000;
 
 /**
  * Limits a provider publishes about its OWN deployment of a model.
@@ -131,8 +130,7 @@ export class ModelCatalog {
   private pending = new Map<string, Promise<string[]>>();
   private revision = 0;
   private readonly writeBehind: boolean;
-  private flushTimer: NodeJS.Timeout | null = null;
-  private dirtySince: number | null = null;
+  private readonly flushTimer = new WriteBehindTimer();
 
   constructor(opts: { ttlMs?: number; cachePath?: string | null; writeBehind?: boolean } = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
@@ -163,11 +161,7 @@ export class ModelCatalog {
 
   private saveDisk(): void {
     if (!this.cachePath) return;
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this.dirtySince = null;
+    this.flushTimer.clear();
     try {
       mkdirSync(dirname(this.cachePath), { recursive: true });
       const obj: Record<string, Entry> = {};
@@ -184,11 +178,7 @@ export class ModelCatalog {
       this.saveDisk();
       return;
     }
-    const now = Date.now();
-    this.dirtySince ??= now;
-    if (this.flushTimer) clearTimeout(this.flushTimer);
-    const remaining = Math.max(0, MAX_FLUSH_DELAY_MS - (now - this.dirtySince));
-    this.flushTimer = setTimeout(() => this.saveDisk(), Math.min(DEFAULT_FLUSH_DELAY_MS, remaining));
+    this.flushTimer.touch(() => this.saveDisk());
   }
 
   /** Monotonic in-memory catalog revision used to invalidate routing snapshots cheaply. */
@@ -199,7 +189,7 @@ export class ModelCatalog {
 
   /** Force any write-behind catalog update to disk (graceful shutdown / explicit durability). */
   flushPersistence(): void {
-    if (this.dirtySince !== null) this.saveDisk();
+    if (this.flushTimer.dirty) this.saveDisk();
   }
 
   /** Cached model ids for a provider; empty array if fetch fails and no prior cache. */
