@@ -63,6 +63,15 @@ to, so the real error is returned exactly as before.
 **A genuine client 4xx (413, 422, …) still does not fail over.** Fourteen candidates would reject
 it identically; retrying would just multiply one bad request by fourteen.
 
+**402 is not one of those — it is quota exhaustion, a 429 with a monthly window.** Observed live
+2026-08-04: HuggingFace's router answers `402 "You have depleted your monthly included credits"`
+while other members of the same pool serve fine, and the relay returned it to the client because
+402 fell into the "client" class. It now classifies as retriable (fails over, recorded on the
+breaker) but trips a much longer cooldown — 1 hour, the same default `dispatch.ts` uses for a
+host-reported `quota_exhausted` — because monthly credits do not reset inside the 2-minute 429
+window. The member stays in the cooling band (demoted, never dropped) and any success clears it,
+so a mid-month top-up recovers without a restart.
+
 ### §2 — half the pool is dead and nothing surfaces it
 
 Three separate things were tangled here, and they have different answers.

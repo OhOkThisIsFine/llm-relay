@@ -404,3 +404,91 @@ describe("all-429 exhaustion serves the pool's earliest reset, not the last cand
     expect(resp.headers.get("retry-after")).toBe("300");
   });
 });
+
+describe("402 is quota exhaustion — a monthly-window 429, not a client error", () => {
+  // Observed live 2026-08-04: HuggingFace's router answers 402 "You have depleted your monthly
+  // included credits" while other pool members serve fine — and the relay returned it to the
+  // client, because 402 fell into the "client" class and never failed over. Requests then
+  // hard-errored intermittently, depending on whether the depleted member ranked first.
+  // ≥2 candidates throughout, per this file's header warning.
+  const QUOTA_BODY = JSON.stringify({ error: { message: "You have depleted your monthly included credits.", type: "insufficient_quota" } });
+
+  it("openai front: fails over past a 402 and is served by the next member", async () => {
+    const a = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+  });
+
+  it("records the 402 on the breaker with a cooldown far LONGER than the 429 default", async () => {
+    // Monthly credits do not reset in the 2-minute rate-limit window; retrying on that cadence
+    // pays a round-trip per request for the rest of the billing period to hear the same answer.
+    const a = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    expect((await chat(p)).status).toBe(200);
+    const state = globalCircuitBreaker.getState("p1/m1")!;
+    expect(state.lastStatus).toBe(402);
+    expect(state.consecutiveFailures).toBe(1); // health data, unlike a 401
+    const remaining = state.cooldownUntil - Date.now();
+    expect(remaining).toBeGreaterThan(120000); // longer than the 429 default cooldown
+    expect(remaining).toBeLessThanOrEqual(3600000); // the 1-hour quota cooldown
+
+    // Demoted for the next request — the depleted member is not asked again.
+    expect((await chat(p)).status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(2);
+  });
+
+  it("anthropic front: same policy — a 402 on the top candidate does not strand the pool", async () => {
+    const a = await scripted(() => ({ status: 402, body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "You have depleted your monthly included credits." } }) }));
+    const b = await scripted(() => ({
+      body: JSON.stringify({
+        id: "msg_1", type: "message", role: "assistant", model: "m2",
+        content: [{ type: "text", text: "ok" }], stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+    }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`], "anthropic");
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+    expect(globalCircuitBreaker.getState("p1/m1")?.lastStatus).toBe(402);
+  });
+
+  it("all-402 exhaustion still returns the last candidate's real error body, naming everyone tried", async () => {
+    const a = await scripted(() => ({ status: 402, body: JSON.stringify({ error: { message: "credits gone on a", type: "insufficient_quota" } }) }));
+    const b = await scripted(() => ({ status: 402, body: JSON.stringify({ error: { message: "credits gone on b", type: "insufficient_quota" } }) }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(402); // the LAST candidate's real status, not a synthesized proxy error
+    expect(((await resp.json()) as { error: { message: string } }).error.message).toContain("credits gone on b");
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p1/m1, p2/m2");
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+  });
+
+  it("a success clears the quota cooldown — a mid-month top-up recovers without a restart", () => {
+    const cb = new CircuitBreaker();
+    cb.recordOutcome("p/m", { ok: false, status: 402, elapsedMs: 5 });
+    expect(cb.isHealthy("p/m")).toBe(false); // cooling, demoted behind live members
+    cb.recordOutcome("p/m", { ok: true, status: 200, elapsedMs: 5 });
+    expect(cb.isHealthy("p/m")).toBe(true);
+    expect(cb.getState("p/m")!.cooldownUntil).toBe(0);
+  });
+});
+
