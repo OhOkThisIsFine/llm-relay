@@ -1,11 +1,10 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
+import { WriteBehindTimer } from "../write-behind.js";
 
 export const MAX_RECENT_CALLS = 50;
 export const DEFAULT_MIN_CALLS_FOR_SCORE = 5;
-export const DEFAULT_TELEMETRY_FLUSH_DELAY_MS = 250;
-export const MAX_TELEMETRY_FLUSH_DELAY_MS = 2_000;
 
 export interface RecentCall {
   timestamp: number;
@@ -39,8 +38,7 @@ export function getRuntimeTelemetryPath(): string {
 
 let _telemetry: TelemetryData | null = null;
 let _telemetryPath: string | null = null;
-let _flushTimer: NodeJS.Timeout | null = null;
-let _dirtySince: number | null = null;
+const _writeBehind = new WriteBehindTimer();
 
 export function loadRuntimeTelemetry(opts: { path?: string; reload?: boolean } = {}): TelemetryData {
   const target = opts.path ?? getRuntimeTelemetryPath();
@@ -63,11 +61,7 @@ export function loadRuntimeTelemetry(opts: { path?: string; reload?: boolean } =
 export function flushRuntimeTelemetry(opts: { path?: string; telemetry?: TelemetryData } = {}): void {
   const target = opts.path ?? _telemetryPath ?? getRuntimeTelemetryPath();
   const data = opts.telemetry ?? _telemetry ?? { version: 1, models: {} };
-  if (_flushTimer && !opts.path) {
-    clearTimeout(_flushTimer);
-    _flushTimer = null;
-  }
-  if (!opts.path) _dirtySince = null;
+  if (!opts.path) _writeBehind.clear();
   try {
     mkdirSync(dirname(target), { recursive: true });
     const tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
@@ -77,20 +71,9 @@ export function flushRuntimeTelemetry(opts: { path?: string; telemetry?: Telemet
 }
 
 function scheduleRuntimeTelemetryFlush(): void {
-  const now = Date.now();
-  _dirtySince ??= now;
-  if (_flushTimer) clearTimeout(_flushTimer);
-  const remaining = Math.max(0, MAX_TELEMETRY_FLUSH_DELAY_MS - (now - _dirtySince));
   const target = _telemetryPath ?? getRuntimeTelemetryPath();
   const data = _telemetry ?? { version: 1, models: {} };
-  _flushTimer = setTimeout(
-    () => {
-      _flushTimer = null;
-      _dirtySince = null;
-      flushRuntimeTelemetry({ path: target, telemetry: data });
-    },
-    Math.min(DEFAULT_TELEMETRY_FLUSH_DELAY_MS, remaining),
-  );
+  _writeBehind.touch(() => flushRuntimeTelemetry({ path: target, telemetry: data }));
 }
 
 export function recordModelCall(

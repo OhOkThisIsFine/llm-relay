@@ -65,7 +65,7 @@ export interface DeploymentFitness {
 }
 
 const NEUTRAL = 50;
-export const STATIC_RANKING_EPOCH_MS = 30_000;
+const STATIC_RANKING_EPOCH_MS = 30_000;
 const staticRankingCache = new Map<string, string[]>();
 
 /**

@@ -523,14 +523,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
   }
 
-  // Candidate execution loop with failover across healthyTargets
-  //
-  // When the whole pool is rate-limited, the client is served the LAST candidate's real 429 —
-  // but that candidate's Retry-After may be the pool's worst. Track the earliest reset among
-  // the 429s failed over past, and only when every skipped response was a 429 (a mixed walk
-  // says nothing about when the POOL frees up) surface the minimum on the returned error.
-  let pool429RetryAfterMs: number | null = null;
-  let failedOverOnly429 = true;
+  // Candidate execution loop with failover across healthyTargets.
+  // All-429 exhaustion Retry-After policy: `Pool429Tracker`.
+  const pool429 = new Pool429Tracker();
   for (let i = 0; i < healthyTargets.length; i++) {
     if (res.destroyed) break;
     target = healthyTargets[i]!;
@@ -621,13 +616,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         clearTimeout(timer);
         res.off("close", onResClose);
         await backendRes.body?.cancel().catch(() => {});
-        if (backendRes.status === 429) {
-          if (retryAfterMs !== null) {
-            pool429RetryAfterMs = pool429RetryAfterMs === null ? retryAfterMs : Math.min(pool429RetryAfterMs, retryAfterMs);
-          }
-        } else {
-          failedOverOnly429 = false;
-        }
+        pool429.recordFailover(backendRes.status, retryAfterMs);
         completeAttemptFailure(h, attempt, {
           failure: "http",
           provenance: localFailure ? "relay-mapper-defect" : "upstream",
@@ -645,10 +634,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       if (doRepair) {
         await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal }, h);
       } else {
-        const poolRetryAfterMs =
-          backendRes.status === 429 && failedOverOnly429 && pool429RetryAfterMs !== null
-            ? Math.min(pool429RetryAfterMs, retryAfterMs ?? Infinity)
-            : undefined;
+        const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
         await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs }, h);
       }
       return;
@@ -729,6 +715,36 @@ export function classifyStatus(status: number): OutcomeClass {
 /** Whether another pool candidate is useful; health mutation occurs only at terminal completion. */
 function shouldTryNext(cls: OutcomeClass): boolean {
   return cls === "retriable" || cls === "credential";
+}
+
+/**
+ * All-429 exhaustion policy — one policy, both fronts (same maxim as `classifyStatus`).
+ *
+ * When the whole pool is rate-limited, the client is served the LAST candidate's real 429, but
+ * that candidate's Retry-After may be the pool's worst: the earliest reset among the walked 429s
+ * is when the POOL next has capacity. Only an all-429 walk qualifies — a mixed walk says nothing
+ * about when the pool frees up, so any non-429 failure leaves the final header untouched.
+ */
+class Pool429Tracker {
+  private minRetryAfterMs: number | null = null;
+  private only429 = true;
+
+  /** Record a response being failed over past. */
+  recordFailover(status: number, retryAfterMs: number | null): void {
+    if (status === 429) {
+      if (retryAfterMs !== null) {
+        this.minRetryAfterMs = this.minRetryAfterMs === null ? retryAfterMs : Math.min(this.minRetryAfterMs, retryAfterMs);
+      }
+    } else {
+      this.only429 = false;
+    }
+  }
+
+  /** Retry-After (ms) to serve on the FINAL response, or undefined to leave its real header alone. */
+  overrideMs(finalStatus: number, finalRetryAfterMs: number | null): number | undefined {
+    if (finalStatus !== 429 || !this.only429 || this.minRetryAfterMs === null) return undefined;
+    return Math.min(this.minRetryAfterMs, finalRetryAfterMs ?? Infinity);
+  }
 }
 
 /**
@@ -909,10 +925,8 @@ async function openAiFrontPath(
   h: Handlers,
 ): Promise<void> {
   const tried: string[] = [];
-  // Same earliest-reset policy as the Anthropic path's loop: on an all-429 walk, the served
-  // Retry-After is the pool's minimum, not the last candidate's. One policy, both fronts.
-  let pool429RetryAfterMs: number | null = null;
-  let failedOverOnly429 = true;
+  // All-429 exhaustion Retry-After policy, shared with the Anthropic path: `Pool429Tracker`.
+  const pool429 = new Pool429Tracker();
 
   for (let i = 0; i < candidates.length; i++) {
     if (res.destroyed) break;
@@ -997,13 +1011,7 @@ async function openAiFrontPath(
       res.off("close", onResClose);
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
       await upstream.body?.cancel().catch(() => {});
-      if (upstream.status === 429) {
-        if (retryAfterMs !== null) {
-          pool429RetryAfterMs = pool429RetryAfterMs === null ? retryAfterMs : Math.min(pool429RetryAfterMs, retryAfterMs);
-        }
-      } else {
-        failedOverOnly429 = false;
-      }
+      pool429.recordFailover(upstream.status, retryAfterMs);
       completeAttemptFailure(h, attempt, {
         failure: "http",
         provenance: "upstream",
@@ -1023,9 +1031,9 @@ async function openAiFrontPath(
     try {
       const servedBy = upstream.status >= 400 ? tried.join(", ") : specOf(target);
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
-      if (upstream.status === 429 && failedOverOnly429 && pool429RetryAfterMs !== null) {
-        const effective = Math.min(pool429RetryAfterMs, retryAfterMs ?? Infinity);
-        headers["retry-after"] = String(Math.max(1, Math.ceil(effective / 1000)));
+      const poolRetryAfterMs = pool429.overrideMs(upstream.status, retryAfterMs);
+      if (poolRetryAfterMs !== undefined) {
+        headers["retry-after"] = String(Math.max(1, Math.ceil(poolRetryAfterMs / 1000)));
       }
       if (upstream.status >= 400) {
         // Error bodies are small and are never streamed: buffer, normalize the envelope, send.
