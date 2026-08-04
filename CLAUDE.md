@@ -280,9 +280,12 @@ test stale code.
   `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, so a provider with **no** declared `authEnv` still
   resolves to a name whenever either is set — which would invert the one behaviour a passthrough
   exists to provide.
-- **The breaker records failure on EVERY retriable error response (429/5xx/400/404),** including
+- **The breaker records failure on EVERY retriable error response (429/5xx/400/402/404),** including
   on the last candidate — `test/server.test.ts` "circuit breaker accounting" pins that a
-  single-candidate 429 is never recorded as a success.
+  single-candidate 429 is never recorded as a success. **402 is quota exhaustion, not a client
+  error** — on the free/router providers this proxy fronts it means depleted monthly credits, so it
+  fails over like a 429 but cools the member down for 1 hour (monthly credits don't reset in the
+  2-minute 429 window); any success clears it (`test/pool-failover.test.ts`).
 - **BOTH request paths must classify outcomes through `classifyStatus()` + `recordAttempt()`.**
   The OpenAI front (`/v1/chat/completions`) had neither failover nor breaker accounting: it was
   handed `healthyTargets[0]` and returned before the Anthropic path's loop, and it reported to

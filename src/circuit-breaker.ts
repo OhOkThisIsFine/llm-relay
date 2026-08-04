@@ -76,6 +76,16 @@ type CircuitTarget = ResolvedTarget | ProviderTargetIdentity | string;
 
 const DEFAULT_COOLDOWN_MS = 60000; // 1 minute cooldown after consecutive failures
 const RATE_LIMIT_COOLDOWN_MS = 120000; // 2 minutes cooldown on 429
+
+/**
+ * Cooldown for HTTP 402 — depleted credits on a free/router provider, i.e. a rate limit whose
+ * window is a MONTH. The 429 default would retry it every 2 minutes for the rest of the billing
+ * period, paying a round-trip per request to hear the same answer. An hour (the same default
+ * `dispatch.ts` uses for a host-reported `quota_exhausted`) demotes it without permanently hiding
+ * it: `orderByUsability` still walks cooling members last, so it is retried when everything
+ * better has failed, and any success — a mid-month top-up — clears it immediately.
+ */
+const QUOTA_EXHAUSTED_COOLDOWN_MS = 3600000; // 1 hour
 const MAX_FAILURES_BEFORE_TRIP = 2;
 const MAX_PING_HISTORY = 10;
 
@@ -307,12 +317,14 @@ export class CircuitBreaker implements AttemptLifecyclePort {
 
     // A genuine client-side 4xx says nothing about deployment health. The request lifecycle
     // still reaches its one terminal state, but it must not manufacture a failure ping. The
-    // historically retriable 400/404/429 statuses remain health failures.
+    // historically retriable 400/404/429 statuses remain health failures, and 402 joins them:
+    // depleted credits is a fact about the deployment's availability, not the request's shape.
     if (
       outcome.status !== null &&
       outcome.status >= 400 &&
       outcome.status < 500 &&
       outcome.status !== 400 &&
+      outcome.status !== 402 &&
       outcome.status !== 404 &&
       outcome.status !== 429
     ) {
@@ -405,6 +417,11 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     // or 2 minutes when it did not say.
     if (outcome.status === 429) {
       state.cooldownUntil = now + (asked ?? RATE_LIMIT_COOLDOWN_MS);
+    } else if (outcome.status === 402) {
+      // Depleted monthly credits also trips immediately, but for much longer: no provider has
+      // been observed to send a Retry-After on a 402 (the observed HuggingFace one carries
+      // none), and the 2-minute guess is off by roughly the length of a billing period.
+      state.cooldownUntil = now + (asked ?? QUOTA_EXHAUSTED_COOLDOWN_MS);
     } else if (asked !== null) {
       // A 503 with a Retry-After is the provider scheduling us; honour it on the first
       // failure rather than waiting for a second one to trip the generic cooldown.
