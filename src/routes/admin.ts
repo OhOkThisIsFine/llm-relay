@@ -6,7 +6,7 @@ import type { MetadataLogger } from "../log.js";
 import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
-import { buildDispatch, markExhausted, clearExhausted } from "../dispatch.js";
+import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, type DispatchOutcome } from "../dispatch.js";
 import { getTelemetryReport } from "../telemetry.js";
 import type { CircuitBreaker } from "../circuit-breaker.js";
 import { baseLog } from "../request-log.js";
@@ -211,8 +211,23 @@ export async function handleAdminRoutes(
     let bodyTier: string | undefined;
     let bodyClient: string | undefined = pickQuery(path, "client");
     if (req.method === "POST") {
-      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown; tier?: unknown; client?: unknown };
-      const ttlMs = typeof body.ttlMs === "number" ? body.ttlMs : undefined;
+      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown; tier?: unknown; client?: unknown; outcome?: unknown; retryAfterMs?: unknown };
+      let outcome: DispatchOutcome | undefined;
+      if (body.outcome !== undefined) {
+        if (body.outcome !== "rate_limited" && body.outcome !== "quota_exhausted") {
+          failClosed(res, 400, `POST /dispatch outcome must be "rate_limited" or "quota_exhausted"`);
+          h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
+          return true;
+        }
+        outcome = body.outcome;
+      }
+      // Explicit wins over vendor-reported wins over the outcome's default; markExhausted's own
+      // default covers the plain {"exhausted"} report. normalizeTtl clamps whatever arrives.
+      const retryAfterMs = typeof body.retryAfterMs === "number" ? body.retryAfterMs : undefined;
+      const ttlMs =
+        (typeof body.ttlMs === "number" ? body.ttlMs : undefined) ??
+        retryAfterMs ??
+        (outcome !== undefined ? OUTCOME_DEFAULT_MS[outcome] : undefined);
       bodyTier = typeof body.tier === "string" ? body.tier : undefined;
       if (body.client !== undefined && (typeof body.client !== "string" || body.client.length === 0)) {
         failClosed(res, 400, `POST /dispatch client must be a non-empty string`);

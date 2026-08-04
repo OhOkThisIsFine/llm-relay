@@ -79,6 +79,8 @@ const VALUE_FLAGS = new Set<string>([
   '--listen', '-listen', '-l',
   '--task', '-task', '-t',
   '--exhausted', '-exhausted', '-x',
+  '--outcome', '-outcome',
+  '--retry-after-ms', '-retry-after-ms',
   '--after', '-after',
   '--lane', '-lane',
   '--tier', '-tier',
@@ -213,6 +215,8 @@ ${formatTextTable([
   ["-t, --task <task>", "Task text for the selected lane."],
   ["--after <lane>", "Skip past this lane."],
   ["-x, --exhausted <lane>", "Mark this lane spent."],
+  ["--outcome <kind>", "With -x: rate_limited (15m) or quota_exhausted (1h)."],
+  ["--retry-after-ms <n>", "With -x: vendor-stated reset; beats the outcome default."],
   ["--shell sh|pwsh", "Quote for sh or PowerShell."],
   ["--json", "Print JSON."],
 ], "  ")}
@@ -781,12 +785,26 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const lane = arg && !arg.startsWith("-") ? arg : argValue("--lane");
   const tier = argValue("--tier");
   const client = argValue("--client");
+  const outcome = argValue("--outcome");
+  const retryAfterRaw = argValue("--retry-after-ms");
+
+  if (outcome !== undefined && outcome !== "rate_limited" && outcome !== "quota_exhausted") {
+    process.stderr.write(`llm-relay dispatch: --outcome must be rate_limited or quota_exhausted (got "${outcome}")\n`);
+    process.exit(1);
+  }
+  const retryAfterMs = retryAfterRaw !== undefined ? Number(retryAfterRaw) : undefined;
 
   if (spent) {
     const live = await tryServer(cfg, "/dispatch", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ exhausted: spent, ...(tier ? { tier } : {}), ...(client ? { client } : {}) }),
+      body: JSON.stringify({
+        exhausted: spent,
+        ...(tier ? { tier } : {}),
+        ...(client ? { client } : {}),
+        ...(outcome ? { outcome } : {}),
+        ...(retryAfterMs !== undefined && Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}),
+      }),
     });
     // Cooldowns are runtime state held by the proxy; with nothing listening there is no
     // process to remember it, and pretending otherwise would silently lose the report.

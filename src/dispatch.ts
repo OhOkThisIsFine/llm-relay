@@ -33,6 +33,18 @@ export const DEFAULT_EXHAUSTED_MS = 15 * 60 * 1000;
  */
 export const MAX_EXHAUSTED_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * Host-reported WHY behind an exhaustion report. Two kinds because they call for different
+ * waits: a rate limit resets on a clock measured in minutes, a spent quota on one measured in
+ * hours (or the vendor's reset boundary). The relay still never invents the signal — the host
+ * says which happened, and an explicit `ttlMs`/`retryAfterMs` always beats the outcome default.
+ */
+export type DispatchOutcome = "rate_limited" | "quota_exhausted";
+export const OUTCOME_DEFAULT_MS: Record<DispatchOutcome, number> = {
+  rate_limited: DEFAULT_EXHAUSTED_MS,
+  quota_exhausted: 60 * 60 * 1000,
+};
+
 /** Longest caller-supplied id echoed back in a `reason`. See `describeId`. */
 const MAX_ECHOED_ID = 120;
 
