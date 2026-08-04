@@ -1,7 +1,8 @@
-# Project goals — working draft
+# Project goals
 
-> Status: **DRAFT under discussion** (2026-08-04). Being hashed out in conversation before any
-> external suggestions are evaluated against it. Not yet authoritative; do not cite as policy.
+> Status: **ratified by the owner 2026-08-04** (hashed out in conversation, then confirmed).
+> This is the standing statement of what llm-relay is for and the rubric every proposed change
+> is judged against. Change it only with the owner.
 
 ## What llm-relay is for
 
@@ -89,12 +90,19 @@ side. That pair is the supported install path — for friends and for the owner'
 machines. Anything the install actually requires that lives only in CLAUDE.md or in chat history
 is a bug against this standard.
 
-## Open threads in the discussion
+## Resolution (2026-08-04, v0.16.0)
 
-- Owner sign-off on the kernel deletion (critique above; recommended in the suggestion review).
-- Owner decision on the `freeOnly` offload guard and the two optional harvests — see
-  [suggestion-review-2026-08-04.md](suggestion-review-2026-08-04.md) for the full review and the
-  recommended two-sprint path forward.
-- Confirm intended reasoning effort per Codex ladder tier (notes say "xhigh" on three tiers —
-  possibly copy-paste drift).
-- CLAUDE.md rewrite to re-center the mission statement (queued in Sprint 1).
+Every thread from the discussion closed the same day, shipped as 0.16.0:
+
+- **Kernel**: owner signed off on deletion; only the adopted attempt lifecycle remains.
+- **Harvests**: all four landed (freeOnly guard, earliest-reset Retry-After, dispatch outcome
+  split, estimator unification). The rejected remainder is documented with reasons in
+  [suggestion-review-2026-08-04.md](suggestion-review-2026-08-04.md).
+- **Codex ladder**: owner confirmed xhigh-on-three-tiers was intent, not drift; the missing
+  effort flags were added to the personal config (not the package).
+- **Docs**: CLAUDE.md re-centered on the traffic-control-plane mission; README friend-passed
+  against the "README + onboard alone" standard; the stale assessment doc deleted.
+- **Personal config**: `freeOnly: true` set on both existing offload rules.
+
+Open (minor): `llm-relay offload status` prints enabled/scope but not `freeOnly` — a small
+transparency gap in the table rendering; the JSON state carries it.
