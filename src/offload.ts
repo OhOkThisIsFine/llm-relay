@@ -16,6 +16,7 @@ import {
   DEFAULT_CLIENT,
   offloadRule,
   parseOffload,
+  unroutableOffloadClient,
   type Config,
   type OffloadConfig,
   type OffloadRule,
@@ -38,6 +39,8 @@ export interface OffloadState {
   configPath?: string;
   /** Why persistence failed, when it did. */
   persistError?: string;
+  /** Advisory: the targeted client name is one no request path ever produces (dead rule). */
+  warning?: string;
 }
 
 function normalizedClients(cfg: Config): Record<string, OffloadRule> {
@@ -63,6 +66,10 @@ export function offloadState(cfg: Config, client?: string): OffloadState {
   const scope = targeted?.scope ??
     (typeof configured === "boolean" || configured === undefined ? "subagents" : aggregateScope(clients));
 
+  // A targeted view of a name no request path produces carries the warning on the state itself,
+  // so every surface reading it (CLI, GET/POST /offload, live or file-only) reports the dead rule.
+  const unroutable = client !== undefined ? unroutableOffloadClient(client, cfg) : null;
+
   return {
     enabled,
     scope,
@@ -71,6 +78,7 @@ export function offloadState(cfg: Config, client?: string): OffloadState {
     clients,
     persisted: true,
     ...(cfg.sourcePath ? { configPath: cfg.sourcePath } : {}),
+    ...(unroutable ? { warning: unroutable.message } : {}),
   };
 }
 

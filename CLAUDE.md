@@ -322,6 +322,15 @@ test stale code.
   form is independently keyed by client and each rule defaults to subagents-only. Never infer
   enabled state from the presence of a `subagents` map. Tests pin legacy and client-specific state
   (`test/config.test.ts`, `test/offload.test.ts`).
+- **An offload rule is only ever consulted under a `clientForPath()` name** (`claude`, `codex`,
+  `openai`, `default` — `FRONT_DOOR_CLIENTS`). A rule keyed anything else ("claude-desktop" was the
+  real case) is dead config: the toggle succeeds, status shows it ON, and every request falls
+  through to the `default` rule. Creating one is therefore refused — CLI exit 1 and `POST /offload`
+  400, both via `unroutableOffloadClient()` — and the CLI must pre-check because `tryServer` treats
+  a server 400 as "no proxy" and falls back to writing the file. An already-configured dead key
+  stays visible and togglable (turning it OFF must work); status flags it ⚠ and a targeted
+  `OffloadState` carries `warning`. `test/offload.test.ts` pins the valid-name set to
+  `clientForPath` so they cannot drift apart.
 - **`freeOnly` binds RESOLVED candidates, refuses loudly, and outranks `@relay:`.** A rule with
   `freeOnly: true` filters what `subagentSpec`-rerouted traffic may reach down to deployments
   `assessCost()` calls `free` — enforced after pool expansion, because a pool lists free and paid

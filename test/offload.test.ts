@@ -4,7 +4,14 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { loadConfig, subagentSpec, type Config } from "../src/config.js";
+import {
+  clientForPath,
+  FRONT_DOOR_CLIENTS,
+  loadConfig,
+  subagentSpec,
+  unroutableOffloadClient,
+  type Config,
+} from "../src/config.js";
 import { createProxy } from "../src/server.js";
 import { offloadState, setOffload } from "../src/offload.js";
 import { buildCandidates } from "../src/candidates.js";
@@ -349,6 +356,112 @@ describe("/offload endpoint", () => {
 
     const codex = await (await fetch(`http://127.0.0.1:${port}/offload?client=codex`)).json() as { enabled?: boolean };
     expect(codex.enabled).toBe(false);
+  });
+});
+
+/**
+ * The request path derives client names ONLY through `clientForPath` — a rule keyed anything else
+ * ("claude-desktop" was the real-world case) is dead config that `offloadRule` never consults, so
+ * the operator's `--scope all` silently did nothing. Same loud-failure principle as an unknown
+ * pool: refuse to create such a rule, keep an already-configured one visible and togglable.
+ */
+describe("unroutable offload clients", () => {
+  it("the valid-name set is exactly what clientForPath can produce — pinned so they cannot drift apart", () => {
+    const derived = new Set([
+      clientForPath("/v1/messages"),
+      clientForPath("/v1/messages/count_tokens"),
+      clientForPath("/v1/responses"),
+      clientForPath("/responses"),
+      clientForPath("/v1/chat/completions"),
+      clientForPath("/chat/completions"),
+      clientForPath("/anything/else"), // the fallback front door
+    ]);
+    expect(new Set(FRONT_DOOR_CLIENTS)).toEqual(derived);
+  });
+
+  it("every front-door name is legal, configured or not — including default", () => {
+    const cfg = freshConfig("routable.json");
+    for (const name of FRONT_DOOR_CLIENTS) {
+      expect(unroutableOffloadClient(name, cfg)).toBeNull();
+    }
+  });
+
+  it("an unknown, unconfigured name is fatal and the refusal names every valid front door", () => {
+    const cfg = freshConfig("unroutable-fatal.json");
+    const issue = unroutableOffloadClient("claude-desktop", cfg);
+    expect(issue?.fatal).toBe(true);
+    expect(issue?.message).toContain("claude-desktop");
+    for (const name of FRONT_DOOR_CLIENTS) expect(issue?.message).toContain(name);
+  });
+
+  it("an already-configured unknown key stays legal but non-fatal, and status carries the warning", () => {
+    const cfg = freshConfig("unroutable-warn.json", {
+      offload: { "claude-desktop": { enabled: true, scope: "all" } },
+    });
+    const issue = unroutableOffloadClient("claude-desktop", cfg);
+    expect(issue?.fatal).toBe(false);
+
+    // State is not hidden: the rule shows exactly as configured, with the dead-rule warning on it.
+    const state = offloadState(cfg, "claude-desktop");
+    expect(state.enabled).toBe(true);
+    expect(state.scope).toBe("all");
+    expect(state.warning).toContain("no request ever consults it");
+    // A routable client's targeted view stays warning-free.
+    expect(offloadState(cfg, "claude").warning).toBeUndefined();
+  });
+
+  describe("POST /offload", () => {
+    const servers: Server[] = [];
+    afterAll(() => servers.forEach((s) => s.close()));
+
+    const listen = async (s: Server): Promise<number> => {
+      servers.push(s);
+      return new Promise((resolve) => s.listen(0, "127.0.0.1", () => resolve((s.address() as AddressInfo).port)));
+    };
+
+    it("refuses (400, no write) a client no request path ever produces", async () => {
+      const path = join(dir, "endpoint-unroutable.json");
+      writeFileSync(path, JSON.stringify(CONFIG, null, 2));
+      const cfg = loadConfig(path);
+      const proxy = createProxy(cfg, { controlAuthorization: CONTROL_AUTHORIZATION });
+      const port = await listen(proxy);
+
+      const res = await fetch(`http://127.0.0.1:${port}/offload`, {
+        method: "POST",
+        headers: CONTROL_JSON_HEADERS,
+        body: JSON.stringify({ client: "claude-desktop", enabled: true, scope: "all" }),
+      });
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("claude-desktop");
+      // Refusal means refusal: nothing changed in memory or on disk.
+      expect(cfg.routing.offload).toBe(false);
+      expect(JSON.parse(readFileSync(path, "utf8")).routing.offload).toBeUndefined();
+    });
+
+    it("still toggles an already-configured dead rule OFF — state is never trapped", async () => {
+      const path = join(dir, "endpoint-dead-off.json");
+      writeFileSync(path, JSON.stringify({
+        ...CONFIG,
+        routing: {
+          ...CONFIG.routing,
+          offload: { "claude-desktop": { enabled: true, scope: "all" } },
+        },
+      }, null, 2));
+      const cfg = loadConfig(path);
+      const proxy = createProxy(cfg, { controlAuthorization: CONTROL_AUTHORIZATION });
+      const port = await listen(proxy);
+
+      const res = await fetch(`http://127.0.0.1:${port}/offload`, {
+        method: "POST",
+        headers: CONTROL_JSON_HEADERS,
+        body: JSON.stringify({ client: "claude-desktop", enabled: false }),
+      });
+      expect(res.status).toBe(200);
+      const state = (await res.json()) as { enabled: boolean; warning?: string };
+      expect(state.enabled).toBe(false);
+      expect(state.warning).toContain("no request ever consults it");
+      expect(JSON.parse(readFileSync(path, "utf8")).routing.offload["claude-desktop"].enabled).toBe(false);
+    });
   });
 });
 
