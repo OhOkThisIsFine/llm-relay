@@ -1,8 +1,11 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeAll, afterAll } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createProxy } from "../src/server.js";
-import { ModelCatalog } from "../src/catalog.js";
+import { ModelCatalog, type ModelLimits } from "../src/catalog.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 
 function port(s: Server): number {
@@ -11,13 +14,30 @@ function port(s: Server): number {
 
 /**
  * `cachePath: null` keeps the proxy off the developer's real ~/.llm-relay/models-cache.json.
- * The front resolves a concrete target model, so the context guardrail calls `cachedLimits()`
- * on this path too — with the default catalog these tests read that file, and a machine holding
- * a real entry for the provider/model id a test uses would 400 the request it expects to serve.
+ * The front resolves concrete target models, so the context guardrail calls `cachedLimits()` on
+ * this path too — with the default catalog these tests read that file, and a machine holding a
+ * real entry for the provider/model id a test uses would 400 the request it expects to serve.
+ * (This comment predates the behaviour: until 0.17.0 the guardrail was gated to /v1/messages
+ * and never ran here, so the hermeticity it describes was one code move away from mattering.)
  */
-function startProxy(c: Config): Promise<Server> {
-  const s = createProxy(c, { catalog: new ModelCatalog({ cachePath: null }) });
+function startProxy(c: Config, catalog: ModelCatalog = new ModelCatalog({ cachePath: null })): Promise<Server> {
+  const s = createProxy(c, { catalog });
   return new Promise((r) => s.listen(0, "127.0.0.1", () => r(s)));
+}
+
+/** A catalog seeded from a temp cache file — the only way to give `cachedLimits()` data without fetching. */
+function catalogWithLimits(dir: string, seed: Record<string, Record<string, Partial<ModelLimits>>>): ModelCatalog {
+  const file = join(dir, `cache-${Math.random().toString(36).slice(2)}.json`);
+  const entries: Record<string, unknown> = {};
+  for (const [provider, models] of Object.entries(seed)) {
+    const limits: Record<string, ModelLimits> = {};
+    for (const [model, l] of Object.entries(models)) {
+      limits[model] = { contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, ...l };
+    }
+    entries[provider] = { fetchedAt: Date.now(), models: Object.keys(models), limits };
+  }
+  writeFileSync(file, JSON.stringify(entries));
+  return new ModelCatalog({ cachePath: file });
 }
 
 /** Mock OpenAI /chat/completions backend capturing the model + auth it received. */
@@ -360,5 +380,99 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(resp.status).toBe(429);
     expect(await resp.text()).toBe(upstreamBody);
     expect(resp.headers.get("retry-after")).toBe("42");
+  });
+});
+
+/**
+ * INV: the context guardrail covers the OpenAI front, with the same policy as /v1/messages —
+ * prune candidates whose SERVING-provider-published limit the estimate exceeds, fail closed
+ * only when nothing survives, and never guard on an unpublished limit.
+ *
+ * Until 0.17.0 the guardrail was gated to /v1/messages, so front requests reached backends
+ * with no context pre-check — while this file's hermeticity comment claimed otherwise. The
+ * same "two paths, two policies, one of them empty" shape as the pool-failover incident.
+ */
+describe("OpenAI front context guardrail", () => {
+  let dir: string;
+  let backend: Server;
+  let proxy: Server;
+  beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "rp-front-guard-")); });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+  afterEach(() => {
+    backend?.close();
+    proxy?.close();
+  });
+
+  // ~4000 chars ≈ 1000 estimated tokens — far over a 200-token limit, far under a 1M one.
+  const chatBody = JSON.stringify({ model: "pool/duo", messages: [{ role: "user", content: "x".repeat(4000) }] });
+
+  function duoConfig(backendPort: number): Config {
+    const c = cfg({ up: { base: `http://127.0.0.1:${backendPort}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
+    c.routing.pools = { duo: ["up/small", "up/big"] };
+    return c;
+  }
+
+  it("prunes an undersized pool member and serves from the one that fits", async () => {
+    const mock = await mockOpenAi();
+    backend = mock.server;
+    const catalog = catalogWithLimits(dir, { up: { small: { contextLength: 200 }, big: { contextLength: 1_000_000 } } });
+    proxy = await startProxy(duoConfig(port(backend)), catalog);
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/chat/completions`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: chatBody,
+    });
+    expect(resp.status).toBe(200);
+    expect(mock.seen().model).toBe("big"); // "small" stepped aside before any upstream spend
+  });
+
+  it("fails closed with 400 naming the provider's published limit when every candidate is pruned", async () => {
+    const mock = await mockOpenAi();
+    backend = mock.server;
+    const catalog = catalogWithLimits(dir, { up: { small: { contextLength: 200 }, big: { contextLength: 300 } } });
+    proxy = await startProxy(duoConfig(port(backend)), catalog);
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/chat/completions`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: chatBody,
+    });
+    expect(resp.status).toBe(400);
+    const j = (await resp.json()) as { error?: { message?: string } };
+    expect(j.error?.message).toMatch(/"up" publishes for "small"/);
+    expect(j.error?.message).toContain("200");
+    expect(mock.seen().model).toBeUndefined(); // nothing reached a backend
+  });
+
+  it("does NOT guard when the provider published nothing — no invented fallback ceiling", async () => {
+    const mock = await mockOpenAi();
+    backend = mock.server;
+    // Default hermetic catalog: no limits known, so an enormous prompt must reach the backend
+    // and get the backend's own authoritative answer.
+    proxy = await startProxy(duoConfig(port(backend)));
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/chat/completions`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/duo", messages: [{ role: "user", content: "x".repeat(600_000) }] }),
+    });
+    expect(resp.status).toBe(200);
+    expect(mock.seen().model).toBe("small");
+  });
+
+  it("guards the /v1/responses shape too — the estimator counts `input`", async () => {
+    const mock = await mockOpenAi();
+    backend = mock.server;
+    const catalog = catalogWithLimits(dir, { up: { small: { contextLength: 200 } } });
+    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
+    proxy = await startProxy(c, catalog);
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "up/small",
+        input: [{ role: "user", content: [{ type: "input_text", text: "x".repeat(4000) }] }],
+      }),
+    });
+    expect(resp.status).toBe(400);
+    const j = (await resp.json()) as { error?: { message?: string } };
+    expect(j.error?.message).toMatch(/"up" publishes for "small"/);
+    expect(mock.seen().model).toBeUndefined();
   });
 });
