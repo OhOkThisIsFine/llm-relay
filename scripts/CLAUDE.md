@@ -25,4 +25,4 @@ Needs network (no provider key):
 - `sync-tiers.mjs` (`npm run sync:tiers`) — snapshots **OpenRouter** (Artificial Analysis intelligence/coding/agentic indices, Design Arena Elo, context length, pricing, tool support — and the only source whose ids match our routing specs exactly), **BFCL** (tool-use accuracy), **LMArena** (general) and **Aider polyglot** (edit benchmark + edit-format compliance) into `docs/tier-data.json` (~770 models). Each source is independently failable and records a warning; schema drift inside a source still throws loudly — don't "fix" that by softening the check. Zero working sources is fatal.
 
 Usage wrappers (for pointing a real `claude` CLI at a running proxy):
-- `claude-proxied.ps1` / `claude-proxied.sh` — see README "Use it from your projects".
+- `claude-proxied.ps1` / `claude-proxied.sh` — see docs/reference.md "Using it from your projects".

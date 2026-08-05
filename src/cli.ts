@@ -161,39 +161,7 @@ function formatTextTable(rows: readonly TableRow[], indent = ""): string {
     .join("\n");
 }
 
-const HELP = `llm-relay — loopback Anthropic/OpenAI proxy with tool-call validation and repair.
-
-Routing:
-  Model routing order:
-${formatTextTable([
-  ["pool/<name>", "Fitness-ranked pool with failover."],
-  ["provider/model", "Exact target; no reranking."],
-  ["Claude model id", "Matches opus|sonnet|haiku|fable tiers."],
-  ["anything else", "Uses routing.default."],
-], "  ")}
-
-Anthropic providers without authEnv forward caller credentials. Use them for Claude traffic while
-pool/* requests use other providers.
-
-Offload:
-${formatTextTable([
-  ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Set one harness's rule."],
-  ["llm-relay offload [status]", "Show current rules."],
-  ["harness", "claude | codex | <configured client>"],
-  ["scope", "subagents | all (default: subagents)"],
-  ["llm-relay candidates", "Show offload target data."],
-], "  ")}
-
-One-off: put "@relay: <spec>" on its own line in the subagent prompt; the relay strips it.
-
-Setup checks:
-${formatTextTable([
-  ["llm-relay keys", "Check provider keys."],
-  ["llm-relay pools --probe", "Test every pool model."],
-], "  ")}
-  keys uses an authenticated probe when possible; --probe sends a real completion per model.
-
-Keys: environment variables override ~/.llm-relay/.env.
+const HELP = `llm-relay — loopback Anthropic/OpenAI proxy: routes models across providers, repairs tool calls.
 
 Usage:
 ${formatTextTable([
@@ -201,20 +169,36 @@ ${formatTextTable([
   ["llm-relay onboard", "Set up provider keys."],
   ["llm-relay setup [target]", "target: claude-cli | claude-desktop."],
   ["llm-relay keys | check-keys", "Check provider keys."],
-  ["llm-relay telemetry", "Print telemetry/quota JSON."],
-  ["llm-relay models [-p <name>] [-r]", "List provider models."],
   ["llm-relay pools [--probe]", "List pool members; --probe tests each."],
   ["llm-relay pools <action> <name> [<spec>...]", "action: set|add|remove|delete."],
   ["llm-relay routing <action> ...", "action: show|get|default|tier|subagent|sort|benchmark|set|unset."],
   ["llm-relay config <action> [<path>] [<value>]", "action: show|get|set|unset."],
+  ["llm-relay models [-p <name>] [-r]", "List provider models."],
   ["llm-relay ping [-p <name>]", "Probe providers."],
-  ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Set one harness's rule."],
-  ["llm-relay offload [status]", "Show current rules."],
+  ["llm-relay telemetry", "Print telemetry/quota JSON."],
+  ["llm-relay offload [status]", "Show current offload rules."],
+  ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
+  ["llm-relay candidates [-p <name>]", "Compare offload targets."],
   ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane."],
-  ["llm-relay candidates [-p <name>]", "Show offload target data."],
   ["llm-relay help | --help | -h", "Show help."],
   ["llm-relay version | --version | -v", "Print version."],
 ], "  ")}
+
+Model routing (first match wins):
+${formatTextTable([
+  ["pool/<name>", "Ranked pool with failover."],
+  ["provider/model", "Exact target; never reranked."],
+  ["Claude model id", "Matches opus|sonnet|haiku|fable tiers."],
+  ["anything else", "Uses routing.default."],
+], "  ")}
+  An anthropic provider without authEnv forwards the caller's own credentials — use it to keep
+  Claude traffic on real Anthropic while pool/* requests use other providers.
+
+Offload is off by default. To route one subagent call without turning it on, put
+"@relay: <spec>" on its own line at the start of the subagent prompt (the relay strips it).
+
+Setup checks: "llm-relay keys" verifies credentials; "llm-relay pools --probe" sends a real
+completion to every pool model. Environment variables override ~/.llm-relay/.env.
 
 Dispatch options:
 ${formatTextTable([

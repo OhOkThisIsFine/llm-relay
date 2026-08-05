@@ -442,7 +442,7 @@ export interface Config {
 
 /**
  * Tools a repaired call is never allowed to name. THE single definition — the
- * shipped config template, config.example.json and the README all derive from or
+ * shipped config template, config.example.json and the docs all derive from or
  * are asserted equal to this list, because they previously disagreed: this array
  * had 8 entries including "remove" while the other three had 7, so a config that
  * omitted repair.destructiveTools got different coverage than a generated one.
