@@ -171,9 +171,9 @@ function describe(v: unknown): string {
   return typeof v;
 }
 
-/** Deterministic key for schema caching (order-independent). */
-function stableStringify(v: unknown): string {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
+/** Order-independent deterministic serialization — schema cache keys here, block comparison in repair.ts. */
+export function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "undefined";
   if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
   const keys = Object.keys(v as Record<string, unknown>).sort();
   return `{${keys

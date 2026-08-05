@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import {
   loadConfig,
+  splitSpec,
   unroutableOffloadClient,
   type Config,
   type ConfigOverrides,
@@ -350,11 +351,7 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
   2,
 );
 
-/** Split a "provider/model" spec on the first slash. */
-export function splitSpec(spec: string): { provider: string; model?: string } {
-  const i = spec.indexOf("/");
-  return i === -1 ? { provider: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
-}
+export { splitSpec };
 
 export function resolveConfigPath(): string {
   const explicit = argValue("--config", "-c");

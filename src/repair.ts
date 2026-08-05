@@ -4,7 +4,7 @@ import {
   isToolUseBlock,
   type JsonSchema,
 } from "./anthropic.js";
-import { type ToolUseValidator } from "./validator.js";
+import { stableStringify, type ToolUseValidator } from "./validator.js";
 import { type Reshaper } from "./reshaper.js";
 
 export type RepairOutcome =
@@ -193,16 +193,6 @@ function conservesStructure(original: AssistantMessage, candidate: AssistantMess
     if (stableStringify(a) !== stableStringify(b)) return false;
   }
   return true;
-}
-
-/** Order-independent structural key, so a re-serialized block still compares equal. */
-function stableStringify(v: unknown): string {
-  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "undefined";
-  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
-  const keys = Object.keys(v as Record<string, unknown>).sort();
-  return `{${keys
-    .map((k) => `${JSON.stringify(k)}:${stableStringify((v as Record<string, unknown>)[k])}`)
-    .join(",")}}`;
 }
 
 /**

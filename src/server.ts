@@ -26,6 +26,7 @@ import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens, assessCost } from "./metadata.js";
+import { specOfTarget } from "./benchmarks.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog, logSafePath } from "./request-log.js";
 import type {
@@ -932,7 +933,7 @@ async function openAiFrontPath(
     if (res.destroyed) break;
     const target = candidates[i]!;
     const isLast = i === candidates.length - 1;
-    tried.push(specOf(target));
+    tried.push(specOfTarget(target));
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
@@ -1029,7 +1030,7 @@ async function openAiFrontPath(
     // see that the failure they are holding is the last of N, not the only one.
     const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
     try {
-      const servedBy = upstream.status >= 400 ? tried.join(", ") : specOf(target);
+      const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
       const poolRetryAfterMs = pool429.overrideMs(upstream.status, retryAfterMs);
       if (poolRetryAfterMs !== undefined) {
@@ -1075,11 +1076,6 @@ async function openAiFrontPath(
   }
   // Unreachable with candidates present: the last iteration always responds and returns. An
   // empty candidate list cannot get here either — routing rejects that with a 400 upstream.
-}
-
-/** The `provider/model` spec a resolved target came from — what a reader recognises from config. */
-function specOf(t: ResolvedTarget): string {
-  return t.model ? `${t.provider}/${t.model}` : t.provider;
 }
 
 /** detect/default: forward bytes unchanged, observe + log if applicable. */
@@ -1850,13 +1846,6 @@ function pickString(obj: unknown, key: string): string | null {
     if (typeof v === "string") return v;
   }
   return null;
-}
-
-/** Read one query-string param off a raw request path. */
-function pickQuery(path: string, key: string): string | null {
-  const q = path.indexOf("?");
-  if (q === -1) return null;
-  return new URLSearchParams(path.slice(q + 1)).get(key);
 }
 
 function pickBool(obj: unknown, key: string): boolean {
