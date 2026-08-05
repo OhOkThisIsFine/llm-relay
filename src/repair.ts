@@ -190,6 +190,14 @@ function conservesStructure(original: AssistantMessage, candidate: AssistantMess
       if (a.id !== b.id || a.name !== b.name) return false;
       continue;
     }
+    // Non-tool blocks: check for structural equality.
+    // Short-circuit on reference equality before stringifying.
+    if (a === b) continue;
+    // For non-objects or primitives, use direct comparison; otherwise use stable stringify.
+    if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+      if (a !== b) return false;
+      continue;
+    }
     if (stableStringify(a) !== stableStringify(b)) return false;
   }
   return true;

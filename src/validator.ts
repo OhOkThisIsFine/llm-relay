@@ -51,6 +51,7 @@ export interface ValidationResult {
 export class ToolUseValidator {
   private readonly ajv: AjvInstance;
   private readonly cache = new Map<string, ValidateFunction | null>();
+  private readonly schemaStringCache = new WeakMap<object, string>();
 
   constructor() {
     // Non-strict so vendor schemas (unknown formats/keywords) aren't rejected by
@@ -60,7 +61,15 @@ export class ToolUseValidator {
 
   /** Returns a compiled validator, or null if the schema could not compile. */
   private compiledFor(name: string, schema: JsonSchema): ValidateFunction | null {
-    const key = `${name}::${stableStringify(schema)}`;
+    // The parsed schema object is shared across a request's tool_use blocks
+    // (toolSchemaMap guarantees it is a real object), so memoize its stable
+    // string per object rather than re-serializing it on every validate call.
+    let schemaStr = this.schemaStringCache.get(schema);
+    if (schemaStr === undefined) {
+      schemaStr = stableStringify(schema);
+      this.schemaStringCache.set(schema, schemaStr);
+    }
+    const key = `${name}::${schemaStr}`;
     if (this.cache.has(key)) return this.cache.get(key) ?? null;
     let fn: ValidateFunction | null;
     try {
