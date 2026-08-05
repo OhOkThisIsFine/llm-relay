@@ -378,7 +378,8 @@ fabricates credential bugs.** On Windows a User-scope environment variable enter
 that a freshly launched shell had. `llm-relay keys` / `llm-relay candidates` run as new processes and
 report *their own* env; `GET /registry` and `GET /candidates` are answered by the relay and are the
 authoritative `has_key`. The two disagreed, and the whole "half the pool is dead, seven 401s" finding
-of 2026-07-30 was this — **not** bad keys. `pool/coding` went from 5 live members to **11**
+of 2026-07-30 was this — **not** bad keys. `pool/coding` (the pools were task-named back then; they
+are effort-named — `low`/`medium`/`high`/`xhigh` — since v0.15.4) went from 5 live members to **11**
 (`llm-relay pools --probe`: 29/35 live overall). **`winenv.ts` now closes the gap at startup**, so a
 key added after logon is picked up on the next relay restart rather than needing a reboot. ⚠ Still
 check `curl 127.0.0.1:8791/registry | grep has_key` before ever concluding a key is bad. Genuinely
@@ -421,8 +422,9 @@ Every script in `scripts/` and every proxy endpoint has been exercised live agai
 `getStrength()` ranks pools off it. Source probe results, coverage per source, and why EvalPlus /
 HF Open LLM / LiveCodeBench were rejected: [docs/capability-sources.md](docs/capability-sources.md).
 
-Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; top of the
-`coding` pool by synced strength, 4 signals). `llama-3.1-8b` trips 25% of calls and the reshaper
+Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; it topped
+the then-`coding` pool by synced strength, 4 signals — pools are effort-tiered now, see
+`config.example.json`). `llama-3.1-8b` trips 25% of calls and the reshaper
 fixes ~2/3 of those — the proxy's use case.
 
 Durable project state also lives in agent memory (`project-repair-proxy`).
