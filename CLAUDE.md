@@ -2,7 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Read this first. It's the map; [README.md](README.md) is the user-facing usage guide.
+Read this first. It's the map; [README.md](README.md) is the short user-facing front door
+(kept ~400 words for npm) and [docs/reference.md](docs/reference.md) is the full usage
+reference — user-facing detail belongs there, not in the README.
 
 ## What this is
 
