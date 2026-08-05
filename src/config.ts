@@ -171,17 +171,20 @@ const CODEX_SUBAGENT_REQUEST_KIND = "subagent";
 /** Routing directive the dispatcher may put on its own line in a subagent prompt. */
 const RELAY_DIRECTIVE = /^[ \t]*@relay:[ \t]*(\S+)[ \t]*$/m;
 
-/** Flatten an Anthropic `system` field (string or content-block array) to plain text. */
-function systemText(system: unknown): string {
-  if (typeof system === "string") return system;
-  if (!Array.isArray(system)) return "";
-  return system.map((b) => (typeof b === "string" ? b : ((b as { text?: unknown }).text ?? ""))).join("\n");
-}
-
 /** True when this request is a marked Claude Code or local Codex child turn. */
 export function isSubagentRequest(reqJson: unknown, headers?: RequestHeaders): boolean {
   if (typeof reqJson === "object" && reqJson !== null) {
-    if (systemText((reqJson as { system?: unknown }).system).includes(SUBAGENT_MARKER)) return true;
+    const system = (reqJson as { system?: unknown }).system;
+    // Check if system contains SUBAGENT_MARKER. Since the marker contains no newline,
+    // it cannot span join boundaries — safe to check each block independently.
+    if (typeof system === "string") {
+      if (system.includes(SUBAGENT_MARKER)) return true;
+    } else if (Array.isArray(system)) {
+      for (const b of system) {
+        const text = typeof b === "string" ? b : ((b as { text?: unknown }).text ?? "");
+        if (typeof text === "string" && text.includes(SUBAGENT_MARKER)) return true;
+      }
+    }
   }
 
   // Codex's Responses requests do not have an Anthropic `system` field. Its local clients identify
