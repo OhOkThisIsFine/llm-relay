@@ -96,8 +96,8 @@ rule.
 ```jsonc
 "routing": {
   "tiers":     { "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic", "fable": "anthropic" },
-  "subagents": { "opus": "pool/reasoning", "sonnet": "pool/coding", "haiku": "pool/fast", "default": "pool/coding" },
-  "pools":     { "coding": ["nim/z-ai/glm-5.2", "nim/deepseek-ai/deepseek-v4-pro"] },
+  "subagents": { "opus": "pool/xhigh", "fable": "pool/xhigh", "sonnet": "pool/high", "haiku": "pool/medium", "default": "pool/medium" },
+  "pools":     { "high": { "preferred": [], "include": "free", "effort": "high" } },
   "offload": {
     "claude": { "enabled": true, "scope": "subagents" },
     "codex":  { "enabled": false, "scope": "all" }

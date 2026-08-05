@@ -153,7 +153,7 @@ To offload a **single** dispatch without turning the switch on globally, put thi
 line of that subagent's prompt:
 
 ```
-@relay: pool/coding
+@relay: pool/high
 ```
 
 The line is stripped before forwarding, so the model never sees it.
