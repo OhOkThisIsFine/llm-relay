@@ -1,4 +1,4 @@
-import { anyOffloadEnabled, type Config, type OffloadRule, type ProviderConfig } from "./config.js";
+import { anyOffloadEnabled, splitSpec, type Config, type OffloadRule, type ProviderConfig } from "./config.js";
 import { POOL_PREFIX } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
@@ -201,11 +201,6 @@ function collectSpecs(cfg: Config): Map<string, { pools: string[]; subagentTiers
 function metadataConfidence(source: MetadataSource | null, exactMatch: boolean): number {
   if (source === "provider") return 1;
   return source === "reference" && exactMatch ? 0.5 : 0;
-}
-
-function splitSpec(spec: string): { provider: string; model?: string } {
-  const i = spec.indexOf("/");
-  return i === -1 ? { provider: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
 }
 
 /** Build the un-blended decision table for offload targets. */

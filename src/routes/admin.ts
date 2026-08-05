@@ -115,33 +115,36 @@ export async function handleAdminRoutes(
   cfg: Config,
   h: AdminHandlers,
 ): Promise<boolean> {
-  if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
-    const models = relayModels(cfg);
+  const ok = (body: unknown, pretty = false): true => {
     res.writeHead(200, { "content-type": "application/json" });
-    // `data` is the standard OpenAI shape; Codex's custom-provider catalog reader also accepts
-    // the same entries under `models`. Returning both keeps the endpoint useful to both clients.
-    res.end(JSON.stringify({ object: "list", data: models, models }));
+    res.end(pretty ? JSON.stringify(body, null, 2) : JSON.stringify(body));
     h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
     return true;
+  };
+  const bad = (status: number, message: string): true => {
+    failClosed(res, status, message);
+    h.logger.write(baseLog(started, path, false, false, status, "skipped", null));
+    return true;
+  };
+
+  if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
+    const models = relayModels(cfg);
+    // `data` is the standard OpenAI shape; Codex's custom-provider catalog reader also accepts
+    // the same entries under `models`. Returning both keeps the endpoint useful to both clients.
+    return ok({ object: "list", data: models, models });
   }
 
   // Discovery endpoint for an external dispatcher
   if (req.method === "GET" && pathname === "/registry") {
     const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(view));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return true;
+    return ok(view);
   }
 
   if (req.method === "GET" && pathname === "/ping") {
     if (h.pingLoop) {
       await h.pingLoop.tickOnce();
     }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, pingMode: h.pingLoop?.getMode(), intervalMs: h.pingLoop?.getIntervalMs() }));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return true;
+    return ok({ ok: true, pingMode: h.pingLoop?.getMode(), intervalMs: h.pingLoop?.getIntervalMs() });
   }
 
   if (req.method === "GET" && (pathname === "/health/stats" || pathname === "/health")) {
@@ -151,10 +154,7 @@ export async function handleAdminRoutes(
       ping_mode: h.pingLoop?.getMode(),
       providers: view.providers,
     };
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(stats));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return true;
+    return ok(stats);
   }
 
   if (req.method === "GET" && pathname === "/candidates") {
@@ -165,10 +165,7 @@ export async function handleAdminRoutes(
       ...(h.pingLoop ? { pingLoop: h.pingLoop } : {}),
       ...(providerFilter ? { provider: providerFilter } : {}),
     });
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return true;
+    return ok(view, true);
   }
 
   if ((req.method === "GET" || req.method === "POST") && pathname === "/offload") {
@@ -179,25 +176,17 @@ export async function handleAdminRoutes(
       const client = typeof body.client === "string" && body.client.length > 0 ? body.client : queryClient;
       const scope = body.scope === undefined ? undefined : body.scope;
       if (body.client !== undefined && (typeof body.client !== "string" || body.client.length === 0)) {
-        failClosed(res, 400, `POST /offload client must be a non-empty string`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return true;
+        return bad(400, `POST /offload client must be a non-empty string`);
       }
       if (scope !== undefined && scope !== "subagents" && scope !== "all") {
-        failClosed(res, 400, `POST /offload scope must be "subagents" or "all"`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return true;
+        return bad(400, `POST /offload scope must be "subagents" or "all"`);
       }
       if (scope !== undefined && client === undefined) {
-        failClosed(res, 400, `POST /offload scope requires a client`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return true;
+        return bad(400, `POST /offload scope requires a client`);
       }
       const want = body.enabled;
       if (typeof want !== "boolean") {
-        failClosed(res, 400, `POST /offload needs {"enabled": true|false, "client"?: string, "scope"?: "subagents"|"all"}`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return true;
+        return bad(400, `POST /offload needs {"enabled": true|false, "client"?: string, "scope"?: "subagents"|"all"}`);
       }
       // A toggle keyed to a name no front door produces would be dead config that silently does
       // nothing — refuse it like an unknown pool. An already-configured key stays togglable (an
@@ -205,17 +194,12 @@ export async function handleAdminRoutes(
       if (client !== undefined) {
         const unroutable = unroutableOffloadClient(client, cfg);
         if (unroutable?.fatal) {
-          failClosed(res, 400, `POST /offload: ${unroutable.message}`);
-          h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-          return true;
+          return bad(400, `POST /offload: ${unroutable.message}`);
         }
       }
       state = setOffload(cfg, want, client, scope as OffloadScope | undefined);
     }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(state, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return true;
+    return ok(state, true);
   }
 
   if ((req.method === "GET" || req.method === "POST") && pathname === "/dispatch") {
@@ -226,9 +210,7 @@ export async function handleAdminRoutes(
       let outcome: DispatchOutcome | undefined;
       if (body.outcome !== undefined) {
         if (body.outcome !== "rate_limited" && body.outcome !== "quota_exhausted") {
-          failClosed(res, 400, `POST /dispatch outcome must be "rate_limited" or "quota_exhausted"`);
-          h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-          return true;
+          return bad(400, `POST /dispatch outcome must be "rate_limited" or "quota_exhausted"`);
         }
         outcome = body.outcome;
       }
@@ -241,9 +223,7 @@ export async function handleAdminRoutes(
         (outcome !== undefined ? OUTCOME_DEFAULT_MS[outcome] : undefined);
       bodyTier = typeof body.tier === "string" ? body.tier : undefined;
       if (body.client !== undefined && (typeof body.client !== "string" || body.client.length === 0)) {
-        failClosed(res, 400, `POST /dispatch client must be a non-empty string`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return true;
+        return bad(400, `POST /dispatch client must be a non-empty string`);
       }
       if (typeof body.client === "string") bodyClient = body.client;
       if (typeof body.clear === "string") {
@@ -252,21 +232,15 @@ export async function handleAdminRoutes(
         clearExhausted(cfg);
       } else if (typeof body.exhausted === "string") {
         if (!markExhausted(cfg, body.exhausted, ttlMs, bodyTier)) {
-          failClosed(res, 400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
-          h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-          return true;
+          return bad(400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
         }
       } else {
-        failClosed(res, 400, `POST /dispatch needs {"exhausted":"<lane>"} or {"clear":"<lane>"|true}`);
-        h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-        return true;
+        return bad(400, `POST /dispatch needs {"exhausted":"<lane>"} or {"clear":"<lane>"|true}`);
       }
     }
     const rawTask = pickQuery(path, "task");
     if (typeof rawTask === "string" && rawTask.length > MAX_TASK_LEN) {
-      failClosed(res, 400, `?task= exceeds ${MAX_TASK_LEN} characters`);
-      h.logger.write(baseLog(started, path, false, false, 400, "skipped", null));
-      return true;
+      return bad(400, `?task= exceeds ${MAX_TASK_LEN} characters`);
     }
     const taskParam = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : undefined;
     const view = buildDispatch(cfg, {
@@ -276,18 +250,11 @@ export async function handleAdminRoutes(
       ...((pickQuery(path, "tier") ?? bodyTier) ? { tier: (pickQuery(path, "tier") ?? bodyTier) as string } : {}),
       ...(bodyClient ? { client: bodyClient } : {}),
     });
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(view, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return true;
+    return ok(view, true);
   }
 
   if (req.method === "GET" && pathname === "/telemetry") {
-    const report = getTelemetryReport(cfg, h.breaker);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(report, null, 2));
-    h.logger.write(baseLog(started, path, false, false, 200, "skipped", null));
-    return true;
+    return ok(getTelemetryReport(cfg, h.breaker), true);
   }
 
   return false;

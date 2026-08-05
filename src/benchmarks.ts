@@ -269,11 +269,12 @@ export function rankTargetsWithProvenance(
   } = {},
 ): RankedTarget[] {
   const cache = new Map<string, Strength>();
+  const tierData = opts.tierData === undefined ? loadTierData() : opts.tierData;
   const ranked: RankedTarget[] = targets.map((target) => {
     const spec = specOfTarget(target);
     let strength = cache.get(spec);
     if (strength === undefined) {
-      strength = getStrength(spec, opts.tierData === undefined ? loadTierData() : opts.tierData);
+      strength = getStrength(spec, tierData);
       cache.set(spec, strength);
     }
     // The custom callback already owns operational telemetry. Constructing the default first made
