@@ -58,6 +58,40 @@ describe("metadata", () => {
     expect(est).toBeLessThan(100); // nowhere near 25k — the blob did not count
     expect(est).toBeGreaterThan(Math.floor(text.length / 4) - 1); // the text did
   });
+
+  it("counts OpenAI Responses `instructions` and `input` — the front's other wire shape", () => {
+    // The guardrail runs on the OpenAI front too (0.17.0). Chat shares `messages`+`tools`
+    // with the Anthropic shape, but a Responses body carries its prompt here instead — an
+    // estimator blind to these fields would report ~0 and never prune on that path.
+    const responses = {
+      instructions: "s".repeat(2000),
+      input: [{ role: "user", content: [{ type: "input_text", text: "x".repeat(2000) }] }],
+    };
+    expect(estimateRequestTokens(responses)).toBeGreaterThan(900);
+    expect(estimateRequestTokens({ input: "just a plain string input" })).toBeGreaterThan(4);
+  });
+
+  it("excludes base64 data: URLs — the OpenAI shapes inline media there, not in a `data` field", () => {
+    // Same blob, different envelope: OpenAI Chat/Responses put base64 images in a
+    // `url`/`image_url` STRING, so the Anthropic-side `data`-key skip never fires. A 1MB
+    // image counted as text would prune every candidate the moment the guardrail covered
+    // the front.
+    const text = "Describe this image for me please.";
+    const withImage = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: "data:image/png;base64," + "A".repeat(100_000) } },
+            { type: "text", text },
+          ],
+        },
+      ],
+    };
+    const est = estimateRequestTokens(withImage);
+    expect(est).toBeLessThan(100); // the data URL did not count
+    expect(est).toBeGreaterThan(Math.floor(text.length / 4) - 1); // the text did
+  });
 });
 
 describe("assessCost — the one definition of free", () => {

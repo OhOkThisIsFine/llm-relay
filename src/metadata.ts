@@ -129,25 +129,32 @@ export function assessCost(
 }
 
 /**
- * Estimate input prompt token count from an Anthropic messages request object.
+ * Estimate input prompt token count from a request object.
  *
- * The ONE estimator — the context guardrail and the local `count_tokens` answer
- * for OpenAI backends both use it (there used to be two, which disagreed: one
- * ignored tools, the other counted base64 payloads as text). ~4 chars/token
- * over every string in system+messages+tools — tool schemas and tool_use
- * inputs genuinely consume context upstream, so they count. Binary payloads
- * (the `data` field of base64 image/document sources) are excluded: a base64
- * blob's byte length says nothing about its token cost, and a wildly inflated
- * guess must not masquerade as a measurement. Undercounting media is safe in
- * both call sites — the guardrail only prunes on published limits and the
- * provider stays authoritative; count_tokens is advisory bookkeeping.
+ * The ONE estimator — the context guardrail (on BOTH fronts) and the local
+ * `count_tokens` answer for OpenAI backends all use it (there used to be two,
+ * which disagreed: one ignored tools, the other counted base64 payloads as
+ * text). ~4 chars/token over every string in the prompt-carrying fields, which
+ * cover all three wire shapes the proxy fronts: `system`+`messages`+`tools`
+ * (Anthropic Messages; OpenAI Chat shares `messages`+`tools`) and
+ * `instructions`+`input` (OpenAI Responses) — the walker is shape-generic
+ * inside each field, so the differing inner structures need no per-shape code.
+ * Tool schemas and tool_use inputs genuinely consume context upstream, so they
+ * count. Binary payloads are excluded — the `data` field of Anthropic base64
+ * image/document sources, and base64 `data:` URLs, which is how the OpenAI
+ * shapes inline the same bytes: a base64 blob's byte length says nothing about
+ * its token cost, and a wildly inflated guess must not masquerade as a
+ * measurement. Undercounting media is safe in both call sites — the guardrail
+ * only prunes on published limits and the provider stays authoritative;
+ * count_tokens is advisory bookkeeping.
  */
 export function estimateRequestTokens(reqJson: unknown): number {
   if (typeof reqJson !== "object" || reqJson === null) return 0;
   let chars = 0;
+  const isBase64DataUrl = (s: string) => s.startsWith("data:") && s.includes(";base64,");
   const walk = (v: unknown, key?: string): void => {
     if (typeof v === "string") {
-      if (key !== "data") chars += v.length;
+      if (key !== "data" && !isBase64DataUrl(v)) chars += v.length;
     } else if (Array.isArray(v)) {
       for (const x of v) walk(x);
     } else if (v && typeof v === "object") {
@@ -158,5 +165,7 @@ export function estimateRequestTokens(reqJson: unknown): number {
   walk(obj.system);
   walk(obj.messages);
   walk(obj.tools);
+  walk(obj.instructions);
+  walk(obj.input);
   return Math.ceil(chars / 4);
 }

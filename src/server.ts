@@ -442,13 +442,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
   let healthyTargets = orderByUsability(targetCandidates, h.breaker);
 
+  // The OpenAI front (Chat Completions / Responses) is detected BEFORE the context guardrail so
+  // the guardrail covers it: both fronts resolve concrete target deployments, and the estimator
+  // walks all three wire shapes. The front went without this pruning until 0.17.0 — the same
+  // "two paths, two policies, one of them empty" failure mode as the pool-failover incident.
+  const openAiFrontProtocol = detectOpenAiFrontProtocol(req.method, pathname);
+
   // Context guardrail — enforced ONLY against a limit the serving provider published about its own
   // deployment. An unknown limit means no guardrail: the request goes upstream and the provider
   // answers with its own (authoritative) error.
   //
   // Candidates whose published context limits are exceeded by the estimated prompt tokens are pruned.
   // If all candidates are pruned, fail closed with 400 naming the context limit.
-  if (isMessages && reqJson) {
+  if ((isMessages || openAiFrontProtocol) && reqJson) {
     const estimatedTokens = estimateRequestTokens(reqJson);
     if (estimatedTokens > 0) {
       const remainingTargets: ResolvedTarget[] = [];
@@ -489,7 +495,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // OpenAI-compatible FRONT: route both Chat Completions and Responses requests through the
   // resolved target. The adapter supports OpenAI-compatible and Anthropic backends, so Codex and
   // OpenAI-native IDEs can use the same relay that Claude clients use in the other direction.
-  const openAiFrontProtocol = detectOpenAiFrontProtocol(req.method, pathname);
   if (openAiFrontProtocol) {
     await openAiFrontPath(res, healthyTargets, {
       reqJson,
