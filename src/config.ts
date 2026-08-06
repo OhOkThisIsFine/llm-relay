@@ -49,6 +49,12 @@ export interface ReshaperConfig {
   timeoutMs: number;
 }
 
+/**
+ * What happens to the CALLER's own `Authorization`/`x-api-key` at a provider that declares no
+ * `authEnv` of its own. See `buildForwardHeaders`.
+ */
+export type CredentialMode = "passthrough" | "contained";
+
 /** One HTTP backend provider in the registry (NIM, OpenRouter, Gemini API, …). */
 export interface ProviderConfig {
   base: string;
@@ -59,6 +65,20 @@ export interface ProviderConfig {
    */
   kind: Kind;
   authEnv?: string;
+  /**
+   * What to do with the caller's own credential when this provider declares no `authEnv`:
+   *  - `"passthrough"` — forward it. This is the declaration that makes an Anthropic
+   *    passthrough deliberate rather than a side effect of leaving `authEnv` out.
+   *  - `"contained"` — strip it and send none. The right answer for a keyless backend that
+   *    is not the caller's own vendor: a local daemon, a second relay, someone else's
+   *    Anthropic-format endpoint.
+   *
+   * Omitting it still forwards, so existing configs keep working, but config load warns for an
+   * `anthropic`-kind provider. "This backend needs no key of its own" and "send this host the
+   * user's subscription credential" are different intentions, and only the first one should be
+   * inferable from an omission. Illegal together with `authEnv` — that pair states both at once.
+   */
+  credentialMode?: CredentialMode;
   /** Which header to inject the provider key into. Default: authorization (openai) / x-api-key (anthropic). */
   authHeader: AuthHeader;
   /** Backend request deadline in ms. Default 120000. */
@@ -164,9 +184,32 @@ const SUBAGENT_MARKER = "cc_is_subagent=true";
 /** The request headers needed for protocol-specific subagent markers. */
 export type RequestHeaders = Readonly<Record<string, string | string[] | undefined>>;
 
+/**
+ * Claude Code's documented per-request agent identifier: "Identifier of the subagent that issued
+ * the request, present only on requests from an agent Claude Code spawned inside the session"
+ * (gateway protocol reference), which the same page explicitly permits a gateway to consume for
+ * routing. Same semantics as SUBAGENT_MARKER.
+ *
+ * ⚠ Checked ALONGSIDE the marker, never instead of it — each covers the other's silent failure,
+ * and the failure is the same either way: an undetected subagent falls through to the passthrough
+ * and spends PRIMARY quota while looking like a successful offload.
+ *  - The header dies to any middleware that filters unknown request headers (this relay commonly
+ *    runs behind one), and Anthropic's own advice is to treat `x-claude-code-*` as an open list.
+ *  - The marker dies to `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, which drops the attribution block —
+ *    and therefore the marker — from the system prompt entirely.
+ * The header travels outside the body, the marker inside it, so no single component drops both.
+ */
+const CLAUDE_AGENT_ID_HEADER = "x-claude-code-agent-id";
+
 /** Codex's local Responses client marks child-agent turns in this JSON header. */
 const CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata";
 const CODEX_SUBAGENT_REQUEST_KIND = "subagent";
+
+/** Case-insensitive single-value header lookup (node lowercases, hand-built maps may not). */
+function headerValue(headers: RequestHeaders | undefined, name: string): string | undefined {
+  const raw = Object.entries(headers ?? {}).find(([n]) => n.toLowerCase() === name)?.[1];
+  return Array.isArray(raw) ? raw[0] : raw;
+}
 
 /** Routing directive the dispatcher may put on its own line in a subagent prompt. */
 const RELAY_DIRECTIVE = /^[ \t]*@relay:[ \t]*(\S+)[ \t]*$/m;
@@ -187,11 +230,16 @@ export function isSubagentRequest(reqJson: unknown, headers?: RequestHeaders): b
     }
   }
 
+  // Claude Code's own subagent header — present on exactly the requests the marker is present on,
+  // and independent of it. Presence alone is the signal; the value identifies WHICH agent, and per
+  // the protocol reference identifies an agent rather than a person, so it is never used as one.
+  const agentId = headerValue(headers, CLAUDE_AGENT_ID_HEADER);
+  if (typeof agentId === "string" && agentId.trim().length > 0) return true;
+
   // Codex's Responses requests do not have an Anthropic `system` field. Its local clients identify
   // child-agent turns in `x-codex-turn-metadata`; parse it defensively and fail open for ordinary
   // turns or metadata we do not recognize. This header is intentionally not forwarded upstream.
-  const raw = Object.entries(headers ?? {}).find(([name]) => name.toLowerCase() === CODEX_TURN_METADATA_HEADER)?.[1];
-  const metadataText = Array.isArray(raw) ? raw[0] : raw;
+  const metadataText = headerValue(headers, CODEX_TURN_METADATA_HEADER);
   if (typeof metadataText !== "string") return false;
   try {
     const metadata = JSON.parse(metadataText) as unknown;
@@ -396,6 +444,8 @@ export interface ResolvedTarget {
   /** Real backend model id (required for openai; absent = anthropic passthrough). */
   model?: string;
   authEnv?: string;
+  /** Carried from the provider: whether the caller's own credential may travel to this target. */
+  credentialMode?: CredentialMode;
   authHeader: AuthHeader;
   timeoutMs: number;
 }
@@ -571,6 +621,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     timeoutMs: p.timeoutMs,
     ...(realModel !== undefined ? { model: realModel } : {}),
     ...(p.authEnv ? { authEnv: p.authEnv } : {}),
+    ...(p.credentialMode !== undefined ? { credentialMode: p.credentialMode } : {}),
   };
 }
 
@@ -825,6 +876,7 @@ function parseProviders(
       base?: unknown;
       kind?: unknown;
       authEnv?: unknown;
+      credentialMode?: unknown;
       authHeader?: unknown;
       timeoutMs?: unknown;
       tierType?: unknown;
@@ -846,6 +898,32 @@ function parseProviders(
     }
     const kind: Kind = p.kind === "openai" ? "openai" : "anthropic";
     const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
+    const declaresAuthEnv = typeof p.authEnv === "string" && p.authEnv.trim().length > 0;
+    const credentialMode =
+      p.credentialMode === "passthrough" || p.credentialMode === "contained" ? p.credentialMode : undefined;
+    if (p.credentialMode !== undefined && credentialMode === undefined) {
+      throw new Error(`config.providers.${name}.credentialMode must be "passthrough" or "contained"`);
+    }
+    // A typo with a credential consequence, so it fails loudly at load rather than resolving to
+    // whichever branch the header builder happens to test first.
+    if (credentialMode === "passthrough" && declaresAuthEnv) {
+      throw new Error(
+        `config.providers.${name}: credentialMode "passthrough" forwards the CALLER's own credential, ` +
+          `but authEnv ${String(p.authEnv)} declares one of its own — declare exactly one`,
+      );
+    }
+    // Warn, don't fail: this proxy fronts every client session, so refusing to start over a
+    // config that has worked for months would turn a hardening step into an outage. Scoped to
+    // `anthropic` kind because that is the only path whose upstream headers come from the inbound
+    // request at all — an `openai`-kind target gets a freshly built header map and can never
+    // receive the caller's credential, so warning about `ollama` would be a false alarm.
+    if (kind === "anthropic" && !declaresAuthEnv && credentialMode === undefined) {
+      warnings.push(
+        `provider "${name}" forwards the CALLER's own credential to ${expanded.value} — inferred from ` +
+          `having no authEnv. Declare credentialMode "passthrough" to confirm that is intended, or ` +
+          `"contained" to strip it.`,
+      );
+    }
     out[name] = {
       base: expanded.value.trim().replace(/\/+$/, ""),
       kind,
@@ -857,6 +935,7 @@ function parseProviders(
       ...(typeof p.authEnv === "string"
         ? { authEnv: resolveAuthEnv(name, p.authEnv).name ?? p.authEnv }
         : {}),
+      ...(credentialMode !== undefined ? { credentialMode } : {}),
       ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
         ? { tierType: p.tierType }
         : {}),

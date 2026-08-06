@@ -1526,7 +1526,13 @@ export class CredentialConfigError extends Error {
  *
  * The three `CredentialState`s are three different obligations:
  *  - `not-declared`   — a real passthrough. The caller's own credential is FORWARDED;
- *                       that is the whole point of the anthropic passthrough.
+ *                       that is the whole point of the anthropic passthrough. A provider may
+ *                       DECLARE this with `credentialMode: "passthrough"`, and declare the
+ *                       opposite with `credentialMode: "contained"` — a keyless backend that is
+ *                       not the caller's own vendor (a local daemon, a second relay, someone
+ *                       else's Anthropic-format endpoint) must not receive their credential just
+ *                       because it needs none of its own. Omitting the field still forwards, so
+ *                       existing configs keep working, and config load warns instead.
  *  - `declared-present` — the provider's own key is attached and the caller's inbound
  *                       `Authorization`/`x-api-key` are REMOVED, never merged.
  *  - `declared-missing` — the caller's inbound `Authorization`/`x-api-key` are REMOVED
@@ -1544,7 +1550,7 @@ export function buildForwardHeaders(inbound: IncomingMessage["headers"], target:
   // credential) and "authEnv declared but unset" (a misconfiguration) — so in the
   // second case the caller's own Anthropic token was forwarded verbatim to a
   // third-party base URL. Only a real passthrough forwards inbound auth now.
-  const stripAuth = state !== "not-declared";
+  const stripAuth = state !== "not-declared" || target.credentialMode === "contained";
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(inbound)) {
     const key = k.toLowerCase();

@@ -216,4 +216,19 @@ describe("inbound credential removal (INV-HS-8)", () => {
     const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller" }, base);
     expect(out["authorization"]).toBe("Bearer sk-ant-caller");
   });
+
+  it('credentialMode "contained" strips the caller\'s credential from a keyless target', () => {
+    // The gap this closes: "declares no key of its own" and "may be sent the user's subscription
+    // credential" were the same state, so a keyless anthropic-format backend that is not the
+    // caller's own vendor received their token purely because it needed none itself.
+    const target = { ...base, credentialMode: "contained" } as ResolvedTarget;
+    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller", "x-api-key": "sk-ant-caller" }, target);
+    expect(Object.values(out).some((v) => v.includes("sk-ant-caller"))).toBe(false);
+  });
+
+  it('credentialMode "passthrough" forwards it, identically to the inferred case', () => {
+    const target = { ...base, credentialMode: "passthrough" } as ResolvedTarget;
+    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller" }, target);
+    expect(out["authorization"]).toBe("Bearer sk-ant-caller");
+  });
 });

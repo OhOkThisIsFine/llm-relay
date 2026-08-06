@@ -97,7 +97,7 @@ block. All state lives under `~/.llm-relay/` (`config.json`, `.env`, `models-cac
   "providers": {
     "nim":        { "base": "https://integrate.api.nvidia.com/v1", "kind": "openai", "authEnv": "NVIDIA_API_KEY" },
     "openrouter": { "base": "https://openrouter.ai/api/v1",        "kind": "openai", "authEnv": "OPENROUTER_API_KEY" },
-    "anthropic":  { "base": "https://api.anthropic.com",           "kind": "anthropic" }  // no authEnv = passthrough
+    "anthropic":  { "base": "https://api.anthropic.com", "kind": "anthropic", "credentialMode": "passthrough" }
   },
   "routing": {
     "default": "pool/medium",
@@ -141,6 +141,16 @@ pool-in-pool is rejected at load.
 credentials byte-for-byte (`authorization`/`x-api-key` *and* `anthropic-beta`). Point every tier
 at it and real Claude traffic stays on real Anthropic while `pool/*` routes elsewhere — one
 proxy, both behaviours.
+
+Say so with **`"credentialMode": "passthrough"`**. Omitting it still forwards, so existing
+configs keep working, but startup warns: "needs no key of its own" and "may be sent the user's
+subscription credential" are different intentions, and only the first should follow from an
+omission. The opposite declaration, **`"credentialMode": "contained"`**, is the one to use for a
+keyless `anthropic`-kind backend that is *not* your own vendor — a local daemon, a second relay,
+someone else's Anthropic-format endpoint — and strips the caller's credential instead. It is
+illegal alongside `authEnv` (that pair claims both at once). `openai`-kind providers never
+receive inbound credentials at all: their upstream headers are built from scratch, which is why
+a keyless `ollama` needs no declaration and gets no warning.
 
 ### Pools — static and dynamic
 
