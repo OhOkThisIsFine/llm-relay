@@ -34,6 +34,66 @@ function base(extra: Record<string, unknown> = {}) {
   };
 }
 
+describe("loadConfig — credentialMode (declared vs inferred passthrough)", () => {
+  const withProviders = (name: string, providers: Record<string, unknown>) =>
+    loadConfig(write(name, base({ providers, routing: { default: "anthropic" } })));
+
+  it("warns when an anthropic-kind provider forwards the caller's credential by omission", () => {
+    const c = withProviders("cred-inferred.json", {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+    });
+    // Warn, never fail: this proxy fronts every client session, so a hardening step that
+    // refuses to start would be an outage.
+    expect(c.warnings?.some((w) => /forwards the CALLER's own credential/.test(w))).toBe(true);
+    expect(c.providers.anthropic!.credentialMode).toBeUndefined();
+  });
+
+  it("stays silent once the intent is declared, either way", () => {
+    const pass = withProviders("cred-declared.json", {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic", credentialMode: "passthrough" },
+    });
+    expect(pass.warnings?.some((w) => /forwards the CALLER/.test(w)) ?? false).toBe(false);
+    expect(pass.providers.anthropic!.credentialMode).toBe("passthrough");
+
+    const contained = loadConfig(write("cred-contained.json", base({
+      providers: { peer: { base: "https://peer.test", kind: "anthropic", credentialMode: "contained" } },
+      routing: { default: "peer" },
+    })));
+    expect(contained.warnings?.some((w) => /forwards the CALLER/.test(w)) ?? false).toBe(false);
+    expect(contained.providers.peer!.credentialMode).toBe("contained");
+  });
+
+  it("never warns for an openai-kind keyless provider — it cannot receive inbound credentials", () => {
+    // `fetchBackend`'s openai path builds a fresh header map (`buildTargetHeaders`), so nothing
+    // inbound reaches it. Warning about `ollama` would be a false alarm, and a false alarm here
+    // teaches the operator to ignore the true one above.
+    const c = loadConfig(write("cred-ollama.json", base({
+      providers: { ollama: { base: "http://localhost:11434/v1", kind: "openai" } },
+      routing: { default: "ollama/qwen2.5-coder:32b" },
+    })));
+    expect(c.warnings?.some((w) => /forwards the CALLER/.test(w)) ?? false).toBe(false);
+  });
+
+  it("rejects a provider that claims both credentialMode passthrough and its own authEnv", () => {
+    expect(() => withProviders("cred-conflict.json", {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic", credentialMode: "passthrough", authEnv: "X_KEY" },
+    })).toThrow(/declare exactly one/);
+  });
+
+  it("rejects an unrecognized credentialMode instead of silently ignoring it", () => {
+    expect(() => withProviders("cred-typo.json", {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic", credentialMode: "contain" },
+    })).toThrow(/credentialMode must be/);
+  });
+
+  it("carries the mode onto the resolved target", () => {
+    const c = withProviders("cred-resolved.json", {
+      anthropic: { base: "https://api.anthropic.com", kind: "anthropic", credentialMode: "passthrough" },
+    });
+    expect(resolveTarget("claude-opus-5", c).credentialMode).toBe("passthrough");
+  });
+});
+
 describe("loadConfig — authEnv alias resolution", () => {
   it("keeps the declared authEnv when that variable is the one set", () => {
     process.env.GEMINI_API_KEY = "declared";
@@ -392,6 +452,20 @@ describe("subagent-aware routing", () => {
     expect(isSubagentRequest({ system: MAIN })).toBe(false);
     expect(isSubagentRequest({ system: [{ type: "text", text: SUB }] })).toBe(true);
     expect(isSubagentRequest({})).toBe(false);
+  });
+
+  it("detects a Claude subagent from the documented agent-id header, with no marker present", () => {
+    // Two independent signals, either sufficient. The header survives
+    // CLAUDE_CODE_ATTRIBUTION_HEADER=0 (which removes the marker); the marker survives middleware
+    // that filters unknown request headers (which removes the header). Neither alone is safe, and
+    // the shared failure mode is silent: an undetected subagent spends primary quota.
+    expect(isSubagentRequest({ system: MAIN }, { "x-claude-code-agent-id": "agent_01ABC" })).toBe(true);
+    expect(isSubagentRequest({}, { "X-Claude-Code-Agent-Id": "agent_01ABC" })).toBe(true);
+    expect(isSubagentRequest({ system: SUB }, {})).toBe(true);
+    // Presence is the signal, so an empty value is not one.
+    expect(isSubagentRequest({ system: MAIN }, { "x-claude-code-agent-id": "  " })).toBe(false);
+    // The parent header travels only WITH an agent id; on its own it says nothing.
+    expect(isSubagentRequest({ system: MAIN }, { "x-claude-code-parent-agent-id": "agent_01ABC" })).toBe(false);
   });
 
   it("detects Codex child turns from explicit request metadata only", () => {

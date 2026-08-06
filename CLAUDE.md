@@ -200,12 +200,18 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 - **`count_tokens` and non-`/v1/messages` paths** are handled locally for OpenAI backends (token
   estimate / clean 404) — they must NOT be routed to `/chat/completions`. See `server.ts` `handle()`.
 - Backends rate-limit (HTTP 429). The proxy passes it through; the client's retry/backoff handles it.
-- **Subagent routing depends on a Claude Code client behaviour, not an API contract.**
-  `routing.subagents` only applies when the request carries `cc_is_subagent=true` in its `system`
-  block (verified against Claude Code 2.1.220). If a Claude Code upgrade drops that marker, every
-  subagent silently falls back to normal routing — safe (passthrough) but **silent**, so nothing
-  will alert you. Re-verify with the capture recipe in
-  [docs/subagent-routing.md](docs/subagent-routing.md#re-verifying).
+- **Subagent detection uses TWO signals, either sufficient — keep it that way.** `routing.subagents`
+  applies when the request carries the documented `x-claude-code-agent-id` header (gateway protocol
+  reference: present only on requests from an agent Claude Code spawned in the session, and
+  gateways may route on it) **or** `cc_is_subagent=true` in its `system` block (verified against
+  2.1.220). Each covers the other's silent failure: the header dies to middleware that filters
+  unknown request headers (this relay runs behind one), the marker dies to
+  `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, which removes the attribution block that carries it. One
+  travels in the headers, the other in the body, so nothing drops both. If both ever go, every
+  subagent falls back to normal routing — safe (passthrough) but **silent**, so nothing will alert
+  you. Re-verify with the capture recipe in
+  [docs/subagent-routing.md](docs/subagent-routing.md#re-verifying), which reports each signal
+  separately.
 - **Pool refs (`pool/<name>`) are legal in `routing.tiers`, `routing.default` and
   `routing.subagents`,** expanded by `expandPoolSpecs()` at resolve time and validated at config
   load (pool-aware `assertSpecResolvable`). Pool members themselves must be provider specs —
@@ -246,6 +252,16 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   identically falsy for the first and last, so a provider declaring an `authEnv` whose variable was
   unset forwarded the caller's own Anthropic token verbatim to a third-party base URL. A
   `declared-missing` target now throws `CredentialConfigError` rather than egressing anything.
+  **The other half of the same principle landed 2026-08-05:** passthrough itself is declarable —
+  `credentialMode: "passthrough" | "contained"` on the provider. Absence of `authEnv` alone used to
+  mean "forward the user's credential to this host", so the most consequential default in the file
+  was the one nobody opted into, and it was bounded only by the fact that the sole such provider
+  points at Anthropic. Omission still forwards (config load warns instead of failing — this proxy
+  fronts every session, so refusing to start would be an outage), `"contained"` strips for a keyless
+  backend that is not the caller's vendor, and `"passthrough"` + `authEnv` is a hard error. Scoped
+  to `anthropic`-kind: an `openai`-kind target's headers are built from scratch in
+  `buildTargetHeaders()` and can never carry an inbound credential, so warning about a keyless
+  `ollama` would be a false alarm that teaches the operator to ignore the true one.
   Do not re-derive this from `resolveAuthEnv()` returning a name: the anthropic alias list holds
   `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, so a provider with **no** declared `authEnv` still
   resolves to a name whenever either is set — which would invert the one behaviour a passthrough
@@ -373,6 +389,12 @@ for judging proposed changes. An external proposal was reviewed against it 2026-
 ([docs/suggestion-review-2026-08-04.md](docs/suggestion-review-2026-08-04.md)): four small
 pieces harvested (all landed), the enterprise-shaped remainder rejected with reasons — read it
 before proposing routing refactors, budgets, tracing stores, or LLM-assisted classification.
+A second external review (terms compliance + credential handling) was assessed 2026-08-05 —
+[docs/codex-review-2026-08-05.md](docs/codex-review-2026-08-05.md): its headline credential finding
+was false (it missed that the openai path builds its own headers), two changes were adopted anyway
+(`credentialMode`, the OR'd subagent signal), and it carries the verified terms position plus the
+one open proposal — a "credentials stay user-operated" invariant awaiting owner ratification in
+[docs/project-goals.md](docs/project-goals.md).
 
 ⚠ **A CLI process's environment is NOT the running relay's environment, and confusing the two
 fabricates credential bugs.** On Windows a User-scope environment variable enters a process only at

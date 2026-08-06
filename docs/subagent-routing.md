@@ -53,7 +53,28 @@ conversation to protect there, so nothing is silently downgraded. The failure mo
 precisely when the two are mixed: an Anthropic passthrough in the config *and* a tier pointed
 somewhere else.
 
-## The signal: `cc_is_subagent=true`
+## The signals: `x-claude-code-agent-id` **and** `cc_is_subagent=true`
+
+Two independent signals, either one sufficient (`isSubagentRequest`). They are checked together
+because each covers the other's silent failure, and the shared failure mode is expensive: an
+undetected subagent falls through to the passthrough and spends **primary quota** while the
+dispatcher believes it offloaded.
+
+**`x-claude-code-agent-id`** (adopted 2026-08-05) is the documented one. Anthropic's
+[gateway protocol reference](https://code.claude.com/docs/en/llm-gateway-protocol) defines it as the
+"Identifier of the subagent that issued the request, present only on requests from an agent Claude
+Code spawned inside the session", and states that a gateway may consume the `x-claude-code-*`
+headers for routing. Presence is the whole signal — the value identifies *which* agent, and the
+same page warns it identifies an agent rather than a person, so the relay never treats it as a user
+id. It dies to any middleware that filters unknown request headers, which this relay commonly runs
+behind, and Anthropic's advice is to treat the set as open and growing.
+
+**The system-block marker** below is the original signal, kept because it travels *inside the body*
+and so survives header filtering. It has its own kill switch: `CLAUDE_CODE_ATTRIBUTION_HEADER=0`
+removes the attribution block, and therefore the marker, from the system prompt entirely. No single
+component drops both signals.
+
+### The marker: `cc_is_subagent=true`
 
 Claude Code stamps a billing header as the **first line of the `system` block**, and on subagent
 requests only:
@@ -71,9 +92,10 @@ Captured off the wire **2026-07-28 against Claude Code 2.1.220**. Observed facts
 | Subagent model is inherited | A built-in subagent's `model` was `claude-opus-5`, the main conversation's model, unless the Agent tool's `model` param overrides it |
 | `messages[0]` is block-structured | Block 0 is Claude Code's injected `<system-reminder>` (CLAUDE.md, current date, …); the **last** text block is the dispatcher's authored prompt |
 
-⚠ **This is a client behaviour, not a documented API guarantee.** Re-verify after a Claude Code
-upgrade (see [Re-verifying](#re-verifying)). If the marker ever disappears, every subagent falls back
-to normal routing — which is *safe* (passthrough) but **silent**, so nothing will alert you.
+⚠ **The marker is a client behaviour, not a documented API guarantee** (the header is the
+documented half). Re-verify after a Claude Code upgrade (see [Re-verifying](#re-verifying)). If
+*both* signals ever disappear, every subagent falls back to normal routing — which is *safe*
+(passthrough) but **silent**, so nothing will alert you.
 
 ## Design
 
@@ -246,7 +268,11 @@ http.createServer((req, res) => {
       const p = JSON.parse(raw.toString("utf8"));
       const sys = Array.isArray(p.system) ? p.system.map(s => s.text ?? s).join("\n") : (p.system ?? "");
       if (req.url?.startsWith("/v1/messages")) {
-        console.log(sys.includes("cc_is_subagent=true") ? "SUB" : "main", p.model);
+        // Both signals, reported separately — either one alone still routes, but a signal that
+        // has quietly stopped arriving is exactly what this check exists to surface.
+        const marker = sys.includes("cc_is_subagent=true");
+        const header = Boolean(req.headers["x-claude-code-agent-id"]);
+        console.log(marker || header ? "SUB" : "main", `marker=${marker} header=${header}`, p.model);
       }
     } catch {}
     const up = http.request(
@@ -259,8 +285,11 @@ http.createServer((req, res) => {
 ```
 
 Point a session at it (`ANTHROPIC_BASE_URL=http://127.0.0.1:8890`) and dispatch a subagent. You want
-to see at least one `SUB` line. If every line says `main`, the marker is gone and `routing.subagents`
-has silently stopped applying.
+to see at least one `SUB` line. If every line says `main`, both signals are gone and
+`routing.subagents` has silently stopped applying. A `SUB` line reporting only one of
+`marker=true`/`header=true` is still working, but it is now single-signal — worth knowing before the
+remaining one goes too. (Note the capture proxy forwards `req.headers` verbatim; a real middleware
+in that position may not.)
 
 A quick behavioural check needs no proxy at all — the same body with and without the marker must
 route differently:
