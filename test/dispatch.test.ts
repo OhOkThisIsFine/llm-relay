@@ -95,6 +95,55 @@ describe("dispatch ladder — config", () => {
   });
 });
 
+/**
+ * `env` on a cli rung is what makes a `claude -p` lane declarable at all: a terminal-spawned
+ * `claude` honours ANTHROPIC_BASE_URL (Claude Desktop pins its own sessions to api.anthropic.com,
+ * so shelling out IS the redirect), and the nested-session variables must be unset or the child
+ * inherits the parent harness's wiring. Set and unset are therefore both first-class here.
+ */
+describe("dispatch ladder — cli rung env", () => {
+  const rungWith = (env: unknown) => ({
+    id: "claude-pool",
+    kind: "cli",
+    command: "claude",
+    args: ["-p", "--model", "pool/coding", "{task}"],
+    env,
+  });
+
+  it("accepts string (set) and null (unset) values and surfaces both on invoke", () => {
+    const env = { ANTHROPIC_BASE_URL: "http://127.0.0.1:8791", ANTHROPIC_API_KEY: null };
+    const view = buildDispatch(cfgWith({ ladder: [rungWith(env)] }), { task: "count the files" });
+    expect(view.next?.invoke?.env).toEqual(env);
+  });
+
+  it("never substitutes the task placeholder into env values", () => {
+    const view = buildDispatch(cfgWith({ ladder: [rungWith({ NOTE: "around {task} here" })] }), { task: "INJECTED" });
+    // The args got the task; the env value keeps its braces verbatim — it is routing, not prompt.
+    expect(view.next?.invoke?.args).toContain("INJECTED");
+    expect(view.next?.invoke?.env).toEqual({ NOTE: "around {task} here" });
+  });
+
+  it("omits an empty env object from the parsed rung", () => {
+    const view = buildDispatch(cfgWith({ ladder: [rungWith({})] }), { task: "t" });
+    expect(view.next?.invoke?.env).toBeUndefined();
+  });
+
+  it("rejects an env that is not an object", () => {
+    expect(() => cfgWith({ ladder: [rungWith("ANTHROPIC_BASE_URL=x")] })).toThrow(/env must be an object/);
+    expect(() => cfgWith({ ladder: [rungWith(["A=b"])] })).toThrow(/env must be an object/);
+  });
+
+  it("rejects a value that is neither string nor null", () => {
+    expect(() => cfgWith({ ladder: [rungWith({ PORT: 8791 })] })).toThrow(/string \(set\) or null \(unset\)/);
+  });
+
+  it("rejects variable names containing '=', whitespace or control characters", () => {
+    for (const name of ["A=B", "A B", "A\u001bB", ""]) {
+      expect(() => cfgWith({ ladder: [rungWith({ [name]: "x" })] })).toThrow(/invalid variable name/);
+    }
+  });
+});
+
 describe("dispatch ladder — ordering", () => {
   it("selects tier-specific ladders and infers coding from the default subagent pool", () => {
     const ladders = {

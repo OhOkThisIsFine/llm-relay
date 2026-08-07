@@ -61,8 +61,13 @@ export interface DispatchLane {
   note?: string;
   /** When an exhausted rung becomes eligible again (ISO 8601). */
   readyAt?: string;
-  /** cli rungs: exactly what to run. `args` already has the task substituted when one was given. */
-  invoke?: { command: string; args: string[] };
+  /**
+   * cli rungs: exactly what to run. `args` already has the task substituted when one was given.
+   * `env` is applied by the HOST when spawning: a string value sets the variable, `null` unsets
+   * an inherited one (see `LadderRung.env` for why both directions matter). The task placeholder
+   * is never substituted into env values — they are operator-authored routing, not task content.
+   */
+  invoke?: { command: string; args: string[]; env?: Record<string, string | null> };
   /** relay rungs: the spec to address (`pool/<name>`, `<provider>/<model>`, …). */
   spec?: string;
   /**
@@ -293,6 +298,7 @@ function toLane(
       // rather than receiving a command that silently asks the agent to do nothing.
       args: opts.task === undefined ? [...rung.args] : rung.args.map((a) => a.split(TASK_TOKEN).join(opts.task!)),
     };
+    if (rung.env) lane.invoke.env = { ...rung.env };
   }
   if (rung.kind === "relay" && rung.spec) {
     lane.spec = rung.spec;

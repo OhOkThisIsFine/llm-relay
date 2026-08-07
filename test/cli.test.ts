@@ -278,6 +278,64 @@ describe("dispatch command rendering — shell quoting", () => {
     expect(renderCommand(undefined, "sh")).toBe("");
   });
 
+  it("renders env on the same runnable line — env(1) for sh, $env:/Remove-Item for pwsh", () => {
+    const invoke = {
+      command: "claude",
+      args: ["-p", "count files"],
+      // Insertion order mixed on purpose: unsets must be grouped first regardless.
+      env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8791", ANTHROPIC_API_KEY: null, TOKEN: "a b'c" },
+    };
+    expect(renderCommand(invoke, "sh")).toBe(
+      "env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=http://127.0.0.1:8791 'TOKEN=a b'\\''c' claude -p 'count files'",
+    );
+    expect(renderCommand(invoke, "pwsh")).toBe(
+      "Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue; " +
+        "$env:ANTHROPIC_BASE_URL = 'http://127.0.0.1:8791'; $env:TOKEN = 'a b''c'; claude -p 'count files'",
+    );
+  });
+
+  it("always quotes a pwsh env VALUE — bare words are commands in expression position", () => {
+    // `abc` passes the shell-safe allow-list, so quoteArg would leave it bare — correct for an
+    // argv element, a parse error after `$env:X =`. The assignment form must quote regardless.
+    expect(renderCommand({ command: "c", args: ["a"], env: { X: "abc" } }, "pwsh")).toBe("$env:X = 'abc'; c a");
+  });
+
+  it("renders no env prefix for an absent or empty env", () => {
+    expect(renderCommand({ command: "c", args: ["a"] }, "sh")).toBe("c a");
+    expect(renderCommand({ command: "c", args: ["a"], env: {} }, "sh")).toBe("c a");
+  });
+
+  /** The env property proven by a real shell: the child sees the set value and NOT the unset one. */
+  it("env survives a real shell — set applied, unset removed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rp-env-"));
+    try {
+      const shell = shellFor();
+      const probe = "console.log(JSON.stringify([process.env.RP_ENV_SET ?? null, process.env.RP_ENV_UNSET ?? null]))";
+      const line = renderCommand(
+        {
+          command: process.execPath,
+          args: ["-e", probe],
+          env: { RP_ENV_SET: "value with 'quote", RP_ENV_UNSET: null },
+        },
+        shell,
+      );
+      const script = join(dir, shell === "pwsh" ? "run.ps1" : "run.sh");
+      writeFileSync(script, line + "\n");
+      const res =
+        shell === "pwsh"
+          ? spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-File", script], {
+              encoding: "utf8",
+              env: { ...process.env, RP_ENV_UNSET: "leaked" },
+            })
+          : spawnSync("sh", [script], { encoding: "utf8", env: { ...process.env, RP_ENV_UNSET: "leaked" } });
+      expect(res.error).toBeUndefined();
+      expect(res.status).toBe(0);
+      expect(JSON.parse(res.stdout.trim())).toEqual(["value with 'quote", null]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("names the shell version it targets, because 5.1 and 7 disagree", () => {
     // Not cosmetic. Windows PowerShell 5.1 does not escape an embedded `"` when it builds the
     // command line for a native exe, so a correctly single-quoted argument containing one

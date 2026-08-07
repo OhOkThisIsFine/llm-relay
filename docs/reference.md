@@ -345,6 +345,29 @@ host a command and **never spawns a CLI itself**. Mark a spent lane with
 `llm-relay dispatch -x <lane> --outcome rate_limited|quota_exhausted` (or
 `--retry-after-ms <n>` for a vendor-stated reset).
 
+A `cli` rung may declare `env`: string values are set on the spawned command, `null` values are
+unset (`llm-relay dispatch` renders both into the printed line — `env -u X NAME=value cmd …` for
+sh, `$env:`/`Remove-Item Env:` statements for PowerShell). This is what makes a **relay-routed
+`claude` CLI rung** declarable — the lane for hosts whose own HTTP traffic cannot be redirected
+(Claude Desktop pins its sessions to `api.anthropic.com`; a terminal-spawned `claude` honours
+`ANTHROPIC_BASE_URL`, so shelling out IS the redirect):
+
+```jsonc
+{
+  "id": "claude-pool", "kind": "cli", "command": "claude",
+  "args": ["-p", "--model", "pool/medium", "--permission-mode", "plan", "{task}"],
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791",
+    "ANTHROPIC_AUTH_TOKEN": "dummy",           // relay strips it for contained providers
+    "CLAUDE_CONFIG_DIR": "/home/me/.llm-relay-claude", // isolated: no OAuth conflict with a
+                                               // subscription. ABSOLUTE path — env values are
+                                               // passed verbatim, `~` is never expanded
+    "CLAUDECODE": null, "CLAUDE_CODE_SSE_PORT": null, "CLAUDE_CODE_ENTRYPOINT": null,
+    "ANTHROPIC_API_KEY": null                  // nested-session vars a parent claude leaks
+  }
+}
+```
+
 ---
 
 ## The OpenAI front and `/registry`

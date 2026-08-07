@@ -163,6 +163,17 @@ export interface LadderRung {
   /** cli rungs: the binary to run, and its args — one of which must contain the task placeholder. */
   command?: string;
   args?: string[];
+  /**
+   * cli rungs: environment the HOST applies when spawning the command. A string value sets the
+   * variable; `null` unsets an inherited one. Both directions are load-bearing for the lane this
+   * exists for — a `claude -p` child routed through this proxy: `ANTHROPIC_BASE_URL` must be SET
+   * (a terminal-spawned `claude` honours it even though Claude Desktop pins its own sessions to
+   * api.anthropic.com), and `CLAUDECODE`/`CLAUDE_CODE_SSE_PORT`/`CLAUDE_CODE_ENTRYPOINT`/
+   * `ANTHROPIC_API_KEY` must be UNSET or a child spawned from inside a Claude session inherits
+   * the parent's harness wiring and refuses to start cleanly. The task placeholder is never
+   * substituted here — env values are operator-authored routing, not task content.
+   */
+  env?: Record<string, string | null>;
   /** relay rungs: the spec to address (`pool/<name>`, `<provider>/<model>`, a provider name). */
   spec?: string;
 }
@@ -1260,6 +1271,25 @@ function parseLadder(raw: unknown, root: string): LadderRung[] {
       }
       rung.command = e.command;
       rung.args = args;
+      if (e.env !== undefined) {
+        if (typeof e.env !== "object" || e.env === null || Array.isArray(e.env)) {
+          throw new Error(`${where}.env must be an object mapping variable names to a string (set) or null (unset)`);
+        }
+        const env: Record<string, string | null> = {};
+        for (const [name, value] of Object.entries(e.env as Record<string, unknown>)) {
+          // "=", whitespace and control characters cannot appear in an environment variable
+          // NAME on any platform this runs on; accepting one would render a command that
+          // silently sets a different variable than the config names.
+          if (name.length === 0 || /[=\s\u0000-\u001f\u007f]/.test(name)) {
+            throw new Error(`${where}.env has an invalid variable name ${JSON.stringify(name)}`);
+          }
+          if (typeof value !== "string" && value !== null) {
+            throw new Error(`${where}.env.${name} must be a string (set) or null (unset)`);
+          }
+          env[name] = value;
+        }
+        if (Object.keys(env).length > 0) rung.env = env;
+      }
     } else {
       if (typeof e.spec !== "string" || e.spec.length === 0) {
         throw new Error(`${where}.spec must be a non-empty string for a "relay" rung`);
