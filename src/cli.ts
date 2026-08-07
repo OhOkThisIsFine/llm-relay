@@ -738,14 +738,31 @@ export function quoteArg(arg: string, shell: RenderShell = shellFor()): string {
 }
 
 /**
+ * A PowerShell single-quoted literal, ALWAYS quoted. `quoteArg` leaves shell-safe strings bare,
+ * which is right for argv elements and wrong in expression position: `$env:X = abc` is not an
+ * assignment of the string "abc", it is a parse error. Same literal form, same control scrub.
+ */
+function pwshLiteral(value: string): string {
+  return `'${value.replace(RENDER_CONTROL, "�").replace(/'/g, "''")}'`;
+}
+
+/**
  * Render a cli rung's `{ command, args }` as a runnable line. Every element is quoted FIRST and
  * only the quoted forms are joined — never `args.join(" ")`, which is the defect this replaces.
  *
  * A quoted command NAME is not a command in PowerShell (`'agy' -p x` evaluates a string and
  * throws the rest away), so a command that needed quoting gets the call operator in front of it.
+ *
+ * A rung's `env` renders as part of the same line: `env -u UNSET NAME=value cmd …` for `sh`,
+ * and `Remove-Item Env:UNSET …; $env:NAME = 'value'; cmd …` for PowerShell. The PowerShell form
+ * mutates the calling session's environment rather than scoping to the child — PowerShell has no
+ * `env(1)` equivalent, and the wrapper scripts this replaces (`scripts/claude-proxied.ps1`) have
+ * always done the same. Variable NAMES are interpolated bare in both forms; they are safe because
+ * config load rejects names containing `=`, whitespace or control characters, and they read
+ * better than a quoted form that suggests they might be data.
  */
 export function renderCommand(
-  invoke: { command: string; args: string[] } | undefined,
+  invoke: { command: string; args: string[]; env?: Record<string, string | null> } | undefined,
   shell: RenderShell = shellFor(),
 ): string {
   if (!invoke) return "";
@@ -755,7 +772,21 @@ export function renderCommand(
   const command = normalizeCliCommand(invoke.command, shell === "pwsh" ? "win32" : "linux");
   const cmd = quoteArg(command, shell);
   const head = cmd === command || shell === "sh" ? cmd : `& ${cmd}`;
-  return [head, ...invoke.args.map((a) => quoteArg(a, shell))].join(" ");
+  const line = [head, ...invoke.args.map((a) => quoteArg(a, shell))].join(" ");
+
+  const env = invoke.env ?? {};
+  const unsets = Object.keys(env).filter((name) => env[name] === null);
+  const sets = Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== null);
+  if (unsets.length === 0 && sets.length === 0) return line;
+
+  if (shell === "sh") {
+    return ["env", ...unsets.map((name) => `-u ${name}`), ...sets.map(([name, value]) => quoteArg(`${name}=${value}`, shell)), line].join(" ");
+  }
+  return [
+    ...unsets.map((name) => `Remove-Item Env:${name} -ErrorAction SilentlyContinue`),
+    ...sets.map(([name, value]) => `$env:${name} = ${pwshLiteral(value)}`),
+    line,
+  ].join("; ");
 }
 
 /**

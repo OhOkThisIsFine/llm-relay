@@ -178,6 +178,20 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
   `routing.subagents` when the originating client's offload rule is on. Spends provider API keys. *Exhausted when:* the pool
   4xx/5xxs after failover walks every candidate, or `llm-relay candidates` shows the breaker open
   / quota drained across the pool.
+  ⚠ Reaching a pool this way requires the dispatching session's own HTTP traffic to traverse the
+  relay. **Claude Desktop sessions do not** — the Desktop launcher pins `ANTHROPIC_BASE_URL` to
+  `api.anthropic.com` and no setting overrides it — so from a Desktop session a subagent
+  `@relay:` directive silently reaches real Anthropic (the directive line goes to the model as
+  prompt text). From such a host, use the **Claude CLI lane** below instead.
+- **Claude CLI (relay-routed)** — a `cli` rung running `claude -p "<task>" --model pool/<name>`
+  with rung `env` setting `ANTHROPIC_BASE_URL` to the relay, `ANTHROPIC_AUTH_TOKEN=dummy`, an
+  isolated absolute `CLAUDE_CONFIG_DIR`, and `null`-unsetting `CLAUDECODE`,
+  `CLAUDE_CODE_SSE_PORT`, `CLAUDE_CODE_ENTRYPOINT`, `ANTHROPIC_API_KEY` (a child spawned inside
+  a Claude session inherits those and refuses to start cleanly). A terminal-spawned `claude`
+  honours the env var even though Desktop pins its own sessions, so **shelling out IS the
+  redirect** — this is how a Desktop session reaches relay pools at all. Spends the pool's
+  provider keys, with the relay's ranking/failover/repair in the path. *Exhausted when:* the
+  pool it addresses is (same signals as Relay pools).
 - **Antigravity (`agy`)** — `agy -p "<task>" --model <id> --output-format json` (`agy.exe` on
   Windows). The dispatch API automatically changes a configured bare `agy` to `agy.exe` on
   Windows so a same-named PowerShell function cannot open the IDE instead of the headless CLI.
@@ -269,7 +283,9 @@ Ordering exists at three levels; change the right one:
 - **Which lane is tried first** (`routing.ladders.<tier>`, or legacy `routing.ladder`, in
   `~/.llm-relay/config.json`): reorder the array; rung order *is* the ladder. Add
   `"enabled": false` to park a rung without deleting it.
-  Validated at load — a bad spec, a duplicate id, or a `cli` rung whose `args` lack `{task}`
+  A `cli` rung may carry `env` (string = set, `null` = unset), applied by the host when spawning
+  and rendered into the printed command — the primitive behind the relay-routed Claude CLI lane.
+  Validated at load — a bad spec, a duplicate id, a malformed `env`, or a `cli` rung whose `args` lack `{task}`
   fails at startup, not mid-fallback. ⚠ Never put a personal ordering in the installed
   `~/.claude/skills/llm-relay/SKILL.md` or `~/.codex/skills/llm-relay/SKILL.md` copies:
   `postinstall` generates both from this package source on every global install.
