@@ -255,6 +255,23 @@ Two consequences worth internalising:
 - On a bypassed host the `@relay:` hint is never emitted, because the directive is *inert* there —
   not merely insufficient. If you find yourself about to add one, ask dispatch instead.
 
+A transposed lane also carries the spec's **context window** when the serving provider published
+one, via a `{contextWindow}` placeholder in the template (typically
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`). Without it a spawned CLI assumes a window for the model it does
+not recognize — `claude` assumes 200k — and compacts against that, throwing away most of a
+1M-context model. `dispatch` prints which happened:
+
+```
+   context: 1,048,576 tokens (published by the serving provider)
+   context: not published for this spec — the variable is omitted and the CLI uses its own default
+```
+
+⚠ **"Not published" is the normal answer for pools** and is not a fault to fix. Most free providers
+publish no metadata (NIM publishes none), and a pool needs *every* member to publish before a floor
+can be stated — failover can land on any of them, so the pool's usable window is its smallest.
+Never hand-set the variable to work around this: a number nobody published will overflow the real
+backend, which is worse than the client's conservative default.
+
 If no `routing.cliLane` is configured, an unreachable rung is reported `[unreachable]` with the
 reason and skipped when choosing `next`, rather than being offered as a lane that cannot work.
 

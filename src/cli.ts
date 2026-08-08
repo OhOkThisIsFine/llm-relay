@@ -16,7 +16,7 @@ import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
-import { buildDispatch, normalizeCliCommand, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { createProxy } from "./server.js";
@@ -204,6 +204,11 @@ ${formatTextTable([
 Offload is off by default. To route one subagent call without turning it on, put
 "@relay: <spec>" on its own line at the start of the subagent prompt (the relay strips it).
 
+If this host's traffic does not reach the relay (Claude Desktop pins its own base URL), no
+subagent can be rerouted and "@relay:" is inert. "llm-relay dispatch" detects that and hands
+back runnable commands instead; "offload claude on" there also installs a PreToolUse(Agent)
+hook that redirects Agent() calls to the same lane. "offload claude off" removes it.
+
 Setup checks: "llm-relay keys" verifies credentials; "llm-relay pools --probe" sends a real
 completion to every pool model. Environment variables override ~/.llm-relay/.env.
 
@@ -217,6 +222,8 @@ ${formatTextTable([
   ["--outcome <kind>", "With -x: rate_limited (15m) or quota_exhausted (1h)."],
   ["--retry-after-ms <n>", "With -x: vendor-stated reset; beats the outcome default."],
   ["--shell sh|pwsh", "Quote for sh or PowerShell."],
+  ["--host <state>", "Override host detection: routed|bypassed|unknown."],
+  ["--next-command", "Print only the runnable command for the next lane."],
   ["--json", "Print JSON."],
 ], "  ")}
 
@@ -889,13 +896,40 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (hostRouting.entrypoint) qs.set("entrypoint", hostRouting.entrypoint);
   const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
 
+  // One catalog for the whole render — it reads from disk, so building it per lane lookup would
+  // re-read the cache once per pool member. Same on-disk data the proxy uses, so a cold-read
+  // answer matches a live one; `cachedLimits` never fetches, so an unwarmed cache simply means no
+  // lane carries a window.
+  const catalog = new ModelCatalog();
+  const cachedContextWindow = (provider: string, model: string | undefined): number | null =>
+    model === undefined ? null : (catalog.cachedLimits(provider, model)?.contextLength ?? null);
+
   const liveRaw = (await tryServer(cfg, path)) as WireDispatchView | null;
   // A proxy predating host-adaptive dispatch ignores `?host=` and answers as though every relay
   // rung were reachable. Its ladder would then quietly advise the subagent path this host cannot
   // use — the exact failure being fixed — so the stale answer is discarded rather than rendered.
   // The cost is live exhaustion state, which the existing "no proxy running" line already covers;
   // trusting the reply would cost correctness, which it does not.
-  const staleProxy = liveRaw !== null && hostRouting.state !== "unknown" && liveRaw.host !== hostRouting.state;
+  //
+  // A SECOND staleness shape, found the moment this was built: a proxy that understands `?host=`
+  // but predates context-window substitution answers the host check correctly and still returns
+  // lanes with the variable missing. From the rendered output that is indistinguishable from "the
+  // provider published nothing" — the failure would read as a correct result. The discriminator is
+  // cheap and exact: both sides resolve the window from the SAME on-disk cache, so if this process
+  // can resolve one for a transposed lane and the live answer carries none, the difference is the
+  // proxy's code, not the data.
+  const hostStale = liveRaw !== null && hostRouting.state !== "unknown" && liveRaw.host !== hostRouting.state;
+  const windowStale =
+    liveRaw !== null &&
+    !hostStale &&
+    liveRaw.ladder.some(
+      (l) =>
+        l.transposed === true &&
+        l.contextWindow === undefined &&
+        l.spec !== undefined &&
+        specContextWindow(l.spec, cfg, cachedContextWindow) !== null,
+    );
+  const staleProxy = hostStale || windowStale;
   const live = staleProxy ? null : liveRaw;
   const view = normalizeDispatchCommands(
     live ??
@@ -907,6 +941,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
       ...(client ? { client } : {}),
       host: hostRouting.state,
       ...(hostRouting.entrypoint ? { entrypoint: hostRouting.entrypoint } : {}),
+      publishedContextWindow: cachedContextWindow,
       }),
   );
 
@@ -950,13 +985,21 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (!live) {
     process.stdout.write(
       staleProxy
-        ? `(running proxy predates host-adaptive dispatch — restart it; live exhaustion state unknown)\n`
+        ? `(running proxy is older than this CLI${hostStale ? "" : " (no context-window substitution)"} — restart it; live exhaustion state unknown)\n`
         : `(no proxy running — live exhaustion state unknown)\n`,
     );
   }
   process.stdout.write("\n");
 
   const shell = parseRenderShell(argValue("--shell")) ?? shellFor();
+  // Only report the context window when the template actually asks for one — otherwise every
+  // transposed lane would carry a line about a feature this config does not use.
+  const laneTemplate = cfg.routing.cliLane;
+  const wantsContextWindow =
+    laneTemplate !== undefined &&
+    [...laneTemplate.args, ...Object.values(laneTemplate.env ?? {})].some(
+      (v) => typeof v === "string" && v.includes(CONTEXT_TOKEN),
+    );
   let renderedCli = false;
   for (const l of view.ladder) {
     const mark = view.next && l.id === view.next.id ? "->" : "  ";
@@ -980,6 +1023,16 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     // Keep the spec visible on a transposed lane: the mechanism changed, the target did not, and
     // a reader comparing this against the config needs to see which rung this is.
     if (l.transposed && l.spec) process.stdout.write(`   via: routing.cliLane → ${l.spec} (this host cannot reach it as a subagent)\n`);
+    // Say which way it went. A silently-absent window looks identical to one that was applied,
+    // and the consequence differs a lot: the child falls back to its own assumed window, which on
+    // a large-context model throws most of it away.
+    if (l.transposed && wantsContextWindow) {
+      process.stdout.write(
+        l.contextWindow !== undefined
+          ? `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (published by the serving provider)\n`
+          : `   context: not published for this spec — the variable is omitted and the CLI uses its own default\n`,
+      );
+    }
     if (l.unreachable) process.stdout.write(`   ⚠ ${l.unreachable}\n`);
     if (l.requiresDirective) {
       process.stdout.write(`   hint: add "@relay: ${l.spec}" to the subagent prompt (offload is off)\n`);

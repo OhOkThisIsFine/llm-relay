@@ -411,17 +411,52 @@ per tier:
   "cliLane": {
     "command": "claude",
     "args": ["-p", "--model", "{spec}", "--permission-mode", "plan", "{task}"],
-    "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791", "CLAUDECODE": null }
+    "env": {
+      "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791",
+      "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "{contextWindow}",   // dropped when unpublished
+      "CLAUDECODE": null
+    }
   }
 }
 ```
 
-`{spec}` is the rung's routing spec, `{task}` the delegated task; both are required, and neither is
-ever substituted into `env` values. A rung pointing at the plain Anthropic passthrough is **not**
-transposed — a bare `Agent(...)` reaches that from any host. With no template configured, such a
-rung is reported `unreachable` and skipped when picking `next` (an explicit `?lane=` still reaches
-it, and says why it is blocked). `requiresDirective` is never set on a bypassed host, because an
-`@relay:` line there is inert, not merely insufficient.
+**Placeholders.** `{spec}` (required) is the rung's routing spec and `{task}` (required) the
+delegated task. `{contextWindow}` (optional) is the spec's published context window in tokens.
+
+| Placeholder | In `args` | In `env` | Why |
+|---|---|---|---|
+| `{spec}` | yes | yes | relay-resolved routing |
+| `{contextWindow}` | yes | yes | relay-resolved provider metadata |
+| `{task}` | yes | **rejected at config load** | request content must never become process configuration |
+
+A rung pointing at the plain Anthropic passthrough is **not** transposed — a bare `Agent(...)`
+reaches that from any host. With no template configured, such a rung is reported `unreachable` and
+skipped when picking `next` (an explicit `?lane=` still reaches it, and says why it is blocked).
+`requiresDirective` is never set on a bypassed host, because an `@relay:` line there is inert, not
+merely insufficient.
+
+#### The context window (`{contextWindow}`)
+
+A CLI told to use a model it does not recognize assumes a window and compacts against it — the
+`claude` CLI assumes 200k — so a lane pointed at a 1M-context model silently throws away most of
+it. The relay already harvests per-(provider, model) limits for the request-path guardrail, so it
+substitutes the number it has.
+
+It resolves through the same rule as everything else here: **the serving provider's own published
+value, or nothing.** Never another provider's figure for the same model id (`resolveMetadata`'s
+`reference` class — the `~` column in `llm-relay candidates`), and never a guess.
+
+- **Pinned spec** — that deployment's published `contextLength`.
+- **`pool/<name>`** — every member must publish one, and the **minimum** is used: failover can land
+  the request on any member, so the pool's usable window is its smallest. One unknown member means
+  the floor is unknown, not that the others' floor applies.
+- **Unknown** — the env entry is **dropped entirely**, not set empty, and the child falls back to
+  its own default. `llm-relay dispatch` says which happened per lane.
+
+⚠ **Expect "not published" to be the common answer for pools.** Free providers largely publish no
+metadata (NIM publishes none at all), so most pool members are unknown. That is honest, not a bug:
+a window we invented would override the client's conservative default with fiction and overflow the
+real backend. Pinned specs on providers that do publish — OpenRouter, for instance — resolve fine.
 
 `llm-relay dispatch --next-command -t "<task>"` prints just the runnable line for `next`, for
 callers that want something executable rather than the human ladder.

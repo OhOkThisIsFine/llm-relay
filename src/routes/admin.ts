@@ -260,6 +260,11 @@ export async function handleAdminRoutes(
       ...(bodyClient ? { client: bodyClient } : {}),
       ...(hostParam ? { host: hostParam } : {}),
       ...(entrypointParam ? { entrypoint: entrypointParam } : {}),
+      // `cachedLimits` never fetches, so a cold cache degrades to "no window stated" rather than
+      // turning a dispatch query into a blocking upstream round-trip — same rule as the request
+      // -path context guardrail this reads the numbers from.
+      publishedContextWindow: (provider, model) =>
+        model === undefined ? null : (h.catalog.cachedLimits(provider, model)?.contextLength ?? null),
     });
     return ok(view, true);
   }
