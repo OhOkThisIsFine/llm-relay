@@ -1,9 +1,9 @@
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { existsSync, appendFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import type { Config, ProviderTierType } from "./config.js";
-import { ALL_PROVIDER_PRESETS, FREE_PROVIDER_PRESETS, SUBSCRIPTION_PROVIDER_PRESETS } from "./presets.js";
+import { ALL_PROVIDER_PRESETS } from "./presets.js";
 import { keyIsPresent } from "./authEnv.js";
 
 export interface OnboardingStatus {
@@ -149,11 +149,11 @@ export async function runInteractiveOnboarding(cfg?: Config, opts?: { envPath?: 
       if (!p.authEnv || !p.authEnv.trim()) continue;
       console.log(`\nSetting up ${p.displayName}`);
       if (p.signupUrl) console.log(`Signup URL: ${p.signupUrl}`);
-      const val = await ask(`Enter key for \$${p.authEnv} (leave blank to skip): `);
+      const val = await ask(`Enter key for $${p.authEnv} (leave blank to skip): `);
       if (val) {
         process.env[p.authEnv] = val;
         addedKeys[p.authEnv] = val;
-        console.log(`  Added \$${p.authEnv}!`);
+        console.log(`  Added $${p.authEnv}!`);
       }
     }
 

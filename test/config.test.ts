@@ -9,7 +9,6 @@ import {
   reshaperForTarget,
   isSubagentRequest,
   subagentSpec,
-  readRelayDirective,
   offloadRule,
   clientForPath,
 } from "../src/config.js";

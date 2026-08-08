@@ -1,5 +1,6 @@
 node_modules/
 dist/
+analysis-reports/
 config.json
 *.local.json
 *.log

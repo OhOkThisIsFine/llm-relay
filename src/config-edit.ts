@@ -10,7 +10,7 @@ export function readConfigDocument(path: string): ConfigDocument {
   try {
     value = JSON.parse(readFileSync(path, "utf8"));
   } catch (e) {
-    throw new Error(`could not read config ${path}: ${(e as Error).message}`);
+    throw new Error(`could not read config ${path}: ${(e as Error).message}`, { cause: e });
   }
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`config ${path} must contain a JSON object`);

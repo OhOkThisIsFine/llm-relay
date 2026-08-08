@@ -1,0 +1,8 @@
+{
+  "ignoreDependencies": [
+    "dependency-cruiser",
+    "jscpd",
+    "madge",
+    "ts-prune"
+  ]
+}

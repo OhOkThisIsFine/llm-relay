@@ -47,7 +47,7 @@ async function readLog(logPath) {
   return "(no log written)";
 }
 
-const request = (port, mode) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
+const request = (port) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
   method: "POST", headers: { "content-type": "application/json" },
   body: JSON.stringify({
     model: "weak-model", stream: false, messages: [{ role: "user", content: "weather in Paris?" }],
@@ -88,7 +88,7 @@ console.log("\n=== 1) DETECT mode — measure the trip-rate (no change to output
     routing: { default: "demo" },
     mode: "detect",
   });
-  const got = await request(port, "detect");
+  const got = await request(port);
   console.log("client received tool input :", JSON.stringify(got.content[0].input), "  <-- still broken (detect never alters)");
   console.log("proxy log line             :", await readLog(logPath));
   proc.kill();
@@ -106,7 +106,7 @@ console.log("\n=== 2) REPAIR mode — reshape the broken call before the client 
     reshaper: { base: `http://127.0.0.1:${reshaperPort}`, model: "stub-haiku", kind: "anthropic" },
     mode: "repair",
   });
-  const got = await request(port, "repair");
+  const got = await request(port);
   console.log("client received tool input :", JSON.stringify(got.content[0].input), "  <-- REPAIRED");
   console.log("proxy log line             :", await readLog(logPath));
   proc.kill();

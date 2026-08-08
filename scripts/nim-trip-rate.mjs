@@ -106,6 +106,15 @@ function toAssistant(msg) {
   return { content, stop_reason: content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn" };
 }
 
+function trialMark(verdict, repairOutcome) {
+  if (verdict === "valid") return ".";
+  if (verdict === "fail") {
+    return repairOutcome === "fixed" ? "r" : "x";
+  }
+  if (verdict === "no_tool_call") return "n";
+  return "E";
+}
+
 // Strong-model reshaper in the proxy's Reshaper shape (corrected-inputs contract).
 function makeReshaper(schema) {
   return {
@@ -160,7 +169,7 @@ for (const model of liveModels) {
     for (let i = 0; i < TRIALS; i++) {
       const rec = await trial(model, scenario);
       records.push(rec);
-      marks.push(rec.verdict === "valid" ? "." : rec.verdict === "fail" ? (rec.repair === "fixed" ? "r" : "x") : rec.verdict === "no_tool_call" ? "n" : "E");
+      marks.push(trialMark(rec.verdict, rec.repair));
     }
     line += `${scenario.id.slice(0, 6)}:${marks.join("")} `;
   }

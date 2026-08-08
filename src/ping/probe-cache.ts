@@ -168,10 +168,7 @@ export function getModelsDueForProbe(
       if (now - entry.lastProbedAt >= delay) due.push(id);
       continue;
     }
-    if (now - entry.lastProbedAt >= ttlMs) {
-      due.push(id);
-      continue;
-    }
+    if (now - entry.lastProbedAt >= ttlMs) due.push(id);
   }
   return due;
 }

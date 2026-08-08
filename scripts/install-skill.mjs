@@ -45,6 +45,19 @@ const CODEX_AGENTS = [
 ];
 
 /** Add the provider section without disturbing unrelated Codex settings or duplicating it. */
+function hasConfiguredCodexProvider(current) {
+  // Accept the normal unquoted TOML table and the equivalent quoted spelling, and tolerate
+  // whitespace inside the brackets — `[ model_providers.llm-relay ]` is the SAME table.
+  // ⚠ Comparing the trimmed line against the literal string is not enough: a config written by
+  // hand with inner spaces reads as "not configured", so postinstall appends a SECOND provider
+  // block and the user's config.toml ends up with a duplicate table. Collapsing whitespace keeps
+  // the match tolerant without the backtracking regex this replaced.
+  return current.split("\n").some((line) => {
+    const collapsed = line.replace(/\s/g, "");
+    return collapsed === CODEX_PROVIDER_SECTION || collapsed === '[model_providers."llm-relay"]';
+  });
+}
+
 function ensureCodexProvider(configPath) {
   if (!existsSync(configPath)) {
     writeFileSync(configPath, CODEX_PROVIDER_BLOCK, "utf8");
@@ -52,12 +65,14 @@ function ensureCodexProvider(configPath) {
   }
 
   const current = readFileSync(configPath, "utf8");
-  // Accept both the normal unquoted TOML table and the equivalent quoted table spelling.
-  if (/^\s*\[\s*model_providers\.(?:llm-relay|"llm-relay")\s*\]\s*$/m.test(current)) {
+  if (hasConfiguredCodexProvider(current)) {
     return "already configured";
   }
 
-  const separator = current.length === 0 ? "" : current.endsWith("\n") ? "\n" : "\n\n";
+  let separator = "";
+  if (current.length !== 0) {
+    separator = current.endsWith("\n") ? "\n" : "\n\n";
+  }
   writeFileSync(configPath, `${current}${separator}${CODEX_PROVIDER_BLOCK}`, "utf8");
   return "configured";
 }
@@ -93,7 +108,12 @@ try {
   // an npm global tree (…/npm/node_modules/llm-relay on Windows, …/lib/node_modules/llm-relay
   // elsewhere) — the env var alone is npm-version-dependent.
   const pkgDir = join(here, "..");
-  const inGlobalTree = /(^|[\\/])(npm|lib)[\\/]node_modules[\\/]llm-relay$/i.test(pkgDir.replace(/[\\/]+$/, ""));
+  const normalizedPkgDir = pkgDir.replace(/\\/g, "/");
+  const cleanPkgDir = normalizedPkgDir.endsWith("/") ? normalizedPkgDir.slice(0, -1) : normalizedPkgDir;
+  const pkgParts = cleanPkgDir.split("/");
+  const parentDir = pkgParts.at(-2);
+  const grandparentDir = pkgParts.at(-3);
+  const inGlobalTree = parentDir === "node_modules" && (grandparentDir === "npm" || grandparentDir === "lib");
   const isGlobal = process.env.npm_config_global === "true" || inGlobalTree;
 
   if (!isGlobal && !force) {

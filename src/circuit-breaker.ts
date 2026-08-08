@@ -265,7 +265,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   private getAttemptRecord(
     handle: AttemptHandle,
   ): TransitionResult<BreakerAttemptRecord, AttemptCompletionFailure> {
-    if ((typeof handle !== "object" && typeof handle !== "function") || handle === null) {
+    if (typeof handle !== "object" && typeof handle !== "function") {
       return { ok: false, error: { kind: "stale-handle" } };
     }
 

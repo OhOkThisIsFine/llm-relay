@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll } from "vitest";
-import { createServer, type Server } from "node:http";
+import { type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { buildRegistry, loadTierData, joinCapability } from "../src/registry.js";
 import { createProxy } from "../src/server.js";

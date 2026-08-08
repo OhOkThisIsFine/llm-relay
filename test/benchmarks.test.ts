@@ -77,11 +77,11 @@ describe("ranking keeps the provenance that produced the order", () => {
 
 describe("strength — evidence hierarchy", () => {
   it("shrinks thin and fuzzy evidence toward neutral before it can steer routing", () => {
-    expect(evidenceConfidence("snapshot", 1, "exact")).toBe(0.2);
-    expect(evidenceConfidence("snapshot", 5, "exact")).toBe(1);
-    expect(evidenceConfidence("snapshot", 2, "fuzzy")).toBe(0.2);
-    expect(confidenceAdjustedScore(90, 0.2)).toBe(58);
-    expect(confidenceAdjustedScore(80, 1)).toBe(80);
+    expect(evidenceConfidence("snapshot", 1, "exact")).toBeCloseTo(0.2);
+    expect(evidenceConfidence("snapshot", 5, "exact")).toBeCloseTo(1);
+    expect(evidenceConfidence("snapshot", 2, "fuzzy")).toBeCloseTo(0.2);
+    expect(confidenceAdjustedScore(90, 0.2)).toBeCloseTo(58);
+    expect(confidenceAdjustedScore(80, 1)).toBeCloseTo(80);
   });
 
   it("builds cumulative capability floors without excluding stronger models from lower effort", () => {
