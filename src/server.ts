@@ -17,7 +17,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -29,6 +29,8 @@ import { specOfTarget } from "./benchmarks.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
+import { clearEligibility, cooldownUntil, isCostBlocked, recordEligibility } from "./deployment-eligibility.js";
+import { interpretRefusal, recordUnknownRefusal } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -396,18 +398,34 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     // "the pool is mostly free" is exactly the assumption this exists to not rely on. Refusal is
     // loud (a clean 503 naming the rule), never a fall-through: falling through to
     // `routing.default` is the Anthropic passthrough, i.e. the very spend being guarded against.
-    if (subSpec !== null && offloadRule(cfg, requestClient).freeOnly === true) {
+    // ⚠ The guard covers a DIRECTLY ADDRESSED pool too, not only offload-rerouted traffic.
+    // Gating it on `subSpec !== null` meant it never ran for the case it most needed to: a
+    // dispatch `cliLane` runs `claude -p --model pool/<name>`, whose requests are a MAIN
+    // conversation — no subagent marker, no `@relay:` directive — so the free-lane traffic this
+    // flag exists to bound walked straight past it. `pool/<name>` is by construction relay-routed
+    // free-lane traffic and never the vendor passthrough, and the guard can only ever refuse to
+    // spend, so extending it there cannot cost anyone an answer they were entitled to.
+    const addressesPool = typeof routedModel === "string" && routedModel.startsWith("pool/");
+    if ((subSpec !== null || addressesPool) && offloadRule(cfg, requestClient).freeOnly === true) {
       const kept: ResolvedTarget[] = [];
       let blocked: { spec: string; why: string } | null = null;
       for (const t of targetCandidates) {
         const assessment = t.kind === "openai" && t.model
           ? assessCost(t.model, h.catalog.cachedLimits(t.provider, t.model), cfg.providers[t.provider]?.tierType)
           : null; // anthropic passthrough — primary quota, definitionally not free
-        if (assessment?.costClass === "free") kept.push(t);
+        // A deployment that STATED it is not free outranks a price table that says it is. The
+        // `provider-tier` basis is an assumption about a roster; a 403 naming a subscription is
+        // that deployment correcting us. (`isCostBlocked` excludes `allowance-exhausted` — a
+        // spent allowance is not a price, and must not be laundered into one here either.)
+        if (assessment?.costClass === "free" && !isCostBlocked(t.provider, t.model)) kept.push(t);
         else if (!blocked) {
           blocked = {
             spec: t.model ? `${t.provider}/${t.model}` : t.provider,
-            why: assessment ? `${assessment.costClass} (${assessment.basis})` : "anthropic passthrough (primary quota)",
+            why: !assessment
+              ? "anthropic passthrough (primary quota)"
+              : assessment.costClass === "free"
+                ? "observed not free (the deployment stated it requires a subscription, or is gone)"
+                : `${assessment.costClass} (${assessment.basis})`,
           };
         }
       }
@@ -618,12 +636,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
       observeAttemptHeaders(h, attempt, backendRes.status, retryAfterMs);
       observeContextLimit(backendRes, target);
+
       const localFailure = errorOrigin(backendRes) === "local";
       const tryNext = !localFailure && shouldTryNext(cls);
       if (tryNext && !res.destroyed && i < healthyTargets.length - 1) {
         clearTimeout(timer);
         res.off("close", onResClose);
-        await backendRes.body?.cancel().catch(() => {});
+        await discardCandidate(backendRes, target, backendRes.status, retryAfterMs);
         pool429.recordFailover(backendRes.status, retryAfterMs);
         completeAttemptFailure(h, attempt, {
           failure: "http",
@@ -643,7 +662,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal }, h);
       } else {
         const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs }, h);
+        pool429.recordFinal(backendRes.status);
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary() }, h);
       }
       return;
     } finally {
@@ -680,6 +700,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
  *
  * Stable within each band, so the already-computed deployment fitness still decides among equals.
  */
+/** Is a learned allowance exhaustion still cooling this target? Never throws — no store, no cooling. */
+function cooledByAllowance(t: ResolvedTarget, now: number): boolean {
+  try {
+    const until = cooldownUntil(t.provider, t.model ?? null, { now });
+    return until !== null && now < until;
+  } catch {
+    return false;
+  }
+}
+
 export function orderByUsability(
   targets: ResolvedTarget[],
   breaker = globalCircuitBreaker,
@@ -689,7 +719,17 @@ export function orderByUsability(
   const faulted: ResolvedTarget[] = [];
   const cooling: ResolvedTarget[] = [];
   for (const t of targets) {
-    if (!breaker.isHealthy(t, now)) cooling.push(t);
+    // A learned allowance exhaustion cools a target the breaker may know nothing about. That is
+    // the whole point of the ACCOUNT scope: one member's stated "you have depleted your monthly
+    // included credits" is a fact about the credential, so its siblings are spent too and should
+    // step aside without each first spending a round-trip to be told so individually. Measured
+    // here: `pool/xhigh`'s 15 members share only four independent quota domains, so the walk was
+    // rediscovering four facts fifteen times.
+    //
+    // Demotion, never exclusion — same contract as the rest of this function, and doubly so here:
+    // an exhausted allowance is a temporary condition on a deployment that is still free, and a
+    // pool with nothing else left must still be able to try it.
+    if (!breaker.isHealthy(t, now) || cooledByAllowance(t, now)) cooling.push(t);
     else if (breaker.hasCredentialFault(t, now)) faulted.push(t);
     else live.push(t);
   }
@@ -736,9 +776,12 @@ function shouldTryNext(cls: OutcomeClass): boolean {
 class Pool429Tracker {
   private minRetryAfterMs: number | null = null;
   private only429 = true;
+  /** status → how many candidates answered it, in first-seen order. */
+  private readonly counts = new Map<number, number>();
 
   /** Record a response being failed over past. */
   recordFailover(status: number, retryAfterMs: number | null): void {
+    this.count(status);
     if (status === 429) {
       if (retryAfterMs !== null) {
         this.minRetryAfterMs = this.minRetryAfterMs === null ? retryAfterMs : Math.min(this.minRetryAfterMs, retryAfterMs);
@@ -746,6 +789,44 @@ class Pool429Tracker {
     } else {
       this.only429 = false;
     }
+  }
+
+  /** Record the response actually served — the walk's last candidate, success or failure. */
+  recordFinal(status: number): void {
+    this.count(status);
+  }
+
+  private count(status: number): void {
+    this.counts.set(status, (this.counts.get(status) ?? 0) + 1);
+  }
+
+  /**
+   * The walk, as one line: `"13 tried, 0 served: 4x402, 5x429, 3x403, 1x400"`.
+   *
+   * ⚠ ASCII only. This is an HTTP header value, and Node latin1-encodes those — a `×` reaches a
+   * UTF-8 client as mojibake. Caught on a live pool, where the header read `6�402`.
+   *
+   * A pool's error is one member's error, and that is genuinely misleading when the other twelve
+   * failed for three other reasons: the client is handed HuggingFace's 402 and told to go buy
+   * credits, when the correct action is "use another pool". The BODY still carries that member's
+   * real upstream error — a true upstream error beats a synthesized one, the same maxim the
+   * context guardrail and the all-429 policy follow — so the aggregate rides alongside it in a
+   * header and in the log, where it costs the client nothing and answers "what actually happened"
+   * without a round of manual probing.
+   *
+   * Null for a single-candidate walk: there is no aggregate to report, and emitting one would
+   * dress up an ordinary passthrough error as a pool exhaustion.
+   */
+  summary(): string | null {
+    let tried = 0;
+    let served = 0;
+    for (const [status, n] of this.counts) {
+      tried += n;
+      if (status < 400) served += n;
+    }
+    if (tried < 2) return null;
+    const breakdown = [...this.counts.entries()].map(([status, n]) => `${n}x${status}`).join(", ");
+    return `${tried} tried, ${served} served: ${breakdown}`;
   }
 
   /** Retry-After (ms) to serve on the FINAL response, or undefined to leave its real header alone. */
@@ -784,6 +865,11 @@ interface Ctx {
    * earliest reset is when the POOL next has capacity — the honest number for a client backoff.
    */
   retryAfterOverrideMs?: number | undefined;
+  /**
+   * The whole walk in one line — see `Pool429Tracker.summary()`. Null when only one candidate was
+   * tried, because then the response IS the walk and an aggregate would add nothing.
+   */
+  poolSummary?: string | null;
   /**
    * The target this response actually came from — the resolved (provider, model)
    * after tier/pool expansion, subagent redirection and failover. Every log record
@@ -855,6 +941,66 @@ function observeContextLimit(res: Response, target: ResolvedTarget): void {
     });
 }
 
+/**
+ * Learn what a refusal proved about a deployment — or, when nothing confirmed covers it, learn
+ * NOTHING and queue the message for offline research.
+ *
+ * ⚠ Called from BOTH request paths beside `observeContextLimit`, for the reason that helper
+ * documents: a learning loop running on one front knows nothing about half the traffic, which is
+ * the exact shape of the pool-failover incident (docs/pool-failover.md).
+ *
+ * ⚠ The request path does not INTERPRET anything. `interpretRefusal` is a deterministic lookup
+ * against confirmed entries and reviewed seeds; a miss records the signature and stops. Judgement
+ * about an unrecognized message happens out of band — see `refusal-interpretation.ts` — because
+ * an LLM's opinion must never decide a live routing decision.
+ *
+ * ⚠ Takes a body STRING, never a `Response`, and is called only where that body was going to be
+ * read or discarded anyway. The obvious implementation — `res.clone()`, like `observeContextLimit`
+ * does — breaks failover outright: `clone()` TEES the body, and the failover branch immediately
+ * cancels the original, so the un-read tee branch strands the walk and the client is served the
+ * first candidate's error with the rest of the pool untouched. Caught by
+ * `test/pool-failover.test.ts` (three pre-existing 402 tests went red), which is the whole reason
+ * those tests insist on ≥2 candidates.
+ *
+ * Never throws: the worst outcome of a failure here is that nothing is learned this time.
+ */
+function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs: number | null, body: string): void {
+  if (target.model === undefined) return;
+  try {
+    const verdict = interpretRefusal(target.provider, target.model, status, body);
+    if (verdict === null) {
+      // The fail-safe: an unrecognized refusal changes nothing about routing. It is held so a
+      // researcher can say what it means, and only then will it ever bind.
+      recordUnknownRefusal(target.provider, target.model, status, body);
+      return;
+    }
+    recordEligibility(target.provider, target.model, verdict, { retryAfterMs });
+  } catch {
+    /* learning is best-effort and never in the request's way */
+  }
+}
+
+/** Statuses that can carry a durable fact about a deployment. A 429 is the breaker's business. */
+function carriesEligibilityFact(status: number): boolean {
+  return status === 400 || status === 402 || status === 403 || status === 404;
+}
+
+/**
+ * Release a candidate the walk is stepping over — reading its body first when that body might say
+ * something durable about the deployment.
+ *
+ * The read replaces the `cancel()` it used to be, rather than joining it: the body is being thrown
+ * away either way, so consuming it costs nothing extra and frees the socket just the same.
+ */
+async function discardCandidate(res: Response, target: ResolvedTarget, status: number, retryAfterMs: number | null): Promise<void> {
+  if (carriesEligibilityFact(status)) {
+    const body = await res.text().catch(() => "");
+    if (body) observeEligibility(target, status, retryAfterMs, body);
+    return;
+  }
+  await res.body?.cancel().catch(() => {});
+}
+
 function observeAttemptHeaders(
   h: Handlers,
   attempt: HealthAttempt,
@@ -886,6 +1032,16 @@ function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: num
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
   recordCall(attempt.target, true, attempt.started);
+  // A served request is first-party proof that this deployment exists and that the credential has
+  // allowance RIGHT NOW — strictly better evidence than any stored refusal, so it clears the
+  // record, including the account-scoped one. That is how a topped-up balance or a rolled-over
+  // month recovers well before the TTL would have expired, with no restart. Same contract as the
+  // breaker clearing a credential fault on success.
+  try {
+    clearEligibility(attempt.target.provider, attempt.target.model ?? null);
+  } catch {
+    /* best-effort */
+  }
 }
 
 function completeAttemptFailure(
@@ -1049,13 +1205,16 @@ async function openAiFrontPath(
     const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
     observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs);
     observeContextLimit(upstream, target);
+
     const tryNext = localFailure ? false : shouldTryNext(cls);
 
     if (tryNext && !isLast && !res.writableEnded && !res.destroyed) {
       clearTimeout(timer);
       res.off("close", onResClose);
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
-      await upstream.body?.cancel().catch(() => {});
+      // The body is read rather than cancelled when it might state a durable fact about the
+      // deployment; either way the socket is freed and the bytes are discarded.
+      await discardCandidate(upstream, target, upstream.status, retryAfterMs);
       pool429.recordFailover(upstream.status, retryAfterMs);
       completeAttemptFailure(h, attempt, {
         failure: "http",
@@ -1076,6 +1235,11 @@ async function openAiFrontPath(
     try {
       const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
+      // Same aggregate as the Anthropic path, from the same tracker — the two fronts having
+      // separate copies of one policy is the defect this file has already shipped once.
+      pool429.recordFinal(upstream.status);
+      const poolAttempts = pool429.summary();
+      if (poolAttempts) headers[POOL_ATTEMPTS_HEADER] = poolAttempts;
       const poolRetryAfterMs = pool429.overrideMs(upstream.status, retryAfterMs);
       if (poolRetryAfterMs !== undefined) {
         headers["retry-after"] = String(Math.max(1, Math.ceil(poolRetryAfterMs / 1000)));
@@ -1083,6 +1247,9 @@ async function openAiFrontPath(
       if (upstream.status >= 400) {
         // Error bodies are small and are never streamed: buffer, normalize the envelope, send.
         const raw = await upstream.text().catch(() => "");
+        // The last candidate teaches us as much as the ones stepped over — and for a
+        // single-member pool it is the ONLY one that can. Free, since the body is already here.
+        if (raw && carriesEligibilityFact(upstream.status)) observeEligibility(target, upstream.status, retryAfterMs, raw);
         const normalized = normalizeOpenAiErrorBody(raw, upstream.status);
         const out = Buffer.from(normalized ?? raw, "utf8");
         res.writeHead(upstream.status, { ...headers, "content-type": "application/json" });
@@ -1134,6 +1301,7 @@ async function transparentPath(
   if (ctx.retryAfterOverrideMs !== undefined && Number.isFinite(ctx.retryAfterOverrideMs)) {
     responseHeaders["retry-after"] = String(Math.max(1, Math.ceil(ctx.retryAfterOverrideMs / 1000)));
   }
+  if (ctx.poolSummary) responseHeaders[POOL_ATTEMPTS_HEADER] = ctx.poolSummary;
   res.writeHead(backendRes.status, responseHeaders);
   let assistant: AssistantMessage | null = null;
   try {
@@ -1155,6 +1323,12 @@ async function transparentPath(
     } else {
       const bytes = Buffer.from(await backendRes.arrayBuffer());
       if (!res.writableEnded) res.end(bytes);
+      // Same as the OpenAI front's terminal branch: the served response is the last candidate's,
+      // and for a single-member pool the only refusal we will ever see. Errors are never streamed,
+      // so this branch is where they land.
+      if (backendRes.status >= 400 && carriesEligibilityFact(backendRes.status)) {
+        observeEligibility(ctx.target, backendRes.status, parseRetryAfterMs(backendRes.headers.get("retry-after")), bytes.toString("utf8"));
+      }
       if (ctx.willValidate && bytes.length <= MAX_VALIDATE_BYTES) assistant = parseAssistant(bytes.toString("utf8"));
     }
   } catch (e) {
