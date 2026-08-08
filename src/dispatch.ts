@@ -1,4 +1,4 @@
-import { expandPoolSpecs, offloadRule, splitSpec, type Config, type LadderRung } from "./config.js";
+import { expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX, type Config, type LadderRung } from "./config.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 
@@ -311,6 +311,25 @@ export function specContextWindow(
     return null;
   }
   if (specs.length === 0) return null;
+
+  // ⚠ The DEGRADE TAIL is excluded from the floor.
+  //
+  // A pool does not have a context window; a CLI launched against one has to be told a single
+  // number up front (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`) before any request exists, and cannot
+  // renegotiate per turn. Since failover can land on any member, that number has to be a floor.
+  //
+  // Taking it over EVERY member made the floor hostage to the weakest thing the pool can fall back
+  // to — and once pools began admitting paid and lower-band members, that went from ~44 members to
+  // 200, so one small model capped a lane whose in-band members are all large. The band is what
+  // the caller asked for; the tail is an announced last resort (`x-llm-relay-degraded`), and
+  // landing there already means accepting something weaker. It is safe because the context
+  // guardrail prunes any member that cannot take the prompt, so an over-length request skips the
+  // small ones instead of failing on them.
+  const tail = new Set(cfg.routing.poolDegraded?.[spec.startsWith(POOL_PREFIX + "/") ? spec.slice(POOL_PREFIX.length + 1) : ""] ?? []);
+  if (tail.size > 0) {
+    const inBand = specs.filter((s) => !tail.has(s));
+    if (inBand.length > 0) specs = inBand;
+  }
 
   let best: ResolvedContextWindow | null = null;
   let unknown = 0;
