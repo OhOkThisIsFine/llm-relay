@@ -1,7 +1,7 @@
 # Host-adaptive dispatch
 
-**Status:** implemented 2026-08-07, suite green (`npm run check`: 51 files, 764 tests). Design
-ratified by the owner in-session. Not yet released — see "Remaining" at the end.
+**Status:** shipped in **v0.20.0** (2026-08-07). Design ratified by the owner in-session; verified
+end-to-end from a real Claude Desktop session against the published build.
 
 ## The problem
 
@@ -169,14 +169,17 @@ script as its first argument, which also avoids a shell entirely.
 
 ## Remaining
 
-Owner decisions, not pending code:
+One optional config change, owner's call — no pending code:
 
-1. **Release.** The working tree already carried an unrelated in-flight sprint (eslint / knip /
-   dependency-cruiser config plus edits across ~20 files) when this landed, overlapping
-   `src/cli.ts`, `src/config.ts` and `src/dispatch.ts`. Committing this work would bundle that
-   sprint into the release, so the commit/tag/publish flow was deliberately not run.
-2. **`routing.cliLane` in the live config.** Adding it is currently a no-op for this machine: the
-   live ladder's only `relay` rung is the Anthropic passthrough, which is never transposed. The
-   value arrives when the three hand-written per-tier `claude` CLI rungs (`claude-free-pool`,
-   `claude-deepseek-credits`, `claude-deepseek-late` — twelve copies of the same ten-key env block
-   across four tiers) are collapsed back into `relay` rungs plus one template.
+**Collapse the hand-written CLI rungs into `routing.cliLane`.** Adding the template alone is a
+no-op today: the live ladder's only `relay` rung is the Anthropic passthrough, which is never
+transposed. The value arrives when the three per-tier `claude` CLI rungs (`claude-free-pool`,
+`claude-deepseek-credits`, `claude-deepseek-late` — twelve copies of the same ten-key env block
+across four tiers) are rewritten as `relay` rungs plus one template. The behaviour is identical
+from a bypassed host; the difference is that a fourth pool or a fifth tier stops meaning another
+hand-copied env block, and a routed host would then get the real relay rungs instead of a
+shell-out it does not need.
+
+⚠ **The `Agent` hook installs on a TOGGLE, so an already-on rule does not have it.** This machine
+had `offload claude on` set before v0.20.0; re-running `llm-relay offload claude on` is what
+installs the hook.
