@@ -2,6 +2,21 @@ import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bri
 import { buildAuthHeaders, readCredential } from "./authEnv.js";
 import { type ResolvedTarget } from "./config.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
+import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
+import { toolSchemaMap } from "./anthropic.js";
+
+/**
+ * A tool-call envelope was present in the response text but could not be parsed — truncated, or a
+ * dialect variant we do not model. Distinct from a mapper defect: the relay's translation is fine,
+ * the SERVING HOST returned an unusable body. Carried as a retriable failure so the pool fails over
+ * to a host that parses its models' dialect.
+ */
+export class DialectUnparseableError extends Error {
+  constructor(public readonly dialect: string) {
+    super(`backend returned an unparseable ${dialect} tool-call envelope as text`);
+    this.name = "DialectUnparseableError";
+  }
+}
 
 /**
  * Response header stating who produced an error status: the provider, or this proxy.
@@ -453,22 +468,84 @@ export async function fetchBackend(
 
   let anthropicJson: object;
   try {
-    anthropicJson = openAiResponseToAnthropic(upstreamJson as Record<string, unknown>, target.model ?? "");
+    const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
+    anthropicJson = openAiResponseToAnthropic(upstreamJson as Record<string, unknown>, target.model ?? "", schemas);
   } catch (e) {
+    if (e instanceof DialectUnparseableError) {
+      // NOT a mapper defect — the translation is fine and the HOST returned an unusable body. It
+      // counts against this deployment so the breaker sees it and the pool fails over to a host
+      // that parses its models' dialect. 502 is retriable, which is what drives the walk.
+      return anthropicError(502, `llm-relay: ${e.message}`, "upstream", {}, "tool_dialect_unparseable");
+    }
     // The provider returned a valid source envelope, so a failure after this point belongs to
     // the relay mapper rather than the provider or its failure budget.
     return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
   }
-  return new Response(JSON.stringify(anthropicJson), { status: 200, headers: { "content-type": "application/json" } });
+  // Announce a recovered call for the same reason `x-llm-relay-degraded` is announced: a response
+  // whose tool call the RELAY reconstructed is not the same as one that arrived correct, and an
+  // unflagged reconstruction is indistinguishable from a host that worked.
+  const recoveredDialect = recoveredDialectOf(anthropicJson);
+  return new Response(JSON.stringify(anthropicJson), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      ...(recoveredDialect ? { "x-llm-relay-tool-dialect": recoveredDialect } : {}),
+    },
+  });
 }
 
-/** Map a non-streaming OpenAI chat completion into an Anthropic message. */
-export function openAiResponseToAnthropic(j: Record<string, unknown>, model: string): object {
+/** Did this translated message carry a tool call the relay reconstructed from text? */
+function recoveredDialectOf(message: object): string | null {
+  const content = (message as { content?: Array<Record<string, unknown>> }).content ?? [];
+  return content.some((b) => b.type === "tool_use" && typeof b.id === "string" && b.id.startsWith("tu_recovered_"))
+    ? "recovered"
+    : null;
+}
+
+/**
+ * Map a non-streaming OpenAI chat completion into an Anthropic message.
+ *
+ * `schemas` enables recovery of a tool call the HOST failed to parse: some free hosts return the
+ * model's native tool-call dialect as assistant TEXT instead of populating `tool_calls`, which
+ * without this reaches the client as markup it treats as a final answer (see
+ * docs/tool-call-dialect-leak.md). Omitting it keeps the pure translation behaviour.
+ */
+export function openAiResponseToAnthropic(
+  j: Record<string, unknown>,
+  model: string,
+  schemas?: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>,
+): object {
   const choice = (j.choices as Array<Record<string, unknown>> | undefined)?.[0] ?? {};
   const msg = (choice.message as Record<string, unknown> | undefined) ?? {};
   const content: object[] = [];
-  if (typeof msg.content === "string" && msg.content.length > 0) content.push({ type: "text", text: msg.content });
-  const toolCalls = (msg.tool_calls as Array<Record<string, unknown>> | undefined) ?? [];
+  let toolCalls = (msg.tool_calls as Array<Record<string, unknown>> | undefined) ?? [];
+
+  // Recover ONLY when the host parsed nothing. A host that populated `tool_calls` has already
+  // spoken; second-guessing it here would be inference, not translation.
+  let recovered: DialectToolCall[] = [];
+  if (toolCalls.length === 0 && typeof msg.content === "string" && msg.content.length > 0) {
+    const out = recoverToolCalls(msg.content, schemas ?? new Map());
+    if (out.status === "parsed") {
+      recovered = out.calls;
+      if (out.text.length > 0) content.push({ type: "text", text: out.text });
+    } else if (out.status === "detected") {
+      // Framing present, nothing parseable — a truncated or unmodelled envelope. Fail clean so
+      // failover reaches a host that parses, exactly as repair fails clean on an unrepairable
+      // call. Returning the fragment would hand the client a "final answer" that is really the
+      // tail of a broken tool call, which is the misdiagnosis this whole path exists to prevent.
+      throw new DialectUnparseableError(out.dialect);
+    } else {
+      content.push({ type: "text", text: msg.content });
+    }
+  } else if (typeof msg.content === "string" && msg.content.length > 0) {
+    content.push({ type: "text", text: msg.content });
+  }
+  if (recovered.length > 0) {
+    toolCalls = recovered.map((c, i) => ({
+      id: `tu_recovered_${i}`,
+      function: { name: c.name, arguments: JSON.stringify(c.input) },
+    }));
+  }
   for (const tc of toolCalls) {
     const fn = (tc.function as Record<string, unknown> | undefined) ?? {};
     let input: unknown;
