@@ -225,6 +225,45 @@ function findMessage(v: unknown, depth = 0): string | null {
   return null;
 }
 
+/**
+ * A reset the refusal BODY stated, in ms — or null.
+ *
+ * `Retry-After` is a header, and several providers put the same fact in the body instead: Google's
+ * `google.rpc.RetryInfo` carries `"retryDelay": "3600s"` inside the error details, which is the
+ * only place Gemini says when a spent quota comes back. Without this the relay falls back to a
+ * kind's default TTL and re-probes on a schedule it invented, which for a 5-hourly or weekly quota
+ * means hours of pointless attempts.
+ *
+ * ⚠ Same rule as `parseStatedContextLimit`: only an EXPLICIT statement counts. Nothing is derived
+ * from how long a request took, how many failed, or what a window "usually" is — a store whose
+ * value is that it holds measurements must not accept a guess. If nothing parses, the kind's TTL
+ * applies and the relay simply re-checks sooner than it strictly needed to, which is the safe
+ * direction.
+ */
+export function parseStatedResetMs(body: string): number | null {
+  if (typeof body !== "string" || body.length === 0) return null;
+  const text = body.length > 8192 ? body.slice(0, 8192) : body;
+  const patterns: Array<{ re: RegExp; scale: number }> = [
+    // google.rpc.RetryInfo — "retryDelay": "27s" / "1.5s" / "3600s"
+    { re: /"retry[_-]?delay"\s*:\s*"?(\d+(?:\.\d+)?)s"?/i, scale: 1000 },
+    // Common JSON spellings of the Retry-After header's seconds form.
+    { re: /"retry[_-]?after(?:[_-]?seconds)?"\s*:\s*"?(\d+(?:\.\d+)?)"?/i, scale: 1000 },
+    // Prose, as a last resort: "try again in 45 seconds" / "retry in 5 minutes".
+    { re: /(?:try|retry)\s+again\s+in\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b/i, scale: 1000 },
+    { re: /(?:try|retry)\s+again\s+in\s+(\d+(?:\.\d+)?)\s*(?:minutes?|mins?)\b/i, scale: 60_000 },
+    { re: /(?:try|retry)\s+again\s+in\s+(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b/i, scale: 3_600_000 },
+  ];
+  for (const { re, scale } of patterns) {
+    const m = re.exec(text);
+    if (!m?.[1]) continue;
+    const ms = Number(m[1]) * scale;
+    // A week is the longest window any of these providers publish; beyond that it is a parse
+    // artifact, and believing it would strand a deployment far past any real reset.
+    if (Number.isFinite(ms) && ms > 0 && ms <= 7 * 24 * 60 * 60 * 1000) return Math.round(ms);
+  }
+  return null;
+}
+
 /** The lookup key. Per (provider, model, normalized message) — see the header for why all three. */
 export function refusalSignature(provider: string, model: string | null | undefined, status: number, body: string): string {
   return `${provider}|${model ?? "-"}|${status}|${normalizeRefusalMessage(body)}`;
@@ -250,6 +289,27 @@ export const SEED_INTERPRETATIONS: Array<{
   scope: ScopeTemplate;
   note: string;
 }> = [
+  {
+    // ⚠ **A quota is not a rate limit, and the two must not share a cooldown.** FIRST in this list
+    // on purpose — first match wins, and the rate-limit seed below must never see quota wording.
+    //
+    // A rate limit is throughput (requests per minute) and resets in seconds to minutes, which is
+    // why `rate-limited` carries a 2-minute TTL. A quota is an ALLOWANCE over a long window: a
+    // 5-hourly or weekly grant on a free tier, or a monthly credit balance. Classifying one as the
+    // other means re-probing a spent weekly quota every two minutes for days. The rate-limit
+    // pattern below matched the word "quota" in 0.28.0 and did exactly that.
+    //
+    // Resolves to `allowance-exhausted`, the same kind HuggingFace's credit balance uses and for
+    // the same reason: the deployment is still FREE, it is simply spent until the window rolls
+    // over. Gemini's wording — "you exceeded your current quota, please check your plan and
+    // billing details" — names the plan, not the model, so it is the project's allowance and every
+    // deployment behind that key is equally spent.
+    status: (s) => s === 429 || s === 403,
+    pattern: /exceeded\s+your\s+current\s+quota|quota\s+exceeded[^.]{0,40}\b(?:plan|billing|project)|check\s+your\s+plan\s+and\s+billing|\b(?:daily|weekly|monthly|hourly)\s+quota\s+(?:exceeded|exhausted|reached)|out\s+of\s+quota/,
+    class: "allowance-exhausted",
+    scope: { kind: "provider" },
+    note: "stated QUOTA exhaustion (long window); free but spent until the allowance refreshes",
+  },
   {
     // HuggingFace: "You have depleted your monthly included credits. Purchase pre-paid credits…"
     // A BALANCE — the account's, so it covers every model behind that key.
@@ -303,12 +363,13 @@ export const SEED_INTERPRETATIONS: Array<{
     // account-level limit belongs here. Matching plain "rate limit exceeded" would demote whole
     // providers on routine throttling — worse than the problem.
     status: (s) => s === 429,
-    pattern: /(?:account|organization|organisation|project|api\s+key|workspace)[^.]{0,40}\b(?:rate\s*limit|quota|requests?\s+per)|\b(?:rate\s*limit|quota)[^.]{0,24}\bfor\s+(?:your|this)\s+(?:account|organization|organisation|project|key)/,
+    pattern: /(?:account|organization|organisation|project|api\s+key|workspace)[^.]{0,40}\b(?:rate\s*limit|requests?\s+per)|\brate\s*limit[^.]{0,24}\bfor\s+(?:your|this)\s+(?:account|organization|organisation|project|key)/,
     class: "rate-limited",
     scope: { kind: "provider" },
-    note: "stated account-level throttling; every deployment behind the key is limited",
+    note: "stated account-level THROTTLING; resets in seconds to minutes",
   },
 ];
+
 
 function load(path: string): InterpretationStore {
   if (_store && _path === path) return _store;
@@ -428,7 +489,19 @@ export function recordUnknownRefusal(
 
 /** Unseen refusals, most-frequent first — the research tier's work list. */
 export function pendingRefusals(opts: { path?: string } = {}): Array<UnknownRefusal & { signature: string }> {
-  const store = load(opts.path ?? defaultPath());
+  const path = opts.path ?? defaultPath();
+  const store = load(path);
+  // A signature queued before a seed existed for it is no longer pending — shipping a seed should
+  // RETROACTIVELY clear the queue, or every release that teaches the relay something leaves behind
+  // items asking a human to explain what the relay already knows.
+  let resolved = false;
+  for (const [signature, entry] of Object.entries(store.unknown)) {
+    if (entry.model === null) continue;
+    if (interpretRefusal(entry.provider, entry.model, entry.status, entry.sample, { path }) === null) continue;
+    delete store.unknown[signature];
+    resolved = true;
+  }
+  if (resolved) writer.touch(() => persist(path));
   return Object.entries(store.unknown)
     .map(([signature, v]) => ({ ...v, signature }))
     .sort((a, b) => b.count - a.count || b.lastSeen - a.lastSeen);

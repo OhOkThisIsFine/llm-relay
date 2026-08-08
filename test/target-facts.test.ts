@@ -17,6 +17,7 @@ import {
   interpretRefusal,
   materializeScope,
   normalizeRefusalMessage,
+  parseStatedResetMs,
   pendingRefusals,
   proposeInterpretation,
   recordUnknownRefusal,
@@ -57,6 +58,9 @@ const REAL_REFUSALS = {
   nimGone: `{"status":404,"title":"Not Found","detail":"Function '23d4f03a-b8a6-4adb-a183-7daa083a09cc': Not found for account 'J7dEF4LVcClG8WxRebDACMbsYdF6-myJyquausWzrAs'"}`,
   badKey: `{"error":{"message":"Incorrect API key provided. You can find your API key at https://example.test/keys","type":"invalid_request_error"}}`,
 };
+
+/** Gemini's quota refusal, as it arrived through the relay's own error wrapper. */
+const geminiQuotaSample = `openai backend HTTP 429: [{ "error": { "code": 429, "message": "You exceeded your current quota, please check your plan and billing details." } }]`;
 
 describe("seeds classify the refusals measured on this machine, at the right scope", () => {
   it("reads a stated credit balance as TEMPORAL and scoped to the whole account", () => {
@@ -112,12 +116,77 @@ describe("seeds classify the refusals measured on this machine, at the right sco
   });
 });
 
+describe("a quota is not a rate limit", () => {
+  // VERBATIM from the live relay, 2026-08-08 — Gemini answering a pool/xhigh member.
+  const geminiQuota = `[{ "error": { "code": 429, "message": "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits" } }]`;
+
+  it("reads stated quota exhaustion as a long-window ALLOWANCE, not throttling", () => {
+    // The distinction is load-bearing: `rate-limited` carries a 2-minute TTL because throughput
+    // limits reset in seconds, while a quota is a 5-hourly, weekly or monthly grant. Classifying
+    // one as the other re-probes a spent weekly quota every two minutes for days.
+    const v = interpretRefusal("gemini", "models/gemini-3.6-flash", 429, geminiQuota, { path: interpPath });
+    expect(v?.class).toBe("allowance-exhausted");
+    expect(v?.scope).toEqual({ kind: "provider" });
+  });
+
+  it("reads the reset Gemini states in the body, which no header carries", () => {
+    // Google puts it in `google.rpc.RetryInfo`, not in Retry-After — so without this the relay
+    // falls back to the kind's 1h TTL and re-probes a spent 5-hourly or weekly quota on a schedule
+    // it invented.
+    const withRetryInfo = `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3600s"}]}}`;
+    expect(parseStatedResetMs(withRetryInfo)).toBe(3_600_000);
+    expect(parseStatedResetMs(`{"error":{"message":"try again in 45 seconds"}}`)).toBe(45_000);
+    expect(parseStatedResetMs(`{"error":{"message":"retry again in 5 minutes"}}`)).toBe(300_000);
+  });
+
+  it("learns no reset from a body that states none", () => {
+    // Same rule as the context-limit parser: an inferred number in a store whose value is that it
+    // holds measurements is worse than no number. Falling back to the TTL only re-checks early.
+    expect(parseStatedResetMs(geminiQuotaSample)).toBeNull();
+    expect(parseStatedResetMs(`{"status":429,"title":"Too Many Requests"}`)).toBeNull();
+    // A parse artifact beyond any real window is refused rather than stranding a deployment.
+    expect(parseStatedResetMs(`{"retryDelay":"999999999s"}`)).toBeNull();
+  });
+
+  it("a stated reset overrides the kind's default TTL", () => {
+    const now = 9_000_000;
+    recordFact("allowance-exhausted", { kind: "provider", provider: "gemini" }, { path, now, retryAfterMs: 3_600_000 });
+    expect(cooldownUntil("gemini", "m", { path, now: now + 1000 })).toBe(now + 3_600_000);
+  });
+
+  it("still treats a spent quota as FREE — it is spent, not priced", () => {
+    recordFact("allowance-exhausted", { kind: "provider", provider: "gemini" }, { path });
+    expect(isCostBlocked("gemini", "models/gemini-3.6-flash", { path })).toBe(false);
+    expect(cooldownUntil("gemini", "models/gemini-3.6-flash", { path })).not.toBeNull();
+  });
+
+  it("does not let quota wording fall through to the rate-limit seed", () => {
+    // ⚠ 0.28.0's rate-limit pattern matched the word "quota", so a message naming a project's
+    // quota was cooled for two minutes. The quota seed is FIRST and the rate-limit pattern no
+    // longer mentions quota; both halves of that fix are pinned here.
+    const projectQuota = `{"error":{"message":"Quota exceeded for your project, check your billing plan"}}`;
+    expect(interpretRefusal("gemini", "m", 429, projectQuota, { path: interpPath })?.class).toBe("allowance-exhausted");
+  });
+});
+
 describe("a stated ACCOUNT-level rate limit, and only that", () => {
   it("covers every deployment behind the credential", () => {
     const body = `{"error":{"message":"Rate limit reached for your organization. Please try again later."}}`;
     const v = interpretRefusal("groq", "m", 429, body, { path: interpPath });
     expect(v?.class).toBe("rate-limited");
     expect(v?.scope).toEqual({ kind: "provider" });
+  });
+
+  it("a new seed retroactively clears anything it already queued", () => {
+    // Shipping a seed must empty the queue of what it now explains, or every release that teaches
+    // the relay something leaves items asking a human to explain what the relay already knows.
+    const noise = `{"error":{"message":"something nobody has classified yet"}}`;
+    recordUnknownRefusal("p", "m", 403, noise, { path: interpPath });
+    recordUnknownRefusal("gemini", "m", 429, geminiQuotaSample, { path: interpPath });
+    // Only the genuinely unexplained one survives — the Gemini quota message now matches a seed.
+    const pending = pendingRefusals({ path: interpPath });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.provider).toBe("p");
   });
 
   it("leaves an ordinary 429 to the breaker, where it belongs", () => {
