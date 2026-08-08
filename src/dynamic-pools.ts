@@ -7,6 +7,7 @@ import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./p
 import { loadPersistedSamples, loadProbeCache, type ProbeCacheData } from "./ping/probe-cache.js";
 import { getStabilityScore } from "./ping/metrics.js";
 import { assessCost } from "./metadata.js";
+import { isCostBlocked } from "./deployment-eligibility.js";
 
 export const DYNAMIC_POOL_RANKING_EPOCH_MS = 30_000;
 
@@ -109,6 +110,22 @@ export function materializeDynamicPools(
       // unknown-priced models because many publish no prices at all — assessCost folds that
       // rule in via the provider-tier basis.
       if (assessCost(model, catalog.cachedLimits(provider, model), p.tierType).costClass !== "free") continue;
+
+      // What the deployment itself said, which outranks what the roster implies about it.
+      //
+      // `assessCost`'s `provider-tier` basis admits any unpriced model from a `tierType: "free"`
+      // provider — the right default, since most free providers publish no prices at all, but it
+      // is an assumption about a ROSTER and a roster contains subscription-gated SKUs and models
+      // that were de-listed behind the scenes. Both were measured here: five `ollama-cloud/*`
+      // members answering 403 "requires a subscription", and `nim/moonshotai/kimi-k2.6` answering
+      // 404 "not found for account", all of them still holding pool slots and burning one failover
+      // round-trip per request.
+      //
+      // ⚠ Only proven-unfit deployments are dropped. `isCostBlocked` deliberately excludes
+      // `allowance-exhausted`: a spent free allowance is the normal state of a working free lane,
+      // not a discovery about price, and evicting on it would outlive the exhaustion that caused
+      // it. That case cools in `orderByUsability` and returns on its own.
+      if (isCostBlocked(provider, model)) continue;
 
       discovered.push({
         provider,

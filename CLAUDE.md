@@ -111,6 +111,8 @@ in the workflow YAML, so don't judge the protection by the YAML alone.
 | `offload.ts` | Client-specific offload state. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites the targeted `routing.offload.<client>` rule in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
 | `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with tier selection (`?tier=`), host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). `routing.ladders.<tier>` supports different CLI models for reasoning/coding/fast; the legacy `routing.ladder` remains valid. An exhaustion report may carry `outcome: "rate_limited"` (15m default) or `"quota_exhausted"` (1h default) and a vendor-stated `retryAfterMs` that beats both (`OUTCOME_DEFAULT_MS`); the relay still never invents the signal. A `cli` rung may declare `env` (string = set, `null` = unset — both needed for a relay-routed `claude -p` child: base URL set, nested-session vars unset), surfaced on `invoke.env` and rendered by the CLI per shell; the task placeholder is never substituted into env values. Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. |
 | `context-limits.ts` | Context ceilings LEARNED from what a deployment stated when it refused an over-length request (`~/.llm-relay/context-limits.json`). The top rung of `contextWindowResolver` — first-party evidence about the exact deployment, which a published catalogue figure can contradict by being generic or stale. ⚠ **Only an explicitly stated maximum is recorded**: "the request was too long" bounds the ceiling by this proxy's own chars/4 estimate, and a store whose value is that it holds measurements must not accept a guess. Keyed per (provider, model), newest observation wins in either direction, 30-day TTL. |
+| `deployment-eligibility.ts` | What a deployment PROVED about itself when it refused (`~/.llm-relay/deployment-eligibility.json`). Three classes that are **not** interchangeable: `not-servable` (existence), `subscription-required` (cost — refutes `assessCost`'s `provider-tier` free assumption for that one deployment), `allowance-exhausted` (temporal — free but spent). ⚠ The last is scoped to the **account** and must never become a cost verdict; it demotes and expires, never evicts. Any success clears the record, including the account's. |
+| `refusal-interpretation.ts` | What a refusal MEANS — deterministic lookup on the request path, judgement strictly out of band. A refusal reduces to a signature (provider + model + message with uuids/ids/numbers/urls stripped); a hit applies, a **miss learns nothing** and queues the signature for offline research. Seeds (reviewed source, derived from first-party probes) bind immediately; a researched verdict binds only once accepted via `llm-relay eligibility`. |
 | `host-routing.ts` | Does the CALLING host's traffic reach this relay? `routed` / `bypassed` / `unknown`, decided on the caller's `ANTHROPIC_BASE_URL` (loopback ⇒ routed, so a chain like headroom in front still counts) and never on `CLAUDE_CODE_ENTRYPOINT`, which only names the host in the message. ⚠ Evaluated in the **CLI** process and forwarded as `?host=` — the server cannot detect a bypassing host, because a bypassing host sends it nothing. |
 | `claude-hook.ts` | The `PreToolUse(Agent)` hook that delivers `offload claude on` where HTTP rerouting cannot: it denies the `Agent` call and hands back the transposed command. **Forcing function, not a redirect** — no hook can move an in-process subagent's endpoint. Appends alongside the user's own hooks, refuses to rewrite an unparseable `settings.json`, and the generated script fails **open** on every error. |
 | `dynamic-pools.ts` | Materializes `{ preferred: [...], include: "free" }` pools as an invariant fixed prefix plus every catalog-discovered free target in benchmark order. Free-provider unknown prices are admitted unless known paid; mixed providers contribute only zero-priced or explicitly free-labelled models. Replaces the tail after catalog refresh so new models need no manual config edits. |
@@ -346,12 +348,58 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   It applies to a per-call `@relay:` directive too, even with the rule disabled: the flag is the
   owner's standing "this lane never spends money", and a subagent prompt must not outrank it.
   A toggle (`setOffload`) must not strip rule fields it was not asked about — that was a real bug.
+  ⚠ **It also covers a DIRECTLY ADDRESSED `pool/<name>`, not just offload-rerouted traffic** (fixed
+  2026-08-08). Gating it on `subSpec !== null` meant it never ran for the case it most needed to:
+  a dispatch `cliLane` runs `claude -p --model pool/<name>`, whose requests are a MAIN conversation
+  — no subagent marker, no directive — so the free-lane traffic the flag bounds walked straight
+  past it. A `pool/` spec is by construction relay-routed free-lane traffic and never the vendor
+  passthrough, and the guard can only refuse to spend. ⚠ It now also honours what a deployment
+  STATED about itself (`isCostBlocked`), which outranks a price table calling it free — but an
+  exhausted free allowance is deliberately NOT such a fact; see the eligibility gotchas below.
 - **All-429 exhaustion serves the pool's EARLIEST `Retry-After`, and only then.** The body stays
   the last candidate's real error (a true upstream error beats a synthesized one — same maxim as
   the context guardrail), but when every walked candidate 429'd, the served `Retry-After` is the
   minimum across them: the earliest reset is when the POOL next has capacity. A mixed walk (any
   non-429 among the failures) never overrides. Both fronts, one policy
   (`test/pool-failover.test.ts`).
+- **Pool depth is not quota independence, and membership is an ASSUMPTION until a deployment
+  corrects it.** `assessCost()` admits any unpriced model from a `tierType: "free"` provider on the
+  `provider-tier` basis — correct as a default, but it is a claim about a *roster*, and a roster
+  holds subscription-gated SKUs and models de-listed behind the scenes. Measured 2026-08-08:
+  `pool/xhigh`'s 15 members were 6 huggingface + 4 ollama-cloud + 3 nim + 2 gemini, i.e. **four
+  independent quota domains**, so failover spent 13 round-trips to discover 4 facts and the pool
+  went from serviceable to zero survivors in one step. `deployment-eligibility.ts` now records what
+  the deployments themselves stated and feeds it into pool admission and ordering. Full diagnosis
+  and probe evidence: [docs/pool-eligibility.md](docs/pool-eligibility.md).
+- **⚠ "Out of free credits" is NOT "paid", and collapsing the two is the defect to avoid here.**
+  A free-tier account that has spent this period's allowance is the normal state of a working free
+  lane. `allowance-exhausted` therefore demotes (a cooldown that expires on its own, cleared by any
+  success) and is structurally unable to reach the cost path: `isCostBlocked()` excludes it, only
+  `cooldownUntil()` reports it. If it could evict, the eviction would outlive the exhaustion that
+  caused it. Only `subscription-required` and `not-servable` remove a deployment from a pool.
+- **A status code does not carry its meaning — 403 alone is at least four different facts** (revoked
+  key, plan gating, license/region gating, policy refusal), distinguished only by vendor-invented
+  wording. So interpretation is a **lookup, never an inference**, on the request path: signature →
+  confirmed table, and a **miss learns nothing** (same fail-safe as `context-limits.ts`) while
+  queuing the message for offline research. ⚠ **Do not move that research inline.** The repair
+  boundary at the top of this file governs it: an LLM may author the interpretation data, the
+  request path only ever reads it, and a researched verdict binds only after `llm-relay eligibility
+  accept`. Signatures are keyed per (provider, model, message) so a verdict cannot leak to a
+  sibling SKU.
+- **⚠ Never `res.clone()` a backend response on the failover path.** `clone()` tees the body and the
+  failover branch cancels the original, so the un-read branch strands the walk and the client gets
+  the FIRST candidate's error with the rest of the pool untouched. Read the body where it is already
+  being discarded (`discardCandidate()`) or already buffered (the terminal error branches).
+  `observeContextLimit` still clones — it is confined to 400/413 and has not been observed to bite,
+  but it is the same hazard; don't copy the pattern into a new call site. Three pre-existing 402
+  tests caught this, which is what the ≥2-candidate rule in `test/pool-failover.test.ts` is for.
+  ⚠ The learned stores are process-global: reset them per test (`resetEligibility` /
+  `resetInterpretations`) like the breaker, or one test's refusal demotes another's first candidate.
+- **A pool's error is one member's error, so the walk is reported alongside it.** Every walk of ≥2
+  candidates carries `x-llm-relay-pool-attempts: "13 tried, 0 served: 4×402, 5×429, 3×403, 1×400"`
+  on BOTH fronts, successes included. A header, never a rewritten body — the served body stays the
+  last candidate's real upstream error, same maxim as the context guardrail. A single-candidate walk
+  emits nothing: the response already IS the walk.
 - **Don't add a blended "best target" score to `candidates.ts`.** The dimensions are deliberately
   separate; averaging them buries the judgement the reader is there to make. Tests assert no
   `score`/`rank` field, that every source keeps its own key under `scores`, and that the one

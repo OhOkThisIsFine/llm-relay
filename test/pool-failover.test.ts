@@ -4,8 +4,10 @@ import { AddressInfo } from "node:net";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
-import { SERVED_BY_HEADER } from "../src/backend.js";
+import { SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER } from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
+import { resetEligibility, isCostBlocked, cooldownUntil } from "../src/deployment-eligibility.js";
+import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ProviderConfig, ResolvedTarget } from "../src/config.js";
 import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
 
@@ -30,10 +32,21 @@ function track(s: Server): Server {
   return s;
 }
 
-beforeEach(() => globalCircuitBreaker.reset());
+beforeEach(() => {
+  globalCircuitBreaker.reset();
+  // ⚠ The learned-eligibility stores are process-global too, and this file's `QUOTA_BODY` is the
+  // REAL HuggingFace message — so the first 402 test records an account-scoped exhaustion for
+  // provider `p1`, and every later test reusing that provider name found its first candidate
+  // already demoted. Reset them for the same reason the breaker is reset: shared learned state
+  // across tests is a hermeticity bug, not a routing one.
+  resetEligibility();
+  resetInterpretations();
+});
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(r))));
   globalCircuitBreaker.reset();
+  resetEligibility();
+  resetInterpretations();
 });
 
 function port(s: Server): number {
@@ -480,6 +493,94 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p1/m1, p2/m2");
     expect(a.calls()).toBe(1);
     expect(b.calls()).toBe(1);
+  });
+
+  it("reports the whole walk, not just the error the last candidate happened to return", async () => {
+    // The diagnosis problem: a pool's error is ONE member's error. An audit run against a
+    // 13-member pool was handed HuggingFace's 402 and sent to a billing page, when four distinct
+    // causes were in play and the correct action was "use another pool". The body must stay the
+    // real upstream error, so the aggregate rides alongside it.
+    const a = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "rate limited" } }) }));
+    const b = await scripted(() => ({ status: 403, body: JSON.stringify({ error: { message: "needs a subscription" } }) }));
+    const c = await scripted(() => ({ status: 402, body: JSON.stringify({ error: { message: "credits depleted" } }) }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+      `http://127.0.0.1:${port(c.server)}`,
+    ])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(402);
+    // Unchanged: a true upstream error beats a synthesized one.
+    expect(((await resp.json()) as { error: { message: string } }).error.message).toContain("credits depleted");
+    // New: what actually happened to the other two.
+    const summary = resp.headers.get(POOL_ATTEMPTS_HEADER);
+    expect(summary).toContain("3 tried, 0 served");
+    expect(summary).toContain("1x429");
+    expect(summary).toContain("1x403");
+    expect(summary).toContain("1x402");
+  });
+
+  it("reports a degrading pool even when the request succeeded", async () => {
+    const a = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "rate limited" } }) }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    // A 200 that took two candidates to get is worth knowing about before the pool runs out.
+    expect(resp.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 1 served: 1x429, 1x200");
+  });
+
+  it("emits no aggregate for a single-candidate walk", async () => {
+    // With one candidate the response IS the walk; an aggregate would dress an ordinary
+    // passthrough error up as a pool exhaustion.
+    const a = await scripted(() => ({ status: 402, body: JSON.stringify({ error: { message: "credits gone" } }) }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(402);
+    expect(resp.headers.get(POOL_ATTEMPTS_HEADER)).toBeNull();
+  });
+
+  it("a stated credit balance demotes the account's OTHER members, which were never tried", async () => {
+    // The shared-quota-domain problem, end to end. A 15-member pool here resolved to only four
+    // independent quota domains, so failover was spending one round-trip per member to rediscover
+    // one balance. HuggingFace states the balance, and a balance belongs to the credential — so
+    // one member's 402 is already the answer for its siblings.
+    //
+    // ⚠ Demoted, NOT evicted: the deployment is still free, just spent. `p1/m1` stays in the pool
+    // and is tried again once nothing better is left, which is why `b` answers rather than the
+    // request failing.
+    const a = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    // Two models on the SAME provider, so the account-scoped observation covers the second.
+    const cfg = poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`]);
+    cfg.routing.pools = { coding: ["p1/m1", "p1/m-sibling", "p2/m2"] };
+    cfg.providers["p1"]!.base = `http://127.0.0.1:${port(a.server)}`;
+    const p = port(await startProxy(cfg));
+
+    expect((await chat(p)).status).toBe(200);
+    const firstRoundCalls = a.calls();
+
+    // Second request: p1's members are now cooling on a fact learned from ONE of them.
+    expect((await chat(p)).status).toBe(200);
+    expect(a.calls()).toBe(firstRoundCalls); // neither p1/m1 nor p1/m-sibling was tried again
+    expect(b.calls()).toBe(2);
+  });
+
+  it("an exhausted allowance never becomes a cost verdict", async () => {
+    // The distinction this design must not lose: a free-tier account that has spent this period's
+    // credits is the normal state of a working free lane, not a discovery about its price. If a
+    // 402 could mark a deployment "paid", it would be evicted from every free pool and the
+    // eviction would outlive the exhaustion that caused it.
+    const a = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    expect((await chat(p)).status).toBe(200);
+    expect(isCostBlocked("p1", "m1")).toBe(false);
+    expect(cooldownUntil("p1", "m1")).not.toBeNull(); // cooling, which expires on its own
   });
 
   it("a success clears the quota cooldown — a mid-month top-up recovers without a restart", () => {

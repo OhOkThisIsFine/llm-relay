@@ -21,6 +21,14 @@ import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from 
 import { contextWindowResolver } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
 import { observedContextLimit, flushObservedContextLimits } from "./context-limits.js";
+import { allObservations, flushEligibility, type EligibilityClass, type EligibilityScope } from "./deployment-eligibility.js";
+import {
+  acceptInterpretation,
+  flushInterpretations,
+  pendingRefusals,
+  proposeInterpretation,
+  rejectInterpretation,
+} from "./refusal-interpretation.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
@@ -188,6 +196,8 @@ ${formatTextTable([
   ["llm-relay offload [status]", "Show current offload rules."],
   ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
   ["llm-relay candidates [-p <name>]", "Compare offload targets."],
+  ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
+  ["llm-relay eligibility <accept|reject|propose> <n>", "Review an unrecognized refusal; only accept makes it bind."],
   ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane; adapts to the calling host."],
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
   ["llm-relay help | --help | -h", "Show help."],
@@ -555,6 +565,8 @@ export function runProxy() {
       flushRuntimeTelemetry();
       flushProbeCache();
       flushObservedContextLimits();
+      flushEligibility();
+      flushInterpretations();
       process.exit(0);
     });
   };
@@ -1292,6 +1304,107 @@ function strengthTag(c: Candidate): string {
   }
 }
 
+/**
+ * `llm-relay eligibility` — what backends have said about themselves, and what has not been
+ * understood yet.
+ *
+ * This is the review gate of the two-tier design in `refusal-interpretation.ts`. The request path
+ * applies only CONFIRMED interpretations; anything unrecognized lands in `pending` having changed
+ * nothing, and reaches routing only once accepted here. That ordering is what keeps a researched
+ * verdict — a model's opinion about what a vendor's error message means — out of the live request
+ * path, in line with the repair boundary that governs the rest of this project.
+ *
+ * The research tier writes through `propose` and a human (or an agent explicitly acting for one)
+ * commits with `accept`. `reject` is the equally valid answer "this message means nothing durable"
+ * — a policy refusal or a transient fault should teach the router nothing at all.
+ */
+export function runEligibility(sub: string | undefined, arg: string | undefined): void {
+  const pending = pendingRefusals();
+  const action = sub ?? "status";
+
+  if (action === "accept" || action === "reject" || action === "propose") {
+    // Addressed by list POSITION, not by signature: a signature is a whole normalized error
+    // message and nobody is retyping one at a shell.
+    const idx = Number(arg);
+    const entry = Number.isInteger(idx) && idx >= 1 && idx <= pending.length ? pending[idx - 1] : undefined;
+    if (!entry) {
+      process.stderr.write(`llm-relay eligibility: ${action} expects a pending item number 1..${pending.length}\n`);
+      process.exit(1);
+      return;
+    }
+    if (action === "reject") {
+      rejectInterpretation(entry.signature);
+      flushInterpretations();
+      process.stdout.write(`rejected — "${entry.normalized}" will keep teaching the router nothing.\n`);
+      return;
+    }
+    const cls = argValue("--class") as EligibilityClass | undefined;
+    const scope = (argValue("--scope") ?? "deployment") as EligibilityScope;
+    const rationale = argValue("--rationale") ?? "";
+    const classes: EligibilityClass[] = ["not-servable", "subscription-required", "allowance-exhausted"];
+    if (!cls || !classes.includes(cls)) {
+      process.stderr.write(`llm-relay eligibility: --class expects one of ${classes.join(" | ")}\n`);
+      process.exit(1);
+      return;
+    }
+    if (scope !== "deployment" && scope !== "account") {
+      process.stderr.write(`llm-relay eligibility: --scope expects "deployment" or "account"\n`);
+      process.exit(1);
+      return;
+    }
+    if (action === "propose") {
+      proposeInterpretation(entry.signature, { class: cls, scope, rationale });
+      flushInterpretations();
+      process.stdout.write(`proposed ${cls} (${scope}) — not yet binding. Commit with: llm-relay eligibility accept ${idx}\n`);
+      return;
+    }
+    acceptInterpretation(entry.signature, { override: { class: cls, scope } });
+    flushInterpretations();
+    process.stdout.write(`accepted ${cls} (${scope}) — now applied to ${entry.provider}/${entry.model ?? "-"} refusals matching this message.\n`);
+    return;
+  }
+
+  const observations = allObservations();
+  process.stdout.write(`\nLearned deployment state — ${observations.length} live observation(s)\n`);
+  if (observations.length === 0) {
+    process.stdout.write("  (nothing; every deployment is presumed servable until it says otherwise)\n");
+  }
+  for (const o of observations) {
+    const mins = Math.max(0, Math.round((o.until - Date.now()) / 60000));
+    // Spelled out because the classes are NOT interchangeable and a bare label invites the
+    // reading this whole design exists to prevent — that a spent allowance means "paid".
+    const meaning = o.class === "allowance-exhausted"
+      ? "free, but spent until it refreshes — demoted, never evicted"
+      : o.class === "subscription-required"
+        ? "not covered by our plan — excluded from free pools"
+        : "gone from the provider — excluded from pools";
+    process.stdout.write(`  ${o.key.padEnd(52)} ${o.class} [${o.scope}] ${meaning}; expires in ${mins}m\n`);
+  }
+
+  process.stdout.write(`\nUnrecognized refusals — ${pending.length} awaiting interpretation\n`);
+  if (pending.length === 0) {
+    process.stdout.write("  (none; every refusal seen so far was understood)\n");
+  }
+  pending.forEach((p, i) => {
+    process.stdout.write(`\n  [${i + 1}] ${p.provider}/${p.model ?? "-"}  HTTP ${p.status}  ×${p.count}\n`);
+    process.stdout.write(`      ${p.normalized}\n`);
+    if (p.proposed) {
+      process.stdout.write(`      proposed: ${p.proposed.class} [${p.proposed.scope}] — ${p.proposed.rationale}\n`);
+      process.stdout.write(`      accept with: llm-relay eligibility accept ${i + 1} --class ${p.proposed.class} --scope ${p.proposed.scope}\n`);
+    }
+  });
+  if (pending.length > 0) {
+    process.stdout.write(
+      `\n  These change NOTHING until accepted. To resolve one, research what that message means for\n` +
+      `  that provider and model on this account, then:\n` +
+      `    llm-relay eligibility propose <n> --class <not-servable|subscription-required|allowance-exhausted> --scope <deployment|account> --rationale "..."\n` +
+      `    llm-relay eligibility accept <n> --class <...> --scope <...>\n` +
+      `    llm-relay eligibility reject <n>       # means nothing durable\n`,
+    );
+  }
+  process.stdout.write("\n");
+}
+
 /** `llm-relay candidates` — every dimension of every offload target, side by side, unranked. */
 export async function runCandidates(): Promise<void> {
   const cfg = loadOrExit();
@@ -1843,6 +1956,15 @@ export function main(): void {
     });
     return;
   }
+  if (arg2 === "eligibility") {
+    try {
+      runEligibility(arg3, arg4);
+    } catch (e) {
+      process.stderr.write(`llm-relay eligibility: ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+    return;
+  }
   if (arg2 === "candidates") {
     runCandidates().catch((e) => {
       process.stderr.write(`llm-relay candidates: ${(e as Error).message}\n`);
@@ -1942,6 +2064,10 @@ export function classifyCommand(argv: string[]): CommandEffect {
       return arg3 === "set" || arg3 === "add" || arg3 === "remove" || arg3 === "delete" || arg3 === "rm"
         ? "mutating"
         : "read-only";
+    // Accepting an interpretation is what makes it bind on the request path, so the three review
+    // verbs write; the bare listing only reports.
+    case "eligibility":
+      return arg3 === "accept" || arg3 === "reject" || arg3 === "propose" ? "mutating" : "read-only";
     // keys, check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
     // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a
     // running proxy's in-memory cooldowns and changes nothing on this machine.

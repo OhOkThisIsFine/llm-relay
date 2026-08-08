@@ -34,6 +34,19 @@ export function errorOrigin(res: Response): ErrorOrigin | null {
 export const SERVED_BY_HEADER = "x-llm-relay-served-by";
 
 /**
+ * WHY each of those candidates dropped out — `"13 tried, 0 served: 4×402, 5×429, 3×403, 1×400"`.
+ *
+ * `SERVED_BY_HEADER` answers "who was tried"; this answers "what happened to them", which is the
+ * half that turns a pool exhaustion into a diagnosis. Without it a client holds one member's
+ * error — a HuggingFace 402 pointing at a billing page — while the other twelve failed for three
+ * unrelated reasons, and the correct action ("use another pool") is invisible.
+ *
+ * A header rather than a rewritten body, deliberately: the served body stays the last candidate's
+ * real upstream error, because a true upstream error beats a synthesized one.
+ */
+export const POOL_ATTEMPTS_HEADER = "x-llm-relay-pool-attempts";
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both

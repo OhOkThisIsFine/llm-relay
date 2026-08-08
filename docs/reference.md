@@ -188,6 +188,18 @@ Health **demotes** candidates, never drops them (live → credential-faulted →
 carry `x-llm-relay-served-by`: the deployment that served, or on error every deployment tried,
 in order. Background: [pool-failover.md](pool-failover.md).
 
+Any walk of **two or more** candidates also carries `x-llm-relay-pool-attempts` — what happened to
+each of them, in one line:
+
+```
+x-llm-relay-pool-attempts: 13 tried, 0 served: 4×402, 5×429, 3×403, 1×400
+```
+
+Without it a pool's error is one member's error: a 402 pointing at a billing page, while the other
+twelve failed for three unrelated reasons and the right move was "use another pool". The body is
+left alone — it stays the last candidate's real upstream error — so the aggregate rides in a header.
+It appears on successes too, where it warns that a pool is thinning before it runs out.
+
 ### Context guardrail
 
 The relay estimates each request's prompt tokens against the target model's context limit and
@@ -321,6 +333,43 @@ free, and nothing free resolving is a clean 503 naming the rule — never a sile
 past it.
 
 Full design and wire evidence: [subagent-routing.md](subagent-routing.md).
+
+### What backends said about themselves: `llm-relay eligibility`
+
+A pool's membership is an assumption until a deployment corrects it. `assessCost()` admits any
+unpriced model from a `tierType: "free"` provider as free — right as a default, wrong for the
+subscription-gated SKUs and de-listed models every roster carries. This command shows what the
+backends have since stated, and what has not been understood yet:
+
+```
+llm-relay eligibility
+```
+
+Three verdicts, and they are **not interchangeable**:
+
+| Verdict | Means | Effect |
+|---|---|---|
+| `not-servable` | the model is gone from the provider | excluded from pools |
+| `subscription-required` | exists, but is not covered by our plan | excluded from **free** pools |
+| `allowance-exhausted` | free, but spent until it refreshes | **demoted only**, expires by itself |
+
+⚠ The last is never treated as "paid" — a free account that has spent this period's credits is the
+normal state of a working free lane, not a discovery about price. It is scoped to the **account**,
+so one member's stated credit balance also steps its siblings aside instead of each spending a
+round-trip to be told individually. Any success clears it.
+
+A refusal whose message the relay does not recognise changes **nothing** and is listed as pending.
+Resolve one by researching what that message means for that provider and model on this account:
+
+```
+llm-relay eligibility propose 1 --class subscription-required --scope deployment --rationale "..."
+llm-relay eligibility accept 1 --class subscription-required --scope deployment
+llm-relay eligibility reject 1
+```
+
+Only `accept` makes an interpretation affect routing. That gate is deliberate: research may be done
+by an agent, but the request path only ever reads confirmed data — it never asks a model what an
+error means mid-request. Design and evidence: [pool-eligibility.md](pool-eligibility.md).
 
 ### Choosing a target: `llm-relay candidates`
 
