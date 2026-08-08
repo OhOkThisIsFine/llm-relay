@@ -198,6 +198,41 @@ the relay working. Three things bound it, and none may be traded away for conven
 A count, not the message, travels in the header for the same reason: a response header is the field
 a client is most likely to treat as trustworthy.
 
+## The structural half: bands that degrade, order that spreads
+
+Eligibility fixed membership *hygiene*. It did not fix the structural problem, which was measured
+again after that work landed — same moment, same credentials:
+
+```
+pool/low   (46 members) → 200 OK   10 tried, 1 served: 7x429, 1x404, 1x403, 1x200
+pool/xhigh (12 members) → 402      12 tried, 0 served: 6x402, 6x429
+```
+
+Two changes, both live:
+
+**An exhausted band degrades.** Each effort pool is its banded members, then a tail of everything
+clearing a lower band, strongest first. The tail is reached only after every in-band member has
+actually failed, so a healthy pool is untouched. ⚠ A model clearing **no** band is admitted nowhere,
+tail included — unassessed is not weaker, and admitting it would quietly reverse the evidence-aware
+admission rule. Degradation is automatic but announced: `x-llm-relay-degraded: <spec> (below <band>)`.
+An unflagged downgrade is indistinguishable from getting what you asked for.
+
+**Order interleaves providers within a band.** Members sharing a credential share their failure, and
+fitness ranking clustered them: `pool/xhigh` opened huggingface, gemini, huggingface, huggingface —
+three of four attempts behind one credit balance. Interleaved, the first N attempts cover N domains.
+The top-ranked candidate still goes first; this only decides who is second.
+
+Measured after, on the same exhausted pool:
+
+```
+pool/xhigh → 200 OK   7 tried, 1 served: 6x429, 1x200
+             x-llm-relay-degraded: gemini/models/gemini-2.5-flash (below xhigh)
+```
+
+Consequence worth expecting: every effort pool now has near-identical **membership** and differs
+only in **order**, so `{contextWindow}` converges across pools. That is correct — the minimum is
+taken precisely because failover can land anywhere, which is now more true than it was.
+
 ## Still open
 
 - `routing.offload.*.freeOnly` is **off**. Owner's decision, 2026-08-08.

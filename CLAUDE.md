@@ -371,6 +371,24 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   went from serviceable to zero survivors in one step. `deployment-eligibility.ts` now records what
   the deployments themselves stated and feeds it into pool admission and ordering. Full diagnosis
   and probe evidence: [docs/pool-eligibility.md](docs/pool-eligibility.md).
+- **An exhausted effort band degrades to weaker MEASURED members — automatically, and never
+  silently.** Each effort pool is banded members first, then a degrade tail of everything clearing a
+  LOWER band, strongest band first. The tail is reached only after every in-band member has actually
+  failed, so a healthy pool is unaffected. When the answer comes from the tail the response carries
+  `x-llm-relay-degraded: "<spec> (below <band>)"` — automatic degradation is only acceptable because
+  it is announced; an unflagged capability downgrade is indistinguishable from getting what you
+  asked for. ⚠ **A model clearing NO band is admitted nowhere, tail included** — unassessed is not
+  weak, and sweeping it in would quietly reverse the evidence-aware admission rule. Consequence to
+  expect: every effort pool now has near-identical MEMBERSHIP and differs only in order, so
+  `{contextWindow}` converges across pools — correct, since the minimum is taken precisely because
+  failover can land anywhere, which is now more true than before.
+- **Pool order interleaves PROVIDERS within a rank band,** so the first N attempts cover N quota
+  domains instead of N members of one. Ranking by fitness alone clustered them: `pool/xhigh` opened
+  huggingface, gemini, huggingface, huggingface — three of four behind one credit balance. ⚠ Not the
+  "two ranking passes" mistake `orderByUsability` warns about: that is a REQUEST-time re-sort on
+  live health competing with deployment fitness; this runs once at materialization, is
+  deterministic, never reorders within a provider, and leaves the top-ranked candidate first. It
+  only decides who is tried second.
 - **⚠ "Out of free credits" is NOT "paid", and collapsing the two is the defect to avoid here.**
   A free-tier account that has spent this period's allowance is the normal state of a working free
   lane. `allowance-exhausted` therefore demotes (a cooldown that expires on its own, cleared by any

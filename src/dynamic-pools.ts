@@ -1,4 +1,4 @@
-import type { Config, ResolvedTarget } from "./config.js";
+import type { Config, EffortLevel, ResolvedTarget } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import { rankTargetsWithProvenance, specOfTarget, strengthAllowedForEffort } from "./benchmarks.js";
 import type { DeploymentRankingSignals } from "./benchmarks.js";
@@ -58,6 +58,56 @@ export function deploymentRankingSignals(
     benchmarkTaskFitScore: typeof tier?.task_fit_score === "number" ? tier.task_fit_score * 100 : null,
     benchmarkTaskFitConfidence: Math.min(1, (tier?.task_fit_signal_count ?? 0) / 3),
   };
+}
+
+/** Effort bands weakest-first — the one ordering, so "lower band" means the same thing everywhere. */
+const EFFORT_ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh"];
+
+/** Bands strictly below `effort`, strongest first: `xhigh` → high, medium, low. Empty for `low`. */
+function lowerBands(effort: EffortLevel): EffortLevel[] {
+  const at = EFFORT_ORDER.indexOf(effort);
+  return at <= 0 ? [] : EFFORT_ORDER.slice(0, at).reverse();
+}
+
+/**
+ * Round-robin a ranked list across PROVIDERS, keeping each provider's own rank order intact.
+ *
+ * Failover's job is to reach working capacity, and members sharing a credential share their
+ * failure: a 402 stating an account balance, one subscription, one account rate limit. Ranking by
+ * fitness alone clusters them — `pool/xhigh`'s first four candidates were huggingface, gemini,
+ * huggingface, huggingface, so three of four attempts sat behind ONE credit balance and four
+ * attempts covered only two quota domains. Interleaved, the first N attempts cover N domains.
+ * Measured cost of not doing this: a `pool/low` walk spent 7 of 10 attempts before reaching a live
+ * domain.
+ *
+ * ⚠ This is NOT the "two ranking passes" mistake `orderByUsability` warns about. That warning is
+ * about re-sorting at REQUEST time on live health, where a second pass competes with deployment
+ * fitness and promotes on a single request's latency. This runs once at materialization, is
+ * deterministic, and never reorders within a provider — the best candidate overall is still tried
+ * first, so a healthy pool behaves identically. It only decides who is tried SECOND.
+ */
+function interleaveByProvider<T extends { target: ResolvedTarget }>(entries: T[]): T[] {
+  const queues = new Map<string, T[]>();
+  for (const entry of entries) {
+    const q = queues.get(entry.target.provider);
+    if (q) q.push(entry);
+    else queues.set(entry.target.provider, [entry]);
+  }
+  // Provider order follows each provider's BEST member, so the overall top-ranked candidate stays
+  // first and the strongest providers keep their precedence within each round.
+  const order = [...queues.keys()];
+  const out: T[] = [];
+  let drained = false;
+  while (!drained) {
+    drained = true;
+    for (const provider of order) {
+      const next = queues.get(provider)!.shift();
+      if (next === undefined) continue;
+      out.push(next);
+      drained = false;
+    }
+  }
+  return out;
 }
 
 /**
@@ -145,17 +195,52 @@ export function materializeDynamicPools(
     signalsForTarget: (target) => deploymentRankingSignals(target, catalog, snapshot),
   });
 
+  const degraded: Record<string, string[]> = {};
   for (const [pool, policy] of Object.entries(cfg.routing.poolPolicies)) {
     const preferred = new Set(policy.preferred);
-    const rankedTail = (policy.effort
-      ? ranked.filter((entry) =>
-          strengthAllowedForEffort(entry.strength, policy.effort!) &&
-          entry.fitness.signals.supportsTools !== false
-        )
-      : ranked
-    ).map((entry) => specOfTarget(entry.target)).filter((spec) => !preferred.has(spec));
-    cfg.routing.pools[pool] = [...policy.preferred, ...rankedTail];
+    const usable = ranked.filter((entry) => entry.fitness.signals.supportsTools !== false);
+    const inBand = policy.effort
+      ? usable.filter((entry) => strengthAllowedForEffort(entry.strength, policy.effort!))
+      : usable;
+
+    // Everything live that did NOT clear the band, in rank order — the degrade tail. An effort
+    // band selects on CAPABILITY, and capability correlates with the providers that meter hardest,
+    // so the top band is both the narrowest and the first to run dry: measured 2026-08-08,
+    // `pool/xhigh` had 12 members across 4 quota domains and returned 0 served while `pool/low`
+    // answered from 46 at the same moment with the same credentials. A band with nothing behind it
+    // turns "the strongest models are busy" into "no answer at all".
+    //
+    // ⚠ Appended, never merged: the band still decides who is tried FIRST, so a healthy pool is
+    // completely unaffected and the tail is reached only after every in-band member has actually
+    // failed on this request. And it is never silent — `poolDegraded` is what lets the response
+    // say the answer came from below the band.
+    const inBandSpecs = new Set(inBand.map((entry) => specOfTarget(entry.target)));
+
+    // ⚠ The tail holds members that clear a LOWER band — never members that clear no band at all.
+    // A model with no snapshot evidence is not "weaker", it is UNASSESSED, and admitting it here
+    // would quietly reverse the evidence-aware admission rule that keeps unmeasured models out of
+    // every pool. Degrading to a measured weaker model is a considered trade; degrading to one
+    // nothing is known about is a guess wearing the same clothes. Walked strongest-first, so an
+    // exhausted `xhigh` reaches `high` before `medium` before `low`.
+    const tail: typeof usable = [];
+    if (policy.effort) {
+      const seen = new Set(inBandSpecs);
+      for (const band of lowerBands(policy.effort)) {
+        for (const entry of usable) {
+          const spec = specOfTarget(entry.target);
+          if (seen.has(spec) || !strengthAllowedForEffort(entry.strength, band)) continue;
+          seen.add(spec);
+          tail.push(entry);
+        }
+      }
+    }
+
+    const bandOrder = interleaveByProvider(inBand).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s));
+    const tailOrder = interleaveByProvider(tail).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s) && !inBandSpecs.has(s));
+    cfg.routing.pools[pool] = [...policy.preferred, ...bandOrder, ...tailOrder];
+    if (tailOrder.length > 0) degraded[pool] = tailOrder;
   }
+  cfg.routing.poolDegraded = degraded;
   materializationCache.set(cfg, { signature });
   return true;
 }
