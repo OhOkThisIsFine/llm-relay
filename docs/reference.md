@@ -442,21 +442,44 @@ A CLI told to use a model it does not recognize assumes a window and compacts ag
 it. The relay already harvests per-(provider, model) limits for the request-path guardrail, so it
 substitutes the number it has.
 
-It resolves through the same rule as everything else here: **the serving provider's own published
-value, or nothing.** Never another provider's figure for the same model id (`resolveMetadata`'s
-`reference` class — the `~` column in `llm-relay candidates`), and never a guess.
+Two rungs, **both real publications** — there is deliberately no guessed rung, the same rule that
+keeps `resolveMetadata` honest and the request-path guardrail silent on an unknown limit:
 
-- **Pinned spec** — that deployment's published `contextLength`.
-- **`pool/<name>`** — every member must publish one, and the **minimum** is used: failover can land
-  the request on any member, so the pool's usable window is its smallest. One unknown member means
-  the floor is unknown, not that the others' floor applies.
-- **Unknown** — the env entry is **dropped entirely**, not set empty, and the child falls back to
-  its own default. `llm-relay dispatch` says which happened per lane.
+1. **`provider`** — the serving deployment's own published `contextLength`. Authoritative.
+2. **`snapshot`** — `context_length` from the synced capability data (`docs/tier-data.json`, from
+   OpenRouter), matched **exactly** on the spec's last segment.
 
-⚠ **Expect "not published" to be the common answer for pools.** Free providers largely publish no
-metadata (NIM publishes none at all), so most pool members are unknown. That is honest, not a bug:
-a window we invented would override the client's conservative default with fiction and overflow the
-real backend. Pinned specs on providers that do publish — OpenRouter, for instance — resolve fine.
+`llm-relay dispatch` prints which rung answered, because a first-party figure and a same-model
+figure measured on another host are different claims:
+
+```
+   context: 1,048,576 tokens (published by the serving provider)
+   context: 163,840 tokens (synced snapshot, same model id on another host)
+   context: not published anywhere for this spec — the variable is omitted and the CLI uses its own default
+```
+
+⚠ **Rung 2 is what makes this usable.** Free providers publish little metadata and NIM publishes
+none, so rung 1 alone is nearly empty — measured 2026-08-07, 0 of 29 `pool/high` members carry a
+provider-published window while 28 of 29 carry a snapshot one.
+
+⚠ **Fuzzy snapshot matches are rejected.** `findTierModel` will fall back to containment, which can
+borrow a different SKU's row (`glm-5.2` → `glm-5.2-max`). A wrong capability score mis-ranks a pool;
+a wrong context window tells a client it may send tokens the backend will reject, so this path takes
+the stricter rule.
+
+For a **`pool/<name>`**, every member must resolve and the **minimum** is used — failover can land
+the request on any member, so the pool's usable window is its smallest, and one unknown member means
+the floor is unknown rather than that the others' floor applies. In practice a single unresolvable
+model can therefore block a whole pool; `llm-relay dispatch` showing "not published anywhere" for a
+pool usually means one member, not all of them.
+
+**Unknown** drops the env entry entirely rather than setting it empty (which a child would read as
+zero or garbage), leaving the client on its own default.
+
+⚠ **Do not "fix" an unknown by hand-setting a large value.** The measured pool minimums here are
+131,072–163,840 — *below* the 200k the `claude` CLI already assumes for an unrecognized model. A
+speculative 1M would overshoot the weakest member by six to eight times and overflow the real
+backend, which is strictly worse than the conservative default it replaced.
 
 `llm-relay dispatch --next-command -t "<task>"` prints just the runnable line for `next`, for
 callers that want something executable rather than the human ladder.

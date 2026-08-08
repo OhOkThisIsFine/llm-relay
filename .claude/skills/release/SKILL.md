@@ -115,6 +115,31 @@ the remote (`git fetch && git status -sb` showing no ahead/behind).
 State the published version, the CI run URL, and the confirmed `npm view` output. If you stopped at
 a gate, say which gate and exactly what has to happen before the release can resume.
 
+## Known trap: `--prefer-online` is not always enough
+
+Observed on the v0.21.0 release (2026-08-07), minutes after a **successful** publish:
+
+```
+npm view llm-relay version --prefer-online   → 0.20.0        (previous version)
+npm install -g llm-relay@latest --prefer-online → E404 notarget
+npm install -g llm-relay@0.21.0                 → E404 notarget
+curl -s https://registry.npmjs.org/llm-relay    → dist-tags.latest = 0.21.0, versions has 0.21.0
+```
+
+The registry already had it; npm's local metadata did not, and `--prefer-online` alone did not
+revalidate. **The combination that worked was the exact version AND the flag together:**
+
+```bash
+npm install -g llm-relay@0.21.0 --prefer-online
+```
+
+So when step 6 or 7 disagrees with the registry, escalate in this order rather than concluding the
+release failed: (1) `curl` the registry — it is the tie-breaker; (2) if it shows the new version,
+retry the install pinned **and** with `--prefer-online`; (3) only if the registry itself lacks the
+version is anything actually wrong. Do not delete or re-push the tag on the strength of an npm
+error alone — the run's own conclusion (`gh run view <id> --json conclusion`) plus the registry are
+what say whether the publish happened.
+
 ## Known trap
 
 Versions can be committed but never released: `npm version` was skipped and the bump was hand-edited

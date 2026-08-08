@@ -8,6 +8,8 @@ import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
+import { contextWindowResolver } from "../metadata.js";
+import { snapshotContextWindow } from "../tier-data.js";
 import { getTelemetryReport } from "../telemetry.js";
 import type { CircuitBreaker } from "../circuit-breaker.js";
 import { baseLog } from "../request-log.js";
@@ -263,8 +265,10 @@ export async function handleAdminRoutes(
       // `cachedLimits` never fetches, so a cold cache degrades to "no window stated" rather than
       // turning a dispatch query into a blocking upstream round-trip — same rule as the request
       // -path context guardrail this reads the numbers from.
-      publishedContextWindow: (provider, model) =>
-        model === undefined ? null : (h.catalog.cachedLimits(provider, model)?.contextLength ?? null),
+      publishedContextWindow: contextWindowResolver(
+        (provider, model) => h.catalog.cachedLimits(provider, model)?.contextLength ?? null,
+        snapshotContextWindow,
+      ),
     });
     return ok(view, true);
   }

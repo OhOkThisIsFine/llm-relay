@@ -263,14 +263,21 @@ not recognize — `claude` assumes 200k — and compacts against that, throwing 
 
 ```
    context: 1,048,576 tokens (published by the serving provider)
-   context: not published for this spec — the variable is omitted and the CLI uses its own default
+   context: 163,840 tokens (synced snapshot, same model id on another host)
+   context: not published anywhere for this spec — the variable is omitted and the CLI uses its own default
 ```
 
-⚠ **"Not published" is the normal answer for pools** and is not a fault to fix. Most free providers
-publish no metadata (NIM publishes none), and a pool needs *every* member to publish before a floor
-can be stated — failover can land on any of them, so the pool's usable window is its smallest.
-Never hand-set the variable to work around this: a number nobody published will overflow the real
-backend, which is worse than the client's conservative default.
+Two sources, both real publications: the serving provider's own figure, then the synced snapshot's
+`context_length` for the same model id (exact matches only — a fuzzy match can borrow a different
+SKU's window). There is no guessed value.
+
+A pool needs *every* member to resolve and uses the **minimum**, since failover can land on any of
+them — so "not published anywhere" for a pool usually means **one** member is missing, not all.
+
+⚠ **Never hand-set the variable to a large value to work around an unknown.** Measured pool minimums
+are 131,072–163,840, *below* the 200k `claude` already assumes; a speculative 1M would overshoot the
+weakest member eightfold and overflow the real backend. A number nobody published is worse than no
+number.
 
 If no `routing.cliLane` is configured, an unreachable rung is reported `[unreachable]` with the
 reason and skipped when choosing `next`, rather than being offered as a lane that cannot work.

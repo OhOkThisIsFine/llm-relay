@@ -395,14 +395,24 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   configuration and are substituted in args AND env; `{task}` is request content and is substituted
   in args ONLY — config load *rejects* it in an env value, because it would otherwise pass through
   literally while the operator believed it worked.
-  **`{contextWindow}` resolves the SERVING provider's published limit or nothing** — never a
-  `reference` figure borrowed from another provider (`resolveMetadata`), never a guess. A pool needs
-  every member to publish before a floor exists, and uses the MINIMUM, because failover can land on
-  any member. Unknown ⇒ the env entry is dropped, not emptied, and the child keeps its own default.
-  ⚠ Unknown is the common case (0 of 29 `pool/high` members publish one, measured 2026-08-07): free
-  providers publish little metadata. Do not "fix" that by inventing a number — a fabricated window
-  overrides the client's conservative default and overflows the real backend, which is the same
-  reasoning as "the context guardrail fires only on a limit the serving provider published". ⚠ **A rung pointing at the caller's own vendor passthrough
+  **`{contextWindow}` has TWO rungs, both real publications** (`contextWindowResolver` in
+  `metadata.ts`): the serving deployment's own `contextLength`, then `context_length` from the
+  synced snapshot for the same model id. There is no guessed rung, same as `resolveMetadata`.
+  ⚠ Rung 2 is load-bearing, not a nicety: free providers publish almost nothing (NIM publishes
+  none), so rung 1 alone covered 0 of 29 `pool/high` members while the snapshot covered 28 of 29
+  (measured 2026-08-07). ⚠ **Fuzzy snapshot matches are rejected here** even though
+  `findTierModel` offers them — a borrowed SKU's *score* mis-ranks a pool, a borrowed SKU's
+  *context window* tells a client it may send tokens the backend will reject. A pool needs every
+  member to resolve and uses the MINIMUM (failover can land anywhere), so one unresolvable model
+  blocks a whole pool. Unknown ⇒ the entry is dropped, not emptied.
+  ⚠ **Never "fix" an unknown with a large speculative value.** Measured pool minimums here are
+  131,072–163,840 — *below* the 200k the `claude` CLI already assumes — so a speculative 1M would
+  overshoot the weakest member eightfold. Same reasoning as "the context guardrail fires only on a
+  limit the serving provider published": a number nobody published is worse than no number.
+  ⚠ `buildDispatch`'s LOCAL path must materialize dynamic pools first (`runDispatch` does). Until
+  materialized a `{ include: "free" }` pool has zero members, so it resolved to no window while the
+  same query against the running proxy resolved one — the fallback may know less about live state,
+  never about configuration. ⚠ **A rung pointing at the caller's own vendor passthrough
   is NOT transposed** — an `anthropic`-kind provider with no `authEnv` is reachable as a plain
   `Agent(...)` from anywhere, and that rung *means* "spend primary quota". With no template
   configured the rung is marked `unreachable` and skipped when picking `next`; an explicit

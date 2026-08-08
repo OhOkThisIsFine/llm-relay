@@ -1,3 +1,4 @@
+import { contextWindowResolver } from "../src/metadata.js";
 import { describe, it, expect } from "vitest";
 import { assessCost, estimateRequestTokens, resolveMetadata } from "../src/metadata.js";
 import { createServer, type Server } from "node:http";
@@ -402,5 +403,49 @@ describe("resolveMetadata provenance", () => {
     expect(m.contextLengthSource).toBeNull();
     expect(m.maxOutputTokens).toBeNull();
     expect(m.maxOutputTokensSource).toBeNull();
+  });
+});
+
+describe("contextWindowResolver — two rungs, both real publications", () => {
+  const noSnapshot = () => null;
+
+  it("prefers the SERVING provider's own published window", () => {
+    const r = contextWindowResolver(
+      (p, m) => (p === "nim" && m === "z-ai/glm-5.2" ? 131072 : null),
+      () => ({ tokens: 1_000_000, match: "exact" as const }),
+    );
+    expect(r("nim/z-ai/glm-5.2")).toEqual({ tokens: 131072, source: "provider" });
+  });
+
+  it("falls back to the synced snapshot when the provider publishes nothing", () => {
+    // This rung is what makes the feature usable at all: free providers publish little metadata
+    // and NIM publishes none, so nearly every pool member would otherwise resolve to null.
+    const r = contextWindowResolver(() => null, () => ({ tokens: 262144, match: "exact" as const }));
+    expect(r("nim/z-ai/glm-5.2")).toEqual({ tokens: 262144, source: "snapshot" });
+  });
+
+  it("REJECTS a fuzzy snapshot match — a borrowed SKU's window is not this model's", () => {
+    // `glm-5.2` containment-matching `glm-5.2-max` mis-ranks a pool when it is a capability score;
+    // as a context window it tells a client it may send tokens the backend will reject.
+    const r = contextWindowResolver(() => null, () => ({ tokens: 1_000_000, match: "fuzzy" as const }));
+    expect(r("nim/z-ai/glm-5.2")).toBeNull();
+  });
+
+  it("has no guessed rung — unknown stays null", () => {
+    expect(contextWindowResolver(() => null, noSnapshot)("nim/whatever")).toBeNull();
+  });
+
+  it("rejects non-positive and non-finite published values from either rung", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(contextWindowResolver(() => bad, noSnapshot)("nim/m")).toBeNull();
+      expect(
+        contextWindowResolver(() => null, () => ({ tokens: bad, match: "exact" as const }))("nim/m"),
+      ).toBeNull();
+    }
+  });
+
+  it("still consults the snapshot for a bare provider spec with no model part", () => {
+    const r = contextWindowResolver(() => 999, () => ({ tokens: 4096, match: "exact" as const }));
+    expect(r("anthropic")).toEqual({ tokens: 4096, source: "snapshot" });
   });
 });

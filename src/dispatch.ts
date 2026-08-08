@@ -1,5 +1,6 @@
 import { expandPoolSpecs, offloadRule, splitSpec, type Config, type LadderRung } from "./config.js";
 import type { HostRoutingState } from "./host-routing.js";
+import type { ResolvedContextWindow } from "./metadata.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -95,6 +96,15 @@ export interface DispatchLane {
    */
   contextWindow?: number;
   /**
+   * Where `contextWindow` came from: `provider` (the serving deployment published it) or
+   * `snapshot` (a published figure for the same model id from the synced capability data). Travels
+   * with the number for the same reason `strengthBasis` travels with `strength` — a reader must be
+   * able to tell a first-party measurement from a same-model figure taken elsewhere.
+   *
+   * For a pool this describes the MEMBER that set the minimum, which is the binding constraint.
+   */
+  contextWindowSource?: "provider" | "snapshot";
+  /**
    * Why this rung cannot be used by the calling host as configured. Set when a `relay` rung needs
    * transposing and no `routing.cliLane` template exists to transpose it with. Such a rung is
    * never auto-selected as `next` — offering a lane known not to work is the defect being fixed.
@@ -151,7 +161,7 @@ export interface DispatchOptions {
    * Absent means no window is resolved for any lane, which is exactly the behaviour before this
    * existed. Never guess a number here: see `specContextWindow`.
    */
-  publishedContextWindow?: (provider: string, model: string | undefined) => number | null;
+  publishedContextWindow?: (spec: string) => ResolvedContextWindow | null;
 }
 
 /**
@@ -273,8 +283,8 @@ export const CONTEXT_TOKEN = "{contextWindow}";
 export function specContextWindow(
   spec: string,
   cfg: Config,
-  published: (provider: string, model: string | undefined) => number | null,
-): number | null {
+  published: (spec: string) => ResolvedContextWindow | null,
+): ResolvedContextWindow | null {
   let specs: string[];
   try {
     specs = expandPoolSpecs([spec], cfg);
@@ -283,14 +293,15 @@ export function specContextWindow(
   }
   if (specs.length === 0) return null;
 
-  let min: number | null = null;
+  let best: ResolvedContextWindow | null = null;
   for (const s of specs) {
-    const { provider, model } = splitSpec(s);
-    const window = published(provider, model);
-    if (window === null || !Number.isFinite(window) || window <= 0) return null;
-    min = min === null ? window : Math.min(min, window);
+    const window = published(s);
+    if (window === null || !Number.isFinite(window.tokens) || window.tokens <= 0) return null;
+    // The MEMBER that sets the minimum is the binding constraint, so its provenance is the one
+    // that describes the number being reported — not the first member's, and not a blend.
+    if (best === null || window.tokens < best.tokens) best = window;
   }
-  return min;
+  return best;
 }
 
 /**
@@ -518,9 +529,12 @@ function toLane(
         const window = opts.publishedContextWindow
           ? specContextWindow(rung.spec, cfg, opts.publishedContextWindow)
           : null;
-        lane.invoke = transposeToCli(rung.spec, cfg.routing.cliLane, opts.task, platform, window);
+        lane.invoke = transposeToCli(rung.spec, cfg.routing.cliLane, opts.task, platform, window?.tokens ?? null);
         lane.transposed = true;
-        if (window !== null) lane.contextWindow = window;
+        if (window !== null) {
+          lane.contextWindow = window.tokens;
+          lane.contextWindowSource = window.source;
+        }
       } else {
         lane.unreachable =
           `${who} does not route its traffic through this relay, so a subagent cannot reach ` +

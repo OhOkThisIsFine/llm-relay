@@ -169,3 +169,50 @@ export function estimateRequestTokens(reqJson: unknown): number {
   walk(obj.input);
   return Math.ceil(chars / 4);
 }
+
+/** Where a context window came from, in descending order of authority. */
+export type ContextWindowSource = "provider" | "snapshot";
+
+export interface ResolvedContextWindow {
+  tokens: number;
+  source: ContextWindowSource;
+}
+
+/**
+ * Build the context-window lookup used to fill a `cliLane` template's `{contextWindow}`.
+ *
+ * Two rungs, both REAL PUBLICATIONS — there is deliberately no guessed rung, for the same reason
+ * `resolveMetadata` has none and the request-path guardrail stays silent on an unknown limit:
+ *
+ *  1. `provider` — the serving deployment's own published `contextLength`. Authoritative.
+ *  2. `snapshot` — `context_length` from the synced capability snapshot (`docs/tier-data.json`,
+ *     OpenRouter), matched **exactly** on the spec's last segment.
+ *
+ * ⚠ Rung 2 exists because rung 1 is nearly empty in practice: free providers publish little
+ * metadata and NIM publishes none, so 0 of 29 `pool/high` members carry a provider-published
+ * window (measured 2026-08-07) while 28 of 29 carry a snapshot one. Without it the feature would
+ * be correct and useless.
+ *
+ * ⚠ **Exact matches only.** `findTierModel` will fall back to a fuzzy match, which can borrow a
+ * different SKU's row (`glm-5.2` → `glm-5.2-max`). A wrong capability score mis-ranks a pool; a
+ * wrong context window tells a client it may send tokens the backend will reject. The blast radius
+ * differs, so this path takes the stricter rule.
+ *
+ * The provider limit lookup is injected so this module keeps no catalog dependency.
+ */
+export function contextWindowResolver(
+  providerLimit: (provider: string, model: string) => number | null,
+  snapshot: (spec: string) => { tokens: number; match: "exact" | "fuzzy" } | null,
+): (spec: string) => ResolvedContextWindow | null {
+  const positive = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n > 0;
+  return (spec: string) => {
+    const slash = spec.indexOf("/");
+    if (slash > 0) {
+      const own = providerLimit(spec.slice(0, slash), spec.slice(slash + 1));
+      if (positive(own)) return { tokens: own, source: "provider" };
+    }
+    const hit = snapshot(spec);
+    if (hit && hit.match === "exact" && positive(hit.tokens)) return { tokens: hit.tokens, source: "snapshot" };
+    return null;
+  };
+}
