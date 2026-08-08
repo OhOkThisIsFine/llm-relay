@@ -70,6 +70,20 @@ Tooling that fanned work out across per-task worktrees inside the repo once made
 files / 638 tests instead of the real suite. That breaks the gate in both directions: another
 worktree's half-finished edit fails this tree's run, and a stale copy passes one. Don't widen it.
 
+**Static analysis is ADVISORY and deliberately outside the gate.** `npm run analysis:run`
+(eslint + sonarjs, knip, madge, dependency-cruiser, ts-prune, jscpd) writes to `analysis-reports/`
+(gitignored). It is **not** in `npm run check` and CI does not run it — the gate stays the two
+typechecks plus the suite. Several default rules contradict documented invariants here, so they
+are switched **off in `eslint.config.mjs` with the invariant named beside each**: this proxy is
+loopback-only so `http://127.0.0.1` is the architecture (`no-clear-text-protocols`); the dispatch
+ladder names agent CLIs for the HOST to resolve (`no-os-command-from-path`); the suite uses temp
+dirs to stay hermetic (`publicly-writable-directories`). What is left as a **warning** —
+cognitive complexity, super-linear regexes — is worth reading and not worth blocking on;
+restructuring `server.ts`/`config.ts` to clear the first is the enterprise-shaped refactor
+[docs/suggestion-review-2026-08-04.md](docs/suggestion-review-2026-08-04.md) already rejected.
+⚠ Don't "fix" a finding by deleting an intentional discard: `_`-prefixed names and
+`const { key, ...rest }` are conventions here, covered by the rule options rather than by edits.
+
 **CI** (`.github/workflows/ci.yml`) runs `npm ci --ignore-scripts` → `npm run build` →
 `npm run check` on every push to `main` and every PR, plus a check that the `postinstall` hook stays
 inert on a non-global install. Before this existed, `typecheck` ran in **no** workflow and the suite
@@ -96,6 +110,8 @@ in the workflow YAML, so don't judge the protection by the YAML alone.
 | `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **client-specific offload routing** (`isSubagentRequest` reads Claude/Codex child markers; `subagentSpec` applies `routing.subagents` through the originating client's `routing.offload` rule, with `scope: "subagents" | "all"`, or an `@relay:` directive read ONLY from the last text block of `messages[0]`; a rule may carry `freeOnly: true` — see the gotcha), reshaper auto-synthesis. Also `leave_me_alone` — the onboarding-nudge suppression list, whose entries are deliberately NOT validated against the known providers (see `onboarding.ts`). |
 | `offload.ts` | Client-specific offload state. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites the targeted `routing.offload.<client>` rule in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
 | `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with tier selection (`?tier=`), host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). `routing.ladders.<tier>` supports different CLI models for reasoning/coding/fast; the legacy `routing.ladder` remains valid. An exhaustion report may carry `outcome: "rate_limited"` (15m default) or `"quota_exhausted"` (1h default) and a vendor-stated `retryAfterMs` that beats both (`OUTCOME_DEFAULT_MS`); the relay still never invents the signal. A `cli` rung may declare `env` (string = set, `null` = unset — both needed for a relay-routed `claude -p` child: base URL set, nested-session vars unset), surfaced on `invoke.env` and rendered by the CLI per shell; the task placeholder is never substituted into env values. Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. |
+| `host-routing.ts` | Does the CALLING host's traffic reach this relay? `routed` / `bypassed` / `unknown`, decided on the caller's `ANTHROPIC_BASE_URL` (loopback ⇒ routed, so a chain like headroom in front still counts) and never on `CLAUDE_CODE_ENTRYPOINT`, which only names the host in the message. ⚠ Evaluated in the **CLI** process and forwarded as `?host=` — the server cannot detect a bypassing host, because a bypassing host sends it nothing. |
+| `claude-hook.ts` | The `PreToolUse(Agent)` hook that delivers `offload claude on` where HTTP rerouting cannot: it denies the `Agent` call and hands back the transposed command. **Forcing function, not a redirect** — no hook can move an in-process subagent's endpoint. Appends alongside the user's own hooks, refuses to rewrite an unparseable `settings.json`, and the generated script fails **open** on every error. |
 | `dynamic-pools.ts` | Materializes `{ preferred: [...], include: "free" }` pools as an invariant fixed prefix plus every catalog-discovered free target in benchmark order. Free-provider unknown prices are admitted unless known paid; mixed providers contribute only zero-priced or explicitly free-labelled models. Replaces the tail after catalog refresh so new models need no manual config edits. |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
 | `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/registry`, `/telemetry`, `/ping`, `/health`, `/health/stats`, `/candidates`, `/offload`, `/dispatch`). Front-door paths identify the originating client for offload. **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
@@ -361,6 +377,32 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 - **A source's absence is not a low score.** Models are never penalised for signals nobody
   publishes; `signal_count` travels with the score instead, so a 1-source guess and a 5-source
   consensus are distinguishable. Don't "fix" a sparse row by defaulting it to zero.
+- **A host whose traffic never reaches the relay cannot be detected by the relay.** Every
+  subagent-reroute mechanism (`routing.subagents`, an `@relay:` directive, a `freeOnly` rule)
+  works by answering an HTTP request differently, so it needs the request to arrive. From Claude
+  Desktop it never does — the launcher pins `ANTHROPIC_BASE_URL` and beats the `settings.json`
+  `env` block (that block's *other* keys still land; only this one is managed). There is therefore
+  no request to classify, and `process.env` inside the **server** describes a process launched at
+  logon, not whoever is asking. Detection lives in `host-routing.ts`, runs in the **CLI**, and is
+  forwarded as `?host=`; `buildDispatch` takes it as an argument and must never sniff for it.
+  Absent ⇒ `unknown` ⇒ exactly the pre-existing behaviour.
+- **On a bypassed host, `requiresDirective` is never set and relay rungs are transposed.** The
+  directive hint is true advice under a routed host and *false* advice under a bypassed one, where
+  the `@relay:` line reaches the model as literal prompt text — a hint that cannot work is worse
+  than none, because the host acts on it and believes it offloaded. A `relay` rung needing the
+  reroute path is instead rendered as a CLI invoke from `routing.cliLane` (`{spec}` + `{task}`,
+  never substituted into `env` values). ⚠ **A rung pointing at the caller's own vendor passthrough
+  is NOT transposed** — an `anthropic`-kind provider with no `authEnv` is reachable as a plain
+  `Agent(...)` from anywhere, and that rung *means* "spend primary quota". With no template
+  configured the rung is marked `unreachable` and skipped when picking `next`; an explicit
+  `?lane=` still reaches it and says why it is blocked.
+- **The Agent hook is the DELIVERY of `offload claude on`, not a separate feature — so it must
+  track the setting in both directions.** `offload claude off` removes it. A forcing function that
+  outlived the rule justifying it would deny subagents nobody asked to redirect. It appends a new
+  matcher rather than editing the array (users run their own `Agent` hooks; Claude Code runs every
+  match), and it fails **open** everywhere: a hook that denied subagents because the proxy was down
+  would turn one unavailable optional lane into a total outage — same reasoning as an unset
+  `${ENV}` disabling one provider instead of aborting startup.
 - **The dispatch ladder decides ORDER, never execution.** `routing.ladder` may name agent CLIs
   (`kind: "cli"`), but `src/` must never spawn one: their quota is client-bound, they run their
   own tool loop, and they return only final text — so a relay that shelled out could never return

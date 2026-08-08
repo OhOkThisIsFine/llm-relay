@@ -93,6 +93,20 @@ Three ways to steer a subagent, in precedence order:
 ⚠ Dispatching a subagent does NOT offload it by itself. With that client's rule off, a subagent
 runs on its normal route. Check `llm-relay offload status`, don't assume.
 
+⚠ **All three steering methods need the session's traffic to reach the relay.** They reroute an
+HTTP request, which requires the request to arrive; from a bypassed host (Claude Desktop) none of
+them do anything, and the `@relay:` line reaches the model as literal prompt text. `offload status`
+says so when it applies to you.
+
+**On such a host, `llm-relay offload claude on` installs a `PreToolUse(Agent)` hook** into
+`~/.claude/settings.json` — that is how the setting is *delivered* where HTTP rerouting cannot
+work, not a separate feature. It appends alongside any hook you already have, and
+`llm-relay offload claude off` removes it. What it does: deny the `Agent(...)` call and hand back
+the relay-routed command to run instead. It is a forcing function, not a redirect — no hook can
+change where an in-process subagent's request goes (`SubagentStart` is context-only, and rewriting
+the prompt or model does not move the endpoint). It fails **open**: any error allows the call, so a
+down proxy never becomes "no subagent works".
+
 Offloaded output is **advisory** — verify claims against source files before acting on them.
 
 ### Native Codex parent with relay children
@@ -182,7 +196,9 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
   relay. **Claude Desktop sessions do not** — the Desktop launcher pins `ANTHROPIC_BASE_URL` to
   `api.anthropic.com` and no setting overrides it — so from a Desktop session a subagent
   `@relay:` directive silently reaches real Anthropic (the directive line goes to the model as
-  prompt text). From such a host, use the **Claude CLI lane** below instead.
+  prompt text). **You do not have to detect this or work around it**: `llm-relay dispatch`
+  classifies the calling host and hands back a shell-out for any lane a subagent cannot reach.
+  See "One verb, host-adapted" below.
 - **Claude CLI (relay-routed)** — a `cli` rung running `claude -p "<task>" --model pool/<name>`
   with rung `env` setting `ANTHROPIC_BASE_URL` to the relay, `ANTHROPIC_AUTH_TOKEN=dummy`, an
   isolated absolute `CLAUDE_CONFIG_DIR`, and `null`-unsetting `CLAUDECODE`,
@@ -219,6 +235,29 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
 The CLIs' own model lists are the authority on what exists — re-check them rather than trusting
 ids written down anywhere, since a de-listed id fails a whole rung.
 
+### One verb, host-adapted
+
+`llm-relay dispatch -t "<task>"` is the **only** thing you need to ask, from any harness. Do not
+branch on which one you are in, and do not reason about whether a subagent can reach a pool from
+here — the relay works that out and answers with something you can actually run.
+
+It classifies the calling session as **routed** (its traffic reaches the relay, so relay rungs work
+as written) or **bypassed** (it does not — Claude Desktop, or any session with no loopback
+`ANTHROPIC_BASE_URL`). On a bypassed host, every relay rung a subagent cannot reach comes back
+already **transposed** into a `claude -p --model <spec>` command via `routing.cliLane`, marked
+`transposed: true` and printed as `run:` rather than `target:`. A rung pointing at the plain
+Anthropic passthrough is left alone — an ordinary `Agent(...)` reaches that from anywhere.
+
+Two consequences worth internalising:
+
+- A `run:` line is for you to execute (Bash). A `target:` line is a spec to address as a subagent.
+  The relay has already decided which is possible here; trust it over your own guess.
+- On a bypassed host the `@relay:` hint is never emitted, because the directive is *inert* there —
+  not merely insufficient. If you find yourself about to add one, ask dispatch instead.
+
+If no `routing.cliLane` is configured, an unreachable rung is reported `[unreachable]` with the
+reason and skipped when choosing `next`, rather than being offered as a lane that cannot work.
+
 ### Order — ask the relay, don't guess
 
 The ordering is **config, not prose**: `routing.ladder` in `~/.llm-relay/config.json`, an ordered
@@ -227,6 +266,7 @@ list of rungs. Ask for the next lane rather than deciding yourself:
 ```bash
 llm-relay dispatch -t "<the task>"     # ordered ladder + the exact command to run
 llm-relay dispatch --json              # same, machine-readable
+llm-relay dispatch --next-command -t "<task>"   # JUST the runnable command line for `next`
 ```
 
 Use `--tier low|medium|high|xhigh` when task effort matters; tier-specific configurations live

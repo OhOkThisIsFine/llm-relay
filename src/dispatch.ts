@@ -1,4 +1,5 @@
-import { offloadRule, type Config, type LadderRung } from "./config.js";
+import { expandPoolSpecs, offloadRule, splitSpec, type Config, type LadderRung } from "./config.js";
+import type { HostRoutingState } from "./host-routing.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -74,8 +75,24 @@ export interface DispatchLane {
    * relay rungs only: with this client's subagent offload OFF, a bare subagent will NOT route to
    * this spec — the host must put `@relay: <spec>` in the prompt or turn the client rule on.
    * Surfaced so a host never silently spends primary quota believing it offloaded.
+   *
+   * ⚠ Never set for a bypassed host. There, the directive is not merely insufficient — it is
+   * inert, and reaches the model as literal prompt text. A hint that cannot work is worse than
+   * no hint, because the host acts on it and believes it offloaded.
    */
   requiresDirective?: boolean;
+  /**
+   * This rung was a `relay` rung rendered as a CLI invoke, because the calling host's traffic
+   * does not reach this relay. `spec` is retained alongside `invoke` so the reader can still see
+   * what is being addressed — the transposition is a change of MECHANISM, not of target.
+   */
+  transposed?: boolean;
+  /**
+   * Why this rung cannot be used by the calling host as configured. Set when a `relay` rung needs
+   * transposing and no `routing.cliLane` template exists to transpose it with. Such a rung is
+   * never auto-selected as `next` — offering a lane known not to work is the defect being fixed.
+   */
+  unreachable?: string;
 }
 
 export interface DispatchView {
@@ -85,6 +102,12 @@ export interface DispatchView {
   offload: boolean;
   /** Originating harness whose rule controls relay-rung directive hints. */
   client: string;
+  /**
+   * Whether the CALLING host's traffic reaches this relay, as reported by the caller — the
+   * server cannot observe it (a bypassing host sends nothing here) and must not guess from its
+   * own environment. Governs whether relay rungs are usable as written or transposed.
+   */
+  host: HostRoutingState;
   ladder: DispatchLane[];
   /** The lane the host should use now, or null when every rung is spent or none configured. */
   next: DispatchLane | null;
@@ -103,6 +126,15 @@ export interface DispatchOptions {
   lane?: string;
   /** Walk the ladder: pick the first ready rung strictly after this one. */
   after?: string;
+  /**
+   * Whether the CALLER's traffic reaches this relay (`src/host-routing.ts`). Supplied by the
+   * caller, never sniffed here: `buildDispatch` runs inside the server as often as not, and the
+   * server's own environment describes the process launched at logon, not the session asking.
+   * Absent means `unknown` — behave exactly as before this existed.
+   */
+  host?: HostRoutingState;
+  /** Harness name, for messages only (`claude-desktop`). Never used to decide anything. */
+  entrypoint?: string;
 }
 
 /**
@@ -190,6 +222,68 @@ export function clearExhausted(cfg: Config, id?: string, tier?: string): void {
 /** The placeholder a cli rung's args must contain; substituted with the task text. */
 export const TASK_TOKEN = "{task}";
 
+/** The placeholder a `routing.cliLane` template's args must contain; substituted with the spec. */
+export const SPEC_TOKEN = "{spec}";
+
+/**
+ * Can a bypassed host reach this spec with a plain subagent, no relay involvement?
+ *
+ * Only when every provider it resolves to is the caller's OWN vendor passthrough — an
+ * `anthropic`-kind provider declaring no `authEnv`, i.e. one that forwards the caller's own
+ * credential to the caller's own vendor. Such a rung means "give up and spend primary quota",
+ * and an ordinary `Agent(...)` call does exactly that from any host. It needs no directive, no
+ * offload rule and no shell-out, so transposing it would replace a working lane with a
+ * needlessly heavier one.
+ *
+ * Everything else — pools, pinned third-party models — needs the subagent-reroute machinery,
+ * which is precisely what a bypassed host does not have.
+ *
+ * An unresolvable spec counts as NOT reachable. Config load already rejects those, so this is a
+ * narrow edge; when it does happen, declining to claim the dead subagent path works is the
+ * conservative direction.
+ */
+function reachableWithoutRelay(spec: string, cfg: Config): boolean {
+  let specs: string[];
+  try {
+    specs = expandPoolSpecs([spec], cfg);
+  } catch {
+    return false;
+  }
+  if (specs.length === 0) return false;
+  return specs.every((s) => {
+    const provider = cfg.providers[splitSpec(s).provider];
+    return provider !== undefined && provider.kind === "anthropic" && provider.authEnv === undefined;
+  });
+}
+
+/**
+ * Render a `relay` rung's spec as a CLI invocation via the operator's `routing.cliLane` template.
+ *
+ * `{spec}` and `{task}` are substituted only into ARGS, never into env values — same rule as a
+ * cli rung's own env, and for the same reason: env is operator-authored routing, not task
+ * content. Each substitution stays inside a single argv element, so no amount of shell
+ * metacharacter in a task can become a second word.
+ */
+function transposeToCli(
+  spec: string,
+  lane: NonNullable<Config["routing"]["cliLane"]>,
+  task: string | undefined,
+  platform: NodeJS.Platform,
+): NonNullable<DispatchLane["invoke"]> {
+  const fill = (arg: string): string => {
+    const withSpec = arg.split(SPEC_TOKEN).join(spec);
+    // No task given => leave the placeholder visible, exactly as a cli rung does, so the caller
+    // can see where it goes rather than receiving a command that asks the agent to do nothing.
+    return task === undefined ? withSpec : withSpec.split(TASK_TOKEN).join(task);
+  };
+  const invoke: NonNullable<DispatchLane["invoke"]> = {
+    command: normalizeCliCommand(lane.command, platform),
+    args: lane.args.map(fill),
+  };
+  if (lane.env) invoke.env = { ...lane.env };
+  return invoke;
+}
+
 /**
  * Resolve command names whose Windows shell semantics differ from their POSIX spelling.
  *
@@ -238,6 +332,14 @@ function normalizeOptions(opts: DispatchOptions): DispatchOptions {
   if (tier !== undefined) out.tier = tier;
   const client = str(opts.client);
   if (client !== undefined) out.client = client;
+  // An unrecognised host verdict is treated as absent rather than corrected: the caller is
+  // asserting something only it can know, and inventing "bypassed" from a typo would transpose
+  // lanes that did not need it, while inventing "routed" would re-offer the dead subagent path.
+  // "unknown" — behave as before this existed — is the only safe reading of a value we cannot parse.
+  const host = str(opts.host);
+  if (host === "routed" || host === "bypassed" || host === "unknown") out.host = host;
+  const entrypoint = str(opts.entrypoint);
+  if (entrypoint !== undefined) out.entrypoint = describeId(entrypoint);
   return out;
 }
 
@@ -260,7 +362,14 @@ function selectLadder(cfg: Config, requested?: string): { tier: string | null; r
 }
 
 /** C0 + C1 control characters, including ESC — never legal in a rung id, and the ANSI carrier. */
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+function stripControlCharacters(value: string): string {
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    out += (code >= 0 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f) ? "\uFFFD" : value[i]!;
+  }
+  return out;
+}
 
 /**
  * Render a caller-supplied id for a `reason` string. The reason is reflected back verbatim in the
@@ -270,7 +379,7 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
  * — enough to recognise your own typo, not a channel.
  */
 function describeId(id: string): string {
-  const clean = id.replace(CONTROL_CHARS, "\uFFFD");
+  const clean = stripControlCharacters(id);
   return clean.length > MAX_ECHOED_ID ? `${clean.slice(0, MAX_ECHOED_ID)}\u2026` : clean;
 }
 
@@ -282,6 +391,8 @@ function toLane(
   now: number,
   client: string,
   platform: NodeJS.Platform,
+  host: HostRoutingState,
+  entrypoint: string | undefined,
 ): DispatchLane {
   const until = cooldownUntil(cfg, rung, now);
   const state: LaneState = !rung.enabled ? "disabled" : until !== null ? "exhausted" : "ready";
@@ -302,7 +413,23 @@ function toLane(
   }
   if (rung.kind === "relay" && rung.spec) {
     lane.spec = rung.spec;
-    lane.requiresDirective = !offloadRule(cfg, client).enabled;
+    const bypassed = host === "bypassed";
+    if (!bypassed) {
+      lane.requiresDirective = !offloadRule(cfg, client).enabled;
+    } else if (!reachableWithoutRelay(rung.spec, cfg)) {
+      // The host cannot address this spec as a subagent at all, so the rung is offered as the
+      // shell-out that CAN reach it — a change of mechanism, not of target. `requiresDirective`
+      // is deliberately left unset: see its doc comment.
+      const who = entrypoint ? `this host (${entrypoint})` : "this host";
+      if (cfg.routing.cliLane) {
+        lane.invoke = transposeToCli(rung.spec, cfg.routing.cliLane, opts.task, platform);
+        lane.transposed = true;
+      } else {
+        lane.unreachable =
+          `${who} does not route its traffic through this relay, so a subagent cannot reach ` +
+          `"${rung.spec}" — configure routing.cliLane to reach it by shelling out`;
+      }
+    }
   }
   return lane;
 }
@@ -314,58 +441,48 @@ export function buildDispatch(
 ): DispatchView {
   const opts = normalizeOptions(rawOpts ?? {});
   const client = opts.client ?? "default";
+  const host = opts.host ?? "unknown";
   const now = Date.now();
   const selected = selectLadder(cfg, opts.tier);
   const rungs = selected.rungs;
-  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client, platform));
+  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client, platform, host, opts.entrypoint));
   const offload = offloadRule(cfg, client).enabled;
+  const base = { tier: selected.tier, offload, client, host, ladder };
 
   if (selected.missing) {
     return {
-      tier: selected.tier,
-      offload,
-      client,
-      ladder,
+      ...base,
       next: null,
       reason: `no dispatch tier "${describeId(selected.missing)}" configured (have: ${Object.keys(cfg.routing.ladders ?? {}).join(", ")})`,
     };
   }
 
   if (ladder.length === 0) {
-    return {
-      tier: selected.tier,
-      offload,
-      client,
-      ladder,
-      next: null,
-      reason: "no routing.ladder configured — dispatch order is the host's to choose",
-    };
+    return { ...base, next: null, reason: "no routing.ladder configured — dispatch order is the host's to choose" };
   }
 
   if (opts.lane !== undefined) {
     const forced = ladder.find((l) => l.id === opts.lane);
     if (!forced) {
       return {
-        tier: selected.tier,
-        offload,
-        client,
-        ladder,
+        ...base,
         next: null,
         reason: `no lane "${describeId(opts.lane)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
       };
     }
-    // An explicit override is honoured even when the rung is cooling down or parked: the host
-    // asked for THIS target, and second-guessing it would defeat the point of an override.
+    // An explicit override is honoured even when the rung is cooling down, parked, or unreachable
+    // from this host: the host asked for THIS target, and second-guessing it would defeat the
+    // point of an override. The `unreachable` field still travels on the lane, so the caller can
+    // see what it overrode rather than discovering it at spawn time.
     return {
-      tier: selected.tier,
-      offload,
-      client,
-      ladder,
+      ...base,
       next: forced,
       reason:
-        forced.state === "ready"
-          ? `lane "${forced.id}" selected by host override`
-          : `lane "${forced.id}" selected by host override (currently ${forced.state})`,
+        forced.unreachable !== undefined
+          ? `lane "${forced.id}" selected by host override (${forced.unreachable})`
+          : forced.state === "ready"
+            ? `lane "${forced.id}" selected by host override`
+            : `lane "${forced.id}" selected by host override (currently ${forced.state})`,
     };
   }
 
@@ -374,10 +491,7 @@ export function buildDispatch(
     const idx = ladder.findIndex((l) => l.id === opts.after);
     if (idx < 0) {
       return {
-        tier: selected.tier,
-        offload,
-        client,
-        ladder,
+        ...base,
         next: null,
         reason: `no lane "${describeId(opts.after)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
       };
@@ -385,18 +499,22 @@ export function buildDispatch(
     pool = ladder.slice(idx + 1);
   }
 
-  const next = pool.find((l) => l.state === "ready") ?? null;
+  // An unreachable rung is skipped like an exhausted one. Auto-selecting a lane already known not
+  // to work for this host is the exact defect this is here to fix — the host would spend a turn
+  // discovering it, and in the Desktop case would discover it as a silent no-op rather than an
+  // error. An explicit `?lane=` override above still reaches it.
+  const usable = pool.filter((l) => l.state === "ready" && l.unreachable === undefined);
+  const next = usable[0] ?? null;
   if (!next) {
+    const blocked = pool.filter((l) => l.unreachable !== undefined).length;
+    const why =
+      opts.after !== undefined
+        ? `no ready lane after "${describeId(opts.after)}" — the ladder is exhausted`
+        : "every lane is exhausted or disabled";
     return {
-      tier: selected.tier,
-      offload,
-      client,
-      ladder,
+      ...base,
       next: null,
-      reason:
-        opts.after !== undefined
-          ? `no ready lane after "${describeId(opts.after)}" — the ladder is exhausted`
-          : "every lane is exhausted or disabled",
+      reason: blocked > 0 ? `${why} (${blocked} unreachable from this host)` : why,
     };
   }
 
@@ -406,5 +524,5 @@ export function buildDispatch(
       : next.position === 1
         ? "first lane in the ladder"
         : `first ready lane (${next.position - 1} ahead of it unavailable)`;
-  return { tier: selected.tier, offload, client, ladder, next, reason: why };
+  return { ...base, next, reason: why };
 }

@@ -277,6 +277,28 @@ block of subagent requests; local Codex stamps `x-codex-turn-metadata`. This is 
 behaviour, not an API contract — re-verify after a client upgrade
 ([subagent-routing.md](subagent-routing.md#re-verifying)).
 
+### Hosts whose traffic never arrives
+
+Rerouting a subagent means answering its HTTP request differently, which requires the request to
+arrive. A **Claude Desktop** session's does not: the launcher pins `ANTHROPIC_BASE_URL` to
+`api.anthropic.com`, overriding both the User-scope variable and the `env` block of
+`~/.claude/settings.json` (the block's other keys still land — only that one is managed). The
+switch then reports ON and nothing changes.
+
+`llm-relay offload status` detects this and says so. And on such a host, `llm-relay offload claude
+on` installs a **`PreToolUse(Agent)` hook** into `~/.claude/settings.json` — the delivery mechanism
+for the setting where HTTP rerouting cannot work, not a separate feature. `offload claude off`
+removes it again.
+
+The hook denies the `Agent(...)` call and returns the relay-routed command
+(`llm-relay dispatch --next-command`) for the agent to run. It is a **forcing function, not a
+redirect**: no hook can move an in-process subagent's endpoint — it is served by the same process
+over the same pinned connection, `SubagentStart` is context-only by specification, and rewriting
+the prompt or `model` via `updatedInput` changes neither the host nor the vendor. It **appends**
+alongside any `Agent` hook you already have, refuses to touch an unparseable settings file, and
+**fails open** — every error path allows the call, so a stopped proxy never becomes "no subagent
+works at all".
+
 **Per-call pin:** put a directive on its own line at the start of the subagent's prompt:
 
 ```
@@ -367,6 +389,42 @@ sh, `$env:`/`Remove-Item Env:` statements for PowerShell). This is what makes a 
   }
 }
 ```
+
+#### Host-adaptive lanes (`routing.cliLane`)
+
+`llm-relay dispatch` is meant to be the **one verb** a host agent uses, whatever harness it runs
+in. To make that true it classifies the calling session — **routed** (its traffic reaches the
+relay, so `relay` rungs work as written) or **bypassed** (it does not) — and adapts the answer.
+
+The verdict comes from the caller's `ANTHROPIC_BASE_URL`: a loopback address means routed (a proxy
+chain in front, e.g. headroom, still counts), anything else or unset inside a Claude session means
+bypassed. It is detected by the **CLI**, which is a child of that session, and forwarded as
+`?host=`; the relay cannot work it out from a request, because a bypassing host sends none.
+`--host routed|bypassed|unknown` overrides it.
+
+On a bypassed host, a `relay` rung whose spec needs the subagent-reroute path is **transposed** into
+a CLI invocation using `routing.cliLane`, so one template replaces a hand-written CLI rung per pool
+per tier:
+
+```jsonc
+"routing": {
+  "cliLane": {
+    "command": "claude",
+    "args": ["-p", "--model", "{spec}", "--permission-mode", "plan", "{task}"],
+    "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791", "CLAUDECODE": null }
+  }
+}
+```
+
+`{spec}` is the rung's routing spec, `{task}` the delegated task; both are required, and neither is
+ever substituted into `env` values. A rung pointing at the plain Anthropic passthrough is **not**
+transposed — a bare `Agent(...)` reaches that from any host. With no template configured, such a
+rung is reported `unreachable` and skipped when picking `next` (an explicit `?lane=` still reaches
+it, and says why it is blocked). `requiresDirective` is never set on a bypassed host, because an
+`@relay:` line there is inert, not merely insufficient.
+
+`llm-relay dispatch --next-command -t "<task>"` prints just the runnable line for `next`, for
+callers that want something executable rather than the human ladder.
 
 ---
 

@@ -134,6 +134,32 @@ export interface Routing {
   ladder?: LadderRung[];
   /** Tier-specific dispatch ladders. `dispatch --tier <name>` selects one. */
   ladders?: Record<string, LadderRung[]>;
+  /**
+   * How to reach a `relay` rung's spec by SHELLING OUT, for a host whose own traffic does not
+   * reach this relay (see `src/host-routing.ts`). `/dispatch` substitutes the rung's spec into
+   * `{spec}` and the task into `{task}`, and hands back an ordinary `cli` invoke.
+   *
+   * Declared, never invented: the relay must not learn what a `claude` binary is or how to
+   * address one — that is the provider/model-agnostic invariant applied to lane rendering. Absent
+   * means no transposition is possible, and such rungs are reported unreachable rather than
+   * quietly replaced with something the operator never authorised.
+   */
+  cliLane?: CliLaneTemplate;
+}
+
+/**
+ * Template for rendering a `relay` rung as a shelled-out CLI command.
+ *
+ * Same executable shape as a `cli` rung — the host runs `command` with `args`, applying `env`
+ * (string sets, `null` unsets) — with one extra placeholder: `{spec}`, replaced by the rung's
+ * routing spec so ONE template serves every pool and pinned model in the ladder.
+ */
+export interface CliLaneTemplate {
+  command: string;
+  /** Must contain `{spec}`; `{task}` too, on the same reasoning as a cli rung's args. */
+  args: string[];
+  /** Applied by the host when spawning. Placeholders are never substituted here. */
+  env?: Record<string, string | null>;
 }
 
 /** A fixed configured prefix followed by automatically discovered free models. */
@@ -373,7 +399,7 @@ export function unroutableOffloadClient(
   if (FRONT_DOOR_CLIENTS.includes(client)) return null;
   const doors = FRONT_DOOR_CLIENTS.join(", ");
   const configured = cfg.routing.offload;
-  if (typeof configured === "object" && configured !== null && client in configured) {
+  if (typeof configured === "object" && client in configured) {
     return {
       fatal: false,
       message: `rule "${client}" matches no front door — no request ever consults it (front doors: ${doors})`,
@@ -587,7 +613,7 @@ function pickSpecs(model: string | null, cfg: Config): string[] {
  * An unknown pool must NOT silently fall through to routing.default — that is exactly the
  * "succeeded against a much weaker model than you asked for" failure. Fail loudly instead.
  */
-function expandPoolSpecs(specs: string[], cfg: Config): string[] {
+export function expandPoolSpecs(specs: string[], cfg: Config): string[] {
   const out: string[] = [];
   for (const s of specs) {
     const slash = s.indexOf("/");
@@ -749,7 +775,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch (e) {
-    throw new Error(`could not read/parse config at ${path}: ${(e as Error).message}`);
+    throw new Error(`could not read/parse config at ${path}: ${(e as Error).message}`, { cause: e });
   }
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`config at ${path} is not a JSON object`);
@@ -975,6 +1001,7 @@ function parseRouting(
     benchmarkSort?: unknown;
     ladder?: unknown;
     ladders?: unknown;
+    cliLane?: unknown;
   };
   // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
   if (providers[POOL_PREFIX]) {
@@ -1083,6 +1110,8 @@ function parseRouting(
     ladders[tier] = parsed;
   }
   if (Object.keys(ladders).length > 0) routing.ladders = ladders;
+  const cliLane = parseCliLane(r.cliLane, "config.routing.cliLane");
+  if (cliLane) routing.cliLane = cliLane;
 
   // A spec naming a DISABLED provider is dropped with a warning, exactly like a pool member;
   // a spec naming a provider that was never declared is still fatal below. Doing this before
@@ -1155,39 +1184,53 @@ function parseRouting(
 /** Parse the legacy global switch or the independently keyed client-rule form. */
 export function parseOffload(raw: unknown): OffloadConfig {
   // Absent => false. Offload is opt-in: a missing key must never mean "send every request to
-  // another provider", which is what an implicit-on default would do to an existing config.
-  if (raw === undefined) return false;
-  if (typeof raw === "boolean") return raw;
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    throw new Error(`config.routing.offload must be a boolean or an object keyed by client`);
+  // another provider, which is what an implicit-on default would do to an existing config.
+  let out: OffloadConfig = false;
+
+  if (typeof raw === "boolean") {
+    out = raw;
+  } else if (raw !== undefined) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      throw new Error(`config.routing.offload must be a boolean or an object keyed by client`);
+    }
+
+    const parsed: Record<string, OffloadRule> = {};
+    for (const [client, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (client.length === 0) throw new Error(`config.routing.offload client name must not be empty`);
+      if (typeof value === "boolean") {
+        parsed[client] = { enabled: value, scope: "subagents" };
+        continue;
+      }
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error(`config.routing.offload.${client} must be a boolean or {"enabled":bool,"scope":...}`);
+      }
+      const rule = value as { enabled?: unknown; scope?: unknown; freeOnly?: unknown };
+      if (typeof rule.enabled !== "boolean") {
+        throw new Error(`config.routing.offload.${client}.enabled must be true or false`);
+      }
+      const scope = rule.scope === undefined ? "subagents" : rule.scope;
+      if (scope !== "subagents" && scope !== "all") {
+        throw new Error(`config.routing.offload.${client}.scope must be "subagents" or "all"`);
+      }
+      if (rule.freeOnly !== undefined && typeof rule.freeOnly !== "boolean") {
+        throw new Error(`config.routing.offload.${client}.freeOnly must be true or false`);
+      }
+      parsed[client] = { enabled: rule.enabled, scope, ...(rule.freeOnly !== undefined ? { freeOnly: rule.freeOnly } : {}) };
+    }
+    out = parsed;
   }
 
-  const out: Record<string, OffloadRule> = {};
-  for (const [client, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (client.length === 0) throw new Error(`config.routing.offload client name must not be empty`);
-    if (typeof value === "boolean") {
-      out[client] = { enabled: value, scope: "subagents" };
-      continue;
-    }
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      throw new Error(`config.routing.offload.${client} must be a boolean or {"enabled":bool,"scope":...}`);
-    }
-    const rule = value as { enabled?: unknown; scope?: unknown; freeOnly?: unknown };
-    if (typeof rule.enabled !== "boolean") {
-      throw new Error(`config.routing.offload.${client}.enabled must be true or false`);
-    }
-    const scope = rule.scope === undefined ? "subagents" : rule.scope;
-    if (scope !== "subagents" && scope !== "all") {
-      throw new Error(`config.routing.offload.${client}.scope must be "subagents" or "all"`);
-    }
-    if (rule.freeOnly !== undefined && typeof rule.freeOnly !== "boolean") {
-      throw new Error(`config.routing.offload.${client}.freeOnly must be true or false`);
-    }
-    out[client] = { enabled: rule.enabled, scope, ...(rule.freeOnly !== undefined ? { freeOnly: rule.freeOnly } : {}) };
-  }
   return out;
 }
 
+/** ASCII control characters are never valid in environment variable names. */
+function hasAsciiControl(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
 /**
  * Drop the members of a spec (or spec list) whose provider was disabled by an unset `${ENV}`,
  * warning for each. Returns the survivors, or `null` when nothing survives.
@@ -1225,6 +1268,69 @@ function dropDisabledSpecs(
 /** Placeholder a cli rung's args must contain. Duplicated from dispatch.ts as a literal rather
  *  than imported, to keep config.ts free of dependencies on modules that import it. */
 const LADDER_TASK_TOKEN = "{task}";
+
+/** Placeholder a cliLane template's args must contain, replaced by the rung's routing spec. */
+const LADDER_SPEC_TOKEN = "{spec}";
+
+/**
+ * Environment a HOST applies when spawning a rendered command — shared by `cli` rungs and the
+ * `cliLane` template, because a divergence between the two would be a silent one: both are
+ * handed to the same spawn site, and the stricter of two copies is whichever was edited last.
+ */
+function parseSpawnEnv(raw: unknown, where: string): Record<string, string | null> | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`${where}.env must be an object mapping variable names to a string (set) or null (unset)`);
+  }
+  const env: Record<string, string | null> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    // "=", whitespace and control characters cannot appear in an environment variable NAME on any
+    // platform this runs on; accepting one would render a command that silently sets a different
+    // variable than the config names.
+    if (name.length === 0 || name.includes("=") || /\s/.test(name) || hasAsciiControl(name)) {
+      throw new Error(`${where}.env has an invalid variable name ${JSON.stringify(name)}`);
+    }
+    if (typeof value !== "string" && value !== null) {
+      throw new Error(`${where}.env.${name} must be a string (set) or null (unset)`);
+    }
+    env[name] = value;
+  }
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
+/**
+ * Validate `routing.cliLane` at load. A template missing `{spec}` cannot address a target: every
+ * rung it rendered would invoke the same default model, so the ladder would appear to fail over
+ * while sending every lane to one place. That is worse than having no template at all, which is
+ * why it is a hard error rather than a warning.
+ */
+function parseCliLane(raw: unknown, root: string): CliLaneTemplate | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${root} must be an object`);
+  const e = raw as Record<string, unknown>;
+
+  if (typeof e.command !== "string" || e.command.length === 0) {
+    throw new Error(`${root}.command must be a non-empty string`);
+  }
+  if (!Array.isArray(e.args) || e.args.some((a) => typeof a !== "string")) {
+    throw new Error(`${root}.args must be an array of strings`);
+  }
+  const args = e.args as string[];
+  if (!args.some((a) => a.includes(LADDER_SPEC_TOKEN))) {
+    throw new Error(
+      `${root}.args must contain "${LADDER_SPEC_TOKEN}" in one argument — otherwise every transposed rung ` +
+        `invokes ${e.command} with the same model and the ladder only appears to fail over`,
+    );
+  }
+  if (!args.some((a) => a.includes(LADDER_TASK_TOKEN))) {
+    throw new Error(`${root}.args must contain "${LADDER_TASK_TOKEN}" in one argument — otherwise the task is never passed to ${e.command}`);
+  }
+
+  const lane: CliLaneTemplate = { command: e.command, args };
+  const env = parseSpawnEnv(e.env, root);
+  if (env) lane.env = env;
+  return lane;
+}
 
 /**
  * Validate `routing.ladder` at load, not at request time — a ladder whose rung cannot be invoked
@@ -1271,25 +1377,8 @@ function parseLadder(raw: unknown, root: string): LadderRung[] {
       }
       rung.command = e.command;
       rung.args = args;
-      if (e.env !== undefined) {
-        if (typeof e.env !== "object" || e.env === null || Array.isArray(e.env)) {
-          throw new Error(`${where}.env must be an object mapping variable names to a string (set) or null (unset)`);
-        }
-        const env: Record<string, string | null> = {};
-        for (const [name, value] of Object.entries(e.env as Record<string, unknown>)) {
-          // "=", whitespace and control characters cannot appear in an environment variable
-          // NAME on any platform this runs on; accepting one would render a command that
-          // silently sets a different variable than the config names.
-          if (name.length === 0 || /[=\s\u0000-\u001f\u007f]/.test(name)) {
-            throw new Error(`${where}.env has an invalid variable name ${JSON.stringify(name)}`);
-          }
-          if (typeof value !== "string" && value !== null) {
-            throw new Error(`${where}.env.${name} must be a string (set) or null (unset)`);
-          }
-          env[name] = value;
-        }
-        if (Object.keys(env).length > 0) rung.env = env;
-      }
+      const env = parseSpawnEnv(e.env, where);
+      if (env) rung.env = env;
     } else {
       if (typeof e.spec !== "string" || e.spec.length === 0) {
         throw new Error(`${where}.spec must be a non-empty string for a "relay" rung`);
@@ -1418,3 +1507,4 @@ function normalizeMode(v: unknown): Mode {
   if (v === "detect" || v === "repair" || v === "strict") return v;
   return "detect";
 }
+

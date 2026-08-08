@@ -7,6 +7,7 @@ import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, type DispatchOutcome } from "../dispatch.js";
+import { parseHostRoutingState } from "../host-routing.js";
 import { getTelemetryReport } from "../telemetry.js";
 import type { CircuitBreaker } from "../circuit-breaker.js";
 import { baseLog } from "../request-log.js";
@@ -243,12 +244,22 @@ export async function handleAdminRoutes(
       return bad(400, `?task= exceeds ${MAX_TASK_LEN} characters`);
     }
     const taskParam = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : undefined;
+    // ⚠ `host` is REPORTED by the caller, never derived here. Whether a session's traffic reaches
+    // this relay is a fact about the caller's process environment; this process was launched at
+    // logon and its own environment describes nothing about whoever is asking. A bypassing host
+    // is by definition one that sends no traffic here, so there is no request to infer it from —
+    // only the CLI, running as a child of that session, can see it. `buildDispatch` validates the
+    // value and falls back to "unknown" (pre-existing behaviour) for anything it cannot parse.
+    const hostParam = parseHostRoutingState(pickQuery(path, "host"));
+    const entrypointParam = pickQuery(path, "entrypoint");
     const view = buildDispatch(cfg, {
       ...(taskParam ? { task: taskParam } : {}),
       ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
       ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
       ...((pickQuery(path, "tier") ?? bodyTier) ? { tier: (pickQuery(path, "tier") ?? bodyTier) as string } : {}),
       ...(bodyClient ? { client: bodyClient } : {}),
+      ...(hostParam ? { host: hostParam } : {}),
+      ...(entrypointParam ? { entrypoint: entrypointParam } : {}),
     });
     return ok(view, true);
   }
