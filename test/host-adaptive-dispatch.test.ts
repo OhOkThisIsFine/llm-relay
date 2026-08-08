@@ -226,8 +226,13 @@ describe("context window substitution", () => {
       cliLane: WINDOWED_LANE,
     });
 
-  const windows = (map: Record<string, number>) => (_p: string, model: string | undefined) =>
-    model !== undefined && map[model] !== undefined ? map[model]! : null;
+  /** Keyed by the spec's model part, mirroring how a real resolver is asked. */
+  const windows =
+    (map: Record<string, number>, source: "provider" | "snapshot" = "provider") =>
+    (spec: string) => {
+      const model = spec.slice(spec.indexOf("/") + 1);
+      return map[model] !== undefined ? { tokens: map[model]!, source } : null;
+    };
 
   it("substitutes a published window into the env value", () => {
     const l = lane(cfg(), "pinned", { host: "bypassed", publishedContextWindow: windows({ "z-ai/glm-5.2": 131072 }) });
@@ -259,9 +264,23 @@ describe("context window substitution", () => {
 
   it("ignores a nonsensical published window rather than passing it through", () => {
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      const l = lane(cfg(), "pinned", { host: "bypassed", publishedContextWindow: () => bad });
+      const l = lane(cfg(), "pinned", { host: "bypassed", publishedContextWindow: () => ({ tokens: bad, source: "provider" as const }) });
       expect(l.contextWindow).toBeUndefined();
     }
+  });
+
+  it("carries the provenance of the member that SET the minimum, not the first member", () => {
+    // A pool's binding constraint is its smallest member, so that member's provenance is what
+    // describes the number being reported. Ordering must not decide it.
+    const l = lane(cfg(), "pool", {
+      host: "bypassed",
+      publishedContextWindow: (spec) =>
+        spec.endsWith("/a")
+          ? { tokens: 1_000_000, source: "provider" as const }
+          : { tokens: 131_072, source: "snapshot" as const },
+    });
+    expect(l.contextWindow).toBe(131_072);
+    expect(l.contextWindowSource).toBe("snapshot");
   });
 
   it("resolves no window at all when no lookup is supplied", () => {

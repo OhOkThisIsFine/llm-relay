@@ -18,6 +18,8 @@ import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
 import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
+import { contextWindowResolver } from "./metadata.js";
+import { snapshotContextWindow } from "./tier-data.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
@@ -901,8 +903,20 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   // answer matches a live one; `cachedLimits` never fetches, so an unwarmed cache simply means no
   // lane carries a window.
   const catalog = new ModelCatalog();
-  const cachedContextWindow = (provider: string, model: string | undefined): number | null =>
-    model === undefined ? null : (catalog.cachedLimits(provider, model)?.contextLength ?? null);
+  // ⚠ Dynamic pools (`{ include: "free" }`) are EMPTY until materialized, and the server does this
+  // at startup while this path never did — so a `pool/*` rung resolved to zero members here and
+  // therefore to no context window, while the same query against the running proxy resolved one.
+  // The local fallback is allowed to know less about live state (exhaustion); it must not disagree
+  // about configuration. Synchronous and catalog-cache-only, so it costs no round-trip.
+  try {
+    materializeDynamicPools(cfg, catalog);
+  } catch {
+    // A pool we cannot materialize simply stays empty — the same degradation as a cold cache.
+  }
+  const cachedContextWindow = contextWindowResolver(
+    (provider, model) => catalog.cachedLimits(provider, model)?.contextLength ?? null,
+    snapshotContextWindow,
+  );
 
   const liveRaw = (await tryServer(cfg, path)) as WireDispatchView | null;
   // A proxy predating host-adaptive dispatch ignores `?host=` and answers as though every relay
@@ -1027,10 +1041,16 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     // and the consequence differs a lot: the child falls back to its own assumed window, which on
     // a large-context model throws most of it away.
     if (l.transposed && wantsContextWindow) {
+      // Provenance travels with the number, same rule as `strengthBasis` on a candidate row: a
+      // first-party figure and a same-model figure taken from another host are different claims.
       process.stdout.write(
-        l.contextWindow !== undefined
-          ? `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (published by the serving provider)\n`
-          : `   context: not published for this spec — the variable is omitted and the CLI uses its own default\n`,
+        l.contextWindow === undefined
+          ? `   context: not published anywhere for this spec — the variable is omitted and the CLI uses its own default\n`
+          : `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (${
+              l.contextWindowSource === "snapshot"
+                ? "synced snapshot, same model id on another host"
+                : "published by the serving provider"
+            })\n`,
       );
     }
     if (l.unreachable) process.stdout.write(`   ⚠ ${l.unreachable}\n`);

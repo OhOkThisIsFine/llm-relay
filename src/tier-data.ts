@@ -29,6 +29,14 @@ export interface TierModel extends Record<string, unknown> {
   published_signal_count?: number;
   /** Capability-floor bands materialized by sync, including persisted exit hysteresis. */
   effort_eligibility?: string[];
+  /**
+   * Context window in tokens as OpenRouter publishes it for this model id.
+   *
+   * A real published measurement, not a capability score — which is why it can back a context
+   * window when the SERVING provider publishes nothing. It is still a different host's figure for
+   * the same model, so it must never be presented as the serving provider's own number.
+   */
+  context_length?: number | null;
 }
 
 export interface TierData {
@@ -133,4 +141,19 @@ export function findTierModel<T = TierModel>(
   if (seg.length < 5) return null;
   const contained = byNorm.find((e) => e.norm.includes(seg));
   return contained ? { rec: contained.rec, match: "fuzzy" } : null;
+}
+
+/**
+ * Context window the synced snapshot publishes for a spec, with how it was matched.
+ *
+ * Cheap to call per pool member: `loadTierData` is memoized on the file's mtime, and the caller
+ * decides what to do with a `fuzzy` match. `contextWindowResolver` in metadata.ts rejects fuzzy —
+ * a borrowed SKU's context window tells a client it may send tokens the backend will reject.
+ */
+export function snapshotContextWindow(spec: string): { tokens: number; match: "exact" | "fuzzy" } | null {
+  const data = loadTierData();
+  if (!data) return null;
+  const hit = findTierModel<TierModel>(spec, data.byNorm, data.exactByNorm);
+  const tokens = hit?.rec.context_length;
+  return hit && typeof tokens === "number" ? { tokens, match: hit.match } : null;
 }

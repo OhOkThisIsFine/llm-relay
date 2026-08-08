@@ -114,8 +114,25 @@ A CLI handed a model it does not recognize assumes a context window and compacts
 silently. The relay already harvests per-(provider, model) limits (`catalog.limitsFromRecord`) for
 the request-path guardrail, so it can simply say what it knows.
 
-Resolution follows the same rule as every other number here — **the serving provider's own
-published value, or nothing**:
+Resolution has **two rungs, both real publications** (`contextWindowResolver`): the serving
+deployment's own `contextLength`, then `context_length` from the synced snapshot for the same model
+id, exact-matched. There is no guessed rung.
+
+Rung 2 was added in 0.22.0 after measuring rung 1's coverage, and it is the difference between a
+correct feature and a useless one:
+
+| pool | provider-published | snapshot | neither |
+|---|---|---|---|
+| `pool/high` | 0 / 29 | 28 | 1 |
+| `pool/xhigh` | 0 / 15 | 15 | 0 |
+| `pool/medium` | 2 / 41 | 38 | 1 |
+| `pool/low` | 4 / 49 | 44 | 1 |
+
+⚠ **Fuzzy snapshot matches are rejected**, though `findTierModel` offers them. A borrowed SKU's
+capability score mis-ranks a pool; a borrowed SKU's context window tells a client it may send tokens
+the backend will reject. Different blast radius, stricter rule.
+
+The rest of the resolution rule:
 
 - pinned spec → that deployment's published `contextLength`;
 - `pool/<name>` → every member must publish, and the **minimum** wins, because failover can land
@@ -124,12 +141,24 @@ published value, or nothing**:
 - unknown → the env entry is **dropped**, not set to an empty string (which a child would read as
   zero or garbage), and the client keeps its own conservative default.
 
-⚠ **Unknown is the common answer, and that is the honest outcome.** Measured on this machine
-2026-08-07: `pool/high` 0 of 29 members publish a context length, `pool/xhigh` 0 of 15,
-`pool/medium` 2 of 41. Free providers publish little or no metadata — NIM publishes none at all.
-Pinned specs on providers that do publish resolve fine: `openrouter/deepseek/deepseek-v4-flash-0731`
-returns 1,048,576, so that lane was compacting at 200k against a 1M model until this landed. A
-window we invented would override the client's default with fiction and overflow the real backend.
+**Why there is no speculative rung**, considered and rejected 2026-08-07 with the numbers above.
+The proposal was to assume 1M when nothing is published and let errors correct it downward. Two
+findings killed it:
+
+- **The measured floors point the other way.** With the snapshot rung, resolved pool minimums here
+  are 131,072 (`pool/low`) to 163,840 (`pool/medium`, `high`, `xhigh`) — *below* the 200k the
+  `claude` CLI already assumes for an unrecognized model. A speculative 1M would overshoot the
+  weakest member by six to eight times; the correct adjustment for these pools is **downward**, and
+  the honest data already provides it.
+- **The correction loop does not exist.** Limits are written in exactly one place — `limitsFromRecord`
+  off a `/models` record. Nothing anywhere learns a limit from an error response, so a speculative
+  value would not be corrected; it would just be wrong until someone noticed. Building that loop is
+  a real piece of work (parse per-provider context-length errors, attribute them to a deployment,
+  persist, invalidate) and it is not a prerequisite for this feature — the snapshot rung already
+  covers ~97% of members.
+
+One unresolvable model can still block a whole pool, since every member must resolve. Here that is
+`huggingface/Qwen/Qwen3-235B-A22B-Instruct-2507`, which alone blocks `low`, `medium` and `high`.
 
 The lookup is **injected** (`DispatchOptions.publishedContextWindow`), not imported: `dispatch.ts`
 keeps no catalog dependency and stays synchronous. The server backs it with
