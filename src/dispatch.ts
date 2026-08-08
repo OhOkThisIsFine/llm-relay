@@ -1,6 +1,7 @@
 import { expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX, type Config, type LadderRung } from "./config.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
+import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -50,7 +51,7 @@ export const OUTCOME_DEFAULT_MS: Record<DispatchOutcome, number> = {
 /** Longest caller-supplied id echoed back in a `reason`. See `describeId`. */
 const MAX_ECHOED_ID = 120;
 
-export type LaneState = "ready" | "exhausted" | "disabled";
+export type LaneState = "ready" | "exhausted" | "disabled" | "not-servable";
 
 export interface DispatchLane {
   id: string;
@@ -63,6 +64,14 @@ export interface DispatchLane {
   note?: string;
   /** When an exhausted rung becomes eligible again (ISO 8601). */
   readyAt?: string;
+  /**
+   * The lane's own tool states it does not serve this rung's model. An EXISTENCE fact, so the rung
+   * is removed from selection and its `invoke` is withheld — a command that cannot work must not be
+   * renderable. It stays LISTED with this reason: silently vanishing is its own debugging problem.
+   */
+  notServable?: string;
+  /** Arguments removed because the lane states (or was observed to state) it rejects them. */
+  droppedArgs?: string[];
   /**
    * cli rungs: exactly what to run. `args` already has the task substituted when one was given.
    * `env` is applied by the HOST when spawning: a string value sets the variable, `null` unsets
@@ -145,6 +154,12 @@ export interface DispatchOptions {
   tier?: string;
   /** Substituted for the `{task}` placeholder in a cli rung's args. */
   task?: string;
+  /**
+   * Cached lane manifest (`llm-relay lanes --probe`). Passed in rather than loaded here so the
+   * request path never touches the filesystem on our behalf and tests can pin it. Absent ⇒ every
+   * rung is UNKNOWN and nothing is evicted.
+   */
+  manifest?: LaneManifest | null;
   /** Host override: return THIS lane as `next`, whatever the order says. */
   lane?: string;
   /** Walk the ladder: pick the first ready rung strictly after this one. */
@@ -487,6 +502,13 @@ function normalizeOptions(opts: DispatchOptions): DispatchOptions {
   // the same reason as everything else here: this object can arrive from a JSON body, where the
   // key could be any shape, and calling a non-function would throw mid-render.
   if (typeof opts.publishedContextWindow === "function") out.publishedContextWindow = opts.publishedContextWindow;
+  // Not a wire field either — supplied in-process by the server/CLI from the cached manifest. Shape
+  // is guarded for the same reason as the rest: a malformed value must read as "no manifest"
+  // (⇒ nothing evicted), never throw mid-render or evict on garbage.
+  const manifest = opts.manifest;
+  if (manifest && typeof manifest === "object" && manifest.version === 1 && typeof manifest.lanes === "object" && manifest.lanes !== null) {
+    out.manifest = manifest;
+  }
   return out;
 }
 
@@ -557,6 +579,23 @@ function toLane(
       args: opts.task === undefined ? [...rung.args] : rung.args.map((a) => a.split(TASK_TOKEN).join(opts.task!)),
     };
     if (rung.env) lane.invoke.env = { ...rung.env };
+
+    // Validate the rung against what the lane's own tool says it serves. Reads the CACHED manifest
+    // only — nothing here spawns anything. ⚠ Absent/unprobed/unknown ⇒ no change at all, so a stale
+    // manifest can never empty the ladder (see lane-manifest.ts).
+    const dropped = unsupportedRungArgs(rung, opts.manifest ?? null);
+    if (dropped.length > 0) {
+      lane.invoke.args = stripArgs(lane.invoke.args, dropped.map((d) => d.arg));
+      lane.droppedArgs = dropped.map((d) => d.reason);
+    }
+    const verdict = verifyRungModel(rung, opts.manifest ?? null);
+    if (verdict?.status === "not-servable") {
+      lane.notServable = verdict.reason;
+      lane.state = "not-servable";
+      // Withhold the command entirely. A rung whose model does not exist must not be renderable —
+      // handing back a command known to fail is the whole defect being fixed here.
+      delete lane.invoke;
+    }
   }
   if (rung.kind === "relay" && rung.spec) {
     lane.spec = rung.spec;
@@ -587,6 +626,72 @@ function toLane(
     }
   }
   return lane;
+}
+
+
+/** The `--model` / `--config model_reasoning_effort=` value a cli rung actually passes. */
+function rungModel(rung: LadderRung): string | null {
+  const args = rung.args ?? [];
+  const i = args.indexOf("--model");
+  if (i >= 0 && i + 1 < args.length) return args[i + 1] ?? null;
+  const m = args.find((a) => a.startsWith("--model="));
+  return m ? m.slice("--model=".length) : null;
+}
+
+function verifyRungModel(rung: LadderRung, manifest: LaneManifest | null) {
+  if (!rung.command) return null;
+  const model = rungModel(rung);
+  if (!model) return null;
+  return verifyModel(manifest, rung.command, model);
+}
+
+/** Argument name/value pairs a cli rung passes, in both `--flag value` and `key=value` forms. */
+function rungArgValues(rung: LadderRung): Array<{ arg: string; value: string }> {
+  const args = rung.args ?? [];
+  const out: Array<{ arg: string; value: string }> = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === undefined) continue;
+    if (a.startsWith("--") && !a.includes("=")) {
+      const v = args[i + 1];
+      if (v !== undefined && !v.startsWith("--")) out.push({ arg: a, value: v });
+    } else if (a.includes("=") && !a.startsWith("--")) {
+      const [k, ...rest] = a.split("=");
+      if (k) out.push({ arg: k, value: rest.join("=") });
+    }
+  }
+  return out;
+}
+
+function unsupportedRungArgs(rung: LadderRung, manifest: LaneManifest | null): Array<{ arg: string; reason: string }> {
+  if (!rung.command) return [];
+  const model = rungModel(rung);
+  if (!model) return [];
+  const dropped: Array<{ arg: string; reason: string }> = [];
+  for (const { arg, value } of rungArgValues(rung)) {
+    if (arg === "--model") continue;
+    const v = unsupportedArgValues(manifest, rung.command, model, arg, value);
+    if (v.unsupported && v.reason) dropped.push({ arg, reason: v.reason });
+  }
+  return dropped;
+}
+
+/** Remove `--flag value` pairs and `key=value` tokens (including a `--config key=value` pair). */
+function stripArgs(args: string[], drop: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === undefined) continue;
+    if (drop.includes(a)) { i++; continue; }
+    const key = a.includes("=") ? a.split("=")[0] : null;
+    if (key && drop.includes(key)) {
+      // `--config key=value`: the preceding flag goes with it.
+      if (out[out.length - 1] === "--config") out.pop();
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
 }
 
 export function buildDispatch(
@@ -658,7 +763,7 @@ export function buildDispatch(
   // to work for this host is the exact defect this is here to fix — the host would spend a turn
   // discovering it, and in the Desktop case would discover it as a silent no-op rather than an
   // error. An explicit `?lane=` override above still reaches it.
-  const usable = pool.filter((l) => l.state === "ready" && l.unreachable === undefined);
+  const usable = pool.filter((l) => l.state === "ready" && l.unreachable === undefined && l.notServable === undefined);
   const next = usable[0] ?? null;
   if (!next) {
     const blocked = pool.filter((l) => l.unreachable !== undefined).length;

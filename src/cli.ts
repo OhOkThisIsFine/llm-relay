@@ -16,6 +16,8 @@ import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
+import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
+import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { contextWindowResolver } from "./metadata.js";
@@ -846,6 +848,73 @@ export function renderCommand(
 }
 
 /**
+ * `llm-relay lanes [--probe]` — what each cli lane's own tool says it serves.
+ *
+ * ⚠ `--probe` is the ONE place the relay runs a lane's command, and only as an explicit operator
+ * action — same precedent as `pools --probe` sending real completions. The request path reads the
+ * cached manifest and never spawns anything. Without `--probe` this just prints the cache.
+ */
+export function runLanes(): void {
+  const cfg = loadOrExit();
+  if (hasFlag("--probe")) {
+    for (const r of probeLanes(cfg)) {
+      process.stdout.write(
+        r.ok
+          ? `  ✓ ${r.lane.padEnd(8)} ${String(r.modelCount).padStart(3)} models via \`${r.via}\`
+`
+          : `  ✗ ${r.lane.padEnd(8)} ${r.error}
+`,
+      );
+    }
+  }
+
+  const manifest = loadLaneManifest();
+  if (!manifest || Object.keys(manifest.lanes).length === 0) {
+    // Never phrased as "no models" — an unprobed lane is UNKNOWN, and nothing is evicted on it.
+    process.stdout.write("\nNo lane manifest yet. Run `llm-relay lanes --probe`.\n");
+    process.stdout.write("Until then every cli rung is treated as unknown and nothing is evicted.\n");
+    return;
+  }
+
+  for (const [lane, entry] of Object.entries(manifest.lanes)) {
+    process.stdout.write(`
+${lane} — ${entry.models.length} models, probed ${entry.probedAt} via \`${entry.via}\`
+`);
+    for (const m of entry.models) {
+      const supports = m.supports
+        ? Object.entries(m.supports).map(([k, v]) => `${k}=${v.join("|")}`).join("  ")
+        : "";
+      process.stdout.write(`  ${m.id.padEnd(28)} ${supports}
+`);
+    }
+    for (const [model, args] of Object.entries(entry.rejectedArgs ?? {})) {
+      process.stdout.write(`  ⚠ ${model} rejects: ${args.join(", ")} (observed)
+`);
+    }
+  }
+
+  // What the CONFIG names that the manifest contradicts — the reason this command exists.
+  const bad: string[] = [];
+  const ladders = cfg.routing.ladders ?? {};
+  for (const rung of [...Object.values(ladders).flat(), ...(cfg.routing.ladder ?? [])]) {
+    if (rung?.kind !== "cli" || !rung.command || !rung.args) continue;
+    const i = rung.args.indexOf("--model");
+    const model = i >= 0 ? rung.args[i + 1] : undefined;
+    if (!model) continue;
+    const v = verifyModel(manifest, rung.command, model);
+    if (v.status === "not-servable" && !bad.includes(v.reason)) bad.push(v.reason);
+  }
+  if (bad.length > 0) {
+    process.stdout.write(`
+⚠ ${bad.length} configured rung(s) name a model their lane does not serve:
+`);
+    for (const b of bad) process.stdout.write(`  ${b}
+`);
+    process.stdout.write("These are removed from the ladder and their command is withheld.\n");
+  }
+}
+
+/**
  * `llm-relay dispatch [lane]` — which lane to hand a delegated task to next.
  *
  * Prefers a running proxy so the answer reflects live exhaustion state reported by whichever
@@ -973,6 +1042,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
       host: hostRouting.state,
       ...(hostRouting.entrypoint ? { entrypoint: hostRouting.entrypoint } : {}),
       publishedContextWindow: cachedContextWindow,
+      manifest: loadLaneManifest(),
       }),
   );
 
@@ -1997,6 +2067,16 @@ export function main(): void {
       process.stderr.write(`llm-relay offload: ${(e as Error).message}\n`);
       process.exit(1);
     });
+    return;
+  }
+  if (arg2 === "lanes") {
+    try {
+      runLanes();
+    } catch (e) {
+      process.stderr.write(`llm-relay lanes: ${(e as Error).message}
+`);
+      process.exit(1);
+    }
     return;
   }
   if (arg2 === "dispatch") {
