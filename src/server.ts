@@ -30,7 +30,7 @@ import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
 import { clearFacts, cooldownUntil, isCostBlocked, recordFact } from "./target-facts.js";
-import { interpretRefusal, materializeScope, recordUnknownRefusal } from "./refusal-interpretation.js";
+import { interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -1018,7 +1018,12 @@ function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs
     // and model. A provider-scoped verdict therefore covers every deployment behind that
     // credential from one observation — which is the whole point: a stated credit balance or a
     // rejected key is one fact, and rediscovering it once per model is pure waste.
-    recordFact(verdict.class, materializeScope(verdict.scope, target.provider, target.model), { retryAfterMs });
+    // A reset the BODY stated outranks the header, and outranks the kind's default TTL. Gemini
+    // says when a spent quota returns only in `google.rpc.RetryInfo` inside the error details, so
+    // without this a 5-hourly or weekly quota is re-probed on a schedule the relay invented.
+    recordFact(verdict.class, materializeScope(verdict.scope, target.provider, target.model), {
+      retryAfterMs: retryAfterMs ?? parseStatedResetMs(body),
+    });
   } catch {
     /* learning is best-effort and never in the request's way */
   }
