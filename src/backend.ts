@@ -47,6 +47,22 @@ export const SERVED_BY_HEADER = "x-llm-relay-served-by";
 export const POOL_ATTEMPTS_HEADER = "x-llm-relay-pool-attempts";
 
 /**
+ * How many refusals in this walk said something the relay could not interpret.
+ *
+ * The learned-eligibility store converges only as fast as somebody explains the messages it does
+ * not recognise, and a pull-only queue is a backlog nobody works. This is the push half: the
+ * caller — which is usually an agent that is about to report a pool failure to a human anyway —
+ * finds out at the moment it matters that a NEW kind of refusal just appeared, and can run
+ * `llm-relay eligibility` while the context is still in hand.
+ *
+ * ⚠ It is a COUNT, never the message. The message is untrusted text from an external service, and
+ * putting it in a response header would be the relay handing an agent attacker-controlled prose in
+ * a field agents tend to trust. The count says "go look"; `llm-relay eligibility` shows the text
+ * with its provenance and the enum-constrained verdicts it may receive.
+ */
+export const UNKNOWN_REFUSAL_HEADER = "x-llm-relay-unknown-refusal";
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both

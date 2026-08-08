@@ -17,7 +17,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -642,7 +642,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       if (tryNext && !res.destroyed && i < healthyTargets.length - 1) {
         clearTimeout(timer);
         res.off("close", onResClose);
-        await discardCandidate(backendRes, target, backendRes.status, retryAfterMs);
+        if (await discardCandidate(backendRes, target, backendRes.status, retryAfterMs)) pool429.noteUnknownRefusal();
         pool429.recordFailover(backendRes.status, retryAfterMs);
         completeAttemptFailure(h, attempt, {
           failure: "http",
@@ -663,7 +663,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       } else {
         const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
         pool429.recordFinal(backendRes.status);
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary() }, h);
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount() }, h);
       }
       return;
     } finally {
@@ -796,6 +796,17 @@ class Pool429Tracker {
     this.count(status);
   }
 
+  /** A refusal in this walk whose meaning the relay could not look up. */
+  private unknownRefusals = 0;
+  noteUnknownRefusal(): void {
+    this.unknownRefusals += 1;
+  }
+
+  /** How many, or null when every refusal was understood. */
+  unknownCount(): number | null {
+    return this.unknownRefusals > 0 ? this.unknownRefusals : null;
+  }
+
   private count(status: number): void {
     this.counts.set(status, (this.counts.get(status) ?? 0) + 1);
   }
@@ -870,6 +881,8 @@ interface Ctx {
    * tried, because then the response IS the walk and an aggregate would add nothing.
    */
   poolSummary?: string | null;
+  /** Unrecognized refusals among the candidates stepped over. See the caveat at the emit site. */
+  poolUnknownRefusals?: number | null;
   /**
    * The target this response actually came from — the resolved (provider, model)
    * after tier/pool expansion, subagent redirection and failover. Every log record
@@ -964,20 +977,21 @@ function observeContextLimit(res: Response, target: ResolvedTarget): void {
  *
  * Never throws: the worst outcome of a failure here is that nothing is learned this time.
  */
-function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs: number | null, body: string): void {
-  if (target.model === undefined) return;
+function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs: number | null, body: string): boolean {
+  if (target.model === undefined) return false;
   try {
     const verdict = interpretRefusal(target.provider, target.model, status, body);
     if (verdict === null) {
       // The fail-safe: an unrecognized refusal changes nothing about routing. It is held so a
       // researcher can say what it means, and only then will it ever bind.
       recordUnknownRefusal(target.provider, target.model, status, body);
-      return;
+      return true;
     }
     recordEligibility(target.provider, target.model, verdict, { retryAfterMs });
   } catch {
     /* learning is best-effort and never in the request's way */
   }
+  return false;
 }
 
 /** Statuses that can carry a durable fact about a deployment. A 429 is the breaker's business. */
@@ -992,13 +1006,14 @@ function carriesEligibilityFact(status: number): boolean {
  * The read replaces the `cancel()` it used to be, rather than joining it: the body is being thrown
  * away either way, so consuming it costs nothing extra and frees the socket just the same.
  */
-async function discardCandidate(res: Response, target: ResolvedTarget, status: number, retryAfterMs: number | null): Promise<void> {
+async function discardCandidate(res: Response, target: ResolvedTarget, status: number, retryAfterMs: number | null): Promise<boolean> {
   if (carriesEligibilityFact(status)) {
     const body = await res.text().catch(() => "");
-    if (body) observeEligibility(target, status, retryAfterMs, body);
-    return;
+    if (body) return observeEligibility(target, status, retryAfterMs, body);
+    return false;
   }
   await res.body?.cancel().catch(() => {});
+  return false;
 }
 
 function observeAttemptHeaders(
@@ -1214,7 +1229,7 @@ async function openAiFrontPath(
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
       // The body is read rather than cancelled when it might state a durable fact about the
       // deployment; either way the socket is freed and the bytes are discarded.
-      await discardCandidate(upstream, target, upstream.status, retryAfterMs);
+      if (await discardCandidate(upstream, target, upstream.status, retryAfterMs)) pool429.noteUnknownRefusal();
       pool429.recordFailover(upstream.status, retryAfterMs);
       completeAttemptFailure(h, attempt, {
         failure: "http",
@@ -1249,7 +1264,13 @@ async function openAiFrontPath(
         const raw = await upstream.text().catch(() => "");
         // The last candidate teaches us as much as the ones stepped over — and for a
         // single-member pool it is the ONLY one that can. Free, since the body is already here.
-        if (raw && carriesEligibilityFact(upstream.status)) observeEligibility(target, upstream.status, retryAfterMs, raw);
+        if (raw && carriesEligibilityFact(upstream.status) && observeEligibility(target, upstream.status, retryAfterMs, raw)) {
+          pool429.noteUnknownRefusal();
+        }
+        // Emitted here rather than with the other headers because the terminal candidate's verdict
+        // is only known once its body has been read — and on this front the head is written after.
+        const unknown = pool429.unknownCount();
+        if (unknown !== null) headers[UNKNOWN_REFUSAL_HEADER] = String(unknown);
         const normalized = normalizeOpenAiErrorBody(raw, upstream.status);
         const out = Buffer.from(normalized ?? raw, "utf8");
         res.writeHead(upstream.status, { ...headers, "content-type": "application/json" });
@@ -1302,6 +1323,13 @@ async function transparentPath(
     responseHeaders["retry-after"] = String(Math.max(1, Math.ceil(ctx.retryAfterOverrideMs / 1000)));
   }
   if (ctx.poolSummary) responseHeaders[POOL_ATTEMPTS_HEADER] = ctx.poolSummary;
+  // ⚠ Counts only the candidates STEPPED OVER. This front commits the head before reading the
+  // body, so the terminal candidate's verdict does not exist yet — a single-member pool answering
+  // an unrecognized refusal therefore emits no header here, and the refusal reaches the operator
+  // through `llm-relay eligibility` instead. Fixing that would mean buffering error bodies before
+  // `writeHead`, which reorders a path that streams; the skill's "check eligibility on a pool
+  // failure" reflex covers the gap at no risk.
+  if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
   res.writeHead(backendRes.status, responseHeaders);
   let assistant: AssistantMessage | null = null;
   try {

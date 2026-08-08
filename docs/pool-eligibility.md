@@ -171,6 +171,33 @@ A second trap, also caught by the suite: the learned stores are process-global, 
 recorded an account-scoped exhaustion for provider `p1` and every later test reusing that name found
 its first candidate already demoted. Reset the stores per test, same as the breaker.
 
+## Closing the loop: the dispatcher interprets, the owner accepts
+
+A pull-only queue is a backlog nobody works, so the unseen-refusal signal is **pushed**: a failure
+carrying uninterpretable refusals returns `x-llm-relay-unknown-refusal: <n>`, and the `llm-relay`
+skill makes "run `llm-relay eligibility` on a pool failure" the reflex. The agent driving the
+session is the right reader — it is already outside the request path, it already receives the
+error, and it knows which pool it addressed and whether the task then succeeded elsewhere, which a
+CLI listing cannot tell you.
+
+The split is: **the agent may `propose`, only the user may `accept`.** That keeps the gate exactly
+where it was — acceptance is what changes routing — while moving the review to where the owner
+already is, instead of a file they have to remember to open.
+
+⚠ **Error bodies are untrusted content from an external service**, and an agent that reads them is
+an injection target. The payoff is real: text crafted to get rival providers classified
+`not-servable` would evict the competition from every pool — a denial of service that looks like
+the relay working. Three things bound it, and none may be traded away for convenience:
+
+- a proposal is constrained to **three classes and two scopes** — not free text, not a command, so
+  the most a hostile message can do is argue for its own classification;
+- signatures are keyed per (provider, model), so one provider's message can **never** produce a
+  verdict about another;
+- the user accepts.
+
+A count, not the message, travels in the header for the same reason: a response header is the field
+a client is most likely to treat as trustworthy.
+
 ## Still open
 
 - `routing.offload.*.freeOnly` is **off**. Owner's decision, 2026-08-08.

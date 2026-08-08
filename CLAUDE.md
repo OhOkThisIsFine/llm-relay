@@ -385,7 +385,13 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   boundary at the top of this file governs it: an LLM may author the interpretation data, the
   request path only ever reads it, and a researched verdict binds only after `llm-relay eligibility
   accept`. Signatures are keyed per (provider, model, message) so a verdict cannot leak to a
-  sibling SKU.
+  sibling SKU. **The queue is PUSHED, not polled** — a failure carrying uninterpretable refusals
+  returns `x-llm-relay-unknown-refusal: <n>` and the skill makes checking it the reflex on a pool
+  failure, because a queue nobody opens is a backlog. The dispatcher may `propose`; only the user
+  may `accept`. ⚠ Error bodies are untrusted external content and an agent reading them is an
+  injection target — the containment is that a proposal is a 3-class/2-scope enum, signatures are
+  keyed per (provider, model) so one provider can never produce a verdict about another, and the
+  header carries a COUNT, never the message. Don't trade any of those for convenience.
 - **⚠ Never `res.clone()` a backend response on the failover path.** `clone()` tees the body and the
   failover branch cancels the original, so the un-read branch strands the walk and the client gets
   the FIRST candidate's error with the rest of the pool untouched. Read the body where it is already
