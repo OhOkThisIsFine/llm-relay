@@ -21,7 +21,7 @@ import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from 
 import { contextWindowResolver } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
 import { observedContextLimit, flushObservedContextLimits } from "./context-limits.js";
-import { allFacts, describeScope, flushFacts, type FactKind } from "./target-facts.js";
+import { allFacts, describeScope, flushFacts, FACT_KINDS, type FactKind } from "./target-facts.js";
 import {
   acceptInterpretation,
   flushInterpretations,
@@ -1341,7 +1341,9 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     }
     const cls = argValue("--class") as FactKind | undefined;
     const rationale = argValue("--rationale") ?? "";
-    const classes: FactKind[] = ["not-servable", "subscription-required", "allowance-exhausted", "credential-invalid"];
+    // Derived from the store, never hand-listed: a kind it accepts but this rejects is invisible
+    // until somebody tries to use it, and `rate-limited` shipped exactly that way.
+    const classes = FACT_KINDS;
     if (!cls || !classes.includes(cls)) {
       process.stderr.write(`llm-relay eligibility: --class expects one of ${classes.join(" | ")}\n`);
       process.exit(1);
