@@ -402,12 +402,6 @@ export function rejectInterpretation(signature: string, opts: { path?: string } 
   return true;
 }
 
-/** Every binding entry, for `llm-relay eligibility --table`. */
-export function confirmedInterpretations(opts: { path?: string } = {}): Array<Interpretation & { signature: string }> {
-  const store = load(opts.path ?? defaultPath());
-  return Object.entries(store.confirmed).map(([signature, v]) => ({ ...v, signature }));
-}
-
 /** Flush pending writes. Called on shutdown, like the other write-behind stores. */
 export function flushInterpretations(opts: { path?: string } = {}): void {
   if (!writer.dirty) return;
