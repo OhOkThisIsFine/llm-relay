@@ -83,6 +83,26 @@ consistent with the repo's existing philosophy.
 - `docs/fcc-replacement-assessment.md` was a snapshot at commit 799eed3 with open items nobody
   was tracking; deleted 2026-08-04.
 
+## Credentials stay user-operated (owner-ratified 2026-08-08)
+
+> Each person logs into Claude Code themselves, on their own machine, against their own account.
+> llm-relay never operates a login, never asks anyone to paste a Claude token into it, never
+> centrally proxies subscription traffic, and never pools consumer accounts. Each person supplies
+> their own third-party provider keys.
+
+Proposed in [codex-review-2026-08-05.md](codex-review-2026-08-05.md) §1 and ratified here.
+Everything in the repo already satisfies it; the point of writing it down is that a "hosted
+llm-relay" or a "shared relay for the group" are natural-sounding next features that would violate
+it, and the project is shared with friends.
+
+**⚠ Decisions made on the strength of this invariant must be stated OUT LOUD.** If a request is
+narrowed, declined, or redesigned because of this rule, say so in the response — name the
+invariant, say what it ruled out, and say what was done instead. An invariant that silently shapes
+work is indistinguishable from an agent being unhelpful for its own reasons, and the owner cannot
+overrule a constraint they were never told was applied. This is a standing instruction from the
+owner (2026-08-08), and it generalizes: the same applies to any project invariant that changes what
+gets built.
+
 ## Friend-install standard (owner decision 2026-08-04)
 
 A friend must succeed with **README + `llm-relay onboard` alone**, with minimal work on their

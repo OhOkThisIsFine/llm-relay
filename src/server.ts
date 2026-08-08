@@ -17,7 +17,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -415,7 +415,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     // free-lane traffic and never the vendor passthrough, and the guard can only ever refuse to
     // spend, so extending it there cannot cost anyone an answer they were entitled to.
     const addressesPool = typeof routedModel === "string" && routedModel.startsWith("pool/");
-    if ((subSpec !== null || addressesPool) && offloadRule(cfg, requestClient).freeOnly === true) {
+    if ((subSpec !== null || addressesPool) && freeOnlyApplies(offloadRule(cfg, requestClient), subSpec !== null)) {
       const kept: ResolvedTarget[] = [];
       let blocked: { spec: string; why: string } | null = null;
       for (const t of targetCandidates) {
@@ -535,6 +535,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       req,
       addressedPool,
       degradedSpecs,
+      cfg,
     }, h);
     return;
   }
@@ -674,7 +675,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       } else {
         const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
         pool429.recordFinal(backendRes.status);
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount(), degraded: degradedLabel(addressedPool, degradedSpecs, target) }, h);
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount(), degraded: degradedLabel(addressedPool, degradedSpecs, target), paid: paidLabel(cfg, h, target) }, h);
       }
       return;
     } finally {
@@ -719,6 +720,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
  * at all" — but only because the caller is told. An unannounced downgrade is indistinguishable
  * from getting what you asked for.
  */
+function paidLabel(cfg: Config, h: Handlers, target: ResolvedTarget): string | null {
+  // Only openai-kind targets carry a price we can assess; the anthropic passthrough is the
+  // caller's own subscription and is reported by the absence of any pool at all.
+  if (target.kind !== "openai" || !target.model) return null;
+  const assessment = assessCost(target.model, h.catalog.cachedLimits(target.provider, target.model), cfg.providers[target.provider]?.tierType);
+  if (assessment.costClass === "free") return null;
+  return `${specOfTarget(target)} (${assessment.costClass}, ${assessment.basis})`;
+}
+
 function degradedLabel(pool: string | null, degraded: Set<string> | null, target: ResolvedTarget): string | null {
   if (pool === null || degraded === null) return null;
   const spec = specOfTarget(target);
@@ -910,6 +920,8 @@ interface Ctx {
   poolUnknownRefusals?: number | null;
   /** Set when the answering deployment came from the pool's degrade tail. See `degradedLabel`. */
   degraded?: string | null;
+  /** Set when the answering deployment is not free. See `PAID_HEADER`. */
+  paid?: string | null;
   /**
    * The target this response actually came from — the resolved (provider, model)
    * after tier/pool expansion, subagent redirection and failover. Every log record
@@ -1025,6 +1037,27 @@ function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs
     /* learning is best-effort and never in the request's way */
   }
   return false;
+}
+
+/**
+ * Does the free-only guard bind this request?
+ *
+ *   explicit `true`  → always. The owner's standing "this lane never spends money", which a
+ *                      per-call `@relay:` directive and a dispatch cliLane must not outrank.
+ *   explicit `false` → never. Spending was opted into deliberately.
+ *   UNSET            → defaults ON for offload-rerouted traffic, OFF for a directly addressed pool.
+ *
+ * ⚠ That asymmetry is the whole point, and it is why `loadConfig` keeps "unset" distinguishable
+ * from "false". Offload exists to spend somebody else's free capacity instead of your
+ * subscription, so an install that has never thought about cost must not discover the feature by
+ * being billed for it — the default belongs there. But a request that *names* `pool/<name>` is an
+ * explicit routing choice by someone who knows what a pool is, and silently gating all of it on a
+ * flag they never set would turn every unpriced deployment into a 503 for a decision they did not
+ * make. Defaulting both the same way was tried: it failed 29 tests, all of them pool traffic that
+ * had nothing to do with offload, which is exactly the surprise a user would have hit.
+ */
+function freeOnlyApplies(rule: { freeOnly?: boolean }, rerouted: boolean): boolean {
+  return rule.freeOnly ?? rerouted;
 }
 
 /**
@@ -1212,6 +1245,7 @@ async function openAiFrontPath(
     /** The pool addressed, and its degrade tail — so a below-band answer can say so. */
     addressedPool?: string | null;
     degradedSpecs?: Set<string> | null;
+    cfg?: Config;
   },
   h: Handlers,
 ): Promise<void> {
@@ -1328,6 +1362,8 @@ async function openAiFrontPath(
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
       const degradedBy = degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target);
       if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
+      const paidBy = ctx.cfg ? paidLabel(ctx.cfg, h, target) : null;
+      if (paidBy) headers[PAID_HEADER] = paidBy;
       // Same aggregate as the Anthropic path, from the same tracker — the two fronts having
       // separate copies of one policy is the defect this file has already shipped once.
       pool429.recordFinal(upstream.status);
@@ -1409,6 +1445,8 @@ async function transparentPath(
   // failure" reflex covers the gap at no risk.
   if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
+  // Spending is never silent — see PAID_HEADER.
+  if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
   res.writeHead(backendRes.status, responseHeaders);
   let assistant: AssistantMessage | null = null;
   try {

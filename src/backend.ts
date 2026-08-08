@@ -76,6 +76,19 @@ export const UNKNOWN_REFUSAL_HEADER = "x-llm-relay-unknown-refusal";
 export const DEGRADED_HEADER = "x-llm-relay-degraded";
 
 /**
+ * This answer came from a deployment that is NOT free.
+ *
+ * Pools rank free capacity first but no longer exclude paid capacity, so a spent free lane is not
+ * a dead end. That is only acceptable if spending is announced: an unflagged paid response is
+ * indistinguishable from a free one, and the difference is money. Same reasoning as
+ * `DEGRADED_HEADER` — automatic fallback is fine, silent fallback is not.
+ *
+ * Carries the deployment and how its cost was assessed, e.g.
+ * `openrouter/anthropic/claude-sonnet-5 (paid, published-price)`.
+ */
+export const PAID_HEADER = "x-llm-relay-paid";
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both

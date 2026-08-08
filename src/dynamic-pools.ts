@@ -6,7 +6,7 @@ import { loadTierData, findTierModel, type TierData } from "./tier-data.js";
 import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./ping/runtime-telemetry.js";
 import { loadPersistedSamples, loadProbeCache, type ProbeCacheData } from "./ping/probe-cache.js";
 import { getStabilityScore } from "./ping/metrics.js";
-import { assessCost } from "./metadata.js";
+import { assessCost, type CostClass } from "./metadata.js";
 import { isCostBlocked } from "./target-facts.js";
 
 export const DYNAMIC_POOL_RANKING_EPOCH_MS = 30_000;
@@ -147,6 +147,8 @@ export function materializeDynamicPools(
   };
   const discovered: ResolvedTarget[] = [];
   const discoveredSpecs = new Set<string>();
+  /** spec -> what serving one request costs. Decides ORDER within a band, never admission. */
+  const costBySpec = new Map<string, CostClass>();
 
   for (const [provider, p] of Object.entries(cfg.providers)) {
     if (p.kind !== "openai") continue;
@@ -159,7 +161,13 @@ export function materializeDynamicPools(
       // `free`-named models; genuinely free-tier providers (`tierType: "free"`) may contribute
       // unknown-priced models because many publish no prices at all — assessCost folds that
       // rule in via the provider-tier basis.
-      if (assessCost(model, catalog.cachedLimits(provider, model), p.tierType).costClass !== "free") continue;
+      // Cost no longer gates ADMISSION — it decides ORDER (see `costRank` and the band assembly
+      // below). A pool that admits only free deployments is free by construction, which sounds
+      // safe until the free lane is spent and the pool has nothing left; the owner's call is that
+      // paid capacity should be reachable, always behind every free option, and never silently.
+      // The `freeOnly` guard (default ON) is what still makes a pool free-only for anyone who has
+      // not opted into spending.
+      const cost = assessCost(model, catalog.cachedLimits(provider, model), p.tierType);
 
       // What the deployment itself said, which outranks what the roster implies about it.
       //
@@ -186,6 +194,7 @@ export function materializeDynamicPools(
         timeoutMs: p.timeoutMs,
         ...(p.authEnv ? { authEnv: p.authEnv } : {}),
       });
+      costBySpec.set(spec, cost.costClass);
       discoveredSpecs.add(spec);
     }
   }
@@ -235,8 +244,17 @@ export function materializeDynamicPools(
       }
     }
 
-    const bandOrder = interleaveByProvider(inBand).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s));
-    const tailOrder = interleaveByProvider(tail).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s) && !inBandSpecs.has(s));
+    // FREE FIRST, within every band. Cost decides order, not admission: paid capacity is reachable
+    // so a spent free lane is not a dead end, but it is only ever reached after every free member
+    // of the same band has failed. `unknown` cost sits with paid — a guess must not spend money,
+    // the same rule `assessCost` applies for the `freeOnly` guard.
+    const byCost = (entries: typeof inBand) => {
+      const free = entries.filter((e) => costBySpec.get(specOfTarget(e.target)) === "free");
+      const rest = entries.filter((e) => costBySpec.get(specOfTarget(e.target)) !== "free");
+      return [...interleaveByProvider(free), ...interleaveByProvider(rest)];
+    };
+    const bandOrder = byCost(inBand).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s));
+    const tailOrder = byCost(tail).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s) && !inBandSpecs.has(s));
     cfg.routing.pools[pool] = [...policy.preferred, ...bandOrder, ...tailOrder];
     if (tailOrder.length > 0) degraded[pool] = tailOrder;
   }

@@ -64,8 +64,8 @@ Two genuine code gaps sat behind it, both now fixed:
 - The guard assessed **price only**. A deployment that has *stated* it requires a subscription now
   outranks a price table that calls it free.
 
-⚠ The flag itself remains **off** — the owner's call, 2026-08-08. The code is correct for whenever
-it is switched on; nothing about this fix turns it on.
+⚠ Superseded 2026-08-08 — see *Settled* below. The flag became an option that defaults ON for
+offload-rerouted traffic, and this machine keeps an explicit `false`.
 
 ### 2 & 3. Paid endpoints and catalog rot inside free-assessed pools
 
@@ -289,9 +289,17 @@ breaker fields and call for opposite responses.
 folding it in would be tidiness, not a fix — and it is the one store whose parsing rules are
 genuinely specific to what it reads.
 
-## Still open
+## Settled
 
-- `routing.offload.*.freeOnly` is **off**. Owner's decision, 2026-08-08.
+- **`freeOnly` is an option that defaults ON for offload-rerouted traffic** and OFF for a directly
+  addressed pool (owner decision, 2026-08-08 — see `freeOnlyApplies`). An install that has never
+  thought about cost cannot discover offload by being billed for it; a request that *names* a pool
+  is an explicit choice by someone who knows what a pool is. This machine carries an explicit
+  `false` and is unaffected.
+- **Pools rank free capacity first rather than excluding paid capacity** (same decision). A pool
+  that admits only free deployments is free by construction — safe-sounding, until the free lane is
+  spent and there is nothing left. Paid is reachable, always behind every free member of the band,
+  and never silent: `x-llm-relay-paid` names the deployment and how its cost was assessed.
 - The seed patterns generalize from a handful of observed messages. Everything they miss now lands
   in `llm-relay eligibility` as a pending item instead of being silently re-discovered every
   request — that queue is the intended way this converges.
