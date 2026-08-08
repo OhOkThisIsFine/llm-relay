@@ -1,6 +1,6 @@
 # Lane discovery — validating `cli` rung model ids and arguments
 
-**Status: designed, not built.** Written 2026-08-08 after a live failure.
+**Status: BUILT and shipped in 0.33.0.** Written 2026-08-08 after a live failure.
 
 ## The failure
 
@@ -108,6 +108,24 @@ Two things fall out of it:
    existence fact about a flag, not a temporal one — arguing for persist).
 3. Should `xhigh` tiers use Codex's `max` / `ultra`? Sol and Terra support both, Luna supports `max`.
    The ladder currently stops at `xhigh`, leaving headroom unused on the top tier.
+
+## Shipped
+
+`llm-relay lanes [--probe]` (`src/lane-probe.ts`, `src/lane-manifest.ts`) caches each lane's roster
+to `~/.llm-relay/lane-manifest.json`; `buildDispatch` reads the cache and never spawns. A rung whose
+model the roster omits is marked `not-servable`, dropped from selection, and has its `invoke`
+WITHHELD — it stays listed with its reason. An argument the lane rejects is stripped from the
+rendered command. Every not-positive path (no manifest, unprobed lane, empty roster, corrupt file,
+command outside the closed prober set) is UNKNOWN and changes nothing.
+
+⚠ Under vitest the manifest path is redirected to a temp dir, same rule as `getProbeCachePath()`:
+without it, three dispatch tests whose fixtures name made-up models went red as soon as a real
+`lanes --probe` had run on the machine. A test's ladder must be decided by its own config, not by
+whichever CLIs are installed.
+
+Open question 3 is resolved: the ladder now uses each Codex model's full supported range, clamped
+per model from `supported_reasoning_levels` (xhigh tier ⇒ `ultra` on Sol/Terra, `max` on Luna,
+`xhigh` on Spark).
 
 ## Interim state
 
