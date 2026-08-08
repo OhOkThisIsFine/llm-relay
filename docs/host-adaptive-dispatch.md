@@ -1,7 +1,15 @@
 # Host-adaptive dispatch
 
-**Status:** shipped in **v0.20.0** (2026-08-07). Design ratified by the owner in-session; verified
-end-to-end from a real Claude Desktop session against the published build.
+**Status:** shipped in **v0.20.0**, extended with `{contextWindow}` in **v0.21.0** (2026-08-07).
+Design ratified by the owner in-session; verified end-to-end from a real Claude Desktop session
+against the published build.
+
+The context-window half was proved by A/B against the live ladder: the pinned
+`openrouter/deepseek/deepseek-v4-flash-0731` lane renders
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576` and the child runs with no window warning, while the
+`pool/high` lane renders no such variable and the child still reports that it "assumes 200k" for an
+unrecognized model. Same template, same command shape — the only difference is whether a provider
+published a number.
 
 ## The problem
 
