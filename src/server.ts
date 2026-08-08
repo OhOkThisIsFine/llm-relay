@@ -1025,9 +1025,16 @@ function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs
   return false;
 }
 
-/** Statuses that can carry a durable fact about a deployment. A 429 is the breaker's business. */
+/**
+ * Statuses whose body can carry a durable fact.
+ *
+ * 429 is included, but narrowly: an ordinary rate limit stays the breaker's business and produces
+ * no fact, because only the small set of messages that NAME an account-level limit matches a seed.
+ * Reading the body costs nothing here — it is already being discarded — and the alternative was
+ * never learning the one 429 that is worth learning.
+ */
 function carriesEligibilityFact(status: number): boolean {
-  return status === 400 || status === 402 || status === 403 || status === 404;
+  return status === 400 || status === 401 || status === 402 || status === 403 || status === 404 || status === 429;
 }
 
 /**
@@ -1084,7 +1091,13 @@ function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: num
   // month recovers well before the TTL would have expired, with no restart. Same contract as the
   // breaker clearing a credential fault on success.
   try {
-    clearFacts(attempt.target.provider, attempt.target.model ?? null);
+    const cleared = clearFacts(attempt.target.provider, attempt.target.model ?? null);
+    // A stated bad credential has just been disproved, so the per-deployment 401s it caused are
+    // stale evidence about a problem that no longer exists. Clearing them together is what makes a
+    // key rotation recover the WHOLE provider at once instead of one model per expiry.
+    if (cleared.includes("credential-invalid")) {
+      h.breaker.clearProviderCredentialFaults(attempt.target.provider);
+    }
   } catch {
     /* best-effort */
   }

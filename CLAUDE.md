@@ -402,6 +402,15 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   credential axis. ⚠ **A group carries its own member list** — no registry, no prefix inference
   (that is the heuristic `authEnv.ts` refuses), and the reviewer sees exactly which models a group
   verdict will cover before accepting it.
+- **The breaker and the fact store COMPOSE; neither replaces the other.** Per-deployment behaviour
+  (back-pressure, timeouts, an entitlement wall on one model) stays on the breaker. Only what a
+  backend *states* about a wider scope becomes a fact: `rate-limited` fires on a 429 naming the
+  account/organization/key and an ordinary 429 produces nothing, because matching plain throttling
+  would demote whole providers on routine back-pressure. ⚠ **A proven credential clears its own
+  symptoms**: `clearFacts` returns the provider-scoped kinds it disproved, and a disproved
+  `credential-invalid` drops that provider's per-deployment credential faults together — otherwise
+  a key rotation recovers one model per expiry. Only on a disproved *stated* fact, never on any
+  success: clearing bare 403s whenever a sibling succeeds re-tries gated models forever.
 - **⚠ "Out of free credits" is NOT "paid", and collapsing the two is the defect to avoid here.**
   A free-tier account that has spent this period's allowance is the normal state of a working free
   lane. `allowance-exhausted` therefore demotes (a cooldown that expires on its own, cleared by any

@@ -111,6 +111,48 @@ describe("seeds classify the refusals measured on this machine, at the right sco
   });
 });
 
+describe("a stated ACCOUNT-level rate limit, and only that", () => {
+  it("covers every deployment behind the credential", () => {
+    const body = `{"error":{"message":"Rate limit reached for your organization. Please try again later."}}`;
+    const v = interpretRefusal("groq", "m", 429, body, { path: interpPath });
+    expect(v?.class).toBe("rate-limited");
+    expect(v?.scope).toEqual({ kind: "provider" });
+  });
+
+  it("leaves an ordinary 429 to the breaker, where it belongs", () => {
+    // ⚠ The narrowness IS the feature. Matching plain throttling would demote whole providers on
+    // routine back-pressure — worse than the problem, and a per-target cooldown already handles it.
+    for (const body of [
+      `{"error":{"message":"Rate limit exceeded"}}`,
+      `{"error":{"message":"TPM limit reached for this model, please slow down"}}`,
+      `{"status":429,"title":"Too Many Requests"}`,
+    ]) {
+      expect(interpretRefusal("nim", "m", 429, body, { path: interpPath })).toBeNull();
+    }
+  });
+
+  it("cools rather than blocks — a throttled account is not a paid one", () => {
+    recordFact("rate-limited", { kind: "provider", provider: "groq" }, { path });
+    expect(cooldownUntil("groq", "any", { path })).not.toBeNull();
+    expect(isCostBlocked("groq", "any", { path })).toBe(false);
+  });
+});
+
+describe("clearing reports what it disproved", () => {
+  it("names provider-scoped facts so their symptoms can be cleared too", () => {
+    recordFact("credential-invalid", { kind: "provider", provider: "p" }, { path });
+    recordFact("not-servable", { kind: "deployment", provider: "p", model: "gone" }, { path });
+    // Only the provider-scoped kinds come back: they are the ones whose per-deployment 401s on the
+    // breaker are now stale evidence about a problem that no longer exists.
+    expect(clearFacts("p", "gone", { path })).toEqual(["credential-invalid"]);
+  });
+
+  it("reports nothing when only deployment-scoped facts were cleared", () => {
+    recordFact("subscription-required", { kind: "deployment", provider: "p", model: "m" }, { path });
+    expect(clearFacts("p", "m", { path })).toEqual([]);
+  });
+});
+
 describe("scope decides blast radius", () => {
   it("a provider-scoped fact covers siblings that were never tried", () => {
     recordFact("allowance-exhausted", { kind: "provider", provider: "huggingface" }, { path });

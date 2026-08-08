@@ -610,6 +610,25 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).toBeNull();
   });
 
+  it("a rotated key recovers the WHOLE provider, not one model per expiry", async () => {
+    // While a key is bad, every model that happens to be tried records its own credential fault
+    // with its own clock — so after a rotation the pool stayed artificially narrow until the last
+    // of them aged out. A served request proves the shared credential works, so the symptoms go
+    // together with the cause.
+    const cb = new CircuitBreaker();
+    cb.recordCredentialFault("p1/m1", 401);
+    cb.recordCredentialFault("p1/m2", 401);
+    cb.recordCredentialFault("p2/m1", 401);
+    expect(cb.hasCredentialFault("p1/m1")).toBe(true);
+    expect(cb.hasCredentialFault("p1/m2")).toBe(true);
+
+    expect(cb.clearProviderCredentialFaults("p1")).toBe(2);
+    expect(cb.hasCredentialFault("p1/m1")).toBe(false);
+    expect(cb.hasCredentialFault("p1/m2")).toBe(false);
+    // ...and says nothing about a different credential.
+    expect(cb.hasCredentialFault("p2/m1")).toBe(true);
+  });
+
   it("a success clears the quota cooldown — a mid-month top-up recovers without a restart", () => {
     const cb = new CircuitBreaker();
     cb.recordOutcome("p/m", { ok: false, status: 402, elapsedMs: 5 });
