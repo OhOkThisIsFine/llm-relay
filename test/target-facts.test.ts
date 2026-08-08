@@ -14,6 +14,7 @@ import {
 } from "../src/target-facts.js";
 import {
   acceptInterpretation,
+  applyResetRule,
   interpretRefusal,
   materializeScope,
   normalizeRefusalMessage,
@@ -146,6 +147,42 @@ describe("a quota is not a rate limit", () => {
     expect(parseStatedResetMs(`{"status":429,"title":"Too Many Requests"}`)).toBeNull();
     // A parse artifact beyond any real window is refused rather than stranding a deployment.
     expect(parseStatedResetMs(`{"retryDelay":"999999999s"}`)).toBeNull();
+  });
+
+  it("a reviewer can teach WHERE the reset lives, not just what the message means", () => {
+    // The gap this closes: `propose` could record class and scope but not duration, so learning
+    // "this means allowance-exhausted" left the relay re-probing on a TTL it invented — and the
+    // fix kept being a regex added to source, which is the relay's author learning, not the relay.
+    const withRetryInfo = `openai backend HTTP 429: {"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"18000s"}]}}`;
+    expect(applyResetRule({ kind: "field", field: "retryDelay" }, withRetryInfo)).toBe(18_000_000);
+    // A field the message does not carry teaches nothing, rather than guessing.
+    expect(applyResetRule({ kind: "field", field: "nope" }, withRetryInfo)).toBeNull();
+  });
+
+  it("a reviewer's asserted window is bounded and refused when implausible", () => {
+    expect(applyResetRule({ kind: "fixed", ms: 5 * 60 * 60 * 1000 }, "{}")).toBe(18_000_000);
+    // Beyond any real window: believing it would strand a deployment for longer than any provider
+    // publishes. Same bound as the generic parser.
+    expect(applyResetRule({ kind: "fixed", ms: 30 * 24 * 60 * 60 * 1000 }, "{}")).toBeNull();
+  });
+
+  it("carries the reset through propose and accept", () => {
+    const body = `{"error":{"message":"a message nobody has classified","retryDelay":"600s"}}`;
+    recordUnknownRefusal("p", "m", 429, body, { path: interpPath });
+    const sig = pendingRefusals({ path: interpPath })[0]!.signature;
+    proposeInterpretation(sig, {
+      class: "allowance-exhausted",
+      scope: { kind: "provider" },
+      rationale: "quota; the reset is in retryDelay",
+      reset: { kind: "field", field: "retryDelay" },
+    }, { path: interpPath });
+    acceptInterpretation(sig, { path: interpPath });
+
+    // Accepting commits EVERYTHING known about the shape — meaning, scope and duration.
+    const v = interpretRefusal("p", "m", 429, body, { path: interpPath });
+    expect(v?.class).toBe("allowance-exhausted");
+    expect(v?.reset).toEqual({ kind: "field", field: "retryDelay" });
+    expect(applyResetRule(v!.reset, body)).toBe(600_000);
   });
 
   it("a stated reset overrides the kind's default TTL", () => {

@@ -514,6 +514,37 @@ models failing identically is equally several gated models under a working key.
 ⚠ **A `group` verdict must name its members** (`--members id1,id2`) — there is no family registry
 and no prefix matching, deliberately. If you cannot enumerate the family, use `deployment`.
 
+### Extract the RULE, not just a label
+
+A verdict is incomplete until it also says **when the condition clears**. Without that the relay
+falls back to the fact kind's default TTL — a schedule it invented — and re-probes a spent weekly
+quota hourly for days. Answer all three:
+
+| Question | Flag |
+|---|---|
+| What does it mean? | `--class` |
+| Who does it apply to? | `--scope` (+ `--members`) |
+| **When does it clear?** | `--reset-field <jsonKey>` or `--reset-ms <n>` |
+
+- **`--reset-field`** names a JSON key in the message that carries the reset — Google's
+  `google.rpc.RetryInfo` puts it in `retryDelay`, which no HTTP header carries. **Prefer this
+  whenever the provider states it**: it is re-read from every real response, so it stays a
+  measurement.
+- **`--reset-ms`** is you asserting a window the provider never states (a 5-hourly grant, a daily
+  quota). Useful, but it is a claim rather than a measurement, so it ranks *below* anything the
+  response itself says and is capped at 7 days.
+
+⚠ **Distinguish a rate limit from a quota — they are not the same fact.** A rate limit is
+throughput (requests per minute) and resets in seconds, so `rate-limited` cools for 2 minutes. A
+quota is an *allowance* over a long window — 5-hourly, weekly, monthly credits — and is
+`allowance-exhausted`: still **free**, just spent until it refreshes. Calling a quota a rate limit
+re-probes a spent weekly allowance every two minutes for days.
+
+⚠ **Don't ask for a source-code change instead.** The seed patterns in `refusal-interpretation.ts`
+are a bootstrap from first-party probes, not the mechanism. If a message is unrecognized, the
+answer is a researched interpretation through this command — one that a future session inherits.
+Editing the seeds means the relay's author learned something and the relay did not.
+
 ⚠ The third is not a cost verdict. A free lane that has spent this period's allowance is still
 free, and marking it otherwise would evict it from every free pool long after the credits refresh.
 If a message is about a balance, it is `allowance-exhausted`; only *entitlement* wording is

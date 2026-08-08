@@ -425,7 +425,15 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   boundary at the top of this file governs it: an LLM may author the interpretation data, the
   request path only ever reads it, and a researched verdict binds only after `llm-relay eligibility
   accept`. Signatures are keyed per (provider, model, message) so a verdict cannot leak to a
-  sibling SKU. **The queue is PUSHED, not polled** — a failure carrying uninterpretable refusals
+  sibling SKU. ⚠ **An interpretation carries the whole RULE, not a label**: class, scope, and a
+  `reset` saying when the condition clears (`field` = a JSON key in the message, preferred because
+  it is re-read from every real response; `fixed` = a reviewer-asserted window, ranked below
+  anything the response states). Without it, learning what a message MEANS still left the relay
+  re-probing on a TTL it invented. ⚠ **`SEED_INTERPRETATIONS` is a bootstrap, not the mechanism** —
+  adding a seed per unfamiliar message means the author learned and the relay did not. ⚠ **A quota
+  is not a rate limit**: `rate-limited` is throughput and cools 2 minutes; a 5-hourly/weekly/monthly
+  allowance is `allowance-exhausted` (still free, just spent). 0.28.0's rate-limit pattern matched
+  the word "quota" and cooled spent quotas for 2 minutes. **The queue is PUSHED, not polled** — a failure carrying uninterpretable refusals
   returns `x-llm-relay-unknown-refusal: <n>` and the skill makes checking it the reflex on a pool
   failure, because a queue nobody opens is a backlog. The dispatcher may `propose`; only the user
   may `accept`. ⚠ Error bodies are untrusted external content and an agent reading them is an
