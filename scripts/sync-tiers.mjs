@@ -22,6 +22,7 @@
 // Usage: node scripts/sync-tiers.mjs
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   CAPABILITY_DIMENSIONS,
@@ -39,18 +40,63 @@ const ARENA_PARQUET =
   "https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset/resolve/main/text_style_control/latest-00000-of-00001.parquet";
 const AIDER_YML =
   "https://raw.githubusercontent.com/Aider-AI/aider/main/aider/website/_data/polyglot_leaderboard.yml";
+const AA_MODELS = "https://artificialanalysis.ai/api/v2/data/llms/models";
+const AA_KEY_ENV = "ARTIFICIALANALYSIS_API_KEY";
 
 // Columns we depend on — a rename here should FAIL the source, not silently drop data.
 const BFCL_REQUIRED = ["Model", "Overall Acc"];
 const BFCL_WANTED = ["Model", "Overall Acc", "Multi Turn Acc", "Irrelevance Detection"];
 
-/** Strip BFCL mode suffixes ("(FC)", "(Prompt)", "(FC thinking)") + lowercase for joining. */
+/**
+ * Reasoning-effort qualifiers, as a CLOSED vocabulary — same reasoning as the per-provider alias
+ * list in src/authEnv.ts: a heuristic "does this trailing word look like an effort level" would
+ * eventually decide that the `-max` in `glm-5.2-max` (a SKU tier) is an effort setting and collapse
+ * two different models into one.
+ */
+const EFFORT_TOKENS = new Set([
+  "none", "minimal", "low", "medium", "high", "xhigh", "max",
+  "thinking", "reasoning", "no thinking", "non-thinking",
+]);
+/** Aider spells out thinking budgets: "(32k thinking)", "(32k thinking tokens)". */
+const THINKING_BUDGET = /^\d+k thinking(?: tokens)?$/;
+
+function canonicalEffort(inner) {
+  const s = inner.trim().toLowerCase().replace(/\s+/g, " ");
+  if (EFFORT_TOKENS.has(s)) return s.replace(/ /g, "-");
+  if (THINKING_BUDGET.test(s)) return s.replace(/ tokens$/, "").replace(/\s+/g, "-");
+  return null;
+}
+
+/**
+ * Strip BFCL mode suffixes ("(FC)", "(Prompt)", "(FC thinking)"), lowercase, and CANONICALIZE a
+ * trailing reasoning-effort qualifier so the sources' three notations produce ONE join key:
+ *
+ *   aider      "gpt-5 (high)"  ─┐
+ *   lmarena    "gpt-5-high"    ─┼─> "gpt-5-high"
+ *   openrouter "openai/gpt-5-high" (via normId) ─┘
+ *
+ * Measured 2026-08-08 before this existed: 0 of 60 effort-qualified rows in the snapshot carried
+ * more than one source. Every one was a single-signal orphan, and none joined to the OpenRouter row
+ * holding that model's AA scores, context window and price — so multi-source consensus was being
+ * shattered into guesses, and `signal_count: 1` on every effort variant looked like thin publishing
+ * when it was a failed join.
+ *
+ * ⚠ This REWRITES notation, it never STRIPS. "gpt-5 (high)" becomes "gpt-5-high", never "gpt-5" —
+ * an effort variant must stay a separate row from its base model, which is exactly the borrowed-
+ * score bug the merge comment in main() warns about. A qualifier outside the vocabulary (a date,
+ * "(prev)") is left alone rather than guessed at.
+ */
 function normName(raw) {
-  return String(raw)
+  const base = String(raw)
     .replace(/\((?:FC|Prompt)[^)]*\)/gi, "")
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+  // Trailing parenthetical only: "o3 (high) + gpt-4.1" is a composite, not a variant of "o3".
+  const m = /^(.*?)\s*\(([^()]+)\)$/.exec(base);
+  if (!m) return base;
+  const effort = canonicalEffort(m[2]);
+  return effort ? `${m[1].trim()}-${effort}` : base;
 }
 
 /**
@@ -225,6 +271,112 @@ async function fetchAider() {
   return [...best.values()].map(({ dirname, ...rest }) => ({ ...rest, aider_run: dirname }));
 }
 
+/**
+ * Read a key out of ~/.llm-relay/.env without overwriting the real environment — same contract as
+ * src/dotenv.ts, because the more explicit signal must win. This script is the only one that needs
+ * a credential, so it reads the file directly rather than growing a dependency for one lookup.
+ */
+function keyFromRelayEnv(name) {
+  if (process.env[name]) return process.env[name];
+  const file = join(homedir(), ".llm-relay", ".env");
+  if (!existsSync(file)) return null;
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    const kv = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (kv && kv[1] === name) return kv[2].trim().replace(/^["']|["']$/g, "") || null;
+  }
+  return null;
+}
+
+/**
+ * Artificial Analysis, FIRST-HAND. Its intelligence/coding/agentic indices already reach the
+ * snapshot second-hand through OpenRouter's per-model `benchmarks.artificial_analysis` block — but
+ * that block is keyed by OpenRouter's catalogue ids, which carry no reasoning-effort dimension
+ * (measured 2026-08-08: 154 of 400 OpenRouter models carry an AA block; 6 of those encode anything
+ * effort-like in the id, and only `openai/o3-mini-high` is genuinely an effort variant rather than
+ * a SKU name). AA publishes per-effort rows directly, so this is the source that can actually
+ * answer "is luna at xhigh stronger than terra at low".
+ *
+ * ⚠ Key-gated: the endpoint 401s without one, and there is no public mirror. Absent key ⇒ the
+ * source reports `configured: false` and contributes nothing, exactly like a dead endpoint — this
+ * must never be fatal, because `npm run sync:tiers` has to keep working for anyone who has not
+ * signed up. Get a free key at https://artificialanalysis.ai/ and put it in ~/.llm-relay/.env as
+ * ARTIFICIALANALYSIS_API_KEY.
+ *
+ * ⚠ The response schema is NOT publicly documented (the docs URL 404s), so the field mapping below
+ * is an ALIAS LIST in the style of `limitsFromRecord()` in src/catalog.ts rather than a hardcoded
+ * per-field path — and it THROWS if a payload arrives in which no model resolves a single score.
+ * That is the established contract here: schema drift inside a source is corruption and fails that
+ * source loudly, it does not silently drop data. If it throws on your first keyed run, the fix is
+ * to extend the alias lists, not to soften the check.
+ */
+const AA_ALIASES = {
+  aa_intelligence: ["intelligence_index", "artificial_analysis_intelligence_index", "intelligence"],
+  aa_coding: ["coding_index", "artificial_analysis_coding_index", "coding"],
+  aa_agentic: ["agentic_index", "artificial_analysis_agentic_index", "agentic"],
+};
+const AA_NAME_FIELDS = ["name", "model_name", "slug", "id"];
+const AA_EFFORT_FIELDS = ["reasoning_effort", "effort", "variant", "reasoning_mode", "thinking"];
+const AA_SCORE_CONTAINERS = ["evaluations", "benchmarks", "scores", "metrics"];
+
+function aaPick(record, fields) {
+  for (const f of fields) {
+    const v = record?.[f];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function aaScore(record, aliases) {
+  const pools = [record, ...AA_SCORE_CONTAINERS.map((c) => record?.[c]).filter((c) => c && typeof c === "object")];
+  for (const pool of pools) {
+    for (const a of aliases) {
+      const v = pool[a];
+      if (Number.isFinite(v)) return Number(v);
+      if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+    }
+  }
+  return null;
+}
+
+async function fetchArtificialAnalysis() {
+  const key = keyFromRelayEnv(AA_KEY_ENV);
+  if (!key) return { rows: [], configured: false };
+
+  const res = await fetch(AA_MODELS, { headers: { "x-api-key": key } });
+  if (!res.ok) throw new Error(`Artificial Analysis fetch HTTP ${res.status}`);
+  const j = await res.json();
+  const list = Array.isArray(j) ? j : Array.isArray(j.data) ? j.data : null;
+  if (!list) throw new Error(`AA schema drift — no array payload. Top-level keys: ${Object.keys(j).join(" | ")}`);
+  if (list.length === 0) throw new Error("AA returned zero models");
+
+  const out = [];
+  for (const m of list) {
+    const rawName = aaPick(m, AA_NAME_FIELDS);
+    if (!rawName) continue;
+    // AA may express effort as its own field rather than baked into the name. Fold it into the
+    // name BEFORE normalizing so it lands on the same canonical key as the other sources.
+    const effort = canonicalEffort(aaPick(m, AA_EFFORT_FIELDS) ?? "");
+    const name = effort ? `${rawName} (${effort})` : rawName;
+    const row = { name, norm: normName(name) };
+    for (const [field, aliases] of Object.entries(AA_ALIASES)) {
+      const v = aaScore(m, aliases);
+      if (v != null) row[field] = v;
+    }
+    out.push(row);
+  }
+  if (!out.some((r) => r.aa_intelligence != null || r.aa_coding != null || r.aa_agentic != null)) {
+    const keys = Object.keys(list[0] ?? {}).join(" | ");
+    throw new Error(`AA schema drift — ${list.length} models but no recognized score field. Keys: ${keys}`);
+  }
+  // One row per (model, effort); keep the strongest run if AA repeats a key.
+  const best = new Map();
+  for (const m of out) {
+    const prev = best.get(m.norm);
+    if (!prev || (m.aa_intelligence ?? -1) > (prev.aa_intelligence ?? -1)) best.set(m.norm, m);
+  }
+  return { rows: [...best.values()], configured: true };
+}
+
 async function main() {
   const warnings = [];
   const sources = {};
@@ -241,15 +393,31 @@ async function main() {
     }
   };
 
+  // A key-gated source distinguishes "not configured" from "failed": an operator who never signed
+  // up should see a neutral note, not a warning that reads like an outage.
+  const runOptional = async (key, url, note, fn) => {
+    try {
+      const { rows, configured } = await fn();
+      sources[key] = { url, note, model_count: rows.length, ok: true, configured };
+      if (!configured) sources[key].skipped = `no ${AA_KEY_ENV} configured — source contributed nothing`;
+      return rows;
+    } catch (e) {
+      warnings.push(`${key} sync FAILED: ${e.message}`);
+      sources[key] = { url, note, model_count: 0, ok: false, configured: true, error: e.message };
+      return [];
+    }
+  };
+
   // Independent: one dead source costs only its own columns.
-  const [openrouter, bfcl, arena, aider] = await Promise.all([
+  const [openrouter, bfcl, arena, aider, aa] = await Promise.all([
     run("openrouter", OPENROUTER_MODELS, "AA intelligence/coding/agentic + design arena + context/pricing; EXACT ids", fetchOpenRouter),
     run("bfcl", BFCL_CSV, "tool-use / function-calling accuracy", fetchBfcl),
     run("lmarena", ARENA_PARQUET, "general capability", fetchArena),
     run("aider", AIDER_YML, "polyglot edit benchmark + edit-format compliance", fetchAider),
+    runOptional("artificialanalysis", AA_MODELS, "AA intelligence/coding/agentic FIRST-HAND, per reasoning effort", fetchArtificialAnalysis),
   ]);
 
-  if (openrouter.length + bfcl.length + arena.length + aider.length === 0) {
+  if (openrouter.length + bfcl.length + arena.length + aider.length + aa.length === 0) {
     throw new Error(`every source failed:\n  ${warnings.join("\n  ")}`);
   }
 
@@ -270,6 +438,9 @@ async function main() {
   absorb(bfcl, "bfcl");
   absorb(arena, "lmarena");
   absorb(aider, "aider");
+  // AA last of the AA-bearing sources on purpose: `absorb` is last-write-wins, and a figure read
+  // from AA directly outranks the same figure relayed through OpenRouter's catalogue metadata.
+  absorb(aa, "artificialanalysis");
   const models = [...byNorm.values()];
 
   const prev = existsSync(OUT) ? JSON.parse(readFileSync(OUT, "utf8")) : null;
@@ -310,9 +481,20 @@ async function main() {
 
   console.log(`\nSynced ${models.length} models → ${OUT}`);
   for (const [k, s] of Object.entries(sources)) {
-    console.log(`  ${s.ok ? "✓" : "✗"} ${k.padEnd(11)} ${String(s.model_count).padStart(4)} models${s.ok ? "" : `  — ${s.error}`}`);
+    const mark = s.configured === false ? "-" : s.ok ? "✓" : "✗";
+    const tail = s.configured === false ? `  — ${s.skipped}` : s.ok ? "" : `  — ${s.error}`;
+    console.log(`  ${mark} ${k.padEnd(19)} ${String(s.model_count).padStart(4)} models${tail}`);
   }
   if (warnings.length) console.log(warnings.map((w) => `  ⚠ ${w}`).join("\n"));
+
+  // The effort-notation join is the thing most likely to regress silently, so it is REPORTED:
+  // a drop back toward zero multi-source means a source changed notation again.
+  const effort = models.filter((m) => canonicalEffort(String(m.norm).split("-").pop() ?? "") != null);
+  const joined = effort.filter((m) => m.sources.length > 1).length;
+  console.log(
+    `\nEffort-qualified rows: ${effort.length}, of which ${joined} carry >1 source ` +
+      `(was 0 of 60 before notation was canonicalized).`,
+  );
   if (prev) console.log(`  (previous snapshot: ${prev.synced_at}, ${prev.models?.length ?? "?"} models)`);
 
   const multi = models.filter((m) => m.published_signal_count >= 3);
