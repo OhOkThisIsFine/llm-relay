@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 /**
  * What a `cli` lane's own tool says it can serve.
@@ -44,7 +44,19 @@ export interface LaneManifest {
   lanes: Record<string, LaneEntry>;
 }
 
-export const DEFAULT_MANIFEST_PATH = join(homedir(), ".llm-relay", "lane-manifest.json");
+/**
+ * ⚠ Under vitest, never read the developer's real manifest — same rule and same reason as
+ * `getProbeCachePath()`. A suite fixture naming a made-up model (`agy-gemini`, `codex`) would be
+ * evicted by the machine's ACTUAL roster, so three pre-existing dispatch tests went red the moment
+ * a real `lanes --probe` had been run. A test's ladder must be decided by its own config, not by
+ * whichever CLIs happen to be installed. Tests needing a manifest pass one explicitly.
+ */
+export function getLaneManifestPath(): string {
+  if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "lane-manifest.json");
+  return join(homedir(), ".llm-relay", "lane-manifest.json");
+}
+
+export const DEFAULT_MANIFEST_PATH = getLaneManifestPath();
 
 export function loadLaneManifest(path: string = DEFAULT_MANIFEST_PATH): LaneManifest | null {
   try {

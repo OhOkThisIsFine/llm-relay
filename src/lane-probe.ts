@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import type { Config } from "./config.js";
 import {
   laneOfCommand,
@@ -41,7 +41,7 @@ function run(command: string, args: string[]): string {
     encoding: "utf8" as const,
     maxBuffer: 64 * 1024 * 1024,
     timeout: 60_000,
-    stdio: ["ignore", "pipe", "pipe"] as const,
+    stdio: ["ignore", "pipe", "pipe"] as ("ignore" | "pipe")[],
   };
   try {
     return execFileSync(command, args, opts);
@@ -54,7 +54,7 @@ function run(command: string, args: string[]): string {
       // Passed as ONE command line rather than command+args: node deprecates the args form under
       // `shell: true` because it concatenates without escaping. Every token here is a fixed literal
       // from a prober above — no task content, no user input — and the path is quoted.
-      return execFileSync(`"${command}" ${args.join(" ")}`, { ...opts, shell: true });
+      return execSync(`"${command}" ${args.join(" ")}`, opts);
     }
     throw e;
   }
