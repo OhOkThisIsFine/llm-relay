@@ -1272,6 +1272,9 @@ const LADDER_TASK_TOKEN = "{task}";
 /** Placeholder a cliLane template's args must contain, replaced by the rung's routing spec. */
 const LADDER_SPEC_TOKEN = "{spec}";
 
+/** Optional cliLane placeholder for the spec's published context window. Legal in args AND env. */
+const LADDER_CONTEXT_TOKEN = "{contextWindow}";
+
 /**
  * Environment a HOST applies when spawning a rendered command — shared by `cli` rungs and the
  * `cliLane` template, because a divergence between the two would be a silent one: both are
@@ -1328,7 +1331,22 @@ function parseCliLane(raw: unknown, root: string): CliLaneTemplate | undefined {
 
   const lane: CliLaneTemplate = { command: e.command, args };
   const env = parseSpawnEnv(e.env, root);
-  if (env) lane.env = env;
+  if (env) {
+    // `{task}` in an env value would put text a model or user wrote into a spawned process's
+    // environment. It is never substituted, so leaving it legal would silently pass the literal
+    // string `{task}` to the child — the operator would believe it worked. Reject it by name.
+    // `{contextWindow}` IS substituted here, deliberately: it is a number this relay resolved from
+    // published provider metadata, i.e. configuration rather than request content.
+    for (const [name, value] of Object.entries(env)) {
+      if (typeof value === "string" && value.includes(LADDER_TASK_TOKEN)) {
+        throw new Error(
+          `${root}.env.${name} must not contain "${LADDER_TASK_TOKEN}" — task text is never placed in a spawned ` +
+            `process's environment (use args for the task; "${LADDER_CONTEXT_TOKEN}" is available here)`,
+        );
+      }
+    }
+    lane.env = env;
+  }
   return lane;
 }
 

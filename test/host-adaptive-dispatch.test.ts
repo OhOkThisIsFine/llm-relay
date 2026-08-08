@@ -38,7 +38,7 @@ const LADDER = [
 const CLI_LANE = {
   command: "claude",
   args: ["-p", "--model", "{spec}", "{task}"],
-  env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8791", CLAUDECODE: null, TASK_LOOKALIKE: "{task}" },
+  env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8791", CLAUDECODE: null },
 };
 
 let n = 0;
@@ -126,9 +126,12 @@ describe("transposing relay rungs for a bypassed host", () => {
     expect(lane(cfg(), "pools", { host: "bypassed" }).invoke?.args).toContain("{task}");
   });
 
-  it("never substitutes placeholders into env values — env is routing, not task content", () => {
-    const l = lane(cfg(), "pinned", { host: "bypassed", task: "rm -rf /" });
-    expect(l.invoke?.env?.TASK_LOOKALIKE).toBe("{task}");
+  it("never lets task text reach env — env is routing, not request content", () => {
+    // `{task}` in an env value is now rejected at config load (see "cliLane env placeholder
+    // rules"), which is the stronger guarantee. This pins the runtime half: whatever the task
+    // says, no env VALUE contains any of it, and `null` unsets survive as unsets.
+    const l = lane(cfg(), "pinned", { host: "bypassed", task: "rm -rf / #SENTINEL" });
+    expect(Object.values(l.invoke?.env ?? {}).join("|")).not.toContain("SENTINEL");
     expect(l.invoke?.env?.CLAUDECODE).toBeNull();
   });
 
@@ -203,6 +206,114 @@ describe("a bypassed host with no cliLane configured", () => {
     expect(view.next?.id).toBe("pools");
     expect(view.reason).toContain("host override");
     expect(view.next?.unreachable).toBeDefined();
+  });
+});
+
+describe("context window substitution", () => {
+  const WINDOWED_LANE = {
+    command: "claude",
+    args: ["-p", "--model", "{spec}", "{task}"],
+    env: { MAX_CONTEXT: "{contextWindow}", BASE: "http://127.0.0.1:8791" },
+  };
+  // pool/coding has one member (nim/z-ai/glm-5.2); pool/mixed has two with different windows.
+  const cfg = (pools: Record<string, string[]> = {}) =>
+    cfgWith({
+      ladder: [
+        { id: "pinned", kind: "relay", spec: "nim/z-ai/glm-5.2" },
+        { id: "pool", kind: "relay", spec: "pool/mixed" },
+      ],
+      pools: { coding: ["nim/z-ai/glm-5.2"], mixed: ["nim/a", "nim/b"], ...pools },
+      cliLane: WINDOWED_LANE,
+    });
+
+  const windows = (map: Record<string, number>) => (_p: string, model: string | undefined) =>
+    model !== undefined && map[model] !== undefined ? map[model]! : null;
+
+  it("substitutes a published window into the env value", () => {
+    const l = lane(cfg(), "pinned", { host: "bypassed", publishedContextWindow: windows({ "z-ai/glm-5.2": 131072 }) });
+    expect(l.invoke?.env?.MAX_CONTEXT).toBe("131072");
+    expect(l.contextWindow).toBe(131072);
+  });
+
+  it("DROPS the env entry when nothing published a window, rather than setting it empty", () => {
+    // An empty value reads to the child as zero or garbage; omitting leaves it on its own default,
+    // which is the honest outcome when nobody stated a number.
+    const l = lane(cfg(), "pinned", { host: "bypassed", publishedContextWindow: () => null });
+    expect(l.invoke?.env).not.toHaveProperty("MAX_CONTEXT");
+    expect(l.invoke?.env?.BASE).toBe("http://127.0.0.1:8791");
+    expect(l.contextWindow).toBeUndefined();
+  });
+
+  it("uses the pool MINIMUM — failover can land on any member", () => {
+    const l = lane(cfg(), "pool", { host: "bypassed", publishedContextWindow: windows({ a: 1_000_000, b: 131_072 }) });
+    expect(l.contextWindow).toBe(131_072);
+  });
+
+  it("reports NO window when any pool member is unpublished — a partial floor is not a floor", () => {
+    // Measured on the real config: 0 of 29 members of pool/high publish a context length. Taking
+    // the min of the few that do would state a floor the pool does not actually have.
+    const l = lane(cfg(), "pool", { host: "bypassed", publishedContextWindow: windows({ a: 1_000_000 }) });
+    expect(l.contextWindow).toBeUndefined();
+    expect(l.invoke?.env).not.toHaveProperty("MAX_CONTEXT");
+  });
+
+  it("ignores a nonsensical published window rather than passing it through", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const l = lane(cfg(), "pinned", { host: "bypassed", publishedContextWindow: () => bad });
+      expect(l.contextWindow).toBeUndefined();
+    }
+  });
+
+  it("resolves no window at all when no lookup is supplied", () => {
+    const l = lane(cfg(), "pinned", { host: "bypassed" });
+    expect(l.contextWindow).toBeUndefined();
+    expect(l.invoke?.env).not.toHaveProperty("MAX_CONTEXT");
+  });
+
+  it("never substitutes into env for a null (unset) entry", () => {
+    const c = cfgWith({
+      ladder: [{ id: "pinned", kind: "relay", spec: "nim/z-ai/glm-5.2" }],
+      cliLane: { ...WINDOWED_LANE, env: { ...WINDOWED_LANE.env, UNSET_ME: null } },
+    });
+    const l = lane(c, "pinned", { host: "bypassed", publishedContextWindow: windows({ "z-ai/glm-5.2": 4096 }) });
+    expect(l.invoke?.env?.UNSET_ME).toBeNull();
+  });
+
+  it("substitutes into args too, not only env", () => {
+    const c = cfgWith({
+      ladder: [{ id: "pinned", kind: "relay", spec: "nim/z-ai/glm-5.2" }],
+      cliLane: { command: "claude", args: ["--ctx", "{contextWindow}", "--model", "{spec}", "{task}"] },
+    });
+    const l = lane(c, "pinned", { host: "bypassed", publishedContextWindow: windows({ "z-ai/glm-5.2": 8192 }) });
+    expect(l.invoke?.args).toEqual(["--ctx", "8192", "--model", "nim/z-ai/glm-5.2", "{task}"]);
+  });
+});
+
+describe("cliLane env placeholder rules", () => {
+  it("rejects {task} in an env value — request content must not become process configuration", () => {
+    const p = join(dir, `envtask${n++}.json`);
+    writeFileSync(
+      p,
+      JSON.stringify({
+        ...BASE,
+        routing: {
+          ...BASE.routing,
+          ladder: LADDER,
+          cliLane: { command: "claude", args: ["--model", "{spec}", "{task}"], env: { PROMPT: "{task}" } },
+        },
+      }),
+    );
+    // It is never substituted, so allowing it would pass the literal string `{task}` to the child
+    // while the operator believed it worked.
+    expect(() => loadConfig(p)).toThrow(/\{task\}/);
+  });
+
+  it("accepts {contextWindow} in an env value", () => {
+    const c = cfgWith({
+      ladder: LADDER,
+      cliLane: { command: "claude", args: ["--model", "{spec}", "{task}"], env: { MAX: "{contextWindow}" } },
+    });
+    expect(c.routing.cliLane?.env?.MAX).toBe("{contextWindow}");
   });
 });
 

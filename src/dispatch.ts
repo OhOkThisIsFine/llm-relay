@@ -88,6 +88,13 @@ export interface DispatchLane {
    */
   transposed?: boolean;
   /**
+   * Context window in tokens that the serving provider PUBLISHES for this lane's spec, when it
+   * published one and (for a pool) every member did. Absent means nobody stated it — never that
+   * it is small. Surfaced so a reader can see whether the rendered command carries a window or
+   * left the child on its own default.
+   */
+  contextWindow?: number;
+  /**
    * Why this rung cannot be used by the calling host as configured. Set when a `relay` rung needs
    * transposing and no `routing.cliLane` template exists to transpose it with. Such a rung is
    * never auto-selected as `next` — offering a lane known not to work is the defect being fixed.
@@ -135,6 +142,16 @@ export interface DispatchOptions {
   host?: HostRoutingState;
   /** Harness name, for messages only (`claude-desktop`). Never used to decide anything. */
   entrypoint?: string;
+  /**
+   * Context window a provider PUBLISHES for one of its models, in tokens, or null when it
+   * publishes none. Injected rather than read here so this module keeps no catalog dependency and
+   * stays synchronous — the server backs it with `catalog.cachedLimits()` (which never fetches, so
+   * this cannot become a blocking round-trip), and the CLI with the same on-disk cache.
+   *
+   * Absent means no window is resolved for any lane, which is exactly the behaviour before this
+   * existed. Never guess a number here: see `specContextWindow`.
+   */
+  publishedContextWindow?: (provider: string, model: string | undefined) => number | null;
 }
 
 /**
@@ -226,6 +243,57 @@ export const TASK_TOKEN = "{task}";
 export const SPEC_TOKEN = "{spec}";
 
 /**
+ * Optional placeholder for the spec's context window, in tokens. Usable in a `cliLane` template's
+ * args AND env values — unlike `{task}`, which is never substituted into env.
+ *
+ * The distinction is not arbitrary. `{task}` carries text a model or a user wrote, so putting it
+ * in the environment of a spawned process would let request content become process configuration.
+ * `{contextWindow}` is a number this relay resolved from the serving provider's own published
+ * metadata; it IS configuration. That is what makes it safe here and `{task}` not.
+ *
+ * Exists because a client cannot be expected to know the window of a model it does not recognise —
+ * the `claude` CLI assumes 200k for an unknown `--model` and compacts against that, so a lane
+ * pointed at a 1M-context model silently throws away four fifths of it.
+ */
+export const CONTEXT_TOKEN = "{contextWindow}";
+
+/**
+ * Published context window for a spec, in tokens, or null when it cannot be stated.
+ *
+ * ⚠ Null is the common answer and must stay honest. Free providers largely publish no metadata at
+ * all (NIM publishes none), so a pool's members are mostly unknown — measured on this machine, 0
+ * of 29 members of `pool/high` publish a context length. Guessing a window is strictly worse than
+ * omitting it: the client already has a conservative default, and a number we invented would
+ * override that default with fiction and overflow the real backend.
+ *
+ * For a POOL every member must publish one, and the MINIMUM is used: failover can land the request
+ * on any member, so the pool's usable window is its smallest. One unknown member means the floor
+ * is unknown, not that the others' floor applies.
+ */
+export function specContextWindow(
+  spec: string,
+  cfg: Config,
+  published: (provider: string, model: string | undefined) => number | null,
+): number | null {
+  let specs: string[];
+  try {
+    specs = expandPoolSpecs([spec], cfg);
+  } catch {
+    return null;
+  }
+  if (specs.length === 0) return null;
+
+  let min: number | null = null;
+  for (const s of specs) {
+    const { provider, model } = splitSpec(s);
+    const window = published(provider, model);
+    if (window === null || !Number.isFinite(window) || window <= 0) return null;
+    min = min === null ? window : Math.min(min, window);
+  }
+  return min;
+}
+
+/**
  * Can a bypassed host reach this spec with a plain subagent, no relay involvement?
  *
  * Only when every provider it resolves to is the caller's OWN vendor passthrough — an
@@ -259,28 +327,49 @@ function reachableWithoutRelay(spec: string, cfg: Config): boolean {
 /**
  * Render a `relay` rung's spec as a CLI invocation via the operator's `routing.cliLane` template.
  *
- * `{spec}` and `{task}` are substituted only into ARGS, never into env values — same rule as a
- * cli rung's own env, and for the same reason: env is operator-authored routing, not task
- * content. Each substitution stays inside a single argv element, so no amount of shell
- * metacharacter in a task can become a second word.
+ * `{task}` is substituted only into ARGS, never into env values: env is operator-authored routing,
+ * and request content must not become process configuration. `{spec}` and `{contextWindow}` are
+ * relay-resolved configuration, so they are substituted in both places. Each substitution stays
+ * inside a single argv element, so no amount of shell metacharacter in a task can become a second
+ * word.
+ *
+ * ⚠ An env entry asking for `{contextWindow}` is DROPPED when the window is unknown, rather than
+ * being set to an empty string or a guess. An empty value would be read by the child as a limit of
+ * zero or as garbage; omitting the variable leaves the client on its own conservative default,
+ * which is the correct behaviour when nobody published a number.
  */
 function transposeToCli(
   spec: string,
   lane: NonNullable<Config["routing"]["cliLane"]>,
   task: string | undefined,
   platform: NodeJS.Platform,
+  contextWindow: number | null,
 ): NonNullable<DispatchLane["invoke"]> {
-  const fill = (arg: string): string => {
-    const withSpec = arg.split(SPEC_TOKEN).join(spec);
-    // No task given => leave the placeholder visible, exactly as a cli rung does, so the caller
-    // can see where it goes rather than receiving a command that asks the agent to do nothing.
-    return task === undefined ? withSpec : withSpec.split(TASK_TOKEN).join(task);
+  const fillShared = (value: string): string => {
+    const withSpec = value.split(SPEC_TOKEN).join(spec);
+    return contextWindow === null ? withSpec : withSpec.split(CONTEXT_TOKEN).join(String(contextWindow));
   };
   const invoke: NonNullable<DispatchLane["invoke"]> = {
     command: normalizeCliCommand(lane.command, platform),
-    args: lane.args.map(fill),
+    args: lane.args.map((a) => {
+      const shared = fillShared(a);
+      // No task given => leave the placeholder visible, exactly as a cli rung does, so the caller
+      // can see where it goes rather than receiving a command that asks the agent to do nothing.
+      return task === undefined ? shared : shared.split(TASK_TOKEN).join(task);
+    }),
   };
-  if (lane.env) invoke.env = { ...lane.env };
+  if (lane.env) {
+    const env: Record<string, string | null> = {};
+    for (const [name, value] of Object.entries(lane.env)) {
+      if (value === null) {
+        env[name] = null;
+        continue;
+      }
+      if (contextWindow === null && value.includes(CONTEXT_TOKEN)) continue;
+      env[name] = fillShared(value);
+    }
+    if (Object.keys(env).length > 0) invoke.env = env;
+  }
   return invoke;
 }
 
@@ -340,6 +429,10 @@ function normalizeOptions(opts: DispatchOptions): DispatchOptions {
   if (host === "routed" || host === "bypassed" || host === "unknown") out.host = host;
   const entrypoint = str(opts.entrypoint);
   if (entrypoint !== undefined) out.entrypoint = describeId(entrypoint);
+  // Not a wire field — an in-process callback supplied by the server or the CLI. Type-guarded for
+  // the same reason as everything else here: this object can arrive from a JSON body, where the
+  // key could be any shape, and calling a non-function would throw mid-render.
+  if (typeof opts.publishedContextWindow === "function") out.publishedContextWindow = opts.publishedContextWindow;
   return out;
 }
 
@@ -422,8 +515,12 @@ function toLane(
       // is deliberately left unset: see its doc comment.
       const who = entrypoint ? `this host (${entrypoint})` : "this host";
       if (cfg.routing.cliLane) {
-        lane.invoke = transposeToCli(rung.spec, cfg.routing.cliLane, opts.task, platform);
+        const window = opts.publishedContextWindow
+          ? specContextWindow(rung.spec, cfg, opts.publishedContextWindow)
+          : null;
+        lane.invoke = transposeToCli(rung.spec, cfg.routing.cliLane, opts.task, platform, window);
         lane.transposed = true;
+        if (window !== null) lane.contextWindow = window;
       } else {
         lane.unreachable =
           `${who} does not route its traffic through this relay, so a subagent cannot reach ` +

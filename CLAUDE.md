@@ -390,8 +390,19 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   directive hint is true advice under a routed host and *false* advice under a bypassed one, where
   the `@relay:` line reaches the model as literal prompt text — a hint that cannot work is worse
   than none, because the host acts on it and believes it offloaded. A `relay` rung needing the
-  reroute path is instead rendered as a CLI invoke from `routing.cliLane` (`{spec}` + `{task}`,
-  never substituted into `env` values). ⚠ **A rung pointing at the caller's own vendor passthrough
+  reroute path is instead rendered as a CLI invoke from `routing.cliLane`. **Placeholder rules are
+  a security boundary, not a convenience:** `{spec}` and `{contextWindow}` are relay-resolved
+  configuration and are substituted in args AND env; `{task}` is request content and is substituted
+  in args ONLY — config load *rejects* it in an env value, because it would otherwise pass through
+  literally while the operator believed it worked.
+  **`{contextWindow}` resolves the SERVING provider's published limit or nothing** — never a
+  `reference` figure borrowed from another provider (`resolveMetadata`), never a guess. A pool needs
+  every member to publish before a floor exists, and uses the MINIMUM, because failover can land on
+  any member. Unknown ⇒ the env entry is dropped, not emptied, and the child keeps its own default.
+  ⚠ Unknown is the common case (0 of 29 `pool/high` members publish one, measured 2026-08-07): free
+  providers publish little metadata. Do not "fix" that by inventing a number — a fabricated window
+  overrides the client's conservative default and overflows the real backend, which is the same
+  reasoning as "the context guardrail fires only on a limit the serving provider published". ⚠ **A rung pointing at the caller's own vendor passthrough
   is NOT transposed** — an `anthropic`-kind provider with no `authEnv` is reachable as a plain
   `Agent(...)` from anywhere, and that rung *means* "spend primary quota". With no template
   configured the rung is marked `unreachable` and skipped when picking `next`; an explicit

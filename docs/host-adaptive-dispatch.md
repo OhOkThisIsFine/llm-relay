@@ -90,9 +90,44 @@ what a `claude` binary is; the operator states it once and the relay substitutes
 ```
 
 `{spec}` is the new placeholder (`SPEC_TOKEN`), alongside the existing `{task}`. Validated at
-config load: a template whose args contain no `{spec}` cannot address a target and is a hard
-error. As with `cli` rungs, **neither placeholder is ever substituted into env values** — env
-is operator-authored routing, not task content.
+config load: a template whose args contain no `{spec}` cannot address a target and is a hard error.
+
+**Placeholders split by what they carry, not by convenience.** `{task}` is text a model or a user
+wrote, so putting it in a spawned process's environment would let request content become process
+configuration — it is substituted into args only, and config load *rejects* it in an env value
+rather than passing the literal string through while the operator believes it worked. `{spec}` and
+`{contextWindow}` are values this relay resolved from its own config and from published provider
+metadata; they are configuration, and are substituted in both places.
+
+### `{contextWindow}` — the number the relay already has
+
+A CLI handed a model it does not recognize assumes a context window and compacts against it; the
+`claude` CLI assumes 200k. A lane pointed at a 1M-context model therefore throws away most of it,
+silently. The relay already harvests per-(provider, model) limits (`catalog.limitsFromRecord`) for
+the request-path guardrail, so it can simply say what it knows.
+
+Resolution follows the same rule as every other number here — **the serving provider's own
+published value, or nothing**:
+
+- pinned spec → that deployment's published `contextLength`;
+- `pool/<name>` → every member must publish, and the **minimum** wins, because failover can land
+  the request on any member. One unknown member means the floor is unknown, not that the known
+  members' floor applies;
+- unknown → the env entry is **dropped**, not set to an empty string (which a child would read as
+  zero or garbage), and the client keeps its own conservative default.
+
+⚠ **Unknown is the common answer, and that is the honest outcome.** Measured on this machine
+2026-08-07: `pool/high` 0 of 29 members publish a context length, `pool/xhigh` 0 of 15,
+`pool/medium` 2 of 41. Free providers publish little or no metadata — NIM publishes none at all.
+Pinned specs on providers that do publish resolve fine: `openrouter/deepseek/deepseek-v4-flash-0731`
+returns 1,048,576, so that lane was compacting at 200k against a 1M model until this landed. A
+window we invented would override the client's default with fiction and overflow the real backend.
+
+The lookup is **injected** (`DispatchOptions.publishedContextWindow`), not imported: `dispatch.ts`
+keeps no catalog dependency and stays synchronous. The server backs it with
+`catalog.cachedLimits()` and the CLI with the same on-disk cache, so a cold-read answer matches a
+live one — and because `cachedLimits` never fetches, an unwarmed cache degrades to "no window
+stated" rather than turning a dispatch query into a blocking round-trip.
 
 This also collapses real duplication. The owner's live config hand-writes the transposition
 three times per tier across four tiers — twelve copies of the same ten-key env block —
@@ -149,6 +184,14 @@ is a persistent change to the operator's harness, and the file already carries a
 the positional *lane id*, so the command answered `no lane "routed" in the ladder` and every relay
 rung silently kept its old rendering. Any value-taking flag omitted from that set fails this exact
 way. Pinned by a test on the parser, not on dispatch.
+
+**A second version-skew shape, found while adding `{contextWindow}`.** The original staleness check
+compared only `host`. A proxy that understands `?host=` but predates context-window substitution
+answers that check correctly and still returns lanes with the variable missing — and from the
+rendered output that is indistinguishable from "the provider published nothing", so the failure
+reads as a correct result. The discriminator is cheap and exact: both sides resolve the window from
+the *same* on-disk cache, so if the CLI can resolve one for a transposed lane and the live answer
+carries none, the difference is the proxy's code rather than the data.
 
 **The hook cannot exec the installed launcher.** The first version spawned `process.argv[1]`. On
 Windows an npm global install's `llm-relay` is a **`.cmd`**, and `execFileSync` refuses to run
