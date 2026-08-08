@@ -112,7 +112,23 @@ interface InterpretationStore {
   confirmed: Record<string, Interpretation>;
   /** signature → the unseen refusal, awaiting research or acceptance. */
   unknown: Record<string, UnknownRefusal>;
+  /**
+   * signature → when it was judged to mean nothing durable.
+   *
+   * ⚠ Rejection has to be REMEMBERED, or it does not exist. Deleting the pending entry alone left
+   * the next occurrence to re-queue the same signature, forever — and routine throttling recurs
+   * constantly, so the queue filled with messages already judged uninteresting and the ones worth
+   * reading were buried. "This teaches the router nothing" is a real verdict and is stored like
+   * any other.
+   */
+  ignored?: Record<string, { at: number }>;
 }
+
+/**
+ * How long a rejection is honoured. Long, because "this message is noise" is a slow-moving fact —
+ * but not forever, so a mistaken reject heals on its own rather than needing a file edited by hand.
+ */
+export const IGNORED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 let _store: InterpretationStore | null = null;
 let _path: string | null = null;
@@ -303,6 +319,7 @@ function load(path: string): InterpretationStore {
       _store = {
         version: 1,
         confirmed: (parsed.confirmed ?? {}) as Record<string, Interpretation>,
+        ignored: (parsed.ignored ?? {}) as Record<string, { at: number }>,
         unknown: (parsed.unknown ?? {}) as Record<string, UnknownRefusal>,
       };
       return _store;
@@ -311,7 +328,7 @@ function load(path: string): InterpretationStore {
     // Corrupt or absent: start clean. Seeds live in source, so nothing that BINDS is lost — only
     // researched entries, which the queue will re-surface as the refusals recur.
   }
-  _store = { version: 1, confirmed: {}, unknown: {} };
+  _store = { version: 1, confirmed: {}, unknown: {}, ignored: {} };
   return _store;
 }
 
@@ -376,6 +393,10 @@ export function recordUnknownRefusal(
   const sig = refusalSignature(provider, model, status, body);
   if (store.confirmed[sig]) return;
   const now = opts.now ?? Date.now();
+  // Already judged to mean nothing. Re-queuing it would bury the signatures worth reading under
+  // the ones a human has explicitly finished with — which is what routine throttling does.
+  const ignoredAt = store.ignored?.[sig]?.at;
+  if (typeof ignoredAt === "number" && now - ignoredAt < IGNORED_TTL_MS) return;
   const existing = store.unknown[sig];
   if (existing) {
     existing.count += 1;
@@ -456,12 +477,19 @@ export function acceptInterpretation(
   return true;
 }
 
-/** Drop a pending signature without accepting it — "this means nothing durable". */
-export function rejectInterpretation(signature: string, opts: { path?: string } = {}): boolean {
+/**
+ * "This means nothing durable" — a real verdict, and therefore remembered.
+ *
+ * Routine throttling, a policy refusal, a transient fault: none of them should teach the router
+ * anything, and none of them should keep asking. Recording the rejection is what makes the queue
+ * converge instead of refilling with messages already judged uninteresting.
+ */
+export function rejectInterpretation(signature: string, opts: { path?: string; now?: number } = {}): boolean {
   const path = opts.path ?? defaultPath();
   const store = load(path);
   if (!store.unknown[signature]) return false;
   delete store.unknown[signature];
+  store.ignored = { ...(store.ignored ?? {}), [signature]: { at: opts.now ?? Date.now() } };
   writer.touch(() => persist(path));
   return true;
 }

@@ -23,6 +23,7 @@ import {
   refusalSignature,
   rejectInterpretation,
   resetInterpretations,
+  IGNORED_TTL_MS,
 } from "../src/refusal-interpretation.js";
 
 let dir: string;
@@ -318,6 +319,29 @@ describe("the review gate keeps researched verdicts out of the request path", ()
     rejectInterpretation(sig, { path: interpPath });
     expect(pendingRefusals({ path: interpPath })).toHaveLength(0);
     expect(interpretRefusal("groq", "some-model", 403, body, { path: interpPath })).toBeNull();
+  });
+
+  it("REMEMBERS a rejection, so routine noise cannot refill the queue", () => {
+    // Measured on the live relay: adding 429s to the observed set immediately queued NIM's
+    // "too many requests" — a message already understood to be uninteresting. Without a durable
+    // rejection every recurrence re-queues it, and the signatures worth reading get buried under
+    // the ones a human has explicitly finished with.
+    const noise = `{"status":429,"title":"Too Many Requests"}`;
+    recordUnknownRefusal("nim", "m", 429, noise, { path: interpPath });
+    rejectInterpretation(pendingRefusals({ path: interpPath })[0]!.signature, { path: interpPath });
+
+    recordUnknownRefusal("nim", "m", 429, noise, { path: interpPath });
+    recordUnknownRefusal("nim", "m", 429, noise, { path: interpPath });
+    expect(pendingRefusals({ path: interpPath })).toHaveLength(0);
+  });
+
+  it("a rejection expires, so a mistaken one heals without editing a file", () => {
+    const noise = `{"status":429,"title":"Too Many Requests"}`;
+    const now = 5_000_000;
+    recordUnknownRefusal("nim", "m", 429, noise, { path: interpPath, now });
+    rejectInterpretation(pendingRefusals({ path: interpPath })[0]!.signature, { path: interpPath, now });
+    recordUnknownRefusal("nim", "m", 429, noise, { path: interpPath, now: now + IGNORED_TTL_MS + 1 });
+    expect(pendingRefusals({ path: interpPath })).toHaveLength(1);
   });
 
   it("counts repeats of one signature rather than growing an entry per request", () => {

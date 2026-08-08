@@ -1417,9 +1417,13 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     process.stdout.write(
       `\n  These change NOTHING until accepted. To resolve one, research what that message means for\n` +
       `  that provider and model on this account, then:\n` +
-      `    llm-relay eligibility propose <n> --class <not-servable|subscription-required|allowance-exhausted> --scope <deployment|account> --rationale "..."\n` +
+      `    llm-relay eligibility propose <n> --class <not-servable|subscription-required|allowance-exhausted|credential-invalid|rate-limited> \\\n` +
+      `        --scope <deployment|provider|group|model> [--members id1,id2] --rationale "..."\n` +
       `    llm-relay eligibility accept <n> --class <...> --scope <...>\n` +
-      `    llm-relay eligibility reject <n>       # means nothing durable\n`,
+      `    llm-relay eligibility reject <n>       # means nothing durable, and is remembered\n` +
+      `\n  Scope by what the message STATES, not by a pattern of failures: "provider" means one\n` +
+      `  observation covers every model behind that key, which is also what takes out a whole\n` +
+      `  provider if it is wrong.\n`,
     );
   }
   process.stdout.write("\n");
