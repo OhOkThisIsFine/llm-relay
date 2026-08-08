@@ -449,3 +449,27 @@ describe("contextWindowResolver — two rungs, both real publications", () => {
     expect(r("anthropic")).toEqual({ tokens: 4096, source: "snapshot" });
   });
 });
+
+describe("contextWindowResolver — the observed rung", () => {
+  it("outranks both published sources", () => {
+    const r = contextWindowResolver(
+      () => 200_000,
+      () => ({ tokens: 1_000_000, match: "exact" as const }),
+      () => 32_768,
+    );
+    expect(r("nim/m")).toEqual({ tokens: 32_768, source: "observed" });
+  });
+
+  it("falls through to provider, then snapshot, when nothing was learned", () => {
+    expect(
+      contextWindowResolver(() => 200_000, () => ({ tokens: 1e6, match: "exact" as const }), () => null)("nim/m"),
+    ).toEqual({ tokens: 200_000, source: "provider" });
+    expect(
+      contextWindowResolver(() => null, () => ({ tokens: 1e6, match: "exact" as const }), () => null)("nim/m"),
+    ).toEqual({ tokens: 1e6, source: "snapshot" });
+  });
+
+  it("is optional — omitting it keeps the two published rungs", () => {
+    expect(contextWindowResolver(() => 4096, () => null)("nim/m")).toEqual({ tokens: 4096, source: "provider" });
+  });
+});

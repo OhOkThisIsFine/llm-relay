@@ -267,12 +267,15 @@ not recognize — `claude` assumes 200k — and compacts against that, throwing 
    context: not published anywhere for this spec — the variable is omitted and the CLI uses its own default
 ```
 
-Two sources, both real publications: the serving provider's own figure, then the synced snapshot's
-`context_length` for the same model id (exact matches only — a fuzzy match can borrow a different
-SKU's window). There is no guessed value.
+Three sources, all real measurements, in descending authority: a ceiling the deployment **stated
+when it refused an over-length request** (learned automatically and persisted), the serving
+provider's own published figure, then the synced snapshot's `context_length` for the same model id
+(exact matches only — a fuzzy match can borrow a different SKU's window). There is no guessed value.
 
-A pool needs *every* member to resolve and uses the **minimum**, since failover can land on any of
-them — so "not published anywhere" for a pool usually means **one** member is missing, not all.
+A pool reports the **minimum over members that resolve**, since failover can land on any of them,
+and says how many members are unmeasured. That gap is self-correcting: the first over-length
+rejection from an unmeasured member states its ceiling, and the next dispatch reports the corrected
+floor.
 
 ⚠ **Never hand-set the variable to a large value to work around an unknown.** Measured pool minimums
 are 131,072–163,840, *below* the 200k `claude` already assumes; a speculative 1M would overshoot the

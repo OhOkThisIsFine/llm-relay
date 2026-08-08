@@ -141,24 +141,39 @@ The rest of the resolution rule:
 - unknown → the env entry is **dropped**, not set to an empty string (which a child would read as
   zero or garbage), and the client keeps its own conservative default.
 
-**Why there is no speculative rung**, considered and rejected 2026-08-07 with the numbers above.
-The proposal was to assume 1M when nothing is published and let errors correct it downward. Two
-findings killed it:
+### The learning loop (0.23.0)
+
+A deployment that refuses an over-length request usually states its real ceiling. `context-limits.ts`
+reads that from the error body — on a 400/413, on **both** request paths, from a *clone* so the
+client's body and failover are untouched — and persists it per `(provider, model)`. It becomes the
+TOP rung, above both published sources: it is a first-party fact about the exact deployment that
+will serve the next request, where a catalogue figure can be generic or stale.
+
+⚠ **Only an explicitly stated maximum is recorded.** "The request was too long" is not a limit; it
+bounds the ceiling by this proxy's own chars/4 estimate. Recording it would put a guess into the one
+store whose entire value is that it holds measurements.
+
+This is what makes an unmeasured pool member safe rather than merely tolerated: the first rejection
+from that member states its ceiling, and the next dispatch reports the corrected floor.
+
+### Why there is still no speculative rung
+
+Considered and rejected 2026-08-07 with the numbers above. The proposal was to assume 1M when
+nothing is published and let errors correct it downward. The learning loop above is the half of that
+proposal worth having; the speculative default is not, for two reasons:
 
 - **The measured floors point the other way.** With the snapshot rung, resolved pool minimums here
   are 131,072 (`pool/low`) to 163,840 (`pool/medium`, `high`, `xhigh`) — *below* the 200k the
   `claude` CLI already assumes for an unrecognized model. A speculative 1M would overshoot the
   weakest member by six to eight times; the correct adjustment for these pools is **downward**, and
   the honest data already provides it.
-- **The correction loop does not exist.** Limits are written in exactly one place — `limitsFromRecord`
-  off a `/models` record. Nothing anywhere learns a limit from an error response, so a speculative
-  value would not be corrected; it would just be wrong until someone noticed. Building that loop is
-  a real piece of work (parse per-provider context-length errors, attribute them to a deployment,
-  persist, invalidate) and it is not a prerequisite for this feature — the snapshot rung already
-  covers ~97% of members.
+- **A speculative value is only corrected by a failure it caused.** The loop learns from a
+  rejection, so seeding an optimistic ceiling means *deliberately* provoking a failed request to
+  discover a number the snapshot usually already holds. Correcting a measurement downward when a
+  deployment disagrees is cheap; manufacturing the disagreement is not.
 
-One unresolvable model can still block a whole pool, since every member must resolve. Here that is
-`huggingface/Qwen/Qwen3-235B-A22B-Instruct-2507`, which alone blocks `low`, `medium` and `high`.
+Between them the three rungs now resolve every pool on this machine, so there is nothing left for a
+speculative default to cover.
 
 The lookup is **injected** (`DispatchOptions.publishedContextWindow`), not imported: `dispatch.ts`
 keeps no catalog dependency and stays synchronous. The server backs it with

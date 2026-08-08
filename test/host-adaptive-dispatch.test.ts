@@ -254,12 +254,38 @@ describe("context window substitution", () => {
     expect(l.contextWindow).toBe(131_072);
   });
 
-  it("reports NO window when any pool member is unpublished — a partial floor is not a floor", () => {
-    // Measured on the real config: 0 of 29 members of pool/high publish a context length. Taking
-    // the min of the few that do would state a floor the pool does not actually have.
+  it("an unresolvable member does NOT veto the pool — it reports the min of what IS known", () => {
+    // This deliberately reverses the original rule. One model with no published figure anywhere
+    // blanked three of four real pools while 28-of-29, 38-of-41 and 44-of-49 members resolved
+    // fine. A pool is a routing construct; membership says nothing about any member's window, so
+    // "no data on one model" must not read as "nothing known about this pool".
     const l = lane(cfg(), "pool", { host: "bypassed", publishedContextWindow: windows({ a: 1_000_000 }) });
+    expect(l.contextWindow).toBe(1_000_000);
+    expect(l.contextWindowUnknownMembers).toBe(1);
+    expect(l.invoke?.env?.MAX_CONTEXT).toBe("1000000");
+  });
+
+  it("still reports nothing when NO member resolves — a floor over an empty set is not a floor", () => {
+    const l = lane(cfg(), "pool", { host: "bypassed", publishedContextWindow: () => null });
     expect(l.contextWindow).toBeUndefined();
     expect(l.invoke?.env).not.toHaveProperty("MAX_CONTEXT");
+  });
+
+  it("omits the unknown-member count when every member resolved", () => {
+    const l = lane(cfg(), "pool", { host: "bypassed", publishedContextWindow: windows({ a: 900_000, b: 500_000 }) });
+    expect(l.contextWindow).toBe(500_000);
+    expect(l.contextWindowUnknownMembers).toBeUndefined();
+  });
+
+  it("prefers a LEARNED ceiling over both published sources", () => {
+    // The deployment refusing an over-length request is the authority on its own ceiling; a
+    // published catalogue figure can be generic or stale.
+    const l = lane(cfg(), "pinned", {
+      host: "bypassed",
+      publishedContextWindow: () => ({ tokens: 32_768, source: "observed" as const }),
+    });
+    expect(l.contextWindow).toBe(32_768);
+    expect(l.contextWindowSource).toBe("observed");
   });
 
   it("ignores a nonsensical published window rather than passing it through", () => {

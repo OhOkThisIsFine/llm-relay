@@ -10,6 +10,7 @@ import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, type 
 import { parseHostRoutingState } from "../host-routing.js";
 import { contextWindowResolver } from "../metadata.js";
 import { snapshotContextWindow } from "../tier-data.js";
+import { observedContextLimit } from "../context-limits.js";
 import { getTelemetryReport } from "../telemetry.js";
 import type { CircuitBreaker } from "../circuit-breaker.js";
 import { baseLog } from "../request-log.js";
@@ -268,6 +269,7 @@ export async function handleAdminRoutes(
       publishedContextWindow: contextWindowResolver(
         (provider, model) => h.catalog.cachedLimits(provider, model)?.contextLength ?? null,
         snapshotContextWindow,
+        observedContextLimit,
       ),
     });
     return ok(view, true);

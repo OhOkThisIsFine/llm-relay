@@ -20,6 +20,7 @@ import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, t
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { contextWindowResolver } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
+import { observedContextLimit, flushObservedContextLimits } from "./context-limits.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
@@ -553,6 +554,7 @@ export function runProxy() {
       catalog.flushPersistence();
       flushRuntimeTelemetry();
       flushProbeCache();
+      flushObservedContextLimits();
       process.exit(0);
     });
   };
@@ -916,6 +918,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const cachedContextWindow = contextWindowResolver(
     (provider, model) => catalog.cachedLimits(provider, model)?.contextLength ?? null,
     snapshotContextWindow,
+    observedContextLimit,
   );
 
   const liveRaw = (await tryServer(cfg, path)) as WireDispatchView | null;
@@ -1043,14 +1046,22 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     if (l.transposed && wantsContextWindow) {
       // Provenance travels with the number, same rule as `strengthBasis` on a candidate row: a
       // first-party figure and a same-model figure taken from another host are different claims.
+      const basis =
+        l.contextWindowSource === "observed"
+          ? "learned from what this deployment stated when it refused an over-length request"
+          : l.contextWindowSource === "snapshot"
+            ? "synced snapshot, same model id on another host"
+            : "published by the serving provider";
+      // Say how much of a pool the reported minimum actually covers. Without it, a floor drawn
+      // from 28 of 29 members reads identically to one drawn from all of them.
+      const coverage =
+        l.contextWindowUnknownMembers !== undefined
+          ? `; ${l.contextWindowUnknownMembers} pool member${l.contextWindowUnknownMembers === 1 ? "" : "s"} unmeasured`
+          : "";
       process.stdout.write(
         l.contextWindow === undefined
-          ? `   context: not published anywhere for this spec — the variable is omitted and the CLI uses its own default\n`
-          : `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (${
-              l.contextWindowSource === "snapshot"
-                ? "synced snapshot, same model id on another host"
-                : "published by the serving provider"
-            })\n`,
+          ? `   context: nothing known for this spec — the variable is omitted and the CLI uses its own default\n`
+          : `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (${basis}${coverage})\n`,
       );
     }
     if (l.unreachable) process.stdout.write(`   ⚠ ${l.unreachable}\n`);

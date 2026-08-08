@@ -171,7 +171,7 @@ export function estimateRequestTokens(reqJson: unknown): number {
 }
 
 /** Where a context window came from, in descending order of authority. */
-export type ContextWindowSource = "provider" | "snapshot";
+export type ContextWindowSource = "observed" | "provider" | "snapshot";
 
 export interface ResolvedContextWindow {
   tokens: number;
@@ -184,8 +184,12 @@ export interface ResolvedContextWindow {
  * Two rungs, both REAL PUBLICATIONS — there is deliberately no guessed rung, for the same reason
  * `resolveMetadata` has none and the request-path guardrail stays silent on an unknown limit:
  *
- *  1. `provider` — the serving deployment's own published `contextLength`. Authoritative.
- *  2. `snapshot` — `context_length` from the synced capability snapshot (`docs/tier-data.json`,
+ *  1. `observed` — a ceiling THIS deployment stated when it refused an over-length request. The
+ *     strongest evidence there is: a first-party fact about the exact deployment that will serve
+ *     the next request, which a published catalogue figure can contradict by being generic or
+ *     stale. Only an explicitly stated maximum is ever recorded — see `context-limits.ts`.
+ *  2. `provider` — the serving deployment's own published `contextLength`.
+ *  3. `snapshot` — `context_length` from the synced capability snapshot (`docs/tier-data.json`,
  *     OpenRouter), matched **exactly** on the spec's last segment.
  *
  * ⚠ Rung 2 exists because rung 1 is nearly empty in practice: free providers publish little
@@ -203,12 +207,17 @@ export interface ResolvedContextWindow {
 export function contextWindowResolver(
   providerLimit: (provider: string, model: string) => number | null,
   snapshot: (spec: string) => { tokens: number; match: "exact" | "fuzzy" } | null,
+  observed?: (provider: string, model: string) => number | null,
 ): (spec: string) => ResolvedContextWindow | null {
   const positive = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n > 0;
   return (spec: string) => {
     const slash = spec.indexOf("/");
     if (slash > 0) {
-      const own = providerLimit(spec.slice(0, slash), spec.slice(slash + 1));
+      const provider = spec.slice(0, slash);
+      const model = spec.slice(slash + 1);
+      const learned = observed?.(provider, model) ?? null;
+      if (positive(learned)) return { tokens: learned, source: "observed" };
+      const own = providerLimit(provider, model);
       if (positive(own)) return { tokens: own, source: "provider" };
     }
     const hit = snapshot(spec);

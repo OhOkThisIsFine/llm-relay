@@ -1,6 +1,6 @@
 import { expandPoolSpecs, offloadRule, splitSpec, type Config, type LadderRung } from "./config.js";
 import type { HostRoutingState } from "./host-routing.js";
-import type { ResolvedContextWindow } from "./metadata.js";
+import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -103,7 +103,13 @@ export interface DispatchLane {
    *
    * For a pool this describes the MEMBER that set the minimum, which is the binding constraint.
    */
-  contextWindowSource?: "provider" | "snapshot";
+  contextWindowSource?: ContextWindowSource;
+  /**
+   * How many members of a POOL had no resolvable window. The reported number is the minimum over
+   * the members that DID resolve, so this says how much of the pool that minimum actually covers.
+   * Absent or 0 means every member resolved.
+   */
+  contextWindowUnknownMembers?: number;
   /**
    * Why this rung cannot be used by the calling host as configured. Set when a `relay` rung needs
    * transposing and no `routing.cliLane` template exists to transpose it with. Such a rung is
@@ -276,15 +282,28 @@ export const CONTEXT_TOKEN = "{contextWindow}";
  * omitting it: the client already has a conservative default, and a number we invented would
  * override that default with fiction and overflow the real backend.
  *
- * For a POOL every member must publish one, and the MINIMUM is used: failover can land the request
- * on any member, so the pool's usable window is its smallest. One unknown member means the floor
- * is unknown, not that the others' floor applies.
+ * For a POOL the MINIMUM across members that resolve is used: failover can land the request on any
+ * member, so the pool's usable window is the smallest one known.
+ *
+ * ⚠ **An unresolvable member does NOT veto the pool.** That was the original rule and it was
+ * wrong twice over. Practically, a single model with no published figure anywhere blanked three of
+ * four pools on the owner's machine — `huggingface/Qwen/Qwen3-235B-A22B-Instruct-2507` alone
+ * blocked `low`, `medium` and `high` while 44 of 49, 38 of 41 and 28 of 29 members resolved fine.
+ * Conceptually, a pool is a ROUTING construct — a ranked candidate list — and membership of one
+ * says nothing about any member's context window; treating "we have no data on one model" as "we
+ * know nothing about this pool" confuses an absent measurement with a measured absence.
+ *
+ * The residual risk — an unmeasured member whose real ceiling is below the reported minimum — is
+ * exactly what the observed rung exists to close: the first over-length rejection from that
+ * deployment states its ceiling, `context-limits.ts` records it, and the next dispatch reports the
+ * corrected floor. `contextWindowUnknownMembers` carries how much of the pool the number covers,
+ * so the gap is visible rather than implied.
  */
 export function specContextWindow(
   spec: string,
   cfg: Config,
   published: (spec: string) => ResolvedContextWindow | null,
-): ResolvedContextWindow | null {
+): (ResolvedContextWindow & { unknownMembers: number }) | null {
   let specs: string[];
   try {
     specs = expandPoolSpecs([spec], cfg);
@@ -294,14 +313,19 @@ export function specContextWindow(
   if (specs.length === 0) return null;
 
   let best: ResolvedContextWindow | null = null;
+  let unknown = 0;
   for (const s of specs) {
     const window = published(s);
-    if (window === null || !Number.isFinite(window.tokens) || window.tokens <= 0) return null;
+    if (window === null || !Number.isFinite(window.tokens) || window.tokens <= 0) {
+      unknown++;
+      continue;
+    }
     // The MEMBER that sets the minimum is the binding constraint, so its provenance is the one
     // that describes the number being reported — not the first member's, and not a blend.
     if (best === null || window.tokens < best.tokens) best = window;
   }
-  return best;
+  // Nothing resolved at all is still null: a floor over an empty set is not a floor.
+  return best === null ? null : { ...best, unknownMembers: unknown };
 }
 
 /**
@@ -534,6 +558,7 @@ function toLane(
         if (window !== null) {
           lane.contextWindow = window.tokens;
           lane.contextWindowSource = window.source;
+          if (window.unknownMembers > 0) lane.contextWindowUnknownMembers = window.unknownMembers;
         }
       } else {
         lane.unreachable =
