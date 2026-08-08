@@ -10,12 +10,15 @@ import {
   type ConfigOverrides,
   DEFAULT_DESTRUCTIVE,
   FRONT_DOOR_CLIENTS,
+  CLAUDE_CLIENT,
 } from "./config.js";
 import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
 import { buildDispatch, normalizeCliCommand, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
+import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
@@ -92,6 +95,9 @@ const VALUE_FLAGS = new Set<string>([
   '--after', '-after',
   '--lane', '-lane',
   '--tier', '-tier',
+  // ⚠ A value-taking flag MUST be listed here or its value is read as a positional. `--host
+  // routed` was parsed as the positional lane id "routed" and reported as a missing lane.
+  '--host', '-host',
   '--client', '-client',
   '--scope', '-scope',
   '--include', '-include',
@@ -179,7 +185,8 @@ ${formatTextTable([
   ["llm-relay offload [status]", "Show current offload rules."],
   ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
   ["llm-relay candidates [-p <name>]", "Compare offload targets."],
-  ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane."],
+  ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane; adapts to the calling host."],
+  ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
   ["llm-relay help | --help | -h", "Show help."],
   ["llm-relay version | --version | -v", "Print version."],
 ], "  ")}
@@ -567,11 +574,13 @@ export async function runPingCommand(): Promise<void> {
     if (p.kind === "openai") {
       try {
         models = await catalog.list(name, p);
-      } catch {}
+      } catch (error) {
+        void error;
+      }
     }
 
     const quota = pingLoop.getProviderQuota(name);
-    const quotaStr = quota !== null && quota !== undefined ? `${quota}% remaining` : "N/A";
+    const quotaStr = quota !== null ? `${quota}% remaining` : "N/A";
     process.stdout.write(`\nProvider: ${name} (quota: ${quotaStr})\n`);
     if (models.length === 0) {
       process.stdout.write("  (no models listed or reachable)\n");
@@ -645,9 +654,18 @@ export function proxyUrl(cfg: Pick<Config, "host" | "port">, path: string): stri
   return `http://${host}:${cfg.port}${path}`;
 }
 
+/**
+ * What actually comes back from `GET /dispatch` — which is NOT necessarily a `DispatchView`.
+ * The proxy answering may be an older build than this CLI (they are separate processes with
+ * separate lifetimes; the relay runs for days). Fields this CLI requires can therefore be absent
+ * on the wire, and typing the response as the current shape would assert a guarantee the other
+ * process never made.
+ */
+export type WireDispatchView = Omit<DispatchView, "host"> & { host?: DispatchView["host"] };
+
 /** Normalize structured output from an older live proxy before exposing it to this host. */
 export function normalizeDispatchCommands(
-  view: DispatchView,
+  view: WireDispatchView,
   platform: NodeJS.Platform = process.platform,
 ): DispatchView {
   const normalizeLane = (lane: DispatchLane): DispatchLane =>
@@ -656,6 +674,10 @@ export function normalizeDispatchCommands(
       : { ...lane };
   return {
     ...view,
+    // An older proxy said nothing about the calling host, which is exactly "unknown" — the state
+    // whose behaviour predates this field. Never inferred from the caller's own verdict here:
+    // that would label the answer with a question the answerer was never asked.
+    host: view.host ?? "unknown",
     ladder: view.ladder.map(normalizeLane),
     next: view.next ? normalizeLane(view.next) : null,
   };
@@ -696,11 +718,20 @@ export function parseRenderShell(value: string | undefined): RenderShell | null 
  * absent even though `sh` treats them as ordinary: `@` leads PowerShell splatting and `%` is
  * cmd.exe variable expansion, and this line gets pasted into whatever the operator is running.
  */
-const SHELL_SAFE_PWSH = /^[A-Za-z0-9_+=:,.\/\\-]+$/;
-const SHELL_SAFE_SH = /^[A-Za-z0-9_+=:,.\/-]+$/;
+const SHELL_SAFE_PWSH = /^[A-Za-z0-9_+=:,./\\-]+$/;
+const SHELL_SAFE_SH = /^[A-Za-z0-9_+=:,./-]+$/;
 
 /** C0 + C1 control characters except tab and newline. ESC — the ANSI carrier — is among them. */
-const RENDER_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+function sanitizeRenderedArgument(value: string): string {
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    out += (code >= 0 && code <= 0x1f && code !== 0x09 && code !== 0x0a && code !== 0x0d) || (code >= 0x7f && code <= 0x9f)
+      ? "\uFFFD"
+      : value[i]!;
+  }
+  return out;
+}
 
 /**
  * Quote ONE argv element so it stays exactly one argv element.
@@ -731,7 +762,7 @@ export function quoteArg(arg: string, shell: RenderShell = shellFor()): string {
   // otherwise rewrite what the operator sees they are about to execute — the same reason
   // `dispatch.ts` scrubs an echoed lane id. Tab and newline survive: both are legal inside
   // either literal form and a multi-line task is a real thing, not an attack.
-  const clean = arg.replace(RENDER_CONTROL, "\uFFFD");
+  const clean = sanitizeRenderedArgument(arg);
   const safeRegex = shell === "pwsh" ? SHELL_SAFE_PWSH : SHELL_SAFE_SH;
   if (clean.length > 0 && safeRegex.test(clean)) return clean;
   return shell === "pwsh" ? `'${clean.replace(/'/g, "''")}'` : `'${clean.replace(/'/g, "'\\''")}'`;
@@ -743,7 +774,7 @@ export function quoteArg(arg: string, shell: RenderShell = shellFor()): string {
  * assignment of the string "abc", it is a parse error. Same literal form, same control scrub.
  */
 function pwshLiteral(value: string): string {
-  return `'${value.replace(RENDER_CONTROL, "�").replace(/'/g, "''")}'`;
+  return `'${sanitizeRenderedArgument(value).replace(/'/g, "''")}'`;
 }
 
 /**
@@ -807,6 +838,21 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const outcome = argValue("--outcome");
   const retryAfterRaw = argValue("--retry-after-ms");
 
+  // Whether the CALLING session's traffic reaches this relay. Detected from this process's
+  // environment — the CLI is a child of that session and inherits it — and then FORWARDED to the
+  // proxy, which cannot work it out for itself. `--host` overrides for testing and for a host
+  // whose wiring this cannot see.
+  const hostOverrideRaw = argValue("--host");
+  const hostOverride = hostOverrideRaw === undefined ? null : parseHostRoutingState(hostOverrideRaw);
+  if (hostOverrideRaw !== undefined && hostOverride === null) {
+    process.stderr.write(`llm-relay dispatch: --host expects "routed", "bypassed" or "unknown" (got "${hostOverrideRaw}")\n`);
+    process.exit(1);
+  }
+  const detected = detectHostRouting();
+  const hostRouting = hostOverride
+    ? { state: hostOverride, entrypoint: detected.entrypoint, reason: `--host ${hostOverride} (host override)` }
+    : detected;
+
   if (outcome !== undefined && outcome !== "rate_limited" && outcome !== "quota_exhausted") {
     process.stderr.write(`llm-relay dispatch: --outcome must be rate_limited or quota_exhausted (got "${outcome}")\n`);
     process.exit(1);
@@ -839,9 +885,18 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (after) qs.set("after", after);
   if (tier) qs.set("tier", tier);
   if (client) qs.set("client", client);
+  qs.set("host", hostRouting.state);
+  if (hostRouting.entrypoint) qs.set("entrypoint", hostRouting.entrypoint);
   const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
 
-  const live = (await tryServer(cfg, path)) as DispatchView | null;
+  const liveRaw = (await tryServer(cfg, path)) as WireDispatchView | null;
+  // A proxy predating host-adaptive dispatch ignores `?host=` and answers as though every relay
+  // rung were reachable. Its ladder would then quietly advise the subagent path this host cannot
+  // use — the exact failure being fixed — so the stale answer is discarded rather than rendered.
+  // The cost is live exhaustion state, which the existing "no proxy running" line already covers;
+  // trusting the reply would cost correctness, which it does not.
+  const staleProxy = liveRaw !== null && hostRouting.state !== "unknown" && liveRaw.host !== hostRouting.state;
+  const live = staleProxy ? null : liveRaw;
   const view = normalizeDispatchCommands(
     live ??
       buildDispatch(cfg, {
@@ -850,6 +905,8 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
       ...(after ? { after } : {}),
       ...(tier ? { tier } : {}),
       ...(client ? { client } : {}),
+      host: hostRouting.state,
+      ...(hostRouting.entrypoint ? { entrypoint: hostRouting.entrypoint } : {}),
       }),
   );
 
@@ -858,10 +915,45 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     return;
   }
 
+  // `--next-command`: the rendered command line for `next`, and nothing else. Exists so a caller
+  // that needs something RUNNABLE (the Agent hook, a script) gets exactly that without parsing the
+  // human ladder — and, more importantly, without a second copy of the shell-quoting rules, which
+  // is the one part of this that is unsafe to reimplement.
+  if (hasFlag("--next-command")) {
+    const shellOnly = parseRenderShell(argValue("--shell")) ?? shellFor();
+    if (!view.next) {
+      process.stderr.write(`llm-relay dispatch: ${view.reason}\n`);
+      process.exit(1);
+    }
+    if (!view.next.invoke) {
+      // A relay lane is addressed through the proxy, not spawned; there is no command to print
+      // and inventing one would be a lie about the mechanism.
+      process.stderr.write(`llm-relay dispatch: lane "${view.next.id}" is a relay target (${view.next.spec ?? "?"}), not a command\n`);
+      process.exit(2);
+    }
+    process.stdout.write(renderCommand(view.next.invoke, shellOnly) + "\n");
+    return;
+  }
+
   const clientLabel = view.client ?? "default";
   process.stdout.write(`${clientLabel === "default" ? "subagent" : clientLabel} offload: ${view.offload ? "ON" : "OFF"}\n`);
   if (view.tier) process.stdout.write(`dispatch tier: ${view.tier}\n`);
-  if (!live) process.stdout.write(`(no proxy running — live exhaustion state unknown)\n`);
+  // State the verdict whenever it changed the answer. Silence here would leave the reader unable
+  // to tell a transposed ladder from a hand-written one — and unable to see that "offload: ON"
+  // above does not apply to the session they are sitting in.
+  if (hostRouting.state === "bypassed") {
+    process.stdout.write(`host: ${hostRouting.reason}\n`);
+    if (view.offload) {
+      process.stdout.write(`      ⚠ subagent offload cannot apply to this session — lanes below are shell-outs\n`);
+    }
+  }
+  if (!live) {
+    process.stdout.write(
+      staleProxy
+        ? `(running proxy predates host-adaptive dispatch — restart it; live exhaustion state unknown)\n`
+        : `(no proxy running — live exhaustion state unknown)\n`,
+    );
+  }
   process.stdout.write("\n");
 
   const shell = parseRenderShell(argValue("--shell")) ?? shellFor();
@@ -871,15 +963,24 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     const state = l.state === "ready" ? "" : ` [${l.state}${l.readyAt ? ` until ${l.readyAt}` : ""}]`;
     // Quoted per element. The task text is caller-supplied and this line is meant to be run
     // verbatim, so joining the raw argv would hand the host extra shell words.
+    // A transposed rung is a relay rung the host must SPAWN, so it renders as a command like any
+    // other cli lane — that is the whole point of the transposition, and printing its spec instead
+    // would hand back something this host cannot act on.
+    const spawnable = l.kind === "cli" || l.transposed === true;
     let target: string;
-    if (l.kind === "cli") {
+    if (spawnable && l.invoke) {
       target = renderCommand(l.invoke, shell);
       renderedCli = true;
     } else {
       target = l.spec ?? "";
     }
-    process.stdout.write(`${mark} ${l.position}. ${l.id}${state}\n`);
-    if (target) process.stdout.write(`   ${l.kind === "cli" ? "run" : "target"}: ${target}\n`);
+    const blocked = l.unreachable !== undefined && l.state === "ready" ? " [unreachable]" : "";
+    process.stdout.write(`${mark} ${l.position}. ${l.id}${state}${blocked}\n`);
+    if (target) process.stdout.write(`   ${spawnable ? "run" : "target"}: ${target}\n`);
+    // Keep the spec visible on a transposed lane: the mechanism changed, the target did not, and
+    // a reader comparing this against the config needs to see which rung this is.
+    if (l.transposed && l.spec) process.stdout.write(`   via: routing.cliLane → ${l.spec} (this host cannot reach it as a subagent)\n`);
+    if (l.unreachable) process.stdout.write(`   ⚠ ${l.unreachable}\n`);
     if (l.requiresDirective) {
       process.stdout.write(`   hint: add "@relay: ${l.spec}" to the subagent prompt (offload is off)\n`);
     }
@@ -896,6 +997,39 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   }
 
   process.stdout.write(`\n${view.next ? `use: ${view.next.id}` : "no lane available"} — ${view.reason}\n`);
+}
+
+/**
+ * Keep the `PreToolUse(Agent)` hook in step with the claude offload rule.
+ *
+ * The hook is not a separate feature to opt into — it is how "offload subagents" is DELIVERED on a
+ * host whose traffic never reaches the relay. Where the HTTP path works (a terminal session,
+ * Codex), the rule alone does the job and no hook is installed. So the two must move together, and
+ * in particular `offload claude off` must remove it: a forcing function that outlived the setting
+ * that justified it would deny subagents nobody asked to redirect.
+ *
+ * Never fatal. Failing to write the harness's settings file must not fail the toggle — the routing
+ * rule itself is already applied and persisted by then, and reporting the toggle as failed would
+ * misdescribe what happened.
+ */
+function syncAgentHook(enabled: boolean, host: HostRoutingState): void {
+  try {
+    if (enabled && host === "bypassed") {
+      // `process.execPath` + this CLI's own entry script: never the installed launcher, which on
+      // Windows is a `.cmd` the hook could not exec. See `renderAgentHookScript`.
+      const change = installAgentHook(process.execPath, process.argv[1] ?? "");
+      process.stdout.write(
+        change.changed
+          ? `  installed PreToolUse(Agent) hook → ${change.settingsPath}\n    Agent() calls now return a relay-routed command instead of silently spending primary quota\n`
+          : `  PreToolUse(Agent) hook already installed (${change.settingsPath})\n`,
+      );
+    } else {
+      const change = removeAgentHook();
+      if (change.changed) process.stdout.write(`  removed PreToolUse(Agent) hook from ${change.settingsPath}\n`);
+    }
+  } catch (e) {
+    process.stdout.write(`  ⚠ offload rule applied, but the Agent hook could not be updated: ${(e as Error).message}\n`);
+  }
 }
 
 /** `llm-relay offload [status]` or `llm-relay offload <client> [on|off|status]`. */
@@ -969,6 +1103,24 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   const configuredClients = state.clients ?? {};
   const effectiveScope = state.scope ?? "subagents";
   process.stdout.write(`${label} offload: ${state.enabled ? "ON" : "OFF"}${client ? ` (${effectiveScope})` : ""}\n`);
+
+  // The toggle is real and it persists — it governs every host whose traffic DOES reach the relay,
+  // and the relay-routed CLI children this ladder spawns. What it cannot do is affect the session
+  // running this command, when that session's traffic never arrives. Saying so here is the point:
+  // the switch reporting ON while nothing changes is precisely how the no-op went unnoticed.
+  const hostRouting = detectHostRouting();
+  if (hostRouting.state === "bypassed" && state.enabled) {
+    process.stdout.write(`  ⚠ ${hostRouting.reason}\n`);
+    process.stdout.write(`    subagents in THIS session are unaffected — use \`llm-relay dispatch -t "<task>"\` to reach a pool from here\n`);
+  }
+  if (client === CLAUDE_CLIENT && want !== null) {
+    syncAgentHook(want, hostRouting.state);
+  } else if (client === CLAUDE_CLIENT && agentHookInstalled()) {
+    // Report it on a plain status read too. A hook that denies Agent() calls is a visible change
+    // in how the harness behaves; leaving its state discoverable only by reading settings.json
+    // would recreate the "something is silently intercepting this" problem in the other direction.
+    process.stdout.write(`  PreToolUse(Agent) hook: installed — Agent() calls return a relay-routed command\n`);
+  }
   if (want !== null) {
     process.stdout.write(
       live ? "  applied to the running proxy (effective now)\n" : "  no proxy listening — config file only\n",
@@ -1128,7 +1280,7 @@ export async function runCandidates(): Promise<void> {
         fmt(c.scores.bfclOverall).padEnd(7) +
         fmt(c.scores.aiderPassRate).padEnd(7) +
         (c.scores.arenaRating ? String(Math.round(c.scores.arenaRating)) : "-").padEnd(7) +
-        (c.pricePerMTokOut !== null && c.pricePerMTokOut !== undefined
+        (c.pricePerMTokOut !== null
           ? `$${c.pricePerMTokOut}${c.priceSource === "reference" ? "~" : ""}`
           : "-"
         ).padEnd(8) +
