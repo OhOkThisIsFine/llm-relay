@@ -480,6 +480,14 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 - **A source's absence is not a low score.** Models are never penalised for signals nobody
   publishes; `signal_count` travels with the score instead, so a 1-source guess and a 5-source
   consensus are distinguishable. Don't "fix" a sparse row by defaulting it to zero.
+- **⚠ Never pin a REAL model's band membership in a test — inject the tier rows.** Effort floors are
+  calibrated against the whole synced population, so a model's band moves when the population does,
+  with no change to that model's own evidence: `kimi-k2.6` drifted 0.794 → 0.799 on a routine
+  `npm run sync:tiers` (same two sources, same four signals), crossed into `xhigh`, and emptied the
+  degrade tail that `test/dynamic-pools.test.ts` exists to assert. The behaviour was correct and the
+  test was right to exist — the *fixture* was live data, so `sync:tiers` could turn the gate red for
+  a reason unrelated to any code change. `materializeDynamicPools` takes an optional `tierData` for
+  exactly this; production passes nothing and reads the snapshot as before.
 - **A host whose traffic never reaches the relay cannot be detected by the relay.** Every
   subagent-reroute mechanism (`routing.subagents`, an `@relay:` directive, a `freeOnly` rule)
   works by answering an HTTP request differently, so it needs the request to arrive. From Claude
@@ -633,9 +641,21 @@ Every script in `scripts/` and every proxy endpoint has been exercised live agai
 `multimodal-probe.mjs` is 5/5 green.
 
 **Capability ranking now lives here** (0.5.0), no longer deferred to the router/auditor project:
-`npm run sync:tiers` merges OpenRouter + BFCL + LMArena + Aider into `docs/tier-data.json` and
-`getStrength()` ranks pools off it. Source probe results, coverage per source, and why EvalPlus /
-HF Open LLM / LiveCodeBench were rejected: [docs/capability-sources.md](docs/capability-sources.md).
+`npm run sync:tiers` merges OpenRouter + BFCL + LMArena + Aider + Artificial Analysis into
+`docs/tier-data.json` and `getStrength()` ranks pools off it. Source probe results, coverage per
+source, and why EvalPlus / HF Open LLM / LiveCodeBench were rejected:
+[docs/capability-sources.md](docs/capability-sources.md).
+
+⚠ **Reasoning-effort rows were being shattered, not missing** (fixed 2026-08-08). The sources spell
+the same variant three ways — `gpt-5 (high)` (Aider), `gpt-5-high` (LMArena), a bare id
+(OpenRouter) — so **0 of 60** effort-qualified rows joined across sources and every one looked like
+a 1-signal guess. `normName()` now canonicalizes the notation (8 of 71 joined, best case 3 sources
+/ 5 signals). ⚠ It REWRITES to suffix form against a **closed** vocabulary and never STRIPS —
+`gpt-5 (high)` → `gpt-5-high`, never `gpt-5`, because collapsing a variant into its base is exactly
+the borrowed-score bug. Artificial Analysis is also fetched first-hand now (key-gated; absent key
+skips cleanly, undocumented schema so the mapping is a throwing alias list). Neither change moved
+the current ladder — no source publishes two effort points for any model this machine routes to.
+Full diagnosis: [docs/effort-granularity-gap.md](docs/effort-granularity-gap.md).
 
 Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; it topped
 the then-`coding` pool by synced strength, 4 signals — pools are effort-tiered now, see

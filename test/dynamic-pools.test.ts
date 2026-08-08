@@ -152,7 +152,27 @@ describe("dynamic free-model pools", () => {
         ] }), { status: 200 })) as unknown as typeof fetch,
       });
 
-      materializeDynamicPools(cfg, catalog);
+      // ⚠ Band membership is PINNED here, not read from `docs/tier-data.json`. Effort floors are
+      // calibrated against the whole synced population, so a real model's band moves when the
+      // population does: `kimi-k2.6` drifted 0.794 -> 0.799 on a routine `sync:tiers` refresh —
+      // same two sources, same four signals — crossed into `xhigh`, and emptied the degrade tail
+      // this test exists to assert. The behaviour was never wrong; the fixture was live data.
+      const row = (norm: string, effort_eligibility: string[], strength: number) => ({
+        norm, effort_eligibility, strength, published_signal_count: 3, signal_count: 3,
+      });
+      const models = [
+        row("glm-5.2", ["low", "medium", "high", "xhigh"], 0.9),
+        row("kimi-k2.6", ["low", "medium", "high"], 0.79),
+        // `unknown-unscored-model` is deliberately ABSENT — unassessed, not weak.
+      ];
+      const tierData = {
+        models,
+        byNorm: models.map((rec) => ({ norm: rec.norm, rec })),
+        exactByNorm: new Map(models.map((rec) => [rec.norm, rec])),
+        revision: "test-fixture",
+      };
+
+      materializeDynamicPools(cfg, catalog, { tierData });
 
       // In-band first, then the weaker measured model. Order matters: the tail is only reached
       // after every in-band member has actually failed on this request.

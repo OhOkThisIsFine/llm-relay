@@ -122,12 +122,18 @@ function interleaveByProvider<T extends { target: ResolvedTarget }>(entries: T[]
 export function materializeDynamicPools(
   cfg: Config,
   catalog: ModelCatalog,
-  opts: { now?: number; force?: boolean } = {},
+  opts: { now?: number; force?: boolean; tierData?: TierData | null } = {},
 ): boolean {
   if (!cfg.routing.poolPolicies || !cfg.routing.pools) return false;
 
   const now = opts.now ?? Date.now();
-  const tierData = loadTierData({ now });
+  // `tierData` is injectable so a test can pin band membership. Band floors are CALIBRATED against
+  // the whole synced population, so a test naming real models asserts on a threshold that moves
+  // every time `npm run sync:tiers` runs: `kimi-k2.6` drifted 0.794 -> 0.799 on a routine refresh
+  // (same two sources, same four signals) and crossed into `xhigh`, turning a correct test red for
+  // a reason that had nothing to do with the behaviour under test. Production passes nothing and
+  // reads the snapshot exactly as before.
+  const tierData = opts.tierData !== undefined ? opts.tierData : loadTierData({ now });
   const catalogRevision = typeof catalog.getRevision === "function" ? catalog.getRevision() : 0;
   const signature = JSON.stringify({
     catalogRevision,
