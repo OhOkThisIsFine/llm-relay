@@ -1411,8 +1411,14 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     process.stdout.write(`\n  [${i + 1}] ${p.provider}/${p.model ?? "-"}  HTTP ${p.status}  ×${p.count}\n`);
     process.stdout.write(`      ${p.normalized}\n`);
     if (p.proposed) {
-      process.stdout.write(`      proposed: ${p.proposed.class} [${p.proposed.scope}] — ${p.proposed.rationale}\n`);
-      process.stdout.write(`      accept with: llm-relay eligibility accept ${i + 1} --class ${p.proposed.class} --scope ${p.proposed.scope}\n`);
+      // ⚠ The scope is a STRUCTURE now, not a word — interpolating it printed "[object Object]"
+      // and produced an accept command that could not run. A review UI that emits an invalid
+      // command is worse than none: it teaches the reviewer the tool is broken.
+      const sc = p.proposed.scope;
+      const scopeArgs = sc.kind === "group" ? `group --members ${sc.members.join(",")}` : sc.kind;
+      const scopeLabel = sc.kind === "group" ? `group of ${sc.members.length}` : sc.kind;
+      process.stdout.write(`      proposed: ${p.proposed.class} [${scopeLabel}] — ${p.proposed.rationale}\n`);
+      process.stdout.write(`      accept with: llm-relay eligibility accept ${i + 1} --class ${p.proposed.class} --scope ${scopeArgs}\n`);
     }
   });
   if (pending.length > 0) {
