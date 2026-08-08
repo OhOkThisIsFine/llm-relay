@@ -200,6 +200,17 @@ twelve failed for three unrelated reasons and the right move was "use another po
 left alone — it stays the last candidate's real upstream error — so the aggregate rides in a header.
 It appears on successes too, where it warns that a pool is thinning before it runs out.
 
+A failure whose refusals the relay could not interpret also carries
+`x-llm-relay-unknown-refusal: <n>` — a **count, never the message**. The learned-eligibility store
+converges only as fast as somebody explains what an unrecognised refusal means, and a queue that
+must be polled is a backlog nobody works; this tells the caller to run `llm-relay eligibility` while
+it still has the context. The message itself stays out of the header deliberately: it is untrusted
+text from an external service, and a response header is exactly the field a client tends to trust.
+
+⚠ On `/v1/messages` the count covers only the candidates **stepped over** — that front commits the
+response head before reading the body, so a single-member pool's own refusal is not counted there.
+It still reaches `llm-relay eligibility`.
+
 ### Context guardrail
 
 The relay estimates each request's prompt tokens against the target model's context limit and

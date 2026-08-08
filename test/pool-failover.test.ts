@@ -4,7 +4,7 @@ import { AddressInfo } from "node:net";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
-import { SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER } from "../src/backend.js";
+import { SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER } from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
 import { resetEligibility, isCostBlocked, cooldownUntil } from "../src/deployment-eligibility.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
@@ -581,6 +581,33 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     expect((await chat(p)).status).toBe(200);
     expect(isCostBlocked("p1", "m1")).toBe(false);
     expect(cooldownUntil("p1", "m1")).not.toBeNull(); // cooling, which expires on its own
+  });
+
+  it("flags refusals it could not interpret, so the queue is pushed rather than polled", async () => {
+    // The learned store converges only as fast as somebody explains the messages it does not
+    // recognise, and a pull-only queue is a backlog nobody works. The caller — usually an agent
+    // about to report this failure to a human — finds out at the moment it matters.
+    const odd = `{"error":{"message":"your organization is not permitted to use this model in this region"}}`;
+    const a = await scripted(() => ({ status: 403, body: odd }));
+    const b = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    // One unrecognized (the 403); the 402 matches a seed and is understood.
+    expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).toBe("1");
+    // ⚠ A COUNT, never the message: the body is untrusted text from an external service, and a
+    // response header is exactly the field an agent tends to trust.
+    expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).not.toContain("region");
+  });
+
+  it("says nothing when every refusal was understood", async () => {
+    const a = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).toBeNull();
   });
 
   it("a success clears the quota cooldown — a mid-month top-up recovers without a restart", () => {
