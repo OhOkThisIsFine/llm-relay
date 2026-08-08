@@ -90,7 +90,7 @@ export class AttemptLifecycle implements AttemptLifecyclePort {
     handle: AttemptHandle,
     outcome: AttemptOutcome,
   ): TransitionResult<CompletedAttempt, AttemptCompletionFailure> {
-    if ((typeof handle !== "object" && typeof handle !== "function") || handle === null) {
+    if (typeof handle !== "object" && typeof handle !== "function") {
       return { ok: false, error: { kind: "stale-handle" } };
     }
     const record = knownHandles.get(handle as object);

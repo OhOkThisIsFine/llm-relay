@@ -202,8 +202,18 @@ function labelTitle(raw: unknown): string {
   // Control characters (newlines included), angle brackets and quotes only — a deny-list
   // narrow enough that a non-Latin title survives intact. It is defence in depth: the tag
   // itself is already independent of this value, so the title cannot reach the delimiter.
-  const flattened = s.replace(/[\u0000-\u001f\u007f<>"]+/g, " ").replace(/\s+/g, " ").trim();
+  const flattened = replaceControlCharacters(s).replace(/[<>"]+/g, " ").replace(/\s+/g, " ").trim();
   return flattened.slice(0, 120) || "document";
+}
+
+/** Replace C0/C1 control characters with a neutral space before markdown fencing. */
+function replaceControlCharacters(value: string): string {
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    out += code <= 0x1f || (code >= 0x7f && code <= 0x9f) ? " " : value[i]!;
+  }
+  return out;
 }
 
 /** True if the request carries at least one `document` content block. */

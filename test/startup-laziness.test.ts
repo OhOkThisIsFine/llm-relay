@@ -43,6 +43,6 @@ describe("startup catalog warming", () => {
     } as unknown as ModelCatalog;
 
     await warmAndValidate(cfg, catalog);
-    expect(warmed.sort()).toEqual(["free", "mixed", "routed"]);
+    expect([...warmed].sort()).toEqual(["free", "mixed", "routed"]);
   });
 });

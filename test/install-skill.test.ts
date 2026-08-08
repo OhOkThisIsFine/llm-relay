@@ -114,6 +114,27 @@ describe("install-skill postinstall hook", () => {
     expect(second.stderr).toContain("Codex agent already exists");
   });
 
+  it.each([
+    ["inner whitespace", '[ model_providers.llm-relay ]\nname = "llm-relay"\n'],
+    ["quoted key", '[model_providers."llm-relay"]\nname = "llm-relay"\n'],
+    ["quoted key with whitespace", '[ model_providers."llm-relay" ]\nname = "llm-relay"\n'],
+    ["leading indent", '  [model_providers.llm-relay]\nname = "llm-relay"\n'],
+  ])("recognizes an already-configured Codex provider written with %s", (_label, existing) => {
+    // TOML treats all of these as the SAME table. Matching only the exact literal spelling makes
+    // postinstall append a SECOND provider block to the user's config.toml on every install —
+    // a duplicate table in a file this tool edits in the user's home directory.
+    const paths = installedPaths(home);
+    mkdirSync(join(home, ".codex", "agents"), { recursive: true });
+    writeFileSync(paths.codexConfig, existing);
+
+    const r = run([], home, { npm_config_global: "true" });
+    const after = readFileSync(paths.codexConfig, "utf8");
+
+    expect(r.status).toBe(0);
+    expect(after).toBe(existing);
+    expect(r.stderr).toContain("Codex provider already configured");
+  });
+
   it("exits 0 AND explains itself when the copy cannot happen", () => {
     // A home path that is a FILE makes mkdir of ~/.claude/... fail (ENOTDIR) on every platform.
     const notADir = join(home, "home-is-a-file");

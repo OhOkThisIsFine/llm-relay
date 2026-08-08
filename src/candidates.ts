@@ -407,9 +407,7 @@ export async function buildCandidates(
   return {
     generated_at: opts.now ?? new Date(nowMs).toISOString(),
     offload_enabled: anyOffloadEnabled(cfg),
-    offload_clients: typeof cfg.routing.offload === "object" && cfg.routing.offload !== null
-      ? cfg.routing.offload
-      : {},
+    offload_clients: typeof cfg.routing.offload === "object" ? cfg.routing.offload : {},
     note: NOTE,
     candidates,
   };

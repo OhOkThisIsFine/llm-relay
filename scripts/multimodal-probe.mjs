@@ -105,10 +105,16 @@ const textOf = (j) =>
     .map((b) => b.text)
     .join("");
 
+function verdictMarker(verdict) {
+  if (verdict === "PASS") return "OK  ";
+  if (verdict === "DEGRADED") return "WARN";
+  return "FAIL";
+}
+
 const results = [];
 function record(name, verdict, detail) {
   results.push({ name, verdict, detail });
-  const mark = verdict === "PASS" ? "OK  " : verdict === "DEGRADED" ? "WARN" : "FAIL";
+  const mark = verdictMarker(verdict);
   console.log(`[${mark}] ${name} — ${detail}`);
 }
 

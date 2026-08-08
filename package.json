@@ -38,6 +38,7 @@
     "typecheck:test": "tsc -p tsconfig.test.json",
     "check": "npm run typecheck && npm run typecheck:test && npm test",
     "postinstall": "node scripts/install-skill.mjs || node -e \"process.stderr.write('llm-relay: the postinstall hook crashed, so the bundled host skills and Codex setup were NOT fully installed. The package itself is fine. Retry with: node scripts/install-skill.mjs --force\\n')\"",
+    "analysis:run": "node scripts/analysis-run.mjs",
     "prepublishOnly": "npm run build && npm run check"
   },
   "dependencies": {
@@ -45,8 +46,18 @@
     "llm-bridge": "^2.0.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.66.0",
+    "@typescript-eslint/parser": "^8.66.0",
+    "dependency-cruiser": "^18.1.1",
+    "eslint": "^10.8.1",
+    "eslint-plugin-sonarjs": "^4.2.0",
     "hyparquet": "^1.26.2",
+    "jscpd": "^5.0.14",
+    "knip": "^6.32.0",
+    "madge": "^8.0.0",
+    "ts-prune": "^0.10.3",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

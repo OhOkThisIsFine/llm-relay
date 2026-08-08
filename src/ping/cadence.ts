@@ -303,7 +303,7 @@ export class PingLoop {
       for (const mId of toProbe) {
         const res = await pingProviderModel(providerName, mId, pCfg, apiKey, {
           ...optsObj(this.opts.fetchFn),
-          ...(pCfg.timeoutMs !== undefined ? { timeoutMs: pCfg.timeoutMs } : {}),
+          timeoutMs: pCfg.timeoutMs,
         });
         this.recordPing(providerName, mId, res);
       }

@@ -194,7 +194,7 @@ function conservesStructure(original: AssistantMessage, candidate: AssistantMess
     // Short-circuit on reference equality before stringifying.
     if (a === b) continue;
     // For non-objects or primitives, use direct comparison; otherwise use stable stringify.
-    if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    if (typeof a !== "object" || typeof b !== "object") {
       if (a !== b) return false;
       continue;
     }

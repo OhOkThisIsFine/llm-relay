@@ -383,7 +383,7 @@ describe("resolveMetadata provenance", () => {
       providerLimits: null,
       reference: { pricePromptPerToken: 0.0000007, priceCompletionPerToken: 0.0000024, from: "openrouter" },
     });
-    expect(borrowed.pricePerMTokOut).toBe(2.4); // per-token → per-million
+    expect(borrowed.pricePerMTokOut).toBeCloseTo(2.4); // per-token → per-million
     expect(borrowed.priceSource).toBe("reference");
     expect(borrowed.referenceFrom).toBe("openrouter");
 

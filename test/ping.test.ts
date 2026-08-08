@@ -4,11 +4,10 @@ import { extractQuotaPercent, buildPingRequest, pingProviderModel } from "../src
 import {
   BROKEN_PROBE_BACKOFF_BASE_MS,
   loadProbeCache,
-  flushProbeCache,
   recordProbeResult,
   getModelsDueForProbe,
 } from "../src/ping/probe-cache.js";
-import { recordModelCall, getRealWorldScore, loadRuntimeTelemetry } from "../src/ping/runtime-telemetry.js";
+import { recordModelCall, getRealWorldScore } from "../src/ping/runtime-telemetry.js";
 import { PingLoop, collectRoutableModels } from "../src/ping/cadence.js";
 import { createProxy } from "../src/server.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
@@ -16,7 +15,7 @@ import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 
 /**
  * A probe-cache path no other test shares.
@@ -136,7 +135,7 @@ describe("Probe Cache Persistence", () => {
   const tmpPath = join(tmpdir(), `probe-cache-test-${Date.now()}.json`);
 
   afterEach(() => {
-    try { unlinkSync(tmpPath); } catch {}
+    rmSync(tmpPath, { force: true });
   });
 
   it("tracks models due for probing based on TTL and status", () => {
@@ -209,7 +208,7 @@ describe("Runtime Telemetry", () => {
   const tmpPath = join(tmpdir(), `telemetry-test-${Date.now()}.json`);
 
   afterEach(() => {
-    try { unlinkSync(tmpPath); } catch {}
+    rmSync(tmpPath, { force: true });
   });
 
   it("records model calls and calculates real world scores", () => {

@@ -51,7 +51,9 @@ export function loadRuntimeTelemetry(opts: { path?: string; reload?: boolean } =
       _telemetryPath = target;
       return parsed;
     }
-  } catch {}
+  } catch {
+    // Unreadable/corrupt telemetry is not a request failure — fall through to a fresh store.
+  }
 
   _telemetry = { version: 1, models: {} };
   _telemetryPath = target;
@@ -67,7 +69,9 @@ export function flushRuntimeTelemetry(opts: { path?: string; telemetry?: Telemet
     const tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
     writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf8");
     renameSync(tmpPath, target);
-  } catch {}
+  } catch {
+    return;
+  }
 }
 
 function scheduleRuntimeTelemetryFlush(): void {

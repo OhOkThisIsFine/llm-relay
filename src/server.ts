@@ -1,5 +1,4 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { once } from "node:events";
 import {
   DEFAULT_ANTHROPIC_VERSION,
   resolveTargets,
@@ -28,7 +27,7 @@ import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens, assessCost } from "./metadata.js";
 import { specOfTarget } from "./benchmarks.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
-import { baseLog, logSafePath } from "./request-log.js";
+import { baseLog } from "./request-log.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -53,8 +52,9 @@ const HOP_BY_HOP = new Set([
 const INTERNAL_REQUEST_HEADERS = new Set(["x-codex-turn-metadata", CONTROL_AUTHORIZATION_HEADER]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
 
-/** A task string long enough to be an abuse attempt rather than a task. */
-const MAX_TASK_LEN = 4096;
+// `MAX_TASK_LEN` lived here until the admin routes moved to `routes/admin.ts`, which owns the
+// `?task=` bound now. Two copies of a limit drift; the one at the boundary that accepts the
+// request is the one that counts.
 
 const TOKENLESS_CONTROL_READS = new Set([
   "/v1/models",
@@ -1212,7 +1212,6 @@ async function repairStreamingPath(
   h: Handlers,
 ): Promise<void> {
   const filtered = filterResponseHeaders(backendRes.headers);
-  const decoder = new TextDecoder();
   let acc = "";                 // full decoded stream, for reconstruction
   let overflow = false;         // acc exceeded the validate cap → give up repair
   let work = Buffer.alloc(0);   // raw bytes not yet split into complete frames
