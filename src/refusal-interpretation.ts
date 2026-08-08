@@ -74,10 +74,35 @@ export function materializeScope(template: ScopeTemplate, provider: string, mode
   }
 }
 
+/**
+ * WHEN the condition this message describes clears — the third thing a reviewer knows and the
+ * table could not previously hold.
+ *
+ * Without this, learning "Gemini's quota message means allowance-exhausted" left the *duration*
+ * unlearnable, so the relay fell back to the kind's default TTL and re-probed on a schedule it
+ * invented. The reviewer usually knows better than the default: they can see whether the message
+ * carries a reset, and where.
+ *
+ *   field — the reset is IN this message, under a named JSON key (Google's RetryInfo puts it in
+ *           `retryDelay`). Deterministic extraction from the actual response, so it stays a
+ *           measurement rather than a claim. Preferred whenever the provider states it.
+ *   fixed — the provider never states it, but the window is known (a daily quota, a 5-hourly
+ *           grant). This IS a reviewer's assertion rather than a measurement, which is why it
+ *           ranks below anything the response itself says and why any success clears it.
+ *
+ * ⚠ A field NAME, never a pattern. An LLM-authored regex would run on the request path against
+ * attacker-influenceable text — the one place this design refuses to put judgement.
+ */
+export type ResetRule =
+  | { kind: "field"; field: string }
+  | { kind: "fixed"; ms: number };
+
 /** A refusal interpretation, however it got here. */
 export interface Interpretation {
   class: FactKind;
   scope: ScopeTemplate;
+  /** How long until it clears, when the reviewer could determine that. Optional. */
+  reset?: ResetRule;
   /**
    * `seed`       — shipped in this file, derived from first-party probes and reviewable in source.
    *                Binds immediately: it is deterministic code, not an opinion.
@@ -103,7 +128,7 @@ export interface UnknownRefusal {
   firstSeen: number;
   lastSeen: number;
   /** A researched verdict awaiting acceptance. Present once the research tier has run. */
-  proposed?: { class: FactKind; scope: ScopeTemplate; rationale: string; at: number };
+  proposed?: { class: FactKind; scope: ScopeTemplate; rationale: string; at: number; reset?: ResetRule };
 }
 
 interface InterpretationStore {
@@ -129,6 +154,12 @@ interface InterpretationStore {
  * but not forever, so a mistaken reject heals on its own rather than needing a file edited by hand.
  */
 export const IGNORED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * The longest reset any of these providers publishes. Beyond it a value is a parse artifact or a
+ * mistaken assertion, and believing it would strand a deployment far past any real window.
+ */
+const MAX_RESET_MS = 7 * 24 * 60 * 60 * 1000;
 
 let _store: InterpretationStore | null = null;
 let _path: string | null = null;
@@ -259,9 +290,57 @@ export function parseStatedResetMs(body: string): number | null {
     const ms = Number(m[1]) * scale;
     // A week is the longest window any of these providers publish; beyond that it is a parse
     // artifact, and believing it would strand a deployment far past any real reset.
-    if (Number.isFinite(ms) && ms > 0 && ms <= 7 * 24 * 60 * 60 * 1000) return Math.round(ms);
+    if (Number.isFinite(ms) && ms > 0 && ms <= MAX_RESET_MS) return Math.round(ms);
   }
   return null;
+}
+
+/**
+ * Apply a reviewed reset rule to one response body.
+ *
+ * Ranked below anything the response itself states — see `resolveResetMs` in `server.ts`. A
+ * `field` rule reads THIS response, so it is still a measurement; a `fixed` rule is the reviewer's
+ * knowledge of a window and is the last word before falling back to the kind's TTL.
+ */
+export function applyResetRule(rule: ResetRule | undefined, body: string): number | null {
+  if (!rule) return null;
+  if (rule.kind === "fixed") return rule.ms > 0 && rule.ms <= MAX_RESET_MS ? Math.round(rule.ms) : null;
+  const raw = findField(body, rule.field);
+  if (raw === null) return null;
+  // Providers write durations as "3600s", "3600", or a number. Seconds is the universal unit here
+  // (Retry-After, RetryInfo, every JSON spelling seen), so anything without a unit is seconds.
+  const m = /(\d+(?:\.\d+)?)\s*(ms|s|m|h)?/i.exec(String(raw));
+  if (!m?.[1]) return null;
+  const scale = m[2]?.toLowerCase() === "ms" ? 1 : m[2]?.toLowerCase() === "m" ? 60_000 : m[2]?.toLowerCase() === "h" ? 3_600_000 : 1000;
+  const ms = Number(m[1]) * scale;
+  return Number.isFinite(ms) && ms > 0 && ms <= MAX_RESET_MS ? Math.round(ms) : null;
+}
+
+/** Deep lookup of a JSON key by NAME, wrapper-tolerant. Returns the first scalar found. */
+function findField(body: string, field: string): string | number | null {
+  const parse = (text: string): unknown => {
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      const brace = text.search(/[[{]/);
+      if (brace <= 0) return null;
+      try {
+        return JSON.parse(text.slice(brace)) as unknown;
+      } catch {
+        return null;
+      }
+    }
+  };
+  const walk = (v: unknown, depth = 0): string | number | null => {
+    if (depth > 8 || v === null || typeof v !== "object") return null;
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (k === field && (typeof val === "string" || typeof val === "number")) return val;
+      const found = walk(val, depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  };
+  return walk(parse(body.length > 8192 ? body.slice(0, 8192) : body));
 }
 
 /** The lookup key. Per (provider, model, normalized message) — see the header for why all three. */
@@ -273,6 +352,13 @@ export function refusalSignature(provider: string, model: string | null | undefi
  * Interpretations shipped with the relay, each derived from a refusal observed first-party against
  * a real account (probed 2026-08-08). These bind without review: they are deterministic code in
  * version control, and an operator who disagrees can override the entry.
+ *
+ * ⚠ **This list is a BOOTSTRAP, not the mechanism.** Reaching for a new seed every time an
+ * unfamiliar message appears means the relay's author learned something and the relay did not —
+ * and it is the reflex this two-tier design exists to replace. A researched interpretation carries
+ * the same information, is reviewed the same way, and a future session inherits it without a
+ * release. Add a seed only for a message shape common enough that every install should start
+ * knowing it.
  *
  * ⚠ These are matched as PATTERNS against the normalized message, not as exact signatures, because
  * a seed has to cover a provider it has never been run against. That is a deliberate exception to
@@ -510,7 +596,7 @@ export function pendingRefusals(opts: { path?: string } = {}): Array<UnknownRefu
 /** Attach a researched verdict to a pending signature. It does NOT bind until accepted. */
 export function proposeInterpretation(
   signature: string,
-  proposal: { class: FactKind; scope: ScopeTemplate; rationale: string },
+  proposal: { class: FactKind; scope: ScopeTemplate; rationale: string; reset?: ResetRule },
   opts: { path?: string; now?: number } = {},
 ): boolean {
   const path = opts.path ?? defaultPath();
@@ -531,16 +617,22 @@ export function proposeInterpretation(
  */
 export function acceptInterpretation(
   signature: string,
-  opts: { path?: string; now?: number; override?: { class: FactKind; scope: ScopeTemplate } } = {},
+  opts: { path?: string; now?: number; override?: { class: FactKind; scope: ScopeTemplate; reset?: ResetRule } } = {},
 ): boolean {
   const path = opts.path ?? defaultPath();
   const store = load(path);
   const pending = store.unknown[signature];
-  const verdict = opts.override ?? (pending?.proposed ? { class: pending.proposed.class, scope: pending.proposed.scope } : null);
+  const verdict = opts.override ?? (pending?.proposed
+    ? { class: pending.proposed.class, scope: pending.proposed.scope, reset: pending.proposed.reset }
+    : null);
   if (!verdict) return false;
+  // The reset travels with the verdict: accepting an interpretation commits everything known about
+  // that message shape — what it means, who it covers, and when it clears — not just a label.
+  const reset = verdict.reset ?? pending?.proposed?.reset;
   store.confirmed[signature] = {
     class: verdict.class,
     scope: verdict.scope,
+    ...(reset ? { reset } : {}),
     source: "researched",
     acceptedAt: opts.now ?? Date.now(),
     ...(pending?.proposed?.rationale ? { rationale: pending.proposed.rationale } : {}),

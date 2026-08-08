@@ -28,6 +28,7 @@ import {
   pendingRefusals,
   proposeInterpretation,
   rejectInterpretation,
+  type ResetRule,
   type ScopeTemplate,
 } from "./refusal-interpretation.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
@@ -1367,14 +1368,31 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     const scope: ScopeTemplate = scopeName === "group"
       ? { kind: "group", members }
       : { kind: scopeName as "deployment" | "provider" | "model" };
+    // WHEN it clears, which is the third thing a reviewer knows. `--reset-field` names a JSON key
+    // in the message itself (Google's RetryInfo uses `retryDelay`) and is preferred, because it is
+    // read from the real response every time; `--reset-ms` is the reviewer asserting a window the
+    // provider never states, and is used only when the response says nothing.
+    const resetField = argValue("--reset-field");
+    const resetMsRaw = argValue("--reset-ms");
+    let reset: ResetRule | undefined;
+    if (resetField) reset = { kind: "field", field: resetField };
+    else if (resetMsRaw !== undefined) {
+      const ms = Number(resetMsRaw);
+      if (!Number.isFinite(ms) || ms <= 0) {
+        process.stderr.write(`llm-relay eligibility: --reset-ms expects a positive number of milliseconds\n`);
+        process.exit(1);
+        return;
+      }
+      reset = { kind: "fixed", ms };
+    }
     const shown = scopeName === "group" ? `group of ${members.length}` : scopeName;
     if (action === "propose") {
-      proposeInterpretation(entry.signature, { class: cls, scope, rationale });
+      proposeInterpretation(entry.signature, { class: cls, scope, rationale, ...(reset ? { reset } : {}) });
       flushInterpretations();
       process.stdout.write(`proposed ${cls} (${shown}) — not yet binding. Commit with: llm-relay eligibility accept ${idx}\n`);
       return;
     }
-    acceptInterpretation(entry.signature, { override: { class: cls, scope } });
+    acceptInterpretation(entry.signature, { override: { class: cls, scope, ...(reset ? { reset } : {}) } });
     flushInterpretations();
     process.stdout.write(`accepted ${cls} (${shown}) — now applied to ${entry.provider}/${entry.model ?? "-"} refusals matching this message.\n`);
     return;

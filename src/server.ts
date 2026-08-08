@@ -30,7 +30,7 @@ import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
 import { clearFacts, cooldownUntil, isCostBlocked, recordFact } from "./target-facts.js";
-import { interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal } from "./refusal-interpretation.js";
+import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -1018,16 +1018,40 @@ function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs
     // and model. A provider-scoped verdict therefore covers every deployment behind that
     // credential from one observation — which is the whole point: a stated credit balance or a
     // rejected key is one fact, and rediscovering it once per model is pure waste.
-    // A reset the BODY stated outranks the header, and outranks the kind's default TTL. Gemini
-    // says when a spent quota returns only in `google.rpc.RetryInfo` inside the error details, so
-    // without this a 5-hourly or weekly quota is re-probed on a schedule the relay invented.
     recordFact(verdict.class, materializeScope(verdict.scope, target.provider, target.model), {
-      retryAfterMs: retryAfterMs ?? parseStatedResetMs(body),
+      retryAfterMs: resolveResetMs(verdict, retryAfterMs, body),
     });
   } catch {
     /* learning is best-effort and never in the request's way */
   }
   return false;
+}
+
+/**
+ * When the condition this refusal describes clears, best evidence first.
+ *
+ *   1. `Retry-After` — the header, stated by THIS response.
+ *   2. A reviewed `field` rule — also read from THIS response, just from a place only a reviewer
+ *      knew to look (Google's `retryDelay`, which no header carries).
+ *   3. The generic body parse — the same class of evidence, found without being told where.
+ *   4. A reviewed `fixed` window — a reviewer's knowledge of the provider, not a measurement of
+ *      this response, so it ranks below everything the response actually said.
+ *   5. null ⇒ the fact kind's default TTL.
+ *
+ * ⚠ The ordering is the point. A reviewer may know MORE than the response (that a daily quota
+ * resets in hours when the body says nothing), but never more than the response about itself — so
+ * an assertion can fill a gap and can never overrule a statement.
+ */
+function resolveResetMs(interpretation: Interpretation, headerMs: number | null, body: string): number | null {
+  if (headerMs !== null) return headerMs;
+  if (interpretation.reset?.kind === "field") {
+    const fromField = applyResetRule(interpretation.reset, body);
+    if (fromField !== null) return fromField;
+  }
+  const generic = parseStatedResetMs(body);
+  if (generic !== null) return generic;
+  if (interpretation.reset?.kind === "fixed") return applyResetRule(interpretation.reset, body);
+  return null;
 }
 
 /**
