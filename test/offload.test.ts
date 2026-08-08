@@ -182,7 +182,10 @@ describe("/offload endpoint", () => {
         listen: "127.0.0.1:8791", // the test binds port 0 explicitly; config just has to be valid
         providers: {
           anthropic: { base: `http://127.0.0.1:${upPort}`, kind: "anthropic" },
-          nim: { base: `http://127.0.0.1:${offloadPort}`, kind: "openai" },
+          // tierType free: a local mock costs nothing, and this test is about ROUTING. Without it
+          // the (default-on) freeOnly guard would filter the target and the test would be
+          // measuring the cost guard instead of the reroute it exists to pin.
+          nim: { base: `http://127.0.0.1:${offloadPort}`, kind: "openai", tierType: "free" },
         },
         routing: {
           default: "anthropic",
@@ -275,7 +278,7 @@ describe("/offload endpoint", () => {
         listen: "127.0.0.1:8791",
         providers: {
           anthropic: { base: `http://127.0.0.1:${upPort}`, kind: "anthropic" },
-          nim: { base: `http://127.0.0.1:${directedPort}`, kind: "openai" },
+          nim: { base: `http://127.0.0.1:${directedPort}`, kind: "openai", tierType: "free" },
         },
         // No routing.subagents at all, and offload therefore off: the directive is the ONLY
         // thing that can move this request off the passthrough.
@@ -728,14 +731,43 @@ describe("freeOnly offload guard", () => {
     expect(paid.calls()).toBe(0);
   });
 
-  it("without freeOnly, the same pool serves its first (unknown-cost) member — the guard is opt-in", async () => {
+  it("with freeOnly UNSET, offload-rerouted traffic is free-only anyway — the default is ON", async () => {
+    // ⚠ Reversed deliberately. This test previously pinned "the guard is opt-in", which meant an
+    // install that enabled offload without thinking about cost could discover the feature by being
+    // billed for it. Offload exists to spend somebody else's free capacity instead of your
+    // subscription, so refusing to spend is the safe direction and the refusal is loud.
     const { paid, free, port } = await guardSetup("freeonly-off.json", {
       offload: { claude: { enabled: true, scope: "subagents" } },
     });
     const resp = await subagentCall(port);
+    // The pool lists the unknown-cost member FIRST; the guard filters it out and the free member
+    // answers. Steering, not refusing — a 503 is only for a pool with nothing free left.
+    expect(resp.status).toBe(200);
+    expect(paid.calls()).toBe(0);
+    expect(free.calls()).toBe(1);
+  });
+
+  it("with freeOnly UNSET and nothing free in the pool, refuses loudly with zero egress", async () => {
+    const { paid, free, port } = await guardSetup("freeonly-default-empty.json", {
+      offload: { claude: { enabled: true, scope: "subagents" } },
+      pool: ["paidp/model-x"],
+    });
+    const resp = await subagentCall(port);
+    expect(resp.status).toBe(503);
+    expect(await resp.text()).toMatch(/freeOnly/);
+    expect(paid.calls()).toBe(0); // never contacted — the guard promises zero egress
+    expect(free.calls()).toBe(0);
+  });
+
+  it("an explicit false still opts into spending", async () => {
+    // The owner's escape hatch, and the reason `loadConfig` keeps "unset" distinguishable from
+    // "false": this machine runs with an explicit false and must be unaffected by the new default.
+    const { paid, port } = await guardSetup("freeonly-explicit-off.json", {
+      offload: { claude: { enabled: true, scope: "subagents", freeOnly: false } },
+    });
+    const resp = await subagentCall(port);
     expect(resp.status).toBe(200);
     expect(paid.calls()).toBe(1);
-    expect(free.calls()).toBe(0);
   });
 
   it("setOffload toggles do not strip freeOnly from the rule", async () => {

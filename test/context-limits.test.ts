@@ -101,7 +101,14 @@ describe("the learned-limit store", () => {
     recordObservedContextLimit("nim", "m", 65536, { path });
     flushObservedContextLimits({ path });
     expect(existsSync(path)).toBe(true);
-    expect(JSON.parse(readFileSync(path, "utf8")).limits["nim/m"].tokens).toBe(65536);
+
+    // ⚠ Asserts the ROUND TRIP, not the file's internal shape. Ceilings moved into the shared
+    // `target-facts.ts` store so scope and keying live in one place, which changed the on-disk
+    // layout deliberately — a test pinning `limits["nim/m"].tokens` was pinning an implementation
+    // detail and would have to be rewritten by anyone who ever reorganised the storage. What must
+    // hold is that a learned ceiling survives a restart.
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    expect(JSON.stringify(onDisk)).toContain("65536");
 
     resetObservedContextLimits();
     expect(observedContextLimit("nim", "m", { path })).toBe(65536);

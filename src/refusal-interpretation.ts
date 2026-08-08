@@ -343,6 +343,55 @@ function findField(body: string, field: string): string | number | null {
   return walk(parse(body.length > 8192 ? body.slice(0, 8192) : body));
 }
 
+/**
+ * Meaning read from a SELF-DESCRIBING error payload, rather than from prose.
+ *
+ * Some providers publish the fact in a structured, versioned envelope that names its own schema.
+ * Google's is the one in use here: a 429 carries `google.rpc.QuotaFailure` whose `quotaId` states
+ * both the window and what the limit is counted against —
+ * `GenerateRequestsPerDayPerProjectPerModel-FreeTier` says, unambiguously, that this is a *daily*
+ * allowance counted *per model* on the *free tier*. No wording to interpret.
+ *
+ * ⚠ This is NOT a per-provider switch, which this project refuses elsewhere (`catalog.ts` uses a
+ * generic field-alias list; `authEnv.ts` refuses to guess). The dispatch key is the payload's own
+ * `@type` URL — the message declares which schema it is speaking, and we read only schemas we
+ * understand. A provider adopting `google.rpc` gets this for free; one that does not is unaffected.
+ *
+ * Ranked ABOVE the prose seeds and BELOW an accepted human verdict: structured evidence beats a
+ * pattern guess, and an operator's explicit decision beats both.
+ */
+function interpretStructured(
+  status: number,
+  body: string,
+): { class: FactKind; scope: ScopeTemplate } | null {
+  if (!/google\.rpc\.QuotaFailure/.test(body)) return null;
+  // The quotaId is the load-bearing field; read it without trusting the surrounding shape, because
+  // a partial or wrapped body must degrade to "learned nothing" rather than throwing.
+  const m = /"quotaId"\s*:\s*"([^"]{1,200})"/.exec(body);
+  const quotaId = m?.[1];
+  if (!quotaId) return null;
+
+  // WINDOW → which fact this is. Per-minute/second is throughput; per-hour and longer is an
+  // allowance. This is the rate-limit-vs-quota distinction read off a field instead of inferred
+  // from wording, which is exactly where reading wording got it wrong before.
+  const perShort = /Per(?:Second|Minute)/i.test(quotaId);
+  const perLong = /Per(?:Hour|Day|Week|Month)/i.test(quotaId);
+  if (!perShort && !perLong) return null;
+  const kind: FactKind = perShort ? "rate-limited" : "allowance-exhausted";
+
+  // SCOPE → what the limit is counted against. "PerProjectPerModel" is counted per model, so the
+  // project's other models are unaffected; "PerProject" alone covers the whole credential.
+  const scope: ScopeTemplate = /PerModel/i.test(quotaId)
+    ? { kind: "deployment" }
+    : /Per(?:Project|User|Consumer|Client)/i.test(quotaId)
+      ? { kind: "provider" }
+      : { kind: "deployment" }; // Unrecognized dimension: assume the narrowest blast radius.
+
+  // A 429 is the only status this shape is published on; anything else naming QuotaFailure is not
+  // something we have seen and should not be guessed at.
+  return status === 429 || status === 403 ? { class: kind, scope } : null;
+}
+
 /** The lookup key. Per (provider, model, normalized message) — see the header for why all three. */
 export function refusalSignature(provider: string, model: string | null | undefined, status: number, body: string): string {
   return `${provider}|${model ?? "-"}|${status}|${normalizeRefusalMessage(body)}`;
@@ -508,6 +557,20 @@ export function interpretRefusal(
   const hit = store.confirmed[refusalSignature(provider, model, status, body)];
   // A researched entry binds only once accepted; an unaccepted one is still sitting in review.
   if (hit && (hit.source === "seed" || hit.acceptedAt !== undefined)) return hit;
+
+  // Structured evidence beats prose: the payload states its own schema and its own dimensions,
+  // where a seed only pattern-matches wording. Below an accepted human verdict, above the seeds.
+  const structured = interpretStructured(status, body);
+  if (structured) {
+    return {
+      class: structured.class,
+      scope: structured.scope,
+      source: "seed",
+      // The same envelope carries `google.rpc.RetryInfo`, so the reset is read from the response
+      // itself rather than falling back to the kind's default TTL.
+      reset: { kind: "field", field: "retryDelay" },
+    };
+  }
 
   const normalized = normalizeRefusalMessage(body);
   for (const seed of SEED_INTERPRETATIONS) {

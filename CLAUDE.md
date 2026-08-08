@@ -579,9 +579,13 @@ before proposing routing refactors, budgets, tracing stores, or LLM-assisted cla
 A second external review (terms compliance + credential handling) was assessed 2026-08-05 —
 [docs/codex-review-2026-08-05.md](docs/codex-review-2026-08-05.md): its headline credential finding
 was false (it missed that the openai path builds its own headers), two changes were adopted anyway
-(`credentialMode`, the OR'd subagent signal), and it carries the verified terms position plus the
-one open proposal — a "credentials stay user-operated" invariant awaiting owner ratification in
-[docs/project-goals.md](docs/project-goals.md).
+(`credentialMode`, the OR'd subagent signal), and it carries the verified terms position. Its one
+open proposal — **"credentials stay user-operated"** — was **ratified 2026-08-08** into
+[docs/project-goals.md](docs/project-goals.md): llm-relay never operates a login, never centrally
+proxies subscription traffic, never pools consumer accounts. ⚠ **Decisions made on the strength of
+that invariant must be stated out loud** — name it, say what it ruled out, say what was done
+instead. A constraint the owner is never told was applied is one they cannot overrule; the same
+goes for any project invariant that changes what gets built.
 
 ⚠ **A CLI process's environment is NOT the running relay's environment, and confusing the two
 fabricates credential bugs.** On Windows a User-scope environment variable enters a process only at

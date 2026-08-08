@@ -1226,6 +1226,12 @@ export function parseOffload(raw: unknown): OffloadConfig {
       if (rule.freeOnly !== undefined && typeof rule.freeOnly !== "boolean") {
         throw new Error(`config.routing.offload.${client}.freeOnly must be true or false`);
       }
+      // ⚠ Stored EXACTLY as configured — absent stays absent. The default is applied where the
+      // rule is consulted (`freeOnlyApplies` in server.ts), not baked in here, because "unset"
+      // and "explicitly false" have to stay distinguishable: an unset flag defaults ON for
+      // offload-rerouted traffic and OFF for a directly addressed pool, and materializing a value
+      // here would collapse that into one answer. It also keeps `setOffload` from inventing a
+      // field the operator never wrote.
       parsed[client] = { enabled: rule.enabled, scope, ...(rule.freeOnly !== undefined ? { freeOnly: rule.freeOnly } : {}) };
     }
     out = parsed;

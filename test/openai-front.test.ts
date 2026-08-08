@@ -86,7 +86,7 @@ describe("OpenAI front (/chat/completions)", () => {
     process.env.RP_FRONT_KEY = "sk-backend";
     const mock = await mockOpenAi();
     backend = mock.server;
-    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000, authEnv: "RP_FRONT_KEY" } }, "up/fallback");
+    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000, authEnv: "RP_FRONT_KEY" } }, "up/fallback");
     proxy = await startProxy(c);
     const p = port(proxy);
 
@@ -107,7 +107,7 @@ describe("OpenAI front (/chat/completions)", () => {
   it("serves the /chat/completions path without the /v1 prefix too", async () => {
     const mock = await mockOpenAi();
     backend = mock.server;
-    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
+    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
     proxy = await startProxy(c);
     const p = port(proxy);
     const resp = await fetch(`http://127.0.0.1:${p}/chat/completions`, {
@@ -238,7 +238,7 @@ describe("OpenAI front (/chat/completions)", () => {
     });
     const c = cfg({ up: {
       base: `http://127.0.0.1:${port(backend)}`,
-      kind: "openai",
+      kind: "openai", tierType: "free",
       authHeader: "authorization",
       timeoutMs: 5000,
     } }, "up/target-model");
@@ -283,7 +283,7 @@ describe("OpenAI front (/chat/completions)", () => {
 
     const c = cfg({ up: {
       base: `http://127.0.0.1:${port(backend)}`,
-      kind: "openai",
+      kind: "openai", tierType: "free",
       authHeader: "authorization",
       timeoutMs: 5000,
     } }, "up/main-model");
@@ -331,7 +331,7 @@ describe("OpenAI front (/chat/completions)", () => {
 
     const c = cfg({ up: {
       base: `http://127.0.0.1:${port(backend)}`,
-      kind: "openai",
+      kind: "openai", tierType: "free",
       authHeader: "authorization",
       timeoutMs: 5000,
     } }, "up/main-model");
@@ -371,7 +371,7 @@ describe("OpenAI front (/chat/completions)", () => {
       });
       s.listen(0, "127.0.0.1", () => resolve(s));
     });
-    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
+    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
     proxy = await startProxy(c);
     const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/chat/completions`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -407,7 +407,7 @@ describe("OpenAI front context guardrail", () => {
   const chatBody = JSON.stringify({ model: "pool/duo", messages: [{ role: "user", content: "x".repeat(4000) }] });
 
   function duoConfig(backendPort: number): Config {
-    const c = cfg({ up: { base: `http://127.0.0.1:${backendPort}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
+    const c = cfg({ up: { base: `http://127.0.0.1:${backendPort}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
     c.routing.pools = { duo: ["up/small", "up/big"] };
     return c;
   }
@@ -460,7 +460,7 @@ describe("OpenAI front context guardrail", () => {
     const mock = await mockOpenAi();
     backend = mock.server;
     const catalog = catalogWithLimits(dir, { up: { small: { contextLength: 200 } } });
-    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
+    const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000 } }, "up/fallback");
     proxy = await startProxy(c, catalog);
 
     const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {

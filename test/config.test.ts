@@ -666,6 +666,9 @@ describe("client-specific offload routing", () => {
       },
     })));
 
+    // ⚠ `freeOnly` stays ABSENT when unset — "unset" and "explicitly false" must remain
+    // distinguishable, because unset defaults ON for offload-rerouted traffic and OFF for a
+    // directly addressed pool. Materializing a value here would collapse that into one answer.
     expect(cfg.routing.offload).toEqual({
       claude: { enabled: true, scope: "all" },
       codex: { enabled: false, scope: "subagents" },
@@ -722,6 +725,8 @@ describe("client-specific offload routing", () => {
     })));
     expect(offloadRule(cfg, "claude")).toEqual({ enabled: true, scope: "subagents", freeOnly: true });
     // Absent stays absent — the guard is opt-in like offload itself.
+    // Absent, not false — the default is applied at the guard (`freeOnlyApplies`), where it can
+    // differ between offload-rerouted traffic (ON) and a directly addressed pool (OFF).
     expect(offloadRule(cfg, "codex").freeOnly).toBeUndefined();
     expect(() => loadConfig(write("client-offload-freeonly-bad.json", base({
       routing: { default: "nim/model", offload: { claude: { enabled: true, freeOnly: "yes" } } },

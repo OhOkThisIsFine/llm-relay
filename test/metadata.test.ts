@@ -163,13 +163,13 @@ describe("per-provider limits", () => {
         status: 200,
         headers: { "content-type": "application/json" },
       })) as unknown as typeof fetch;
-    const cfg: ProviderConfig = { base: "http://blank.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+    const cfg: ProviderConfig = { base: "http://blank.test/v1", kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000 };
     expect(await catalog.limits("blank", cfg, "shared/model-a", { fetchFn })).toBeNull();
   });
 
   it("keeps limits per (provider, model) — the same id on two providers is two deployments", async () => {
     const cfg = (base: string): ProviderConfig => ({
-      base, kind: "openai", authHeader: "authorization", timeoutMs: 5000,
+      base, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000,
     });
     const catalog = new ModelCatalog({ cachePath: null });
     const fetchFn = (async (url: string | URL) => {
@@ -196,7 +196,7 @@ describe("per-provider limits", () => {
 describe("context guardrail", () => {
   const cfgFor = (base: string) => ({
     host: "127.0.0.1", port: 0,
-    providers: { nim: { base, kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 5000 } },
+    providers: { nim: { base, kind: "openai" as const, tierType: "free" as const, authHeader: "authorization" as const, timeoutMs: 5000 } },
     routing: { default: "nim/small/model", tiers: {}, benchmarkSort: false },
     mode: "detect" as const,
     repair: { maxAttempts: 2, destructiveTools: [] },
@@ -301,8 +301,8 @@ describe("context guardrail", () => {
       const cfg = {
         host: "127.0.0.1", port: 0,
         providers: {
-          p1: { base: `http://127.0.0.1:${upPort1}/v1`, kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 5000 },
-          p2: { base: `http://127.0.0.1:${upPort2}/v1`, kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 5000 },
+          p1: { base: `http://127.0.0.1:${upPort1}/v1`, kind: "openai" as const, tierType: "free" as const, authHeader: "authorization" as const, timeoutMs: 5000 },
+          p2: { base: `http://127.0.0.1:${upPort2}/v1`, kind: "openai" as const, tierType: "free" as const, authHeader: "authorization" as const, timeoutMs: 5000 },
         },
         routing: { default: "pool/pool", pools: { pool: ["p1/model1", "p2/model2"] }, tiers: {}, benchmarkSort: false },
         mode: "detect" as const,

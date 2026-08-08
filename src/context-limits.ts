@@ -1,7 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
-import { WriteBehindTimer } from "./write-behind.js";
+import { factsFor, flushFacts, recordFact, resetFacts, FACT_TTL_MS } from "./target-facts.js";
 
 /**
  * Context limits LEARNED from what a deployment actually said when it refused a request.
@@ -19,76 +16,22 @@ import { WriteBehindTimer } from "./write-behind.js";
  * `resolveMetadata`: no rung may be a guess.
  */
 
-/** Learned limits expire, because a provider that raises a ceiling would otherwise never be
- *  believed again. Long, because a ceiling is a slow-moving fact — this is staleness, not health. */
-export const OBSERVED_LIMIT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * ⚠ **The storage moved; the PARSING is what this module is.** Ceilings now live in
+ * `target-facts.ts` as a `context-limit` fact at deployment scope, so scope and keying are decided
+ * in one place rather than reinvented per store. What stays here is the part that is genuinely
+ * specific to what it reads: knowing which error bodies state a maximum, and extracting it without
+ * ever mistaking the REQUESTED count for the ceiling.
+ *
+ * A context limit is a MEASUREMENT, not a condition, which is why the shared store refuses to let
+ * a success clear it — a normally-sized request succeeding says nothing about the ceiling.
+ */
+
+/** Retained for callers and docs that name the ceiling's staleness window. */
+export const OBSERVED_LIMIT_TTL_MS = FACT_TTL_MS["context-limit"];
 
 /** A stated ceiling above this is a parse artifact, not a context window. */
 const MAX_CREDIBLE_TOKENS = 100_000_000;
-
-interface ObservedLimit {
-  tokens: number;
-  /** Epoch ms of the observation, for TTL. */
-  at: number;
-}
-
-interface LimitStore {
-  version: 1;
-  /** `<provider>/<model>` → the ceiling that deployment stated. */
-  limits: Record<string, ObservedLimit>;
-}
-
-let _store: LimitStore | null = null;
-let _path: string | null = null;
-const writer = new WriteBehindTimer();
-
-function defaultPath(): string {
-  // ⚠ Redirected under vitest, for the same reason probe-cache is: the suite was found writing
-  // `openai_mock` entries into the user's live health data. A learned context limit is exactly the
-  // same hazard — a test's fake ceiling persisted here would then cap a real lane.
-  if (process.env.VITEST !== undefined) {
-    return join(tmpdir(), `llm-relay-test-context-limits-${process.pid}.json`);
-  }
-  const xdg = process.env.XDG_CONFIG_HOME;
-  const baseDir = xdg && xdg.trim() ? join(xdg, "llm-relay") : join(homedir(), ".llm-relay");
-  return join(baseDir, "context-limits.json");
-}
-
-function key(provider: string, model: string): string {
-  return `${provider}/${model}`;
-}
-
-function load(path: string): LimitStore {
-  if (_store && _path === path) return _store;
-  _path = path;
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<LimitStore>;
-    if (parsed && typeof parsed === "object" && parsed.limits && typeof parsed.limits === "object") {
-      _store = { version: 1, limits: parsed.limits as Record<string, ObservedLimit> };
-      return _store;
-    }
-  } catch {
-    // Unreadable or corrupt: start clean. A learned limit is an optimization, never a
-    // correctness dependency, so losing the file must not fail anything.
-  }
-  _store = { version: 1, limits: {} };
-  return _store;
-}
-
-function persist(path: string): void {
-  if (!_store) return;
-  try {
-    mkdirSync(join(path, ".."), { recursive: true });
-    // Write-then-rename, same as probe-cache: a crash mid-write must not leave a half-file that
-    // then parses as an empty store and silently discards everything learned.
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(_store, null, 2) + "\n", "utf8");
-    renameSync(tmp, path);
-  } catch {
-    // Same contract as the metadata logger: a full disk is a storage problem, never a request
-    // failure. The learned limit simply stays in memory for this process's lifetime.
-  }
-}
 
 /**
  * Patterns that carry an explicitly stated ceiling. Deliberately a small, literal set rather than
@@ -143,10 +86,11 @@ export function recordObservedContextLimit(
   opts: { path?: string; now?: number } = {},
 ): void {
   if (!Number.isFinite(tokens) || tokens <= 0 || tokens > MAX_CREDIBLE_TOKENS) return;
-  const path = opts.path ?? defaultPath();
-  const store = load(path);
-  store.limits[key(provider, model)] = { tokens: Math.floor(tokens), at: opts.now ?? Date.now() };
-  writer.touch(() => persist(path));
+  recordFact("context-limit", { kind: "deployment", provider, model }, {
+    ...(opts.path !== undefined ? { path: opts.path } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+    value: Math.floor(tokens),
+  });
 }
 
 /** The learned ceiling for a deployment, or null when none was observed or it has expired. */
@@ -155,25 +99,18 @@ export function observedContextLimit(
   model: string,
   opts: { path?: string; now?: number } = {},
 ): number | null {
-  const path = opts.path ?? defaultPath();
-  const store = load(path);
-  const hit = store.limits[key(provider, model)];
-  if (!hit) return null;
-  const now = opts.now ?? Date.now();
-  if (now - hit.at > OBSERVED_LIMIT_TTL_MS) return null;
-  return hit.tokens;
+  for (const fact of factsFor(provider, model, opts)) {
+    if (fact.kind === "context-limit" && typeof fact.value === "number") return fact.value;
+  }
+  return null;
 }
 
 /** Flush pending observations. Called on shutdown, like the other write-behind stores. */
 export function flushObservedContextLimits(opts: { path?: string } = {}): void {
-  if (!writer.dirty) return;
-  writer.clear();
-  persist(opts.path ?? defaultPath());
+  flushFacts(opts);
 }
 
 /** Test seam: drop the in-memory store so a suite can point at a fresh path. */
 export function resetObservedContextLimits(): void {
-  _store = null;
-  _path = null;
-  writer.clear();
+  resetFacts();
 }

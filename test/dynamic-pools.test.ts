@@ -7,7 +7,7 @@ import { ModelCatalog } from "../src/catalog.js";
 import { materializeDynamicPools } from "../src/dynamic-pools.js";
 
 describe("dynamic free-model pools", () => {
-  it("keeps the preferred prefix and appends every discovered free target without known-paid models", async () => {
+  it("keeps the preferred prefix and ranks every free target ahead of every paid one", async () => {
     const dir = mkdtempSync(join(tmpdir(), "rp-dynamic-pool-"));
     try {
       const path = join(dir, "config.json");
@@ -47,9 +47,21 @@ describe("dynamic free-model pools", () => {
       expect(specs).toContain("free/catalog-free-unknown-price");
       expect(specs).toContain("mixed/zero-priced");
       expect(specs).toContain("mixed/community-model:free");
-      expect(specs).not.toContain("mixed/premium-unknown-price");
-      expect(specs).not.toContain("mixed/known-paid");
-      expect(specs).not.toContain("paid/unknown-price");
+      // ⚠ Reversed deliberately. Cost used to gate ADMISSION, which made a pool free by
+      // construction — safe-sounding, until the free lane is spent and the pool has nothing left.
+      // Paid capacity is now reachable but ordered strictly behind every free member, and the
+      // `freeOnly` guard (default ON for offload) is what keeps a pool free-only for anyone who
+      // has not opted into spending.
+      const paidSpecs = ["mixed/premium-unknown-price", "mixed/known-paid", "paid/unknown-price"];
+      for (const spec of paidSpecs) expect(specs).toContain(spec);
+
+      // `unknown` cost ranks WITH paid, never with free: a guess must not spend money, the same
+      // rule `assessCost` applies for the guard.
+      const firstPaidIndex = Math.min(...paidSpecs.map((s) => specs.indexOf(s)));
+      const lastFreeIndex = Math.max(
+        ...["free/catalog-free-unknown-price", "mixed/zero-priced", "mixed/community-model:free"].map((s) => specs.indexOf(s)),
+      );
+      expect(lastFreeIndex).toBeLessThan(firstPaidIndex);
       expect(new Set(specs).size).toBe(specs.length);
       // Dynamic pools preserve the preferred prefix instead of benchmark-sorting it away.
       expect(resolveTargets("pool/coding", cfg)[0]?.model).toBe("manual-first");

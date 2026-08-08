@@ -54,7 +54,16 @@ export type FactKind =
    * the case the breaker cannot express: a limit the provider says belongs to the ACCOUNT, where
    * every sibling is equally throttled and discovering that once per model is the waste.
    */
-  | "rate-limited";
+  | "rate-limited"
+  /**
+   * The context ceiling a deployment STATED when it refused an over-length request, in tokens.
+   *
+   * ⚠ A MEASUREMENT, not a condition — and the distinction is load-bearing. Every other kind here
+   * describes something that is currently true and stops being true: a success disproves it. A
+   * context window is a property of the deployment, so a successful request says nothing about it
+   * and must not clear it. See `CONDITIONS` below.
+   */
+  | "context-limit";
 
 /**
  * Who a fact applies to, specific → general. Resolution walks this order and stops at the first
@@ -87,6 +96,8 @@ interface StoredFact {
   at: number;
   /** Epoch ms this fact stops applying, when the evidence stated a reset. */
   until?: number;
+  /** The measured quantity, for kinds that carry one (`context-limit` → tokens). */
+  value?: number;
 }
 
 interface FactStore {
@@ -114,7 +125,26 @@ export const FACT_TTL_MS: Record<FactKind, number> = {
   // believing a stale one keeps working capacity idle. `RATE_LIMIT_COOLDOWN_MS` in the breaker is
   // the same figure for the same reason — the two must not disagree about when to try again.
   "rate-limited": 2 * 60 * 1000,
+  // Long, because a ceiling is a slow-moving fact — this is staleness, not health. A provider that
+  // raises a ceiling would otherwise never be believed again.
+  "context-limit": 30 * 24 * 60 * 60 * 1000,
 };
+
+/**
+ * Kinds that describe a CONDITION — something currently true that a success disproves.
+ *
+ * The complement is measurements (`context-limit`), which a success says nothing about. Folding
+ * the context-limit store in here made the difference matter: `clearFacts` deletes every fact
+ * covering a deployment on success, and doing that to a learned ceiling would discard a real
+ * measurement every time the deployment served a normally-sized request — i.e. constantly.
+ */
+const CONDITIONS: ReadonlySet<FactKind> = new Set<FactKind>([
+  "not-servable",
+  "subscription-required",
+  "allowance-exhausted",
+  "credential-invalid",
+  "rate-limited",
+]);
 
 /**
  * Every fact kind, for callers that must enumerate them (the review CLI's `--class` validation).
@@ -219,7 +249,7 @@ function covers(fact: StoredFact, provider: string, model: string | null): boole
 export function recordFact(
   kind: FactKind,
   scope: FactScope,
-  opts: { path?: string; now?: number; retryAfterMs?: number | null } = {},
+  opts: { path?: string; now?: number; retryAfterMs?: number | null; value?: number } = {},
 ): void {
   const path = opts.path ?? defaultPath();
   const store = load(path);
@@ -232,6 +262,7 @@ export function recordFact(
     // A vendor-stated reset beats our TTL, exactly as it does for the breaker's cooldown: the
     // provider knows when its own allowance refreshes and we are guessing.
     ...(stated !== null ? { until: now + stated } : {}),
+    ...(typeof opts.value === "number" && Number.isFinite(opts.value) ? { value: opts.value } : {}),
   };
   writer.touch(() => persist(path));
 }
@@ -241,16 +272,16 @@ export function factsFor(
   provider: string,
   model: string | null | undefined,
   opts: { path?: string; now?: number } = {},
-): Array<{ kind: FactKind; scope: FactScope; until: number }> {
+): Array<{ kind: FactKind; scope: FactScope; until: number; value?: number }> {
   const store = load(opts.path ?? defaultPath());
   const now = opts.now ?? Date.now();
   const m = typeof model === "string" ? model : null;
-  const hits: Array<{ kind: FactKind; scope: FactScope; until: number }> = [];
+  const hits: Array<{ kind: FactKind; scope: FactScope; until: number; value?: number }> = [];
   for (const fact of Object.values(store.facts)) {
     const until = expiryOf(fact);
     if (now >= until) continue;
     if (!covers(fact, provider, m)) continue;
-    hits.push({ kind: fact.kind, scope: fact.scope, until });
+    hits.push({ kind: fact.kind, scope: fact.scope, until, ...(typeof fact.value === "number" ? { value: fact.value } : {}) });
   }
   hits.sort((a, b) => SCOPE_PRECEDENCE.indexOf(a.scope.kind) - SCOPE_PRECEDENCE.indexOf(b.scope.kind));
   return hits;
@@ -316,6 +347,10 @@ export function clearFacts(
   let changed = false;
   for (const [key, fact] of Object.entries(store.facts)) {
     if (!covers(fact, provider, m)) continue;
+    // ⚠ A success disproves a CONDITION, never a measurement. A learned context ceiling is a
+    // property of the deployment, so a normally-sized request succeeding says nothing about it —
+    // clearing it here would discard a real measurement on essentially every request.
+    if (!CONDITIONS.has(fact.kind)) continue;
     changed = true;
     // Reported back so the caller can clear the SYMPTOMS of a fact that has just been disproved.
     // A stated bad credential leaves a per-deployment 401 on the breaker for every model that
