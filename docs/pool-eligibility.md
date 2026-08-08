@@ -233,6 +233,43 @@ Consequence worth expecting: every effort pool now has near-identical **membersh
 only in **order**, so `{contextWindow}` converges across pools. That is correct — the minimum is
 taken precisely because failover can land anywhere, which is now more true than it was.
 
+## Scope is part of the fact
+
+The eligibility store was a one-off patch of a general problem. A fact's natural scope and its
+storage keying kept drifting apart, independently, in every store that learned something:
+
+| Fact | Real scope | Was stored as |
+|---|---|---|
+| Credit balance (402) | provider/account | per-deployment, until fixed here |
+| Revoked key (401/403) | provider/account | per-deployment (`credentialFaultUntil`) |
+| Account rate limit (429) | often provider | per-deployment (`cooldownUntil`) |
+| Context window | deployment | deployment ✓ |
+| Price / limits | deployment, cross-provider `reference` | correct ✓ |
+
+`target-facts.ts` makes scope explicit and part of the fact — `deployment` → `group` → `provider` →
+`model`, resolved most-specific-first with provenance, the shape `metadata.ts` already used for
+limits and prices. A new fact kind can no longer invent its own keying.
+
+⚠ **Scope comes from evidence, never from counting.** "Three models on this provider returned 401"
+is equally three gated models under a working key — the false accusation `key-checker.ts` exists to
+avoid. A provider-scoped fact requires wording that *states* an account-level condition; a bare
+401/403 produces no fact at all and stays on the breaker's credential axis. Anything ambiguous goes
+to the review tier and binds only once accepted.
+
+⚠ **A group carries its own member list.** No registry, no prefix inference — that is the heuristic
+`authEnv.ts` refuses, and a wrong match here evicts a working family. The reviewer sees exactly
+which models a group verdict covers before accepting it.
+
+### Staged, not done
+
+Landed: the scoped store, all four scopes, eligibility migrated onto it, and `credential-invalid` at
+provider scope — so a *stated* bad key is learned once instead of once per model.
+
+Not yet: `circuit-breaker.ts` still keys its own credential-fault and rate-limit cooldowns
+per-deployment, so a bare 401 or an account-level 429 is still rediscovered per model; and
+`context-limits.ts` remains a separate store (it is correctly scoped already, so folding it in is
+tidiness rather than a fix). Both are mechanical follow-ons now that the scope model exists.
+
 ## Still open
 
 - `routing.offload.*.freeOnly` is **off**. Owner's decision, 2026-08-08.

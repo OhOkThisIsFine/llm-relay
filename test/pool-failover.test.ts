@@ -6,7 +6,7 @@ import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
 import { SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER } from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
-import { resetEligibility, isCostBlocked, cooldownUntil } from "../src/deployment-eligibility.js";
+import { resetFacts, isCostBlocked, cooldownUntil } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ProviderConfig, ResolvedTarget } from "../src/config.js";
 import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
@@ -39,13 +39,13 @@ beforeEach(() => {
   // provider `p1`, and every later test reusing that provider name found its first candidate
   // already demoted. Reset them for the same reason the breaker is reset: shared learned state
   // across tests is a hermeticity bug, not a routing one.
-  resetEligibility();
+  resetFacts();
   resetInterpretations();
 });
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(r))));
   globalCircuitBreaker.reset();
-  resetEligibility();
+  resetFacts();
   resetInterpretations();
 });
 

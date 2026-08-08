@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { WriteBehindTimer } from "./write-behind.js";
-import type { EligibilityClass, EligibilityScope } from "./deployment-eligibility.js";
+import type { FactKind, FactScope } from "./target-facts.js";
 
 /**
  * What a backend's refusal MEANS — a lookup, never an inference, on the request path.
@@ -39,10 +39,45 @@ import type { EligibilityClass, EligibilityScope } from "./deployment-eligibilit
  * wasted round-trip, the cost of a false hit is a working deployment evicted from every pool.
  */
 
+/**
+ * WHO a verdict applies to, expressed independently of the request that triggered it.
+ *
+ * An interpretation is stored against a message signature, but the fact it produces is about
+ * targets — so the stored form is a TEMPLATE, materialized into a concrete `FactScope` with the
+ * provider and model of whatever request hit it. That indirection is what lets one entry mean
+ * "this message always states an account-level condition" without naming an account.
+ *
+ * ⚠ **A group carries its own membership.** There is no group registry and no prefix inference:
+ * the reviewer sees the exact list of models a group verdict will cover before accepting it.
+ * Inferring a family from id shape is the heuristic `authEnv.ts` refuses — a wrong match there
+ * ships a credential to the wrong host, and a wrong match here evicts a working family.
+ */
+export type ScopeTemplate =
+  | { kind: "deployment" }
+  | { kind: "provider" }
+  | { kind: "model" }
+  | { kind: "group"; members: string[] };
+
+/** Turn a stored template into the concrete scope for the request that matched it. */
+export function materializeScope(template: ScopeTemplate, provider: string, model: string): FactScope {
+  switch (template.kind) {
+    case "deployment":
+      return { kind: "deployment", provider, model };
+    case "provider":
+      return { kind: "provider", provider };
+    case "model":
+      return { kind: "model", model };
+    case "group":
+      // The triggering model is always included: it demonstrably exhibits the fact, and a group
+      // verdict that excluded its own evidence would be incoherent.
+      return { kind: "group", provider, members: template.members.includes(model) ? template.members : [...template.members, model] };
+  }
+}
+
 /** A refusal interpretation, however it got here. */
 export interface Interpretation {
-  class: EligibilityClass;
-  scope: EligibilityScope;
+  class: FactKind;
+  scope: ScopeTemplate;
   /**
    * `seed`       — shipped in this file, derived from first-party probes and reviewable in source.
    *                Binds immediately: it is deterministic code, not an opinion.
@@ -68,7 +103,7 @@ export interface UnknownRefusal {
   firstSeen: number;
   lastSeen: number;
   /** A researched verdict awaiting acceptance. Present once the research tier has run. */
-  proposed?: { class: EligibilityClass; scope: EligibilityScope; rationale: string; at: number };
+  proposed?: { class: FactKind; scope: ScopeTemplate; rationale: string; at: number };
 }
 
 interface InterpretationStore {
@@ -195,8 +230,8 @@ export function refusalSignature(provider: string, model: string | null | undefi
 export const SEED_INTERPRETATIONS: Array<{
   status: (s: number) => boolean;
   pattern: RegExp;
-  class: EligibilityClass;
-  scope: EligibilityScope;
+  class: FactKind;
+  scope: ScopeTemplate;
   note: string;
 }> = [
   {
@@ -205,7 +240,7 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 402,
     pattern: /deplet\w*\s+your\s+(?:monthly\s+)?(?:included\s+)?credits|insufficient\s+credits|purchase\s+(?:pre-?paid\s+)?credits|out\s+of\s+credits/,
     class: "allowance-exhausted",
-    scope: "account",
+    scope: { kind: "provider" },
     note: "stated credit balance; free but spent until it refreshes",
   },
   {
@@ -215,7 +250,7 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 403,
     pattern: /requires?\s+(?:both\s+)?an?\s+[\w, ]*\bsubscription\b|requires?\s+(?:both\s+)?an?\s+[\w, ]*\bplan\b|upgrade\s+for\s+access/,
     class: "subscription-required",
-    scope: "deployment",
+    scope: { kind: "deployment" },
     note: "stated plan gating on one model; the credential itself is fine",
   },
   {
@@ -225,8 +260,23 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 400 || s === 404,
     pattern: /does\s+not\s+exist|model_not_found|unknown\s+model|no\s+such\s+model|not\s+found\s+for\s+account/,
     class: "not-servable",
-    scope: "deployment",
+    scope: { kind: "deployment" },
     note: "stated non-existence; catalog rot",
+  },
+  {
+    // A credential the provider says is bad — "invalid api key", "authentication failed". A fact
+    // about the KEY, so it covers every deployment behind it: without this, each model on that
+    // provider independently discovers the same 401 and expires on its own clock.
+    //
+    // ⚠ Requires the message to state it. A BARE 401/403 stays on the breaker's credential axis and
+    // produces no fact at all, because it is equally an entitlement wall on one model under a
+    // perfectly good key — the false accusation `key-checker.ts` exists to avoid. This seed fires
+    // on wording about the credential, never on the status alone.
+    status: (s) => s === 401 || s === 403,
+    pattern: /invalid\s+(?:api\s+)?(?:key|token|credentials?)|authentication\s+failed|incorrect\s+api\s+key|api\s+key\s+(?:not\s+valid|is\s+invalid|expired|revoked)|unauthorized:\s*invalid/,
+    class: "credential-invalid",
+    scope: { kind: "provider" },
+    note: "stated bad credential; covers every deployment behind that key",
   },
 ];
 
@@ -352,7 +402,7 @@ export function pendingRefusals(opts: { path?: string } = {}): Array<UnknownRefu
 /** Attach a researched verdict to a pending signature. It does NOT bind until accepted. */
 export function proposeInterpretation(
   signature: string,
-  proposal: { class: EligibilityClass; scope: EligibilityScope; rationale: string },
+  proposal: { class: FactKind; scope: ScopeTemplate; rationale: string },
   opts: { path?: string; now?: number } = {},
 ): boolean {
   const path = opts.path ?? defaultPath();
@@ -373,7 +423,7 @@ export function proposeInterpretation(
  */
 export function acceptInterpretation(
   signature: string,
-  opts: { path?: string; now?: number; override?: { class: EligibilityClass; scope: EligibilityScope } } = {},
+  opts: { path?: string; now?: number; override?: { class: FactKind; scope: ScopeTemplate } } = {},
 ): boolean {
   const path = opts.path ?? defaultPath();
   const store = load(path);

@@ -21,13 +21,14 @@ import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from 
 import { contextWindowResolver } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
 import { observedContextLimit, flushObservedContextLimits } from "./context-limits.js";
-import { allObservations, flushEligibility, type EligibilityClass, type EligibilityScope } from "./deployment-eligibility.js";
+import { allFacts, describeScope, flushFacts, type FactKind } from "./target-facts.js";
 import {
   acceptInterpretation,
   flushInterpretations,
   pendingRefusals,
   proposeInterpretation,
   rejectInterpretation,
+  type ScopeTemplate,
 } from "./refusal-interpretation.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { createProxy } from "./server.js";
@@ -565,7 +566,7 @@ export function runProxy() {
       flushRuntimeTelemetry();
       flushProbeCache();
       flushObservedContextLimits();
-      flushEligibility();
+      flushFacts();
       flushInterpretations();
       process.exit(0);
     });
@@ -1338,34 +1339,47 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       process.stdout.write(`rejected — "${entry.normalized}" will keep teaching the router nothing.\n`);
       return;
     }
-    const cls = argValue("--class") as EligibilityClass | undefined;
-    const scope = (argValue("--scope") ?? "deployment") as EligibilityScope;
+    const cls = argValue("--class") as FactKind | undefined;
     const rationale = argValue("--rationale") ?? "";
-    const classes: EligibilityClass[] = ["not-servable", "subscription-required", "allowance-exhausted"];
+    const classes: FactKind[] = ["not-servable", "subscription-required", "allowance-exhausted", "credential-invalid"];
     if (!cls || !classes.includes(cls)) {
       process.stderr.write(`llm-relay eligibility: --class expects one of ${classes.join(" | ")}\n`);
       process.exit(1);
       return;
     }
-    if (scope !== "deployment" && scope !== "account") {
-      process.stderr.write(`llm-relay eligibility: --scope expects "deployment" or "account"\n`);
+    // ⚠ A group needs its MEMBERS named, here and at review time. There is no group registry and
+    // no prefix inference, so the only way a verdict covers a family is by listing the family —
+    // which means whoever accepts it sees exactly what it will cover.
+    const scopeName = argValue("--scope") ?? "deployment";
+    const members = (argValue("--members") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (scopeName === "group" && members.length === 0) {
+      process.stderr.write(`llm-relay eligibility: --scope group requires --members <id,id,...>\n`);
       process.exit(1);
       return;
     }
+    if (!["deployment", "provider", "group", "model"].includes(scopeName)) {
+      process.stderr.write(`llm-relay eligibility: --scope expects deployment | provider | group | model\n`);
+      process.exit(1);
+      return;
+    }
+    const scope: ScopeTemplate = scopeName === "group"
+      ? { kind: "group", members }
+      : { kind: scopeName as "deployment" | "provider" | "model" };
+    const shown = scopeName === "group" ? `group of ${members.length}` : scopeName;
     if (action === "propose") {
       proposeInterpretation(entry.signature, { class: cls, scope, rationale });
       flushInterpretations();
-      process.stdout.write(`proposed ${cls} (${scope}) — not yet binding. Commit with: llm-relay eligibility accept ${idx}\n`);
+      process.stdout.write(`proposed ${cls} (${shown}) — not yet binding. Commit with: llm-relay eligibility accept ${idx}\n`);
       return;
     }
     acceptInterpretation(entry.signature, { override: { class: cls, scope } });
     flushInterpretations();
-    process.stdout.write(`accepted ${cls} (${scope}) — now applied to ${entry.provider}/${entry.model ?? "-"} refusals matching this message.\n`);
+    process.stdout.write(`accepted ${cls} (${shown}) — now applied to ${entry.provider}/${entry.model ?? "-"} refusals matching this message.\n`);
     return;
   }
 
-  const observations = allObservations();
-  process.stdout.write(`\nLearned deployment state — ${observations.length} live observation(s)\n`);
+  const observations = allFacts();
+  process.stdout.write(`\nLearned target facts — ${observations.length} live\n`);
   if (observations.length === 0) {
     process.stdout.write("  (nothing; every deployment is presumed servable until it says otherwise)\n");
   }
@@ -1373,12 +1387,18 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     const mins = Math.max(0, Math.round((o.until - Date.now()) / 60000));
     // Spelled out because the classes are NOT interchangeable and a bare label invites the
     // reading this whole design exists to prevent — that a spent allowance means "paid".
-    const meaning = o.class === "allowance-exhausted"
+    const meaning = o.kind === "allowance-exhausted"
       ? "free, but spent until it refreshes — demoted, never evicted"
-      : o.class === "subscription-required"
+      : o.kind === "subscription-required"
         ? "not covered by our plan — excluded from free pools"
-        : "gone from the provider — excluded from pools";
-    process.stdout.write(`  ${o.key.padEnd(52)} ${o.class} [${o.scope}] ${meaning}; expires in ${mins}m\n`);
+        : o.kind === "credential-invalid"
+          ? "the provider says this key is bad — every deployment behind it demoted"
+          : "gone from the provider — excluded from pools";
+    process.stdout.write(`  ${describeScope(o.scope).padEnd(46)} ${o.kind.padEnd(22)} ${meaning}; expires in ${mins}m\n`);
+    if (o.scope.kind === "group") {
+      // The membership is the whole reason a group verdict is reviewable — show it, always.
+      process.stdout.write(`      covers: ${o.scope.members.join(", ")}\n`);
+    }
   }
 
   process.stdout.write(`\nUnrecognized refusals — ${pending.length} awaiting interpretation\n`);

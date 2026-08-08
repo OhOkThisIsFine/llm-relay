@@ -495,13 +495,24 @@ constrained to the three classes and two scopes, a signature is keyed per (provi
 provider's message can never produce a verdict about another, and the user accepts. Do not weaken
 any of them to "save a step".
 
-Choosing between the three classes:
+Choosing the class, and the scope it applies to:
 
 | The message states | Class | Scope |
 |---|---|---|
-| the model does not exist / is not found for the account | `not-servable` | deployment |
-| a plan or subscription is needed for **this model** | `subscription-required` | deployment |
-| the **account's** credits or allowance are spent | `allowance-exhausted` | account |
+| the model does not exist / is not found for the account | `not-servable` | `deployment` |
+| a plan or subscription is needed for **this model** | `subscription-required` | `deployment` |
+| a plan is needed for a **named family** of models | `subscription-required` | `group` + `--members` |
+| the **account's** credits or allowance are spent | `allowance-exhausted` | `provider` |
+| the **key itself** is invalid / revoked | `credential-invalid` | `provider` |
+
+Scope is the half most worth getting right: `provider` means one observation covers every model
+behind that credential, which is exactly what stops a pool spending one round-trip per member to
+rediscover one balance. But it is also what takes out a whole provider if you are wrong, so
+**scope by what the message states, never by what you infer from a pattern of failures.** Several
+models failing identically is equally several gated models under a working key.
+
+⚠ **A `group` verdict must name its members** (`--members id1,id2`) — there is no family registry
+and no prefix matching, deliberately. If you cannot enumerate the family, use `deployment`.
 
 ⚠ The third is not a cost verdict. A free lane that has spent this period's allowance is still
 free, and marking it otherwise would evict it from every free pool long after the credits refresh.
