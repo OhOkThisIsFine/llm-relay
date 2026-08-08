@@ -6,6 +6,7 @@ import type { MetadataLogger } from "../log.js";
 import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
+import { loadLaneManifest } from "../lane-manifest.js";
 import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
 import { contextWindowResolver } from "../metadata.js";
@@ -256,6 +257,8 @@ export async function handleAdminRoutes(
     const hostParam = parseHostRoutingState(pickQuery(path, "host"));
     const entrypointParam = pickQuery(path, "entrypoint");
     const view = buildDispatch(cfg, {
+      // Cached manifest only — the request path never probes. Absent ⇒ nothing is evicted.
+      manifest: loadLaneManifest(),
       ...(taskParam ? { task: taskParam } : {}),
       ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
       ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
