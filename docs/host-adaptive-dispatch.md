@@ -167,19 +167,43 @@ script as its first argument, which also avoids a shell entirely.
 - **Order, never execution.** Transposition changes how a rung is *rendered*, never the
   ladder's order or the host's authority to pick.
 
+## The migration, done (2026-08-07)
+
+This machine's ladder was collapsed onto the template. Twelve hand-written `claude -p` CLI rungs —
+`claude-deepseek-credits`, `claude-free-pool`, `claude-deepseek-late` across four tiers, each
+carrying its own copy of the same ten-key env block — became twelve `relay` rungs plus one
+`routing.cliLane`. **120 hand-maintained env entries → 10.** Backup:
+`~/.llm-relay/config.json.pre-clilane-2026-08-07.bak`.
+
+Only rungs matching the template *exactly* (command, arg shape, and env) were converted; the
+`--model` argument became the rung's `spec`, so every rung reaches the same deployment it did
+before. `codex-*` and `agy-*` rungs have their own command shapes and stay `cli`.
+
+Verified before and after, across all four tiers and both host states:
+
+- **Bypassed host: the rendered commands are byte-identical** — 24 `run:` lines, diff-clean. The
+  only addition is a `via: routing.cliLane → <spec>` provenance line.
+- **Routed host: behaviour improves.** Those three rungs now render as `target: pool/high` etc.
+  instead of a shell-out, so a terminal session gets an in-process subagent rather than paying to
+  spawn a whole `claude` CLI. This is the point of the migration, not a side effect.
+- **End-to-end:** a transposed `pool/medium` lane was executed and answered, served by
+  `nim/deepseek-ai/deepseek-v4-flash-0731` with failover through `huggingface/moonshotai/Kimi-K3`.
+  Zero primary quota.
+
+The rungs' notes were rewritten at the same time: they described themselves as hand-written CLI
+lanes ("shelling out IS the redirect"), which is now the relay's decision per calling host, not a
+property of the rung. A note should say what a rung is FOR; the mechanism is readable off the
+rendered lane.
+
+⚠ **What this trades:** twelve independent hardcoded copies for one shared point of failure. A
+missing or broken `cliLane` now turns all twelve rungs `[unreachable]` from a bypassed host at
+once, where before each was self-contained. That is the usual deduplication bargain and it is the
+right side of it here — but it is why config load rejects a template without `{spec}` rather than
+warning.
+
 ## Remaining
-
-One optional config change, owner's call — no pending code:
-
-**Collapse the hand-written CLI rungs into `routing.cliLane`.** Adding the template alone is a
-no-op today: the live ladder's only `relay` rung is the Anthropic passthrough, which is never
-transposed. The value arrives when the three per-tier `claude` CLI rungs (`claude-free-pool`,
-`claude-deepseek-credits`, `claude-deepseek-late` — twelve copies of the same ten-key env block
-across four tiers) are rewritten as `relay` rungs plus one template. The behaviour is identical
-from a bypassed host; the difference is that a fourth pool or a fifth tier stops meaning another
-hand-copied env block, and a routed host would then get the real relay rungs instead of a
-shell-out it does not need.
 
 ⚠ **The `Agent` hook installs on a TOGGLE, so an already-on rule does not have it.** This machine
 had `offload claude on` set before v0.20.0; re-running `llm-relay offload claude on` is what
-installs the hook.
+installs the hook. Owner's call — it changes how `Agent(...)` behaves in every Claude session on
+this machine.
