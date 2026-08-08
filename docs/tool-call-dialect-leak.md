@@ -1,7 +1,7 @@
 # Tool-call dialect leaking to the client as text
 
-**Reported 2026-08-08** by an agent running relay-pool dispatches. Mechanism **confirmed in source**;
-the specific incident **not reproduced** (see Status).
+**Reported 2026-08-08** by an agent running relay-pool dispatches. Mechanism **confirmed in source**; **partially fixed in 0.33.0 — the buffered path only**;
+the specific incident **not reproduced** (see Status and Coverage).
 
 ## The report
 
@@ -90,11 +90,30 @@ Constraints it must respect:
 - **Streaming too.** The reported bytes were the tail of a stream, so buffering-from-first-suspicion
   has to work the way `repairStreamingPath` already does.
 
-## Open question
+## Resolved: an unparseable envelope fails clean
 
-Should an unparseable-but-suspicious text block (`<think`, a partial envelope) **fail the request**
-so failover moves to another member, rather than returning text that the client will treat as a
-final answer? Arguments both ways: returning it is honest passthrough, but the client cannot tell it
-from a real answer, which is what made this read as "the job died" for a whole session. Failing it
-would make the member's breaker record the failure and let the pool route around a host that does
-not parse — which is arguably the correct long-run behaviour.
+The open question — return the suspicious text, or fail the request — needed no new policy. The
+repair path already answers it: **unrepairable ⇒ fail clean.** A `detected`-but-unparseable envelope
+now raises `DialectUnparseableError`, served as a retriable 502, so the breaker records it against
+that deployment and the pool fails over to a host that parses. Returning the fragment would hand the
+client a "final answer" that is really the tail of a broken tool call — the misdiagnosis this whole
+path exists to prevent.
+
+## ⚠ Coverage: what is NOT fixed yet
+
+Recovery is wired into `openAiResponseToAnthropic`, which is the **buffered, non-streaming**
+translation. Two gaps remain, and the first is the one that matters most:
+
+1. **Streaming is NOT covered.** The SSE path goes through `handleUniversalStreamRequest` in
+   llm-bridge, not through the buffered mapper. ⚠ **The reported failure was a stream tail** (70
+   bytes of closing tags), and the `claude` CLI streams — so the fix as shipped may not cover the
+   incident that motivated it. Closing this means buffering from first suspicion, the way
+   `repairStreamingPath` already does for tool blocks.
+2. **The OpenAI front's direct passthrough is not covered.** An `openai`-kind client talking to an
+   `openai`-kind backend is not translated at all, so the dialect text reaches that client intact.
+   Lower priority — the harness this exists for speaks Anthropic — but it is the same "two paths,
+   one policy empty" shape the pool-failover incident warns about, so it should not be left
+   indefinitely.
+
+Detection itself is already correct for the truncated case: markers deliberately omit the `<` / `</`
+prefix so a tail of closing tags is recognized. A unit test pins exactly the observed 70-byte body.
