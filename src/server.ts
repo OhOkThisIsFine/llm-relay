@@ -28,6 +28,7 @@ import { estimateRequestTokens, assessCost } from "./metadata.js";
 import { specOfTarget } from "./benchmarks.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
+import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -616,6 +617,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const cls = classifyStatus(backendRes.status);
       const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
       observeAttemptHeaders(h, attempt, backendRes.status, retryAfterMs);
+      observeContextLimit(backendRes, target);
       const localFailure = errorOrigin(backendRes) === "local";
       const tryNext = !localFailure && shouldTryNext(cls);
       if (tryNext && !res.destroyed && i < healthyTargets.length - 1) {
@@ -817,6 +819,42 @@ function beginHealthAttempt(h: Handlers, target: ResolvedTarget, started: number
   return { handle: begun.value, identity, target, started, completed: false };
 }
 
+/**
+ * Learn a deployment's real context ceiling from an error it just returned.
+ *
+ * ⚠ Called from BOTH request paths, right beside `observeAttemptHeaders`, and for the same reason
+ * that helper is shared: this repo has already shipped one defect where the OpenAI front had no
+ * copy of a policy the Anthropic path enforced ("two paths, two policies, one of them empty" — see
+ * docs/pool-failover.md). A learning loop that only ran on one front would silently know less
+ * about half the traffic.
+ *
+ * Never throws and never blocks the response: it reads a CLONE, so the real body is untouched for
+ * streaming or failover, and any failure simply means nothing was learned this time.
+ */
+function observeContextLimit(res: Response, target: ResolvedTarget): void {
+  // Context-length rejections are 400 (OpenAI-compatible) or 413. Anything else is a different
+  // fault, and scanning every error body would be work for nothing.
+  if (res.status !== 400 && res.status !== 413) return;
+  if (target.model === undefined) return;
+  let clone: Response;
+  try {
+    clone = res.clone();
+  } catch {
+    return; // Body already consumed/locked — nothing safe to read.
+  }
+  void clone
+    .text()
+    .then((body) => {
+      if (!looksLikeContextLengthError(body)) return;
+      const stated = parseStatedContextLimit(body);
+      if (stated === null) return;
+      recordObservedContextLimit(target.provider, target.model!, stated);
+    })
+    .catch(() => {
+      // A body that cannot be read teaches us nothing. That is the whole consequence.
+    });
+}
+
 function observeAttemptHeaders(
   h: Handlers,
   attempt: HealthAttempt,
@@ -1010,6 +1048,7 @@ async function openAiFrontPath(
     const cls = classifyStatus(upstream.status);
     const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
     observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs);
+    observeContextLimit(upstream, target);
     const tryNext = localFailure ? false : shouldTryNext(cls);
 
     if (tryNext && !isLast && !res.writableEnded && !res.destroyed) {

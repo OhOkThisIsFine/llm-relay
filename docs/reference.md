@@ -442,11 +442,14 @@ A CLI told to use a model it does not recognize assumes a window and compacts ag
 it. The relay already harvests per-(provider, model) limits for the request-path guardrail, so it
 substitutes the number it has.
 
-Two rungs, **both real publications** — there is deliberately no guessed rung, the same rule that
+Three rungs, **all real measurements** — there is deliberately no guessed rung, the same rule that
 keeps `resolveMetadata` honest and the request-path guardrail silent on an unknown limit:
 
-1. **`provider`** — the serving deployment's own published `contextLength`. Authoritative.
-2. **`snapshot`** — `context_length` from the synced capability data (`docs/tier-data.json`, from
+1. **`observed`** — a ceiling this deployment *stated when it refused an over-length request*.
+   The strongest evidence available: a first-party fact about the exact deployment that will serve
+   the next request. See "Learned limits" below.
+2. **`provider`** — the serving deployment's own published `contextLength`.
+3. **`snapshot`** — `context_length` from the synced capability data (`docs/tier-data.json`, from
    OpenRouter), matched **exactly** on the spec's last segment.
 
 `llm-relay dispatch` prints which rung answered, because a first-party figure and a same-model
@@ -467,19 +470,42 @@ borrow a different SKU's row (`glm-5.2` → `glm-5.2-max`). A wrong capability s
 a wrong context window tells a client it may send tokens the backend will reject, so this path takes
 the stricter rule.
 
-For a **`pool/<name>`**, every member must resolve and the **minimum** is used — failover can land
-the request on any member, so the pool's usable window is its smallest, and one unknown member means
-the floor is unknown rather than that the others' floor applies. In practice a single unresolvable
-model can therefore block a whole pool; `llm-relay dispatch` showing "not published anywhere" for a
-pool usually means one member, not all of them.
+For a **`pool/<name>`**, the **minimum across members that resolve** is used — failover can land the
+request on any member, so the pool's usable window is the smallest one known. An unresolvable member
+does **not** veto the pool; the count of unmeasured members is reported alongside the number, so a
+floor drawn from 28 of 29 members does not read like one drawn from all of them:
 
-**Unknown** drops the env entry entirely rather than setting it empty (which a child would read as
-zero or garbage), leaving the client on its own default.
+```
+   context: 163,840 tokens (synced snapshot, same model id on another host; 1 pool member unmeasured)
+```
+
+**Nothing known at all** drops the env entry entirely rather than setting it empty (which a child
+would read as zero or garbage), leaving the client on its own default.
 
 ⚠ **Do not "fix" an unknown by hand-setting a large value.** The measured pool minimums here are
 131,072–163,840 — *below* the 200k the `claude` CLI already assumes for an unrecognized model. A
 speculative 1M would overshoot the weakest member by six to eight times and overflow the real
 backend, which is strictly worse than the conservative default it replaced.
+
+#### Learned limits (`~/.llm-relay/context-limits.json`)
+
+Providers publish little, but a deployment that *rejects* an over-length request usually states its
+real ceiling in the error message. The proxy reads that and remembers it, so a pool's floor gets
+more accurate the more it is used:
+
+- Fires on a backend **400/413** whose body reads as a context-length rejection, on **both**
+  request paths.
+- Records **only an explicitly stated maximum**. "The request was too long" is *not* recorded — it
+  bounds the ceiling by this proxy's own chars/4 estimate, and a store whose value is that it holds
+  measurements must not accept a guess.
+- Reads a **clone** of the response, so the client's body and any failover are untouched. Every
+  failure path simply learns nothing.
+- Keyed per `(provider, model)`, since the same model id on two hosts is two deployments. A fresh
+  observation always replaces an older one in either direction — the deployment is the authority on
+  its own ceiling — and entries expire after 30 days so a raised ceiling is not disbelieved forever.
+
+This is what makes the "unmeasured member" case self-correcting: the first over-length rejection
+from that member states its ceiling, and the next dispatch reports the corrected floor.
 
 `llm-relay dispatch --next-command -t "<task>"` prints just the runnable line for `next`, for
 callers that want something executable rather than the human ladder.
