@@ -396,6 +396,16 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   configuration and are substituted in args AND env; `{task}` is request content and is substituted
   in args ONLY — config load *rejects* it in an env value, because it would otherwise pass through
   literally while the operator believed it worked.
+  ⚠ **Never put `--permission-mode plan` in a `cliLane` template.** Headless `claude -p` has no
+  `ExitPlanMode` tool, so a lane started in plan mode can never leave it: the agent explores with
+  its tools, writes a plan document into the config dir's `plans/`, and exits `is_error: false`
+  with `permission_denials: []`. Nothing in the result distinguishes "did the work" from "was
+  caged", so the lane looks healthy while completing none of its tasks — this machine's template
+  shipped that way and it read as "offload can't use tools". Tool use and the multi-turn loop were
+  never the problem. Use `acceptEdits` (plus `--allowedTools`, since other shell and network calls
+  still abort without it) for a working lane, or `dontAsk` for a read-only one that fails loudly
+  instead of silently. Measured evidence and the alternatives others use:
+  [docs/offload-agentic-capability.md](docs/offload-agentic-capability.md).
   **`{contextWindow}` has THREE rungs, all real measurements** (`contextWindowResolver` in
   `metadata.ts`): a ceiling this deployment *stated when refusing an over-length request*
   (`context-limits.ts`), then its own published `contextLength`, then `context_length` from the
