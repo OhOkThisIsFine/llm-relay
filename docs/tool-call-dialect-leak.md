@@ -70,9 +70,17 @@ Constraints it must respect:
 - **Parse, never infer.** A closed set of recognized envelopes, like the effort vocabulary in
   `sync-tiers.mjs` and the alias list in `authEnv.ts`. Prose that merely mentions a tool name is not
   a tool call, and guessing one into existence would be fabricating intent.
-- **The destructive refusal still applies.** A reconstructed call is a call: it must go through
-  `destructiveMatcher()` exactly like a repaired one, or the dialect path becomes a way to smuggle
-  a `Bash` call past the guard that repair honours.
+- **The destructive guard needs no new code, and adding one would be wrong.** ⚠ An earlier draft of
+  this section said a reconstructed call must be run through `destructiveMatcher()` or it "smuggles
+  a `Bash` call past the guard". That misread the guard. `DEFAULT_DESTRUCTIVE` stops the RESHAPER —
+  an LLM — from inventing or rewriting a destructive call; it has never blocked a backend from
+  legitimately emitting one, and a normal `Bash` tool_call passes through today. Recovery is a
+  deterministic parse of what the model actually emitted, so a recovered call carries exactly the
+  same authority as one the host parsed itself. Refusing recovered destructive calls would break
+  every agentic task routed through a non-parsing host, which is worse than the risk. The dangerous
+  case — recovered, *invalid*, and destructive — is already covered for free: recovery happens in
+  `backend.ts` before validation, so such a call reaches `repair()` and hits its existing
+  destructive pre-check unchanged.
 - **Re-validate after reconstruction**, same as `repair()` does — a parsed envelope can still carry
   args that violate the schema.
 - **Report it.** A response whose tool call was reconstructed is not the same as one that arrived
