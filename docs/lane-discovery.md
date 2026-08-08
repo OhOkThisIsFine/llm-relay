@@ -54,39 +54,65 @@ mid-request could never return the `tool_use` blocks an HTTP turn owes its calle
 running a diagnostic is not the request path, exactly as `pools --probe` sends real completions that
 the request path would never send. **Nothing on the request path may spawn a CLI.**
 
-## Discovery is not uniform across lanes — the hard part
+## Discovery per lane
 
-| Lane | Mechanism | Cost | Refresh |
+⚠ **An earlier revision of this doc claimed Codex had no list command and that discovery would cost
+one real API call per model.** That was wrong — it was read off `codex --help`'s subcommand list,
+which does not mention it. `codex debug models` ("Render the raw model catalog as JSON") exists, is
+free and offline. Both lanes are cheap to probe; the asymmetry that remains is about *arguments*,
+and it runs the opposite way from what was written.
+
+| Lane | Model list | Per-model argument support | Cost |
 |---|---|---|---|
-| AGY | `agy models` — a real subcommand, lists id + label | ~1 cheap call | freely |
-| Codex | **no list command.** Validity is only observable by *attempting* a model and reading `The '<id>' model is not supported when using Codex with a ChatGPT account.` | one real API call **per model** | sparingly |
+| Codex | `codex debug models` → JSON | **stated**: `supported_reasoning_levels` per model, plus `default_reasoning_level`, `visibility`, `supported_in_api`, `priority` | free, offline |
+| AGY | `agy models` → `id<TAB>label`, nothing else (`--output-format` is not a flag it accepts) | **not stated** — `--effort is not supported for model X` is only observable by sending it | free, offline |
 
-This asymmetry is the main design constraint, and it is why a manifest is required rather than
-probing on demand: Codex discovery **spends the quota the lane exists to conserve**. Consequences:
+So model-id validation is fully solvable for both lanes from a cheap offline command, and can be
+refreshed freely on any schedule. Argument validation splits:
 
-- The manifest must record **when** each lane was probed and by which mechanism, so a Codex entry is
-  understood as a point-in-time attempt rather than a roster reading.
-- Codex probing must be opt-in per run (`--lane codex`), never implied by a bare `lanes --probe`.
-- Argument support is even harder: `--effort is not supported for model X` was discovered by
-  *sending* it. There is no roster of valid flags for either tool, so argument facts can only be
-  learned from a rejection — which argues for recording rejections observed in normal use rather
-  than probing the cross-product of flags and models.
+- **Codex: read from the catalog.** `supported_reasoning_levels` is authoritative and per-model, so
+  `model_reasoning_effort=<x>` can be validated before rendering — no probing, no failed call.
+- **AGY: learn from rejection.** Its roster states nothing about flags. The signal has to come from
+  an observed failure, which fits the existing "the relay never invents the signal" contract and the
+  `POST /dispatch {"exhausted"}` reporting path — but it means the first bad invocation still fails
+  once. Probing the flag×model cross-product is the alternative and is worse: it spends real calls
+  to discover something the vendor could simply publish.
+
+Verified 2026-08-08, and this is what the corrected ladder rests on:
+
+```
+gpt-5.6-sol          list  api=true   pri=1   low,medium,high,xhigh,max,ultra  default=low
+gpt-5.6-terra        list  api=true   pri=2   low,medium,high,xhigh,max,ultra  default=medium
+gpt-5.6-luna         list  api=true   pri=3   low,medium,high,xhigh,max        default=medium
+gpt-5.3-codex-spark  list  api=false  pri=26  low,medium,high,xhigh            default=high
+```
+
+Two things fall out of it:
+
+- **Every effort level the ladder emits is supported** by the model it is emitted for, so there was
+  no second latent bug of the `--effort` kind on the Codex side.
+- **Spark is not unassessed after all.** The capability snapshot has no row for it, but Codex's own
+  catalogue ranks it `priority: 26` — below `gpt-5.4-mini` (23) and far below Luna (3). That is
+  first-party vendor ordering, so its placement last among the Codex rungs is now positively
+  supported rather than merely "no evidence either way". ⚠ It also carries `supported_in_api: false`
+  while an actual `codex exec` run against it succeeds, so that flag evidently means something
+  narrower than "unusable here" — do not evict on it.
 
 ## Open questions for the build
 
-1. Should argument facts be **learned from observed rejections** (the host reports a lane failure
-   back, as `POST /dispatch {"exhausted"}` already does for availability) rather than probed? That
-   fits the existing "the relay never invents the signal" contract and avoids a flag×model probe
-   matrix — but it means the first invocation still fails once.
-2. Does a removed rung disappear entirely from `GET /dispatch`, or remain visible as `evicted` with
+1. Does a removed rung disappear entirely from `GET /dispatch`, or remain visible as `evicted` with
    its reason? Visible-with-reason matches how a blocked `unreachable` rung already explains itself
    on an explicit `?lane=`, and "it silently vanished" is its own debugging problem.
-3. Manifest TTL. A roster reading is cheap to refresh and can expire; a Codex attempt is expensive
-   and should probably persist until contradicted.
+2. Manifest TTL. Both rosters are cheap, so a short TTL is affordable; the question is whether a
+   *learned* AGY argument rejection should expire at all, or persist until contradicted (it is an
+   existence fact about a flag, not a temporal one — arguing for persist).
+3. Should `xhigh` tiers use Codex's `max` / `ultra`? Sol and Terra support both, Luna supports `max`.
+   The ladder currently stops at `xhigh`, leaving headroom unused on the top tier.
 
 ## Interim state
 
 The ladder's ids and arguments were corrected by hand on 2026-08-08 and verified against both tools:
-all four Codex ids (`gpt-5.6-{sol,terra,luna}`, `gpt-5.3-codex-spark`) accepted by the account,
-`gpt-5.6-spark` rejected; AGY ids taken from `agy models`; `--effort` removed from every AGY rung.
-That is a point-in-time fix with no mechanism behind it — it will rot exactly as the last one did.
+Codex ids and their effort levels read from `codex debug models` (`gpt-5.6-spark` does not exist;
+the model is `gpt-5.3-codex-spark`); AGY ids from `agy models`; `--effort` removed from every AGY
+rung. That is a point-in-time fix with no mechanism behind it — it will rot exactly as the last one
+did, which is what this document exists to prevent.
