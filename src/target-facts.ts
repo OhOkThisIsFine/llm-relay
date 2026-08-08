@@ -116,6 +116,16 @@ export const FACT_TTL_MS: Record<FactKind, number> = {
   "rate-limited": 2 * 60 * 1000,
 };
 
+/**
+ * Every fact kind, for callers that must enumerate them (the review CLI's `--class` validation).
+ *
+ * Derived from `FACT_TTL_MS`, which is a `Record<FactKind, …>` and therefore exhaustive by
+ * compiler enforcement — so this list cannot fall behind the type. A hand-maintained copy already
+ * did: `rate-limited` existed in the store while the CLI rejected it, which made the review
+ * command unusable for the one kind it had just gained.
+ */
+export const FACT_KINDS = Object.keys(FACT_TTL_MS) as FactKind[];
+
 /** Facts that make a target unfit for a FREE pool — a statement about cost or existence. */
 const COST_BLOCKING: ReadonlySet<FactKind> = new Set<FactKind>(["not-servable", "subscription-required"]);
 /** Facts that make a target temporarily unusable but leave its pool membership intact. */
