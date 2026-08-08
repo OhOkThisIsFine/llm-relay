@@ -200,6 +200,24 @@ twelve failed for three unrelated reasons and the right move was "use another po
 left alone — it stays the last candidate's real upstream error — so the aggregate rides in a header.
 It appears on successes too, where it warns that a pool is thinning before it runs out.
 
+When the answer came from **below** the requested effort band, the response carries
+`x-llm-relay-degraded: gemini/models/gemini-2.5-flash (below xhigh)`.
+
+An effort pool is its banded members first, then a degrade tail of everything clearing a lower band
+— strongest band first. The tail is reached only after every in-band member has actually failed on
+that request, so a healthy pool behaves exactly as before. This exists because a band selects on
+capability and capability correlates with the providers that meter hardest, so the top band is both
+the narrowest and the first to run dry: measured 2026-08-08, `pool/xhigh` returned 0 served from 12
+members while `pool/low` answered from 46 on the same credentials at the same moment.
+
+⚠ Degradation is automatic but never silent — an unflagged capability downgrade is indistinguishable
+from getting what you asked for. ⚠ A model that clears **no** band is admitted nowhere, tail
+included: unassessed is not the same as weaker.
+
+Ordering also **interleaves providers** within a rank band, so the first N attempts land in N
+distinct quota domains rather than N members sharing one credential. The top-ranked candidate is
+still tried first; interleaving only decides who is tried second.
+
 A failure whose refusals the relay could not interpret also carries
 `x-llm-relay-unknown-refusal: <n>` — a **count, never the message**. The learned-eligibility store
 converges only as fast as somebody explains what an unrecognised refusal means, and a queue that

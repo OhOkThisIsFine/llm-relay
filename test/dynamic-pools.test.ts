@@ -110,6 +110,103 @@ describe("dynamic free-model pools", () => {
     }
   });
 
+  it("gives an exhausted band a degrade tail of measured WEAKER models, never unmeasured ones", async () => {
+    // An effort band selects on capability, and capability correlates with the providers that
+    // meter hardest — so the top band is both the narrowest and the first to run dry. Measured
+    // 2026-08-08: `pool/xhigh` returned 0 served from 12 members while `pool/low` answered from 46
+    // at the same moment on the same credentials. A band with nothing behind it turns "the
+    // strongest models are busy" into "no answer at all".
+    const dir = mkdtempSync(join(tmpdir(), "rp-degrade-pool-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: { free: { base: "https://free.test/v1", kind: "openai", tierType: "free" } },
+        routing: {
+          default: "free/z-ai/glm-5.2",
+          pools: {
+            low: { preferred: [], include: "free", effort: "low" },
+            xhigh: { preferred: [], include: "free", effort: "xhigh" },
+          },
+        },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      await catalog.list("free", cfg.providers.free!, {
+        fetchFn: (async () => new Response(JSON.stringify({ data: [
+          { id: "z-ai/glm-5.2" },              // clears xhigh
+          { id: "moonshotai/kimi-k2.6" },      // clears low/medium/high — NOT xhigh
+          { id: "unknown-unscored-model" },    // clears nothing: unassessed, not weak
+        ] }), { status: 200 })) as unknown as typeof fetch,
+      });
+
+      materializeDynamicPools(cfg, catalog);
+
+      // In-band first, then the weaker measured model. Order matters: the tail is only reached
+      // after every in-band member has actually failed on this request.
+      expect(cfg.routing.pools!.xhigh).toEqual(["free/z-ai/glm-5.2", "free/moonshotai/kimi-k2.6"]);
+      expect(cfg.routing.poolDegraded!.xhigh).toEqual(["free/moonshotai/kimi-k2.6"]);
+
+      // ⚠ The unassessed model is admitted NOWHERE, tail included. "No evidence" is not "weaker";
+      // degrading to a measured weaker model is a considered trade, degrading to one nothing is
+      // known about is a guess wearing the same clothes.
+      expect(cfg.routing.pools!.xhigh).not.toContain("free/unknown-unscored-model");
+      expect(cfg.routing.pools!.low).not.toContain("free/unknown-unscored-model");
+
+      // The weakest band has nothing below it, so it has no tail and reports none.
+      expect(cfg.routing.poolDegraded!.low).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("interleaves providers so failover reaches a different quota domain early", async () => {
+    // Members sharing a credential share their failure — one credit balance, one subscription, one
+    // account rate limit. Ranked by fitness alone they cluster: the real `pool/xhigh` opened with
+    // huggingface, gemini, huggingface, huggingface, so four attempts covered only TWO quota
+    // domains and three of them sat behind one balance.
+    const dir = mkdtempSync(join(tmpdir(), "rp-interleave-pool-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: {
+          a: { base: "https://a.test/v1", kind: "openai", tierType: "free" },
+          b: { base: "https://b.test/v1", kind: "openai", tierType: "free" },
+        },
+        routing: { default: "a/z-ai/glm-5.2", pools: { low: { preferred: [], include: "free", effort: "low" } } },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      // Provider `a` holds three strong models, `b` holds one. Unordered, `a` would take the first
+      // three slots and a caller would spend three attempts inside one quota domain.
+      const listing = (ids: string[]) => (async () =>
+        new Response(JSON.stringify({ data: ids.map((id) => ({ id })) }), { status: 200 })) as unknown as typeof fetch;
+      await catalog.list("a", cfg.providers.a!, { fetchFn: listing(["z-ai/glm-5.2", "moonshotai/kimi-k3", "deepseek-ai/deepseek-v4-pro"]) });
+      await catalog.list("b", cfg.providers.b!, { fetchFn: listing(["moonshotai/kimi-k2.6"]) });
+
+      materializeDynamicPools(cfg, catalog);
+      const pool = cfg.routing.pools!.low!;
+
+      // The single most capable deployment still leads — interleaving decides who is tried SECOND,
+      // never who is tried first, so a healthy pool is unaffected.
+      expect(pool[0]!.startsWith("a/")).toBe(true);
+      // ...and the second attempt lands in the OTHER quota domain.
+      expect(pool[1]!.startsWith("b/")).toBe(true);
+      // Provider `a` keeps its own internal rank order; interleaving never reorders within one.
+      // Compared against `a` materialized ALONE rather than a hardcoded list, so the assertion
+      // survives a capability-snapshot resync changing which of a's models ranks highest.
+      const solo = loadConfig(path);
+      delete solo.providers.b;
+      const soloCatalog = new ModelCatalog({ cachePath: null });
+      await soloCatalog.list("a", solo.providers.a!, { fetchFn: listing(["z-ai/glm-5.2", "moonshotai/kimi-k3", "deepseek-ai/deepseek-v4-pro"]) });
+      materializeDynamicPools(solo, soloCatalog);
+      expect(pool.filter((s) => s.startsWith("a/"))).toEqual(solo.routing.pools!.low);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reuses one materialization within an epoch and invalidates on catalog revision", async () => {
     const dir = mkdtempSync(join(tmpdir(), "rp-pool-cache-"));
     try {

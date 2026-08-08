@@ -63,6 +63,19 @@ export const POOL_ATTEMPTS_HEADER = "x-llm-relay-pool-attempts";
 export const UNKNOWN_REFUSAL_HEADER = "x-llm-relay-unknown-refusal";
 
 /**
+ * This answer came from BELOW the effort band that was asked for.
+ *
+ * An effort pool falls back to lower-banded live members once its own band is exhausted, because a
+ * band with nothing behind it turns "the strongest models are busy" into "no answer at all". That
+ * fallback is automatic — but it must never be silent. A capability downgrade that reads as an
+ * ordinary 200 is indistinguishable from having got what you asked for, which is the failure mode
+ * that lets a caller build on a weaker answer without knowing it did.
+ *
+ * Names the deployment and the band it fell out of, e.g. `groq/llama-3.3-70b (below xhigh)`.
+ */
+export const DEGRADED_HEADER = "x-llm-relay-degraded";
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both

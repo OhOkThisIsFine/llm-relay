@@ -108,6 +108,17 @@ export interface Routing {
   /** Dynamic pool policies are normalized separately from their materialized target arrays. */
   poolPolicies?: Record<string, PoolPolicy>;
   /**
+   * Pool → the specs in its DEGRADE TAIL: live members below the pool's effort band, appended so
+   * an exhausted band still has somewhere to go.
+   *
+   * Materialized alongside `pools`, never written to config.json — it is derived state, and the
+   * same refresh that rebuilds a pool rebuilds this. It exists so a served response can say the
+   * answer came from below the requested band: degrading automatically is only acceptable if it is
+   * never silent, since a capability downgrade that reads as an ordinary success is indistinguishable
+   * from having got what you asked for.
+   */
+  poolDegraded?: Record<string, string[]>;
+  /**
    * Tier → spec for SUBAGENT requests only (`cc_is_subagent=true`). Lets the dispatcher pick a
    * destination with the one per-call knob it actually has — the Agent tool's `model` enum
    * (sonnet|opus|haiku|fable) — without writing an agent file. `default` catches anything that

@@ -459,6 +459,11 @@ A pool's error response is ONE member's error. Two headers tell you what actuall
 - `x-llm-relay-pool-attempts: 15 tried, 0 served: 6x402, 3x403, 6x429` — the whole walk. Four
   distinct causes behind one 402 means the answer is "use another pool", not "go buy credits".
 - `x-llm-relay-unknown-refusal: <n>` — `n` refusals said something the relay could not interpret.
+- `x-llm-relay-degraded: <spec> (below <band>)` — the request **succeeded**, but was answered by a
+  model below the effort band you asked for, because the band was exhausted. Treat the output
+  accordingly and say so when reporting: a task dispatched to `pool/xhigh` that came back from a
+  `low`-band model got a weaker answer than requested, and the caller cannot know that unless you
+  pass it on.
 
 **On a pool failure, run `llm-relay eligibility`.** It shows what the backends have proven about
 themselves and, at the bottom, the refusals awaiting interpretation. The store only converges as

@@ -17,7 +17,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -379,6 +379,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // bug and invisible to the operator. A bad directive is a client routing error
   // (400) like any other unresolvable spec.
   let targetCandidates: ResolvedTarget[];
+  // Hoisted out of the try: the served response has to say whether the answer came from below the
+  // requested effort band, and that is only knowable from the pool that was actually addressed.
+  let degradedSpecs: Set<string> | null = null;
+  let addressedPool: string | null = null;
   try {
     // A SUBAGENT request may route somewhere other than its nominal model: either an explicit
     // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it),
@@ -392,6 +396,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     // in place, and it must not reach the backend even when the spec matches the nominal model.
     if (subSpec !== null) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
     targetCandidates = resolveTargets(routedModel, cfg);
+    if (typeof routedModel === "string" && routedModel.startsWith("pool/")) {
+      addressedPool = routedModel.slice("pool/".length);
+      const tail = cfg.routing.poolDegraded?.[addressedPool];
+      degradedSpecs = tail && tail.length > 0 ? new Set(tail) : null;
+    }
 
     // The freeOnly guard: rerouted-by-offload traffic must not spend money. Enforced on the
     // RESOLVED candidates, not the spec — a pool lists free and paid members side by side, and
@@ -524,6 +533,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       path,
       hadTools,
       req,
+      addressedPool,
+      degradedSpecs,
     }, h);
     return;
   }
@@ -663,7 +674,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       } else {
         const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
         pool429.recordFinal(backendRes.status);
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount() }, h);
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount(), degraded: degradedLabel(addressedPool, degradedSpecs, target) }, h);
       }
       return;
     } finally {
@@ -700,6 +711,20 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
  *
  * Stable within each band, so the already-computed deployment fitness still decides among equals.
  */
+/**
+ * `"<spec> (below <band>)"` when this answer came from the pool's degrade tail, else null.
+ *
+ * The "loudly" half of automatic degradation. Falling back to a weaker live model is the right
+ * behaviour — a band with nothing behind it turns "the strongest models are busy" into "no answer
+ * at all" — but only because the caller is told. An unannounced downgrade is indistinguishable
+ * from getting what you asked for.
+ */
+function degradedLabel(pool: string | null, degraded: Set<string> | null, target: ResolvedTarget): string | null {
+  if (pool === null || degraded === null) return null;
+  const spec = specOfTarget(target);
+  return degraded.has(spec) ? `${spec} (below ${pool})` : null;
+}
+
 /** Is a learned allowance exhaustion still cooling this target? Never throws — no store, no cooling. */
 function cooledByAllowance(t: ResolvedTarget, now: number): boolean {
   try {
@@ -883,6 +908,8 @@ interface Ctx {
   poolSummary?: string | null;
   /** Unrecognized refusals among the candidates stepped over. See the caveat at the emit site. */
   poolUnknownRefusals?: number | null;
+  /** Set when the answering deployment came from the pool's degrade tail. See `degradedLabel`. */
+  degraded?: string | null;
   /**
    * The target this response actually came from — the resolved (provider, model)
    * after tier/pool expansion, subagent redirection and failover. Every log record
@@ -1136,6 +1163,9 @@ async function openAiFrontPath(
     path: string;
     hadTools: boolean;
     req?: IncomingMessage;
+    /** The pool addressed, and its degrade tail — so a below-band answer can say so. */
+    addressedPool?: string | null;
+    degradedSpecs?: Set<string> | null;
   },
   h: Handlers,
 ): Promise<void> {
@@ -1250,6 +1280,8 @@ async function openAiFrontPath(
     try {
       const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
+      const degradedBy = degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target);
+      if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
       // Same aggregate as the Anthropic path, from the same tracker — the two fronts having
       // separate copies of one policy is the defect this file has already shipped once.
       pool429.recordFinal(upstream.status);
@@ -1330,6 +1362,7 @@ async function transparentPath(
   // `writeHead`, which reorders a path that streams; the skill's "check eligibility on a pool
   // failure" reflex covers the gap at no risk.
   if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
+  if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   res.writeHead(backendRes.status, responseHeaders);
   let assistant: AssistantMessage | null = null;
   try {
