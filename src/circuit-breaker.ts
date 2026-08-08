@@ -457,6 +457,35 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     state.credentialFaultUntil = at + CREDENTIAL_FAULT_TTL_MS;
   }
 
+  /**
+   * Drop every credential fault recorded against one provider's deployments.
+   *
+   * Called when the shared credential has been PROVEN good — a served request on any deployment
+   * behind that key. Those per-deployment 401s were symptoms of one problem: while a key was bad
+   * or missing, each model that happened to be tried recorded its own fault with its own expiry,
+   * so after a rotation the pool stayed artificially narrow until the last of them aged out.
+   *
+   * ⚠ Only ever called for a **stated** credential fact that has just been disproved, never on any
+   * success. A bare 403 is equally an entitlement wall on one gated model, and clearing those
+   * whenever a sibling succeeds would re-try the gated model after every single successful
+   * request — a permanent waste loop instead of a one-time recovery.
+   *
+   * Returns how many were cleared, so a caller can log a recovery rather than guess at one.
+   */
+  clearProviderCredentialFaults(provider: string): number {
+    const prefix = `${provider}/`;
+    let cleared = 0;
+    for (const [key, state] of this.states) {
+      if (key !== provider && !key.startsWith(prefix)) continue;
+      if (state.credentialFaultUntil === 0 && state.credentialFailures === 0) continue;
+      state.credentialFaultUntil = 0;
+      state.credentialFailures = 0;
+      delete state.lastCredentialStatus;
+      cleared += 1;
+    }
+    return cleared;
+  }
+
   /** True while a recent 401/403 makes this target a last resort. Expires, so a fixed key recovers. */
   hasCredentialFault(target: CircuitTarget, now = Date.now()): boolean {
     const state = this.states.get(this.getKey(target));

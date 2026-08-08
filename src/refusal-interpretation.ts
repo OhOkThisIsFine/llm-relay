@@ -278,6 +278,20 @@ export const SEED_INTERPRETATIONS: Array<{
     scope: { kind: "provider" },
     note: "stated bad credential; covers every deployment behind that key",
   },
+  {
+    // A 429 that names the ACCOUNT, ORGANIZATION or KEY rather than the model — every sibling
+    // behind that credential is equally throttled, so discovering it once per model is the waste.
+    //
+    // ⚠ Narrow on purpose. An ordinary 429 is one deployment's back-pressure and must stay on the
+    // breaker's per-target cooldown, which handles it well; only wording that states an
+    // account-level limit belongs here. Matching plain "rate limit exceeded" would demote whole
+    // providers on routine throttling — worse than the problem.
+    status: (s) => s === 429,
+    pattern: /(?:account|organization|organisation|project|api\s+key|workspace)[^.]{0,40}\b(?:rate\s*limit|quota|requests?\s+per)|\b(?:rate\s*limit|quota)[^.]{0,24}\bfor\s+(?:your|this)\s+(?:account|organization|organisation|project|key)/,
+    class: "rate-limited",
+    scope: { kind: "provider" },
+    note: "stated account-level throttling; every deployment behind the key is limited",
+  },
 ];
 
 function load(path: string): InterpretationStore {

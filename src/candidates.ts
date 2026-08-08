@@ -7,6 +7,7 @@ import { findTierModel, type TierData } from "./tier-data.js";
 import { keyIsPresent } from "./authEnv.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
+import { describeScope, factsFor } from "./target-facts.js";
 import { getRealWorldScore, loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { loadTierData } from "./registry.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
@@ -61,6 +62,18 @@ export interface Candidate {
     lastCredentialStatus: number | null;
     credentialFault: boolean;
   };
+  /**
+   * What this deployment (or its provider, or its group) has STATED about itself — the learned
+   * facts from `target-facts.ts`, each with the scope it applies at.
+   *
+   * Separate from `breaker` on purpose, and for the same reason credential faults are: these are
+   * not health measurements, they are things a backend said. The breaker fields describe how a
+   * deployment has been behaving; these describe what it is entitled to. A member cooling on an
+   * account-wide credit balance and one cooling on its own repeated timeouts look identical in
+   * `breaker` alone, and they call for completely different responses — one is "wait or switch
+   * provider", the other is "this deployment is sick".
+   */
+  facts: Array<{ kind: string; scope: string; expiresInMs: number }>;
   /** Observed real traffic through this proxy (not synthetic probes). */
   observed: {
     totalCalls: number;
@@ -352,6 +365,11 @@ export async function buildCandidates(
         lastCredentialStatus: state?.lastCredentialStatus ?? null,
         credentialFault: breaker.hasCredentialFault(spec, nowMs),
       },
+      facts: factsFor(provider, model, { now: nowMs }).map((f) => ({
+        kind: f.kind,
+        scope: describeScope(f.scope),
+        expiresInMs: Math.max(0, f.until - nowMs),
+      })),
       observed: obs
         ? {
             totalCalls: obs.totalCalls,

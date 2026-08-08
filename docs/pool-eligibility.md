@@ -260,15 +260,34 @@ to the review tier and binds only once accepted.
 `authEnv.ts` refuses, and a wrong match here evicts a working family. The reviewer sees exactly
 which models a group verdict covers before accepting it.
 
-### Staged, not done
+### Where the breaker fits
 
-Landed: the scoped store, all four scopes, eligibility migrated onto it, and `credential-invalid` at
-provider scope — so a *stated* bad key is learned once instead of once per model.
+The breaker keeps its per-deployment axes, deliberately. They are the right home for behaviour that
+really is per-deployment: this model's back-pressure, this model's repeated timeouts, this model's
+entitlement wall. What moved to the fact store is only what a backend **states** about a wider
+scope, and the two now compose rather than compete:
 
-Not yet: `circuit-breaker.ts` still keys its own credential-fault and rate-limit cooldowns
-per-deployment, so a bare 401 or an account-level 429 is still rediscovered per model; and
-`context-limits.ts` remains a separate store (it is correctly scoped already, so folding it in is
-tidiness rather than a fix). Both are mechanical follow-ons now that the scope model exists.
+- `rate-limited` (provider scope) exists for a 429 that names the *account*, *organization* or
+  *key*. An ordinary 429 still produces no fact and stays entirely on the breaker's cooldown —
+  matching plain throttling would demote whole providers on routine back-pressure, which is worse
+  than the problem it solves.
+- `credential-invalid` (provider scope) covers a *stated* bad key. A bare 401/403 still produces no
+  fact, because it is equally an entitlement wall on one gated model.
+- **A proven credential clears its own symptoms.** While a key is bad, every model that happens to
+  be tried records its own credential fault on its own clock, so after a rotation the pool stayed
+  artificially narrow until the last of them aged out. A served request proves the shared
+  credential works, so `clearFacts` reports which provider-scoped facts it disproved and the
+  breaker drops that provider's credential faults together. ⚠ Only on a disproved *stated* fact,
+  never on any success — clearing bare 403s whenever a sibling succeeds would re-try gated models
+  after every successful request, a permanent waste loop instead of a one-time recovery.
+
+`/candidates` now carries a `facts` array per deployment, separate from `breaker`, because "cooling
+on an account-wide credit balance" and "cooling on its own repeated timeouts" are identical in the
+breaker fields and call for opposite responses.
+
+`context-limits.ts` remains its own store. It is already correctly scoped per (provider, model), so
+folding it in would be tidiness, not a fix — and it is the one store whose parsing rules are
+genuinely specific to what it reads.
 
 ## Still open
 

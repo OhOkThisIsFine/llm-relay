@@ -45,7 +45,16 @@ export type FactKind =
   /** Free, and spent until the allowance refreshes (402 naming a credit balance). */
   | "allowance-exhausted"
   /** The credential itself is rejected — stated, e.g. "invalid api key". NOT inferred from 401s. */
-  | "credential-invalid";
+  | "credential-invalid"
+  /**
+   * Rate limited at a scope the response STATED — "your account has exceeded its rate limit".
+   *
+   * ⚠ This is not where ordinary 429s go. A bare 429 is one deployment's back-pressure and belongs
+   * to the breaker's per-target cooldown, which already handles it well. This kind exists only for
+   * the case the breaker cannot express: a limit the provider says belongs to the ACCOUNT, where
+   * every sibling is equally throttled and discovering that once per model is the waste.
+   */
+  | "rate-limited";
 
 /**
  * Who a fact applies to, specific → general. Resolution walks this order and stops at the first
@@ -101,12 +110,16 @@ export const FACT_TTL_MS: Record<FactKind, number> = {
   "subscription-required": 24 * 60 * 60 * 1000,
   "allowance-exhausted": 60 * 60 * 1000,
   "credential-invalid": 15 * 60 * 1000,
+  // Short, and almost always superseded by a stated reset: a rate limit window is minutes, and
+  // believing a stale one keeps working capacity idle. `RATE_LIMIT_COOLDOWN_MS` in the breaker is
+  // the same figure for the same reason — the two must not disagree about when to try again.
+  "rate-limited": 2 * 60 * 1000,
 };
 
 /** Facts that make a target unfit for a FREE pool — a statement about cost or existence. */
 const COST_BLOCKING: ReadonlySet<FactKind> = new Set<FactKind>(["not-servable", "subscription-required"]);
 /** Facts that make a target temporarily unusable but leave its pool membership intact. */
-const COOLING: ReadonlySet<FactKind> = new Set<FactKind>(["allowance-exhausted", "credential-invalid"]);
+const COOLING: ReadonlySet<FactKind> = new Set<FactKind>(["allowance-exhausted", "credential-invalid", "rate-limited"]);
 
 let _store: FactStore | null = null;
 let _path: string | null = null;
@@ -281,17 +294,28 @@ export function cooldownUntil(
  * ⚠ A group fact is cleared only if this model is IN the group — one member serving says nothing
  * about the others, and dropping the whole verdict would re-admit models that are genuinely gated.
  */
-export function clearFacts(provider: string, model: string | null | undefined, opts: { path?: string } = {}): void {
+export function clearFacts(
+  provider: string,
+  model: string | null | undefined,
+  opts: { path?: string } = {},
+): FactKind[] {
   const path = opts.path ?? defaultPath();
   const store = load(path);
   const m = typeof model === "string" ? model : null;
+  const cleared: FactKind[] = [];
   let changed = false;
   for (const [key, fact] of Object.entries(store.facts)) {
     if (!covers(fact, provider, m)) continue;
-    delete store.facts[key];
     changed = true;
+    // Reported back so the caller can clear the SYMPTOMS of a fact that has just been disproved.
+    // A stated bad credential leaves a per-deployment 401 on the breaker for every model that
+    // tried during the outage; when the key starts working, those are stale evidence about a
+    // problem that no longer exists, and expiring them one by one keeps the pool narrow.
+    if (fact.scope.kind === "provider") cleared.push(fact.kind);
+    delete store.facts[key];
   }
   if (changed) writer.touch(() => persist(path));
+  return cleared;
 }
 
 /** Every live fact, for `llm-relay eligibility`. Expired entries are omitted, not reported. */
