@@ -7,7 +7,7 @@ import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./p
 import { loadPersistedSamples, loadProbeCache, type ProbeCacheData } from "./ping/probe-cache.js";
 import { getStabilityScore } from "./ping/metrics.js";
 import { assessCost } from "./metadata.js";
-import { isCostBlocked } from "./deployment-eligibility.js";
+import { isCostBlocked } from "./target-facts.js";
 
 export const DYNAMIC_POOL_RANKING_EPOCH_MS = 30_000;
 

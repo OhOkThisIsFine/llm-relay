@@ -374,13 +374,28 @@ backends have since stated, and what has not been understood yet:
 llm-relay eligibility
 ```
 
-Three verdicts, and they are **not interchangeable**:
+Four verdicts, and they are **not interchangeable**:
 
 | Verdict | Means | Effect |
 |---|---|---|
 | `not-servable` | the model is gone from the provider | excluded from pools |
 | `subscription-required` | exists, but is not covered by our plan | excluded from **free** pools |
 | `allowance-exhausted` | free, but spent until it refreshes | **demoted only**, expires by itself |
+| `credential-invalid` | the provider says this key is bad | **demoted only**, cleared by any success |
+
+Each is stored at the **scope its evidence supports**, and lookups resolve most-specific-first:
+
+| Scope | Covers | Typical evidence |
+|---|---|---|
+| `deployment` | one (provider, model) | "this model requires a subscription" |
+| `group` | an explicit list of models on one provider | a family-wide gate, members named |
+| `provider` | every deployment behind that credential | a credit balance, a revoked key |
+| `model` | the same id wherever served | reference-grade only; never cost or availability |
+
+⚠ Scope comes from what the evidence **states**, never from counting failures — several models
+failing identically is equally several gated models under a working key. ⚠ A `group` carries its own
+member list; there is no family registry and no prefix inference, so a group verdict can never
+quietly widen to a model nobody reviewed.
 
 ⚠ The last is never treated as "paid" — a free account that has spent this period's credits is the
 normal state of a working free lane, not a discovery about price. It is scoped to the **account**,
@@ -392,6 +407,7 @@ Resolve one by researching what that message means for that provider and model o
 
 ```
 llm-relay eligibility propose 1 --class subscription-required --scope deployment --rationale "..."
+llm-relay eligibility propose 2 --class subscription-required --scope group --members pro-1,pro-2 --rationale "..."
 llm-relay eligibility accept 1 --class subscription-required --scope deployment
 llm-relay eligibility reject 1
 ```

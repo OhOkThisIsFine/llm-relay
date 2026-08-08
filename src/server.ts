@@ -29,8 +29,8 @@ import { specOfTarget } from "./benchmarks.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
-import { clearEligibility, cooldownUntil, isCostBlocked, recordEligibility } from "./deployment-eligibility.js";
-import { interpretRefusal, recordUnknownRefusal } from "./refusal-interpretation.js";
+import { clearFacts, cooldownUntil, isCostBlocked, recordFact } from "./target-facts.js";
+import { interpretRefusal, materializeScope, recordUnknownRefusal } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -1014,7 +1014,11 @@ function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs
       recordUnknownRefusal(target.provider, target.model, status, body);
       return true;
     }
-    recordEligibility(target.provider, target.model, verdict, { retryAfterMs });
+    // The verdict's scope TEMPLATE becomes a concrete scope here, using this request's provider
+    // and model. A provider-scoped verdict therefore covers every deployment behind that
+    // credential from one observation — which is the whole point: a stated credit balance or a
+    // rejected key is one fact, and rediscovering it once per model is pure waste.
+    recordFact(verdict.class, materializeScope(verdict.scope, target.provider, target.model), { retryAfterMs });
   } catch {
     /* learning is best-effort and never in the request's way */
   }
@@ -1080,7 +1084,7 @@ function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: num
   // month recovers well before the TTL would have expired, with no restart. Same contract as the
   // breaker clearing a credential fault on success.
   try {
-    clearEligibility(attempt.target.provider, attempt.target.model ?? null);
+    clearFacts(attempt.target.provider, attempt.target.model ?? null);
   } catch {
     /* best-effort */
   }
