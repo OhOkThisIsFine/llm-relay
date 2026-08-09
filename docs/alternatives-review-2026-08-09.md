@@ -297,13 +297,47 @@ was dropped in V23 — free tier permanently retired, 402 once the $5 trial cred
 1. **No context-window advertisement.** Claude Code warned `"auto" is not a model this version
    recognizes` and assumed 200k. That is the exact problem `contextWindowResolver`'s three rungs
    solve, and freellmapi does not solve it either — a genuine wash, not a regression.
-2. `requested_model` / `served_model` are null in the `requests` table, and no response header names
-   the serving deployment. You lose the `x-llm-relay-degraded` style announcement.
+2. ~~No response header names the serving deployment.~~ **Wrong — corrected 2026-08-09 by reading
+   the source.** It sets `X-Routed-Via: <platform>/<modelId>` on all three fronts, plus
+   `X-Provider` / `X-Model` on the chat path. What is genuinely absent is the *walk census*
+   (`x-llm-relay-pool-attempts`, "13 tried, 0 served: 4×402, 5×429…") and the capability-downgrade
+   announcement (`x-llm-relay-degraded`). `requested_model` / `served_model` are null in the
+   `requests` table, but `platform` + `model_id` are recorded there.
 3. **It phones home every 12h** to `api.freellmapi.co` for the catalog. Signed and verified, so not a
    control channel — but it is not loopback-only, which llm-relay is by design.
 4. No refusal-interpretation / eligibility-learning equivalent. Membership correctness comes from the
    curated catalog instead, which is the *upstream* answer to the same problem and arguably better —
    but it is monthly on the free tier.
+
+## Feature-parity audit (source-read 2026-08-09, after adoption)
+
+Verified by reading `freellmapi/server/src`, not inferred.
+
+**Present, contrary to my first pass:** `POST /v1/messages/count_tokens` (heuristic estimate); a
+per-request token-budget guardrail (`REQUEST_MAX_TOKENS_BUDGET`, plus
+`MAX_CONSECUTIVE_UPSTREAM_FAILS`); and served-deployment headers (above).
+
+**Genuinely absent — what llm-relay had and this does not:**
+
+| Capability | Status in freellmapi |
+|---|---|
+| **Schema validation + LLM repair of tool args** | Partial. `lib/tool-args.ts` repairs *double-encoded* JSON args, schema-aware and deterministic — it never invents a value. There is no Ajv verdict and no reshaper model, so genuinely schema-violating args pass through unrepaired. |
+| **Destructive-tool refusal** | Absent. Nothing corresponds to `DEFAULT_DESTRUCTIVE`. Note its dialect rescue *constructs* `tool_calls` from text (its own tests cover `Bash`), with no destructive filter on that path. |
+| Refusal interpretation (signature → verdict) | Absent. Cooldowns + penalties instead. |
+| Learned eligibility facts w/ scope (`not-servable`, `subscription-required`, `allowance-exhausted`) | Absent. Curated upstream catalog instead. |
+| Explicit free/paid cost class + `freeOnly` guard | Absent (every provider is free-tier by construction). |
+| `credentialMode` / Anthropic passthrough containment | N/A — it is never the Anthropic path. |
+| Subagent detection (`cc_is_subagent`, agent-id header) | **Absent.** No per-subagent routing at all. |
+| Anthropic `document` blocks / PDF transcoding | Absent — no MarkItDown path. |
+| Dispatch ladder / peer-CLI lanes | Absent (never a proxy feature). |
+| Locally-synced capability ranking with provenance | Absent. `intelligenceRank`/`speedRank` come from the curated catalog, with no `signal_count`. |
+| Pool-walk census + degrade announcement | Absent (see the header note above). |
+
+**What it has that llm-relay never did:** request-side prompt compression (3 modes), an opt-in
+response cache, an MCP server at `/mcp`, AES-256-GCM encrypted key storage behind one unified token,
+sticky sessions + context handoff on model switch, p50/p95/TTFT analytics, embeddings/media/
+transcription routing, bandit exploration, encrypted DB backups, outbound SOCKS/HTTP proxy support,
+and a 60-language dashboard.
 
 ## Verdict
 
