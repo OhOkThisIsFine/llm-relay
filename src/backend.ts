@@ -3,6 +3,7 @@ import { buildAuthHeaders, readCredential } from "./authEnv.js";
 import { type ResolvedTarget } from "./config.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
+import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
 
 /**
@@ -445,7 +446,12 @@ export async function fetchBackend(
     }
     try {
       const anthStream = handleUniversalStreamRequest(preflight.body, "openai", "anthropic");
-      return new Response(anthStream, { status: res.status, headers: { "content-type": "text/event-stream" } });
+      // Recover a tool call this host returned as raw dialect TEXT. Gated on the request actually
+      // declaring tools: with none declared there is no call to recover, and wrapping the stream
+      // would add holdback latency for nothing.
+      const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
+      const body = schemas.size > 0 ? recoverDialectInStream(anthStream, schemas) : anthStream;
+      return new Response(body, { status: res.status, headers: { "content-type": "text/event-stream" } });
     } catch (e) {
       return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
     }

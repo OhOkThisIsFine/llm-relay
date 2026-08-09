@@ -1,7 +1,7 @@
 # Tool-call dialect leaking to the client as text
 
-**Reported 2026-08-08** by an agent running relay-pool dispatches. Mechanism **confirmed in source**; **partially fixed in 0.33.0 — the buffered path only**;
-the specific incident **not reproduced** (see Status and Coverage).
+**Reported 2026-08-08** by an agent running relay-pool dispatches. Mechanism **confirmed in source**; fixed for the buffered path in 0.33.0 and for **streaming in
+0.34.0**; the specific incident **not reproduced** (see Status and Coverage).
 
 ## The report
 
@@ -104,16 +104,28 @@ path exists to prevent.
 Recovery is wired into `openAiResponseToAnthropic`, which is the **buffered, non-streaming**
 translation. Two gaps remain, and the first is the one that matters most:
 
-1. **Streaming is NOT covered.** The SSE path goes through `handleUniversalStreamRequest` in
-   llm-bridge, not through the buffered mapper. ⚠ **The reported failure was a stream tail** (70
-   bytes of closing tags), and the `claude` CLI streams — so the fix as shipped may not cover the
-   incident that motivated it. Closing this means buffering from first suspicion, the way
-   `repairStreamingPath` already does for tool blocks.
+1. ~~Streaming is NOT covered.~~ **Closed in 0.34.0.** `dialect-stream.ts` wraps the translated SSE
+   stream: text streams through until a marker lands, then everything after it is withheld and
+   recovered at stream end. `scanForMarker` supplies a holdback bounded by the longest marker, so a
+   marker split across deltas is never half-emitted and ordinary prose containing `<` keeps
+   streaming — buffering every tool-bearing request would have traded this bug for a latency
+   regression on all pool traffic. A truncated envelope becomes a mid-stream SSE `error`, which is
+   CLAUDE.md's stated alternative to a 502 once headers are gone.
+   ⚠ **`markerStart` must back up over the tag opener.** Markers omit the `<` / `</` prefix so a
+   CLOSING tag matches, which means a hit points one character past the real start; capturing from
+   there left the `<` behind as prose and handed `stripEnvelopes` a tag it no longer recognized, so
+   the envelope's outer wrapper survived into the recovered text. A test pins it.
 2. **The OpenAI front's direct passthrough is not covered.** An `openai`-kind client talking to an
    `openai`-kind backend is not translated at all, so the dialect text reaches that client intact.
    Lower priority — the harness this exists for speaks Anthropic — but it is the same "two paths,
    one policy empty" shape the pool-failover incident warns about, so it should not be left
    indefinitely.
+
+Verified 2026-08-08 against the live relay: streaming tool calls through `pool/high`, `pool/xhigh`
+and `openrouter/deepseek/deepseek-v4-flash-0731` all return proper `tool_use` blocks with
+`stop_reason: tool_use`, no SSE error and no dialect text — i.e. the wrapper is a no-op on hosts
+that parse. Recovery itself could not be verified against a live leaking host (all cost-blocked),
+so it rests on unit tests built from the exact observed bytes.
 
 Detection itself is already correct for the truncated case: markers deliberately omit the `<` / `</`
 prefix so a tail of closing tags is recognized. A unit test pins exactly the observed 70-byte body.

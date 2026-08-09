@@ -67,6 +67,51 @@ export function detectDialect(text: string): string | null {
   return null;
 }
 
+const ALL_MARKERS: readonly string[] = DIALECT_MARKERS.flatMap((d) => d.markers);
+const LONGEST_MARKER = Math.max(...ALL_MARKERS.map((m) => m.length));
+
+/**
+ * How much of a partial text stream is safe to forward, and whether a marker has landed.
+ *
+ * The streaming-needle problem: a marker arrives split across SSE deltas, so forwarding each delta
+ * as it comes would emit the first half of an envelope before we know it is one. `safeLen` is
+ * everything except the longest trailing run that could still GROW into a marker, so the caller can
+ * stream normally while never emitting into an envelope it is about to capture.
+ *
+ * ⚠ The holdback is bounded by the longest marker, so ordinary prose containing `<` streams with at
+ * most that many characters of lag — it does not degrade into buffering the whole response, which
+ * would trade this bug for a latency regression on every tool-bearing request.
+ */
+export function scanForMarker(text: string): { safeLen: number; hit: boolean } {
+  if (ALL_MARKERS.some((m) => text.includes(m))) return { safeLen: text.length, hit: true };
+  const start = Math.max(0, text.length - (LONGEST_MARKER - 1));
+  for (let i = start; i < text.length; i++) {
+    const tail = text.slice(i);
+    if (ALL_MARKERS.some((m) => m.startsWith(tail))) return { safeLen: i, hit: false };
+  }
+  return { safeLen: text.length, hit: false };
+}
+
+/**
+ * Index at which a marker begins, for splitting emitted prose from a captured envelope.
+ *
+ * ⚠ Backs up over the tag opener. Markers deliberately omit the `<` / `</` prefix so a CLOSING tag
+ * matches, which means a `｜DSML｜tool_calls` hit points one character PAST the real start. Capturing
+ * from there left the `<` behind as prose and handed `stripEnvelopes` a tag it no longer recognized,
+ * so the envelope's outer wrapper survived into the recovered text.
+ */
+export function markerStart(text: string): number {
+  let best = -1;
+  for (const m of ALL_MARKERS) {
+    const i = text.indexOf(m);
+    if (i >= 0 && (best === -1 || i < best)) best = i;
+  }
+  if (best <= 0) return best;
+  if (text.startsWith("</", Math.max(0, best - 2)) && best >= 2) return best - 2;
+  if (text[best - 1] === "<") return best - 1;
+  return best;
+}
+
 /** Coerce a stringly-typed dialect parameter using the tool's declared schema. */
 function coerce(raw: string, schema: SchemaLike | undefined): unknown {
   const t = Array.isArray(schema?.type) ? schema?.type[0] : schema?.type;
