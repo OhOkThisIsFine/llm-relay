@@ -4,3 +4,7 @@ analysis-reports/
 config.json
 *.local.json
 *.log
+# /audit-code run output — multi-MB reports regenerated per run. Durable conclusions
+# belong in docs/, never in the raw artifacts. Same reasoning as analysis-reports/.
+.audit-tools/
+.audit-code/
