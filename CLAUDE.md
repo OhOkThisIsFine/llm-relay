@@ -570,7 +570,18 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 
 ## Status & open work
 
-**Nothing is pending in the code.** (Re-verified 2026-08-04 after the goals review: the
+⚠ **Four confirmed defects are open** — [docs/audit-2026-08-09.md](docs/audit-2026-08-09.md).
+From a full `/audit-code` run on 2026-08-09: `argValue()` re-reads an option's VALUE as a flag
+(`cli.ts`, reachable from an untrusted Agent prompt via `claude-hook.ts` — parser confusion, NOT
+command injection); `DEFAULT_DESTRUCTIVE` omits Codex's `shell_command`/`apply_patch` while Codex
+is a first-class client; the ping probe follows redirects carrying `x-api-key`; and `winenv`'s
+scope merge is case-sensitive against a case-insensitive `process.env`, so Machine beats User.
+None are fixed. ⚠ The run produced 676 findings but **only 6 were verified against source** — the
+rest are advisory output from the Codex offload lane and their severities are a model's estimate,
+so do not treat that report as a to-do list. Raw artifacts live in `.audit-tools/` and are
+deliberately untracked.
+
+**Otherwise nothing is pending in the code.** (Re-verified 2026-08-04 after the goals review: the
 half-adopted kernel contract surface — the one open item this line previously missed — was
 resolved by deletion; what remains of `src/kernel/` is fully adopted.) A full audit was
 remediated to completion and its follow-up list closed in v0.12.0; the audit apparatus, its
