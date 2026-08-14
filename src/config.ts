@@ -534,7 +534,7 @@ export interface Config {
   walkBudgetMs?: number;
   /** Maximum inbound request-body size in bytes. Absent ⇒ 36 MiB. */
   maxBodyBytes?: number;
-  log: { level: "metadata" | "silent"; file: string | null };
+  log: { level: "metadata" | "silent"; file: string | null; maxBytes?: number };
   /**
    * Providers the onboarding nudge must stop asking about (`leave_me_alone` in config.json).
    *
@@ -877,9 +877,19 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     ? repairRaw.destructiveTools.filter((s): s is string => typeof s === "string")
     : DEFAULT_DESTRUCTIVE;
 
-  const logRaw = (c.log ?? {}) as { level?: unknown; file?: unknown };
+  const logRaw = (c.log ?? {}) as { level?: unknown; file?: unknown; maxBytes?: unknown };
   const level = logRaw.level === "silent" ? "silent" : "metadata";
   const file = typeof logRaw.file === "string" ? logRaw.file : null;
+  let logMaxBytes: number | undefined;
+  if (logRaw.maxBytes !== undefined) {
+    const maxConfiguredLogBytes = 1024 * 1024 * 1024;
+    if (!Number.isSafeInteger(logRaw.maxBytes) || (logRaw.maxBytes as number) <= 0 || (logRaw.maxBytes as number) > maxConfiguredLogBytes) {
+      throw new Error(
+        `config.log.maxBytes must be a positive integer no greater than ${maxConfiguredLogBytes}; got ${JSON.stringify(logRaw.maxBytes)}`,
+      );
+    }
+    logMaxBytes = logRaw.maxBytes as number;
+  }
 
   const walkBudgetRaw = (c as { walkBudgetMs?: unknown }).walkBudgetMs;
   let walkBudgetMs: number | undefined;
@@ -918,7 +928,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     repair: { maxAttempts, destructiveTools },
     ...(walkBudgetMs !== undefined ? { walkBudgetMs } : {}),
     ...(maxBodyBytes !== undefined ? { maxBodyBytes } : {}),
-    log: { level, file },
+    log: { level, file, ...(logMaxBytes !== undefined ? { maxBytes: logMaxBytes } : {}) },
     ...(leaveMeAlone.length > 0 ? { leaveMeAlone } : {}),
     sourcePath: path,
     ...(warnings.length > 0 ? { warnings } : {}),

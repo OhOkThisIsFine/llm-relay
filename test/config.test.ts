@@ -987,3 +987,24 @@ describe("loadConfig — maxBodyBytes", () => {
     },
   );
 });
+
+describe("loadConfig — log.maxBytes", () => {
+  it("accepts a positive integer within the configured bound", () => {
+    const c = loadConfig(write("log-max-ok.json", base({
+      log: { level: "metadata", file: "proxy.jsonl", maxBytes: 50 * 1024 * 1024 },
+    })));
+    expect(c.log.maxBytes).toBe(50 * 1024 * 1024);
+  });
+
+  it("is absent when not configured — the logger applies its 50 MiB default", () => {
+    expect(loadConfig(write("log-max-absent.json", base())).log.maxBytes).toBeUndefined();
+  });
+
+  it.each([0, -1, 1.5, 1024 * 1024 * 1024 + 1, "50MB"])(
+    "rejects invalid log.maxBytes value %j and names the field",
+    (maxBytes) => {
+      expect(() => loadConfig(write("log-max-invalid.json", base({ log: { maxBytes } }))))
+        .toThrow(/log\.maxBytes/);
+    },
+  );
+});
