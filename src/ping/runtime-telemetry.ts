@@ -142,8 +142,19 @@ export function getRealWorldScore(
 
   if (!m || m.totalCalls < minCalls) return null;
 
-  const successRate = m.successCalls / m.totalCalls;
-  const avgLatency = m.totalLatencyMs / m.totalCalls;
+  // Score from the ROLLING WINDOW, not lifetime totals (adoption review §1.10): a model that
+  // degrades today must not hide behind months of good lifetime averages — before this,
+  // freshness entered only as the 15%-weight time-since-last-call term, so a run of recent
+  // failures barely moved a veteran's score. Lifetime totals still gate minimum evidence
+  // (`totalCalls < minCalls` above) and remain the fallback when a caller demands more samples
+  // than the window holds.
+  const windowed = m.recentCalls.length >= minCalls ? m.recentCalls : null;
+  const successRate = windowed
+    ? windowed.filter((c) => c.ok).length / windowed.length
+    : m.successCalls / m.totalCalls;
+  const avgLatency = windowed
+    ? windowed.reduce((s, c) => s + c.latencyMs, 0) / windowed.length
+    : m.totalLatencyMs / m.totalCalls;
   const speedScore = Math.max(0, Math.min(100, 100 * (1 - avgLatency / 5000)));
   const recencyHours = ((opts.now ?? Date.now()) - m.lastCalledAt) / (1000 * 60 * 60);
   const recencyScore = Math.max(0, Math.min(100, 100 * (1 - recencyHours / 24)));
