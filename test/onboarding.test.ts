@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
-import { getOnboardingStatusList, runInteractiveOnboarding } from "../src/onboarding.js";
+import { getOnboardingStatusList, runInteractiveOnboarding, saveKeysToEnv } from "../src/onboarding.js";
 import { loadConfig, type Config } from "../src/config.js";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -156,5 +156,38 @@ describe("interactive onboarding path creation and edge cases", () => {
 
     const list = getOnboardingStatusList(cfg);
     expect(list.find((s) => s.provider === "noauth")?.hasKey).toBe(true);
+  });
+});
+
+describe("saveKeysToEnv — the key file is owner-only (adoption review §1.12)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "relay-envmode-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writes KEY=\"VALUE\" lines, escaping embedded quotes", () => {
+    const envPath = join(dir, ".env");
+    saveKeysToEnv(envPath, { A_KEY: "plain", B_KEY: 'has"quote' });
+    const text = readFileSync(envPath, "utf8");
+    expect(text).toContain('A_KEY="plain"');
+    expect(text).toContain('B_KEY="has\\"quote"');
+  });
+
+  it.skipIf(process.platform === "win32")("creates the file 0600 and its directory 0700", () => {
+    const envPath = join(dir, "made", ".env");
+    saveKeysToEnv(envPath, { A_KEY: "v" });
+    expect(statSync(envPath).mode & 0o777).toBe(0o600);
+    expect(statSync(join(dir, "made")).mode & 0o777).toBe(0o700);
+  });
+
+  it.skipIf(process.platform === "win32")("re-restricts a pre-existing wide file on save", () => {
+    const envPath = join(dir, ".env");
+    writeFileSync(envPath, "OLD=1\n", { mode: 0o644 });
+    saveKeysToEnv(envPath, { A_KEY: "v" });
+    expect(statSync(envPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(envPath, "utf8")).toContain("OLD=1");
   });
 });
