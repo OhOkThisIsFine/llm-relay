@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { getAvg, getP95, getJitter, getSpikeRate, getUptime, getStabilityScore, getVerdict, type PingRecord } from "../src/ping/metrics.js";
 import { extractQuotaPercent, buildPingRequest, pingProviderModel } from "../src/ping/ping.js";
 import {
@@ -335,5 +335,29 @@ describe("Proxy Health Endpoints", () => {
     } finally {
       proxy.close();
     }
+  });
+});
+
+describe("real-world score freshness (adoption review §1.10)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-rt-window-"));
+  const path = join(dir, "runtime-telemetry.json");
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("a model that degrades today cannot hide behind its lifetime average", () => {
+    // 60 good calls, then 50 recent failures: the lifetime success rate is still ~55%, but the
+    // rolling window — which is what the score now reads — is all failures.
+    for (let i = 0; i < 60; i++) recordModelCall("prov", "m", { ok: true, latencyMs: 200 }, { path });
+    for (let i = 0; i < 50; i++) recordModelCall("prov", "m", { ok: false, latencyMs: 200 }, { path });
+
+    const score = getRealWorldScore("prov", "m", { minCalls: 5, path });
+    expect(score).not.toBeNull();
+    // Lifetime-average scoring put this at ~72; windowed scoring collapses the success term.
+    expect(score!).toBeLessThan(45);
+  });
+
+  it("…and recovers just as fast when the window refills with successes", () => {
+    for (let i = 0; i < 50; i++) recordModelCall("prov", "m", { ok: true, latencyMs: 200 }, { path });
+    const score = getRealWorldScore("prov", "m", { minCalls: 5, path });
+    expect(score!).toBeGreaterThan(70);
   });
 });
