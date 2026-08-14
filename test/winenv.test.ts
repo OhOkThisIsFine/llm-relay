@@ -50,6 +50,36 @@ describe("recoverWindowsEnv", () => {
     expect(env.GROQ_API_KEY).toBe("gsk_real");
   });
 
+  it("lets User scope win case-insensitively while preserving its key spelling", () => {
+    const env: NodeJS.ProcessEnv = {};
+    const readScopes = (key: string): Record<string, string> => key.startsWith("HKLM")
+      ? { PROVIDER_KEY: "machine-value", PATH: "C:\\machine" }
+      : { Provider_Key: "user-value", Path: "C:\\user-fragment" };
+
+    recoverWindowsEnv(env, { platform: "win32", read: readScopes });
+
+    const readCaseInsensitive = (name: string): string | undefined => {
+      const match = Object.keys(env).find((candidate) => candidate.toUpperCase() === name.toUpperCase());
+      return match ? env[match] : undefined;
+    };
+    expect(readCaseInsensitive("PROVIDER_KEY")).toBe("user-value");
+    expect(Object.keys(env)).toContain("Provider_Key");
+    expect(Object.keys(env)).not.toContain("PROVIDER_KEY");
+    expect(readCaseInsensitive("PATH")).toBeUndefined();
+  });
+
+  it("checks an existing launcher environment case-insensitively", () => {
+    const env: NodeJS.ProcessEnv = { Provider_Key: "from-launcher" };
+    const r = recoverWindowsEnv(env, {
+      platform: "win32",
+      read: read({ PROVIDER_KEY: "from-registry" }),
+    });
+
+    expect(env.Provider_Key).toBe("from-launcher");
+    expect(env.PROVIDER_KEY).toBeUndefined();
+    expect(r.skipped).toContain("PROVIDER_KEY");
+  });
+
   it("NEVER imports PATH — the User scope holds a fragment, not the effective value", () => {
     // Importing it wholesale replaces a complete PATH with a partial one and breaks executable
     // lookup; `node.exe` stops resolving. Measured the hard way.

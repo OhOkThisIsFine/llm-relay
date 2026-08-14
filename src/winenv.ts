@@ -43,6 +43,22 @@ export interface WinEnvResult {
  */
 const NEVER_IMPORT = new Set(["PATH", "PATHEXT", "TEMP", "TMP", "PROMPT", "PSMODULEPATH", "COMSPEC"]);
 
+function normalizedEnvName(name: string): string {
+  return name.toUpperCase();
+}
+
+/** Merge registry scopes using Windows' case-insensitive name semantics. Later scopes win. */
+function mergeScopes(...scopes: Array<Record<string, string>>): Array<[string, string]> {
+  const merged = new Map<string, [string, string]>();
+  for (const scope of scopes) {
+    for (const [name, value] of Object.entries(scope)) {
+      // Store the winning entry, not just its value, so User-scope spelling survives too.
+      merged.set(normalizedEnvName(name), [name, value]);
+    }
+  }
+  return [...merged.values()];
+}
+
 /** Parse `reg query` output: lines of `    NAME    REG_SZ    value`. */
 export function parseRegQuery(text: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -91,15 +107,25 @@ export function recoverWindowsEnv(
 
   const read = opts.read ?? readScope;
   // Machine first, then User — User wins on a conflict, matching how Windows itself composes them.
-  const merged = { ...read("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"), ...read("HKCU\\Environment") };
+  const merged = mergeScopes(
+    read("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"),
+    read("HKCU\\Environment"),
+  );
 
-  for (const [name, value] of Object.entries(merged)) {
-    if (NEVER_IMPORT.has(name.toUpperCase())) continue;
+  for (const [name, value] of merged) {
+    const normalizedName = normalizedEnvName(name);
+    if (NEVER_IMPORT.has(normalizedName)) continue;
     // The shared presence predicate, so a whitespace-only exported variable counts as ABSENT
     // and does not shadow a real value in the registry. Presence has one definition here.
-    if (keyIsPresent(env[name])) {
+    const existingNames = Object.keys(env).filter((candidate) => normalizedEnvName(candidate) === normalizedName);
+    if (existingNames.some((candidate) => keyIsPresent(env[candidate]))) {
       result.skipped.push(name);
       continue;
+    }
+    // A plain injected object can hold differently-cased duplicates even though process.env on
+    // Windows cannot. Remove blank aliases so the winning registry spelling is observable there.
+    for (const existingName of existingNames) {
+      if (existingName !== name) delete env[existingName];
     }
     env[name] = value;
     result.loaded.push(name);
