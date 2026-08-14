@@ -139,11 +139,11 @@ describe("server-safety features (CP-NODE-1)", () => {
     }
   });
 
-  it("package.json requires node >= 20 engine", () => {
+  it("package.json requires node >= 22 engine", () => {
     // Resolved from this file, not from cwd: a relative read silently picks up whichever
     // package.json the runner happened to be launched next to.
     const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
     const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
-    expect(pkg.engines?.node).toBe(">=20");
+    expect(pkg.engines?.node).toBe(">=22");
   });
 });
