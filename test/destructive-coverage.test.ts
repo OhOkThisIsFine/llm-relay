@@ -15,9 +15,12 @@ import { DEFAULT_DESTRUCTIVE } from "../src/config.js";
 describe("destructive-tool coverage (ARC-4e8f64b6)", () => {
   const isDestructive = destructiveMatcher(DEFAULT_DESTRUCTIVE);
 
-  it("refuses the harness's real destructive tools", () => {
+  it("refuses the clients' real destructive tools", () => {
     // The whole point: repair output may run under --dangerously-skip-permissions.
-    for (const name of ["Bash", "BashOutput", "Write", "Edit", "MultiEdit", "NotebookEdit"]) {
+    for (const name of [
+      "Bash", "BashOutput", "Write", "Edit", "MultiEdit", "NotebookEdit",
+      "shell_command", "apply_patch",
+    ]) {
       expect(isDestructive(name), `${name} must be treated as destructive`).toBe(true);
     }
   });
@@ -26,6 +29,8 @@ describe("destructive-tool coverage (ARC-4e8f64b6)", () => {
     expect(isDestructive("bash")).toBe(true);
     expect(isDestructive("WRITE")).toBe(true);
     expect(isDestructive("mUlTiEdIt")).toBe(true);
+    expect(isDestructive("SHELL_COMMAND")).toBe(true);
+    expect(isDestructive("ApPlY_pAtCh")).toBe(true);
   });
 
   it("does NOT refuse safe tools that merely share a fragment", () => {
@@ -55,6 +60,8 @@ describe("destructive-tool coverage (ARC-4e8f64b6)", () => {
     expect(DEFAULT_DESTRUCTIVE).toContain("Bash");
     expect(DEFAULT_DESTRUCTIVE).toContain("Write");
     expect(DEFAULT_DESTRUCTIVE).toContain("Edit");
+    expect(DEFAULT_DESTRUCTIVE).toContain("shell_command");
+    expect(DEFAULT_DESTRUCTIVE).toContain("apply_patch");
     expect(DEFAULT_DESTRUCTIVE).toContain("remove");
     // "push" and "force" as bare fragments were the false-positive source.
     expect(DEFAULT_DESTRUCTIVE).not.toContain("push");
@@ -76,17 +83,20 @@ describe("destructive-tool coverage (ARC-4e8f64b6)", () => {
  */
 describe("destructive-tool matching POLICY (not a fixed example set)", () => {
   const isDestructive = destructiveMatcher(DEFAULT_DESTRUCTIVE);
-  /** Every Claude Code tool that writes, deletes or executes. Update when the harness adds one. */
-  const HARNESS_MUTATING = ["Bash", "BashOutput", "Write", "Edit", "MultiEdit", "NotebookEdit"];
+  /** Every first-party client tool that writes, deletes or executes. Update when a client adds one. */
+  const CLIENT_MUTATING = [
+    "Bash", "BashOutput", "Write", "Edit", "MultiEdit", "NotebookEdit",
+    "shell_command", "apply_patch",
+  ];
   /** Harness tools that only read or search — refusing these breaks working sessions. */
   const HARNESS_READONLY = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite", "Task"];
   const exactPatterns = DEFAULT_DESTRUCTIVE.filter((p) => !p.endsWith("*"));
 
-  it("covers the WHOLE harness mutating set, not a sample of it", () => {
-    const uncovered = HARNESS_MUTATING.filter((n) => !isDestructive(n));
-    expect(uncovered, `harness tools left unguarded: ${uncovered.join(", ")}`).toEqual([]);
+  it("covers the WHOLE first-party client mutating set, not a sample of it", () => {
+    const uncovered = CLIENT_MUTATING.filter((n) => !isDestructive(n));
+    expect(uncovered, `client tools left unguarded: ${uncovered.join(", ")}`).toEqual([]);
     // And the list is the mechanism, so a name can only be covered by being on it.
-    expect(HARNESS_MUTATING.every((n) => DEFAULT_DESTRUCTIVE.includes(n))).toBe(true);
+    expect(CLIENT_MUTATING.every((n) => DEFAULT_DESTRUCTIVE.includes(n))).toBe(true);
   });
 
   it("matches EVERY configured pattern, in any case", () => {
@@ -118,7 +128,7 @@ describe("destructive-tool matching POLICY (not a fixed example set)", () => {
     // An empty `repair.destructiveTools` must refuse nothing, so coverage is always
     // traceable to config rather than to a hidden table in src/.
     const none = destructiveMatcher([]);
-    for (const n of [...HARNESS_MUTATING, ...HARNESS_READONLY]) expect(none(n)).toBe(false);
+    for (const n of [...CLIENT_MUTATING, ...HARNESS_READONLY]) expect(none(n)).toBe(false);
   });
 });
 
