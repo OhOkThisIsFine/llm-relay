@@ -14,6 +14,7 @@ import {
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { restrictSecretFileOnWindows } from "./secret-file-acl.js";
 
 /** Header carried by local CLI control requests. */
 export const CONTROL_AUTHORIZATION_HEADER = "x-llm-relay-control-token";
@@ -100,9 +101,11 @@ function parseCapability(raw: string): string {
 }
 
 function restrictFile(path: string): void {
-  // POSIX mode bits are meaningful and enforceable. Windows does not expose an equivalent ACL
-  // primitive through node:fs; the exclusive create mode remains the best portable baseline.
-  if (process.platform !== "win32") chmodSync(path, FILE_MODE);
+  if (process.platform === "win32") {
+    restrictSecretFileOnWindows(path);
+    return;
+  }
+  chmodSync(path, FILE_MODE);
 }
 
 function readInstalledCapability(path: string): string | undefined {

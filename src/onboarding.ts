@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import type { Config, ProviderTierType } from "./config.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
 import { keyIsPresent } from "./authEnv.js";
+import { restrictSecretFileOnWindows } from "./secret-file-acl.js";
 
 export interface OnboardingStatus {
   provider: string;
@@ -175,9 +176,9 @@ export async function runInteractiveOnboarding(cfg?: Config, opts?: { envPath?: 
  *
  * The .env holds every provider key, yet it was born with default (world-readable) mode while
  * the far less sensitive control token got 0600/0700 — adoption review §1.12. Create restricted
- * and re-restrict on every save so a pre-existing wide file converges. POSIX bits only: Windows
- * has no fs mode equivalent, and %USERPROFILE% inheritance already scopes ACLs to the owner
- * there (the same position `control-authorization.ts` takes).
+ * and re-restrict on every save so a pre-existing wide file converges. On Windows the shared
+ * secret-file hardener removes inherited ACEs and explicitly grants the current user full access;
+ * its failure is best-effort and never turns key persistence into an availability failure.
  */
 export function saveKeysToEnv(envPath: string, addedKeys: Record<string, string>): void {
   const envDir = dirname(envPath);
@@ -191,4 +192,5 @@ export function saveKeysToEnv(envPath: string, addedKeys: Record<string, string>
   // already-existing case.
   appendFileSync(envPath, "\n" + envLines + "\n", { mode: 0o600 });
   if (process.platform !== "win32") chmodSync(envPath, 0o600);
+  restrictSecretFileOnWindows(envPath);
 }
