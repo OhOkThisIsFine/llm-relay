@@ -639,3 +639,57 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
   });
 });
 
+
+describe("410 Gone is a fact about one member — fail over, and learn only stated EOL", () => {
+  // Observed live 2026-08-07: NVIDIA answered 410 End-of-Life for retired deepseek models while
+  // sibling deployments served fine. 410 sat in the non-retriable "client" class, so the
+  // retirement returned straight to the client with healthy pool members standing by — and the
+  // discard path never read the body, so nothing was learned either (adoption review §1.4).
+  // ≥2 candidates throughout, per this file's header warning.
+  const EOL_BODY = JSON.stringify({
+    error: { message: "Model deepseek-ai/deepseek-v4-flash has reached end of life.", type: "gone" },
+  });
+
+  it("openai front: fails over past a 410 and records not-servable from stated EOL wording", async () => {
+    const a = await scripted(() => ({ status: 410, body: EOL_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+    // Status + wording agreed the deployment is gone → excluded from free pools…
+    expect(isCostBlocked("p1", "m1")).toBe(true);
+    // …and the verdict cannot leak to the sibling that served.
+    expect(isCostBlocked("p2", "m2")).toBe(false);
+  });
+
+  it("anthropic front: same policy — one classifyStatus, both paths", async () => {
+    const a = await scripted(() => ({ status: 410, body: EOL_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", max_tokens: 20, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+    expect(isCostBlocked("p1", "m1")).toBe(true);
+  });
+
+  it("a bare 410 fails over but teaches NOTHING — status alone is not a statement", async () => {
+    const a = await scripted(() => ({ status: 410, body: JSON.stringify({ error: { message: "Gone" } }) }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(b.calls()).toBe(1);
+    expect(isCostBlocked("p1", "m1")).toBe(false);
+  });
+});

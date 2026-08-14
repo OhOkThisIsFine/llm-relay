@@ -475,6 +475,20 @@ export const SEED_INTERPRETATIONS: Array<{
     note: "stated non-existence; catalog rot",
   },
   {
+    // NVIDIA NIM retires models with HTTP 410 and end-of-life wording (observed on this machine
+    // 2026-08-07: deepseek-v4-pro/-flash). Status and wording must AGREE the model is gone: a bare
+    // 410 stays uninterpreted and queues for research, and this wording on a non-410 status must
+    // not retire a live model (an advisory notice or status-page quote MENTIONING a retirement is
+    // still just text). Phrase set fork-validated in freellmapi's retirement classifier — on a 410
+    // even the softer "no longer available" wording is status-agreed gone.
+    status: (s) => s === 410,
+    pattern:
+      /end[\s-]of[\s-]life|has\s+been\s+(?:retired|decommissioned|sunset|removed|discontinued|deprecated)|no\s+longer\s+(?:available|offered|supported)|is\s+deprecated|was\s+removed/,
+    class: "not-servable",
+    scope: { kind: "deployment" },
+    note: "stated end-of-life on a gone-shaped status; the deployment is permanently retired",
+  },
+  {
     // A credential the provider says is bad — "invalid api key", "authentication failed". A fact
     // about the KEY, so it covers every deployment behind it: without this, each model on that
     // provider independently discovers the same 401 and expires on its own clock.
