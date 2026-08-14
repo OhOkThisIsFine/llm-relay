@@ -173,9 +173,10 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
 
 ### Failover (both fronts, one policy)
 
-- **429 / 5xx / 400 / 402 / 404** → recorded as a breaker failure, next candidate tried. A
+- **429 / 5xx / 400 / 402 / 404 / 410** → recorded as a breaker failure, next candidate tried. A
   `Retry-After` sets that candidate's cooldown for exactly as long as the provider asked;
-  402 (depleted credits) cools for 1 hour.
+  402 (depleted credits) cools for 1 hour. A 410 whose body states end-of-life additionally
+  records a `not-servable` fact, so a retired model stops burning a walk slot per request.
 - **401 / 403** → next candidate tried, but the fault is recorded on its own axis so
   `llm-relay candidates` shows `AUTH 401` instead of hiding it. It expires after 5 minutes, so a
   rotated key recovers with no restart.
@@ -183,6 +184,10 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
   identically.
 - **Every candidate failed** → the last real upstream error, never a synthesized one. If every
   failure was a 429, the served `Retry-After` is the earliest across the pool.
+- **Walk budget** — a wall-clock ceiling on *starting* further attempts, so a deep pool cannot
+  spend `members × timeoutMs` on one request. The first two attempts are always allowed and an
+  attempt in flight is never aborted. Default 45 s; tune with top-level `"walkBudgetMs"` in
+  config.json (`0` disables).
 
 Health **demotes** candidates, never drops them (live → credential-faulted → cooling). Responses
 carry `x-llm-relay-served-by`: the deployment that served, or on error every deployment tried,

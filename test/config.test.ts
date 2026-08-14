@@ -953,3 +953,19 @@ describe("ergonomics: env expansion, overrides, reshaper", () => {
     delete process.env.TEST_KEY_BLANK;
   });
 });
+
+describe("loadConfig — walkBudgetMs", () => {
+  it("accepts a non-negative number, floors it, and preserves 0 (disabled)", () => {
+    expect(loadConfig(write("wb-ok.json", base({ walkBudgetMs: 30000.9 }))).walkBudgetMs).toBe(30000);
+    expect(loadConfig(write("wb-zero.json", base({ walkBudgetMs: 0 }))).walkBudgetMs).toBe(0);
+  });
+
+  it("is absent when not configured — the server applies its own default", () => {
+    expect(loadConfig(write("wb-absent.json", base())).walkBudgetMs).toBeUndefined();
+  });
+
+  it("rejects a negative or non-numeric value loudly", () => {
+    expect(() => loadConfig(write("wb-neg.json", base({ walkBudgetMs: -1 })))).toThrow(/walkBudgetMs/);
+    expect(() => loadConfig(write("wb-str.json", base({ walkBudgetMs: "45s" })))).toThrow(/walkBudgetMs/);
+  });
+});
