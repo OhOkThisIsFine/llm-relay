@@ -142,6 +142,8 @@ export interface Routing {
    */
   offload?: OffloadConfig;
   benchmarkSort?: boolean;
+  /** Ephemeral session affinity. Boolean shorthand uses the 30m/1,000-entry defaults. */
+  sticky?: StickyConfig;
   /**
    * Ordered dispatch ladder consulted by `/dispatch` — which LANE a host agent should hand a
    * whole delegated task to, and in what order to fall back. Distinct from `subagents`, which
@@ -165,6 +167,14 @@ export interface Routing {
    */
   cliLane?: CliLaneTemplate;
 }
+
+export interface StickyRoutingConfig {
+  enabled: boolean;
+  ttlMs?: number;
+  maxSessions?: number;
+}
+
+export type StickyConfig = boolean | StickyRoutingConfig;
 
 /**
  * Template for rendering a `relay` rung as a shelled-out CLI command.
@@ -1074,6 +1084,7 @@ function parseRouting(
     offload?: unknown;
     subagents?: unknown;
     benchmarkSort?: unknown;
+    sticky?: unknown;
     ladder?: unknown;
     ladders?: unknown;
     cliLane?: unknown;
@@ -1185,6 +1196,8 @@ function parseRouting(
   const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
   const offload = parseOffload(r.offload);
   const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
+  const sticky = parseSticky(r.sticky);
+  if (sticky) routing.sticky = sticky;
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
@@ -1269,6 +1282,49 @@ function parseRouting(
     }
   }
   return routing;
+}
+
+function parseSticky(raw: unknown): StickyRoutingConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === "boolean") {
+    return { enabled: raw, ttlMs: 1_800_000, maxSessions: 1000 };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`config.routing.sticky must be a boolean or an object`);
+  }
+
+  const sticky = raw as Record<string, unknown>;
+  if (typeof sticky.enabled !== "boolean") {
+    throw new Error(`config.routing.sticky.enabled must be a boolean`);
+  }
+
+  let ttlMs = 1_800_000;
+  if (sticky.ttlMs !== undefined) {
+    if (
+      typeof sticky.ttlMs !== "number" ||
+      !Number.isFinite(sticky.ttlMs) ||
+      sticky.ttlMs < 1000 ||
+      sticky.ttlMs > 86_400_000
+    ) {
+      throw new Error(`config.routing.sticky.ttlMs must be between 1000 and 86400000 ms (1s to 24h)`);
+    }
+    ttlMs = Math.floor(sticky.ttlMs);
+  }
+
+  let maxSessions = 1000;
+  if (sticky.maxSessions !== undefined) {
+    if (
+      typeof sticky.maxSessions !== "number" ||
+      !Number.isFinite(sticky.maxSessions) ||
+      sticky.maxSessions < 10 ||
+      sticky.maxSessions > 100_000
+    ) {
+      throw new Error(`config.routing.sticky.maxSessions must be an integer between 10 and 100000`);
+    }
+    maxSessions = Math.floor(sticky.maxSessions);
+  }
+
+  return { enabled: sticky.enabled, ttlMs, maxSessions };
 }
 
 /** Parse the legacy global switch or the independently keyed client-rule form. */

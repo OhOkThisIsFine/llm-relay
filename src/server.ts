@@ -53,6 +53,12 @@ import {
   validateControlAuthorization,
   type ControlAuthorizationPort,
 } from "./control-authorization.js";
+import {
+  deriveSessionKey,
+  STICKY_PROVENANCE_HEADER,
+  STICKY_SESSION_HEADER,
+  StickySessionManager,
+} from "./session-pin.js";
 
 export { baseLog, logSafePath } from "./request-log.js";
 
@@ -61,7 +67,7 @@ const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-encoding", "host",
 ]);
-const INTERNAL_REQUEST_HEADERS = new Set(["x-codex-turn-metadata", CONTROL_AUTHORIZATION_HEADER]);
+const INTERNAL_REQUEST_HEADERS = new Set(["x-codex-turn-metadata", STICKY_SESSION_HEADER, CONTROL_AUTHORIZATION_HEADER]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
 
 // `MAX_TASK_LEN` lived here until the admin routes moved to `routes/admin.ts`, which owns the
@@ -211,6 +217,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const catalog = deps.catalog ?? new ModelCatalog();
   const pingLoop = deps.pingLoop ?? new PingLoop(cfg, catalog);
   const breaker = deps.breaker ?? new CircuitBreaker();
+  const stickyConfig = cfg.routing.sticky;
+  const stickySessions = stickyConfig === true || (typeof stickyConfig === "object" && stickyConfig.enabled)
+    ? new StickySessionManager(typeof stickyConfig === "object" ? stickyConfig : undefined)
+    : undefined;
   let controlAuthorization: ControlAuthorizationPort | undefined;
   if (deps.controlAuthorization !== undefined) {
     controlAuthorization = deps.controlAuthorization ?? undefined;
@@ -284,6 +294,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       catalog,
       pingLoop,
       breaker,
+      ...(stickySessions ? { stickySessions } : {}),
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
     }).catch((e) => {
@@ -330,6 +341,7 @@ interface Handlers {
   catalog: ModelCatalog;
   pingLoop?: PingLoop;
   breaker: CircuitBreaker;
+  stickySessions?: StickySessionManager;
   controlAuthorization?: ControlAuthorizationPort;
   server: Server;
 }
@@ -478,13 +490,38 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // to promote: a target the breaker is cooling steps aside, everything else keeps
   // its fitness order. (The re-sort was invisible for as long as an untracked target
   // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
-  let healthyTargets = orderByUsability(targetCandidates, h.breaker);
-
   // The OpenAI front (Chat Completions / Responses) is detected BEFORE the context guardrail so
   // the guardrail covers it: both fronts resolve concrete target deployments, and the estimator
   // walks all three wire shapes. The front went without this pruning until 0.17.0 — the same
   // "two paths, two policies, one of them empty" failure mode as the pool-failover incident.
   const openAiFrontProtocol = detectOpenAiFrontProtocol(req.method, pathname);
+
+  const routingNow = Date.now();
+  let healthyTargets = orderByUsability(targetCandidates, h.breaker, routingNow);
+  let sticky: StickyRequestContext | null = null;
+  if ((isMessages || openAiFrontProtocol) && h.stickySessions) {
+    const key = deriveSessionKey(req.headers, reqJson);
+    if (key) {
+      const pinnedSpec = h.stickySessions.getPin(key, routingNow);
+      sticky = {
+        key,
+        multiCandidateRoute: targetCandidates.length > 1,
+        provenance: null,
+      };
+      if (pinnedSpec) {
+        const applied = applyStickyOrdering(
+          healthyTargets,
+          targetCandidates,
+          pinnedSpec,
+          h.breaker,
+          degradedSpecs,
+          routingNow,
+        );
+        healthyTargets = applied.targets;
+        sticky.provenance = `${pinnedSpec} (${applied.status})`;
+      }
+    }
+  }
 
   // Context guardrail — enforced ONLY against a limit the serving provider published about its own
   // deployment. An unknown limit means no guardrail: the request goes upstream and the provider
@@ -517,6 +554,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           400,
           `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds the context limit ` +
             `"${firstExceeded.target.provider}" publishes for "${firstExceeded.target.model}" (${firstExceeded.limit})`,
+          stickyProvenanceHeaders(sticky),
         );
         h.logger.write(baseLog(started, path, hadTools, false, 400, "skipped", null));
         return;
@@ -545,6 +583,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       req,
       addressedPool,
       degradedSpecs,
+      sticky,
       cfg,
     }, h);
     return;
@@ -649,7 +688,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           continue;
         }
 
-        failClosed(res, status, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
+        failClosed(
+          res,
+          status,
+          aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
+          stickyProvenanceHeaders(sticky),
+        );
         h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot()));
         return;
       }
@@ -718,6 +762,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
           pool429.recordFinal(502);
           const headers: Record<string, string> = { [SERVED_BY_HEADER]: tried.join(", ") };
+          Object.assign(headers, stickyProvenanceHeaders(sticky));
           const summary = pool429.summary();
           if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
           failClosed(res, 502, `llm-relay: ${probe.reason}`, headers);
@@ -765,6 +810,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         poolUnknownRefusals: pool429.unknownCount(),
         degraded: degradedLabel(addressedPool, degradedSpecs, target),
         paid: paidLabel(cfg, h, target),
+        sticky,
       };
 
       if (streamCommitted) {
@@ -788,11 +834,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           }
 
           const poolSummary = pool429.summary();
+          const headers = stickyProvenanceHeaders(sticky) ?? {};
+          if (poolSummary) headers[POOL_ATTEMPTS_HEADER] = poolSummary;
           failClosed(
             res,
             502,
             "llm-relay: tool call could not be repaired (failed)",
-            poolSummary ? { [POOL_ATTEMPTS_HEADER]: poolSummary } : undefined,
+            Object.keys(headers).length > 0 ? headers : undefined,
           );
           h.logger.write({
             ...baseLog(
@@ -888,6 +936,85 @@ function cooledByAllowance(t: ResolvedTarget, now: number): boolean {
   }
 }
 
+interface StickyRequestContext {
+  key: string;
+  multiCandidateRoute: boolean;
+  /** The previously stored pin's routing evaluation; null means a new pin may be created. */
+  provenance: string | null;
+}
+
+type TargetUsability = "live" | "credential-fault" | "cooling";
+
+function targetUsability(
+  target: ResolvedTarget,
+  breaker: CircuitBreaker,
+  now: number,
+): TargetUsability {
+  if (!breaker.isHealthy(target, now) || cooledByAllowance(target, now)) return "cooling";
+  if (breaker.hasCredentialFault(target, now)) return "credential-fault";
+  return "live";
+}
+
+/**
+ * Promote a pin only inside its live capability segment. In particular, a live degrade-tail pin
+ * never jumps a live in-band member; the tail remains a fallback after the requested band.
+ */
+function applyStickyOrdering(
+  ordered: ResolvedTarget[],
+  candidates: ResolvedTarget[],
+  pinnedSpec: string,
+  breaker: CircuitBreaker,
+  degraded: Set<string> | null,
+  now: number,
+): { targets: ResolvedTarget[]; status: string } {
+  const pinned = candidates.find((candidate) => specOfTarget(candidate) === pinnedSpec);
+  if (!pinned) return { targets: ordered, status: "bypassed: not-in-pool" };
+
+  const usability = targetUsability(pinned, breaker, now);
+  if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
+
+  if (degraded?.has(pinnedSpec)) {
+    const hasLiveInBand = candidates.some(
+      (candidate) => !degraded.has(specOfTarget(candidate)) && targetUsability(candidate, breaker, now) === "live",
+    );
+    if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
+  }
+
+  const index = ordered.findIndex((candidate) => specOfTarget(candidate) === pinnedSpec);
+  if (index <= 0) return { targets: ordered, status: "pinned, natural" };
+  const reordered = [...ordered];
+  const [target] = reordered.splice(index, 1);
+  reordered.unshift(target!);
+  return { targets: reordered, status: "pinned, reordered" };
+}
+
+function stickyHeaderValue(
+  sticky: StickyRequestContext | null | undefined,
+  target: ResolvedTarget,
+  status: number,
+): string | null {
+  if (!sticky) return null;
+  if (sticky.provenance) return sticky.provenance;
+  if (status < 400 && sticky.multiCandidateRoute) return `${specOfTarget(target)} (new)`;
+  return null;
+}
+
+function stickyProvenanceHeaders(
+  sticky: StickyRequestContext | null | undefined,
+): Record<string, string> | undefined {
+  return sticky?.provenance ? { [STICKY_PROVENANCE_HEADER]: sticky.provenance } : undefined;
+}
+
+function recordStickySuccess(
+  h: Handlers,
+  sticky: StickyRequestContext | null | undefined,
+  target: ResolvedTarget,
+  status: number,
+): void {
+  if (status >= 400 || !sticky?.multiCandidateRoute) return;
+  h.stickySessions?.setPin(sticky.key, specOfTarget(target));
+}
+
 export function orderByUsability(
   targets: ResolvedTarget[],
   breaker = globalCircuitBreaker,
@@ -907,8 +1034,9 @@ export function orderByUsability(
     // Demotion, never exclusion — same contract as the rest of this function, and doubly so here:
     // an exhausted allowance is a temporary condition on a deployment that is still free, and a
     // pool with nothing else left must still be able to try it.
-    if (!breaker.isHealthy(t, now) || cooledByAllowance(t, now)) cooling.push(t);
-    else if (breaker.hasCredentialFault(t, now)) faulted.push(t);
+    const usability = targetUsability(t, breaker, now);
+    if (usability === "cooling") cooling.push(t);
+    else if (usability === "credential-fault") faulted.push(t);
     else live.push(t);
   }
   return [...live, ...faulted, ...cooling];
@@ -1162,6 +1290,8 @@ interface Ctx {
   degraded?: string | null;
   /** Set when the answering deployment is not free. See `PAID_HEADER`. */
   paid?: string | null;
+  /** Request-local sticky key and the previously stored pin's evaluation. */
+  sticky?: StickyRequestContext | null;
   /**
    * The target this response actually came from — the resolved (provider, model)
    * after tier/pool expansion, subagent redirection and failover. Every log record
@@ -1537,6 +1667,7 @@ async function openAiFrontPath(
     /** The pool addressed, and its degrade tail — so a below-band answer can say so. */
     addressedPool?: string | null;
     degradedSpecs?: Set<string> | null;
+    sticky?: StickyRequestContext | null;
     cfg?: Config;
   },
   h: Handlers,
@@ -1684,7 +1815,11 @@ async function openAiFrontPath(
       // against a socket nobody is reading.
       if (i < candidates.length - 1 && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) continue;
       if (!res.headersSent) {
-        res.writeHead(status, { "content-type": "application/json", [SERVED_BY_HEADER]: tried.join(", ") });
+        res.writeHead(status, {
+          "content-type": "application/json",
+          [SERVED_BY_HEADER]: tried.join(", "),
+          ...stickyProvenanceHeaders(ctx.sticky),
+        });
         res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
       }
       h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target, attemptTrace.snapshot()));
@@ -1767,6 +1902,7 @@ async function openAiFrontPath(
           "content-type": "application/json",
           [SERVED_BY_HEADER]: tried.join(", "),
         };
+        Object.assign(headers, stickyProvenanceHeaders(ctx.sticky));
         const summary = pool429.summary();
         if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
         res.writeHead(502, headers);
@@ -1801,6 +1937,8 @@ async function openAiFrontPath(
       if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
       const paidBy = ctx.cfg ? paidLabel(ctx.cfg, h, target) : null;
       if (paidBy) headers[PAID_HEADER] = paidBy;
+      const stickyBy = stickyHeaderValue(ctx.sticky, target, upstream.status);
+      if (stickyBy) headers[STICKY_PROVENANCE_HEADER] = stickyBy;
       // Same aggregate as the Anthropic path, from the same tracker — the two fronts having
       // separate copies of one policy is the defect this file has already shipped once.
       pool429.recordFinal(upstream.status);
@@ -1843,7 +1981,10 @@ async function openAiFrontPath(
         }
         if (!res.writableEnded) res.end();
         if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
-        else completeAttemptSuccess(h, attempt, upstream.status);
+        else {
+          completeAttemptSuccess(h, attempt, upstream.status);
+          recordStickySuccess(h, ctx.sticky, target, upstream.status);
+        }
       }
     } catch (e) {
       handleMidStreamError(
@@ -1895,6 +2036,8 @@ function responseHeadersForTarget(backendRes: Response, ctx: Ctx): Record<string
   if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
+  const sticky = stickyHeaderValue(ctx.sticky, ctx.target, backendRes.status);
+  if (sticky) responseHeaders[STICKY_PROVENANCE_HEADER] = sticky;
   return responseHeaders;
 }
 
@@ -1988,6 +2131,7 @@ async function transparentPath(
     });
   } else {
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
+    recordStickySuccess(h, ctx.sticky, ctx.target, backendRes.status);
   }
   h.logger.write({
     ...baseLog(
@@ -2227,6 +2371,7 @@ async function repairStreamingPath(
     });
   } else {
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
+    recordStickySuccess(h, ctx.sticky, ctx.target, backendRes.status);
   }
   h.logger.write({
     ...baseLog(
@@ -2269,7 +2414,9 @@ async function repairBufferedPath(
     ? reconstructFromSse(bytes.toString("utf8"))
     : parseAssistant(bytes.toString("utf8"));
 
-  const filtered = filterResponseHeaders(backendRes.headers);
+  // W8's winning-candidate metadata assembly is shared with transparent and streaming repair;
+  // sticky provenance must describe the candidate that actually commits here too.
+  const filtered = responseHeadersForTarget(backendRes, ctx);
   let repairOutcome: RepairOutcome | "none" = "none";
   let validated: RequestLog["validated"] = "skipped";
   let toolUseCount = 0;
@@ -2293,7 +2440,12 @@ async function repairBufferedPath(
       // Nothing has been committed yet on this buffered path, so return a bounded clean 502.
       validated = "fail";
       errorKinds = ["invalid_upstream_envelope"];
-      failClosed(res, 502, "llm-relay: invalid Anthropic upstream envelope", recordFinalWalk(502));
+      failClosed(
+        res,
+        502,
+        "llm-relay: invalid Anthropic upstream envelope",
+        recordFinalWalk(502, stickyProvenanceHeaders(ctx.sticky)),
+      );
     } else {
       recordFinalWalk(backendRes.status, filtered);
       res.writeHead(backendRes.status, filtered);
@@ -2331,7 +2483,7 @@ async function repairBufferedPath(
           res,
           502,
           `llm-relay: tool call could not be repaired (${decision.outcome})`,
-          recordFinalWalk(502),
+          recordFinalWalk(502, stickyProvenanceHeaders(ctx.sticky)),
         );
       }
     }
@@ -2356,6 +2508,7 @@ async function repairBufferedPath(
     });
   } else {
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
+    recordStickySuccess(h, ctx.sticky, ctx.target, backendRes.status);
   }
   if (repairOutcome === "failed") {
     return { validated, toolUseCount, uncheckableCount, errorKinds };

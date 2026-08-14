@@ -114,7 +114,8 @@ block. All state lives under `~/.llm-relay/` (`config.json`, `.env`, `models-cac
       "medium": { "preferred": [], "include": "free", "effort": "medium" },
       "high":   { "preferred": [], "include": "free", "effort": "high" },
       "xhigh":  { "preferred": [], "include": "free", "effort": "xhigh" }
-    }
+    },
+    "sticky": false                         // opt-in session affinity; see below
   },
   "mode": "repair",                        // detect | repair
   "repair": { "maxAttempts": 2, "destructiveTools": ["Bash", "Write", "Edit", "..."] },
@@ -245,6 +246,52 @@ included: unassessed is not the same as weaker.
 Ordering also **interleaves providers** within a rank band, so the first N attempts land in N
 distinct quota domains rather than N members sharing one credential. The top-ranked candidate is
 still tried first; interleaving only decides who is tried second.
+
+### Sticky sessions (opt-in)
+
+`routing.sticky` preserves backend affinity across a multi-turn session without weakening health,
+cost, or effort-band guardrails. It is **off by default**. Enable the defaults with `true`, or set
+the bounded in-memory lifetime and capacity explicitly:
+
+```jsonc
+"sticky": { "enabled": true, "ttlMs": 1800000, "maxSessions": 1000 }
+```
+
+The TTL is sliding (30 minutes by default), capacity eviction is least-recently-used, and all pins
+are ephemeral: a relay restart clears them. The map stores only a session key, deployment spec,
+timestamps, and use count—never request or response text.
+
+There are exactly two verified base key sources:
+
+1. `x-llm-relay-session: <id>` — the relay-defined, client-agnostic opt-in header. It is consumed
+   by the relay and never forwarded to a provider.
+2. Otherwise, the first user message's extracted text is SHA-256 hashed and only the first 16 hex
+   characters are retained. Anthropic/Chat `text` and Responses `input_text` blocks are supported;
+   `<system-reminder>` blocks are skipped. A first user turn with no text creates no pin.
+
+The relay does not accept `x-claude-code-session-id`, `x-session-id`, or session-looking fields in
+`x-codex-turn-metadata`: this repository has no evidence that supported clients actually send those
+identifiers. When the documented `x-claude-code-agent-id` is present, it compounds either verified
+base key so a subagent cannot overwrite its parent session's pin.
+
+Only pool or multi-spec routes with at least two resolved candidates record a successful winner;
+single-spec routes create no no-op pin. A stored pin may reorder live candidates, but the current
+request's guardrails always win: `freeOnly` filters first, transport failures can skip the rest of a
+provider, breaker cooling and credential faults are bypassed, and `@relay:` selects the request's
+pool. A pin in a pool's degrade tail is also bypassed while any in-band live candidate exists, so
+affinity never crosses the effort degrade boundary.
+
+Responses on both public fronts announce the decision in `x-llm-relay-sticky`:
+
+```text
+p2/m2 (new)
+p2/m2 (pinned, natural)
+p2/m2 (pinned, reordered)
+p2/m2 (bypassed: cooling)
+p2/m2 (bypassed: credential-fault)
+p2/m2 (bypassed: degraded)
+p2/m2 (bypassed: not-in-pool)
+```
 
 A failure whose refusals the relay could not interpret also carries
 `x-llm-relay-unknown-refusal: <n>` — a **count, never the message**. The learned-eligibility store
