@@ -251,10 +251,11 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   harness's real destructive tools, so the "never fabricate a destructive call" guard covered none
   of the tools that can destroy anything; meanwhile `push` matched `PushNotification` and `reset`
   matched `ResetZoom`, refusing safe calls. `DEFAULT_DESTRUCTIVE` therefore now leads with the
-  harness's own tools — `Bash`, `BashOutput`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit` —
-  before the conventional names. ⚠ **User-visible behaviour change:** repairs of malformed `Bash`/
-  `Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`BashOutput` calls that used to succeed are now refused
-  (`repair: "refused_destructive"`), and calls whose names merely *contain* a pattern
+  first-party mutation tools — Claude Code's `Bash`, `BashOutput`, `Write`, `Edit`, `MultiEdit`,
+  `NotebookEdit`, and Codex's `shell_command`, `apply_patch` — before the conventional names.
+  ⚠ **User-visible behaviour change:** repairs of malformed `Bash`/`Write`/`Edit`/`MultiEdit`/
+  `NotebookEdit`/`BashOutput`/`shell_command`/`apply_patch` calls that used to succeed are now
+  refused (`repair: "refused_destructive"`), and calls whose names merely *contain* a pattern
   (`PushNotification`, `ResetZoom`, `ForceRefresh`) are now permitted. An **empty**
   `repair.destructiveTools` refuses nothing — there is no hidden built-in set in `src/`, so
   coverage is always traceable to config.

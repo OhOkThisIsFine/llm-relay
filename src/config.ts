@@ -565,7 +565,7 @@ export interface Config {
  * omitted repair.destructiveTools got different coverage than a generated one.
  *
  * Matching is exact (see destructiveMatcher), so these are real tool names, not
- * fragments. The harness's own destructive tools are listed first — they are the
+ * fragments. The clients' own destructive tools are listed first — they are the
  * ones that can actually destroy something, and the previous fragment list
  * ("rm", "delete", …) matched none of them.
  */
@@ -577,6 +577,9 @@ export const DEFAULT_DESTRUCTIVE = [
   "Edit",
   "MultiEdit",
   "NotebookEdit",
+  // Codex tools that execute or write.
+  "shell_command",
+  "apply_patch",
   // Conventional names an MCP server or custom tool may use.
   "rm",
   "delete",
