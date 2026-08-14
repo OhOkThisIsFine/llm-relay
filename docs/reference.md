@@ -112,7 +112,7 @@ block. All state lives under `~/.llm-relay/` (`config.json`, `.env`, `models-cac
   "mode": "repair",                        // detect | repair
   "repair": { "maxAttempts": 2, "destructiveTools": ["Bash", "Write", "Edit", "..."] },
   "maxBodyBytes": 37748736,                 // optional; 36 MiB default, 256 MiB maximum
-  "log": { "level": "metadata", "file": null }
+  "log": { "level": "metadata", "file": null, "maxBytes": 52428800 }
 }
 ```
 
@@ -751,7 +751,9 @@ leak a header, body, or key. Query parameter *values* are replaced by their leng
 `servedProvider`/`servedModel` are the deployment that actually answered (the id the client
 asked for is deliberately not recorded — for a pool spec it is routinely not the model that
 served). A failed log write is swallowed: a full disk is a logging problem, never a request
-failure.
+failure. File logging defaults to a 50 MiB cap; before the next line would exceed it, the relay
+replaces `<file>.1` with the current file and starts a fresh `<file>`. Set `log.maxBytes` to tune
+the cap (maximum 1 GiB); exactly one predecessor is retained.
 
 Run in `detect` first, measure which models trip the validator on your traffic, then decide on
 repair. `node scripts/nim-trip-rate.mjs` produces a per-model trip-rate dataset

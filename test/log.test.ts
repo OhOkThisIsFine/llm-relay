@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MetadataLogger, type RequestLog } from "../src/log.js";
+import { DEFAULT_LOG_MAX_BYTES, MetadataLogger, type RequestLog } from "../src/log.js";
 
 let dir: string;
 let file: string;
@@ -132,6 +132,27 @@ describe("metadata-only logging", () => {
     expect(existsSync(file)).toBe(false);
   });
 
+  it("rotates at the byte boundary and keeps exactly one predecessor", () => {
+    const first = record({ latencyMs: 1 });
+    const second = record({ latencyMs: 2 });
+    const third = record({ latencyMs: 3 });
+    const lineBytes = Buffer.byteLength(JSON.stringify(first) + "\n");
+    const logger = new MetadataLogger({ level: "metadata", file, maxBytes: lineBytes * 2 });
+
+    logger.write(first);
+    logger.write(second); // Exactly at the cap: no rotation.
+    writeFileSync(`${file}.1`, "stale predecessor\n");
+    logger.write(third); // Would exceed: replace .1 and start fresh.
+
+    expect(linesIn(`${file}.1`).map((line) => line["latencyMs"])).toEqual([1, 2]);
+    expect(linesIn(file).map((line) => line["latencyMs"])).toEqual([3]);
+    expect(existsSync(`${file}.2`)).toBe(false);
+  });
+
+  it("uses a bounded 50 MiB default", () => {
+    expect(DEFAULT_LOG_MAX_BYTES).toBe(50 * 1024 * 1024);
+  });
+
   /**
    * Reporting degradation must never itself become a failure path: a log write
    * that cannot land is a logging problem, not a request problem, and must not
@@ -152,6 +173,19 @@ describe("metadata-only logging", () => {
     });
     const unwritable = join(dir, "no-such-subdir", "proxy.jsonl");
     expect(() => new MetadataLogger({ level: "metadata", file: unwritable }).write(record())).not.toThrow();
+  });
+
+  it("does not throw when rotation fails", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const first = record({ latencyMs: 1 });
+    const lineBytes = Buffer.byteLength(JSON.stringify(first) + "\n");
+    const logger = new MetadataLogger({ level: "metadata", file, maxBytes: lineBytes });
+    logger.write(first);
+    mkdirSync(`${file}.1`); // A directory cannot be replaced as the rotated log file.
+
+    expect(() => logger.write(record({ latencyMs: 2 }))).not.toThrow();
+    expect(stderr).toHaveBeenCalledOnce();
+    expect(linesIn(file).map((line) => line["latencyMs"])).toEqual([1]);
   });
 
   it("does not throw when the stdout sink fails", () => {

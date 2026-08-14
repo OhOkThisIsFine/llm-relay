@@ -1,5 +1,7 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, renameSync, rmSync, statSync } from "node:fs";
 import type { Config } from "./config.js";
+
+export const DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024;
 
 /**
  * Metadata-only request log. NEVER records headers or bodies — only the shape of
@@ -84,6 +86,14 @@ function metadataOnly(record: RequestLog): Record<string, unknown> {
   return out;
 }
 
+/** Keep one predecessor when the next complete JSONL record would exceed the cap. */
+function rotateIfNeeded(file: string, incomingBytes: number, maxBytes: number): void {
+  if (!existsSync(file) || statSync(file).size + incomingBytes <= maxBytes) return;
+  const predecessor = `${file}.1`;
+  rmSync(predecessor, { force: true });
+  renameSync(file, predecessor);
+}
+
 export class MetadataLogger {
   constructor(private readonly cfg: Config["log"]) {}
 
@@ -96,7 +106,13 @@ export class MetadataLogger {
       const line = JSON.stringify(metadataOnly(record));
       if (this.cfg.file) {
         try {
-          appendFileSync(this.cfg.file, line + "\n");
+          const entry = line + "\n";
+          rotateIfNeeded(
+            this.cfg.file,
+            Buffer.byteLength(entry),
+            this.cfg.maxBytes ?? DEFAULT_LOG_MAX_BYTES,
+          );
+          appendFileSync(this.cfg.file, entry);
         } catch {
           process.stderr.write(line + "\n");
         }
