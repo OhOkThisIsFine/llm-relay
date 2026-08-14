@@ -232,3 +232,105 @@ describe("inbound credential removal (INV-HS-8)", () => {
     expect(out["authorization"]).toBe("Bearer sk-ant-caller");
   });
 });
+
+describe("streamed deadline split — stall watchdog vs total deadline (adoption review §1.2)", () => {
+  // One flat timeoutMs mis-served streams in both directions: a healthy long generation was
+  // killed at the deadline mid-answer, while a dead stream survived until the same deadline.
+  // Once a stream is being served the total deadline disarms and an inter-byte watchdog takes
+  // over; stallTimeoutMs: 0 keeps the old single-deadline behavior.
+
+  /** Sends a valid stream head then goes silent forever — dead, but the socket stays open. */
+  function stallingSseBackend(): Promise<Server> {
+    return listen(
+      createServer((_req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        );
+      }),
+    );
+  }
+
+  /** A healthy SLOW stream: pings every 100ms for ~700ms, then a clean message_stop. */
+  function slowHealthySseBackend(): Promise<Server> {
+    return listen(
+      createServer((_req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        );
+        let n = 0;
+        const cadence = setInterval(() => {
+          n++;
+          res.write('event: ping\ndata: {"type":"ping"}\n\n');
+          if (n >= 6) {
+            clearInterval(cadence);
+            res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+            res.end();
+          }
+        }, 100);
+        res.on("close", () => clearInterval(cadence));
+      }),
+    );
+  }
+
+  function stallCfg(backendPort: number, logFile: string, timeoutMs: number, stallTimeoutMs: number): Config {
+    return {
+      host: "127.0.0.1",
+      port: 0,
+      providers: {
+        up: { base: `http://127.0.0.1:${backendPort}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs, stallTimeoutMs },
+      },
+      routing: { default: "up", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "metadata", file: logFile },
+    };
+  }
+
+  const streamReq = (proxyPort: number) =>
+    fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+
+  it("a silent stream is aborted by the watchdog long before the total deadline", async () => {
+    dir = mkdtempSync(join(tmpdir(), "rp-stall-dead-"));
+    const backend = await stallingSseBackend();
+    const proxy = await listen(
+      createProxy(stallCfg(port(backend), join(dir, "log.jsonl"), 30_000, 150), { breaker: globalCircuitBreaker }),
+    );
+
+    const started = Date.now();
+    const body = await (await streamReq(port(proxy))).text();
+    expect(Date.now() - started).toBeLessThan(10_000); // nowhere near the 30s total deadline
+    expect(body).toContain("event: message_start"); // streamed prefix reached the client
+    expect(body).toContain("event: error"); // …and the death was reported, not silently ended
+  });
+
+  it("a healthy slow stream OUTLIVES the total deadline — it disarms once the stream is served", async () => {
+    dir = mkdtempSync(join(tmpdir(), "rp-stall-slow-"));
+    const backend = await slowHealthySseBackend();
+    // timeoutMs 250 < the ~700ms the stream takes: the old single deadline killed this mid-answer.
+    const proxy = await listen(
+      createProxy(stallCfg(port(backend), join(dir, "log.jsonl"), 250, 5_000), { breaker: globalCircuitBreaker }),
+    );
+
+    const body = await (await streamReq(port(proxy))).text();
+    expect(body).toContain("event: message_stop"); // ran to completion
+    expect(body).not.toContain("event: error");
+  });
+
+  it("stallTimeoutMs: 0 keeps the old single-deadline behavior", async () => {
+    dir = mkdtempSync(join(tmpdir(), "rp-stall-off-"));
+    const backend = await slowHealthySseBackend();
+    const proxy = await listen(
+      createProxy(stallCfg(port(backend), join(dir, "log.jsonl"), 250, 0), { breaker: globalCircuitBreaker }),
+    );
+
+    const body = await (await streamReq(port(proxy))).text();
+    expect(body).toContain("event: error"); // the total deadline still spans the stream
+    expect(body).not.toContain("event: message_stop");
+  });
+});

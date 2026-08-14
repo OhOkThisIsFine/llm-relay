@@ -83,6 +83,14 @@ export interface ProviderConfig {
   authHeader: AuthHeader;
   /** Backend request deadline in ms. Default 120000. */
   timeoutMs: number;
+  /**
+   * Inter-byte stall watchdog for STREAMED responses, in ms. Once a stream is being served, the
+   * total `timeoutMs` deadline disarms — one flat deadline kills a healthy long generation at
+   * minute two while letting a dead stream hang until the same minute two — and this watchdog
+   * aborts only when NO byte arrives for this long. 0 keeps the old single-deadline behavior.
+   * Default 90000 (fork-validated in freellmapi). Adoption review §1.2.
+   */
+  stallTimeoutMs?: number;
   /** "free": wholly free/free-tier catalog. "mixed": catalog contains free and paid models. */
   tierType?: ProviderTierType;
   /** Web URL where users can sign up or obtain API keys. */
@@ -496,6 +504,8 @@ export interface ResolvedTarget {
   credentialMode?: CredentialMode;
   authHeader: AuthHeader;
   timeoutMs: number;
+  /** Carried from the provider: inter-byte stall watchdog for streamed responses. */
+  stallTimeoutMs?: number;
 }
 
 export interface Config {
@@ -674,6 +684,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     kind: p.kind,
     authHeader: p.authHeader,
     timeoutMs: p.timeoutMs,
+    ...(p.stallTimeoutMs !== undefined ? { stallTimeoutMs: p.stallTimeoutMs } : {}),
     ...(realModel !== undefined ? { model: realModel } : {}),
     ...(p.authEnv ? { authEnv: p.authEnv } : {}),
     ...(p.credentialMode !== undefined ? { credentialMode: p.credentialMode } : {}),
@@ -946,6 +957,7 @@ function parseProviders(
       credentialMode?: unknown;
       authHeader?: unknown;
       timeoutMs?: unknown;
+      stallTimeoutMs?: unknown;
       tierType?: unknown;
       signupUrl?: unknown;
     };
@@ -996,6 +1008,9 @@ function parseProviders(
       kind,
       authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
       timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
+      ...(typeof p.stallTimeoutMs === "number" && Number.isFinite(p.stallTimeoutMs) && p.stallTimeoutMs >= 0
+        ? { stallTimeoutMs: Math.floor(p.stallTimeoutMs) }
+        : {}),
       // The declared name is a default, not a requirement: if the key is present under
       // a known alias instead, use that so an already-working env var doesn't have to
       // be renamed. Resolved here so routing, key checks and the backend all agree.

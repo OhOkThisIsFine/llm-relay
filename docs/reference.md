@@ -188,6 +188,11 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
   spend `members × timeoutMs` on one request. The first two attempts are always allowed and an
   attempt in flight is never aborted. Default 45 s; tune with top-level `"walkBudgetMs"` in
   config.json (`0` disables).
+- **Streamed deadline split** — a provider's `timeoutMs` covers the request until a stream is
+  being served, then disarms; from there an inter-byte stall watchdog (per-provider
+  `"stallTimeoutMs"`, default 90 s, `0` restores the single deadline) aborts only when no byte
+  arrives for the whole window. A healthy long generation is never killed by the total deadline,
+  and a dead stream is detected by silence, not by waiting out the deadline.
 
 Health **demotes** candidates, never drops them (live → credential-faulted → cooling). Responses
 carry `x-llm-relay-served-by`: the deployment that served, or on error every deployment tried,
