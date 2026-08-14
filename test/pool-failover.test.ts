@@ -917,3 +917,67 @@ describe("live-traffic quota headers reach the breaker (adoption review §1.9)",
     expect(globalCircuitBreaker.getState("p1/m1")?.quotaPercent ?? null).toBeNull();
   });
 });
+
+describe("first-event in-band error frames fail over pre-commit (adoption review §1.1)", () => {
+  // A 200 SSE stream whose FIRST event is an error frame used to pass preflight as a "real
+  // protocol envelope" and reach the client — spending the whole pool's walk on one member's
+  // error inside a 200. Pre-commit it now fails over; POST-commit (any bytes after a valid
+  // first event) the frame still streams through untouched, because honesty beats replay once
+  // the client has seen bytes. ≥2 candidates throughout.
+  const SSE_HEADERS = { "content-type": "text/event-stream" };
+  const ERROR_FRAME =
+    'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n';
+  const START_FRAME =
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n';
+  const STOP_FRAME = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+
+  const streamReq = (p: number) =>
+    fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", stream: true, max_tokens: 20, messages: [{ role: "user", content: "hi" }] }),
+    });
+
+  it("an error frame as the FIRST event fails over invisibly to the next member", async () => {
+    const a = await scripted(() => ({ headers: SSE_HEADERS, body: ERROR_FRAME }));
+    const b = await scripted(() => ({ headers: SSE_HEADERS, body: START_FRAME + STOP_FRAME }));
+    const p = port(
+      await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`], "anthropic")),
+    );
+
+    const resp = await streamReq(p);
+    const body = await resp.text();
+    expect(resp.status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+    expect(body).toContain("message_stop");
+    expect(body).not.toContain("Overloaded"); // the first member's error never reached the client
+  });
+
+  it("an error frame AFTER a valid first event streams through — post-commit honesty is unchanged", async () => {
+    const a = await scripted(() => ({ headers: SSE_HEADERS, body: START_FRAME + ERROR_FRAME }));
+    const b = await scripted(() => ({ headers: SSE_HEADERS, body: START_FRAME + STOP_FRAME }));
+    const p = port(
+      await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`], "anthropic")),
+    );
+
+    const resp = await streamReq(p);
+    const body = await resp.text();
+    expect(resp.status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(0); // committed to the first stream; no replay behind the client's back
+    expect(body).toContain("Overloaded");
+  });
+
+  it("last candidate: the synthesized 502 carries the upstream's own message excerpt", async () => {
+    const a = await scripted(() => ({ headers: SSE_HEADERS, body: ERROR_FRAME }));
+    const b = await scripted(() => ({ headers: SSE_HEADERS, body: ERROR_FRAME }));
+    const p = port(
+      await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`], "anthropic")),
+    );
+
+    const resp = await streamReq(p);
+    expect(resp.status).toBe(502);
+    expect(await resp.text()).toContain("Overloaded");
+  });
+});
