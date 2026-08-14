@@ -24,6 +24,7 @@ import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
 import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -572,11 +573,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // All-429 exhaustion Retry-After policy: `Pool429Tracker`.
   const attemptTrace = new RequestAttemptTrace();
   const pool429 = new Pool429Tracker();
+  const tried: string[] = [];
   const walkBudgetMs = cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
   const walkStarted = Date.now();
   for (let i = 0; i < healthyTargets.length; i++) {
     if (res.destroyed) break;
     target = healthyTargets[i]!;
+    tried.push(specOfTarget(target));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
     const onResClose = () => {
@@ -683,6 +686,56 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       }
 
       const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
+      if (streamed && backendRes.status < 400) {
+        const probe = backendRes.body
+          ? await probeStreamForCommit(backendRes.body, "anthropic-messages", {
+              isCancelled: () => res.destroyed,
+              // OpenAI→Anthropic translation owns malformed final-wire syntax. Semantic error
+              // events still carry upstream provenance inside the probe and remain retryable.
+              malformedProvenance: target.kind === "openai" ? "local" : "upstream",
+            })
+          : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
+
+        if (probe.kind === "cancelled") {
+          completeAttemptCancelled(h, attempt, "client disconnected before stream commit");
+          return;
+        }
+        if (probe.kind === "dead") {
+          completeAttemptFailure(h, attempt, {
+            failure: "protocol",
+            provenance: probe.provenance === "local" ? "relay-mapper-defect" : "invalid-upstream-envelope",
+            status: 502,
+          });
+          const canTryNext = probe.provenance === "upstream" &&
+            !res.destroyed &&
+            i < healthyTargets.length - 1 &&
+            walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1);
+          if (canTryNext) {
+            pool429.recordFailover(502, null);
+            continue;
+          }
+
+          pool429.recordFinal(502);
+          const headers: Record<string, string> = { [SERVED_BY_HEADER]: tried.join(", ") };
+          const summary = pool429.summary();
+          if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+          failClosed(res, 502, `llm-relay: ${probe.reason}`, headers);
+          h.logger.write(baseLog(
+            started,
+            path,
+            hadTools,
+            true,
+            502,
+            "skipped",
+            target,
+            attemptTrace.snapshot(),
+            upstreamReportedModel(reportedModelSource),
+          ));
+          return;
+        }
+
+        backendRes = new Response(probe.body, { status: backendRes.status, headers: backendRes.headers });
+      }
       // Phase switch (adoption review §1.2): this stream IS the response now — failover is over,
       // so the total deadline has done its job and would only kill a healthy long generation.
       // From here, silence (not duration) is the failure signal.
@@ -694,9 +747,35 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const willValidate = isMessages && hadTools && backendRes.status < 400;
       const reshaper = h.resolveReshaper(target);
       const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
+      const streamCommitted = streamed && backendRes.status < 400;
+      const responseCtx: Ctx = {
+        tools,
+        streamed,
+        started,
+        path,
+        hadTools,
+        req,
+        target,
+        attempt,
+        signal: controller.signal,
+        reportedModelSource,
+        retryAfterOverrideMs: pool429.overrideMs(backendRes.status, retryAfterMs),
+        poolSummary: null,
+        poolUnknownRefusals: pool429.unknownCount(),
+        degraded: degradedLabel(addressedPool, degradedSpecs, target),
+        paid: paidLabel(cfg, h, target),
+      };
+
+      if (streamCommitted) {
+        // Semantic readiness, not an HTTP 200 or metadata preamble, is the commit point. Only now
+        // does the winner count as served and only its headers become client-visible.
+        pool429.recordFinal(backendRes.status);
+        responseCtx.poolSummary = pool429.summary();
+        res.writeHead(backendRes.status, responseHeadersForTarget(backendRes, responseCtx));
+      }
 
       if (doRepair) {
-        const repairResult = await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal, reportedModelSource, pool429 }, h);
+        const repairResult = await repairPath(res, backendRes, timer, { ...responseCtx, wantsStream, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, pool429 }, h);
         if (repairResult !== null) {
           // A schema-invalid 200 that the reshaper exhausted is a dead turn, not a transport
           // failure. Resume THIS request's candidate walk without teaching the breaker a new
@@ -734,9 +813,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           return;
         }
       } else {
-        const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
-        pool429.recordFinal(backendRes.status);
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, reportedModelSource, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount(), degraded: degradedLabel(addressedPool, degradedSpecs, target), paid: paidLabel(cfg, h, target) }, h);
+        if (!streamCommitted) {
+          pool429.recordFinal(backendRes.status);
+          responseCtx.poolSummary = pool429.summary();
+        }
+        await transparentPath(res, backendRes, timer, { ...responseCtx, willValidate }, h);
       }
       return;
     } finally {
@@ -1576,6 +1657,66 @@ async function openAiFrontPath(
     // deployment tried, in order — so an exhausted pool is self-describing and the reader can
     // see that the failure they are holding is the last of N, not the only one.
     const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+    if (streamed && upstream.status < 400) {
+      const protocol: StreamCommitProtocol = ctx.protocol === "responses" ? "openai-responses" : "openai-chat";
+      const probe = upstream.body
+        ? await probeStreamForCommit(upstream.body, protocol, {
+            isCancelled: () => res.destroyed,
+            // Direct Chat is upstream-native. Every other pair is a mapper-owned final wire;
+            // malformed syntax there is local and must not make another provider repeat it.
+            malformedProvenance: target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
+          })
+        : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
+
+      if (probe.kind === "cancelled") {
+        clearTimeout(timer);
+        res.off("close", onResClose);
+        completeAttemptCancelled(h, attempt, "client disconnected before stream commit");
+        return;
+      }
+      if (probe.kind === "dead") {
+        completeAttemptFailure(h, attempt, {
+          failure: "protocol",
+          provenance: probe.provenance === "local" ? "relay-mapper-defect" : "invalid-upstream-envelope",
+          status: 502,
+        });
+        const canTryNext = probe.provenance === "upstream" &&
+          !isLast &&
+          !res.writableEnded &&
+          !res.destroyed &&
+          walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1);
+        clearTimeout(timer);
+        res.off("close", onResClose);
+        if (canTryNext) {
+          pool429.recordFailover(502, null);
+          continue;
+        }
+
+        pool429.recordFinal(502);
+        const headers: Record<string, string> = {
+          "content-type": "application/json",
+          [SERVED_BY_HEADER]: tried.join(", "),
+        };
+        const summary = pool429.summary();
+        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+        res.writeHead(502, headers);
+        res.end(JSON.stringify({ error: { message: `llm-relay: ${probe.reason}`, type: "api_error" } }));
+        h.logger.write(baseLog(
+          ctx.started,
+          ctx.path,
+          ctx.hadTools,
+          true,
+          502,
+          "skipped",
+          target,
+          attemptTrace.snapshot(),
+          upstreamReportedModel(reportedModelSource),
+        ));
+        return;
+      }
+
+      upstream = new Response(probe.body, { status: upstream.status, headers: upstream.headers });
+    }
     // Same phase switch as the Anthropic path — one deadline policy, both fronts (§1.2).
     const stallMs = target.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
     if (streamed && upstream.status < 400 && stallMs > 0) {
@@ -1664,6 +1805,21 @@ async function openAiFrontPath(
   // empty candidate list cannot get here either — routing rejects that with a 400 upstream.
 }
 
+/** Winning-candidate response metadata, shared by transparent and repair streaming paths. */
+function responseHeadersForTarget(backendRes: Response, ctx: Ctx): Record<string, string | string[]> {
+  const responseHeaders = filterResponseHeaders(backendRes.headers);
+  if (backendRes.status < 400) responseHeaders[SERVED_BY_HEADER] = specOfTarget(ctx.target);
+  if (ctx.retryAfterOverrideMs !== undefined && Number.isFinite(ctx.retryAfterOverrideMs)) {
+    responseHeaders["retry-after"] = String(Math.max(1, Math.ceil(ctx.retryAfterOverrideMs / 1000)));
+  }
+  if (ctx.poolSummary) responseHeaders[POOL_ATTEMPTS_HEADER] = ctx.poolSummary;
+  // Counts only candidates stepped over: terminal refusal bodies are not buffered on this path.
+  if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
+  if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
+  if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
+  return responseHeaders;
+}
+
 /** detect/default: forward bytes unchanged, observe + log if applicable. */
 async function transparentPath(
   res: ServerResponse,
@@ -1672,22 +1828,7 @@ async function transparentPath(
   ctx: Ctx & { willValidate: boolean },
   h: Handlers,
 ): Promise<void> {
-  const responseHeaders = filterResponseHeaders(backendRes.headers);
-  if (ctx.retryAfterOverrideMs !== undefined && Number.isFinite(ctx.retryAfterOverrideMs)) {
-    responseHeaders["retry-after"] = String(Math.max(1, Math.ceil(ctx.retryAfterOverrideMs / 1000)));
-  }
-  if (ctx.poolSummary) responseHeaders[POOL_ATTEMPTS_HEADER] = ctx.poolSummary;
-  // ⚠ Counts only the candidates STEPPED OVER. This front commits the head before reading the
-  // body, so the terminal candidate's verdict does not exist yet — a single-member pool answering
-  // an unrecognized refusal therefore emits no header here, and the refusal reaches the operator
-  // through `llm-relay eligibility` instead. Fixing that would mean buffering error bodies before
-  // `writeHead`, which reorders a path that streams; the skill's "check eligibility on a pool
-  // failure" reflex covers the gap at no risk.
-  if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
-  if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
-  // Spending is never silent — see PAID_HEADER.
-  if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
-  res.writeHead(backendRes.status, responseHeaders);
+  if (!res.headersSent) res.writeHead(backendRes.status, responseHeadersForTarget(backendRes, ctx));
   let assistant: AssistantMessage | null = null;
   let responseBytesWritten = false;
   try {
@@ -1765,6 +1906,7 @@ async function transparentPath(
       failure: "protocol",
       provenance: "invalid-upstream-envelope",
       status: 502,
+      ...(ctx.streamed && res.headersSent ? { logStatus: "committed" as const } : {}),
     });
   } else {
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
@@ -1838,18 +1980,18 @@ async function repairStreamingPath(
   ctx: RepairCtx,
   h: Handlers,
 ): Promise<void> {
-  const filtered = filterResponseHeaders(backendRes.headers);
+  const filtered = responseHeadersForTarget(backendRes, ctx);
   let acc = "";                 // full decoded stream, for reconstruction
   let overflow = false;         // acc exceeded the validate cap → give up repair
   let work = Buffer.alloc(0);   // raw bytes not yet split into complete frames
   const held: Buffer[] = [];    // frames withheld from the client (first tool_use onward)
   let buffering = false;
   let firstToolUseIndex = -1;
-  let headWritten = false;
+  let headWritten = res.headersSent;
   let responseBytesWritten = false;
 
   const ensureHead = () => {
-    if (!headWritten) {
+    if (!headWritten && !res.headersSent) {
       res.writeHead(backendRes.status, filtered);
       headWritten = true;
     }
@@ -2003,6 +2145,7 @@ async function repairStreamingPath(
       failure: "protocol",
       provenance: "invalid-upstream-envelope",
       status: 502,
+      logStatus: "committed",
     });
   } else {
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);

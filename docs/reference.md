@@ -199,8 +199,13 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
   spend `members × timeoutMs` on one request. The first two attempts are always allowed and an
   attempt in flight is never aborted. Default 45 s; tune with top-level `"walkBudgetMs"` in
   config.json (`0` disables).
-- **Streamed deadline split** — a provider's `timeoutMs` covers the request until a stream is
-  being served, then disarms; from there an inter-byte stall watchdog (per-provider
+- **Deferred streamed commit** — downstream headers remain provisional through comments,
+  heartbeats, role/usage frames, and other metadata. The first meaningful text, reasoning, or
+  structured tool call commits the response. Before that point an in-band error, empty completion,
+  broken socket, or 64 KiB pre-content prefix fails cleanly and can advance to the next candidate;
+  after it, errors are forwarded honestly and never replayed elsewhere.
+- **Streamed deadline split** — a provider's `timeoutMs` covers the request through that first
+  meaningful content, then disarms; from there an inter-byte stall watchdog (per-provider
   `"stallTimeoutMs"`, default 90 s, `0` restores the single deadline) aborts only when no byte
   arrives for the whole window. A healthy long generation is never killed by the total deadline,
   and a dead stream is detected by silence, not by waiting out the deadline.
@@ -246,9 +251,10 @@ must be polled is a backlog nobody works; this tells the caller to run `llm-rela
 it still has the context. The message itself stays out of the header deliberately: it is untrusted
 text from an external service, and a response header is exactly the field a client tends to trust.
 
-⚠ On `/v1/messages` the count covers only the candidates **stepped over** — that front commits the
-response head before reading the body, so a single-member pool's own refusal is not counted there.
-It still reaches `llm-relay eligibility`.
+⚠ On `/v1/messages` a terminal HTTP refusal still contributes only after its body is consumed, so
+the response header can count only the candidates **stepped over**; a single-member pool's own
+refusal still reaches `llm-relay eligibility`. Successful SSE is different: its head is withheld
+until meaningful content, and semantic failures before that point are counted as synthetic 502s.
 
 ### Context guardrail
 
