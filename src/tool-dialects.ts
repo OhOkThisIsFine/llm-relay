@@ -54,6 +54,20 @@ export type DialectOutcome =
  */
 const DIALECT_MARKERS: ReadonlyArray<{ dialect: string; markers: readonly string[] }> = [
   { dialect: "deepseek", markers: ["｜tool▁calls▁begin｜", "｜tool▁call▁begin｜", "｜tool▁sep｜", "｜tool▁call▁end｜", "｜tool▁calls▁end｜"] },
+  // The ASCII-pipe token family (Kimi-K2 and friends) is a DIFFERENT grammar from the fullwidth
+  // DeepSeek form above, not a spelling variant: section wrappers, the name riding in a
+  // `functions.NAME:IDX` id token, and an argument-begin separator. Observed in production on the
+  // same free pool (fork-validated in freellmapi's rescue). Adoption review §1.8.
+  {
+    dialect: "kimi",
+    markers: [
+      "|tool_calls_section_begin|",
+      "|tool_call_begin|",
+      "|tool_call_argument_begin|",
+      "|tool_call_end|",
+      "|tool_calls_section_end|",
+    ],
+  },
   { dialect: "dsml", markers: ["｜DSML｜tool_calls", "｜DSML｜invoke", "｜DSML｜parameter"] },
   { dialect: "hermes", markers: ["<tool_call>", "</tool_call>"] },
   { dialect: "xml-invoke", markers: ["<function_calls>", "</function_calls>", "<invoke name=", "</invoke>"] },
@@ -191,6 +205,31 @@ function fromDeepSeekForm(text: string): DialectToolCall[] {
   return calls;
 }
 
+/** Kimi ASCII token blocks: `<|tool_call_begin|>functions.NAME:0<|tool_call_argument_begin|>{…}<|tool_call_end|>`. */
+function fromKimiTokenForm(text: string): DialectToolCall[] {
+  const calls: DialectToolCall[] = [];
+  const re = /<\|tool_call_begin\|>\s*([\s\S]*?)\s*<\|tool_call_argument_begin\|>\s*([\s\S]*?)\s*<\|tool_call_end\|>/g;
+  for (const m of text.matchAll(re)) {
+    const idToken = m[1];
+    const payload = m[2];
+    if (!idToken || payload === undefined) continue;
+    // The function name rides in the id token as `functions.NAME:IDX`. Some models degrade it to
+    // an opaque id (observed upstream: `chatcmpl-tool-<hex>`), which leaves no way to know WHICH
+    // tool was meant — unparseable, so the whole recovery fails clean to `detected` rather than
+    // guessing a target.
+    const nameMatch = /^functions\.([A-Za-z0-9_.-]+):\d+$/.exec(idToken.trim());
+    if (!nameMatch) return [];
+    try {
+      const parsed = JSON.parse(payload.trim()) as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+      calls.push({ name: nameMatch[1]!, input: parsed as Record<string, unknown> });
+    } catch {
+      return [];
+    }
+  }
+  return calls;
+}
+
 /** `<tool_call>{json}</tool_call>` (Hermes/Qwen) and `<function=NAME>{json}</function>`. */
 function fromTaggedJsonForms(text: string): DialectToolCall[] {
   const calls: DialectToolCall[] = [];
@@ -220,6 +259,8 @@ function stripEnvelopes(text: string): string {
     .replace(/<｜DSML｜tool_calls>[\s\S]*?(?:<\/｜DSML｜tool_calls>|$)/g, "")
     .replace(/<(?:｜DSML｜)?invoke\s+name="[^"]*"\s*>[\s\S]*?<\/(?:｜DSML｜)?invoke>/g, "")
     .replace(/<｜tool▁calls▁begin｜>[\s\S]*?(?:<｜tool▁calls▁end｜>|$)/g, "")
+    .replace(/<\|tool_calls_section_begin\|>[\s\S]*?(?:<\|tool_calls_section_end\|>|$)/g, "")
+    .replace(/<\|tool_call_begin\|>[\s\S]*?(?:<\|tool_call_end\|>|$)/g, "")
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
     .replace(/<function=[^>]+>[\s\S]*?<\/function>/g, "")
     .replace(/<\/?think>/g, "")
@@ -243,6 +284,7 @@ export function recoverToolCalls(
   const calls = [
     ...fromInvokeForm(text, schemas),
     ...fromDeepSeekForm(text),
+    ...fromKimiTokenForm(text),
     ...fromTaggedJsonForms(text),
   ].filter((c) => c.name.length > 0);
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectDialect, recoverToolCalls } from "../src/tool-dialects.js";
+import { detectDialect, recoverToolCalls, scanForMarker } from "../src/tool-dialects.js";
 
 const schemas = new Map([
   ["write_note", { type: "object", properties: { path: { type: "string" }, count: { type: "number" }, force: { type: "boolean" } } }],
@@ -83,5 +83,50 @@ describe("tool-call dialect recovery", () => {
     // `<think` alone was one of the two observed failure bodies. It carries no call, so it must
     // not parse as one — but it is also not a dialect marker on its own.
     expect(recoverToolCalls("<think>reasoning</think>Done.", schemas)).toEqual({ status: "none" });
+  });
+});
+
+describe("kimi ASCII token dialect (adoption review §1.8)", () => {
+  // A different grammar from the fullwidth DeepSeek form, not a spelling variant: section
+  // wrappers, the name riding in a `functions.NAME:IDX` id token, an argument-begin separator.
+  it("parses a full envelope, name and args recovered, prose preserved", () => {
+    const text =
+      'Let me update that.\n<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0' +
+      '<|tool_call_argument_begin|>{"city":"Paris"}<|tool_call_end|><|tool_calls_section_end|>';
+    const out = recoverToolCalls(text);
+    expect(out.status).toBe("parsed");
+    if (out.status !== "parsed") return;
+    expect(out.dialect).toBe("kimi");
+    expect(out.calls).toEqual([{ name: "get_weather", input: { city: "Paris" } }]);
+    expect(out.text).toBe("Let me update that.");
+  });
+
+  it("parses multiple calls in one section", () => {
+    const text =
+      '<|tool_calls_section_begin|>' +
+      '<|tool_call_begin|>functions.a:0<|tool_call_argument_begin|>{"x":1}<|tool_call_end|>' +
+      '<|tool_call_begin|>functions.b:1<|tool_call_argument_begin|>{"y":2}<|tool_call_end|>' +
+      '<|tool_calls_section_end|>';
+    const out = recoverToolCalls(text);
+    expect(out.status).toBe("parsed");
+    if (out.status !== "parsed") return;
+    expect(out.calls.map((c) => c.name)).toEqual(["a", "b"]);
+  });
+
+  it("an opaque id token leaves no way to know WHICH tool was meant — detected, never guessed", () => {
+    const text =
+      '<|tool_call_begin|>chatcmpl-tool-9f3a:0<|tool_call_argument_begin|>{"city":"Paris"}<|tool_call_end|>';
+    expect(recoverToolCalls(text)).toEqual({ status: "detected", dialect: "kimi" });
+  });
+
+  it("a truncated envelope is detected, so the caller fails clean instead of answering with markup", () => {
+    const text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"ci';
+    expect(recoverToolCalls(text)).toEqual({ status: "detected", dialect: "kimi" });
+  });
+
+  it("streaming holdback covers a split ASCII marker", () => {
+    const { safeLen, hit } = scanForMarker("some prose <|tool_call_beg");
+    expect(hit).toBe(false);
+    expect(safeLen).toBeLessThanOrEqual("some prose <".length);
   });
 });
