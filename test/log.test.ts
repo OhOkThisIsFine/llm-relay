@@ -104,7 +104,7 @@ describe("metadata-only logging", () => {
     const attempts = Array.from({ length: MAX_LOG_ATTEMPTS + 10 }, (_, index) => ({
       provider: "nim",
       model: `model-${index}`,
-      status: index === 0 ? "committed" : 429,
+      status: index === 0 ? "committed" : index === 1 ? "dead-turn" : 429,
       ms: index,
       error: "private upstream error text",
       body: "private response body",
@@ -118,6 +118,7 @@ describe("metadata-only logging", () => {
     const logged = line!["attempts"] as Array<Record<string, unknown>>;
     expect(logged).toHaveLength(MAX_LOG_ATTEMPTS);
     expect(logged[0]).toEqual({ provider: "nim", model: "model-0", status: "committed", ms: 0 });
+    expect(logged[1]).toEqual({ provider: "nim", model: "model-1", status: "dead-turn", ms: 1 });
     expect(Object.keys(logged[0]!)).toEqual(["provider", "model", "status", "ms"]);
   });
 

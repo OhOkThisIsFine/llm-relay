@@ -4,7 +4,7 @@ import type { Config } from "./config.js";
 export const DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024;
 export const MAX_LOG_ATTEMPTS = 64;
 
-export type RequestAttemptStatus = number | "failed" | "cancelled" | "committed";
+export type RequestAttemptStatus = number | "failed" | "cancelled" | "committed" | "dead-turn";
 
 /** Status-only metadata for one deployment visited during a bounded candidate walk. */
 export interface RequestAttemptLog {
@@ -108,7 +108,8 @@ function metadataOnlyAttempts(value: unknown): RequestAttemptLog[] {
       (typeof status === "number" && Number.isFinite(status)) ||
       status === "failed" ||
       status === "cancelled" ||
-      status === "committed";
+      status === "committed" ||
+      status === "dead-turn";
     if (
       typeof provider !== "string" ||
       (typeof model !== "string" && model !== null) ||
