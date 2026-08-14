@@ -6,6 +6,7 @@ import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
 import { stripOpeningThinkTag, stripThinkTagsInStream } from "./think-tags.js";
+import { STREAM_PREFLIGHT_LIMIT } from "./stream-commit.js";
 
 /**
  * A tool-call envelope was present in the response text but could not be parsed — truncated, or a
@@ -132,8 +133,6 @@ export function parseRetryAfterMs(value: string | null | undefined, now = Date.n
 }
 
 type ResponseProtocol = "openai-chat" | "anthropic-messages";
-
-const STREAM_PREFLIGHT_LIMIT = 64 * 1024;
 
 interface UpstreamResponseMetadata {
   reportedModel?: string;
