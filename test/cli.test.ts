@@ -95,6 +95,31 @@ describe("cli helper utilities", () => {
     expect(argValue("--config", "-c")).toBe("baz.json");
   });
 
+  it("does not reinterpret an option value that looks like a later flag", () => {
+    process.argv = [
+      "node", "cli.ts", "--config=real.json", "dispatch",
+      "-t", "--config=prompt.json", "--exhausted", "codex",
+    ];
+
+    expect(argValue("--task", "-t")).toBe("--config=prompt.json");
+    expect(argValue("--config", "-c")).toBe("real.json");
+    expect(argValue("--exhausted", "-x")).toBe("codex");
+    expect(getPositionalArgs()).toEqual(["dispatch"]);
+  });
+
+  it("consumes a flag-shaped task while still parsing normal flags before and after it", () => {
+    process.argv = [
+      "node", "cli.ts", "--client", "claude", "dispatch",
+      "-t", "--exhausted=prompt", "--config", "real.json", "--exhausted=codex",
+    ];
+
+    expect(argValue("--client")).toBe("claude");
+    expect(argValue("--task", "-t")).toBe("--exhausted=prompt");
+    expect(argValue("--config", "-c")).toBe("real.json");
+    expect(argValue("--exhausted", "-x")).toBe("codex");
+    expect(hasFlag("--exhausted", "-x")).toBe(true);
+  });
+
   it("hasFlag returns true for double dash, single dash, short form, and equals syntax", () => {
     process.argv = ["node", "cli.ts", "--refresh"];
     expect(hasFlag("--refresh", "-r")).toBe(true);

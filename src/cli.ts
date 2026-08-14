@@ -51,78 +51,52 @@ import { createControlAuthorization, resolveControlAuthorizationConfigDir } from
 import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { flushProbeCache } from "./ping/probe-cache.js";
 
-export function argValue(...flags: string[]): string | undefined {
-  const allFlags = new Set<string>();
-  for (const flag of flags) {
-    allFlags.add(flag);
-    if (flag.startsWith("--")) {
-      allFlags.add(flag.slice(1));
-    }
-  }
-
-  for (let i = 1; i < process.argv.length; i++) {
-    const arg = process.argv[i];
-    if (!arg) continue;
-
-    for (const f of allFlags) {
-      if (arg === f) {
-        return process.argv[i + 1];
-      }
-      if (arg.startsWith(f + "=")) {
-        return arg.slice(f.length + 1);
-      }
-    }
-  }
-  return undefined;
-}
-
-export function hasFlag(...flags: string[]): boolean {
-  const allFlags = new Set<string>();
-  for (const flag of flags) {
-    allFlags.add(flag);
-    if (flag.startsWith("--")) {
-      allFlags.add(flag.slice(1));
-    }
-  }
-
-  for (let i = 1; i < process.argv.length; i++) {
-    const arg = process.argv[i];
-    if (!arg) continue;
-
-    for (const f of allFlags) {
-      if (arg === f || arg.startsWith(f + "=")) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 const VALUE_FLAGS = new Set<string>([
-  '--config', '-config', '-c',
-  '--provider', '-provider', '-p',
-  '--default', '-default', '-d',
-  '--mode', '-mode', '-m',
-  '--listen', '-listen', '-l',
-  '--task', '-task', '-t',
-  '--exhausted', '-exhausted', '-x',
-  '--outcome', '-outcome',
-  '--retry-after-ms', '-retry-after-ms',
-  '--after', '-after',
-  '--lane', '-lane',
-  '--tier', '-tier',
+  "--config", "-config", "-c",
+  "--provider", "-provider", "-p",
+  "--default", "-default", "-d",
+  "--mode", "-mode", "-m",
+  "--listen", "-listen", "-l",
+  "--task", "-task", "-t",
+  "--exhausted", "-exhausted", "-x",
+  "--outcome", "-outcome",
+  "--retry-after-ms", "-retry-after-ms",
+  "--after", "-after",
+  "--lane", "-lane",
+  "--tier", "-tier",
   // ⚠ A value-taking flag MUST be listed here or its value is read as a positional. `--host
   // routed` was parsed as the positional lane id "routed" and reported as a missing lane.
-  '--host', '-host',
-  '--client', '-client',
-  '--scope', '-scope',
-  '--include', '-include',
-  '--effort', '-effort',
-  '--shell', '-shell',
+  "--host", "-host",
+  "--client", "-client",
+  "--scope", "-scope",
+  "--include", "-include",
+  "--effort", "-effort",
+  "--shell", "-shell",
+  "--class", "-class",
+  "--members", "-members",
+  "--rationale", "-rationale",
+  "--reset-field", "-reset-field",
+  "--reset-ms", "-reset-ms",
 ]);
 
-/** Extract non-flag positional arguments from an argv array, skipping flags and their values. */
-export function getPositionalArgs(argv: string[] = process.argv): string[] {
+interface ParsedCliArgs {
+  flags: string[];
+  values: Array<{ flag: string; value: string | undefined }>;
+  positionals: string[];
+}
+
+let cachedArgv: string[] | undefined;
+let cachedParsedArgs: ParsedCliArgs | undefined;
+
+function parseCliArgs(argv: string[]): ParsedCliArgs {
+  if (cachedArgv && cachedParsedArgs
+      && argv.length === cachedArgv.length
+      && argv.every((value, index) => value === cachedArgv![index])) {
+    return cachedParsedArgs;
+  }
+
+  const flags: string[] = [];
+  const values: ParsedCliArgs["values"] = [];
   const positionals: string[] = [];
   let i = 2;
   while (i < argv.length) {
@@ -131,20 +105,52 @@ export function getPositionalArgs(argv: string[] = process.argv): string[] {
       i++;
       continue;
     }
-    if (arg.startsWith('-')) {
-      if (arg.includes('=')) {
-        i += 1;
-      } else if (VALUE_FLAGS.has(arg)) {
-        i += 2;
-      } else {
-        i += 1;
-      }
-    } else {
+    if (!arg.startsWith("-")) {
       positionals.push(arg);
       i += 1;
+      continue;
     }
+
+    const equalsAt = arg.indexOf("=");
+    const flag = equalsAt === -1 ? arg : arg.slice(0, equalsAt);
+    flags.push(flag);
+    if (!VALUE_FLAGS.has(flag)) {
+      i += 1;
+      continue;
+    }
+
+    const value = equalsAt === -1 ? argv[i + 1] : arg.slice(equalsAt + 1);
+    values.push({ flag, value });
+    i += equalsAt === -1 ? 2 : 1;
   }
-  return positionals;
+
+  cachedArgv = [...argv];
+  cachedParsedArgs = { flags, values, positionals };
+  return cachedParsedArgs;
+}
+
+function expandFlagAliases(flags: string[]): Set<string> {
+  const aliases = new Set<string>();
+  for (const flag of flags) {
+    aliases.add(flag);
+    if (flag.startsWith("--")) aliases.add(flag.slice(1));
+  }
+  return aliases;
+}
+
+export function argValue(...flags: string[]): string | undefined {
+  const aliases = expandFlagAliases(flags);
+  return parseCliArgs(process.argv).values.find(({ flag }) => aliases.has(flag))?.value;
+}
+
+export function hasFlag(...flags: string[]): boolean {
+  const aliases = expandFlagAliases(flags);
+  return parseCliArgs(process.argv).flags.some((flag) => aliases.has(flag));
+}
+
+/** Extract non-flag positional arguments from an argv array, skipping flags and their values. */
+export function getPositionalArgs(argv: string[] = process.argv): string[] {
+  return [...parseCliArgs(argv).positionals];
 }
 
 type TableCell = string | readonly string[];
