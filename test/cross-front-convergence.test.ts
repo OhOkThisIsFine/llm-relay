@@ -342,7 +342,10 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     const state = globalCircuitBreaker.getState("p1/m1");
     expect(state?.lastStatus).toBe(429);
     expect(state?.consecutiveFailures).toBe(1);
-    expect(state?.cooldownUntil).toBeGreaterThan(Date.now());
+    const remaining = (state?.cooldownUntil ?? 0) - Date.now();
+    expect(remaining).toBeGreaterThan(0);
+    expect(remaining).toBeLessThanOrEqual(5000);
+    expect(state?.cooldownSource).toBe("loopback");
   });
 
   it("Retry-After sets the failed candidate's breaker cooldown without delaying failover", async () => {

@@ -6,7 +6,7 @@ import { deploymentFitness, getStrength, type StrengthBasis } from "./benchmarks
 import { findTierModel, type TierData } from "./tier-data.js";
 import { keyIsPresent } from "./authEnv.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
-import { globalCircuitBreaker, type CircuitBreaker } from "./circuit-breaker.js";
+import { globalCircuitBreaker, type CircuitBreaker, type CooldownSource } from "./circuit-breaker.js";
 import { describeScope, factsFor } from "./target-facts.js";
 import { getRealWorldScore, loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { loadTierData } from "./registry.js";
@@ -48,6 +48,8 @@ export interface Candidate {
     consecutiveFailures: number;
     lastStatus: number | null;
     cooldownRemainingMs: number;
+    cooldownSource: CooldownSource | null;
+    unexplained429s: number;
     /**
      * Credential faults observed on real traffic, on their own axis.
      *
@@ -361,6 +363,8 @@ export async function buildCandidates(
         consecutiveFailures: state?.consecutiveFailures ?? 0,
         lastStatus: state?.lastStatus ?? null,
         cooldownRemainingMs: Math.max(0, (state?.cooldownUntil ?? 0) - nowMs),
+        cooldownSource: state?.cooldownSource ?? null,
+        unexplained429s: state?.unexplained429s ?? 0,
         credentialFailures: state?.credentialFailures ?? 0,
         lastCredentialStatus: state?.lastCredentialStatus ?? null,
         credentialFault: breaker.hasCredentialFault(spec, nowMs),

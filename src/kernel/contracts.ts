@@ -27,6 +27,8 @@ export interface ProviderTargetIdentity {
   readonly provider: string;
   readonly model: string | null;
   readonly kind: ProviderKind;
+  /** Optional routing metadata used by breaker policy; never part of target equality. */
+  readonly base?: string;
 }
 
 declare const attemptHandleBrand: unique symbol;

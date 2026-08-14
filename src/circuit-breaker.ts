@@ -17,6 +17,10 @@ export interface CircuitState {
   consecutiveFailures: number;
   lastFailureTime: number;
   cooldownUntil: number;
+  /** Why the current/most-recent cooldown duration was selected. */
+  cooldownSource: CooldownSource | null;
+  /** Unexplained 429s since the last success, used only for remote escalation. */
+  unexplained429s: number;
   lastStatus?: number | undefined;
   pings: PingRecord[];
   quotaPercent?: number | null | undefined;
@@ -74,8 +78,11 @@ interface HealthOutcome {
 
 type CircuitTarget = ResolvedTarget | ProviderTargetIdentity | string;
 
+export type CooldownSource = "default" | "escalation" | "retry-after" | "loopback";
+
 const DEFAULT_COOLDOWN_MS = 60000; // 1 minute cooldown after consecutive failures
-const RATE_LIMIT_COOLDOWN_MS = 120000; // 2 minutes cooldown on 429
+const RATE_LIMIT_ESCALATION_MS = [120000, 600000, 3600000, 86400000] as const;
+const LOOPBACK_RATE_LIMIT_COOLDOWN_MS = 5000;
 
 /**
  * Cooldown for HTTP 402 — depleted credits on a free/router provider, i.e. a rate limit whose
@@ -136,6 +143,16 @@ function sameTarget(a: ProviderTargetIdentity, b: ProviderTargetIdentity): boole
   return a.provider === b.provider && a.model === b.model && a.kind === b.kind;
 }
 
+function isLoopbackTarget(target: CircuitTarget): boolean {
+  if (typeof target === "string" || target.base === undefined) return false;
+  try {
+    const hostname = new URL(target.base).hostname.toLowerCase();
+    return hostname === "127.0.0.1" || hostname === "localhost";
+  } catch {
+    return false;
+  }
+}
+
 // Shared only to distinguish a genuine handle issued by another breaker from an arbitrary or
 // expired object. Weak keys keep ownership per instance without extending a handle's lifetime.
 const breakerHandleOwners = new WeakMap<object, object>();
@@ -159,6 +176,8 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       consecutiveFailures: 0,
       lastFailureTime: 0,
       cooldownUntil: 0,
+      cooldownSource: null,
+      unexplained429s: 0,
       pings: [],
       credentialFailures: 0,
       credentialFaultUntil: 0,
@@ -398,6 +417,8 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     if (outcome.ok) {
       state.consecutiveFailures = 0;
       state.cooldownUntil = 0;
+      state.cooldownSource = null;
+      state.unexplained429s = 0;
       // A call that actually succeeded is proof the credential works now — that is the
       // recovery path for a key fixed while the proxy is running.
       state.credentialFailures = 0;
@@ -413,21 +434,36 @@ export class CircuitBreaker implements AttemptLifecyclePort {
         ? Math.min(MAX_RETRY_AFTER_MS, Math.max(MIN_RETRY_AFTER_MS, outcome.retryAfterMs))
         : null;
 
-    // HTTP 429 (Rate Limit) trips immediately — for exactly as long as the provider asked,
-    // or 2 minutes when it did not say.
+    // HTTP 429 (Rate Limit) trips immediately. A provider-stated Retry-After remains
+    // authoritative. Otherwise remote targets escalate across repeated unexplained throttles,
+    // while a busy loopback daemon receives only a short bench.
     if (outcome.status === 429) {
-      state.cooldownUntil = now + (asked ?? RATE_LIMIT_COOLDOWN_MS);
+      if (asked !== null) {
+        state.cooldownUntil = now + asked;
+        state.cooldownSource = "retry-after";
+      } else if (isLoopbackTarget(target)) {
+        state.cooldownUntil = now + LOOPBACK_RATE_LIMIT_COOLDOWN_MS;
+        state.cooldownSource = "loopback";
+      } else {
+        state.unexplained429s += 1;
+        const index = Math.min(state.unexplained429s - 1, RATE_LIMIT_ESCALATION_MS.length - 1);
+        state.cooldownUntil = now + RATE_LIMIT_ESCALATION_MS[index]!;
+        state.cooldownSource = state.unexplained429s === 1 ? "default" : "escalation";
+      }
     } else if (outcome.status === 402) {
       // Depleted monthly credits also trips immediately, but for much longer: no provider has
       // been observed to send a Retry-After on a 402 (the observed HuggingFace one carries
       // none), and the 2-minute guess is off by roughly the length of a billing period.
       state.cooldownUntil = now + (asked ?? QUOTA_EXHAUSTED_COOLDOWN_MS);
+      state.cooldownSource = asked === null ? "default" : "retry-after";
     } else if (asked !== null) {
       // A 503 with a Retry-After is the provider scheduling us; honour it on the first
       // failure rather than waiting for a second one to trip the generic cooldown.
       state.cooldownUntil = now + asked;
+      state.cooldownSource = "retry-after";
     } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
       state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
+      state.cooldownSource = "default";
     }
   }
 
