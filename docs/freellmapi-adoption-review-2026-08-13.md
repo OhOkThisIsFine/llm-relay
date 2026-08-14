@@ -23,16 +23,13 @@ provider skip — from different starting points. Those are the ones to trust mo
 
 ---
 
-> **Implementation status (2026-08-14):** every item in §1 landed, each with pinning tests in the
-> same commit — 1.3 `e673d39`, 1.4 `8a918d8`, 1.5 `c714774`, 1.6 `e3428d1`, 1.7 `2e0a6ca`,
-> 1.8 `0a38e42`, 1.9 `a700aaa`, 1.10 `c61b55f`, 1.11 `4d057d4`, 1.12 `9d6123b`, 1.2 `ed2499f`,
-> 1.1 `070c4b2`. One deliberate scope note: **1.1 landed as its verified first slice** — a
-> first-event in-band error frame now fails over pre-commit (the preflight-visible case). The
-> fuller deferred-commit machinery (withholding client headers until first meaningful content, so
-> a streamed-but-unparseable dialect envelope and an empty stream can also fail over invisibly)
-> remains open: it restructures when `writeHead` fires relative to the candidate loop on both
-> fronts and deserves its own design pass — see the bounded minimal version sketched below and in
-> §2's "deferred headers" discussion. **All fourteen §2 decisions were made 2026-08-14 (12 adopt / 2 skip); implementation started 2026-08-14.** See the decision record: [docs/adoption-round2-decisions-2026-08-14.md](adoption-round2-decisions-2026-08-14.md).
+> **Implementation status (2026-08-14):** every adopted item in §1 and §2 is implemented with
+> pinning tests. The full deferred-commit machinery now withholds both fronts until meaningful
+> content, including empty-stream and unparseable-dialect failover; the OpenAI direct-path dialect
+> gap recorded as [coverage item 2](tool-call-dialect-leak.md#coverage) is closed. §2.1 is
+> intentionally **buffered-only by design**, not deferred. The two owner-skipped items remain
+> skipped: §2.7 bare/fenced-JSON dialect envelopes and §2.12 speculative schema-key stripping.
+> See the [decision record](adoption-round2-decisions-2026-08-14.md).
 
 ## 1. Adopt — verified, rubric-clean, ranked
 
@@ -203,7 +200,7 @@ memory half (it retains response bodies — against the metadata-only posture). 
 against entirely: hidden request-to-request state, and stickiness can hold a session on a weaker
 target after better capacity returns.
 
-**Decision (2026-08-14): Adopt with guardrails.** Owner overrode Codex's skip recommendation. Constraints from the review: provenance header, always loses to breaker/health ordering, NO response-body retention (metadata-only posture). 30-min pin keyed on session header or first-user-message hash.
+**Decision (2026-08-14): Adopt with guardrails.** Owner overrode Codex's skip recommendation. Constraints from the review: provenance header, always loses to breaker/health ordering, NO response-body retention (metadata-only posture). 30-min pin keyed on session header or first-user-message hash. See the [sticky-session design and binding amendments](design-sticky-sessions-2026-08-14.md).
 
 **2.3 Escalating cooldown for repeat unexplained 429s + short bench for loopback providers.** (small)
 The breaker retries an unexplained 429 on a flat 2-minute cooldown forever
