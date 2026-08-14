@@ -880,3 +880,40 @@ describe("request-scoped provider skip — transport evidence condemns the host,
     expect(ok.calls()).toBe(1);
   });
 });
+
+describe("live-traffic quota headers reach the breaker (adoption review §1.9)", () => {
+  // The breaker's observation shape always carried quotaPercent, but only synthetic probes ever
+  // supplied it — every real response's x-ratelimit-* headers were dropped, so /telemetry showed
+  // probe-aged quota beside fresh live health.
+  it("a served response's x-ratelimit headers set the breaker's quotaPercent", async () => {
+    const a = await scripted(() => ({
+      headers: { "x-ratelimit-remaining-requests": "25", "x-ratelimit-limit-requests": "100" },
+      body: OK_BODY,
+    }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`])));
+
+    expect((await chat(p)).status).toBe(200);
+    expect(globalCircuitBreaker.getState("p1/m1")?.quotaPercent).toBe(25);
+  });
+
+  it("a 429's stated zero-remaining is recorded too — exhaustion is quota data", async () => {
+    const a = await scripted(() => ({
+      status: 429,
+      headers: { "x-ratelimit-remaining": "0", "x-ratelimit-limit": "50" },
+      body: JSON.stringify({ error: { message: "TPM exceeded", type: "rate_limit_exceeded" } }),
+    }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    expect((await chat(p)).status).toBe(200);
+    expect(globalCircuitBreaker.getState("p1/m1")?.quotaPercent).toBe(0);
+  });
+
+  it("no rate-limit headers ⇒ the field stays unset — never guessed", async () => {
+    const a = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`])));
+
+    expect((await chat(p)).status).toBe(200);
+    expect(globalCircuitBreaker.getState("p1/m1")?.quotaPercent ?? null).toBeNull();
+  });
+});

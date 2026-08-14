@@ -26,6 +26,7 @@ import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens, assessCost } from "./metadata.js";
 import { specOfTarget } from "./benchmarks.js";
+import { extractQuotaPercent } from "./ping/ping.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
@@ -653,7 +654,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       // returned exactly as before.
       const cls = classifyStatus(backendRes.status);
       const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
-      observeAttemptHeaders(h, attempt, backendRes.status, retryAfterMs);
+      observeAttemptHeaders(h, attempt, backendRes.status, retryAfterMs, backendRes.headers);
       observeContextLimit(backendRes, target);
 
       const localFailure = errorOrigin(backendRes) === "local";
@@ -1177,13 +1178,20 @@ function observeAttemptHeaders(
   attempt: HealthAttempt,
   status: number,
   retryAfterMs: number | null,
+  headers?: Headers,
 ): void {
   const observedAt = Date.now();
+  // Provider-stated quota from the response that just served REAL traffic (adoption review
+  // §1.9). The breaker's observation shape always carried `quotaPercent`; only synthetic probes
+  // ever supplied it, so live rate-limit headers were dropped on the floor and `/telemetry`
+  // showed probe-aged quota beside fresh live health.
+  const quotaPercent = headers ? extractQuotaPercent(headers) : null;
   const result = h.breaker.observeHeaders(attempt.handle, {
     target: attempt.identity,
     status,
     observedAt,
     elapsedMs: observedAt - attempt.started,
+    ...(quotaPercent !== null ? { quotaPercent } : {}),
     ...(retryAfterMs !== null ? { retryAfterMs } : {}),
   });
   if (!result.ok) throw new Error(`attempt header observation rejected: ${result.error.kind}`);
@@ -1391,7 +1399,7 @@ async function openAiFrontPath(
     const localFailure = errorOrigin(upstream) === "local";
     const cls = classifyStatus(upstream.status);
     const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
-    observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs);
+    observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs, upstream.headers);
     observeContextLimit(upstream, target);
 
     const tryNext = localFailure ? false : shouldTryNext(cls);
