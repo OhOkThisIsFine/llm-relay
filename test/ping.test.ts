@@ -16,6 +16,8 @@ import type { ModelCatalog } from "../src/catalog.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 
 /**
  * A probe-cache path no other test shares.
@@ -128,6 +130,46 @@ describe("Ping Requests", () => {
     expect(res.code).toBe("200");
     expect(res.quotaPercent).toBe(80);
     expect(res.ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("reports a redirect without following it or forwarding probe credentials", async () => {
+    let redirectTargetHits = 0;
+    const redirectTarget = createServer((_req, response) => {
+      redirectTargetHits++;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end("{}");
+    });
+    const redirectingBackend = createServer((_req, response) => {
+      const targetPort = (redirectTarget.address() as AddressInfo).port;
+      response.writeHead(302, { location: `http://127.0.0.1:${targetPort}/credential-target` });
+      response.end();
+    });
+    const listen = (server: Server) => new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const close = (server: Server) => new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+
+    await listen(redirectTarget);
+    await listen(redirectingBackend);
+    try {
+      const backendPort = (redirectingBackend.address() as AddressInfo).port;
+      const pCfg: ProviderConfig = {
+        base: `http://127.0.0.1:${backendPort}/v1`,
+        kind: "openai",
+        authHeader: "x-api-key",
+        timeoutMs: 5000,
+      };
+
+      const result = await pingProviderModel("test", "model-a", pCfg, "secret-key");
+
+      expect(result.code).toBe("302");
+      expect(result.code).not.toBe("200");
+      expect(redirectTargetHits).toBe(0);
+    } finally {
+      await Promise.all([close(redirectingBackend), close(redirectTarget)]);
+    }
   });
 });
 

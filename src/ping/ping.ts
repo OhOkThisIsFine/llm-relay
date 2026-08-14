@@ -116,6 +116,7 @@ async function sendPingFetch(
 ): Promise<Response> {
   return fetchFn(req.url, {
     method: "POST",
+    redirect: "manual",
     signal,
     headers: req.headers,
     body: JSON.stringify(req.body),
