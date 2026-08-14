@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { repair, destructiveMatcher, guardReshaped } from "../src/repair.js";
+import { repair, destructiveMatcher, guardReshaped, decodeDoubleEncodedInputs } from "../src/repair.js";
 import { ToolUseValidator } from "../src/validator.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
 import { FailoverReshaper, ReshaperTransportError, type Reshaper, type ReshapeRequest, type ReshapeResult } from "../src/reshaper.js";
@@ -288,5 +288,116 @@ describe("repair: post-reshape structural gate", () => {
     const a: AssistantMessage = { content: [{ type: "text", text: "hi", extra: 1 } as never], stop_reason: "tool_use" };
     const b: AssistantMessage = { content: [{ extra: 1, text: "hi", type: "text" } as never], stop_reason: "tool_use" };
     expect(guardReshaped(a, b, () => false)).toBeNull();
+  });
+});
+
+describe("deterministic double-encoding pre-pass (adoption review §1.7)", () => {
+  // GLM-family models emit nested JSON as a STRING. The decode is provable from the declared
+  // schema alone, so it must fix the call with ZERO reshaper egress — and never touch anything
+  // the schema does not prove.
+  const noDestruct = () => false;
+  const planTools = toolSchemaMap({
+    tools: [
+      {
+        name: "update_plan",
+        input_schema: {
+          type: "object",
+          properties: {
+            plan: { type: "array", items: { type: "object", properties: { step: { type: "string" } } } },
+            note: { type: "string" },
+            config: { type: "object", properties: { tags: { type: "array", items: { type: "string" } } } },
+          },
+          required: ["plan"],
+        },
+      },
+    ],
+  });
+  const neverReshaper: Reshaper = {
+    reshape: async () => {
+      throw new Error("the pre-pass must not spend a reshaper round-trip on a provable decode");
+    },
+  };
+
+  it("decodes a stringified array parameter and fixes the call without any reshaper egress", async () => {
+    const doubleEncoded: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "update_plan", input: { plan: '[{"step":"a"},{"step":"b"}]' } }],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(doubleEncoded, planTools, { validator, reshaper: neverReshaper, maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+    const input = (d.message!.content[0] as { input: { plan: unknown } }).input;
+    expect(input.plan).toEqual([{ step: "a" }, { step: "b" }]);
+  });
+
+  it("decodes recursively — a nested stringified array inside an object parameter", async () => {
+    const nested: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "update_plan", input: { plan: "[]", config: { tags: '["a","b"]' } } }],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(nested, planTools, { validator, reshaper: neverReshaper, maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+    const input = (d.message!.content[0] as { input: { config: { tags: unknown } } }).input;
+    expect(input.config.tags).toEqual(["a", "b"]);
+  });
+
+  it("unwraps whole-input double encoding — the input object arriving as its own JSON text", async () => {
+    const wrapped: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "update_plan", input: '{"plan":[{"step":"a"}]}' }],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(wrapped, planTools, { validator, reshaper: neverReshaper, maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+    const input = (d.message!.content[0] as { input: { plan: unknown } }).input;
+    expect(input.plan).toEqual([{ step: "a" }]);
+  });
+
+  it("composes with the stop_reason pre-pass — both fixed, still zero reshaper calls", async () => {
+    const both: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "update_plan", input: { plan: '[{"step":"a"}]' } }],
+      stop_reason: "end_turn",
+    };
+    const d = await repair(both, planTools, { validator, reshaper: neverReshaper, maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+    expect(d.message?.stop_reason).toBe("tool_use");
+  });
+
+  it("never decodes what the schema does not prove", () => {
+    // A string-typed param that LOOKS like JSON stays a string; a type mismatch stays put;
+    // an unknown key has no schema to justify a change.
+    expect(
+      decodeDoubleEncodedInputs(
+        {
+          content: [
+            { type: "tool_use", id: "t1", name: "update_plan", input: { plan: [], note: '["not","touched"]', mystery: "[1]" } },
+          ],
+          stop_reason: "tool_use",
+        },
+        planTools,
+      ),
+    ).toBeNull();
+    expect(
+      decodeDoubleEncodedInputs(
+        {
+          // Schema wants an array; the string parses to an OBJECT — a mismatch is left alone, never coerced.
+          content: [{ type: "tool_use", id: "t1", name: "update_plan", input: { plan: '{"step":"a"}' } }],
+          stop_reason: "tool_use",
+        },
+        planTools,
+      ),
+    ).toBeNull();
+  });
+
+  it("keeps the destructive refusal ahead of every pre-pass", async () => {
+    const destructive: AssistantMessage = {
+      content: [{ type: "tool_use", id: "t1", name: "update_plan", input: { plan: '[{"step":"a"}]' } }],
+      stop_reason: "tool_use",
+    };
+    const d = await repair(destructive, planTools, {
+      validator,
+      reshaper: neverReshaper,
+      maxAttempts: 2,
+      isDestructive: destructiveMatcher(["update_plan"]),
+    });
+    expect(d.outcome).toBe("refused_destructive");
   });
 });

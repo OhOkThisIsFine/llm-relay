@@ -65,13 +65,28 @@ export async function repair(
     return { outcome: "failed" };
   }
 
-  // A stop_reason mismatch is PURE protocol form: the message carries tool_use
-  // blocks but announces some other stop_reason, so the harness never runs the
-  // tool. Fixing it needs no model — it is fully determined by the content — so
-  // do it here rather than paying a reshaper round-trip that also ships this
-  // request's tool schemas and arguments to another provider.
+  // Deterministic pre-pass #1: double-encoded tool arguments (adoption review §1.7). Several
+  // free-tier models (GLM family prominently) emit nested JSON as a STRING —
+  // `{"plan": "[{\"step\":…}]"}` where the schema wants an array — or the whole input as its own
+  // JSON text. Both are provable from the declared schema alone, so decoding them here spends no
+  // reshaper round-trip and ships nothing to another provider. Anything unproven is untouched.
+  if (errors.length > 0) {
+    const decoded = decodeDoubleEncodedInputs(current, tools);
+    if (decoded !== null) {
+      const recheck = deps.validator.validate(decoded, tools);
+      if (recheck.valid) return { outcome: "fixed", message: decoded };
+      errors = recheck.errors;
+      current = decoded;
+    }
+  }
+
+  // Deterministic pre-pass #2: a stop_reason mismatch is PURE protocol form — the message
+  // carries tool_use blocks but announces some other stop_reason, so the harness never runs the
+  // tool. Fixing it needs no model — it is fully determined by the content — so do it here
+  // rather than paying a reshaper round-trip that also ships this request's tool schemas and
+  // arguments to another provider. Spreads `current` so it composes with pre-pass #1.
   if (errors.length > 0 && errors.every((e) => e.kind === "stop_reason_mismatch")) {
-    const normalized: AssistantMessage = { ...assistant, stop_reason: "tool_use" };
+    const normalized: AssistantMessage = { ...current, stop_reason: "tool_use" };
     const recheck = deps.validator.validate(normalized, tools);
     if (recheck.valid) return { outcome: "fixed", message: normalized };
     errors = recheck.errors;
@@ -104,6 +119,143 @@ export async function repair(
     current = result.message;
   }
   return { outcome: "failed" };
+}
+
+/** The three schema facts the decode gate reads; everything else in a node is ignored. */
+type SchemaNode = { type?: string; properties?: Record<string, unknown>; items?: unknown };
+
+function schemaNode(v: unknown): SchemaNode | undefined {
+  if (v === null || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  return {
+    ...(typeof o["type"] === "string" ? { type: o["type"] } : {}),
+    ...(o["properties"] !== null && typeof o["properties"] === "object"
+      ? { properties: o["properties"] as Record<string, unknown> }
+      : {}),
+    ...(o["items"] !== undefined ? { items: o["items"] } : {}),
+  };
+}
+
+/**
+ * Decode `value` against the schema node that describes it, or return undefined for "leave it
+ * alone". The gate is the whole design (fork-validated in freellmapi's tool-args repair): the
+ * schema must say `array` or `object`, and the string must parse to exactly that type. A
+ * parameter whose schema says `string` is never touched even when it looks like JSON, an absent
+ * or type-less schema node is never guessed at, and a mismatch is left as-is, never coerced.
+ */
+function decodeIfSchemaSays(value: string, schema: SchemaNode | undefined): unknown {
+  const want = schema?.type;
+  if (want !== "array" && want !== "object") return undefined;
+  const trimmed = value.trim();
+  if (!(trimmed.startsWith("[") || trimmed.startsWith("{"))) return undefined;
+  try {
+    const inner: unknown = JSON.parse(trimmed);
+    const match =
+      want === "array" ? Array.isArray(inner) : inner !== null && typeof inner === "object" && !Array.isArray(inner);
+    return match ? inner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Walk a decoded input alongside its schema, decoding double-encoded strings wherever the schema
+ * is unambiguous. Recursion is the point: the model that stringifies a top-level array
+ * stringifies a nested one too, and each level re-applies the identical gate, so depth adds
+ * reach without loosening the rule. A tuple `items` array is deliberately not followed —
+ * matching a decoded element to its position is inference, not proof. Mutates `node` (always a
+ * fresh clone here, never the caller's message) and reports whether anything changed.
+ */
+function decodeInPlace(node: unknown, schemaRaw: unknown): boolean {
+  if (node === null || typeof node !== "object") return false;
+  const schema = schemaNode(schemaRaw);
+  let changed = false;
+
+  if (Array.isArray(node)) {
+    const itemSchema = schema?.items;
+    if (itemSchema === undefined || Array.isArray(itemSchema)) return false;
+    for (let i = 0; i < node.length; i++) {
+      const value: unknown = node[i];
+      if (typeof value === "string") {
+        const decoded = decodeIfSchemaSays(value, schemaNode(itemSchema));
+        if (decoded !== undefined) {
+          node[i] = decoded;
+          changed = true;
+          decodeInPlace(decoded, itemSchema);
+        }
+      } else if (decodeInPlace(value, itemSchema)) {
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  const props = schema?.properties;
+  if (!props) return false;
+  const obj = node as Record<string, unknown>;
+  for (const [key, value] of Object.entries(obj)) {
+    const child = props[key];
+    if (child === undefined) continue; // Unknown key — no schema to justify a change.
+    if (typeof value === "string") {
+      const decoded = decodeIfSchemaSays(value, schemaNode(child));
+      if (decoded !== undefined) {
+        obj[key] = decoded;
+        changed = true;
+        decodeInPlace(decoded, child);
+      }
+    } else if (decodeInPlace(value, child)) {
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Repair double-encoded tool inputs across a message, returning the corrected message or null
+ * when nothing provable changed. Structure is conserved by construction — same blocks, same
+ * order, same tool_use ids and names, only `input` values decoded — so this needs no
+ * `guardReshaped`: it is not a collaborator, it is arithmetic on the schema.
+ */
+export function decodeDoubleEncodedInputs(
+  message: AssistantMessage,
+  tools: Map<string, JsonSchema | null>,
+): AssistantMessage | null {
+  let changed = false;
+  const content = message.content.map((block) => {
+    if (!isToolUseBlock(block)) return block;
+    let input: unknown = block.input;
+    let blockChanged = false;
+
+    // Whole-input double encoding: the input object arrived as its own JSON text. Needs no
+    // schema — an input must be an object, so a string input proves the wrapping.
+    if (typeof input === "string") {
+      const trimmed = input.trim();
+      if (trimmed.startsWith("{")) {
+        try {
+          const inner: unknown = JSON.parse(trimmed);
+          if (inner !== null && typeof inner === "object" && !Array.isArray(inner)) {
+            input = inner;
+            blockChanged = true;
+          }
+        } catch {
+          // Not JSON — nothing provable; the reshaper can still try.
+        }
+      }
+    }
+
+    if (input !== null && typeof input === "object") {
+      const copy: unknown = structuredClone(input);
+      if (decodeInPlace(copy, tools.get(block.name) ?? undefined)) {
+        input = copy;
+        blockChanged = true;
+      }
+    }
+
+    if (!blockChanged) return block;
+    changed = true;
+    return { ...block, input };
+  });
+  return changed ? { ...message, content } : null;
 }
 
 /**
