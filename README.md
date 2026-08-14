@@ -11,6 +11,7 @@ weaker (often free) models.
 ```bash
 npm install -g llm-relay
 llm-relay onboard          # collect free provider keys (NIM, Groq, Gemini, OpenRouter, ...)
+llm-relay onboard --import keys.env  # import dotenv or a FreeLLMAPI export JSON
 llm-relay setup claude-desktop   # or: llm-relay setup claude-cli
 llm-relay                  # start the proxy — leave it running
 ```

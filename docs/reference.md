@@ -83,6 +83,11 @@ actually answer?* Both are needed:
 Keys are read from the environment and, if present, from `~/.llm-relay/.env` (one `KEY=value`
 per line). **A variable already set in the environment always wins over the file.**
 
+`llm-relay onboard --import <file>` imports dotenv files and FreeLLMAPI v1 export JSON. Credential
+names must match the closed alias list for a configured provider; unknown names are explained and
+skipped, and key values are never printed. Existing entries in `~/.llm-relay/.env` are preserved
+unless `--force` is supplied. CSV, JSONC, generic JSON and value-shape guessing are not supported.
+
 ---
 
 ## Config
@@ -661,7 +666,7 @@ llm-relay models -p nim -r       # one provider, force re-fetch
 | Command | Description |
 | :--- | :--- |
 | `llm-relay` | Start the proxy |
-| `llm-relay onboard` | Set up provider keys |
+| `llm-relay onboard [--import <file>] [--force]` | Set up or import provider keys |
 | `llm-relay setup <claude-cli\|claude-desktop>` | Point a client at the relay |
 | `llm-relay keys` | Check provider credentials |
 | `llm-relay pools [--probe]` | List pool members; `--probe` tests each with a real completion |

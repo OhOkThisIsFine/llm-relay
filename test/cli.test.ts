@@ -74,6 +74,12 @@ describe("cli helper utilities", () => {
     expect(argValue("--config", "-c")).toBe("custom.json");
   });
 
+  it("treats --import's file as a flag value, not an onboard positional", () => {
+    process.argv = ["node", "cli.js", "onboard", "--import", "keys.env", "--force"];
+    expect(argValue("--import")).toBe("keys.env");
+    expect(getPositionalArgs()).toEqual(["onboard"]);
+  });
+
   it("argValue extracts values with single dash -flag value", () => {
     process.argv = ["node", "cli.ts", "-config", "custom.json"];
     expect(argValue("--config", "-c")).toBe("custom.json");

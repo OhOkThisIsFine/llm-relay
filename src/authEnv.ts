@@ -33,6 +33,16 @@ const PROVIDER_ENV_ALIASES: Record<string, string[]> = {
   anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
 };
 
+/**
+ * The curated aliases only, without the provider-name-derived candidates used by
+ * `candidateEnvNames()`. Importers need this narrower surface: accepting a credential from a
+ * file is allowed only when its NAME is explicitly listed, never because its value happens to
+ * look like a key or because an arbitrary provider slug can be turned into a plausible env name.
+ */
+export function curatedEnvNames(providerName: string): string[] {
+  return [...(PROVIDER_ENV_ALIASES[providerName.toLowerCase()] ?? [])];
+}
+
 /** `my-provider.2` → `MY_PROVIDER_2`, so a custom provider gets sane derived candidates. */
 function slug(providerName: string): string {
   return providerName.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
