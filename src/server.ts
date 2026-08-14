@@ -674,6 +674,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       }
 
       const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
+      // Phase switch (adoption review §1.2): this stream IS the response now — failover is over,
+      // so the total deadline has done its job and would only kill a healthy long generation.
+      // From here, silence (not duration) is the failure signal.
+      const stallMs = target.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+      if (streamed && backendRes.status < 400 && stallMs > 0) {
+        clearTimeout(timer);
+        backendRes = withStallWatchdog(backendRes, controller, stallMs);
+      }
       const willValidate = isMessages && hadTools && backendRes.status < 400;
       const reshaper = h.resolveReshaper(target);
       const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
@@ -826,6 +834,44 @@ function walkBudgetAllowsNext(budgetMs: number, walkStarted: number, attemptsCom
   if (attemptsCompleted < 2) return true;
   if (budgetMs === 0) return true;
   return Date.now() - walkStarted < budgetMs;
+}
+
+/**
+ * Streamed-response deadline split (adoption review §1.2) — one policy, both fronts.
+ *
+ * One flat `timeoutMs` spanning the whole attempt mis-serves streams in both directions: a
+ * healthy long generation still emitting bytes at the deadline is killed mid-answer, while a
+ * genuinely dead stream is not detected until the same deadline. So once a stream is chosen for
+ * serving, the total deadline DISARMS and an inter-byte watchdog takes over: every arriving
+ * chunk re-arms it, and only silence for the full window aborts — through the same controller,
+ * so the existing mid-stream error path reports it honestly. Default fork-validated in
+ * freellmapi (90s); `stallTimeoutMs: 0` keeps the old single-deadline behavior.
+ */
+export const DEFAULT_STALL_TIMEOUT_MS = 90_000;
+
+function withStallWatchdog(upstream: Response, controller: AbortController, stallMs: number): Response {
+  if (!upstream.body) return upstream;
+  let timer: NodeJS.Timeout | undefined;
+  const arm = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), stallMs);
+  };
+  const disarm = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+  const watchdog = new TransformStream<Uint8Array, Uint8Array>({
+    start: arm,
+    transform(chunk, ctrl) {
+      arm();
+      ctrl.enqueue(chunk);
+    },
+    flush: disarm,
+  });
+  return new Response(upstream.body.pipeThrough(watchdog), {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
 }
 
 /**
@@ -1428,6 +1474,12 @@ async function openAiFrontPath(
     // deployment tried, in order — so an exhausted pool is self-describing and the reader can
     // see that the failure they are holding is the last of N, not the only one.
     const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+    // Same phase switch as the Anthropic path — one deadline policy, both fronts (§1.2).
+    const stallMs = target.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    if (streamed && upstream.status < 400 && stallMs > 0) {
+      clearTimeout(timer);
+      upstream = withStallWatchdog(upstream, controller, stallMs);
+    }
     try {
       const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
