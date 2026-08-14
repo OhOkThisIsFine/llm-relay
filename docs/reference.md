@@ -138,6 +138,11 @@ Code subagent frontmatter. A pool gives them ranking and failover anyway. `pool`
 provider name. Pool refs are legal in `routing.tiers`, `routing.default` and `routing.subagents`;
 pool-in-pool is rejected at load.
 
+A dynamic pool (`{ "preferred": [...], "include": "free" }`) may also declare
+`"exclude": ["provider/model", ...]`. These are permanent user tombstones: they remove matching
+entries from both the preferred prefix and the discovered tail. Unknown or no-longer-catalogued
+entries are intentionally inert, so a tombstone can outlive the deployment it excludes.
+
 **Passthrough:** an `anthropic`-kind provider with **no `authEnv`** forwards the caller's own
 credentials byte-for-byte (`authorization`/`x-api-key` *and* `anthropic-beta`). Point every tier
 at it and real Claude traffic stays on real Anthropic while `pool/*` routes elsewhere — one

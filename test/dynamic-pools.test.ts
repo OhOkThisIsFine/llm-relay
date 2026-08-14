@@ -7,6 +7,50 @@ import { ModelCatalog } from "../src/catalog.js";
 import { materializeDynamicPools } from "../src/dynamic-pools.js";
 
 describe("dynamic free-model pools", () => {
+  it("excludes user tombstones from preferred and discovered members while unknown entries stay inert", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rp-dynamic-exclude-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: { free: { base: "https://free.test/v1", kind: "openai", tierType: "free" } },
+        routing: {
+          default: "free/kept-preferred",
+          pools: {
+            coding: {
+              preferred: ["free/excluded-preferred", "free/kept-preferred"],
+              include: "free",
+              exclude: [
+                "free/excluded-preferred",
+                "free/excluded-discovered",
+                "retired/no-longer-catalogued",
+              ],
+            },
+          },
+        },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      await catalog.list("free", cfg.providers.free!, {
+        fetchFn: (async () => new Response(JSON.stringify({ data: [
+          { id: "excluded-preferred" },
+          { id: "kept-preferred" },
+          { id: "excluded-discovered" },
+          { id: "kept-discovered" },
+        ] }), { status: 200 })) as unknown as typeof fetch,
+      });
+
+      expect(materializeDynamicPools(cfg, catalog)).toBe(true);
+      expect(cfg.routing.pools!.coding).toContain("free/kept-preferred");
+      expect(cfg.routing.pools!.coding).toContain("free/kept-discovered");
+      expect(cfg.routing.pools!.coding).not.toContain("free/excluded-preferred");
+      expect(cfg.routing.pools!.coding).not.toContain("free/excluded-discovered");
+      expect(cfg.routing.pools!.coding).not.toContain("retired/no-longer-catalogued");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the preferred prefix and ranks every free target ahead of every paid one", async () => {
     const dir = mkdtempSync(join(tmpdir(), "rp-dynamic-pool-"));
     try {

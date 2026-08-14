@@ -322,6 +322,36 @@ describe("resolveTargets — pool/<name> ranked routing", () => {
     })))).toThrow(/effort must be low, medium, high, or xhigh/);
   });
 
+  it("validates dynamic-pool exclude tombstones without resolving their providers", () => {
+    const valid = loadConfig(write("exclude-pool.json", base({
+      routing: {
+        default: "nim/m",
+        pools: {
+          medium: {
+            preferred: ["nim/keep", "gone/old-model"],
+            include: "free",
+            exclude: ["gone/old-model", "retired/unknown-model"],
+          },
+        },
+      },
+    })));
+    expect(valid.routing.poolPolicies?.medium).toEqual({
+      preferred: ["nim/keep"],
+      include: "free",
+      exclude: ["gone/old-model", "retired/unknown-model"],
+    });
+    expect(valid.routing.pools?.medium).toEqual(["nim/keep"]);
+
+    for (const [index, exclude] of ["nim", "pool/other", ["nim/good", 42]].entries()) {
+      expect(() => loadConfig(write(`bad-exclude-${index}.json`, base({
+        routing: {
+          default: "nim/m",
+          pools: { medium: { preferred: [], include: "free", exclude } },
+        },
+      })))).toThrow(/exclude must be an array of "provider\/model" specs/);
+    }
+  });
+
   it("FAILS LOUDLY on an unknown pool instead of silently using routing.default", () => {
     // The whole point: a typo'd pool must not quietly succeed against a different model.
     expect(() => resolveTargets("pool/nope", poolCfg)).toThrow(/no pool "nope" configured/);

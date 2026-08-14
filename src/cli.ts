@@ -1916,6 +1916,9 @@ export async function runPools(
         ? Array.isArray(dynamic.preferred) ? dynamic.preferred.filter((v): v is string => typeof v === "string") : []
         : Array.isArray(existing) ? existing.filter((v): v is string => typeof v === "string") : [];
       const oldEffort = dynamic && typeof dynamic.effort === "string" ? dynamic.effort : undefined;
+      const oldExclude = dynamic && Array.isArray(dynamic.exclude)
+        ? dynamic.exclude.filter((v): v is string => typeof v === "string")
+        : [];
       let next: string[];
       if (action === "set") next = [...new Set(specs)];
       else if (action === "add") next = [...new Set([...oldMembers, ...specs])];
@@ -1931,6 +1934,7 @@ export async function runPools(
           ...(effort ?? (action !== "set" ? oldEffort : undefined)
             ? { effort: effort ?? oldEffort }
             : {}),
+          ...(action !== "set" && oldExclude.length > 0 ? { exclude: oldExclude } : {}),
         };
       } else {
         pools[name] = next;
