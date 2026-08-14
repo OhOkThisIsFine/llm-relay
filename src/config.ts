@@ -532,6 +532,8 @@ export interface Config {
    * DEFAULT_WALK_BUDGET_MS (45s).
    */
   walkBudgetMs?: number;
+  /** Maximum inbound request-body size in bytes. Absent ⇒ 36 MiB. */
+  maxBodyBytes?: number;
   log: { level: "metadata" | "silent"; file: string | null };
   /**
    * Providers the onboarding nudge must stop asking about (`leave_me_alone` in config.json).
@@ -890,6 +892,18 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     walkBudgetMs = Math.floor(walkBudgetRaw);
   }
 
+  const maxBodyBytesRaw = (c as { maxBodyBytes?: unknown }).maxBodyBytes;
+  let maxBodyBytes: number | undefined;
+  if (maxBodyBytesRaw !== undefined) {
+    const maxConfiguredBodyBytes = 256 * 1024 * 1024;
+    if (!Number.isSafeInteger(maxBodyBytesRaw) || (maxBodyBytesRaw as number) <= 0 || (maxBodyBytesRaw as number) > maxConfiguredBodyBytes) {
+      throw new Error(
+        `config.maxBodyBytes must be a positive integer no greater than ${maxConfiguredBodyBytes}; got ${JSON.stringify(maxBodyBytesRaw)}`,
+      );
+    }
+    maxBodyBytes = maxBodyBytesRaw as number;
+  }
+
   const leaveMeAlone = parseLeaveMeAlone(c["leave_me_alone"]);
 
   return {
@@ -903,6 +917,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     ...(dynamicReshaperPool ? { reshaperPool: dynamicReshaperPool } : {}),
     repair: { maxAttempts, destructiveTools },
     ...(walkBudgetMs !== undefined ? { walkBudgetMs } : {}),
+    ...(maxBodyBytes !== undefined ? { maxBodyBytes } : {}),
     log: { level, file },
     ...(leaveMeAlone.length > 0 ? { leaveMeAlone } : {}),
     sourcePath: path,

@@ -111,6 +111,7 @@ block. All state lives under `~/.llm-relay/` (`config.json`, `.env`, `models-cac
   },
   "mode": "repair",                        // detect | repair
   "repair": { "maxAttempts": 2, "destructiveTools": ["Bash", "Write", "Edit", "..."] },
+  "maxBodyBytes": 37748736,                 // optional; 36 MiB default, 256 MiB maximum
   "log": { "level": "metadata", "file": null }
 }
 ```

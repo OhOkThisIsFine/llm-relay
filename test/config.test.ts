@@ -969,3 +969,21 @@ describe("loadConfig — walkBudgetMs", () => {
     expect(() => loadConfig(write("wb-str.json", base({ walkBudgetMs: "45s" })))).toThrow(/walkBudgetMs/);
   });
 });
+
+describe("loadConfig — maxBodyBytes", () => {
+  it("accepts a positive integer within the configured bound", () => {
+    expect(loadConfig(write("body-ok.json", base({ maxBodyBytes: 36 * 1024 * 1024 }))).maxBodyBytes)
+      .toBe(36 * 1024 * 1024);
+  });
+
+  it("is absent when not configured — the server applies its 36 MiB default", () => {
+    expect(loadConfig(write("body-absent.json", base())).maxBodyBytes).toBeUndefined();
+  });
+
+  it.each([0, -1, 1.5, 256 * 1024 * 1024 + 1, "36MB"])(
+    "rejects invalid maxBodyBytes value %j and names the field",
+    (maxBodyBytes) => {
+      expect(() => loadConfig(write("body-invalid.json", base({ maxBodyBytes })))).toThrow(/maxBodyBytes/);
+    },
+  );
+});

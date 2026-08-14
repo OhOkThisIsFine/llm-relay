@@ -184,7 +184,8 @@ function listenerAuthority(server: Server, cfg: Config): NormalizedAuthority | n
 }
 
 const MAX_VALIDATE_BYTES = 8 * 1024 * 1024;
-const MAX_BODY_BYTES = 10 * 1024 * 1024;
+/** 25 MiB decoded document × base64 expansion, plus JSON-envelope headroom. */
+export const DEFAULT_MAX_BODY_BYTES = 36 * 1024 * 1024;
 
 export interface ProxyDeps {
   reshaper?: Reshaper;
@@ -339,7 +340,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   let reqBuf: Buffer;
   try {
-    reqBuf = await readBody(req);
+    reqBuf = await readBody(req, cfg.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
   } catch (e) {
     const msg = (e as Error).message;
     const status = msg.includes("too large") ? 413 : 400;
@@ -2237,7 +2238,7 @@ function midStreamMessage(e: unknown): string {
   return `llm-relay: backend stream failed mid-response: ${errStr}`;
 }
 
-function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Buffer> {
+function readBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -2255,7 +2256,8 @@ function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Buff
       if (total > maxBytes) {
         done = true;
         cleanup();
-        req.destroy();
+        // Drain without retaining the rest so the client can receive the explicit 413 response.
+        req.resume();
         reject(new Error("request body too large"));
         return;
       }
