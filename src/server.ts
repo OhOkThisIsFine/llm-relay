@@ -778,9 +778,13 @@ export function orderByUsability(
  *
  *   ok         — serve it; the target is proven healthy.
  *   retriable  — the deployment could not serve this request (429/5xx, a 400/404 that here is
- *                nearly always "this model won't take this shape", or a 402 — on the free/router
+ *                nearly always "this model won't take this shape", a 402 — on the free/router
  *                providers this proxy fronts, "payment required" means depleted monthly credits,
- *                i.e. a 429 with a monthly window). Breaker failure, try the next.
+ *                i.e. a 429 with a monthly window — or a 410: the deployment is GONE, which is a
+ *                fact about one member, never about the request, so a sibling can still serve it.
+ *                NVIDIA retired models with real 410 End-of-Life responses on 2026-08-07; before
+ *                410 joined this class those returned straight to the client with a healthy pool
+ *                standing by. Breaker failure, try the next.
  *   credential — 401/403. Try the next candidate, but tell the breaker's HEALTH side nothing:
  *                see `recordCredentialFault`.
  *   client     — a genuine client-side 4xx (413, 422, …). The next candidate would reject it
@@ -791,7 +795,7 @@ export type OutcomeClass = "ok" | "retriable" | "credential" | "client";
 export function classifyStatus(status: number): OutcomeClass {
   if (status < 400) return "ok";
   if (status === 401 || status === 403) return "credential";
-  if (status === 400 || status === 402 || status === 404 || status === 429 || status >= 500) return "retriable";
+  if (status === 400 || status === 402 || status === 404 || status === 410 || status === 429 || status >= 500) return "retriable";
   return "client";
 }
 
@@ -1096,7 +1100,15 @@ function resolveResetMs(interpretation: Interpretation, headerMs: number | null,
  * never learning the one 429 that is worth learning.
  */
 function carriesEligibilityFact(status: number): boolean {
-  return status === 400 || status === 401 || status === 402 || status === 403 || status === 404 || status === 429;
+  return (
+    status === 400 ||
+    status === 401 ||
+    status === 402 ||
+    status === 403 ||
+    status === 404 ||
+    status === 410 ||
+    status === 429
+  );
 }
 
 /**
