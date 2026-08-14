@@ -2,6 +2,17 @@ import { appendFileSync, existsSync, renameSync, rmSync, statSync } from "node:f
 import type { Config } from "./config.js";
 
 export const DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024;
+export const MAX_LOG_ATTEMPTS = 64;
+
+export type RequestAttemptStatus = number | "failed" | "cancelled" | "committed";
+
+/** Status-only metadata for one deployment visited during a bounded candidate walk. */
+export interface RequestAttemptLog {
+  provider: string;
+  model: string | null;
+  status: RequestAttemptStatus;
+  ms: number;
+}
 
 /**
  * Metadata-only request log. NEVER records headers or bodies — only the shape of
@@ -37,6 +48,8 @@ export interface RequestLog {
    * passthrough target carries no model id of its own, and that is `null` too.
    */
   servedModel: string | null;
+  /** Bounded, statuses-only candidate walk. Never carries error text or bodies. */
+  attempts: RequestAttemptLog[];
   hadTools: boolean;
   streamed: boolean;
   backendStatus: number;
@@ -64,6 +77,7 @@ const LOG_FIELDS = [
   "path",
   "servedProvider",
   "servedModel",
+  "attempts",
   "hadTools",
   "streamed",
   "backendStatus",
@@ -75,12 +89,49 @@ const LOG_FIELDS = [
   "latencyMs",
 ] as const satisfies readonly (keyof RequestLog)[];
 
+const ATTEMPT_FIELDS = ["provider", "model", "status", "ms"] as const satisfies readonly (keyof RequestAttemptLog)[];
+
+function metadataOnlyAttempts(value: unknown): RequestAttemptLog[] {
+  if (!Array.isArray(value)) return [];
+  const out: RequestAttemptLog[] = [];
+  for (const raw of value.slice(0, MAX_LOG_ATTEMPTS)) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const candidate = raw as Record<string, unknown>;
+    const provider = candidate["provider"];
+    const model = candidate["model"];
+    const status = candidate["status"];
+    const ms = candidate["ms"];
+    const validStatus =
+      (typeof status === "number" && Number.isFinite(status)) ||
+      status === "failed" ||
+      status === "cancelled" ||
+      status === "committed";
+    if (
+      typeof provider !== "string" ||
+      (typeof model !== "string" && model !== null) ||
+      !validStatus ||
+      typeof ms !== "number" ||
+      !Number.isFinite(ms)
+    ) {
+      continue;
+    }
+    const projected: Record<string, unknown> = {};
+    for (const field of ATTEMPT_FIELDS) projected[field] = candidate[field];
+    out.push(projected as unknown as RequestAttemptLog);
+  }
+  return out;
+}
+
 /** Project a record down to the allow-listed metadata fields. */
 function metadataOnly(record: RequestLog): Record<string, unknown> {
   const seen = record as unknown as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const field of LOG_FIELDS) {
     const value = seen[field];
+    if (field === "attempts") {
+      out[field] = metadataOnlyAttempts(value);
+      continue;
+    }
     if (value !== undefined) out[field] = value;
   }
   return out;

@@ -748,11 +748,17 @@ gateway. Verified against Claude Code 2.1.220; re-check after an upgrade.
 
 ## Logging (metadata only)
 
-Per request: `{ ts, path, servedProvider, servedModel, hadTools, streamed, backendStatus,
-validated, toolUseCount, uncheckableCount, errorKinds[], repair, latencyMs }`.
+Per request: `{ ts, path, servedProvider, servedModel, attempts[], hadTools, streamed,
+backendStatus, validated, toolUseCount, uncheckableCount, errorKinds[], repair, latencyMs }`.
+`attempts` is capped at 64 status-only entries shaped as `{ provider, model, status, ms }`; a
+normal HTTP attempt uses its status code, a lifecycle-only failure/cancellation uses
+`"failed"`/`"cancelled"`, and a partially flushed response whose upstream body then dies uses
+`"committed"`.
 
 The list is an **allow-list applied at the sink** — a caller handing over a wider object cannot
-leak a header, body, or key. Query parameter *values* are replaced by their lengths.
+leak a header, body, or key. Attempt entries are projected through their own nested allow-list too,
+so an error string attached by a caller is discarded. Query parameter *values* are replaced by
+their lengths.
 `servedProvider`/`servedModel` are the deployment that actually answered (the id the client
 asked for is deliberately not recorded — for a pool spec it is routinely not the model that
 served). A failed log write is swallowed: a full disk is a logging problem, never a request

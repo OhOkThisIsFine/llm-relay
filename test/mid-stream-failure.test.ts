@@ -114,6 +114,9 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     expect(lines[0]!.errorKinds).toEqual(["backend_stream_failed"]);
     // OBS-b5ade458: the record names the target that actually served the turn.
     expect(lines[0]!.servedProvider).toBe("up");
+    expect(lines[0]!.attempts).toEqual([
+      { provider: "up", model: null, status: "committed", ms: expect.any(Number) },
+    ]);
   });
 
   it("repair mode: the same truncation is reported and logged, not silently ended", async () => {
@@ -140,6 +143,9 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     const lines = logLines(logFile);
     expect(lines).toHaveLength(1);
     expect(lines[0]!.errorKinds).toEqual(["backend_stream_failed"]);
+    expect(lines[0]!.attempts).toEqual([
+      { provider: "up", model: null, status: "committed", ms: expect.any(Number) },
+    ]);
   });
 
   it("reports mid-stream failures to circuit breaker and trips breaker on repeated failures", async () => {
