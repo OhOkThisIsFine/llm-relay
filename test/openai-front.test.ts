@@ -41,7 +41,7 @@ function catalogWithLimits(dir: string, seed: Record<string, Record<string, Part
 }
 
 /** Mock OpenAI /chat/completions backend capturing the model + auth it received. */
-function mockOpenAi(): Promise<{ server: Server; seen: () => { model?: string; auth?: string } }> {
+function mockOpenAi(content = "hi from backend"): Promise<{ server: Server; seen: () => { model?: string; auth?: string } }> {
   let captured: { model?: string; auth?: string } = {};
   return new Promise((resolve) => {
     const s = createServer((req, res) => {
@@ -54,7 +54,7 @@ function mockOpenAi(): Promise<{ server: Server; seen: () => { model?: string; a
           ...(typeof req.headers["authorization"] === "string" ? { auth: req.headers["authorization"] } : {}),
         };
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ id: "cmpl_1", object: "chat.completion", choices: [{ message: { role: "assistant", content: "hi from backend" }, finish_reason: "stop" }] }));
+        res.end(JSON.stringify({ id: "cmpl_1", object: "chat.completion", choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }] }));
       });
     });
     s.listen(0, "127.0.0.1", () => resolve({ server: s, seen: () => captured }));
@@ -84,7 +84,8 @@ describe("OpenAI front (/chat/completions)", () => {
 
   it("routes a namespaced model, rewrites to the backend id, injects the key, returns OpenAI verbatim", async () => {
     process.env.RP_FRONT_KEY = "sk-backend";
-    const mock = await mockOpenAi();
+    const directContent = "<think>direct OpenAI bytes stay exact</think>hi from backend";
+    const mock = await mockOpenAi(directContent);
     backend = mock.server;
     const c = cfg({ up: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000, authEnv: "RP_FRONT_KEY" } }, "up/fallback");
     proxy = await startProxy(c);
@@ -101,7 +102,7 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(mock.seen().model).toBe("real-model");          // namespace stripped, backend id sent
     expect(mock.seen().auth).toBe("Bearer sk-backend");    // backend key injected (client secret dropped)
     expect(mock.seen().auth).not.toContain("CLIENT-SECRET"); // and the caller's own credential never egressed
-    expect(body.choices[0]!.message.content).toBe("hi from backend"); // OpenAI response passed through
+    expect(body.choices[0]!.message.content).toBe(directContent); // direct OpenAI response stays byte-exact, tags included
   });
 
   it("serves the /chat/completions path without the /v1 prefix too", async () => {
