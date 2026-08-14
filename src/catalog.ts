@@ -7,6 +7,44 @@ import { WriteBehindTimer } from "./write-behind.js";
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
 const DEFAULT_CACHE = join(homedir(), ".llm-relay", "models-cache.json");
 
+// Bounds on a /models response (adoption review §1.11). The byte cap is the load-bearing one:
+// `AbortSignal.timeout` bounds time, not size, so a fast hostile stream could balloon this
+// process within the window. The model-count cap is far above any real roster (OpenRouter lists
+// ~500) — it exists only to stop pathological floods of tiny records that fit under the byte cap.
+const MAX_CATALOG_BYTES = 2 * 1024 * 1024;
+const MAX_CATALOG_MODELS = 5000;
+const MAX_MODEL_ID_CHARS = 256;
+
+/** Read a response body with a hard byte ceiling, refusing a stated oversize before reading. */
+async function readBoundedBody(res: Response, maxBytes: number): Promise<string> {
+  const stated = Number(res.headers.get("content-length") ?? "");
+  if (Number.isFinite(stated) && stated > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`models response states ${stated} bytes; cap is ${maxBytes}`);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) {
+    // No stream (a synthetic Response in tests, or an empty body): text() cannot exceed what
+    // already exists in memory, and the content-length check above covered the stated size.
+    const text = await res.text();
+    if (text.length > maxBytes) throw new Error(`models response exceeded the ${maxBytes}-byte cap`);
+    return text;
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`models response exceeded the ${maxBytes}-byte cap`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 /**
  * Limits a provider publishes about its OWN deployment of a model.
  *
@@ -341,17 +379,29 @@ export class ModelCatalog {
     const signal = cfg.timeoutMs && cfg.timeoutMs > 0 ? AbortSignal.timeout(cfg.timeoutMs) : undefined;
     const res = await fetchFn(cfg.base + "/models", { headers, ...(signal ? { signal } : {}) });
     if (!res.ok) throw new Error(`models fetch HTTP ${res.status}`);
-    const j = (await res.json()) as { data?: Array<Record<string, unknown>> };
-    const records = j.data ?? [];
+    // A /models response is semi-trusted external content, and this is the one process fronting
+    // every client session — `res.json()` buffered unboundedly, so a buggy or hostile endpoint
+    // could balloon it within the timeout window (time bounds are not size bounds). Caps
+    // fork-validated in freellmapi's model discovery; adoption review §1.11. The failure mode is
+    // the same as any fetch error: this provider's catalog degrades, nothing else does.
+    const body = await readBoundedBody(res, MAX_CATALOG_BYTES);
+    const j = JSON.parse(body) as { data?: Array<Record<string, unknown>> };
+    let records = Array.isArray(j.data) ? j.data : [];
+    if (records.length > MAX_CATALOG_MODELS) {
+      console.warn(
+        `llm-relay: ${cfg.base} listed ${records.length} models; keeping the first ${MAX_CATALOG_MODELS}`,
+      );
+      records = records.slice(0, MAX_CATALOG_MODELS);
+    }
     const limits: Record<string, ModelLimits> = {};
     for (const rec of records) {
-      if (typeof rec?.id !== "string") continue;
+      if (typeof rec?.id !== "string" || rec.id.length > MAX_MODEL_ID_CHARS) continue;
       const l = limitsFromRecord(rec);
       if (!isEmpty(l)) limits[rec.id] = l;
     }
     const models = records
       .map((m) => m.id)
-      .filter((s): s is string => typeof s === "string")
+      .filter((s): s is string => typeof s === "string" && s.length <= MAX_MODEL_ID_CHARS)
       .sort();
     return { models, limits };
   }

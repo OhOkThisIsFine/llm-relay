@@ -183,3 +183,39 @@ describe("ModelCatalog", () => {
     expect(receivedSignal?.aborted).toBe(false);
   });
 });
+
+describe("bounded catalog fetch (adoption review §1.11)", () => {
+  // A /models response is semi-trusted external content served to the one process fronting every
+  // session. Time bounds are not size bounds: res.json() buffered unboundedly within the timeout.
+  it("refuses a body over the byte cap and degrades like any fetch failure", async () => {
+    const huge = JSON.stringify({ data: [{ id: "x".repeat(3 * 1024 * 1024) }] });
+    const bigFetch = (async () => new Response(huge, { status: 200 })) as unknown as typeof fetch;
+    const c = new ModelCatalog({ cachePath: null });
+    expect(await c.list("p", provider, { fetchFn: bigFetch })).toEqual([]);
+  });
+
+  it("refuses a STATED oversize up front — the content-length check precedes any read", async () => {
+    const lyingFetch = (async () => {
+      const res = new Response(new ReadableStream({}), { status: 200 });
+      Object.defineProperty(res, "headers", {
+        value: new Headers({ "content-length": String(50 * 1024 * 1024) }),
+      });
+      return res;
+    }) as unknown as typeof fetch;
+    const c = new ModelCatalog({ cachePath: null });
+    expect(await c.list("p", provider, { fetchFn: lyingFetch })).toEqual([]);
+  });
+
+  it("drops an id longer than the cap and keeps its siblings", async () => {
+    const c = new ModelCatalog({ cachePath: null });
+    const models = await c.list("p", provider, { fetchFn: okFetch(["good-model", "m".repeat(300)]) });
+    expect(models).toEqual(["good-model"]);
+  });
+
+  it("caps a pathological model count, keeping the first N", async () => {
+    const ids = Array.from({ length: 5010 }, (_, i) => `m${String(i).padStart(5, "0")}`);
+    const c = new ModelCatalog({ cachePath: null });
+    const models = await c.list("p", provider, { fetchFn: okFetch(ids) });
+    expect(models.length).toBe(5000);
+  });
+});
