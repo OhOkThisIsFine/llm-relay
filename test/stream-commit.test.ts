@@ -72,6 +72,17 @@ describe("final-wire stream commit probe", () => {
     await expectReady("anthropic-messages", [bytes(event(frame))]);
   });
 
+  it.each([
+    { label: "signature", delta: { type: "signature_delta", signature: "sig_abc" } },
+    { label: "tool arguments", delta: { type: "input_json_delta", partial_json: '{"city":"Paris"}' } },
+  ])("does not commit an Anthropic $label delta without its content block start", async ({ delta }) => {
+    const result = await probeStreamForCommit(
+      streamOf([bytes(event({ type: "content_block_delta", index: 0, delta }, "content_block_delta"))]),
+      "anthropic-messages",
+    );
+    expect(result).toMatchObject({ kind: "dead", reason: "stream ended before meaningful content" });
+  });
+
   it("fails an Anthropic in-band error before content but commits content before a later error", async () => {
     const error = event({ type: "error", error: { message: "capacity" } }, "error");
     const dead = await probeStreamForCommit(
@@ -94,14 +105,21 @@ describe("final-wire stream commit probe", () => {
     expect(result).toMatchObject({ kind: "dead", reason: expect.stringContaining("without meaningful content") });
   });
 
-  it("recognizes Chat content, refusal, reasoning, and native tool-call bytes", async () => {
+  it("recognizes Chat content, refusal, reasoning aliases, and native tool-call bytes", async () => {
     const frames = [
       { choices: [{ delta: { content: "answer" } }] },
       { choices: [{ delta: { refusal: "cannot" } }] },
       { choices: [{ delta: { reasoning_content: "reason" } }] },
+      { choices: [{ delta: { reasoning: "reason" } }] },
       { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "{" } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1" }] } }] },
     ];
     for (const frame of frames) await expectReady("openai-chat", [bytes(event(frame))]);
+  });
+
+  it("commits a Chat frame whose content and finish reason arrive together", async () => {
+    const raw = event({ choices: [{ delta: { content: "answer" }, finish_reason: "stop" }] });
+    expect(await expectReady("openai-chat", [bytes(raw)])).toEqual(bytes(raw));
   });
 
   it("holds Chat role and usage frames and rejects finish-only completion", async () => {
@@ -123,6 +141,18 @@ describe("final-wire stream commit probe", () => {
     await expectReady("openai-responses", [bytes(event(frame, String(frame.type)))]);
   });
 
+  it.each([
+    { type: "response.failed" },
+    { type: "response.incomplete" },
+    { type: "response.cancelled" },
+  ])("treats Responses $type before content as dead", async (frame) => {
+    const result = await probeStreamForCommit(
+      streamOf([bytes(event(frame, frame.type))]),
+      "openai-responses",
+    );
+    expect(result).toMatchObject({ kind: "dead", provenance: "upstream" });
+  });
+
   it("handles CRLF, multi-line data, a UTF-8 split, and replays the exact original bytes", async () => {
     const raw = ": heartbeat\r\n\r\n" +
       "data: {\"choices\":[\r\n" +
@@ -134,6 +164,19 @@ describe("final-wire stream commit probe", () => {
     const chunks = [encoded.subarray(0, 7), encoded.subarray(7, split), encoded.subarray(split)];
 
     expect(await expectReady("openai-chat", chunks)).toEqual(encoded);
+  });
+
+  it.each([
+    { label: "LF", newline: "\n" },
+    { label: "CRLF", newline: "\r\n" },
+  ])("parses and byte-exactly replays a $label event delimiter split across chunks", async ({ newline }) => {
+    const raw = event({ choices: [{ delta: { content: "answer" } }] }, undefined, newline);
+    const encoded = bytes(raw);
+    const secondNewlineBytes = bytes(newline).byteLength;
+    const split = encoded.byteLength - secondNewlineBytes;
+
+    expect(await expectReady("openai-chat", [encoded.subarray(0, split), encoded.subarray(split)]))
+      .toEqual(encoded);
   });
 
   it("preserves event ordering when error and content share one transport chunk", async () => {
@@ -162,6 +205,21 @@ describe("final-wire stream commit probe", () => {
   it("enforces the 64 KiB pre-commit cap with a distinct reason", async () => {
     const raw = bytes(`: ${"x".repeat(STREAM_PREFLIGHT_LIMIT)}\n\n`);
     const result = await probeStreamForCommit(streamOf([raw]), "anthropic-messages");
+    expect(result).toEqual({
+      kind: "dead",
+      reason: "no meaningful content within commit probe limit",
+      provenance: "upstream",
+    });
+  });
+
+  it("does not corrupt or commit UTF-8 content that straddles the 64 KiB cap", async () => {
+    const prefix = 'data: {"choices":[{"delta":{"content":"';
+    const suffix = '"}}]}\n\n';
+    const padding = " ".repeat(STREAM_PREFLIGHT_LIMIT - bytes(prefix).byteLength - 2);
+    const raw = bytes(`${prefix}${padding}🌋${suffix}`);
+
+    expect(raw.subarray(STREAM_PREFLIGHT_LIMIT - 2, STREAM_PREFLIGHT_LIMIT + 2)).toEqual(bytes("🌋"));
+    const result = await probeStreamForCommit(streamOf([raw]), "openai-chat");
     expect(result).toEqual({
       kind: "dead",
       reason: "no meaningful content within commit probe limit",
