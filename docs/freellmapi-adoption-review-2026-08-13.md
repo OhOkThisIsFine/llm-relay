@@ -191,7 +191,7 @@ already fails over on unparseable dialect envelopes — but it reorders the deli
 repair-then-fail-clean contract, and the owner must decide whether failover comes before or after
 the reshaper attempt. Buffered path only unless 1.1 lands first.
 
-**Decision (2026-08-14): Adopt — failover AFTER repair fails.** Repair-first contract preserved: reshaper gets its attempts; only when repair is exhausted does the candidate walk resume instead of returning 502. Buffered path only until 1.1's deferred commit lands.
+**Decision (2026-08-14): Adopt — failover AFTER repair fails; buffered-only BY DESIGN.** Repair-first contract preserved: the reshaper gets its attempts, and only when buffered repair is exhausted does the candidate walk resume instead of returning 502. The streaming revisit is closed: the deferred-commit boundary is deliberately the first structured `tool_use`, per [design-deferred-commit-2026-08-14.md](design-deferred-commit-2026-08-14.md), so an unrepairable streaming tool call is post-commit by definition. Walk resumption is therefore structurally impossible there, and the existing mid-stream fail-clean error remains correct behavior; buffered-only is not a deferral.
 
 **2.2 Sticky-session affinity.** (medium — the lanes disagree; see §4)
 llm-relay re-derives ordering per request, so a conversation can flap across providers turn to
