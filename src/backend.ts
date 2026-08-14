@@ -147,9 +147,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function invalidEnvelopeReason(value: unknown, protocol: ResponseProtocol, streamed: boolean): string | null {
   if (!isRecord(value)) return "expected a JSON object";
 
-  // An error delivered inside a 2xx SSE stream is still a real protocol envelope. Leave it to
-  // the stream adapter to forward rather than reclassifying it as malformed transport data.
-  if (streamed && isRecord(value.error)) return null;
+  // An error envelope seen here under `streamed` is the FIRST event of a 2xx stream — preflight
+  // inspects nothing later, so this cannot fire mid-stream. Pre-commit, an in-band error frame
+  // is a dead turn, not a response: failing it makes the candidate loop walk on to a member
+  // that answers, where forwarding it spent the whole pool on one member's error inside a 200
+  // (adoption review §1.1). An error frame arriving AFTER a valid first event still streams
+  // through untouched — post-commit, honesty beats replay. The reason carries a bounded excerpt
+  // of the upstream's own message, same maxim as serving the last candidate's real error.
+  if (streamed && isRecord(value.error)) {
+    const message = typeof value.error.message === "string" ? value.error.message.slice(0, 200) : "";
+    return message
+      ? `stream opened with an in-band error event: ${message}`
+      : "stream opened with an in-band error event";
+  }
 
   if (protocol === "openai-chat") {
     if (!Array.isArray(value.choices)) return "missing choices array";
