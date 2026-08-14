@@ -32,7 +32,7 @@ provider skip — from different starting points. Those are the ones to trust mo
 > a streamed-but-unparseable dialect envelope and an empty stream can also fail over invisibly)
 > remains open: it restructures when `writeHead` fires relative to the candidate loop on both
 > fronts and deserves its own design pass — see the bounded minimal version sketched below and in
-> §2's "deferred headers" discussion. §2's owner decisions remain undecided and unimplemented.
+> §2's "deferred headers" discussion. **All fourteen §2 decisions were made 2026-08-14 (12 adopt / 2 skip); implementation started 2026-08-14.** See the decision record: [docs/adoption-round2-decisions-2026-08-14.md](adoption-round2-decisions-2026-08-14.md).
 
 ## 1. Adopt — verified, rubric-clean, ranked
 
@@ -181,6 +181,8 @@ inheritance-stripped) is a separate owner call — §2.10. Found by: workflow.
 Each of these survived verification but changes a contract, adds config surface, or trades against
 a documented posture. They need a yes from the owner, not a default.
 
+Full decision record: [docs/adoption-round2-decisions-2026-08-14.md](adoption-round2-decisions-2026-08-14.md).
+
 **2.1 Unrepairable schema-invalid tool call → dead turn that resumes the candidate walk.** (medium)
 Today an unrepaired invalid call fails clean as a 502 (src/server.ts:1713-1721) and never fails
 over. freellmapi marks it a retryable dead turn scoped to skip that model for the request
@@ -188,6 +190,8 @@ over. freellmapi marks it a retryable dead turn scoped to skip that model for th
 already fails over on unparseable dialect envelopes — but it reorders the deliberate
 repair-then-fail-clean contract, and the owner must decide whether failover comes before or after
 the reshaper attempt. Buffered path only unless 1.1 lands first.
+
+**Decision (2026-08-14): Adopt — failover AFTER repair fails.** Repair-first contract preserved: reshaper gets its attempts; only when repair is exhausted does the candidate walk resume instead of returning 502. Buffered path only until 1.1's deferred commit lands.
 
 **2.2 Sticky-session affinity.** (medium — the lanes disagree; see §4)
 llm-relay re-derives ordering per request, so a conversation can flap across providers turn to
@@ -199,6 +203,8 @@ memory half (it retains response bodies — against the metadata-only posture). 
 against entirely: hidden request-to-request state, and stickiness can hold a session on a weaker
 target after better capacity returns.
 
+**Decision (2026-08-14): Adopt with guardrails.** Owner overrode Codex's skip recommendation. Constraints from the review: provenance header, always loses to breaker/health ordering, NO response-body retention (metadata-only posture). 30-min pin keyed on session header or first-user-message hash.
+
 **2.3 Escalating cooldown for repeat unexplained 429s + short bench for loopback providers.** (small)
 The breaker retries an unexplained 429 on a flat 2-minute cooldown forever
 (src/circuit-breaker.ts:418-431); freellmapi escalates 2m→10m→1h→day-scale with provenance tags
@@ -207,6 +213,8 @@ and benches *loopback* endpoints only 5s so a busy local Ollama isn't stranded f
 freellmapi's numeric limit-learning from error bodies — guess-adjacent inference on untrusted
 text, exactly what the interpretation store keeps off the request path.
 
+**Decision (2026-08-14): Adopt.** Both halves: 2m→10m→1h→day escalation with provenance tags + 5s short bench for loopback providers. Leave OUT numeric limit-learning from error bodies.
+
 **2.4 An `exclude` list on dynamic pool policy.** (small)
 User intent has no home today: a known-bad model in a `{ include: "free" }` pool can only be
 avoided by abandoning dynamic pools, while target-facts re-learns its badness every TTL expiry.
@@ -214,6 +222,8 @@ freellmapi separates user tombstones (permanent) from machine retirement (soft, 
 (`services/model-state.ts:91-190`). The machine half llm-relay already has better (TTL +
 success-clearing); the user half would be one config field. Cost: config surface on a project
 trying to stay boring.
+
+**Decision (2026-08-14): Adopt.** User tombstone config field on dynamic pool policy; machine half (TTL facts) unchanged.
 
 **2.5 `llm-relay onboard --import <.env>`.** (small)
 Onboarding is one-key-at-a-time readline; no file import exists. freellmapi's key-parser does
@@ -224,6 +234,8 @@ from freellmapi (note: they are AES-encrypted in its DB — its export produces 
 freellmapi's `looksLikeApiKey` value heuristic (it is precisely the key-shaped guessing authEnv.ts
 refuses) and the CSV/JSONC/opencode formats.
 
+**Decision (2026-08-14): Adopt.** Reuse authEnv closed alias list; drop looksLikeApiKey heuristic and CSV/JSONC/opencode formats. Concrete use: moving the 12 keys back from freellmapi's export.
+
 **2.6 A bounded `attempts` array in the metadata log.** (small)
 The walk is client-visible (`x-llm-relay-pool-attempts`) and live in `/candidates`, but the durable
 log records only the terminal deployment — after the response, "which members were walked and why"
@@ -233,12 +245,16 @@ freellmapi's `committed` outcome — stream flushed bytes then died — an hones
 mid-stream handling could name (`lib/attempt-trace.ts:19-27`). Cost: grows the deliberately-small
 log schema; the owner may judge the header sufficient.
 
+**Decision (2026-08-14): Adopt.** Statuses-only per-attempt list (provider/model/status/ms, no error text) through the LOG_FIELDS sink; include the `committed` outcome class.
+
 **2.7 The bare/fenced-JSON dialect envelope.** (owner call, small)
 freellmapi also rescues a tool call emitted as a bare or ```json-fenced object, gated on declared
 tool names (`lib/tool-call-rescue.ts:25,234-237`). It sits right on llm-relay's
 fabricating-intent boundary even with name gating — and even freellmapi only does it on the
 buffered path (markerless JSON flushes as passthrough after 256 chars streamed). Decide
 deliberately; the ASCII marker variant (1.8) does not depend on it.
+
+**Decision (2026-08-14): Skip.** The closed-envelope rule stands; 1.8's ASCII marker variant (already landed) covers the marker cases.
 
 **2.8 Upstream-reported model drift field.** (small)
 freellmapi captures the upstream's raw `model` before normalizing and records genuine
@@ -248,11 +264,15 @@ A nullable `upstreamReportedModel`/mismatch flag — never overwriting the autho
 target — is cheap provenance that catches meta-routers silently substituting models. Verified by
 hand. Found by: Codex.
 
+**Decision (2026-08-14): Adopt.** Nullable upstreamReportedModel/mismatch flag; never overwrites servedModel.
+
 **2.9 Cap the metadata log's growth.** (small)
 `log.ts` appends forever (appendFileSync, src/log.ts:99); freellmapi bounds analytics by age and
 row count (`services/request-retention.ts`). Copy the principle, not SQLite: a max-size/rotation
 pair on the one log file. An unbounded log eventually turns transparency into a disk problem.
 Verified by hand. Found by: Codex.
+
+**Decision (2026-08-14): Adopt.** Max-size/rotation pair on the one log file; principle only, no SQLite.
 
 **2.10 Redact the stored refusal sample; Windows ACLs on secret files.** (small each)
 Two residual hardening items. (a) `recordUnknownRefusal` persists a VERBATIM 400-char provider
@@ -265,11 +285,15 @@ normalization, or the :649 seed match silently breaks. (b) freellmapi's icacls l
 a comment; but `%USERPROFILE%` inheritance already yields owner-scoped ACLs on a default install,
 so it buys marginal hardening for a subprocess spawn at startup.
 
+**Decision (2026-08-14):** (a) **Adopt.** Sanitizer must run before BOTH signature and sample or be idempotent under normalization (refusal-interpretation.ts:649 seed recheck constraint). (b) **Adopt.** Owner chose it despite the marginal-benefit note. Follows freellmapi's file-permissions leg; closes control-authorization.ts's admitted win32 no-op.
+
 **2.11 Align the wire body cap with the document cap.** (small)
 `MAX_BODY_BYTES` is a hard-coded 10MB (src/server.ts:186) while documents.ts accepts 25MB decoded
 (src/documents.ts:39) — after base64 expansion, a document the converter would accept can never
 arrive. Make the wire cap configurable (or at least consistent), keep it bounded, keep the explicit
 413. Verified by hand. Found by: Codex.
+
+**Decision (2026-08-14): Adopt.** Wire cap configurable or at least consistent with documents.ts's 25MB; bounded; explicit 413 kept.
 
 **2.12 Strip provider-intolerant JSON-Schema keys — only when a real provider bites.** (conditional)
 freellmapi strips `additionalProperties`/`$schema` from outbound tool schemas for providers that
@@ -280,6 +304,8 @@ load-bearing lesson, and note the verified-open question of whether llm-bridge a
 keys on the translated path (the certainly-verbatim surface is the direct Chat passthrough,
 src/backend.ts:831-838).
 
+**Decision (2026-08-14): Skip until a real provider bites.** (Not selected in the breaker/pool batch; matches the review's own conditional framing.) If it ever lands: return a NEW tools array — the immutability constraint is the load-bearing lesson.
+
 **2.13 `<think>`-tag extraction.** (medium)
 A bounded four-state stream filter moving a message-opening `<think>…</think>` block out of
 content (`lib/think-tags.ts`, ≤512B lead hold, ≤7-char close holdback, one block, lossless flush).
@@ -288,10 +314,14 @@ is one llm-relay already uses. But the Anthropic-front landing is an open design
 unsigned thinking blocks don't round-trip, so the minimal safe version (strip vs text-prefix
 convention) is the owner's pick.
 
+**Decision (2026-08-14): Adopt — STRIP the block.** Bounded four-state stream filter, ≤512B lead hold, one block, lossless flush on doubt. Strip (not text-prefix): unsigned thinking blocks don't round-trip anyway.
+
 **2.14 Node-20 CI leg — or raise `engines` to `>=22`.** (tiny)
 ci.yml runs Node 22 only while package.json declares `>=20`: the bottom of the declared range runs
 nowhere, ever. freellmapi keeps a 20+22 matrix precisely because 20 historically caught crashes
 newer local Nodes hid. Either fix is two lines; pick one. Found by: workflow + Codex.
+
+**Decision (2026-08-14): Raise engines to >=22.** (No Node-20 CI leg.) Node 20 is past EOL; declare what is tested.
 
 ---
 
@@ -323,7 +353,7 @@ history. Recorded here so the dissent isn't lost: if concurrent-subagent 429 sto
 *measured* problem, Codex's narrow version (in-memory per-deployment lease, stale-lease backstop,
 user-configured cap — no quota ledger) is the shape to revisit.
 
-**Sticky sessions** — see 2.2: workflow says consider-with-guardrails, Codex says skip. Owner call.
+**Sticky sessions** — resolved by decision 2.2 (adopt with guardrails).
 
 **Wake-from-sleep recovery.** Workflow: skip (symptoms already absorbed by failover + wall-clock
 cooldowns; the undici global-dispatcher swap is version-fragile private API). Codex: adopt narrowly
@@ -386,7 +416,8 @@ Grouped; every one was source-verified before rejection. Listed so they are not 
    failover behavior across its API surfaces (`__tests__/routes/*-fallback-convergence.test.ts`)
    because its bugs once differed by surface — exactly this repo's pool-failover scar ("two paths,
    one policy empty"). A matrix asserting identical 401/429/timeout/degradation handling across
-   `/v1/messages` and the OpenAI front is cheaper than debugging the next drift. (Codex)
+   `/v1/messages` and the OpenAI front is cheaper than debugging the next drift. Design deliverable:
+   [docs/design-cross-front-convergence-2026-08-14.md](design-cross-front-convergence-2026-08-14.md). (Codex)
 2. **Transport tests against real hanging sockets.** Partial JSON bodies, first-byte vs mid-stream
    stalls, actual socket closure (`abort-signal.test.ts`, `stream-first-byte.test.ts`). Adoptions
    1.1/1.2 should arrive with these, in the suite's existing real-server style. (Codex)
@@ -398,7 +429,8 @@ Grouped; every one was source-verified before rejection. Listed so they are not 
    clean directory, and exercises the installed binary — proving the `files` whitelist ships every
    runtime asset. publish.yml runs build/check and the postinstall probe but never installs the
    tarball (verified). One job step. Keep everything else about llm-relay's release pipeline —
-   pinned action SHAs, tag-ancestry gates, Trusted Publishing are all stronger than freellmapi's. (Codex)
+   pinned action SHAs, tag-ancestry gates, Trusted Publishing are all stronger than freellmapi's.
+   Design deliverable: [docs/design-tarball-smoke-2026-08-14.md](design-tarball-smoke-2026-08-14.md). (Codex)
 5. **Already practiced here, worth naming so it stays deliberate:** ephemeral vs durable state
    handled differently (in-memory leases vs persisted observations ↔ breaker state vs facts
    store); real-socket test style; defect-pinning tests; provenance on every persisted measurement.
