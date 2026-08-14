@@ -5,6 +5,7 @@ import { DocumentError, transcodeDocuments } from "./documents.js";
 import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
+import { stripOpeningThinkTag, stripThinkTagsInStream } from "./think-tags.js";
 
 /**
  * A tool-call envelope was present in the response text but could not be parsed — truncated, or a
@@ -536,11 +537,15 @@ export async function fetchBackend(
     }
     try {
       const anthStream = handleUniversalStreamRequest(preflight.body, "openai", "anthropic");
+      // Strip a complete message-opening think block BEFORE dialect scanning. Otherwise the
+      // preamble can hide a tool envelope from recovery. Native Anthropic streams never enter
+      // this branch, and direct OpenAI Chat passthrough is handled on the other front.
+      const strippedStream = stripThinkTagsInStream(anthStream);
       // Recover a tool call this host returned as raw dialect TEXT. Gated on the request actually
       // declaring tools: with none declared there is no call to recover, and wrapping the stream
       // would add holdback latency for nothing.
       const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
-      const body = schemas.size > 0 ? recoverDialectInStream(anthStream, schemas) : anthStream;
+      const body = schemas.size > 0 ? recoverDialectInStream(strippedStream, schemas) : strippedStream;
       return attachUpstreamMetadata(
         new Response(body, { status: res.status, headers: { "content-type": "text/event-stream" } }),
         preflight.metadata,
@@ -621,12 +626,15 @@ export function openAiResponseToAnthropic(
   const msg = (choice.message as Record<string, unknown> | undefined) ?? {};
   const content: object[] = [];
   let toolCalls = (msg.tool_calls as Array<Record<string, unknown>> | undefined) ?? [];
+  // This mapper is the translated OpenAI→Anthropic seam. Strip first so an opening think block
+  // cannot conceal a following dialect envelope from the recovery pass below.
+  const messageText = typeof msg.content === "string" ? stripOpeningThinkTag(msg.content) : null;
 
   // Recover ONLY when the host parsed nothing. A host that populated `tool_calls` has already
   // spoken; second-guessing it here would be inference, not translation.
   let recovered: DialectToolCall[] = [];
-  if (toolCalls.length === 0 && typeof msg.content === "string" && msg.content.length > 0) {
-    const out = recoverToolCalls(msg.content, schemas ?? new Map());
+  if (toolCalls.length === 0 && messageText !== null && messageText.length > 0) {
+    const out = recoverToolCalls(messageText, schemas ?? new Map());
     if (out.status === "parsed") {
       recovered = out.calls;
       if (out.text.length > 0) content.push({ type: "text", text: out.text });
@@ -637,10 +645,10 @@ export function openAiResponseToAnthropic(
       // tail of a broken tool call, which is the misdiagnosis this whole path exists to prevent.
       throw new DialectUnparseableError(out.dialect);
     } else {
-      content.push({ type: "text", text: msg.content });
+      content.push({ type: "text", text: messageText });
     }
-  } else if (typeof msg.content === "string" && msg.content.length > 0) {
-    content.push({ type: "text", text: msg.content });
+  } else if (messageText !== null && messageText.length > 0) {
+    content.push({ type: "text", text: messageText });
   }
   if (recovered.length > 0) {
     toolCalls = recovered.map((c, i) => ({

@@ -47,6 +47,37 @@ describe("openAiResponseToAnthropic", () => {
     expect(anth.content).toEqual([{ type: "text", text: "hello there" }]);
     expect(anth.stop_reason).toBe("end_turn");
   });
+
+  it("strips a complete message-opening think block on the translated buffered path", () => {
+    const anth = openAiResponseToAnthropic({
+      choices: [{
+        finish_reason: "stop",
+        message: { role: "assistant", content: "<think>private reasoning</think>Visible answer" },
+      }],
+    }, "m") as any;
+
+    expect(anth.content).toEqual([{ type: "text", text: "Visible answer" }]);
+  });
+
+  it("strips think text before dialect detection so the following envelope recovers", () => {
+    const schemas = new Map([
+      ["write_note", { type: "object", properties: { path: { type: "string" } } }],
+    ]);
+    const anth = openAiResponseToAnthropic({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          role: "assistant",
+          content: '<think>choose a path</think><tool_call>{"name":"write_note","arguments":{"path":"a.txt"}}</tool_call>',
+        },
+      }],
+    }, "m", schemas) as any;
+
+    expect(anth.content).toEqual([
+      { type: "tool_use", id: "tu_recovered_0", name: "write_note", input: { path: "a.txt" } },
+    ]);
+    expect(anth.stop_reason).toBe("tool_use");
+  });
 });
 
 describe("anthropicMessageToOpenAi", () => {
@@ -131,6 +162,41 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete process.env.RP_BACKEND_KEY;
   });
 
+  it("strips a split opening think block from the translated streaming path", async () => {
+    process.env.RP_BACKEND_KEY = "sk-nim";
+    try {
+      const target = openaiTarget("https://openai-backend.test");
+      const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
+      const openAiSse = [
+        `data: ${JSON.stringify({ id: "cmpl", model: "m", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "cmpl", model: "m", choices: [{ index: 0, delta: { content: "<think>hidden</thi" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "cmpl", model: "m", choices: [{ index: 0, delta: { content: "nk>Visible" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "cmpl", model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        "data: [DONE]\n\n",
+      ].join("");
+
+      const res = await fetchBackend(target, {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from(JSON.stringify(req)),
+        reqJson: req,
+        anthropicHeaders: {},
+        wantsStream: true,
+        signal: AbortSignal.timeout(1000),
+      }, async () => new Response(openAiSse, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }));
+
+      const out = await res.text();
+      expect(out).toContain("Visible");
+      expect(out).not.toContain("hidden");
+      expect(out).not.toContain("<think>");
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  });
+
   it("captures a streamed Anthropic model even when a leading ping ends preflight", async () => {
     const target: ResolvedTarget = {
       provider: "anthropic",
@@ -160,6 +226,38 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
 
     await res.text();
     expect(upstreamReportedModel(res)).toBe("upstream-substitute");
+  });
+
+  it("leaves literal think tags untouched on native Anthropic passthrough", async () => {
+    const target: ResolvedTarget = {
+      provider: "anthropic",
+      base: "https://anthropic-backend.test",
+      kind: "anthropic",
+      authHeader: "x-api-key",
+      timeoutMs: 1000,
+    };
+    const raw = JSON.stringify({
+      id: "msg_native",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "<think>literal native text</think>Answer" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    const res = await fetchBackend(target, {
+      path: "/v1/messages",
+      method: "POST",
+      reqBuf: Buffer.from("{}"),
+      reqJson: {},
+      anthropicHeaders: {},
+      wantsStream: false,
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response(raw, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+
+    expect(await res.text()).toBe(raw);
   });
 
   it("refuses a document block it cannot convert instead of leaking base64 into the prompt", async () => {
