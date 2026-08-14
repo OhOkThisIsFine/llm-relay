@@ -1,4 +1,4 @@
-import { existsSync, appendFileSync, mkdirSync } from "node:fs";
+import { existsSync, appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
@@ -159,14 +159,7 @@ export async function runInteractiveOnboarding(cfg?: Config, opts?: { envPath?: 
 
     if (Object.keys(addedKeys).length > 0) {
       try {
-        const envDir = dirname(envPath);
-        if (!existsSync(envDir)) {
-          mkdirSync(envDir, { recursive: true });
-        }
-        const envLines = Object.entries(addedKeys)
-          .map(([k, v]) => `${k}="${v.replace(/"/g, '\\"')}"`)
-          .join("\n");
-        appendFileSync(envPath, "\n" + envLines + "\n");
+        saveKeysToEnv(envPath, addedKeys);
         console.log(`\n✅ Saved ${Object.keys(addedKeys).length} key(s) to ${envPath}\n`);
       } catch {
         console.log("\n⚠️ Could not write to ~/.llm-relay/.env, but keys are active for this session.\n");
@@ -175,4 +168,27 @@ export async function runInteractiveOnboarding(cfg?: Config, opts?: { envPath?: 
   }
 
   rl.close();
+}
+
+/**
+ * Persist wizard-collected keys, owner-only.
+ *
+ * The .env holds every provider key, yet it was born with default (world-readable) mode while
+ * the far less sensitive control token got 0600/0700 — adoption review §1.12. Create restricted
+ * and re-restrict on every save so a pre-existing wide file converges. POSIX bits only: Windows
+ * has no fs mode equivalent, and %USERPROFILE% inheritance already scopes ACLs to the owner
+ * there (the same position `control-authorization.ts` takes).
+ */
+export function saveKeysToEnv(envPath: string, addedKeys: Record<string, string>): void {
+  const envDir = dirname(envPath);
+  if (!existsSync(envDir)) {
+    mkdirSync(envDir, { recursive: true, mode: 0o700 });
+  }
+  const envLines = Object.entries(addedKeys)
+    .map(([k, v]) => `${k}="${v.replace(/"/g, '\\"')}"`)
+    .join("\n");
+  // `mode` applies only when appendFileSync CREATES the file; the chmod below covers the
+  // already-existing case.
+  appendFileSync(envPath, "\n" + envLines + "\n", { mode: 0o600 });
+  if (process.platform !== "win32") chmodSync(envPath, 0o600);
 }
