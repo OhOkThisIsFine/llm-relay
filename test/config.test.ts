@@ -33,6 +33,41 @@ function base(extra: Record<string, unknown> = {}) {
   };
 }
 
+describe("loadConfig — sticky session affinity", () => {
+  it("is off by default and normalizes boolean shorthand", () => {
+    expect(loadConfig(write("sticky-absent.json", base())).routing.sticky).toBeUndefined();
+    expect(loadConfig(write("sticky-on.json", base({
+      routing: { default: "nim/z-ai/glm-5.2", sticky: true },
+    }))).routing.sticky).toEqual({ enabled: true, ttlMs: 1_800_000, maxSessions: 1000 });
+    expect(loadConfig(write("sticky-off.json", base({
+      routing: { default: "nim/z-ai/glm-5.2", sticky: false },
+    }))).routing.sticky).toEqual({ enabled: false, ttlMs: 1_800_000, maxSessions: 1000 });
+  });
+
+  it("validates and normalizes the bounded object form", () => {
+    expect(loadConfig(write("sticky-object.json", base({
+      routing: {
+        default: "nim/z-ai/glm-5.2",
+        sticky: { enabled: true, ttlMs: 2500.9, maxSessions: 20.9 },
+      },
+    }))).routing.sticky).toEqual({ enabled: true, ttlMs: 2500, maxSessions: 20 });
+
+    const invalid = [
+      ["sticky-kind.json", "yes", /boolean or an object/],
+      ["sticky-enabled.json", {}, /sticky.enabled must be a boolean/],
+      ["sticky-ttl-low.json", { enabled: true, ttlMs: 999 }, /ttlMs must be between/],
+      ["sticky-ttl-high.json", { enabled: true, ttlMs: 86_400_001 }, /ttlMs must be between/],
+      ["sticky-cap-low.json", { enabled: true, maxSessions: 9 }, /maxSessions must be an integer/],
+      ["sticky-cap-high.json", { enabled: true, maxSessions: 100_001 }, /maxSessions must be an integer/],
+    ] as const;
+    for (const [name, sticky, message] of invalid) {
+      expect(() => loadConfig(write(name, base({
+        routing: { default: "nim/z-ai/glm-5.2", sticky },
+      })))).toThrow(message);
+    }
+  });
+});
+
 describe("loadConfig — credentialMode (declared vs inferred passthrough)", () => {
   const withProviders = (name: string, providers: Record<string, unknown>) =>
     loadConfig(write(name, base({ providers, routing: { default: "anthropic" } })));

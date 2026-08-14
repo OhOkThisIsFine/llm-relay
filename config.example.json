@@ -77,7 +77,8 @@
     "offload": {
       "claude": { "enabled": false, "scope": "subagents" },
       "codex": { "enabled": false, "scope": "subagents" }
-    }
+    },
+    "sticky": false
   },
   "mode": "repair",
   "repair": {
