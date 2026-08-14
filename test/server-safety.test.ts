@@ -5,7 +5,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { createProxy } from "../src/server.js";
+import { createProxy, DEFAULT_MAX_BODY_BYTES } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import type { Config } from "../src/config.js";
 
@@ -90,53 +90,44 @@ describe("server-safety features (CP-NODE-1)", () => {
     expect(cookies[1]).toContain("cookie2=val2");
   });
 
-  it("enforces body size limit and returns 413 for oversized requests", async () => {
+  it("admits a body at the configured cap and returns 413 one byte over", async () => {
+    backend = await mockBackend(() => ({
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "1", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }] }),
+    }));
+    const atCap = JSON.stringify({ model: "mock-model", messages: [{ role: "user", content: "x" }] });
     const cfg: Config = {
       host: "127.0.0.1",
       port: 0,
-      providers: { up: { base: "http://127.0.0.1:9999", kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
       routing: { default: "up", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 2, destructiveTools: [] },
+      maxBodyBytes: Buffer.byteLength(atCap),
       log: { level: "metadata", file: logFile },
     };
     const p = await startProxy(cfg);
     const pPort = port(p);
 
-    // Send a payload exceeding 10MB
-    const largeChunk = "a".repeat(1024 * 1024);
-    const chunks = [];
-    for (let i = 0; i < 11; i++) {
-      chunks.push(largeChunk);
-    }
-    const bodyStr = JSON.stringify({ large: chunks.join("") });
+    const accepted = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: atCap,
+    });
+    expect(accepted.status).toBe(200);
 
-    // ⚠ The assertion MUST live outside the try. This test used to read
-    //     try { … expect(resp.status).toBe(413) } catch (e) { expect(e).toBeDefined() }
-    // — and a vitest assertion failure is just a thrown Error, so the catch swallowed it and
-    // re-asserted that *something* was thrown. The test could not fail for any reason: a proxy
-    // that answered 200, or 500, or crashed, was green. Capture the outcome, then judge it.
-    let outcome: { kind: "status"; status: number } | { kind: "error"; err: unknown };
-    try {
-      const resp = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: bodyStr,
-      });
-      outcome = { kind: "status", status: resp.status };
-    } catch (e) {
-      outcome = { kind: "error", err: e };
-    }
+    const overCap = await fetch(`http://127.0.0.1:${pPort}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: `${atCap} `,
+    });
+    expect(overCap.status).toBe(413);
+  });
 
-    if (outcome.kind === "status") {
-      expect(outcome.status).toBe(413);
-    } else {
-      // readBody() destroys the socket as soon as the cap is passed, so the upload can die
-      // before the 413 is read back. That is a TRANSPORT failure of this exact shape — not a
-      // licence to accept any error at all.
-      const detail = String((outcome.err as { cause?: unknown })?.cause ?? outcome.err);
-      expect(detail).toMatch(/ECONNRESET|EPIPE|socket hang up|terminated|other side closed/i);
-    }
+  it("defaults above the old 10 MiB cap and the 25 MiB document's base64 size", () => {
+    expect(DEFAULT_MAX_BODY_BYTES).toBe(36 * 1024 * 1024);
+    expect(DEFAULT_MAX_BODY_BYTES).toBeGreaterThan(10 * 1024 * 1024);
+    expect(DEFAULT_MAX_BODY_BYTES).toBeGreaterThan(Math.ceil(25 * 1024 * 1024 * 4 / 3));
   });
 
   it("package.json requires node >= 22 engine", () => {
