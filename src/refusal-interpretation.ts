@@ -122,7 +122,7 @@ export interface UnknownRefusal {
   status: number;
   /** The normalized message — the signature's readable half. */
   normalized: string;
-  /** One verbatim sample, so a researcher sees what was actually said. Truncated. */
+  /** One normalized sample: readable for research, with variable identifiers and URLs removed. */
   sample: string;
   count: number;
   firstSeen: number;
@@ -167,9 +167,6 @@ const writer = new WriteBehindTimer();
 
 /** Cap on retained unknown signatures — a misbehaving backend must not grow this without bound. */
 const MAX_UNKNOWN = 200;
-/** Verbatim sample cap. Enough to research from, small enough to keep the file readable. */
-const SAMPLE_CHARS = 400;
-
 function defaultPath(): string {
   if (process.env.VITEST !== undefined) {
     return join(tmpdir(), `llm-relay-test-interpretations-${process.pid}.json`);
@@ -597,11 +594,11 @@ export function interpretRefusal(
 /**
  * Hold an uninterpretable refusal for the research tier.
  *
- * Deliberately cheap and lossy: one verbatim sample per signature and a count. The queue exists to
+ * Deliberately cheap and lossy: one normalized sample per signature and a count. The queue exists to
  * tell a researcher "this message happens, here is what it looks like", not to be a log — the
  * metadata logger already covers the traffic, and it is metadata-only precisely so bodies do not
- * land on disk. This file holds error bodies, which are the provider's own text about a
- * deployment, never the user's prompt.
+ * land on disk. Normalization runs before both the signature and the stored sample, stripping
+ * variable ids, key-shaped strings and URLs while leaving the provider's readable refusal text.
  */
 export function recordUnknownRefusal(
   provider: string,
@@ -641,7 +638,9 @@ export function recordUnknownRefusal(
       model: typeof model === "string" ? model : null,
       status,
       normalized,
-      sample: body.length > SAMPLE_CHARS ? body.slice(0, SAMPLE_CHARS) : body,
+      // The seed recheck in `pendingRefusals()` normalizes this again. The same normalizer is
+      // intentionally idempotent, so redacting what lands on disk cannot break retroactive seeds.
+      sample: normalized,
       count: 1,
       firstSeen: now,
       lastSeen: now,
