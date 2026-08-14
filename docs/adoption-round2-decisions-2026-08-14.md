@@ -17,7 +17,7 @@ read-only; nothing in the repo has been edited yet.
 
 | Item | Decision | Scope notes fixed at decision time |
 |---|---|---|
-| 2.1 Dead turns | **Adopt — failover AFTER repair fails.** | Repair-first contract preserved: reshaper gets its attempts; only when repair is exhausted does the candidate walk resume instead of returning 502. Buffered path only until 1.1's deferred commit lands. |
+| 2.1 Dead turns | **Adopt — failover AFTER repair fails; buffered-only BY DESIGN.** | Repair-first contract preserved: only exhausted buffered repair resumes the candidate walk. Streaming commits deliberately at the first structured `tool_use`, per [the deferred-commit design](design-deferred-commit-2026-08-14.md), so an unrepairable streaming call is post-commit by definition. Walk resumption is structurally impossible there; the existing mid-stream fail-clean error remains correct behavior. This is not a deferral. |
 | 2.2 Sticky sessions | **Adopt with guardrails.** | Owner overrode Codex's skip recommendation. Constraints from the review: provenance header, always loses to breaker/health ordering, NO response-body retention (metadata-only posture). 30-min pin keyed on session header or first-user-message hash. |
 | 2.3 Escalating 429 cooldown | **Adopt.** | Both halves: 2m→10m→1h→day escalation with provenance tags + 5s short bench for loopback providers. Leave OUT numeric limit-learning from error bodies. |
 | 2.4 Pool exclude list | **Adopt.** | User tombstone config field on dynamic pool policy; machine half (TTL facts) unchanged. |
@@ -69,9 +69,10 @@ All three lane outputs are ADVISORY — re-verify file:line claims during implem
    safety net BEFORE the behavior-changing items, and closes the verified pinning gaps.
 3. **§6.4** tarball smoke step in publish.yml.
 4. **2.3, 2.4, 2.6, 2.8** — breaker/pool/log items, each small and independently testable.
-5. **2.1** dead-turn failover (buffered path only) and **2.13** think-tag strip.
+5. **2.1** dead-turn failover (buffered-only BY DESIGN) and **2.13** think-tag strip.
 6. **2.5** onboard --import, **2.10a** redaction, **2.10b** icacls.
 7. **§1.1 remainder** (deferred commit) per the Codex design — riskiest, last, with hanging-socket
-   tests; then revisit whether 2.1 can extend to the streaming path.
+   tests. The streaming revisit is closed: 2.1 cannot extend past the deliberate first-structured-
+   `tool_use` commit boundary, because repair exhaustion is then post-commit.
 8. **2.2** sticky sessions — design doc first (session key, TTL, provenance header name), since it
    is the one adopted item with real design latitude.
