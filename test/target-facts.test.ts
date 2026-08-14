@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -15,6 +15,7 @@ import {
 import {
   acceptInterpretation,
   applyResetRule,
+  flushInterpretations,
   interpretRefusal,
   materializeScope,
   normalizeRefusalMessage,
@@ -381,6 +382,37 @@ describe("signatures identify a refusal without identifying a request", () => {
   it("keys per (provider, model, message), so a verdict cannot leak to a sibling SKU", () => {
     expect(refusalSignature("ollama-cloud", "glm-5.2", 403, REAL_REFUSALS.ollamaSub))
       .not.toBe(refusalSignature("ollama-cloud", "kimi-k3", 403, REAL_REFUSALS.ollamaSub));
+  });
+
+  it("stores only the normalized sample, without ids, key-shaped strings, or URLs", () => {
+    const uuid = "e7592a59-d5d4-4e52-b072-905bdb4f9fbc";
+    const key = "sk_live_1234567890abcdefghijklmnop";
+    const url = "https://provider.test/upgrade?request=secret";
+    const body = JSON.stringify({
+      error: { message: `Regional policy denied request ${uuid} using ${key}; details at ${url}` },
+    });
+
+    recordUnknownRefusal("groq", "some-model", 403, body, { path: interpPath });
+    flushInterpretations({ path: interpPath });
+    const persisted = JSON.parse(readFileSync(interpPath, "utf8")) as {
+      unknown: Record<string, { sample: string }>;
+    };
+    const stored = Object.values(persisted.unknown)[0]!;
+
+    expect(stored.sample).toBe(normalizeRefusalMessage(body));
+    expect(stored.sample).not.toContain(uuid);
+    expect(stored.sample).not.toContain(key);
+    expect(stored.sample).not.toContain(url);
+    expect(stored.sample).toContain("<id>");
+    expect(stored.sample).toContain("<url>");
+  });
+
+  it("keeps the seed recheck matching when it normalizes an already-redacted sample", () => {
+    recordUnknownRefusal("ollama-cloud", "some-model", 403, REAL_REFUSALS.ollamaSub, { path: interpPath });
+
+    // `recordUnknownRefusal` stores the normalized sample; `pendingRefusals` sends that stored
+    // sample through the normalizer again before checking seeds. It must still bind and disappear.
+    expect(pendingRefusals({ path: interpPath })).toHaveLength(0);
   });
 });
 
