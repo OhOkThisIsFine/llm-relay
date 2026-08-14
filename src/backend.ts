@@ -7,6 +7,11 @@ import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
 import { stripOpeningThinkTag, stripThinkTagsInStream } from "./think-tags.js";
 import { STREAM_PREFLIGHT_LIMIT } from "./stream-commit.js";
+import {
+  inspectDialectInOpenAiChat,
+  recoverDialectInOpenAiChatStream,
+  type RecoveredOpenAiChatProcessor,
+} from "./openai-dialect.js";
 
 /**
  * A tool-call envelope was present in the response text but could not be parsed — truncated, or a
@@ -105,6 +110,9 @@ export const DEGRADED_HEADER = "x-llm-relay-degraded";
  * `openrouter/anthropic/claude-sonnet-5 (paid, published-price)`.
  */
 export const PAID_HEADER = "x-llm-relay-paid";
+
+/** This response contains a tool call reconstructed from a recognized text dialect envelope. */
+export const TOOL_DIALECT_HEADER = "x-llm-relay-tool-dialect";
 
 /**
  * The provider's `Retry-After` in milliseconds, or null.
@@ -592,7 +600,7 @@ export async function fetchBackend(
     status: 200,
     headers: {
       "content-type": "application/json",
-      ...(recoveredDialect ? { "x-llm-relay-tool-dialect": recoveredDialect } : {}),
+      ...(recoveredDialect ? { [TOOL_DIALECT_HEADER]: recoveredDialect } : {}),
     },
   });
   const metadata: UpstreamResponseMetadata = {};
@@ -924,6 +932,7 @@ export async function fetchOpenAiFront(
     signal: AbortSignal;
     protocol?: OpenAiFrontProtocol;
     anthropicHeaders?: Record<string, string>;
+    processRecoveredChat?: RecoveredOpenAiChatProcessor;
   },
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
@@ -932,6 +941,7 @@ export async function fetchOpenAiFront(
   // Preserve the existing direct path for the protocol/backend pair that already speaks the
   // same wire format. It keeps provider-specific OpenAI fields byte-for-byte intact.
   if (target.kind === "openai" && protocol === "chat") {
+    const schemas = toolSchemaMap(base);
     const body = { ...base, model: target.model, stream: args.wantsStream };
     const res = await fetchFn(target.base + "/chat/completions", {
       method: "POST",
@@ -949,10 +959,17 @@ export async function fetchOpenAiFront(
       if (!preflight.ok) {
         return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${preflight.reason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
       }
-      return attachUpstreamMetadata(
-        new Response(preflight.body, { status: res.status, headers: res.headers }),
-        preflight.metadata,
-      );
+      let response: Response | null = null;
+      let recovered = false;
+      const responseBody = schemas.size > 0
+        ? recoverDialectInOpenAiChatStream(preflight.body, schemas, () => {
+            recovered = true;
+            response?.headers.set(TOOL_DIALECT_HEADER, "recovered");
+          }, args.processRecoveredChat)
+        : preflight.body;
+      response = new Response(responseBody, { status: res.status, headers: res.headers });
+      if (recovered) response.headers.set(TOOL_DIALECT_HEADER, "recovered");
+      return attachUpstreamMetadata(response, preflight.metadata);
     }
 
     let responseBody: unknown;
@@ -965,8 +982,40 @@ export async function fetchOpenAiFront(
     if (invalidReason) {
       return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${invalidReason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
     }
+    let recovery;
+    try {
+      recovery = await inspectDialectInOpenAiChat(
+        responseBody as Record<string, unknown>,
+        schemas,
+        args.processRecoveredChat,
+      );
+    } catch (error) {
+      return openaiError(
+        502,
+        `llm-relay: ${error instanceof Error ? error.message : String(error)}`,
+        "upstream",
+        "tool_call_recovery_failed",
+      );
+    }
+    if (recovery.status === "detected") {
+      return openaiError(
+        502,
+        `llm-relay: backend returned an unparseable ${recovery.dialect} tool-call envelope as text`,
+        "upstream",
+        "tool_dialect_unparseable",
+      );
+    }
     const metadata: UpstreamResponseMetadata = {};
-    captureReportedModel(metadata, responseBody, "openai-chat", false);
+    const finalBody = recovery.status === "parsed" ? recovery.body : responseBody;
+    captureReportedModel(metadata, finalBody, "openai-chat", false);
+    if (recovery.status === "parsed") {
+      const headers = new Headers(res.headers);
+      headers.set(TOOL_DIALECT_HEADER, "recovered");
+      return attachUpstreamMetadata(new Response(JSON.stringify(finalBody), {
+        status: res.status,
+        headers,
+      }), metadata);
+    }
     return attachUpstreamMetadata(res, metadata);
   }
 

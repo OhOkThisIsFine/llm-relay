@@ -28,6 +28,7 @@ import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
+import type { RecoveredOpenAiChat, RecoveredOpenAiChatProcessor } from "./openai-dialect.js";
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
@@ -1542,6 +1543,7 @@ async function openAiFrontPath(
 ): Promise<void> {
   const tried: string[] = [];
   const attemptTrace = new RequestAttemptTrace();
+  const directTools = toolSchemaMap(ctx.reqJson);
   // All-429 exhaustion Retry-After policy, shared with the Anthropic path: `Pool429Tracker`.
   const pool429 = new Pool429Tracker();
   const walkBudgetMs = ctx.cfg?.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
@@ -1583,6 +1585,73 @@ async function openAiFrontPath(
       return;
     }
 
+    const recoveryAudit: { value: {
+      validated: RequestLog["validated"];
+      toolUseCount: number;
+      uncheckableCount: number;
+      errorKinds: string[];
+      repair: RepairOutcome | "none";
+    } | null } = { value: null };
+    const processRecoveredChat: RecoveredOpenAiChatProcessor = async (recovered) => {
+      const assistant: AssistantMessage = {
+        content: [
+          ...(recovered.text ? [{ type: "text", text: recovered.text } as const] : []),
+          ...recovered.calls.map((call) => ({
+            type: "tool_use" as const,
+            id: call.id,
+            name: call.name,
+            input: call.input,
+          })),
+        ],
+        stop_reason: "tool_use",
+      };
+      const validation = h.validator.validate(assistant, directTools);
+      recoveryAudit.value = {
+        validated: validation.errors.length > 0
+          ? "fail"
+          : validation.uncheckableCount > 0 ? "uncheckable" : "pass",
+        toolUseCount: validation.toolUseCount,
+        uncheckableCount: validation.uncheckableCount,
+        errorKinds: dedupe(validation.errors.map((error) => error.kind)),
+        repair: "none",
+      };
+      if (validation.valid || ctx.cfg?.mode !== "repair") return recovered;
+
+      const reshaper = h.resolveReshaper(target);
+      if (!reshaper) return recovered;
+      const decision = await repair(assistant, directTools, {
+        validator: h.validator,
+        reshaper,
+        maxAttempts: ctx.cfg.repair.maxAttempts,
+        isDestructive: h.isDestructive,
+        backendModel: target.model ?? null,
+      });
+      recoveryAudit.value.repair = decision.outcome;
+      if (decision.outcome !== "fixed" || !decision.message) {
+        throw new Error(`tool call could not be repaired (${decision.outcome})`);
+      }
+
+      const fixed: RecoveredOpenAiChat = { text: "", calls: [] };
+      for (const block of decision.message.content) {
+        if (block.type === "text" && typeof block.text === "string") fixed.text += block.text;
+        if (
+          block.type === "tool_use" &&
+          typeof block.id === "string" &&
+          typeof block.name === "string" &&
+          typeof block.input === "object" &&
+          block.input !== null &&
+          !Array.isArray(block.input)
+        ) {
+          fixed.calls.push({
+            id: block.id,
+            name: block.name,
+            input: block.input as Record<string, unknown>,
+          });
+        }
+      }
+      return fixed;
+    };
+
     let upstream: Response;
     try {
       upstream = await fetchOpenAiFront(target, {
@@ -1591,6 +1660,7 @@ async function openAiFrontPath(
         protocol: ctx.protocol,
         anthropicHeaders: forwardHeaders,
         signal: controller.signal,
+        processRecoveredChat,
       });
     } catch (e) {
       clearTimeout(timer);
@@ -1788,17 +1858,25 @@ async function openAiFrontPath(
       clearTimeout(timer);
       res.off("close", onResClose);
     }
-    h.logger.write(baseLog(
+    const audit = recoveryAudit.value;
+    const log = baseLog(
       ctx.started,
       ctx.path,
       ctx.hadTools,
       streamed,
       upstream.status,
-      "skipped",
+      audit?.validated ?? "skipped",
       target,
       attemptTrace.snapshot(),
       upstreamReportedModel(reportedModelSource),
-    ));
+    );
+    h.logger.write(audit ? {
+      ...log,
+      toolUseCount: audit.toolUseCount,
+      uncheckableCount: audit.uncheckableCount,
+      errorKinds: audit.errorKinds,
+      repair: audit.repair,
+    } : log);
     return;
   }
   // Unreachable with candidates present: the last iteration always responds and returns. An
