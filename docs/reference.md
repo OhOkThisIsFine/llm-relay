@@ -748,7 +748,7 @@ gateway. Verified against Claude Code 2.1.220; re-check after an upgrade.
 
 ## Logging (metadata only)
 
-Per request: `{ ts, path, servedProvider, servedModel, attempts[], hadTools, streamed,
+Per request: `{ ts, path, servedProvider, servedModel, upstreamReportedModel?, attempts[], hadTools, streamed,
 backendStatus, validated, toolUseCount, uncheckableCount, errorKinds[], repair, latencyMs }`.
 `attempts` is capped at 64 status-only entries shaped as `{ provider, model, status, ms }`; a
 normal HTTP attempt uses its status code, a lifecycle-only failure/cancellation uses
@@ -761,7 +761,9 @@ so an error string attached by a caller is discarded. Query parameter *values* a
 their lengths.
 `servedProvider`/`servedModel` are the deployment that actually answered (the id the client
 asked for is deliberately not recorded — for a pool spec it is routinely not the model that
-served). A failed log write is swallowed: a full disk is a logging problem, never a request
+served). If the raw upstream response claims a different model, `upstreamReportedModel` records
+that claim without replacing `servedModel`; matching or absent claims are omitted. A failed log
+write is swallowed: a full disk is a logging problem, never a request
 failure. File logging defaults to a 50 MiB cap; before the next line would exceed it, the relay
 replaces `<file>.1` with the current file and starts a fresh `<file>`. Set `log.maxBytes` to tune
 the cap (maximum 1 GiB); exactly one predecessor is retained.

@@ -48,6 +48,8 @@ export interface RequestLog {
    * passthrough target carries no model id of its own, and that is `null` too.
    */
   servedModel: string | null;
+  /** Raw upstream model id, present only when it differs from the resolved target. */
+  upstreamReportedModel?: string;
   /** Bounded, statuses-only candidate walk. Never carries error text or bodies. */
   attempts: RequestAttemptLog[];
   hadTools: boolean;
@@ -77,6 +79,7 @@ const LOG_FIELDS = [
   "path",
   "servedProvider",
   "servedModel",
+  "upstreamReportedModel",
   "attempts",
   "hadTools",
   "streamed",

@@ -134,6 +134,24 @@ type ResponseProtocol = "openai-chat" | "anthropic-messages";
 
 const STREAM_PREFLIGHT_LIMIT = 64 * 1024;
 
+interface UpstreamResponseMetadata {
+  reportedModel?: string;
+}
+
+// Response provenance is private process state, not a wire header: callers can
+// read it for logging without accidentally forwarding it to the client.
+const upstreamResponseMetadata = new WeakMap<Response, UpstreamResponseMetadata>();
+
+/** Raw model id stated by the upstream response, before any relay translation. */
+export function upstreamReportedModel(response: Response): string | undefined {
+  return upstreamResponseMetadata.get(response)?.reportedModel;
+}
+
+function attachUpstreamMetadata(response: Response, metadata: UpstreamResponseMetadata): Response {
+  upstreamResponseMetadata.set(response, metadata);
+  return response;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -219,8 +237,23 @@ function invalidEnvelopeReason(value: unknown, protocol: ResponseProtocol, strea
 }
 
 type StreamPreflight =
-  | { ok: true; body: ReadableStream<Uint8Array> }
+  | { ok: true; body: ReadableStream<Uint8Array>; metadata: UpstreamResponseMetadata }
   | { ok: false; reason: string };
+
+function captureReportedModel(
+  metadata: UpstreamResponseMetadata,
+  value: unknown,
+  protocol: ResponseProtocol,
+  streamed: boolean,
+): void {
+  if (metadata.reportedModel !== undefined || !isRecord(value)) return;
+  const envelope = protocol === "anthropic-messages" && streamed && value.type === "message_start"
+    ? value.message
+    : value;
+  if (isRecord(envelope) && typeof envelope.model === "string") {
+    metadata.reportedModel = envelope.model;
+  }
+}
 
 /** Inspect the first data event before handing a provider stream to llm-bridge. */
 async function preflightResponseStream(
@@ -230,12 +263,29 @@ async function preflightResponseStream(
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   const decoder = new TextDecoder();
+  const metadata: UpstreamResponseMetadata = {};
   let buffered = "";
   let byteLength = 0;
 
+  const captureCompleteEvents = (final = false): void => {
+    let boundary: RegExpExecArray | null;
+    const separator = /\r?\n\r?\n/g;
+    while ((boundary = separator.exec(buffered)) !== null) {
+      const event = buffered.slice(0, boundary.index);
+      buffered = buffered.slice(boundary.index + boundary[0].length);
+      separator.lastIndex = 0;
+      captureEventModel(event);
+    }
+    if (final && buffered.trim()) captureEventModel(buffered);
+  };
+
   const replay = (): StreamPreflight => {
     let prefixIndex = 0;
-    return { ok: true, body: new ReadableStream<Uint8Array>({
+    // The first valid event can be a ping. Keep observing the untouched raw
+    // stream while the consumer drains it so a later message_start/chunk can
+    // still supply the upstream's model before terminal logging.
+    captureCompleteEvents();
+    return { ok: true, metadata, body: new ReadableStream<Uint8Array>({
       async pull(controller) {
         if (prefixIndex < chunks.length) {
           controller.enqueue(chunks[prefixIndex++]!);
@@ -243,8 +293,15 @@ async function preflightResponseStream(
         }
         try {
           const more = await reader.read();
-          if (more.done) controller.close();
-          else controller.enqueue(more.value);
+          if (more.done) {
+            buffered += decoder.decode();
+            captureCompleteEvents(true);
+            controller.close();
+          } else {
+            buffered += decoder.decode(more.value, { stream: true });
+            captureCompleteEvents();
+            controller.enqueue(more.value);
+          }
         } catch (error) {
           controller.error(error);
         }
@@ -275,7 +332,23 @@ async function preflightResponseStream(
     } catch {
       return "data event is not valid JSON";
     }
+    captureReportedModel(metadata, parsed, protocol, true);
     return invalidEnvelopeReason(parsed, protocol, true);
+  };
+
+  const captureEventModel = (event: string): void => {
+    const data = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data || data === "[DONE]") return;
+    try {
+      captureReportedModel(metadata, JSON.parse(data), protocol, true);
+    } catch {
+      // Preflight owns envelope validity; this observer owns provenance only.
+    }
   };
 
   while (byteLength <= STREAM_PREFLIGHT_LIMIT) {
@@ -288,7 +361,9 @@ async function preflightResponseStream(
       // completion. Preserve the old adapter behaviour for that genuine envelope.
       if (finalReason === undefined && buffered.trim()) {
         try {
-          finalReason = invalidEnvelopeReason(JSON.parse(buffered), protocol, false);
+          const parsed = JSON.parse(buffered);
+          captureReportedModel(metadata, parsed, protocol, false);
+          finalReason = invalidEnvelopeReason(parsed, protocol, false);
         } catch {
           // The SSE-specific reason below remains more useful.
         }
@@ -360,7 +435,10 @@ export async function fetchBackend(
           ...retryAfterHeader(res.headers),
         }, "invalid_upstream_envelope");
       }
-      return new Response(preflight.body, { status: res.status, headers: res.headers });
+      return attachUpstreamMetadata(
+        new Response(preflight.body, { status: res.status, headers: res.headers }),
+        preflight.metadata,
+      );
     }
 
     let body: unknown;
@@ -377,7 +455,9 @@ export async function fetchBackend(
         ...retryAfterHeader(res.headers),
       }, "invalid_upstream_envelope");
     }
-    return res;
+    const metadata: UpstreamResponseMetadata = {};
+    captureReportedModel(metadata, body, "anthropic-messages", false);
+    return attachUpstreamMetadata(res, metadata);
   }
 
   // kind === "openai"
@@ -461,7 +541,10 @@ export async function fetchBackend(
       // would add holdback latency for nothing.
       const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
       const body = schemas.size > 0 ? recoverDialectInStream(anthStream, schemas) : anthStream;
-      return new Response(body, { status: res.status, headers: { "content-type": "text/event-stream" } });
+      return attachUpstreamMetadata(
+        new Response(body, { status: res.status, headers: { "content-type": "text/event-stream" } }),
+        preflight.metadata,
+      );
     } catch (e) {
       return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
     }
@@ -501,13 +584,16 @@ export async function fetchBackend(
   // whose tool call the RELAY reconstructed is not the same as one that arrived correct, and an
   // unflagged reconstruction is indistinguishable from a host that worked.
   const recoveredDialect = recoveredDialectOf(anthropicJson);
-  return new Response(JSON.stringify(anthropicJson), {
+  const response = new Response(JSON.stringify(anthropicJson), {
     status: 200,
     headers: {
       "content-type": "application/json",
       ...(recoveredDialect ? { "x-llm-relay-tool-dialect": recoveredDialect } : {}),
     },
   });
+  const metadata: UpstreamResponseMetadata = {};
+  captureReportedModel(metadata, upstreamJson, "openai-chat", false);
+  return attachUpstreamMetadata(response, metadata);
 }
 
 /** Did this translated message carry a tool call the relay reconstructed from text? */
@@ -856,7 +942,10 @@ export async function fetchOpenAiFront(
       if (!preflight.ok) {
         return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${preflight.reason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
       }
-      return new Response(preflight.body, { status: res.status, headers: res.headers });
+      return attachUpstreamMetadata(
+        new Response(preflight.body, { status: res.status, headers: res.headers }),
+        preflight.metadata,
+      );
     }
 
     let responseBody: unknown;
@@ -869,7 +958,9 @@ export async function fetchOpenAiFront(
     if (invalidReason) {
       return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${invalidReason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
     }
-    return res;
+    const metadata: UpstreamResponseMetadata = {};
+    captureReportedModel(metadata, responseBody, "openai-chat", false);
+    return attachUpstreamMetadata(res, metadata);
   }
 
   let anthropicBody: Record<string, unknown>;
@@ -892,6 +983,7 @@ export async function fetchOpenAiFront(
     wantsStream: args.wantsStream,
     signal: args.signal,
   }, fetchFn);
+  const metadata = upstreamResponseMetadata.get(backendRes);
 
   if (!backendRes.ok) {
     const raw = await backendRes.text().catch(() => "");
@@ -932,7 +1024,8 @@ export async function fetchOpenAiFront(
     const targetProtocol = protocol === "responses" ? "openai-responses" : "openai";
     try {
       const output = handleUniversalStreamRequest(preflight.body, "anthropic", targetProtocol);
-      return new Response(output, { status: backendRes.status, headers: { "content-type": "text/event-stream" } });
+      const response = new Response(output, { status: backendRes.status, headers: { "content-type": "text/event-stream" } });
+      return metadata ? attachUpstreamMetadata(response, metadata) : response;
     } catch (e) {
       return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", "relay_mapper_defect");
     }
@@ -966,10 +1059,11 @@ export async function fetchOpenAiFront(
   }
 
   try {
-    return new Response(JSON.stringify(anthropicMessageToOpenAi(body as Record<string, unknown>, protocol, target.model ?? String(base.model ?? ""))), {
+    const response = new Response(JSON.stringify(anthropicMessageToOpenAi(body as Record<string, unknown>, protocol, target.model ?? String(base.model ?? ""))), {
       status: backendRes.status,
       headers: { "content-type": "application/json" },
     });
+    return metadata ? attachUpstreamMetadata(response, metadata) : response;
   } catch (e) {
     return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", "relay_mapper_defect");
   }
