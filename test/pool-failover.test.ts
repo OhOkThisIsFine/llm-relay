@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { createProxy } from "../src/server.js";
+import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
 import { SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER } from "../src/backend.js";
@@ -10,6 +10,8 @@ import { resetFacts, isCostBlocked, cooldownUntil } from "../src/target-facts.js
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ProviderConfig, ResolvedTarget } from "../src/config.js";
 import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
+import type { Reshaper } from "../src/reshaper.js";
+import type { AssistantMessage } from "../src/anthropic.js";
 
 /**
  * Pool failover, measured end to end.
@@ -102,8 +104,8 @@ function poolCfg(bases: string[], kind: "openai" | "anthropic" = "openai"): Conf
   };
 }
 
-function startProxy(c: Config): Promise<Server> {
-  const s = createProxy(c, { catalog: new ModelCatalog({ cachePath: null }), breaker: globalCircuitBreaker });
+function startProxy(c: Config, deps: ProxyDeps = {}): Promise<Server> {
+  const s = createProxy(c, { catalog: new ModelCatalog({ cachePath: null }), breaker: globalCircuitBreaker, ...deps });
   return new Promise((r) => s.listen(0, "127.0.0.1", () => r(track(s))));
 }
 
@@ -786,6 +788,149 @@ describe("wall-clock walk budget — bounds the walk, never the answer", () => {
     });
     expect(resp.status).toBe(429);
     expect(c.calls()).toBe(0);
+  });
+});
+
+describe("buffered repair dead turns resume the candidate walk (adoption review §2.1)", () => {
+  const weatherTools = [
+    {
+      name: "get_weather",
+      input_schema: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+      },
+    },
+  ];
+
+  function assistantBody(name: string, input: Record<string, unknown>): string {
+    return JSON.stringify({
+      type: "message",
+      role: "assistant",
+      stop_reason: "tool_use",
+      content: [{ type: "tool_use", id: "t1", name, input }],
+    });
+  }
+
+  function repairPool(bases: string[], destructiveTools: string[] = []): Config {
+    const cfg = poolCfg(bases, "anthropic");
+    cfg.mode = "repair";
+    cfg.repair = { maxAttempts: 2, destructiveTools };
+    return cfg;
+  }
+
+  function toolTurn(p: number, tools: object[] = weatherTools): Promise<Response> {
+    return fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "pool/coding",
+        max_tokens: 20,
+        messages: [{ role: "user", content: "weather?" }],
+        tools,
+      }),
+    });
+  }
+
+  const useless: Reshaper = {
+    reshape: async (req) => ({ kind: "message", message: req.rawAssistant }),
+  };
+
+  const fixer: Reshaper = {
+    reshape: async () => ({
+      kind: "message",
+      message: {
+        content: [{ type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } }],
+        stop_reason: "tool_use",
+      } as AssistantMessage,
+    }),
+  };
+
+  it("repair exhaustion on candidate 1 becomes a dead turn and candidate 2 serves", async () => {
+    const broken = await scripted(() => ({ body: assistantBody("get_weather", {}) }));
+    const valid = await scripted(() => ({ body: assistantBody("get_weather", { city: "Rome" }) }));
+    const cfg = repairPool([
+      `http://127.0.0.1:${port(broken.server)}`,
+      `http://127.0.0.1:${port(valid.server)}`,
+    ]);
+    const p = port(await startProxy(cfg, { reshaper: useless }));
+
+    const resp = await toolTurn(p);
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { content: Array<{ input?: unknown }> };
+    expect(body.content[0]?.input).toEqual({ city: "Rome" });
+    expect(broken.calls()).toBe(1);
+    expect(valid.calls()).toBe(1);
+    expect(resp.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 1 served: 1xdead-turn, 1x200");
+  });
+
+  it("repairs candidate 1 before considering failover", async () => {
+    const broken = await scripted(() => ({ body: assistantBody("get_weather", {}) }));
+    const fallback = await scripted(() => ({ body: assistantBody("get_weather", { city: "Rome" }) }));
+    const cfg = repairPool([
+      `http://127.0.0.1:${port(broken.server)}`,
+      `http://127.0.0.1:${port(fallback.server)}`,
+    ]);
+    const p = port(await startProxy(cfg, { reshaper: fixer }));
+
+    const resp = await toolTurn(p);
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { content: Array<{ input?: unknown }> };
+    expect(body.content[0]?.input).toEqual({ city: "Paris" });
+    expect(broken.calls()).toBe(1);
+    expect(fallback.calls()).toBe(0);
+    expect(resp.headers.get(POOL_ATTEMPTS_HEADER)).toBeNull();
+  });
+
+  it("refused_destructive remains a fail-clean 502 and never rerolls another candidate", async () => {
+    let reshapeCalls = 0;
+    const shouldNotRun: Reshaper = {
+      reshape: async () => {
+        reshapeCalls++;
+        return {
+          kind: "message",
+          message: {
+            content: [{ type: "tool_use", id: "t1", name: "delete_file", input: { path: "safe" } }],
+            stop_reason: "tool_use",
+          } as AssistantMessage,
+        };
+      },
+    };
+    const broken = await scripted(() => ({ body: assistantBody("delete_file", {}) }));
+    const fallback = await scripted(() => ({ body: assistantBody("delete_file", { path: "safe" }) }));
+    const cfg = repairPool([
+      `http://127.0.0.1:${port(broken.server)}`,
+      `http://127.0.0.1:${port(fallback.server)}`,
+    ], ["delete_file"]);
+    const p = port(await startProxy(cfg, { reshaper: shouldNotRun }));
+    const deleteTools = [{
+      name: "delete_file",
+      input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    }];
+
+    const resp = await toolTurn(p, deleteTools);
+    expect(resp.status).toBe(502);
+    expect(await resp.text()).toContain("could not be repaired (refused_destructive)");
+    expect(broken.calls()).toBe(1);
+    expect(fallback.calls()).toBe(0);
+    expect(reshapeCalls).toBe(0);
+  });
+
+  it("all dead turns preserve the terminal 502 after walking every candidate", async () => {
+    const first = await scripted(() => ({ body: assistantBody("get_weather", {}) }));
+    const second = await scripted(() => ({ body: assistantBody("get_weather", {}) }));
+    const cfg = repairPool([
+      `http://127.0.0.1:${port(first.server)}`,
+      `http://127.0.0.1:${port(second.server)}`,
+    ]);
+    const p = port(await startProxy(cfg, { reshaper: useless }));
+
+    const resp = await toolTurn(p);
+    expect(resp.status).toBe(502);
+    expect(await resp.text()).toContain("could not be repaired (failed)");
+    expect(first.calls()).toBe(1);
+    expect(second.calls()).toBe(1);
+    expect(resp.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 0 served: 2xdead-turn");
   });
 });
 

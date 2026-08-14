@@ -696,7 +696,43 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
 
       if (doRepair) {
-        await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal, reportedModelSource }, h);
+        const repairResult = await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal, reportedModelSource, pool429 }, h);
+        if (repairResult !== null) {
+          // A schema-invalid 200 that the reshaper exhausted is a dead turn, not a transport
+          // failure. Resume THIS request's candidate walk without teaching the breaker a new
+          // policy or reselecting a duplicate entry for the same deployment.
+          pool429.recordDeadTurn();
+          dropRemainingSameDeployment(healthyTargets, i, target);
+          if (!res.destroyed && i < healthyTargets.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
+            continue;
+          }
+
+          const poolSummary = pool429.summary();
+          failClosed(
+            res,
+            502,
+            "llm-relay: tool call could not be repaired (failed)",
+            poolSummary ? { [POOL_ATTEMPTS_HEADER]: poolSummary } : undefined,
+          );
+          h.logger.write({
+            ...baseLog(
+              started,
+              path,
+              hadTools,
+              false,
+              backendRes.status,
+              repairResult.validated,
+              target,
+              attemptTrace.snapshot(),
+              upstreamReportedModel(reportedModelSource),
+            ),
+            toolUseCount: repairResult.toolUseCount,
+            uncheckableCount: repairResult.uncheckableCount,
+            errorKinds: repairResult.errorKinds,
+            repair: "failed",
+          });
+          return;
+        }
       } else {
         const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
         pool429.recordFinal(backendRes.status);
@@ -904,6 +940,18 @@ function dropRemainingSameProvider(targets: ResolvedTarget[], afterIndex: number
   }
 }
 
+/** Remove duplicate entries for one failed deployment from this request's remaining walk only. */
+function dropRemainingSameDeployment(
+  targets: ResolvedTarget[],
+  afterIndex: number,
+  failed: ResolvedTarget,
+): void {
+  for (let j = targets.length - 1; j > afterIndex; j--) {
+    const candidate = targets[j]!;
+    if (candidate.provider === failed.provider && candidate.model === failed.model) targets.splice(j, 1);
+  }
+}
+
 /**
  * All-429 exhaustion policy — one policy, both fronts (same maxim as `classifyStatus`).
  *
@@ -916,7 +964,7 @@ class Pool429Tracker {
   private minRetryAfterMs: number | null = null;
   private only429 = true;
   /** status → how many candidates answered it, in first-seen order. */
-  private readonly counts = new Map<number, number>();
+  private readonly counts = new Map<number | "dead-turn", number>();
 
   /** Record a response being failed over past. */
   recordFailover(status: number, retryAfterMs: number | null): void {
@@ -935,6 +983,12 @@ class Pool429Tracker {
     this.count(status);
   }
 
+  /** A backend answered 200, but its malformed tool call remained unusable after repair. */
+  recordDeadTurn(): void {
+    this.only429 = false;
+    this.count("dead-turn");
+  }
+
   /** A refusal in this walk whose meaning the relay could not look up. */
   private unknownRefusals = 0;
   noteUnknownRefusal(): void {
@@ -946,7 +1000,7 @@ class Pool429Tracker {
     return this.unknownRefusals > 0 ? this.unknownRefusals : null;
   }
 
-  private count(status: number): void {
+  private count(status: number | "dead-turn"): void {
     this.counts.set(status, (this.counts.get(status) ?? 0) + 1);
   }
 
@@ -972,7 +1026,7 @@ class Pool429Tracker {
     let served = 0;
     for (const [status, n] of this.counts) {
       tried += n;
-      if (status < 400) served += n;
+      if (typeof status === "number" && status < 400) served += n;
     }
     if (tried < 2) return null;
     const breakdown = [...this.counts.entries()].map(([status, n]) => `${n}x${status}`).join(", ");
@@ -1737,7 +1791,20 @@ async function transparentPath(
  * parsed, validated and documented in `config.ts`, and settable per install — was
  * silently ignored on every request.
  */
-type RepairCtx = Ctx & { wantsStream: boolean; reshaper: Reshaper; maxAttempts: number };
+type RepairCtx = Ctx & {
+  wantsStream: boolean;
+  reshaper: Reshaper;
+  maxAttempts: number;
+  /** Request-local aggregate shared with the outer candidate walk. */
+  pool429: Pool429Tracker;
+};
+
+interface BufferedRepairDeadTurn {
+  validated: RequestLog["validated"];
+  toolUseCount: number;
+  uncheckableCount: number;
+  errorKinds: string[];
+}
 
 /** repair: route to the streaming or buffered variant. */
 async function repairPath(
@@ -1746,11 +1813,12 @@ async function repairPath(
   timer: NodeJS.Timeout,
   ctx: RepairCtx,
   h: Handlers,
-): Promise<void> {
+): Promise<BufferedRepairDeadTurn | null> {
   if (ctx.streamed) {
     await repairStreamingPath(res, backendRes, timer, ctx, h);
+    return null;
   } else {
-    await repairBufferedPath(res, backendRes, timer, ctx, h);
+    return repairBufferedPath(res, backendRes, timer, ctx, h);
   }
 }
 
@@ -1962,7 +2030,7 @@ async function repairBufferedPath(
   timer: NodeJS.Timeout,
   ctx: RepairCtx,
   h: Handlers,
-): Promise<void> {
+): Promise<BufferedRepairDeadTurn | null> {
   let bytes: Buffer;
   try {
     bytes = Buffer.from(await backendRes.arrayBuffer());
@@ -1971,11 +2039,11 @@ async function repairBufferedPath(
     // a truncated body — but it still has to be LOGGED, which the bare finally did
     // not do: the throw went straight to the top-level catch.
     handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, ctx.attempt, h, () => null, ctx.reportedModelSource, ctx.signal.aborted);
-    return;
+    return null;
   } finally {
     clearTimeout(timer);
   }
-  if (res.destroyed) return;
+  if (res.destroyed) return null;
   const assistant = ctx.streamed
     ? reconstructFromSse(bytes.toString("utf8"))
     : parseAssistant(bytes.toString("utf8"));
@@ -1987,14 +2055,26 @@ async function repairBufferedPath(
   let uncheckableCount = 0;
   let errorKinds: string[] = [];
 
+  const recordFinalWalk = (
+    status: number,
+    headers?: Record<string, string | string[]>,
+  ): Record<string, string | string[]> | undefined => {
+    ctx.pool429.recordFinal(status);
+    const summary = ctx.pool429.summary();
+    if (!summary) return headers;
+    if (headers) headers[POOL_ATTEMPTS_HEADER] = summary;
+    return headers ?? { [POOL_ATTEMPTS_HEADER]: summary };
+  };
+
   if (!assistant) {
     if (backendRes.status < 400) {
       // A successful status with no Anthropic message is not a successful provider attempt.
       // Nothing has been committed yet on this buffered path, so return a bounded clean 502.
       validated = "fail";
       errorKinds = ["invalid_upstream_envelope"];
-      failClosed(res, 502, "llm-relay: invalid Anthropic upstream envelope");
+      failClosed(res, 502, "llm-relay: invalid Anthropic upstream envelope", recordFinalWalk(502));
     } else {
+      recordFinalWalk(backendRes.status, filtered);
       res.writeHead(backendRes.status, filtered);
       if (!res.writableEnded) res.end(bytes);
     }
@@ -2004,6 +2084,7 @@ async function repairBufferedPath(
     uncheckableCount = r.uncheckableCount;
     if (r.valid) {
       validated = r.uncheckableCount > 0 ? "uncheckable" : "pass";
+      recordFinalWalk(backendRes.status, filtered);
       res.writeHead(backendRes.status, filtered); // pass through untouched
       if (!res.writableEnded) res.end(bytes);
     } else {
@@ -2018,10 +2099,19 @@ async function repairBufferedPath(
       });
       repairOutcome = decision.outcome;
       if (decision.outcome === "fixed" && decision.message) {
+        recordFinalWalk(backendRes.status, filtered);
         emitFixed(res, backendRes.status, filtered, decision.message, ctx.wantsStream);
+      } else if (decision.outcome === "failed") {
+        // Nothing has been committed on the buffered path. The outer candidate loop decides
+        // whether this request can resume or whether this remains the terminal fail-clean 502.
       } else {
         // fail-clean: loud, well-formed error rather than a silently broken call.
-        failClosed(res, 502, `llm-relay: tool call could not be repaired (${decision.outcome})`);
+        failClosed(
+          res,
+          502,
+          `llm-relay: tool call could not be repaired (${decision.outcome})`,
+          recordFinalWalk(502),
+        );
       }
     }
   }
@@ -2041,10 +2131,15 @@ async function repairBufferedPath(
       failure: "protocol",
       provenance: "invalid-upstream-envelope",
       status: 502,
+      ...(repairOutcome === "failed" ? { logStatus: "dead-turn" as const } : {}),
     });
   } else {
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
   }
+  if (repairOutcome === "failed") {
+    return { validated, toolUseCount, uncheckableCount, errorKinds };
+  }
+
   h.logger.write({
     ...baseLog(
       ctx.started,
@@ -2059,6 +2154,7 @@ async function repairBufferedPath(
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
+  return null;
 }
 
 function emitFixed(
@@ -2436,12 +2532,17 @@ async function writeChunk(res: ServerResponse, chunk: Buffer): Promise<boolean> 
   }
 }
 
-function failClosed(res: ServerResponse, status: number, message: string): void {
+function failClosed(
+  res: ServerResponse,
+  status: number,
+  message: string,
+  headers?: Record<string, string | string[]>,
+): void {
   if (res.headersSent) {
     if (!res.writableEnded) res.end();
     return;
   }
-  res.writeHead(status, { "content-type": "application/json" });
+  res.writeHead(status, { ...headers, "content-type": "application/json" });
   res.end(JSON.stringify({ type: "error", error: { type: "api_error", message } }));
 }
 
