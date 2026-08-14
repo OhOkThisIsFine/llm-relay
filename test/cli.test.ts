@@ -672,6 +672,30 @@ describe("CLI configuration editing", () => {
     });
   });
 
+  it("preserves dynamic-pool exclude tombstones while editing the preferred prefix", async () => {
+    writeFileSync(configPath, JSON.stringify({
+      ...baseConfig,
+      routing: {
+        ...baseConfig.routing,
+        pools: {
+          medium: {
+            preferred: ["test/coder"],
+            include: "free",
+            exclude: ["test/retired"],
+          },
+        },
+      },
+    }, null, 2));
+
+    process.argv.push("pools", "add", "medium", "other/coder");
+    await runPools();
+    expect(document().routing.pools.medium).toEqual({
+      preferred: ["test/coder", "other/coder"],
+      include: "free",
+      exclude: ["test/retired"],
+    });
+  });
+
   it("configures fallback, tiers, subagents, sorting, and arbitrary routing fields", async () => {
     process.argv.push("routing", "default", "test/strong", "other/fallback");
     runRoutingCommand();

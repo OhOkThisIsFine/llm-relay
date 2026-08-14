@@ -212,8 +212,13 @@ export function materializeDynamicPools(
 
   const degraded: Record<string, string[]> = {};
   for (const [pool, policy] of Object.entries(cfg.routing.poolPolicies)) {
-    const preferred = new Set(policy.preferred);
-    const usable = ranked.filter((entry) => entry.fitness.signals.supportsTools !== false);
+    const excluded = new Set(policy.exclude ?? []);
+    const preferredPrefix = policy.preferred.filter((spec) => !excluded.has(spec));
+    const preferred = new Set(preferredPrefix);
+    const usable = ranked.filter(
+      (entry) =>
+        !excluded.has(specOfTarget(entry.target)) && entry.fitness.signals.supportsTools !== false,
+    );
     const inBand = policy.effort
       ? usable.filter((entry) => strengthAllowedForEffort(entry.strength, policy.effort!))
       : usable;
@@ -261,7 +266,7 @@ export function materializeDynamicPools(
     };
     const bandOrder = byCost(inBand).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s));
     const tailOrder = byCost(tail).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s) && !inBandSpecs.has(s));
-    cfg.routing.pools[pool] = [...policy.preferred, ...bandOrder, ...tailOrder];
+    cfg.routing.pools[pool] = [...preferredPrefix, ...bandOrder, ...tailOrder];
     if (tailOrder.length > 0) degraded[pool] = tailOrder;
   }
   cfg.routing.poolDegraded = degraded;

@@ -185,6 +185,8 @@ export interface CliLaneTemplate {
 export interface PoolPolicy {
   preferred: string[];
   include: "free";
+  /** Permanent user tombstones, applied to both the fixed prefix and discovered tail. */
+  exclude?: string[];
   /** Optional evidence-aware effort band for the discovered tail. */
   effort?: EffortLevel;
 }
@@ -1114,20 +1116,35 @@ function parseRouting(
       if (Array.isArray(v)) {
         declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
       } else if (typeof v === "object" && v !== null) {
-        const policy = v as { preferred?: unknown; include?: unknown; effort?: unknown };
+        const policy = v as { preferred?: unknown; include?: unknown; exclude?: unknown; effort?: unknown };
         if (!Array.isArray(policy.preferred) || policy.preferred.some((s) => typeof s !== "string" || s.length === 0)) {
           throw new Error(`config.routing.pools.${k}.preferred must be an array of non-empty "provider/model" specs`);
         }
         if (policy.include !== "free") {
           throw new Error(`config.routing.pools.${k}.include must be "free"`);
         }
+        if (
+          policy.exclude !== undefined &&
+          (!Array.isArray(policy.exclude) ||
+            policy.exclude.some(
+              (s) =>
+                typeof s !== "string" ||
+                !/^\S+\/\S+$/.test(s) ||
+                s.startsWith(`${POOL_PREFIX}/`),
+            ))
+        ) {
+          throw new Error(`config.routing.pools.${k}.exclude must be an array of "provider/model" specs`);
+        }
         if (policy.effort !== undefined && !EFFORT_LEVELS.has(policy.effort as EffortLevel)) {
           throw new Error(`config.routing.pools.${k}.effort must be low, medium, high, or xhigh`);
         }
-        declared = [...(policy.preferred as string[])];
+        const exclude = [...((policy.exclude as string[] | undefined) ?? [])];
+        const excluded = new Set(exclude);
+        declared = (policy.preferred as string[]).filter((spec) => !excluded.has(spec));
         poolPolicies[k] = {
           preferred: declared,
           include: "free",
+          ...(exclude.length > 0 ? { exclude } : {}),
           ...(policy.effort ? { effort: policy.effort as EffortLevel } : {}),
         };
       } else {
