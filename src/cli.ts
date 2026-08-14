@@ -34,6 +34,7 @@ import {
   type ScopeTemplate,
 } from "./refusal-interpretation.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
+import { installProcessSafetyNet } from "./process-safety-net.js";
 import { createProxy } from "./server.js";
 import { ModelCatalog } from "./catalog.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
@@ -546,6 +547,18 @@ export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promi
 export function runProxy() {
   const cfg = loadOrExit();
   const catalog = new ModelCatalog();
+  // A late socket reset from a discarded failover body must not kill the process that fronts
+  // every session; genuine bugs still exit 1. See src/process-safety-net.ts.
+  installProcessSafetyNet({
+    beforeExit: () => {
+      catalog.flushPersistence();
+      flushRuntimeTelemetry();
+      flushProbeCache();
+      flushObservedContextLimits();
+      flushFacts();
+      flushInterpretations();
+    },
+  });
   const server = createProxy(cfg, { catalog });
   server.listen(cfg.port, cfg.host, () => {
     const providers = Object.keys(cfg.providers).join(",");
