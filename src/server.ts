@@ -10,7 +10,13 @@ import {
   type Config,
   type ResolvedTarget,
 } from "./config.js";
-import { MetadataLogger, type RequestLog } from "./log.js";
+import {
+  MAX_LOG_ATTEMPTS,
+  MetadataLogger,
+  type RequestAttemptLog,
+  type RequestAttemptStatus,
+  type RequestLog,
+} from "./log.js";
 import { credentialState } from "./authEnv.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
@@ -564,6 +570,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
   // Candidate execution loop with failover across healthyTargets.
   // All-429 exhaustion Retry-After policy: `Pool429Tracker`.
+  const attemptTrace = new RequestAttemptTrace();
   const pool429 = new Pool429Tracker();
   const walkBudgetMs = cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
   const walkStarted = Date.now();
@@ -589,16 +596,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       } catch (e) {
         if (e instanceof CredentialConfigError) {
           failClosed(res, 502, `llm-relay configuration: ${e.message}`);
-          h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null));
+          h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
           return;
         }
         throw e;
       }
 
-      attempt = beginHealthAttempt(h, target, Date.now()) ?? undefined;
+      attempt = beginHealthAttempt(h, target, Date.now(), attemptTrace) ?? undefined;
       if (!attempt) {
         failClosed(res, 502, "llm-relay: could not begin provider attempt");
-        h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null));
+        h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
         return;
       }
 
@@ -639,7 +646,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         }
 
         failClosed(res, status, aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`);
-        h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", target));
+        h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot()));
         return;
       }
 
@@ -1030,11 +1037,31 @@ interface Ctx {
   signal: AbortSignal;
 }
 
+/** Request-scoped, bounded attempt metadata shared by both public fronts. */
+class RequestAttemptTrace {
+  private readonly entries: RequestAttemptLog[] = [];
+
+  record(target: ResolvedTarget, status: RequestAttemptStatus, started: number, completedAt: number): void {
+    if (this.entries.length >= MAX_LOG_ATTEMPTS) return;
+    this.entries.push({
+      provider: target.provider,
+      model: target.model ?? null,
+      status,
+      ms: Math.max(0, completedAt - started),
+    });
+  }
+
+  snapshot(): RequestAttemptLog[] {
+    return this.entries.map((entry) => ({ ...entry }));
+  }
+}
+
 interface HealthAttempt {
   readonly handle: AttemptHandle;
   readonly identity: ProviderTargetIdentity;
   readonly target: ResolvedTarget;
   readonly started: number;
+  readonly trace: RequestAttemptTrace;
   completed: boolean;
 }
 
@@ -1047,11 +1074,16 @@ function targetIdentity(target: ResolvedTarget): ProviderTargetIdentity {
   });
 }
 
-function beginHealthAttempt(h: Handlers, target: ResolvedTarget, started: number): HealthAttempt | null {
+function beginHealthAttempt(
+  h: Handlers,
+  target: ResolvedTarget,
+  started: number,
+  trace: RequestAttemptTrace,
+): HealthAttempt | null {
   const identity = targetIdentity(target);
   const begun = h.breaker.beginAttempt(identity);
   if (!begun.ok) return null;
-  return { handle: begun.value, identity, target, started, completed: false };
+  return { handle: begun.value, identity, target, started, trace, completed: false };
 }
 
 /**
@@ -1258,6 +1290,7 @@ function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: num
   });
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
+  attempt.trace.record(attempt.target, status, attempt.started, completedAt);
   recordCall(attempt.target, true, attempt.started);
   // A served request is first-party proof that this deployment exists and that the credential has
   // allowance RIGHT NOW — strictly better evidence than any stored refusal, so it clears the
@@ -1285,6 +1318,7 @@ function completeAttemptFailure(
     provenance: OutcomeProvenance;
     status: number | null;
     retryAfterMs?: number | null;
+    logStatus?: RequestAttemptStatus;
   },
 ): void {
   if (attempt.completed) return;
@@ -1301,6 +1335,12 @@ function completeAttemptFailure(
   });
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
+  attempt.trace.record(
+    attempt.target,
+    options.logStatus ?? options.status ?? "failed",
+    attempt.started,
+    completedAt,
+  );
   recordCall(attempt.target, false, attempt.started);
 }
 
@@ -1317,6 +1357,7 @@ function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: s
   });
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
+  attempt.trace.record(attempt.target, "cancelled", attempt.started, completedAt);
 }
 
 function detectOpenAiFrontProtocol(method: string | undefined, pathname: string): OpenAiFrontProtocol | null {
@@ -1362,6 +1403,7 @@ async function openAiFrontPath(
   h: Handlers,
 ): Promise<void> {
   const tried: string[] = [];
+  const attemptTrace = new RequestAttemptTrace();
   // All-429 exhaustion Retry-After policy, shared with the Anthropic path: `Pool429Tracker`.
   const pool429 = new Pool429Tracker();
   const walkBudgetMs = ctx.cfg?.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
@@ -1388,18 +1430,18 @@ async function openAiFrontPath(
       res.off("close", onResClose);
       if (e instanceof CredentialConfigError) {
         failClosed(res, 502, `llm-relay configuration: ${e.message}`);
-        h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null));
+        h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
         return;
       }
       throw e;
     }
 
-    const attempt = beginHealthAttempt(h, target, Date.now());
+    const attempt = beginHealthAttempt(h, target, Date.now(), attemptTrace);
     if (!attempt) {
       clearTimeout(timer);
       res.off("close", onResClose);
       failClosed(res, 502, "llm-relay: could not begin provider attempt");
-      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null));
+      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
       return;
     }
 
@@ -1437,7 +1479,7 @@ async function openAiFrontPath(
         res.writeHead(status, { "content-type": "application/json", [SERVED_BY_HEADER]: tried.join(", ") });
         res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
       }
-      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target));
+      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target, attemptTrace.snapshot()));
       return;
     }
 
@@ -1482,6 +1524,7 @@ async function openAiFrontPath(
       clearTimeout(timer);
       upstream = withStallWatchdog(upstream, controller, stallMs);
     }
+    let responseBytesWritten = false;
     try {
       const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
@@ -1524,7 +1567,9 @@ async function openAiFrontPath(
         res.writeHead(upstream.status, headers);
         if (upstream.body) {
           for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
-            if (!await writeChunk(res, Buffer.from(chunk))) break;
+            const bytes = Buffer.from(chunk);
+            if (!await writeChunk(res, bytes)) break;
+            if (bytes.length > 0) responseBytesWritten = true;
           }
         }
         if (!res.writableEnded) res.end();
@@ -1536,13 +1581,14 @@ async function openAiFrontPath(
         res, e, ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, target, attempt, h,
         (msg) => streamed ? openAiSseError(msg) : null,
         controller.signal.aborted,
+        responseBytesWritten,
       );
       return;
     } finally {
       clearTimeout(timer);
       res.off("close", onResClose);
     }
-    h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target));
+    h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target, attemptTrace.snapshot()));
     return;
   }
   // Unreachable with candidates present: the last iteration always responds and returns. An
@@ -1574,6 +1620,7 @@ async function transparentPath(
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
   res.writeHead(backendRes.status, responseHeaders);
   let assistant: AssistantMessage | null = null;
+  let responseBytesWritten = false;
   try {
     if (!backendRes.body) {
       if (!res.writableEnded) res.end();
@@ -1582,7 +1629,9 @@ async function transparentPath(
       let acc = "";
       let overflow = false;
       for await (const chunk of backendRes.body as unknown as AsyncIterable<Uint8Array>) {
-        if (!await writeChunk(res, Buffer.from(chunk))) break;
+        const bytes = Buffer.from(chunk);
+        if (!await writeChunk(res, bytes)) break;
+        if (bytes.length > 0) responseBytesWritten = true;
         if (ctx.willValidate && !overflow) {
           acc += decoder.decode(chunk, { stream: true });
           if (acc.length > MAX_VALIDATE_BYTES) overflow = true;
@@ -1611,6 +1660,7 @@ async function transparentPath(
       ctx.target, ctx.attempt, h,
       (msg) => ctx.streamed ? sseError(msg) : null,
       ctx.signal.aborted,
+      responseBytesWritten,
     );
     return;
   } finally {
@@ -1650,7 +1700,16 @@ async function transparentPath(
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
   }
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
+    ...baseLog(
+      ctx.started,
+      ctx.path,
+      ctx.hadTools,
+      ctx.streamed,
+      backendRes.status,
+      validated,
+      ctx.target,
+      ctx.attempt.trace.snapshot(),
+    ),
     toolUseCount, uncheckableCount, errorKinds,
   });
 }
@@ -1702,6 +1761,7 @@ async function repairStreamingPath(
   let buffering = false;
   let firstToolUseIndex = -1;
   let headWritten = false;
+  let responseBytesWritten = false;
 
   const ensureHead = () => {
     if (!headWritten) {
@@ -1711,7 +1771,7 @@ async function repairStreamingPath(
   };
   const forward = async (frame: Buffer) => {
     ensureHead();
-    await writeChunk(res, frame);
+    if (await writeChunk(res, frame) && frame.length > 0) responseBytesWritten = true;
   };
   const flushHeld = async () => {
     for (const f of held) {
@@ -1769,7 +1829,21 @@ async function repairStreamingPath(
     // head has not been written yet (a failure before any text frame) this is still
     // a clean 502. Either way the turn is logged.
     held.length = 0;
-    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, ctx.target, ctx.attempt, h, sseError, ctx.signal.aborted);
+    handleMidStreamError(
+      res,
+      e,
+      ctx.started,
+      ctx.path,
+      ctx.hadTools,
+      true,
+      backendRes.status,
+      ctx.target,
+      ctx.attempt,
+      h,
+      sseError,
+      ctx.signal.aborted,
+      responseBytesWritten,
+    );
     return;
   } finally {
     clearTimeout(timer);
@@ -1848,7 +1922,16 @@ async function repairStreamingPath(
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
   }
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.hadTools, true, backendRes.status, validated, ctx.target),
+    ...baseLog(
+      ctx.started,
+      ctx.path,
+      ctx.hadTools,
+      true,
+      backendRes.status,
+      validated,
+      ctx.target,
+      ctx.attempt.trace.snapshot(),
+    ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
 }
@@ -1944,7 +2027,16 @@ async function repairBufferedPath(
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
   }
   h.logger.write({
-    ...baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, validated, ctx.target),
+    ...baseLog(
+      ctx.started,
+      ctx.path,
+      ctx.hadTools,
+      ctx.streamed,
+      backendRes.status,
+      validated,
+      ctx.target,
+      ctx.attempt.trace.snapshot(),
+    ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
 }
@@ -2211,6 +2303,7 @@ function handleMidStreamError(
   h: Handlers,
   errorFrameBuilder: (msg: string) => string | null,
   deadlineAborted = false,
+  committed = false,
 ): void {
   const message = midStreamMessage(e);
   const errorFrame = errorFrameBuilder(message);
@@ -2222,10 +2315,20 @@ function handleMidStreamError(
       failure: deadlineAborted ? "transport" : "protocol",
       provenance: deadlineAborted ? "deadline" : "upstream",
       status: deadlineAborted ? 504 : 502,
+      ...(committed ? { logStatus: "committed" as const } : {}),
     });
   }
   h.logger.write({
-    ...baseLog(started, path, hadTools, streamed, backendStatus, "skipped", target),
+    ...baseLog(
+      started,
+      path,
+      hadTools,
+      streamed,
+      backendStatus,
+      "skipped",
+      target,
+      attempt.trace.snapshot(),
+    ),
     errorKinds: [MID_STREAM_ERROR_KIND],
   });
 }

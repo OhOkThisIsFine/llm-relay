@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_LOG_MAX_BYTES, MetadataLogger, type RequestLog } from "../src/log.js";
+import { DEFAULT_LOG_MAX_BYTES, MAX_LOG_ATTEMPTS, MetadataLogger, type RequestLog } from "../src/log.js";
 
 let dir: string;
 let file: string;
@@ -23,6 +23,7 @@ const record = (over: Partial<RequestLog> = {}): RequestLog => ({
   path: "/v1/messages",
   servedProvider: "nim",
   servedModel: "z-ai/glm-5.2",
+  attempts: [],
   hadTools: true,
   streamed: false,
   backendStatus: 200,
@@ -57,6 +58,7 @@ describe("metadata-only logging", () => {
       "path",
       "servedProvider",
       "servedModel",
+      "attempts",
       "hadTools",
       "streamed",
       "backendStatus",
@@ -94,6 +96,27 @@ describe("metadata-only logging", () => {
     expect(line).not.toHaveProperty("authorization");
     expect(line).not.toHaveProperty("requestBody");
     expect(line).not.toHaveProperty("responseHeaders");
+  });
+
+  it("projects and bounds nested attempts so error text cannot enter through an allowed field", () => {
+    const attempts = Array.from({ length: MAX_LOG_ATTEMPTS + 10 }, (_, index) => ({
+      provider: "nim",
+      model: `model-${index}`,
+      status: index === 0 ? "committed" : 429,
+      ms: index,
+      error: "private upstream error text",
+      body: "private response body",
+    }));
+    new MetadataLogger({ level: "metadata", file }).write({ ...record(), attempts } as unknown as RequestLog);
+
+    const raw = readFileSync(file, "utf8");
+    expect(raw).not.toContain("private upstream error text");
+    expect(raw).not.toContain("private response body");
+    const [line] = linesIn(file);
+    const logged = line!["attempts"] as Array<Record<string, unknown>>;
+    expect(logged).toHaveLength(MAX_LOG_ATTEMPTS);
+    expect(logged[0]).toEqual({ provider: "nim", model: "model-0", status: "committed", ms: 0 });
+    expect(Object.keys(logged[0]!)).toEqual(["provider", "model", "status", "ms"]);
   });
 
   /**

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
@@ -82,6 +85,7 @@ const FRONTS: FrontDriver[] = [
 ];
 
 const servers: Server[] = [];
+const tempDirs: string[] = [];
 
 function track(server: Server): Server {
   servers.push(server);
@@ -108,6 +112,7 @@ afterEach(async () => {
       ),
     );
   } finally {
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
     globalCircuitBreaker.reset();
     resetFacts();
     resetInterpretations();
@@ -184,6 +189,7 @@ interface PoolConfigOptions {
   candidates?: string[];
   timeoutMs?: number[];
   tierTypes?: Array<ProviderTierType | undefined>;
+  logFile?: string;
 }
 
 /** A config-order pool; no live capability snapshot can reorder a convergence fixture. */
@@ -215,7 +221,9 @@ function poolConfig(bases: string[], options: PoolConfigOptions = {}): Config {
     },
     mode: "detect",
     repair: { maxAttempts: 2, destructiveTools: [] },
-    log: { level: "silent", file: null },
+    log: options.logFile
+      ? { level: "metadata", file: options.logFile }
+      : { level: "silent", file: null },
   };
 }
 
@@ -328,10 +336,13 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
   it("429 steps to the next candidate, records the breaker, and reports the whole walk", async () => {
     const first = await scripted(() => ({ status: 429, body: errorBody("slow down", "rate_limit_error") }));
     const second = await scripted(() => ({ body: OK_BODY }));
+    const logDir = mkdtempSync(join(tmpdir(), "rp-convergence-log-"));
+    tempDirs.push(logDir);
+    const logFile = join(logDir, "relay.jsonl");
     const config = poolConfig([
       `http://127.0.0.1:${port(first.server)}`,
       `http://127.0.0.1:${port(second.server)}`,
-    ]);
+    ], { logFile });
     const proxyPort = port(await startProxy(config));
 
     const response = await front.post(proxyPort);
@@ -346,6 +357,16 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     expect(remaining).toBeGreaterThan(0);
     expect(remaining).toBeLessThanOrEqual(5000);
     expect(state?.cooldownSource).toBe("loopback");
+
+    const logged = JSON.parse(readFileSync(logFile, "utf8").trim()) as {
+      attempts: Array<Record<string, unknown>>;
+    };
+    expect(logged.attempts).toEqual([
+      { provider: "p1", model: "m1", status: 429, ms: expect.any(Number) },
+      { provider: "p2", model: "m2", status: 200, ms: expect.any(Number) },
+    ]);
+    expect(Object.keys(logged.attempts[0]!)).toEqual(["provider", "model", "status", "ms"]);
+    expect(JSON.stringify(logged.attempts)).not.toContain("slow down");
   });
 
   it("Retry-After sets the failed candidate's breaker cooldown without delaying failover", async () => {

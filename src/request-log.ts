@@ -1,5 +1,5 @@
 import type { ResolvedTarget } from "./config.js";
-import type { RequestLog } from "./log.js";
+import type { RequestAttemptLog, RequestLog } from "./log.js";
 
 /** Build the metadata-only record shared by data-plane and admin handlers. */
 export function baseLog(
@@ -10,12 +10,14 @@ export function baseLog(
   backendStatus: number,
   validated: RequestLog["validated"],
   served: ResolvedTarget | null,
+  attempts: readonly RequestAttemptLog[] = [],
 ): RequestLog {
   return {
     ts: new Date(started).toISOString(),
     path: logSafePath(path),
     servedProvider: served ? served.provider : null,
     servedModel: served ? served.model ?? null : null,
+    attempts: [...attempts],
     hadTools,
     streamed,
     backendStatus,
