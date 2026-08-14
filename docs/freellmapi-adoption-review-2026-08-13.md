@@ -23,6 +23,17 @@ provider skip — from different starting points. Those are the ones to trust mo
 
 ---
 
+> **Implementation status (2026-08-14):** every item in §1 landed, each with pinning tests in the
+> same commit — 1.3 `e673d39`, 1.4 `8a918d8`, 1.5 `c714774`, 1.6 `e3428d1`, 1.7 `2e0a6ca`,
+> 1.8 `0a38e42`, 1.9 `a700aaa`, 1.10 `c61b55f`, 1.11 `4d057d4`, 1.12 `9d6123b`, 1.2 `ed2499f`,
+> 1.1 `070c4b2`. One deliberate scope note: **1.1 landed as its verified first slice** — a
+> first-event in-band error frame now fails over pre-commit (the preflight-visible case). The
+> fuller deferred-commit machinery (withholding client headers until first meaningful content, so
+> a streamed-but-unparseable dialect envelope and an empty stream can also fail over invisibly)
+> remains open: it restructures when `writeHead` fires relative to the candidate loop on both
+> fronts and deserves its own design pass — see the bounded minimal version sketched below and in
+> §2's "deferred headers" discussion. §2's owner decisions remain undecided and unimplemented.
+
 ## 1. Adopt — verified, rubric-clean, ranked
 
 ### Reliability on the request path
