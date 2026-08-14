@@ -19,6 +19,8 @@ export interface StreamCommitProbeOptions {
   isCancelled?: () => boolean;
   /** Malformed final wire produced by a response mapper is a local defect, not target health. */
   malformedProvenance?: "upstream" | "local";
+  /** A rejected body read is normally transport/upstream even when parsing is mapper-local. */
+  readFailureProvenance?: "upstream" | "local";
 }
 
 /** Shared by structural preflight and final-wire commit probing. */
@@ -259,6 +261,7 @@ export async function probeStreamForCommit(
   const chunks: Uint8Array[] = [];
   const decoder = new TextDecoder();
   const malformedProvenance = options.malformedProvenance ?? "upstream";
+  const readFailureProvenance = options.readFailureProvenance ?? "upstream";
   let buffered = "";
   let inspectedBytes = 0;
 
@@ -323,7 +326,7 @@ export async function probeStreamForCommit(
       next = await reader.read();
     } catch {
       if (isCancelled()) return cancelled();
-      return dead("stream failed before meaningful content", malformedProvenance);
+      return dead("stream failed before meaningful content", readFailureProvenance);
     }
 
     if (isCancelled()) return cancelled();

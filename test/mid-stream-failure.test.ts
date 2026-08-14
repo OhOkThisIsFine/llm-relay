@@ -41,6 +41,7 @@ function truncatingSseBackend(): Promise<Server> {
         'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
       );
       res.write('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n');
+      res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"started"}}\n\n');
       // Destroy the socket without a terminating frame: the proxy's body iteration
       // throws, which is the exact condition this test exists for.
       setTimeout(() => res.socket?.destroy(), 20);
@@ -56,6 +57,7 @@ function slowSseBackend(): Promise<Server> {
       res.write(
         'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
       );
+      res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"started"}}\n\n');
       const cadence = setInterval(() => {
         res.write('event: ping\ndata: {"type":"ping"}\n\n');
       }, 10);
@@ -253,6 +255,7 @@ describe("streamed deadline split — stall watchdog vs total deadline (adoption
         res.write(
           'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
         );
+        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"started"}}\n\n');
       }),
     );
   }
@@ -265,6 +268,7 @@ describe("streamed deadline split — stall watchdog vs total deadline (adoption
         res.write(
           'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
         );
+        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"started"}}\n\n');
         let n = 0;
         const cadence = setInterval(() => {
           n++;
