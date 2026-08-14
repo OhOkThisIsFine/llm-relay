@@ -286,4 +286,4 @@ This is not a concern for the current runner choice, but is the single line that
 
 ### 4.6 A note on the Node version in publish.yml
 
-`publish.yml` uses Node 22 (line 84); `package.json` `engines` declares `>=20` (line 8). The adoption review item 2.14 notes this discrepancy: "ci.yml runs Node 22 only while package.json declares `>=20`." The smoke test inherits the same Node 22. This is not a smoke-test defect — the tarball ships `dist/` compiled to ES2022 (tsconfig.json), which runs on both Node 20 and 22. But if the `engines` floor were ever raised to `>=22`, the smoke test would catch a `package.json` that declares a floor the artifact does not satisfy — which is the direction the review recommends fixing the discrepancy, not the direction that breaks anything.
+`publish.yml` and `package.json` now both require Node 22. The smoke test inherits that version and would catch a future mismatch between the package's declared floor and the artifact it ships.

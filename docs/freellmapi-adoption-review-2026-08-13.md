@@ -317,8 +317,8 @@ convention) is the owner's pick.
 **Decision (2026-08-14): Adopt — STRIP the block.** Bounded four-state stream filter, ≤512B lead hold, one block, lossless flush on doubt. Strip (not text-prefix): unsigned thinking blocks don't round-trip anyway.
 
 **2.14 Node-20 CI leg — or raise `engines` to `>=22`.** (tiny)
-ci.yml runs Node 22 only while package.json declares `>=20`: the bottom of the declared range runs
-nowhere, ever. freellmapi keeps a 20+22 matrix precisely because 20 historically caught crashes
+At review time ci.yml ran Node 22 only while package.json declared `>=20`: the bottom of the declared
+range ran nowhere, ever. freellmapi keeps a 20+22 matrix precisely because 20 historically caught crashes
 newer local Nodes hid. Either fix is two lines; pick one. Found by: workflow + Codex.
 
 **Decision (2026-08-14): Raise engines to >=22.** (No Node-20 CI leg.) Node 20 is past EOL; declare what is tested.
