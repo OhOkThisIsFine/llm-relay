@@ -571,13 +571,11 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 
 ## Status & open work
 
-⚠ **Four confirmed defects are open** — [docs/audit-2026-08-09.md](docs/audit-2026-08-09.md).
-From a full `/audit-code` run on 2026-08-09: `argValue()` re-reads an option's VALUE as a flag
-(`cli.ts`, reachable from an untrusted Agent prompt via `claude-hook.ts` — parser confusion, NOT
-command injection); `DEFAULT_DESTRUCTIVE` omits Codex's `shell_command`/`apply_patch` while Codex
-is a first-class client; the ping probe follows redirects carrying `x-api-key`; and `winenv`'s
-scope merge is case-sensitive against a case-insensitive `process.env`, so Machine beats User.
-None are fixed. ⚠ The run produced 676 findings but **only 6 were verified against source** — the
+✅ **The four confirmed defects are fixed (2026-08-14)** —
+[docs/audit-2026-08-09.md](docs/audit-2026-08-09.md). The `argValue()` parser confusion
+(`961a750`), missing Codex destructive-tool defaults (`55ae136`), credential-carrying ping redirects
+(`fcc1452`), and case-sensitive `winenv` scope merge (`7f6f6e4`) are closed with pinning tests.
+⚠ The run produced 676 findings but **only 6 were verified against source** — the
 rest are advisory output from the Codex offload lane and their severities are a model's estimate,
 so do not treat that report as a to-do list. Raw artifacts live in `.audit-tools/` and are
 deliberately untracked.
