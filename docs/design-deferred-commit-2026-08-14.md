@@ -8,282 +8,166 @@ caveat: "This is an ADVISORY lane deliverable. File:line claims must be re-verif
 
 # Deferred Commit Design — §1.1 Remainder
 
-**Reference:** [docs/freellmapi-adoption-review-2026-08-13.md](file:///C:/Code/llm-relay/docs/freellmapi-adoption-review-2026-08-13.md#L385-L390) §6 Item 1
-**Background:** [docs/pool-failover.md](file:///C:/Code/llm-relay/docs/pool-failover.md) (*"two paths, one policy empty"*)
-**Source Fronts:** Anthropic front (`POST /v1/messages`) and OpenAI front (`POST /v1/chat/completions` and `POST /v1/responses`) in [src/server.ts](file:///C:/Code/llm-relay/src/server.ts#L474-L712).
+**Reference:** [docs/freellmapi-adoption-review-2026-08-13.md](freellmapi-adoption-review-2026-08-13.md#L385-L390) §6 Item 1
+**Background:** [docs/pool-failover.md](pool-failover.md) (*"two paths, one policy empty"*)
+**Source Fronts:** Anthropic front (`POST /v1/messages`) and OpenAI front (`POST /v1/chat/completions` and `POST /v1/responses`) in [src/server.ts](../src/server.ts).
 
----
+No files were modified. The status banner accurately describes the remaining gap: the first-event check landed, but full header deferral remains open on both fronts ([docs/freellmapi-adoption-review-2026-08-13.md:26-35](docs/freellmapi-adoption-review-2026-08-13.md#L26-L35)).
 
-## 1. Fact inventory
+## Recommended design
 
-### 1.1 What `files` ships
+Add a second, final-wire commit probe. Keep the existing structural `preflightResponseStream`; it protects the response mappers and deliberately returns after the first structurally valid event ([src/backend.ts:225-318](src/backend.ts#L225-L318)). The new probe must run after all translation and dialect recovery, immediately inside each candidate loop, before any client `writeHead`, `write`, `end`, or stall-watchdog phase switch.
 
-`package.json` lines 20–30 declare:
+Use a tagged result:
 
-```
-dist/                          — compiled JS (root + subdirectories)
-docs/tier-data.json            — the capability snapshot
-skills/                        — directory (flat entry = recursive inclusion)
-scripts/install-skill.mjs      — one specific file, not the whole scripts/
-scripts/sync-tiers.mjs
-scripts/tier-scoring.mjs
-scripts/tier-scoring.d.mts
-README.md
-config.example.json
-```
-
-Critical observation: `scripts/sync-tiers.mjs` ships, but `scripts/CLAUDE.md` (the operators' inventory of those scripts) does not. That is a docs omission that no smoke test will catch.
-
-### 1.2 Runtime assets the installed binary reads outside `dist/`
-
-There are exactly **three** non-`dist` assets the binary reaches on a live code path:
-
-**a) `docs/tier-data.json`** (`src/tier-data.ts` line 74)
 ```ts
-path = fileURLToPath(new URL("../docs/tier-data.json", import.meta.url));
+type StreamCommitProbe =
+  | { kind: "ready"; body: ReadableStream<Uint8Array> }
+  | { kind: "dead"; reason: string; provenance: "upstream" | "local" }
+  | { kind: "cancelled" };
 ```
-This resolves relative to the installed `dist/tier-data.js` location. After `npm install -g` or `npm pack` + local install, `import.meta.url` points at the tarball's `dist/`, so `../docs/tier-data.json` lands in the right place **only if** the `files` whitelist actually placed it there. The path is computed with `fileURLToPath(new URL(...))` — no env-var override, no fallback directory. The file is missing, the function returns `null` (lines 77–83), so it degrades without crashing, but every caller that depends on tier data then degrades silently.
 
-**b) `package.json`** (`src/self-update.ts` lines 160–174)
-```ts
-function packageRoot(): string {
-  return dirname(dirname(fileURLToPath(import.meta.url)));
-}
-export function currentVersion(): string {
-  return readPackageJson(packageRoot()).version ?? "0.0.0";
-}
-```
-`packageRoot()` walks from `dist/self-update.js` → two dirs up → the install root. `currentVersion()` then reads `package.json` from there. This runs on every invocation via `run()` (cli.ts lines 2226–2234), gated by `shouldCheckUpdates()`. If `package.json` is missing from the tarball, version reporting degrades to `"0.0.0"` — and since the npm cache check (lines 176–199) runs before any network call, a missing file turns the currency gate into a 2.5-second network probe on every start.
+Like the current preflight, it buffers raw chunks and returns a replay stream, preserving bytes exactly rather than reserializing SSE ([src/backend.ts:230-255](src/backend.ts#L230-L255)). A failed probe cancels its reader and releases the candidate socket ([src/backend.ts:258-260](src/backend.ts#L258-L260)).
 
-**c) `skills/llm-relay/SKILL.md`** (`scripts/install-skill.mjs` line 123)
-```js
-const src = join(here, "..", "skills", "llm-relay", "SKILL.md");
-```
-Only reached by the postinstall hook. The binary itself never reads it. If the `skills/` directory is missing from the tarball, a global `npm i -g llm-relay` silently fails to install the Claude Code and Codex skill files. The hook catches the error and prints a message (line 124–125, 150–153), so it does not crash the install — but the skill goes uninstalled with no loud signal.
+### 1. Commit-point contract
 
-### 1.3 Assets the binary does NOT read from the package
+The probe operates on the client-facing protocol:
 
-- `scripts/sync-tiers.mjs` — only invoked by the operator running `npm run sync:tiers`; not a binary dependency.
-- `config.example.json` — never loaded by any source path; it is documentation, not a default. `resolveConfigPath` (cli.ts lines 372–390) falls back to writing the inline `DEFAULT_CONFIG_TEMPLATE` (line 298), not reading this file.
-- `README.md` — never imported.
-- The remaining `dist/` sub-files are all reachable via ESM imports resolved from `dist/cli.js` and are covered by the `dist/` directory entry.
-
-### 1.4 Subcommands that qualify for offline smoke testing
-
-The constraint is: no provider keys, no running proxy, no network. The binary must load config, load tier data, and execute without touching any backend endpoint.
-
-| Command | Why it qualifies | Assets exercised |
+| Front | Meaningful content—the first event that permits commit | Held/non-meaningful before commit |
 |---|---|---|
-| `llm-relay --version` | No config load at all; reads `package.json` via `packageRoot()` (self-update.ts line 160) before any network call. Exits immediately after `currentVersion()` (cli.ts line 2039). | `package.json` |
-| `llm-relay config show` | Calls `loadOrExit()` → `resolveConfigPath()` → loads `config.json` from `~/.llm-relay/` (which we will create in the temp dir), then reads and prints it. No backend calls. | config system |
-| `llm-relay routing show` | Same path through `loadOrExit()`, then reads the routing block. No backend calls. | config system |
-| `llm-relay dispatch --lane relay --json` | Calls `loadOrExit()`, then `materializeDynamicPools()` (cli.ts line 1010) which calls `loadTierData()` (dynamic-pools.ts line 136), then falls through to the cold local `buildDispatch` path because no proxy is listening (cli.ts line 1049). The `--lane relay` is not a configured rung so it returns a `no lane available` reason, not an error. | `docs/tier-data.json`, config system, `dist/cli.js`, all imported modules |
+| Anthropic `/v1/messages` | A non-whitespace `text_delta`; a non-whitespace `thinking_delta`; a substantive opaque/redacted-thinking block; or a structured `tool_use` carrying a non-empty name/id. | `message_start`, `ping`, empty text-block starts, role/usage metadata, stop events, empty deltas. These are currently accepted structurally by `invalidEnvelopeReason`, including `ping`, `message_stop`, and block stops ([src/backend.ts:202-217](src/backend.ts#L202-L217)). |
+| OpenAI Chat Completions | Non-whitespace `delta.content`, `delta.refusal`, `delta.reasoning_content`/`delta.reasoning`, or a `delta.tool_calls` entry containing an id, function name, or argument bytes. | Role-only deltas, empty choices with usage, empty deltas, finish-only frames, comments and `[DONE]`. The current structural validator explicitly accepts usage-only empty choices ([src/backend.ts:164-189](src/backend.ts#L164-L189)). |
+| OpenAI Responses | Non-whitespace output/refusal/reasoning delta; a substantive function-call item; or a completed response whose `output` contains text or a function call. | `response.created`, `response.in_progress`, empty item/content skeletons, usage-only events, and completion metadata without output. The Responses surface is selected alongside Chat at [src/server.ts:1320-1324](src/server.ts#L1320-L1324), and translated Responses SSE is produced at [src/backend.ts:932-935](src/backend.ts#L932-L935). |
 
-**Commands that do NOT qualify and why:**
+A non-whitespace rule is necessary: otherwise whitespace before a dialect marker would commit the response and defeat invisible failover. Metadata is not content merely because it is structurally valid—the existing first slice currently commits at exactly that weaker boundary ([src/backend.ts:310-314](src/backend.ts#L310-L314)).
 
-- `llm-relay models` — calls `catalog.list()` (cli.ts line 451) which fetches from each provider's `/models` endpoint; requires network and working keys.
-- `llm-relay pools --probe` — calls `probeAllPools()` (cli.ts line 1989) which sends real completions; requires network and keys.
-- `llm-relay candidates` — in cold mode calls `buildCandidates()` (cli.ts line 1549) which calls `materializeDynamicPools()` and reads tier data (qualifies), but also calls `loadRuntimeTelemetry()` and `loadProbeCache()` which read from `~/.llm-relay/` (present or absent, both OK). However, it produces large tabular output that is harder to assert on cleanly than the three targeted commands above. It qualifies, but is noisier.
-- `llm-relay keys` / `check-keys` — calls `validateProviderKeys()` which probes every provider; requires network.
-- `llm-relay ping` — calls `pingLoop.tickOnce()` which probes every model; requires network and keys.
-- `llm-relay offload` — writes config when toggling on/off; is mutating.
-- `llm-relay lanes --probe` — spawns lane commands; requires config and tooling.
-- `llm-relay eligibility` — reads learned-state files; works offline but produces variable output depending on prior state; not a clean pass/fail signal.
-- Bare `llm-relay` (no subcommand) — starts the proxy, which binds a port; unsuitable for a CI step.
+Before meaningful content:
 
-The four cleanest probes, in order of asset coverage:
+- Any Anthropic `error` event, OpenAI `{error:…}` data frame, `response.failed`, or equivalent is a retryable dead turn. This extends the existing first-event rule at [src/backend.ts:150-161](src/backend.ts#L150-L161) across arbitrary preamble events.
+- EOF, `[DONE]`, `message_stop`, or `response.completed` without output is an empty completion and a retryable 502.
+- Malformed SSE/JSON is a retryable upstream 502 unless the error is tagged as a relay mapper defect.
+- After meaningful content, all subsequent errors remain post-commit and must be delivered honestly without replay or failover, preserving the rule pinned at [test/pool-failover.test.ts:957-969](test/pool-failover.test.ts#L957-L969).
 
-1. `--version` → validates `package.json` is present and loadable
-2. `config show` → validates config loading pipeline, confirms `dist/cli.js` and all its imports resolve
-3. `dispatch --lane relay --json` → validates `docs/tier-data.json` is present, parseable, and loadable by `loadTierData()`; also re-validates the config and import graph
-4. The tarball itself → validates the `files` whitelist is complete
+Bounds:
 
----
+- Hold at most **64 KiB of raw final-wire prefix**, reusing the existing `STREAM_PREFLIGHT_LIMIT` value ([src/backend.ts:133-135](src/backend.ts#L133-L135)). If no meaningful content appears by then, cancel the candidate and fail it as `502 no meaningful content within commit probe limit`; never flush the prefix merely to escape the bound.
+- On tool-bearing requests, dialect ambiguity is limited to **256 UTF-16 code units**, matching freellmapi's decision ceiling (`C:/Code/freellmapi/server/src/lib/inbound-chat.ts:373-380`; `C:/Code/freellmapi/server/src/routes/proxy.ts:2003-2010`).
+- A positively detected dialect envelope also counts against the 64 KiB pre-commit cap. A larger envelope fails cleanly instead of creating unbounded capture; current dialect recovery otherwise accumulates the full envelope until termination ([src/dialect-stream.ts:164-169](src/dialect-stream.ts#L164-L169)).
 
-## 2. YAML steps to add
+Dialect probing must be front-aware. The Anthropic translation path already applies `recoverDialectInStream` after OpenAI-to-Anthropic conversion ([src/backend.ts:457-464](src/backend.ts#L457-L464)), and that wrapper emits a protocol error when recovery is impossible ([src/dialect-stream.ts:105-116](src/dialect-stream.ts#L105-L116)). The final-wire probe will hold its preamble and see that error before content.
 
-### 2.1 The artifact smoke-test step
+The OpenAI direct Chat path is currently deliberately byte-transparent and bypasses that recovery ([src/backend.ts:839-859](src/backend.ts#L839-L859)), so satisfying "both fronts" requires an OpenAI-native dialect adapter:
 
-Place this **after** `npm run build` (line 104) and **before** `npm run check` (line 106) in `publish.yml`. The rationale for this position: `build` produces `dist/`; packing the tarball after that captures the compiled output the way npm would ship it. If `check` were first, a `files`-whitelist defect would be masked by the source-tree checks passing — `npm run check` exercises `src/` directly, not the packed artifact. Running the smoke test before `npm publish` means it is the last gate before the irreversible publish.
+- Hold initial text while it can be a known marker.
+- Run the existing detector/recovery vocabulary, whose broad marker set intentionally recognizes truncated closing tails ([src/tool-dialects.ts:35-80](src/tool-dialects.ts#L35-L80)).
+- On valid recovery, emit native Chat `tool_calls` SSE, or feed an Anthropic `tool_use` sequence through the existing Anthropic→Responses mapper.
+- On detected-but-unparseable recovery, return `dead` without committing.
 
-```yaml
-      # Artifact smoke test: npm pack, install into a clean directory, and exercise the
-      # installed binary against every runtime asset it loads from outside dist/.
-      # This is the only gate that verifies the `files` whitelist is complete — CI's
-      # build/check runs against the source tree, not the packed tarball, and would
-      # miss a missing tier-data.json or skills/ directory in the published artifact.
-      - name: Smoke-test the packed artifact
-        run: |
-          set -euo pipefail
+Also add an OpenAI-aware tool-request detector. The current `toolSchemaMap` recognizes only Anthropic `{name,input_schema}` tools, so `hadTools` is false for ordinary OpenAI `{type:"function",function:{…}}` requests ([src/anthropic.ts:84-102](src/anthropic.ts#L84-L102); [src/server.ts:357-358](src/server.ts#L357-L358)).
 
-          # --- pack ---------------------------------------------------------------
-          TARBALL="$(npm pack --dry-run=false 2>&1 | tail -1)"
-          # npm pack prints: "llm-relay-0.35.0.tgz" as its last line
-          echo "packed: ${TARBALL}"
+### 2. Exact `writeHead` placement
 
-          # --- install into a clean temp directory --------------------------------
-          DEST="$(mktemp -d)"
-          # Extract only the package/ subtree from the tarball into DEST
-          tar xzf "${TARBALL}" -C "${DEST}" --strip-components=1
+#### Anthropic front
 
-          # Verify the binary itself is present
-          test -f "${DEST}/dist/cli.js" || { echo "::error::dist/cli.js missing from tarball"; exit 1; }
+Current sequence:
 
-          # --- tier-data.json: must be present and loadable ------------------------
-          # loadTierData() resolves ../docs/tier-data.json relative to dist/tier-data.js.
-          # We exercise it through a command that reaches it: dispatch --lane <nonexistent>
-          # in local fallback mode calls materializeDynamicPools -> loadTierData.
-          if ! node "${DEST}/dist/cli.js" dispatch --lane __smoke__no_such_lane --json > /dev/null 2>&1; then
-            echo "::error::dispatch --lane (tier-data consumer) failed — tier-data.json missing or unreadable"
-            echo "--- tarball contents ---"
-            tar tzf "${TARBALL}" | sort
-            exit 1
-          fi
-          echo "tier-data.json: present and loadable"
+1. Receive/classify candidate response ([src/server.ts:604-674](src/server.ts#L604-L674)).
+2. Clear the total timer and install the stall watchdog immediately on an SSE 200 ([src/server.ts:676-684](src/server.ts#L676-L684)).
+3. Enter repair or transparent handling ([src/server.ts:685-695](src/server.ts#L685-L695)).
+4. Transparent mode commits immediately at function entry ([src/server.ts:1558-1573](src/server.ts#L1558-L1573)); repair mode commits through `ensureHead`, normally on the replayed `message_start` ([src/server.ts:1695-1713](src/server.ts#L1695-L1713), [src/server.ts:1745](src/server.ts#L1745)).
+5. Return from the candidate loop unconditionally ([src/server.ts:696](src/server.ts#L696)).
 
-          # --- package.json: version command must report the published version -------
-          VERSION="$(node -p "require('./${TARBALL%.tgz}/package.json').version")"
-          BIN_VERSION="$("${DEST}/dist/cli.js" --version 2>&1 | tr -d '\n')"
-          if [ "${BIN_VERSION}" != "${VERSION}" ]; then
-            echo "::error::version mismatch: package.json=${VERSION}, binary reports=${BIN_VERSION}"
-            exit 1
-          fi
-          echo "version: ${BIN_VERSION} (matches package.json)"
+Proposed sequence at the [src/server.ts:676](src/server.ts#L676) anchor:
 
-          # --- config path resolution: create a minimal config, verify it loads ---------
-          CFG_DIR="${DEST}/.llm-relay"
-          mkdir -p "${CFG_DIR}"
-          cat > "${CFG_DIR}/config.json" <<'JSON'
-          {
-            "listen": "127.0.0.1:8791",
-            "providers": {},
-            "routing": { "default": "pool/medium", "pools": {} },
-            "mode": "repair",
-            "repair": { "maxAttempts": 2, "destructiveTools": [] },
-            "log": { "level": "metadata", "file": null }
-          }
-          JSON
-          # config show must succeed against a config it just created
-          "${DEST}/dist/cli.js" -c "${CFG_DIR}/config.json" config show > /dev/null 2>&1 \
-            || { echo "::error::config show failed — config loading broken in packed artifact"; exit 1; }
-          echo "config loading: ok"
+1. Determine `streamed`.
+2. For a successful stream, run the final Anthropic commit probe **while the original per-candidate timer remains armed**.
+3. On `dead`, complete the attempt as `failure:"protocol"`, provenance `invalid-upstream-envelope`, logical status 502; call `pool429.recordFailover(502, null)`; then use the existing next-candidate and walk-budget checks before continuing ([src/server.ts:662-673](src/server.ts#L662-L673), [src/server.ts:823-837](src/server.ts#L823-L837)).
+4. On `cancelled`, complete the attempt as client-cancelled and leave the loop.
+5. On `ready`, replace the body with its replay stream, then perform the §1.2 phase switch currently at [src/server.ts:677-684](src/server.ts#L677-L684).
+6. Only now call `pool429.recordFinal(200)`, compute winning-candidate headers, and execute the streamed `writeHead`.
+7. Pump the replay body through repair or transparent handling.
 
-          # --- skills directory: at least the entrypoint file ships ------------------
-          if ! tar tzf "${TARBALL}" | grep -q "^skills/llm-relay/SKILL.md$"; then
-            echo "::error::skills/llm-relay/SKILL.md missing from tarball — postinstall hook cannot install the Claude Code / Codex skill"
-            exit 1
-          fi
-          echo "skills/llm-relay/SKILL.md: present in tarball"
+Physically centralize successful streamed `writeHead` in this ready branch. Remove the streamed use of `transparentPath`'s unconditional head at [src/server.ts:1573](src/server.ts#L1573), and make `repairStreamingPath.ensureHead` idempotent against an already-committed response or remove it ([src/server.ts:1704-1709](src/server.ts#L1704-L1709)). Buffered and HTTP-error paths keep their existing write timing.
 
-          # --- report tarball contents for diagnostics ---------------------------------
-          echo "--- tarball contents ---"
-          tar tzf "${TARBALL}" | sort
+#### OpenAI front
 
-          rm -rf "${DEST}"
-```
+Current sequence:
 
-### 2.2 Breakdown of what each sub-step validates
+1. Fetch and status-classify at [src/server.ts:1404-1468](src/server.ts#L1404-L1468).
+2. Declare the candidate terminal before reading its stream ([src/server.ts:1470-1476](src/server.ts#L1470-L1476)).
+3. Switch timers at [src/server.ts:1477-1482](src/server.ts#L1477-L1482).
+4. Build headers at [src/server.ts:1484-1498](src/server.ts#L1484-L1498).
+5. Commit a successful stream at [src/server.ts:1522](src/server.ts#L1522), then read it.
 
-| Sub-step | Asset validated | Mechanism |
-|---|---|---|
-| `test -f dist/cli.js` | `dist/` directory entry | Direct file existence |
-| `dispatch --lane __smoke__no_such_lane --json` | `docs/tier-data.json` | `runDispatch` → `materializeDynamicPools` → `loadTierData()` reads and parses the file; returns a JSON "no lane available" error rather than crashing if it works |
-| `--version` vs `package.json` version | `package.json` | `currentVersion()` reads `packageRoot()/package.json` via `fileURLToPath(import.meta.url)` from `dist/self-update.js` |
-| `config show` with a fresh config | Config loading pipeline | `loadOrExit` → `resolveConfigPath` → `loadConfig`; validates the whole config system works in the installed tree |
-| `tar tzf \| grep skills/llm-relay/SKILL.md` | `skills/` directory entry | tarball manifest inspection; confirms npm will extract the skill source that `install-skill.mjs` copies to `~/.claude/` and `~/.codex/` |
+Insert the final Chat/Responses probe at [src/server.ts:1476](src/server.ts#L1476), before both the timer switch and header construction:
 
-### 2.3 Where it goes in publish.yml
+- `dead`: complete as a synthetic protocol 502, count it with `pool429.recordFailover(502,null)`, and continue under the same guards used at [src/server.ts:1453-1467](src/server.ts#L1453-L1467).
+- `cancelled`: stop without another candidate.
+- `ready`: switch to the stall watchdog, build headers for this candidate, call `pool429.recordFinal(200)`, then execute the existing successful `writeHead` and replay pump at [src/server.ts:1522-1528](src/server.ts#L1522-L1528).
 
-Between the existing lines:
+If the failed probe is terminal because it is the last candidate or the walk budget forbids another start, emit a protocol-correct HTTP 502. The Anthropic envelope can use the shape currently produced by `failClosed` ([src/server.ts:2311-2317](src/server.ts#L2311-L2317)); the OpenAI envelope should follow the normalization path used at [src/server.ts:1499-1514](src/server.ts#L1499-L1514).
 
-```
-      - run: npm run build          # line 104 — produces dist/
-      - run: npm run check          # line 106 — source-tree tests
-```
+### 3. Edge interactions
 
-becomes:
+- **Client disconnect pre-commit:** Both loops already attach `res.close` to the attempt controller ([src/server.ts:572-579](src/server.ts#L572-L579), [src/server.ts:1374-1379](src/server.ts#L1374-L1379)) and stop when `res.destroyed` ([src/server.ts:569-570](src/server.ts#L569-L570), [src/server.ts:1368-1369](src/server.ts#L1368-L1369)). A probe read rejected while `res.destroyed` must return `cancelled`, not `dead`: cancel the upstream reader, complete the health handle through `completeAttemptCancelled`, and never start the next candidate ([src/server.ts:1305-1318](src/server.ts#L1305-L1318)).
 
-```
-      - run: npm run build          # line 104
-      - name: Smoke-test the packed artifact   # NEW
-        run: | ...
-      - run: npm run check          # line 106 (unchanged)
-      - run: npm publish --access public       # line 107
-```
+- **Keepalive/heartbeat while headers are withheld:** Buffer SSE comments, Anthropic `ping`, role-only chunks, and usage frames. Do not send a downstream heartbeat: any `write` or `flushHeaders` would irrevocably commit. Endless heartbeats remain bounded by the absolute pre-commit timer and 64 KiB prefix cap; they must not extend either.
 
-`check` stays after the smoke step rather than before it: if `check` fails, the artifact smoke step never runs, which is correct — there is no point testing a tarball built from a source tree that already fails. If the smoke step fails, `check` also never runs, and the publish step is skipped. The step produces `::error::` annotations so GitHub renders the failure inline in the Actions UI.
+- **§1.2 timer interaction:** The current implementation disarms the total timer as soon as it sees an SSE HTTP response ([src/server.ts:676-684](src/server.ts#L676-L684), [src/server.ts:1477-1482](src/server.ts#L1477-L1482)). Move that switch after semantic readiness. Thus `timeoutMs` becomes connect-to-first-meaningful-content grace, while `stallTimeoutMs` begins only at commit. After commit, the current watchdog re-arms on every byte ([src/server.ts:852-874](src/server.ts#L852-L874)). With `stallTimeoutMs:0`, retain the existing whole-stream total deadline contract ([src/server.ts:840-850](src/server.ts#L840-L850)).
 
----
+- **Repair path:** Run the outer probe before `repairPath`, so empty streams, early errors, and bad dialects never spend a reshaper call ([src/server.ts:685-690](src/server.ts#L685-L690)). Once the probe finds a native structured `tool_use`, repair behavior remains unchanged. Do not make an unrepaired schema-invalid tool call resume the candidate walk in this slice: that remains the separate owner decision in §2.1 ([docs/freellmapi-adoption-review-2026-08-13.md:184-190](docs/freellmapi-adoption-review-2026-08-13.md#L184-L190)). Valid or recovered tool-only streams may therefore commit and then use the current repair/error behavior ([src/server.ts:1799-1825](src/server.ts#L1799-L1825)).
 
-## 3. Should ci.yml also run it?
+- **Per-candidate headers:** Compute response headers only after the winning candidate reaches `ready`. `x-llm-relay-pool-attempts` must include semantic failures as synthetic 502s and the winner as 200; its existing format counts status occurrences and served statuses ([src/server.ts:940-970](src/server.ts#L940-L970)). A two-member walk should therefore say `2 tried, 1 served: 1x502, 1x200`.
 
-**Publish-only.** The reasoning:
+  `x-llm-relay-degraded`, paid-status, and served-by must describe only the committed candidate, never a rejected prefix. Their current OpenAI assembly is already candidate-local ([src/server.ts:1484-1494](src/server.ts#L1484-L1494)); Anthropic transparent assembly is at [src/server.ts:1558-1572](src/server.ts#L1558-L1572). Centralizing streamed header construction also closes the current repair asymmetry, where `repairStreamingPath` starts only from filtered upstream headers and does not add the pool/degraded/paid fields ([src/server.ts:1695-1707](src/server.ts#L1695-L1707)).
 
-`ci.yml` runs `npm ci --ignore-scripts` (line 40) from the registry, then `npm run build` (line 44), then `npm run check` (line 47). Its job is to validate that the source tree is green — typecheck clean, suite green — before any tag is pushed. The `files` whitelist is irrelevant to this check because `npm ci` resolves from the registry, not from the local tree; the installed files are whatever the *previous* published version's `files` declared, not this commit's.
+### 4. New failure modes and bounds
 
-Running the smoke test in ci.yml would test a freshly-packed tarball from this source tree, which IS a different signal. But:
+- **Higher time-to-headers:** Clients now wait through protocol preamble and initial reasoning metadata. Count real reasoning as meaningful and enforce `timeoutMs`; this mirrors freellmapi committing on reasoning deltas (`C:/Code/freellmapi/server/src/lib/inbound-chat.ts:385-390`).
+- **Healthy but large preamble/tool call rejected:** The 64 KiB cap can reject an unusually large first structured call. Keep the cap fixed and emit a distinct diagnostic reason so operators can distinguish a safety bound from malformed SSE.
+- **Unknown future event misclassified as empty:** Treat unknown Anthropic content-block types with substantive payload, and unknown OpenAI `*.delta` output events with a non-empty payload, as meaningful. Do not treat unknown metadata-only events as content.
+- **Loss of byte transparency:** Classification must decode only for inspection and replay the original raw chunks. The current preflight's chunk replay is the model ([src/backend.ts:231-255](src/backend.ts#L231-L255)).
+- **Duplicate or reordered prefix:** The replay stream must emit each buffered chunk exactly once before resuming the same locked reader. Add byte-exact tests with multiple SSE events in one chunk and boundaries split across chunks; current parsing already handles CRLF/LF separators and fragmented reads ([src/backend.ts:281-315](src/backend.ts#L281-L315)).
+- **Misattributed health:** A semantic dead turn is a protocol/upstream failure, not a successful HTTP 200. Complete it through the existing failure lifecycle ([src/server.ts:1278-1303](src/server.ts#L1278-L1303)). Mapper defects must remain local and terminal, consistent with the OpenAI front's existing no-repeat rule ([src/server.ts:1442-1451](src/server.ts#L1442-L1451)).
+- **Error/content in one transport chunk:** Ordering is event-based, not chunk-based. Error-before-content fails invisibly; content-before-error commits and forwards the later error.
 
-1. **It duplicates publish.yml's gate without catching a different failure mode.** The `files` defect this smoke test catches is "a file the binary needs at runtime is absent from the packed tarball." That defect is introduced in `package.json` and ships through `npm publish`. The publish gate is the only place the artifact actually ships. CI would catch it hours or days earlier, but the failure mode and the fix are identical — and CI runs on every PR, so a PR that introduces a `files` defect would already fail the publish job.
+## 5. Test plan
 
-2. **It slows every PR.** `npm pack` + `npm install` into a temp dir + four binary invocations adds roughly 20–30 seconds to every PR's CI run. The current ci.yml timeout is 20 minutes (line 27), so there is headroom, but the cost is paid N times where N is the number of PRs, and the signal is redundant.
+Use `createServer` backends and a real proxy listener, matching [test/pool-failover.test.ts:56-70](test/pool-failover.test.ts#L56-L70), [test/mid-stream-failure.test.ts:30-46](test/mid-stream-failure.test.ts#L30-L46), and the review's real-socket requirement ([docs/freellmapi-adoption-review-2026-08-13.md:383-392](docs/freellmapi-adoption-review-2026-08-13.md#L383-L392)).
 
-3. **The postinstall hook probe already lives in ci.yml** (lines 49–53), which is the argument by analogy: that step tests a hook that ships in the tarball, but it does so by running the source file directly (`node scripts/install-skill.mjs`) rather than installing the packed artifact. It validates the hook's *logic*, not its inclusion in the package. The smoke test fills the gap that probe leaves.
+1. **Commit-probe unit tests**
 
-**If a second CI signal were wanted**, the cheaper alternative is a tarball manifest inspection only — `npm pack --dry-run` and `tar tzf` the output against a whitelist of expected paths, without installing and executing it. That validates inclusion in ~5 seconds without the install overhead. But the publish-only execution test is the stronger signal, and one gate is enough.
+   Cover Anthropic, Chat, and Responses classifiers; LF/CRLF; multi-line `data:`; UTF-8 split across chunks; exact byte replay; error-before-content versus content-before-error; empty termination; reasoning; native tool calls; 256-character dialect decision; and the 64 KiB hard limit. The existing preflight event splitter provides the fixture style ([src/backend.ts:263-315](src/backend.ts#L263-L315)).
 
----
+2. **Cross-front real-server matrix**
 
-## 4. Windows/Linux runner considerations
+   For `/v1/messages`, `/v1/chat/completions`, and `/v1/responses`, candidate A returns HTTP 200 plus:
 
-### 4.1 Runner choice
+   - protocol preamble followed by an in-band error;
+   - clean termination without meaningful content;
+   - a tool-bearing truncated dialect envelope;
+   - a valid dialect envelope;
+   - meaningful content followed by an error.
 
-Both `publish.yml` and `ci.yml` use `ubuntu-latest` (publish.yml line 44, ci.yml line 27). The smoke test as written uses POSIX shell (`bash -euo pipefail`, `mktemp -d`, `tar xzf --strip-components=1`). This runs correctly on the Ubuntu GitHub runner. **Do not run this step on `windows-latest`** without rewriting the shell syntax.
+   Candidate B returns valid content. Assert A and B call counts, winning status/body, absence of A bytes, breaker outcomes, and `x-llm-relay-pool-attempts`. Preserve the existing invariant that every failover test has at least two candidates ([test/pool-failover.test.ts:14-26](test/pool-failover.test.ts#L14-L26)).
 
-### 4.2 What would need to change for a Windows runner
+3. **Header-withholding assertion**
 
-If publish.yml ever moves to `windows-latest` (not recommended — see below), the shell steps would need PowerShell equivalents:
+   Have A send upstream headers and preamble, signal the test, then pause. Race the client's `fetch()` promise against a short sentinel and assert it has not resolved—`fetch` resolves when downstream headers arrive. Release meaningful content and assert the same request then resolves with the exact buffered prefix and content.
 
-```yaml
-# POSIX (current):
-TARBALL="$(npm pack 2>&1 | tail -1)"
-DEST="$(mktemp -d)"
-tar xzf "${TARBALL}" -C "${DEST}" --strip-components=1
+4. **Hanging sockets**
 
-# PowerShell equivalent:
-$TARBALL = npm pack 2>&1 | Select-Object -Last 1
-$DEST = Join-Path $env:TEMP ("llm-relay-smoke-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $DEST -Force | Out-Null
-tar -xzf $TARBALL -C $DEST --strip-components=1   # tar IS available in pwsh on ubuntu; on windows-latest it is also present (Git Bash / tar.exe)
-```
+   - **Pre-commit silence:** A writes headers and only preamble, then leaves the socket open. Its short `timeoutMs` must abort it and fail over to B.
+   - **Pre-commit heartbeats:** A sends `ping`/comments every 20 ms but no payload. It must still hit the absolute pre-commit timeout; heartbeats must not activate or re-arm the stall watchdog.
+   - **Pre-commit socket reset:** A writes preamble then calls `res.socket.destroy()`. B must serve invisibly.
+   - **Post-commit silence/reset:** A first sends a non-empty content delta, then stalls or destroys the socket. B must not be called; the client receives the protocol-specific mid-stream error.
 
-The `--strip-components=1` flag works with both `tar` implementations. On Windows the `tar` command is available (it ships as `tar.exe` in the system PATH). The `mktemp` equivalent is the `$env:TEMP` + `[guid]` pattern shown above. The `test -f` / `grep -q` checks have PowerShell equivalents (`Test-Path`, `Select-String`).
+   Existing helpers need adjustment: `truncatingSseBackend` currently emits only `message_start` and an empty block before destroying the socket ([test/mid-stream-failure.test.ts:35-46](test/mid-stream-failure.test.ts#L35-L46)), which becomes pre-commit under this design. Add a non-empty text delta for tests that intend to exercise post-commit failure. Likewise, `slowHealthySseBackend` currently emits only pings and `message_stop` ([test/mid-stream-failure.test.ts:254-269](test/mid-stream-failure.test.ts#L254-L269)); it must emit real content to remain a healthy-completion fixture.
 
-### 4.3 Why staying on Ubuntu is correct
+5. **Client disconnect**
 
-`ci.yml` lines 8–9 state the rationale explicitly:
+   Wait until candidate A has sent preamble, then destroy the real client request/socket. Assert B is never called, A's attempt is cancelled rather than failed, and no provider cooldown/logged protocol failure appears. The existing immediate-abort test establishes the policy but does not pin the pre-commit race after upstream activity ([test/pool-failover.test.ts:342-364](test/pool-failover.test.ts#L342-L364)).
 
-> Development happens on Windows, so Linux is the platform whose result nobody sees locally.
+6. **Header provenance**
 
-The same reasoning applies to the artifact smoke test: the binary runs identically on both platforms (pure ESM JavaScript, no native modules — the two runtime dependencies are `ajv` and `llm-bridge`, both pure JS), so testing on Linux validates the artifact. The binary's *consumers* run on Windows (Claude Desktop, Claude CLI on Windows, Codex on Windows), and the `dist/` output is platform-independent. A Windows runner would add no signal that Ubuntu does not already cover.
-
-### 4.4 One Windows-specific risk in the test
-
-The `node -p "require(...).version"` sub-step (reading `package.json` to get the expected version) works identically on both platforms. The `--strip-components=1` flag is required because `npm pack` produces a tarball with a `package/` top-level directory; without it, the binary's `import.meta.url` would resolve to `DEST/package/dist/cli.js`, and `packageRoot()` (two `dirname` calls from there) would land at `DEST/package/`, where no `package.json` exists. On Windows the same path arithmetic applies — `fileURLToPath` converts `file:///` URLs to native paths regardless of platform.
-
-### 4.5 The `skills/` check across platforms
-
-The tarball manifest check (`tar tzf ... | grep "^skills/llm-relaw/SKILL.md$"`) is POSIX-only. On PowerShell the equivalent is:
-
-```powershell
-$contents = tar tzf $TARBALL
-if (-not ($contents | Select-String -Pattern '^skills/llm-relay/SKILL.md$')) {
-  Write-Error "skills/llm-relaw/SKILL.md missing from tarball"
-  exit 1
-}
-```
-
-This is not a concern for the current runner choice, but is the single line that would need changing if the step were ever ported to a Windows runner.
-
-### 4.6 A note on the Node version in publish.yml
-
-`publish.yml` and `package.json` now both require Node 22. The smoke test inherits that version and would catch a future mismatch between the package's declared floor and the artifact it ships.
+   Make A fail semantically and B be in the configured degraded tail. Assert the successful response carries B's degraded/paid/served-by values and `1x502, 1x200`; assert no upstream header or cookie from A leaks. Repeat in repair mode to pin the current repair-header gap at [src/server.ts:1695-1707](src/server.ts#L1695-L1707).
