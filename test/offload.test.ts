@@ -558,6 +558,8 @@ describe("candidates view", () => {
     expect(glm.breaker.open).toBe(true);
     expect(glm.breaker.lastStatus).toBe(429);
     expect(glm.breaker.cooldownRemainingMs).toBeGreaterThan(0);
+    expect(glm.breaker.cooldownSource).toBe("default");
+    expect(glm.breaker.unexplained429s).toBe(1);
 
     const other = view.candidates.find((c) => c.spec === "nim/openai/gpt-oss-20b")!;
     expect(other.breaker.open).toBe(false);

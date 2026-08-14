@@ -35,6 +35,51 @@ describe("CircuitBreaker", () => {
     expect(cb.isHealthy(targetA, now + 130000)).toBe(true); // after cooldown
   });
 
+  it("escalates repeat unexplained remote 429s and caps at a day", () => {
+    const cb = new CircuitBreaker();
+    const at = 1_000_000;
+    const expected = [120_000, 600_000, 3_600_000, 86_400_000, 86_400_000];
+
+    expected.forEach((cooldown, index) => {
+      const now = at + index;
+      cb.recordOutcome(targetA, { ok: false, status: 429, elapsedMs: 5, at: now });
+      const state = cb.getState(targetA)!;
+      expect(state.cooldownUntil).toBe(now + cooldown);
+      expect(state.cooldownSource).toBe(index === 0 ? "default" : "escalation");
+      expect(state.unexplained429s).toBe(index + 1);
+    });
+  });
+
+  it("resets unexplained 429 escalation on success", () => {
+    const cb = new CircuitBreaker();
+    const at = 1_000_000;
+    cb.recordOutcome(targetA, { ok: false, status: 429, elapsedMs: 5, at });
+    cb.recordOutcome(targetA, { ok: false, status: 429, elapsedMs: 5, at: at + 1 });
+    cb.recordOutcome(targetA, { ok: true, status: 200, elapsedMs: 5, at: at + 2 });
+    cb.recordOutcome(targetA, { ok: false, status: 429, elapsedMs: 5, at: at + 3 });
+
+    const state = cb.getState(targetA)!;
+    expect(state.cooldownUntil).toBe(at + 3 + 120_000);
+    expect(state.cooldownSource).toBe("default");
+    expect(state.unexplained429s).toBe(1);
+  });
+
+  it.each(["http://127.0.0.1:11434/v1", "http://localhost:11434/v1"])(
+    "short-benches unexplained 429s from loopback base %s",
+    (base) => {
+      const cb = new CircuitBreaker();
+      const at = 1_000_000;
+      const local = { ...targetA, base };
+      cb.recordOutcome(local, { ok: false, status: 429, elapsedMs: 5, at });
+      cb.recordOutcome(local, { ok: false, status: 429, elapsedMs: 5, at: at + 1 });
+
+      const state = cb.getState(local)!;
+      expect(state.cooldownUntil).toBe(at + 1 + 5_000);
+      expect(state.cooldownSource).toBe("loopback");
+      expect(state.unexplained429s).toBe(0);
+    },
+  );
+
   it("trips circuit after consecutive failure threshold", () => {
     const cb = new CircuitBreaker();
     const now = 100000;
@@ -125,6 +170,7 @@ describe("CircuitBreaker — Retry-After drives the cooldown", () => {
     const at = 1_000_000;
     cb.recordOutcome(t, { ok: false, status: 429, elapsedMs: 5, at, retryAfterMs: 20_000 });
     expect(cb.getState(t)!.cooldownUntil).toBe(at + 20_000);
+    expect(cb.getState(t)!.cooldownSource).toBe("retry-after");
   });
 
   it("falls back to the flat cooldown when the provider said nothing", () => {
@@ -132,6 +178,7 @@ describe("CircuitBreaker — Retry-After drives the cooldown", () => {
     const at = 1_000_000;
     cb.recordOutcome(t, { ok: false, status: 429, elapsedMs: 5, at });
     expect(cb.getState(t)!.cooldownUntil).toBe(at + 120_000);
+    expect(cb.getState(t)!.cooldownSource).toBe("default");
   });
 
   it("trips a 503 immediately when it carries a Retry-After, without waiting for a second failure", () => {

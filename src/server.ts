@@ -1043,6 +1043,7 @@ function targetIdentity(target: ResolvedTarget): ProviderTargetIdentity {
     provider: target.provider,
     model: target.model ?? null,
     kind: target.kind,
+    base: target.base,
   });
 }
 
