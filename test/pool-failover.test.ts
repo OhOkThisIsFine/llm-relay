@@ -693,3 +693,98 @@ describe("410 Gone is a fact about one member — fail over, and learn only stat
     expect(isCostBlocked("p1", "m1")).toBe(false);
   });
 });
+
+describe("wall-clock walk budget — bounds the walk, never the answer", () => {
+  // A deep pool could legitimately spend members x timeoutMs on one request. The budget stops
+  // STARTING further attempts once spent; the first two attempts are always allowed (a
+  // slow-failing first candidate must not starve the request of its one retry) and an attempt in
+  // flight is never aborted. Adoption review §1.5. ≥2 candidates throughout.
+  const RL_BODY = JSON.stringify({ error: { message: "TPM exceeded", type: "rate_limit_exceeded" } });
+
+  /** A 429 backend that takes `delayMs` to answer, so the walk measurably spends the budget. */
+  function slow429(delayMs: number): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          n++;
+          setTimeout(() => {
+            res.writeHead(429, { "content-type": "application/json" });
+            res.end(RL_BODY);
+          }, delayMs);
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  it("openai front: stops starting attempts once the budget is spent — after the guaranteed two", async () => {
+    const a = await slow429(25);
+    const b = await slow429(25);
+    const c = await scripted(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+      `http://127.0.0.1:${port(c.server)}`,
+    ]);
+    cfg.walkBudgetMs = 20;
+    const p = port(await startProxy(cfg));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(429); // the second candidate's REAL error, not a synthesized one
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+    expect(c.calls()).toBe(0); // never started: ~50ms elapsed > 20ms budget
+  });
+
+  it("the first two attempts are always allowed, however slow the first", async () => {
+    const a = await slow429(25);
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`]);
+    cfg.walkBudgetMs = 1; // long gone after attempt 1 — attempt 2 must start anyway
+    const p = port(await startProxy(cfg));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+  });
+
+  it("0 disables the budget entirely", async () => {
+    const a = await slow429(25);
+    const b = await slow429(25);
+    const c = await scripted(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+      `http://127.0.0.1:${port(c.server)}`,
+    ]);
+    cfg.walkBudgetMs = 0;
+    const p = port(await startProxy(cfg));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p3/m3");
+  });
+
+  it("anthropic front: same policy — one budget, both paths", async () => {
+    const a = await slow429(25);
+    const b = await slow429(25);
+    const c = await scripted(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+      `http://127.0.0.1:${port(c.server)}`,
+    ]);
+    cfg.walkBudgetMs = 20;
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", max_tokens: 20, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(429);
+    expect(c.calls()).toBe(0);
+  });
+});

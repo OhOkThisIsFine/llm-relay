@@ -563,6 +563,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Candidate execution loop with failover across healthyTargets.
   // All-429 exhaustion Retry-After policy: `Pool429Tracker`.
   const pool429 = new Pool429Tracker();
+  const walkBudgetMs = cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
+  const walkStarted = Date.now();
   for (let i = 0; i < healthyTargets.length; i++) {
     if (res.destroyed) break;
     target = healthyTargets[i]!;
@@ -624,8 +626,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           });
         }
 
-        // Failover if additional candidates exist
-        if (!res.destroyed && i < healthyTargets.length - 1) {
+        // Failover if additional candidates exist and the walk budget allows another start
+        if (!res.destroyed && i < healthyTargets.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
           continue;
         }
 
@@ -651,7 +653,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
       const localFailure = errorOrigin(backendRes) === "local";
       const tryNext = !localFailure && shouldTryNext(cls);
-      if (tryNext && !res.destroyed && i < healthyTargets.length - 1) {
+      if (tryNext && !res.destroyed && i < healthyTargets.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
         clearTimeout(timer);
         res.off("close", onResClose);
         if (await discardCandidate(backendRes, target, backendRes.status, retryAfterMs)) pool429.noteUnknownRefusal();
@@ -802,6 +804,22 @@ export function classifyStatus(status: number): OutcomeClass {
 /** Whether another pool candidate is useful; health mutation occurs only at terminal completion. */
 function shouldTryNext(cls: OutcomeClass): boolean {
   return cls === "retriable" || cls === "credential";
+}
+
+/**
+ * Wall-clock ceiling on STARTING further failover attempts — one policy, both fronts, same maxim
+ * as `classifyStatus`. A deep pool could legitimately spend members × timeoutMs on one request;
+ * the budget bounds the walk, never the answer: an attempt already in flight is not aborted, and
+ * the first TWO attempts are always allowed, so a slow-failing first candidate cannot starve the
+ * request of its one retry. 0 disables. Default fork-validated in freellmapi (45s) — adoption
+ * review §1.5.
+ */
+export const DEFAULT_WALK_BUDGET_MS = 45_000;
+
+function walkBudgetAllowsNext(budgetMs: number, walkStarted: number, attemptsCompleted: number): boolean {
+  if (attemptsCompleted < 2) return true;
+  if (budgetMs === 0) return true;
+  return Date.now() - walkStarted < budgetMs;
 }
 
 /**
@@ -1264,6 +1282,8 @@ async function openAiFrontPath(
   const tried: string[] = [];
   // All-429 exhaustion Retry-After policy, shared with the Anthropic path: `Pool429Tracker`.
   const pool429 = new Pool429Tracker();
+  const walkBudgetMs = ctx.cfg?.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
+  const walkStarted = Date.now();
 
   for (let i = 0; i < candidates.length; i++) {
     if (res.destroyed) break;
@@ -1325,7 +1345,7 @@ async function openAiFrontPath(
       }
       // The client hanging up aborts every candidate; walking the rest would be pointless work
       // against a socket nobody is reading.
-      if (!isLast && !res.writableEnded && !res.destroyed) continue;
+      if (!isLast && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) continue;
       if (!res.headersSent) {
         res.writeHead(status, { "content-type": "application/json", [SERVED_BY_HEADER]: tried.join(", ") });
         res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
@@ -1345,7 +1365,7 @@ async function openAiFrontPath(
 
     const tryNext = localFailure ? false : shouldTryNext(cls);
 
-    if (tryNext && !isLast && !res.writableEnded && !res.destroyed) {
+    if (tryNext && !isLast && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
       clearTimeout(timer);
       res.off("close", onResClose);
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.

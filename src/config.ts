@@ -515,6 +515,13 @@ export interface Config {
   /** Dynamic reshaper pool resolved lazily after its catalog-backed tail is materialized. */
   reshaperPool?: { name: string; timeoutMs?: number };
   repair: { maxAttempts: number; destructiveTools: string[] };
+  /**
+   * Wall-clock ceiling (ms) on STARTING further failover attempts within one request's pool
+   * walk. The first two attempts are always allowed and an attempt already in flight is never
+   * aborted — the budget bounds the walk, not the answer. 0 disables. Absent ⇒ the server's
+   * DEFAULT_WALK_BUDGET_MS (45s).
+   */
+  walkBudgetMs?: number;
   log: { level: "metadata" | "silent"; file: string | null };
   /**
    * Providers the onboarding nudge must stop asking about (`leave_me_alone` in config.json).
@@ -861,6 +868,17 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   const level = logRaw.level === "silent" ? "silent" : "metadata";
   const file = typeof logRaw.file === "string" ? logRaw.file : null;
 
+  const walkBudgetRaw = (c as { walkBudgetMs?: unknown }).walkBudgetMs;
+  let walkBudgetMs: number | undefined;
+  if (walkBudgetRaw !== undefined) {
+    if (typeof walkBudgetRaw !== "number" || !Number.isFinite(walkBudgetRaw) || walkBudgetRaw < 0) {
+      throw new Error(
+        `config.walkBudgetMs must be a non-negative number of milliseconds (0 disables); got ${JSON.stringify(walkBudgetRaw)}`,
+      );
+    }
+    walkBudgetMs = Math.floor(walkBudgetRaw);
+  }
+
   const leaveMeAlone = parseLeaveMeAlone(c["leave_me_alone"]);
 
   return {
@@ -873,6 +891,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
     ...(reshaperCandidates && reshaperCandidates.length > 1 ? { reshaperCandidates } : {}),
     ...(dynamicReshaperPool ? { reshaperPool: dynamicReshaperPool } : {}),
     repair: { maxAttempts, destructiveTools },
+    ...(walkBudgetMs !== undefined ? { walkBudgetMs } : {}),
     log: { level, file },
     ...(leaveMeAlone.length > 0 ? { leaveMeAlone } : {}),
     sourcePath: path,
