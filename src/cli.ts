@@ -77,6 +77,7 @@ const VALUE_FLAGS = new Set<string>([
   "--rationale", "-rationale",
   "--reset-field", "-reset-field",
   "--reset-ms", "-reset-ms",
+  "--import", "-import",
 ]);
 
 interface ParsedCliArgs {
@@ -194,7 +195,7 @@ const HELP = `llm-relay — loopback Anthropic/OpenAI proxy: routes models acros
 Usage:
 ${formatTextTable([
   ["llm-relay [options]", "Start proxy."],
-  ["llm-relay onboard", "Set up provider keys."],
+  ["llm-relay onboard [--import <file>] [--force]", "Set up or import provider keys."],
   ["llm-relay setup [target]", "target: claude-cli | claude-desktop."],
   ["llm-relay keys | check-keys", "Check provider keys."],
   ["llm-relay pools [--probe]", "List pool members; --probe tests each."],
@@ -2030,6 +2031,7 @@ export async function runPools(
 
 import { probeAllPools, DEAD_VERDICTS, type MemberVerdict } from "./pool-health.js";
 import { runInteractiveOnboarding } from "./onboarding.js";
+import { importKeysFromFile } from "./key-import.js";
 import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
 import { getTelemetryReport } from "./telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
@@ -2050,6 +2052,21 @@ export function main(): void {
   }
   if (arg2 === "onboard") {
     const cfg = loadOrExit();
+    if (hasFlag("--import", "-import")) {
+      const importPath = argValue("--import", "-import");
+      if (!importPath) {
+        process.stderr.write("llm-relay onboard: --import requires a file path\n");
+        process.exit(1);
+        return;
+      }
+      try {
+        importKeysFromFile(importPath, cfg, { force: hasFlag("--force", "-force") });
+      } catch (e) {
+        process.stderr.write(`llm-relay onboard: ${(e as Error).message}\n`);
+        process.exit(1);
+      }
+      return;
+    }
     runInteractiveOnboarding(cfg).catch((e) => {
       process.stderr.write(`llm-relay onboard: ${(e as Error).message}\n`);
       process.exit(1);
