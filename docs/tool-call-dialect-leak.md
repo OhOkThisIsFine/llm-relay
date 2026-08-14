@@ -1,7 +1,9 @@
 # Tool-call dialect leaking to the client as text
 
-**Reported 2026-08-08** by an agent running relay-pool dispatches. Mechanism **confirmed in source**; fixed for the buffered path in 0.33.0 and for **streaming in
-0.34.0**; the specific incident **not reproduced** (see Status and Coverage).
+**Reported 2026-08-08** by an agent running relay-pool dispatches. Mechanism **confirmed in source**;
+fixed for the translated buffered path in 0.33.0, translated streaming in **0.34.0**, and the
+OpenAI direct passthrough on main on 2026-08-14; the specific incident **not reproduced** (see
+Status and Coverage).
 
 ## The report
 
@@ -30,9 +32,10 @@ instead returns it as text in `content`, then in order:
    `toolUseCount: 0` and **passes** — there is nothing malformed to find.
 4. `repair()` therefore never engages, and the raw markup reaches the client as assistant text.
 
-There is **no dialect handling anywhere in `src/`** (grepped: no `tool_calls_begin`, no `DSML`, no
-text-embedded tool-call detection). The repair layer validates and repairs *malformed `tool_use`
-structure*; it has no concept of *a tool call that never became structure at all*. So this is a real
+At the time of the report there was **no dialect handling anywhere in `src/`** (grepped: no
+`tool_calls_begin`, no `DSML`, no text-embedded tool-call detection). The repair layer validates
+and repairs *malformed `tool_use` structure*; it has no concept of *a tool call that never became
+structure at all*. So this is a real
 gap, and squarely inside this project's stated competence — the relay exists so the harness can run
 on models that are weaker at tool use.
 
@@ -84,7 +87,8 @@ Constraints it must respect:
 - **Re-validate after reconstruction**, same as `repair()` does — a parsed envelope can still carry
   args that violate the schema.
 - **Report it.** A response whose tool call was reconstructed is not the same as one that arrived
-  correct; it needs a header and a log field, on the same reasoning as `x-llm-relay-degraded`.
+  correct. Both paths use `x-llm-relay-tool-dialect: recovered`; direct recovery also feeds the
+  existing validation/repair log fields rather than inventing a second dialect field.
 - **Both fronts.** `/v1/messages` and the OpenAI front, in one policy — a detector wired into one
   path is the exact shape of the pool-failover incident.
 - **Streaming too.** The reported bytes were the tail of a stream, so buffering-from-first-suspicion
@@ -99,10 +103,10 @@ that deployment and the pool fails over to a host that parses. Returning the fra
 client a "final answer" that is really the tail of a broken tool call — the misdiagnosis this whole
 path exists to prevent.
 
-## ⚠ Coverage: what is NOT fixed yet
+## Coverage
 
-Recovery is wired into `openAiResponseToAnthropic`, which is the **buffered, non-streaming**
-translation. Two gaps remain, and the first is the one that matters most:
+Recovery began in `openAiResponseToAnthropic`, the **buffered, non-streaming** translation. Both
+cross-path gaps are now closed:
 
 1. ~~Streaming is NOT covered.~~ **Closed in 0.34.0.** `dialect-stream.ts` wraps the translated SSE
    stream: text streams through until a marker lands, then everything after it is withheld and
@@ -115,17 +119,23 @@ translation. Two gaps remain, and the first is the one that matters most:
    CLOSING tag matches, which means a hit points one character past the real start; capturing from
    there left the `<` behind as prose and handed `stripEnvelopes` a tag it no longer recognized, so
    the envelope's outer wrapper survived into the recovered text. A test pins it.
-2. **The OpenAI front's direct passthrough is not covered.** An `openai`-kind client talking to an
-   `openai`-kind backend is not translated at all, so the dialect text reaches that client intact.
-   Lower priority — the harness this exists for speaks Anthropic — but it is the same "two paths,
-   one policy empty" shape the pool-failover incident warns about, so it should not be left
-   indefinitely.
+2. ~~The OpenAI front's direct passthrough is not covered.~~ **Closed on main 2026-08-14.**
+   `openai-dialect.ts` is gated on an actual OpenAI function declaration, uses the same closed
+   marker/parser vocabulary as `tool-dialects.ts`, reconstructs buffered responses as native Chat
+   `tool_calls`, and applies the bounded streaming holdback before the final-wire commit probe.
+   Detected-but-unparseable pre-commit envelopes become invisible candidate failover; after content
+   commits they remain an honest OpenAI SSE error. No-tools traffic bypasses the adapter and remains
+   byte-exact. Recovered calls are validated and, in repair mode, use the existing reshaper path;
+   valid destructive calls pass without invoking that guard, exactly like host-parsed calls.
 
-Verified 2026-08-08 against the live relay: streaming tool calls through `pool/high`, `pool/xhigh`
-and `openrouter/deepseek/deepseek-v4-flash-0731` all return proper `tool_use` blocks with
+Verified 2026-08-08 against the live relay: translated streaming tool calls through `pool/high`,
+`pool/xhigh` and `openrouter/deepseek/deepseek-v4-flash-0731` all return proper `tool_use` blocks with
 `stop_reason: tool_use`, no SSE error and no dialect text — i.e. the wrapper is a no-op on hosts
 that parse. Recovery itself could not be verified against a live leaking host (all cost-blocked),
-so it rests on unit tests built from the exact observed bytes.
+so it rests on unit tests built from the exact observed bytes. The 2026-08-14 direct-path closure is
+covered by buffered and split-marker unit tests plus real-socket two-candidate proxy tests for
+pre-commit failover and response-header timing. It is likewise **not live-verified against a leaking
+public host**: every known host that could reproduce the leak remains cost-blocked.
 
 Detection itself is already correct for the truncated case: markers deliberately omit the `<` / `</`
 prefix so a tail of closing tags is recognized. A unit test pins exactly the observed 70-byte body.

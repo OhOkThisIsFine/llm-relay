@@ -74,8 +74,8 @@ export function isToolUseBlock(b: ContentBlock): b is ToolUseBlock {
 }
 
 /**
- * Extract the tools[] map (name → input_schema) from a parsed request body.
- * Value is `null` for a tool that is DECLARED but has no JSON `input_schema` —
+ * Extract the tools[] map (name → JSON schema) from a parsed Anthropic, Chat, or
+ * Responses request body. Value is `null` for a tool that is DECLARED but has no schema —
  * notably Anthropic's built-in/typed tools (`bash`, `text_editor`, `computer`,
  * `web_search`), which carry a `type` but no schema. Such tools are "known but
  * unvalidatable": a tool_use naming them must NOT be flagged unknown_tool, but
@@ -89,13 +89,31 @@ export function toolSchemaMap(requestBody: unknown): Map<string, JsonSchema | nu
     Array.isArray((requestBody as { tools?: unknown }).tools)
   ) {
     for (const t of (requestBody as { tools: unknown[] }).tools) {
-      if (typeof t === "object" && t !== null && typeof (t as Tool).name === "string") {
-        const rawSchema = (t as { input_schema?: unknown }).input_schema;
+      if (typeof t !== "object" || t === null || Array.isArray(t)) continue;
+      const tool = t as Record<string, unknown>;
+
+      // Anthropic Messages and OpenAI Responses both put the function name on the tool itself;
+      // their schema fields differ. Anthropic built-ins deliberately remain declared/null.
+      if (typeof tool.name === "string") {
+        const rawSchema = tool.input_schema ?? tool.parameters;
         const schema =
           typeof rawSchema === "object" && rawSchema !== null
             ? (rawSchema as JsonSchema)
             : null;
-        map.set((t as Tool).name, schema);
+        map.set(tool.name, schema);
+        continue;
+      }
+
+      // Chat Completions wraps declarations in `{ type, function: { name, parameters } }`.
+      // Reading only Anthropic's shape made every direct Chat tool request look tool-free.
+      if (tool.type === "function" && typeof tool.function === "object" && tool.function !== null) {
+        const fn = tool.function as Record<string, unknown>;
+        if (typeof fn.name !== "string") continue;
+        const schema =
+          typeof fn.parameters === "object" && fn.parameters !== null
+            ? (fn.parameters as JsonSchema)
+            : null;
+        map.set(fn.name, schema);
       }
     }
   }

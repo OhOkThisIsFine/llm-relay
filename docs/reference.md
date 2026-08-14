@@ -18,7 +18,9 @@ config, routing, pools, offload, repair, the CLI, endpoints, and the caveats.
   Requests are translated Anthropic↔OpenAI via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge);
   the validate/repair layer always sees Anthropic Messages regardless of backend.
 - **Bidirectional OpenAI front** — `POST /v1/chat/completions` and `POST /v1/responses` work
-  against both `openai` and `anthropic` targets, streaming and tool calls included.
+  against both `openai` and `anthropic` targets, streaming and tool calls included. Direct Chat
+  recovers recognized tool-call dialect envelopes when the request declares functions; no-tools
+  traffic remains byte-exact.
 - **Streaming repair** — text SSE frames stream to the client as they arrive; the proxy only
   withholds from the first `tool_use` block. Pure-text responses are byte-for-byte passthrough
   with zero added latency. A mid-stream repair failure surfaces as an SSE `error` event, never a
@@ -637,9 +639,11 @@ callers that want something executable rather than the human ladder.
 
 OpenAI-native clients point their base URL at `http://127.0.0.1:8791/v1` and use a namespaced
 model (`anthropic/claude-sonnet-4-20250514`, `pool/medium`). Codex uses `/v1/responses`; most
-IDEs use `/v1/chat/completions`. OpenAI Chat to an OpenAI backend is byte-transparent; other
-combinations translate through the Anthropic seam, streaming and tool calls included. The
-Anthropic front with tool-call repair runs in parallel — no mode switch.
+IDEs use `/v1/chat/completions`. OpenAI Chat to an OpenAI backend is byte-transparent unless a
+tool-bearing response contains a recognized text dialect envelope, which is reconstructed as
+native `tool_calls`; no-tools traffic remains byte-exact. Other combinations translate through the
+Anthropic seam, streaming and tool calls included. The Anthropic front with tool-call repair runs
+in parallel — no mode switch.
 
 `GET /registry` returns one JSON view for an external dispatcher: every provider with `has_key`,
 `reachable`, and its live models (each with raw capability scores, never collapsed to tiers),
