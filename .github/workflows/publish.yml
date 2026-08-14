@@ -102,6 +102,133 @@ jobs:
       # hooks. This package's own postinstall only acts on global installs, so nothing is lost.
       - run: npm ci --ignore-scripts
       - run: npm run build
+      # Artifact smoke test: npm pack, install into a clean directory, and exercise the
+      # installed binary against every runtime asset it loads from outside dist/.
+      # This is the only gate that verifies the `files` whitelist is complete — CI's
+      # build/check runs against the source tree, not the packed tarball, and would
+      # miss a missing tier-data.json or skills/ directory in the published artifact.
+      - name: Smoke-test the packed artifact
+        run: |
+          set -euo pipefail
+
+          # --- pack ---------------------------------------------------------------
+          WORKSPACE="$PWD"
+          if command -v cygpath > /dev/null 2>&1; then
+            WORKSPACE="$(cygpath -u "${WORKSPACE}")"
+          fi
+          TARBALL=""
+          DEST=""
+          NEG_DEST=""
+          NEG_OUTPUT=""
+          cleanup() {
+            cd "${WORKSPACE}"
+            [ -z "${DEST}" ] || rm -rf -- "${DEST}"
+            [ -z "${NEG_DEST}" ] || rm -rf -- "${NEG_DEST}"
+            [ -z "${NEG_OUTPUT}" ] || rm -f -- "${NEG_OUTPUT}"
+            [ -z "${TARBALL}" ] || rm -f -- "${TARBALL}"
+          }
+          trap cleanup EXIT
+
+          TARBALL_NAME="$(npm pack 2>&1 | tail -1)"
+          TARBALL="${WORKSPACE}/${TARBALL_NAME}"
+          echo "packed: ${TARBALL}"
+
+          # --- install into a clean temp directory --------------------------------
+          DEST="$(mktemp -d)"
+          tar xzf "${TARBALL}" -C "${DEST}" --strip-components=1
+          cd "${DEST}"
+          npm install --ignore-scripts > /dev/null 2>&1
+
+          # Verify the binary itself is present
+          test -f "${DEST}/dist/cli.js" || { echo "::error::dist/cli.js missing from tarball"; exit 1; }
+          echo "dist/cli.js: present"
+
+          # --- tier-data.json: must be present and loadable ------------------------
+          # loadTierData() resolves ../docs/tier-data.json relative to dist/tier-data.js.
+          # Direct check: the file must exist and parse to a non-empty models array.
+          node -e "
+          const { loadTierData } = require('./dist/tier-data.js');
+          const data = loadTierData({ force: true });
+          if (!data || !Array.isArray(data.models) || data.models.length === 0) {
+            console.error('::error::tier-data.json missing or empty');
+            process.exit(1);
+          }
+          console.log('tier-data.json: present, models=' + data.models.length);
+          "
+
+          # --- package.json: version command must report the published version -------
+          VERSION="$(node -p "require('./package.json').version")"
+          BIN_VERSION="$("${DEST}/dist/cli.js" --version 2>&1 | tr -d '\n')"
+          if [ "${BIN_VERSION}" != "${VERSION}" ]; then
+              echo "::error::version mismatch: package.json=${VERSION}, binary reports=${BIN_VERSION}"
+              exit 1
+          fi
+          echo "version: ${BIN_VERSION} (matches package.json)"
+
+          # --- skills directory: at least the entrypoint file ships ------------------
+          # npm pack wraps contents in package/; strip that prefix when listing.
+          SKILL_PRESENT=0
+          while IFS= read -r line; do
+            if [ "$line" = "skills/llm-relay/SKILL.md" ]; then
+              SKILL_PRESENT=1
+              break
+            fi
+          done < <(tar tzf "${TARBALL}" | sed 's|^package/||')
+          if [ "$SKILL_PRESENT" -ne 1 ]; then
+            echo "::error::skills/llm-relay/SKILL.md missing from tarball — postinstall hook cannot install the Claude Code / Codex skill"
+            exit 1
+          fi
+          echo "skills/llm-relay/SKILL.md: present in tarball"
+
+          # --- report tarball contents for diagnostics ---------------------------------
+          echo "--- tarball contents ---"
+          tar tzf "${TARBALL}" | sort
+
+          cd "${WORKSPACE}"
+          rm -rf -- "${DEST}"
+          DEST=""
+
+          # --- negative test: tier-data.json absent must FAIL ------------------------
+          echo ""
+          echo "--- negative test: tier-data.json absent ---"
+
+          NEG_DEST="$(mktemp -d)"
+          tar xzf "${TARBALL}" -C "${NEG_DEST}" --strip-components=1
+          cd "${NEG_DEST}"
+          npm install --ignore-scripts > /dev/null 2>&1
+          rm -f "${NEG_DEST}/docs/tier-data.json"
+          NEG_OUTPUT="$(mktemp)"
+
+          # This MUST fail with the expected asset-detection error, not an unrelated runtime error.
+          if node -e "
+          const { loadTierData } = require('./dist/tier-data.js');
+          const data = loadTierData({ force: true });
+          if (!data || !Array.isArray(data.models) || data.models.length === 0) {
+            console.error('::error::tier-data.json missing or empty');
+            process.exit(1);
+          }
+          console.log('tier-data.json: present, models=' + data.models.length);
+          " > "${NEG_OUTPUT}" 2>&1; then
+            echo "::error::tier-data.json absence was NOT detected — smoke step would silently pass with the asset missing"
+            echo "negative test output:"
+            cat "${NEG_OUTPUT}"
+            exit 1
+          fi
+
+          cat "${NEG_OUTPUT}"
+          if ! grep -Fq "::error::tier-data.json missing or empty" "${NEG_OUTPUT}"; then
+            echo "::error::negative tier-data probe failed for an unexpected reason"
+            exit 1
+          fi
+          echo "PASS-AS-EXPECTED: tier-data.json absent correctly detected"
+
+          cd "${WORKSPACE}"
+          rm -rf -- "${NEG_DEST}"
+          NEG_DEST=""
+          rm -f -- "${NEG_OUTPUT}" "${TARBALL}"
+          NEG_OUTPUT=""
+          TARBALL=""
+          trap - EXIT
       # `check` is typecheck + the suite. Publishing was previously gated on the suite alone.
       - run: npm run check
       - run: npm publish --access public
