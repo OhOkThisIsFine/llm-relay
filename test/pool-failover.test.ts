@@ -788,3 +788,95 @@ describe("wall-clock walk budget — bounds the walk, never the answer", () => {
     expect(c.calls()).toBe(0);
   });
 });
+
+describe("request-scoped provider skip — transport evidence condemns the host, not the model", () => {
+  // A provider-wide outage used to burn one hop per member of that provider in the same walk
+  // (the transport half of docs/pool-eligibility.md's 13-round-trips pathology). A genuine
+  // transport failure — thrown before any HTTP response existed — now prunes the provider's
+  // remaining members from THIS walk only. Deliberately narrow: a 5xx status or this proxy's own
+  // deadline must NOT widen (a slow model is not a dead host). Adoption review §1.6.
+
+  /** A backend that resets the connection at the socket level — a real transport failure. */
+  function resetting(): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer((req) => {
+        n++;
+        req.socket.destroy();
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  /** A backend that never answers, so only this proxy's own per-target deadline ends the attempt. */
+  function hanging(): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer(() => {
+        n++;
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  /** p1 owns TWO pool members; p2 owns the third. Config order preserved. */
+  function twoOnOneProvider(p1Base: string, p2Base: string, p1TimeoutMs = 5000): Config {
+    return {
+      host: "127.0.0.1",
+      port: 0,
+      providers: {
+        p1: { base: p1Base, kind: "openai", authHeader: "authorization", timeoutMs: p1TimeoutMs },
+        p2: { base: p2Base, kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      },
+      routing: {
+        default: "pool/coding",
+        tiers: {},
+        benchmarkSort: false,
+        pools: { coding: ["p1/m1", "p1/m2", "p2/m3"] },
+      },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+  }
+
+  it("openai front: a socket reset skips the provider's remaining member for this walk", async () => {
+    const broken = await resetting();
+    const ok = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(twoOnOneProvider(`http://127.0.0.1:${port(broken.server)}`, `http://127.0.0.1:${port(ok.server)}`)));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m3");
+    expect(broken.calls()).toBe(1); // p1/m2 was pruned, not re-attempted against the same dead host
+    expect(ok.calls()).toBe(1);
+  });
+
+  it("this proxy's own deadline does NOT widen — a slow model is not a dead host", async () => {
+    const slow = await hanging();
+    const ok = await scripted(() => ({ body: OK_BODY }));
+    const p = port(
+      await startProxy(twoOnOneProvider(`http://127.0.0.1:${port(slow.server)}`, `http://127.0.0.1:${port(ok.server)}`, 250)),
+    );
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m3");
+    expect(slow.calls()).toBe(2); // both p1 members were tried: timeouts stay per-deployment
+  });
+
+  it("anthropic front: same policy — one prune, both paths", async () => {
+    const broken = await resetting();
+    const ok = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(twoOnOneProvider(`http://127.0.0.1:${port(broken.server)}`, `http://127.0.0.1:${port(ok.server)}`)));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", max_tokens: 20, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(200);
+    expect(broken.calls()).toBe(1);
+    expect(ok.calls()).toBe(1);
+  });
+});

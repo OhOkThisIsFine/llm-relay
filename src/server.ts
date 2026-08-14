@@ -626,6 +626,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           });
         }
 
+        // A genuine transport throw (not this proxy's own deadline) condemns the provider's host
+        // for the rest of THIS walk only — prune before the "is there a next candidate" check so
+        // a walk whose only remaining members share the dead host ends honestly here.
+        if (!aborted) dropRemainingSameProvider(healthyTargets, i, target.provider);
+
         // Failover if additional candidates exist and the walk budget allows another start
         if (!res.destroyed && i < healthyTargets.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
           continue;
@@ -820,6 +825,27 @@ function walkBudgetAllowsNext(budgetMs: number, walkStarted: number, attemptsCom
   if (attemptsCompleted < 2) return true;
   if (budgetMs === 0) return true;
   return Date.now() - walkStarted < budgetMs;
+}
+
+/**
+ * Request-local failure-domain elimination (adoption review §1.6) — one policy, both fronts.
+ *
+ * A TRANSPORT failure — DNS, connection refused, TLS, socket reset: thrown before any HTTP
+ * response existed — is evidence about the provider's HOST, not about one model, so the rest of
+ * this walk drops the failed provider's remaining members instead of burning one hop per member
+ * to rediscover the same dead host (the transport half of the 13-round-trips-to-learn-4-facts
+ * pathology in docs/pool-eligibility.md).
+ *
+ * Deliberately narrow. NOT widened on 5xx statuses — a status is a live host answering, and this
+ * repo has measured a 529 that was model-local while sibling deployments served. NOT widened on
+ * this proxy's own per-target deadline — a slow model is not a dead host, and the next member may
+ * be a smaller, faster one. Request-local by construction: the pruned array dies with the
+ * response, so it cannot fight the breaker's per-deployment accounting.
+ */
+function dropRemainingSameProvider(targets: ResolvedTarget[], afterIndex: number, provider: string): void {
+  for (let j = targets.length - 1; j > afterIndex; j--) {
+    if (targets[j]!.provider === provider) targets.splice(j, 1);
+  }
 }
 
 /**
@@ -1343,9 +1369,14 @@ async function openAiFrontPath(
           status,
         });
       }
+      // A genuine transport throw (not this proxy's own deadline) condemns the provider's host
+      // for the rest of THIS walk only. Prune first, and re-read the live length below — the
+      // `isLast` cached at loop top predates the prune.
+      if (!aborted) dropRemainingSameProvider(candidates, i, target.provider);
+
       // The client hanging up aborts every candidate; walking the rest would be pointless work
       // against a socket nobody is reading.
-      if (!isLast && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) continue;
+      if (i < candidates.length - 1 && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) continue;
       if (!res.headersSent) {
         res.writeHead(status, { "content-type": "application/json", [SERVED_BY_HEADER]: tried.join(", ") });
         res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
