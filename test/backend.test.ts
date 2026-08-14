@@ -10,6 +10,7 @@ import {
   normalizeOpenAiErrorBody,
   openAiResponseToAnthropic,
   parseRetryAfterMs,
+  upstreamReportedModel,
 } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
 
@@ -102,7 +103,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
         req.on("end", () => {
           seen = JSON.parse(Buffer.concat(chunks).toString());
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ id: "cmpl", choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{ id: "c1", function: { name: "get_weather", arguments: '{"city":"Rome"}' } }] } }] }));
+          res.end(JSON.stringify({ id: "cmpl", model: "upstream-substitute", choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{ id: "c1", function: { name: "get_weather", arguments: '{"city":"Rome"}' } }] } }] }));
         });
       });
       s.listen(0, "127.0.0.1", () => resolve(s));
@@ -125,7 +126,40 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     // response mapped back to Anthropic tool_use
     expect(body.content[0]).toEqual({ type: "tool_use", id: "c1", name: "get_weather", input: { city: "Rome" } });
     expect(body.stop_reason).toBe("tool_use");
+    expect(body.model).toBe("meta/llama-3.1-70b-instruct");
+    expect(upstreamReportedModel(res)).toBe("upstream-substitute");
     delete process.env.RP_BACKEND_KEY;
+  });
+
+  it("captures a streamed Anthropic model even when a leading ping ends preflight", async () => {
+    const target: ResolvedTarget = {
+      provider: "anthropic",
+      base: "https://anthropic-backend.test",
+      kind: "anthropic",
+      model: "routed-model",
+      authHeader: "x-api-key",
+      timeoutMs: 1000,
+    };
+    const raw = [
+      `event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`,
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_stream", model: "upstream-substitute" } })}\n\n`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const res = await fetchBackend(target, {
+      path: "/v1/messages",
+      method: "POST",
+      reqBuf: Buffer.from("{}"),
+      reqJson: {},
+      anthropicHeaders: {},
+      wantsStream: true,
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response(raw, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+
+    await res.text();
+    expect(upstreamReportedModel(res)).toBe("upstream-substitute");
   });
 
   it("refuses a document block it cannot convert instead of leaking base64 into the prompt", async () => {

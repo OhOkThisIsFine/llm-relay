@@ -23,6 +23,7 @@ const record = (over: Partial<RequestLog> = {}): RequestLog => ({
   path: "/v1/messages",
   servedProvider: "nim",
   servedModel: "z-ai/glm-5.2",
+  upstreamReportedModel: "meta-router/actual-model",
   attempts: [],
   hadTools: true,
   streamed: false,
@@ -58,6 +59,7 @@ describe("metadata-only logging", () => {
       "path",
       "servedProvider",
       "servedModel",
+      "upstreamReportedModel",
       "attempts",
       "hadTools",
       "streamed",
@@ -134,6 +136,15 @@ describe("metadata-only logging", () => {
     const [line] = linesIn(file);
     expect(line!["servedProvider"]).toBe("nim");
     expect(line!["servedModel"]).toBe("z-ai/glm-5.2");
+    expect(line!["upstreamReportedModel"]).toBe("meta-router/actual-model");
+  });
+
+  it("omits upstream model provenance when no genuine mismatch was supplied", () => {
+    const withoutDrift = record();
+    delete withoutDrift.upstreamReportedModel;
+    new MetadataLogger({ level: "metadata", file }).write(withoutDrift);
+    const [line] = linesIn(file);
+    expect(line).not.toHaveProperty("upstreamReportedModel");
   });
 
   /**

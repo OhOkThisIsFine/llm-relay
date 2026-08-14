@@ -11,12 +11,20 @@ export function baseLog(
   validated: RequestLog["validated"],
   served: ResolvedTarget | null,
   attempts: readonly RequestAttemptLog[] = [],
+  upstreamReportedModel?: string,
 ): RequestLog {
+  const modelDrift =
+    served?.model !== undefined &&
+    upstreamReportedModel !== undefined &&
+    upstreamReportedModel !== served.model
+      ? upstreamReportedModel
+      : undefined;
   return {
     ts: new Date(started).toISOString(),
     path: logSafePath(path),
     servedProvider: served ? served.provider : null,
     servedModel: served ? served.model ?? null : null,
+    ...(modelDrift !== undefined ? { upstreamReportedModel: modelDrift } : {}),
     attempts: [...attempts],
     hadTools,
     streamed,

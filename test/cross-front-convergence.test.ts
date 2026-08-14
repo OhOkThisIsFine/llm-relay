@@ -169,17 +169,21 @@ function hanging(): Promise<{ server: Server; calls: () => number }> {
   });
 }
 
-const OK_BODY = JSON.stringify({
-  id: "cmpl_convergence",
-  object: "chat.completion",
-  model: "served-model",
-  choices: [{
-    index: 0,
-    message: { role: "assistant", content: "served" },
-    finish_reason: "stop",
-  }],
-  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-});
+function openAiBody(model: string): string {
+  return JSON.stringify({
+    id: "cmpl_convergence",
+    object: "chat.completion",
+    model,
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: "served" },
+      finish_reason: "stop",
+    }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+}
+
+const OK_BODY = openAiBody("served-model");
 
 function errorBody(message: string, type = "upstream_error"): string {
   return JSON.stringify({ error: { message, type } });
@@ -359,14 +363,34 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     expect(state?.cooldownSource).toBe("loopback");
 
     const logged = JSON.parse(readFileSync(logFile, "utf8").trim()) as {
+      servedModel: string;
+      upstreamReportedModel?: string;
       attempts: Array<Record<string, unknown>>;
     };
+    expect(logged.servedModel).toBe("m2");
+    expect(logged.upstreamReportedModel).toBe("served-model");
     expect(logged.attempts).toEqual([
       { provider: "p1", model: "m1", status: 429, ms: expect.any(Number) },
       { provider: "p2", model: "m2", status: 200, ms: expect.any(Number) },
     ]);
     expect(Object.keys(logged.attempts[0]!)).toEqual(["provider", "model", "status", "ms"]);
     expect(JSON.stringify(logged.attempts)).not.toContain("slow down");
+  });
+
+  it("omits upstream model provenance when the reported model matches the routed target", async () => {
+    const only = await scripted(() => ({ body: openAiBody("m1") }));
+    const logDir = mkdtempSync(join(tmpdir(), "rp-convergence-model-match-"));
+    tempDirs.push(logDir);
+    const logFile = join(logDir, "relay.jsonl");
+    const config = poolConfig([
+      `http://127.0.0.1:${port(only.server)}`,
+    ], { logFile });
+    const proxyPort = port(await startProxy(config));
+
+    await expectServed(front, await front.post(proxyPort));
+    const logged = JSON.parse(readFileSync(logFile, "utf8").trim()) as Record<string, unknown>;
+    expect(logged["servedModel"]).toBe("m1");
+    expect(logged).not.toHaveProperty("upstreamReportedModel");
   });
 
   it("Retry-After sets the failed candidate's breaker cooldown without delaying failover", async () => {
@@ -543,5 +567,35 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     expect(await response.text()).toContain("freeOnly");
     expect(firstPaid.calls()).toBe(0);
     expect(secondPaid.calls()).toBe(0);
+  });
+});
+
+describe("raw upstream model provenance", () => {
+  it("captures an Anthropic passthrough mismatch without replacing the routed model", async () => {
+    const backend = await scripted(() => ({
+      body: JSON.stringify({
+        id: "msg_model_drift",
+        type: "message",
+        role: "assistant",
+        model: "upstream-substitute",
+        content: [{ type: "text", text: "served" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+    }));
+    const logDir = mkdtempSync(join(tmpdir(), "rp-convergence-anthropic-model-"));
+    tempDirs.push(logDir);
+    const logFile = join(logDir, "relay.jsonl");
+    const config = poolConfig([
+      `http://127.0.0.1:${port(backend.server)}`,
+    ], { candidates: ["p1/routed-model"], logFile });
+    config.providers.p1!.kind = "anthropic";
+    const proxyPort = port(await startProxy(config));
+
+    const front = FRONTS[0]!;
+    await expectServed(front, await front.post(proxyPort));
+    const logged = JSON.parse(readFileSync(logFile, "utf8").trim()) as Record<string, unknown>;
+    expect(logged["servedModel"]).toBe("routed-model");
+    expect(logged["upstreamReportedModel"]).toBe("upstream-substitute");
   });
 });

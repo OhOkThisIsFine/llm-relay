@@ -23,7 +23,7 @@ import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
 import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthropic.js";
@@ -650,6 +650,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         return;
       }
 
+      const reportedModelSource = backendRes;
       // One shared policy with the OpenAI front — see `classifyStatus` / `shouldTryNext`.
       //
       // A 401/403 now fails over WHEN ANOTHER CANDIDATE EXISTS. It did not before, so a pool
@@ -695,11 +696,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
 
       if (doRepair) {
-        await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal }, h);
+        await repairPath(res, backendRes, timer, { tools, wantsStream, streamed, started, path, hadTools, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, req, target, attempt, signal: controller.signal, reportedModelSource }, h);
       } else {
         const poolRetryAfterMs = pool429.overrideMs(backendRes.status, retryAfterMs);
         pool429.recordFinal(backendRes.status);
-        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount(), degraded: degradedLabel(addressedPool, degradedSpecs, target), paid: paidLabel(cfg, h, target) }, h);
+        await transparentPath(res, backendRes, timer, { tools, streamed, willValidate, started, path, hadTools, req, target, attempt, signal: controller.signal, reportedModelSource, retryAfterOverrideMs: poolRetryAfterMs, poolSummary: pool429.summary(), poolUnknownRefusals: pool429.unknownCount(), degraded: degradedLabel(addressedPool, degradedSpecs, target), paid: paidLabel(cfg, h, target) }, h);
       }
       return;
     } finally {
@@ -1035,6 +1036,8 @@ interface Ctx {
   target: ResolvedTarget;
   attempt: HealthAttempt;
   signal: AbortSignal;
+  /** Original adapter response retaining private raw-upstream provenance across stream wrappers. */
+  reportedModelSource: Response;
 }
 
 /** Request-scoped, bounded attempt metadata shared by both public fronts. */
@@ -1483,6 +1486,7 @@ async function openAiFrontPath(
       return;
     }
 
+    const reportedModelSource = upstream;
     // A local translation/configuration failure is deterministic for the request and should not
     // make every other candidate repeat the same failure. Provider responses still use the shared
     // breaker/failover policy.
@@ -1580,6 +1584,7 @@ async function openAiFrontPath(
       handleMidStreamError(
         res, e, ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, target, attempt, h,
         (msg) => streamed ? openAiSseError(msg) : null,
+        reportedModelSource,
         controller.signal.aborted,
         responseBytesWritten,
       );
@@ -1588,7 +1593,17 @@ async function openAiFrontPath(
       clearTimeout(timer);
       res.off("close", onResClose);
     }
-    h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, "skipped", target, attemptTrace.snapshot()));
+    h.logger.write(baseLog(
+      ctx.started,
+      ctx.path,
+      ctx.hadTools,
+      streamed,
+      upstream.status,
+      "skipped",
+      target,
+      attemptTrace.snapshot(),
+      upstreamReportedModel(reportedModelSource),
+    ));
     return;
   }
   // Unreachable with candidates present: the last iteration always responds and returns. An
@@ -1659,6 +1674,7 @@ async function transparentPath(
       res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status,
       ctx.target, ctx.attempt, h,
       (msg) => ctx.streamed ? sseError(msg) : null,
+      ctx.reportedModelSource,
       ctx.signal.aborted,
       responseBytesWritten,
     );
@@ -1709,6 +1725,7 @@ async function transparentPath(
       validated,
       ctx.target,
       ctx.attempt.trace.snapshot(),
+      upstreamReportedModel(ctx.reportedModelSource),
     ),
     toolUseCount, uncheckableCount, errorKinds,
   });
@@ -1841,6 +1858,7 @@ async function repairStreamingPath(
       ctx.attempt,
       h,
       sseError,
+      ctx.reportedModelSource,
       ctx.signal.aborted,
       responseBytesWritten,
     );
@@ -1931,6 +1949,7 @@ async function repairStreamingPath(
       validated,
       ctx.target,
       ctx.attempt.trace.snapshot(),
+      upstreamReportedModel(ctx.reportedModelSource),
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
@@ -1951,7 +1970,7 @@ async function repairBufferedPath(
     // Nothing has been written yet on this path, so this is a clean 502 rather than
     // a truncated body — but it still has to be LOGGED, which the bare finally did
     // not do: the throw went straight to the top-level catch.
-    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, ctx.attempt, h, () => null, ctx.signal.aborted);
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, ctx.attempt, h, () => null, ctx.reportedModelSource, ctx.signal.aborted);
     return;
   } finally {
     clearTimeout(timer);
@@ -2036,6 +2055,7 @@ async function repairBufferedPath(
       validated,
       ctx.target,
       ctx.attempt.trace.snapshot(),
+      upstreamReportedModel(ctx.reportedModelSource),
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
@@ -2302,6 +2322,7 @@ function handleMidStreamError(
   attempt: HealthAttempt,
   h: Handlers,
   errorFrameBuilder: (msg: string) => string | null,
+  reportedModelSource: Response,
   deadlineAborted = false,
   committed = false,
 ): void {
@@ -2328,6 +2349,7 @@ function handleMidStreamError(
       "skipped",
       target,
       attempt.trace.snapshot(),
+      upstreamReportedModel(reportedModelSource),
     ),
     errorKinds: [MID_STREAM_ERROR_KIND],
   });
