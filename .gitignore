@@ -8,3 +8,4 @@ config.json
 # belong in docs/, never in the raw artifacts. Same reasoning as analysis-reports/.
 .audit-tools/
 .audit-code/
+.remediate-code/
