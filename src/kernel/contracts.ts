@@ -27,6 +27,8 @@ export interface ProviderTargetIdentity {
   readonly provider: string;
   readonly model: string | null;
   readonly kind: ProviderKind;
+  /** Opaque configured credential-slot identity; never key material. */
+  readonly credentialId: string;
   /** Optional routing metadata used by breaker policy; never part of target equality. */
   readonly base?: string;
 }

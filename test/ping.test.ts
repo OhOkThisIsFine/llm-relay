@@ -7,15 +7,16 @@ import {
   recordProbeResult,
   getModelsDueForProbe,
 } from "../src/ping/probe-cache.js";
-import { recordModelCall, getRealWorldScore } from "../src/ping/runtime-telemetry.js";
+import { recordModelCall, getRealWorldScore, loadRuntimeTelemetry } from "../src/ping/runtime-telemetry.js";
 import { PingLoop, collectRoutableModels } from "../src/ping/cadence.js";
+import { makeCredentialId } from "../src/credential-id.js";
 import { createProxy } from "../src/server.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -95,16 +96,22 @@ describe("Ping Metrics", () => {
 
 
 describe("Header Quota Parsing", () => {
-  it("parses x-ratelimit-remaining / limit headers", () => {
+  it("keeps the deprecated scalar wrapper only for one unambiguous observation", () => {
     const headers = {
-      "x-ratelimit-remaining": "45",
-      "x-ratelimit-limit": "100",
+      "x-ratelimit-remaining-requests": "45",
+      "x-ratelimit-limit-requests": "100",
     };
     expect(extractQuotaPercent(headers)).toBe(45);
   });
 
-  it("returns null when rate limit headers are absent", () => {
+  it("returns null for absent or ambiguous quota", () => {
     expect(extractQuotaPercent({})).toBeNull();
+    expect(extractQuotaPercent({
+      "x-ratelimit-remaining-requests-day": "45",
+      "x-ratelimit-limit-requests-day": "100",
+      "x-ratelimit-remaining-tokens-minute": "800",
+      "x-ratelimit-limit-tokens-minute": "1000",
+    })).toBeNull();
   });
 });
 
@@ -117,18 +124,27 @@ describe("Ping Requests", () => {
     expect(req.body["thinking"]).toEqual({ type: "disabled" });
   });
 
-  it("pings provider and extracts code and latency", async () => {
+  it("pings provider and extracts every typed quota axis", async () => {
     const mockFetch = async () =>
       new Response(JSON.stringify({ choices: [] }), {
         status: 200,
-        headers: { "x-ratelimit-remaining": "80", "x-ratelimit-limit": "100" },
+        headers: {
+          "x-ratelimit-remaining-requests-day": "80",
+          "x-ratelimit-limit-requests-day": "100",
+          "x-ratelimit-remaining-tokens-minute": "800",
+          "x-ratelimit-limit-tokens-minute": "1000",
+        },
       });
 
     const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
     const res = await pingProviderModel("test", "model-a", pCfg, "sk-test", { fetchFn: mockFetch as any });
 
     expect(res.code).toBe("200");
-    expect(res.quotaPercent).toBe(80);
+    expect(res.quotaObservations.map(({ axis, period, remaining, limit }) => ({ axis, period, remaining, limit })))
+      .toEqual([
+        { axis: "requests", period: "day", remaining: 80, limit: 100 },
+        { axis: "tokens", period: "minute", remaining: 800, limit: 1000 },
+      ]);
     expect(res.ms).toBeGreaterThanOrEqual(0);
   });
 
@@ -184,8 +200,8 @@ describe("Probe Cache Persistence", () => {
     loadProbeCache({ path: tmpPath });
     const now = Date.now();
 
-    recordProbeResult("prov1", "m1", { code: "200", ms: 100, quotaPercent: 90 }, { now, path: tmpPath });
-    recordProbeResult("prov1", "m2", { code: "500", ms: 500, quotaPercent: null }, { now, path: tmpPath });
+    recordProbeResult("prov1", "m1", { code: "200", ms: 100, quotaObservations: [] }, { now, path: tmpPath });
+    recordProbeResult("prov1", "m2", { code: "500", ms: 500, quotaObservations: [] }, { now, path: tmpPath });
 
     const due = getModelsDueForProbe("prov1", ["m1", "m2", "m3"], { now, path: tmpPath });
     // m1 is fresh + ok, m2 is broken but in backoff, and m3 has never been measured.
@@ -202,7 +218,7 @@ describe("Probe Cache Persistence", () => {
     loadProbeCache({ path: tmpPath });
     const now = Date.now();
 
-    const entry = recordProbeResult("prov1", "unauthorised", { code: "401", ms: 40, quotaPercent: null }, { now, path: tmpPath });
+    const entry = recordProbeResult("prov1", "unauthorised", { code: "401", ms: 40, quotaObservations: [] }, { now, path: tmpPath });
     expect(entry.status).toBe("broken");
 
     expect(getModelsDueForProbe("prov1", ["unauthorised"], { now, path: tmpPath })).toEqual([]);
@@ -215,8 +231,8 @@ describe("Probe Cache Persistence", () => {
   it("backs repeated failures off exponentially and lets passive success reset freshness", () => {
     loadProbeCache({ path: tmpPath });
     const now = Date.now();
-    recordProbeResult("prov1", "flaky", { code: "500", ms: 10, quotaPercent: null }, { now, path: tmpPath });
-    recordProbeResult("prov1", "flaky", { code: "500", ms: 10, quotaPercent: null }, {
+    recordProbeResult("prov1", "flaky", { code: "500", ms: 10, quotaObservations: [] }, { now, path: tmpPath });
+    recordProbeResult("prov1", "flaky", { code: "500", ms: 10, quotaObservations: [] }, {
       now: now + BROKEN_PROBE_BACKOFF_BASE_MS,
       path: tmpPath,
     });
@@ -260,6 +276,123 @@ describe("Runtime Telemetry", () => {
     const score = getRealWorldScore("prov1", "m1", { minCalls: 5, path: tmpPath });
     expect(score).not.toBeNull();
     expect(score).toBeGreaterThan(70);
+  });
+
+  it("counts reported zero as covered, but missing usage as uncovered", () => {
+    recordModelCall("prov-zero", "m1", { ok: true, latencyMs: 10, completionTokens: 0 }, { path: tmpPath });
+    recordModelCall("prov-zero", "m1", { ok: true, latencyMs: 10 }, { path: tmpPath });
+    const model = loadRuntimeTelemetry({ path: tmpPath, reload: true }).models["prov-zero/m1"]!;
+    expect(model.totalCalls).toBe(2);
+    expect(model.totalCompletionTokens).toBe(0);
+    expect(model.completionTokenCalls).toBe(1);
+  });
+
+  it("migrates valid v1 call data while resetting unwired token totals", () => {
+    writeFileSync(tmpPath, JSON.stringify({
+      version: 1,
+      models: {
+        "prov-v1/m1": {
+          providerKey: "prov-v1", modelId: "m1", totalCalls: 2, successCalls: 1,
+          totalLatencyMs: 30, totalCompletionTokens: 999, lastCalledAt: 10,
+          recentCalls: [{ timestamp: 10, ok: true, latencyMs: 15, tokens: "legacy-corrupt" }],
+        },
+      },
+    }));
+    const data = loadRuntimeTelemetry({ path: tmpPath, reload: true });
+    expect(data.version).toBe(2);
+    expect(data.models["prov-v1/m1"]).toMatchObject({ totalCalls: 2, successCalls: 1, totalLatencyMs: 30, totalCompletionTokens: 0, completionTokenCalls: 0 });
+    expect(data.models["prov-v1/m1"]?.recentCalls).toHaveLength(1);
+    recordModelCall("prov-v1", "m1", { ok: true, latencyMs: 1, completionTokens: 4 }, { path: tmpPath });
+    expect(JSON.parse(readFileSync(tmpPath, "utf8")).version).toBe(2);
+  });
+
+  it("drops malformed telemetry rows and counters without throwing", () => {
+    writeFileSync(tmpPath, JSON.stringify({
+      version: 2,
+      models: {
+        good: {
+          providerKey: "p", modelId: "m", totalCalls: 1, successCalls: 1, totalLatencyMs: 2,
+          totalCompletionTokens: 0, completionTokenCalls: 1, lastCalledAt: 3,
+          recentCalls: [{ timestamp: 3, ok: true, latencyMs: 2 }, { timestamp: "bad", ok: true, latencyMs: 2 }],
+        },
+        bad: { providerKey: "p", modelId: "bad", totalCalls: -1, successCalls: 0, totalLatencyMs: 0, totalCompletionTokens: 0, completionTokenCalls: 0, lastCalledAt: 0, recentCalls: [] },
+      },
+    }));
+    const data = loadRuntimeTelemetry({ path: tmpPath, reload: true });
+    expect(data.version).toBe(2);
+    expect(data.models.good?.recentCalls).toHaveLength(1);
+    expect(data.models.bad).toBeUndefined();
+  });
+
+  it("rejects finite timestamps outside the JavaScript Date range", () => {
+    writeFileSync(tmpPath, JSON.stringify({
+      version: 2,
+      models: {
+        huge: {
+          providerKey: "p", modelId: "huge", totalCalls: 1, successCalls: 1, totalLatencyMs: 2,
+          totalCompletionTokens: 0, completionTokenCalls: 0, lastCalledAt: Number.MAX_VALUE,
+          recentCalls: [{ timestamp: Number.MAX_VALUE, ok: true, latencyMs: 2 }],
+        },
+      },
+    }));
+    const data = loadRuntimeTelemetry({ path: tmpPath, reload: true });
+    expect(data.models.huge).toBeUndefined();
+  });
+
+  it("ignores invalid recorder timing inputs without creating telemetry rows", () => {
+    const invalid = [
+      { model: "negative-latency", result: { ok: false, latencyMs: -1 }, now: 1 },
+      { model: "nan-latency", result: { ok: false, latencyMs: Number.NaN }, now: 1 },
+      { model: "infinite-latency", result: { ok: false, latencyMs: Number.POSITIVE_INFINITY }, now: 1 },
+      { model: "negative-time", result: { ok: false, latencyMs: 1 }, now: -1 },
+      { model: "nan-time", result: { ok: false, latencyMs: 1 }, now: Number.NaN },
+      { model: "infinite-time", result: { ok: false, latencyMs: 1 }, now: Number.POSITIVE_INFINITY },
+      { model: "out-of-date-time", result: { ok: false, latencyMs: 1 }, now: 8_640_000_000_000_001 },
+    ];
+    for (const row of invalid) recordModelCall("invalid", row.model, row.result, { path: tmpPath, now: row.now });
+    const data = loadRuntimeTelemetry({ path: tmpPath, reload: true });
+    expect(Object.keys(data.models).filter((key) => key.startsWith("invalid/"))).toEqual([]);
+  });
+
+  it("keeps saturated counters and latency aggregates within the persisted v2 schema", () => {
+    writeFileSync(tmpPath, JSON.stringify({
+      version: 2,
+      models: {
+        "limits/calls": {
+          providerKey: "limits", modelId: "calls",
+          totalCalls: Number.MAX_SAFE_INTEGER, successCalls: Number.MAX_SAFE_INTEGER,
+          totalLatencyMs: Number.MAX_VALUE,
+          totalCompletionTokens: Number.MAX_SAFE_INTEGER,
+          completionTokenCalls: Number.MAX_SAFE_INTEGER,
+          lastCalledAt: 1, recentCalls: [],
+        },
+        "limits/latency": {
+          providerKey: "limits", modelId: "latency",
+          totalCalls: 1, successCalls: 1, totalLatencyMs: Number.MAX_VALUE,
+          totalCompletionTokens: Number.MAX_SAFE_INTEGER - 1, completionTokenCalls: 0,
+          lastCalledAt: 1, recentCalls: [],
+        },
+      },
+    }));
+    loadRuntimeTelemetry({ path: tmpPath, reload: true });
+
+    recordModelCall("limits", "calls", { ok: true, latencyMs: 1, completionTokens: 1 }, { path: tmpPath, now: 2 });
+    recordModelCall("limits", "latency", { ok: true, latencyMs: Number.MAX_VALUE, completionTokens: 2 }, { path: tmpPath, now: 2 });
+
+    const data = loadRuntimeTelemetry({ path: tmpPath, reload: true });
+    expect(data.models["limits/calls"]).toMatchObject({
+      totalCalls: Number.MAX_SAFE_INTEGER,
+      successCalls: Number.MAX_SAFE_INTEGER,
+      totalCompletionTokens: Number.MAX_SAFE_INTEGER,
+      completionTokenCalls: Number.MAX_SAFE_INTEGER,
+    });
+    expect(data.models["limits/latency"]).toMatchObject({
+      totalCalls: 2,
+      successCalls: 2,
+      totalLatencyMs: Number.MAX_VALUE,
+      totalCompletionTokens: Number.MAX_SAFE_INTEGER - 1,
+      completionTokenCalls: 0,
+    });
   });
 });
 
@@ -341,6 +474,39 @@ describe("PingLoop Cadence", () => {
     await loop.tickOnce("routable");
     expect(probed).toEqual(["pool-leader", "routed-second"]);
     expect(probed).not.toContain("catalog-only");
+  });
+
+  it("keeps quota isolated by exact credential and model", () => {
+    const loop = new PingLoop(testConfig({}), {} as ModelCatalog, { probeCachePath: isolatedProbeCache() });
+    const personal = makeCredentialId("testProv");
+    const work = makeCredentialId("testProv", "work");
+    const requestsDay = [{
+      axis: "requests" as const,
+      period: "day" as const,
+      limit: 100,
+      remaining: 25,
+      resetsAt: null,
+      observedAt: 1,
+      basis: "provider-stated" as const,
+    }];
+    const tokensMinute = [{
+      axis: "tokens" as const,
+      period: "minute" as const,
+      limit: 1000,
+      remaining: 800,
+      resetsAt: null,
+      observedAt: 2,
+      basis: "provider-stated" as const,
+    }];
+
+    loop.recordPing("testProv", "model-a", { code: "200", ms: 1, quotaObservations: requestsDay }, 1, personal);
+    loop.recordPing("testProv", "model-a", { code: "200", ms: 1, quotaObservations: tokensMinute }, 2, work);
+    loop.recordPing("testProv", "model-b", { code: "200", ms: 1, quotaObservations: tokensMinute }, 3, personal);
+
+    expect(loop.getQuotaObservations(personal, "model-a")).toEqual(requestsDay);
+    expect(loop.getQuotaObservations(work, "model-a")).toEqual(tokensMinute);
+    expect(loop.getQuotaObservations(personal, "model-b")).toEqual(tokensMinute);
+    expect(loop.getQuotaObservations(work, "model-b")).toEqual([]);
   });
 });
 

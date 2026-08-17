@@ -1,6 +1,9 @@
 import type { Config, ProviderTierType } from "./config.js";
 import type { CircuitBreaker, CircuitState } from "./circuit-breaker.js";
+import { readCredential } from "./authEnv.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
+import type { ProviderTargetIdentity } from "./kernel/contracts.js";
+import { getStabilityScore } from "./ping/metrics.js";
 
 export interface ProviderTelemetry {
   provider: string;
@@ -9,32 +12,10 @@ export interface ProviderTelemetry {
   tierType: ProviderTierType;
   signupUrl?: string | undefined;
   hasKey: boolean;
-  /**
-   * `true` — at least one OBSERVED deployment of this provider can take traffic now.
-   * `false` — every observed deployment is cooling down, or there is no credential.
-   * `null` — nothing has been observed, so health is genuinely UNKNOWN.
-   *
-   * ⚠ `null` must never be rendered as healthy. This field used to be a bare
-   * boolean fed by `CircuitBreaker.isHealthy(<bare provider name>)`, which missed
-   * every state (the breaker keys by `provider/model`) and returned `true` on a
-   * miss — so every provider read healthy no matter what (OBS-dc5f56e7).
-   */
   isHealthy: boolean | null;
-  /**
-   * Best MEASURED stability (0-100) across this provider's observed deployments,
-   * or `null` when nothing has been measured. Never a default: an unmeasured
-   * provider reports unknown, the same way an unpublished limit or price stays
-   * `null` rather than becoming a confident-looking guess.
-   *
-   * The BEST rather than the mean, because routing sends a request to the
-   * best-ranked live deployment (`CircuitBreaker.getHealthyTargets`), so the best
-   * is what a caller of this provider would actually experience. One dead SKU in a
-   * roster is not evidence against the provider.
-   */
   stabilityScore: number | null;
-  /** How many `provider/model` deployments the breaker holds observations for. */
+  /** Unique provider/model deployments; credential cells are intentionally deduplicated. */
   observedTargets: number;
-  quotaPercent: number | null;
   lastStatus?: number | undefined;
   cooldownRemainingMs: number;
 }
@@ -42,9 +23,7 @@ export interface ProviderTelemetry {
 export interface TelemetryReport {
   timestamp: string;
   activeProvidersCount: number;
-  /** Providers OBSERVED available. Excludes unknown — see `unmeasuredProvidersCount`. */
   healthyProvidersCount: number;
-  /** Providers with a credential but no observations at all: health unknown, not unhealthy. */
   unmeasuredProvidersCount: number;
   freeProvidersCount: number;
   mixedProvidersCount: number;
@@ -53,27 +32,50 @@ export interface TelemetryReport {
   routingTiers: Record<string, string | string[]>;
 }
 
-/**
- * Every breaker key belonging to one provider.
- *
- * `CircuitBreaker.getKey()` writes `${provider}/${model}` (and the bare provider
- * name only for a model-less target), so a provider row has to AGGREGATE its
- * deployments — querying the breaker by bare provider name simply misses, which
- * is the whole of OBS-dc5f56e7. Matching on the `provider/` prefix rather than
- * `startsWith(provider)` is deliberate: a model id contains slashes of its own
- * (`nim/z-ai/glm-5.2`), and a loose prefix would let `openai/gpt-4o` count as a
- * provider named `open`.
- */
-function breakerKeysFor(cb: CircuitBreaker, provider: string): string[] {
-  const prefix = `${provider}/`;
-  const keys: string[] = [];
-  for (const key of cb.getAllStates().keys()) {
-    if (key === provider || key.startsWith(prefix)) keys.push(key);
-  }
-  return keys;
+type StoredCircuitState = CircuitState & { readonly target: ProviderTargetIdentity };
+
+interface DeploymentAggregate {
+  readonly provider: string;
+  readonly model: string | null;
+  readonly states: CircuitState[];
+  readonly samples: CircuitState["pings"];
+  readonly stability: number | null;
+  readonly confidenceSamples: number;
 }
 
-/** When this deployment was last observed (0 = never). */
+/**
+ * Group cells by their stored target identity. Credential labels never enter this deployment
+ * key, and no serialized breaker key is reverse-parsed. Samples are sorted because each cell's
+ * bounded FIFO is independently ordered.
+ */
+function deploymentAggregates(cb: CircuitBreaker): DeploymentAggregate[] {
+  const groups = new Map<string, { provider: string; model: string | null; states: CircuitState[] }>();
+  for (const state of cb.getAllStates().values() as Iterable<StoredCircuitState>) {
+    const target = state.target;
+    const model = target.model ?? null;
+    const key = `${target.provider}\u0000${model ?? ""}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { provider: target.provider, model, states: [] };
+      groups.set(key, group);
+    }
+    group.states.push(state);
+  }
+  return [...groups.values()].map((group) => {
+    const samples = group.states
+      .flatMap((state) => state.pings)
+      .sort((a, b) => a.timestamp - b.timestamp);
+    return {
+      ...group,
+      samples,
+      stability: samples.length > 0 ? Math.max(0, getStabilityScore(samples)) : null,
+      confidenceSamples: group.states.length > 0
+        ? Math.min(...group.states.map((state) => state.pings.length))
+        : 0,
+    };
+  });
+}
+
 function lastSeen(state: CircuitState): number {
   const last = state.pings[state.pings.length - 1];
   return last ? last.timestamp : 0;
@@ -82,42 +84,36 @@ function lastSeen(state: CircuitState): number {
 /** Aggregate live telemetry and health status across all configured providers. */
 export function getTelemetryReport(cfg: Config, cb: CircuitBreaker, now = Date.now()): TelemetryReport {
   const providers: ProviderTelemetry[] = [];
+  const deployments = deploymentAggregates(cb);
 
   for (const [name, p] of Object.entries(cfg.providers)) {
-    const envVar = p.authEnv;
-    const hasKey = envVar ? Boolean(process.env[envVar]) : true;
+    const hasKey = p.authEnv ? readCredential(p.authEnv, process.env, name) !== undefined : true;
     const preset = ALL_PROVIDER_PRESETS[name];
-
-    const keys = breakerKeysFor(cb, name);
-    const observedTargets = keys.filter((k) => cb.hasObservations(k)).length;
-    const measured = keys
-      .map((k) => cb.getMeasuredStability(k))
-      .filter((s): s is number => s !== null);
+    const providerDeployments = deployments.filter((deployment) => deployment.provider === name);
+    const observedDeployments = providerDeployments.filter((deployment) => deployment.samples.length > 0);
+    const observedTargets = observedDeployments.length;
+    const measured = observedDeployments
+      .map((deployment) => deployment.stability)
+      .filter((score): score is number => score !== null);
     const stabilityScore = measured.length > 0 ? Math.max(...measured) : null;
 
-    // No credential ⇒ it cannot serve, and that is knowledge, not a guess.
-    // No observations ⇒ unknown. Otherwise: can any observed deployment take traffic?
+    // A deployment is available when any credential cell for it is available. A provider is
+    // unknown until at least one cell has actual observations.
     const isHealthy = !hasKey
       ? false
-      : observedTargets === 0
+      : observedDeployments.length === 0
         ? null
-        : keys.some((k) => cb.isHealthy(k, now));
+        : observedDeployments.some((deployment) =>
+            deployment.states.some((state) => cb.isHealthy(state.target, now)),
+          );
 
-    // Newest observation first: quota and last status are point-in-time facts, so
-    // the most recently observed deployment is the one worth reporting.
-    const states = keys
-      .map((k) => cb.getState(k))
-      .filter((s): s is CircuitState => s !== undefined)
+    const states = providerDeployments
+      .flatMap((deployment) => deployment.states)
       .sort((a, b) => lastSeen(b) - lastSeen(a));
-
-    // Time until this provider next has an available deployment: 0 as soon as any
-    // one of them is not cooling down, because routing would pick that one.
     const cooldownRemainingMs = states.length === 0
       ? 0
-      : Math.min(...states.map((s) => (s.cooldownUntil > now ? s.cooldownUntil - now : 0)));
-
-    const quotaState = states.find((s) => s.quotaPercent !== undefined);
-    const statusState = states.find((s) => s.lastStatus !== undefined);
+      : Math.min(...states.map((state) => (state.cooldownUntil > now ? state.cooldownUntil - now : 0)));
+    const statusState = states.find((state) => state.lastStatus !== undefined);
 
     providers.push({
       provider: name,
@@ -129,18 +125,17 @@ export function getTelemetryReport(cfg: Config, cb: CircuitBreaker, now = Date.n
       isHealthy,
       stabilityScore,
       observedTargets,
-      quotaPercent: quotaState?.quotaPercent ?? null,
       lastStatus: statusState?.lastStatus,
       cooldownRemainingMs,
     });
   }
 
-  const activeProvidersCount = providers.filter((p) => p.hasKey).length;
-  const healthyProvidersCount = providers.filter((p) => p.isHealthy === true).length;
-  const unmeasuredProvidersCount = providers.filter((p) => p.isHealthy === null).length;
-  const freeProvidersCount = providers.filter((p) => p.tierType === "free" && p.hasKey).length;
-  const mixedProvidersCount = providers.filter((p) => p.tierType === "mixed" && p.hasKey).length;
-  const subscriptionProvidersCount = providers.filter((p) => p.tierType === "subscription" && p.hasKey).length;
+  const activeProvidersCount = providers.filter((provider) => provider.hasKey).length;
+  const healthyProvidersCount = providers.filter((provider) => provider.isHealthy === true).length;
+  const unmeasuredProvidersCount = providers.filter((provider) => provider.isHealthy === null).length;
+  const freeProvidersCount = providers.filter((provider) => provider.tierType === "free" && provider.hasKey).length;
+  const mixedProvidersCount = providers.filter((provider) => provider.tierType === "mixed" && provider.hasKey).length;
+  const subscriptionProvidersCount = providers.filter((provider) => provider.tierType === "subscription" && provider.hasKey).length;
 
   return {
     timestamp: new Date(now).toISOString(),

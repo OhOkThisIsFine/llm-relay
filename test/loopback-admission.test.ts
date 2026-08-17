@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
 import { buildForwardHeaders, createProxy, logSafePath } from "../src/server.js";
 import type { Config } from "../src/config.js";
+import { resolveAttempt } from "../src/resolved-attempt.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 
 const CONTROL_TOKEN = "test-control-capability";
@@ -202,13 +203,13 @@ describe("logs stay metadata-only (INV-OB-1)", () => {
   it("never forwards the local control capability to a provider", () => {
     const forwarded = buildForwardHeaders(
       { [CONTROL_AUTHORIZATION_HEADER]: CONTROL_TOKEN, "content-type": "application/json" },
-      {
+      resolveAttempt({
         provider: "anthropic",
         base: "https://api.anthropic.com",
         kind: "anthropic",
         authHeader: "x-api-key",
         timeoutMs: 1000,
-      },
+      }),
     );
     expect(forwarded[CONTROL_AUTHORIZATION_HEADER]).toBeUndefined();
   });

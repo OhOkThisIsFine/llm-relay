@@ -7,12 +7,20 @@ import { join } from "node:path";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
+import { makeCredentialId } from "../src/credential-id.js";
 import { DEGRADED_HEADER, POOL_ATTEMPTS_HEADER } from "../src/backend.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import { materializeDynamicPools } from "../src/dynamic-pools.js";
 import type { Config, ProviderConfig, ProviderTierType } from "../src/config.js";
 import type { TierData, TierModel } from "../src/tier-data.js";
+
+const breakerIdentity = (provider: string, model: string | null) => ({
+  provider,
+  model,
+  kind: "openai" as const,
+  credentialId: makeCredentialId(provider),
+});
 
 /**
  * One policy matrix, driven through every public request shape.
@@ -330,7 +338,7 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     await expectServed(front, response);
     expect(first.calls()).toBe(1);
     expect(second.calls()).toBe(1);
-    const state = globalCircuitBreaker.getState("p1/m1");
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"));
     expect(state?.credentialFailures).toBe(1);
     expect(state?.lastCredentialStatus).toBe(401);
     expect(state?.consecutiveFailures).toBe(0);
@@ -354,7 +362,7 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     await expectServed(front, response);
     expect(first.calls()).toBe(1);
     expect(second.calls()).toBe(1);
-    const state = globalCircuitBreaker.getState("p1/m1");
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"));
     expect(state?.lastStatus).toBe(429);
     expect(state?.consecutiveFailures).toBe(1);
     const remaining = (state?.cooldownUntil ?? 0) - Date.now();
@@ -408,7 +416,7 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
 
     const response = await front.post(proxyPort);
     await expectServed(front, response);
-    const state = globalCircuitBreaker.getState("p1/m1");
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"));
     expect(state?.lastStatus).toBe(429);
     const remaining = (state?.cooldownUntil ?? 0) - Date.now();
     expect(remaining).toBeGreaterThan(0);
@@ -429,7 +437,7 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
 
     const response = await front.post(proxyPort);
     await expectServed(front, response);
-    const state = globalCircuitBreaker.getState("p1/m1");
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"));
     expect(state?.lastStatus).toBe(402);
     expect(state?.consecutiveFailures).toBe(1);
     const remaining = (state?.cooldownUntil ?? 0) - Date.now();
@@ -450,7 +458,7 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     await expectServed(front, response);
     expect(first.calls()).toBe(1);
     expect(second.calls()).toBe(1);
-    const state = globalCircuitBreaker.getState("p1/m1");
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"));
     expect(state?.lastStatus).toBe(503);
     expect(state?.consecutiveFailures).toBe(1);
   });

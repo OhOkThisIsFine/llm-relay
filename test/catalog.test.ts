@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ModelCatalog } from "../src/catalog.js";
 import type { ProviderConfig } from "../src/config.js";
+import { candidateEnvNames } from "../src/authEnv.js";
 
 const dir = mkdtempSync(join(tmpdir(), "rp-cat-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -19,6 +20,32 @@ function throwFetch(): typeof fetch {
 }
 
 describe("ModelCatalog", () => {
+  it("uses a provider alias and emits exactly one Bearer prefix", async () => {
+    const declared = "CATALOG_ALIAS_DECLARED_KEY";
+    const envKeys = candidateEnvNames("gemini", declared);
+    const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    try {
+      for (const key of envKeys) delete process.env[key];
+      process.env.GOOGLEAI_API_KEY = "Bearer catalog-alias";
+      let seen: Headers | undefined;
+      const fetchFn = (async (_url: string, init?: RequestInit) => {
+        seen = new Headers(init?.headers);
+        return new Response(JSON.stringify({ data: [{ id: "alias-model" }] }), { status: 200 });
+      }) as unknown as typeof fetch;
+      const c = new ModelCatalog({ cachePath: null });
+      const models = await c.list("gemini", {
+        base: "https://prov.test/v1", kind: "openai", authEnv: declared,
+        authHeader: "authorization", timeoutMs: 5000,
+      }, { fetchFn });
+      expect(models).toEqual(["alias-model"]);
+      expect(seen?.get("authorization")).toBe("Bearer catalog-alias");
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
   it("fetches, parses {data:[{id}]}, and sorts", async () => {
     const c = new ModelCatalog({ cachePath: null });
     const models = await c.list("p", provider, { fetchFn: okFetch(["z-model", "a-model"]) });

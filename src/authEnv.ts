@@ -71,6 +71,12 @@ export interface AuthEnvResolution {
   candidates: string[];
 }
 
+export interface CredentialResolution {
+  state: CredentialState;
+  value: string | undefined;
+  envName: string | undefined;
+}
+
 /**
  * Whether a credential value counts as PRESENT. The single predicate — three
  * call sites used to disagree (config.ts tested Boolean() with no trim while
@@ -103,26 +109,24 @@ export function resolveTargetAuthEnv(
   providerName?: string,
 ): string | undefined {
   if (!declaredAuthEnv) return undefined;
-  if (keyIsPresent(env[declaredAuthEnv])) return declaredAuthEnv;
-
-  let provider = providerName?.toLowerCase();
-  if (!provider) {
-    for (const [p, aliases] of Object.entries(PROVIDER_ENV_ALIASES)) {
-      if (aliases.includes(declaredAuthEnv)) {
-        provider = p;
-        break;
-      }
+  // A configured provider can be named differently from the provider family
+  // implied by its declared env name (for example, `claude` declaring
+  // `ANTHROPIC_API_KEY`). Search the declared family first so that a curated
+  // alias is not hidden by the explicit provider name's derived candidates.
+  let declaredFamily: string | undefined;
+  for (const [provider, aliases] of Object.entries(PROVIDER_ENV_ALIASES)) {
+    if (aliases.includes(declaredAuthEnv)) {
+      declaredFamily = provider;
+      break;
     }
   }
-
-  if (provider) {
-    const res = resolveAuthEnv(provider, declaredAuthEnv, env);
-    if (res.name && keyIsPresent(env[res.name])) {
-      return res.name;
-    }
-  }
-
-  return declaredAuthEnv;
+  const candidates = [
+    declaredAuthEnv,
+    ...(declaredFamily ? PROVIDER_ENV_ALIASES[declaredFamily] ?? [] : []),
+    ...(providerName ? candidateEnvNames(providerName).filter((name) => name !== declaredAuthEnv) : []),
+  ];
+  const found = [...new Set(candidates)].find((name) => keyIsPresent(env[name]));
+  return found ?? declaredAuthEnv;
 }
 
 export function credentialState(
@@ -130,9 +134,7 @@ export function credentialState(
   env: NodeJS.ProcessEnv = process.env,
   providerName?: string,
 ): CredentialState {
-  if (!declaredAuthEnv) return "not-declared";
-  const activeName = resolveTargetAuthEnv(declaredAuthEnv, env, providerName);
-  return activeName && keyIsPresent(env[activeName]) ? "declared-present" : "declared-missing";
+  return resolveCredential(declaredAuthEnv, env, providerName).state;
 }
 
 export function readCredential(
@@ -140,10 +142,26 @@ export function readCredential(
   env: NodeJS.ProcessEnv = process.env,
   providerName?: string,
 ): string | undefined {
-  if (!declaredAuthEnv) return undefined;
-  const activeName = resolveTargetAuthEnv(declaredAuthEnv, env, providerName);
-  const raw = activeName ? env[activeName] : undefined;
-  return keyIsPresent(raw) ? raw!.trim() : undefined;
+  return resolveCredential(declaredAuthEnv, env, providerName).value;
+}
+
+export function resolveCredential(
+  declaredAuthEnv: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  providerName?: string,
+): CredentialResolution {
+  const normalized = declaredAuthEnv?.trim();
+  if (!normalized) {
+    return { state: "not-declared", value: undefined, envName: undefined };
+  }
+  const envName = resolveTargetAuthEnv(normalized, env, providerName);
+  const raw = envName ? env[envName] : undefined;
+  const value = keyIsPresent(raw) ? raw!.trim() : undefined;
+  return {
+    state: value ? "declared-present" : "declared-missing",
+    value,
+    envName,
+  };
 }
 
 /**

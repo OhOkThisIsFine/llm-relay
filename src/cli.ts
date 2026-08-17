@@ -16,6 +16,7 @@ import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
+import { makeCredentialId } from "./credential-id.js";
 import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
@@ -204,12 +205,14 @@ ${formatTextTable([
   ["llm-relay config <action> [<path>] [<value>]", "action: show|get|set|unset."],
   ["llm-relay models [-p <name>] [-r]", "List provider models."],
   ["llm-relay ping [-p <name>]", "Probe providers."],
-  ["llm-relay telemetry", "Print telemetry/quota JSON."],
+  ["llm-relay telemetry", "Print telemetry JSON."],
   ["llm-relay offload [status]", "Show current offload rules."],
   ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
   ["llm-relay candidates [-p <name>]", "Compare offload targets."],
   ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
-  ["llm-relay eligibility <accept|reject|propose> <n>", "Review an unrecognized refusal; only accept makes it bind."],
+  ["llm-relay eligibility <propose|accept> <n> --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model."],
+  ["llm-relay eligibility ... --scope group --members <id,id,...> [--all-credentials]", "Groups default to the current credential slot; the flag explicitly widens them."],
+  ["eligibility scope breadth", "credential = current credential slot; provider = all credentials for that provider."],
   ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane; adapts to the calling host."],
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
   ["llm-relay help | --help | -h", "Show help."],
@@ -295,7 +298,7 @@ ${formatTextTable([
   ["GET /candidates", "Offload target data."],
   ["GET|POST /offload", "Read/set rules; accepts ?client=<name>."],
   ["GET|POST /dispatch", "Read/set next lane; POST {\"exhausted\":\"<lane>\"}."],
-  ["GET /telemetry", "Telemetry and quota."],
+  ["GET /telemetry", "Provider telemetry."],
   ["GET /ping", "Run health probe."],
   ["GET /health", "Provider health."],
 ], "  ")}
@@ -626,9 +629,7 @@ export async function runPingCommand(): Promise<void> {
       }
     }
 
-    const quota = pingLoop.getProviderQuota(name);
-    const quotaStr = quota !== null ? `${quota}% remaining` : "N/A";
-    process.stdout.write(`\nProvider: ${name} (quota: ${quotaStr})\n`);
+  process.stdout.write(`\nProvider: ${name}\n`);
     if (models.length === 0) {
       process.stdout.write("  (no models listed or reachable)\n");
       continue;
@@ -638,9 +639,13 @@ export async function runPingCommand(): Promise<void> {
       const summary = pingLoop.getModelSummary(name, mId);
       const avgStr = summary.avgMs >= 0 ? `${summary.avgMs}ms` : "pending";
       const p95Str = summary.p95Ms >= 0 ? `${summary.p95Ms}ms` : "pending";
-      const scoreStr = summary.stabilityScore >= 0 ? `${summary.stabilityScore}/100` : "N/A";
-      process.stdout.write(
-        `  ${fitCell(mId, 45)} | verdict: ${fitCell(summary.verdict, 10)} | avg: ${fitCell(avgStr, 8)} | p95: ${fitCell(p95Str, 8)} | stability: ${scoreStr}\n`,
+    const scoreStr = summary.stabilityScore >= 0 ? `${summary.stabilityScore}/100` : "N/A";
+      const quota = formatCandidateQuota(
+        pingLoop.getQuotaObservations(makeCredentialId(name), mId),
+        Date.now(),
+      );
+    process.stdout.write(
+      `  ${fitCell(mId, 45)} | verdict: ${fitCell(summary.verdict, 10)} | avg: ${fitCell(avgStr, 8)} | p95: ${fitCell(p95Str, 8)} | stability: ${scoreStr} | quota: ${quota}\n`,
       );
     }
   }
@@ -1410,6 +1415,27 @@ function strengthTag(c: Candidate): string {
  * commits with `accept`. `reject` is the equally valid answer "this message means nothing durable"
  * — a policy refusal or a transient fault should teach the router nothing at all.
  */
+function eligibilityScopeArgs(scope: ScopeTemplate): string {
+  if (scope.kind !== "group") return scope.kind;
+  return `group --members ${quoteArg(scope.members.join(","))}${scope.credential === "all" ? " --all-credentials" : ""}`;
+}
+
+function eligibilityResetArgs(reset: ResetRule | undefined): string {
+  if (!reset) return "";
+  return reset.kind === "field"
+    ? ` --reset-field ${quoteArg(reset.field)}`
+    : ` --reset-ms ${reset.ms}`;
+}
+
+function eligibilityAcceptCommand(
+  index: number,
+  cls: FactKind,
+  scope: ScopeTemplate,
+  reset: ResetRule | undefined,
+): string {
+  return `llm-relay eligibility accept ${index} --class ${cls} --scope ${eligibilityScopeArgs(scope)}${eligibilityResetArgs(reset)}`;
+}
+
 export function runEligibility(sub: string | undefined, arg: string | undefined): void {
   const pending = pendingRefusals();
   const action = sub ?? "status";
@@ -1450,14 +1476,20 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       process.exit(1);
       return;
     }
-    if (!["deployment", "provider", "group", "model"].includes(scopeName)) {
-      process.stderr.write(`llm-relay eligibility: --scope expects deployment | provider | group | model\n`);
+    const allCredentials = hasFlag("--all-credentials");
+    if (!["attempt", "deployment", "credential", "provider", "group", "model"].includes(scopeName)) {
+      process.stderr.write(`llm-relay eligibility: --scope expects attempt | group | deployment | credential | provider | model\n`);
+      process.exit(1);
+      return;
+    }
+    if (allCredentials && scopeName !== "group") {
+      process.stderr.write("llm-relay eligibility: --all-credentials is valid only with --scope group\n");
       process.exit(1);
       return;
     }
     const scope: ScopeTemplate = scopeName === "group"
-      ? { kind: "group", members }
-      : { kind: scopeName as "deployment" | "provider" | "model" };
+      ? { kind: "group", members, credential: allCredentials ? "all" : "attempt" }
+      : { kind: scopeName as "attempt" | "deployment" | "credential" | "provider" | "model" };
     // WHEN it clears, which is the third thing a reviewer knows. `--reset-field` names a JSON key
     // in the message itself (Google's RetryInfo uses `retryDelay`) and is preferred, because it is
     // read from the real response every time; `--reset-ms` is the reviewer asserting a window the
@@ -1475,11 +1507,15 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       }
       reset = { kind: "fixed", ms };
     }
-    const shown = scopeName === "group" ? `group of ${members.length}` : scopeName;
+    const shown = scopeName === "group"
+      ? `group of ${members.length} (${allCredentials ? "all credentials" : "current credential slot"})`
+      : scopeName;
     if (action === "propose") {
       proposeInterpretation(entry.signature, { class: cls, scope, rationale, ...(reset ? { reset } : {}) });
       flushInterpretations();
-      process.stdout.write(`proposed ${cls} (${shown}) — not yet binding. Commit with: llm-relay eligibility accept ${idx}\n`);
+      process.stdout.write(
+        `proposed ${cls} (${shown}) — not yet binding. Commit with: ${eligibilityAcceptCommand(idx, cls, scope, reset)}\n`,
+      );
       return;
     }
     acceptInterpretation(entry.signature, { override: { class: cls, scope, ...(reset ? { reset } : {}) } });
@@ -1508,6 +1544,7 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     if (o.scope.kind === "group") {
       // The membership is the whole reason a group verdict is reviewable — show it, always.
       process.stdout.write(`      covers: ${o.scope.members.join(", ")}\n`);
+      process.stdout.write(`      credentials: ${o.scope.credentialId ? "current credential slot" : "all credentials for this provider"}\n`);
     }
   }
 
@@ -1523,10 +1560,16 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       // and produced an accept command that could not run. A review UI that emits an invalid
       // command is worse than none: it teaches the reviewer the tool is broken.
       const sc = p.proposed.scope;
-      const scopeArgs = sc.kind === "group" ? `group --members ${sc.members.join(",")}` : sc.kind;
-      const scopeLabel = sc.kind === "group" ? `group of ${sc.members.length}` : sc.kind;
+      const scopeLabel = sc.kind === "group"
+        ? `group of ${sc.members.length} (${sc.credential === "all" ? "all credentials" : "current credential slot"})`
+        : sc.kind;
       process.stdout.write(`      proposed: ${p.proposed.class} [${scopeLabel}] — ${p.proposed.rationale}\n`);
-      process.stdout.write(`      accept with: llm-relay eligibility accept ${i + 1} --class ${p.proposed.class} --scope ${scopeArgs}\n`);
+      if (sc.kind === "group") {
+        process.stdout.write(`      covers: ${sc.members.join(", ")}\n`);
+      }
+      process.stdout.write(
+        `      accept with: ${eligibilityAcceptCommand(i + 1, p.proposed.class, sc, p.proposed.reset)}\n`,
+      );
     }
   });
   if (pending.length > 0) {
@@ -1534,12 +1577,12 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       `\n  These change NOTHING until accepted. To resolve one, research what that message means for\n` +
       `  that provider and model on this account, then:\n` +
       `    llm-relay eligibility propose <n> --class <not-servable|subscription-required|allowance-exhausted|credential-invalid|rate-limited> \\\n` +
-      `        --scope <deployment|provider|group|model> [--members id1,id2] --rationale "..."\n` +
+      `        --scope <attempt|group|deployment|credential|provider|model> [--members id1,id2] [--all-credentials] --rationale "..."\n` +
       `    llm-relay eligibility accept <n> --class <...> --scope <...>\n` +
       `    llm-relay eligibility reject <n>       # means nothing durable, and is remembered\n` +
-      `\n  Scope by what the message STATES, not by a pattern of failures: "provider" means one\n` +
-      `  observation covers every model behind that key, which is also what takes out a whole\n` +
-      `  provider if it is wrong.\n`,
+      `\n  Scope by what the message STATES, not by a pattern of failures: "credential" means the\n` +
+      `  current credential slot; "provider" means all credentials for that provider. Groups stay\n` +
+      `  on the current credential slot unless --all-credentials is stated explicitly.\n`,
     );
   }
   process.stdout.write("\n");
@@ -1586,7 +1629,6 @@ export async function runCandidates(): Promise<void> {
     // while the proxy had already measured it at 60+ seconds per call — which is the difference
     // between a pool that suits mechanical batch work and one that does not.
     "obs".padEnd(8) +
-    "quota".padEnd(7) +
     "breaker".padEnd(9) +
     "ctx";
   process.stdout.write(head + "\n" + "-".repeat(head.length) + "\n");
@@ -1624,7 +1666,6 @@ export async function runCandidates(): Promise<void> {
         (c.health?.verdict ?? "-").padEnd(10) +
         fmt(c.health?.p95Ms ?? null, "ms").padEnd(8) +
         obsLatency(c.observed).padEnd(8) +
-        fmt(c.quotaPercent, "%").padEnd(7) +
         breaker.padEnd(9) +
         // Provenance inline: "~" = another provider's figure for this model id. A NIM row must
         // never present OpenRouter's ceiling as its own.
@@ -1633,6 +1674,7 @@ export async function runCandidates(): Promise<void> {
         (live === "NO" ? "  ⚠UNLISTED" : "") +
         "\n",
     );
+    process.stdout.write(`  quota: ${formatCandidateQuota(c.quota, Date.now())}\n`);
   }
 
   const fuzzy = view.candidates.filter((c) => c.capabilityMatch?.match === "fuzzy");
@@ -1661,7 +1703,7 @@ export async function runCandidates(): Promise<void> {
   process.stdout.write(
     "\nColumns are independent — weigh them yourself. agentic/coding/BFCL/aider/arena are\n" +
       "capability from DIFFERENT leaderboards and they disagree; verdict/p95 are live behaviour;\n" +
-      "quota/breaker/$ are what it costs to use right now. A blank cell means NOT MEASURED.\n" +
+      "quota/breaker/$ are independent availability/cost signals. A blank cell means NOT MEASURED.\n" +
       `  p95 = synthetic probe loop; obs = mean of this proxy's OWN requests. Different samples,\n` +
       `        so they are not merged — and a high "obs" on a top-ranked member is worth seeing\n` +
       `        before pointing bulk work at that pool.\n` +
@@ -1689,6 +1731,17 @@ export async function runCandidates(): Promise<void> {
   process.stdout.write(
     `Full detail (every source's raw score, jitter, observed traffic): curl 127.0.0.1:${cfg.port}/candidates\n`,
   );
+}
+
+/** Render observations without collapsing their axes into a misleading percentage. */
+export function formatCandidateQuota(quota: readonly Candidate["quota"][number][], now: number): string {
+  if (quota.length === 0) return "-";
+  return quota.map((observation) => {
+    const ageMs = Math.max(0, now - observation.observedAt);
+    const age = ageMs < 1_000 ? "0s" : `${Math.floor(ageMs / 1_000)}s`;
+    const period = observation.period === "unknown" ? "-" : observation.period;
+    return `${observation.axis}/${period} ${observation.remaining}/${observation.limit} ${observation.basis} age ${age}`;
+  }).join("; ");
 }
 
 function configSourcePath(cfg: Config): string {

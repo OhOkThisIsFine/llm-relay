@@ -1,13 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { makeCredentialId } from "../src/credential-id.js";
 import {
   allFacts,
-  clearFacts,
-  cooldownUntil,
-  factsFor,
-  isCostBlocked,
+  clearFacts as clearFactsV2,
+  cooldownUntil as cooldownUntilV2,
+  factsFor as factsForV2,
+  isCostBlocked as isCostBlockedV2,
+  keyOf,
   recordFact,
   resetFacts,
   FACT_TTL_MS,
@@ -17,7 +19,7 @@ import {
   applyResetRule,
   flushInterpretations,
   interpretRefusal,
-  materializeScope,
+  materializeScope as materializeScopeV2,
   normalizeRefusalMessage,
   parseStatedResetMs,
   pendingRefusals,
@@ -28,6 +30,202 @@ import {
   resetInterpretations,
   IGNORED_TTL_MS,
 } from "../src/refusal-interpretation.js";
+
+// Legacy single-slot scenarios remain useful coverage. Their former provider/model calls now
+// explicitly resolve the implicit default credential; v2-specific cases below call the direct API.
+const defaultCredential = (provider: string) => makeCredentialId(provider);
+const factsFor = (provider: string, model: string | null | undefined, opts?: { path?: string; now?: number }) =>
+  factsForV2(provider, defaultCredential(provider), model, opts);
+const isCostBlocked = (provider: string, model: string | null | undefined, opts?: { path?: string; now?: number }) =>
+  isCostBlockedV2(provider, defaultCredential(provider), model, opts);
+const cooldownUntil = (provider: string, model: string | null | undefined, opts?: { path?: string; now?: number }) =>
+  cooldownUntilV2(provider, defaultCredential(provider), model, opts);
+const clearFacts = (provider: string, model: string | null | undefined, opts?: { path?: string }) =>
+  clearFactsV2(provider, defaultCredential(provider), model, opts);
+const materializeScope = (
+  template: Parameters<typeof materializeScopeV2>[0],
+  provider: string,
+  model: string,
+) => materializeScopeV2(template, provider, defaultCredential(provider), model);
+
+describe("credential-scoped v2 persistence", () => {
+  const personal = makeCredentialId("p", "personal");
+  const work = makeCredentialId("p", "work");
+
+  it("treats v1 persistence as zero facts rather than migrating a guessed default", () => {
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      facts: {
+        "p:p": { kind: "credential-invalid", scope: { kind: "provider", provider: "p" }, at: 1 },
+        "d:p/m": { kind: "not-servable", scope: { kind: "deployment", provider: "p", model: "m" }, at: 1 },
+        "g:p:m": { kind: "subscription-required", scope: { kind: "group", provider: "p", members: ["m"] }, at: 1 },
+        "m:m": { kind: "not-servable", scope: { kind: "model", model: "m" }, at: 1 },
+      },
+    }));
+    resetFacts();
+    expect(factsForV2("p", personal, "m", { path, now: 2 })).toEqual([]);
+    expect(cooldownUntilV2("p", personal, "m", { path, now: 2 })).toBeNull();
+  });
+
+  it("drops malformed v2 rows independently, including forged credential/provider agreement", () => {
+    const valid = { kind: "credential-invalid" as const, scope: { kind: "credential" as const, provider: "p", credentialId: personal }, at: 1 };
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      facts: {
+        [keyOf(valid.scope)]: valid,
+        "c:wrong-key": { ...valid, scope: { ...valid.scope, credentialId: work } },
+        "d:p/m": { kind: "bogus", scope: { kind: "deployment", provider: "p", model: "m" }, at: 1 },
+        "c:other#default": { ...valid, scope: { ...valid.scope, credentialId: makeCredentialId("other") } },
+        [`a:${personal}/attempt`]: { kind: "not-servable", scope: { kind: "attempt", provider: "p", credentialId: personal, model: "attempt", extra: true }, at: 1 },
+        [`g:c:${personal}/group`]: { kind: "not-servable", scope: { kind: "group", provider: "p", credentialId: personal, members: ["group"], extra: true }, at: 1 },
+        "d:p/deployment": { kind: "not-servable", scope: { kind: "deployment", provider: "p", model: "deployment", credentialId: personal }, at: 1 },
+        [`c:${work}`]: { kind: "credential-invalid", scope: { kind: "credential", provider: "p", credentialId: work, model: "wrong" }, at: 1 },
+        "p:p": { kind: "not-servable", scope: { kind: "provider", provider: "p", credentialId: personal }, at: 1 },
+        "m:m": { kind: "not-servable", scope: { kind: "model", model: "m", provider: "p", credentialId: personal }, at: 1 },
+      },
+    }));
+    resetFacts();
+    expect(factsForV2("p", personal, "m", { path, now: 2 })).toHaveLength(1);
+    expect(allFacts({ path, now: 2 })).toHaveLength(1);
+  });
+
+  it("orders all six scope kinds attempt through model", () => {
+    recordFact("not-servable", { kind: "model", model: "m" }, { path });
+    recordFact("subscription-required", { kind: "provider", provider: "p" }, { path });
+    recordFact("allowance-exhausted", { kind: "credential", provider: "p", credentialId: personal }, { path });
+    recordFact("credential-invalid", { kind: "deployment", provider: "p", model: "m" }, { path });
+    recordFact("rate-limited", { kind: "group", provider: "p", credentialId: personal, members: ["m"] }, { path });
+    recordFact("context-limit", { kind: "attempt", provider: "p", credentialId: personal, model: "m" }, { path, value: 8_192 });
+    expect(factsForV2("p", personal, "m", { path }).map((fact) => fact.scope.kind))
+      .toEqual(["attempt", "group", "deployment", "credential", "provider", "model"]);
+  });
+
+  it("keeps personal and work credentials isolated and null fail-closed", () => {
+    recordFact("credential-invalid", { kind: "credential", provider: "p", credentialId: personal }, { path });
+    recordFact("rate-limited", { kind: "group", provider: "p", credentialId: personal, members: ["m"] }, { path });
+    recordFact("not-servable", { kind: "attempt", provider: "p", credentialId: personal, model: "m" }, { path });
+    expect(factsForV2("p", work, "m", { path })).toEqual([]);
+    expect(factsForV2("p", null, "m", { path })).toEqual([]);
+  });
+
+  it("makes group widening explicit: credential-bound and all-credential groups differ", () => {
+    recordFact("subscription-required", { kind: "group", provider: "p", credentialId: personal, members: ["bound"] }, { path });
+    recordFact("subscription-required", { kind: "group", provider: "p", members: ["all"] }, { path });
+    expect(isCostBlockedV2("p", personal, "bound", { path })).toBe(true);
+    expect(isCostBlockedV2("p", work, "bound", { path })).toBe(false);
+    expect(isCostBlockedV2("p", null, "all", { path })).toBe(true);
+  });
+
+  it("clears conditions that cover the exact cell but never a context measurement", () => {
+    recordFact("credential-invalid", { kind: "credential", provider: "p", credentialId: personal }, { path });
+    recordFact("credential-invalid", { kind: "attempt", provider: "p", credentialId: personal, model: "m" }, { path });
+    recordFact("context-limit", { kind: "attempt", provider: "p", credentialId: personal, model: "m" }, { path, value: 4_096 });
+    expect(clearFactsV2("p", personal, "m", { path })).toEqual(["credential-invalid"]);
+    expect(factsForV2("p", personal, "m", { path }).map((fact) => fact.kind)).toEqual(["context-limit"]);
+  });
+
+  it("reports a breaker-clearing signal only for credential-scoped conditions", () => {
+    recordFact("credential-invalid", { kind: "attempt", provider: "p", credentialId: personal, model: "m" }, { path });
+    expect(clearFactsV2("p", personal, "m", { path })).toEqual([]);
+    recordFact("credential-invalid", { kind: "credential", provider: "p", credentialId: personal }, { path });
+    expect(clearFactsV2("p", personal, "m", { path })).toEqual(["credential-invalid"]);
+  });
+
+  it("materializes new templates with the attempt credential and explicit all widening", () => {
+    expect(materializeScopeV2({ kind: "attempt" }, "p", personal, "m"))
+      .toEqual({ kind: "attempt", provider: "p", credentialId: personal, model: "m" });
+    expect(materializeScopeV2({ kind: "credential" }, "p", personal, "m"))
+      .toEqual({ kind: "credential", provider: "p", credentialId: personal });
+    expect(materializeScopeV2({ kind: "group", credential: "attempt", members: ["other"] }, "p", personal, "m"))
+      .toEqual({ kind: "group", provider: "p", credentialId: personal, members: ["other", "m"] });
+    expect(materializeScopeV2({ kind: "group", credential: "all", members: ["m"] }, "p", personal, "m"))
+      .toEqual({ kind: "group", provider: "p", members: ["m"] });
+  });
+
+  it("requeues accepted v1 provider interpretations as nonbinding pending review", () => {
+    const signature = "p|m|403|unfamiliar refusal";
+    writeFileSync(interpPath, JSON.stringify({
+      version: 1,
+      confirmed: {
+        [signature]: { class: "credential-invalid", scope: { kind: "provider" }, source: "researched", acceptedAt: 1 },
+      },
+      unknown: {},
+      ignored: {},
+    }));
+    resetInterpretations();
+    expect(interpretRefusal("p", "m", 403, "unfamiliar refusal", { path: interpPath })).toBeNull();
+    expect(pendingRefusals({ path: interpPath }).map((entry) => entry.signature)).toEqual([signature]);
+  });
+
+  it("drops v2 unknown rows whose fields do not exactly match their storage signature", () => {
+    const signature = "p|m|403|known unknown";
+    writeFileSync(interpPath, JSON.stringify({
+      version: 2,
+      confirmed: {},
+      ignored: {},
+      unknown: {
+        [signature]: {
+          provider: "other",
+          model: "m",
+          status: 403,
+          normalized: "known unknown",
+          sample: "known unknown",
+          count: 1,
+          firstSeen: 1,
+          lastSeen: 1,
+        },
+      },
+    }));
+    resetInterpretations();
+    expect(pendingRefusals({ path: interpPath })).toEqual([]);
+  });
+
+  it("accepts only exact v1 and v2 template shapes", () => {
+    const v1Deployment = "p|m|403|legacy deployment";
+    const v1Extra = "p|m|403|legacy extra";
+    writeFileSync(interpPath, JSON.stringify({
+      version: 1,
+      confirmed: {
+        [v1Deployment]: { class: "not-servable", scope: { kind: "deployment" }, source: "researched", acceptedAt: 1 },
+        [v1Extra]: { class: "not-servable", scope: { kind: "deployment", model: "m" }, source: "researched", acceptedAt: 1 },
+      },
+      unknown: {},
+      ignored: {},
+    }));
+    resetInterpretations();
+    expect(interpretRefusal("p", "m", 403, "legacy deployment", { path: interpPath })?.scope).toEqual({ kind: "deployment" });
+    expect(interpretRefusal("p", "m", 403, "legacy extra", { path: interpPath })).toBeNull();
+
+    const v2Attempt = "p|m|403|new attempt";
+    const v2Extra = "p|m|403|new extra";
+    writeFileSync(interpPath, JSON.stringify({
+      version: 2,
+      confirmed: {
+        [v2Attempt]: { class: "not-servable", scope: { kind: "attempt" }, source: "researched", acceptedAt: 1 },
+        [v2Extra]: { class: "not-servable", scope: { kind: "attempt", model: "m" }, source: "researched", acceptedAt: 1 },
+      },
+      unknown: {},
+      ignored: {},
+    }));
+    resetInterpretations();
+    expect(interpretRefusal("p", "m", 403, "new attempt", { path: interpPath })?.scope).toEqual({ kind: "attempt" });
+    expect(interpretRefusal("p", "m", 403, "new extra", { path: interpPath })).toBeNull();
+  });
+
+  it("uses structured quota dimensions without widening unknown or model-bound evidence", () => {
+    const structured = (quotaId: string) => JSON.stringify({
+      error: { details: [{ "@type": "type.googleapis.com/google.rpc.QuotaFailure", quotaId }] },
+    });
+    expect(interpretRefusal("p", "m", 429, structured("GenerateRequestsPerDayPerProjectPerModel"), { path: interpPath })?.scope)
+      .toEqual({ kind: "attempt" });
+    expect(interpretRefusal("p", "m", 429, structured("GenerateRequestsPerDayPerProject"), { path: interpPath })?.scope)
+      .toEqual({ kind: "credential" });
+    expect(interpretRefusal("p", "m", 429, structured("GenerateRequestsPerMinutePerKey"), { path: interpPath }))
+      .toMatchObject({ class: "rate-limited", scope: { kind: "credential" } });
+    expect(interpretRefusal("p", "m", 429, structured("GenerateRequestsPerDayPerUnrecognizedDimension"), { path: interpPath })?.scope)
+      .toEqual({ kind: "attempt" });
+  });
+});
 
 let dir: string;
 let path: string;
@@ -68,7 +266,7 @@ describe("seeds classify the refusals measured on this machine, at the right sco
   it("reads a stated credit balance as TEMPORAL and scoped to the whole account", () => {
     const v = interpretRefusal("huggingface", "deepseek-ai/DeepSeek-V4-Pro", 402, REAL_REFUSALS.hfCredits, { path: interpPath });
     expect(v?.class).toBe("allowance-exhausted");
-    expect(v?.scope).toEqual({ kind: "provider" });
+    expect(v?.scope).toEqual({ kind: "credential" });
   });
 
   it("reads stated plan gating as a COST fact scoped to the one deployment", () => {
@@ -77,7 +275,7 @@ describe("seeds classify the refusals measured on this machine, at the right sco
       // Deployment, NOT provider: the credential works fine for that provider's other models, so
       // blocking the provider would take out members that serve.
       expect(v?.class).toBe("subscription-required");
-      expect(v?.scope).toEqual({ kind: "deployment" });
+      expect(v?.scope).toEqual({ kind: "attempt" });
     }
   });
 
@@ -87,7 +285,7 @@ describe("seeds classify the refusals measured on this machine, at the right sco
     // NIM's "Not found for account '<id>'" names an account but is about the serving function.
     const v = interpretRefusal("nim", "moonshotai/kimi-k2.6", 404, REAL_REFUSALS.nimGone, { path: interpPath });
     expect(v?.class).toBe("not-servable");
-    expect(v?.scope).toEqual({ kind: "deployment" });
+    expect(v?.scope).toEqual({ kind: "attempt" });
   });
 
   it("reads a STATED bad credential as a provider-wide fact", () => {
@@ -96,7 +294,7 @@ describe("seeds classify the refusals measured on this machine, at the right sco
     // independently discover the same 401, each on its own expiry clock.
     const v = interpretRefusal("groq", "some-model", 401, REAL_REFUSALS.badKey, { path: interpPath });
     expect(v?.class).toBe("credential-invalid");
-    expect(v?.scope).toEqual({ kind: "provider" });
+    expect(v?.scope).toEqual({ kind: "credential" });
   });
 
   it("learns NOTHING from a bare 401/403, which is the whole point", () => {
@@ -128,7 +326,7 @@ describe("a quota is not a rate limit", () => {
     // one as the other re-probes a spent weekly quota every two minutes for days.
     const v = interpretRefusal("gemini", "models/gemini-3.6-flash", 429, geminiQuota, { path: interpPath });
     expect(v?.class).toBe("allowance-exhausted");
-    expect(v?.scope).toEqual({ kind: "provider" });
+    expect(v?.scope).toEqual({ kind: "credential" });
   });
 
   it("reads the reset Gemini states in the body, which no header carries", () => {
@@ -212,7 +410,7 @@ describe("a stated ACCOUNT-level rate limit, and only that", () => {
     const body = `{"error":{"message":"Rate limit reached for your organization. Please try again later."}}`;
     const v = interpretRefusal("groq", "m", 429, body, { path: interpPath });
     expect(v?.class).toBe("rate-limited");
-    expect(v?.scope).toEqual({ kind: "provider" });
+    expect(v?.scope).toEqual({ kind: "credential" });
   });
 
   it("a new seed retroactively clears anything it already queued", () => {
@@ -252,7 +450,7 @@ describe("clearing reports what it disproved", () => {
     recordFact("not-servable", { kind: "deployment", provider: "p", model: "gone" }, { path });
     // Only the provider-scoped kinds come back: they are the ones whose per-deployment 401s on the
     // breaker are now stale evidence about a problem that no longer exists.
-    expect(clearFacts("p", "gone", { path })).toEqual(["credential-invalid"]);
+    expect(clearFacts("p", "gone", { path })).toEqual([]);
   });
 
   it("reports nothing when only deployment-scoped facts were cleared", () => {
@@ -298,7 +496,7 @@ describe("scope decides blast radius", () => {
   });
 
   it("materializes a group template so it always contains the model that proved it", () => {
-    const scope = materializeScope({ kind: "group", members: ["a"] }, "p", "b");
+    const scope = materializeScope({ kind: "group", credential: "all", members: ["a"] }, "p", "b");
     expect(scope).toEqual({ kind: "group", provider: "p", members: ["a", "b"] });
   });
 });
@@ -446,9 +644,9 @@ describe("the review gate keeps researched verdicts out of the request path", ()
   it("can accept a GROUP verdict, and it carries the reviewed membership", () => {
     recordUnknownRefusal("p", "pro-1", 403, body, { path: interpPath });
     const sig = pendingRefusals({ path: interpPath })[0]!.signature;
-    acceptInterpretation(sig, { path: interpPath, override: { class: "subscription-required", scope: { kind: "group", members: ["pro-1", "pro-2"] } } });
+    acceptInterpretation(sig, { path: interpPath, override: { class: "subscription-required", scope: { kind: "group", credential: "attempt", members: ["pro-1", "pro-2"] } } });
     const v = interpretRefusal("p", "pro-1", 403, body, { path: interpPath });
-    expect(v?.scope).toEqual({ kind: "group", members: ["pro-1", "pro-2"] });
+    expect(v?.scope).toEqual({ kind: "group", credential: "attempt", members: ["pro-1", "pro-2"] });
   });
 
   it("rejecting means the message stays meaningless, not that it binds as harmless", () => {

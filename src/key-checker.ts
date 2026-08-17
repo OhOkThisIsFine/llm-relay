@@ -230,7 +230,7 @@ export async function validateProviderKeys(
     // as a blank line was truthy, slipped past this branch, and went to the wire as an
     // empty `x-api-key` / bare `Bearer` — reported back as a broken key rather than an
     // unset one.
-    const apiKey = readCredential(envVarName);
+    const apiKey = readCredential(envVarName, process.env, name);
 
     if (envVarName && !apiKey) {
       return {
@@ -364,7 +364,7 @@ export async function validateProviderKeys(
         () => ({
           provider: name,
           authEnv: p.authEnv,
-          hasEnvKey: keyIsPresent(readCredential(p.authEnv)),
+          hasEnvKey: keyIsPresent(readCredential(p.authEnv, process.env, name)),
           status: "unreachable" as const,
           message: `No answer within ${budgetMs}ms`,
         }),

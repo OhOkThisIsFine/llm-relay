@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   recordProbeResult,
   loadPersistedSamples,
   loadTotals,
+  loadPersistedQuotaObservations,
   persistedModels,
   getModelsDueForProbe,
   loadProbeCache,
@@ -17,6 +18,10 @@ import { getVerdict, isPersistentlyDown, trailingFailures, getP95, type PingReco
 import { PingLoop } from "../src/ping/cadence.js";
 import { ModelCatalog } from "../src/catalog.js";
 import type { Config } from "../src/config.js";
+import { makeCredentialId } from "../src/credential-id.js";
+
+const noQuota = { quotaObservations: [] };
+const emptyConfig = { providers: {}, routing: { default: "x", tiers: {} } } as unknown as Config;
 
 /**
  * Long-term health metadata, and not disqualifying a model over a bad moment.
@@ -45,7 +50,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 describe("probe cache keeps a HISTORY, not one sample", () => {
   it("accumulates samples across probes", () => {
     for (const ms of [100, 200, 300]) {
-      recordProbeResult("p", "m", { code: "200", ms, quotaPercent: null }, { path: cachePath });
+      recordProbeResult("p", "m", { code: "200", ms, ...noQuota }, { path: cachePath });
     }
     const samples = loadPersistedSamples("p", "m", { path: cachePath });
     expect(samples.map((s) => s.ms)).toEqual([100, 200, 300]);
@@ -55,7 +60,7 @@ describe("probe cache keeps a HISTORY, not one sample", () => {
 
   it("bounds the window, dropping oldest first", () => {
     for (let i = 0; i < MAX_SAMPLES + 10; i++) {
-      recordProbeResult("p", "m", { code: "200", ms: i, quotaPercent: null }, { path: cachePath });
+      recordProbeResult("p", "m", { code: "200", ms: i, ...noQuota }, { path: cachePath });
     }
     const samples = loadPersistedSamples("p", "m", { path: cachePath });
     expect(samples).toHaveLength(MAX_SAMPLES);
@@ -67,7 +72,7 @@ describe("probe cache keeps a HISTORY, not one sample", () => {
     // The window says "lately"; totals say "ever". Without them, one bad afternoon inside the
     // window erases a model's whole record.
     for (let i = 0; i < MAX_SAMPLES + 5; i++) {
-      recordProbeResult("p", "m", { code: i < 2 ? "500" : "200", ms: 10, quotaPercent: null }, { path: cachePath });
+      recordProbeResult("p", "m", { code: i < 2 ? "500" : "200", ms: 10, ...noQuota }, { path: cachePath });
     }
     const t = loadTotals("p", "m", { path: cachePath })!;
     expect(t.probes).toBe(MAX_SAMPLES + 5);
@@ -77,16 +82,75 @@ describe("probe cache keeps a HISTORY, not one sample", () => {
   });
 
   it("enumerates every persisted model, which is what a restarting loop rehydrates", () => {
-    recordProbeResult("a", "m1", { code: "200", ms: 1, quotaPercent: null }, { path: cachePath });
-    recordProbeResult("b", "m2", { code: "200", ms: 1, quotaPercent: null }, { path: cachePath });
+    recordProbeResult("a", "m1", { code: "200", ms: 1, ...noQuota }, { path: cachePath });
+    recordProbeResult("b", "m2", { code: "200", ms: 1, ...noQuota }, { path: cachePath });
     expect(persistedModels({ path: cachePath })).toEqual(
       expect.arrayContaining([{ provider: "a", model: "m1" }, { provider: "b", model: "m2" }]),
     );
   });
 
   it("marks a v1 single-sample entry as due, so old caches refill instead of needing migration", () => {
-    recordProbeResult("p", "m", { code: "200", ms: 5, quotaPercent: null }, { path: cachePath, probeVersion: 1 });
+    recordProbeResult("p", "m", { code: "200", ms: 5, ...noQuota }, { path: cachePath, probeVersion: 1 });
     expect(getModelsDueForProbe("p", ["m"], { path: cachePath, probeVersion: CURRENT_PROBE_VERSION })).toContain("m");
+  });
+
+  it("ignores v2 scalar quota and makes the old entry due", () => {
+    writeFileSync(cachePath, JSON.stringify({
+      version: 2,
+      providers: {
+        p: {
+          models: {
+            m: {
+              modelId: "m",
+              status: "ok",
+              lastProbedAt: Date.now(),
+              probeVersion: 2,
+              ms: 5,
+              code: "200",
+              quotaPercent: 73,
+            },
+          },
+        },
+      },
+    }), "utf8");
+    loadProbeCache({ path: cachePath, reload: true });
+
+    expect(loadPersistedQuotaObservations("p", "m", { path: cachePath })).toEqual([]);
+    expect(getModelsDueForProbe("p", ["m"], { path: cachePath })).toEqual(["m"]);
+  });
+
+  it("persists and merges typed quota axes without a scalar", () => {
+    const requestsDay = [{
+      axis: "requests" as const,
+      period: "day" as const,
+      limit: 100,
+      remaining: 25,
+      resetsAt: null,
+      observedAt: 1,
+      basis: "provider-stated" as const,
+    }];
+    const tokensMinute = [{
+      axis: "tokens" as const,
+      period: "minute" as const,
+      limit: 1000,
+      remaining: 800,
+      resetsAt: null,
+      observedAt: 2,
+      basis: "provider-stated" as const,
+    }];
+    const now = Date.now();
+    recordProbeResult("p", "m", { code: "200", ms: 5, quotaObservations: requestsDay }, { path: cachePath, now });
+    recordProbeResult("p", "m", { code: "200", ms: 6, quotaObservations: tokensMinute }, { path: cachePath, now: now + 1 });
+
+    const persisted = loadPersistedQuotaObservations("p", "m", { path: cachePath });
+    expect(persisted).toEqual([...requestsDay, ...tokensMinute]);
+    expect(readFileSync(cachePath, "utf8")).not.toContain("quotaPercent");
+    // A current v3 record is still fresh for probe scheduling, but a restarted surface must be
+    // able to read its quota immediately rather than losing it until the 24h TTL expires.
+    expect(getModelsDueForProbe("p", ["m"], { path: cachePath, now: now + 1 })).toEqual([]);
+    const loop = new PingLoop(emptyConfig, new ModelCatalog({ cachePath: null }), { probeCachePath: cachePath });
+    expect(loop.getQuotaObservations(makeCredentialId("p"), "m")).toEqual(persisted);
+    expect(loop.getQuotaObservations(makeCredentialId("p", "work"), "m")).toEqual([]);
   });
 });
 
@@ -95,7 +159,7 @@ describe("PingLoop rehydrates from disk", () => {
 
   it("a fresh process sees the history previous runs recorded", () => {
     for (const ms of [50, 60, 70]) {
-      recordProbeResult("p", "m", { code: "200", ms, quotaPercent: null }, { path: cachePath });
+      recordProbeResult("p", "m", { code: "200", ms, ...noQuota }, { path: cachePath });
     }
     // A brand-new loop, as after a restart — nothing in memory.
     const loop = new PingLoop(cfg, new ModelCatalog({ cachePath: null }), { probeCachePath: cachePath });
@@ -110,16 +174,16 @@ describe("PingLoop rehydrates from disk", () => {
   });
 
   it("appends to the persisted history rather than starting a second one beside it", () => {
-    recordProbeResult("p", "m", { code: "200", ms: 10, quotaPercent: null }, { path: cachePath });
+    recordProbeResult("p", "m", { code: "200", ms: 10, ...noQuota }, { path: cachePath });
     const loop = new PingLoop(cfg, new ModelCatalog({ cachePath: null }), { probeCachePath: cachePath });
-    loop.recordPing("p", "m", { ms: 20, code: "200", quotaPercent: null } as never);
+    loop.recordPing("p", "m", { ms: 20, code: "200", quotaObservations: [] });
     expect(loop.getModelPings("p", "m").map((p) => p.ms)).toEqual([10, 20]);
   });
 
   it("reports lifetime uptime across every probe ever recorded", () => {
-    recordProbeResult("p", "m", { code: "500", ms: 10, quotaPercent: null }, { path: cachePath });
+    recordProbeResult("p", "m", { code: "500", ms: 10, ...noQuota }, { path: cachePath });
     for (let i = 0; i < 3; i++) {
-      recordProbeResult("p", "m", { code: "200", ms: 10, quotaPercent: null }, { path: cachePath });
+      recordProbeResult("p", "m", { code: "200", ms: 10, ...noQuota }, { path: cachePath });
     }
     const loop = new PingLoop(cfg, new ModelCatalog({ cachePath: null }), { probeCachePath: cachePath });
     expect(loop.getLifetimeUptimePct("p", "m")).toBe(75);
@@ -178,7 +242,7 @@ describe("the suite never writes the developer's real probe cache", () => {
     // Point the module's cached path back at the default before writing — earlier tests in this
     // file pass an explicit `path`, and that is remembered process-wide.
     loadProbeCache({ path: getProbeCachePath() });
-    recordProbeResult("vitest_probe", "m", { code: "200", ms: 1, quotaPercent: null });
+    recordProbeResult("vitest_probe", "m", { code: "200", ms: 1, ...noQuota });
 
     expect(loadProbeCache({ path: getProbeCachePath() }).providers.vitest_probe).toBeDefined();
 

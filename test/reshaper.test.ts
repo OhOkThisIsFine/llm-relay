@@ -1,8 +1,9 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { FailoverReshaper, HttpReshaper, ReshaperTransportError, parseCorrectedInputs, reconstruct, type ReshapeRequest } from "../src/reshaper.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
+import { candidateEnvNames } from "../src/authEnv.js";
 
 const tools = toolSchemaMap({
   tools: [{ name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }],
@@ -19,6 +20,21 @@ const CORRECTED = JSON.stringify({ inputs: { t1: { city: "Paris" } } });
 
 let server: Server;
 afterEach(() => server?.close());
+
+const reshaperEnvKeys = [...new Set([
+  ...candidateEnvNames("nim", "RP_RESHAPER_KEY"),
+  ...candidateEnvNames("gemini", "RESHAPER_ALIAS_DECLARED_KEY"),
+])];
+const savedReshaperEnv: Record<string, string | undefined> = {};
+beforeEach(() => {
+  for (const key of reshaperEnvKeys) { savedReshaperEnv[key] = process.env[key]; delete process.env[key]; }
+});
+afterEach(() => {
+  for (const key of reshaperEnvKeys) {
+    const value = savedReshaperEnv[key];
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+});
 
 function startServer(handler: (path: string, body: string) => { status?: number; body: string }): Promise<string> {
   return new Promise((resolve) => {
@@ -48,7 +64,21 @@ describe("HttpReshaper", () => {
     expect(hitPath).toBe("/chat/completions");
     expect(out.kind).toBe("message");
     if (out.kind === "message") expect(out.message.content[0]).toMatchObject({ type: "tool_use", input: { city: "Paris" } });
-    delete process.env.RP_RESHAPER_KEY;
+  });
+
+  it("resolves a provider-aware alias and emits exactly one Bearer prefix", async () => {
+    let seen: Headers | undefined;
+    const base = await startServer((_path, _body) => ({ body: JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }) }));
+    // The configured provider is gemini, while the credential is under its curated alias.
+    process.env.GOOGLEAI_API_KEY = "Bearer reshaper-alias";
+    const r = new HttpReshaper({ base, model: "m", kind: "openai", provider: "gemini", authEnv: "RESHAPER_ALIAS_DECLARED_KEY", authHeader: "authorization", timeoutMs: 5000 },
+      (async (_url: string, init?: RequestInit) => {
+        seen = new Headers(init?.headers);
+        return new Response(JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }), { status: 200 });
+      }) as unknown as typeof fetch,
+    );
+    await r.reshape(req);
+    expect(seen?.get("authorization")).toBe("Bearer reshaper-alias");
   });
 
   it("anthropic kind: calls /v1/messages and parses the corrected message", async () => {

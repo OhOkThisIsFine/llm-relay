@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { CircuitBreaker, type HeaderObservation } from "../src/circuit-breaker.js";
+import {
+  CircuitBreaker,
+  type HeaderObservation,
+} from "../src/circuit-breaker.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -7,14 +10,17 @@ import type {
   AttemptSucceeded,
   ProviderTargetIdentity,
 } from "../src/kernel/contracts.js";
+import type { QuotaObservation } from "../src/quota-observation.js";
 
 const targetA: ProviderTargetIdentity = {
   provider: "provider-a",
+  credentialId: "provider-a#default",
   model: "deployment-a",
   kind: "openai",
 };
 const targetB: ProviderTargetIdentity = {
   provider: "provider-a",
+  credentialId: "provider-a#default",
   model: "deployment-b",
   kind: "openai",
 };
@@ -35,6 +41,23 @@ function headers(
     elapsedMs: 7,
     observedAt: 1_007,
     ...overrides,
+  };
+}
+
+function quota(
+  axis: QuotaObservation["axis"],
+  period: QuotaObservation["period"],
+  remaining: number,
+  observedAt = 1_007,
+): QuotaObservation {
+  return {
+    axis,
+    period,
+    limit: 100,
+    remaining,
+    resetsAt: null,
+    observedAt,
+    basis: "provider-stated",
   };
 }
 
@@ -135,7 +158,8 @@ describe("CircuitBreaker attempt lifecycle", () => {
     const duplicate = breaker.completeAttempt(handle, success());
 
     expect(duplicate.ok).toBe(false);
-    if (!duplicate.ok) expect(duplicate.error.kind).toBe("duplicate-completion");
+    if (!duplicate.ok)
+      expect(duplicate.error.kind).toBe("duplicate-completion");
     expect(stateBytes(breaker)).toBe(before);
   });
 
@@ -153,7 +177,9 @@ describe("CircuitBreaker attempt lifecycle", () => {
 
     expect(staleResult.ok || staleResult.error.kind).toBe("stale-handle");
     expect(foreignResult.ok || foreignResult.error.kind).toBe("foreign-handle");
-    expect(crossTargetResult.ok || crossTargetResult.error.kind).toBe("cross-target");
+    expect(crossTargetResult.ok || crossTargetResult.error.kind).toBe(
+      "cross-target",
+    );
     expect(stateBytes(breaker)).toBe(before);
 
     // A rejected cross-target completion did not spend the valid local handle.
@@ -168,10 +194,16 @@ describe("CircuitBreaker attempt lifecycle", () => {
     expect(breaker.observeHeaders(local, headers()).ok).toBe(true);
     const before = stateBytes(breaker);
 
-    const duplicate = breaker.observeHeaders(local, headers(targetA, { status: 204 }));
+    const duplicate = breaker.observeHeaders(
+      local,
+      headers(targetA, { status: 204 }),
+    );
     const stale = breaker.observeHeaders({} as AttemptHandle, headers());
     const foreignResult = breaker.observeHeaders(foreign, headers());
-    const crossTarget = breaker.observeHeaders(begin(breaker), headers(targetB));
+    const crossTarget = breaker.observeHeaders(
+      begin(breaker),
+      headers(targetB),
+    );
 
     expect(duplicate.ok || duplicate.error.kind).toBe("duplicate-observation");
     expect(stale.ok || stale.error.kind).toBe("stale-handle");
@@ -183,7 +215,12 @@ describe("CircuitBreaker attempt lifecycle", () => {
   it("makes handles stale on reset", () => {
     const breaker = new CircuitBreaker();
     const oldHandle = begin(breaker);
-    breaker.recordOutcome(targetA, { ok: true, status: 200, elapsedMs: 1, at: 1 });
+    breaker.recordOutcome(targetA, {
+      ok: true,
+      status: 200,
+      elapsedMs: 1,
+      at: 1,
+    });
     breaker.reset();
     const before = stateBytes(breaker);
 
@@ -224,13 +261,17 @@ describe("CircuitBreaker attempt lifecycle", () => {
     expect(JSON.stringify(breaker.getState(targetB))).toBe(otherBefore);
   });
 
-  it("preserves terminal latency, Retry-After, header quota, and bounded ping history", () => {
+  it("preserves terminal latency, Retry-After, typed header quota, and bounded ping history", () => {
     const breaker = new CircuitBreaker();
     const limited = begin(breaker);
     expect(
       breaker.observeHeaders(
         limited,
-        headers(targetA, { status: 429, quotaPercent: 3, retryAfterMs: 20_000 }),
+        headers(targetA, {
+          status: 429,
+          quotaObservations: [quota("requests", "minute", 3)],
+          retryAfterMs: 20_000,
+        }),
       ).ok,
     ).toBe(true);
     expect(
@@ -244,7 +285,9 @@ describe("CircuitBreaker attempt lifecycle", () => {
       ).ok,
     ).toBe(true);
     expect(breaker.getState(targetA)?.cooldownUntil).toBe(30_000);
-    expect(breaker.getState(targetA)?.quotaPercent).toBe(3);
+    expect(breaker.getState(targetA)?.quotaObservations).toEqual([
+      quota("requests", "minute", 3),
+    ]);
     expect(breaker.getState(targetA)?.pings[0]).toEqual({
       code: "429",
       ms: 123,
@@ -256,13 +299,118 @@ describe("CircuitBreaker attempt lifecycle", () => {
       expect(
         breaker.completeAttempt(
           handle,
-          success(targetA, { completedAt: 11_000 + index, elapsedMs: 200 + index }),
+          success(targetA, {
+            completedAt: 11_000 + index,
+            elapsedMs: 200 + index,
+          }),
         ).ok,
       ).toBe(true);
     }
     expect(breaker.getState(targetA)?.pings).toHaveLength(10);
     expect(breaker.getState(targetA)?.pings[0]?.ms).toBe(201);
     expect(breaker.getState(targetA)?.pings[9]?.ms).toBe(210);
+  });
+
+  it("commits header quota independently for success and health failure", () => {
+    const breaker = new CircuitBreaker();
+    const cases: Array<{ status: number; outcome: AttemptOutcome; observation: QuotaObservation }> = [
+      { status: 200, outcome: success(targetA), observation: quota("requests", "day", 60) },
+      { status: 429, outcome: failure(targetA, { status: 429 }), observation: quota("tokens", "minute", 30) },
+    ];
+    for (const entry of cases) {
+      const handle = begin(breaker);
+      expect(breaker.observeHeaders(handle, headers(targetA, {
+        status: entry.status,
+        quotaObservations: [entry.observation],
+      })).ok).toBe(true);
+      expect(breaker.completeAttempt(handle, entry.outcome).ok).toBe(true);
+    }
+    expect(breaker.getState(targetA)?.quotaObservations).toEqual([
+      quota("requests", "day", 60),
+      quota("tokens", "minute", 30),
+    ]);
+  });
+
+  it.each([401, 403])(
+    "commits header quota independently for credential failure %s",
+    (credentialStatus) => {
+    const breaker = new CircuitBreaker();
+    const handle = begin(breaker);
+    const observation = quota("requests", "month", 20);
+    expect(breaker.observeHeaders(handle, headers(targetA, {
+      status: credentialStatus,
+      quotaObservations: [observation],
+    })).ok).toBe(true);
+    expect(breaker.completeAttempt(handle, failure(targetA, {
+      status: credentialStatus,
+    })).ok).toBe(true);
+    expect(breaker.getState(targetA)?.quotaObservations).toEqual([
+      observation,
+    ]);
+    expect(breaker.getState(targetA)?.credentialFailures).toBe(1);
+    },
+  );
+
+  it("commits valid quota from a relay mapper defect without provider health", () => {
+    const breaker = new CircuitBreaker();
+    const handle = begin(breaker);
+    const observation = quota("tokens", "minute", 12);
+    expect(breaker.observeHeaders(handle, headers(targetA, {
+      status: 502,
+      quotaObservations: [observation],
+    })).ok).toBe(true);
+    expect(breaker.completeAttempt(handle, failure(targetA, {
+      provenance: "relay-mapper-defect",
+      failure: "mapping",
+      status: 502,
+    })).ok).toBe(true);
+    expect(breaker.getState(targetA)?.quotaObservations).toEqual([observation]);
+    expect(breaker.getState(targetA)?.pings).toEqual([]);
+  });
+
+  it("snapshots quota observations before completion", () => {
+    const breaker = new CircuitBreaker();
+    const handle = begin(breaker);
+    const observation = quota("requests", "minute", 25);
+    const quotaObservations = [observation];
+    expect(breaker.observeHeaders(handle, headers(targetA, {
+      quotaObservations,
+    })).ok).toBe(true);
+
+    observation.remaining = 0;
+    quotaObservations.push(quota("tokens", "day", 1));
+    expect(breaker.completeAttempt(handle, success()).ok).toBe(true);
+    expect(breaker.getState(targetA)?.quotaObservations).toEqual([
+      quota("requests", "minute", 25),
+    ]);
+  });
+
+  it("replaces only the matching quota axis and period on its exact credential/model cell", () => {
+    const breaker = new CircuitBreaker();
+    const sibling = { ...targetA, credentialId: "provider-a#work" };
+    const first = begin(breaker);
+    expect(breaker.observeHeaders(first, headers(targetA, {
+      quotaObservations: [quota("requests", "day", 80), quota("tokens", "minute", 70)],
+    })).ok).toBe(true);
+    expect(breaker.completeAttempt(first, success()).ok).toBe(true);
+    const replacement = begin(breaker);
+    expect(breaker.observeHeaders(replacement, headers(targetA, {
+      quotaObservations: [quota("requests", "day", 40, 2_000)],
+    })).ok).toBe(true);
+    expect(breaker.completeAttempt(replacement, success()).ok).toBe(true);
+    const siblingHandle = begin(breaker, sibling);
+    expect(breaker.observeHeaders(siblingHandle, headers(sibling, {
+      quotaObservations: [quota("requests", "day", 5)],
+    })).ok).toBe(true);
+    expect(breaker.completeAttempt(siblingHandle, success(sibling)).ok).toBe(true);
+
+    expect(breaker.getState(targetA)?.quotaObservations).toEqual([
+      quota("requests", "day", 40, 2_000),
+      quota("tokens", "minute", 70),
+    ]);
+    expect(breaker.getState(sibling)?.quotaObservations).toEqual([
+      quota("requests", "day", 5),
+    ]);
   });
 
   it("keeps credential failures separate and lets a terminal success recover them", () => {
@@ -294,11 +442,17 @@ describe("CircuitBreaker attempt lifecycle", () => {
       const breaker = new CircuitBreaker();
       const handle = begin(breaker);
 
-      const completed = breaker.completeAttempt(handle, failure(targetA, { status }));
+      const completed = breaker.completeAttempt(
+        handle,
+        failure(targetA, { status }),
+      );
 
       expect(completed.ok).toBe(true);
       expect(breaker.getState(targetA)).toBeUndefined();
-      const duplicate = breaker.completeAttempt(handle, failure(targetA, { status }));
+      const duplicate = breaker.completeAttempt(
+        handle,
+        failure(targetA, { status }),
+      );
       expect(duplicate.ok || duplicate.error.kind).toBe("duplicate-completion");
       expect(breaker.getState(targetA)).toBeUndefined();
     },
@@ -320,20 +474,22 @@ describe("CircuitBreaker attempt lifecycle", () => {
     expect(breaker.getState(targetA)).toBeUndefined();
   });
 
-  it("keys a passthrough target with a null model by provider", () => {
+  it("keys a passthrough target with a null model by credential", () => {
     const breaker = new CircuitBreaker();
     const passthrough: ProviderTargetIdentity = {
       provider: "passthrough",
+      credentialId: "passthrough#default",
       model: null,
       kind: "anthropic",
     };
     const handle = begin(breaker, passthrough);
     expect(breaker.completeAttempt(handle, success(passthrough)).ok).toBe(true);
 
-    expect(breaker.hasObservations(passthrough)).toBe(true);
-    expect(breaker.getState("passthrough")?.pings[0]?.code).toBe("200");
-    expect(breaker.isHealthy(passthrough)).toBe(true);
-  });
+  expect(breaker.getDeploymentMeasurement(passthrough).pings).toHaveLength(1);
+  expect(breaker.getState(passthrough)?.pings[0]?.code).toBe("200");
+  expect(breaker.isHealthy(passthrough)).toBe(true);
+  expect([...breaker.getAllStates().keys()]).toEqual(["passthrough#default"]);
+});
 
   it("accepts cancellation once without inventing a health observation", () => {
     const breaker = new CircuitBreaker();
@@ -352,5 +508,34 @@ describe("CircuitBreaker attempt lifecycle", () => {
     const duplicate = breaker.completeAttempt(handle, cancelled);
     expect(duplicate.ok || duplicate.error.kind).toBe("duplicate-completion");
     expect(breaker.getState(targetA)).toBeUndefined();
+  });
+});
+
+describe("CircuitBreaker cross-credential lifecycle", () => {
+  const otherCredential: ProviderTargetIdentity = {
+    ...targetA,
+    credentialId: "provider-a#other",
+  };
+
+  it("rejects completion and observation under another credential on the same deployment", () => {
+    const breaker = new CircuitBreaker();
+    const handle = begin(breaker, targetA);
+    const observation = breaker.observeHeaders(
+      handle,
+      headers(otherCredential),
+    );
+    expect(observation.ok).toBe(false);
+    if (!observation.ok) expect(observation.error.kind).toBe("cross-target");
+    const completion = breaker.completeAttempt(
+      handle,
+      failure(otherCredential),
+    );
+    expect(completion.ok).toBe(false);
+    if (!completion.ok) expect(completion.error.kind).toBe("cross-target");
+    expect(
+      breaker.completeAttempt(handle, failure(targetA, { status: 401 })).ok,
+    ).toBe(true);
+    expect(breaker.hasCredentialFault(targetA, 1_051)).toBe(true);
+    expect(breaker.hasCredentialFault(otherCredential, 1_051)).toBe(false);
   });
 });

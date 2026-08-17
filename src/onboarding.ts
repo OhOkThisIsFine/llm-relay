@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import type { Config, ProviderTierType } from "./config.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
-import { keyIsPresent } from "./authEnv.js";
+import { readCredential } from "./authEnv.js";
 import { restrictSecretFileOnWindows } from "./secret-file-acl.js";
 
 export interface OnboardingStatus {
@@ -49,7 +49,7 @@ export function getOnboardingStatusList(cfg?: Config): OnboardingStatus[] {
     // The shared presence predicate, not a local `Boolean(...)`: presence has exactly one
     // definition in this codebase, and a whitespace-only exported variable is ABSENT. Reporting
     // such a provider "✅ Ready" sends the user off to debug a live call instead of their key.
-    const hasKey = authEnv ? keyIsPresent(process.env[authEnv]) : true;
+    const hasKey = authEnv ? readCredential(authEnv, process.env, name) !== undefined : true;
 
     result.push({
       provider: name,

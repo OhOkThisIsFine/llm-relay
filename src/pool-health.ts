@@ -65,7 +65,7 @@ export async function probeMember(
   }
   // `readCredential` treats a whitespace-only value as absent, so a key pasted as a blank
   // line is reported here as an auth problem instead of being sent as a bare `Bearer`.
-  const apiKey = readCredential(p.authEnv);
+  const apiKey = readCredential(p.authEnv, process.env, provider);
   if (p.authEnv && !apiKey) {
     return { pool, spec, verdict: "auth", detail: `${p.authEnv} is not set` };
   }

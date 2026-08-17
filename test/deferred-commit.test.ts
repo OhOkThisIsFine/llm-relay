@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProxy } from "../src/server.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
+import { makeCredentialId } from "../src/credential-id.js";
 import { ModelCatalog } from "../src/catalog.js";
 import {
   DEGRADED_HEADER,
@@ -38,6 +39,12 @@ const TRANSLATED_FRONTS: StreamFront[] = [
 ];
 
 const servers: Server[] = [];
+const breakerIdentity = (provider: string, model: string | null, kind: StreamFront["backendKind"]) => ({
+  provider,
+  model,
+  kind,
+  credentialId: makeCredentialId(provider),
+});
 const tempDirs: string[] = [];
 
 function track(server: Server): Server {
@@ -268,7 +275,7 @@ describe.each(FRONTS)("$name — deferred header commit", (front) => {
     expect(b.calls()).toBe(1);
     expect(response.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
     expect(response.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 1 served: 1x502, 1x200");
-    expect(breaker.getState("p1/m1")?.lastStatus).toBe(502);
+    expect(breaker.getState(breakerIdentity("p1", "m1", front.backendKind))?.lastStatus).toBe(502);
     expect(logRecords(logFile)[0]?.attempts).toEqual([
       { provider: "p1", model: "m1", status: 502, ms: expect.any(Number) },
       { provider: "p2", model: "m2", status: 200, ms: expect.any(Number) },
@@ -385,7 +392,7 @@ describe.each(FRONTS)("$name — deferred header commit", (front) => {
     await delay(60);
 
     expect(b.calls()).toBe(0);
-    expect(breaker.getState("p1/m1")).toBeUndefined();
+    expect(breaker.getState(breakerIdentity("p1", "m1", front.backendKind))).toBeUndefined();
     expect(logRecords(logFile)).toEqual([]);
   });
 });
