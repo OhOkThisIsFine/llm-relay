@@ -203,6 +203,50 @@ describe("key-checker", () => {
     expect(results[0]?.hasEnvKey).toBe(false);
   });
 
+  it("checks each fleet slot independently and never probes disabled or empty slots", async () => {
+    process.env.FLEET_GOOD = "good";
+    process.env.MOCK_PROV_KEY = "legacy-must-not-be-used";
+    const fleetConfig: Config = {
+      ...baseConfig,
+      providers: {
+        mockProv: {
+          base: "http://mock.provider",
+          kind: "openai",
+          authHeader: "authorization",
+          timeoutMs: 1000,
+          credentials: [
+            { label: "good", authEnv: "FLEET_GOOD", models: ["model-x"] },
+            { label: "missing", authEnv: "FLEET_MISSING", models: ["model-x"] },
+            { label: "disabled", authEnv: "FLEET_DISABLED", enabled: false },
+            { label: "empty", authEnv: "FLEET_EMPTY", models: [] },
+          ],
+        },
+      },
+    };
+    let calls = 0;
+    const mockFetch = (async (url: string, init?: RequestInit) => {
+      calls++;
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      if (init?.method === "GET" && !headers.authorization) {
+        return new Response(JSON.stringify({ data: [{ id: "model-x" }] }), { status: 200 });
+      }
+      if (url.endsWith("/models")) expect(headers.authorization).toBe("Bearer good");
+      return new Response(JSON.stringify({ data: [{ id: "model-x" }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const results = await validateProviderKeys(fleetConfig, mockFetch);
+    expect(results.map((r) => r.credentialId)).toEqual([
+      "mockProv#good",
+      "mockProv#missing",
+      "mockProv#disabled",
+      "mockProv#empty",
+    ]);
+    expect(results.map((r) => r.status)).toEqual(["valid", "missing_env", "disabled", "no_models"]);
+    expect(calls).toBe(3);
+    delete process.env.FLEET_GOOD;
+    delete process.env.MOCK_PROV_KEY;
+  });
+
   it("verifies provider key when present and endpoint responds 200", async () => {
     process.env.MOCK_PROV_KEY = "test-key-123";
     const mockFetch = (async () => {

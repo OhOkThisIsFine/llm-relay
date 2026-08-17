@@ -46,6 +46,37 @@ describe("ModelCatalog", () => {
     }
   });
 
+  it("walks explicit credential slots only on credential-attributable roster failures", async () => {
+    const saved = { CATALOG_ONE: process.env.CATALOG_ONE, CATALOG_TWO: process.env.CATALOG_TWO, GOOGLEAI_API_KEY: process.env.GOOGLEAI_API_KEY };
+    try {
+      process.env.CATALOG_ONE = "one";
+      process.env.CATALOG_TWO = "two";
+      delete process.env.GOOGLEAI_API_KEY;
+      const seen: string[] = [];
+      const fetchFn = (async (_url: string, init?: RequestInit) => {
+        const auth = new Headers(init?.headers).get("authorization") ?? "";
+        seen.push(auth);
+        return auth === "Bearer one"
+          ? new Response("no", { status: 403 })
+          : new Response(JSON.stringify({ data: [{ id: "first-only" }, { id: "other-model" }] }), { status: 200 });
+      }) as unknown as typeof fetch;
+      const c = new ModelCatalog({ cachePath: null });
+      const models = await c.list("fleet", {
+        base: "https://prov.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000,
+        credentials: [
+          { label: "one", authEnv: "CATALOG_ONE", models: ["first-only"] },
+          { label: "two", authEnv: "CATALOG_TWO", models: ["second-only"] },
+        ],
+      }, { fetchFn });
+      expect(models).toEqual(["first-only", "other-model"]);
+      expect(seen).toEqual(["Bearer one", "Bearer two"]);
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
   it("fetches, parses {data:[{id}]}, and sorts", async () => {
     const c = new ModelCatalog({ cachePath: null });
     const models = await c.list("p", provider, { fetchFn: okFetch(["z-model", "a-model"]) });

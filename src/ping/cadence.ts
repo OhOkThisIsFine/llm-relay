@@ -9,7 +9,7 @@ import {
   loadPersistedQuotaObservations,
   loadTotals,
 } from "./probe-cache.js";
-import { readCredential } from "../authEnv.js";
+import { providerCredentialSlots, resolveCredentialSlot, slotAllowsModel } from "../credential-fleet.js";
 import { getLastSuccessfulCallAt, loadRuntimeTelemetry } from "./runtime-telemetry.js";
 import { materializeDynamicPools } from "../dynamic-pools.js";
 import { makeCredentialId, parseCredentialId, type CredentialId } from "../credential-id.js";
@@ -101,6 +101,8 @@ export class PingLoop {
   private pingHistory = new Map<string, PingRecord[]>();
   /** Quota is credential and model scoped; provider-wide percentages were always ambiguous. */
   private latestQuota = new Map<string, QuotaObservation[]>();
+  /** Request-local fleet cursor persisted between ticks so one-due-model ticks still rotate. */
+  private credentialCursors = new Map<string, number>();
 
   constructor(
     private cfg: Config,
@@ -322,9 +324,6 @@ export class PingLoop {
     const telemetry = loadRuntimeTelemetry();
 
     for (const [providerName, pCfg] of providers) {
-      // Via the shared reader, not `process.env[...]` — a whitespace-only value is absent,
-      // and open-coding the presence test is what let three call sites drift apart.
-      const apiKey = readCredential(pCfg.authEnv, process.env, providerName);
       const modelIds = scope === "catalog"
         ? listedByProvider.get(providerName) ?? []
         : routable?.get(providerName) ?? [];
@@ -341,13 +340,34 @@ export class PingLoop {
       });
       // Probe up to 3 due models per provider per tick to avoid flooding
       const toProbe = dueIds.slice(0, 3);
+      const slots = providerCredentialSlots(providerName, pCfg).filter((slot) => slot.enabled);
+      let slotCursor = this.credentialCursors.get(providerName) ?? 0;
 
       for (const mId of toProbe) {
-        const res = await pingProviderModel(providerName, mId, pCfg, apiKey, {
+        // Credential rotation is inside the existing model probe budget: a provider with three
+        // due deployments still spends at most three requests, while successive deployments use
+        // successive serviceable slots. Health remains keyed to provider/model; quota evidence is
+        // recorded against the exact credential that made this request.
+        let selected: ReturnType<typeof resolveCredentialSlot> | undefined;
+        let selectedSlot: (typeof slots)[number] | undefined;
+        for (let i = 0; i < slots.length; i++) {
+          const slotIndex = (slotCursor + i) % slots.length;
+          const slot = slots[slotIndex];
+          if (!slot || !slotAllowsModel(slot, mId)) continue;
+          const resolution = resolveCredentialSlot(slot);
+          if (resolution.state === "declared-missing") continue;
+          selected = resolution;
+          selectedSlot = slot;
+          slotCursor = (slotIndex + 1) % Math.max(1, slots.length);
+          break;
+        }
+        if (!selected || !selectedSlot) continue;
+        this.credentialCursors.set(providerName, slotCursor);
+        const res = await pingProviderModel(providerName, mId, pCfg, selected.value, {
           ...optsObj(this.opts.fetchFn),
           timeoutMs: pCfg.timeoutMs,
         });
-        this.recordPing(providerName, mId, res, Date.now(), makeCredentialId(providerName));
+        this.recordPing(providerName, mId, res, Date.now(), selectedSlot.credentialId);
       }
     }
   }
