@@ -17,7 +17,9 @@ import {
   type RequestAttemptStatus,
   type RequestLog,
 } from "./log.js";
-import { credentialState } from "./authEnv.js";
+import { buildAuthHeaders } from "./authEnv.js";
+import { makeCredentialId } from "./credential-id.js";
+import { resolveAttempt, type ResolvedAttempt } from "./resolved-attempt.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
@@ -31,10 +33,11 @@ import { toolSchemaMap, type AssistantMessage, type JsonSchema } from "./anthrop
 import type { RecoveredOpenAiChat, RecoveredOpenAiChatProcessor } from "./openai-dialect.js";
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
+import { createUsageAccumulator, type UsageAccumulator } from "./usage-observer.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens, assessCost } from "./metadata.js";
 import { specOfTarget } from "./benchmarks.js";
-import { extractQuotaPercent } from "./ping/ping.js";
+import { extractQuotaObservations } from "./quota-observation.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
@@ -206,9 +209,17 @@ export interface ProxyDeps {
   catalog?: ModelCatalog;
   pingLoop?: PingLoop;
   breaker?: CircuitBreaker;
+  /** Optional per-attempt accounting seam; injected recorders always run. */
+  modelCallRecorder?: ModelCallRecorder;
   /** null deliberately exercises fail-closed control authorization. */
   controlAuthorization?: ControlAuthorizationPort | null;
 }
+
+export type ModelCallRecorder = (
+  providerKey: string,
+  modelId: string,
+  callResult: { ok: boolean; latencyMs: number; completionTokens?: number },
+) => void;
 
 export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const validator = new ToolUseValidator();
@@ -217,6 +228,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const catalog = deps.catalog ?? new ModelCatalog();
   const pingLoop = deps.pingLoop ?? new PingLoop(cfg, catalog);
   const breaker = deps.breaker ?? new CircuitBreaker();
+  const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
   const stickyConfig = cfg.routing.sticky;
   const stickySessions = stickyConfig === true || (typeof stickyConfig === "object" && stickyConfig.enabled)
     ? new StickySessionManager(typeof stickyConfig === "object" ? stickyConfig : undefined)
@@ -265,6 +277,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
         base: candidate.base,
         model: candidate.model!,
         kind: "openai",
+        provider: candidate.provider,
         authHeader: candidate.authHeader,
         timeoutMs: cfg.reshaperPool?.timeoutMs ?? Math.min(candidate.timeoutMs, 60_000),
         ...(candidate.authEnv ? { authEnv: candidate.authEnv } : {}),
@@ -294,6 +307,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       catalog,
       pingLoop,
       breaker,
+      ...(modelCallRecorder ? { modelCallRecorder } : {}),
       ...(stickySessions ? { stickySessions } : {}),
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
@@ -341,6 +355,7 @@ interface Handlers {
   catalog: ModelCatalog;
   pingLoop?: PingLoop;
   breaker: CircuitBreaker;
+  modelCallRecorder?: ModelCallRecorder;
   stickySessions?: StickySessionManager;
   controlAuthorization?: ControlAuthorizationPort;
   server: Server;
@@ -448,7 +463,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         // `provider-tier` basis is an assumption about a roster; a 403 naming a subscription is
         // that deployment correcting us. (`isCostBlocked` excludes `allowance-exhausted` — a
         // spent allowance is not a price, and must not be laundered into one here either.)
-        if (assessment?.costClass === "free" && !isCostBlocked(t.provider, t.model)) kept.push(t);
+        if (assessment?.costClass === "free" && !isCostBlocked(
+          t.provider,
+          makeCredentialId(t.provider),
+          t.model,
+        )) kept.push(t);
         else if (!blocked) {
           blocked = {
             spec: t.model ? `${t.provider}/${t.model}` : t.provider,
@@ -497,7 +516,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const openAiFrontProtocol = detectOpenAiFrontProtocol(req.method, pathname);
 
   const routingNow = Date.now();
-  let healthyTargets = orderByUsability(targetCandidates, h.breaker, routingNow);
+  // Resolve the credential once per configured candidate after all route-level pruning. The
+  // resulting attempt is immutable for this request: retries and both public fronts must not
+  // observe an environment change halfway through a provider attempt.
+  const attempts = targetCandidates.map((target) => resolveAttempt(target));
+  let healthyAttempts = orderByUsability(attempts, h.breaker, routingNow);
   let sticky: StickyRequestContext | null = null;
   if ((isMessages || openAiFrontProtocol) && h.stickySessions) {
     const key = deriveSessionKey(req.headers, reqJson);
@@ -510,14 +533,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       };
       if (pinnedSpec) {
         const applied = applyStickyOrdering(
-          healthyTargets,
-          targetCandidates,
+          healthyAttempts,
+          attempts,
           pinnedSpec,
           h.breaker,
           degradedSpecs,
           routingNow,
         );
-        healthyTargets = applied.targets;
+        healthyAttempts = applied.targets;
         sticky.provenance = `${pinnedSpec} (${applied.status})`;
       }
     }
@@ -532,10 +555,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   if ((isMessages || openAiFrontProtocol) && reqJson) {
     const estimatedTokens = estimateRequestTokens(reqJson);
     if (estimatedTokens > 0) {
-      const remainingTargets: ResolvedTarget[] = [];
+      const remainingAttempts: ResolvedAttempt[] = [];
       let firstExceeded: { target: ResolvedTarget; limit: number } | null = null;
 
-      for (const t of healthyTargets) {
+      for (const candidate of healthyAttempts) {
+        const t = candidate.target;
         if (t.model) {
           const limits = h.catalog.cachedLimits(t.provider, t.model);
           if (limits?.contextLength && estimatedTokens > limits.contextLength) {
@@ -545,10 +569,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
             continue;
           }
         }
-        remainingTargets.push(t);
+        remainingAttempts.push(candidate);
       }
 
-      if (remainingTargets.length === 0 && firstExceeded) {
+      if (remainingAttempts.length === 0 && firstExceeded) {
         failClosed(
           res,
           400,
@@ -560,19 +584,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         return;
       }
 
-      if (remainingTargets.length > 0) {
-        healthyTargets = remainingTargets;
+      if (remainingAttempts.length > 0) {
+        healthyAttempts = remainingAttempts;
       }
     }
   }
 
-  let target = healthyTargets[0]!;
+  let target = healthyAttempts[0]!.target;
 
   // OpenAI-compatible FRONT: route both Chat Completions and Responses requests through the
   // resolved target. The adapter supports OpenAI-compatible and Anthropic backends, so Codex and
   // OpenAI-native IDEs can use the same relay that Claude clients use in the other direction.
   if (openAiFrontProtocol) {
-    await openAiFrontPath(res, healthyTargets, {
+    await openAiFrontPath(res, healthyAttempts, {
       reqJson,
       wantsStream,
       protocol: openAiFrontProtocol,
@@ -609,16 +633,17 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
   }
 
-  // Candidate execution loop with failover across healthyTargets.
+  // Candidate execution loop with failover across healthyAttempts.
   // All-429 exhaustion Retry-After policy: `Pool429Tracker`.
   const attemptTrace = new RequestAttemptTrace();
   const pool429 = new Pool429Tracker();
   const tried: string[] = [];
   const walkBudgetMs = cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
   const walkStarted = Date.now();
-  for (let i = 0; i < healthyTargets.length; i++) {
+  for (let i = 0; i < healthyAttempts.length; i++) {
     if (res.destroyed) break;
-    target = healthyTargets[i]!;
+    const resolvedAttempt = healthyAttempts[i]!;
+    target = resolvedAttempt.target;
     tried.push(specOfTarget(target));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
@@ -635,7 +660,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       try {
         // Credential/header validation precedes beginAttempt: it performs no provider
         // egress and therefore creates no terminal health obligation on rejection.
-        forwardHeaders = buildForwardHeaders(req.headers, target);
+        forwardHeaders = buildForwardHeaders(req.headers, resolvedAttempt);
       } catch (e) {
         if (e instanceof CredentialConfigError) {
           failClosed(res, 502, `llm-relay configuration: ${e.message}`);
@@ -645,7 +670,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         throw e;
       }
 
-      attempt = beginHealthAttempt(h, target, Date.now(), attemptTrace) ?? undefined;
+      attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace) ?? undefined;
       if (!attempt) {
         failClosed(res, 502, "llm-relay: could not begin provider attempt");
         h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
@@ -654,13 +679,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
       let backendRes: Response;
       try {
-        backendRes = await fetchBackend(target, {
+        backendRes = await fetchBackend(resolvedAttempt, {
           path,
           method: req.method ?? "POST",
           reqBuf,
           reqJson,
           anthropicHeaders: forwardHeaders,
           wantsStream,
+          usage: attempt.usage,
           signal: controller.signal,
         });
       } catch (e) {
@@ -681,10 +707,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         // A genuine transport throw (not this proxy's own deadline) condemns the provider's host
         // for the rest of THIS walk only — prune before the "is there a next candidate" check so
         // a walk whose only remaining members share the dead host ends honestly here.
-        if (!aborted) dropRemainingSameProvider(healthyTargets, i, target.provider);
+        if (!aborted) dropRemainingSameProvider(healthyAttempts, i, target.provider);
 
         // Failover if additional candidates exist and the walk budget allows another start
-        if (!res.destroyed && i < healthyTargets.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
+        if (!res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
           continue;
         }
 
@@ -716,10 +742,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
       const localFailure = errorOrigin(backendRes) === "local";
       const tryNext = !localFailure && shouldTryNext(cls);
-      if (tryNext && !res.destroyed && i < healthyTargets.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
+      if (tryNext && !res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
         clearTimeout(timer);
         res.off("close", onResClose);
-        if (await discardCandidate(backendRes, target, backendRes.status, retryAfterMs)) pool429.noteUnknownRefusal();
+        if (await discardCandidate(backendRes, resolvedAttempt, backendRes.status, retryAfterMs)) pool429.noteUnknownRefusal();
         pool429.recordFailover(backendRes.status, retryAfterMs);
         completeAttemptFailure(h, attempt, {
           failure: "http",
@@ -753,7 +779,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           });
           const canTryNext = probe.provenance === "upstream" &&
             !res.destroyed &&
-            i < healthyTargets.length - 1 &&
+            i < healthyAttempts.length - 1 &&
             walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1);
           if (canTryNext) {
             pool429.recordFailover(502, null);
@@ -828,8 +854,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           // failure. Resume THIS request's candidate walk without teaching the breaker a new
           // policy or reselecting a duplicate entry for the same deployment.
           pool429.recordDeadTurn();
-          dropRemainingSameDeployment(healthyTargets, i, target);
-          if (!res.destroyed && i < healthyTargets.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
+          dropRemainingSameDeployment(healthyAttempts, i, target);
+          if (!res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
             continue;
           }
 
@@ -927,9 +953,10 @@ function degradedLabel(pool: string | null, degraded: Set<string> | null, target
 }
 
 /** Is a learned allowance exhaustion still cooling this target? Never throws — no store, no cooling. */
-function cooledByAllowance(t: ResolvedTarget, now: number): boolean {
+function cooledByAllowance(attempt: ResolvedAttempt, now: number): boolean {
   try {
-    const until = cooldownUntil(t.provider, t.model ?? null, { now });
+    const { target } = attempt;
+    const until = cooldownUntil(target.provider, attempt.credentialId, target.model ?? null, { now });
     return until !== null && now < until;
   } catch {
     return false;
@@ -946,12 +973,13 @@ interface StickyRequestContext {
 type TargetUsability = "live" | "credential-fault" | "cooling";
 
 function targetUsability(
-  target: ResolvedTarget,
+  attempt: ResolvedAttempt,
   breaker: CircuitBreaker,
   now: number,
 ): TargetUsability {
-  if (!breaker.isHealthy(target, now) || cooledByAllowance(target, now)) return "cooling";
-  if (breaker.hasCredentialFault(target, now)) return "credential-fault";
+  const identity = targetIdentity(attempt);
+  if (!breaker.isHealthy(identity, now) || cooledByAllowance(attempt, now)) return "cooling";
+  if (breaker.hasCredentialFault(identity, now)) return "credential-fault";
   return "live";
 }
 
@@ -960,14 +988,14 @@ function targetUsability(
  * never jumps a live in-band member; the tail remains a fallback after the requested band.
  */
 function applyStickyOrdering(
-  ordered: ResolvedTarget[],
-  candidates: ResolvedTarget[],
+  ordered: ResolvedAttempt[],
+  candidates: ResolvedAttempt[],
   pinnedSpec: string,
   breaker: CircuitBreaker,
   degraded: Set<string> | null,
   now: number,
-): { targets: ResolvedTarget[]; status: string } {
-  const pinned = candidates.find((candidate) => specOfTarget(candidate) === pinnedSpec);
+): { targets: ResolvedAttempt[]; status: string } {
+  const pinned = candidates.find((candidate) => specOfTarget(candidate.target) === pinnedSpec);
   if (!pinned) return { targets: ordered, status: "bypassed: not-in-pool" };
 
   const usability = targetUsability(pinned, breaker, now);
@@ -975,12 +1003,12 @@ function applyStickyOrdering(
 
   if (degraded?.has(pinnedSpec)) {
     const hasLiveInBand = candidates.some(
-      (candidate) => !degraded.has(specOfTarget(candidate)) && targetUsability(candidate, breaker, now) === "live",
+      (candidate) => !degraded.has(specOfTarget(candidate.target)) && targetUsability(candidate, breaker, now) === "live",
     );
     if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
   }
 
-  const index = ordered.findIndex((candidate) => specOfTarget(candidate) === pinnedSpec);
+  const index = ordered.findIndex((candidate) => specOfTarget(candidate.target) === pinnedSpec);
   if (index <= 0) return { targets: ordered, status: "pinned, natural" };
   const reordered = [...ordered];
   const [target] = reordered.splice(index, 1);
@@ -1016,14 +1044,14 @@ function recordStickySuccess(
 }
 
 export function orderByUsability(
-  targets: ResolvedTarget[],
+  attempts: ResolvedAttempt[],
   breaker = globalCircuitBreaker,
   now = Date.now(),
-): ResolvedTarget[] {
-  const live: ResolvedTarget[] = [];
-  const faulted: ResolvedTarget[] = [];
-  const cooling: ResolvedTarget[] = [];
-  for (const t of targets) {
+): ResolvedAttempt[] {
+  const live: ResolvedAttempt[] = [];
+  const faulted: ResolvedAttempt[] = [];
+  const cooling: ResolvedAttempt[] = [];
+  for (const attempt of attempts) {
     // A learned allowance exhaustion cools a target the breaker may know nothing about. That is
     // the whole point of the ACCOUNT scope: one member's stated "you have depleted your monthly
     // included credits" is a fact about the credential, so its siblings are spent too and should
@@ -1034,10 +1062,10 @@ export function orderByUsability(
     // Demotion, never exclusion — same contract as the rest of this function, and doubly so here:
     // an exhausted allowance is a temporary condition on a deployment that is still free, and a
     // pool with nothing else left must still be able to try it.
-    const usability = targetUsability(t, breaker, now);
-    if (usability === "cooling") cooling.push(t);
-    else if (usability === "credential-fault") faulted.push(t);
-    else live.push(t);
+    const usability = targetUsability(attempt, breaker, now);
+    if (usability === "cooling") cooling.push(attempt);
+    else if (usability === "credential-fault") faulted.push(attempt);
+    else live.push(attempt);
   }
   return [...live, ...faulted, ...cooling];
 }
@@ -1144,20 +1172,20 @@ function withStallWatchdog(upstream: Response, controller: AbortController, stal
  * be a smaller, faster one. Request-local by construction: the pruned array dies with the
  * response, so it cannot fight the breaker's per-deployment accounting.
  */
-function dropRemainingSameProvider(targets: ResolvedTarget[], afterIndex: number, provider: string): void {
+function dropRemainingSameProvider(targets: ResolvedAttempt[], afterIndex: number, provider: string): void {
   for (let j = targets.length - 1; j > afterIndex; j--) {
-    if (targets[j]!.provider === provider) targets.splice(j, 1);
+    if (targets[j]!.target.provider === provider) targets.splice(j, 1);
   }
 }
 
 /** Remove duplicate entries for one failed deployment from this request's remaining walk only. */
 function dropRemainingSameDeployment(
-  targets: ResolvedTarget[],
+  targets: ResolvedAttempt[],
   afterIndex: number,
   failed: ResolvedTarget,
 ): void {
   for (let j = targets.length - 1; j > afterIndex; j--) {
-    const candidate = targets[j]!;
+    const candidate = targets[j]!.target;
     if (candidate.provider === failed.provider && candidate.model === failed.model) targets.splice(j, 1);
   }
 }
@@ -1256,10 +1284,17 @@ class Pool429Tracker {
  * `observed`. Only targets with a concrete model id are recorded; the Anthropic passthrough
  * has none. Skipped under vitest so tests never write the user's real telemetry file.
  */
-function recordCall(target: ResolvedTarget, ok: boolean, started: number): void {
-  if (!target.model || process.env.VITEST) return;
+function recordCall(h: Handlers, attempt: HealthAttempt, ok: boolean, completedAt: number): void {
+  const { target, usage } = attempt;
+  // Keep the historical default writer out of the test filesystem, but never suppress an
+  // explicit recorder: that seam is how ledger callers observe every terminal attempt.
+  if (!target.model || !h.modelCallRecorder) return;
   try {
-    recordModelCall(target.provider, target.model, { ok, latencyMs: Date.now() - started });
+    h.modelCallRecorder(target.provider, target.model, {
+      ok,
+      latencyMs: completedAt - attempt.started,
+      ...(usage.completionTokens !== undefined ? { completionTokens: usage.completionTokens } : {}),
+    });
   } catch {
     /* telemetry is best-effort, never in the request's way */
   }
@@ -1328,31 +1363,45 @@ class RequestAttemptTrace {
 interface HealthAttempt {
   readonly handle: AttemptHandle;
   readonly identity: ProviderTargetIdentity;
+  /** The immutable credential snapshot used for this exact provider attempt. */
+  readonly resolvedAttempt: ResolvedAttempt;
   readonly target: ResolvedTarget;
   readonly started: number;
   readonly trace: RequestAttemptTrace;
+  readonly usage: UsageAccumulator;
   completed: boolean;
 }
 
-function targetIdentity(target: ResolvedTarget): ProviderTargetIdentity {
+function targetIdentity(attempt: ResolvedAttempt): ProviderTargetIdentity {
+  const { target } = attempt;
   return Object.freeze({
     provider: target.provider,
     model: target.model ?? null,
     kind: target.kind,
+    credentialId: attempt.credentialId,
     base: target.base,
   });
 }
 
 function beginHealthAttempt(
   h: Handlers,
-  target: ResolvedTarget,
+  resolvedAttempt: ResolvedAttempt,
   started: number,
   trace: RequestAttemptTrace,
 ): HealthAttempt | null {
-  const identity = targetIdentity(target);
+  const identity = targetIdentity(resolvedAttempt);
   const begun = h.breaker.beginAttempt(identity);
   if (!begun.ok) return null;
-  return { handle: begun.value, identity, target, started, trace, completed: false };
+  return {
+    handle: begun.value,
+    identity,
+    resolvedAttempt,
+    target: resolvedAttempt.target,
+    started,
+    trace,
+    usage: createUsageAccumulator(),
+    completed: false,
+  };
 }
 
 /**
@@ -1414,7 +1463,8 @@ function observeContextLimit(res: Response, target: ResolvedTarget): void {
  *
  * Never throws: the worst outcome of a failure here is that nothing is learned this time.
  */
-function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs: number | null, body: string): boolean {
+function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfterMs: number | null, body: string): boolean {
+  const { target } = attempt;
   if (target.model === undefined) return false;
   try {
     const verdict = interpretRefusal(target.provider, target.model, status, body);
@@ -1428,7 +1478,12 @@ function observeEligibility(target: ResolvedTarget, status: number, retryAfterMs
     // and model. A provider-scoped verdict therefore covers every deployment behind that
     // credential from one observation — which is the whole point: a stated credit balance or a
     // rejected key is one fact, and rediscovering it once per model is pure waste.
-    recordFact(verdict.class, materializeScope(verdict.scope, target.provider, target.model), {
+    recordFact(verdict.class, materializeScope(
+      verdict.scope,
+      target.provider,
+      attempt.credentialId,
+      target.model,
+    ), {
       retryAfterMs: resolveResetMs(verdict, retryAfterMs, body),
     });
   } catch {
@@ -1512,10 +1567,15 @@ function carriesEligibilityFact(status: number): boolean {
  * The read replaces the `cancel()` it used to be, rather than joining it: the body is being thrown
  * away either way, so consuming it costs nothing extra and frees the socket just the same.
  */
-async function discardCandidate(res: Response, target: ResolvedTarget, status: number, retryAfterMs: number | null): Promise<boolean> {
+async function discardCandidate(
+  res: Response,
+  attempt: ResolvedAttempt,
+  status: number,
+  retryAfterMs: number | null,
+): Promise<boolean> {
   if (carriesEligibilityFact(status)) {
     const body = await res.text().catch(() => "");
-    if (body) return observeEligibility(target, status, retryAfterMs, body);
+    if (body) return observeEligibility(attempt, status, retryAfterMs, body);
     return false;
   }
   await res.body?.cancel().catch(() => {});
@@ -1530,17 +1590,17 @@ function observeAttemptHeaders(
   headers?: Headers,
 ): void {
   const observedAt = Date.now();
-  // Provider-stated quota from the response that just served REAL traffic (adoption review
-  // §1.9). The breaker's observation shape always carried `quotaPercent`; only synthetic probes
-  // ever supplied it, so live rate-limit headers were dropped on the floor and `/telemetry`
-  // showed probe-aged quota beside fresh live health.
-  const quotaPercent = headers ? extractQuotaPercent(headers) : null;
+  // Provider-stated quota from the response that just served real traffic. Keep every attributed
+  // axis/period pair: reducing it to one scalar can conflate requests/day with tokens/minute.
+  const quotaObservations = headers
+    ? extractQuotaObservations(headers, { observedAt })
+    : [];
   const result = h.breaker.observeHeaders(attempt.handle, {
     target: attempt.identity,
     status,
     observedAt,
     elapsedMs: observedAt - attempt.started,
-    ...(quotaPercent !== null ? { quotaPercent } : {}),
+    ...(quotaObservations.length > 0 ? { quotaObservations } : {}),
     ...(retryAfterMs !== null ? { retryAfterMs } : {}),
   });
   if (!result.ok) throw new Error(`attempt header observation rejected: ${result.error.kind}`);
@@ -1560,19 +1620,23 @@ function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: num
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
   attempt.trace.record(attempt.target, status, attempt.started, completedAt);
-  recordCall(attempt.target, true, attempt.started);
+  recordCall(h, attempt, true, completedAt);
   // A served request is first-party proof that this deployment exists and that the credential has
   // allowance RIGHT NOW — strictly better evidence than any stored refusal, so it clears the
   // record, including the account-scoped one. That is how a topped-up balance or a rolled-over
   // month recovers well before the TTL would have expired, with no restart. Same contract as the
   // breaker clearing a credential fault on success.
   try {
-    const cleared = clearFacts(attempt.target.provider, attempt.target.model ?? null);
+    const cleared = clearFacts(
+      attempt.target.provider,
+      attempt.resolvedAttempt.credentialId,
+      attempt.target.model ?? null,
+    );
     // A stated bad credential has just been disproved, so the per-deployment 401s it caused are
     // stale evidence about a problem that no longer exists. Clearing them together is what makes a
     // key rotation recover the WHOLE provider at once instead of one model per expiry.
     if (cleared.includes("credential-invalid")) {
-      h.breaker.clearProviderCredentialFaults(attempt.target.provider);
+      h.breaker.clearCredentialFaults(attempt.resolvedAttempt.credentialId);
     }
   } catch {
     /* best-effort */
@@ -1610,7 +1674,7 @@ function completeAttemptFailure(
     attempt.started,
     completedAt,
   );
-  recordCall(attempt.target, false, attempt.started);
+  recordCall(h, attempt, false, completedAt);
 }
 
 function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: string | null): void {
@@ -1654,7 +1718,7 @@ function detectOpenAiFrontProtocol(method: string | undefined, pathname: string)
  */
 async function openAiFrontPath(
   res: ServerResponse,
-  candidates: ResolvedTarget[],
+  candidates: ResolvedAttempt[],
   ctx: {
     reqJson: unknown;
     wantsStream: boolean;
@@ -1682,7 +1746,8 @@ async function openAiFrontPath(
 
   for (let i = 0; i < candidates.length; i++) {
     if (res.destroyed) break;
-    const target = candidates[i]!;
+    const resolvedAttempt = candidates[i]!;
+    const target = resolvedAttempt.target;
     const isLast = i === candidates.length - 1;
     tried.push(specOfTarget(target));
 
@@ -1695,7 +1760,7 @@ async function openAiFrontPath(
 
     let forwardHeaders: Record<string, string>;
     try {
-      forwardHeaders = buildForwardHeaders(ctx.inboundHeaders, target);
+      forwardHeaders = buildForwardHeaders(ctx.inboundHeaders, resolvedAttempt);
     } catch (e) {
       clearTimeout(timer);
       res.off("close", onResClose);
@@ -1707,7 +1772,7 @@ async function openAiFrontPath(
       throw e;
     }
 
-    const attempt = beginHealthAttempt(h, target, Date.now(), attemptTrace);
+    const attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace);
     if (!attempt) {
       clearTimeout(timer);
       res.off("close", onResClose);
@@ -1785,13 +1850,14 @@ async function openAiFrontPath(
 
     let upstream: Response;
     try {
-      upstream = await fetchOpenAiFront(target, {
+      upstream = await fetchOpenAiFront(resolvedAttempt, {
         reqJson: ctx.reqJson,
         wantsStream: ctx.wantsStream,
         protocol: ctx.protocol,
         anthropicHeaders: forwardHeaders,
         signal: controller.signal,
         processRecoveredChat,
+        usage: attempt.usage,
       });
     } catch (e) {
       clearTimeout(timer);
@@ -1844,7 +1910,7 @@ async function openAiFrontPath(
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
       // The body is read rather than cancelled when it might state a durable fact about the
       // deployment; either way the socket is freed and the bytes are discarded.
-      if (await discardCandidate(upstream, target, upstream.status, retryAfterMs)) pool429.noteUnknownRefusal();
+      if (await discardCandidate(upstream, resolvedAttempt, upstream.status, retryAfterMs)) pool429.noteUnknownRefusal();
       pool429.recordFailover(upstream.status, retryAfterMs);
       completeAttemptFailure(h, attempt, {
         failure: "http",
@@ -1953,7 +2019,7 @@ async function openAiFrontPath(
         const raw = await upstream.text().catch(() => "");
         // The last candidate teaches us as much as the ones stepped over — and for a
         // single-member pool it is the ONLY one that can. Free, since the body is already here.
-        if (raw && carriesEligibilityFact(upstream.status) && observeEligibility(target, upstream.status, retryAfterMs, raw)) {
+        if (raw && carriesEligibilityFact(upstream.status) && observeEligibility(resolvedAttempt, upstream.status, retryAfterMs, raw)) {
           pool429.noteUnknownRefusal();
         }
         // Emitted here rather than with the other headers because the terminal candidate's verdict
@@ -2077,7 +2143,12 @@ async function transparentPath(
       // and for a single-member pool the only refusal we will ever see. Errors are never streamed,
       // so this branch is where they land.
       if (backendRes.status >= 400 && carriesEligibilityFact(backendRes.status)) {
-        observeEligibility(ctx.target, backendRes.status, parseRetryAfterMs(backendRes.headers.get("retry-after")), bytes.toString("utf8"));
+        observeEligibility(
+          ctx.attempt.resolvedAttempt,
+          backendRes.status,
+          parseRetryAfterMs(backendRes.headers.get("retry-after")),
+          bytes.toString("utf8"),
+        );
       }
       if (ctx.willValidate && bytes.length <= MAX_VALIDATE_BYTES) assistant = parseAssistant(bytes.toString("utf8"));
     }
@@ -2605,16 +2676,15 @@ export class CredentialConfigError extends Error {
  *                       satisfied the weaker reading while forwarding the caller's
  *                       Anthropic token verbatim to a third-party base URL.
  */
-export function buildForwardHeaders(inbound: IncomingMessage["headers"], target: ResolvedTarget): Record<string, string> {
-  const state = credentialState(target.authEnv);
-  const apiKey = state === "declared-present" ? process.env[target.authEnv!]?.trim() : undefined;
+export function buildForwardHeaders(inbound: IncomingMessage["headers"], attempt: ResolvedAttempt): Record<string, string> {
+  const { target, credential } = attempt;
   // Containment is DECLARED, not inferred from key presence. The old
   // `stripAuth = !!apiKey` was identically falsy for two opposite configurations —
   // "no authEnv declared" (an intentional passthrough: forward the caller's own
   // credential) and "authEnv declared but unset" (a misconfiguration) — so in the
   // second case the caller's own Anthropic token was forwarded verbatim to a
   // third-party base URL. Only a real passthrough forwards inbound auth now.
-  const stripAuth = state !== "not-declared" || target.credentialMode === "contained";
+  const stripAuth = credential.state !== "not-declared" || target.credentialMode === "contained";
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(inbound)) {
     const key = k.toLowerCase();
@@ -2629,16 +2699,13 @@ export function buildForwardHeaders(inbound: IncomingMessage["headers"], target:
     out[key] = Array.isArray(v) ? v.join(", ") : v;
   }
   if (!out["anthropic-version"]) out["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION;
-  if (state === "declared-missing") {
+  if (credential.state === "declared-missing") {
     // Should be unreachable — resolveTargets drops keyless targets — but thrown
     // rather than silently proceeding so a routing change that lets one through
     // fails loudly instead of egressing whatever the caller happened to send.
     throw new CredentialConfigError(target.provider, target.authEnv!);
   }
-  if (apiKey) {
-    if (target.authHeader === "authorization") out["authorization"] = `Bearer ${apiKey}`;
-    else out["x-api-key"] = apiKey;
-  }
+  Object.assign(out, buildAuthHeaders(credential.value, target.authHeader));
   return out;
 }
 

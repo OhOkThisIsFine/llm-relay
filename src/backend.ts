@@ -1,6 +1,6 @@
 import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bridge";
-import { buildAuthHeaders, readCredential } from "./authEnv.js";
-import { type ResolvedTarget } from "./config.js";
+import { buildAuthHeaders } from "./authEnv.js";
+import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
@@ -12,6 +12,7 @@ import {
   recoverDialectInOpenAiChatStream,
   type RecoveredOpenAiChatProcessor,
 } from "./openai-dialect.js";
+import { observeUsage, type UsageAccumulator } from "./usage-observer.js";
 
 /**
  * A tool-call envelope was present in the response text but could not be parsed — truncated, or a
@@ -410,7 +411,7 @@ async function preflightResponseStream(
  * of the proxy (validate/repair) always sees Anthropic Messages.
  */
 export async function fetchBackend(
-  target: ResolvedTarget,
+  attempt: ResolvedAttempt,
   args: {
     path: string;
     method: string;
@@ -418,14 +419,20 @@ export async function fetchBackend(
     reqJson: unknown;
     anthropicHeaders: Record<string, string>;
     wantsStream: boolean;
+    usage?: UsageAccumulator;
     signal: AbortSignal;
   },
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
+  const target = attempt.target;
   if (target.kind === "anthropic") {
     const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
     if (args.reqBuf.length) init.body = args.reqBuf;
-    const res = await fetchFn(target.base + args.path, init);
+    const native = await fetchFn(target.base + args.path, init);
+    const nativeStreamed = nativeResponseIsStreamed(native, args.wantsStream);
+    const res = args.usage
+      ? observeUsage(native, "anthropic-messages", args.usage, { streamed: nativeStreamed })
+      : native;
     // Preserve passthrough bytes, but do not preserve a successful status for a malformed
     // Messages envelope. Inspecting a clone leaves the original buffered body byte-exact.
     const messagesPath = args.path.split("?", 1)[0] === "/v1/messages";
@@ -497,7 +504,7 @@ export async function fetchBackend(
   const post = (body: Record<string, unknown>) =>
     fetchFn(target.base + "/chat/completions", {
       method: "POST",
-      headers: buildTargetHeaders(target),
+      headers: buildTargetHeaders(attempt),
       body: JSON.stringify(body),
       signal: args.signal,
     });
@@ -510,6 +517,11 @@ export async function fetchBackend(
     await res.body?.cancel().catch(() => {});
     const { stream_options: _omit, ...withoutUsage } = openaiBody;
     res = await post(withoutUsage);
+  }
+
+  if (args.usage) {
+    const nativeStreamed = nativeResponseIsStreamed(res, args.wantsStream);
+    res = observeUsage(res, "openai-chat", args.usage, { streamed: nativeStreamed });
   }
 
   if (!res.ok) {
@@ -672,7 +684,14 @@ export function openAiResponseToAnthropic(
   const finish = choice.finish_reason as string | undefined;
   const stopReason =
     toolCalls.length > 0 ? "tool_use" : finish === "length" ? "max_tokens" : finish === "stop" ? "end_turn" : finish ?? "end_turn";
-  const usage = (j.usage as Record<string, number> | undefined) ?? {};
+  const rawUsage = isRecord(j.usage) ? j.usage : null;
+  const usage = rawUsage &&
+    (typeof rawUsage.prompt_tokens === "number" || typeof rawUsage.completion_tokens === "number")
+    ? {
+        ...(typeof rawUsage.prompt_tokens === "number" ? { input_tokens: rawUsage.prompt_tokens } : {}),
+        ...(typeof rawUsage.completion_tokens === "number" ? { output_tokens: rawUsage.completion_tokens } : {}),
+      }
+    : null;
   return {
     id: (j.id as string) ?? "msg_translated",
     type: "message",
@@ -681,7 +700,7 @@ export function openAiResponseToAnthropic(
     content,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: { input_tokens: usage.prompt_tokens ?? 0, output_tokens: usage.completion_tokens ?? 0 },
+    ...(usage ? { usage } : {}),
   };
 }
 
@@ -718,6 +737,81 @@ function openaiError(
 }
 
 export type OpenAiFrontProtocol = "chat" | "responses";
+
+/**
+ * Remove the usage-only Chat SSE event we requested on the caller's behalf.  This sits after
+ * the observer: accounting sees the native bytes immediately, while the client sees its
+ * original stream contract.  It deliberately matches only an empty-choices event with usage.
+ */
+function suppressRelayAddedOpenAiUsageFrames(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  const append = (left: Uint8Array<ArrayBufferLike>, right: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBufferLike> => {
+    const out = new Uint8Array(left.byteLength + right.byteLength);
+    out.set(left);
+    out.set(right, left.byteLength);
+    return out;
+  };
+  const frameEnd = (bytes: Uint8Array): number | null => {
+    for (let i = 0; i + 1 < bytes.byteLength; i += 1) {
+      if (bytes[i] === 10 && bytes[i + 1] === 10) return i + 2;
+      if (i + 3 < bytes.byteLength && bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) return i + 4;
+    }
+    return null;
+  };
+  const isUsageOnly = (frame: Uint8Array): boolean => {
+    let event: string;
+    try {
+      // Fatal decoding means opaque/noncanonical bytes pass through untouched.
+      event = new TextDecoder("utf-8", { fatal: true }).decode(frame);
+    } catch {
+      return false;
+    }
+    const data = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data || data === "[DONE]") return false;
+    try {
+      const parsed = JSON.parse(data) as unknown;
+      return isRecord(parsed) && Array.isArray(parsed.choices) && parsed.choices.length === 0 && isRecord(parsed.usage);
+    } catch {
+      return false;
+    }
+  };
+  const drain = (controller: TransformStreamDefaultController<Uint8Array>, final = false): void => {
+    while (true) {
+      const end = frameEnd(pending);
+      if (end === null) break;
+      const frame = pending.slice(0, end);
+      pending = pending.slice(end);
+      if (!isUsageOnly(frame)) controller.enqueue(frame);
+    }
+    // Do not let a malformed provider frame become unbounded buffering. Retained bytes are
+    // always original slices, never decoder/re-encoder output.
+    if ((final || pending.byteLength > 16 * 1024) && pending.byteLength > 0) {
+      controller.enqueue(pending);
+      pending = new Uint8Array(0);
+    }
+  };
+  return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      pending = append(pending, chunk);
+      drain(controller);
+    },
+    flush(controller) {
+      drain(controller, true);
+    },
+  }));
+}
+
+function nativeResponseIsStreamed(response: Response, wantsStream: boolean): boolean {
+  const type = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (type.includes("text/event-stream")) return true;
+  if (type.includes("application/json") || /\+json(?:;|$)/.test(type)) return false;
+  return wantsStream;
+}
 
 /**
  * Turn an Anthropic Message response into the response envelope expected by an OpenAI client.
@@ -906,11 +1000,11 @@ export function normalizeOpenAiErrorBody(body: string, status: number): string |
   });
 }
 
-function buildTargetHeaders(target: ResolvedTarget): Record<string, string> {
-  const key = readCredential(target.authEnv, process.env, target.provider);
+function buildTargetHeaders(attempt: ResolvedAttempt): Record<string, string> {
+  const { target, credential } = attempt;
   return {
     "content-type": "application/json",
-    ...buildAuthHeaders(key, target.authHeader),
+    ...buildAuthHeaders(credential.value, target.authHeader),
   };
 }
 
@@ -925,7 +1019,7 @@ function buildTargetHeaders(target: ResolvedTarget): Record<string, string> {
  * the existing Claude client path.
  */
 export async function fetchOpenAiFront(
-  target: ResolvedTarget,
+  attempt: ResolvedAttempt,
   args: {
     reqJson: unknown;
     wantsStream: boolean;
@@ -933,22 +1027,44 @@ export async function fetchOpenAiFront(
     protocol?: OpenAiFrontProtocol;
     anthropicHeaders?: Record<string, string>;
     processRecoveredChat?: RecoveredOpenAiChatProcessor;
+    usage?: UsageAccumulator;
   },
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
+  const target = attempt.target;
   const protocol = args.protocol ?? "chat";
   const base = (args.reqJson ?? {}) as Record<string, unknown>;
   // Preserve the existing direct path for the protocol/backend pair that already speaks the
   // same wire format. It keeps provider-specific OpenAI fields byte-for-byte intact.
   if (target.kind === "openai" && protocol === "chat") {
     const schemas = toolSchemaMap(base);
-    const body = { ...base, model: target.model, stream: args.wantsStream };
-    const res = await fetchFn(target.base + "/chat/completions", {
+    const callerRequestedUsage = isRecord(base.stream_options) && base.stream_options.include_usage === true;
+    const relayAddedUsage = args.wantsStream && !callerRequestedUsage;
+    const body: Record<string, unknown> = { ...base, model: target.model, stream: args.wantsStream };
+    const originalBody = { ...body };
+    if (relayAddedUsage) {
+      body.stream_options = {
+        ...(isRecord(base.stream_options) ? base.stream_options : {}),
+        include_usage: true,
+      };
+    }
+    const post = (requestBody: Record<string, unknown>) => fetchFn(target.base + "/chat/completions", {
       method: "POST",
-      headers: buildTargetHeaders(target),
-      body: JSON.stringify(body),
+      headers: buildTargetHeaders(attempt),
+      body: JSON.stringify(requestBody),
       signal: args.signal,
     });
+    let res = await post(body);
+    // Only a relay-added compatibility hint is safe to remove. A caller-provided option is
+    // their request, not relay policy.
+    if (!res.ok && relayAddedUsage && (res.status === 400 || res.status === 422)) {
+      await res.body?.cancel().catch(() => {});
+      res = await post(originalBody);
+    }
+    if (args.usage) {
+      const nativeStreamed = nativeResponseIsStreamed(res, args.wantsStream);
+      res = observeUsage(res, "openai-chat", args.usage, { streamed: nativeStreamed });
+    }
     if (!res.ok) return res;
     const streamed = args.wantsStream || (res.headers.get("content-type") ?? "").includes("text/event-stream");
     if (streamed) {
@@ -967,7 +1083,10 @@ export async function fetchOpenAiFront(
             response?.headers.set(TOOL_DIALECT_HEADER, "recovered");
           }, args.processRecoveredChat)
         : preflight.body;
-      response = new Response(responseBody, { status: res.status, headers: res.headers });
+      response = new Response(
+        relayAddedUsage ? suppressRelayAddedOpenAiUsageFrames(responseBody) : responseBody,
+        { status: res.status, headers: res.headers },
+      );
       if (recovered) response.headers.set(TOOL_DIALECT_HEADER, "recovered");
       return attachUpstreamMetadata(response, preflight.metadata);
     }
@@ -1030,13 +1149,14 @@ export async function fetchOpenAiFront(
   }
 
   const reqBuf = Buffer.from(JSON.stringify(anthropicBody), "utf8");
-  const backendRes = await fetchBackend(target, {
+  const backendRes = await fetchBackend(attempt, {
     path: "/v1/messages",
     method: "POST",
     reqBuf,
     reqJson: anthropicBody,
     anthropicHeaders: args.anthropicHeaders ?? {},
     wantsStream: args.wantsStream,
+    ...(args.usage ? { usage: args.usage } : {}),
     signal: args.signal,
   }, fetchFn);
   const metadata = upstreamResponseMetadata.get(backendRes);

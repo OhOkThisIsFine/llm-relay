@@ -6,12 +6,17 @@ import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
 import { SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER } from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
-import { resetFacts, isCostBlocked, cooldownUntil } from "../src/target-facts.js";
+import { factsFor, recordFact, resetFacts, isCostBlocked, cooldownUntil } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ProviderConfig, ResolvedTarget } from "../src/config.js";
 import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
 import type { Reshaper } from "../src/reshaper.js";
+import { makeCredentialId } from "../src/credential-id.js";
+import { resolveAttempt } from "../src/resolved-attempt.js";
 import type { AssistantMessage } from "../src/anthropic.js";
+function breakerIdentity(provider: string, model: string | null, kind: "anthropic" | "openai" = "openai"): ProviderTargetIdentity {
+  return { provider, model, kind, credentialId: makeCredentialId(provider) };
+}
 
 /**
  * Pool failover, measured end to end.
@@ -117,7 +122,103 @@ function chat(p: number, model = "pool/coding"): Promise<Response> {
   });
 }
 
+function messages(p: number, model = "pool/coding"): Promise<Response> {
+  return fetch(`http://127.0.0.1:${p}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model, max_tokens: 20, messages: [{ role: "user", content: "hi" }] }),
+  });
+}
+
 describe("OpenAI front — failover across pool candidates", () => {
+  it("records exactly one failed and one measured winner across both public fronts", async () => {
+    const anthBuffered = JSON.stringify({ id: "m", type: "message", role: "assistant", model: "m2", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 2, output_tokens: 6 } });
+    const anthStream = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", type: "message", role: "assistant", model: "m2", content: [] } })}\n\n`,
+      `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 6 } })}\n\n`,
+      "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ].join("");
+    const chatBuffered = JSON.stringify({ id: "c", choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 6 } });
+    const chatStream = [
+      `data: ${JSON.stringify({ id: "c", choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ id: "c", choices: [], usage: { completion_tokens: 6 } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("");
+    const cases: Array<{ name: string; kind: "anthropic" | "openai"; body: string; headers?: Record<string, string>; path: string; request: object }> = [
+      { name: "Messages buffered", kind: "anthropic", body: anthBuffered, path: "/v1/messages", request: { model: "pool/coding", max_tokens: 20, messages: [{ role: "user", content: "hi" }] } },
+      { name: "Messages streamed", kind: "anthropic", body: anthStream, headers: { "content-type": "text/event-stream" }, path: "/v1/messages", request: { model: "pool/coding", stream: true, max_tokens: 20, messages: [{ role: "user", content: "hi" }] } },
+      { name: "Chat buffered", kind: "openai", body: chatBuffered, path: "/v1/chat/completions", request: { model: "pool/coding", messages: [{ role: "user", content: "hi" }] } },
+      { name: "Chat streamed", kind: "openai", body: chatStream, headers: { "content-type": "text/event-stream" }, path: "/v1/chat/completions", request: { model: "pool/coding", stream: true, messages: [{ role: "user", content: "hi" }] } },
+      { name: "Responses buffered", kind: "anthropic", body: anthBuffered, path: "/v1/responses", request: { model: "pool/coding", input: "hi" } },
+    ];
+    for (const scenario of cases) {
+      globalCircuitBreaker.reset();
+      resetFacts();
+      const failed = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+      const winner = await scripted(() => ({ body: scenario.body, ...(scenario.headers ? { headers: scenario.headers } : {}) }));
+      const calls: Array<{ provider: string; model: string; ok: boolean; completionTokens?: number }> = [];
+      const p = port(await startProxy(poolCfg([
+        `http://127.0.0.1:${port(failed.server)}`,
+        `http://127.0.0.1:${port(winner.server)}`,
+      ], scenario.kind), {
+        modelCallRecorder(provider, model, call) {
+          calls.push({ provider, model, ok: call.ok, ...(call.completionTokens !== undefined ? { completionTokens: call.completionTokens } : {}) });
+        },
+      }));
+      const response = await fetch(`http://127.0.0.1:${p}${scenario.path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(scenario.request),
+      });
+      expect(response.status, scenario.name).toBe(200);
+      await response.text();
+      expect(calls, scenario.name).toEqual([
+        { provider: "p1", model: "m1", ok: false },
+        { provider: "p2", model: "m2", ok: true, completionTokens: 6 },
+      ]);
+    }
+  });
+
+  it("records one unknown failed attempt and the winning streamed usage exactly once", async () => {
+    const a = await scripted(() => ({
+      status: 429,
+      body: JSON.stringify({ error: { message: "TPM exceeded", type: "rate_limit_exceeded" } }),
+    }));
+    const b = await scripted(() => ({
+      headers: { "content-type": "text/event-stream" },
+      body: [
+        `data: ${JSON.stringify({ id: "c", model: "m2", choices: [{ index: 0, delta: { content: "served" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c", model: "m2", choices: [], usage: { prompt_tokens: 2, completion_tokens: 7 } })}\n\n`,
+        "data: [DONE]\n\n",
+      ].join(""),
+    }));
+    const calls: Array<{ provider: string; model: string; ok: boolean; completionTokens?: number }> = [];
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+    ]), {
+      modelCallRecorder(provider, model, call) {
+        calls.push({ provider, model, ok: call.ok, ...(call.completionTokens !== undefined ? { completionTokens: call.completionTokens } : {}) });
+      },
+    }));
+    const response = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    // The relay asked upstream for usage but restores the caller's original SSE shape.
+    expect(body).not.toContain("completion_tokens");
+    expect(calls).toEqual([
+      { provider: "p1", model: "m1", ok: false },
+      { provider: "p2", model: "m2", ok: true, completionTokens: 7 },
+    ]);
+  });
+
   it("steps over a rate-limited candidate and is served by the next one", async () => {
     const a = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "TPM exceeded", type: "rate_limit_exceeded" } }) }));
     const b = await scripted(() => ({ body: OK_BODY }));
@@ -142,7 +243,7 @@ describe("OpenAI front — failover across pool candidates", () => {
     const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
 
     expect((await chat(p)).status).toBe(200);
-    const state = globalCircuitBreaker.getState("p1/m1");
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"));
     expect(state?.lastStatus).toBe(429);
     expect(state?.consecutiveFailures).toBe(1);
     expect(state!.cooldownUntil).toBeGreaterThan(Date.now()); // 429 trips immediately
@@ -162,12 +263,12 @@ describe("OpenAI front — failover across pool candidates", () => {
 
     expect((await chat(p)).status).toBe(200);
 
-    const state = globalCircuitBreaker.getState("p1/m1")!;
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))!;
     expect(state.consecutiveFailures).toBe(0); // NOT health data
     expect(state.cooldownUntil).toBe(0);
     expect(state.credentialFailures).toBe(1); // its own axis
     expect(state.lastCredentialStatus).toBe(401);
-    expect(globalCircuitBreaker.hasCredentialFault("p1/m1")).toBe(true);
+    expect(globalCircuitBreaker.hasCredentialFault(breakerIdentity("p1", "m1"))).toBe(true);
 
     // Demoted, so the next request does not pay its round-trip first.
     expect((await chat(p)).status).toBe(200);
@@ -200,7 +301,7 @@ describe("OpenAI front — failover across pool candidates", () => {
     const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
 
     expect((await chat(p)).status).toBe(200);
-    const remaining = globalCircuitBreaker.getState("p1/m1")!.cooldownUntil - Date.now();
+    const remaining = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))!.cooldownUntil - Date.now();
     expect(remaining).toBeGreaterThan(0);
     expect(remaining).toBeLessThanOrEqual(5000); // the 5s asked for, not the 120s default
   });
@@ -289,7 +390,7 @@ describe("orderByUsability — demotes, never drops", () => {
   const [a, b, c] = [t("a"), t("b"), t("c")];
 
   it("keeps config/benchmark order among equals", () => {
-    expect(orderByUsability([a, b, c], new CircuitBreaker()).map((x) => x.provider)).toEqual(["a", "b", "c"]);
+    expect(orderByUsability([a, b, c].map((target) => resolveAttempt(target)), new CircuitBreaker()).map((x) => x.target.provider)).toEqual(["a", "b", "c"]);
   });
 
   it("sinks a cooling target to the back instead of removing it from the pool", () => {
@@ -298,17 +399,17 @@ describe("orderByUsability — demotes, never drops", () => {
     // member failed too. A demoted target is only reached after every better one has actually
     // failed on this request — which costs nothing and preserves all 14 chances.
     const cb = new CircuitBreaker();
-    cb.recordOutcome(a, { ok: false, status: 429, elapsedMs: 5 });
-    const out = orderByUsability([a, b, c], cb);
-    expect(out.map((x) => x.provider)).toEqual(["b", "c", "a"]);
+    cb.recordOutcome(breakerIdentity("a", "m"), { ok: false, status: 429, elapsedMs: 5 });
+    const out = orderByUsability([a, b, c].map((target) => resolveAttempt(target)), cb);
+    expect(out.map((x) => x.target.provider)).toEqual(["b", "c", "a"]);
     expect(out).toHaveLength(3); // nothing dropped
   });
 
   it("orders live before credential-faulted before cooling", () => {
     const cb = new CircuitBreaker();
-    cb.recordOutcome(a, { ok: false, status: 429, elapsedMs: 5 }); // cooling
-    cb.recordCredentialFault(b, 401); // unusable, but not sick
-    expect(orderByUsability([a, b, c], cb).map((x) => x.provider)).toEqual(["c", "b", "a"]);
+    cb.recordOutcome(breakerIdentity("a", "m"), { ok: false, status: 429, elapsedMs: 5 }); // cooling
+    cb.recordCredentialFault(breakerIdentity("b", "m"), 401); // unusable, but not sick
+    expect(orderByUsability([a, b, c].map((target) => resolveAttempt(target)), cb).map((x) => x.target.provider)).toEqual(["c", "b", "a"]);
   });
 });
 
@@ -337,8 +438,8 @@ describe("Anthropic path — failover past a credential fault", () => {
     expect(resp.status).toBe(200);
     expect(a.calls()).toBe(1);
     expect(b.calls()).toBe(1);
-    expect(globalCircuitBreaker.getState("p1/m1")?.credentialFailures).toBe(1);
-    expect(globalCircuitBreaker.getState("p1/m1")?.consecutiveFailures).toBe(0);
+    expect(globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))?.credentialFailures).toBe(1);
+    expect(globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))?.consecutiveFailures).toBe(0);
   });
 
   it("does not failover to subsequent candidates if client socket is destroyed (res.destroyed)", async () => {
@@ -448,7 +549,7 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
 
     expect((await chat(p)).status).toBe(200);
-    const state = globalCircuitBreaker.getState("p1/m1")!;
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))!;
     expect(state.lastStatus).toBe(402);
     expect(state.consecutiveFailures).toBe(1); // health data, unlike a 401
     const remaining = state.cooldownUntil - Date.now();
@@ -481,7 +582,7 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     expect(resp.status).toBe(200);
     expect(a.calls()).toBe(1);
     expect(b.calls()).toBe(1);
-    expect(globalCircuitBreaker.getState("p1/m1")?.lastStatus).toBe(402);
+    expect(globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))?.lastStatus).toBe(402);
   });
 
   it("all-402 exhaustion still returns the last candidate's real error body, naming everyone tried", async () => {
@@ -581,8 +682,8 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
 
     expect((await chat(p)).status).toBe(200);
-    expect(isCostBlocked("p1", "m1")).toBe(false);
-    expect(cooldownUntil("p1", "m1")).not.toBeNull(); // cooling, which expires on its own
+    expect(isCostBlocked("p1", makeCredentialId("p1"), "m1")).toBe(false);
+    expect(cooldownUntil("p1", makeCredentialId("p1"), "m1")).not.toBeNull(); // cooling, which expires on its own
   });
 
   it("flags refusals it could not interpret, so the queue is pushed rather than polled", async () => {
@@ -618,27 +719,71 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     // of them aged out. A served request proves the shared credential works, so the symptoms go
     // together with the cause.
     const cb = new CircuitBreaker();
-    cb.recordCredentialFault("p1/m1", 401);
-    cb.recordCredentialFault("p1/m2", 401);
-    cb.recordCredentialFault("p2/m1", 401);
-    expect(cb.hasCredentialFault("p1/m1")).toBe(true);
-    expect(cb.hasCredentialFault("p1/m2")).toBe(true);
+    cb.recordCredentialFault(breakerIdentity("p1", "m1"), 401);
+    cb.recordCredentialFault(breakerIdentity("p1", "m2"), 401);
+    cb.recordCredentialFault(breakerIdentity("p2", "m1"), 401);
+    expect(cb.hasCredentialFault(breakerIdentity("p1", "m1"))).toBe(true);
+    expect(cb.hasCredentialFault(breakerIdentity("p1", "m2"))).toBe(true);
 
-    expect(cb.clearProviderCredentialFaults("p1")).toBe(2);
-    expect(cb.hasCredentialFault("p1/m1")).toBe(false);
-    expect(cb.hasCredentialFault("p1/m2")).toBe(false);
+    expect(cb.clearCredentialFaults(makeCredentialId("p1"))).toBe(2);
+    expect(cb.hasCredentialFault(breakerIdentity("p1", "m1"))).toBe(false);
+    expect(cb.hasCredentialFault(breakerIdentity("p1", "m2"))).toBe(false);
     // ...and says nothing about a different credential.
-    expect(cb.hasCredentialFault("p2/m1")).toBe(true);
+    expect(cb.hasCredentialFault(breakerIdentity("p2", "m1"))).toBe(true);
   });
 
   it("a success clears the quota cooldown — a mid-month top-up recovers without a restart", () => {
     const cb = new CircuitBreaker();
-    cb.recordOutcome("p/m", { ok: false, status: 402, elapsedMs: 5 });
-    expect(cb.isHealthy("p/m")).toBe(false); // cooling, demoted behind live members
-    cb.recordOutcome("p/m", { ok: true, status: 200, elapsedMs: 5 });
-    expect(cb.isHealthy("p/m")).toBe(true);
-    expect(cb.getState("p/m")!.cooldownUntil).toBe(0);
+    cb.recordOutcome(breakerIdentity("p", "m"), { ok: false, status: 402, elapsedMs: 5 });
+    expect(cb.isHealthy(breakerIdentity("p", "m"))).toBe(false); // cooling, demoted behind live members
+    cb.recordOutcome(breakerIdentity("p", "m"), { ok: true, status: 200, elapsedMs: 5 });
+    expect(cb.isHealthy(breakerIdentity("p", "m"))).toBe(true);
+    expect(cb.getState(breakerIdentity("p", "m"))!.cooldownUntil).toBe(0);
   });
+});
+
+describe("runtime credential-scoped eligibility facts", () => {
+  const ANTHROPIC_OK = JSON.stringify({
+    id: "msg_credential_ok",
+    type: "message",
+    role: "assistant",
+    model: "m1",
+    content: [{ type: "text", text: "served" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+
+  for (const front of [
+    { name: "OpenAI front", kind: "openai" as const, request: chat, success: OK_BODY },
+    { name: "Anthropic front", kind: "anthropic" as const, request: messages, success: ANTHROPIC_OK },
+  ]) {
+    it(`${front.name} materializes and clears only the served credential cell`, async () => {
+      let calls = 0;
+      const backend = await scripted(() => {
+        calls++;
+        return calls === 1
+          ? { status: 401, body: JSON.stringify({ error: { message: "invalid api key" } }) }
+          : { body: front.success };
+      });
+      const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(backend.server)}`], front.kind)));
+      const defaultCredential = makeCredentialId("p1");
+      const otherCredential = makeCredentialId("p1", "work");
+
+      expect((await front.request(p)).status).toBe(401);
+      expect(factsFor("p1", defaultCredential, "m1").map((fact) => fact.kind)).toContain("credential-invalid");
+      expect(factsFor("p1", otherCredential, "m1")).toEqual([]);
+
+      recordFact("credential-invalid", {
+        kind: "credential",
+        provider: "p1",
+        credentialId: otherCredential,
+      });
+      expect((await front.request(p)).status).toBe(200);
+
+      expect(factsFor("p1", defaultCredential, "m1")).toEqual([]);
+      expect(factsFor("p1", otherCredential, "m1").map((fact) => fact.kind)).toEqual(["credential-invalid"]);
+    });
+  }
 });
 
 
@@ -663,9 +808,9 @@ describe("410 Gone is a fact about one member — fail over, and learn only stat
     expect(b.calls()).toBe(1);
     expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
     // Status + wording agreed the deployment is gone → excluded from free pools…
-    expect(isCostBlocked("p1", "m1")).toBe(true);
+    expect(isCostBlocked("p1", makeCredentialId("p1"), "m1")).toBe(true);
     // …and the verdict cannot leak to the sibling that served.
-    expect(isCostBlocked("p2", "m2")).toBe(false);
+    expect(isCostBlocked("p2", makeCredentialId("p2"), "m2")).toBe(false);
   });
 
   it("anthropic front: same policy — one classifyStatus, both paths", async () => {
@@ -681,7 +826,7 @@ describe("410 Gone is a fact about one member — fail over, and learn only stat
     expect(resp.status).toBe(200);
     expect(a.calls()).toBe(1);
     expect(b.calls()).toBe(1);
-    expect(isCostBlocked("p1", "m1")).toBe(true);
+    expect(isCostBlocked("p1", makeCredentialId("p1"), "m1")).toBe(true);
   });
 
   it("a bare 410 fails over but teaches NOTHING — status alone is not a statement", async () => {
@@ -692,7 +837,7 @@ describe("410 Gone is a fact about one member — fail over, and learn only stat
     const resp = await chat(p);
     expect(resp.status).toBe(200);
     expect(b.calls()).toBe(1);
-    expect(isCostBlocked("p1", "m1")).toBe(false);
+    expect(isCostBlocked("p1", makeCredentialId("p1"), "m1")).toBe(false);
   });
 });
 
@@ -845,6 +990,36 @@ describe("buffered repair dead turns resume the candidate walk (adoption review 
       } as AssistantMessage,
     }),
   };
+
+  it("preserves provider usage through buffered validation and repair, recording once", async () => {
+    const reported = JSON.stringify({
+      type: "message",
+      role: "assistant",
+      stop_reason: "tool_use",
+      content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }],
+      usage: { input_tokens: 2, output_tokens: 9 },
+    });
+    const failed = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+    const backend = await scripted(() => ({ body: reported }));
+    const calls: Array<{ provider: string; model: string; ok: boolean; completionTokens?: number }> = [];
+    const p = port(await startProxy(repairPool([
+      `http://127.0.0.1:${port(failed.server)}`,
+      `http://127.0.0.1:${port(backend.server)}`,
+    ]), {
+      reshaper: fixer,
+      modelCallRecorder(provider, model, call) {
+        calls.push({ provider, model, ok: call.ok, ...(call.completionTokens !== undefined ? { completionTokens: call.completionTokens } : {}) });
+      },
+    }));
+    const response = await toolTurn(p);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { content: Array<{ input?: unknown }> };
+    expect(body.content[0]?.input).toEqual({ city: "Paris" });
+    expect(calls).toEqual([
+      { provider: "p1", model: "m1", ok: false },
+      { provider: "p2", model: "m2", ok: true, completionTokens: 9 },
+    ]);
+  });
 
   it("repair exhaustion on candidate 1 becomes a dead turn and candidate 2 serves", async () => {
     const broken = await scripted(() => ({ body: assistantBody("get_weather", {}) }));
@@ -1027,39 +1202,100 @@ describe("request-scoped provider skip — transport evidence condemns the host,
 });
 
 describe("live-traffic quota headers reach the breaker (adoption review §1.9)", () => {
-  // The breaker's observation shape always carried quotaPercent, but only synthetic probes ever
-  // supplied it — every real response's x-ratelimit-* headers were dropped, so /telemetry showed
-  // probe-aged quota beside fresh live health.
-  it("a served response's x-ratelimit headers set the breaker's quotaPercent", async () => {
-    const a = await scripted(() => ({
-      headers: { "x-ratelimit-remaining-requests": "25", "x-ratelimit-limit-requests": "100" },
-      body: OK_BODY,
-    }));
-    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`])));
+  const quotaHeaders = (requestRemaining: string, tokenRemaining?: string) => ({
+    "x-ratelimit-limit-requests-day": "100",
+    "x-ratelimit-remaining-requests-day": requestRemaining,
+    ...(tokenRemaining === undefined ? {} : {
+      "x-ratelimit-limit-tokens-minute": "1000",
+      "x-ratelimit-remaining-tokens-minute": tokenRemaining,
+    }),
+  });
+  const quotaTuples = (provider: string) =>
+    globalCircuitBreaker.getState(breakerIdentity(provider, `${provider === "p1" ? "m1" : "m2"}`))
+      ?.quotaObservations.map(({ axis, period, remaining, limit }) => ({ axis, period, remaining, limit }));
+  const ANTHROPIC_QUOTA_OK = JSON.stringify({
+    id: "msg_quota",
+    type: "message",
+    role: "assistant",
+    model: "m",
+    content: [{ type: "text", text: "served" }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const fronts = [
+    { name: "OpenAI", request: chat, kind: "openai" as const, okBody: OK_BODY },
+    { name: "Anthropic", request: messages, kind: "anthropic" as const, okBody: ANTHROPIC_QUOTA_OK },
+  ] as const;
 
-    expect((await chat(p)).status).toBe(200);
-    expect(globalCircuitBreaker.getState("p1/m1")?.quotaPercent).toBe(25);
+  it.each(fronts)("$name front records two typed axes on success and preserves an omitted axis", async ({ request, kind, okBody }) => {
+    const a = await scripted((call) => ({
+      headers: call === 1 ? quotaHeaders("75", "800") : quotaHeaders("50"),
+      body: okBody,
+    }));
+    const b = await scripted(() => ({ body: okBody }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+    ], kind)));
+
+    expect((await request(p)).status).toBe(200);
+    expect((await request(p)).status).toBe(200);
+    expect(a.calls()).toBe(2);
+    expect(b.calls()).toBe(0);
+    expect(quotaTuples("p1")).toEqual([
+      { axis: "requests", period: "day", remaining: 50, limit: 100 },
+      { axis: "tokens", period: "minute", remaining: 800, limit: 1000 },
+    ]);
+    expect(globalCircuitBreaker.getState(breakerIdentity("p2", "m2"))).toBeUndefined();
   });
 
-  it("a 429's stated zero-remaining is recorded too — exhaustion is quota data", async () => {
+  it.each(fronts)("$name front commits two typed axes from a failed candidate without mixing the next cell", async ({ request, kind, okBody }) => {
     const a = await scripted(() => ({
       status: 429,
-      headers: { "x-ratelimit-remaining": "0", "x-ratelimit-limit": "50" },
+      headers: quotaHeaders("0", "0"),
       body: JSON.stringify({ error: { message: "TPM exceeded", type: "rate_limit_exceeded" } }),
     }));
-    const b = await scripted(() => ({ body: OK_BODY }));
-    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+    const b = await scripted(() => ({ headers: quotaHeaders("90", "900"), body: okBody }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+    ], kind)));
 
-    expect((await chat(p)).status).toBe(200);
-    expect(globalCircuitBreaker.getState("p1/m1")?.quotaPercent).toBe(0);
+    expect((await request(p)).status).toBe(200);
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+    expect(quotaTuples("p1")).toEqual([
+      { axis: "requests", period: "day", remaining: 0, limit: 100 },
+      { axis: "tokens", period: "minute", remaining: 0, limit: 1000 },
+    ]);
+    expect(quotaTuples("p2")).toEqual([
+      { axis: "requests", period: "day", remaining: 90, limit: 100 },
+      { axis: "tokens", period: "minute", remaining: 900, limit: 1000 },
+    ]);
   });
 
-  it("no rate-limit headers ⇒ the field stays unset — never guessed", async () => {
-    const a = await scripted(() => ({ body: OK_BODY }));
-    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`])));
+  it.each(fronts)("$name front commits quota on a credential failure without changing its health classification", async ({ request, kind, okBody }) => {
+    const a = await scripted(() => ({
+      status: 401,
+      headers: quotaHeaders("10", "100"),
+      body: JSON.stringify({ error: { message: "Wrong API Key" } }),
+    }));
+    const b = await scripted(() => ({ body: okBody }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+    ], kind)));
 
-    expect((await chat(p)).status).toBe(200);
-    expect(globalCircuitBreaker.getState("p1/m1")?.quotaPercent ?? null).toBeNull();
+    expect((await request(p)).status).toBe(200);
+    const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))!;
+    expect(state.credentialFailures).toBe(1);
+    expect(state.consecutiveFailures).toBe(0);
+    expect(state.cooldownUntil).toBe(0);
+    expect(quotaTuples("p1")).toEqual([
+      { axis: "requests", period: "day", remaining: 10, limit: 100 },
+      { axis: "tokens", period: "minute", remaining: 100, limit: 1000 },
+    ]);
   });
 });
 

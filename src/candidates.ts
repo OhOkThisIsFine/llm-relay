@@ -4,13 +4,20 @@ import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
 import { deploymentFitness, getStrength, type StrengthBasis } from "./benchmarks.js";
 import { findTierModel, type TierData } from "./tier-data.js";
-import { keyIsPresent } from "./authEnv.js";
+import { readCredential } from "./authEnv.js";
+import { makeCredentialId } from "./credential-id.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
-import { globalCircuitBreaker, type CircuitBreaker, type CooldownSource } from "./circuit-breaker.js";
+import {
+  globalCircuitBreaker,
+  type CircuitBreaker,
+  type CooldownSource,
+} from "./circuit-breaker.js";
+import type { ProviderTargetIdentity } from "./kernel/contracts.js";
 import { describeScope, factsFor } from "./target-facts.js";
-import { getRealWorldScore, loadRuntimeTelemetry } from "./ping/runtime-telemetry.js";
+import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./ping/runtime-telemetry.js";
 import { loadTierData } from "./registry.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
+import { type QuotaObservation } from "./quota-observation.js";
 
 /**
  * Everything known about one offload destination, kept as SEPARATE raw dimensions.
@@ -23,6 +30,8 @@ export interface Candidate {
   spec: string;
   provider: string;
   model?: string;
+  /** The credential cell this row describes. */
+  credentialId: string;
   /** Pools this spec belongs to, and subagent tiers currently pointing at it. */
   pools: string[];
   subagentTiers: string[];
@@ -42,7 +51,8 @@ export interface Candidate {
     lastPingCode: string | null;
     lastPingMs: number | null;
   } | null;
-  quotaPercent: number | null;
+  /** Typed observations for this credential/model cell. Empty means not measured. */
+  quota: QuotaObservation[];
   breaker: {
     open: boolean;
     consecutiveFailures: number;
@@ -83,6 +93,12 @@ export interface Candidate {
     avgLatencyMs: number | null;
     lastCalledAt: string | null;
   } | null;
+  /** Provider-reported completion-token coverage; null means no usage was reported. */
+  completionTokens: {
+    reported: number | null;
+    reportedCalls: number;
+    totalCalls: number;
+  };
   /**
    * Limits, each with its own provenance. `provider` = this provider published it about its own
    * deployment; `reference` = borrowed from another provider serving the same model id (different
@@ -218,6 +234,43 @@ function metadataConfidence(source: MetadataSource | null, exactMatch: boolean):
   return source === "reference" && exactMatch ? 0.5 : 0;
 }
 
+/**
+ * The breaker owns credential cells, while this view describes deployments. Its deployment
+ * measurement merges stored cell samples in timestamp order and derives confidence from the
+ * least-observed contributing cell. Cell-only fields below still use the exact requested identity.
+ */
+function deploymentBreakerStats(
+  breaker: CircuitBreaker,
+  target: ProviderTargetIdentity,
+): { stability: number | null; confidenceSamples: number } {
+  const measurement = breaker.getDeploymentMeasurement({
+    provider: target.provider,
+    model: target.model,
+  });
+  return {
+    stability: measurement.stabilityScore,
+    confidenceSamples: measurement.minSamples,
+  };
+}
+
+/**
+ * Probe and live response observations describe the same typed tuple but arrive through
+ * independent paths. Keep every axis/period and let the newer measurement win each tuple;
+ * source order must never make an older probe look fresher than real traffic.
+ */
+function mergeCandidateQuota(
+  probe: readonly QuotaObservation[],
+  breaker: readonly QuotaObservation[],
+): QuotaObservation[] {
+  const merged = new Map<string, QuotaObservation>();
+  for (const observation of [...probe, ...breaker]) {
+    const key = `${observation.axis}:${observation.period}`;
+    const existing = merged.get(key);
+    if (!existing || observation.observedAt >= existing.observedAt) merged.set(key, observation);
+  }
+  return [...merged.values()];
+}
+
 /** Build the un-blended decision table for offload targets. */
 export async function buildCandidates(
   cfg: Config,
@@ -232,6 +285,8 @@ export async function buildCandidates(
      *  match-quality behaviour can be exercised against a fixed row set instead of whatever
      *  `npm run sync:tiers` last wrote. Omitted ⇒ the real snapshot. */
     tierData?: TierData | null;
+    /** Runtime telemetry override for deterministic views/tests. Omitted ⇒ the live store. */
+    telemetry?: TelemetryData;
   } = {},
 ): Promise<CandidatesView> {
   if (opts.catalog) materializeDynamicPools(cfg, opts.catalog);
@@ -239,7 +294,7 @@ export async function buildCandidates(
   const nowMs = opts.nowMs ?? Date.now();
   const tierData = opts.tierData === undefined ? loadTierData() : opts.tierData;
   const byNorm = tierData?.byNorm ?? [];
-  const telemetry = loadRuntimeTelemetry();
+  const telemetry = opts.telemetry ?? loadRuntimeTelemetry();
   const memberships = collectSpecs(cfg);
 
   // Hydrate each provider once. `has()` + `limits()` per row both call `list()`, which turned a
@@ -275,6 +330,16 @@ export async function buildCandidates(
     const { provider, model } = splitSpec(spec);
     if (opts.provider && provider !== opts.provider) continue;
     const p: ProviderConfig | undefined = cfg.providers[provider];
+    const credentialId = makeCredentialId(provider);
+    // This is the implicit single-slot attempt identity.  Cell-only breaker operations below
+    // must receive the identity, never the display spec or a serialized provider/model key.
+    const cellTarget: ProviderTargetIdentity = {
+      provider,
+      model: model ?? null,
+      kind: p?.kind ?? "openai",
+      credentialId,
+      ...(p?.base ? { base: p.base } : {}),
+    };
 
     const providerModels = listedByProvider.get(provider) ?? null;
     const listed = p && p.kind === "openai" && model && opts.catalog
@@ -282,7 +347,7 @@ export async function buildCandidates(
       : null;
 
     const summary = opts.pingLoop && model ? opts.pingLoop.getModelSummary(provider, model) : null;
-    const state = breaker.getState(spec);
+    const state = breaker.getState(cellTarget);
     const obs = model ? telemetry.models[`${provider}/${model}`] : undefined;
     const strength = getStrength(spec, tierData);
     const matched = findTierModel(model ?? spec, byNorm, tierData?.exactByNorm);
@@ -315,13 +380,17 @@ export async function buildCandidates(
     });
     const exactTier = matched?.match === "exact" ? tier : undefined;
     const supportsTools = typeof exactTier?.supports_tools === "boolean" ? exactTier.supports_tools : null;
-    const breakerStability = breaker.getMeasuredStability(spec);
+    const deploymentStats = deploymentBreakerStats(breaker, cellTarget);
+    const breakerStability = deploymentStats.stability;
+    // Preserve the existing evidence order: the purpose-built probe summary wins when present;
+    // live breaker observations are the fallback. Packet 2 changes the breaker's fallback from
+    // one credential cell to the deployment aggregate, not which measurement source outranks it.
     const stabilityScore = summary && summary.stabilityScore >= 0
       ? summary.stabilityScore
       : breakerStability;
     const stabilitySamples = summary && opts.pingLoop && model
       ? opts.pingLoop.getModelPings(provider, model).length
-      : state?.pings.length ?? 0;
+      : deploymentStats.confidenceSamples;
     const fitness = deploymentFitness(strength, {
       stabilityScore,
       stabilityConfidence: Math.min(1, stabilitySamples / 5),
@@ -339,11 +408,12 @@ export async function buildCandidates(
       spec,
       provider,
       ...(model ? { model } : {}),
+      credentialId,
       pools: membership.pools,
       subagentTiers: membership.subagentTiers,
       // The shared presence predicate, not an open-coded `?.trim()`. Three sites disagreed
       // about whether a whitespace-only key counts as present; this is the single answer.
-      hasKey: p?.authEnv ? keyIsPresent(process.env[p.authEnv]) : true,
+      hasKey: p?.authEnv ? readCredential(p.authEnv, process.env, provider) !== undefined : true,
       listed,
       capabilityMatch: matched ? { name: matched.rec.norm, match: matched.match } : null,
       health: summary
@@ -357,9 +427,12 @@ export async function buildCandidates(
             lastPingMs: summary.lastPingMs,
           }
         : null,
-      quotaPercent: opts.pingLoop ? opts.pingLoop.getProviderQuota(provider) : null,
+      quota: mergeCandidateQuota(
+        opts.pingLoop && model ? opts.pingLoop.getQuotaObservations(credentialId, model) : [],
+        state?.quotaObservations ?? [],
+      ),
       breaker: {
-        open: !breaker.isHealthy(spec, nowMs),
+        open: !breaker.isHealthy(cellTarget, nowMs),
         consecutiveFailures: state?.consecutiveFailures ?? 0,
         lastStatus: state?.lastStatus ?? null,
         cooldownRemainingMs: Math.max(0, (state?.cooldownUntil ?? 0) - nowMs),
@@ -367,9 +440,9 @@ export async function buildCandidates(
         unexplained429s: state?.unexplained429s ?? 0,
         credentialFailures: state?.credentialFailures ?? 0,
         lastCredentialStatus: state?.lastCredentialStatus ?? null,
-        credentialFault: breaker.hasCredentialFault(spec, nowMs),
+        credentialFault: breaker.hasCredentialFault(cellTarget, nowMs),
       },
-      facts: factsFor(provider, model, { now: nowMs }).map((f) => ({
+      facts: factsFor(provider, credentialId, model, { now: nowMs }).map((f) => ({
         kind: f.kind,
         scope: describeScope(f.scope),
         expiresInMs: Math.max(0, f.until - nowMs),
@@ -382,6 +455,11 @@ export async function buildCandidates(
             lastCalledAt: obs.lastCalledAt ? new Date(obs.lastCalledAt).toISOString() : null,
           }
         : null,
+      completionTokens: {
+        reported: obs && obs.completionTokenCalls > 0 ? obs.totalCompletionTokens : null,
+        reportedCalls: obs?.completionTokenCalls ?? 0,
+        totalCalls: obs?.totalCalls ?? 0,
+      },
       contextLength: meta.contextLength,
       contextLengthSource: meta.contextLengthSource,
       maxOutputTokens: meta.maxOutputTokens,

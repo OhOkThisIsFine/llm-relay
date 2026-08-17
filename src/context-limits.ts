@@ -99,7 +99,8 @@ export function observedContextLimit(
   model: string,
   opts: { path?: string; now?: number } = {},
 ): number | null {
-  for (const fact of factsFor(provider, model, opts)) {
+  // Context ceilings are deployment-scoped measurements, not credential-scoped facts.
+  for (const fact of factsFor(provider, null, model, opts)) {
     if (fact.kind === "context-limit" && typeof fact.value === "number") return fact.value;
   }
   return null;

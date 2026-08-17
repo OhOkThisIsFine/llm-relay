@@ -22,9 +22,12 @@ import {
   runConfigCommand,
   runPools,
   runRoutingCommand,
+  runEligibility,
+  formatCandidateQuota,
 } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { ModelCatalog } from "../src/catalog.js";
+import { interpretRefusal, pendingRefusals, proposeInterpretation, recordUnknownRefusal, resetInterpretations } from "../src/refusal-interpretation.js";
 
 describe("cli helper utilities", () => {
   const origArgv = process.argv;
@@ -221,6 +224,26 @@ describe("cli helper utilities", () => {
 
     stdoutSpy.mockRestore();
     exitSpy.mockRestore();
+  });
+});
+
+describe("candidate quota rendering", () => {
+  it("prints each typed axis/period with raw values, basis, age, and unknown as dash", () => {
+    expect(formatCandidateQuota([], 10_000)).toBe("-");
+    expect(formatCandidateQuota([
+      {
+        axis: "requests", period: "day", remaining: 25, limit: 100,
+        resetsAt: null, observedAt: 8_000, basis: "provider-stated",
+      },
+      {
+        axis: "tokens", period: "minute", remaining: 800, limit: 1_000,
+        resetsAt: null, observedAt: 9_500, basis: "provider-stated",
+      },
+      { axis: "requests", period: "unknown", remaining: 4, limit: 10,
+        resetsAt: null, observedAt: 10_000, basis: "provider-stated" },
+    ], 10_000)).toBe(
+      "requests/day 25/100 provider-stated age 2s; tokens/minute 800/1000 provider-stated age 0s; requests/- 4/10 provider-stated age 0s",
+    );
   });
 });
 
@@ -557,6 +580,131 @@ describe("classifyCommand — the update-check gate", () => {
     // The failure mode of an unlisted command is "no update check", never "surprise reinstall".
     expect(classifyCommand(argv("some-future-subcommand"))).toBe("read-only");
     expect(classifyCommand(argv("keys", "--json"))).toBe("read-only");
+  });
+});
+
+describe("llm-relay eligibility scopes", () => {
+  const originalArgv = process.argv;
+
+  beforeEach(() => {
+    resetInterpretations();
+  });
+
+  afterEach(() => {
+    process.argv = originalArgv;
+    vi.restoreAllMocks();
+    resetInterpretations();
+  });
+
+  function queue(body: string): string {
+    recordUnknownRefusal("provider", "model", 418, body);
+    return pendingRefusals()[0]!.signature;
+  }
+
+  it("accepts every v2 scope", () => {
+    for (const scope of ["attempt", "deployment", "credential", "provider", "model"]) {
+      const body = `unrecognized ${scope}`;
+      queue(body);
+      process.argv = ["node", "cli.ts", "eligibility", "accept", "1", "--class", "not-servable", "--scope", scope];
+      runEligibility("accept", "1");
+      expect(interpretRefusal("provider", "model", 418, body)?.scope).toEqual({ kind: scope });
+      resetInterpretations();
+    }
+  });
+
+  it("defaults groups to the current credential and widens only with --all-credentials", () => {
+    const first = "unrecognized default group";
+    queue(first);
+    process.argv = ["node", "cli.ts", "eligibility", "accept", "1", "--class", "not-servable", "--scope", "group", "--members", "a,b"];
+    runEligibility("accept", "1");
+    expect(interpretRefusal("provider", "model", 418, first)?.scope).toEqual({
+      kind: "group", members: ["a", "b"], credential: "attempt",
+    });
+
+    resetInterpretations();
+    const second = "unrecognized widened group";
+    queue(second);
+    process.argv = ["node", "cli.ts", "eligibility", "accept", "1", "--class", "not-servable", "--scope", "group", "--members", "a,b", "--all-credentials"];
+    runEligibility("accept", "1");
+    expect(interpretRefusal("provider", "model", 418, second)?.scope).toEqual({
+      kind: "group", members: ["a", "b"], credential: "all",
+    });
+  });
+
+  it("rejects --all-credentials outside a group", () => {
+    queue("invalid widening");
+    process.argv = ["node", "cli.ts", "eligibility", "accept", "1", "--class", "not-servable", "--scope", "credential", "--all-credentials"];
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit:1"); }) as never);
+    expect(() => runEligibility("accept", "1")).toThrow("exit:1");
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("valid only with --scope group"));
+    exit.mockRestore();
+    err.mockRestore();
+  });
+
+  it("renders group members and explicit widening in a proposed accept command", () => {
+    const signature = queue("render widened group");
+    proposeInterpretation(signature, {
+      class: "not-servable",
+      scope: { kind: "group", members: ["a", "b"], credential: "all" },
+      rationale: "stated account policy",
+    });
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    runEligibility(undefined, undefined);
+    const rendered = out.join("");
+    expect(rendered).toContain("covers: a, b");
+    expect(rendered).toContain("group --members a,b --all-credentials");
+    expect(rendered).toContain("all credentials");
+    expect(rendered).toContain("current credential slot");
+    expect(rendered).toContain("all credentials for that provider");
+  });
+
+  it("prints a fully runnable accept command when proposing a widened group", () => {
+    queue("propose widened group");
+    process.argv = [
+      "node", "cli.ts", "eligibility", "propose", "1",
+      "--class", "not-servable", "--scope", "group", "--members", "a,b", "--all-credentials",
+      "--reset-ms", "1000", "--rationale", "stated account policy",
+    ];
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+
+    runEligibility("propose", "1");
+    expect(out.join("")).toContain(
+      "llm-relay eligibility accept 1 --class not-servable --scope group --members a,b --all-credentials --reset-ms 1000",
+    );
+
+    process.argv = [
+      "node", "cli.ts", "eligibility", "accept", "1",
+      "--class", "not-servable", "--scope", "group", "--members", "a,b", "--all-credentials", "--reset-ms", "1000",
+    ];
+    runEligibility("accept", "1");
+    expect(interpretRefusal("provider", "model", 418, "propose widened group")).toMatchObject({
+      scope: { kind: "group", members: ["a", "b"], credential: "all" },
+      reset: { kind: "fixed", ms: 1000 },
+    });
+  });
+
+  it("documents group options and credential breadth in top-level help", () => {
+    process.argv = ["node", "cli.ts", "help"];
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit:0"); }) as never);
+
+    expect(() => main()).toThrow("exit:0");
+    const help = out.join("");
+    expect(help).toContain("--scope group --members <id,id,...> [--all-credentials]");
+    expect(help).toContain("credential = current credential slot; provider = all credentials for that provider.");
   });
 });
 

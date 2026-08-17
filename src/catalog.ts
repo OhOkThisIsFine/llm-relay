@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { ProviderConfig } from "./config.js";
+import { buildAuthHeaders, readCredential } from "./authEnv.js";
 import { WriteBehindTimer } from "./write-behind.js";
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
@@ -278,7 +279,7 @@ export class ModelCatalog {
 
     const p = (async () => {
       try {
-        const { models, limits } = await this.fetch(cfg, opts.fetchFn ?? fetch);
+        const { models, limits } = await this.fetch(name, cfg, opts.fetchFn ?? fetch);
         this.mem.set(name, { fetchedAt: now, models, limits });
         this.revision++;
         this.persistSoon();
@@ -303,7 +304,7 @@ export class ModelCatalog {
     this.refreshing.add(name);
     void (async () => {
       try {
-        const { models, limits } = await this.fetch(cfg, fetchFn ?? fetch);
+        const { models, limits } = await this.fetch(name, cfg, fetchFn ?? fetch);
         this.mem.set(name, { fetchedAt: Date.now(), models, limits });
         this.revision++;
         this.persistSoon();
@@ -365,17 +366,14 @@ export class ModelCatalog {
   /** Returned together so concurrent fetches for different providers can never cross-assign
    *  one provider's limits to another's cache entry (which shared mutable state used to allow). */
   private async fetch(
+    name: string,
     cfg: ProviderConfig,
     fetchFn: typeof fetch,
   ): Promise<{ models: string[]; limits: Record<string, ModelLimits> }> {
     // Anthropic-kind backends have no OpenAI-style /models list we consume.
     if (cfg.kind !== "openai") return { models: [], limits: {} };
-    const key = cfg.authEnv ? process.env[cfg.authEnv]?.trim() : undefined;
-    const headers: Record<string, string> = {};
-    if (key) {
-      if (cfg.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
-      else headers["x-api-key"] = key;
-    }
+    const key = readCredential(cfg.authEnv, process.env, name);
+    const headers: Record<string, string> = buildAuthHeaders(key, cfg.authHeader);
     const signal = cfg.timeoutMs && cfg.timeoutMs > 0 ? AbortSignal.timeout(cfg.timeoutMs) : undefined;
     const res = await fetchFn(cfg.base + "/models", { headers, ...(signal ? { signal } : {}) });
     if (!res.ok) throw new Error(`models fetch HTTP ${res.status}`);

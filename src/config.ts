@@ -44,6 +44,8 @@ export interface ReshaperConfig {
   model: string;
   /** "anthropic": call /v1/messages. "openai": call /chat/completions (NIM/vLLM). */
   kind: Kind;
+  /** Provider name for provider-aware credential resolution (auth alias + passthrough rules). */
+  provider?: string;
   authEnv?: string;
   authHeader: AuthHeader;
   timeoutMs: number;
@@ -726,7 +728,7 @@ export function resolveTargets(model: string | null, cfg: Config): ResolvedTarge
   // keep-everything fallback below never ran, and the request went to a provider the proxy could
   // not authenticate to. Any drift between the two answers reopens that gap, so both must keep
   // calling the one predicate.
-  const activeTargets = targets.filter((t) => credentialState(t.authEnv) !== "declared-missing");
+  const activeTargets = targets.filter((t) => credentialState(t.authEnv, process.env, t.provider) !== "declared-missing");
   if (activeTargets.length > 0) {
     targets = activeTargets;
   }
@@ -760,6 +762,7 @@ export function reshaperForTarget(target: ResolvedTarget): ReshaperConfig | unde
       base: target.base,
       model: target.model,
       kind: "openai",
+      provider: target.provider,
       authHeader: target.authHeader,
       timeoutMs: Math.min(target.timeoutMs, 60000),
       ...(target.authEnv ? { authEnv: target.authEnv } : {}),
@@ -1017,7 +1020,8 @@ function parseProviders(
     }
     const kind: Kind = p.kind === "openai" ? "openai" : "anthropic";
     const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
-    const declaresAuthEnv = typeof p.authEnv === "string" && p.authEnv.trim().length > 0;
+    const declaredAuthEnv = typeof p.authEnv === "string" ? p.authEnv.trim() : undefined;
+    const declaresAuthEnv = typeof declaredAuthEnv === "string" && declaredAuthEnv.length > 0;
     const credentialMode =
       p.credentialMode === "passthrough" || p.credentialMode === "contained" ? p.credentialMode : undefined;
     if (p.credentialMode !== undefined && credentialMode === undefined) {
@@ -1028,7 +1032,7 @@ function parseProviders(
     if (credentialMode === "passthrough" && declaresAuthEnv) {
       throw new Error(
         `config.providers.${name}: credentialMode "passthrough" forwards the CALLER's own credential, ` +
-          `but authEnv ${String(p.authEnv)} declares one of its own — declare exactly one`,
+        `but authEnv ${String(declaredAuthEnv)} declares one of its own — declare exactly one`,
       );
     }
     // Warn, don't fail: this proxy fronts every client session, so refusing to start over a
@@ -1054,9 +1058,7 @@ function parseProviders(
       // The declared name is a default, not a requirement: if the key is present under
       // a known alias instead, use that so an already-working env var doesn't have to
       // be renamed. Resolved here so routing, key checks and the backend all agree.
-      ...(typeof p.authEnv === "string"
-        ? { authEnv: resolveAuthEnv(name, p.authEnv).name ?? p.authEnv }
-        : {}),
+      ...(declaredAuthEnv ? { authEnv: declaredAuthEnv } : {}),
       ...(credentialMode !== undefined ? { credentialMode } : {}),
       ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
         ? { tierType: p.tierType }
@@ -1628,6 +1630,7 @@ function resolveReshaperPool(
       base: p.base,
       model,
       kind: "openai",
+      provider,
       authHeader: p.authHeader,
       timeoutMs:
         typeof timeoutOverride === "number" && Number.isFinite(timeoutOverride) && timeoutOverride > 0

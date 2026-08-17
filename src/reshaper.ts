@@ -1,6 +1,7 @@
 import { DEFAULT_ANTHROPIC_VERSION } from "./config.js";
 import { type AssistantMessage, type JsonSchema, isToolUseBlock } from "./anthropic.js";
 import { type ValidationError } from "./validator.js";
+import { buildAuthHeaders, readCredential } from "./authEnv.js";
 
 export interface ReshapeRequest {
   /** The declared tools (name → schema|null) so the reshaper knows the contract. */
@@ -165,6 +166,7 @@ export class HttpReshaper implements Reshaper {
       base: string;
       model: string;
       kind: "anthropic" | "openai";
+      provider?: string;
       authEnv?: string;
       authHeader: "x-api-key" | "authorization";
       timeoutMs: number;
@@ -176,12 +178,10 @@ export class HttpReshaper implements Reshaper {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.cfg.timeoutMs);
     try {
-      const headers: Record<string, string> = { "content-type": "application/json" };
-      const key = this.cfg.authEnv ? process.env[this.cfg.authEnv]?.trim() : undefined;
-      if (key) {
-        if (this.cfg.authHeader === "authorization") headers["authorization"] = `Bearer ${key}`;
-        else headers["x-api-key"] = key;
-      }
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        ...buildAuthHeaders(readCredential(this.cfg.authEnv, process.env, this.cfg.provider), this.cfg.authHeader),
+      };
       const userContent = buildUserContent(req);
 
       const { url, body } =

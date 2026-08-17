@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
+import { makeCredentialId } from "../src/credential-id.js";
 import { STICKY_PROVENANCE_HEADER, STICKY_SESSION_HEADER } from "../src/session-pin.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
@@ -28,6 +29,9 @@ const OPENAI_OK = JSON.stringify({
 const RATE_LIMIT = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } });
 
 const servers: Server[] = [];
+const breakerIdentity = (provider: string, model: string | null) => ({
+  provider, model, kind: "anthropic" as const, credentialId: makeCredentialId(provider),
+});
 
 function track(server: Server): Server {
   servers.push(server);
@@ -265,7 +269,7 @@ describe("sticky sessions — guarded request-path affinity", () => {
 
     await messages(proxy.port, { headers: sessionHeaders("cooling") });
     proxy.breaker.reset();
-    proxy.breaker.recordOutcome("p2/m2", { ok: false, status: 429, elapsedMs: 1 });
+    proxy.breaker.recordOutcome(breakerIdentity("p2", "m2"), { ok: false, status: 429, elapsedMs: 1 });
     const bypassed = await messages(proxy.port, { headers: sessionHeaders("cooling") });
     expect(bypassed.headers.get(STICKY_PROVENANCE_HEADER)).toBe("p2/m2 (bypassed: cooling)");
 
@@ -284,7 +288,7 @@ describe("sticky sessions — guarded request-path affinity", () => {
 
     await messages(proxy.port, { headers: sessionHeaders("credential") });
     proxy.breaker.reset();
-    proxy.breaker.recordCredentialFault("p2/m2", 401);
+    proxy.breaker.recordCredentialFault(breakerIdentity("p2", "m2"), 401);
     const response = await messages(proxy.port, { headers: sessionHeaders("credential") });
     expect(response.headers.get(STICKY_PROVENANCE_HEADER)).toBe("p2/m2 (bypassed: credential-fault)");
     expect(first.calls()).toBe(2);

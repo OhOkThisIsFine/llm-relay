@@ -43,7 +43,12 @@ export interface AttemptLifecycleView {
 }
 
 function sameTarget(a: ProviderTargetIdentity, b: ProviderTargetIdentity): boolean {
-  return a.provider === b.provider && a.model === b.model && a.kind === b.kind;
+  return (
+    a.provider === b.provider &&
+    a.model === b.model &&
+    a.kind === b.kind &&
+    a.credentialId === b.credentialId
+  );
 }
 
 /** Request-scoped owner of opaque, target-bound attempt handles. */

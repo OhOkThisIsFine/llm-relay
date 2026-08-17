@@ -1,12 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { getTelemetryReport } from "../src/telemetry.js";
+import { candidateEnvNames } from "../src/authEnv.js";
 import { CircuitBreaker, UNMEASURED_STABILITY } from "../src/circuit-breaker.js";
-import type { Config, ProviderTierType, ResolvedTarget } from "../src/config.js";
+import { makeCredentialId } from "../src/credential-id.js";
+import type { Config, ProviderTierType } from "../src/config.js";
+import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
 
 const NOW = 100000;
 
 /** Every env var any provider in these fixtures declares. */
-const ENV_KEYS = ["NVIDIA_API_KEY", "OPENAI_API_KEY", "OPEN_API_KEY"] as const;
+const ENV_KEYS = [...new Set([
+  ...candidateEnvNames("nim", "NVIDIA_API_KEY"),
+  ...candidateEnvNames("openai", "OPENAI_API_KEY"),
+  ...candidateEnvNames("open", "OPEN_API_KEY"),
+  ...candidateEnvNames("gemini", "GEMINI_DECLARED_KEY"),
+  ...candidateEnvNames("my-provider", "MY_DECLARED_KEY"),
+])];
 
 const provider = (authEnv: string, tierType: ProviderTierType, signupUrl?: string) => ({
   base: "https://example.invalid/v1",
@@ -39,21 +48,24 @@ const twoProviderCfg = (): Config =>
   });
 
 /**
- * The key shape the breaker ACTUALLY writes. `CircuitBreaker.getKey()` produces
- * `${provider}/${model}` for a resolved target, so a fixture that records under a
- * bare provider name exercises a key that no real request ever creates — which is
- * precisely how the bare-name lookups in `/telemetry` passed their test while
- * missing every state in production (OBS-dc5f56e7).
+ * Breaker fixtures use the same explicit identity as request attempts. A raw provider/model
+ * string is not a valid cell identity: the implicit single slot is `<provider>#default`.
  */
-const target = (providerName: string, model: string): ResolvedTarget =>
+const target = (providerName: string, model: string): ProviderTargetIdentity =>
   ({
     provider: providerName,
     model,
     base: "https://example.invalid/v1",
     kind: "openai",
+    credentialId: makeCredentialId(providerName),
     authHeader: "authorization",
     timeoutMs: 120000,
-  }) as ResolvedTarget;
+  }) as ProviderTargetIdentity;
+
+const credentialTarget = (providerName: string, model: string, label: string): ProviderTargetIdentity => ({
+  ...target(providerName, model),
+  credentialId: makeCredentialId(providerName, label),
+});
 
 const saved: Record<string, string | undefined> = {};
 
@@ -75,7 +87,15 @@ afterEach(() => {
 describe("telemetry", () => {
   it("getTelemetryReport generates valid metrics report", () => {
     const cb = new CircuitBreaker();
-    cb.recordOutcome(target("nim", "z-ai/glm-5.2"), { ok: true, elapsedMs: 350, quotaPercent: 95, at: NOW });
+    cb.recordOutcome(target("nim", "z-ai/glm-5.2"), {
+      ok: true,
+      elapsedMs: 350,
+      quotaObservations: [{
+        axis: "requests", period: "day", remaining: 95, limit: 100,
+        resetsAt: null, observedAt: NOW, basis: "provider-stated",
+      }],
+      at: NOW,
+    });
     cb.recordOutcome(target("openai", "gpt-4o"), { ok: false, status: 429, elapsedMs: 350, at: NOW });
 
     const report = getTelemetryReport(twoProviderCfg(), cb, NOW);
@@ -85,7 +105,7 @@ describe("telemetry", () => {
     const nimTele = report.providers.find((p) => p.provider === "nim");
     expect(nimTele).toBeDefined();
     expect(nimTele?.tierType).toBe("free");
-    expect(nimTele?.quotaPercent).toBe(95);
+    expect(nimTele).not.toHaveProperty("quotaPercent");
     expect(nimTele?.signupUrl).toBe("https://build.nvidia.com");
 
     const openaiTele = report.providers.find((p) => p.provider === "openai");
@@ -133,7 +153,7 @@ describe("telemetry", () => {
       expect(p.isHealthy).toBeNull();
       expect(p.stabilityScore).toBeNull();
       expect(p.observedTargets).toBe(0);
-      expect(p.quotaPercent).toBeNull();
+      expect(p).not.toHaveProperty("quotaPercent");
       expect(p.cooldownRemainingMs).toBe(0);
     }
     // Unknown is counted as unknown. It is neither healthy nor unhealthy, and a
@@ -144,7 +164,7 @@ describe("telemetry", () => {
   });
 
   it("a provider with no credential is known-unhealthy, not unknown", () => {
-    delete process.env["NVIDIA_API_KEY"];
+    for (const key of candidateEnvNames("nim", "NVIDIA_API_KEY")) delete process.env[key];
     const report = getTelemetryReport(twoProviderCfg(), new CircuitBreaker(), NOW);
 
     const nimTele = report.providers.find((p) => p.provider === "nim")!;
@@ -152,6 +172,31 @@ describe("telemetry", () => {
     expect(nimTele.isHealthy).toBe(false);
     expect(report.activeProvidersCount).toBe(1);
     expect(report.unmeasuredProvidersCount).toBe(1);
+  });
+
+  it("treats a whitespace-only declared credential as absent", () => {
+    for (const key of candidateEnvNames("nim", "NVIDIA_API_KEY")) delete process.env[key];
+    process.env.NVIDIA_API_KEY = "   \t";
+    const report = getTelemetryReport(twoProviderCfg(), new CircuitBreaker(), NOW);
+    expect(report.providers.find((p) => p.provider === "nim")?.hasKey).toBe(false);
+  });
+
+  it("recognizes a credential under a curated provider alias", () => {
+    const cfg = cfgWith({
+      gemini: provider("GEMINI_DECLARED_KEY", "free"),
+    });
+    process.env.GOOGLEAI_API_KEY = "gemini-alias";
+    const report = getTelemetryReport(cfg, new CircuitBreaker(), NOW);
+    expect(report.providers[0]?.hasKey).toBe(true);
+  });
+
+  it("recognizes a credential under a provider-derived alias", () => {
+    const cfg = cfgWith({
+      "my-provider": provider("MY_DECLARED_KEY", "free"),
+    });
+    process.env.MY_PROVIDER_API_KEY = "derived-alias";
+    const report = getTelemetryReport(cfg, new CircuitBreaker(), NOW);
+    expect(report.providers[0]?.hasKey).toBe(true);
   });
 
   it("reports the BEST measured deployment, and aggregates across a provider's models", () => {
@@ -164,11 +209,55 @@ describe("telemetry", () => {
 
     const nimTele = getTelemetryReport(twoProviderCfg(), cb, NOW).providers.find((p) => p.provider === "nim")!;
     expect(nimTele.observedTargets).toBe(2);
-    expect(nimTele.stabilityScore).toBe(cb.getMeasuredStability(fast));
-    expect(nimTele.stabilityScore!).toBeGreaterThan(cb.getMeasuredStability(erratic)!);
+    expect(nimTele.stabilityScore).toBe(
+      cb.getDeploymentMeasurement({ provider: "nim", model: "z-ai/glm-5.2" }).stabilityScore,
+    );
+    expect(nimTele.stabilityScore!).toBeGreaterThan(
+      cb.getDeploymentMeasurement({ provider: "nim", model: "llama-3.1-8b" }).stabilityScore!,
+    );
     // One erratic SKU in a roster is not evidence against the provider: routing
     // would send the request to the best live deployment.
     expect(nimTele.isHealthy).toBe(true);
+  });
+
+  it("deduplicates credential cells and never exposes credential labels", () => {
+    const cb = new CircuitBreaker();
+    cb.recordOutcome(credentialTarget("nim", "z-ai/glm-5.2", "personal"), {
+      ok: true,
+      elapsedMs: 120,
+      status: 200,
+      at: NOW,
+    });
+    cb.recordOutcome(credentialTarget("nim", "z-ai/glm-5.2", "work"), {
+      ok: true,
+      elapsedMs: 130,
+      status: 200,
+      at: NOW + 1,
+    });
+
+    const report = getTelemetryReport(twoProviderCfg(), cb, NOW + 2);
+    const nim = report.providers.find((p) => p.provider === "nim")!;
+    expect(nim.observedTargets).toBe(1);
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain("personal");
+    expect(serialized).not.toContain("work");
+  });
+
+  it("does not expose quota observations on provider-level telemetry", () => {
+    const cb = new CircuitBreaker();
+    cb.recordOutcome(target("nim", "z-ai/glm-5.2"), {
+      ok: true,
+      elapsedMs: 120,
+      quotaObservations: [{
+        axis: "tokens", period: "minute", remaining: 800, limit: 1_000,
+        resetsAt: null, observedAt: NOW, basis: "provider-stated",
+      }],
+      at: NOW,
+    });
+
+    const serialized = JSON.stringify(getTelemetryReport(twoProviderCfg(), cb, NOW));
+    expect(serialized).not.toContain("quota");
+    expect(serialized).not.toContain("tokens");
   });
 
   it("a provider whose name prefixes another's does not borrow its observations", () => {

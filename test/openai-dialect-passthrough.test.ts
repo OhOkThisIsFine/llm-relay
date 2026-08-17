@@ -13,6 +13,7 @@ import { ModelCatalog } from "../src/catalog.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ResolvedTarget } from "../src/config.js";
+import { resolveAttempt } from "../src/resolved-attempt.js";
 
 const servers: Server[] = [];
 
@@ -102,7 +103,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       choices: [{ index: 0, message: { role: "assistant", content: dialect }, finish_reason: "stop" }],
     });
 
-    const response = await fetchOpenAiFront(target(), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), {
       reqJson: request(false),
       wantsStream: false,
       protocol: "chat",
@@ -135,7 +136,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       STOP,
     ].join("");
 
-    const response = await fetchOpenAiFront(target(), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), {
       reqJson: request(true),
       wantsStream: true,
       protocol: "chat",
@@ -298,7 +299,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       }],
     }, null, 2);
 
-    const response = await fetchOpenAiFront(target(), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), {
       reqJson: request(false),
       wantsStream: false,
       protocol: "chat",
@@ -317,7 +318,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       chatChunk({ content: "literal <tool_call> text" }).replaceAll("\n", "\r\n") +
       STOP.replaceAll("\n", "\r\n");
 
-    const response = await fetchOpenAiFront(target(), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), {
       reqJson: request(true, false),
       wantsStream: true,
       protocol: "chat",

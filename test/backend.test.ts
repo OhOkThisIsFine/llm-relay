@@ -13,6 +13,8 @@ import {
   upstreamReportedModel,
 } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
+import { resolveAttempt } from "../src/resolved-attempt.js";
+import { createUsageAccumulator } from "../src/usage-observer.js";
 
 function openaiTarget(base: string, model = "meta/llama-3.1-70b-instruct"): ResolvedTarget {
   return {
@@ -27,6 +29,13 @@ function openaiTarget(base: string, model = "meta/llama-3.1-70b-instruct"): Reso
 }
 
 describe("openAiResponseToAnthropic", () => {
+  it("keeps usage absent when the upstream omitted it", () => {
+    const anth = openAiResponseToAnthropic({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+    }, "target") as Record<string, unknown>;
+    expect(anth).not.toHaveProperty("usage");
+  });
+
   it("maps a tool call to an Anthropic tool_use with stop_reason tool_use", () => {
     const anth = openAiResponseToAnthropic({
       id: "cmpl_1", model: "x",
@@ -142,7 +151,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const anthropicReq = { model: "claude-x", stream: false, messages: [{ role: "user", content: "weather in Rome?" }], tools: [{ name: "get_weather", description: "w", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }] };
 
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -175,7 +184,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
         "data: [DONE]\n\n",
       ].join("");
 
-      const res = await fetchBackend(target, {
+      const res = await fetchBackend(resolveAttempt(target), {
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)),
@@ -211,7 +220,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_stream", model: "upstream-substitute" } })}\n\n`,
       `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
     ].join("");
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages",
       method: "POST",
       reqBuf: Buffer.from("{}"),
@@ -244,7 +253,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       stop_reason: "end_turn",
       usage: { input_tokens: 1, output_tokens: 1 },
     });
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages",
       method: "POST",
       reqBuf: Buffer.from("{}"),
@@ -277,7 +286,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x.invalid/a.pdf" } }] }],
     };
 
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -303,7 +312,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const req = { model: "claude-x", messages: [{ role: "user", content: "hi" }] };
 
-    const upstream = await fetchBackend(target, {
+    const upstream = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -314,7 +323,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     // Same fetchBackend, same shape of Response, opposite meaning: without the marker a
     // caller counting failures records both as "the provider is unhealthy" and fails over
     // to a second provider that would refuse this document identically.
-    const local = await fetchBackend(target, {
+    const local = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from("{}"),
       reqJson: { model: "claude-x", messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x.invalid/a.pdf" } }] }] },
@@ -327,7 +336,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
   it("rejects a malformed buffered OpenAI 2xx as an upstream envelope failure", async () => {
     const target = openaiTarget("https://openai-backend.test");
     const req = { model: "claude-x", messages: [{ role: "user", content: "hi" }] };
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(1000),
@@ -345,7 +354,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
   it("rejects the equivalent malformed OpenAI SSE 2xx before stream translation", async () => {
     const target = openaiTarget("https://openai-backend.test");
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(1000),
@@ -366,7 +375,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     };
     for (const wantsStream of [false, true]) {
       const raw = wantsStream ? "event: message_start\ndata: {}\n\n" : "{}";
-      const res = await fetchBackend(target, {
+      const res = await fetchBackend(resolveAttempt(target), {
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from("{}"),
@@ -391,7 +400,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       const target = openaiTarget("https://openai-backend.test");
       for (const wantsStream of [false, true]) {
         const raw = wantsStream ? "data: {}\n\n" : "{}";
-        const res = await fetchOpenAiFront(target, {
+        const res = await fetchOpenAiFront(resolveAttempt(target), {
           reqJson: { model: "requested", messages: [{ role: "user", content: "hi" }] },
           wantsStream,
           signal: AbortSignal.timeout(1000),
@@ -419,7 +428,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete anthropicKind.model;
     delete anthropicKind.authEnv;
     const res = await fetchOpenAiFront(
-      anthropicKind,
+      resolveAttempt(anthropicKind),
       {
         reqJson: { model: "m", messages: [{ role: "user", content: "hello" }] },
         wantsStream: false,
@@ -449,7 +458,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete anthropicKind.authEnv;
     for (const wantsStream of [false, true]) {
       const raw = wantsStream ? "event: message_start\ndata: {}\n\n" : "{}";
-      const res = await fetchOpenAiFront(anthropicKind, {
+      const res = await fetchOpenAiFront(resolveAttempt(anthropicKind), {
         reqJson: { model: "m", messages: [{ role: "user", content: "hello" }], stream: wantsStream },
         wantsStream,
         signal: AbortSignal.timeout(1000),
@@ -475,7 +484,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       value: async () => ({ content: [{ type: "tool_use", id: "call_1", name: "tool", input: circular }] }),
     });
 
-    const res = await fetchOpenAiFront(anthropicKind, {
+      const res = await fetchOpenAiFront(resolveAttempt(anthropicKind), {
       reqJson: { model: "m", messages: [{ role: "user", content: "hello" }] },
       wantsStream: false,
       signal: AbortSignal.timeout(1000),
@@ -502,7 +511,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete anthropicKind.model;
     delete anthropicKind.authEnv;
     const res = await fetchOpenAiFront(
-      anthropicKind,
+      resolveAttempt(anthropicKind),
       {
         reqJson: { model: "claude", input: "hello", stream: true },
         wantsStream: true,
@@ -528,7 +537,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     ].join("");
     const target = openaiTarget("https://openai-backend.test", "target");
     const res = await fetchOpenAiFront(
-      target,
+      resolveAttempt(target),
       {
         reqJson: { model: "target", input: "hello", stream: true },
         wantsStream: true,
@@ -569,7 +578,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
 
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
@@ -607,7 +616,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
 
-    const res = await fetchBackend(target, {
+    const res = await fetchBackend(resolveAttempt(target), {
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
@@ -646,7 +655,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget("http://127.0.0.1:9999");
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
     const res = await fetchBackend(
-      target,
+      resolveAttempt(target),
       {
         path: "/v1/messages",
         method: "POST",
@@ -726,6 +735,165 @@ describe("normalizeOpenAiErrorBody", () => {
   });
 });
 
+describe("direct OpenAI stream usage integration", () => {
+  const streamWithUsage = [
+    `data: ${JSON.stringify({ id: "c", choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] })}\n\n`,
+    `data: ${JSON.stringify({ id: "c", choices: [], usage: { prompt_tokens: 2, completion_tokens: 7 } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  it("observes but suppresses the relay-added usage event", async () => {
+    const seen: Record<string, unknown>[] = [];
+    const accumulator = createUsageAccumulator();
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+      reqJson: { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] },
+      wantsStream: true,
+      usage: accumulator,
+      signal: AbortSignal.timeout(1000),
+    }, async (_url, init) => {
+      seen.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(streamWithUsage, { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    expect(await response.text()).not.toContain("completion_tokens");
+    expect(accumulator.completionTokens).toBe(7);
+    expect(seen[0]?.stream_options).toEqual({ include_usage: true });
+  });
+
+  it("preserves a caller-requested usage event", async () => {
+    const accumulator = createUsageAccumulator();
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+      reqJson: {
+        model: "m",
+        stream: true,
+        stream_options: { include_usage: true },
+        messages: [{ role: "user", content: "hi" }],
+      },
+      wantsStream: true,
+      usage: accumulator,
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response(streamWithUsage, { status: 200, headers: { "content-type": "text/event-stream" } }));
+    expect(await response.text()).toContain("completion_tokens");
+    expect(accumulator.completionTokens).toBe(7);
+  });
+
+  it("keeps retained raw frame bytes byte-exact while suppressing only usage", async () => {
+    const encoder = new TextEncoder();
+    const first = encoder.encode(`data: ${JSON.stringify({ id: "c", choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] })}\n\n`);
+    const opaque = new Uint8Array([100, 97, 116, 97, 58, 32, 0xff, 10, 10]); // `data: <invalid utf-8>\n\n`
+    const usage = encoder.encode(`data: ${JSON.stringify({ id: "c", choices: [], usage: { completion_tokens: 7 } })}\n\ndata: [DONE]\n\n`);
+    const raw = new Uint8Array(first.byteLength + opaque.byteLength + usage.byteLength);
+    raw.set(first);
+    raw.set(opaque, first.byteLength);
+    raw.set(usage, first.byteLength + opaque.byteLength);
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+      reqJson: { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] },
+      wantsStream: true,
+      usage: createUsageAccumulator(),
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response(raw, { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const output = new Uint8Array(await response.arrayBuffer());
+    const expected = new Uint8Array(first.byteLength + opaque.byteLength + encoder.encode("data: [DONE]\n\n").byteLength);
+    expected.set(first);
+    expected.set(opaque, first.byteLength);
+    expected.set(encoder.encode("data: [DONE]\n\n"), first.byteLength + opaque.byteLength);
+    expect(output).toEqual(expected);
+  });
+
+  it("retries an added usage hint once and leaves a no-usage retry unknown", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const accumulator = createUsageAccumulator();
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+      reqJson: { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] },
+      wantsStream: true,
+      usage: accumulator,
+      signal: AbortSignal.timeout(1000),
+    }, async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (bodies.length === 1) return new Response(JSON.stringify({ error: { message: "unknown field" } }), { status: 422 });
+      return new Response(
+        `data: ${JSON.stringify({ id: "c", choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] })}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(bodies[0]?.stream_options).toEqual({ include_usage: true });
+    expect(bodies[1]?.stream_options).toBeUndefined();
+    expect(accumulator.completionTokens).toBeUndefined();
+  });
+});
+
+describe("usage observation survives backend adapters", () => {
+  const anthropicTarget: ResolvedTarget = {
+    provider: "anthropic-test",
+    base: "https://backend.test",
+    kind: "anthropic",
+    model: "claude-test",
+    authHeader: "x-api-key",
+    timeoutMs: 1000,
+  };
+
+  it("captures buffered Messages-front OpenAI usage before response mapping", async () => {
+    const accumulator = createUsageAccumulator();
+    const response = await fetchBackend(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+      path: "/v1/messages",
+      method: "POST",
+      reqBuf: Buffer.from(JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] })),
+      reqJson: { model: "m", messages: [{ role: "user", content: "hi" }] },
+      anthropicHeaders: {},
+      wantsStream: false,
+      usage: accumulator,
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+      usage: { prompt_tokens: 2, completion_tokens: 4 },
+    }), { headers: { "content-type": "application/json" } }));
+    await response.json();
+    expect(accumulator.completionTokens).toBe(4);
+  });
+
+  it("captures streamed native Anthropic usage before stream validation", async () => {
+    const accumulator = createUsageAccumulator();
+    const response = await fetchBackend(resolveAttempt(anthropicTarget), {
+      path: "/v1/messages",
+      method: "POST",
+      reqBuf: Buffer.from("{}"),
+      reqJson: {},
+      anthropicHeaders: {},
+      wantsStream: true,
+      usage: accumulator,
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response([
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", model: "claude-test" } })}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 6 } })}\n\n`,
+    ].join(""), { headers: { "content-type": "text/event-stream" } }));
+    await response.text();
+    expect(accumulator.completionTokens).toBe(6);
+  });
+
+  it("captures Responses-front completion usage through an Anthropic backend", async () => {
+    const accumulator = createUsageAccumulator();
+    const response = await fetchOpenAiFront(resolveAttempt(anthropicTarget), {
+      protocol: "responses",
+      reqJson: { model: "claude-test", input: "hi" },
+      wantsStream: false,
+      usage: accumulator,
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response(JSON.stringify({
+      id: "m",
+      type: "message",
+      role: "assistant",
+      model: "claude-test",
+      content: [{ type: "text", text: "ok" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 2, output_tokens: 8 },
+    }), { headers: { "content-type": "application/json" } }));
+    await response.json();
+    expect(accumulator.completionTokens).toBe(8);
+  });
+});
+
 describe("fetchBackend carries Retry-After onto its synthesized error", () => {
   it("does not destroy the one header that says when the provider will serve again", async () => {
     // fetchBackend builds a NEW Response for an upstream error, so the header was dropped here
@@ -743,7 +911,7 @@ describe("fetchBackend carries Retry-After onto its synthesized error", () => {
     try {
       const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
       const req = { model: "m", messages: [{ role: "user", content: "hi" }] };
-      const res = await fetchBackend(target, {
+      const res = await fetchBackend(resolveAttempt(target), {
         path: "/v1/messages", method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
         anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -795,7 +963,7 @@ describe("fetchBackend & fetchOpenAiFront — credential alias resolution", () =
 
     const req = { model: "gemini-2.0-flash", stream: false, messages: [{ role: "user", content: "hello" }] };
     try {
-      await fetchBackend(target, {
+      await fetchBackend(resolveAttempt(target), {
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)),
@@ -848,7 +1016,7 @@ describe("fetchBackend & fetchOpenAiFront — credential alias resolution", () =
 
     const req = { model: "gemini-2.0-flash", messages: [{ role: "user", content: "hello" }] };
     try {
-      await fetchOpenAiFront(target, {
+      await fetchOpenAiFront(resolveAttempt(target), {
         reqJson: req,
         wantsStream: false,
         signal: AbortSignal.timeout(5000),

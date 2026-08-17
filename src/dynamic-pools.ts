@@ -8,6 +8,7 @@ import { loadPersistedSamples, loadProbeCache, type ProbeCacheData } from "./pin
 import { getStabilityScore } from "./ping/metrics.js";
 import { assessCost, type CostClass } from "./metadata.js";
 import { isCostBlocked } from "./target-facts.js";
+import { makeCredentialId } from "./credential-id.js";
 
 export const DYNAMIC_POOL_RANKING_EPOCH_MS = 30_000;
 
@@ -189,7 +190,7 @@ export function materializeDynamicPools(
       // `allowance-exhausted`: a spent free allowance is the normal state of a working free lane,
       // not a discovery about price, and evicting on it would outlive the exhaustion that caused
       // it. That case cools in `orderByUsability` and returns on its own.
-      if (isCostBlocked(provider, model)) continue;
+      if (isCostBlocked(provider, makeCredentialId(provider), model)) continue;
 
       discovered.push({
         provider,

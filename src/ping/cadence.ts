@@ -2,10 +2,18 @@ import type { Config, ProviderConfig } from "../config.js";
 import type { ModelCatalog } from "../catalog.js";
 import { pingProviderModel, type PingResult } from "./ping.js";
 import { type PingRecord, getAvg, getP95, getJitter, getStabilityScore, getVerdict, getUptime } from "./metrics.js";
-import { recordProbeResult, getModelsDueForProbe, loadPersistedSamples, loadTotals } from "./probe-cache.js";
+import {
+  recordProbeResult,
+  getModelsDueForProbe,
+  loadPersistedSamples,
+  loadPersistedQuotaObservations,
+  loadTotals,
+} from "./probe-cache.js";
 import { readCredential } from "../authEnv.js";
 import { getLastSuccessfulCallAt, loadRuntimeTelemetry } from "./runtime-telemetry.js";
 import { materializeDynamicPools } from "../dynamic-pools.js";
+import { makeCredentialId, parseCredentialId, type CredentialId } from "../credential-id.js";
+import { mergeQuotaObservations, type QuotaObservation } from "../quota-observation.js";
 
 export type PingMode = "speed" | "normal" | "slow" | "forced";
 
@@ -28,7 +36,6 @@ export interface ModelHealthSummary {
   stabilityScore: number;
   uptimePct: number;
   verdict: string;
-  quotaPercent: number | null;
   lastPingCode: string | null;
   lastPingMs: number | null;
 }
@@ -92,7 +99,8 @@ export class PingLoop {
   private running = false;
 
   private pingHistory = new Map<string, PingRecord[]>();
-  private latestQuota = new Map<string, number | null>();
+  /** Quota is credential and model scoped; provider-wide percentages were always ambiguous. */
+  private latestQuota = new Map<string, QuotaObservation[]>();
 
   constructor(
     private cfg: Config,
@@ -146,7 +154,13 @@ export class PingLoop {
     }
   }
 
-  public recordPing(providerKey: string, modelId: string, res: PingResult, timestamp = Date.now()): void {
+  public recordPing(
+    providerKey: string,
+    modelId: string,
+    res: PingResult,
+    timestamp = Date.now(),
+    credentialId: CredentialId = makeCredentialId(providerKey),
+  ): void {
     const key = `${providerKey}/${modelId}`;
     // Through the hydrating getter, so a fresh process appends to the history previous runs
     // built instead of starting a second, shorter one beside it.
@@ -159,11 +173,20 @@ export class PingLoop {
     history.push({ ms: res.ms, code: res.code, timestamp });
     if (history.length > 50) history.shift();
 
-    if (res.quotaPercent !== null) {
-      this.latestQuota.set(providerKey, res.quotaPercent);
-    }
+    const quotaKey = this.quotaKey(credentialId, modelId);
+    this.latestQuota.set(
+      quotaKey,
+      mergeQuotaObservations(this.getQuotaObservations(credentialId, modelId), res.quotaObservations),
+    );
 
-    recordProbeResult(providerKey, modelId, res, this.probeCacheOpts());
+    const parsedCredential = parseCredentialId(credentialId);
+    const isDefaultProbe = parsedCredential?.provider === providerKey && parsedCredential.label === "default";
+    // Probe cache has a deployment key, so only its real default-credential producer may attach
+    // quota to it. Health samples are still shared deployment evidence for every call.
+    recordProbeResult(providerKey, modelId, {
+      ...res,
+      quotaObservations: isDefaultProbe ? res.quotaObservations : [],
+    }, this.probeCacheOpts());
   }
 
   /**
@@ -215,8 +238,28 @@ export class PingLoop {
     }
   }
 
-  public getProviderQuota(providerKey: string): number | null {
-    return this.latestQuota.get(providerKey) ?? null;
+  /**
+   * Returns quota only for its exact credential/model cell. A cold default cell may rehydrate
+   * synthetic-probe observations from disk; another credential must never inherit that balance.
+   */
+  public getQuotaObservations(credentialId: CredentialId, modelId: string): QuotaObservation[] {
+    const key = this.quotaKey(credentialId, modelId);
+    const live = this.latestQuota.get(key);
+    if (live) return [...live];
+
+    const parsed = parseCredentialId(credentialId);
+    if (!parsed || parsed.label !== "default") return [];
+    try {
+      const persisted = loadPersistedQuotaObservations(parsed.provider, modelId, this.probeCacheOpts());
+      if (persisted.length > 0) this.latestQuota.set(key, persisted);
+      return [...persisted];
+    } catch {
+      return [];
+    }
+  }
+
+  private quotaKey(credentialId: CredentialId, modelId: string): string {
+    return `${credentialId}/${modelId}`;
   }
 
   public getModelSummary(providerKey: string, modelId: string): ModelHealthSummary {
@@ -244,7 +287,6 @@ export class PingLoop {
       stabilityScore,
       uptimePct,
       verdict,
-      quotaPercent: this.getProviderQuota(providerKey),
       lastPingCode: lastPing?.code ?? null,
       lastPingMs: lastPing?.ms ?? null,
     };
@@ -282,7 +324,7 @@ export class PingLoop {
     for (const [providerName, pCfg] of providers) {
       // Via the shared reader, not `process.env[...]` — a whitespace-only value is absent,
       // and open-coding the presence test is what let three call sites drift apart.
-      const apiKey = readCredential(pCfg.authEnv);
+      const apiKey = readCredential(pCfg.authEnv, process.env, providerName);
       const modelIds = scope === "catalog"
         ? listedByProvider.get(providerName) ?? []
         : routable?.get(providerName) ?? [];
@@ -305,7 +347,7 @@ export class PingLoop {
           ...optsObj(this.opts.fetchFn),
           timeoutMs: pCfg.timeoutMs,
         });
-        this.recordPing(providerName, mId, res);
+        this.recordPing(providerName, mId, res, Date.now(), makeCredentialId(providerName));
       }
     }
   }

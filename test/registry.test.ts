@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { buildRegistry, loadTierData, joinCapability } from "../src/registry.js";
@@ -6,6 +6,7 @@ import { createProxy } from "../src/server.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
+import { candidateEnvNames } from "../src/authEnv.js";
 
 /** Stub catalog: returns canned model ids per provider, no network. */
 function stubCatalog(byProvider: Record<string, string[]>): ModelCatalog {
@@ -24,8 +25,39 @@ function cfg(providers: Record<string, ProviderConfig>, routing: Config["routing
 
 const nim: ProviderConfig = { base: "https://nim.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000, authEnv: "RP_REG_KEY" };
 const anth: ProviderConfig = { base: "https://a.test", kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 };
+const openrouterFixtureKeys = [...new Set([
+  ...candidateEnvNames("openrouter", "RP_MISSING_KEY_XYZ"),
+  ...candidateEnvNames("nim", "RP_REG_KEY"),
+])];
+const restoreOpenRouterEnv = () => {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of openrouterFixtureKeys) {
+    saved[key] = process.env[key];
+    delete process.env[key];
+  }
+  return saved;
+};
+const restoreOpenRouterEnvValues = (saved: Record<string, string | undefined>) => {
+  for (const [key, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+};
 
 describe("buildRegistry", () => {
+  let openRouterEnvSaved: Record<string, string | undefined> | null = null;
+
+  beforeEach(() => {
+    openRouterEnvSaved = restoreOpenRouterEnv();
+  });
+
+  afterEach(() => {
+    if (openRouterEnvSaved) {
+      restoreOpenRouterEnvValues(openRouterEnvSaved);
+      openRouterEnvSaved = null;
+    }
+  });
+
   it("returns providers × live models + routing, with raw (uncollapsed) capability", async () => {
     process.env.RP_REG_KEY = "sk-x";
     const c = cfg(
@@ -52,6 +84,7 @@ describe("buildRegistry", () => {
       }
     }
     expect(typeof view.capability_source.present).toBe("boolean");
+    expect(JSON.stringify(view)).not.toContain("quota");
     delete process.env.RP_REG_KEY;
   });
 
@@ -62,6 +95,15 @@ describe("buildRegistry", () => {
     expect(view.providers.claude!.reachable).toBeNull();
     expect(view.providers.claude!.models).toEqual([]);
     expect(view.providers.claude!.has_key).toBe(true); // no authEnv → configured
+  });
+
+  it("never serializes provider or model quota scalars", async () => {
+    const view = await buildRegistry(
+      cfg({ nim }, { default: "nim/z-ai/glm-5.2", tiers: {} }),
+      stubCatalog({ nim: ["z-ai/glm-5.2"] }),
+    );
+    expect(JSON.stringify(view)).not.toMatch(/quota/i);
+    expect(view.providers.nim).not.toHaveProperty("quota_percent");
   });
 });
 

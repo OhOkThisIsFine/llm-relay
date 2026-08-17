@@ -7,6 +7,15 @@ import { tmpdir } from "node:os";
 import { createProxy, buildForwardHeaders, CredentialConfigError } from "../src/server.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
 import type { Config, ResolvedTarget } from "../src/config.js";
+import { resolveAttempt } from "../src/resolved-attempt.js";
+import { makeCredentialId } from "../src/credential-id.js";
+
+const breakerIdentity = (provider: string, model: string | null) => ({
+  provider,
+  model,
+  kind: "anthropic" as const,
+  credentialId: makeCredentialId(provider),
+});
 
 /**
  * REL-47acf940 + INV-HS-8 (CP-NODE-5).
@@ -165,11 +174,11 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
       }).then((r) => r.text());
 
     await doReq();
-    expect(globalCircuitBreaker.getState("up")?.consecutiveFailures).toBe(1);
+    expect(globalCircuitBreaker.getState(breakerIdentity("up", null))?.consecutiveFailures).toBe(1);
 
     await doReq();
-    expect(globalCircuitBreaker.getState("up")?.consecutiveFailures).toBe(2);
-    expect(globalCircuitBreaker.isHealthy("up")).toBe(false);
+    expect(globalCircuitBreaker.getState(breakerIdentity("up", null))?.consecutiveFailures).toBe(2);
+    expect(globalCircuitBreaker.isHealthy(breakerIdentity("up", null))).toBe(false);
   });
 
   it("treats a post-header client disconnect as cancellation, not provider failure", async () => {
@@ -189,7 +198,7 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
     controller.abort();
     await new Promise((resolve) => setTimeout(resolve, 40));
 
-    expect(breaker.getState("up")).toBeUndefined();
+    expect(breaker.getState(breakerIdentity("up", null))).toBeUndefined();
   });
 });
 
@@ -198,30 +207,30 @@ describe("inbound credential removal (INV-HS-8)", () => {
 
   it("declared-missing REMOVES the caller's Authorization and x-api-key, then throws", () => {
     const varName = "LLM_RELAY_TEST_MISSING_KEY";
-    delete process.env[varName];
     const target = { ...base, authEnv: varName } as ResolvedTarget;
 
     // The throw is the loud half. The removal is the half that matters if a future
     // routing change ever makes this branch reachable again.
     expect(() =>
-      buildForwardHeaders({ authorization: "Bearer sk-ant-secret", "x-api-key": "sk-ant-secret" }, target),
+      buildForwardHeaders(
+        { authorization: "Bearer sk-ant-secret", "x-api-key": "sk-ant-secret" },
+        resolveAttempt(target, {}),
+      ),
     ).toThrow(CredentialConfigError);
 
     // Prove REMOVAL rather than merely "we added nothing": run the same input through
     // the declared-PRESENT path, which shares the identical strip, and assert neither
     // inbound credential survives.
-    process.env[varName] = "provider-own-key";
-    try {
-      const out = buildForwardHeaders({ authorization: "Bearer sk-ant-secret", "x-api-key": "sk-ant-secret" }, target);
-      // Not "we added nothing" — the caller's secret appears in NO forwarded value.
-      expect(Object.values(out).some((v) => v.includes("sk-ant-secret"))).toBe(false);
-    } finally {
-      delete process.env[varName];
-    }
+    const out = buildForwardHeaders(
+      { authorization: "Bearer sk-ant-secret", "x-api-key": "sk-ant-secret" },
+      resolveAttempt(target, { [varName]: "provider-own-key" }),
+    );
+    // Not "we added nothing" — the caller's secret appears in NO forwarded value.
+    expect(Object.values(out).some((v) => v.includes("sk-ant-secret"))).toBe(false);
   });
 
   it("a real passthrough (no authEnv declared) still forwards the caller's own credential", () => {
-    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller" }, base);
+    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller" }, resolveAttempt(base));
     expect(out["authorization"]).toBe("Bearer sk-ant-caller");
   });
 
@@ -230,13 +239,13 @@ describe("inbound credential removal (INV-HS-8)", () => {
     // credential" were the same state, so a keyless anthropic-format backend that is not the
     // caller's own vendor received their token purely because it needed none itself.
     const target = { ...base, credentialMode: "contained" } as ResolvedTarget;
-    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller", "x-api-key": "sk-ant-caller" }, target);
+    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller", "x-api-key": "sk-ant-caller" }, resolveAttempt(target));
     expect(Object.values(out).some((v) => v.includes("sk-ant-caller"))).toBe(false);
   });
 
   it('credentialMode "passthrough" forwards it, identically to the inferred case', () => {
     const target = { ...base, credentialMode: "passthrough" } as ResolvedTarget;
-    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller" }, target);
+    const out = buildForwardHeaders({ authorization: "Bearer sk-ant-caller" }, resolveAttempt(target));
     expect(out["authorization"]).toBe("Bearer sk-ant-caller");
   });
 });

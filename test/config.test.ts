@@ -12,6 +12,7 @@ import {
   offloadRule,
   clientForPath,
 } from "../src/config.js";
+import { candidateEnvNames } from "../src/authEnv.js";
 
 // Eager (not in beforeAll) so describe-body loadConfig(write(...)) calls work at collection.
 const dir = mkdtempSync(join(tmpdir(), "rp-cfg-"));
@@ -32,6 +33,24 @@ function base(extra: Record<string, unknown> = {}) {
     ...extra,
   };
 }
+
+function saveAndClearEnv(names: string[]): Record<string, string | undefined> {
+  const saved: Record<string, string | undefined> = {};
+  for (const name of names) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  return saved;
+}
+
+function restoreEnv(saved: Record<string, string | undefined>): void {
+  for (const [name, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
+
+const geminiEnvSaved = saveAndClearEnv(candidateEnvNames("gemini", "GEMINI_API_KEY"));
 
 describe("loadConfig — sticky session affinity", () => {
   it("is off by default and normalizes boolean shorthand", () => {
@@ -136,18 +155,31 @@ describe("loadConfig — authEnv alias resolution", () => {
       routing: { default: "gemini/gemini-2.5-flash" },
     })));
     expect(c.providers.gemini!.authEnv).toBe("GEMINI_API_KEY");
-    delete process.env.GEMINI_API_KEY;
+    restoreEnv(geminiEnvSaved);
   });
 
-  it("adopts an alias env var when the declared one is unset", () => {
+  it("retains the declared authEnv when an alias supplies the credential", () => {
     delete process.env.GEMINI_API_KEY;
     process.env.GOOGLEAI_API_KEY = "alias";
     const c = loadConfig(write("env-alias.json", base({
       providers: { gemini: { base: "https://g.test/v1", kind: "openai", authEnv: "GEMINI_API_KEY" } },
       routing: { default: "gemini/gemini-2.5-flash" },
     })));
-    expect(c.providers.gemini!.authEnv).toBe("GOOGLEAI_API_KEY");
-    delete process.env.GOOGLEAI_API_KEY;
+    expect(c.providers.gemini!.authEnv).toBe("GEMINI_API_KEY");
+    restoreEnv(geminiEnvSaved);
+  });
+});
+
+describe("loadConfig — blank authEnv", () => {
+  it("omits blank and whitespace authEnv while preserving passthrough", () => {
+    for (const authEnv of ["", "   "]) {
+      const c = loadConfig(write(`blank-auth-${authEnv.length}.json`, base({
+        providers: { peer: { base: "https://peer.test", kind: "anthropic", authEnv, credentialMode: "passthrough" } },
+        routing: { default: "peer" },
+      })));
+      expect(c.providers.peer!.authEnv).toBeUndefined();
+      expect(c.providers.peer!.credentialMode).toBe("passthrough");
+    }
   });
 });
 

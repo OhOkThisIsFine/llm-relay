@@ -2,7 +2,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { WriteBehindTimer } from "./write-behind.js";
-import type { FactKind, FactScope } from "./target-facts.js";
+import type { CredentialId } from "./credential-id.js";
+import { FACT_KINDS, type FactKind, type FactScope } from "./target-facts.js";
 
 /**
  * What a backend's refusal MEANS — a lookup, never an inference, on the request path.
@@ -53,16 +54,27 @@ import type { FactKind, FactScope } from "./target-facts.js";
  * ships a credential to the wrong host, and a wrong match here evicts a working family.
  */
 export type ScopeTemplate =
+  | { kind: "attempt" }
   | { kind: "deployment" }
+  | { kind: "credential" }
   | { kind: "provider" }
   | { kind: "model" }
-  | { kind: "group"; members: string[] };
+  | { kind: "group"; members: string[]; credential: "attempt" | "all" };
 
 /** Turn a stored template into the concrete scope for the request that matched it. */
-export function materializeScope(template: ScopeTemplate, provider: string, model: string): FactScope {
+export function materializeScope(
+  template: ScopeTemplate,
+  provider: string,
+  credentialId: CredentialId,
+  model: string,
+): FactScope {
   switch (template.kind) {
+    case "attempt":
+      return { kind: "attempt", provider, credentialId, model };
     case "deployment":
       return { kind: "deployment", provider, model };
+    case "credential":
+      return { kind: "credential", provider, credentialId };
     case "provider":
       return { kind: "provider", provider };
     case "model":
@@ -70,7 +82,12 @@ export function materializeScope(template: ScopeTemplate, provider: string, mode
     case "group":
       // The triggering model is always included: it demonstrably exhibits the fact, and a group
       // verdict that excluded its own evidence would be incoherent.
-      return { kind: "group", provider, members: template.members.includes(model) ? template.members : [...template.members, model] };
+      return {
+        kind: "group",
+        provider,
+        ...(template.credential === "attempt" ? { credentialId } : {}),
+        members: template.members.includes(model) ? template.members : [...template.members, model],
+      };
   }
 }
 
@@ -132,7 +149,7 @@ export interface UnknownRefusal {
 }
 
 interface InterpretationStore {
-  version: 1;
+  version: 2;
   /** signature → interpretation. Only entries that BIND live here. */
   confirmed: Record<string, Interpretation>;
   /** signature → the unseen refusal, awaiting research or acceptance. */
@@ -376,13 +393,13 @@ function interpretStructured(
   if (!perShort && !perLong) return null;
   const kind: FactKind = perShort ? "rate-limited" : "allowance-exhausted";
 
-  // SCOPE → what the limit is counted against. "PerProjectPerModel" is counted per model, so the
-  // project's other models are unaffected; "PerProject" alone covers the whole credential.
+  // SCOPE → what the limit is counted against. A model dimension is always attempt-local. A
+  // recognized credential dimension is credential-wide; an unfamiliar dimension stays narrow.
   const scope: ScopeTemplate = /PerModel/i.test(quotaId)
-    ? { kind: "deployment" }
-    : /Per(?:Project|User|Consumer|Client)/i.test(quotaId)
-      ? { kind: "provider" }
-      : { kind: "deployment" }; // Unrecognized dimension: assume the narrowest blast radius.
+    ? { kind: "attempt" }
+    : /Per(?:Project|User|Client|Key)/i.test(quotaId)
+      ? { kind: "credential" }
+      : { kind: "attempt" };
 
   // A 429 is the only status this shape is published on; anything else naming QuotaFailure is not
   // something we have seen and should not be guessed at.
@@ -439,7 +456,7 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 429 || s === 403,
     pattern: /exceeded\s+your\s+current\s+quota|quota\s+exceeded[^.]{0,40}\b(?:plan|billing|project)|check\s+your\s+plan\s+and\s+billing|\b(?:daily|weekly|monthly|hourly)\s+quota\s+(?:exceeded|exhausted|reached)|out\s+of\s+quota/,
     class: "allowance-exhausted",
-    scope: { kind: "provider" },
+    scope: { kind: "credential" },
     note: "stated QUOTA exhaustion (long window); free but spent until the allowance refreshes",
   },
   {
@@ -448,7 +465,7 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 402,
     pattern: /deplet\w*\s+your\s+(?:monthly\s+)?(?:included\s+)?credits|insufficient\s+credits|purchase\s+(?:pre-?paid\s+)?credits|out\s+of\s+credits/,
     class: "allowance-exhausted",
-    scope: { kind: "provider" },
+    scope: { kind: "credential" },
     note: "stated credit balance; free but spent until it refreshes",
   },
   {
@@ -458,7 +475,7 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 403,
     pattern: /requires?\s+(?:both\s+)?an?\s+[\w, ]*\bsubscription\b|requires?\s+(?:both\s+)?an?\s+[\w, ]*\bplan\b|upgrade\s+for\s+access/,
     class: "subscription-required",
-    scope: { kind: "deployment" },
+    scope: { kind: "attempt" },
     note: "stated plan gating on one model; the credential itself is fine",
   },
   {
@@ -466,7 +483,14 @@ export const SEED_INTERPRETATIONS: Array<{
     // NIM: "Function '<uuid>': Not found for account '<id>'" — the serving function is gone. It
     // names an account but is a fact about the deployment, not the credential.
     status: (s) => s === 400 || s === 404,
-    pattern: /does\s+not\s+exist|model_not_found|unknown\s+model|no\s+such\s+model|not\s+found\s+for\s+account/,
+    pattern: /not\s+found\s+for\s+account/,
+    class: "not-servable",
+    scope: { kind: "attempt" },
+    note: "stated account-bound absence; narrow until credential/model scope is reviewed",
+  },
+  {
+    status: (s) => s === 400 || s === 404,
+    pattern: /does\s+not\s+exist|model_not_found|unknown\s+model|no\s+such\s+model/,
     class: "not-servable",
     scope: { kind: "deployment" },
     note: "stated non-existence; catalog rot",
@@ -497,7 +521,7 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 401 || s === 403,
     pattern: /invalid\s+(?:api\s+)?(?:key|token|credentials?)|authentication\s+failed|incorrect\s+api\s+key|api\s+key\s+(?:not\s+valid|is\s+invalid|expired|revoked)|unauthorized:\s*invalid/,
     class: "credential-invalid",
-    scope: { kind: "provider" },
+    scope: { kind: "credential" },
     note: "stated bad credential; covers every deployment behind that key",
   },
   {
@@ -511,31 +535,225 @@ export const SEED_INTERPRETATIONS: Array<{
     status: (s) => s === 429,
     pattern: /(?:account|organization|organisation|project|api\s+key|workspace)[^.]{0,40}\b(?:rate\s*limit|requests?\s+per)|\brate\s*limit[^.]{0,24}\bfor\s+(?:your|this)\s+(?:account|organization|organisation|project|key)/,
     class: "rate-limited",
-    scope: { kind: "provider" },
+    scope: { kind: "credential" },
     note: "stated account-level THROTTLING; resets in seconds to minutes",
   },
 ];
 
 
+function signatureParts(signature: string): { provider: string; model: string | null; status: number; sample: string } | null {
+  const match = /^([^|]+)\|([^|]*)\|(\d{3})\|(.+)$/.exec(signature);
+  if (!match || !match[1] || !match[2] || !match[3] || !match[4]) return null;
+  const status = Number(match[3]);
+  if (!Number.isInteger(status)) return null;
+  return { provider: match[1], model: match[2] === "-" ? null : match[2], status, sample: match[4] };
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && actual.every((key) => keys.includes(key));
+}
+
+function validTemplate(value: unknown): value is ScopeTemplate {
+  if (!value || typeof value !== "object") return false;
+  const scope = value as Record<string, unknown>;
+  switch (scope.kind) {
+    case "attempt":
+    case "deployment":
+    case "credential":
+    case "provider":
+    case "model":
+      return hasExactKeys(scope, ["kind"]);
+    case "group":
+      return hasExactKeys(scope, ["kind", "members", "credential"])
+        && Array.isArray(scope.members) && scope.members.every((member) => typeof member === "string" && member.length > 0)
+        && (scope.credential === "attempt" || scope.credential === "all");
+    default:
+      return false;
+  }
+}
+
+function validV1Template(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const scope = value as Record<string, unknown>;
+  switch (scope.kind) {
+    case "deployment":
+    case "provider":
+    case "model":
+      return hasExactKeys(scope, ["kind"]);
+    case "group":
+      return hasExactKeys(scope, ["kind", "members"])
+        && Array.isArray(scope.members) && scope.members.every((member) => typeof member === "string" && member.length > 0);
+    default:
+      return false;
+  }
+}
+
+function validInterpretation(value: unknown): value is Interpretation {
+  if (!value || typeof value !== "object") return false;
+  const interpretation = value as Record<string, unknown>;
+  return FACT_KINDS.includes(interpretation.class as FactKind)
+    && validTemplate(interpretation.scope)
+    && (interpretation.source === "seed" || interpretation.source === "researched")
+    && (interpretation.acceptedAt === undefined || Number.isFinite(interpretation.acceptedAt));
+}
+
+function validV1Interpretation(value: unknown): value is Interpretation {
+  if (!value || typeof value !== "object") return false;
+  const interpretation = value as Record<string, unknown>;
+  return FACT_KINDS.includes(interpretation.class as FactKind)
+    && validV1Template(interpretation.scope)
+    && (interpretation.source === "seed" || interpretation.source === "researched")
+    && (interpretation.acceptedAt === undefined || Number.isFinite(interpretation.acceptedAt));
+}
+
+function validProposal(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const proposal = value as Record<string, unknown>;
+  return FACT_KINDS.includes(proposal.class as FactKind)
+    && validTemplate(proposal.scope)
+    && typeof proposal.rationale === "string"
+    && Number.isFinite(proposal.at);
+}
+
+function validIgnored(value: unknown): value is { at: number } {
+  return !!value && typeof value === "object" && Number.isFinite((value as { at?: unknown }).at);
+}
+
+function validUnknown(value: unknown): value is UnknownRefusal {
+  if (!value || typeof value !== "object") return false;
+  const unknown = value as Record<string, unknown>;
+  const parts = typeof unknown.provider === "string" && (typeof unknown.model === "string" || unknown.model === null)
+    ? signatureParts(`${unknown.provider}|${unknown.model ?? "-"}|${unknown.status}|${unknown.normalized as string}`) : null;
+  return typeof unknown.provider === "string" && unknown.provider.length > 0
+    && (typeof unknown.model === "string" || unknown.model === null)
+    && Number.isInteger(unknown.status) && typeof unknown.normalized === "string" && typeof unknown.sample === "string"
+    && Number.isFinite(unknown.count) && Number.isFinite(unknown.firstSeen) && Number.isFinite(unknown.lastSeen)
+    && (unknown.proposed === undefined || validProposal(unknown.proposed))
+    && parts !== null;
+}
+
+function unknownMatchesSignature(signature: string, value: UnknownRefusal): boolean {
+  const parts = signatureParts(signature);
+  return parts !== null
+    && value.provider === parts.provider
+    && value.model === parts.model
+    && value.status === parts.status
+    && value.normalized === parts.sample;
+}
+
+function validV1Unknown(value: unknown): value is UnknownRefusal {
+  if (!validUnknown({ ...(value as object), proposed: undefined })) return false;
+  const proposed = (value as { proposed?: unknown }).proposed;
+  if (proposed === undefined) return true;
+  if (!proposed || typeof proposed !== "object") return false;
+  const candidate = proposed as Record<string, unknown>;
+  return FACT_KINDS.includes(candidate.class as FactKind)
+    && validV1Template(candidate.scope)
+    && typeof candidate.rationale === "string"
+    && Number.isFinite(candidate.at);
+}
+
+function asPending(signature: string, interpretation: Interpretation): UnknownRefusal | null {
+  const parts = signatureParts(signature);
+  if (!parts) return null;
+  const now = Number.isFinite(interpretation.acceptedAt) ? interpretation.acceptedAt! : Date.now();
+  return {
+    provider: parts.provider,
+    model: parts.model,
+    status: parts.status,
+    normalized: parts.sample,
+    sample: parts.sample,
+    count: 1,
+    firstSeen: now,
+    lastSeen: now,
+  };
+}
+
+function migrateV1(parsed: Record<string, unknown>): InterpretationStore {
+  const confirmed: Record<string, Interpretation> = {};
+  const unknown: Record<string, UnknownRefusal> = {};
+  const ignored: Record<string, { at: number }> = {};
+  const rawUnknown = parsed.unknown;
+  if (rawUnknown && typeof rawUnknown === "object") {
+    for (const [signature, entry] of Object.entries(rawUnknown)) {
+      if (!validV1Unknown(entry) || !unknownMatchesSignature(signature, entry)) continue;
+      const migrated = { ...entry };
+      // An old provider proposal could otherwise be accepted later and silently acquire the old,
+      // over-broad meaning. It must be researched again under v2's explicit scopes.
+      if (migrated.proposed?.scope?.kind === "provider") delete migrated.proposed;
+      else if (migrated.proposed?.scope?.kind === "group") {
+        migrated.proposed = {
+          ...migrated.proposed,
+          scope: { ...migrated.proposed.scope, credential: "attempt" },
+        };
+      }
+      unknown[signature] = migrated;
+    }
+  }
+  const rawConfirmed = parsed.confirmed;
+  if (rawConfirmed && typeof rawConfirmed === "object") {
+    for (const [signature, entry] of Object.entries(rawConfirmed)) {
+      if (!signatureParts(signature) || !validV1Interpretation(entry)) continue;
+      if (entry.scope.kind === "provider") {
+        // v1 provider meant “the credential”, but it did not name the credential. Requeue rather
+        // than guessing a v2 scope or letting it keep binding.
+        const pending = entry.acceptedAt === undefined ? null : asPending(signature, entry);
+        if (pending) unknown[signature] = pending;
+        continue;
+      }
+      confirmed[signature] = entry.scope.kind === "group"
+        ? { ...entry, scope: { ...entry.scope, credential: "attempt" } }
+        : entry;
+    }
+  }
+  const rawIgnored = parsed.ignored;
+  if (rawIgnored && typeof rawIgnored === "object") {
+    for (const [signature, entry] of Object.entries(rawIgnored)) {
+      if (signatureParts(signature) && validIgnored(entry)) ignored[signature] = entry;
+    }
+  }
+  return { version: 2, confirmed, unknown, ignored };
+}
+
 function load(path: string): InterpretationStore {
   if (_store && _path === path) return _store;
   _path = path;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<InterpretationStore>;
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (parsed && typeof parsed === "object") {
-      _store = {
-        version: 1,
-        confirmed: (parsed.confirmed ?? {}) as Record<string, Interpretation>,
-        ignored: (parsed.ignored ?? {}) as Record<string, { at: number }>,
-        unknown: (parsed.unknown ?? {}) as Record<string, UnknownRefusal>,
-      };
-      return _store;
+      const raw = parsed as Record<string, unknown>;
+      if (raw.version === 1) {
+        _store = migrateV1(raw);
+        return _store;
+      }
+      if (raw.version === 2) {
+        const confirmed: Record<string, Interpretation> = {};
+        const unknown: Record<string, UnknownRefusal> = {};
+        const ignored: Record<string, { at: number }> = {};
+        if (raw.confirmed && typeof raw.confirmed === "object") {
+          for (const [signature, entry] of Object.entries(raw.confirmed)) {
+            if (signatureParts(signature) && validInterpretation(entry)) confirmed[signature] = entry;
+          }
+        }
+        if (raw.unknown && typeof raw.unknown === "object") {
+          for (const [signature, entry] of Object.entries(raw.unknown)) {
+            if (validUnknown(entry) && unknownMatchesSignature(signature, entry)) unknown[signature] = entry;
+          }
+        }
+        if (raw.ignored && typeof raw.ignored === "object") {
+          for (const [signature, entry] of Object.entries(raw.ignored)) {
+            if (signatureParts(signature) && validIgnored(entry)) ignored[signature] = entry;
+          }
+        }
+        _store = { version: 2, confirmed, unknown, ignored };
+        return _store;
+      }
     }
   } catch {
-    // Corrupt or absent: start clean. Seeds live in source, so nothing that BINDS is lost — only
-    // researched entries, which the queue will re-surface as the refusals recur.
+    // Corrupt or absent: start clean. Seeds live in source, so nothing binding is lost.
   }
-  _store = { version: 1, confirmed: {}, unknown: {}, ignored: {} };
+  _store = { version: 2, confirmed: {}, unknown: {}, ignored: {} };
   return _store;
 }
 

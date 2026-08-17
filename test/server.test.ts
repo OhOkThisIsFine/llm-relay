@@ -7,11 +7,19 @@ import { tmpdir } from "node:os";
 import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog, type ModelLimits } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
-import type { Config } from "../src/config.js";
+import { makeCredentialId } from "../src/credential-id.js";
+import type { Config, ProviderConfig } from "../src/config.js";
 import type { Reshaper } from "../src/reshaper.js";
 import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
 import { reconstructFromSse } from "../src/sse.js";
 import { reconstruct } from "../src/reshaper.js";
+
+const breakerIdentity = (provider: string, model: string | null) => ({
+  provider,
+  model,
+  kind: "anthropic" as const,
+  credentialId: makeCredentialId(provider),
+});
 
 /**
  * Every listener this file opens, closed after each test.
@@ -394,6 +402,83 @@ describe("repair mode", () => {
   function reqBody(stream: boolean, tools: object[] = weatherTools): string {
     return JSON.stringify({ model: "m", stream, messages: [{ role: "user", content: "weather?" }], tools });
   }
+
+  it("passes the candidate provider into a catalog-backed dynamic reshaper", async () => {
+    const savedKey = process.env.CUSTOM_PROVIDER_API_KEY;
+    process.env.CUSTOM_PROVIDER_API_KEY = "sk-dynamic-derived";
+    let reshaperAuth: string | undefined;
+    const reshaperBackend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        reshaperAuth = req.headers.authorization;
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ inputs: { t1: { city: "Paris" } } }) } }] }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(track(s)));
+    });
+    const frontBackend = await mockBackend(() => ({
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "message",
+        role: "assistant",
+        stop_reason: "tool_use",
+        content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }],
+      }),
+    }));
+    const reshaperProvider: ProviderConfig = {
+      base: `http://127.0.0.1:${port(reshaperBackend)}`,
+      kind: "openai",
+      authEnv: "CUSTOM_DECLARED_KEY",
+      authHeader: "authorization",
+      timeoutMs: 5000,
+      tierType: "free",
+    };
+    const catalog = new ModelCatalog({ cachePath: null });
+    await catalog.list("custom-provider", reshaperProvider, {
+      fetchFn: async () => new Response(JSON.stringify({ data: [{ id: "repair-model" }] }), { status: 200 }),
+    });
+    const cfg: Config = {
+      host: "127.0.0.1",
+      port: 0,
+      providers: {
+        up: {
+          base: `http://127.0.0.1:${port(frontBackend)}`,
+          kind: "anthropic",
+          authHeader: "x-api-key",
+          timeoutMs: 5000,
+        },
+        "custom-provider": reshaperProvider,
+      },
+      routing: {
+        default: "up",
+        tiers: {},
+        pools: { medium: [] },
+        poolPolicies: { medium: { preferred: [], include: "free" } },
+      },
+      mode: "repair",
+      reshaperPool: { name: "medium", timeoutMs: 5000 },
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+
+    try {
+      const p = port(await startProxy(cfg, { catalog }));
+      const response = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: reqBody(false),
+      });
+      expect(response.status).toBe(200);
+      expect(reshaperAuth).toBe("Bearer sk-dynamic-derived");
+      const repaired = (await response.json()) as { content: AssistantMessage["content"] };
+      expect(repaired.content.find(isToolUseBlock)?.input).toEqual({ city: "Paris" });
+    } finally {
+      if (savedKey === undefined) delete process.env.CUSTOM_PROVIDER_API_KEY;
+      else process.env.CUSTOM_PROVIDER_API_KEY = savedKey;
+    }
+  });
 
   it("replaces a broken NON-streaming tool call with the reshaped one", async () => {
     const broken = JSON.stringify({ type: "message", role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }] });
@@ -803,7 +888,7 @@ describe("circuit breaker accounting", () => {
     });
     expect(resp.status).toBe(429); // the response itself still passes through untouched
 
-    const state = globalCircuitBreaker.getState("up");
+    const state = globalCircuitBreaker.getState(breakerIdentity("up", null));
     expect(state?.consecutiveFailures).toBe(1);
     expect(state?.lastStatus).toBe(429);
     expect(state!.cooldownUntil).toBeGreaterThan(Date.now()); // 429 trips the cooldown immediately
@@ -821,7 +906,7 @@ describe("circuit breaker accounting", () => {
         body: REQUEST_BODY,
       });
       expect(resp.status).toBe(status); // upstream status reaches the client untouched
-      const state = globalCircuitBreaker.getState("up");
+      const state = globalCircuitBreaker.getState(breakerIdentity("up", null));
       expect(state?.consecutiveFailures).toBe(1);
       expect(state?.lastStatus).toBe(status);
     });
@@ -835,7 +920,7 @@ describe("circuit breaker accounting", () => {
       body: REQUEST_BODY,
     });
     expect(resp.status).toBe(200);
-    const state = globalCircuitBreaker.getState("up");
+    const state = globalCircuitBreaker.getState(breakerIdentity("up", null));
     expect(state?.consecutiveFailures).toBe(0);
     expect(state?.cooldownUntil).toBe(0);
   });
@@ -852,8 +937,8 @@ describe("circuit breaker accounting", () => {
    */
   for (const status of [401, 403]) {
     it(`records neither success nor failure for a ${status}, and does not erase prior failures`, async () => {
-      globalCircuitBreaker.recordOutcome("up", { ok: false, status: 500, elapsedMs: 10 });
-      expect(globalCircuitBreaker.getState("up")?.consecutiveFailures).toBe(1);
+      globalCircuitBreaker.recordOutcome(breakerIdentity("up", null), { ok: false, status: 500, elapsedMs: 10 });
+      expect(globalCircuitBreaker.getState(breakerIdentity("up", null))?.consecutiveFailures).toBe(1);
 
       const p = await bootStatus(status, JSON.stringify({ type: "error", error: { message: "invalid x-api-key" } }));
       const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
@@ -863,7 +948,7 @@ describe("circuit breaker accounting", () => {
       });
       expect(resp.status).toBe(status); // the real error still reaches the client
 
-      const state = globalCircuitBreaker.getState("up");
+      const state = globalCircuitBreaker.getState(breakerIdentity("up", null));
       expect(state?.consecutiveFailures).toBe(1); // not reset to 0 by a false success
       expect(state?.lastStatus).toBe(500); // and not overwritten by the auth status
     });

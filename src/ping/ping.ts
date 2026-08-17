@@ -1,5 +1,11 @@
 import type { ProviderConfig } from "../config.js";
 import { buildAuthHeaders } from "../authEnv.js";
+import {
+  extractQuotaObservations,
+  headroomPercent,
+  type QuotaHeaders,
+  type QuotaObservation,
+} from "../quota-observation.js";
 
 export const DEFAULT_PING_TIMEOUT_MS = 15000;
 
@@ -9,46 +15,16 @@ const disabledThinkingUnsupportedProviders = new Set<string>();
 export interface PingResult {
   code: string;
   ms: number;
-  quotaPercent: number | null;
+  quotaObservations: QuotaObservation[];
 }
 
-
-function getHeaderValue(headers: Headers | Record<string, string | undefined>, key: string): string | null {
-  if (!headers) return null;
-  if (typeof (headers as Headers).get === "function") {
-    return (headers as Headers).get(key);
-  }
-  const obj = headers as Record<string, string | undefined>;
-  return obj[key] ?? obj[key.toLowerCase()] ?? null;
-}
-
-/** Parse rate-limit response headers to calculate remaining quota percentage (0–100). */
-export function extractQuotaPercent(headers: Headers | Record<string, string | undefined>): number | null {
-  const variants: Array<[string, string]> = [
-    ["x-ratelimit-remaining", "x-ratelimit-limit"],
-    ["x-ratelimit-remaining-requests", "x-ratelimit-limit-requests"],
-    ["x-ratelimit-remaining-requests-day", "x-ratelimit-limit-requests-day"],
-    ["x-ratelimit-remaining-tokens", "x-ratelimit-limit-tokens"],
-    ["x-ratelimit-remaining-tokens-minute", "x-ratelimit-limit-tokens-minute"],
-    ["ratelimit-remaining", "ratelimit-limit"],
-    ["ratelimit-remaining-requests", "ratelimit-limit-requests"],
-  ];
-
-  for (const [remainingKey, limitKey] of variants) {
-    const remainingRaw = getHeaderValue(headers, remainingKey);
-    const limitRaw = getHeaderValue(headers, limitKey);
-    if (remainingRaw !== null && limitRaw !== null) {
-      const remaining = parseFloat(remainingRaw);
-      const limit = parseFloat(limitRaw);
-
-      if (Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0) {
-        const pct = Math.round((remaining / limit) * 100);
-        return Math.max(0, Math.min(100, pct));
-      }
-    }
-  }
-
-  return null;
+/**
+ * @deprecated Quota has more than one independent axis. Use `extractQuotaObservations()` and
+ * render each observation directly. This compatibility adapter declines ambiguous responses.
+ */
+export function extractQuotaPercent(headers: QuotaHeaders): number | null {
+  const observations = extractQuotaObservations(headers);
+  return observations.length === 1 ? headroomPercent(observations[0]!) : null;
 }
 
 export function markDisabledThinkingUnsupported(providerName: string): void {
@@ -158,15 +134,15 @@ export async function pingProviderModel(
 
     const code = resp.status >= 200 && resp.status < 300 ? "200" : String(resp.status);
     const ms = Math.round(performance.now() - t0);
-    const quotaPercent = extractQuotaPercent(resp.headers);
+    const quotaObservations = extractQuotaObservations(resp.headers);
 
-    return { code, ms, quotaPercent };
+    return { code, ms, quotaObservations };
   } catch (err: unknown) {
     const isTimeout = err instanceof Error && err.name === "AbortError";
     return {
       code: isTimeout ? "000" : "ERR",
       ms: isTimeout ? timeoutMs : Math.round(performance.now() - t0),
-      quotaPercent: null,
+      quotaObservations: [],
     };
   } finally {
     clearTimeout(timer);

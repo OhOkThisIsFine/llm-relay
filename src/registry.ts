@@ -3,7 +3,7 @@ import { loadTierData, findTierModel } from "./tier-data.js";
 export { loadTierData };
 import type { Config, ProviderConfig } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
-import { keyIsPresent } from "./authEnv.js";
+import { readCredential } from "./authEnv.js";
 
 import type { PingLoop, ModelHealthSummary } from "./ping/cadence.js";
 
@@ -39,7 +39,6 @@ interface RegistryProvider {
   has_key: boolean;
   /** openai providers only: did the live /models catalog return anything (reachable + authorized)? */
   reachable: boolean | null;
-  quota_percent?: number | null;
   models: RegistryModel[];
 }
 
@@ -104,7 +103,7 @@ export async function buildRegistry(
     // The shared presence predicate, not an open-coded `?.trim()` — call sites that each decided
     // for themselves whether a whitespace-only key counts as present is exactly how a blank
     // credential once read "present" here and "absent" to header construction.
-    const has_key = p.authEnv ? keyIsPresent(process.env[p.authEnv]) : true;
+    const has_key = p.authEnv ? readCredential(p.authEnv, process.env, name) !== undefined : true;
     let models: RegistryModel[] = [];
     let reachable: boolean | null = p.kind === "openai" ? false : null;
     if (p.kind === "openai") {
@@ -117,15 +116,12 @@ export async function buildRegistry(
       });
     }
 
-    const quota_percent = opts.pingLoop ? opts.pingLoop.getProviderQuota(name) : undefined;
-
     providers[name] = {
       base: p.base,
       kind: p.kind,
       ...(p.authEnv ? { authEnv: p.authEnv } : {}),
       has_key,
       reachable,
-      ...(quota_percent !== undefined ? { quota_percent } : {}),
       models,
     };
   }

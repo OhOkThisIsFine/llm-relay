@@ -5,8 +5,35 @@ import { tmpdir } from "node:os";
 import { loadConfig, resolveTargets } from "../src/config.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { materializeDynamicPools } from "../src/dynamic-pools.js";
+import { makeCredentialId } from "../src/credential-id.js";
+import { recordFact, resetFacts } from "../src/target-facts.js";
 
 describe("dynamic free-model pools", () => {
+  it("uses the implicit default credential when applying cost facts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rp-dynamic-credential-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: { free: { base: "https://free.test/v1", kind: "openai", tierType: "free" } },
+        routing: { default: "free/m", pools: { low: { preferred: [], include: "free" } } },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      await catalog.list("free", cfg.providers.free!, {
+        fetchFn: (async () => new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 })) as unknown as typeof fetch,
+      });
+      recordFact("not-servable", {
+        kind: "attempt", provider: "free", credentialId: makeCredentialId("free"), model: "m",
+      });
+
+      materializeDynamicPools(cfg, catalog);
+      expect(cfg.routing.pools!.low).not.toContain("free/m");
+    } finally {
+      resetFacts();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it("excludes user tombstones from preferred and discovered members while unknown entries stay inert", async () => {
     const dir = mkdtempSync(join(tmpdir(), "rp-dynamic-exclude-"));
     try {

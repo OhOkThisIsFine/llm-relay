@@ -11,6 +11,7 @@ import {
   resetObservedContextLimits,
   OBSERVED_LIMIT_TTL_MS,
 } from "../src/context-limits.js";
+import { clearFacts } from "../src/target-facts.js";
 
 const dir = mkdtempSync(join(tmpdir(), "rp-ctxlimit-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -67,6 +68,12 @@ describe("the learned-limit store", () => {
   it("records and reads back a ceiling per deployment", () => {
     recordObservedContextLimit("nim", "z-ai/glm-5.2", 131072, { path });
     expect(observedContextLimit("nim", "z-ai/glm-5.2", { path })).toBe(131072);
+  });
+
+  it("keeps deployment measurements through a credential-less condition clear", () => {
+    recordObservedContextLimit("nim", "m", 131072, { path });
+    clearFacts("nim", null, "m", { path });
+    expect(observedContextLimit("nim", "m", { path })).toBe(131072);
   });
 
   it("keys by (provider, model) — the same model id on two hosts is two deployments", () => {

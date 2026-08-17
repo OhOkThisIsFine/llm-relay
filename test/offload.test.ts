@@ -16,8 +16,10 @@ import { createProxy } from "../src/server.js";
 import { offloadState, setOffload } from "../src/offload.js";
 import { buildCandidates } from "../src/candidates.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
+import { makeCredentialId } from "../src/credential-id.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { ModelCatalog } from "../src/catalog.js";
+import type { PingLoop } from "../src/ping/cadence.js";
 
 const CONTROL_TOKEN = "offload-test-control-token";
 const CONTROL_AUTHORIZATION = { validate: (candidate: unknown) => candidate === CONTROL_TOKEN };
@@ -504,6 +506,47 @@ describe("candidates view", () => {
     expect(view.candidates[1]!.subagentTiers).toEqual(["haiku"]);
   });
 
+  it("exposes completion-token coverage without fabricating an unreported zero", async () => {
+    const cfg = freshConfig("completion-coverage.json", {
+      pools: { coding: ["nim/model-without-telemetry", "nim/model-zero", "nim/model-positive"] },
+      subagents: { default: "pool/coding" },
+    });
+    const view = await buildCandidates(cfg, {
+      breaker: new CircuitBreaker(),
+      telemetry: {
+        version: 2,
+        models: {
+          "nim/model-zero": {
+            providerKey: "nim", modelId: "model-zero", totalCalls: 2, successCalls: 2,
+            totalLatencyMs: 20, totalCompletionTokens: 0, completionTokenCalls: 1,
+            lastCalledAt: 1, recentCalls: [],
+          },
+          "nim/model-positive": {
+            providerKey: "nim", modelId: "model-positive", totalCalls: 3, successCalls: 3,
+            totalLatencyMs: 30, totalCompletionTokens: 42, completionTokenCalls: 2,
+            lastCalledAt: 1, recentCalls: [],
+          },
+        },
+      },
+    });
+    expect(view.candidates).toHaveLength(3);
+    expect(view.candidates.find((c) => c.model === "model-without-telemetry")!.completionTokens).toEqual({
+      reported: null,
+      reportedCalls: 0,
+      totalCalls: 0,
+    });
+    expect(view.candidates.find((c) => c.model === "model-zero")!.completionTokens).toEqual({
+      reported: 0,
+      reportedCalls: 1,
+      totalCalls: 2,
+    });
+    expect(view.candidates.find((c) => c.model === "model-positive")!.completionTokens).toEqual({
+      reported: 42,
+      reportedCalls: 2,
+      totalCalls: 3,
+    });
+  });
+
   it("keeps raw dimensions separate and makes every derived routing component explicit", async () => {
     const cfg = freshConfig("g.json");
     const view = await buildCandidates(cfg, { breaker: new CircuitBreaker() });
@@ -512,7 +555,8 @@ describe("candidates view", () => {
     // Capability, live behaviour, availability and observed traffic are distinct fields.
     expect(c).toHaveProperty("capabilityMatch");
     expect(c).toHaveProperty("health");
-    expect(c).toHaveProperty("quotaPercent");
+    expect(c).toHaveProperty("credentialId", "nim#default");
+    expect(c).toHaveProperty("quota");
     expect(c).toHaveProperty("breaker");
     expect(c).toHaveProperty("observed");
     // Limits carry per-field provenance: a NIM row must never present another provider's
@@ -545,13 +589,99 @@ describe("candidates view", () => {
     expect(c).not.toHaveProperty("recommendation");
   });
 
+  it("keeps quota tied to the exact credential/model and preserves typed axes", async () => {
+    const cfg = freshConfig("quota-cells.json");
+    const breaker = new CircuitBreaker();
+    const now = 1_000_000;
+    const first = {
+      provider: "nim", model: "z-ai/glm-5.2", kind: "openai" as const,
+      base: "https://example.invalid/v1", credentialId: makeCredentialId("nim"),
+    };
+    const second = { ...first, model: "openai/gpt-oss-20b" };
+    breaker.recordOutcome(first, {
+      ok: true, elapsedMs: 20, at: now,
+      quotaObservations: [
+        { axis: "requests", period: "day", remaining: 25, limit: 100, resetsAt: null, observedAt: now, basis: "provider-stated" },
+        { axis: "tokens", period: "minute", remaining: 800, limit: 1_000, resetsAt: null, observedAt: now, basis: "provider-stated" },
+      ],
+    });
+    breaker.recordOutcome(second, {
+      ok: true, elapsedMs: 20, at: now,
+      quotaObservations: [
+        { axis: "requests", period: "day", remaining: 10, limit: 50, resetsAt: null, observedAt: now, basis: "provider-stated" },
+      ],
+    });
+
+    const view = await buildCandidates(cfg, { breaker, nowMs: now });
+    const glm = view.candidates.find((candidate) => candidate.model === "z-ai/glm-5.2")!;
+    const oss = view.candidates.find((candidate) => candidate.model === "openai/gpt-oss-20b")!;
+    expect(glm.credentialId).toBe("nim#default");
+    expect(glm.quota).toMatchObject([
+      { axis: "requests", period: "day", remaining: 25, limit: 100 },
+      { axis: "tokens", period: "minute", remaining: 800, limit: 1_000 },
+    ]);
+    expect(oss.quota).toMatchObject([{ axis: "requests", period: "day", remaining: 10, limit: 50 }]);
+    expect(JSON.stringify(view)).not.toMatch(/percent/i);
+  });
+
+  it("merges probe and breaker quota per tuple, with the newer observation winning", async () => {
+    const cfg = freshConfig("quota-merge.json");
+    const breaker = new CircuitBreaker();
+    const now = 1_000_000;
+    const cell = {
+      provider: "nim", model: "z-ai/glm-5.2", kind: "openai" as const,
+      base: "https://example.invalid/v1", credentialId: makeCredentialId("nim"),
+    };
+    breaker.recordOutcome(cell, {
+      ok: true, elapsedMs: 20, at: now,
+      quotaObservations: [{
+        axis: "requests", period: "day", remaining: 25, limit: 100,
+        resetsAt: null, observedAt: now, basis: "provider-stated",
+      }],
+    });
+    const observed: Array<[string, string]> = [];
+    const pingLoop = {
+      getModelSummary: () => null,
+      getQuotaObservations: (credentialId: string, modelId: string) => {
+        observed.push([credentialId, modelId]);
+        return [
+          {
+            axis: "requests" as const, period: "day" as const, remaining: 90, limit: 100,
+            resetsAt: null, observedAt: now - 1, basis: "provider-stated" as const,
+          },
+          {
+            axis: "tokens" as const, period: "minute" as const, remaining: 800, limit: 1_000,
+            resetsAt: null, observedAt: now - 1, basis: "provider-stated" as const,
+          },
+        ];
+      },
+    } as unknown as PingLoop;
+
+    const view = await buildCandidates(cfg, { breaker, pingLoop, nowMs: now });
+    const glm = view.candidates.find((candidate) => candidate.model === "z-ai/glm-5.2")!;
+    expect(observed).toContainEqual(["nim#default", "z-ai/glm-5.2"]);
+    expect(glm.quota).toMatchObject([
+      { axis: "requests", period: "day", remaining: 25 },
+      { axis: "tokens", period: "minute", remaining: 800 },
+    ]);
+  });
+
   it("surfaces live breaker state per target", async () => {
     const cfg = freshConfig("h.json");
     const breaker = new CircuitBreaker();
     const now = 1_000_000;
     // Mechanical migration off the deleted defaulted writers — same target, same 429, same
     // timestamp, with the elapsed time the old signature let the caller omit.
-    breaker.recordOutcome("nim/z-ai/glm-5.2", { ok: false, status: 429, elapsedMs: 42, at: now });
+    breaker.recordOutcome(
+      {
+        provider: "nim",
+        model: "z-ai/glm-5.2",
+        kind: "openai",
+        base: "https://example.invalid/v1",
+        credentialId: makeCredentialId("nim"),
+      },
+      { ok: false, status: 429, elapsedMs: 42, at: now },
+    );
 
     const view = await buildCandidates(cfg, { breaker, nowMs: now + 1000 });
     const glm = view.candidates.find((c) => c.spec === "nim/z-ai/glm-5.2")!;

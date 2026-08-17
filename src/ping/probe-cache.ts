@@ -3,15 +3,16 @@ import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import type { PingRecord } from "./metrics.js";
 import { WriteBehindTimer } from "../write-behind.js";
+import { mergeQuotaObservations, type QuotaObservation } from "../quota-observation.js";
 
 export const DEFAULT_PROBE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export const BROKEN_PROBE_BACKOFF_BASE_MS = 60_000;
 /**
- * Bumped to 2 when entries gained a sample HISTORY. A version mismatch marks a model due for
- * probing (see `getModelsDueForProbe`), so v1 single-sample entries re-probe and refill naturally
- * instead of needing a migration.
+ * Bumped to 3 when probe quota changed from an ambiguous scalar percentage to typed observations.
+ * A version mismatch marks a model due for probing (see `getModelsDueForProbe`), so old entries
+ * refill naturally instead of migrating a scalar whose axis and period were already lost.
  */
-export const CURRENT_PROBE_VERSION = 2;
+export const CURRENT_PROBE_VERSION = 3;
 
 /**
  * How many recent probes are kept per model.
@@ -42,7 +43,7 @@ export interface ProbeEntry {
   probeVersion: number;
   ms: number;
   code: string;
-  quotaPercent: number | null;
+  quotaObservations: QuotaObservation[];
   /** Rolling window, oldest first. Absent on v1 entries. */
   samples?: PingRecord[];
   /** Cumulative counters. Absent on v1 entries. */
@@ -176,7 +177,7 @@ export function getModelsDueForProbe(
 export function recordProbeResult(
   providerKey: string,
   modelId: string,
-  result: { code: string; ms: number; quotaPercent: number | null },
+  result: { code: string; ms: number; quotaObservations: QuotaObservation[] },
   opts: { now?: number; probeVersion?: number; path?: string } = {},
 ): ProbeEntry {
   const now = opts.now ?? Date.now();
@@ -194,6 +195,7 @@ export function recordProbeResult(
   // proves this model will actually serve a request.
   const isOk = result.code === "200";
   const prev = cache.providers[providerKey]!.models[modelId];
+  cache.version = CURRENT_PROBE_VERSION;
 
   // Append to the rolling window rather than replacing the single sample a v1 entry held.
   // One probe cannot describe latency: p95, jitter and spike rate are distribution statistics,
@@ -216,7 +218,9 @@ export function recordProbeResult(
     probeVersion,
     ms: result.ms,
     code: result.code,
-    quotaPercent: result.quotaPercent,
+    // Each response can mention only one quota axis. Keep older, unrelated tuples instead of
+    // presenting partial metadata as a complete account balance.
+    quotaObservations: mergeQuotaObservations(prev?.quotaObservations ?? [], result.quotaObservations),
     samples,
     totals,
   };
@@ -253,6 +257,21 @@ export function loadTotals(
 ): ProbeTotals | null {
   const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
   return cache.providers[providerKey]?.models[modelId]?.totals ?? null;
+}
+
+/**
+ * Typed quota observations persisted by the default synthetic probe, or none when this entry is
+ * not current. In particular, a v2 scalar `quotaPercent` is intentionally never reconstructed.
+ */
+export function loadPersistedQuotaObservations(
+  providerKey: string,
+  modelId: string,
+  opts: { path?: string } = {},
+): QuotaObservation[] {
+  const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
+  const entry = cache.providers[providerKey]?.models[modelId];
+  if (!entry || entry.probeVersion !== CURRENT_PROBE_VERSION) return [];
+  return entry.quotaObservations ? [...entry.quotaObservations] : [];
 }
 
 /** Every (provider, model) the cache holds samples for — what a restarting PingLoop rehydrates. */
