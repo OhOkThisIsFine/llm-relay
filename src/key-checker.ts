@@ -1,6 +1,7 @@
 import type { Config, ProviderConfig } from "./config.js";
 import { fetchProviderQuota } from "./ping/quota.js";
-import { buildAuthHeaders, candidateEnvNames, keyIsPresent, readCredential } from "./authEnv.js";
+import { buildAuthHeaders, candidateEnvNames } from "./authEnv.js";
+import { providerCredentialSlots, resolveCredentialSlot, slotAllowsModel, type CredentialSlot } from "./credential-fleet.js";
 import { splitSpec } from "./config.js";
 
 /**
@@ -102,9 +103,11 @@ function probeHeaders(p: ProviderConfig, apiKey: string | undefined): Record<str
 
 export interface KeyCheckResult {
   provider: string;
+  credentialId: string;
+  label: string;
   authEnv?: string | undefined;
   hasEnvKey: boolean;
-  status: "valid" | "invalid_key" | "rate_limited" | "missing_env" | "unreachable" | "unverified";
+  status: "valid" | "invalid_key" | "rate_limited" | "missing_env" | "unreachable" | "unverified" | "disabled" | "no_models";
   httpStatus?: number | undefined;
   message: string;
   quotaPercent?: number | null | undefined;
@@ -223,28 +226,39 @@ export async function validateProviderKeys(
   const routed = routedModelsByProvider(cfg);
   const budgetMs = opts.budgetMs ?? PROVIDER_CHECK_BUDGET_MS;
 
-  const checkOne = async ([name, p]: [string, ProviderConfig]): Promise<KeyCheckResult> => {
-    const envVarName = p.authEnv;
+ const checkOne = async (name: string, p: ProviderConfig, slot: CredentialSlot): Promise<KeyCheckResult> => {
+  const envVarName = slot.authEnv;
+  const identity = { credentialId: slot.credentialId, label: slot.label };
+  const resolution = resolveCredentialSlot(slot, process.env);
+  const hasEnvKey = resolution.state === "declared-present";
+  if (!slot.enabled) {
+  return { provider: name, ...identity, authEnv: envVarName, hasEnvKey, status: "disabled", message: "Credential slot is disabled" };
+  }
+  if (slot.models !== null && slot.models.length === 0) {
+  return { provider: name, ...identity, authEnv: envVarName, hasEnvKey, status: "no_models", message: "Credential slot is not allowed for any model" };
+ }
     // `readCredential` applies the shared presence predicate: a whitespace-only value is
     // ABSENT, not present. The old `process.env[name]` read was untrimmed, so a key pasted
     // as a blank line was truthy, slipped past this branch, and went to the wire as an
     // empty `x-api-key` / bare `Bearer` — reported back as a broken key rather than an
     // unset one.
-    const apiKey = readCredential(envVarName, process.env, name);
+ const apiKey = resolution.value;
 
-    if (envVarName && !apiKey) {
+ if (resolution.state === "declared-missing") {
       return {
-        provider: name,
-        authEnv: envVarName,
+ provider: name,
+ ...identity,
+ authEnv: envVarName,
         hasEnvKey: false,
         status: "missing_env",
-        message: `No key found — set ${candidateEnvNames(name, envVarName).slice(0, 4).join(" or ")}`,
+ message: `No key found — set ${(slot.resolutionMode === "declared-only"
+ ? [envVarName]
+ : candidateEnvNames(name, envVarName).slice(0, 4)).join(" or ")}`,
       };
     }
     // A provider with no declared `authEnv` is an intentional passthrough: it has no key,
     // and reporting `hasEnvKey: true` for it (as this did unconditionally) claims evidence
     // that does not exist.
-    const hasEnvKey = keyIsPresent(apiKey);
 
     try {
       // 1. Fetch quota if applicable
@@ -259,6 +273,7 @@ export async function validateProviderKeys(
       if (resp.status === 401 || resp.status === 403) {
         return {
           provider: name,
+          ...identity,
           authEnv: envVarName,
           hasEnvKey,
           status: "invalid_key",
@@ -268,6 +283,7 @@ export async function validateProviderKeys(
       } else if (resp.status === 429) {
         return {
           provider: name,
+          ...identity,
           authEnv: envVarName,
           hasEnvKey,
           status: "rate_limited",
@@ -304,13 +320,17 @@ export async function validateProviderKeys(
         // touch, and probing one of those produces a 401/403 that says nothing about the
         // key. The routed model is both the one the user cares about and the one most
         // likely to be reachable on their plan.
-        const probeModel = routed.get(name) ?? firstModelId;
+        const configuredModel = routed.get(name);
+        const probeModel = configuredModel && slotAllowsModel(slot, configuredModel)
+          ? configuredModel
+          : (slot.models?.[0] ?? firstModelId);
         if (resp.ok && apiKey && url.endsWith("/models") && probeModel) {
           const gated = await isAuthGated(p, url, fetchFn);
           if (!gated) {
             const verdict = await probeAuthenticated(p, apiKey, fetchFn, probeModel);
             return {
               provider: name,
+              ...identity,
               authEnv: envVarName,
               hasEnvKey,
               status: verdict.status,
@@ -324,6 +344,7 @@ export async function validateProviderKeys(
 
         return {
           provider: name,
+          ...identity,
           authEnv: envVarName,
           hasEnvKey,
           status: "valid",
@@ -333,9 +354,10 @@ export async function validateProviderKeys(
           modelsFound: modelsCount,
         };
       } else {
-        return {
-          provider: name,
-          authEnv: envVarName,
+ return {
+ provider: name,
+ ...identity,
+ authEnv: envVarName,
           hasEnvKey,
           status: "unreachable",
           httpStatus: resp.status,
@@ -345,6 +367,7 @@ export async function validateProviderKeys(
     } catch (e) {
       return {
         provider: name,
+        ...identity,
         authEnv: envVarName,
         hasEnvKey,
         status: "unreachable",
@@ -356,15 +379,20 @@ export async function validateProviderKeys(
   // Each provider gets its OWN wall clock. `unreachable` is the honest verdict for a host
   // that never answered — silence is not evidence about the credential, so this must never
   // resolve to `invalid_key`.
+  const jobs = entries.flatMap(([name, p]) =>
+    providerCredentialSlots(name, p).map((slot) => ({ name, p, slot })),
+  );
   return Promise.all(
-    entries.map(([name, p]) =>
+    jobs.map(({ name, p, slot }) =>
       withBudget(
         budgetMs,
-        () => checkOne([name, p]),
+        () => checkOne(name, p, slot),
         () => ({
           provider: name,
-          authEnv: p.authEnv,
-          hasEnvKey: keyIsPresent(readCredential(p.authEnv, process.env, name)),
+          credentialId: slot.credentialId,
+          label: slot.label,
+          authEnv: slot.authEnv,
+          hasEnvKey: resolveCredentialSlot(slot, process.env).state === "declared-present",
           status: "unreachable" as const,
           message: `No answer within ${budgetMs}ms`,
         }),

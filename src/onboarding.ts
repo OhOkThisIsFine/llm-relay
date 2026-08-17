@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import type { Config, ProviderTierType } from "./config.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
-import { readCredential } from "./authEnv.js";
+import { aggregateHasKey, providerCredentialSlots } from "./credential-fleet.js";
 import { restrictSecretFileOnWindows } from "./secret-file-acl.js";
 
 export interface OnboardingStatus {
@@ -45,11 +45,15 @@ export function getOnboardingStatusList(cfg?: Config): OnboardingStatus[] {
   for (const [name, p] of Object.entries(providers)) {
     if (quiet.has(name.toLowerCase())) continue;
     const preset = ALL_PROVIDER_PRESETS[name];
-    const authEnv = p.authEnv ?? preset?.authEnv;
+    const slots = providerCredentialSlots(name, p);
+    const authEnv = p.authEnv ?? preset?.authEnv ?? slots.find((slot) => slot.authEnv)?.authEnv;
     // The shared presence predicate, not a local `Boolean(...)`: presence has exactly one
     // definition in this codebase, and a whitespace-only exported variable is ABSENT. Reporting
     // such a provider "✅ Ready" sends the user off to debug a live call instead of their key.
-    const hasKey = authEnv ? readCredential(authEnv, process.env, name) !== undefined : true;
+    // Presence is an aggregate fleet fact: one enabled, model-eligible slot is enough to make
+    // the provider configured. Disabled, missing, and models:[] slots do not create false
+    // readiness, while a keyless legacy provider remains intentionally present.
+    const hasKey = aggregateHasKey(name, p);
 
     result.push({
       provider: name,

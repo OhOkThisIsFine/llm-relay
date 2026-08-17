@@ -112,7 +112,7 @@ export function aggregateHasKey(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return snapshotProviderCredentials(provider, config, env).some(({ slot, resolution }) =>
-    slot.enabled && resolution.state !== "declared-missing",
+    slot.enabled && (slot.models === null || slot.models.length > 0) && resolution.state !== "declared-missing",
   );
 }
 

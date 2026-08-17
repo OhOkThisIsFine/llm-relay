@@ -82,6 +82,84 @@ describe("probeMember", () => {
     expect(called).toBe(false);
   });
 
+  it("uses the first serviceable fleet slot and reports only its stable id", async () => {
+    process.env.FLEET_ONE = "one";
+    process.env.FLEET_TWO = "two";
+    const c = cfg({ coding: ["p1/m"] });
+    c.providers.p1 = {
+      base: "https://p1.test/v1",
+      kind: "openai",
+      authHeader: "authorization",
+      timeoutMs: 1000,
+      credentials: [
+        { label: "one", authEnv: "FLEET_ONE" },
+        { label: "two", authEnv: "FLEET_TWO" },
+      ],
+    };
+    let seen = "";
+    const f = (async (_url: string, init: RequestInit) => {
+      seen = ((init.headers as Record<string, string>)?.authorization ?? "");
+      return new Response(okBody, { status: 200 });
+    }) as unknown as typeof fetch;
+    const r = await probeMember("coding", "p1/m", c, f);
+    expect(r.verdict).toBe("live");
+    expect(r.credentialId).toBe("p1#one");
+    expect(seen).toBe("Bearer one");
+    delete process.env.FLEET_ONE;
+    delete process.env.FLEET_TWO;
+  });
+
+  it("falls through a missing first slot and keeps Anthropic model-less probes", async () => {
+    process.env.FLEET_TWO = "two";
+    const c = cfg({ coding: ["p1/m"] });
+    c.providers.p1 = {
+      base: "https://p1.test/v1",
+      kind: "openai",
+      authHeader: "authorization",
+      timeoutMs: 1000,
+      credentials: [
+        { label: "missing", authEnv: "FLEET_MISSING" },
+        { label: "present", authEnv: "FLEET_TWO" },
+      ],
+    };
+    const selected = await probeMember("coding", "p1/m", c, respond(200, okBody));
+    expect(selected.verdict).toBe("live");
+    expect(selected.credentialId).toBe("p1#present");
+
+    let anthropicBody: Record<string, unknown> | undefined;
+    const anthropic: Config = {
+      ...c,
+      providers: {
+        anthropic: { base: "https://a.test", kind: "anthropic", authHeader: "x-api-key", timeoutMs: 1000 },
+      },
+    } as unknown as Config;
+    const anthropicResult = await probeMember("coding", "anthropic", anthropic, async (_url, init) => {
+      anthropicBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), { status: 200 });
+    });
+    expect(anthropicResult.verdict).toBe("live");
+    expect(anthropicBody?.model).toBeUndefined();
+    delete process.env.FLEET_TWO;
+  });
+
+  it("does not egress when every explicit slot is disabled or missing", async () => {
+    const c = cfg({ coding: ["p1/m"] });
+    c.providers.p1 = {
+      base: "https://p1.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 1000,
+      credentials: [
+        { label: "disabled", authEnv: "FLEET_DISABLED", enabled: false },
+        { label: "missing", authEnv: "FLEET_MISSING" },
+      ],
+    };
+    let called = false;
+    const result = await probeMember("coding", "p1/m", c, async () => {
+      called = true;
+      return new Response(okBody, { status: 200 });
+    });
+    expect(result.verdict).toBe("auth");
+    expect(called).toBe(false);
+  });
+
   it("reports an unknown provider as dead", async () => {
     const r = await probeMember("coding", "ghost/m", cfg({ coding: ["ghost/m"] }), respond(200, okBody));
     expect(r.verdict).toBe("missing");

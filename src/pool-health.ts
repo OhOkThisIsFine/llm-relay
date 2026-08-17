@@ -12,13 +12,16 @@
  */
 import type { Config, ProviderConfig } from "./config.js";
 import { splitSpec } from "./config.js";
-import { buildAuthHeaders, readCredential } from "./authEnv.js";
+import { buildAuthHeaders } from "./authEnv.js";
+import { providerCredentialSlots, resolveCredentialSlot, slotAllowsModel, type CredentialSlot } from "./credential-fleet.js";
 
 export type MemberVerdict = "live" | "empty" | "auth" | "rate_limited" | "missing" | "error";
 
 export interface MemberHealth {
   pool: string;
   spec: string;
+  /** Stable slot identity only; never the credential value. */
+  credentialId?: string;
   verdict: MemberVerdict;
   httpStatus?: number | undefined;
   latencyMs?: number | undefined;
@@ -43,6 +46,17 @@ function authHeaders(p: ProviderConfig, apiKey: string | undefined): Record<stri
   };
 }
 
+function serviceableSlot(provider: string, model: string | undefined, p: ProviderConfig): { slot?: CredentialSlot; key?: string } {
+  for (const slot of providerCredentialSlots(provider, p)) {
+    if (!slot.enabled || !slotAllowsModel(slot, model)) continue;
+    const resolution = resolveCredentialSlot(slot);
+  if (resolution.state !== "declared-missing") {
+    return resolution.value === undefined ? { slot } : { slot, key: resolution.value };
+  }
+  }
+  return {};
+}
+
 /**
  * Send one real completion to a single pool member.
  *
@@ -63,12 +77,15 @@ export async function probeMember(
   if (!p) {
     return { pool, spec, verdict: "missing", detail: `no provider "${provider}" configured` };
   }
-  // `readCredential` treats a whitespace-only value as absent, so a key pasted as a blank
-  // line is reported here as an auth problem instead of being sent as a bare `Bearer`.
-  const apiKey = readCredential(p.authEnv, process.env, provider);
-  if (p.authEnv && !apiKey) {
-    return { pool, spec, verdict: "auth", detail: `${p.authEnv} is not set` };
+  // Select one serviceable slot before spending the single completion. Explicit fleets resolve
+  // only their declared env name; legacy authEnv retains the curated alias behavior.
+  if (p.kind === "openai" && !model) return { pool, spec, verdict: "missing", detail: "openai provider needs a model id" };
+  const selected = serviceableSlot(provider, model, p);
+  if (!selected.slot) {
+    return { pool, spec, verdict: "auth", detail: "no enabled credential slot with a present key" };
   }
+  const apiKey = selected.key;
+  const credentialId = selected.slot.credentialId;
 
   const isOpenAi = p.kind === "openai";
   const url = isOpenAi ? `${p.base}/chat/completions` : `${p.base}/v1/messages`;
@@ -83,25 +100,25 @@ export async function probeMember(
     const r = await fetchFn(url, { method: "POST", headers: authHeaders(p, apiKey), body });
     const latencyMs = now() - started;
     if (r.status === 401 || r.status === 403) {
-      return { pool, spec, verdict: "auth", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status}` };
+      return { pool, spec, credentialId, verdict: "auth", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status}` };
     }
     if (r.status === 429) {
-      return { pool, spec, verdict: "rate_limited", httpStatus: 429, latencyMs, detail: "HTTP 429" };
+      return { pool, spec, credentialId, verdict: "rate_limited", httpStatus: 429, latencyMs, detail: "HTTP 429" };
     }
     if (r.status === 404 || r.status === 400) {
-      return { pool, spec, verdict: "missing", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status} — model not servable` };
+      return { pool, spec, credentialId, verdict: "missing", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status} — model not servable` };
     }
     if (!r.ok) {
-      return { pool, spec, verdict: "error", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status}` };
+      return { pool, spec, credentialId, verdict: "error", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status}` };
     }
     const text = await r.text();
     const content = extractContent(text);
     if (content.trim().length === 0) {
-      return { pool, spec, verdict: "empty", httpStatus: r.status, latencyMs, detail: "200 but no content" };
+      return { pool, spec, credentialId, verdict: "empty", httpStatus: r.status, latencyMs, detail: "200 but no content" };
     }
-    return { pool, spec, verdict: "live", httpStatus: r.status, latencyMs };
+    return { pool, spec, credentialId, verdict: "live", httpStatus: r.status, latencyMs };
   } catch (e) {
-    return { pool, spec, verdict: "error", latencyMs: now() - started, detail: (e as Error).message };
+    return { pool, spec, credentialId, verdict: "error", latencyMs: now() - started, detail: (e as Error).message };
   }
 }
 

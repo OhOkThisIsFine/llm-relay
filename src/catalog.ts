@@ -2,7 +2,12 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { ProviderConfig } from "./config.js";
-import { buildAuthHeaders, readCredential } from "./authEnv.js";
+import { buildAuthHeaders } from "./authEnv.js";
+import {
+  providerCredentialSlots,
+  resolveCredentialSlot,
+  type CredentialSlot,
+} from "./credential-fleet.js";
 import { WriteBehindTimer } from "./write-behind.js";
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
@@ -372,11 +377,47 @@ export class ModelCatalog {
   ): Promise<{ models: string[]; limits: Record<string, ModelLimits> }> {
     // Anthropic-kind backends have no OpenAI-style /models list we consume.
     if (cfg.kind !== "openai") return { models: [], limits: {} };
-    const key = readCredential(cfg.authEnv, process.env, name);
+    const slots = providerCredentialSlots(name, cfg).filter(
+      (slot) => slot.enabled && (slot.models === null || slot.models.length !== 0),
+    );
+    // An explicit empty fleet, disabled slots, and models:[] are all a deliberate no-egress
+    // configuration. Legacy keyless providers retain their anonymous /models probe.
+    if (slots.length === 0) return { models: [], limits: {} };
+
+    let lastCredentialFailure: Error | undefined;
+    for (const slot of slots) {
+      const resolution = resolveCredentialSlot(slot);
+      if (resolution.state === "declared-missing") continue;
+      try {
+        return await this.fetchForSlot(name, cfg, fetchFn, slot, resolution.value);
+      } catch (error) {
+        const status = (error as { status?: unknown }).status;
+        if (typeof status === "number" && [401, 402, 403, 429].includes(status)) {
+          lastCredentialFailure = error instanceof Error ? error : new Error(`models fetch HTTP ${status}`);
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastCredentialFailure ?? new Error("no serviceable credential slot");
+  }
+
+  private async fetchForSlot(
+    name: string,
+    cfg: ProviderConfig,
+    fetchFn: typeof fetch,
+    slot: CredentialSlot,
+    key: string | undefined,
+  ): Promise<{ models: string[]; limits: Record<string, ModelLimits> }> {
     const headers: Record<string, string> = buildAuthHeaders(key, cfg.authHeader);
     const signal = cfg.timeoutMs && cfg.timeoutMs > 0 ? AbortSignal.timeout(cfg.timeoutMs) : undefined;
     const res = await fetchFn(cfg.base + "/models", { headers, ...(signal ? { signal } : {}) });
-    if (!res.ok) throw new Error(`models fetch HTTP ${res.status}`);
+    if (!res.ok) {
+      const error = new Error(`models fetch HTTP ${res.status}`) as Error & { status?: number; credentialId?: string };
+      error.status = res.status;
+      error.credentialId = slot.credentialId;
+      throw error;
+    }
     // A /models response is semi-trusted external content, and this is the one process fronting
     // every client session — `res.json()` buffered unboundedly, so a buggy or hostile endpoint
     // could balloon it within the timeout window (time bounds are not size bounds). Caps
