@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
 import { resolveAuthEnv, credentialState } from "./authEnv.js";
+import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
+import { providerCredentialSlots, type CredentialSlot, type ProviderCredentialConfig } from "./credential-fleet.js";
 
 export type Mode = "detect" | "repair" | "strict";
 
@@ -67,6 +69,8 @@ export interface ProviderConfig {
    */
   kind: Kind;
   authEnv?: string;
+  /** Explicit multi-key declarations. Presence of an empty array means an empty fleet. */
+  credentials?: ProviderCredentialConfig[];
   /**
    * What to do with the caller's own credential when this provider declares no `authEnv`:
    *  - `"passthrough"` — forward it. This is the declaration that makes an Anthropic
@@ -81,6 +85,8 @@ export interface ProviderConfig {
    * inferable from an omission. Illegal together with `authEnv` — that pair states both at once.
    */
   credentialMode?: CredentialMode;
+  /** Maximum concurrent requests for this provider credential domain; null/omitted is unlimited. */
+  maxConcurrent?: number | null;
   /** Which header to inject the provider key into. Default: authorization (openai) / x-api-key (anthropic). */
   authHeader: AuthHeader;
   /** Backend request deadline in ms. Default 120000. */
@@ -514,6 +520,8 @@ export interface ResolvedTarget {
   /** Real backend model id (required for openai; absent = anthropic passthrough). */
   model?: string;
   authEnv?: string;
+  /** Normalized non-secret credential slots for this provider. */
+  credentialSlots?: readonly CredentialSlot[];
   /** Carried from the provider: whether the caller's own credential may travel to this target. */
   credentialMode?: CredentialMode;
   authHeader: AuthHeader;
@@ -706,6 +714,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     ...(p.stallTimeoutMs !== undefined ? { stallTimeoutMs: p.stallTimeoutMs } : {}),
     ...(realModel !== undefined ? { model: realModel } : {}),
     ...(p.authEnv ? { authEnv: p.authEnv } : {}),
+    credentialSlots: providerCredentialSlots(provider, p),
     ...(p.credentialMode !== undefined ? { credentialMode: p.credentialMode } : {}),
   };
 }
@@ -980,6 +989,68 @@ function parseLeaveMeAlone(raw: unknown): string[] {
   return (raw as string[]).map((s) => s.trim());
 }
 
+function parseCredentialDeclarations(
+  provider: string,
+  raw: unknown,
+  warnings: string[],
+): ProviderCredentialConfig[] {
+  if (!Array.isArray(raw)) {
+    throw new Error(`config.providers.${provider}.credentials must be an array`);
+  }
+  const labels = new Set<string>();
+  const envNames = new Set<string>();
+  const out: ProviderCredentialConfig[] = [];
+  raw.forEach((entry, index) => {
+    const where = `config.providers.${provider}.credentials[${index}]`;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      warnings.push(`${where} dropped — expected an object`);
+      return;
+    }
+    const value = entry as {
+      label?: unknown;
+      authEnv?: unknown;
+      enabled?: unknown;
+      models?: unknown;
+    };
+    const label = typeof value.label === "string" ? value.label : "";
+    const authEnv = typeof value.authEnv === "string" ? value.authEnv : "";
+    if (!CREDENTIAL_LABEL_PATTERN.test(label)) {
+      warnings.push(`${where} dropped — label must match [A-Za-z0-9_.-]{1,32}`);
+      return;
+    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(authEnv)) {
+      warnings.push(`${where} dropped — authEnv must be a valid environment variable name`);
+      return;
+    }
+    if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+      warnings.push(`${where} dropped — enabled must be boolean`);
+      return;
+    }
+    let models: readonly string[] | null | undefined;
+    if (value.models !== undefined) {
+      if (!Array.isArray(value.models) || value.models.some((model) => typeof model !== "string")) {
+        warnings.push(`${where} dropped — models must be an array of model id strings`);
+        return;
+      }
+      models = Object.freeze([...new Set((value.models as string[]).map((model) => model.trim()).filter(Boolean))]);
+    }
+    if (labels.has(label) || envNames.has(authEnv)) {
+      const duplicate = labels.has(label) ? `label "${label}"` : `authEnv "${authEnv}"`;
+      warnings.push(`${where} dropped — duplicate ${duplicate}; first valid slot wins`);
+      return;
+    }
+    labels.add(label);
+    envNames.add(authEnv);
+    out.push({
+      label,
+      authEnv,
+      ...(value.enabled !== undefined ? { enabled: value.enabled } : {}),
+      ...(models !== undefined ? { models } : {}),
+    });
+  });
+  return out;
+}
+
 function parseProviders(
   raw: unknown,
   warnings: string[] = [],
@@ -997,32 +1068,35 @@ function parseProviders(
       base?: unknown;
       kind?: unknown;
       authEnv?: unknown;
+      credentials?: unknown;
       credentialMode?: unknown;
+      maxConcurrent?: unknown;
       authHeader?: unknown;
       timeoutMs?: unknown;
       stallTimeoutMs?: unknown;
       tierType?: unknown;
       signupUrl?: unknown;
     };
+    try {
+      makeCredentialId(name);
+    } catch {
+      throw new Error(
+        `config.providers.${name} is not a valid provider name — provider names must be non-empty and must not contain '#'`,
+      );
+    }
     if (typeof p.base !== "string") {
       throw new Error(`config.providers.${name}.base (string URL) is required`);
     }
-    // An unset ${ENV} in `base` disables just this provider — see expandEnvSoft.
+    // An unset ${ENV} in `base` disables just this provider — see expandEnvSoft. Parse the
+    // provider's credential declaration before applying that soft disable so malformed fleet
+    // declarations cannot hide behind an unavailable endpoint.
     const expanded = expandEnvSoft(p.base);
-    if (expanded.missing.length > 0) {
-      warnings.push(
-        `provider "${name}" DISABLED — base references unset env var ` +
-          `${expanded.missing.map((n) => `\${${n}}`).join(", ")}. ` +
-          `Set it and restart, or remove the provider. Everything else still works.`,
-      );
-      disabled.add(name);
-      continue;
-    }
     const kind: Kind = p.kind === "openai" ? "openai" : "anthropic";
     const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
     const declaredAuthEnv = typeof p.authEnv === "string" ? p.authEnv.trim() : undefined;
     const declaresAuthEnv = typeof declaredAuthEnv === "string" && declaredAuthEnv.length > 0;
-    const credentialMode =
+    const hasCredentialsDeclaration = p.credentials !== undefined;
+    let credentialMode: CredentialMode | undefined =
       p.credentialMode === "passthrough" || p.credentialMode === "contained" ? p.credentialMode : undefined;
     if (p.credentialMode !== undefined && credentialMode === undefined) {
       throw new Error(`config.providers.${name}.credentialMode must be "passthrough" or "contained"`);
@@ -1034,6 +1108,49 @@ function parseProviders(
         `config.providers.${name}: credentialMode "passthrough" forwards the CALLER's own credential, ` +
         `but authEnv ${String(declaredAuthEnv)} declares one of its own — declare exactly one`,
       );
+    }
+    if (hasCredentialsDeclaration && p.authEnv !== undefined) {
+      throw new Error(
+        `config.providers.${name}: authEnv and credentials cannot both be declared — declare exactly one`,
+      );
+    }
+    if (hasCredentialsDeclaration && credentialMode === "passthrough") {
+      throw new Error(
+        `config.providers.${name}: credentialMode "passthrough" cannot be combined with credentials`,
+      );
+    }
+    // An explicit fleet, including `credentials: []`, is a provider-owned credential policy.
+    // Normalize it to contained so the absence of a usable slot can never fall through to the
+    // legacy Anthropic caller-credential passthrough.
+    if (hasCredentialsDeclaration) credentialMode = "contained";
+    let credentials: ProviderCredentialConfig[] | undefined;
+    if (hasCredentialsDeclaration) {
+      credentials = parseCredentialDeclarations(name, p.credentials, warnings);
+    }
+    let maxConcurrent: number | null | undefined;
+    if (p.maxConcurrent !== undefined) {
+      if (p.maxConcurrent === null) {
+        maxConcurrent = null;
+      } else if (
+        typeof p.maxConcurrent !== "number" ||
+        !Number.isSafeInteger(p.maxConcurrent) ||
+        p.maxConcurrent <= 0
+      ) {
+        throw new Error(
+          `config.providers.${name}.maxConcurrent must be a positive safe integer or null`,
+        );
+      } else {
+        maxConcurrent = p.maxConcurrent;
+      }
+    }
+    if (expanded.missing.length > 0) {
+      warnings.push(
+        `provider "${name}" DISABLED — base references unset env var ` +
+          `${expanded.missing.map((n) => `\${${n}}`).join(", ")}. ` +
+          `Set it and restart, or remove the provider. Everything else still works.`,
+      );
+      disabled.add(name);
+      continue;
     }
     // Warn, don't fail: this proxy fronts every client session, so refusing to start over a
     // config that has worked for months would turn a hardening step into an outage. Scoped to
@@ -1059,7 +1176,9 @@ function parseProviders(
       // a known alias instead, use that so an already-working env var doesn't have to
       // be renamed. Resolved here so routing, key checks and the backend all agree.
       ...(declaredAuthEnv ? { authEnv: declaredAuthEnv } : {}),
+      ...(credentials !== undefined ? { credentials } : {}),
       ...(credentialMode !== undefined ? { credentialMode } : {}),
+      ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
       ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
         ? { tierType: p.tierType }
         : {}),

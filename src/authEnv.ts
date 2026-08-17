@@ -165,6 +165,26 @@ export function resolveCredential(
 }
 
 /**
+ * Resolve one explicitly-declared fleet slot. Unlike the legacy single `authEnv` form this
+ * intentionally does not consult curated or provider-derived aliases: alias fallback could make
+ * two slots share one environment variable and therefore share a quota domain.
+ */
+export function resolveCredentialExact(
+  declaredAuthEnv: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): CredentialResolution {
+  const normalized = declaredAuthEnv?.trim();
+  if (!normalized) return { state: "not-declared", value: undefined, envName: undefined };
+  const raw = env[normalized];
+  const value = keyIsPresent(raw) ? raw!.trim() : undefined;
+  return {
+    state: value ? "declared-present" : "declared-missing",
+    value,
+    envName: normalized,
+  };
+}
+
+/**
  * Which header a provider's credential is injected into.
  *
  * Structurally identical to `AuthHeader` in `config.ts` and freely assignable in
