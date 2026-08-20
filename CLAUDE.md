@@ -163,10 +163,27 @@ then either `repairPath` (repair mode, invalid tool call) or `transparentPath` (
 Messages** regardless of backend kind — translation is isolated in `backend.ts`.
 
 ## Invariants (keep these true)
+- **Provider knowledge is data, not routing configuration.** Provider URLs, models, and
+  credentials that decide routing come from config. Labelled provider facts in `src` — such as
+  env-var aliases, parameter quirks, refusal wording, and preset defaults — are allowed when
+  config can override them.
+- **Provenance:** a guess must never be labelled a measurement. Reported figures use
+  `provider-stated`, `derived`, `estimated`, or `operator-declared`; a total mixing bases shows its
+  split rather than quietly reporting one undifferentiated number. Unknown stays `null`, never `0`.
+  Tunable defaults are allowed, but unpublished provider limits, prices, and context ceilings may
+  not be invented.
+- **Accounting metering, not custody:** per credential and deployment, record used, left, and
+  rate. Counting is unconditional and needs no published limit. Acting on counts is optional,
+  always announced, and may only reorder. The ledger meters keys the operator already holds and
+  never obtains, stores, mints, or centrally proxies credentials.
+- **No hosted relay or pooled consumer accounts:** the relay never operates a login, never asks
+  anyone to paste a Claude token into it, and never centrally proxies another person's subscription
+  traffic. Each operator runs their own instance with their own keys; this still permits several
+  keys belonging to that operator.
+- **The repair boundary:** the relay fixes protocol form, never judgment. No LLM opinion enters the
+  request path; routing comes from config and deterministic classification.
+- **Health demotes, never drops.**
 
-- **Provider/model agnostic.** No hardcoded provider URLs, models, or keys in `src/`. Everything
-  comes from config: `backend.base`, `backend.model`, `backend.kind`, `backend.authEnv` (env var
-  NAME, not the key), `backend.authHeader`. NIM/llama in `src/` are doc-comment examples only.
 - **Never assert a key is bad without evidence that distinguishes it from an entitlement
   wall.** Free-tier rosters list premium models; a 401/403 on one of them says nothing about
   the credential. `unverified` exists precisely so the check can decline to conclude — a false
@@ -608,13 +625,11 @@ before proposing routing refactors, budgets, tracing stores, or LLM-assisted cla
 A second external review (terms compliance + credential handling) was assessed 2026-08-05 —
 [docs/codex-review-2026-08-05.md](docs/codex-review-2026-08-05.md): its headline credential finding
 was false (it missed that the openai path builds its own headers), two changes were adopted anyway
-(`credentialMode`, the OR'd subagent signal), and it carries the verified terms position. Its one
-open proposal — **"credentials stay user-operated"** — was **ratified 2026-08-08** into
-[docs/project-goals.md](docs/project-goals.md): llm-relay never operates a login, never centrally
-proxies subscription traffic, never pools consumer accounts. ⚠ **Decisions made on the strength of
-that invariant must be stated out loud** — name it, say what it ruled out, say what was done
-instead. A constraint the owner is never told was applied is one they cannot overrule; the same
-goes for any project invariant that changes what gets built.
+(`credentialMode`, the OR'd subagent signal), and it carries the verified terms position. Its
+2026-08-08 anti-hosting proposal was recalibrated 2026-08-16 into accounting metering plus the
+narrow no-hosted-relay/no-pooled-consumer-accounts boundary. Counting, ordering, and holding
+several of an operator's own keys remain allowed. ⚠ **Decisions shaped by any invariant must be
+stated aloud** — name the rule, what it excluded, and the alternative used.
 
 ⚠ **A CLI process's environment is NOT the running relay's environment, and confusing the two
 fabricates credential bugs.** On Windows a User-scope environment variable enters a process only at

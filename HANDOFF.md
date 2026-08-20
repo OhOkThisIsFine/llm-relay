@@ -3,7 +3,8 @@
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
 **State as of 2026-08-20:** Stage 0 and Stage 1 env-backed multi-key pooling are complete on
-`codex/stage-1-credential-pooling`. The authoritative final gate is green:
+`codex/stage-1-credential-pooling`, and the invariant recalibration packet is applied and complete.
+The authoritative final gate is green:
 `npm run build && npm run check` completed on Windows with 77 test files, 1,351 passed and 4
 expected Windows/POSIX-permission skips. The Stage 1 completion point is the commit containing
 this handoff; no not-yet-created commit hash is claimed here.
@@ -56,14 +57,12 @@ custody is the next design stage now that routing and observability behaviour ar
 
 ## 1. ⚠ READ THIS BEFORE YOU READ ANYTHING ELSE
 
-**`CLAUDE.md` and `docs/project-goals.md` still state four rules as law that the owner removed on
-2026-08-16.** The rewrite has not happened yet. If you follow those files as written you will
-re-derive exactly the conclusions the owner overturned, which is how this project lost a founding
-goal for thirteen months.
+The 2026-08-20 invariant recalibration packet is applied. Rubric §2 is now authoritative in
+`CLAUDE.md` and `docs/project-goals.md`; do not reintroduce the retired rules or reasoning below.
 
-Stale text still live in the repo:
+The retired rules and their replacement are recorded here for historical guardrails:
 
-| Location | Says | Reality |
+| Former location | Former text | Replacement |
 |---|---|---|
 | `docs/project-goals.md:86` | "## Credentials stay user-operated (owner-ratified 2026-08-08)" | **REMOVED.** No longer a reason for anything. |
 | `docs/project-goals.md:39` | "One place per policy." | **REMOVED.** |
@@ -85,8 +84,13 @@ to block a feature.
 metering + local key custody + multi-key pooling — serving observability, enforcement, routing input,
 and cost accounting.
 
-Authoritative replacement prose is drafted in **`docs/rubric-recalibration-2026-08-16.md` §2**.
-Applying it to `CLAUDE.md` and `docs/project-goals.md` is unclaimed work; do it if you touch either file.
+The replacement is grounded in **`docs/rubric-recalibration-2026-08-16.md` §2** and is now applied.
+
+Retired rules: credentials-stay-user-operated as a bar on an operator's own key pooling; one
+place per policy; absolute provider/model agnosticism; and the claim that accounting metering was
+outside this relay. The first three blocked the reinstated accounting goal or contradicted existing
+provider-specific data; the last was retired because metering is now a founding goal. For the related
+provenance recalibration—including tunable defaults and labelled provider facts—see rubric §2.
 
 ## 2. What still binds
 
@@ -164,7 +168,7 @@ this and nothing else.** Green means green.
 
 | Document | For |
 |---|---|
-| `CLAUDE.md` | Architecture map, file→responsibility table, gotchas. **Accurate on architecture, stale on invariants** (§1) and carries ~12 known drift items. |
+| `CLAUDE.md` | Architecture map, file→responsibility table, gotchas. Invariants are authoritative (§1); it carries ~12 known drift items. |
 | `docs/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections |
 | `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting — 12 components, staged build order |
 | `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline — 20 metrics, collection sites, storage, 6 stages |
@@ -204,15 +208,14 @@ this and nothing else.** Green means green.
 
 ## 8. Outstanding, unclaimed
 
-1. Apply `docs/rubric-recalibration-2026-08-16.md` §2 to `CLAUDE.md` and `docs/project-goals.md`.
-2. **Design the SPA dashboard.** The owner chose a full SPA port of freellmapi's Analytics page —
+1. **Design the SPA dashboard.** The owner chose a full SPA port of freellmapi's Analytics page —
    against recommendation, knowingly breaking the zero-new-deps / no-build-pipeline budget. It is
    the one piece of the program that is **still unspecified**; the quota spec designed only the
    single-HTML-file option.
-3. Re-audit the remaining documentation drift items in
+2. Re-audit the remaining documentation drift items in
    `docs/status-vs-freellmapi-2026-08-16.md` §5 against current source; Stage 1 corrected its
    credential-surface and phantom-header items.
-4. Render the **effective** `freeOnly` in `llm-relay offload status` (`grep freeOnly src/cli.ts` = 0
+3. Render the **effective** `freeOnly` in `llm-relay offload status` (`grep freeOnly src/cli.ts` = 0
    hits). ⚠ Not a raw field print: unset means **ON** for rerouted traffic and **OFF** for a directly
    addressed pool, so printing the bare optional would be a new transparency bug.
-5. The 14 unresolved decisions in `docs/open-decisions-2026-08-16.md`. None block Stage 0.
+4. The 14 unresolved decisions in `docs/open-decisions-2026-08-16.md`. None block the completed Stage 1 checkpoint.

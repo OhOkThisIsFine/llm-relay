@@ -36,9 +36,13 @@ Every proposed change should pass these, derived from the goals above:
    user must now reason about?
 3. **Minimal mechanism.** Is it the smallest change that does the job? Does it duplicate a
    definition, policy, or translation layer that already exists (llm-bridge, `credentialState()`,
-   `documents.ts`, `tier-data.ts`)? One place per policy.
-4. **Provenance.** Numbers and verdicts must carry where they came from; loud failure beats
-   silent fallback; never guess.
+   `documents.ts`, `tier-data.ts`)?
+4. **Provenance.** Every reported number carries one of `provider-stated`, `derived`, `estimated`,
+   or `operator-declared`; every verdict states its basis. A total mixing bases shows its split
+   rather than quietly reporting one undifferentiated number; unknown stays `null`, never `0`.
+   Tunable, documented defaults are allowed, but an estimate must never masquerade as a measurement
+   and unpublished provider limits, prices, or context ceilings are never invented. Loud failure
+   beats silent fallback.
 5. **Toward boring.** Does it move the project toward stable-and-boring or toward
    enterprise-shaped? Structure-first proposals (new abstraction layers, versioned contract
    envelopes, migration phases) are presumptively wrong here.
@@ -83,25 +87,31 @@ consistent with the repo's existing philosophy.
 - `docs/fcc-replacement-assessment.md` was a snapshot at commit 799eed3 with open items nobody
   was tracking; deleted 2026-08-04.
 
-## Credentials stay user-operated (owner-ratified 2026-08-08)
+## Accounting metering (owner-restated 2026-08-16)
 
-> Each person logs into Claude Code themselves, on their own machine, against their own account.
-> llm-relay never operates a login, never asks anyone to paste a Claude token into it, never
-> centrally proxies subscription traffic, and never pools consumer accounts. Each person supplies
-> their own third-party provider keys.
+**Knowing what each credential has used, how much is left, and at what rate is a founding goal of
+this project.** It was deferred when the project began, then this relay absorbed the routing work
+without bringing the accounting work along. That gap is now deliberately closed.
 
-Proposed in [codex-review-2026-08-05.md](codex-review-2026-08-05.md) §1 and ratified here.
-Everything in the repo already satisfies it; the point of writing it down is that a "hosted
-llm-relay" or a "shared relay for the group" are natural-sounding next features that would violate
-it, and the project is shared with friends.
+llm-relay must answer, per credential and per deployment: **how much was used, how much remains,
+and the rate.** Counting is unconditional and needs no published limit. Acting on counts is
+optional, always announced, and may only reorder.
 
-**⚠ Decisions made on the strength of this invariant must be stated OUT LOUD.** If a request is
-narrowed, declined, or redesigned because of this rule, say so in the response — name the
-invariant, say what it ruled out, and say what was done instead. An invariant that silently shapes
-work is indistinguishable from an agent being unhelpful for its own reasons, and the owner cannot
-overrule a constraint they were never told was applied. This is a standing instruction from the
-owner (2026-08-08), and it generalizes: the same applies to any project invariant that changes what
-gets built.
+The ledger is **accounting, not custody**: it meters keys the operator already holds. It does not
+authorise the relay to obtain, store, mint, or centrally proxy credentials.
+
+There is no hosted relay and no pooled consumer accounts: the relay never operates a login, never
+asks anyone to paste a Claude token into it, and never centrally proxies another person's
+subscription traffic. Each person runs their own instance with their own keys. This bars shared or
+hosted deployment, but does not bar counting, ordering, or holding several keys belonging to that
+operator.
+
+**⚠ Decisions made on the strength of an invariant must be stated OUT LOUD.** If a request is
+narrowed, declined, or redesigned because of a rule, say so in the response — name the invariant,
+say what it ruled out, and say what was done instead. An invariant that silently shapes work is
+indistinguishable from an agent being unhelpful for its own reasons, and the owner cannot overrule a
+constraint they were never told was applied. This is a standing instruction from the owner, and it
+applies to any project invariant that changes what gets built.
 
 ## Friend-install standard (owner decision 2026-08-04)
 
