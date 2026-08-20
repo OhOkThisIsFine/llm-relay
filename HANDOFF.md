@@ -2,9 +2,66 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-**State as of 2026-08-16:** v0.36.1, `main` clean at `a2baa99`, published to npm, gate green
-(67 test files, 1135 passed, 4 skipped, both typechecks clean). No source changes are pending.
-The last commit is documentation only.
+**State as of 2026-08-20:** Stage 0 is complete and Stage 1 env-backed multi-key pooling is in
+progress on `codex/stage-1-credential-pooling`; the implementation checkpoint is `7d9eca2`, with
+this handoff update committed directly on top. The current gate is green:
+`npm run build && npm run check` completed on Windows with 76 test files, 1,284 passed and 4
+expected POSIX-permission skips. This is a committed implementation checkpoint, **not Stage 1
+completion**; the remaining migrations below are known and intentionally handed off.
+
+## 0. Current implementation checkpoint — read this first
+
+The branch contains these landed packets, in order:
+
+| Commit | Packet |
+|---|---|
+| `7217ce0` | Stage 0 credential-aware attempt identity |
+| `024837e` | Normalized `credentials[]` provider fleets |
+| `5206d64` | Deterministic credential selection and breadth-first walk core |
+| `f8f7360` | Fleet-aware ancillary egress (keys, ping, pool probes, onboarding) |
+| `7d9eca2` | Both-front routing integration, credential leases and diagnostic surfaces |
+
+Implemented and covered by the green gate:
+
+- explicit fleet slots resolve only their exact env name; legacy `authEnv` retains aliases;
+- empty, disabled, model-scoped-out and missing fleet slots cannot egress;
+- learned entitlement exclusions retain survivor fallback;
+- selection preserves deployment ordering and ranks credentials by health/demotion, fresh observed
+  headroom, free versus paid/unknown, credential-wide LRU, then config order;
+- credential expansion is breadth-first, and only credential-attributable outcomes unlock a
+  sibling slot; provider transport failures suppress that provider for the request;
+- in-flight concurrency is counted credential-wide across models and only demotes saturated slots;
+- Messages and OpenAI fronts emit credential identity/attempt headers for multi-slot providers and
+  record `servedCredential` through the metadata-only log sink;
+- `/candidates` renders one row per `(spec, credentialId)`, `/registry` nests credential
+  diagnostics, and `/telemetry` remains credential-free/provider-aggregate;
+- CLI candidate/key output distinguishes credential slots; ancillary probes use serviceable slots
+  without exceeding their existing real-egress budgets.
+
+Known remaining Stage 1 work, in suggested pickup order:
+
+1. **Dispatch passthrough policy:** `src/dispatch.ts:392` still decides plain-subagent reachability
+   with `provider.authEnv === undefined`. Replace this legacy proxy with the normalized credential
+   policy (`credentialMode`/fleet semantics) and add contained-fleet versus true-passthrough tests.
+2. **Dynamic-pool fact lookup:** `src/dynamic-pools.ts` still calls `isCostBlocked(provider,
+   makeCredentialId(provider), model)`. Deployment discovery has no selected slot and must query
+   with required `credentialId = null`, so credential-scoped facts cannot leak into deployment
+   admission. Add a multi-slot regression test.
+3. **Reshaper credential binding:** `src/reshaper.ts` still resolves one legacy `authEnv` at egress,
+   while `src/server.ts` caches reshapers by provider/model. Make global/dynamic reshaper selection
+   fleet-aware without caching secret material under provider/model-only identity, and make
+   per-target repair reuse the exact `ResolvedAttempt` credential that served the malformed
+   response. Cover fixed, pool-backed and per-target repair.
+4. **Focused integration review:** the gate is green, but the interrupted scheduler packet was
+   checkpointed under time pressure. Review both front loops for exact lease release on every exit,
+   actual-egress-only LRU/budget accounting, same-deployment suppression after non-credential
+   failures, sticky deployment grouping, and credential header attempt counts. Failover tests must
+   use at least two credentials and at least two candidates.
+5. Update user-facing configuration/reference examples once the three migrations above settle,
+   then rerun the one gate and commit a clean Stage 1 completion point.
+
+Do not start custody/keystore work in this branch. Stage 1 here is env-backed pooling; custody is
+the next design stage after its routing and observability behavior is closed.
 
 ---
 
@@ -57,7 +114,9 @@ These were **not** removed and are load-bearing. Do not relax them:
 - **Health demotes, never drops.** Learned from a real outage where filtering unhealthy candidates
   narrowed a pool to nothing.
 
-## 3. The immediate next task
+## 3. Historical Stage 0 brief (complete at `7217ce0`)
+
+This section is retained as design history. Do not treat it as the current task; use §0 above.
 
 **Stage 0 of the credential fleet, with three counter defects folded in.** Full design:
 `docs/credential-fleet-design-2026-08-16.md` §8. Owner has approved this order (Stage 0, then
