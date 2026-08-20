@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_LOG_MAX_BYTES, MAX_LOG_ATTEMPTS, MetadataLogger, type RequestLog } from "../src/log.js";
+import { baseLog } from "../src/request-log.js";
 
 let dir: string;
 let file: string;
@@ -23,6 +24,7 @@ const record = (over: Partial<RequestLog> = {}): RequestLog => ({
   path: "/v1/messages",
   servedProvider: "nim",
   servedModel: "z-ai/glm-5.2",
+  servedCredential: null,
   upstreamReportedModel: "meta-router/actual-model",
   attempts: [],
   hadTools: true,
@@ -59,6 +61,7 @@ describe("metadata-only logging", () => {
       "path",
       "servedProvider",
       "servedModel",
+      "servedCredential",
       "upstreamReportedModel",
       "attempts",
       "hadTools",
@@ -140,6 +143,22 @@ describe("metadata-only logging", () => {
     expect(line!["upstreamReportedModel"]).toBe("meta-router/actual-model");
   });
 
+  it("emits a shape-stable credential cell without exposing nested attempt identities", () => {
+    const withNestedIdentity = {
+      ...record({ servedCredential: "nim#work" }),
+      attempts: [{ provider: "nim", model: "m", status: 200, ms: 1, credentialId: "nim#other" }],
+    } as unknown as RequestLog;
+    new MetadataLogger({ level: "metadata", file }).write(withNestedIdentity);
+    const [line] = linesIn(file);
+    expect(line!["servedCredential"]).toBe("nim#work");
+    expect(line!["attempts"]).toEqual([{ provider: "nim", model: "m", status: 200, ms: 1 }]);
+  });
+
+  it("baseLog always supplies an explicit null credential when no backend credential is known", () => {
+    const log = baseLog(0, "/health", false, false, 200, "skipped", null);
+    expect(log.servedCredential).toBeNull();
+  });
+
   it("omits upstream model provenance when no genuine mismatch was supplied", () => {
     const withoutDrift = record();
     delete withoutDrift.upstreamReportedModel;
@@ -160,6 +179,7 @@ describe("metadata-only logging", () => {
     expect(line).toHaveProperty("servedProvider");
     expect(line!["servedProvider"]).toBeNull();
     expect(line!["servedModel"]).toBeNull();
+    expect(line!["servedCredential"]).toBeNull();
   });
 
   it("writes nothing at all when the level is silent", () => {

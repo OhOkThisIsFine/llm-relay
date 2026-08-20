@@ -69,6 +69,9 @@ export const SERVED_BY_HEADER = "x-llm-relay-served-by";
  * real upstream error, because a true upstream error beats a synthesized one.
  */
 export const POOL_ATTEMPTS_HEADER = "x-llm-relay-pool-attempts";
+/** Response metadata headers for credential-aware pool diagnostics. */
+export const CREDENTIAL_HEADER = "x-llm-relay-credential";
+export const CREDENTIAL_ATTEMPTS_HEADER = "x-llm-relay-credential-attempts";
 
 /**
  * How many refusals in this walk said something the relay could not interpret.

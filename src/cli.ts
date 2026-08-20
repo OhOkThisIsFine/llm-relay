@@ -17,6 +17,7 @@ import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
 import { makeCredentialId } from "./credential-id.js";
+import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
@@ -636,17 +637,20 @@ export async function runPingCommand(): Promise<void> {
     }
 
     for (const mId of models.slice(0, 10)) {
-      const summary = pingLoop.getModelSummary(name, mId);
-      const avgStr = summary.avgMs >= 0 ? `${summary.avgMs}ms` : "pending";
-      const p95Str = summary.p95Ms >= 0 ? `${summary.p95Ms}ms` : "pending";
-    const scoreStr = summary.stabilityScore >= 0 ? `${summary.stabilityScore}/100` : "N/A";
-      const quota = formatCandidateQuota(
-        pingLoop.getQuotaObservations(makeCredentialId(name), mId),
-        Date.now(),
-      );
-    process.stdout.write(
-      `  ${fitCell(mId, 45)} | verdict: ${fitCell(summary.verdict, 10)} | avg: ${fitCell(avgStr, 8)} | p95: ${fitCell(p95Str, 8)} | stability: ${scoreStr} | quota: ${quota}\n`,
-      );
+      const slots = providerCredentialSlots(name, p).filter((slot) => slotAllowsModel(slot, mId));
+      for (const slot of slots.length > 0 ? slots : [undefined]) {
+        const summary = pingLoop.getModelSummary(name, mId);
+        const avgStr = summary.avgMs >= 0 ? `${summary.avgMs}ms` : "pending";
+        const p95Str = summary.p95Ms >= 0 ? `${summary.p95Ms}ms` : "pending";
+        const scoreStr = summary.stabilityScore >= 0 ? `${summary.stabilityScore}/100` : "N/A";
+        const quota = formatCandidateQuota(
+          pingLoop.getQuotaObservations(slot?.credentialId ?? makeCredentialId(name), mId),
+          Date.now(),
+        );
+        process.stdout.write(
+          `  ${slot ? `${slot.label} (${slot.credentialId})` : "no matching credential"} | model: ${mId} | verdict: ${fitCell(summary.verdict, 10)} | avg: ${fitCell(avgStr, 8)} | p95: ${fitCell(p95Str, 8)} | stability: ${scoreStr} | quota: ${quota}\n`,
+        );
+      }
     }
   }
 }
@@ -661,12 +665,13 @@ export async function runCheckKeys(): Promise<void> {
   const results = await validateProviderKeys(cfg);
 
   const rows = [
-    ["Provider", "Env var", "Status", "Details"],
+    ["Provider", "Credential ID", "Label", "Env var", "Status", "Details"],
     ...results.map((r) => {
       const envStr = r.authEnv ?? "(none)";
       const quotaStr = r.quotaPercent !== undefined && r.quotaPercent !== null ? ` | Quota: ${r.quotaPercent}%` : "";
       const modelsStr = r.modelsFound !== undefined ? ` | Models: ${r.modelsFound}` : "";
-      return [r.provider, envStr, r.status.toUpperCase(), `${r.message}${quotaStr}${modelsStr}`];
+      const status = r.status === "no_models" ? "NO MODELS" : r.status.toUpperCase();
+      return [r.provider, r.credentialId, r.label, envStr, status, `${r.message}${quotaStr}${modelsStr}`];
     }),
   ];
   process.stdout.write(formatTextTable(rows) + "\n");
@@ -1589,6 +1594,19 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
 }
 
 /** `llm-relay candidates` — every dimension of every offload target, side by side, unranked. */
+function candidateCredential(c: Candidate): Candidate["credential"] {
+  // A live relay can be one release behind the CLI. Preserve the legacy default-cell view
+  // until that process restarts onto the nested diagnostic shape.
+  return c.credential ?? {
+    label: c.credentialId?.split("#", 2)[1] ?? "default",
+    authEnv: null,
+    enabled: true,
+    models: null,
+    state: c.hasKey ? "not-declared" : "declared-missing",
+    modelAllowed: true,
+  };
+}
+
 export async function runCandidates(): Promise<void> {
   const cfg = loadOrExit();
   const only = argValue("--provider", "-p");
@@ -1612,6 +1630,7 @@ export async function runCandidates(): Promise<void> {
 
   const head =
     "target".padEnd(32) +
+    "credential".padEnd(40) +
     "pools / tiers".padEnd(24) +
     "fit".padEnd(7) +
     "raw".padEnd(7) +
@@ -1634,6 +1653,7 @@ export async function runCandidates(): Promise<void> {
   process.stdout.write(head + "\n" + "-".repeat(head.length) + "\n");
 
   for (const c of view.candidates) {
+    const credential = candidateCredential(c);
     const tags = [...c.pools, ...c.subagentTiers.map((t) => `@${t}`)].join(",") || "-";
     const live = c.listed === null ? "?" : c.listed ? "yes" : "NO";
     const ctx = c.contextLength ? `${Math.round(c.contextLength / 1000)}k` : "-";
@@ -1648,6 +1668,7 @@ export async function runCandidates(): Promise<void> {
         : "closed";
     process.stdout.write(
       c.spec.slice(0, 31).padEnd(32) +
+        `${credential.label} (${c.credentialId})`.padEnd(40) +
         tags.slice(0, 23).padEnd(24) +
         c.sortInputs.fitness.toFixed(1).padEnd(7) +
         c.sortInputs.rawStrength.toFixed(1).padEnd(7) +
@@ -1683,18 +1704,18 @@ export async function runCandidates(): Promise<void> {
   // Say out loud how much of the roster is currently unusable. A row-by-row table makes
   // "5 of 14 members can actually serve" something the reader has to notice; a pool that is
   // half dead is worth stating.
-  const noKey = view.candidates.filter((c) => !c.hasKey);
+  const noKey = view.candidates.filter((c) => candidateCredential(c).state === "declared-missing");
+  const disabled = view.candidates.filter((c) => !candidateCredential(c).enabled);
+  const modelScopedOut = view.candidates.filter((c) => !candidateCredential(c).modelAllowed);
   const authFault = view.candidates.filter((c) => c.breaker.credentialFault);
   const cooling = view.candidates.filter((c) => c.breaker.open);
-  if (noKey.length || authFault.length || cooling.length) {
+  if (noKey.length || disabled.length || modelScopedOut.length || authFault.length || cooling.length) {
     process.stdout.write(
-      `\nNot first choice right now (of ${view.candidates.length} targets):\n` +
+      `\nNot first choice right now (of ${view.candidates.length} credential cells):\n` +
         `  ${authFault.length} auth-faulted, ${cooling.length} cooling — DEMOTED: still tried, but only\n` +
         "    after every other candidate has failed on that request.\n" +
-        `  ${noKey.length} with no key set — DROPPED from a pool entirely (resolveTargets removes a\n` +
-        "    declared-but-unset credential), so a pool's real size is smaller than its member count.\n" +
-        "    ⚠ That includes free providers that would serve WITHOUT a key: declaring an authEnv and\n" +
-        "    leaving it unset excludes them from every pool they belong to.\n" +
+        `  ${noKey.length} missing-key, ${disabled.length} disabled, ${modelScopedOut.length} model-scoped-out\n` +
+        "    credential cells cannot start an attempt. Sibling slots for the same target remain eligible.\n" +
         "  `llm-relay keys` says whether a credential is good; `llm-relay pools --probe` is the\n" +
         "  only check that proves a member can actually serve.\n",
     );

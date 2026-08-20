@@ -154,10 +154,18 @@ export async function handleAdminRoutes(
 
   if (req.method === "GET" && (pathname === "/health/stats" || pathname === "/health")) {
     const view = await buildRegistry(cfg, h.catalog, h.pingLoop ? { pingLoop: h.pingLoop } : {});
+    // `/health` is a coarse liveness read. Keep it provider-oriented even though
+    // `/registry` now carries nested credential diagnostics.
+    const healthProviders = Object.fromEntries(
+      Object.entries(view.providers).map(([name, provider]) => {
+        const { credentials: _credentials, ...coarse } = provider;
+        return [name, coarse];
+      }),
+    );
     const stats: Record<string, unknown> = {
       generated_at: view.generated_at,
       ping_mode: h.pingLoop?.getMode(),
-      providers: view.providers,
+      providers: healthProviders,
     };
     return ok(stats);
   }

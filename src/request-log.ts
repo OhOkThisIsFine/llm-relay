@@ -12,6 +12,7 @@ export function baseLog(
   served: ResolvedTarget | null,
   attempts: readonly RequestAttemptLog[] = [],
   upstreamReportedModel?: string,
+  servedCredential: string | null = null,
 ): RequestLog {
   const modelDrift =
     served?.model !== undefined &&
@@ -24,6 +25,7 @@ export function baseLog(
     path: logSafePath(path),
     servedProvider: served ? served.provider : null,
     servedModel: served ? served.model ?? null : null,
+    servedCredential,
     ...(modelDrift !== undefined ? { upstreamReportedModel: modelDrift } : {}),
     attempts: [...attempts],
     hadTools,

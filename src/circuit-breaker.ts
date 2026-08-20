@@ -137,6 +137,8 @@ const breakerHandleOwners = new WeakMap<object, object>();
 
 export class CircuitBreaker implements AttemptLifecyclePort {
   private states = new Map<string, CircuitState>();
+  /** Credential-domain leases are deliberately wider than a deployment cell. */
+  private credentialInFlight = new Map<string, number>();
   readonly #owner = Object.freeze({});
   #generation = 1;
   #lifecycle = new AttemptLifecycle(this.#generation);
@@ -179,6 +181,10 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       generation: this.#generation,
       target: Object.freeze({ ...target }),
     });
+    this.credentialInFlight.set(
+      target.credentialId,
+      (this.credentialInFlight.get(target.credentialId) ?? 0) + 1,
+    );
     breakerHandleOwners.set(handle as object, this.#owner);
     return begun;
   }
@@ -246,6 +252,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     const completed = this.#lifecycle.completeAttempt(handle, outcome);
     if (!completed.ok) return completed;
     record.value.completedId = completed.value.id;
+    const inFlight = this.credentialInFlight.get(record.value.target.credentialId) ?? 0;
+    if (inFlight <= 1) this.credentialInFlight.delete(record.value.target.credentialId);
+    else this.credentialInFlight.set(record.value.target.credentialId, inFlight - 1);
     this.applyTerminalOutcome(
       record.value.target,
       outcome,
@@ -465,6 +474,11 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     return state !== undefined && state.credentialFaultUntil > now;
   }
 
+  /** Active backend attempts for one credential slot across all of its deployments. */
+  inFlightCredential(credentialId: string): number {
+    return this.credentialInFlight.get(credentialId) ?? 0;
+  }
+
   /** Exact-cell state only. */
   getState(target: ProviderTargetIdentity): CircuitState | undefined {
     return this.states.get(this.getKey(target));
@@ -519,6 +533,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
 
   reset(): void {
     this.states.clear();
+    this.credentialInFlight.clear();
     this.#lifecycle.close();
     this.#generation += 1;
     this.#lifecycle = new AttemptLifecycle(this.#generation);

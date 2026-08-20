@@ -1,6 +1,6 @@
 import type { Config, ProviderTierType } from "./config.js";
 import type { CircuitBreaker, CircuitState } from "./circuit-breaker.js";
-import { readCredential } from "./authEnv.js";
+import { aggregateHasKey } from "./credential-fleet.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
 import type { ProviderTargetIdentity } from "./kernel/contracts.js";
 import { getStabilityScore } from "./ping/metrics.js";
@@ -87,7 +87,7 @@ export function getTelemetryReport(cfg: Config, cb: CircuitBreaker, now = Date.n
   const deployments = deploymentAggregates(cb);
 
   for (const [name, p] of Object.entries(cfg.providers)) {
-    const hasKey = p.authEnv ? readCredential(p.authEnv, process.env, name) !== undefined : true;
+    const hasKey = aggregateHasKey(name, p);
     const preset = ALL_PROVIDER_PRESETS[name];
     const providerDeployments = deployments.filter((deployment) => deployment.provider === name);
     const observedDeployments = providerDeployments.filter((deployment) => deployment.samples.length > 0);
