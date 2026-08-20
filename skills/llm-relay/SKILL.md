@@ -43,6 +43,33 @@ An unnamespaced/unknown model id lands on `routing.default` — in the standard 
 Anthropic passthrough, so it reaches real Anthropic (spending real quota), never a silently weaker
 model.
 
+## Provider credentials
+
+A provider uses legacy `authEnv` or `credentials[]`, never both. Use a fleet for independently
+metered accounts on the same backend:
+
+```jsonc
+"credentials": [
+  { "label": "personal", "authEnv": "NVIDIA_API_KEY" },
+  { "label": "work", "authEnv": "NVIDIA_WORK_API_KEY", "models": ["meta/llama-3.1-70b-instruct"] }
+]
+```
+
+Slot `authEnv` is an exact env name; legacy provider `authEnv` retains compatibility aliases.
+Labels are visible, non-secret `[A-Za-z0-9_.-]{1,32}` ids. Optional `enabled` defaults on;
+`models` omitted/`null` means all backend ids and `[]` means none. Missing, disabled, or
+model-scoped-out slots cannot egress. Provider `maxConcurrent` applies separately to each
+`provider#label`.
+
+Any explicit fleet, including `[]`, is contained. True passthrough requires `kind: "anthropic"`, no
+provider-owned credentials, and mode not contained; prefer explicit
+`credentialMode: "passthrough"`. Passthrough plus a fleet is rejected. Contained Anthropic-format
+backends strip caller auth.
+
+Credential walks are deterministic and breadth-first across deployments. A credential-attributable
+outcome may unlock the next sibling slot. Provider transport failure suppresses remaining rows for
+that provider on the request; protocol/deployment failure closes only that deployment.
+
 ## Client-specific offload (OPT-IN — off by default)
 
 Claude Code stamps `cc_is_subagent=true` into the `system` block of subagent requests. Local Codex
@@ -175,7 +202,8 @@ p95), quota, breaker state, and traffic observed through this proxy. Pool orderi
   figure as the serving provider's real ceiling or rate.
 - Capability is synced (`npm run sync:tiers` in the repo), never hand-typed.
 
-`GET 127.0.0.1:8791/candidates` returns the full JSON (every raw score, jitter, observed calls).
+`GET 127.0.0.1:8791/candidates` returns one deployment × credential-slot row with `credentialId`,
+policy/state/modelAllowed, quota, breaker, learned facts, raw scores, jitter, and observed calls.
 
 ## The dispatch ladder — including agent-CLI lanes (Antigravity, Codex)
 
@@ -382,14 +410,18 @@ Ordering exists at three levels; change the right one:
 
 ```bash
 llm-relay models -p nim      # live roster per provider (listed ≠ servable — some listed ids 404)
-llm-relay keys               # are the CREDENTIALS good?
-llm-relay pools --probe      # will each configured MODEL answer? real completion per member
+llm-relay keys               # check EVERY configured credential slot
+llm-relay pools --probe      # one completion per unique deployment, via one serviceable slot
 llm-relay ping               # latency/stability probe across providers
 llm-relay telemetry          # JSON health/quota report
 ```
 
 Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload?client=<name>` (GET/POST),
 `/dispatch` (GET/POST), `/telemetry`, `/ping`, `/health`.
+
+`/registry` exposes provider aggregate `has_key` plus nested non-secret slot identity/state;
+`/candidates` exposes deployment × credential policy/state/quota/breaker/facts. `/telemetry`
+remains provider-aggregate and `/health` strips nested credential details.
 
 ⚠ **Control work is capability-authorized — loopback is not authorization.** The proxy creates a
 256-bit per-install capability in `~/.llm-relay/control-token`; the CLI attaches it automatically
@@ -408,16 +440,18 @@ observed yet**. `null` is not `false` — an unmeasured provider is unknown, not
 
 **`keys` and `pools --probe` answer different questions — you need both.**
 
-- `keys` can be wrong in BOTH directions, which is why it hedges. A 200 from a public
+- `keys` checks every slot but still hedges. A 200 from a public
   `/models` proves nothing about a key (it re-probes anonymously and escalates when needed);
   and a 401/403 on the escalated probe does not prove a key is bad, because free-tier rosters
   list premium models a valid key cannot touch. When the probe answers identically with and
   without credentials, nothing can be concluded and it reports **`UNVERIFIED`** — treat that
   as "unknown", never as "broken", and do not tell the user to rotate a key on that basis.
-- `pools --probe` is the ground truth for whether a *model* works, and the only thing that
-  catches a member that is configured, catalogued, and dead. **Run it after editing
-  `routing.pools`.** A `DEAD`/`AUTH` member should be removed: pools are fitness-ranked, so a
-  dead model can sit at the top and burn a failover hop on every request. `EMPTY` is NOT dead —
+- `pools --probe` spends one completion per unique deployment through one serviceable slot. It is
+  the ground truth for whether a *model* works, and the only thing that catches a member that is
+  configured, catalogued, and dead. **Run it after editing `routing.pools`.** Remove a deployment
+  only for deployment-level `DEAD` evidence. `AUTH` belongs to one `provider#label`: repair,
+  rotate, or disable that slot; do not invalidate siblings or the deployment. A dead model can sit
+  at the top and burn a failover hop on every request. `EMPTY` is NOT dead —
   that is a reasoning model that spent its token budget thinking.
 - Never add a spec to a pool without probing that exact spec first.
 
@@ -454,10 +488,15 @@ observed yet**. `null` is not `false` — an unmeasured provider is unknown, not
 
 ## When a pool request fails: read the walk, then explain what was new
 
-A pool's error response is ONE member's error. Two headers tell you what actually happened:
+A pool's error response is ONE member's error. Walk headers tell you what actually happened:
 
 - `x-llm-relay-pool-attempts: 15 tried, 0 served: 6x402, 3x403, 6x429` — the whole walk. Four
   distinct causes behind one 402 means the answer is "use another pool", not "go buy credits".
+- `x-llm-relay-credential: provider#label` — the serving slot, emitted only when that provider has
+  at least two enabled slots.
+- `x-llm-relay-credential-attempts: 3 tried, 1 served: 1x401, 1x503` — when the walk involves a
+  provider with at least two enabled slots, emitted after multiple credential starts or whenever
+  there is no winner. Both credential headers work on both fronts, including streaming.
 - `x-llm-relay-unknown-refusal: <n>` — `n` refusals said something the relay could not interpret.
 - `x-llm-relay-degraded: <spec> (below <band>)` — the request **succeeded**, but was answered by a
   model below the effort band you asked for, because the band was exhausted. Treat the output

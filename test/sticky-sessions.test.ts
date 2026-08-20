@@ -5,6 +5,7 @@ import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
 import { makeCredentialId } from "../src/credential-id.js";
+import { CREDENTIAL_HEADER } from "../src/backend.js";
 import { STICKY_PROVENANCE_HEADER, STICKY_SESSION_HEADER } from "../src/session-pin.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
@@ -29,9 +30,18 @@ const OPENAI_OK = JSON.stringify({
 const RATE_LIMIT = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } });
 
 const servers: Server[] = [];
-const breakerIdentity = (provider: string, model: string | null) => ({
-  provider, model, kind: "anthropic" as const, credentialId: makeCredentialId(provider),
+const breakerIdentity = (provider: string, model: string | null, label = "default") => ({
+  provider, model, kind: "anthropic" as const, credentialId: makeCredentialId(provider, label),
 });
+const FLEET_ENV = {
+  p1: ["STICKY_P1_DEFAULT_KEY", "STICKY_P1_WORK_KEY"],
+  p2: ["STICKY_P2_DEFAULT_KEY", "STICKY_P2_WORK_KEY"],
+} as const;
+const FLEET_SECRETS = {
+  p1: ["sticky-p1-default", "sticky-p1-work"],
+  p2: ["sticky-p2-default", "sticky-p2-work"],
+} as const;
+let previousFleetEnv = new Map<string, string | undefined>();
 
 function track(server: Server): Server {
   servers.push(server);
@@ -45,12 +55,24 @@ function port(server: Server): number {
 beforeEach(() => {
   resetFacts();
   resetInterpretations();
+  previousFleetEnv = new Map();
+  for (const providerName of ["p1", "p2"] as const) {
+    FLEET_ENV[providerName].forEach((name, index) => {
+      previousFleetEnv.set(name, process.env[name]);
+      process.env[name] = FLEET_SECRETS[providerName][index];
+    });
+  }
 });
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   resetFacts();
   resetInterpretations();
+  for (const [name, value] of previousFleetEnv) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  previousFleetEnv.clear();
 });
 
 interface ScriptedReply {
@@ -59,19 +81,22 @@ interface ScriptedReply {
   reset?: boolean;
 }
 
-function scripted(reply: (call: number) => ScriptedReply): Promise<{
+function scripted(reply: (call: number, headers: IncomingHttpHeaders) => ScriptedReply): Promise<{
   server: Server;
   calls: () => number;
   header: (name: string) => string | string[] | undefined;
+  headers: () => IncomingHttpHeaders[];
 }> {
   let calls = 0;
   let lastHeaders: IncomingHttpHeaders = {};
+  const seenHeaders: IncomingHttpHeaders[] = [];
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
       lastHeaders = req.headers;
+      seenHeaders.push(req.headers);
       req.on("data", () => {});
       req.on("end", () => {
-        const result = reply(++calls);
+        const result = reply(++calls, req.headers);
         if (result.reset) {
           req.socket.destroy();
           return;
@@ -84,6 +109,7 @@ function scripted(reply: (call: number) => ScriptedReply): Promise<{
       server: track(server),
       calls: () => calls,
       header: (name) => lastHeaders[name.toLowerCase()],
+      headers: () => [...seenHeaders],
     }));
   });
 }
@@ -128,6 +154,23 @@ function stickyConfig(
     repair: { maxAttempts: 2, destructiveTools: [] },
     log: { level: "silent", file: null },
   };
+}
+
+function enableTwoCredentialFleet(config: Config): Config {
+  for (const providerName of ["p1", "p2"] as const) {
+    const configured = config.providers[providerName];
+    if (!configured) continue;
+    configured.credentialMode = "contained";
+    configured.credentials = [
+      { label: "default", authEnv: FLEET_ENV[providerName][0] },
+      { label: "work", authEnv: FLEET_ENV[providerName][1] },
+    ];
+  }
+  return config;
+}
+
+function observedCredential(headers: IncomingHttpHeaders): string {
+  return String(headers["x-api-key"] ?? "");
 }
 
 async function startProxy(config: Config, breaker = new CircuitBreaker()): Promise<{ port: number; breaker: CircuitBreaker }> {
@@ -222,6 +265,69 @@ describe("sticky sessions — guarded request-path affinity", () => {
     expect(first.header(STICKY_SESSION_HEADER)).toBeUndefined();
     expect(second.header(STICKY_SESSION_HEADER)).toBeUndefined();
   });
+
+  it("keeps a naturally first pin breadth-first across ranked credential slots", async () => {
+    const sequence: string[] = [];
+    const pinned = await scripted((call, headers) => {
+      sequence.push(`p1:${observedCredential(headers)}`);
+      return call === 2 ? { status: 401, body: RATE_LIMIT } : {};
+    });
+    const other = await scripted((_call, headers) => {
+      sequence.push(`p2:${observedCredential(headers)}`);
+      return { status: 429, body: RATE_LIMIT };
+    });
+    const config = enableTwoCredentialFleet(stickyConfig({
+      p1: provider(`http://127.0.0.1:${port(pinned.server)}`),
+      p2: provider(`http://127.0.0.1:${port(other.server)}`),
+    }));
+    const proxy = await startProxy(config);
+
+    const initial = await messages(proxy.port, { headers: sessionHeaders("breadth-first") });
+    await initial.text();
+    expect(initial.headers.get(STICKY_PROVENANCE_HEADER)).toBe("p1/m1 (new)");
+    sequence.length = 0;
+
+    const response = await messages(proxy.port, { headers: sessionHeaders("breadth-first") });
+    await response.text();
+    expect(response.status).toBe(200);
+    expect(response.headers.get(STICKY_PROVENANCE_HEADER)).toBe("p1/m1 (pinned, natural)");
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p1", "default"));
+    expect(sequence).toEqual([
+      `p1:${FLEET_SECRETS.p1[1]}`,
+      `p2:${FLEET_SECRETS.p2[0]}`,
+      `p1:${FLEET_SECRETS.p1[0]}`,
+    ]);
+  });
+
+  it.each(["credential-fault", "cooling"] as const)(
+    "keeps a pin eligible through a live sibling when its first configured slot is %s",
+    async (state) => {
+      const pinned = await scripted(() => ({}));
+      const other = await scripted(() => ({}));
+      const config = enableTwoCredentialFleet(stickyConfig({
+        p1: provider(`http://127.0.0.1:${port(pinned.server)}`),
+        p2: provider(`http://127.0.0.1:${port(other.server)}`),
+      }));
+      const proxy = await startProxy(config);
+
+      const initial = await messages(proxy.port, { headers: sessionHeaders(`live-sibling-${state}`) });
+      await initial.text();
+      const defaultIdentity = breakerIdentity("p1", "m1", "default");
+      if (state === "credential-fault") proxy.breaker.recordCredentialFault(defaultIdentity, 401);
+      else proxy.breaker.recordOutcome(defaultIdentity, { ok: false, status: 429, elapsedMs: 1 });
+
+      const response = await messages(proxy.port, { headers: sessionHeaders(`live-sibling-${state}`) });
+      await response.text();
+      expect(response.status).toBe(200);
+      expect(response.headers.get(STICKY_PROVENANCE_HEADER)).toBe("p1/m1 (pinned, natural)");
+      expect(response.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p1", "work"));
+      expect(pinned.headers().map(observedCredential)).toEqual([
+        FLEET_SECRETS.p1[0],
+        FLEET_SECRETS.p1[1],
+      ]);
+      expect(other.calls()).toBe(0);
+    },
+  );
 
   it("falls back to the first-user-message hash across a growing conversation", async () => {
     const first = await scripted((call) => call === 1 ? { status: 429, body: RATE_LIMIT } : {});

@@ -29,6 +29,8 @@ at login.
 
 ## What you get
 
+- **Credential fleets** — give one provider multiple labeled, env-backed keys; the relay walks
+  slots breadth-first and keeps account faults and limits separate. [Configure fleets](docs/reference.md#provider-credential-fleets).
 - **Pools with failover** — `model: "pool/medium"` expands to a ranked candidate list; 429s
   and outages cascade to the next member. Free-model pools update themselves from live catalogs.
 - **Passthrough** — Claude traffic keeps your own credentials and reaches real Anthropic

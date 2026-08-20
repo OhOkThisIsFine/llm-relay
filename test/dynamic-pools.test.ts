@@ -9,29 +9,59 @@ import { makeCredentialId } from "../src/credential-id.js";
 import { recordFact, resetFacts } from "../src/target-facts.js";
 
 describe("dynamic free-model pools", () => {
-  it("uses the implicit default credential when applying cost facts", async () => {
+  it("keeps discovery credential-neutral while still applying deployment facts", async () => {
     const dir = mkdtempSync(join(tmpdir(), "rp-dynamic-credential-"));
+    const previousDefault = process.env.DYNAMIC_DEFAULT_KEY;
+    const previousWork = process.env.DYNAMIC_WORK_KEY;
+    process.env.DYNAMIC_DEFAULT_KEY = "default-secret";
+    process.env.DYNAMIC_WORK_KEY = "work-secret";
     try {
       const path = join(dir, "config.json");
       writeFileSync(path, JSON.stringify({
         listen: "127.0.0.1:8791",
-        providers: { free: { base: "https://free.test/v1", kind: "openai", tierType: "free" } },
-        routing: { default: "free/m", pools: { low: { preferred: [], include: "free" } } },
+        providers: {
+          free: {
+            base: "https://free.test/v1",
+            kind: "openai",
+            tierType: "free",
+            credentials: [
+              { label: "default", authEnv: "DYNAMIC_DEFAULT_KEY" },
+              { label: "work", authEnv: "DYNAMIC_WORK_KEY" },
+            ],
+          },
+        },
+        routing: {
+          default: "free/attempt-blocked",
+          pools: { low: { preferred: [], include: "free" } },
+        },
       }));
       const cfg = loadConfig(path);
       const catalog = new ModelCatalog({ cachePath: null });
       await catalog.list("free", cfg.providers.free!, {
-        fetchFn: (async () => new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 })) as unknown as typeof fetch,
+        fetchFn: (async () => new Response(JSON.stringify({
+          data: [{ id: "attempt-blocked" }, { id: "deployment-blocked" }],
+        }), { status: 200 })) as unknown as typeof fetch,
       });
       recordFact("not-servable", {
-        kind: "attempt", provider: "free", credentialId: makeCredentialId("free"), model: "m",
+        kind: "attempt",
+        provider: "free",
+        credentialId: makeCredentialId("free", "default"),
+        model: "attempt-blocked",
+      });
+      recordFact("not-servable", {
+        kind: "deployment", provider: "free", model: "deployment-blocked",
       });
 
       materializeDynamicPools(cfg, catalog);
-      expect(cfg.routing.pools!.low).not.toContain("free/m");
+      expect(cfg.routing.pools!.low).toContain("free/attempt-blocked");
+      expect(cfg.routing.pools!.low).not.toContain("free/deployment-blocked");
     } finally {
       resetFacts();
       rmSync(dir, { recursive: true, force: true });
+      if (previousDefault === undefined) delete process.env.DYNAMIC_DEFAULT_KEY;
+      else process.env.DYNAMIC_DEFAULT_KEY = previousDefault;
+      if (previousWork === undefined) delete process.env.DYNAMIC_WORK_KEY;
+      else process.env.DYNAMIC_WORK_KEY = previousWork;
     }
   });
   it("excludes user tombstones from preferred and discovered members while unknown entries stay inert", async () => {

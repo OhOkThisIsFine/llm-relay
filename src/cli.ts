@@ -199,8 +199,8 @@ ${formatTextTable([
   ["llm-relay [options]", "Start proxy."],
   ["llm-relay onboard [--import <file>] [--force]", "Set up or import provider keys."],
   ["llm-relay setup [target]", "target: claude-cli | claude-desktop."],
-  ["llm-relay keys | check-keys", "Check provider keys."],
-  ["llm-relay pools [--probe]", "List pool members; --probe tests each."],
+  ["llm-relay keys | check-keys", "Check every configured credential slot."],
+  ["llm-relay pools [--probe]", "List members; --probe tests each deployment once."],
   ["llm-relay pools <action> <name> [<spec>...]", "action: set|add|remove|delete."],
   ["llm-relay routing <action> ...", "action: show|get|default|tier|subagent|sort|benchmark|set|unset."],
   ["llm-relay config <action> [<path>] [<value>]", "action: show|get|set|unset."],
@@ -209,7 +209,7 @@ ${formatTextTable([
   ["llm-relay telemetry", "Print telemetry JSON."],
   ["llm-relay offload [status]", "Show current offload rules."],
   ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
-  ["llm-relay candidates [-p <name>]", "Compare offload targets."],
+  ["llm-relay candidates [-p <name>]", "Compare deployment x credential-slot targets."],
   ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
   ["llm-relay eligibility <propose|accept> <n> --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model."],
   ["llm-relay eligibility ... --scope group --members <id,id,...> [--all-credentials]", "Groups default to the current credential slot; the flag explicitly widens them."],
@@ -227,8 +227,10 @@ ${formatTextTable([
   ["Claude model id", "Matches opus|sonnet|haiku|fable tiers."],
   ["anything else", "Uses routing.default."],
 ], "  ")}
-  An anthropic provider without authEnv forwards the caller's own credentials — use it to keep
-  Claude traffic on real Anthropic while pool/* requests use other providers.
+  An anthropic provider with no provider-owned auth and mode not contained forwards the caller's
+  credentials. Prefer explicit credentialMode: "passthrough" for real Anthropic. Contained
+  Anthropic-format backends strip caller auth. A provider uses legacy authEnv or credentials[],
+  never both; fleet authEnv names are exact and any explicit fleet is contained.
 
 Offload is off by default. To route one subagent call without turning it on, put
 "@relay: <spec>" on its own line at the start of the subagent prompt (the relay strips it).
@@ -238,8 +240,9 @@ subagent can be rerouted and "@relay:" is inert. "llm-relay dispatch" detects th
 back runnable commands instead; "offload claude on" there also installs a PreToolUse(Agent)
 hook that redirects Agent() calls to the same lane. "offload claude off" removes it.
 
-Setup checks: "llm-relay keys" verifies credentials; "llm-relay pools --probe" sends a real
-completion to every pool model. Environment variables override ~/.llm-relay/.env.
+Setup checks: "llm-relay keys" checks every credential slot; "llm-relay pools --probe" spends one
+real completion per unique pool deployment through one serviceable slot, not every credential.
+Environment variables override ~/.llm-relay/.env.
 
 Dispatch options:
 ${formatTextTable([
@@ -266,7 +269,7 @@ ${formatTextTable([
 
 Pool options:
 ${formatTextTable([
-  ["--probe", "Test each pool member."],
+  ["--probe", "Test each unique deployment through one serviceable credential."],
   ["--free | --include free", "Append discovered free models."],
   ["--effort <level>", "Floor: low|medium|high|xhigh."],
 ], "  ")}
@@ -295,14 +298,17 @@ ${formatTextTable([
   ["POST /v1/messages/count_tokens", "Local token count."],
   ["POST /v1/chat/completions", "OpenAI Chat API."],
   ["POST /v1/responses", "OpenAI Responses API."],
-  ["GET /registry", "Provider/routing metadata."],
-  ["GET /candidates", "Offload target data."],
+  ["GET /registry", "Provider/routing plus nested non-secret credential metadata."],
+  ["GET /candidates", "Deployment x credential policy/state/quota/breaker cells."],
   ["GET|POST /offload", "Read/set rules; accepts ?client=<name>."],
   ["GET|POST /dispatch", "Read/set next lane; POST {\"exhausted\":\"<lane>\"}."],
   ["GET /telemetry", "Provider telemetry."],
   ["GET /ping", "Run health probe."],
   ["GET /health", "Provider health."],
 ], "  ")}
+Control reads (/registry, /candidates, /ping, /health) and control writes require the per-install
+capability token; the CLI attaches it automatically. /telemetry stays provider-aggregate, and
+/health strips nested credential details.
 `;
 
 
@@ -2080,14 +2086,20 @@ export async function runPools(
     missing: "DEAD",
     error: "ERR",
   };
-  let dead = 0;
+  let missing = 0;
+  let auth = 0;
   for (const name of names) {
     process.stdout.write(`pool/${name}\n`);
     for (const r of results.filter((x) => x.pool === name)) {
-      if (DEAD_VERDICTS.has(r.verdict)) dead++;
+      if (r.verdict === "missing") missing++;
+      if (r.verdict === "auth") auth++;
       const lat = r.latencyMs !== undefined ? `${r.latencyMs}ms` : "";
+      const diagnostic = [
+        r.credentialId !== undefined ? `credential=${r.credentialId}` : undefined,
+        r.detail,
+      ].filter((value): value is string => value !== undefined && value.length > 0).join(" ");
       process.stdout.write(
-        `  ${fitCell(icon[r.verdict], 6)} ${fitCell(r.spec, 50)} ${fitCell(lat, 8)} ${r.detail ?? ""}\n`,
+        `  ${fitCell(icon[r.verdict], 6)} ${fitCell(r.spec, 50)} ${fitCell(lat, 8)} ${diagnostic}\n`,
       );
     }
     process.stdout.write("\n");
@@ -2095,15 +2107,27 @@ export async function runPools(
 
   const live = results.filter((r) => r.verdict === "live").length;
   process.stdout.write(`${live}/${results.length} live.\n`);
-  if (dead > 0) {
+  if (missing > 0) {
     process.stdout.write(
-      `⚠ ${dead} member(s) will never answer (DEAD/AUTH). Remove them from routing.pools — a pool\n` +
+      `⚠ ${missing} DEAD/missing pool member(s). Remove or replace those deployments in routing.pools — a pool\n` +
         `  ranked by fitness can otherwise put a dead model first and burn a failover hop on every call.\n`,
+    );
+  }
+  if (auth > 0) {
+    const credentialIds = [...new Set(results.flatMap((r) =>
+      r.verdict === "auth" && r.credentialId !== undefined ? [r.credentialId] : [],
+    ))];
+    const credentialGuidance = credentialIds.length === 0
+      ? "Fix the provider credential configuration"
+      : `Fix or disable credential slot${credentialIds.length === 1 ? "" : "s"} ${credentialIds.join(", ")}`;
+    process.stdout.write(
+      `⚠ ${auth} AUTH result(s). ${credentialGuidance};\n` +
+        `  sibling slots and the deployment were not proven dead by this one-slot probe.\n`,
     );
   }
 }
 
-import { probeAllPools, DEAD_VERDICTS, type MemberVerdict } from "./pool-health.js";
+import { probeAllPools, type MemberVerdict } from "./pool-health.js";
 import { runInteractiveOnboarding } from "./onboarding.js";
 import { importKeysFromFile } from "./key-import.js";
 import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";

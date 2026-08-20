@@ -1028,11 +1028,15 @@ function parseCredentialDeclarations(
     }
     let models: readonly string[] | null | undefined;
     if (value.models !== undefined) {
-      if (!Array.isArray(value.models) || value.models.some((model) => typeof model !== "string")) {
-        warnings.push(`${where} dropped — models must be an array of model id strings`);
-        return;
+      if (value.models === null) {
+        models = null;
+      } else {
+        if (!Array.isArray(value.models) || value.models.some((model) => typeof model !== "string")) {
+          warnings.push(`${where} dropped — models must be an array of model id strings`);
+          return;
+        }
+        models = Object.freeze([...new Set((value.models as string[]).map((model) => model.trim()).filter(Boolean))]);
       }
-      models = Object.freeze([...new Set((value.models as string[]).map((model) => model.trim()).filter(Boolean))]);
     }
     if (labels.has(label) || envNames.has(authEnv)) {
       const duplicate = labels.has(label) ? `label "${label}"` : `authEnv "${authEnv}"`;

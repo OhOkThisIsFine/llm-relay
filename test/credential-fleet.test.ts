@@ -72,13 +72,14 @@ describe("credential fleet normalization", () => {
     }
   });
 
-  it("trims and deduplicates model ids while preserving an empty model allow-list", () => {
+  it("normalizes model allow-lists while preserving null and empty semantics", () => {
     const cfg = load("models.json", {
       fleet: {
         base: "https://fleet.test",
         kind: "openai",
         credentials: [
           { label: "one", authEnv: "FLEET_ONE", models: [" m ", "m", "M"] },
+          { label: "all", authEnv: "FLEET_ALL", models: null },
           { label: "none", authEnv: "FLEET_NONE", models: [] },
         ],
       },
@@ -88,8 +89,12 @@ describe("credential fleet normalization", () => {
     expect(slotAllowsModel(slots[0]!, "m")).toBe(true);
     expect(slotAllowsModel(slots[0]!, "M")).toBe(true);
     expect(slotAllowsModel(slots[0]!, "m ")).toBe(false);
-    expect(slots[1]!.models).toEqual([]);
-    expect(slotAllowsModel(slots[1]!, "anything")).toBe(false);
+    expect(slots[1]!.models).toBeNull();
+    expect(slotAllowsModel(slots[1]!, "first-model")).toBe(true);
+    expect(slotAllowsModel(slots[1]!, "second-model")).toBe(true);
+    expect(slots[2]!.models).toEqual([]);
+    expect(slotAllowsModel(slots[2]!, "first-model")).toBe(false);
+    expect(slotAllowsModel(slots[2]!, "second-model")).toBe(false);
     expect(Object.isFrozen(slots)).toBe(true);
     expect(Object.isFrozen(slots[0]!.models)).toBe(true);
   });

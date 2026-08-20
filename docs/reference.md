@@ -79,8 +79,10 @@ actually answer?* Both are needed:
 - A 401/403 does **not** prove a key is bad — free-tier rosters list premium models a valid key
   cannot touch. When nothing can be concluded, `keys` reports `UNVERIFIED` rather than accusing
   a working key.
-- Neither can see a model that is configured, catalogued, and dead. Only `pools --probe` can —
-  it sends a real completion to every pool member.
+- `keys` checks every configured credential slot, but neither key validation nor a catalog listing
+  proves that a configured model will answer. Only `pools --probe` can — it sends one real
+  completion per unique deployment through one serviceable slot, not once per pool membership or
+  credential.
 
 Keys are read from the environment and, if present, from `~/.llm-relay/.env` (one `KEY=value`
 per line). **A variable already set in the environment always wins over the file.**
@@ -124,6 +126,35 @@ block. All state lives under `~/.llm-relay/` (`config.json`, `.env`, `models-cac
 }
 ```
 
+### Provider credential fleets
+
+A provider declares either the legacy `authEnv` field or an explicit `credentials[]` fleet, never
+both. Use a fleet when one backend account has multiple independently metered keys:
+
+```jsonc
+"nim": {
+  "base": "https://integrate.api.nvidia.com/v1",
+  "kind": "openai",
+  "credentials": [
+    { "label": "personal", "authEnv": "NVIDIA_API_KEY" },
+    { "label": "work", "authEnv": "NVIDIA_WORK_API_KEY", "models": ["meta/llama-3.1-70b-instruct"] },
+    { "label": "spare", "authEnv": "NVIDIA_SPARE_API_KEY", "enabled": false, "models": [] }
+  ],
+  "tierType": "free"
+}
+```
+
+Each slot has a non-secret, user-visible `label` (`[A-Za-z0-9_.-]{1,32}`), an exact `authEnv`
+name, and optional `enabled` and `models`. The `models` entries are backend model ids, not
+provider-prefixed specs. Omitting `models` (or setting it to `null`) allows every backend model;
+`[]` allows none. A missing env var, disabled slot, or model-scoped-out slot is not
+serviceable and cannot start an upstream request. Unlike legacy provider `authEnv`, which retains
+its compatibility alias lookup, a slot's `authEnv` is exact.
+
+Any explicit fleet — including `credentials: []` — makes the provider contained. It cannot be
+combined with passthrough. Provider `maxConcurrent` is enforced independently for each
+`provider#label`, so one account's in-flight limit does not consume a sibling account's allowance.
+
 Config strings may reference env vars as `${NAME}`. An unset `${NAME}` in a provider `base`
 **disables that provider** (its pool members are dropped with a warning) rather than aborting
 startup — losing *every* route is still fatal. CLI startup overrides (`--default`, `--mode`,
@@ -151,20 +182,23 @@ A dynamic pool (`{ "preferred": [...], "include": "free" }`) may also declare
 entries from both the preferred prefix and the discovered tail. Unknown or no-longer-catalogued
 entries are intentionally inert, so a tombstone can outlive the deployment it excludes.
 
-**Passthrough:** an `anthropic`-kind provider with **no `authEnv`** forwards the caller's own
+**Passthrough:** a true passthrough is an `anthropic`-kind provider with no provider-owned
+`authEnv` or `credentials[]`, and whose mode is not `contained`. It forwards the caller's own
 credentials byte-for-byte (`authorization`/`x-api-key` *and* `anthropic-beta`). Point every tier
-at it and real Claude traffic stays on real Anthropic while `pool/*` routes elsewhere — one
-proxy, both behaviours.
+at it and real Claude traffic stays on real Anthropic while `pool/*` routes elsewhere — one proxy,
+both behaviours.
 
 Say so with **`"credentialMode": "passthrough"`**. Omitting it still forwards, so existing
 configs keep working, but startup warns: "needs no key of its own" and "may be sent the user's
 subscription credential" are different intentions, and only the first should follow from an
 omission. The opposite declaration, **`"credentialMode": "contained"`**, is the one to use for a
 keyless `anthropic`-kind backend that is *not* your own vendor — a local daemon, a second relay,
-someone else's Anthropic-format endpoint — and strips the caller's credential instead. It is
-illegal alongside `authEnv` (that pair claims both at once). `openai`-kind providers never
-receive inbound credentials at all: their upstream headers are built from scratch, which is why
-a keyless `ollama` needs no declaration and gets no warning.
+someone else's Anthropic-format endpoint — and strips the caller's credential instead. Contained
+Anthropic-format providers with their own credentials strip caller auth too. Only
+`credentialMode: "passthrough"` conflicts with `authEnv` or `credentials[]`; contained mode may be
+explicit alongside provider-owned auth. `openai`-kind providers never receive inbound credentials
+at all: their upstream headers are built from scratch, which is why a keyless `ollama` needs no
+declaration and gets no warning.
 
 ### Pools — static and dynamic
 
@@ -191,9 +225,11 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
   `Retry-After` sets that candidate's cooldown for exactly as long as the provider asked;
   402 (depleted credits) cools for 1 hour. A 410 whose body states end-of-life additionally
   records a `not-servable` fact, so a retired model stops burning a walk slot per request.
-- **401 / 403** → next candidate tried, but the fault is recorded on its own axis so
-  `llm-relay candidates` shows `AUTH 401` instead of hiding it. It expires after 5 minutes, so a
-  rotated key recovers with no restart.
+- **401 / 403** → the exact credential slot is marked `AUTH` and the walk may try a sibling slot or
+  the next deployment. `llm-relay candidates` exposes the fault instead of hiding it. It expires
+  after 5 minutes, so a rotated key recovers with no restart. One slot's auth failure never
+  invalidates its siblings or the whole deployment; remove a deployment only on deployment-level
+  evidence.
 - **A genuine client 4xx** (413, 422, …) → returned as-is; every candidate would reject it
   identically.
 - **Every candidate failed** → the last real upstream error, never a synthesized one. If every
@@ -217,6 +253,12 @@ Health **demotes** candidates, never drops them (live → credential-faulted →
 carry `x-llm-relay-served-by`: the deployment that served, or on error every deployment tried,
 in order. Background: [pool-failover.md](pool-failover.md).
 
+Credential choice is deterministic and breadth-first: the walk spreads first attempts across
+deployments before consuming their next credential slots. A credential-attributable outcome may
+unlock a sibling slot. A provider transport failure suppresses the remaining rows for that
+provider on the same request; a protocol/deployment failure closes only that deployment, so the
+walk may continue to another deployment.
+
 Any walk of **two or more** candidates also carries `x-llm-relay-pool-attempts` — what happened to
 each of them, in one line:
 
@@ -228,6 +270,18 @@ Without it a pool's error is one member's error: a 402 pointing at a billing pag
 twelve failed for three unrelated reasons and the right move was "use another pool". The body is
 left alone — it stays the last candidate's real upstream error — so the aggregate rides in a header.
 It appears on successes too, where it warns that a pool is thinning before it runs out.
+
+Credential headers are enabled only when the walk involves a provider with at least two enabled
+slots. When the serving provider is one of them, a successful response names its winner as
+`x-llm-relay-credential: provider#label`. After multiple credential starts — or when there is no
+winner — the response includes the aggregate:
+
+```
+x-llm-relay-credential-attempts: 3 tried, 1 served: 1x401, 1x503
+```
+
+These headers are present on both API fronts, including streamed responses. Labels and credential
+ids are non-secret metadata; key values are never exposed.
 
 When the answer came from **below** the requested effort band, the response carries
 `x-llm-relay-degraded: gemini/models/gemini-2.5-flash (below xhigh)`.
@@ -352,12 +406,17 @@ explicit top-level `reshaper` block. **Prefer the pool form:**
 ```
 
 A pinned `{ "base": …, "model": … }` works, but dies silently if the provider de-lists that id.
-The pool form fails over on **transport errors only** — a refusal is a real judgement and is
-never retried elsewhere (that would be shopping for a more compliant answer). Every candidate
-failing at the transport level is logged `repair: "failed"` (nothing reachable), never
-`"refused"` (a model declined); the two call for opposite responses. The reshaper is asked only
-for **corrected arguments per tool-call id**, which is far more reliable on weak models; the
-proxy reconstructs the message and re-validates.
+Self-repair and per-target repair reuse the exact credential snapshot that served the original
+response. Provider-backed static and dynamic reshaper pools resolve request-locally and re-expand
+credential fleets; a standalone `{ "base": …, "model": …, "authEnv": … }` target remains one
+credential.
+
+The pool form may walk on **transport or protocol failures** — a refusal is a real judgement and is
+terminal (retrying would be shopping for a more compliant answer). Every candidate failing at the
+transport/protocol level is logged `repair: "failed"` (nothing usable came back), never `"refused"`
+(a model declined); the two call for opposite responses. The reshaper is asked only for
+**corrected arguments per tool-call id**, which is far more reliable on weak models; the proxy
+reconstructs the message and re-validates.
 
 ---
 
@@ -494,11 +553,15 @@ error means mid-request. Design and evidence: [pool-eligibility.md](pool-eligibi
 
 ### Choosing a target: `llm-relay candidates`
 
-Every offload target with its dimensions **side by side and deliberately un-blended**:
+Every configured deployment × credential-slot target with its dimensions **side by side and
+deliberately un-blended**:
 capability from each leaderboard separately, live behaviour (verdict, p95, jitter, uptime),
 availability now (quota, breaker state, auth faults, still-listed), cost, and traffic observed
 through the proxy. The sources disagree on purpose — weigh the columns for the task at hand.
-`GET /candidates` returns the full JSON.
+`GET /candidates` returns the full JSON, including `credentialId`, policy/state/modelAllowed,
+quota, breaker state, and learned facts for each cell. A provider with two configured slots
+therefore has two rows for the same deployment rather than one blended health record; missing,
+disabled, and model-scoped-out rows remain visible for diagnosis even though they cannot egress.
 
 Capability comes from `npm run sync:tiers`, which merges OpenRouter (Artificial Analysis
 indices, pricing, context, tool support), BFCL (tool-call accuracy), LMArena, and Aider into
@@ -692,9 +755,16 @@ native `tool_calls`; no-tools traffic remains byte-exact. Other combinations tra
 Anthropic seam, streaming and tool calls included. The Anthropic front with tool-call repair runs
 in parallel — no mode switch.
 
-`GET /registry` returns one JSON view for an external dispatcher: every provider with `has_key`,
-`reachable`, and its live models (each with raw capability scores, never collapsed to tiers),
-plus current routing and the full leaderboard dataset.
+`GET /registry` returns one JSON view for an external dispatcher: every provider with aggregate
+`has_key`, `reachable`, and its live models (each with raw capability scores, never collapsed to
+tiers), plus current routing and the full leaderboard dataset. Every provider also exposes nested
+credential metadata: `credentialId`, `label`, env name (`authEnv`), `enabled`, `models`, `state`,
+and slot `has_key`. Fleets have one entry per configured slot; legacy and keyless providers expose
+their implicit `default` slot. These are identities and state only; secret values are never returned.
+
+`/telemetry` deliberately remains provider-aggregate, and `/health` strips nested credential
+details. Use `/registry` for fleet inventory and `/candidates` for deployment × credential policy,
+state, quota, breaker, and fact cells.
 
 ### Document attachments on non-Anthropic backends
 
@@ -725,8 +795,8 @@ llm-relay models -p nim -r       # one provider, force re-fetch
 | `llm-relay` | Start the proxy |
 | `llm-relay onboard [--import <file>] [--force]` | Set up or import provider keys |
 | `llm-relay setup <claude-cli\|claude-desktop>` | Point a client at the relay |
-| `llm-relay keys` | Check provider credentials |
-| `llm-relay pools [--probe]` | List pool members; `--probe` tests each with a real completion |
+| `llm-relay keys` | Check every configured credential slot |
+| `llm-relay pools [--probe]` | List pool members; `--probe` spends one completion per unique deployment through one serviceable slot |
 | `llm-relay pools <set\|add\|remove\|delete> <name> [spec...]` | Edit a pool |
 | `llm-relay routing <show\|get\|default\|tier\|subagent\|sort\|benchmark\|set\|unset>` | Edit routing |
 | `llm-relay config <show\|get\|set\|unset> [path] [value]` | Edit any config field |
@@ -734,7 +804,7 @@ llm-relay models -p nim -r       # one provider, force re-fetch
 | `llm-relay ping [-p <name>]` | Probe provider latency/health |
 | `llm-relay telemetry` | Print telemetry/quota JSON |
 | `llm-relay offload [status \| <client> <on\|off> [--scope <scope>]]` | Show/toggle offload |
-| `llm-relay candidates [-p <name>]` | Compare offload targets |
+| `llm-relay candidates [-p <name>]` | Compare deployment × credential-slot targets |
 | `llm-relay dispatch [lane] [options]` | Choose the next dispatch lane |
 | `llm-relay help` / `llm-relay version` | Help / version |
 
@@ -756,16 +826,19 @@ llm-relay config set routing.offload.claude.freeOnly true
 | `POST /v1/messages` | Anthropic front; validates/repairs tool calls |
 | `POST /v1/messages/count_tokens` | Local token count |
 | `POST /v1/chat/completions`, `POST /v1/responses` | OpenAI front |
-| `GET /registry` | Provider/routing/capability metadata |
-| `GET /candidates` | Offload target data |
+| `GET /registry` | Provider/routing/capability and nested credential metadata |
+| `GET /candidates` | Deployment × credential policy/state/quota/breaker data |
 | `GET\|POST /offload` | Read/set offload rules |
 | `GET\|POST /dispatch` | Read/advance the dispatch ladder |
 | `GET /telemetry`, `GET /ping`, `GET /health` | Telemetry, probe, health |
 
-⚠ **Loopback is not authorization.** Mutating endpoints require the per-install 256-bit
-capability token (`~/.llm-relay/control-token` — the CLI carries it automatically), a loopback
-`Host`, no non-loopback `Origin`, and `content-type: application/json`. Responses carry
-`x-llm-relay-served-by`, `x-llm-relay-quota-percent`, and `x-llm-relay-stability-score`.
+⚠ **Loopback is not authorization.** Mutating control endpoints and control reads that expose or
+materialize provider state (`/registry`, `/candidates`, `/ping`, `/health`) require the per-install
+256-bit capability token (`~/.llm-relay/control-token` — the CLI carries it automatically). Every
+request's `Host` must exactly equal the bound listener authority; any present `Origin` must match
+the exact scheme, host, and effective port, and `Origin: null` is rejected. Writes also require
+`content-type: application/json`. `/telemetry` remains tokenless provider-aggregate data. Response
+attribution and walk headers are documented under Failover above.
 
 ---
 
@@ -791,7 +864,8 @@ env -u CLAUDECODE -u ANTHROPIC_API_KEY \
   claude -p "list the files here"
 ```
 
-`ANTHROPIC_AUTH_TOKEN` can be `dummy` — the proxy injects the real backend key from `authEnv`.
+`ANTHROPIC_AUTH_TOKEN` can be `dummy` — the proxy injects the real backend key from the selected
+`authEnv` credential slot.
 Weak backends still fail *reasoning* (repair fixes form, not judgment) — pick a strong
 tool-caller.
 
@@ -810,7 +884,7 @@ gateway. Verified against Claude Code 2.1.220; re-check after an upgrade.
 
 ## Logging (metadata only)
 
-Per request: `{ ts, path, servedProvider, servedModel, upstreamReportedModel?, attempts[], hadTools, streamed,
+Per request: `{ ts, path, servedProvider, servedModel, servedCredential, upstreamReportedModel?, attempts[], hadTools, streamed,
 backendStatus, validated, toolUseCount, uncheckableCount, errorKinds[], repair, latencyMs }`.
 `attempts` is capped at 64 status-only entries shaped as `{ provider, model, status, ms }`; a
 normal HTTP attempt uses its status code, a lifecycle-only failure/cancellation uses
@@ -819,8 +893,9 @@ normal HTTP attempt uses its status code, a lifecycle-only failure/cancellation 
 
 The list is an **allow-list applied at the sink** — a caller handing over a wider object cannot
 leak a header, body, or key. Attempt entries are projected through their own nested allow-list too,
-so an error string attached by a caller is discarded. Query parameter *values* are replaced by
-their lengths.
+so an error string or credential identity attached by a caller is discarded. Query parameter
+*values* are replaced by their lengths. `servedCredential` is the non-secret `provider#label` that
+actually served, or `null`; credential identities on nested attempts remain sink-stripped.
 `servedProvider`/`servedModel` are the deployment that actually answered (the id the client
 asked for is deliberately not recorded — for a pool spec it is routinely not the model that
 served). If the raw upstream response claims a different model, `upstreamReportedModel` records

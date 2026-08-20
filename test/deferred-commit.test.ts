@@ -9,6 +9,8 @@ import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js"
 import { makeCredentialId } from "../src/credential-id.js";
 import { ModelCatalog } from "../src/catalog.js";
 import {
+  CREDENTIAL_ATTEMPTS_HEADER,
+  CREDENTIAL_HEADER,
   DEGRADED_HEADER,
   PAID_HEADER,
   POOL_ATTEMPTS_HEADER,
@@ -46,6 +48,9 @@ const breakerIdentity = (provider: string, model: string | null, kind: StreamFro
   credentialId: makeCredentialId(provider),
 });
 const tempDirs: string[] = [];
+const FLEET_ENV = ["DEFERRED_DEFAULT_KEY", "DEFERRED_WORK_KEY"] as const;
+const FLEET_SECRETS = ["deferred-default-secret", "deferred-work-secret"] as const;
+let previousFleetEnv = new Map<string, string | undefined>();
 
 function track(server: Server): Server {
   servers.push(server);
@@ -68,6 +73,11 @@ beforeEach(() => {
   globalCircuitBreaker.reset();
   resetFacts();
   resetInterpretations();
+  previousFleetEnv = new Map();
+  FLEET_ENV.forEach((name, index) => {
+    previousFleetEnv.set(name, process.env[name]);
+    process.env[name] = FLEET_SECRETS[index];
+  });
 });
 
 afterEach(async () => {
@@ -78,6 +88,11 @@ afterEach(async () => {
   globalCircuitBreaker.reset();
   resetFacts();
   resetInterpretations();
+  for (const [name, value] of previousFleetEnv) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  previousFleetEnv.clear();
 });
 
 function anthropicEvent(type: string, value: Record<string, unknown>): string {
@@ -158,6 +173,15 @@ function backend(
   })).then((server) => ({ server, calls: () => calls }));
 }
 
+/** A genuine provider transport failure: the HTTP response never starts. */
+function resettingBackend(): Promise<{ server: Server; calls: () => number }> {
+  let calls = 0;
+  return listen(createServer((request) => {
+    calls++;
+    request.socket.destroy();
+  })).then((server) => ({ server, calls: () => calls }));
+}
+
 function fixed(body: string): BackendAction {
   return (response) => response.end(body);
 }
@@ -170,6 +194,7 @@ function poolConfig(
     logFile?: string | null;
     mode?: Config["mode"];
     degraded?: readonly string[];
+    candidates?: readonly string[];
   } = {},
 ): Config {
   const providers: Record<string, ProviderConfig> = {};
@@ -190,13 +215,24 @@ function poolConfig(
       default: "pool/commit",
       tiers: {},
       benchmarkSort: false,
-      pools: { commit: bases.map((_, index) => `p${index + 1}/m${index + 1}`) },
+      pools: { commit: [...(options.candidates ?? bases.map((_, index) => `p${index + 1}/m${index + 1}`))] },
       ...(options.degraded ? { poolDegraded: { commit: [...options.degraded] } } : {}),
     },
     mode: options.mode ?? "detect",
     repair: { maxAttempts: 2, destructiveTools: [] },
     log: options.logFile ? { level: "metadata", file: options.logFile } : { level: "silent", file: null },
   };
+}
+
+function enableTwoCredentialFleet(config: Config): Config {
+  for (const configured of Object.values(config.providers)) {
+    configured.credentialMode = "contained";
+    configured.credentials = [
+      { label: "default", authEnv: FLEET_ENV[0] },
+      { label: "work", authEnv: FLEET_ENV[1] },
+    ];
+  }
+  return config;
 }
 
 function requestBody(front: StreamFront, withTools = false): Record<string, unknown> {
@@ -261,10 +297,10 @@ describe.each(FRONTS)("$name — deferred header commit", (front) => {
     const a = await backend(fixed(preamble(front) + errorFrame(front, "dead-a")));
     const b = await backend(fixed(validCompletion(front)));
     const breaker = new CircuitBreaker();
-    const proxy = await startProxy(poolConfig(front, [
+    const proxy = await startProxy(enableTwoCredentialFleet(poolConfig(front, [
       `http://127.0.0.1:${port(a.server)}`,
       `http://127.0.0.1:${port(b.server)}`,
-    ], { logFile }), breaker);
+    ], { logFile })), breaker);
 
     const response = await post(front, proxy.port);
     const body = await response.text();
@@ -275,6 +311,10 @@ describe.each(FRONTS)("$name — deferred header commit", (front) => {
     expect(b.calls()).toBe(1);
     expect(response.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
     expect(response.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 1 served: 1x502, 1x200");
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p2", "default"));
+    expect(response.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBe(
+      "2 tried, 1 served: 1xprotocol",
+    );
     expect(breaker.getState(breakerIdentity("p1", "m1", front.backendKind))?.lastStatus).toBe(502);
     expect(logRecords(logFile)[0]?.attempts).toEqual([
       { provider: "p1", model: "m1", status: 502, ms: expect.any(Number) },
@@ -338,10 +378,10 @@ describe.each(FRONTS)("$name — deferred header commit", (front) => {
       response.on("close", () => clearInterval(timer));
     });
     const b = await backend(fixed(validCompletion(front)));
-    const proxy = await startProxy(poolConfig(front, [
+    const proxy = await startProxy(enableTwoCredentialFleet(poolConfig(front, [
       `http://127.0.0.1:${port(a.server)}`,
       `http://127.0.0.1:${port(b.server)}`,
-    ], { timeouts: [100, 1_000] }));
+    ], { timeouts: [100, 1_000] })));
 
     const started = Date.now();
     const response = await post(front, proxy.port);
@@ -350,23 +390,33 @@ describe.each(FRONTS)("$name — deferred header commit", (front) => {
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(a.calls()).toBe(1);
     expect(b.calls()).toBe(1);
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p2", "default"));
+    expect(response.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBe(
+      "2 tried, 1 served: 1xtimeout",
+    );
   });
 
-  it("fails over when the pre-commit socket resets", async () => {
-    const a = await backend((response) => {
-      response.write(preamble(front));
-      setTimeout(() => response.socket?.destroy(), 15);
-    });
-    const b = await backend(fixed(validCompletion(front)));
-    const proxy = await startProxy(poolConfig(front, [
+  it("suppresses the reset provider, counts the transport start, and exposes only winner headers", async () => {
+    const a = await resettingBackend();
+    const b = await backend(fixed(validCompletion(front)), { "x-winner": "b" });
+    const proxy = await startProxy(enableTwoCredentialFleet(poolConfig(front, [
       `http://127.0.0.1:${port(a.server)}`,
       `http://127.0.0.1:${port(b.server)}`,
-    ]));
+    ], { candidates: ["p1/m1", "p1/m2", "p2/m3"] })));
 
     const response = await post(front, proxy.port);
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("served-b");
+    expect(a.calls()).toBe(1);
     expect(b.calls()).toBe(1);
+    expect(response.headers.get("x-rejected")).toBeNull();
+    if (front.path !== "/v1/responses") expect(response.headers.get("x-winner")).toBe("b");
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe("p2/m3");
+    expect(response.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 1 served: 1x502, 1x200");
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p2", "default"));
+    expect(response.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBe(
+      "2 tried, 1 served: 1xtransport",
+    );
   });
 
   it("never starts another candidate after a client disconnect during the provisional preamble", async () => {

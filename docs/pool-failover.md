@@ -60,6 +60,16 @@ has actually failed on this request.
 14-member pool answers 401. With a single candidate nothing changes: there is nowhere to fail over
 to, so the real error is returned exactly as before.
 
+**Credential fleets fail over without poisoning sibling accounts.** Each deployment expands into
+its serviceable credential slots, then the request-local walk is deterministic and breadth-first
+across deployments: first slot of deployment A, first slot of B, then A's next slot. A
+credential-attributable outcome such as 401/403 may unlock that deployment's sibling slot. One
+slot's `AUTH` state does not invalidate its siblings or prove the deployment dead.
+
+A provider transport failure suppresses the provider's remaining rows for that request. A 5xx,
+timeout, or protocol/deployment failure closes only that deployment, so the walk may continue elsewhere.
+Missing, disabled, and model-scoped-out slots never reach the backend and consume no egress budget.
+
 **A genuine client 4xx (413, 422, …) still does not fail over.** Fourteen candidates would reject
 it identically; retrying would just multiply one bad request by fourteen.
 
@@ -85,9 +95,9 @@ broken member into a healthy one. So it is neither: `CircuitState.credentialFail
 row previously read `closed`, identical to a healthy member. It **expires** (5 min), so a rotated key
 recovers without restarting the proxy, and it clears immediately on any successful call.
 
-**The pool is smaller than it looks — and that is why the *tenth* entry answered.** This was the
-report's open question. `resolveTargets()` drops targets whose declared `authEnv` is unset, so the
-14-member `pool/coding` resolves to **7**:
+**The pool was smaller than it looked — and that is why the *tenth* entry answered.** In the
+historical single-slot incident, seven deployments had no serviceable key in the serving process,
+so only **7** of the 14 configured `pool/coding` members could egress:
 
 ```
 configured members: 14
@@ -98,13 +108,13 @@ candidates actually routed to: 7
   4 mistral/devstral-medium-latest
 ```
 
-After the keyless seven are dropped, `benchmarkSort` puts gemini (str 83.7/3) ahead of glm-5.2
-(83.3/4) — so the config's tenth entry is rank 1 of what actually remains. Nothing was choosing
-strangely; the list being ranked was half the size it appeared to be.
+After excluding those seven non-serviceable single-slot deployments, `benchmarkSort` put gemini
+(str 83.7/3) ahead of glm-5.2 (83.3/4) — so the config's tenth entry was rank 1 of what actually
+remained. Nothing was choosing strangely; the list being ranked was half the size it appeared to be.
 
-`llm-relay candidates` now states this outright instead of leaving it to be inferred from a row of
-`hasKey: false`, and distinguishes **dropped** (no key — never routed to) from **demoted**
-(auth-faulted or cooling — tried last).
+`llm-relay candidates` now reports every configured deployment × credential cell. Missing-key,
+disabled, and model-scoped-out cells remain visible but cannot start; auth-faulted or cooling cells
+are demoted. Neither condition condemns an eligible sibling slot.
 
 ⚠ **Why those seven had no key — and the trap that hid it.** They were not unconfigured. All eleven
 provider keys were set as **Windows User-scope environment variables**, and Windows only puts a
@@ -112,10 +122,14 @@ User-scope variable into a process's environment when that process **starts**. T
 long-running (launched from `Startup` at logon), so it predated the variables and never had them —
 while a *freshly launched* shell did. That split is what makes this so easy to misdiagnose:
 
-- `llm-relay keys` and `llm-relay candidates` run as **new CLI processes** and report **their own**
-  environment, which is not necessarily the running relay's.
-- `GET /registry` and `GET /candidates` are answered **by the relay**, so `has_key` there is the
-  authoritative answer about the process that actually serves traffic.
+- `llm-relay keys` runs as a **new CLI process** and reports that process's environment, which is
+  not necessarily the running relay's.
+- `llm-relay candidates` prefers the running relay's protected `/candidates` view and attaches the
+  per-install capability automatically. When that live view is available, its credential cells are
+  authoritative for the process actually serving traffic.
+- Direct `GET /registry` and `GET /candidates` requests are protected reads. They require
+  `x-llm-relay-control-token` with the capability from `~/.llm-relay/control-token`; never print,
+  copy, or log it. `/registry` aggregate `has_key` and nested slot state describe the serving relay.
 
 The two disagreed: the relay reported `has_key=false` for six providers whose keys were sitting in
 the registry the whole time. Relaunching the relay from an environment carrying those variables took
@@ -123,10 +137,10 @@ it from **6 providers without a key to 0**, and `pool/coding` from 5 live member
 members that had been reported dead with `401 Wrong API Key` / `no api key supplied` answered
 normally, several in under 400ms.
 
-**Diagnose this by asking the relay, never a fresh CLI process:**
+**Diagnose this through the protected running-relay view, not a fresh key-check process:**
 
 ```bash
-curl -s 127.0.0.1:8791/registry | grep -o '"has_key":[a-z]*'   # what the SERVING process sees
+llm-relay candidates     # CLI attaches the capability and prefers the running proxy
 ```
 
 A `401` from a provider whose key you know is set is this, not a bad credential — check `has_key`
@@ -201,9 +215,11 @@ whose ordering reflects that, or accept the latency knowingly.
   two policies, one of which was "no policy at all".
 - **Any test of failover needs ≥2 candidates.** A single-candidate test cannot distinguish working
   failover from absent failover, and that is exactly how this shipped.
+- **Credential-scoped demotion or exclusion never removes a serviceable sibling.** A breadth-first
+  integration test needs at least two deployments and two slots so it exercises both dimensions.
 - **A credential fault is not health data, and not a success either.** It has its own axis. Do not
   "simplify" it into `recordOutcome`.
-- **Demote, never drop, on health.** Ordering preserves every candidate; only an unset credential
-  removes one, and that happens in `resolveTargets` for a different reason.
+- **Demote, never drop, on health.** Missing, disabled, and model-scoped-out credential cells stay
+  visible for diagnosis but cannot start an attempt; any serviceable sibling remains eligible.
 - **A conforming error body is passed through byte-exact.** Normalization exists for the shapes that
   break an OpenAI client, not to reword providers.

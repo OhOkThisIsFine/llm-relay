@@ -8,9 +8,20 @@ import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
 import { makeCredentialId } from "../src/credential-id.js";
-import { DEGRADED_HEADER, POOL_ATTEMPTS_HEADER } from "../src/backend.js";
-import { resetFacts } from "../src/target-facts.js";
-import { resetInterpretations } from "../src/refusal-interpretation.js";
+import {
+  CREDENTIAL_ATTEMPTS_HEADER,
+  CREDENTIAL_HEADER,
+  DEGRADED_HEADER,
+  POOL_ATTEMPTS_HEADER,
+} from "../src/backend.js";
+import { recordFact, resetFacts } from "../src/target-facts.js";
+import {
+  acceptInterpretation,
+  recordUnknownRefusal,
+  refusalSignature,
+  resetInterpretations,
+  type ScopeTemplate,
+} from "../src/refusal-interpretation.js";
 import { materializeDynamicPools } from "../src/dynamic-pools.js";
 import type { Config, ProviderConfig, ProviderTierType } from "../src/config.js";
 import type { TierData, TierModel } from "../src/tier-data.js";
@@ -32,17 +43,18 @@ const breakerIdentity = (provider: string, model: string | null) => ({
 
 interface FrontDriver {
   name: string;
-  post: (proxyPort: number, model?: string) => Promise<Response>;
+  post: (proxyPort: number, model?: string, signal?: AbortSignal) => Promise<Response>;
   content: (response: Response) => Promise<string>;
 }
 
 const FRONTS: FrontDriver[] = [
   {
     name: "Anthropic Messages (/v1/messages)",
-    post: (proxyPort, model = "pool/convergence") =>
+    post: (proxyPort, model = "pool/convergence", signal) =>
       fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        ...(signal ? { signal } : {}),
         body: JSON.stringify({
           model,
           max_tokens: 32,
@@ -56,10 +68,11 @@ const FRONTS: FrontDriver[] = [
   },
   {
     name: "OpenAI Chat Completions (/v1/chat/completions)",
-    post: (proxyPort, model = "pool/convergence") =>
+    post: (proxyPort, model = "pool/convergence", signal) =>
       fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        ...(signal ? { signal } : {}),
         body: JSON.stringify({
           model,
           max_tokens: 32,
@@ -75,10 +88,11 @@ const FRONTS: FrontDriver[] = [
   },
   {
     name: "OpenAI Responses (/v1/responses)",
-    post: (proxyPort, model = "pool/convergence") =>
+    post: (proxyPort, model = "pool/convergence", signal) =>
       fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        ...(signal ? { signal } : {}),
         body: JSON.stringify({
           model,
           max_output_tokens: 32,
@@ -94,6 +108,15 @@ const FRONTS: FrontDriver[] = [
 
 const servers: Server[] = [];
 const tempDirs: string[] = [];
+const FLEET_ENV = {
+  p1: ["CONVERGENCE_P1_DEFAULT_KEY", "CONVERGENCE_P1_WORK_KEY"],
+  p2: ["CONVERGENCE_P2_DEFAULT_KEY", "CONVERGENCE_P2_WORK_KEY"],
+} as const;
+const FLEET_SECRETS = {
+  p1: ["p1-default-secret", "p1-work-secret"],
+  p2: ["p2-default-secret", "p2-work-secret"],
+} as const;
+let previousFleetEnv = new Map<string, string | undefined>();
 
 function track(server: Server): Server {
   servers.push(server);
@@ -108,6 +131,13 @@ beforeEach(() => {
   globalCircuitBreaker.reset();
   resetFacts();
   resetInterpretations();
+  previousFleetEnv = new Map();
+  for (const provider of ["p1", "p2"] as const) {
+    FLEET_ENV[provider].forEach((name, index) => {
+      previousFleetEnv.set(name, process.env[name]);
+      process.env[name] = FLEET_SECRETS[provider][index];
+    });
+  }
 });
 
 afterEach(async () => {
@@ -124,6 +154,11 @@ afterEach(async () => {
     globalCircuitBreaker.reset();
     resetFacts();
     resetInterpretations();
+    for (const [name, value] of previousFleetEnv) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    previousFleetEnv.clear();
   }
 });
 
@@ -154,6 +189,40 @@ function scripted(
   });
 }
 
+interface FleetRequest {
+  model: string;
+  credential: string;
+}
+
+/** A credential-aware backend that records the exact model/slot cells that reached egress. */
+function fleetScripted(
+  reply: (request: FleetRequest, call: number) => ScriptedResponse,
+): Promise<{ server: Server; seen: () => FleetRequest[] }> {
+  const seen: FleetRequest[] = [];
+  return new Promise((resolve) => {
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string };
+        const authorization = String(request.headers.authorization ?? "");
+        const entry: FleetRequest = {
+          model: parsed.model ?? "",
+          credential: authorization.replace(/^Bearer\s+/i, ""),
+        };
+        seen.push(entry);
+        const out = reply(entry, seen.length);
+        response.writeHead(out.status ?? 200, {
+          "content-type": "application/json",
+          ...out.headers,
+        });
+        response.end(out.body);
+      });
+    });
+    server.listen(0, "127.0.0.1", () => resolve({ server: track(server), seen: () => [...seen] }));
+  });
+}
+
 /** A backend that proves a provider-wide transport failure by resetting the socket. */
 function resetting(): Promise<{ server: Server; calls: () => number }> {
   let calls = 0;
@@ -163,6 +232,42 @@ function resetting(): Promise<{ server: Server; calls: () => number }> {
       request.socket.destroy();
     });
     server.listen(0, "127.0.0.1", () => resolve({ server: track(server), calls: () => calls }));
+  });
+}
+
+/**
+ * Yield a real 401 head, then fail while its declared body is still incomplete. Fetch has already
+ * returned a Response at that point, so this is a post-header protocol failure, not a credential
+ * refusal and not a provider-wide connection failure.
+ */
+function truncatedCredentialFailure(): Promise<{ server: Server; seen: () => FleetRequest[] }> {
+  const seen: FleetRequest[] = [];
+  return new Promise((resolve) => {
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string };
+        const authorization = String(request.headers.authorization ?? "");
+        seen.push({
+          model: parsed.model ?? "",
+          credential: authorization.replace(/^Bearer\s+/i, ""),
+        });
+
+        const partial = '{"error":{"message":"truncated credential refusal';
+        response.on("error", () => {});
+        response.writeHead(401, {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(partial) + 128),
+        });
+        response.flushHeaders();
+        response.write(partial, () => setImmediate(() => response.destroy()));
+      });
+    });
+    server.listen(0, "127.0.0.1", () => resolve({
+      server: track(server),
+      seen: () => [...seen],
+    }));
   });
 }
 
@@ -237,6 +342,36 @@ function poolConfig(bases: string[], options: PoolConfigOptions = {}): Config {
       ? { level: "metadata", file: options.logFile }
       : { level: "silent", file: null },
   };
+}
+
+function enableTwoCredentialFleet(config: Config): Config {
+  for (const provider of ["p1", "p2"] as const) {
+    const configured = config.providers[provider];
+    if (!configured) continue;
+    configured.credentialMode = "contained";
+    configured.credentials = [
+      { label: "default", authEnv: FLEET_ENV[provider][0] },
+      { label: "work", authEnv: FLEET_ENV[provider][1] },
+    ];
+  }
+  return config;
+}
+
+function acceptBodyScope(
+  provider: string,
+  model: string,
+  status: number,
+  body: string,
+  scope: ScopeTemplate,
+): void {
+  recordUnknownRefusal(provider, model, status, body);
+  expect(acceptInterpretation(refusalSignature(provider, model, status, body), {
+    override: { class: "not-servable", scope },
+  })).toBe(true);
+}
+
+function credentialLabel(provider: "p1" | "p2", credential: "default" | "work"): string {
+  return FLEET_SECRETS[provider][credential === "default" ? 0 : 1];
 }
 
 function startProxy(
@@ -324,7 +459,246 @@ async function materializedDegradedConfig(strongBase: string, weakBase: string):
   return { config, catalog };
 }
 
+interface ScopeWalkCase {
+  name: string;
+  scope: ScopeTemplate;
+  candidates: string[];
+  winner: { provider: "p1" | "p2"; model: string; credential: "default" | "work" };
+  expectedEgress: Array<{ provider: "p1" | "p2"; model: string; credential: "default" | "work" }>;
+}
+
+const SCOPE_WALK_CASES: ScopeWalkCase[] = [
+  {
+    name: "attempt",
+    scope: { kind: "attempt" },
+    candidates: ["p1/m1", "p2/m2"],
+    winner: { provider: "p1", model: "m1", credential: "work" },
+    expectedEgress: [
+      { provider: "p1", model: "m1", credential: "default" },
+      { provider: "p2", model: "m2", credential: "default" },
+      { provider: "p1", model: "m1", credential: "work" },
+    ],
+  },
+  {
+    name: "credential",
+    scope: { kind: "credential" },
+    candidates: ["p1/m1", "p1/m2", "p2/m3"],
+    winner: { provider: "p1", model: "m2", credential: "work" },
+    expectedEgress: [
+      { provider: "p1", model: "m1", credential: "default" },
+      { provider: "p1", model: "m2", credential: "work" },
+    ],
+  },
+  {
+    name: "provider",
+    scope: { kind: "provider" },
+    candidates: ["p1/m1", "p1/m2", "p2/m3"],
+    winner: { provider: "p2", model: "m3", credential: "default" },
+    expectedEgress: [
+      { provider: "p1", model: "m1", credential: "default" },
+      { provider: "p2", model: "m3", credential: "default" },
+    ],
+  },
+  {
+    name: "deployment",
+    scope: { kind: "deployment" },
+    candidates: ["p1/m1", "p2/m2"],
+    winner: { provider: "p2", model: "m2", credential: "default" },
+    expectedEgress: [
+      { provider: "p1", model: "m1", credential: "default" },
+      { provider: "p2", model: "m2", credential: "default" },
+    ],
+  },
+  {
+    name: "model",
+    scope: { kind: "model" },
+    candidates: ["p1/m1", "p2/m1", "p2/m2"],
+    winner: { provider: "p2", model: "m2", credential: "default" },
+    expectedEgress: [
+      { provider: "p1", model: "m1", credential: "default" },
+      { provider: "p2", model: "m2", credential: "default" },
+    ],
+  },
+  {
+    name: "credential-bound group",
+    scope: { kind: "group", credential: "attempt", members: ["m2"] },
+    candidates: ["p1/m1", "p1/m2", "p1/m3", "p2/m4"],
+    winner: { provider: "p1", model: "m2", credential: "work" },
+    expectedEgress: [
+      { provider: "p1", model: "m1", credential: "default" },
+      { provider: "p1", model: "m2", credential: "work" },
+    ],
+  },
+];
+
 describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
+  it.each(SCOPE_WALK_CASES)(
+    "an accepted $name scope suppresses only covered cells in the current credential walk",
+    async (scopeCase) => {
+      const scopeMarker = `scheduler scope ${scopeCase.name} refusal`;
+      const refusal = errorBody(scopeMarker, "scope_fixture");
+      acceptBodyScope("p1", "m1", 403, refusal, scopeCase.scope);
+
+      const allSeen: Array<{ provider: "p1" | "p2"; request: FleetRequest }> = [];
+      const makeBackend = async (provider: "p1" | "p2") => fleetScripted((request) => {
+        allSeen.push({ provider, request });
+        const credential = request.credential === credentialLabel(provider, "work") ? "work" : "default";
+        if (provider === "p1" && request.model === "m1" && credential === "default") {
+          return { status: 403, body: refusal };
+        }
+        if (
+          provider === scopeCase.winner.provider
+          && request.model === scopeCase.winner.model
+          && credential === scopeCase.winner.credential
+        ) {
+          return { body: OK_BODY };
+        }
+        return { status: 429, body: errorBody("ordinary per-cell backpressure", "rate_limit_error") };
+      });
+      const p1 = await makeBackend("p1");
+      const p2 = await makeBackend("p2");
+      const config = enableTwoCredentialFleet(poolConfig([
+        `http://127.0.0.1:${port(p1.server)}`,
+        `http://127.0.0.1:${port(p2.server)}`,
+      ], { candidates: scopeCase.candidates }));
+      const proxyPort = port(await startProxy(config));
+
+      const response = await front.post(proxyPort);
+      await expectServed(front, response);
+      expect(response.headers.get(CREDENTIAL_HEADER)).toBe(
+        makeCredentialId(scopeCase.winner.provider, scopeCase.winner.credential),
+      );
+      expect(allSeen.map(({ provider, request }) => ({
+        provider,
+        model: request.model,
+        credential: request.credential === credentialLabel(provider, "work") ? "work" : "default",
+      }))).toEqual(scopeCase.expectedEgress);
+    },
+  );
+
+  it("returns the current real refusal when its accepted body scope exhausts the walk", async () => {
+    const marker = "scheduler terminal provider refusal";
+    const refusal = errorBody(marker, "scope_fixture");
+    acceptBodyScope("p1", "m1", 403, refusal, { kind: "provider" });
+    const onlyProvider = await fleetScripted(() => ({ status: 403, body: refusal }));
+    const config = enableTwoCredentialFleet(poolConfig([
+      `http://127.0.0.1:${port(onlyProvider.server)}`,
+    ], { candidates: ["p1/m1", "p1/m2"] }));
+    const proxyPort = port(await startProxy(config));
+    const controller = new AbortController();
+    const abort = setTimeout(() => controller.abort(), 1_000);
+    const started = Date.now();
+
+    try {
+      const response = await front.post(proxyPort, undefined, controller.signal);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain(marker);
+      expect(onlyProvider.seen()).toHaveLength(1);
+    } finally {
+      clearTimeout(abort);
+    }
+  });
+
+  it("returns the final 503 after each failed deployment closes without trying its sibling slot", async () => {
+    const first = await scripted(() => ({ status: 503, body: errorBody("first deployment unavailable") }));
+    const second = await scripted(() => ({ status: 503, body: errorBody("final deployment unavailable") }));
+    const config = enableTwoCredentialFleet(poolConfig([
+      `http://127.0.0.1:${port(first.server)}`,
+      `http://127.0.0.1:${port(second.server)}`,
+    ]));
+    const proxyPort = port(await startProxy(config));
+
+    const response = await front.post(proxyPort);
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("final deployment unavailable");
+    expect(first.calls()).toBe(1);
+    expect(second.calls()).toBe(1);
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBeNull();
+    expect(response.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBe("2 tried, 0 served: 2x503");
+  });
+
+  it("reports the exact winning slot, actual starts, and failure-only credential bins", async () => {
+    const sequence: string[] = [];
+    const first = await fleetScripted((request) => {
+      sequence.push(`p1:${request.credential}`);
+      return request.credential === credentialLabel("p1", "default")
+        ? { status: 401, body: errorBody("plain credential refusal") }
+        : { body: OK_BODY };
+    });
+    const intervening = await fleetScripted((request) => {
+      sequence.push(`p2:${request.credential}`);
+      return { status: 503, body: errorBody("deployment unavailable") };
+    });
+    const config = enableTwoCredentialFleet(poolConfig([
+      `http://127.0.0.1:${port(first.server)}`,
+      `http://127.0.0.1:${port(intervening.server)}`,
+    ]));
+    const proxyPort = port(await startProxy(config));
+
+    const response = await front.post(proxyPort);
+    await expectServed(front, response);
+    expect(sequence).toEqual([
+      `p1:${credentialLabel("p1", "default")}`,
+      `p2:${credentialLabel("p2", "default")}`,
+      `p1:${credentialLabel("p1", "work")}`,
+    ]);
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p1", "work"));
+    expect(response.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBe(
+      "3 tried, 1 served: 1x401, 1x503",
+    );
+  });
+
+  it("closes only the deployment when an apparent credential refusal body fails after headers", async () => {
+    const truncated = await truncatedCredentialFailure();
+    const final = await fleetScripted(() => ({
+      status: 503,
+      body: errorBody("final deployment unavailable"),
+    }));
+    const config = enableTwoCredentialFleet(poolConfig([
+      `http://127.0.0.1:${port(truncated.server)}`,
+      `http://127.0.0.1:${port(final.server)}`,
+    ]));
+    const proxyPort = port(await startProxy(config));
+
+    const response = await front.post(proxyPort);
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("final deployment unavailable");
+    expect(truncated.seen()).toEqual([
+      { model: "m1", credential: credentialLabel("p1", "default") },
+    ]);
+    expect(final.seen()).toEqual([
+      { model: "m2", credential: credentialLabel("p2", "default") },
+    ]);
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBeNull();
+    expect(response.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBe(
+      "2 tried, 0 served: 1xprotocol, 1x503",
+    );
+  });
+
+  it("counts a transport start in an all-failed walk without claiming a served credential", async () => {
+    const credentialFailures = await fleetScripted(() => ({
+      status: 401,
+      body: errorBody("plain credential refusal"),
+    }));
+    const transportFailure = await resetting();
+    const config = enableTwoCredentialFleet(poolConfig([
+      `http://127.0.0.1:${port(credentialFailures.server)}`,
+      `http://127.0.0.1:${port(transportFailure.server)}`,
+    ]));
+    const proxyPort = port(await startProxy(config));
+
+    const response = await front.post(proxyPort);
+    expect(response.status).toBe(401);
+    await response.text();
+    expect(credentialFailures.seen()).toHaveLength(2);
+    expect(transportFailure.calls()).toBe(1);
+    expect(response.headers.get(CREDENTIAL_HEADER)).toBeNull();
+    expect(response.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBe(
+      "3 tried, 0 served: 2x401, 1xtransport",
+    );
+  });
+
   it("401 credential fault steps to the next candidate without laundering it into health", async () => {
     const first = await scripted(() => ({ status: 401, body: errorBody("wrong API key", "authentication_error") }));
     const second = await scripted(() => ({ body: OK_BODY }));
@@ -558,6 +932,51 @@ describe.each(FRONTS)("$name — cross-front failover convergence", (front) => {
     await expectServed(front, response);
     expect(paid.calls()).toBe(0);
     expect(free.calls()).toBe(1);
+  });
+
+  it("freeOnly keeps a deployment when only its default credential is attempt-blocked", async () => {
+    const deploymentBlocked = await scripted(() => ({ body: OK_BODY }));
+    const fleet = await scripted(() => ({ body: OK_BODY }));
+    const previousDefault = process.env.CONVERGENCE_DEFAULT_KEY;
+    const previousWork = process.env.CONVERGENCE_WORK_KEY;
+    process.env.CONVERGENCE_DEFAULT_KEY = "default-secret";
+    process.env.CONVERGENCE_WORK_KEY = "work-secret";
+    try {
+      const config = poolConfig(
+        [
+          `http://127.0.0.1:${port(deploymentBlocked.server)}`,
+          `http://127.0.0.1:${port(fleet.server)}`,
+        ],
+        { tierTypes: ["free", "free"] },
+      );
+      config.providers.p2!.credentials = [
+        { label: "default", authEnv: "CONVERGENCE_DEFAULT_KEY" },
+        { label: "work", authEnv: "CONVERGENCE_WORK_KEY" },
+      ];
+      config.providers.p2!.credentialMode = "contained";
+      recordFact("not-servable", {
+        kind: "deployment", provider: "p1", model: "m1",
+      });
+      recordFact("not-servable", {
+        kind: "attempt",
+        provider: "p2",
+        credentialId: makeCredentialId("p2", "default"),
+        model: "m2",
+      });
+      enableFreeOnly(config);
+      const proxyPort = port(await startProxy(config));
+
+      const response = await front.post(proxyPort);
+      expect(response.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p2", "work"));
+      await expectServed(front, response);
+      expect(deploymentBlocked.calls()).toBe(0);
+      expect(fleet.calls()).toBe(1);
+    } finally {
+      if (previousDefault === undefined) delete process.env.CONVERGENCE_DEFAULT_KEY;
+      else process.env.CONVERGENCE_DEFAULT_KEY = previousDefault;
+      if (previousWork === undefined) delete process.env.CONVERGENCE_WORK_KEY;
+      else process.env.CONVERGENCE_WORK_KEY = previousWork;
+    }
   });
 
   it("freeOnly returns 503 with zero egress when no candidate is assessed free", async () => {
