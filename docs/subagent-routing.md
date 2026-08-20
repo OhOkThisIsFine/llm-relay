@@ -172,6 +172,16 @@ and never expose the listener off-loopback.
 
 ## Choosing a destination
 
+For a multi-slot provider, `/candidates` emits one row per configured deployment × credential
+slot. Missing, disabled, and model-scoped-out cells remain visible for diagnosis even though they
+cannot egress. Read the slot's `credentialId`, non-secret policy/state, breaker and learned facts,
+and its typed quota observations separately; do not collapse them into a provider-wide percentage.
+
+`GET /candidates` is a protected control read, as is `GET /registry`. Prefer
+`llm-relay candidates`, which attaches the
+per-install capability automatically and uses the running proxy when reachable. A direct client
+must attach the capability from `~/.llm-relay/control-token`; never print, copy, or log it.
+
 `llm-relay candidates` (or `GET /candidates`) is the decision table — every offload target with its
 dimensions **side by side and un-blended**:
 
@@ -181,7 +191,7 @@ dimensions **side by side and un-blended**:
 | Specialized task fit | Design Arena agent Elo, BFCL irrelevance, Aider well-formed |
 | Cost / shape | context window, price per M tokens in + out, declares tool support |
 | Live behaviour | verdict, avg / p95 latency, jitter, uptime %, last ping code |
-| Availability now | provider quota %, circuit-breaker open/closed + cooldown, listed in live catalog |
+| Availability now | credential slot policy/state; typed requests/tokens × period quota observations with remaining, limit, reset and basis; per-cell breaker/cooldown/facts; listed in live catalog |
 | Observed traffic | calls, successes, average latency through this proxy |
 
 Every leaderboard keeps its own field under `scores`; they disagree, and that disagreement remains
@@ -197,8 +207,9 @@ The scalar never travels without `strengthBasis`, `strengthSignals`, `capability
 [`src/benchmarks.ts`](../src/benchmarks.ts)). Runtime telemetry is operational evidence only; it can
 order deployments but never impersonates model capability. There is no `static-table` basis.
 
-The CLI prefers a running proxy so it can use warm ping history and real breaker state; run it cold
-and the live-behaviour columns are empty because nothing has been measured yet.
+The CLI first queries the protected running relay for warm quota, ping, and breaker evidence. If
+that read is unavailable it falls back to a cold local view, whose environment and runtime fields
+may differ from the serving process; unmeasured live-behaviour cells remain blank.
 
 **A blank capability cell means "not measured", not "bad"**, and the sources have very different
 coverage — see [capability-sources.md](capability-sources.md) for the probe results. Capability is

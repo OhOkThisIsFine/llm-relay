@@ -1,8 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   CircuitBreaker,
   type HeaderObservation,
 } from "../src/circuit-breaker.js";
+import { createProxy } from "../src/server.js";
+import { ModelCatalog } from "../src/catalog.js";
+import { makeCredentialId } from "../src/credential-id.js";
+import { resetFacts } from "../src/target-facts.js";
+import { resetInterpretations } from "../src/refusal-interpretation.js";
+import type { Config, ProviderConfig } from "../src/config.js";
 import type {
   AttemptFailed,
   AttemptHandle,
@@ -551,5 +559,317 @@ describe("CircuitBreaker cross-credential lifecycle", () => {
     ).toBe(true);
     expect(breaker.hasCredentialFault(targetA, 1_051)).toBe(true);
     expect(breaker.hasCredentialFault(otherCredential, 1_051)).toBe(false);
+  });
+});
+
+describe("front-level actual-egress attempt lifecycle", () => {
+  interface Front {
+    name: string;
+    path: "/v1/messages" | "/v1/responses";
+  }
+
+  const fronts: Front[] = [
+    { name: "Messages", path: "/v1/messages" },
+    { name: "Responses", path: "/v1/responses" },
+  ];
+  const fleetEnv = ["LIFECYCLE_DEFAULT_KEY", "LIFECYCLE_WORK_KEY"] as const;
+  const servers: Server[] = [];
+  let savedEnv = new Map<string, string | undefined>();
+
+  const bufferedCompletion = JSON.stringify({
+    id: "completion",
+    object: "chat.completion",
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: "served" },
+      finish_reason: "stop",
+    }],
+  });
+  const streamedCompletion = [
+    `data: ${JSON.stringify({ id: "completion", choices: [{ index: 0, delta: { role: "assistant", content: "served" }, finish_reason: null }] })}\n\n`,
+    `data: ${JSON.stringify({ id: "completion", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  class CountingBreaker extends CircuitBreaker {
+    begins = 0;
+    override beginAttempt(target: ProviderTargetIdentity) {
+      this.begins += 1;
+      return super.beginAttempt(target);
+    }
+  }
+
+  beforeEach(() => {
+    resetFacts();
+    resetInterpretations();
+    savedEnv = new Map();
+    fleetEnv.forEach((name, index) => {
+      savedEnv.set(name, process.env[name]);
+      process.env[name] = index === 0 ? "lifecycle-default" : "lifecycle-work";
+    });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    const closing = servers.splice(0);
+    for (const server of closing) server.closeAllConnections();
+    await Promise.all(closing.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+    resetFacts();
+    resetInterpretations();
+    for (const [name, value] of savedEnv) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    savedEnv.clear();
+  });
+
+  function port(server: Server): number {
+    return (server.address() as AddressInfo).port;
+  }
+
+  function listen(server: Server): Promise<Server> {
+    return new Promise((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        servers.push(server);
+        resolve(server);
+      });
+    });
+  }
+
+  async function backend(
+    body: string,
+    contentType = "application/json",
+  ): Promise<{ server: Server; calls: () => number }> {
+    let calls = 0;
+    const server = await listen(createServer((request, response) => {
+      request.on("data", () => {});
+      request.on("end", () => {
+        calls += 1;
+        response.writeHead(200, { "content-type": contentType });
+        response.end(body);
+      });
+    }));
+    return { server, calls: () => calls };
+  }
+
+  async function resettingBackend(): Promise<{ server: Server; calls: () => number }> {
+    let calls = 0;
+    const server = await listen(createServer((request) => {
+      calls += 1;
+      request.socket.destroy();
+    }));
+    return { server, calls: () => calls };
+  }
+
+  function config(bases: readonly string[]): Config {
+    const providers: Record<string, ProviderConfig> = {};
+    bases.forEach((base, index) => {
+      providers[`p${index + 1}`] = {
+        base,
+        kind: "openai",
+        credentialMode: "contained",
+        credentials: [
+          { label: "default", authEnv: fleetEnv[0] },
+          { label: "work", authEnv: fleetEnv[1] },
+        ],
+        authHeader: "authorization",
+        timeoutMs: 2_000,
+      };
+    });
+    return {
+      host: "127.0.0.1",
+      port: 0,
+      providers,
+      routing: {
+        default: "pool/lifecycle",
+        tiers: {},
+        benchmarkSort: false,
+        pools: { lifecycle: bases.map((_, index) => `p${index + 1}/m${index + 1}`) },
+      },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+  }
+
+  async function proxyFor(bases: readonly string[], breaker: CircuitBreaker): Promise<Server> {
+    return listen(createProxy(config(bases), {
+      breaker,
+      catalog: new ModelCatalog({ cachePath: null }),
+    }));
+  }
+
+  function requestBody(front: Front, stream: boolean): Record<string, unknown> {
+    if (front.path === "/v1/messages") {
+      return {
+        model: "pool/lifecycle",
+        max_tokens: 32,
+        stream,
+        messages: [{ role: "user", content: "hi" }],
+      };
+    }
+    return { model: "pool/lifecycle", input: "hi", stream };
+  }
+
+  function invalidRequestBody(front: Front): Record<string, unknown> {
+    if (front.path === "/v1/messages") {
+      return {
+        model: "pool/lifecycle",
+        messages: [{
+          role: "user",
+          content: [{ type: "document", source: { type: "url", url: "https://example.invalid/a.pdf" } }],
+        }],
+      };
+    }
+    return { model: "pool/lifecycle", input: [null] };
+  }
+
+  function post(front: Front, proxy: Server, body = requestBody(front, false)): Promise<Response> {
+    return fetch(`http://127.0.0.1:${port(proxy)}${front.path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function expectAllLeasesReleased(breaker: CircuitBreaker): void {
+    for (const provider of ["p1", "p2"]) {
+      expect(breaker.inFlightCredential(makeCredentialId(provider, "default"))).toBe(0);
+      expect(breaker.inFlightCredential(makeCredentialId(provider, "work"))).toBe(0);
+    }
+  }
+
+  it.each(fronts)("$name releases a buffered successful attempt after consumption", async (front) => {
+    const first = await backend(bufferedCompletion);
+    const second = await backend(bufferedCompletion);
+    const breaker = new CountingBreaker();
+    const proxy = await proxyFor([
+      `http://127.0.0.1:${port(first.server)}`,
+      `http://127.0.0.1:${port(second.server)}`,
+    ], breaker);
+
+    const response = await post(front, proxy);
+    await response.text();
+
+    expect(response.status).toBe(200);
+    expect(first.calls()).toBe(1);
+    expect(second.calls()).toBe(0);
+    expect(breaker.begins).toBe(1);
+    expectAllLeasesReleased(breaker);
+  });
+
+  it.each(fronts)("$name releases a discarded transport failure and its winner", async (front) => {
+    const reset = await resettingBackend();
+    const winner = await backend(bufferedCompletion);
+    const breaker = new CountingBreaker();
+    const proxy = await proxyFor([
+      `http://127.0.0.1:${port(reset.server)}`,
+      `http://127.0.0.1:${port(winner.server)}`,
+    ], breaker);
+
+    const response = await post(front, proxy);
+    await response.text();
+
+    expect(response.status).toBe(200);
+    expect(reset.calls()).toBe(1);
+    expect(winner.calls()).toBe(1);
+    expect(breaker.begins).toBe(2);
+    expectAllLeasesReleased(breaker);
+  });
+
+  it.each(fronts)("$name releases a streamed attempt only after full completion", async (front) => {
+    const first = await backend(streamedCompletion, "text/event-stream");
+    const second = await backend(streamedCompletion, "text/event-stream");
+    const breaker = new CountingBreaker();
+    const proxy = await proxyFor([
+      `http://127.0.0.1:${port(first.server)}`,
+      `http://127.0.0.1:${port(second.server)}`,
+    ], breaker);
+
+    const response = await post(front, proxy, requestBody(front, true));
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(body).toContain("served");
+    expect(first.calls()).toBe(1);
+    expect(second.calls()).toBe(0);
+    expect(breaker.begins).toBe(1);
+    expectAllLeasesReleased(breaker);
+  });
+
+  it.each(fronts)("$name releases a post-egress relay mapper failure", async (front) => {
+    const breaker = new CountingBreaker();
+    const proxy = await proxyFor([
+      "https://mapper-one.invalid/v1",
+      "https://mapper-two.invalid/v1",
+    ], breaker);
+    const proxyBase = `http://127.0.0.1:${port(proxy)}`;
+    const realFetch = globalThis.fetch;
+    const upstreamUrls: string[] = [];
+    const realResponseJson = Response.prototype.json;
+    vi.spyOn(Response.prototype, "json").mockImplementation(function (this: Response) {
+      if (this.headers.get("x-lifecycle-mapper-defect") === "yes") {
+        let contentReads = 0;
+        const message: Record<string, unknown> = {};
+        Object.defineProperty(message, "content", {
+          enumerable: true,
+          get() {
+            contentReads += 1;
+            if (contentReads > 2) throw new Error("synthetic post-validation mapper failure");
+            return "served";
+          },
+        });
+        return Promise.resolve({
+          id: "completion",
+          choices: [{ message, finish_reason: "stop" }],
+        });
+      }
+      return realResponseJson.call(this);
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+      if (url.startsWith(proxyBase)) return realFetch(input, init);
+      upstreamUrls.push(url);
+      const upstream = new Response(bufferedCompletion, {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "x-lifecycle-mapper-defect": "yes",
+        },
+      });
+      return upstream;
+    });
+
+    const response = await post(front, proxy);
+    const body = await response.text();
+
+    expect(response.status).toBe(502);
+    expect(body).toContain("relay_mapper_defect");
+    expect(upstreamUrls).toHaveLength(1);
+    expect(breaker.begins).toBe(1);
+    expectAllLeasesReleased(breaker);
+  });
+
+  it.each(fronts)("$name local rejection never begins an attempt", async (front) => {
+    const first = await backend(bufferedCompletion);
+    const second = await backend(bufferedCompletion);
+    const breaker = new CountingBreaker();
+    const proxy = await proxyFor([
+      `http://127.0.0.1:${port(first.server)}`,
+      `http://127.0.0.1:${port(second.server)}`,
+    ], breaker);
+
+    const response = await post(front, proxy, invalidRequestBody(front));
+    await response.text();
+
+    expect(response.status).toBe(400);
+    expect(first.calls()).toBe(0);
+    expect(second.calls()).toBe(0);
+    expect(breaker.begins).toBe(0);
+    expectAllLeasesReleased(breaker);
   });
 });

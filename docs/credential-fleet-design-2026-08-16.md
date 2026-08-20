@@ -8,6 +8,13 @@ Companion documents: [rubric-recalibration-2026-08-16.md](rubric-recalibration-2
 (why these were rejected and what voided the reasons) and
 [quota-metering-spec-2026-08-16.md](quota-metering-spec-2026-08-16.md) (the tracking pipeline).
 
+> **Implementation status — 2026-08-20, `codex/stage-1-credential-pooling`:** Stage 0 and Stage 1
+> env-backed credential pooling are implemented on the current branch: normalized fleets, exact
+> explicit-slot resolution, credential-aware breaker/fact identity, deterministic breadth-first
+> walks on both API fronts, ancillary probes, fleet-aware reshapers, protected registry/candidate
+> diagnostics, credential response headers, and winner logging. The custody and cost-accounting
+> stages below remain design work. Historical rationale is otherwise preserved.
+
 **Budget: zero new runtime deps, no native module, no database.** The one real restriction is that
 the JSON counter store is single-writer by construction — documented, not hidden.
 
@@ -266,7 +273,10 @@ Every entry names an **env var NAME**, never a key. `credentialMode` stays per-p
 
 **No per-credential `base`.** Design 2 declined per-key proxy overrides and then recommended a per-credential `base` — an egress-redirect primitive sitting directly on a stored credential, which Design 1's AAD (provider + entryId) does not bind, so the stored NVIDIA key would be sent to whatever host the base names. `src/config-edit.ts:78-93` makes `providers.nim.credentials.2.base` a supported single-command edit. This reintroduces through config exactly the leak `src/authEnv.ts:10-13` refuses to create through inference. A different endpoint is a different provider — which is what the provider map is for. Design 2's own reason for declining per-key proxies applies verbatim.
 
-**Alias resolution applies only to the single-credential form.** With N slots, `resolveAuthEnv`'s curated fallback could make two slots resolve to the same env name — one key counted as two quota domains, the precise failure this feature exists to prevent. So N > 1 ⇒ declared names verbatim.
+**Alias resolution applies only to legacy top-level `authEnv`.** Every slot in an explicit
+`credentials[]` declaration resolves only its exact declared env name, even when the array contains
+one slot. This prevents alias fallback from making two configured slots resolve to one key and
+counting that key as two quota domains.
 
 **Config errors degrade, they do not abort.** `authEnv` + `credentials` together is a hard error (two stated intentions, same reasoning as `credentialMode: "passthrough"` + `authEnv` at `src/config.ts:1027-1033` — a typo with a *credential* consequence). But a duplicate env name or a bad label **disables the offending slot with a `Config.warnings` entry** and keeps the provider serving on its remaining slots. That matches the established posture: an unset `${ENV}` disables one provider with a warning (`:1004-1017`), and the `credentialMode` inference case warns rather than throws (`:1038-1046`) precisely because refusing to start turns a hardening step into an outage. A duplicate slot name is a typo, not a leak.
 

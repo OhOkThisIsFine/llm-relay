@@ -1,7 +1,14 @@
 import { DEFAULT_ANTHROPIC_VERSION } from "./config.js";
 import { type AssistantMessage, type JsonSchema, isToolUseBlock } from "./anthropic.js";
 import { type ValidationError } from "./validator.js";
-import { buildAuthHeaders, readCredential } from "./authEnv.js";
+import { buildAuthHeaders, type CredentialResolution } from "./authEnv.js";
+import {
+  CredentialLru,
+  CredentialWalk,
+  type CredentialWalkOptions,
+  type CredentialWalkOutcome,
+} from "./credential-select.js";
+import type { ResolvedAttempt } from "./resolved-attempt.js";
 
 export interface ReshapeRequest {
   /** The declared tools (name → schema|null) so the reshaper knows the contract. */
@@ -73,26 +80,43 @@ export function buildUserContent(req: ReshapeRequest): string {
  * HTTP body. The model never rendered a judgement, so failover MAY try another candidate.
  * Distinct from a `refuse` result, which is a judgement and must never be shopped around.
  */
-export class ReshaperTransportError extends Error {}
+export class ReshaperTransportError extends Error {
+  readonly outcome: CredentialWalkOutcome;
+
+  constructor(message: string, outcome: CredentialWalkOutcome = { kind: "provider-transport" }) {
+    super(message);
+    this.name = "ReshaperTransportError";
+    this.outcome = Object.freeze({ ...outcome });
+  }
+}
 
 export type CorrectedInputs =
   | { kind: "inputs"; inputs: Record<string, unknown> }
   | { kind: "refuse"; reason: string };
 
+type ParsedCorrectedInputs = CorrectedInputs | { kind: "invalid"; reason: string };
+
 /** Parse the reshaper model's text into a per-id corrected-inputs map. */
 export function parseCorrectedInputs(text: string): CorrectedInputs {
+  const parsed = parseCorrectedInputsWire(text);
+  return parsed.kind === "invalid"
+    ? { kind: "refuse", reason: parsed.reason }
+    : parsed;
+}
+
+function parseCorrectedInputsWire(text: string): ParsedCorrectedInputs {
   const json = extractJson(text);
   if (typeof json !== "object" || json === null) {
-    return { kind: "refuse", reason: "reshaper returned no parseable JSON" };
+    return { kind: "invalid", reason: "reshaper returned no parseable JSON" };
   }
   const obj = json as Record<string, unknown>;
   if (obj.refuse === true) {
     return { kind: "refuse", reason: typeof obj.reason === "string" ? obj.reason : "refused" };
   }
-  if (typeof obj.inputs === "object" && obj.inputs !== null) {
+  if (typeof obj.inputs === "object" && obj.inputs !== null && !Array.isArray(obj.inputs)) {
     return { kind: "inputs", inputs: obj.inputs as Record<string, unknown> };
   }
-  return { kind: "refuse", reason: "reshaper output was not a recognized shape" };
+  return { kind: "invalid", reason: "reshaper output was not a recognized shape" };
 }
 
 /**
@@ -160,27 +184,39 @@ export class FailoverReshaper implements Reshaper {
   }
 }
 
+interface HttpReshaperConfig {
+  base: string;
+  model: string;
+  kind: "anthropic" | "openai";
+  /** Retained as non-secret topology metadata; HttpReshaper never resolves either field. */
+  provider?: string;
+  authEnv?: string;
+  authHeader: "x-api-key" | "authorization";
+  timeoutMs: number;
+}
+
 export class HttpReshaper implements Reshaper {
   constructor(
-    private readonly cfg: {
-      base: string;
-      model: string;
-      kind: "anthropic" | "openai";
-      provider?: string;
-      authEnv?: string;
-      authHeader: "x-api-key" | "authorization";
-      timeoutMs: number;
-    },
+    private readonly cfg: HttpReshaperConfig,
+    private readonly credential: CredentialResolution,
     private readonly fetchFn: typeof fetch = fetch,
+    private readonly beforeFetch?: () => void,
   ) {}
 
   async reshape(req: ReshapeRequest): Promise<ReshapeResult> {
+    if (this.credential.state === "declared-missing") {
+      throw new ReshaperTransportError(
+        `reshaper credential ${this.credential.envName ?? "<unknown>"} is not configured`,
+        { kind: "local" },
+      );
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.cfg.timeoutMs);
     try {
       const headers: Record<string, string> = {
         "content-type": "application/json",
-        ...buildAuthHeaders(readCredential(this.cfg.authEnv, process.env, this.cfg.provider), this.cfg.authHeader),
+        ...buildAuthHeaders(this.credential.value, this.cfg.authHeader),
       };
       const userContent = buildUserContent(req);
 
@@ -208,34 +244,127 @@ export class HttpReshaper implements Reshaper {
             };
       if (this.cfg.kind === "anthropic") headers["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION;
 
-      // Transport-level failures THROW (ReshaperTransportError) rather than returning a
-      // refusal: a refusal is a model's judgement, and FailoverReshaper advances only on
-      // throws — reporting "connection refused" as `refuse` silently disabled failover.
+      // This hook is the sole CredentialWalk start/LRU boundary. Everything above is local
+      // preparation and a declared-missing credential returned before reaching it.
+      const bodyText = JSON.stringify(body);
+      this.beforeFetch?.();
       let res: Response;
+    try {
+      res = await this.fetchFn(url, {
+        method: "POST",
+        headers,
+        body: bodyText,
+        signal: controller.signal,
+      });
+    } catch (e) {
+      throw new ReshaperTransportError(
+        `reshaper unreachable: ${(e as Error).message}`,
+        { kind: controller.signal.aborted ? "timeout" : "provider-transport" },
+      );
+    }
+      if (!res.ok) throw new ReshaperTransportError(`reshaper HTTP ${res.status}`, { status: res.status });
+
+    let json: Record<string, unknown>;
+    try {
+      json = (await res.json()) as Record<string, unknown>;
+    } catch (e) {
+      throw new ReshaperTransportError(
+        `reshaper returned non-JSON: ${(e as Error).message}`,
+        { kind: controller.signal.aborted ? "timeout" : "protocol" },
+      );
+    }
       try {
-        res = await this.fetchFn(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
+        const text = this.cfg.kind === "openai" ? openaiText(json) : anthropicText(json);
+        const parsed = parseCorrectedInputsWire(text);
+        if (parsed.kind === "invalid") throw new Error(parsed.reason);
+        if (parsed.kind === "refuse") return { kind: "refuse", reason: parsed.reason };
+        return { kind: "message", message: reconstruct(req.rawAssistant, parsed.inputs) };
       } catch (e) {
-        throw new ReshaperTransportError(`reshaper unreachable: ${(e as Error).message}`);
+        throw new ReshaperTransportError(
+          `reshaper returned malformed response: ${(e as Error).message}`,
+          { kind: "protocol" },
+        );
       }
-      if (!res.ok) throw new ReshaperTransportError(`reshaper HTTP ${res.status}`);
-      let json: Record<string, unknown>;
-      try {
-        json = (await res.json()) as Record<string, unknown>;
-      } catch (e) {
-        throw new ReshaperTransportError(`reshaper returned non-JSON: ${(e as Error).message}`);
-      }
-      const text = this.cfg.kind === "openai" ? openaiText(json) : anthropicText(json);
-      const parsed = parseCorrectedInputs(text);
-      if (parsed.kind === "refuse") return { kind: "refuse", reason: parsed.reason };
-      return { kind: "message", message: reconstruct(req.rawAssistant, parsed.inputs) };
     } finally {
       clearTimeout(timer);
     }
+  }
+}
+
+/** Request-local, fleet-aware reshaper selection using the shared credential walk policy. */
+export class CredentialWalkReshaper implements Reshaper {
+  private readonly walk: CredentialWalk;
+  private readonly lru: CredentialLru;
+  /**
+   * A recognized reshaper response proves this credential can egress, but only `repair()` can
+   * decide whether the corrected message satisfies the caller's schema. Keep that attempt pending
+   * so a semantic retry reuses it; only a later transport outcome may advance the same walk.
+   */
+  private pinnedAttempt: ResolvedAttempt | undefined;
+
+  constructor(
+    attempts: readonly ResolvedAttempt[],
+    walkOptions: CredentialWalkOptions = {},
+    private readonly fetchFn: typeof fetch = fetch,
+  ) {
+    this.lru = walkOptions.lru ?? new CredentialLru();
+    this.walk = new CredentialWalk(attempts, { ...walkOptions, lru: this.lru });
+  }
+
+  async reshape(req: ReshapeRequest): Promise<ReshapeResult> {
+    let lastError: ReshaperTransportError | undefined;
+
+    for (let attempt = this.pinnedAttempt ?? this.walk.next(); attempt; attempt = this.walk.next()) {
+      const { target } = attempt;
+      if (target.model === undefined || attempt.credential.state === "declared-missing") {
+        this.walk.recordRejected(attempt);
+        continue;
+      }
+
+      const alreadyStarted = this.pinnedAttempt === attempt;
+
+      const reshaper = new HttpReshaper(
+        {
+          base: target.base,
+          model: target.model,
+          kind: target.kind,
+          authHeader: target.authHeader,
+          timeoutMs: target.timeoutMs,
+        },
+        attempt.credential,
+        this.fetchFn,
+        () => {
+          if (alreadyStarted) this.lru.touch(attempt.credentialId);
+          else this.walk.recordStarted(attempt);
+        },
+      );
+
+      try {
+        // A message OR refusal is terminal. Shopping a refusal is never allowed.
+        const result = await reshaper.reshape(req);
+        // Do not close the walk yet: a `message` is only wire-valid here. If `repair()` rejects its
+        // corrected arguments and calls us again, the same credential remains authoritative.
+        this.pinnedAttempt = attempt;
+        return result;
+      } catch (e) {
+        const error = e instanceof ReshaperTransportError
+          ? e
+          : new ReshaperTransportError(
+            `reshaper returned malformed response: ${(e as Error).message}`,
+            { kind: "protocol" },
+          );
+        this.walk.record(attempt, error.outcome);
+        this.pinnedAttempt = undefined;
+        lastError = error;
+      }
+    }
+
+    throw new ReshaperTransportError(
+      lastError
+        ? `all reshaper candidates failed to respond (last: ${lastError.message})`
+        : "all reshaper candidates failed to respond (no usable credential)",
+      lastError?.outcome ?? { kind: "local" },
+    );
   }
 }
 

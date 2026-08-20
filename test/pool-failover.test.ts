@@ -4,7 +4,13 @@ import { AddressInfo } from "node:net";
 import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
-import { SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER } from "../src/backend.js";
+import {
+  CREDENTIAL_ATTEMPTS_HEADER,
+  CREDENTIAL_HEADER,
+  SERVED_BY_HEADER,
+  POOL_ATTEMPTS_HEADER,
+  UNKNOWN_REFUSAL_HEADER,
+} from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
 import { factsFor, recordFact, resetFacts, isCostBlocked, cooldownUntil } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
@@ -316,33 +322,132 @@ describe("OpenAI front — failover across pool candidates", () => {
   });
 });
 
-describe("Anthropic front — local failures do not walk the provider pool", () => {
-  it("does not create another target attempt for a deterministic relay-local failure", async () => {
-    class CountingBreaker extends CircuitBreaker {
-      begins = 0;
-      override beginAttempt(target: ProviderTargetIdentity) {
-        this.begins += 1;
-        return super.beginAttempt(target);
-      }
-    }
-    const breaker = new CountingBreaker();
-    const cfg = poolCfg(["https://first.invalid", "https://second.invalid"]);
-    const proxy = createProxy(cfg, { catalog: new ModelCatalog({ cachePath: null }), breaker });
-    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
-    track(proxy);
+describe("relay-local failures do not start credential attempts or perturb ordering", () => {
+  const fleetEnv = {
+    p1: ["POOL_EGRESS_P1_FIRST", "POOL_EGRESS_P1_SECOND"],
+    p2: ["POOL_EGRESS_P2_FIRST", "POOL_EGRESS_P2_SECOND"],
+  } as const;
 
-    const response = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+  class CountingBreaker extends CircuitBreaker {
+    begins = 0;
+    override beginAttempt(target: ProviderTargetIdentity) {
+      this.begins += 1;
+      return super.beginAttempt(target);
+    }
+  }
+
+  beforeEach(() => {
+    process.env.POOL_EGRESS_P1_FIRST = "p1-first-secret";
+    process.env.POOL_EGRESS_P1_SECOND = "p1-second-secret";
+    process.env.POOL_EGRESS_P2_FIRST = "p2-first-secret";
+    process.env.POOL_EGRESS_P2_SECOND = "p2-second-secret";
+  });
+
+  afterEach(() => {
+    for (const names of Object.values(fleetEnv)) {
+      for (const name of names) delete process.env[name];
+    }
+  });
+
+  async function credentialBackend(): Promise<{ server: Server; authorizations: string[] }> {
+    const authorizations: string[] = [];
+    return new Promise((resolve) => {
+      const server = createServer((req, res) => {
+        authorizations.push(String(req.headers.authorization ?? ""));
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(OK_BODY);
+        });
+      });
+      server.listen(0, "127.0.0.1", () => resolve({ server: track(server), authorizations }));
+    });
+  }
+
+  function fleetConfig(firstBase: string, secondBase: string): Config {
+    const cfg = poolCfg([firstBase, secondBase]);
+    for (const provider of ["p1", "p2"] as const) {
+      cfg.providers[provider]!.credentialMode = "contained";
+      cfg.providers[provider]!.credentials = [
+        { label: "first", authEnv: fleetEnv[provider][0] },
+        { label: "second", authEnv: fleetEnv[provider][1] },
+      ];
+    }
+    return cfg;
+  }
+
+  const cases = [
+    {
+      name: "Messages document preparation",
+      path: "/v1/messages",
+      invalid: {
+        model: "pool/coding",
+        messages: [{
+          role: "user",
+          content: [{ type: "document", source: { type: "url", url: "https://example.invalid/a.pdf" } }],
+        }],
+      },
+      valid: {
+        model: "pool/coding",
+        max_tokens: 20,
+        messages: [{ role: "user", content: "hi" }],
+      },
+    },
+    {
+      name: "Responses request translation",
+      path: "/v1/responses",
+      invalid: { model: "pool/coding", input: [null] },
+      valid: { model: "pool/coding", input: "hi" },
+    },
+  ] as const;
+
+  it.each(cases)("$name rejects before egress and leaves the first credential first", async (scenario) => {
+    const first = await credentialBackend();
+    const second = await credentialBackend();
+    const breaker = new CountingBreaker();
+    const modelCalls: Array<{ provider: string; model: string }> = [];
+    const proxy = await startProxy(
+      fleetConfig(
+        `http://127.0.0.1:${port(first.server)}`,
+        `http://127.0.0.1:${port(second.server)}`,
+      ),
+      {
+        breaker,
+        modelCallRecorder(provider, model) { modelCalls.push({ provider, model }); },
+      },
+    );
+
+    const invalid = await fetch(`http://127.0.0.1:${port(proxy)}${scenario.path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "pool/coding",
-        messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://example.invalid/a.pdf" } }] }],
-      }),
+      body: JSON.stringify(scenario.invalid),
     });
+    await invalid.text();
 
-    expect(response.status).toBe(400);
-    expect(breaker.begins).toBe(1);
+    expect(invalid.status).toBe(400);
+    expect(first.authorizations).toEqual([]);
+    expect(second.authorizations).toEqual([]);
+    expect(breaker.begins).toBe(0);
     expect(breaker.getAllStates().size).toBe(0);
+    expect(modelCalls).toEqual([]);
+    expect(invalid.headers.get(CREDENTIAL_HEADER)).toBeNull();
+    expect(invalid.headers.get(CREDENTIAL_ATTEMPTS_HEADER)).toBeNull();
+    for (const provider of ["p1", "p2"] as const) {
+      expect(breaker.inFlightCredential(makeCredentialId(provider, "first"))).toBe(0);
+      expect(breaker.inFlightCredential(makeCredentialId(provider, "second"))).toBe(0);
+    }
+
+    const valid = await fetch(`http://127.0.0.1:${port(proxy)}${scenario.path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(scenario.valid),
+    });
+    await valid.text();
+
+    expect(valid.status).toBe(200);
+    expect(valid.headers.get(CREDENTIAL_HEADER)).toBe(makeCredentialId("p1", "first"));
+    expect(first.authorizations).toEqual(["Bearer p1-first-secret"]);
+    expect(second.authorizations).toEqual([]);
   });
 });
 

@@ -17,17 +17,22 @@ import {
   type RequestAttemptStatus,
   type RequestLog,
 } from "./log.js";
-import { buildAuthHeaders } from "./authEnv.js";
-import { makeCredentialId } from "./credential-id.js";
+import { buildAuthHeaders, resolveCredential } from "./authEnv.js";
 import { resolveAttempt, type ResolvedAttempt } from "./resolved-attempt.js";
 import { resolveAttemptForSlot } from "./credential-fleet.js";
-import { CredentialLru, rankCredentialAttempts } from "./credential-select.js";
+import {
+  CredentialLru,
+  CredentialWalk,
+  groupCredentialAttempts,
+  rankCredentialAttempts,
+  type CredentialWalkOutcome,
+} from "./credential-select.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
-import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { CredentialWalkReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -250,55 +255,66 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
     }
   }
 
-  // Reshaper selection is per-resolved-target: an explicit global reshaper (or an
-  // injected one) wins for every request; otherwise an openai target reshapes on
-  // itself (same base/model/key), built once per (provider, model) and cached.
-  // A pool-backed reshaper (cfg.reshaperCandidates) becomes a FailoverReshaper so one de-listed
-  // model cannot disable repair; a single pinned reshaper keeps the original single-client path.
-  const explicitReshaper: Reshaper | undefined =
-    deps.reshaper ??
-    (cfg.reshaperCandidates && cfg.reshaperCandidates.length > 1
-      ? new FailoverReshaper(cfg.reshaperCandidates.map((c) => new HttpReshaper(c)))
-      : cfg.reshaper
-        ? new HttpReshaper(cfg.reshaper)
-        : undefined);
-  const reshaperCache = new Map<string, Reshaper>();
-  let dynamicPoolCache: { signature: string; reshaper: Reshaper } | null = null;
-  const unavailableDynamicPool: Reshaper = {
-    async reshape() {
-      throw new Error(`dynamic reshaper pool "${cfg.reshaperPool?.name ?? "unknown"}" has no materialized OpenAI target`);
-    },
+  // Secret-bearing reshapers are request-local. Provider-backed forms are rehydrated from the
+  // provider config at the repair decision so current fleet slots and current env snapshots bind
+  // the egress. The implicit form instead keeps the exact credential that served the bad answer.
+  const providerBackedReshaper = (
+    targets: readonly ResolvedTarget[],
+    now: number,
+  ): Reshaper => new CredentialWalkReshaper(expandCredentialAttempts(targets), {
+    lru: credentialLru,
+    walkBudgetMs: cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS,
+    selectionNow: now,
+    evidenceFor: (attempt) => credentialEvidence(attempt, cfg, breaker, now),
+  });
+
+  const rehydrateStaticReshaperTargets = (): ResolvedTarget[] => {
+    const specs = cfg.reshaperCandidates ?? (cfg.reshaper?.provider ? [cfg.reshaper] : []);
+    return specs.flatMap((spec) => {
+      if (!spec.provider) return [];
+      return resolveTargets(`${spec.provider}/${spec.model}`, cfg)
+        .filter((target) => target.kind === "openai" && target.model === spec.model)
+        .map((target) => Object.freeze({ ...target, timeoutMs: spec.timeoutMs }));
+    });
   };
-  const resolveReshaper = (target: ResolvedTarget): Reshaper | undefined => {
-    if (explicitReshaper) return explicitReshaper;
+
+  const resolveReshaper = (servedAttempt: ResolvedAttempt): Reshaper | undefined => {
+    if (deps.reshaper) return deps.reshaper;
+
+    if (cfg.reshaperCandidates || cfg.reshaper?.provider) {
+      const now = Date.now();
+      return providerBackedReshaper(rehydrateStaticReshaperTargets(), now);
+    }
+
     if (cfg.reshaperPool) {
-      const candidates = resolveTargets(`pool/${cfg.reshaperPool.name}`, cfg)
-        .filter((candidate) => candidate.kind === "openai" && candidate.model);
-      if (candidates.length === 0) return unavailableDynamicPool;
-      const signature = candidates.map((candidate) => `${candidate.provider}/${candidate.model}`).join("\n");
-      if (dynamicPoolCache?.signature === signature) return dynamicPoolCache.reshaper;
-      const delegates = candidates.map((candidate) => new HttpReshaper({
-        base: candidate.base,
-        model: candidate.model!,
-        kind: "openai",
-        provider: candidate.provider,
-        authHeader: candidate.authHeader,
-        timeoutMs: cfg.reshaperPool?.timeoutMs ?? Math.min(candidate.timeoutMs, 60_000),
-        ...(candidate.authEnv ? { authEnv: candidate.authEnv } : {}),
-      }));
-      const reshaper = delegates.length > 1 ? new FailoverReshaper(delegates) : delegates[0]!;
-      dynamicPoolCache = { signature, reshaper };
-      return reshaper;
+      const targets = resolveTargets(`pool/${cfg.reshaperPool.name}`, cfg)
+        .filter((target) => target.kind === "openai" && target.model)
+        .map((target) => Object.freeze({
+          ...target,
+          timeoutMs: cfg.reshaperPool?.timeoutMs ?? Math.min(target.timeoutMs, 60_000),
+        }));
+      if (targets.length === 0) {
+        return {
+          async reshape() {
+            throw new Error(`dynamic reshaper pool "${cfg.reshaperPool?.name ?? "unknown"}" has no materialized OpenAI target`);
+          },
+        };
+      }
+      const now = Date.now();
+      return providerBackedReshaper(targets, now);
     }
-    const spec = reshaperForTarget(target);
-    if (!spec) return undefined;
-    const key = `${target.provider}::${target.model ?? ""}`;
-    let r = reshaperCache.get(key);
-    if (!r) {
-      r = new HttpReshaper(spec);
-      reshaperCache.set(key, r);
+
+    if (cfg.reshaper) {
+      // A legacy standalone endpoint owns only its declared authEnv. It has no provider identity,
+      // so never infer one from a coincidentally matching base/model and never attach a fleet.
+      return new HttpReshaper(
+        cfg.reshaper,
+        resolveCredential(cfg.reshaper.authEnv),
+      );
     }
-    return r;
+
+    const spec = reshaperForTarget(servedAttempt.target);
+    return spec ? new HttpReshaper(spec, servedAttempt.credential) : undefined;
   };
 
   const server = createServer((req, res) => {
@@ -356,7 +372,7 @@ interface Handlers {
   validator: ToolUseValidator;
   logger: MetadataLogger;
   isDestructive: (name: string) => boolean;
-  resolveReshaper: (target: ResolvedTarget) => Reshaper | undefined;
+  resolveReshaper: (attempt: ResolvedAttempt) => Reshaper | undefined;
   catalog: ModelCatalog;
   pingLoop?: PingLoop;
   breaker: CircuitBreaker;
@@ -471,7 +487,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         // spent allowance is not a price, and must not be laundered into one here either.)
         if (assessment?.costClass === "free" && !isCostBlocked(
           t.provider,
-          makeCredentialId(t.provider),
+          null,
           t.model,
         )) kept.push(t);
         else if (!blocked) {
@@ -536,7 +552,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const rankedAttempts = rankCredentialAttempts(attempts, h.credentialLru, {
     evidenceFor: (attempt) => credentialEvidence(attempt, cfg, h.breaker, routingNow),
   });
-  let healthyAttempts = interleaveCredentialRounds(orderByUsability(rankedAttempts, h.breaker, routingNow));
+  let walkAttempts = orderDeploymentGroupsByUsability(rankedAttempts, h.breaker, routingNow);
   let sticky: StickyRequestContext | null = null;
   if ((isMessages || openAiFrontProtocol) && h.stickySessions) {
     const key = deriveSessionKey(req.headers, reqJson);
@@ -549,14 +565,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       };
       if (pinnedSpec) {
         const applied = applyStickyOrdering(
-          healthyAttempts,
-          attempts,
+          walkAttempts,
           pinnedSpec,
           h.breaker,
           degradedSpecs,
           routingNow,
         );
-        healthyAttempts = applied.targets;
+        walkAttempts = applied.targets;
         sticky.provenance = `${pinnedSpec} (${applied.status})`;
       }
     }
@@ -574,7 +589,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       const remainingAttempts: ResolvedAttempt[] = [];
       let firstExceeded: { target: ResolvedTarget; limit: number } | null = null;
 
-      for (const candidate of healthyAttempts) {
+      for (const group of groupCredentialAttempts(walkAttempts)) {
+        const candidate = group.attempts[0]!;
         const t = candidate.target;
         if (t.model) {
           const limits = h.catalog.cachedLimits(t.provider, t.model);
@@ -585,7 +601,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
             continue;
           }
         }
-        remainingAttempts.push(candidate);
+        remainingAttempts.push(...group.attempts);
       }
 
       if (remainingAttempts.length === 0 && firstExceeded) {
@@ -601,18 +617,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       }
 
       if (remainingAttempts.length > 0) {
-        healthyAttempts = remainingAttempts;
+        walkAttempts = remainingAttempts;
       }
     }
   }
 
-  let target = healthyAttempts[0]!.target;
+  let target = walkAttempts[0]!.target;
+  const credentialWalk = new CredentialWalk(walkAttempts, {
+    lru: h.credentialLru,
+    walkBudgetMs: cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS,
+    selectionNow: routingNow,
+    evidenceFor: (attempt) => credentialEvidence(attempt, cfg, h.breaker, routingNow),
+  });
+  const credentialTrace = new CredentialAttemptTrace(cfg);
 
   // OpenAI-compatible FRONT: route both Chat Completions and Responses requests through the
   // resolved target. The adapter supports OpenAI-compatible and Anthropic backends, so Codex and
   // OpenAI-native IDEs can use the same relay that Claude clients use in the other direction.
   if (openAiFrontProtocol) {
-    await openAiFrontPath(res, healthyAttempts, {
+    await openAiFrontPath(res, credentialWalk, credentialTrace, {
       reqJson,
       wantsStream,
       protocol: openAiFrontProtocol,
@@ -649,36 +672,40 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     }
   }
 
-  // Candidate execution loop with failover across healthyAttempts.
-  // All-429 exhaustion Retry-After policy: `Pool429Tracker`.
+  // Candidate execution loop: CredentialWalk owns breadth-first slot expansion,
+  // request-local suppression, and the wall-clock start budget.
   const attemptTrace = new RequestAttemptTrace();
   const pool429 = new Pool429Tracker();
   const tried: string[] = [];
-  const credentialStatuses: number[] = [];
-  const walkBudgetMs = cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
-  const walkStarted = Date.now();
-  for (let i = 0; i < healthyAttempts.length; i++) {
-    if (res.destroyed) break;
-    const resolvedAttempt = healthyAttempts[i]!;
+
+  while (!res.destroyed) {
+    const resolvedAttempt = credentialWalk.next();
+    if (!resolvedAttempt) break;
     target = resolvedAttempt.target;
-    tried.push(specOfTarget(target));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
     const onResClose = () => {
-      if (!res.writableEnded) {
-        controller.abort();
-      }
+      if (!res.writableEnded) controller.abort();
     };
     res.on("close", onResClose);
     let attempt: HealthAttempt | undefined;
+    const usage = createUsageAccumulator();
+    let egressCallbackCalled = false;
+    const onEgress = () => {
+      egressCallbackCalled = true;
+      attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace, usage) ?? undefined;
+      if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
+      recordCredentialStarted(credentialWalk, credentialTrace, resolvedAttempt);
+      tried.push(specOfTarget(target));
+    };
+    let credentialRecorded = false;
 
     try {
       let forwardHeaders: Record<string, string>;
       try {
-        // Credential/header validation precedes beginAttempt: it performs no provider
-        // egress and therefore creates no terminal health obligation on rejection.
         forwardHeaders = buildForwardHeaders(req.headers, resolvedAttempt);
       } catch (e) {
+        credentialWalk.recordRejected(resolvedAttempt);
         if (e instanceof CredentialConfigError) {
           failClosed(res, 502, `llm-relay configuration: ${e.message}`);
           h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
@@ -686,16 +713,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         }
         throw e;
       }
-
-      attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace) ?? undefined;
-      if (!attempt) {
-        failClosed(res, 502, "llm-relay: could not begin provider attempt");
-        h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
-        return;
-      }
-
-      // This is the real egress boundary: rejected/missing credentials did not consume LRU.
-      h.credentialLru.touch(resolvedAttempt.credentialId);
 
       let backendRes: Response;
       try {
@@ -706,85 +723,144 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           reqJson,
           anthropicHeaders: forwardHeaders,
           wantsStream,
-          usage: attempt.usage,
+          usage,
           signal: controller.signal,
+          onEgress,
         });
+        if (!attempt) {
+          credentialWalk.recordRejected(resolvedAttempt);
+          if (errorOrigin(backendRes) === "local") {
+            await forwardLocalResponse(res, backendRes);
+            h.logger.write(baseLog(started, path, hadTools, false, backendRes.status, "skipped", null, attemptTrace.snapshot()));
+          } else {
+            await backendRes.body?.cancel().catch(() => {});
+            failClosed(res, 502, "llm-relay: backend returned before provider egress");
+            h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
+          }
+          return;
+        }
       } catch (e) {
-        clearTimeout(timer);
-        res.off("close", onResClose);
+        if (!attempt) {
+          if (credentialWalk.pending === resolvedAttempt) {
+            credentialWalk.recordRejected(resolvedAttempt);
+          }
+          if (res.destroyed) return;
+          const status = controller.signal.aborted ? 504 : 502;
+          failClosed(res, status, egressCallbackCalled
+            ? "llm-relay: could not begin provider attempt"
+            : "llm-relay: backend preparation failed");
+          h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", null, attemptTrace.snapshot()));
+          return;
+        }
         const aborted = controller.signal.aborted;
         const status = aborted ? 504 : 502;
         if (res.destroyed) {
           completeAttemptCancelled(h, attempt, "client disconnected");
-        } else {
-          completeAttemptFailure(h, attempt, {
-            failure: "transport",
-            provenance: aborted ? "deadline" : "upstream",
-            status,
-          });
+          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+          credentialRecorded = true;
+          return;
         }
 
-        // A genuine transport throw (not this proxy's own deadline) condemns the provider's host
-        // for the rest of THIS walk only — prune before the "is there a next candidate" check so
-        // a walk whose only remaining members share the dead host ends honestly here.
-        if (!aborted) dropRemainingSameProvider(healthyAttempts, i, target.provider);
-        else dropRemainingSameDeployment(healthyAttempts, i, target);
-
-        // Failover if additional candidates exist and the walk budget allows another start
-        if (!res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
+        completeAttemptFailure(h, attempt, {
+          failure: "transport",
+          provenance: aborted ? "deadline" : "upstream",
+          status,
+        });
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          aborted ? { kind: "timeout" } : { kind: "provider-transport" },
+        );
+        credentialRecorded = true;
+        const next = credentialWalk.next();
+        if (next && !res.writableEnded && !res.destroyed) {
+          pool429.recordFailover(status, null);
           continue;
         }
 
+        pool429.recordFinal(status);
+        const headers: Record<string, string> = {
+          ...(stickyProvenanceHeaders(sticky) ?? {}),
+          ...credentialTrace.headers(),
+        };
+        const summary = pool429.summary();
+        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
         failClosed(
           res,
           status,
           aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
-          stickyProvenanceHeaders(sticky),
+          Object.keys(headers).length > 0 ? headers : undefined,
         );
         h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot()));
         return;
       }
 
       const reportedModelSource = backendRes;
-      credentialStatuses.push(backendRes.status);
-      // One shared policy with the OpenAI front — see `classifyStatus` / `shouldTryNext`.
-      //
-      // A 401/403 now fails over WHEN ANOTHER CANDIDATE EXISTS. It did not before, so a pool
-      // whose top-ranked member had a revoked key returned that 401 to the client with the
-      // other 13 members untouched — and half of a real 14-member pool answers 401. The
-      // credential fault is still kept out of the breaker's health data (it is recorded on
-      // its own axis, and demotes rather than trips), so the operator sees the 401 in
-      // `/candidates` instead of it hiding behind a "target unhealthy" skip. With a single
-      // candidate nothing changes: there is nowhere to fail over to, so the real error is
-      // returned exactly as before.
       const cls = classifyStatus(backendRes.status);
       const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
       observeAttemptHeaders(h, attempt, backendRes.status, retryAfterMs, backendRes.headers);
-      observeContextLimit(backendRes, target);
+
+      const inspected = await inspectCandidateResponse(backendRes, resolvedAttempt, retryAfterMs);
+      if (inspected.kind === "post-header-body-failure") {
+        const disposition = completePostHeaderBodyFailure(
+          h, res, controller.signal, attempt, credentialWalk, credentialTrace, resolvedAttempt,
+        );
+        credentialRecorded = true;
+        if (disposition === "cancelled") return;
+        const status = disposition === "timeout" ? 504 : 502;
+        const next = credentialWalk.next();
+        if (next && !res.writableEnded && !res.destroyed) {
+          pool429.recordFailover(status, null);
+          continue;
+        }
+        pool429.recordFinal(status);
+        const headers: Record<string, string> = {
+          [SERVED_BY_HEADER]: tried.join(", "),
+          ...(stickyProvenanceHeaders(sticky) ?? {}),
+          ...credentialTrace.headers(),
+        };
+        const summary = pool429.summary();
+        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+        failClosed(
+          res,
+          status,
+          disposition === "timeout"
+            ? "backend timed out while reading response body"
+            : "llm-relay: provider response body failed after headers",
+          headers,
+        );
+        h.logger.write(baseLog(
+          started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot(),
+        ));
+        return;
+      }
+      backendRes = inspected.response;
+      if (inspected.eligibility.unknown) pool429.noteUnknownRefusal();
 
       const localFailure = errorOrigin(backendRes) === "local";
       const tryNext = !localFailure && shouldTryNext(cls);
-      // An HTTP response proves the provider is reachable.  Only credential-attributable
-      // statuses may unlock a sibling slot; 5xx/shape failures close this deployment.
-      if (cls === "retriable" && backendRes.status !== 402 && backendRes.status !== 429) {
-        dropRemainingSameDeployment(healthyAttempts, i, target);
-      }
-      if (tryNext && !res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
-        clearTimeout(timer);
-        res.off("close", onResClose);
-        const eligibility = await discardCandidate(backendRes, resolvedAttempt, backendRes.status, retryAfterMs);
-        if (eligibility.unknown) pool429.noteUnknownRefusal();
-        if (eligibility.scope && (eligibility.scope.kind === "deployment" || eligibility.scope.kind === "provider" || eligibility.scope.kind === "model" || (eligibility.scope.kind === "group" && eligibility.scope.credentialId === undefined))) {
-          dropRemainingSameDeployment(healthyAttempts, i, target);
+      if (backendRes.status >= 400) {
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          walkOutcomeForResponse(backendRes.status, localFailure, inspected.eligibility.scope),
+        );
+        credentialRecorded = true;
+
+        const next = tryNext && !res.destroyed ? credentialWalk.next() : undefined;
+        if (next) {
+          await backendRes.body?.cancel().catch(() => {});
+          pool429.recordFailover(backendRes.status, retryAfterMs);
+          completeAttemptFailure(h, attempt, {
+            failure: "http",
+            provenance: localFailure ? "relay-mapper-defect" : "upstream",
+            status: backendRes.status,
+            retryAfterMs,
+          });
+          continue;
         }
-        pool429.recordFailover(backendRes.status, retryAfterMs);
-        completeAttemptFailure(h, attempt, {
-          failure: "http",
-          provenance: localFailure ? "relay-mapper-defect" : "upstream",
-          status: backendRes.status,
-          retryAfterMs,
-        });
-        continue; // Failover to next target
       }
 
       const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
@@ -792,34 +868,50 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         const probe = backendRes.body
           ? await probeStreamForCommit(backendRes.body, "anthropic-messages", {
               isCancelled: () => res.destroyed,
-              // OpenAI→Anthropic translation owns malformed final-wire syntax. Semantic error
-              // events still carry upstream provenance inside the probe and remain retryable.
               malformedProvenance: target.kind === "openai" ? "local" : "upstream",
             })
           : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
 
         if (probe.kind === "cancelled") {
           completeAttemptCancelled(h, attempt, "client disconnected before stream commit");
+          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+          credentialRecorded = true;
           return;
-        }
-        if (probe.kind === "dead") {
-          completeAttemptFailure(h, attempt, {
-            failure: "protocol",
-            provenance: probe.provenance === "local" ? "relay-mapper-defect" : "invalid-upstream-envelope",
-            status: 502,
-          });
-          const canTryNext = probe.provenance === "upstream" &&
-            !res.destroyed &&
-            i < healthyAttempts.length - 1 &&
-            walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1);
-          if (canTryNext) {
+      }
+      if (probe.kind === "dead") {
+        const deadline = controller.signal.aborted;
+        completeAttemptFailure(h, attempt, deadline
+          ? { failure: "transport", provenance: "deadline", status: 504 }
+          : {
+              failure: "protocol",
+              provenance: probe.provenance === "local"
+                ? "relay-mapper-defect"
+                : "invalid-upstream-envelope",
+              status: 502,
+            });
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          deadline
+            ? { kind: "timeout" }
+            : probe.provenance === "local" ? { kind: "local" } : { kind: "protocol" },
+        );
+          credentialRecorded = true;
+          const next = probe.provenance === "upstream" && !res.destroyed
+            ? credentialWalk.next()
+            : undefined;
+          if (next) {
             pool429.recordFailover(502, null);
             continue;
           }
 
           pool429.recordFinal(502);
-          const headers: Record<string, string> = { [SERVED_BY_HEADER]: tried.join(", ") };
-          Object.assign(headers, stickyProvenanceHeaders(sticky));
+          const headers: Record<string, string> = {
+            [SERVED_BY_HEADER]: tried.join(", "),
+            ...(stickyProvenanceHeaders(sticky) ?? {}),
+            ...credentialTrace.headers(),
+          };
           const summary = pool429.summary();
           if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
           failClosed(res, 502, `llm-relay: ${probe.reason}`, headers);
@@ -837,19 +929,23 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           return;
         }
 
-        backendRes = new Response(probe.body, { status: backendRes.status, headers: backendRes.headers });
+        backendRes = new Response(probe.body, {
+          status: backendRes.status,
+          headers: backendRes.headers,
+        });
       }
-      // Phase switch (adoption review §1.2): this stream IS the response now — failover is over,
-      // so the total deadline has done its job and would only kill a healthy long generation.
-      // From here, silence (not duration) is the failure signal.
+
       const stallMs = target.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
       if (streamed && backendRes.status < 400 && stallMs > 0) {
         clearTimeout(timer);
         backendRes = withStallWatchdog(backendRes, controller, stallMs);
       }
+
       const willValidate = isMessages && hadTools && backendRes.status < 400;
-      const reshaper = h.resolveReshaper(target);
-      const doRepair = cfg.mode === "repair" && willValidate && reshaper !== undefined;
+      const reshaper = cfg.mode === "repair" && willValidate
+        ? h.resolveReshaper(resolvedAttempt)
+        : undefined;
+      const doRepair = reshaper !== undefined;
       const streamCommitted = streamed && backendRes.status < 400;
       const responseCtx: Ctx = {
         tools,
@@ -867,32 +963,52 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         poolUnknownRefusals: pool429.unknownCount(),
         degraded: degradedLabel(addressedPool, degradedSpecs, target),
         paid: paidLabel(cfg, h, target),
-        credentialHeaders: credentialHeaderValues(cfg, resolvedAttempt, credentialStatuses.length, credentialStatuses),
+        credentialHeaders: backendRes.status < 400
+          ? credentialTrace.headers(resolvedAttempt)
+          : credentialTrace.headers(),
         sticky,
       };
 
       if (streamCommitted) {
-        // Semantic readiness, not an HTTP 200 or metadata preamble, is the commit point. Only now
-        // does the winner count as served and only its headers become client-visible.
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          { kind: "success", status: backendRes.status },
+        );
+        credentialRecorded = true;
+        responseCtx.credentialHeaders = credentialTrace.headers();
         pool429.recordFinal(backendRes.status);
         responseCtx.poolSummary = pool429.summary();
         res.writeHead(backendRes.status, responseHeadersForTarget(backendRes, responseCtx));
       }
 
       if (doRepair) {
-        const repairResult = await repairPath(res, backendRes, timer, { ...responseCtx, wantsStream, reshaper: reshaper!, maxAttempts: cfg.repair.maxAttempts, pool429 }, h);
+        const repairResult = await repairPath(
+          res,
+          backendRes,
+          timer,
+          {
+            ...responseCtx,
+            wantsStream,
+            reshaper: reshaper!,
+            maxAttempts: cfg.repair.maxAttempts,
+            pool429,
+          },
+          h,
+        );
         if (repairResult !== null) {
-          // A schema-invalid 200 that the reshaper exhausted is a dead turn, not a transport
-          // failure. Resume THIS request's candidate walk without teaching the breaker a new
-          // policy or reselecting a duplicate entry for the same deployment.
+          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "protocol" });
+          credentialRecorded = true;
           pool429.recordDeadTurn();
-          dropRemainingSameDeployment(healthyAttempts, i, target);
-          if (!res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
-            continue;
-          }
+          const next = !res.destroyed ? credentialWalk.next() : undefined;
+          if (next) continue;
 
           const poolSummary = pool429.summary();
-          const headers = stickyProvenanceHeaders(sticky) ?? {};
+          const headers: Record<string, string> = {
+            ...(stickyProvenanceHeaders(sticky) ?? {}),
+            ...credentialTrace.headers(),
+          };
           if (poolSummary) headers[POOL_ATTEMPTS_HEADER] = poolSummary;
           failClosed(
             res,
@@ -919,15 +1035,47 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           });
           return;
         }
-      } else {
-        if (!streamCommitted) {
-          pool429.recordFinal(backendRes.status);
-          responseCtx.poolSummary = pool429.summary();
+
+        if (!credentialRecorded) {
+          const outcome: CredentialWalkOutcome = attempt.terminal === "succeeded"
+            ? { kind: "success", status: backendRes.status }
+            : attempt.terminal === "cancelled" || res.destroyed
+              ? { kind: "cancelled" }
+              : { kind: "local" };
+          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, outcome);
+          credentialRecorded = true;
         }
-        await transparentPath(res, backendRes, timer, { ...responseCtx, willValidate }, h);
+        return;
       }
+
+      if (!streamCommitted) {
+        if (backendRes.status < 400) {
+          recordCredentialOutcome(
+            credentialWalk,
+            credentialTrace,
+            resolvedAttempt,
+            { kind: "success", status: backendRes.status },
+          );
+          credentialRecorded = true;
+          responseCtx.credentialHeaders = credentialTrace.headers();
+        }
+        pool429.recordFinal(backendRes.status);
+        responseCtx.poolSummary = pool429.summary();
+      }
+      await transparentPath(res, backendRes, timer, { ...responseCtx, willValidate }, h);
       return;
     } finally {
+      if (!credentialRecorded && attempt) {
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          res.destroyed ? { kind: "cancelled" } : { kind: "local" },
+        );
+        credentialRecorded = true;
+      } else if (!credentialRecorded && credentialWalk.pending === resolvedAttempt) {
+        credentialWalk.recordRejected(resolvedAttempt);
+      }
       if (attempt && !attempt.completed) {
         if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
         else {
@@ -1057,41 +1205,126 @@ function credentialEvidence(
   };
 }
 
-/** Breadth-first slots: deployment order remains authoritative inside every credential round. */
-function interleaveCredentialRounds(attempts: readonly ResolvedAttempt[]): ResolvedAttempt[] {
-  const groups = new Map<string, ResolvedAttempt[]>();
-  for (const attempt of attempts) {
-    const { target } = attempt;
-    const key = `${target.provider}\u0000${target.base}\u0000${target.model ?? ""}`;
-    const group = groups.get(key);
-    if (group) group.push(attempt); else groups.set(key, [attempt]);
+/**
+ * Keep every credential row of a deployment together while ordering deployments by their
+ * best-ranked row. CredentialWalk performs the breadth-first interleaving when it offers rows.
+ */
+function orderDeploymentGroupsByUsability(
+  attempts: readonly ResolvedAttempt[],
+  breaker: CircuitBreaker,
+  now: number,
+): ResolvedAttempt[] {
+  type Group = ReturnType<typeof groupCredentialAttempts>[number];
+  const live: Group[] = [];
+  const faulted: Group[] = [];
+  const cooling: Group[] = [];
+  for (const group of groupCredentialAttempts(attempts)) {
+    const usability = targetUsability(group.attempts[0]!, breaker, now);
+    if (usability === "cooling") cooling.push(group);
+    else if (usability === "credential-fault") faulted.push(group);
+    else live.push(group);
   }
-  const grouped = [...groups.values()];
-  const rounds = Math.max(0, ...grouped.map((group) => group.length));
-  const result: ResolvedAttempt[] = [];
-  for (let round = 0; round < rounds; round++) for (const group of grouped) {
-    const attempt = group[round]; if (attempt) result.push(attempt);
-  }
-  return result;
+  return [...live, ...faulted, ...cooling].flatMap((group) => group.attempts);
 }
 
-function credentialHeaderValues(
-  cfg: Config,
-  attempt: ResolvedAttempt,
-  started: number,
-  statuses: readonly number[],
-): Record<string, string> {
-  const slots = cfg.providers[attempt.target.provider]?.credentials;
-  const enabled = slots === undefined ? 1 : slots.filter((slot) => slot.enabled !== false).length;
-  if (enabled < 2) return {};
-  const headers: Record<string, string> = { [CREDENTIAL_HEADER]: attempt.credentialId };
-  if (started >= 2) {
-    const tallies = new Map<number, number>();
-    for (const status of statuses) tallies.set(status, (tallies.get(status) ?? 0) + 1);
-    const summary = [...tallies.entries()].map(([status, count]) => `${count}x${status}`).join(", ");
-    headers[CREDENTIAL_ATTEMPTS_HEADER] = `${started} tried, 1 served${summary ? `: ${summary}` : ""}`;
+type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
+
+/** Metadata-only trace: credential values and storage locations never enter it. */
+class CredentialAttemptTrace {
+  private readonly entries: Array<{
+    provider: string;
+    deployment: string;
+    credentialId: ResolvedAttempt["credentialId"];
+    multiSlot: boolean;
+    outcome?: CredentialWalkOutcome;
+  }> = [];
+
+  constructor(private readonly cfg: Config) {}
+
+  recordStarted(attempt: ResolvedAttempt): void {
+    const configured = this.cfg.providers[attempt.target.provider]?.credentials;
+    const multiSlot = configured !== undefined && configured.filter((slot) => slot.enabled !== false).length >= 2;
+    this.entries.push({
+      provider: attempt.target.provider,
+      deployment: specOfTarget(attempt.target),
+      credentialId: attempt.credentialId,
+      multiSlot,
+    });
   }
-  return headers;
+
+  record(attempt: ResolvedAttempt, outcome: CredentialWalkOutcome): void {
+    const pending = [...this.entries].reverse().find((entry) => entry.outcome === undefined);
+    if (
+      !pending ||
+      pending.provider !== attempt.target.provider ||
+      pending.deployment !== specOfTarget(attempt.target) ||
+      pending.credentialId !== attempt.credentialId
+    ) {
+      throw new Error("credential attempt trace outcome does not match a started attempt");
+    }
+    pending.outcome = Object.freeze({ ...outcome });
+  }
+
+  headers(servedAttempt?: ResolvedAttempt): Record<string, string> {
+    if (!this.entries.some((entry) => entry.multiSlot)) return {};
+    const previewServed = servedAttempt
+      ? [...this.entries].reverse().find((entry) =>
+          entry.outcome === undefined &&
+          entry.provider === servedAttempt.target.provider &&
+          entry.deployment === specOfTarget(servedAttempt.target) &&
+          entry.credentialId === servedAttempt.credentialId,
+        )
+      : undefined;
+    const served = this.entries.find((entry) => entry.outcome?.kind === "success") ?? previewServed;
+    const headers: Record<string, string> = {};
+    if (served?.multiSlot) headers[CREDENTIAL_HEADER] = served.credentialId;
+
+    const failures = this.entries.filter(
+      (entry) => entry !== served && entry.outcome?.kind !== "success",
+    );
+    if (this.entries.length >= 2 || served === undefined) {
+      const tallies: Array<{ label: CredentialAttemptLabel; count: number }> = [];
+      for (const entry of failures) {
+        const label = credentialAttemptLabel(entry.outcome);
+        const existing = tallies.find((candidate) => candidate.label === label);
+        if (existing) existing.count += 1;
+        else tallies.push({ label, count: 1 });
+      }
+      const summary = tallies.map(({ label, count }) => `${count}x${label}`).join(", ");
+      headers[CREDENTIAL_ATTEMPTS_HEADER] =
+        `${this.entries.length} tried, ${served ? 1 : 0} served${summary ? `: ${summary}` : ""}`;
+    }
+    return headers;
+  }
+}
+
+function credentialAttemptLabel(outcome: CredentialWalkOutcome | undefined): CredentialAttemptLabel {
+  if (outcome?.status !== undefined) return outcome.status;
+  if (outcome?.kind === "provider-transport") return "transport";
+  if (outcome?.kind === "timeout") return "timeout";
+  if (outcome?.kind === "protocol") return "protocol";
+  if (outcome?.kind === "client") return "client";
+  if (outcome?.kind === "cancelled") return "cancelled";
+  return "local";
+}
+
+function recordCredentialStarted(
+  walk: CredentialWalk,
+  trace: CredentialAttemptTrace,
+  attempt: ResolvedAttempt,
+): void {
+  walk.recordStarted(attempt);
+  trace.recordStarted(attempt);
+}
+
+function recordCredentialOutcome(
+  walk: CredentialWalk,
+  trace: CredentialAttemptTrace,
+  attempt: ResolvedAttempt,
+  outcome: CredentialWalkOutcome,
+): void {
+  walk.record(attempt, outcome);
+  trace.record(attempt, outcome);
 }
 
 /**
@@ -1100,31 +1333,36 @@ function credentialHeaderValues(
  */
 function applyStickyOrdering(
   ordered: ResolvedAttempt[],
-  candidates: ResolvedAttempt[],
   pinnedSpec: string,
   breaker: CircuitBreaker,
   degraded: Set<string> | null,
   now: number,
 ): { targets: ResolvedAttempt[]; status: string } {
-  const pinned = candidates.find((candidate) => specOfTarget(candidate.target) === pinnedSpec);
-  if (!pinned) return { targets: ordered, status: "bypassed: not-in-pool" };
+  const groups = groupCredentialAttempts(ordered);
+  const pinnedIndex = groups.findIndex((group) => specOfTarget(group.attempts[0]!.target) === pinnedSpec);
+  const pinnedGroup = pinnedIndex < 0 ? undefined : groups[pinnedIndex];
+  const pinned = pinnedGroup?.attempts[0];
+  if (!pinned || !pinnedGroup) return { targets: ordered, status: "bypassed: not-in-pool" };
 
+  // The first row is the credential selector's best-ranked usable slot for this deployment.
   const usability = targetUsability(pinned, breaker, now);
   if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
 
   if (degraded?.has(pinnedSpec)) {
-    const hasLiveInBand = candidates.some(
-      (candidate) => !degraded.has(specOfTarget(candidate.target)) && targetUsability(candidate, breaker, now) === "live",
+    const hasLiveInBand = groups.some(
+      (group) => {
+        const candidate = group.attempts[0]!;
+        return !degraded.has(specOfTarget(candidate.target)) && targetUsability(candidate, breaker, now) === "live";
+      },
     );
     if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
   }
 
-  const index = ordered.findIndex((candidate) => specOfTarget(candidate.target) === pinnedSpec);
-  if (index <= 0) return { targets: ordered, status: "pinned, natural" };
-  // A pin is a deployment decision, never a single credential row.  Moving just the first
-  // row would break the request's breadth-first slot round and can starve a healthy sibling.
-  const pinnedRows = ordered.filter((candidate) => specOfTarget(candidate.target) === pinnedSpec);
-  const reordered = [...pinnedRows, ...ordered.filter((candidate) => specOfTarget(candidate.target) !== pinnedSpec)];
+  if (pinnedIndex === 0) return { targets: ordered, status: "pinned, natural" };
+  // Move the deployment group, not an individual row. CredentialWalk will still offer one slot
+  // per deployment round, so the pin cannot cluster every credential ahead of other deployments.
+  const reordered = [pinnedGroup, ...groups.filter((_, index) => index !== pinnedIndex)]
+    .flatMap((group) => group.attempts);
   return { targets: reordered, status: "pinned, reordered" };
 }
 
@@ -1225,12 +1463,6 @@ function shouldTryNext(cls: OutcomeClass): boolean {
  */
 export const DEFAULT_WALK_BUDGET_MS = 45_000;
 
-function walkBudgetAllowsNext(budgetMs: number, walkStarted: number, attemptsCompleted: number): boolean {
-  if (attemptsCompleted < 2) return true;
-  if (budgetMs === 0) return true;
-  return Date.now() - walkStarted < budgetMs;
-}
-
 /**
  * Streamed-response deadline split (adoption review §1.2) — one policy, both fronts.
  *
@@ -1267,39 +1499,6 @@ function withStallWatchdog(upstream: Response, controller: AbortController, stal
     status: upstream.status,
     headers: upstream.headers,
   });
-}
-
-/**
- * Request-local failure-domain elimination (adoption review §1.6) — one policy, both fronts.
- *
- * A TRANSPORT failure — DNS, connection refused, TLS, socket reset: thrown before any HTTP
- * response existed — is evidence about the provider's HOST, not about one model, so the rest of
- * this walk drops the failed provider's remaining members instead of burning one hop per member
- * to rediscover the same dead host (the transport half of the 13-round-trips-to-learn-4-facts
- * pathology in docs/pool-eligibility.md).
- *
- * Deliberately narrow. NOT widened on 5xx statuses — a status is a live host answering, and this
- * repo has measured a 529 that was model-local while sibling deployments served. NOT widened on
- * this proxy's own per-target deadline — a slow model is not a dead host, and the next member may
- * be a smaller, faster one. Request-local by construction: the pruned array dies with the
- * response, so it cannot fight the breaker's per-deployment accounting.
- */
-function dropRemainingSameProvider(targets: ResolvedAttempt[], afterIndex: number, provider: string): void {
-  for (let j = targets.length - 1; j > afterIndex; j--) {
-    if (targets[j]!.target.provider === provider) targets.splice(j, 1);
-  }
-}
-
-/** Remove duplicate entries for one failed deployment from this request's remaining walk only. */
-function dropRemainingSameDeployment(
-  targets: ResolvedAttempt[],
-  afterIndex: number,
-  failed: ResolvedTarget,
-): void {
-  for (let j = targets.length - 1; j > afterIndex; j--) {
-    const candidate = targets[j]!.target;
-    if (candidate.provider === failed.provider && candidate.model === failed.model) targets.splice(j, 1);
-  }
 }
 
 /**
@@ -1484,6 +1683,7 @@ interface HealthAttempt {
   readonly trace: RequestAttemptTrace;
   readonly usage: UsageAccumulator;
   completed: boolean;
+  terminal?: "succeeded" | "failed" | "cancelled";
 }
 
 function targetIdentity(attempt: ResolvedAttempt): ProviderTargetIdentity {
@@ -1502,6 +1702,7 @@ function beginHealthAttempt(
   resolvedAttempt: ResolvedAttempt,
   started: number,
   trace: RequestAttemptTrace,
+  usage: UsageAccumulator,
 ): HealthAttempt | null {
   const identity = targetIdentity(resolvedAttempt);
   const begun = h.breaker.beginAttempt(identity);
@@ -1513,7 +1714,7 @@ function beginHealthAttempt(
     target: resolvedAttempt.target,
     started,
     trace,
-    usage: createUsageAccumulator(),
+    usage,
     completed: false,
   };
 }
@@ -1527,31 +1728,22 @@ function beginHealthAttempt(
  * docs/pool-failover.md). A learning loop that only ran on one front would silently know less
  * about half the traffic.
  *
- * Never throws and never blocks the response: it reads a CLONE, so the real body is untouched for
- * streaming or failover, and any failure simply means nothing was learned this time.
+ * Called only with bytes already buffered by inspectCandidateResponse, so learning never tees or
+ * consumes the Response that may still need to become the client's terminal real error.
  */
-function observeContextLimit(res: Response, target: ResolvedTarget): void {
+function observeContextLimit(status: number, target: ResolvedTarget, body: string): void {
   // Context-length rejections are 400 (OpenAI-compatible) or 413. Anything else is a different
   // fault, and scanning every error body would be work for nothing.
-  if (res.status !== 400 && res.status !== 413) return;
+  if (status !== 400 && status !== 413) return;
   if (target.model === undefined) return;
-  let clone: Response;
   try {
-    clone = res.clone();
+    if (!looksLikeContextLengthError(body)) return;
+    const stated = parseStatedContextLimit(body);
+    if (stated === null) return;
+    recordObservedContextLimit(target.provider, target.model, stated);
   } catch {
-    return; // Body already consumed/locked — nothing safe to read.
+    // Learning is best-effort and never in the request's way.
   }
-  void clone
-    .text()
-    .then((body) => {
-      if (!looksLikeContextLengthError(body)) return;
-      const stated = parseStatedContextLimit(body);
-      if (stated === null) return;
-      recordObservedContextLimit(target.provider, target.model!, stated);
-    })
-    .catch(() => {
-      // A body that cannot be read teaches us nothing. That is the whole consequence.
-    });
 }
 
 /**
@@ -1568,8 +1760,8 @@ function observeContextLimit(res: Response, target: ResolvedTarget): void {
  * an LLM's opinion must never decide a live routing decision.
  *
  * ⚠ Takes a body STRING, never a `Response`, and is called only where that body was going to be
- * read or discarded anyway. The obvious implementation — `res.clone()`, like `observeContextLimit`
- * does — breaks failover outright: `clone()` TEES the body, and the failover branch immediately
+ * read or discarded anyway. The obvious implementation — `res.clone()` — breaks failover:
+ * `clone()` TEES the body, and the failover branch immediately
  * cancels the original, so the un-read tee branch strands the walk and the client is served the
  * first candidate's error with the rest of the pool untouched. Caught by
  * `test/pool-failover.test.ts` (three pre-existing 402 tests went red), which is the whole reason
@@ -1579,11 +1771,74 @@ function observeContextLimit(res: Response, target: ResolvedTarget): void {
  */
 type EligibilityObservation = { readonly unknown: boolean; readonly scope?: ReturnType<typeof materializeScope> };
 
+/**
+ * Relay protocol adapters sometimes wrap a provider's JSON refusal inside their own error
+ * message. Interpret the original nested payload as well as the outer wire body so a confirmed
+ * signature means the same thing on every front. This is deterministic unwrapping only: no text
+ * is classified or inferred here.
+ */
+function refusalBodyCandidates(body: string): string[] {
+  const candidates: string[] = [];
+  const queued: string[] = [body];
+  const seen = new Set<string>();
+  while (queued.length > 0 && candidates.length < 24) {
+    const text = queued.shift()!;
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    candidates.push(text);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      for (let index = 0; index < text.length; index++) {
+        if (text[index] !== "{" && text[index] !== "[") continue;
+        const nested = text.slice(index);
+        try {
+          JSON.parse(nested);
+          queued.push(nested);
+          break;
+        } catch {
+          // Keep looking for the start of a nested JSON payload.
+        }
+      }
+      continue;
+    }
+
+    const visit = (value: unknown, depth: number): void => {
+      if (depth > 6 || candidates.length + queued.length >= 24) return;
+      if (typeof value === "string") {
+        if (!seen.has(value)) queued.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, depth + 1);
+        return;
+      }
+      if (typeof value === "object" && value !== null) {
+        for (const item of Object.values(value as Record<string, unknown>)) {
+          visit(item, depth + 1);
+        }
+      }
+    };
+    visit(parsed, 0);
+  }
+  return candidates;
+}
+
 function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfterMs: number | null, body: string): EligibilityObservation {
   const { target } = attempt;
   if (target.model === undefined) return { unknown: false };
   try {
-    const verdict = interpretRefusal(target.provider, target.model, status, body);
+    let matchedBody = body;
+    let verdict: ReturnType<typeof interpretRefusal> = null;
+    for (const candidate of refusalBodyCandidates(body)) {
+      verdict = interpretRefusal(target.provider, target.model, status, candidate);
+      if (verdict !== null) {
+        matchedBody = candidate;
+        break;
+      }
+    }
     if (verdict === null) {
       // The fail-safe: an unrecognized refusal changes nothing about routing. It is held so a
       // researcher can say what it means, and only then will it ever bind.
@@ -1601,7 +1856,7 @@ function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfter
       target.model,
     );
     recordFact(verdict.class, scope, {
-      retryAfterMs: resolveResetMs(verdict, retryAfterMs, body),
+      retryAfterMs: resolveResetMs(verdict, retryAfterMs, matchedBody),
     });
     return { unknown: false, scope };
   } catch {
@@ -1678,26 +1933,65 @@ function carriesEligibilityFact(status: number): boolean {
   );
 }
 
+type InspectedCandidateResponse =
+  | {
+      kind: "response";
+      response: Response;
+      eligibility: EligibilityObservation;
+    }
+  | PostHeaderBodyFailure;
+
 /**
- * Release a candidate the walk is stepping over — reading its body first when that body might say
- * something durable about the deployment.
- *
- * The read replaces the `cancel()` it used to be, rather than joining it: the body is being thrown
- * away either way, so consuming it costs nothing extra and frees the socket just the same.
+ * Inspect an error response once and rebuild it from the same bytes. The caller may either discard
+ * the rebuilt response when CredentialWalk offers another candidate or serve it as the terminal
+ * real upstream error. A body failure after headers is returned as a distinct protocol outcome;
+ * it must never be rebuilt as an empty response under the provider's original credential status.
  */
-async function discardCandidate(
+async function inspectCandidateResponse(
   res: Response,
   attempt: ResolvedAttempt,
-  status: number,
   retryAfterMs: number | null,
-): Promise<EligibilityObservation> {
-  if (carriesEligibilityFact(status)) {
-    const body = await res.text().catch(() => "");
-    if (body) return observeEligibility(attempt, status, retryAfterMs, body);
-    return { unknown: false };
+): Promise<InspectedCandidateResponse> {
+  const propagatedFailure = postHeaderBodyFailure(res);
+  if (propagatedFailure) return propagatedFailure;
+  const status = res.status;
+  if (status < 400) {
+    return { kind: "response", response: res, eligibility: { unknown: false } };
   }
-  await res.body?.cancel().catch(() => {});
-  return { unknown: false };
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(await res.arrayBuffer());
+  } catch (cause) {
+    return { kind: "post-header-body-failure", cause };
+  }
+  const body = bytes.toString("utf8");
+  observeContextLimit(status, attempt.target, body);
+  const eligibility = carriesEligibilityFact(status) && body
+    ? observeEligibility(attempt, status, retryAfterMs, body)
+    : { unknown: false };
+  return {
+    kind: "response",
+    response: new Response(bytes, {
+      status,
+      statusText: res.statusText,
+      headers: res.headers,
+    }),
+    eligibility,
+  };
+}
+
+function walkOutcomeForResponse(
+  status: number,
+  localFailure: boolean,
+  scope?: EligibilityObservation["scope"],
+): CredentialWalkOutcome {
+  if (localFailure) return { kind: "local", status, ...(scope ? { scope } : {}) };
+  const cls = classifyStatus(status);
+  if (cls === "client") return { kind: "client", status, ...(scope ? { scope } : {}) };
+  if (status === 401 || status === 403 || status === 402 || status === 429) {
+    return { kind: "credential", status, ...(scope ? { scope } : {}) };
+  }
+  return { kind: "deployment", status, ...(scope ? { scope } : {}) };
 }
 
 function observeAttemptHeaders(
@@ -1737,6 +2031,7 @@ function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: num
   });
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
+  attempt.terminal = "succeeded";
   attempt.trace.record(attempt.target, status, attempt.started, completedAt);
   recordCall(h, attempt, true, completedAt);
   // A served request is first-party proof that this deployment exists and that the credential has
@@ -1786,6 +2081,7 @@ function completeAttemptFailure(
   });
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
+  attempt.terminal = "failed";
   attempt.trace.record(
     attempt.target,
     options.logStatus ?? options.status ?? "failed",
@@ -1808,7 +2104,47 @@ function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: s
   });
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
   attempt.completed = true;
+  attempt.terminal = "cancelled";
   attempt.trace.record(attempt.target, "cancelled", attempt.started, completedAt);
+}
+
+type PostHeaderBodyDisposition = "cancelled" | "timeout" | "protocol";
+
+/**
+ * A Response proves fetch reached the provider and received headers. A later body rejection is
+ * therefore not a provider-wide transport failure and a credential-looking status is not usable
+ * evidence about the credential. Close only this deployment unless the client or deadline won.
+ */
+function completePostHeaderBodyFailure(
+  h: Handlers,
+  downstream: ServerResponse,
+  signal: AbortSignal,
+  attempt: HealthAttempt,
+  credentialWalk: CredentialWalk,
+  credentialTrace: CredentialAttemptTrace,
+  resolvedAttempt: ResolvedAttempt,
+): PostHeaderBodyDisposition {
+  if (downstream.destroyed) {
+    completeAttemptCancelled(h, attempt, "client disconnected while reading provider response body");
+    recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+    return "cancelled";
+  }
+  if (signal.aborted) {
+    completeAttemptFailure(h, attempt, {
+      failure: "transport",
+      provenance: "deadline",
+      status: 504,
+    });
+    recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "timeout" });
+    return "timeout";
+  }
+  completeAttemptFailure(h, attempt, {
+    failure: "protocol",
+    provenance: "invalid-upstream-envelope",
+    status: 502,
+  });
+  recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "protocol" });
+  return "protocol";
 }
 
 function detectOpenAiFrontProtocol(method: string | undefined, pathname: string): OpenAiFrontProtocol | null {
@@ -1836,7 +2172,8 @@ function detectOpenAiFrontProtocol(method: string | undefined, pathname: string)
  */
 async function openAiFrontPath(
   res: ServerResponse,
-  candidates: ResolvedAttempt[],
+  credentialWalk: CredentialWalk,
+  credentialTrace: CredentialAttemptTrace,
   ctx: {
     reqJson: unknown;
     wantsStream: boolean;
@@ -1846,7 +2183,7 @@ async function openAiFrontPath(
     path: string;
     hadTools: boolean;
     req?: IncomingMessage;
-    /** The pool addressed, and its degrade tail — so a below-band answer can say so. */
+    /** The addressed pool and its degrade tail, so a below-band answer can say so. */
     addressedPool?: string | null;
     degradedSpecs?: Set<string> | null;
     sticky?: StickyRequestContext | null;
@@ -1857,52 +2194,54 @@ async function openAiFrontPath(
   const tried: string[] = [];
   const attemptTrace = new RequestAttemptTrace();
   const directTools = toolSchemaMap(ctx.reqJson);
-  // All-429 exhaustion Retry-After policy, shared with the Anthropic path: `Pool429Tracker`.
   const pool429 = new Pool429Tracker();
-  const credentialStatuses: number[] = [];
-  const walkBudgetMs = ctx.cfg?.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
-  const walkStarted = Date.now();
 
-  for (let i = 0; i < candidates.length; i++) {
-    if (res.destroyed) break;
-    const resolvedAttempt = candidates[i]!;
+  while (!res.destroyed) {
+    const resolvedAttempt = credentialWalk.next();
+    if (!resolvedAttempt) break;
     const target = resolvedAttempt.target;
-    const isLast = i === candidates.length - 1;
-    tried.push(specOfTarget(target));
-
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
     const onResClose = () => {
       if (!res.writableEnded) controller.abort();
     };
     res.on("close", onResClose);
+    let attempt: HealthAttempt | undefined;
+    const usage = createUsageAccumulator();
+    let egressCallbackCalled = false;
+    const onEgress = () => {
+      egressCallbackCalled = true;
+      attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace, usage) ?? undefined;
+      if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
+      recordCredentialStarted(credentialWalk, credentialTrace, resolvedAttempt);
+      tried.push(specOfTarget(target));
+    };
+    let credentialRecorded = false;
 
-    let forwardHeaders: Record<string, string>;
     try {
-      forwardHeaders = buildForwardHeaders(ctx.inboundHeaders, resolvedAttempt);
-    } catch (e) {
-      clearTimeout(timer);
-      res.off("close", onResClose);
-      if (e instanceof CredentialConfigError) {
-        failClosed(res, 502, `llm-relay configuration: ${e.message}`);
-        h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
-        return;
+      let forwardHeaders: Record<string, string>;
+      try {
+        forwardHeaders = buildForwardHeaders(ctx.inboundHeaders, resolvedAttempt);
+      } catch (e) {
+        credentialWalk.recordRejected(resolvedAttempt);
+        if (e instanceof CredentialConfigError) {
+          failClosed(res, 502, `llm-relay configuration: ${e.message}`);
+          h.logger.write(baseLog(
+            ctx.started,
+            ctx.path,
+            ctx.hadTools,
+            false,
+            502,
+            "skipped",
+            null,
+            attemptTrace.snapshot(),
+          ));
+          return;
+        }
+        throw e;
       }
-      throw e;
-    }
 
-    const attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace);
-    if (!attempt) {
-      clearTimeout(timer);
-      res.off("close", onResClose);
-      failClosed(res, 502, "llm-relay: could not begin provider attempt");
-      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
-      return;
-    }
-
-    // Match Messages: only a validated candidate about to fetch updates fairness state.
-    h.credentialLru.touch(resolvedAttempt.credentialId);
-
+      /* attempt begins at the real egress callback */
     const recoveryAudit: { value: {
       validated: RequestLog["validated"];
       toolUseCount: number;
@@ -1935,7 +2274,7 @@ async function openAiFrontPath(
       };
       if (validation.valid || ctx.cfg?.mode !== "repair") return recovered;
 
-      const reshaper = h.resolveReshaper(target);
+      const reshaper = h.resolveReshaper(resolvedAttempt);
       if (!reshaper) return recovered;
       const decision = await repair(assistant, directTools, {
         validator: h.validator,
@@ -1971,258 +2310,420 @@ async function openAiFrontPath(
     };
 
     let upstream: Response;
-    try {
-      upstream = await fetchOpenAiFront(resolvedAttempt, {
-        reqJson: ctx.reqJson,
-        wantsStream: ctx.wantsStream,
-        protocol: ctx.protocol,
-        anthropicHeaders: forwardHeaders,
-        signal: controller.signal,
-        processRecoveredChat,
-        usage: attempt.usage,
-      });
+      try {
+        upstream = await fetchOpenAiFront(resolvedAttempt, {
+          reqJson: ctx.reqJson,
+          wantsStream: ctx.wantsStream,
+          protocol: ctx.protocol,
+          anthropicHeaders: forwardHeaders,
+          signal: controller.signal,
+          processRecoveredChat,
+          usage,
+          onEgress,
+        });
+        if (!attempt) {
+          credentialWalk.recordRejected(resolvedAttempt);
+          if (errorOrigin(upstream) === "local") {
+            await forwardLocalResponse(res, upstream);
+            h.logger.write(baseLog(
+              ctx.started,
+              ctx.path,
+              ctx.hadTools,
+              false,
+              upstream.status,
+              "skipped",
+              null,
+              attemptTrace.snapshot(),
+            ));
+          } else {
+            await upstream.body?.cancel().catch(() => {});
+            failClosed(res, 502, "llm-relay: backend returned before provider egress");
+            h.logger.write(baseLog(
+              ctx.started,
+              ctx.path,
+              ctx.hadTools,
+              false,
+              502,
+              "skipped",
+              null,
+              attemptTrace.snapshot(),
+            ));
+          }
+          return;
+        }
     } catch (e) {
-      clearTimeout(timer);
-      res.off("close", onResClose);
-      const aborted = controller.signal.aborted;
-      const status = aborted ? 504 : 502;
-      if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
-      else {
+      if (!attempt) {
+        if (credentialWalk.pending === resolvedAttempt) {
+          credentialWalk.recordRejected(resolvedAttempt);
+        }
+          if (res.destroyed) return;
+          const status = controller.signal.aborted ? 504 : 502;
+          failClosed(res, status, egressCallbackCalled
+            ? "llm-relay: could not begin provider attempt"
+            : "llm-relay: backend preparation failed");
+          h.logger.write(baseLog(
+            ctx.started,
+            ctx.path,
+            ctx.hadTools,
+            false,
+            status,
+            "skipped",
+            null,
+            attemptTrace.snapshot(),
+          ));
+          return;
+        }
+        const aborted = controller.signal.aborted;
+        const status = aborted ? 504 : 502;
+        if (res.destroyed) {
+          completeAttemptCancelled(h, attempt, "client disconnected");
+          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+          credentialRecorded = true;
+          return;
+        }
+
         completeAttemptFailure(h, attempt, {
           failure: "transport",
           provenance: aborted ? "deadline" : "upstream",
           status,
         });
-      }
-      // A genuine transport throw (not this proxy's own deadline) condemns the provider's host
-      // for the rest of THIS walk only. Prune first, and re-read the live length below — the
-      // `isLast` cached at loop top predates the prune.
-      if (!aborted) dropRemainingSameProvider(candidates, i, target.provider);
-      else dropRemainingSameDeployment(candidates, i, target);
-
-      // The client hanging up aborts every candidate; walking the rest would be pointless work
-      // against a socket nobody is reading.
-      if (i < candidates.length - 1 && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) continue;
-      if (!res.headersSent) {
-        res.writeHead(status, {
-          "content-type": "application/json",
-          [SERVED_BY_HEADER]: tried.join(", "),
-          ...stickyProvenanceHeaders(ctx.sticky),
-        });
-        res.end(JSON.stringify({ error: { message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`, type: "api_error" } }));
-      }
-      h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target, attemptTrace.snapshot()));
-      return;
-    }
-
-    const reportedModelSource = upstream;
-    credentialStatuses.push(upstream.status);
-    // A local translation/configuration failure is deterministic for the request and should not
-    // make every other candidate repeat the same failure. Provider responses still use the shared
-    // breaker/failover policy.
-    const localFailure = errorOrigin(upstream) === "local";
-    const cls = classifyStatus(upstream.status);
-    const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
-    observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs, upstream.headers);
-    observeContextLimit(upstream, target);
-
-    const tryNext = localFailure ? false : shouldTryNext(cls);
-    if (cls === "retriable" && upstream.status !== 402 && upstream.status !== 429) {
-      dropRemainingSameDeployment(candidates, i, target);
-    }
-
-    if (tryNext && !isLast && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
-      clearTimeout(timer);
-      res.off("close", onResClose);
-      // Release the skipped candidate's socket — an un-consumed body holds the connection open.
-      // The body is read rather than cancelled when it might state a durable fact about the
-      // deployment; either way the socket is freed and the bytes are discarded.
-      const eligibility = await discardCandidate(upstream, resolvedAttempt, upstream.status, retryAfterMs);
-      if (eligibility.unknown) pool429.noteUnknownRefusal();
-      if (eligibility.scope && (eligibility.scope.kind === "deployment" || eligibility.scope.kind === "provider" || eligibility.scope.kind === "model" || (eligibility.scope.kind === "group" && eligibility.scope.credentialId === undefined))) {
-        dropRemainingSameDeployment(candidates, i, target);
-      }
-      pool429.recordFailover(upstream.status, retryAfterMs);
-      completeAttemptFailure(h, attempt, {
-        failure: "http",
-        provenance: "upstream",
-        status: upstream.status,
-        retryAfterMs,
-      });
-      continue;
-    }
-
-    // This candidate's answer IS the response: it either succeeded, or it is the last one and
-    // its real upstream error is more informative than anything the proxy could synthesize.
-    //
-    // On success the header names the one deployment that served. On an error it names every
-    // deployment tried, in order — so an exhausted pool is self-describing and the reader can
-    // see that the failure they are holding is the last of N, not the only one.
-    const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
-    if (streamed && upstream.status < 400) {
-      const protocol: StreamCommitProtocol = ctx.protocol === "responses" ? "openai-responses" : "openai-chat";
-      const probe = upstream.body
-        ? await probeStreamForCommit(upstream.body, protocol, {
-            isCancelled: () => res.destroyed,
-            // Direct Chat is upstream-native. Every other pair is a mapper-owned final wire;
-            // malformed syntax there is local and must not make another provider repeat it.
-            malformedProvenance: target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
-          })
-        : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
-
-      if (probe.kind === "cancelled") {
-        clearTimeout(timer);
-        res.off("close", onResClose);
-        completeAttemptCancelled(h, attempt, "client disconnected before stream commit");
-        return;
-      }
-      if (probe.kind === "dead") {
-        completeAttemptFailure(h, attempt, {
-          failure: "protocol",
-          provenance: probe.provenance === "local" ? "relay-mapper-defect" : "invalid-upstream-envelope",
-          status: 502,
-        });
-        const canTryNext = probe.provenance === "upstream" &&
-          !isLast &&
-          !res.writableEnded &&
-          !res.destroyed &&
-          walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1);
-        clearTimeout(timer);
-        res.off("close", onResClose);
-        if (canTryNext) {
-          pool429.recordFailover(502, null);
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          aborted ? { kind: "timeout" } : { kind: "provider-transport" },
+        );
+        credentialRecorded = true;
+        const next = credentialWalk.next();
+        if (next && !res.writableEnded && !res.destroyed) {
+          pool429.recordFailover(status, null);
           continue;
         }
 
-        pool429.recordFinal(502);
+        pool429.recordFinal(status);
         const headers: Record<string, string> = {
           "content-type": "application/json",
           [SERVED_BY_HEADER]: tried.join(", "),
+          ...(stickyProvenanceHeaders(ctx.sticky) ?? {}),
+          ...credentialTrace.headers(),
         };
-        Object.assign(headers, stickyProvenanceHeaders(ctx.sticky));
         const summary = pool429.summary();
         if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-        res.writeHead(502, headers);
-        res.end(JSON.stringify({ error: { message: `llm-relay: ${probe.reason}`, type: "api_error" } }));
+        if (!res.headersSent) {
+          res.writeHead(status, headers);
+          res.end(JSON.stringify({
+            error: {
+              message: aborted
+                ? "backend timed out"
+                : `backend unreachable: ${(e as Error).message}`,
+              type: "api_error",
+            },
+          }));
+        }
         h.logger.write(baseLog(
           ctx.started,
           ctx.path,
           ctx.hadTools,
-          true,
-          502,
+          false,
+          status,
           "skipped",
           target,
           attemptTrace.snapshot(),
-          upstreamReportedModel(reportedModelSource),
         ));
         return;
       }
 
-      upstream = new Response(probe.body, { status: upstream.status, headers: upstream.headers });
-    }
-    // Same phase switch as the Anthropic path — one deadline policy, both fronts (§1.2).
-    const stallMs = target.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
-    if (streamed && upstream.status < 400 && stallMs > 0) {
-      clearTimeout(timer);
-      upstream = withStallWatchdog(upstream, controller, stallMs);
-    }
-    let responseBytesWritten = false;
-    try {
-      const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
-      const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
-      if (ctx.cfg) Object.assign(headers, credentialHeaderValues(ctx.cfg, resolvedAttempt, credentialStatuses.length, credentialStatuses));
-      const degradedBy = degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target);
-      if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
-      const paidBy = ctx.cfg ? paidLabel(ctx.cfg, h, target) : null;
-      if (paidBy) headers[PAID_HEADER] = paidBy;
-      const stickyBy = stickyHeaderValue(ctx.sticky, target, upstream.status);
-      if (stickyBy) headers[STICKY_PROVENANCE_HEADER] = stickyBy;
-      // Same aggregate as the Anthropic path, from the same tracker — the two fronts having
-      // separate copies of one policy is the defect this file has already shipped once.
-      pool429.recordFinal(upstream.status);
-      const poolAttempts = pool429.summary();
-      if (poolAttempts) headers[POOL_ATTEMPTS_HEADER] = poolAttempts;
-      const poolRetryAfterMs = pool429.overrideMs(upstream.status, retryAfterMs);
-      if (poolRetryAfterMs !== undefined) {
-        headers["retry-after"] = String(Math.max(1, Math.ceil(poolRetryAfterMs / 1000)));
-      }
-      if (upstream.status >= 400) {
-        // Error bodies are small and are never streamed: buffer, normalize the envelope, send.
-        const raw = await upstream.text().catch(() => "");
-        // The last candidate teaches us as much as the ones stepped over — and for a
-        // single-member pool it is the ONLY one that can. Free, since the body is already here.
-        if (raw && carriesEligibilityFact(upstream.status) && observeEligibility(resolvedAttempt, upstream.status, retryAfterMs, raw).unknown) {
-          pool429.noteUnknownRefusal();
+      const reportedModelSource = upstream;
+      const localFailure = errorOrigin(upstream) === "local";
+      const cls = classifyStatus(upstream.status);
+      const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
+      observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs, upstream.headers);
+
+      const inspected = await inspectCandidateResponse(upstream, resolvedAttempt, retryAfterMs);
+      if (inspected.kind === "post-header-body-failure") {
+        const disposition = completePostHeaderBodyFailure(
+          h, res, controller.signal, attempt, credentialWalk, credentialTrace, resolvedAttempt,
+        );
+        credentialRecorded = true;
+        if (disposition === "cancelled") return;
+        const status = disposition === "timeout" ? 504 : 502;
+        const next = credentialWalk.next();
+        if (next && !res.writableEnded && !res.destroyed) {
+          pool429.recordFailover(status, null);
+          continue;
         }
-        // Emitted here rather than with the other headers because the terminal candidate's verdict
-        // is only known once its body has been read — and on this front the head is written after.
-        const unknown = pool429.unknownCount();
-        if (unknown !== null) headers[UNKNOWN_REFUSAL_HEADER] = String(unknown);
-        const normalized = normalizeOpenAiErrorBody(raw, upstream.status);
-        const out = Buffer.from(normalized ?? raw, "utf8");
-        res.writeHead(upstream.status, { ...headers, "content-type": "application/json" });
-        res.end(out);
-        completeAttemptFailure(h, attempt, {
-          failure: "http",
-          provenance: localFailure ? "relay-mapper-defect" : "upstream",
+        pool429.recordFinal(status);
+        const headers: Record<string, string> = {
+          "content-type": "application/json",
+          [SERVED_BY_HEADER]: tried.join(", "),
+          ...(stickyProvenanceHeaders(ctx.sticky) ?? {}),
+          ...credentialTrace.headers(),
+        };
+        const summary = pool429.summary();
+        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+        if (!res.headersSent) {
+          res.writeHead(status, headers);
+          res.end(JSON.stringify({
+            error: {
+              message: disposition === "timeout"
+                ? "backend timed out while reading response body"
+                : "llm-relay: provider response body failed after headers",
+              type: "api_error",
+            },
+          }));
+        }
+        h.logger.write(baseLog(
+          ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target, attemptTrace.snapshot(),
+        ));
+        return;
+      }
+      upstream = inspected.response;
+      if (inspected.eligibility.unknown) pool429.noteUnknownRefusal();
+
+      const tryNext = !localFailure && shouldTryNext(cls);
+      if (upstream.status >= 400) {
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          walkOutcomeForResponse(upstream.status, localFailure, inspected.eligibility.scope),
+        );
+        credentialRecorded = true;
+        const next = tryNext && !res.writableEnded && !res.destroyed
+          ? credentialWalk.next()
+          : undefined;
+        if (next) {
+          await upstream.body?.cancel().catch(() => {});
+          pool429.recordFailover(upstream.status, retryAfterMs);
+          completeAttemptFailure(h, attempt, {
+            failure: "http",
+            provenance: localFailure ? "relay-mapper-defect" : "upstream",
+            status: upstream.status,
+            retryAfterMs,
+          });
+          continue;
+        }
+      }
+
+      const streamed = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+      if (streamed && upstream.status < 400) {
+        const protocol: StreamCommitProtocol =
+          ctx.protocol === "responses" ? "openai-responses" : "openai-chat";
+        const probe = upstream.body
+          ? await probeStreamForCommit(upstream.body, protocol, {
+              isCancelled: () => res.destroyed,
+              malformedProvenance:
+                target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
+            })
+          : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
+
+        if (probe.kind === "cancelled") {
+          completeAttemptCancelled(h, attempt, "client disconnected before stream commit");
+          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+          credentialRecorded = true;
+          return;
+      }
+      if (probe.kind === "dead") {
+        const deadline = controller.signal.aborted;
+        completeAttemptFailure(h, attempt, deadline
+          ? { failure: "transport", provenance: "deadline", status: 504 }
+          : {
+              failure: "protocol",
+              provenance: probe.provenance === "local"
+                ? "relay-mapper-defect"
+                : "invalid-upstream-envelope",
+              status: 502,
+            });
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          deadline
+            ? { kind: "timeout" }
+            : probe.provenance === "local" ? { kind: "local" } : { kind: "protocol" },
+        );
+          credentialRecorded = true;
+          const next = probe.provenance === "upstream" && !res.writableEnded && !res.destroyed
+            ? credentialWalk.next()
+            : undefined;
+          if (next) {
+            pool429.recordFailover(502, null);
+            continue;
+          }
+
+          pool429.recordFinal(502);
+          const headers: Record<string, string> = {
+            "content-type": "application/json",
+            [SERVED_BY_HEADER]: tried.join(", "),
+            ...(stickyProvenanceHeaders(ctx.sticky) ?? {}),
+            ...credentialTrace.headers(),
+          };
+          const summary = pool429.summary();
+          if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+          res.writeHead(502, headers);
+          res.end(JSON.stringify({
+            error: { message: `llm-relay: ${probe.reason}`, type: "api_error" },
+          }));
+          h.logger.write(baseLog(
+            ctx.started,
+            ctx.path,
+            ctx.hadTools,
+            true,
+            502,
+            "skipped",
+            target,
+            attemptTrace.snapshot(),
+            upstreamReportedModel(reportedModelSource),
+          ));
+          return;
+        }
+
+        upstream = new Response(probe.body, {
           status: upstream.status,
-          retryAfterMs,
+          headers: upstream.headers,
         });
-      } else {
-        res.writeHead(upstream.status, headers);
-        if (upstream.body) {
-          for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
-            const bytes = Buffer.from(chunk);
-            if (!await writeChunk(res, bytes)) break;
-            if (bytes.length > 0) responseBytesWritten = true;
+      }
+
+      const stallMs = target.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+      if (streamed && upstream.status < 400 && stallMs > 0) {
+        clearTimeout(timer);
+        upstream = withStallWatchdog(upstream, controller, stallMs);
+      }
+
+      if (upstream.status < 400) {
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          { kind: "success", status: upstream.status },
+        );
+        credentialRecorded = true;
+      }
+      pool429.recordFinal(upstream.status);
+
+      let responseBytesWritten = false;
+      try {
+        const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
+        const headers: Record<string, string | string[]> = {
+          ...filterResponseHeaders(upstream.headers),
+          [SERVED_BY_HEADER]: servedBy,
+          ...credentialTrace.headers(),
+        };
+        const degradedBy = degradedLabel(
+          ctx.addressedPool ?? null,
+          ctx.degradedSpecs ?? null,
+          target,
+        );
+        if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
+        const paidBy = ctx.cfg ? paidLabel(ctx.cfg, h, target) : null;
+        if (paidBy) headers[PAID_HEADER] = paidBy;
+        const stickyBy = stickyHeaderValue(ctx.sticky, target, upstream.status);
+        if (stickyBy) headers[STICKY_PROVENANCE_HEADER] = stickyBy;
+        const poolAttempts = pool429.summary();
+        if (poolAttempts) headers[POOL_ATTEMPTS_HEADER] = poolAttempts;
+        const poolRetryAfterMs = pool429.overrideMs(upstream.status, retryAfterMs);
+        if (poolRetryAfterMs !== undefined) {
+          headers["retry-after"] = String(Math.max(1, Math.ceil(poolRetryAfterMs / 1000)));
+        }
+
+        if (upstream.status >= 400) {
+          const raw = await upstream.text();
+          const unknown = pool429.unknownCount();
+          if (unknown !== null) headers[UNKNOWN_REFUSAL_HEADER] = String(unknown);
+          const normalized = normalizeOpenAiErrorBody(raw, upstream.status);
+          const out = Buffer.from(normalized ?? raw, "utf8");
+          res.writeHead(upstream.status, { ...headers, "content-type": "application/json" });
+          res.end(out);
+          completeAttemptFailure(h, attempt, {
+            failure: "http",
+            provenance: localFailure ? "relay-mapper-defect" : "upstream",
+            status: upstream.status,
+            retryAfterMs,
+          });
+        } else {
+          res.writeHead(upstream.status, headers);
+          if (upstream.body) {
+            for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
+              const bytes = Buffer.from(chunk);
+              if (!await writeChunk(res, bytes)) break;
+              if (bytes.length > 0) responseBytesWritten = true;
+            }
+          }
+          if (!res.writableEnded) res.end();
+          if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
+          else {
+            completeAttemptSuccess(h, attempt, upstream.status);
+            recordStickySuccess(h, ctx.sticky, target, upstream.status);
           }
         }
-        if (!res.writableEnded) res.end();
-        if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
-        else {
-          completeAttemptSuccess(h, attempt, upstream.status);
-          recordStickySuccess(h, ctx.sticky, target, upstream.status);
-        }
+      } catch (e) {
+        handleMidStreamError(
+          res,
+          e,
+          ctx.started,
+          ctx.path,
+          ctx.hadTools,
+          streamed,
+          upstream.status,
+          target,
+          attempt,
+          h,
+          (msg) => streamed ? openAiSseError(msg) : null,
+          reportedModelSource,
+          controller.signal.aborted,
+          responseBytesWritten,
+        );
+        return;
       }
-    } catch (e) {
-      handleMidStreamError(
-        res, e, ctx.started, ctx.path, ctx.hadTools, streamed, upstream.status, target, attempt, h,
-        (msg) => streamed ? openAiSseError(msg) : null,
-        reportedModelSource,
-        controller.signal.aborted,
-        responseBytesWritten,
+
+      const audit = recoveryAudit.value;
+      const log = baseLog(
+        ctx.started,
+        ctx.path,
+        ctx.hadTools,
+        streamed,
+        upstream.status,
+        audit?.validated ?? "skipped",
+        target,
+        attemptTrace.snapshot(),
+        upstreamReportedModel(reportedModelSource),
+        resolvedAttempt.credentialId,
       );
+      h.logger.write(audit ? {
+        ...log,
+        toolUseCount: audit.toolUseCount,
+        uncheckableCount: audit.uncheckableCount,
+        errorKinds: audit.errorKinds,
+        repair: audit.repair,
+      } : log);
       return;
     } finally {
+      if (!credentialRecorded && attempt) {
+        recordCredentialOutcome(
+          credentialWalk,
+          credentialTrace,
+          resolvedAttempt,
+          res.destroyed ? { kind: "cancelled" } : { kind: "local" },
+        );
+        credentialRecorded = true;
+      } else if (!credentialRecorded && credentialWalk.pending === resolvedAttempt) {
+        credentialWalk.recordRejected(resolvedAttempt);
+      }
+      if (attempt && !attempt.completed) {
+        if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
+        else {
+          completeAttemptFailure(h, attempt, {
+            failure: "mapping",
+            provenance: "relay-mapper-defect",
+            status: 502,
+          });
+        }
+      }
       clearTimeout(timer);
       res.off("close", onResClose);
     }
-    const audit = recoveryAudit.value;
-    const log = baseLog(
-      ctx.started,
-      ctx.path,
-      ctx.hadTools,
-      streamed,
-      upstream.status,
-      audit?.validated ?? "skipped",
-      target,
-      attemptTrace.snapshot(),
-      upstreamReportedModel(reportedModelSource),
-      resolvedAttempt.credentialId,
-    );
-    h.logger.write(audit ? {
-      ...log,
-      toolUseCount: audit.toolUseCount,
-      uncheckableCount: audit.uncheckableCount,
-      errorKinds: audit.errorKinds,
-      repair: audit.repair,
-    } : log);
-    return;
   }
-  // Unreachable with candidates present: the last iteration always responds and returns. An
-  // empty candidate list cannot get here either — routing rejects that with a 400 upstream.
 }
-
 /** Winning-candidate response metadata, shared by transparent and repair streaming paths. */
 function responseHeadersForTarget(backendRes: Response, ctx: Ctx): Record<string, string | string[]> {
   const responseHeaders = filterResponseHeaders(backendRes.headers);
@@ -2732,6 +3233,7 @@ async function repairBufferedPath(
       ctx.target,
       ctx.attempt.trace.snapshot(),
       upstreamReportedModel(ctx.reportedModelSource),
+      ctx.attempt.terminal === "succeeded" ? ctx.attempt.resolvedAttempt.credentialId : null,
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });
@@ -2863,6 +3365,14 @@ function filterResponseHeaders(hh: Headers): Record<string, string | string[]> {
     if (sc) out["set-cookie"] = sc;
   }
   return out;
+}
+
+async function forwardLocalResponse(res: ServerResponse, response: Response): Promise<void> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => { headers[key] = value; });
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!res.headersSent) res.writeHead(response.status, headers);
+  res.end(bytes);
 }
 
 /**

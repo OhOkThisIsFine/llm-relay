@@ -89,6 +89,23 @@ export const CREDENTIAL_ATTEMPTS_HEADER = "x-llm-relay-credential-attempts";
  */
 export const UNKNOWN_REFUSAL_HEADER = "x-llm-relay-unknown-refusal";
 
+type OnEgress = () => void;
+
+function oneShotFetch(
+  fetchFn: typeof fetch,
+  signal: AbortSignal,
+  onEgress?: OnEgress,
+): typeof fetch {
+  let invoked = false;
+  return (input, init) => {
+    if (!invoked && !signal.aborted) {
+      invoked = true;
+      onEgress?.();
+    }
+    return fetchFn(input, init);
+  };
+}
+
 /**
  * This answer came from BELOW the effort band that was asked for.
  *
@@ -153,6 +170,30 @@ interface UpstreamResponseMetadata {
 // Response provenance is private process state, not a wire header: callers can
 // read it for logging without accidentally forwarding it to the client.
 const upstreamResponseMetadata = new WeakMap<Response, UpstreamResponseMetadata>();
+
+/**
+ * A fetch completed far enough to yield provider headers, but consuming its body failed.
+ *
+ * This is process-local metadata rather than a wire marker. Adapters sometimes have to consume
+ * and rebuild an error response before the routing loop sees it; retaining this discriminant on
+ * the original Response prevents that failure from being rewritten as an empty credential error.
+ */
+export interface PostHeaderBodyFailure {
+  readonly kind: "post-header-body-failure";
+  readonly cause: unknown;
+}
+
+const postHeaderBodyFailures = new WeakMap<Response, PostHeaderBodyFailure>();
+
+function attachPostHeaderBodyFailure(response: Response, cause: unknown): Response {
+  postHeaderBodyFailures.set(response, { kind: "post-header-body-failure", cause });
+  return response;
+}
+
+/** Read adapter-private post-header body failure metadata. */
+export function postHeaderBodyFailure(response: Response): PostHeaderBodyFailure | undefined {
+  return postHeaderBodyFailures.get(response);
+}
 
 /** Raw model id stated by the upstream response, before any relay translation. */
 export function upstreamReportedModel(response: Response): string | undefined {
@@ -424,14 +465,16 @@ export async function fetchBackend(
     wantsStream: boolean;
     usage?: UsageAccumulator;
     signal: AbortSignal;
+    onEgress?: OnEgress;
   },
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
+  const invokeFetch = oneShotFetch(fetchFn, args.signal, args.onEgress);
   const target = attempt.target;
   if (target.kind === "anthropic") {
     const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
     if (args.reqBuf.length) init.body = args.reqBuf;
-    const native = await fetchFn(target.base + args.path, init);
+    const native = await invokeFetch(target.base + args.path, init);
     const nativeStreamed = nativeResponseIsStreamed(native, args.wantsStream);
     const res = args.usage
       ? observeUsage(native, "anthropic-messages", args.usage, { streamed: nativeStreamed })
@@ -462,7 +505,8 @@ export async function fetchBackend(
     let body: unknown;
     try {
       body = await res.clone().json();
-    } catch {
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
       return anthropicError(502, "llm-relay: invalid Anthropic upstream envelope: body is not valid JSON", "upstream", {
         ...retryAfterHeader(res.headers),
       }, "invalid_upstream_envelope");
@@ -505,7 +549,7 @@ export async function fetchBackend(
   if (args.wantsStream) openaiBody.stream_options = { include_usage: true };
 
   const post = (body: Record<string, unknown>) =>
-    fetchFn(target.base + "/chat/completions", {
+    invokeFetch(target.base + "/chat/completions", {
       method: "POST",
       headers: buildTargetHeaders(attempt),
       body: JSON.stringify(body),
@@ -528,7 +572,12 @@ export async function fetchBackend(
   }
 
   if (!res.ok) {
-    const body = await res.text();
+    let body: string;
+    try {
+      body = await res.text();
+    } catch (cause) {
+      return attachPostHeaderBodyFailure(res, cause);
+    }
     // A 404 here is nearly always the model id, not the route — and a provider's
     // /models catalog is not proof: several ids NIM lists return 404 from
     // /chat/completions. Say so, or this reads as a proxy bug.
@@ -580,7 +629,8 @@ export async function fetchBackend(
   let upstreamJson: unknown;
   try {
     upstreamJson = await res.json();
-  } catch {
+  } catch (cause) {
+    if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
     return anthropicError(502, "llm-relay: invalid OpenAI upstream envelope: body is not valid JSON", "upstream", {
       ...retryAfterHeader(res.headers),
     }, "invalid_upstream_envelope");
@@ -1031,9 +1081,11 @@ export async function fetchOpenAiFront(
     anthropicHeaders?: Record<string, string>;
     processRecoveredChat?: RecoveredOpenAiChatProcessor;
     usage?: UsageAccumulator;
+    onEgress?: OnEgress;
   },
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
+  const invokeFetch = oneShotFetch(fetchFn, args.signal, args.onEgress);
   const target = attempt.target;
   const protocol = args.protocol ?? "chat";
   const base = (args.reqJson ?? {}) as Record<string, unknown>;
@@ -1051,7 +1103,7 @@ export async function fetchOpenAiFront(
         include_usage: true,
       };
     }
-    const post = (requestBody: Record<string, unknown>) => fetchFn(target.base + "/chat/completions", {
+    const post = (requestBody: Record<string, unknown>) => invokeFetch(target.base + "/chat/completions", {
       method: "POST",
       headers: buildTargetHeaders(attempt),
       body: JSON.stringify(requestBody),
@@ -1097,7 +1149,8 @@ export async function fetchOpenAiFront(
     let responseBody: unknown;
     try {
       responseBody = await res.clone().json();
-    } catch {
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
       return openaiError(502, "llm-relay: invalid OpenAI upstream envelope: body is not valid JSON", "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
     }
     const invalidReason = invalidEnvelopeReason(responseBody, "openai-chat", false);
@@ -1161,11 +1214,18 @@ export async function fetchOpenAiFront(
     wantsStream: args.wantsStream,
     ...(args.usage ? { usage: args.usage } : {}),
     signal: args.signal,
+    ...(args.onEgress ? { onEgress: args.onEgress } : {}),
   }, fetchFn);
   const metadata = upstreamResponseMetadata.get(backendRes);
+  if (postHeaderBodyFailure(backendRes)) return backendRes;
 
   if (!backendRes.ok) {
-    const raw = await backendRes.text().catch(() => "");
+    let raw: string;
+    try {
+      raw = await backendRes.text();
+    } catch (cause) {
+      return attachPostHeaderBodyFailure(backendRes, cause);
+    }
     const origin = errorOrigin(backendRes) ?? "upstream";
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -1213,7 +1273,8 @@ export async function fetchOpenAiFront(
   let body: unknown;
   try {
     body = await backendRes.json();
-  } catch {
+  } catch (cause) {
+    if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(backendRes, cause);
     const generated = target.kind !== "anthropic";
     return openaiError(
       502,

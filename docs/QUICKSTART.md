@@ -105,6 +105,24 @@ Either way, **restart the relay afterwards** or it will not see the new keys.
 Alternatively put them in `~/.llm-relay/.env` as `KEY=value` lines — llm-relay reads that file
 at startup. A variable already set in your environment always wins over the file.
 
+Optional: if one provider has multiple accounts, replace that provider's `authEnv` with a
+credential fleet in `~/.llm-relay/config.json`:
+
+```jsonc
+"nim": {
+  "base": "https://integrate.api.nvidia.com/v1",
+  "kind": "openai",
+  "credentials": [
+    { "label": "personal", "authEnv": "NVIDIA_API_KEY" },
+    { "label": "work", "authEnv": "NVIDIA_WORK_API_KEY" }
+  ],
+  "tierType": "free"
+}
+```
+
+Use `authEnv` or `credentials[]` on a provider, never both. A fleet slot's env name is exact (it
+does not use the legacy provider alias lookup), and its label is visible non-secret metadata.
+
 Now verify, and **do not skip this** — the two checks answer different questions:
 
 ```bash
@@ -115,10 +133,13 @@ llm-relay keys
 llm-relay pools --probe
 ```
 
-`keys` tests credentials. `pools --probe` sends a real completion to every model in your
-routing pools, which is the only way to catch a model that is configured, listed by the
-provider, and nonetheless dead. Anything reported `DEAD` or `AUTH` should be removed from
-`routing.pools` in `~/.llm-relay/config.json`.
+`keys` checks every configured credential slot. `pools --probe` spends one real completion per
+unique deployment in your routing pools, through one serviceable slot — not once per credential.
+It is the only way to catch a model that is configured, listed by the provider, and nonetheless
+dead. Remove a deployment from `routing.pools` only for deployment-level `DEAD` evidence. An
+`AUTH` result belongs to one credential slot: fix, rotate, or disable that slot. It does not by
+itself invalidate sibling slots or prove that the deployment is dead. `keys` names each slot as
+`provider#label`.
 
 > **Assistant note:** never add a model to a pool without probing that exact spec first. A
 > plausible-looking model id that 404s will sit at the top of a pool and burn a failover hop
@@ -230,7 +251,13 @@ variable is unset, that one provider is disabled with a warning and everything e
 working. Set the variable, or use a literal value, and restart.
 
 **`keys` says a key is fine but requests fail.** Run `llm-relay pools --probe` — the key can be
-valid while the specific *model* is dead or not on your plan.
+valid while the specific *model* is dead or not on your plan. With a credential fleet, `keys`
+checks every slot while the probe deliberately uses only one serviceable slot per deployment.
+
+**`keys` reports one credential slot as `INVALID_KEY`.** Its row names the `provider#label`; fix, rotate,
+or disable that slot. `llm-relay candidates` shows the slot's affected deployment cells and policy.
+Do not remove the whole deployment or its sibling slots unless you also have deployment-level
+evidence that the model is unavailable.
 
 **`keys` reports UNVERIFIED.** That means the provider serves its model list publicly *and*
 answers the probe identically with and without your key, so nothing could be concluded. It is

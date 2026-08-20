@@ -135,8 +135,11 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     process.env.RP_BACKEND_KEY = "sk-nim";
     let seen: any = null;
     let seenAuth: string | undefined;
+    let fetches = 0;
+    let egresses = 0;
     backend = await new Promise<Server>((resolve) => {
       const s = createServer((req, res) => {
+        fetches += 1;
         seenAuth = req.headers["authorization"] as string | undefined;
         const chunks: Buffer[] = [];
         req.on("data", (c) => chunks.push(c));
@@ -155,6 +158,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
+      onEgress: () => { egresses += 1; },
     });
     const body = (await res.json()) as any;
 
@@ -168,6 +172,8 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(body.stop_reason).toBe("tool_use");
     expect(body.model).toBe("meta/llama-3.1-70b-instruct");
     expect(upstreamReportedModel(res)).toBe("upstream-substitute");
+    expect(fetches).toBe(1);
+    expect(egresses).toBe(1);
     delete process.env.RP_BACKEND_KEY;
   });
 
@@ -271,6 +277,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
 
   it("refuses a document block it cannot convert instead of leaking base64 into the prompt", async () => {
     let hit = false;
+    let egresses = 0;
     backend = await new Promise<Server>((resolve) => {
       const s = createServer((_req, res) => {
         hit = true;
@@ -290,10 +297,12 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
+      onEgress: () => { egresses += 1; },
     });
 
     expect(res.status).toBe(400);
     expect(hit).toBe(false); // never reached the provider
+    expect(egresses).toBe(0);
     const body = (await res.json()) as any;
     expect(body.error.message).toMatch(/url. source are not supported/);
     expect(JSON.stringify(body)).not.toContain(b64);
@@ -421,6 +430,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
 
   it("translates an OpenAI front request for an Anthropic target", async () => {
     let seen: any;
+    let egresses = 0;
     const anthropicKind = {
       ...openaiTarget("https://api.anthropic.test"),
       kind: "anthropic" as const,
@@ -434,6 +444,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
         wantsStream: false,
         signal: AbortSignal.timeout(1000),
         anthropicHeaders: { "x-api-key": "sk-anthropic" },
+        onEgress: () => { egresses += 1; },
       },
       async (_url, init) => {
         seen = JSON.parse(String(init?.body));
@@ -450,6 +461,38 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(seen.max_tokens).toBe(1024);
     expect(seen.messages[0].content[0].text).toBe("hello");
     expect((await res.json() as any).choices[0].message.content).toBe("hello from Claude");
+    expect(egresses).toBe(1);
+  });
+
+  it("rejects invalid Responses input before provider egress", async () => {
+    const anthropicKind = {
+      ...openaiTarget("https://api.anthropic.test"),
+      kind: "anthropic" as const,
+    };
+    delete anthropicKind.model;
+    delete anthropicKind.authEnv;
+    let fetches = 0;
+    let egresses = 0;
+
+    const res = await fetchOpenAiFront(
+      resolveAttempt(anthropicKind),
+      {
+        reqJson: { model: "m", input: [null] },
+        wantsStream: false,
+        protocol: "responses",
+        signal: AbortSignal.timeout(1000),
+        onEgress: () => { egresses += 1; },
+      },
+      async () => {
+        fetches += 1;
+        return new Response("{}", { status: 200 });
+      },
+    );
+
+    expect(res.status).toBe(400);
+    expect(errorOrigin(res)).toBe("local");
+    expect(fetches).toBe(0);
+    expect(egresses).toBe(0);
   });
 
   it("rejects malformed buffered and streamed Anthropic 2xx envelopes before translation", async () => {
@@ -592,6 +635,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
 
   it("retries without stream_options when the backend rejects it", async () => {
     const bodies: any[] = [];
+    let egresses = 0;
     backend = await new Promise<Server>((resolve) => {
       const s = createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -620,12 +664,14 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
+      onEgress: () => { egresses += 1; },
     });
 
     expect(res.status).toBe(200);
     expect(bodies.length).toBe(2);
     expect(bodies[0].stream_options).toEqual({ include_usage: true });
     expect(bodies[1].stream_options).toBeUndefined();
+    expect(egresses).toBe(1);
     expect(await res.text()).toContain("content_block_delta");
   });
 
@@ -802,11 +848,13 @@ describe("direct OpenAI stream usage integration", () => {
   it("retries an added usage hint once and leaves a no-usage retry unknown", async () => {
     const bodies: Record<string, unknown>[] = [];
     const accumulator = createUsageAccumulator();
+    let egresses = 0;
     const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
       reqJson: { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] },
       wantsStream: true,
       usage: accumulator,
       signal: AbortSignal.timeout(1000),
+      onEgress: () => { egresses += 1; },
     }, async (_url, init) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       bodies.push(body);
@@ -821,6 +869,7 @@ describe("direct OpenAI stream usage integration", () => {
     expect(bodies[0]?.stream_options).toEqual({ include_usage: true });
     expect(bodies[1]?.stream_options).toBeUndefined();
     expect(accumulator.completionTokens).toBeUndefined();
+    expect(egresses).toBe(1);
   });
 });
 

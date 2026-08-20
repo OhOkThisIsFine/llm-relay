@@ -812,6 +812,89 @@ describe("CLI configuration editing", () => {
     expect(probedMembers).toEqual(["test/coder", "test/catalog-model:free"]);
   });
 
+  it("names the probed credential on AUTH without condemning its siblings or deployment", async () => {
+    writeFileSync(configPath, JSON.stringify({
+      ...baseConfig,
+      providers: {
+        fleet: {
+          base: "http://127.0.0.1:3/v1",
+          kind: "openai",
+          credentials: [
+            { label: "first", authEnv: "CLI_FLEET_FIRST" },
+            { label: "second", authEnv: "CLI_FLEET_SECOND" },
+          ],
+        },
+      },
+      routing: {
+        ...baseConfig.routing,
+        default: "fleet/model",
+        pools: { coding: ["fleet/model"] },
+      },
+    }, null, 2));
+    expect(loadConfig(configPath).providers.fleet!.credentials).toHaveLength(2);
+    const probeAll = vi.fn(async () => [{
+      pool: "coding",
+      spec: "fleet/model",
+      credentialId: "fleet#first",
+      verdict: "auth",
+      httpStatus: 401,
+      detail: "HTTP 401",
+    }]);
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "--probe"];
+
+    await runPools({
+      catalog: new ModelCatalog({ cachePath: null }),
+      probeAll: probeAll as typeof import("../src/pool-health.js").probeAllPools,
+    });
+
+    const rendered = out.join("");
+    expect(probeAll).toHaveBeenCalledOnce();
+    expect(rendered).toContain("credential=fleet#first");
+    expect(rendered).toContain("Fix or disable credential slot fleet#first");
+    expect(rendered).toContain("sibling slots and the deployment were not proven dead");
+    expect(rendered).not.toMatch(/remove or replace/i);
+    expect(rendered).not.toContain("CLI_FLEET_FIRST");
+    expect(rendered).not.toContain("CLI_FLEET_SECOND");
+  });
+
+  it("retains deployment removal guidance for a DEAD missing-model result", async () => {
+    writeFileSync(configPath, JSON.stringify({
+      ...baseConfig,
+      routing: {
+        ...baseConfig.routing,
+        pools: { coding: ["test/gone"] },
+      },
+    }, null, 2));
+    const probeAll = vi.fn(async () => [{
+      pool: "coding",
+      spec: "test/gone",
+      verdict: "missing",
+      httpStatus: 404,
+      detail: "HTTP 404 — model not servable",
+    }]);
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    process.argv = ["node", "cli.ts", "--config", configPath, "pools", "--probe"];
+
+    await runPools({
+      catalog: new ModelCatalog({ cachePath: null }),
+      probeAll: probeAll as typeof import("../src/pool-health.js").probeAllPools,
+    });
+
+    const rendered = out.join("");
+    expect(rendered).toContain("1 DEAD/missing pool member(s)");
+    expect(rendered).toContain("Remove or replace those deployments in routing.pools");
+    expect(rendered).not.toContain("AUTH result");
+  });
+
   it("creates and preserves evidence-aware effort policies", async () => {
     process.argv.push("pools", "set", "medium", "--free", "--effort", "medium");
     await runPools();

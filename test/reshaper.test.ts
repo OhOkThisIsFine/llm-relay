@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { FailoverReshaper, HttpReshaper, ReshaperTransportError, parseCorrectedInputs, reconstruct, type ReshapeRequest } from "../src/reshaper.js";
 import { toolSchemaMap, type AssistantMessage } from "../src/anthropic.js";
-import { candidateEnvNames } from "../src/authEnv.js";
+import type { CredentialResolution } from "../src/authEnv.js";
 
 const tools = toolSchemaMap({
   tools: [{ name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }],
@@ -21,20 +21,15 @@ const CORRECTED = JSON.stringify({ inputs: { t1: { city: "Paris" } } });
 let server: Server;
 afterEach(() => server?.close());
 
-const reshaperEnvKeys = [...new Set([
-  ...candidateEnvNames("nim", "RP_RESHAPER_KEY"),
-  ...candidateEnvNames("gemini", "RESHAPER_ALIAS_DECLARED_KEY"),
-])];
-const savedReshaperEnv: Record<string, string | undefined> = {};
-beforeEach(() => {
-  for (const key of reshaperEnvKeys) { savedReshaperEnv[key] = process.env[key]; delete process.env[key]; }
-});
-afterEach(() => {
-  for (const key of reshaperEnvKeys) {
-    const value = savedReshaperEnv[key];
-    if (value === undefined) delete process.env[key]; else process.env[key] = value;
-  }
-});
+const KEYLESS: CredentialResolution = {
+  state: "not-declared",
+  value: undefined,
+  envName: undefined,
+};
+
+function presentCredential(value: string, envName = "RESHAPER_KEY"): CredentialResolution {
+  return { state: "declared-present", value, envName };
+}
 
 function startServer(handler: (path: string, body: string) => { status?: number; body: string }): Promise<string> {
   return new Promise((resolve) => {
@@ -58,27 +53,38 @@ describe("HttpReshaper", () => {
       hitPath = path;
       return { body: JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }) };
     });
-    process.env.RP_RESHAPER_KEY = "sk-nim";
-    const r = new HttpReshaper({ base, model: "meta/llama-3.1-70b-instruct", kind: "openai", authEnv: "RP_RESHAPER_KEY", authHeader: "authorization", timeoutMs: 5000 });
+    const r = new HttpReshaper(
+      { base, model: "meta/llama-3.1-70b-instruct", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      presentCredential("sk-nim", "RP_RESHAPER_KEY"),
+    );
     const out = await r.reshape(req);
     expect(hitPath).toBe("/chat/completions");
     expect(out.kind).toBe("message");
     if (out.kind === "message") expect(out.message.content[0]).toMatchObject({ type: "tool_use", input: { city: "Paris" } });
   });
 
-  it("resolves a provider-aware alias and emits exactly one Bearer prefix", async () => {
+  it("uses the supplied credential snapshot even if process.env changes after construction", async () => {
     let seen: Headers | undefined;
     const base = await startServer((_path, _body) => ({ body: JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }) }));
-    // The configured provider is gemini, while the credential is under its curated alias.
-    process.env.GOOGLEAI_API_KEY = "Bearer reshaper-alias";
-    const r = new HttpReshaper({ base, model: "m", kind: "openai", provider: "gemini", authEnv: "RESHAPER_ALIAS_DECLARED_KEY", authHeader: "authorization", timeoutMs: 5000 },
+    const envName = "RESHAPER_SNAPSHOT_TEST_KEY";
+    const saved = process.env[envName];
+    process.env[envName] = "Bearer original-snapshot";
+    const r = new HttpReshaper(
+      { base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      presentCredential(process.env[envName]!, envName),
       (async (_url: string, init?: RequestInit) => {
         seen = new Headers(init?.headers);
         return new Response(JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }), { status: 200 });
       }) as unknown as typeof fetch,
     );
-    await r.reshape(req);
-    expect(seen?.get("authorization")).toBe("Bearer reshaper-alias");
+    process.env[envName] = "replacement-must-not-be-read";
+    try {
+      await r.reshape(req);
+      expect(seen?.get("authorization")).toBe("Bearer original-snapshot");
+    } finally {
+      if (saved === undefined) delete process.env[envName];
+      else process.env[envName] = saved;
+    }
   });
 
   it("anthropic kind: calls /v1/messages and parses the corrected message", async () => {
@@ -87,7 +93,10 @@ describe("HttpReshaper", () => {
       hitPath = path;
       return { body: JSON.stringify({ content: [{ type: "text", text: CORRECTED }] }) };
     });
-    const r = new HttpReshaper({ base, model: "claude-haiku-4-5-20251001", kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 });
+    const r = new HttpReshaper(
+      { base, model: "claude-haiku-4-5-20251001", kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+      KEYLESS,
+    );
     const out = await r.reshape(req);
     expect(hitPath).toBe("/v1/messages");
     expect(out.kind).toBe("message");
@@ -102,13 +111,19 @@ describe("HttpReshaper", () => {
 
   it("THROWS a transport error on a non-2xx response (a 500 is not a judgement, so failover may advance)", async () => {
     const base = await startServer(() => ({ status: 500, body: "boom" }));
-    const r = new HttpReshaper({ base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
+    const r = new HttpReshaper(
+      { base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      KEYLESS,
+    );
     await expect(r.reshape(req)).rejects.toThrow(ReshaperTransportError);
   });
 
   it("throws a transport error when the endpoint is unreachable", async () => {
     // Port 1 is reserved and never has a listener on loopback.
-    const r = new HttpReshaper({ base: "http://127.0.0.1:1", model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
+    const r = new HttpReshaper(
+      { base: "http://127.0.0.1:1", model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      KEYLESS,
+    );
     await expect(r.reshape(req)).rejects.toThrow(ReshaperTransportError);
   });
 
@@ -129,12 +144,30 @@ describe("HttpReshaper", () => {
         { name: "send_email", input_schema: { type: "object", properties: { to: { type: "string" } } } },
       ],
     });
-    const r = new HttpReshaper({ base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 });
+    const r = new HttpReshaper(
+      { base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      KEYLESS,
+    );
     await r.reshape({ ...req, tools: many });
     expect(seen).toContain("get_weather");
     expect(seen).not.toContain("read_secrets");
     expect(seen).not.toContain("vault_path");
     expect(seen).not.toContain("send_email");
+  });
+
+  it("rejects a declared-missing snapshot before fetch", async () => {
+    let fetchCalls = 0;
+    const r = new HttpReshaper(
+      { base: "https://must-not-egress.test", model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      { state: "declared-missing", value: undefined, envName: "MISSING_RESHAPER_KEY" },
+      (async () => {
+        fetchCalls++;
+        throw new Error("must not fetch");
+      }) as unknown as typeof fetch,
+    );
+
+    await expect(r.reshape(req)).rejects.toThrow(/MISSING_RESHAPER_KEY/);
+    expect(fetchCalls).toBe(0);
   });
 });
 
@@ -250,8 +283,14 @@ describe("FailoverReshaper", () => {
     const liveBase = await startTempServer(() => ({ body: JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }) }));
     try {
       const r = new FailoverReshaper([
-        new HttpReshaper({ base: deadBase.base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 }),
-        new HttpReshaper({ base: liveBase.base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 }),
+        new HttpReshaper(
+          { base: deadBase.base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+          KEYLESS,
+        ),
+        new HttpReshaper(
+          { base: liveBase.base, model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+          KEYLESS,
+        ),
       ]);
       const out = await r.reshape(req);
       expect(out.kind).toBe("message");

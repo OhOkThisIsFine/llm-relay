@@ -2,16 +2,15 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-**State as of 2026-08-20:** Stage 0 is complete and Stage 1 env-backed multi-key pooling is in
-progress on `codex/stage-1-credential-pooling`; the implementation checkpoint is `7d9eca2`, with
-this handoff update committed directly on top. The current gate is green:
-`npm run build && npm run check` completed on Windows with 76 test files, 1,284 passed and 4
-expected POSIX-permission skips. This is a committed implementation checkpoint, **not Stage 1
-completion**; the remaining migrations below are known and intentionally handed off.
+**State as of 2026-08-20:** Stage 0 and Stage 1 env-backed multi-key pooling are complete on
+`codex/stage-1-credential-pooling`. The authoritative final gate is green:
+`npm run build && npm run check` completed on Windows with 77 test files, 1,351 passed and 4
+expected Windows/POSIX-permission skips. The Stage 1 completion point is the commit containing
+this handoff; no not-yet-created commit hash is claimed here.
 
-## 0. Current implementation checkpoint — read this first
+## 0. Stage 1 completion checkpoint — read this first
 
-The branch contains these landed packets, in order:
+The branch builds on these landed packets, in order:
 
 | Commit | Packet |
 |---|---|
@@ -21,9 +20,11 @@ The branch contains these landed packets, in order:
 | `f8f7360` | Fleet-aware ancillary egress (keys, ping, pool probes, onboarding) |
 | `7d9eca2` | Both-front routing integration, credential leases and diagnostic surfaces |
 
-Implemented and covered by the green gate:
+The commit containing this handoff closes Stage 1 with these settled behaviours:
 
 - explicit fleet slots resolve only their exact env name; legacy `authEnv` retains aliases;
+- providers declare either legacy `authEnv` or `credentials[]`; every explicit fleet, including
+  an empty one, is contained and cannot fall through to caller-credential passthrough;
 - empty, disabled, model-scoped-out and missing fleet slots cannot egress;
 - learned entitlement exclusions retain survivor fallback;
 - selection preserves deployment ordering and ranks credentials by health/demotion, fresh observed
@@ -31,37 +32,25 @@ Implemented and covered by the green gate:
 - credential expansion is breadth-first, and only credential-attributable outcomes unlock a
   sibling slot; provider transport failures suppress that provider for the request;
 - in-flight concurrency is counted credential-wide across models and only demotes saturated slots;
+- attempt leases, LRU touches, walk budgets and usage binding begin only at real backend egress and
+  release exactly once across buffered, streaming, transport, cancellation and mapper exits;
 - Messages and OpenAI fronts emit credential identity/attempt headers for multi-slot providers and
-  record `servedCredential` through the metadata-only log sink;
+  record `servedCredential` through the metadata-only log sink; sticky ordering stays grouped by
+  deployment rather than splitting credential siblings;
 - `/candidates` renders one row per `(spec, credentialId)`, `/registry` nests credential
   diagnostics, and `/telemetry` remains credential-free/provider-aggregate;
 - CLI candidate/key output distinguishes credential slots; ancillary probes use serviceable slots
-  without exceeding their existing real-egress budgets.
+  without exceeding their existing real-egress budgets (`keys` checks every slot; pool probes spend
+  one completion per unique deployment through one serviceable slot);
+- dispatch reachability uses normalized passthrough/contained policy, and dynamic-pool discovery is
+  credential-neutral until a concrete slot is selected;
+- reshapers are request-local: self-repair reuses the exact serving credential snapshot, while
+  provider-backed static and dynamic reshaper pools re-expand current fleets;
+- public configuration examples, CLI help and operating guidance describe fleet configuration,
+  per-cell diagnostics, protected control reads and credential response headers.
 
-Known remaining Stage 1 work, in suggested pickup order:
-
-1. **Dispatch passthrough policy:** `src/dispatch.ts:392` still decides plain-subagent reachability
-   with `provider.authEnv === undefined`. Replace this legacy proxy with the normalized credential
-   policy (`credentialMode`/fleet semantics) and add contained-fleet versus true-passthrough tests.
-2. **Dynamic-pool fact lookup:** `src/dynamic-pools.ts` still calls `isCostBlocked(provider,
-   makeCredentialId(provider), model)`. Deployment discovery has no selected slot and must query
-   with required `credentialId = null`, so credential-scoped facts cannot leak into deployment
-   admission. Add a multi-slot regression test.
-3. **Reshaper credential binding:** `src/reshaper.ts` still resolves one legacy `authEnv` at egress,
-   while `src/server.ts` caches reshapers by provider/model. Make global/dynamic reshaper selection
-   fleet-aware without caching secret material under provider/model-only identity, and make
-   per-target repair reuse the exact `ResolvedAttempt` credential that served the malformed
-   response. Cover fixed, pool-backed and per-target repair.
-4. **Focused integration review:** the gate is green, but the interrupted scheduler packet was
-   checkpointed under time pressure. Review both front loops for exact lease release on every exit,
-   actual-egress-only LRU/budget accounting, same-deployment suppression after non-credential
-   failures, sticky deployment grouping, and credential header attempt counts. Failover tests must
-   use at least two credentials and at least two candidates.
-5. Update user-facing configuration/reference examples once the three migrations above settle,
-   then rerun the one gate and commit a clean Stage 1 completion point.
-
-Do not start custody/keystore work in this branch. Stage 1 here is env-backed pooling; custody is
-the next design stage after its routing and observability behavior is closed.
+Do not start custody/keystore work in this branch. Stage 1 is deliberately env-backed pooling;
+custody is the next design stage now that routing and observability behaviour are closed.
 
 ---
 
@@ -182,7 +171,7 @@ this and nothing else.** Green means green.
 | `docs/open-decisions-2026-08-16.md` | 18 owner decisions; 4 resolved, 14 with recommendations |
 | `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind |
 | `docs/evidence-2026-08-16/` | Machine-readable audit trail: 375 claim verdicts, 55 re-adjudications |
-| `docs/reference.md` | Full user-facing reference. ⚠ `:768` advertises two response headers that have never existed. |
+| `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
 
 ## 6. Things that will bite you
 
@@ -220,9 +209,9 @@ this and nothing else.** Green means green.
    against recommendation, knowingly breaking the zero-new-deps / no-build-pipeline budget. It is
    the one piece of the program that is **still unspecified**; the quota spec designed only the
    single-HTML-file option.
-3. The ~12 documentation drift items in `docs/status-vs-freellmapi-2026-08-16.md` §5, including the
-   phantom headers in `docs/reference.md:768` that have been advertised since 2026-07-28 and never
-   existed.
+3. Re-audit the remaining documentation drift items in
+   `docs/status-vs-freellmapi-2026-08-16.md` §5 against current source; Stage 1 corrected its
+   credential-surface and phantom-header items.
 4. Render the **effective** `freeOnly` in `llm-relay offload status` (`grep freeOnly src/cli.ts` = 0
    hits). ⚠ Not a raw field print: unset means **ON** for rerouted traffic and **OFF** for a directly
    addressed pool, so printing the bare optional would be a new transparency bug.

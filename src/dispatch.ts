@@ -366,11 +366,13 @@ export function specContextWindow(
  * Can a bypassed host reach this spec with a plain subagent, no relay involvement?
  *
  * Only when every provider it resolves to is the caller's OWN vendor passthrough — an
- * `anthropic`-kind provider declaring no `authEnv`, i.e. one that forwards the caller's own
- * credential to the caller's own vendor. Such a rung means "give up and spend primary quota",
- * and an ordinary `Agent(...)` call does exactly that from any host. It needs no directive, no
- * offload rule and no shell-out, so transposing it would replace a working lane with a
- * needlessly heavier one.
+ * `anthropic`-kind provider declaring no top-level `authEnv` whose normalized credential policy
+ * is not `contained`. This admits both explicit passthrough and the legacy omitted-mode form,
+ * while rejecting provider-owned single-key and fleet credentials. A fleet also has no top-level
+ * `authEnv`, so that field alone is not a passthrough signal. Such a rung means "give up and spend
+ * primary quota", and an ordinary `Agent(...)` call does exactly that from any host. It needs no
+ * directive, no offload rule and no shell-out, so transposing it would replace a working lane with
+ * a needlessly heavier one.
  *
  * Everything else — pools, pinned third-party models — needs the subagent-reroute machinery,
  * which is precisely what a bypassed host does not have.
@@ -389,7 +391,12 @@ function reachableWithoutRelay(spec: string, cfg: Config): boolean {
   if (specs.length === 0) return false;
   return specs.every((s) => {
     const provider = cfg.providers[splitSpec(s).provider];
-    return provider !== undefined && provider.kind === "anthropic" && provider.authEnv === undefined;
+    return (
+      provider !== undefined &&
+      provider.kind === "anthropic" &&
+      provider.authEnv === undefined &&
+      provider.credentialMode !== "contained"
+    );
   });
 }
 

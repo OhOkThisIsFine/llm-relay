@@ -16,6 +16,17 @@ const BASE = {
     // The caller's own vendor passthrough: anthropic-kind, no authEnv. A relay rung pointing here
     // is reachable from ANY host as a plain subagent, which is what the transposition must respect.
     anthropic: { base: "https://api.anthropic.com", kind: "anthropic" },
+    declaredPassthrough: {
+      base: "https://api.anthropic.com",
+      kind: "anthropic",
+      credentialMode: "passthrough",
+    },
+    keyedAnthropic: { base: "https://keyed.test", kind: "anthropic", authEnv: "HOST_ADAPTIVE_SINGLE_KEY" },
+    fleetAnthropic: {
+      base: "https://fleet.test",
+      kind: "anthropic",
+      credentials: [{ label: "primary", authEnv: "HOST_ADAPTIVE_FLEET_KEY" }],
+    },
     nim: { base: "https://nim.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY" },
   },
   routing: {
@@ -141,12 +152,50 @@ describe("transposing relay rungs for a bypassed host", () => {
     expect(l.invoke?.args).toHaveLength(4);
   });
 
-  it("does NOT transpose the caller's own vendor passthrough — a plain subagent reaches it", () => {
-    const l = lane(cfg(), "anthropic", { host: "bypassed" });
+  it("does NOT transpose legacy omitted-mode passthrough — a plain subagent reaches it", () => {
+    const c = cfg();
+    const l = lane(c, "anthropic", { host: "bypassed" });
+    expect(c.providers.anthropic!.credentialMode).toBeUndefined();
     expect(l.transposed).toBeUndefined();
     expect(l.invoke).toBeUndefined();
     expect(l.unreachable).toBeUndefined();
     expect(l.spec).toBe("anthropic");
+  });
+
+  it("keeps an explicitly declared passthrough reachable without the relay", () => {
+    const c = cfgWith({
+      ladder: [{ id: "declared", kind: "relay", spec: "declaredPassthrough" }],
+      cliLane: CLI_LANE,
+    });
+    const l = lane(c, "declared", { host: "bypassed" });
+    expect(c.providers.declaredPassthrough!.credentialMode).toBe("passthrough");
+    expect(l.transposed).toBeUndefined();
+    expect(l.invoke).toBeUndefined();
+    expect(l.unreachable).toBeUndefined();
+  });
+
+  it("normalizes a populated Anthropic-format fleet to contained and transposes it", () => {
+    const c = cfgWith({
+      ladder: [{ id: "fleet", kind: "relay", spec: "fleetAnthropic" }],
+      cliLane: CLI_LANE,
+    });
+    const l = lane(c, "fleet", { host: "bypassed" });
+    expect(c.providers.fleetAnthropic!.authEnv).toBeUndefined();
+    expect(c.providers.fleetAnthropic!.credentialMode).toBe("contained");
+    expect(l.transposed).toBe(true);
+    expect(l.invoke?.args).toEqual(["-p", "--model", "fleetAnthropic", "{task}"]);
+    expect(l.unreachable).toBeUndefined();
+  });
+
+  it("continues to transpose an Anthropic-format provider with one top-level key", () => {
+    const c = cfgWith({
+      ladder: [{ id: "keyed", kind: "relay", spec: "keyedAnthropic" }],
+      cliLane: CLI_LANE,
+    });
+    const l = lane(c, "keyed", { host: "bypassed" });
+    expect(c.providers.keyedAnthropic!.authEnv).toBe("HOST_ADAPTIVE_SINGLE_KEY");
+    expect(l.transposed).toBe(true);
+    expect(l.invoke?.args).toEqual(["-p", "--model", "keyedAnthropic", "{task}"]);
   });
 
   it("never sets requiresDirective on a bypassed host — the directive is inert there", () => {
