@@ -4,8 +4,13 @@ import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
 import { deploymentFitness, getStrength, type StrengthBasis } from "./benchmarks.js";
 import { findTierModel, type TierData } from "./tier-data.js";
-import { readCredential } from "./authEnv.js";
-import { makeCredentialId } from "./credential-id.js";
+import {
+  implicitCredentialSlot,
+  providerCredentialSlots,
+  resolveCredentialSlot,
+  slotAllowsModel,
+  type CredentialSlot,
+} from "./credential-fleet.js";
 import { resolveMetadata, type MetadataSource } from "./metadata.js";
 import {
   globalCircuitBreaker,
@@ -32,10 +37,20 @@ export interface Candidate {
   model?: string;
   /** The credential cell this row describes. */
   credentialId: string;
+  /** Non-secret credential-slot diagnostics; key material is never included. */
+  credential: {
+    label: string;
+    authEnv: string | null;
+    enabled: boolean;
+    models: readonly string[] | null;
+    state: "not-declared" | "declared-present" | "declared-missing";
+    /** Whether this slot's optional model allow-list includes the row's deployment. */
+    modelAllowed: boolean;
+  };
   /** Pools this spec belongs to, and subagent tiers currently pointing at it. */
   pools: string[];
   subagentTiers: string[];
-  /** Provider auth env var is populated. */
+  /** This slot's auth env var is populated; intentional passthrough/keyless slots are usable. */
   hasKey: boolean;
   /** In the provider's live /models catalog. null = not checkable (anthropic kind, or catalog down). */
   listed: boolean | null;
@@ -325,13 +340,34 @@ export async function buildCandidates(
     }));
   }
 
-  const candidates: Candidate[] = [];
+  const credentialCells: Array<{
+    spec: string;
+    membership: { pools: string[]; subagentTiers: string[] };
+    provider: string;
+    model: string | undefined;
+    providerConfig: ProviderConfig | undefined;
+    slot: CredentialSlot;
+  }> = [];
   for (const [spec, membership] of memberships) {
     const { provider, model } = splitSpec(spec);
     if (opts.provider && provider !== opts.provider) continue;
-    const p: ProviderConfig | undefined = cfg.providers[provider];
-    const credentialId = makeCredentialId(provider);
-    // This is the implicit single-slot attempt identity.  Cell-only breaker operations below
+    const providerConfig: ProviderConfig | undefined = cfg.providers[provider];
+    const slots: readonly CredentialSlot[] = providerConfig
+      ? providerCredentialSlots(provider, providerConfig)
+      : [implicitCredentialSlot(provider)];
+    for (const slot of slots) {
+      credentialCells.push({ spec, membership, provider, model, providerConfig, slot });
+    }
+  }
+
+  const candidates: Candidate[] = [];
+  for (const { spec, membership, provider, model, providerConfig: p, slot } of credentialCells) {
+    const credentialId = slot.credentialId;
+    const credentialResolution = p
+      ? resolveCredentialSlot(slot)
+      : { state: "not-declared" as const, value: undefined, envName: undefined };
+    const modelAllowed = slotAllowsModel(slot, model);
+    // This is the exact credential-cell identity. Cell-only breaker operations below
     // must receive the identity, never the display spec or a serialized provider/model key.
     const cellTarget: ProviderTargetIdentity = {
       provider,
@@ -413,7 +449,15 @@ export async function buildCandidates(
       subagentTiers: membership.subagentTiers,
       // The shared presence predicate, not an open-coded `?.trim()`. Three sites disagreed
       // about whether a whitespace-only key counts as present; this is the single answer.
-      hasKey: p?.authEnv ? readCredential(p.authEnv, process.env, provider) !== undefined : true,
+      hasKey: credentialResolution.state !== "declared-missing",
+      credential: {
+        label: slot.label,
+        authEnv: slot.authEnv ?? null,
+        enabled: slot.enabled,
+        models: slot.models,
+        state: credentialResolution.state,
+        modelAllowed,
+      },
       listed,
       capabilityMatch: matched ? { name: matched.rec.norm, match: matched.match } : null,
       health: summary

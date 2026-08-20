@@ -3,7 +3,8 @@ import { loadTierData, findTierModel } from "./tier-data.js";
 export { loadTierData };
 import type { Config, ProviderConfig } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
-import { readCredential } from "./authEnv.js";
+import type { CredentialState } from "./authEnv.js";
+import { aggregateHasKey, snapshotProviderCredentials } from "./credential-fleet.js";
 
 import type { PingLoop, ModelHealthSummary } from "./ping/cadence.js";
 
@@ -31,15 +32,27 @@ interface RegistryModel {
   health?: ModelHealthSummary;
 }
 
+export interface RegistryCredential {
+  credentialId: string;
+  label: string;
+  authEnv: string | null;
+  enabled: boolean;
+  models: readonly string[] | null;
+  state: CredentialState;
+  has_key: boolean;
+}
+
 interface RegistryProvider {
   base: string;
   kind: "openai" | "anthropic";
   authEnv?: string;
-  /** Whether the provider's auth env var is set (a provider can be configured but keyless). */
+  /** Whether any enabled provider credential slot can make an attempt. */
   has_key: boolean;
   /** openai providers only: did the live /models catalog return anything (reachable + authorized)? */
   reachable: boolean | null;
   models: RegistryModel[];
+  /** Credential identity and resolution diagnostics; values are never exposed. */
+  credentials: RegistryCredential[];
 }
 
 export interface RegistryView {
@@ -103,7 +116,16 @@ export async function buildRegistry(
     // The shared presence predicate, not an open-coded `?.trim()` — call sites that each decided
     // for themselves whether a whitespace-only key counts as present is exactly how a blank
     // credential once read "present" here and "absent" to header construction.
-    const has_key = p.authEnv ? readCredential(p.authEnv, process.env, name) !== undefined : true;
+    const has_key = aggregateHasKey(name, p);
+    const credentials = snapshotProviderCredentials(name, p).map(({ slot, resolution }) => ({
+      credentialId: slot.credentialId,
+      label: slot.label,
+      authEnv: slot.authEnv ?? null,
+      enabled: slot.enabled,
+      models: slot.models,
+      state: resolution.state,
+      has_key: resolution.state !== "declared-missing",
+    }));
     let models: RegistryModel[] = [];
     let reachable: boolean | null = p.kind === "openai" ? false : null;
     if (p.kind === "openai") {
@@ -123,6 +145,7 @@ export async function buildRegistry(
       has_key,
       reachable,
       models,
+      credentials,
     };
   }
 

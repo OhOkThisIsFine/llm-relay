@@ -241,6 +241,9 @@ describe("telemetry", () => {
     const serialized = JSON.stringify(report);
     expect(serialized).not.toContain("personal");
     expect(serialized).not.toContain("work");
+    expect(serialized).not.toContain("credentialId");
+    expect(serialized).not.toContain("nim#");
+    expect(serialized).not.toContain("quota");
   });
 
   it("does not expose quota observations on provider-level telemetry", () => {

@@ -20,12 +20,14 @@ import {
 import { buildAuthHeaders } from "./authEnv.js";
 import { makeCredentialId } from "./credential-id.js";
 import { resolveAttempt, type ResolvedAttempt } from "./resolved-attempt.js";
+import { resolveAttemptForSlot } from "./credential-fleet.js";
+import { CredentialLru, rankCredentialAttempts } from "./credential-select.js";
 import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
 import { FailoverReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -41,7 +43,7 @@ import { extractQuotaObservations } from "./quota-observation.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
-import { clearFacts, cooldownUntil, isCostBlocked, recordFact } from "./target-facts.js";
+import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact } from "./target-facts.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
@@ -228,6 +230,8 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const catalog = deps.catalog ?? new ModelCatalog();
   const pingLoop = deps.pingLoop ?? new PingLoop(cfg, catalog);
   const breaker = deps.breaker ?? new CircuitBreaker();
+  // Process-local and deliberately credential-wide: a deployment switch must not reset fairness.
+  const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
   const stickyConfig = cfg.routing.sticky;
   const stickySessions = stickyConfig === true || (typeof stickyConfig === "object" && stickyConfig.enabled)
@@ -307,6 +311,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       catalog,
       pingLoop,
       breaker,
+      credentialLru,
       ...(modelCallRecorder ? { modelCallRecorder } : {}),
       ...(stickySessions ? { stickySessions } : {}),
       server,
@@ -355,6 +360,7 @@ interface Handlers {
   catalog: ModelCatalog;
   pingLoop?: PingLoop;
   breaker: CircuitBreaker;
+  credentialLru: CredentialLru;
   modelCallRecorder?: ModelCallRecorder;
   stickySessions?: StickySessionManager;
   controlAuthorization?: ControlAuthorizationPort;
@@ -519,8 +525,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Resolve the credential once per configured candidate after all route-level pruning. The
   // resulting attempt is immutable for this request: retries and both public fronts must not
   // observe an environment change halfway through a provider attempt.
-  const attempts = targetCandidates.map((target) => resolveAttempt(target));
-  let healthyAttempts = orderByUsability(attempts, h.breaker, routingNow);
+  const attempts = expandCredentialAttempts(targetCandidates);
+  // An explicit empty/disabled/model-scoped/missing fleet cannot make egress.  Keeping a
+  // synthetic first attempt here would accidentally turn a configuration error into a request.
+  if (attempts.length === 0) {
+    failClosed(res, 502, "llm-relay configuration: no enabled credential slot is available for the resolved target");
+    h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null));
+    return;
+  }
+  const rankedAttempts = rankCredentialAttempts(attempts, h.credentialLru, {
+    evidenceFor: (attempt) => credentialEvidence(attempt, cfg, h.breaker, routingNow),
+  });
+  let healthyAttempts = interleaveCredentialRounds(orderByUsability(rankedAttempts, h.breaker, routingNow));
   let sticky: StickyRequestContext | null = null;
   if ((isMessages || openAiFrontProtocol) && h.stickySessions) {
     const key = deriveSessionKey(req.headers, reqJson);
@@ -638,6 +654,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const attemptTrace = new RequestAttemptTrace();
   const pool429 = new Pool429Tracker();
   const tried: string[] = [];
+  const credentialStatuses: number[] = [];
   const walkBudgetMs = cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
   const walkStarted = Date.now();
   for (let i = 0; i < healthyAttempts.length; i++) {
@@ -677,6 +694,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         return;
       }
 
+      // This is the real egress boundary: rejected/missing credentials did not consume LRU.
+      h.credentialLru.touch(resolvedAttempt.credentialId);
+
       let backendRes: Response;
       try {
         backendRes = await fetchBackend(resolvedAttempt, {
@@ -708,6 +728,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         // for the rest of THIS walk only — prune before the "is there a next candidate" check so
         // a walk whose only remaining members share the dead host ends honestly here.
         if (!aborted) dropRemainingSameProvider(healthyAttempts, i, target.provider);
+        else dropRemainingSameDeployment(healthyAttempts, i, target);
 
         // Failover if additional candidates exist and the walk budget allows another start
         if (!res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
@@ -725,6 +746,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       }
 
       const reportedModelSource = backendRes;
+      credentialStatuses.push(backendRes.status);
       // One shared policy with the OpenAI front — see `classifyStatus` / `shouldTryNext`.
       //
       // A 401/403 now fails over WHEN ANOTHER CANDIDATE EXISTS. It did not before, so a pool
@@ -742,10 +764,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
       const localFailure = errorOrigin(backendRes) === "local";
       const tryNext = !localFailure && shouldTryNext(cls);
+      // An HTTP response proves the provider is reachable.  Only credential-attributable
+      // statuses may unlock a sibling slot; 5xx/shape failures close this deployment.
+      if (cls === "retriable" && backendRes.status !== 402 && backendRes.status !== 429) {
+        dropRemainingSameDeployment(healthyAttempts, i, target);
+      }
       if (tryNext && !res.destroyed && i < healthyAttempts.length - 1 && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
         clearTimeout(timer);
         res.off("close", onResClose);
-        if (await discardCandidate(backendRes, resolvedAttempt, backendRes.status, retryAfterMs)) pool429.noteUnknownRefusal();
+        const eligibility = await discardCandidate(backendRes, resolvedAttempt, backendRes.status, retryAfterMs);
+        if (eligibility.unknown) pool429.noteUnknownRefusal();
+        if (eligibility.scope && (eligibility.scope.kind === "deployment" || eligibility.scope.kind === "provider" || eligibility.scope.kind === "model" || (eligibility.scope.kind === "group" && eligibility.scope.credentialId === undefined))) {
+          dropRemainingSameDeployment(healthyAttempts, i, target);
+        }
         pool429.recordFailover(backendRes.status, retryAfterMs);
         completeAttemptFailure(h, attempt, {
           failure: "http",
@@ -836,6 +867,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         poolUnknownRefusals: pool429.unknownCount(),
         degraded: degradedLabel(addressedPool, degradedSpecs, target),
         paid: paidLabel(cfg, h, target),
+        credentialHeaders: credentialHeaderValues(cfg, resolvedAttempt, credentialStatuses.length, credentialStatuses),
         sticky,
       };
 
@@ -983,6 +1015,85 @@ function targetUsability(
   return "live";
 }
 
+/** Resolve every configured slot once, then retain deployment order while taking credential rounds. */
+function expandCredentialAttempts(targets: readonly ResolvedTarget[]): ResolvedAttempt[] {
+  const expanded: ResolvedAttempt[] = [];
+  for (const target of targets) {
+    const slots = target.credentialSlots;
+    if (slots === undefined) {
+      expanded.push(resolveAttempt(target));
+      continue;
+    }
+    for (const slot of slots) {
+      const attempt = resolveAttemptForSlot(target, slot);
+      if (attempt) expanded.push(attempt);
+    }
+  }
+  return expanded;
+}
+
+function credentialEvidence(
+  attempt: ResolvedAttempt,
+  cfg: Config,
+  breaker: CircuitBreaker,
+  now: number,
+) {
+  const identity = targetIdentity(attempt);
+  const provider = cfg.providers[attempt.target.provider];
+  const state = breaker.getState(identity);
+  let facts: ReturnType<typeof factsFor> = [];
+  try { facts = factsFor(attempt.target.provider, attempt.credentialId, attempt.target.model ?? null, { now }); } catch { /* persistent evidence is best effort */ }
+  const cost = attempt.target.kind === "openai" && attempt.target.model
+    ? assessCost(attempt.target.model, null, provider?.tierType).costClass
+    : "paid";
+  return {
+    facts,
+    health: breaker.isHealthy(identity, now) ? "unknown" as const : "unhealthy" as const,
+    credentialFault: breaker.hasCredentialFault(identity, now),
+    cooling: cooledByAllowance(attempt, now),
+    saturated: provider?.maxConcurrent != null && breaker.inFlightCredential(attempt.credentialId) >= provider.maxConcurrent,
+    quota: state?.quotaObservations ?? [],
+    cost,
+  };
+}
+
+/** Breadth-first slots: deployment order remains authoritative inside every credential round. */
+function interleaveCredentialRounds(attempts: readonly ResolvedAttempt[]): ResolvedAttempt[] {
+  const groups = new Map<string, ResolvedAttempt[]>();
+  for (const attempt of attempts) {
+    const { target } = attempt;
+    const key = `${target.provider}\u0000${target.base}\u0000${target.model ?? ""}`;
+    const group = groups.get(key);
+    if (group) group.push(attempt); else groups.set(key, [attempt]);
+  }
+  const grouped = [...groups.values()];
+  const rounds = Math.max(0, ...grouped.map((group) => group.length));
+  const result: ResolvedAttempt[] = [];
+  for (let round = 0; round < rounds; round++) for (const group of grouped) {
+    const attempt = group[round]; if (attempt) result.push(attempt);
+  }
+  return result;
+}
+
+function credentialHeaderValues(
+  cfg: Config,
+  attempt: ResolvedAttempt,
+  started: number,
+  statuses: readonly number[],
+): Record<string, string> {
+  const slots = cfg.providers[attempt.target.provider]?.credentials;
+  const enabled = slots === undefined ? 1 : slots.filter((slot) => slot.enabled !== false).length;
+  if (enabled < 2) return {};
+  const headers: Record<string, string> = { [CREDENTIAL_HEADER]: attempt.credentialId };
+  if (started >= 2) {
+    const tallies = new Map<number, number>();
+    for (const status of statuses) tallies.set(status, (tallies.get(status) ?? 0) + 1);
+    const summary = [...tallies.entries()].map(([status, count]) => `${count}x${status}`).join(", ");
+    headers[CREDENTIAL_ATTEMPTS_HEADER] = `${started} tried, 1 served${summary ? `: ${summary}` : ""}`;
+  }
+  return headers;
+}
+
 /**
  * Promote a pin only inside its live capability segment. In particular, a live degrade-tail pin
  * never jumps a live in-band member; the tail remains a fallback after the requested band.
@@ -1010,9 +1121,10 @@ function applyStickyOrdering(
 
   const index = ordered.findIndex((candidate) => specOfTarget(candidate.target) === pinnedSpec);
   if (index <= 0) return { targets: ordered, status: "pinned, natural" };
-  const reordered = [...ordered];
-  const [target] = reordered.splice(index, 1);
-  reordered.unshift(target!);
+  // A pin is a deployment decision, never a single credential row.  Moving just the first
+  // row would break the request's breadth-first slot round and can starve a healthy sibling.
+  const pinnedRows = ordered.filter((candidate) => specOfTarget(candidate.target) === pinnedSpec);
+  const reordered = [...pinnedRows, ...ordered.filter((candidate) => specOfTarget(candidate.target) !== pinnedSpec)];
   return { targets: reordered, status: "pinned, reordered" };
 }
 
@@ -1321,6 +1433,8 @@ interface Ctx {
   poolSummary?: string | null;
   /** Unrecognized refusals among the candidates stepped over. See the caveat at the emit site. */
   poolUnknownRefusals?: number | null;
+  /** Credential diagnostics are slot identities only; values never leave the process. */
+  credentialHeaders?: Record<string, string>;
   /** Set when the answering deployment came from the pool's degrade tail. See `degradedLabel`. */
   degraded?: string | null;
   /** Set when the answering deployment is not free. See `PAID_HEADER`. */
@@ -1463,33 +1577,37 @@ function observeContextLimit(res: Response, target: ResolvedTarget): void {
  *
  * Never throws: the worst outcome of a failure here is that nothing is learned this time.
  */
-function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfterMs: number | null, body: string): boolean {
+type EligibilityObservation = { readonly unknown: boolean; readonly scope?: ReturnType<typeof materializeScope> };
+
+function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfterMs: number | null, body: string): EligibilityObservation {
   const { target } = attempt;
-  if (target.model === undefined) return false;
+  if (target.model === undefined) return { unknown: false };
   try {
     const verdict = interpretRefusal(target.provider, target.model, status, body);
     if (verdict === null) {
       // The fail-safe: an unrecognized refusal changes nothing about routing. It is held so a
       // researcher can say what it means, and only then will it ever bind.
       recordUnknownRefusal(target.provider, target.model, status, body);
-      return true;
+      return { unknown: true };
     }
     // The verdict's scope TEMPLATE becomes a concrete scope here, using this request's provider
     // and model. A provider-scoped verdict therefore covers every deployment behind that
     // credential from one observation — which is the whole point: a stated credit balance or a
     // rejected key is one fact, and rediscovering it once per model is pure waste.
-    recordFact(verdict.class, materializeScope(
+    const scope = materializeScope(
       verdict.scope,
       target.provider,
       attempt.credentialId,
       target.model,
-    ), {
+    );
+    recordFact(verdict.class, scope, {
       retryAfterMs: resolveResetMs(verdict, retryAfterMs, body),
     });
+    return { unknown: false, scope };
   } catch {
     /* learning is best-effort and never in the request's way */
   }
-  return false;
+  return { unknown: false };
 }
 
 /**
@@ -1572,14 +1690,14 @@ async function discardCandidate(
   attempt: ResolvedAttempt,
   status: number,
   retryAfterMs: number | null,
-): Promise<boolean> {
+): Promise<EligibilityObservation> {
   if (carriesEligibilityFact(status)) {
     const body = await res.text().catch(() => "");
     if (body) return observeEligibility(attempt, status, retryAfterMs, body);
-    return false;
+    return { unknown: false };
   }
   await res.body?.cancel().catch(() => {});
-  return false;
+  return { unknown: false };
 }
 
 function observeAttemptHeaders(
@@ -1741,6 +1859,7 @@ async function openAiFrontPath(
   const directTools = toolSchemaMap(ctx.reqJson);
   // All-429 exhaustion Retry-After policy, shared with the Anthropic path: `Pool429Tracker`.
   const pool429 = new Pool429Tracker();
+  const credentialStatuses: number[] = [];
   const walkBudgetMs = ctx.cfg?.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS;
   const walkStarted = Date.now();
 
@@ -1780,6 +1899,9 @@ async function openAiFrontPath(
       h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
       return;
     }
+
+    // Match Messages: only a validated candidate about to fetch updates fairness state.
+    h.credentialLru.touch(resolvedAttempt.credentialId);
 
     const recoveryAudit: { value: {
       validated: RequestLog["validated"];
@@ -1876,6 +1998,7 @@ async function openAiFrontPath(
       // for the rest of THIS walk only. Prune first, and re-read the live length below — the
       // `isLast` cached at loop top predates the prune.
       if (!aborted) dropRemainingSameProvider(candidates, i, target.provider);
+      else dropRemainingSameDeployment(candidates, i, target);
 
       // The client hanging up aborts every candidate; walking the rest would be pointless work
       // against a socket nobody is reading.
@@ -1893,6 +2016,7 @@ async function openAiFrontPath(
     }
 
     const reportedModelSource = upstream;
+    credentialStatuses.push(upstream.status);
     // A local translation/configuration failure is deterministic for the request and should not
     // make every other candidate repeat the same failure. Provider responses still use the shared
     // breaker/failover policy.
@@ -1903,6 +2027,9 @@ async function openAiFrontPath(
     observeContextLimit(upstream, target);
 
     const tryNext = localFailure ? false : shouldTryNext(cls);
+    if (cls === "retriable" && upstream.status !== 402 && upstream.status !== 429) {
+      dropRemainingSameDeployment(candidates, i, target);
+    }
 
     if (tryNext && !isLast && !res.writableEnded && !res.destroyed && walkBudgetAllowsNext(walkBudgetMs, walkStarted, i + 1)) {
       clearTimeout(timer);
@@ -1910,7 +2037,11 @@ async function openAiFrontPath(
       // Release the skipped candidate's socket — an un-consumed body holds the connection open.
       // The body is read rather than cancelled when it might state a durable fact about the
       // deployment; either way the socket is freed and the bytes are discarded.
-      if (await discardCandidate(upstream, resolvedAttempt, upstream.status, retryAfterMs)) pool429.noteUnknownRefusal();
+      const eligibility = await discardCandidate(upstream, resolvedAttempt, upstream.status, retryAfterMs);
+      if (eligibility.unknown) pool429.noteUnknownRefusal();
+      if (eligibility.scope && (eligibility.scope.kind === "deployment" || eligibility.scope.kind === "provider" || eligibility.scope.kind === "model" || (eligibility.scope.kind === "group" && eligibility.scope.credentialId === undefined))) {
+        dropRemainingSameDeployment(candidates, i, target);
+      }
       pool429.recordFailover(upstream.status, retryAfterMs);
       completeAttemptFailure(h, attempt, {
         failure: "http",
@@ -1999,6 +2130,7 @@ async function openAiFrontPath(
     try {
       const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
       const headers: Record<string, string | string[]> = { ...filterResponseHeaders(upstream.headers), [SERVED_BY_HEADER]: servedBy };
+      if (ctx.cfg) Object.assign(headers, credentialHeaderValues(ctx.cfg, resolvedAttempt, credentialStatuses.length, credentialStatuses));
       const degradedBy = degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target);
       if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
       const paidBy = ctx.cfg ? paidLabel(ctx.cfg, h, target) : null;
@@ -2019,7 +2151,7 @@ async function openAiFrontPath(
         const raw = await upstream.text().catch(() => "");
         // The last candidate teaches us as much as the ones stepped over — and for a
         // single-member pool it is the ONLY one that can. Free, since the body is already here.
-        if (raw && carriesEligibilityFact(upstream.status) && observeEligibility(resolvedAttempt, upstream.status, retryAfterMs, raw)) {
+        if (raw && carriesEligibilityFact(upstream.status) && observeEligibility(resolvedAttempt, upstream.status, retryAfterMs, raw).unknown) {
           pool429.noteUnknownRefusal();
         }
         // Emitted here rather than with the other headers because the terminal candidate's verdict
@@ -2076,6 +2208,7 @@ async function openAiFrontPath(
       target,
       attemptTrace.snapshot(),
       upstreamReportedModel(reportedModelSource),
+      resolvedAttempt.credentialId,
     );
     h.logger.write(audit ? {
       ...log,
@@ -2102,6 +2235,7 @@ function responseHeadersForTarget(backendRes: Response, ctx: Ctx): Record<string
   if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
+  if (ctx.credentialHeaders) Object.assign(responseHeaders, ctx.credentialHeaders);
   const sticky = stickyHeaderValue(ctx.sticky, ctx.target, backendRes.status);
   if (sticky) responseHeaders[STICKY_PROVENANCE_HEADER] = sticky;
   return responseHeaders;
@@ -2215,6 +2349,7 @@ async function transparentPath(
       ctx.target,
       ctx.attempt.trace.snapshot(),
       upstreamReportedModel(ctx.reportedModelSource),
+      ctx.attempt.resolvedAttempt.credentialId,
     ),
     toolUseCount, uncheckableCount, errorKinds,
   });
@@ -2455,6 +2590,7 @@ async function repairStreamingPath(
       ctx.target,
       ctx.attempt.trace.snapshot(),
       upstreamReportedModel(ctx.reportedModelSource),
+      ctx.attempt.resolvedAttempt.credentialId,
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
   });

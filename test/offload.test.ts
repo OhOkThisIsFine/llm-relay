@@ -471,6 +471,55 @@ describe("unroutable offload clients", () => {
 });
 
 describe("candidates view", () => {
+  it("emits spec-outer, credential-slot-inner rows with orthogonal slot diagnostics", async () => {
+    const cfg = freshConfig("fleet-cells.json", {
+      pools: { coding: ["nim/m1", "nim/m2"] },
+      subagents: { default: "pool/coding" },
+    });
+    const provider = cfg.providers.nim!;
+    delete provider.authEnv;
+    provider.credentials = [
+      { label: "personal", authEnv: "CANDIDATE_PERSONAL" },
+      { label: "work", authEnv: "CANDIDATE_WORK", models: ["m1"] },
+      { label: "spare", authEnv: "CANDIDATE_SPARE", enabled: false, models: ["m2"] },
+      { label: "none", authEnv: "CANDIDATE_NONE", models: [] },
+    ];
+    process.env.CANDIDATE_PERSONAL = "candidate-secret-personal";
+    process.env.CANDIDATE_SPARE = "candidate-secret-spare";
+    process.env.CANDIDATE_NONE = "candidate-secret-none";
+    delete process.env.CANDIDATE_WORK;
+    try {
+      const view = await buildCandidates(cfg, { breaker: new CircuitBreaker(), tierData: null });
+      expect(view.candidates.map((candidate) => [candidate.spec, candidate.credentialId])).toEqual([
+        ["nim/m1", "nim#personal"], ["nim/m1", "nim#work"],
+        ["nim/m1", "nim#spare"], ["nim/m1", "nim#none"],
+        ["nim/m2", "nim#personal"], ["nim/m2", "nim#work"],
+        ["nim/m2", "nim#spare"], ["nim/m2", "nim#none"],
+      ]);
+
+      const workM1 = view.candidates.find((candidate) =>
+        candidate.spec === "nim/m1" && candidate.credentialId === "nim#work"
+      )!;
+      expect(workM1.credential).toMatchObject({
+        label: "work", authEnv: "CANDIDATE_WORK", enabled: true,
+        models: ["m1"], state: "declared-missing", modelAllowed: true,
+      });
+      expect(workM1.hasKey).toBe(false);
+      expect(view.candidates.find((candidate) =>
+        candidate.spec === "nim/m2" && candidate.credentialId === "nim#work"
+      )!.credential.modelAllowed).toBe(false);
+      expect(view.candidates.find((candidate) => candidate.credentialId === "nim#spare")!.credential)
+        .toMatchObject({ enabled: false, state: "declared-present" });
+      expect(view.candidates.find((candidate) => candidate.credentialId === "nim#none")!.credential.modelAllowed)
+        .toBe(false);
+      expect(JSON.stringify(view)).not.toContain("candidate-secret-");
+    } finally {
+      delete process.env.CANDIDATE_PERSONAL;
+      delete process.env.CANDIDATE_SPARE;
+      delete process.env.CANDIDATE_NONE;
+    }
+  });
+
   it("hydrates a provider catalog once and uses local membership/limits for every row", async () => {
     const cfg = freshConfig("batched.json");
     let lists = 0;

@@ -509,6 +509,20 @@ describe("CircuitBreaker attempt lifecycle", () => {
     expect(duplicate.ok || duplicate.error.kind).toBe("duplicate-completion");
     expect(breaker.getState(targetA)).toBeUndefined();
   });
+
+  it("counts leases credential-wide and releases exactly once on every terminal outcome", () => {
+    const breaker = new CircuitBreaker();
+    const sibling = { ...targetA, model: "other-model" };
+    const first = begin(breaker, targetA);
+    const second = begin(breaker, sibling);
+    expect(breaker.inFlightCredential(targetA.credentialId)).toBe(2);
+    expect(breaker.completeAttempt(first, success(targetA)).ok).toBe(true);
+    expect(breaker.inFlightCredential(targetA.credentialId)).toBe(1);
+    expect(breaker.completeAttempt(second, failure(sibling)).ok).toBe(true);
+    expect(breaker.inFlightCredential(targetA.credentialId)).toBe(0);
+    breaker.reset();
+    expect(breaker.inFlightCredential(targetA.credentialId)).toBe(0);
+  });
 });
 
 describe("CircuitBreaker cross-credential lifecycle", () => {

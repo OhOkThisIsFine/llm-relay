@@ -48,6 +48,8 @@ export interface RequestLog {
    * passthrough target carries no model id of its own, and that is `null` too.
    */
   servedModel: string | null;
+  /** Opaque configured credential slot that served, when known. Never a secret value. */
+  servedCredential: string | null;
   /** Raw upstream model id, present only when it differs from the resolved target. */
   upstreamReportedModel?: string;
   /** Bounded, statuses-only candidate walk. Never carries error text or bodies. */
@@ -79,6 +81,7 @@ const LOG_FIELDS = [
   "path",
   "servedProvider",
   "servedModel",
+  "servedCredential",
   "upstreamReportedModel",
   "attempts",
   "hadTools",

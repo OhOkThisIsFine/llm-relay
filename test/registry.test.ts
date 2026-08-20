@@ -97,6 +97,50 @@ describe("buildRegistry", () => {
     expect(view.providers.claude!.has_key).toBe(true); // no authEnv → configured
   });
 
+  it("reports nested credential slots without values and keeps aggregate has_key compatible", async () => {
+    process.env.REG_FLEET_PRESENT = "registry-secret-present";
+    process.env.REG_FLEET_DISABLED = "registry-secret-disabled";
+    delete process.env.REG_FLEET_MISSING;
+    try {
+      const fleet: ProviderConfig = {
+        base: "https://fleet.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000,
+        credentials: [
+          { label: "personal", authEnv: "REG_FLEET_PRESENT" },
+          { label: "work", authEnv: "REG_FLEET_MISSING", models: ["m"] },
+          { label: "spare", authEnv: "REG_FLEET_DISABLED", enabled: false, models: [] },
+        ],
+      };
+      const empty: ProviderConfig = {
+        base: "https://empty.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000,
+        credentials: [],
+      };
+      const view = await buildRegistry(
+        cfg({ fleet, empty }, { default: "fleet/m", tiers: {} }),
+        stubCatalog({ fleet: ["m"], empty: [] }),
+      );
+      expect(view.providers.fleet!.has_key).toBe(true);
+      expect(view.providers.empty!.has_key).toBe(false);
+      expect(view.providers.fleet!.credentials).toEqual([
+        {
+          credentialId: "fleet#personal", label: "personal", authEnv: "REG_FLEET_PRESENT",
+          enabled: true, models: null, state: "declared-present", has_key: true,
+        },
+        {
+          credentialId: "fleet#work", label: "work", authEnv: "REG_FLEET_MISSING",
+          enabled: true, models: ["m"], state: "declared-missing", has_key: false,
+        },
+        {
+          credentialId: "fleet#spare", label: "spare", authEnv: "REG_FLEET_DISABLED",
+          enabled: false, models: [], state: "declared-present", has_key: true,
+        },
+      ]);
+      expect(JSON.stringify(view)).not.toContain("registry-secret-");
+    } finally {
+      delete process.env.REG_FLEET_PRESENT;
+      delete process.env.REG_FLEET_DISABLED;
+    }
+  });
+
   it("never serializes provider or model quota scalars", async () => {
     const view = await buildRegistry(
       cfg({ nim }, { default: "nim/z-ai/glm-5.2", tiers: {} }),
@@ -173,5 +217,13 @@ describe("GET /registry endpoint", () => {
     const view = (await resp.json()) as { providers: Record<string, { models: unknown[] }>; routing: unknown };
     expect(view.providers.nim!.models.length).toBe(1);
     expect(view.routing).toEqual({ default: "nim/z-ai/glm-5.2", tiers: {} });
+
+    const healthResp = await fetch(`http://127.0.0.1:${p}/health`, {
+      headers: { [CONTROL_AUTHORIZATION_HEADER]: controlToken },
+    });
+    expect(healthResp.status).toBe(200);
+    const health = (await healthResp.json()) as { providers: Record<string, Record<string, unknown>> };
+    expect(health.providers.nim).not.toHaveProperty("credentials");
+    expect(JSON.stringify(health)).not.toContain("credentialId");
   });
 });
