@@ -17,7 +17,7 @@ Source documents:
 |---|---|---|
 | G1 | Build order | **Stage 0, then pooling.** The `credentialState` refactor and per-credential keying first, then multi-key pooling on the env vars that already exist. Custody (Stage 3) follows once the resolver seam is proven rather than speculative. |
 | G2 | May metering refuse a request? | **Demote-only, plus a manual per-credential hard cap.** A *derived* number may only demote a candidate to last resort. An explicit operator-set cap may refuse, loudly, with its own status and header. Rationale on record: a candidate never dispatched never returns a usage frame, so an over-count is self-perpetuating and unobservable. |
-| G3 | Dashboard | **Full SPA port of freellmapi's Analytics page.** ⚠ Chosen against the recommendation — see the budget note below; this is a deliberate, stated trade. |
+| G3 | Dashboard | **Full SPA port of freellmapi's Analytics page.** ⚠ Chosen against the recommendation — see the budget note below; this is a deliberate, stated trade. The [implementation design](spa-dashboard-design-2026-08-20.md) is complete. |
 | G4 | Recover `repair-proxy-spec.md` | **Proceed on the reconstruction.** The commit evidence stands on its own: the day-one deferral, the same-day voiding of its premise, and the three unjoined mechanisms are all documented. No further provenance work. |
 
 ### ⚠ G3 changes the dependency and packaging budget — deliberately
@@ -35,9 +35,9 @@ rather than discovered later:
 - **CI.** `npm run check` is the one gate. A client build needs its own gate or it will rot.
 
 None of these is a reason not to do it — the invariants that would have auto-rejected it are removed,
-and the owner has chosen it explicitly. But it needs **its own design document before implementation**:
-the quota spec (§6.3) deliberately designed only the single-HTML-file option, so the SPA port is
-currently unspecified. That design is the one piece of outstanding design work in this program.
+and the owner has chosen it explicitly. The implementation specification was completed 2026-08-20
+in [the Analytics SPA design](spa-dashboard-design-2026-08-20.md): design only, with no code,
+dependencies, measurements, or implementation gates claimed.
 
 ---
 

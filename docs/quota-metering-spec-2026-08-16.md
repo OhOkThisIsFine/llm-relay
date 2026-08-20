@@ -376,6 +376,12 @@ The directive says "the dashboard's tracking", which reads as the capability. Bu
 
 **This is the owner's call and should be asked as a direct question, with (b) named as the default if no answer comes.**
 
+**Resolution.** The owner selected option (c) on 2026-08-16; the linked
+[Analytics SPA implementation design](spa-dashboard-design-2026-08-20.md) completed on 2026-08-20.
+That document supersedes
+only the formerly unspecified full-SPA implementation details, not this metering specification or
+the security/accounting contract.
+
 ---
 
 ## 7. WHAT THIS UNBLOCKS
@@ -476,9 +482,9 @@ Stated because a constraint the owner is never told was applied is one they cann
 
 ## 11. Open questions for the owner
 
+The dashboard choice is resolved in §6.3; Stage 1 delivered env-backed multi-key pooling and opaque `credentialId` keying, and custody remains separate.
+
 1. **UTC or local for "today" / "this month"?** Recommendation: UTC for every provider-facing period boundary, local only for a human-facing label, stated on the surface. freellmapi has both and they disagree.
-2. **Dashboard: none, one self-contained HTML file, or a full SPA?** Recommendation and prices in §6.3. Default to the single file if unanswered.
-3. **Should this pre-shape for multi-key pooling?** llm-relay is one `authEnv` per provider today (`src/authEnv.ts`), so "credential scope" and "provider scope" coincide and freellmapi's per-key metering has nothing to key on. Multi-key pooling is a separate and much larger change (config schema, `resolveTargets`, key selection, `buildForwardHeaders`) and deserves its own spec. **But keying the usage and quota stores on an opaque `credentialId` (today: `= provider`) rather than on the provider name is nearly free now and expensive to retrofit.** Recommend doing it. Confirm.
-4. **Estimated output tokens at all?** They require a byte counter in both stream write loops and are, by construction, a chars/4 guess about text the relay already forwarded. The recalibrated rule permits them if labelled. Worth it, or is `-` the better answer when a provider omits `usage`?
-5. **Retention horizon** for `usage/<date>.json`. 30 days matches the widest window a surface would offer. Longer costs only disk.
-6. **A savings counterfactual?** Deliberately excluded (§1.2) because freellmapi's version mixes an unlabelled fallback price into a real total and extrapolates. A correctly-provenanced version is buildable; it is a separate ask.
+2. **Estimated output tokens at all?** They require a byte counter in both stream write loops and are, by construction, a chars/4 guess about text the relay already forwarded. The recalibrated rule permits them if labelled. Worth it, or is `-` the better answer when a provider omits `usage`?
+3. **Retention horizon** for `usage/<date>.json`. 30 days matches the widest window a surface would offer. Longer costs only disk.
+4. **A savings counterfactual?** Deliberately excluded (§1.2) because freellmapi's version mixes an unlabelled fallback price into a real total and extrapolates. A correctly-provenanced version is buildable; it is a separate ask.

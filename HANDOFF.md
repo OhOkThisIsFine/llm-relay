@@ -9,6 +9,10 @@ The authoritative final gate is green:
 expected Windows/POSIX-permission skips. The Stage 1 completion point is the commit containing
 this handoff; no not-yet-created commit hash is claimed here.
 
+The full Analytics SPA implementation design is complete at
+[`docs/spa-dashboard-design-2026-08-20.md`](docs/spa-dashboard-design-2026-08-20.md). No SPA
+implementation, build dependencies, measurements, or green implementation gate is claimed.
+
 ## 0. Stage 1 completion checkpoint — read this first
 
 The branch builds on these landed packets, in order:
@@ -172,6 +176,7 @@ this and nothing else.** Green means green.
 | `docs/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections |
 | `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting — 12 components, staged build order |
 | `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline — 20 metrics, collection sites, storage, 6 stages |
+| `docs/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA implementation design, protocol, contract, and staged gates |
 | `docs/open-decisions-2026-08-16.md` | 18 owner decisions; 4 resolved, 14 with recommendations |
 | `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind |
 | `docs/evidence-2026-08-16/` | Machine-readable audit trail: 375 claim verdicts, 55 re-adjudications |
@@ -208,10 +213,9 @@ this and nothing else.** Green means green.
 
 ## 8. Outstanding, unclaimed
 
-1. **Design the SPA dashboard.** The owner chose a full SPA port of freellmapi's Analytics page —
-   against recommendation, knowingly breaking the zero-new-deps / no-build-pipeline budget. It is
-   the one piece of the program that is **still unspecified**; the quota spec designed only the
-   single-HTML-file option.
+1. **Implement the Analytics SPA — design complete; implementation unclaimed.**
+   See [the design](docs/spa-dashboard-design-2026-08-20.md). Implementation is gated on canonical
+   meter/read P0, then P1–P3 before linking, and P4 before package/release.
 2. Re-audit the remaining documentation drift items in
    `docs/status-vs-freellmapi-2026-08-16.md` §5 against current source; Stage 1 corrected its
    credential-surface and phantom-header items.
