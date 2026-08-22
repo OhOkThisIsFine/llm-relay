@@ -1,0 +1,16 @@
+{
+  "observedAt": "2026-08-21",
+  "exactMetrics": ["dashboardFiles", "dashboardRawBytes", "jsBytes", "cssBytes", "htmlBytes", "manifestBytes"],
+  "observed": {
+    "dashboardFiles": 5,
+    "dashboardRawBytes": 282847,
+    "jsBytes": 268657,
+    "cssBytes": 12644,
+    "htmlBytes": 383,
+    "manifestBytes": 185,
+    "packBytes": 780111,
+    "unpackedBytes": 3944582,
+    "packageEntries": 245
+  },
+  "ceilings": { "dashboardRawBytes": 325300, "packBytes": 897200, "unpackedBytes": 4536300, "packageEntries": 282 }
+}

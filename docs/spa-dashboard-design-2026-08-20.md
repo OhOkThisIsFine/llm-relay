@@ -2,9 +2,11 @@
 
 ## Status and scope
 
-**Design complete only.** This document fills the quota-metering specification §6.3 / G3
-full-SPA design gap. It claims no implementation, measurements, artifact sizes, passing tests,
-or green gates. The metering, security, and accounting specifications remain authoritative.
+**Implemented and green as of 2026-08-21.** P0–P4 ship in the commit containing the updated
+`HANDOFF.md`: canonical accounting, protected read-only routes, bounded projections, the React SPA,
+and packaging hardening. The authoritative Windows gate passes with the measurements recorded in
+`HANDOFF.md`. This document remains the design contract; the metering, security, and accounting
+specifications remain authoritative.
 
 The owner resolved G3: build a full SPA. This design recommends a clean-room adaptation of
 freellmapi Analytics' information architecture and responsive light/dark character while
@@ -19,7 +21,8 @@ Pinned clean-room evidence:
 - [server analytics route](https://github.com/tashfeenahmed/freellmapi/blob/51f888c65383cc733731604a7274b99ea852f16a/server/src/routes/analytics.ts)
 - local checkout root: `C:\Users\<user>\freellmapi\app`
 
-Current evidence is real but not complete. `src/usage-observer.ts:34-69` captures
+The following was the pre-implementation evidence baseline and is retained as historical context.
+`src/usage-observer.ts:34-69` captures
 provider-reported completion/output without breaking traffic. Both request fronts carry that
 observation: `src/backend.ts:466-480,1083-1121` and
 `src/server.ts:692-726,1593-1607,2210-2322`. Canonical meter/read work remains for input, cached input,
@@ -269,14 +272,15 @@ motion, light/dark, and 320/768/1280 layouts without critical horizontal loss.
 | `test/dashboard/contract.test.ts` | Contract/media/provenance fixtures. |
 | `dashboard/src/components/dashboard.test.tsx` | Component, filters, polling, and dialog tests. |
 | `dashboard/src/a11y.test.tsx` | Keyboard, focus, contrast, and reduced-motion tests. |
-| `test/dashboard/packed-smoke.test.ts` | Packed-install static serving smoke test. |
+| `scripts/packed-dashboard-smoke.mjs` | Packed-install static serving smoke gate. |
 
 Stack: React+TS, Vite, Recharts, Tailwind, Lucide, TanStack Query as build/dev dependencies;
 no Express/SQLite/router/CDN. Assets are self-hosted. `build:server` runs current
 `tsc -p tsconfig.json`; `build:dashboard` runs Vite and emits only dedicated
 `dist/dashboard`; `check:dashboard` runs dashboard `tsc --noEmit` plus its separate Vitest
 config. Root `build` runs build:server then build:dashboard; root `check` retains the existing
-typecheck/test chain then check:dashboard without widening main Vitest.
+typecheck/test chain, then runs `check:dashboard` and the inventory/packed-install `check:package`
+without widening main Vitest.
 
 `package.json files`/tarball include dashboard dist, manifest, assets, notices/licenses; packed
 install serves them. Clean-room is preferred. If substantial upstream code/style is copied, add
@@ -295,9 +299,9 @@ the observed baseline.
 | P3 SPA parity/UX | Charts, filters, cards, dialog, responsive states | component/polling/detail/a11y | P0-P3 are green; then the dashboard may be linked. |
 | P4 hardening/packaging | CSP, notices, package serving | packed install/assets/licenses | Artifact complete. |
 
-Design complete now means this plan is ready. Implementation done later requires packets and
-evidence. P0, P1, P2, and P3 must all be green before dashboard is linked; every packet preserves
-`npm run build && npm run check`; P4 must be green before release/package completion.
+Implementation followed these packet boundaries. P0, P1, P2, and P3 were green before the
+dashboard was linked; every packet preserved `npm run build && npm run check`; P4 is green before
+release/package completion.
 
 | Gate | Required evidence |
 | --- | --- |

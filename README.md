@@ -23,6 +23,12 @@ llm-relay keys             # are the credentials good?
 llm-relay pools --probe    # does every configured model actually answer?
 ```
 
+With the relay still running, open its local read-only analytics in another terminal:
+
+```bash
+llm-relay dashboard
+```
+
 New here? [docs/QUICKSTART.md](docs/QUICKSTART.md) is a staged setup guide you can hand
 straight to an AI assistant ("set this up for me"). It also covers keeping the relay running
 at login.
@@ -42,6 +48,9 @@ at login.
   tool calls are refused, never fabricated; unrepairable calls fail clean.
 - **Both API fronts** — Anthropic `/v1/messages` plus OpenAI `/v1/chat/completions` and
   `/v1/responses`, translated in either direction, streaming included.
+- **Local analytics dashboard** — `llm-relay dashboard` opens bounded request/attempt, token,
+  latency, provider/model/client/credential, quota, and cooldown views. Unknown or unavailable
+  accounting remains explicit; the dashboard never guesses a value or starts provider probes.
 - **Honest metadata** — per-deployment limits and prices with provenance, capability scores
   synced from four leaderboards, metadata-only logging, loopback-only binding.
 

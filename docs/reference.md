@@ -786,6 +786,33 @@ llm-relay models                 # every provider
 llm-relay models -p nim -r       # one provider, force re-fetch
 ```
 
+### Local analytics dashboard
+
+Keep the proxy running, then launch its read-only dashboard from another terminal:
+
+```bash
+llm-relay dashboard
+```
+
+This command does **not** start another proxy. It reads the configured relay address and local
+control capability, asks the already-running relay for a short-lived one-use bootstrap, and opens
+the platform's default browser at `/dashboard/`. If the browser launcher is unavailable, it prints
+the one-use URL instead; if the relay or its control authorization is unavailable, the command
+fails closed.
+
+The bootstrap travels in the URL fragment (which is not sent in the HTTP request). The SPA reads
+and removes it from the address bar before exchanging it once for a scoped dashboard session. The
+static shell is tokenless, but snapshot, detail, and logout operations require that session. The
+dashboard never receives the persistent control capability.
+
+Views use the relay's bounded accounting read model: caller-visible requests, serving and repair
+attempts, reported versus estimated tokens, latency and commit timing, normalized outcomes, recent
+request detail, provider/model/client/credential dimensions, and available quota/cooldown facts.
+Missing coverage and unknown values stay explicit. Reads do not probe providers, perform egress,
+scan logs, or expose prompts, bodies, tool arguments, raw provider errors, or key material. Spend
+cells currently remain explicitly unavailable/unpriced because currency accounting is not yet
+implemented; the UI does not infer a price basis.
+
 ---
 
 ## CLI reference
@@ -802,6 +829,7 @@ llm-relay models -p nim -r       # one provider, force re-fetch
 | `llm-relay config <show\|get\|set\|unset> [path] [value]` | Edit any config field |
 | `llm-relay models [-p <name>] [-r]` | List live provider catalogs |
 | `llm-relay ping [-p <name>]` | Probe provider latency/health |
+| `llm-relay dashboard` | Open the read-only dashboard of an already-running relay |
 | `llm-relay telemetry` | Print telemetry/quota JSON |
 | `llm-relay offload [status \| <client> <on\|off> [--scope <scope>]]` | Show/toggle offload |
 | `llm-relay candidates [-p <name>]` | Compare deployment × credential-slot targets |
@@ -831,6 +859,10 @@ llm-relay config set routing.offload.claude.freeOnly true
 | `GET\|POST /offload` | Read/set offload rules |
 | `GET\|POST /dispatch` | Read/advance the dispatch ladder |
 | `GET /telemetry`, `GET /ping`, `GET /health` | Telemetry, probe, health |
+| `GET /dashboard/`, `GET /dashboard/assets/*` | Read-only SPA shell and manifest-owned assets |
+| `POST /dashboard/api/v1/bootstrap`, `POST /dashboard/api/v1/session` | Mint and exchange a one-use dashboard bootstrap |
+| `GET /dashboard/api/v1/snapshot`, `GET /dashboard/api/v1/requests/:requestId` | Session-authenticated bounded accounting views |
+| `POST /dashboard/api/v1/logout` | Revoke the current dashboard session |
 
 ⚠ **Loopback is not authorization.** Mutating control endpoints and control reads that expose or
 materialize provider state (`/registry`, `/candidates`, `/ping`, `/health`) require the per-install

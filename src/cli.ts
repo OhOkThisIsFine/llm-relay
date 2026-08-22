@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { spawn } from "node:child_process";
 import {
   loadConfig,
   splitSpec,
@@ -38,6 +39,7 @@ import {
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { installProcessSafetyNet } from "./process-safety-net.js";
 import { createProxy } from "./server.js";
+import { createAccountingStore, type AccountingStore } from "./accounting-store.js";
 import { ModelCatalog } from "./catalog.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { currentVersion, ensureUpToDate, shouldCheckUpdates, type CommandEffect } from "./self-update.js";
@@ -50,6 +52,8 @@ import {
   writeConfigPath,
 } from "./config-edit.js";
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
+import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp } from "./dashboard-contract.js";
+import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
 import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { flushProbeCache } from "./ping/probe-cache.js";
 
@@ -206,6 +210,7 @@ ${formatTextTable([
   ["llm-relay config <action> [<path>] [<value>]", "action: show|get|set|unset."],
   ["llm-relay models [-p <name>] [-r]", "List provider models."],
   ["llm-relay ping [-p <name>]", "Probe providers."],
+  ["llm-relay dashboard", "Open the read-only local analytics dashboard."],
   ["llm-relay telemetry", "Print telemetry JSON."],
   ["llm-relay offload [status]", "Show current offload rules."],
   ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
@@ -564,10 +569,31 @@ export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promi
 export function runProxy() {
   const cfg = loadOrExit();
   const catalog = new ModelCatalog();
+  let accountingStore: AccountingStore | undefined;
+  let accountingStoreClosed = false;
+  const closeAccountingStore = () => {
+    if (accountingStoreClosed) return;
+    if (accountingStore === undefined) {
+      accountingStoreClosed = true;
+      return;
+    }
+    try {
+      const result = accountingStore.close();
+      // A retryable flush failure deliberately leaves the store open and its
+      // writer lease intact. The server close callback / beforeExit hook gets
+      // another bounded shutdown opportunity instead of discarding dirty facts.
+      accountingStoreClosed = accountingStore.closed || !result.retryable;
+    } catch {
+      // Accounting is observational; a store close failure must not prevent
+      // the remaining shutdown flushes or process exit. Leave the latch open
+      // so a later shutdown boundary may retry.
+    }
+  };
   // A late socket reset from a discarded failover body must not kill the process that fronts
   // every session; genuine bugs still exit 1. See src/process-safety-net.ts.
   installProcessSafetyNet({
     beforeExit: () => {
+      closeAccountingStore();
       catalog.flushPersistence();
       flushRuntimeTelemetry();
       flushProbeCache();
@@ -576,7 +602,16 @@ export function runProxy() {
       flushInterpretations();
     },
   });
-  const server = createProxy(cfg, { catalog });
+  accountingStore = createAccountingStore();
+  const server = createProxy(cfg, {
+    catalog,
+    accountingRecorder: accountingStore,
+    accountingReader: accountingStore,
+    dashboardRelayVersion: currentVersion(),
+    // The projector aggregates every labeled attribution by default; query filters narrow it.
+    dashboardAttributionPolicy: "include_all_labeled",
+  });
+  server.once("close", closeAccountingStore);
   server.listen(cfg.port, cfg.host, () => {
     const providers = Object.keys(cfg.providers).join(",");
     const addr = server.address();
@@ -588,11 +623,15 @@ export function runProxy() {
     void warmAndValidate(cfg, catalog);
   });
 
+  let shutdownStarted = false;
   const shutdown = () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     if (typeof server.closeIdleConnections === "function") {
       server.closeIdleConnections();
     }
     server.close(() => {
+      closeAccountingStore();
       // Write-behind caches trade a bounded crash window for a quiet request path. Graceful
       // shutdown closes that window explicitly.
       catalog.flushPersistence();
@@ -715,6 +754,195 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
 export function proxyUrl(cfg: Pick<Config, "host" | "port">, path: string): string {
   const host = cfg.host.includes(":") ? `[${cfg.host}]` : cfg.host;
   return `http://${host}:${cfg.port}${path}`;
+}
+
+export type DashboardBrowserOpener = (url: string) => Promise<void> | void;
+
+export interface DashboardBrowserProcess {
+  once(event: "error", listener: () => void): DashboardBrowserProcess;
+  once(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): DashboardBrowserProcess;
+  /** Best-effort termination for a hung native helper; callers still settle independently. */
+  kill(signal?: NodeJS.Signals): boolean;
+}
+
+export type DashboardProcessSpawner = (
+  command: string,
+  args: string[],
+  options: { readonly detached: boolean; readonly shell: false; readonly stdio: "ignore"; readonly windowsHide: boolean },
+) => DashboardBrowserProcess;
+
+export const DASHBOARD_BROWSER_OPEN_TIMEOUT_MS = 5_000;
+
+export interface DashboardCommandDependencies {
+  readonly fetch?: typeof fetch;
+  readonly openBrowser?: DashboardBrowserOpener;
+  readonly now?: () => number;
+  readonly write?: (message: string) => void;
+}
+
+interface DashboardBootstrapWire {
+  readonly schema: typeof DASHBOARD_BOOTSTRAP_SCHEMA;
+  readonly bootstrap: string;
+  readonly expiresAt: string;
+}
+
+function isDashboardBootstrapWire(value: unknown, now: number): value is DashboardBootstrapWire {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length !== 3 || !keys.every((key) => key === "schema" || key === "bootstrap" || key === "expiresAt")) return false;
+  if (record.schema !== DASHBOARD_BOOTSTRAP_SCHEMA || typeof record.bootstrap !== "string") return false;
+  // This is a capability, not merely opaque text: accept only a canonical 32-byte base64url
+  // encoding so alternate spellings cannot reach the dashboard fragment or session exchange.
+  if (!/^[A-Za-z0-9_-]{43}$/.test(record.bootstrap)) return false;
+  let decoded: Buffer;
+  try {
+    decoded = Buffer.from(record.bootstrap, "base64url");
+  } catch {
+    return false;
+  }
+  if (decoded.byteLength !== 32 || decoded.toString("base64url") !== record.bootstrap) return false;
+  if (!isDashboardUtcTimestamp(record.expiresAt)) return false;
+  const expiresAt = Date.parse(record.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt > now;
+}
+
+/** Open a URL through the platform's native launcher without shell interpolation. */
+export function openDashboardInBrowser(
+  url: string,
+  platform: NodeJS.Platform = process.platform,
+  spawnProcess: DashboardProcessSpawner = spawn,
+  timeoutMs = DASHBOARD_BROWSER_OPEN_TIMEOUT_MS,
+): Promise<void> {
+  let command: string;
+  let args: string[];
+  if (platform === "win32") {
+    command = "rundll32.exe";
+    args = ["url.dll,FileProtocolHandler", url];
+  } else if (platform === "darwin") {
+    command = "open";
+    args = [url];
+  } else if (platform === "linux") {
+    command = "xdg-open";
+    args = [url];
+  } else {
+    return Promise.reject(new Error("no supported browser launcher"));
+  }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) return Promise.reject(new Error("invalid browser launcher timeout"));
+
+  return new Promise((resolve, reject) => {
+    let child: DashboardBrowserProcess;
+    try {
+      child = spawnProcess(command, args, {
+        detached: false,
+        shell: false,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {
+      reject(new Error("browser launcher unavailable"));
+      return;
+    }
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    timer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // A launcher that already exited or cannot be signalled still gets the fallback below.
+      }
+      settle(new Error("browser launcher timed out"));
+    }, timeoutMs);
+    child.once("error", () => settle(new Error("browser launcher unavailable")));
+    child.once("close", (code, signal) => {
+      if (code === 0 && signal === null) settle();
+      else settle(new Error("browser launcher failed"));
+    });
+  });
+}
+
+/**
+ * Get one opaque bootstrap from an already-running relay and launch its read-only dashboard.
+ * The persistent control capability stays exclusively in this request header; only the one-use
+ * bootstrap may appear in the fallback link when no browser can be opened.
+ */
+export async function runDashboardCommand(
+  cfg: Config,
+  dependencies: DashboardCommandDependencies = {},
+): Promise<void> {
+  const request = dependencies.fetch ?? fetch;
+  const now = dependencies.now ?? Date.now;
+  const write = dependencies.write ?? ((message: string) => process.stdout.write(message));
+  const openBrowser = dependencies.openBrowser ?? openDashboardInBrowser;
+  let authorization;
+  try {
+    // Unlike tokenless status helpers, dashboard bootstrap must fail closed if this cannot load.
+    authorization = createControlAuthorization(resolveControlAuthorizationConfigDir(cfg.sourcePath));
+  } catch {
+    throw new Error("dashboard control authorization is unavailable");
+  }
+
+  let response: Response;
+  try {
+    response = await request(proxyUrl(cfg, "/dashboard/api/v1/bootstrap"), {
+      method: "POST",
+      headers: authorization.attach({
+        Accept: DASHBOARD_MEDIA_TYPE,
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ schema: DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    throw new Error("could not contact the running relay dashboard");
+  }
+
+  if (response.status !== 200 || response.headers.get("content-type") !== DASHBOARD_MEDIA_TYPE) {
+    throw new Error("running relay rejected the dashboard bootstrap request");
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("running relay returned an invalid dashboard bootstrap response");
+  }
+  if (!isDashboardBootstrapWire(payload, now())) {
+    throw new Error("running relay returned an invalid dashboard bootstrap response");
+  }
+
+  const url = `${proxyUrl(cfg, "/dashboard/")}#bootstrap=${encodeURIComponent(payload.bootstrap)}`;
+  try {
+    await openBrowser(url);
+  } catch {
+    write(`llm-relay dashboard: browser unavailable. Open this one-use link before it expires:\n${url}\n`);
+  }
+}
+
+export interface DashboardCommandRouteDependencies {
+  readonly loadConfig: () => Config;
+  readonly runDashboard: (cfg: Config) => Promise<void>;
+  readonly reportError: (error: unknown) => void;
+  readonly runProxy: () => unknown;
+}
+
+/** The real final command dispatch: dashboard returns before any proxy/store/signal lifecycle. */
+export function dispatchDashboardOrProxy(
+  positional: string | undefined,
+  dependencies: DashboardCommandRouteDependencies,
+): unknown {
+  if (positional === "dashboard") {
+    const cfg = dependencies.loadConfig();
+    void dependencies.runDashboard(cfg).catch(dependencies.reportError);
+    return undefined;
+  }
+  return dependencies.runProxy();
 }
 
 /**
@@ -2272,7 +2500,15 @@ export function main(): void {
     });
     return;
   }
-  runProxy();
+  dispatchDashboardOrProxy(arg2, {
+    loadConfig: loadOrExit,
+    runDashboard: runDashboardCommand,
+    reportError: (e) => {
+      process.stderr.write(`llm-relay dashboard: ${(e as Error).message}\n`);
+      process.exit(1);
+    },
+    runProxy,
+  });
 }
 
 /**
@@ -2336,6 +2572,8 @@ export function classifyCommand(argv: string[]): CommandEffect {
     // verbs write; the bare listing only reports.
     case "eligibility":
       return arg3 === "accept" || arg3 === "reject" || arg3 === "propose" ? "mutating" : "read-only";
+    case "dashboard":
+      return "read-only";
     // keys, check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
     // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a
     // running proxy's in-memory cooldowns and changes nothing on this machine.

@@ -1,5 +1,13 @@
 # llm-relay status, re-derived — and what freellmapi still has (2026-08-16)
 
+> **Status update (2026-08-21):** This document is a dated audit, not the current feature
+> inventory. Since it was written, llm-relay has landed a canonical, bounded request/attempt
+> accounting store wired across both API fronts and caller-visible terminal paths, plus a
+> session-protected read-only Analytics SPA launched by `llm-relay dashboard`. Accounting remains
+> observational: quota availability/enforcement still needs formal closeout, local key custody is
+> a later stage, and currency pricing/spend is not implemented. Historical verdicts below remain
+> useful evidence only where a later correction does not supersede them.
+
 **Verdict up front: the revival is complete and the existing comparison docs hold up. The code is
 green and essentially closed; the *documentation* is not.** Of 373 claims extracted from the seven
 comparison/porting/adoption documents across both trees, 5 are false and none of the five changes a
@@ -184,9 +192,12 @@ exactly such a throw. Post-wake cost is "one provider pruned per throw", not "on
   providers don't publish; it is a second quota policy beside the breaker; it is ruled out by the
   owner-ratified **credentials-stay-user-operated** invariant ([project-goals.md:86](project-goals.md:86));
   and a stochastic draw cannot answer "why this backend" reproducibly.
-- **Extra wire surfaces** (Gemini v1beta, Ollama emulation, embeddings, media, MCP, URL tokens,
-  dashboard). No client that can reach this relay speaks them; MCP specifically would be a second
+- **Extra wire surfaces** (Gemini v1beta, Ollama emulation, embeddings, media, MCP, URL tokens).
+  No client that can reach this relay speaks them; MCP specifically would be a second
   presentation layer over `handleAdminRoutes()`.
+- **Dashboard (superseded 2026-08-21).** The read-only local Analytics SPA is now implemented.
+  It consumes the relay's bounded accounting read model and is intentionally not another upstream
+  wire protocol or provider-facing presentation layer.
 - **Encrypted key storage / per-key proxy / SSRF guard.** The master key lands in the same directory
   class as the ciphertext; llm-relay's containment is stronger and lives at the sink
   ([log.ts:152](../src/log.ts:152)); every preset authenticates by header, so no credential rides a URL.
@@ -228,17 +239,21 @@ TTL; freellmapi per key with immediate revalidation) — a design difference, no
 
 ### 4.2 Where freellmapi is decisively ahead
 
-Real per-key **RPM/RPD/TPM/TPD accounting that gates before dispatch**, with in-flight leases;
-encrypted central key custody; probe-based early recovery of heuristic cooldowns; breadth of wire
-surfaces; and a content-negotiated Anthropic-shaped `GET /v1/models` that llm-relay lacks (its
-`/v1/models` is OpenAI/Codex-shaped only).
+freellmapi remains ahead in per-key **RPM/RPD/TPM/TPD enforcement before dispatch**, including
+in-flight leases; encrypted central key custody; probe-based early recovery of heuristic cooldowns;
+breadth of wire surfaces; and a content-negotiated Anthropic-shaped `GET /v1/models` that llm-relay
+lacks (its `/v1/models` is OpenAI/Codex-shaped only). Accounting and a dashboard are no longer
+freellmapi-only capabilities: llm-relay now records a canonical request/attempt lifecycle and
+serves bounded read-only analytics. The remaining distinction is enforcement and custody, not the
+existence of counters or an operator UI.
 
 ⚠ Precision correction to an earlier framing: it is **not** true that llm-relay "has no counters at
-all and is purely reactive". It keeps `totalCalls` / `successCalls` / `totalLatencyMs`
-([runtime-telemetry.ts:19](../src/ping/runtime-telemetry.ts:19)) and `consecutiveFailures` on the
-breaker, and uses both for ranking and trip decisions. The true distinction is narrower and still
-decisive: **llm-relay counts what already happened; it keeps no pre-dispatch ledger and no leases, so
-nothing gates a request before it is sent.**
+all and is purely reactive". At the time of this audit it kept `totalCalls` / `successCalls` /
+`totalLatencyMs` ([runtime-telemetry.ts:19](../src/ping/runtime-telemetry.ts:19)) and
+`consecutiveFailures` on the breaker. It now also persists the canonical request/attempt lifecycle
+and token observations used by the Analytics SPA. The still-decisive distinction is narrower:
+**that accounting is observational; llm-relay has not yet closed pre-dispatch quota enforcement and
+in-flight leasing, so the accounting store itself does not gate a request before it is sent.**
 
 ⚠⚠ **Correction to the correction (2026-08-16, later the same day).** An earlier revision of this
 section also cited `totalCompletionTokens` as evidence of existing counters. **That field has read
@@ -259,11 +274,12 @@ recalibration document for the current position.
 They are not competitors with a winner, and **running both is the correct configuration.**
 
 - **freellmapi** is the instrument for *serving* a pool of free tiers to arbitrary clients — key
-  custody, quota ledgers, protocol breadth, dashboard, and (live tree only) the offload lane.
+  custody, pre-dispatch quota enforcement, protocol breadth, and (live tree only) the offload lane.
 - **llm-relay** is the instrument for *governing* one operator's own traffic with auditable
   provenance — byte-transparent passthrough, per-field metadata with a provenance label and no
-  guessed rung, un-blended candidate tables that refuse to average away the judgement, and host-side
-  orchestration for the case freellmapi structurally cannot reach: a host whose traffic never arrives.
+  guessed rung, canonical request/attempt accounting, a read-only local Analytics SPA, un-blended
+  candidate tables that refuse to average away the judgement, and host-side orchestration for the
+  case freellmapi structurally cannot reach: a host whose traffic never arrives.
 
 Put sharply: **freellmapi answers "can I get an answer from somewhere free?"; llm-relay answers
 "what exactly answered, on what evidence, and what was it allowed to do?"**
@@ -353,4 +369,3 @@ code exceptions are exactly two — one transparency bug (`freeOnly`) and one ne
 
 Items 2, 3 and 7 are code; the rest is documentation. Nothing here requires a routing or
 architecture change, and no rejected item from the 2026-08-13 review was reopened by this review.
-

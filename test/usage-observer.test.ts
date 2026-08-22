@@ -38,6 +38,24 @@ async function observed(
   return { output: new TextDecoder().decode(output), tokens: accumulator.completionTokens };
 }
 
+async function observedAccumulator(
+  input: string,
+  protocol: UsageProtocol,
+  streamed: boolean,
+  chunkSize = 1,
+): Promise<ReturnType<typeof createUsageAccumulator>> {
+  const bytes = new TextEncoder().encode(input);
+  const accumulator = createUsageAccumulator();
+  const response = observeUsage(
+    new Response(byteStream(bytes, chunkSize)),
+    protocol,
+    accumulator,
+    { streamed },
+  );
+  await response.arrayBuffer();
+  return accumulator;
+}
+
 describe("usage observer", () => {
   it("observes buffered Anthropic, Chat, and Responses JSON", async () => {
     await expect(observed('{"usage":{"output_tokens":0}}', "anthropic-messages", false)).resolves.toEqual({
@@ -54,6 +72,42 @@ describe("usage observer", () => {
     });
   });
 
+  it("preserves provider input/output/cache facts with protocol-specific names", async () => {
+    await expect(observedAccumulator(
+      '{"usage":{"input_tokens":12,"output_tokens":4,"cache_creation_input_tokens":3,"cache_read_input_tokens":8}}',
+      "anthropic-messages",
+      false,
+    )).resolves.toMatchObject({
+      inputTokens: 12,
+      outputTokens: 4,
+      completionTokens: 4,
+      cacheCreationInputTokens: 3,
+      cacheReadInputTokens: 8,
+      // Anthropic's two cache facts are intentionally not collapsed.
+      cachedInputTokens: undefined,
+    });
+    await expect(observedAccumulator(
+      '{"usage":{"prompt_tokens":20,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":7}}}',
+      "openai-chat",
+      false,
+    )).resolves.toMatchObject({
+      inputTokens: 20,
+      outputTokens: 5,
+      completionTokens: 5,
+      cachedInputTokens: 7,
+    });
+    await expect(observedAccumulator(
+      '{"type":"response.completed","response":{"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":9}}}}',
+      "openai-responses",
+      false,
+    )).resolves.toMatchObject({
+      inputTokens: 30,
+      outputTokens: 6,
+      completionTokens: 6,
+      cachedInputTokens: 9,
+    });
+  });
+
   it("handles byte-by-byte Anthropic SSE and ignores the message_start seed", async () => {
     const input = [
       `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { output_tokens: 99 } } })}\n\n`,
@@ -61,6 +115,21 @@ describe("usage observer", () => {
       `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 0 } })}\n\n`,
     ].join("");
     await expect(observed(input, "anthropic-messages", true, 1)).resolves.toEqual({ output: input, tokens: 0 });
+  });
+
+  it("captures Anthropic message_start input/cache facts and message_delta output", async () => {
+    const input = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 10, cache_creation_input_tokens: 2, cache_read_input_tokens: 5 } } })}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 0 } })}\n\n`,
+    ].join("");
+    await expect(observedAccumulator(input, "anthropic-messages", true, 1)).resolves.toMatchObject({
+      inputTokens: 10,
+      outputTokens: 0,
+      completionTokens: 0,
+      cacheCreationInputTokens: 2,
+      cacheReadInputTokens: 5,
+      cachedInputTokens: undefined,
+    });
   });
 
   it("handles LF and CRLF Chat SSE, with the last valid cumulative value winning", async () => {
@@ -72,12 +141,38 @@ describe("usage observer", () => {
     await expect(observed(input, "openai-chat", true, 2)).resolves.toEqual({ output: input, tokens: 7 });
   });
 
+  it("keeps OpenAI cumulative input/output/cache values independently", async () => {
+    const input = [
+      'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0}}}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":4}}}\n\n',
+    ].join("");
+    await expect(observedAccumulator(input, "openai-chat", true, 2)).resolves.toMatchObject({
+      inputTokens: 0,
+      outputTokens: 0,
+      completionTokens: 0,
+      cachedInputTokens: 4,
+    });
+  });
+
   it("observes only Responses response.completed usage", async () => {
     const input = [
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n',
       'event: response.completed\ndata: {"response":{"usage":{"output_tokens":11}}}\n\n',
     ].join("");
     await expect(observed(input, "openai-responses", true, 3)).resolves.toEqual({ output: input, tokens: 11 });
+  });
+
+  it("captures Responses input/output/cache details only on response.completed", async () => {
+    const input = [
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","usage":{"input_tokens":99}}\n\n',
+      'event: response.completed\ndata: {"response":{"usage":{"input_tokens":14,"output_tokens":2,"input_tokens_details":{"cached_tokens":6}}}}\n\n',
+    ].join("");
+    await expect(observedAccumulator(input, "openai-responses", true, 3)).resolves.toMatchObject({
+      inputTokens: 14,
+      outputTokens: 2,
+      completionTokens: 2,
+      cachedInputTokens: 6,
+    });
   });
 
   it("keeps a CR until a split LF before dispatching a Responses event", async () => {
@@ -108,6 +203,20 @@ describe("usage observer", () => {
       'data: {"usage":{"completion_tokens":"8"}}\n\n',
     ].join("");
     await expect(observed(input, "openai-chat", true, 1)).resolves.toEqual({ output: input, tokens: 0 });
+  });
+
+  it("isolates malformed fields while retaining each last valid zero", async () => {
+    const input = [
+      'data: {"usage":{"prompt_tokens":12,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3}}}\n\n',
+      'data: {"usage":{"prompt_tokens":-1,"completion_tokens":"bad","prompt_tokens_details":{"cached_tokens":null}}}\n\n',
+      'data: {"usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}\n\n',
+    ].join("");
+    await expect(observedAccumulator(input, "openai-chat", true, 1)).resolves.toMatchObject({
+      inputTokens: 0,
+      outputTokens: 0,
+      completionTokens: 0,
+      cachedInputTokens: 0,
+    });
   });
 
   it("recovers after an oversized SSE frame", async () => {

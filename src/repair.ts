@@ -27,8 +27,10 @@ export interface RepairDeps {
    * The model that actually SERVED the failing response, reported to the reshaper
    * so it can see which backend produced the malformed call. Optional because the
    * caller owns target resolution; absent ⇒ null (unknown), never a guess.
-   */
+  */
   backendModel?: string | null;
+  /** Cancellation of the caller response; never use it to start another repair. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -47,6 +49,7 @@ export async function repair(
   tools: Map<string, JsonSchema | null>,
   deps: RepairDeps,
 ): Promise<RepairDecision> {
+  if (deps.signal?.aborted) return { outcome: "failed" };
   const destructiveHit = assistant.content
     .filter(isToolUseBlock)
     .some((b) => deps.isDestructive(b.name));
@@ -94,6 +97,7 @@ export async function repair(
   }
 
   for (let attempt = 0; attempt < deps.maxAttempts; attempt++) {
+    if (deps.signal?.aborted) return { outcome: "failed" };
     let result;
     try {
       result = await deps.reshaper.reshape({
@@ -101,12 +105,14 @@ export async function repair(
         rawAssistant: current,
         errors,
         backendModel: deps.backendModel ?? null,
+        ...(deps.signal ? { signal: deps.signal } : {}),
       });
     } catch {
       // Transport-level failure (single reshaper down, or every failover candidate down).
       // Nothing answered — not a refusal, but nothing to retry against either: fail clean.
       return { outcome: "failed" };
     }
+    if (deps.signal?.aborted) return { outcome: "failed" };
     if (result.kind === "refuse") return { outcome: "refused" };
 
     const guard = guardReshaped(assistant, result.message, deps.isDestructive);

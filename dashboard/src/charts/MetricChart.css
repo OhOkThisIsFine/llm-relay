@@ -1,0 +1,51 @@
+.metric-chart-svg {
+  display: block;
+  max-width: 100%;
+  overflow: visible;
+}
+
+.chart-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.chart-axis-label {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.chart-series-0 { fill: #2563eb; }
+.chart-series-1 { fill: #0891b2; }
+.chart-series-2 { fill: #7c3aed; }
+.chart-series-3 { fill: #b45309; }
+.chart-series-4 { fill: #be123c; }
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem 1rem;
+  margin: .5rem 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: .8rem;
+}
+
+.chart-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+}
+
+.chart-swatch {
+  display: inline-block;
+  width: .75rem;
+  height: .75rem;
+  border-radius: .15rem;
+}
+
+.chart-swatch.chart-series-0 { background: #2563eb; }
+.chart-swatch.chart-series-1 { background: #0891b2; }
+.chart-swatch.chart-series-2 { background: #7c3aed; }
+.chart-swatch.chart-series-3 { background: #b45309; }
+.chart-swatch.chart-series-4 { background: #be123c; }

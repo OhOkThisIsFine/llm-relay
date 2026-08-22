@@ -11,11 +11,28 @@ export type UsageProtocol =
   | "openai-responses";
 
 export interface UsageAccumulator {
+  /** Provider-reported prompt/input tokens. */
+  inputTokens: number | undefined;
+  /** Provider-reported completion/output tokens. */
+  outputTokens: number | undefined;
+  /** OpenAI's explicitly reported cached prompt/input tokens. */
+  cachedInputTokens: number | undefined;
+  /** Anthropic reports cache writes and cache reads as distinct facts. */
+  cacheCreationInputTokens: number | undefined;
+  cacheReadInputTokens: number | undefined;
+  /** Compatibility alias consumed by existing model telemetry. */
   completionTokens: number | undefined;
 }
 
 export function createUsageAccumulator(): UsageAccumulator {
-  return { completionTokens: undefined };
+  return {
+    inputTokens: undefined,
+    outputTokens: undefined,
+    cachedInputTokens: undefined,
+    cacheCreationInputTokens: undefined,
+    cacheReadInputTokens: undefined,
+    completionTokens: undefined,
+  };
 }
 
 const MAX_SSE_FRAME = 16 * 1024;
@@ -31,31 +48,71 @@ function validCompletionTokens(value: unknown): value is number {
   );
 }
 
-function record(accumulator: UsageAccumulator, value: unknown): void {
-  if (validCompletionTokens(value)) accumulator.completionTokens = value;
-}
-
-function usageValue(
+function recordField(
+  accumulator: UsageAccumulator,
+  field: keyof UsageAccumulator,
   value: unknown,
-  protocol: UsageProtocol,
-): unknown {
-  if (!value || typeof value !== "object") return undefined;
-  const root = value as Record<string, unknown>;
-  const usage = root.usage;
-  if (!usage || typeof usage !== "object") return undefined;
-  const usageRecord = usage as Record<string, unknown>;
-  return protocol === "openai-chat"
-    ? usageRecord.completion_tokens
-    : usageRecord.output_tokens;
+): void {
+  if (!validCompletionTokens(value)) return;
+  try {
+    accumulator[field] = value;
+  } catch {
+    // A malformed/hostile accumulator must not affect pass-through.
+  }
 }
 
-function responseCompletedUsage(value: unknown): unknown {
-  if (!value || typeof value !== "object") return undefined;
-  const root = value as Record<string, unknown>;
-  if (root.type !== "response.completed") return undefined;
-  const response = root.response;
-  if (!response || typeof response !== "object") return undefined;
-  return usageValue(response, "openai-responses");
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function usageRecords(value: unknown, protocol: UsageProtocol): Record<string, unknown>[] {
+  const root = asRecord(value);
+  if (!root) return [];
+  const records: Record<string, unknown>[] = [];
+  const rootUsage = asRecord(root.usage);
+  if (rootUsage) records.push(rootUsage);
+
+  if (protocol === "anthropic-messages" && root.type === "message_start") {
+    const message = asRecord(root.message);
+    const messageUsage = message && asRecord(message.usage);
+    if (messageUsage) records.push(messageUsage);
+  }
+
+  if (protocol === "openai-responses" && root.type === "response.completed") {
+    const response = asRecord(root.response);
+    const responseUsage = response && asRecord(response.usage);
+    if (responseUsage) records.push(responseUsage);
+  }
+  return records;
+}
+
+function inspectUsageRecord(
+  usage: Record<string, unknown>,
+  protocol: UsageProtocol,
+  accumulator: UsageAccumulator,
+): void {
+  const inputName = protocol === "openai-chat" ? "prompt_tokens" : "input_tokens";
+  const outputName = protocol === "openai-chat" ? "completion_tokens" : "output_tokens";
+  recordField(accumulator, "inputTokens", usage[inputName]);
+  recordField(accumulator, "outputTokens", usage[outputName]);
+  // Keep completionTokens as a compatibility alias, while outputTokens is the
+  // canonical provider-reported field. Each assignment is isolated so a
+  // consumer's accessor cannot suppress the other fact.
+  if (validCompletionTokens(usage[outputName])) {
+    recordField(accumulator, "completionTokens", usage[outputName]);
+  }
+
+  if (protocol === "anthropic-messages") {
+    recordField(accumulator, "cacheCreationInputTokens", usage.cache_creation_input_tokens);
+    recordField(accumulator, "cacheReadInputTokens", usage.cache_read_input_tokens);
+    return;
+  }
+
+  const detailsName = protocol === "openai-chat"
+    ? "prompt_tokens_details"
+    : "input_tokens_details";
+  const details = asRecord(usage[detailsName]);
+  if (details) recordField(accumulator, "cachedInputTokens", details.cached_tokens);
 }
 
 function inspectJson(
@@ -64,7 +121,9 @@ function inspectJson(
   accumulator: UsageAccumulator,
 ): void {
   try {
-    record(accumulator, usageValue(value, protocol));
+    for (const usage of usageRecords(value, protocol)) {
+      inspectUsageRecord(usage, protocol, accumulator);
+    }
   } catch {
     // An observer must never make provider bytes fail a request.
   }
@@ -90,25 +149,22 @@ function inspectSseFrame(
   try {
     const value: unknown = JSON.parse(state.data.join("\n"));
     if (protocol === "anthropic-messages") {
-      if (value && typeof value === "object") {
-        const root = value as Record<string, unknown>;
-        if (state.event === "message_delta" || root.type === "message_delta") {
-          record(accumulator, usageValue(root, protocol));
-        }
+      const root = asRecord(value);
+      if (root && (state.event === "message_start" || state.event === "message_delta" || root.type === "message_start" || root.type === "message_delta")) {
+        inspectJson(root, protocol, accumulator);
       }
     } else if (protocol === "openai-chat") {
-      record(accumulator, usageValue(value, protocol));
+      inspectJson(value, protocol, accumulator);
     } else {
       // Most Responses servers include `type` in the data object; some use
       // the SSE event field as the discriminator instead.
-      record(
-        accumulator,
-        state.event === "response.completed"
-          ? value && typeof value === "object"
-            ? usageValue((value as Record<string, unknown>).response, "openai-responses")
-            : undefined
-          : responseCompletedUsage(value),
-      );
+      const root = asRecord(value);
+      if (state.event === "response.completed" && root && root.type !== "response.completed") {
+        const response = asRecord(root.response);
+        if (response) inspectJson({ type: "response.completed", response }, protocol, accumulator);
+      } else if (root?.type === "response.completed") {
+        inspectJson(root, protocol, accumulator);
+      }
     }
   } catch {
     // Malformed/incomplete SSE data is simply not a usage report.

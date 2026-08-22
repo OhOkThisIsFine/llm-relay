@@ -1,0 +1,24 @@
+import { useEffect, useRef, type ReactElement } from "react";
+import type { DetailV1 } from "../../../src/dashboard-contract.js";
+import { duration, stamp } from "../formatters.js";
+import { PanelCoverage, SpendCells, TokenCells } from "./ProjectionMetadata.js";
+
+export function DetailDialog({ detail, onClose }: Readonly<{ detail: DetailV1; onClose(): void }>): ReactElement {
+  const close = useRef<HTMLButtonElement>(null); const dialog = useRef<HTMLElement>(null);
+  useEffect(() => {
+    close.current?.focus(); const keys = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { onClose(); return; }
+      if (event.key !== "Tab") return;
+      const focusable = [...(dialog.current?.querySelectorAll<HTMLElement>("button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])") ?? [])].filter((node) => !node.hasAttribute("disabled"));
+      if (focusable.length === 0) return; const first = focusable[0]!; const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }; window.addEventListener("keydown", keys); return () => window.removeEventListener("keydown", keys);
+  }, [onClose]);
+  const request = detail.request;
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialog} className="dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title" aria-describedby="detail-description">
+    <button ref={close} type="button" className="close" onClick={onClose}>Close details</button><h2 id="detail-title">Request {request.requestId}</h2><p id="detail-description">{request.outcome}; {request.attemptCount} recorded attempts ({detail.attempts.map((attempt) => attempt.attemptId).join(", ") || "none"}). Coverage states include reason, provenance, and observed timestamp in each labelled status.</p>
+    <section aria-labelledby="request-projection"><h3 id="request-projection">Request projection</h3><dl className="detail-grid"><dt>Occurred</dt><dd>{stamp(request.occurredAt)}</dd><dt>Client</dt><dd>{request.client ?? "Unavailable"}</dd><dt>Attribution</dt><dd>{request.attribution}</dd><dt>Outcome</dt><dd>{request.outcome}</dd><dt>Failure kind</dt><dd>{request.failureKind ?? "Unavailable"}</dd><dt>Latency</dt><dd>{duration(request.latencyMs)}</dd><dt>Commit</dt><dd>{duration(request.commitMs)}</dd><dt>Provider</dt><dd>{request.provider ?? "Unavailable"}</dd><dt>Model</dt><dd>{request.model ?? "Unavailable"}</dd><dt>Credential</dt><dd>{request.credentialId ?? "Unavailable"}</dd><dt>Repair included</dt><dd>{request.repairIncluded ? "Yes" : "No"}</dd></dl><h4>Request tokens</h4><TokenCells tokens={request.tokens} /><h4>Request spend</h4><SpendCells spend={request.spend} /></section>
+    <section aria-labelledby="detail-coverage"><h3 id="detail-coverage">Detail coverage</h3>{detail.panelCoverage.length === 0 ? <p className="null-value">No panel coverage record was supplied.</p> : detail.panelCoverage.map((item) => <PanelCoverage key={item.panel} label={`Detail ${item.panel}`} value={item} />)}</section>
+    <section aria-labelledby="attempt-projection"><h3 id="attempt-projection">Attempts</h3>{detail.attempts.length === 0 ? <p>No recorded attempts are available for this request.</p> : <div className="table-wrap"><table className="responsive-table"><caption>Bounded request attempts</caption><thead><tr><th scope="col">Attempt ID</th><th scope="col">Role</th><th scope="col">Status</th><th scope="col">Started</th><th scope="col">Ended</th><th scope="col">Latency</th><th scope="col">Commit</th><th scope="col">Provider</th><th scope="col">Model</th><th scope="col">Credential</th><th scope="col">Failure</th><th scope="col">Tokens</th><th scope="col">Spend</th></tr></thead><tbody>{detail.attempts.map((attempt) => <tr key={attempt.attemptId}><th scope="row" data-label="Attempt ID">{attempt.attemptId}</th><td data-label="Role">{attempt.role}</td><td data-label="Status">{attempt.status}</td><td data-label="Started">{stamp(attempt.startedAt)}</td><td data-label="Ended">{stamp(attempt.endedAt)}</td><td data-label="Latency">{duration(attempt.latencyMs)}</td><td data-label="Commit">{duration(attempt.commitMs)}</td><td data-label="Provider">{attempt.provider ?? "Unavailable"}</td><td data-label="Model">{attempt.model ?? "Unavailable"}</td><td data-label="Credential">{attempt.credentialId ?? "Unavailable"}</td><td data-label="Failure">{attempt.failureKind ?? "Unavailable"}</td><td data-label="Tokens"><TokenCells tokens={attempt.tokens} /></td><td data-label="Spend"><SpendCells spend={attempt.spend} /></td></tr>)}</tbody></table></div>}</section>
+  </section></div>;
+}

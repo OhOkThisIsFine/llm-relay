@@ -1,6 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { WriteBehindTimer } from "./write-behind.js";
 import type { CredentialId } from "./credential-id.js";
 import { FACT_KINDS, type FactKind, type FactScope } from "./target-facts.js";
@@ -182,11 +183,20 @@ let _store: InterpretationStore | null = null;
 let _path: string | null = null;
 const writer = new WriteBehindTimer();
 
+// Vitest workers can reuse a PID across separate runs. Keep the test store in a fresh,
+// process-local namespace so a prior run can never make a new suite observe stale verdicts.
+const testPath = process.env.VITEST === undefined
+  ? null
+  : join(tmpdir(), `llm-relay-test-interpretations-${process.pid}-${randomUUID()}.json`);
+if (testPath !== null) {
+  process.once("exit", () => rmSync(testPath, { force: true }));
+}
+
 /** Cap on retained unknown signatures — a misbehaving backend must not grow this without bound. */
 const MAX_UNKNOWN = 200;
 function defaultPath(): string {
   if (process.env.VITEST !== undefined) {
-    return join(tmpdir(), `llm-relay-test-interpretations-${process.pid}.json`);
+    return testPath!;
   }
   const xdg = process.env.XDG_CONFIG_HOME;
   const baseDir = xdg && xdg.trim() ? join(xdg, "llm-relay") : join(homedir(), ".llm-relay");
