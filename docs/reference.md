@@ -323,10 +323,12 @@ There are exactly two verified base key sources:
    characters are retained. Anthropic/Chat `text` and Responses `input_text` blocks are supported;
    `<system-reminder>` blocks are skipped. A first user turn with no text creates no pin.
 
-The relay does not accept `x-claude-code-session-id`, `x-session-id`, or session-looking fields in
-`x-codex-turn-metadata`: this repository has no evidence that supported clients actually send those
-identifiers. When the documented `x-claude-code-agent-id` is present, it compounds either verified
-base key so a subagent cannot overwrite its parent session's pin.
+The relay accepts **no client session header as a sticky base key** — not `x-claude-code-session-id`,
+not `x-session-id`, and no session-looking field inside `x-codex-turn-metadata`. This hedge is about
+sticky-session ids only: the same Codex header IS consumed for subagent *detection* (its
+`request_kind: "subagent"` marker), but never as a session identity. When the documented
+`x-claude-code-agent-id` is present, it compounds either verified base key so a subagent cannot
+overwrite its parent session's pin.
 
 Only pool or multi-spec routes with at least two resolved candidates record a successful winner;
 single-spec routes create no no-op pin. A stored pin may reorder live candidates, but the current
@@ -358,6 +360,23 @@ text from an external service, and a response header is exactly the field a clie
 the response header can count only the candidates **stepped over**; a single-member pool's own
 refusal still reaches `llm-relay eligibility`. Successful SSE is different: its head is withheld
 until meaningful content, and semantic failures before that point are counted as synthetic 502s.
+
+### Other relay headers
+
+- `x-llm-relay-error-origin: upstream|local` — who produced an error status. Every failure out of
+  `fetchBackend` is a synthesized Response (a refused document, a translation bug and a dead
+  provider all arrive as a bare status), so without this marker the circuit breaker charged the
+  proxy's own local bugs to the provider. `fetchBackend` states it; the caller decides.
+- `x-llm-relay-paid: <deployment> (<assessment>)` — this answer came from a deployment that is NOT
+  free, e.g. `openrouter/anthropic/claude-sonnet-5 (paid, published-price)`. Pools rank free
+  capacity first but no longer exclude paid, so an unflagged paid response would be
+  indistinguishable from a free one — and the difference is money.
+- `x-llm-relay-tool-dialect` — present when this response contains a tool call reconstructed from a
+  recognized text dialect envelope (the host returned the model's native tool syntax as assistant
+  TEXT and the relay recovered it as native tool calls).
+- `x-llm-relay-dashboard-session: <token>` — REQUEST header on dashboard API calls, carrying the
+  read-only session token minted by the bootstrap exchange. It is consumed by the relay, never
+  forwarded upstream, and never persisted (only its SHA-256 digest is held in memory).
 
 ### Context guardrail
 
@@ -448,8 +467,10 @@ llm-relay offload status
 llm-relay offload claude on --scope subagents
 ```
 
-**How subagents are recognized:** Claude Code stamps `cc_is_subagent=true` into the `system`
-block of subagent requests; local Codex stamps `x-codex-turn-metadata`. This is a client
+**How subagents are recognized:** any ONE of three signals — Claude Code's `cc_is_subagent=true`
+stamped into the `system` block of subagent requests, Claude Code's documented
+`x-claude-code-agent-id` request header (present only on requests from a spawned agent), or local
+Codex's `x-codex-turn-metadata` header carrying `request_kind: "subagent"`. This is a client
 behaviour, not an API contract — re-verify after a client upgrade
 ([subagent-routing.md](subagent-routing.md#re-verifying)).
 
@@ -495,6 +516,13 @@ deployments assessed **free**. Unknown cost counts as paid, the Anthropic passth
 free, and nothing free resolving is a clean 503 naming the rule — never a silent fall-through to
 `routing.default`. It also binds `@relay:` directives, so a subagent prompt cannot spend money
 past it.
+
+**Unset vs explicit:** an absent `freeOnly` is **ON for offload-rerouted traffic** (subagent
+reroutes and `@relay:` directives) and **OFF for a directly addressed `pool/<name>`** spec (a
+dispatch CLI lane, for instance). The two defaults are deliberate — see the guard's own comment in
+`server.ts` — so `llm-relay offload status` never prints one collapsed boolean: each rule shows
+`ON (explicit)` / `OFF (explicit)` / `ON (default)`, with a legend stating how a direct pool is
+governed.
 
 Full design and wire evidence: [subagent-routing.md](subagent-routing.md).
 
@@ -720,7 +748,10 @@ would read as zero or garbage), leaving the client on its own default.
 speculative 1M would overshoot the weakest member by six to eight times and overflow the real
 backend, which is strictly worse than the conservative default it replaced.
 
-#### Learned limits (`~/.llm-relay/context-limits.json`)
+#### Learned limits (a `context-limit` fact in `~/.llm-relay/target-facts.json`)
+
+There is no separate `context-limits.json`: ceilings are stored as a deployment-scoped fact by
+the shared learned-facts store, so scope and keying are decided in one place.
 
 Providers publish little, but a deployment that *rejects* an over-length request usually states its
 real ceiling in the error message. The proxy reads that and remembers it, so a pool's floor gets
@@ -801,7 +832,9 @@ the one-use URL instead; if the relay or its control authorization is unavailabl
 fails closed.
 
 The bootstrap travels in the URL fragment (which is not sent in the HTTP request). The SPA reads
-and removes it from the address bar before exchanging it once for a scoped dashboard session. The
+and removes it from the address bar before exchanging it once for a scoped dashboard session.
+A printed fallback URL is machine-local — the relay accepts the exchange only from its own
+listener's Origin — and expires after 60 seconds, so a link pasted elsewhere is inert. The
 static shell is tokenless, but snapshot, detail, and logout operations require that session. The
 dashboard never receives the persistent control capability.
 

@@ -75,15 +75,17 @@ consistent with the repo's existing philosophy.
 - Completing the migration is months of churn in the riskiest code for zero user-visible
   behavior — the opposite of "stabilize and harden."
 
-## Doc drift found (2026-08-04)
+## Doc drift found (2026-08-04) — resolved
 
-- CLAUDE.md architecture table is missing: `src/kernel/` (4 files), `src/routes/admin.ts`
-  (admin endpoints factored out of `server.ts`), `src/control-authorization.ts` (capability
-  token for mutating control-plane endpoints), `src/request-log.ts` (`baseLog`/`logSafePath`
-  extracted), `src/self-update.ts` (npm-registry version check + global-install self-update).
-- CLAUDE.md "What this is" mis-centers repair (confirmed by owner as drift).
-- CLAUDE.md "Nothing is pending in the code" predates the half-adopted kernel.
-- README: essentially current (only `help`/`version` missing from the command table).
+All of the drift found that day was fixed in the same cycle:
+
+- CLAUDE.md's architecture table gained the then-missing rows (`src/kernel/`,
+  `src/routes/admin.ts`, `src/control-authorization.ts`, `src/request-log.ts`, `src/self-update.ts`),
+  and a follow-up sweep on 2026-08-22 added every remaining uncovered module plus
+  `test/architecture-map.test.ts`, which fails when any `src/` file lacks a table row.
+- CLAUDE.md "What this is" was re-centered on the traffic-control-plane mission.
+- The kernel surface question was closed by deletion; only the adopted attempt lifecycle remains.
+- README: essentially current (only `help`/`version` missing from the command table at the time).
 - `docs/fcc-replacement-assessment.md` was a snapshot at commit 799eed3 with open items nobody
   was tracking; deleted 2026-08-04.
 
@@ -134,5 +136,6 @@ Every thread from the discussion closed the same day, shipped as 0.16.0:
   against the "README + onboard alone" standard; the stale assessment doc deleted.
 - **Personal config**: `freeOnly: true` set on both existing offload rules.
 
-Open (minor): `llm-relay offload status` prints enabled/scope but not `freeOnly` — a small
-transparency gap in the table rendering; the JSON state carries it.
+Open (minor), closed 2026-08-22: `llm-relay offload status` now renders the **effective**
+`freeOnly` — explicit ON/OFF, with unset shown as its two-sided default rather than a bare field —
+so the transparency gap in the table rendering is closed.

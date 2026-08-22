@@ -15,9 +15,14 @@ Roster used for the coverage column: `z-ai/glm-5.2`, `deepseek-ai/deepseek-v4-pr
 | **LMArena** | HF parquet (`lmarena-ai/leaderboard-dataset`) | parquet | 433 | 5/5 (fuzzy names) | Keep |
 | **BFCL** | `gorilla.cs.berkeley.edu/data_overall.csv` | CSV | ~100 | 1/5 | Keep — uniquely relevant |
 | **Aider polyglot** | raw.githubusercontent (`polyglot_leaderboard.yml`) | YAML | 69 | 2/5 | Adopt, flag as stale |
+| **Artificial Analysis** (direct) | `artificialanalysis.ai/api/v2/data/llms/models` | JSON | — | — | Wired first-hand 2026-08-08; **key-gated** (`ARTIFICIALANALYSIS_API_KEY`). Currently unconfigured on this install, so it contributes nothing — the shipped snapshot records it `model_count: 0, configured: false`. Set the key to enable. |
 | HF Open LLM | HF parquet (`open-llm-leaderboard/contents`) | parquet | 4576 | 1/5 (glm only) | **Skip** |
 | EvalPlus | raw.githubusercontent (`results.json`) | JSON | 125 | **0/5** | **Skip** |
 | LiveCodeBench | `livecodebench.github.io/leaderboard.html` | HTML only | — | — | **Skip** |
+
+⚠ The AA figures cited below this table come from OpenRouter's embedded copy of them, not from a
+first-hand AA fetch — so today's snapshot has **four effective sources**, and every AA number in
+it is one step removed.
 
 ## Why OpenRouter is the spine
 

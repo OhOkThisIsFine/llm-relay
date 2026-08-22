@@ -176,6 +176,19 @@ export const LOCAL_USED_BASES = Object.freeze(["reported", "estimated", "mixed"]
 export type ResponseAttribution = Attribution | "all";
 export const RESPONSE_ATTRIBUTIONS = Object.freeze(["relay_held", "caller_operated", "unknown", "all"] as const);
 
+/**
+ * Map a snapshot query's attribution filter onto the response attribution it selects.
+ *
+ * Both spellings are owned by this contract (DASHBOARD_QUERY_ATTRIBUTION_VALUES vs
+ * ATTRIBUTIONS), so the pairing lives here too — a route validating a query and a
+ * projection labelling its rows must not re-derive it separately and drift.
+ */
+export function mapDashboardQueryAttribution(value: DashboardQueryAttribution | undefined): Attribution | "all" {
+  if (value === "relay-held") return "relay_held";
+  if (value === "caller-operated") return "caller_operated";
+  return "all";
+}
+
 export interface PanelCoverageV1 {
   panel: PanelId;
   state: Coverage;
@@ -404,6 +417,7 @@ export interface SnapshotV1 {
   from: string | null;
   to: string;
   retentionFrom: string | null;
+  /** Reserved at null until the accounting store exposes a retention end cursor. */
   retentionTo: string | null;
   panelCoverage: PanelCoverageV1[];
   summary: SummaryV1;
@@ -481,7 +495,12 @@ export const isDashboardQueryFilterName = (value: unknown): value is DashboardQu
 export const isNonNegativeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-const utf8ByteLength = (value: string): number | null => {
+/**
+ * UTF-8 byte length of a string, or null when it carries control characters or an
+ * unpaired surrogate. Exported because the routes module gates the SAME query budget
+ * with it before decoding — one implementation, so the limit's logic cannot drift.
+ */
+export const utf8ByteLength = (value: string): number | null => {
   let bytes = 0;
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
@@ -505,7 +524,6 @@ export const isDashboardSafeId = (value: unknown): value is string => {
   const bytes = utf8ByteLength(value);
   return value.length >= 1 && bytes !== null && bytes <= DASHBOARD_SAFE_ID_MAX_BYTES;
 };
-export const isDashboardSafeIdUtf8 = isDashboardSafeId;
 export const isDashboardAttemptId = (value: unknown): value is string => {
   if (typeof value !== "string") return false;
   const bytes = utf8ByteLength(value);

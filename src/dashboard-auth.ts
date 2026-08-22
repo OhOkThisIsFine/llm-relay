@@ -2,8 +2,6 @@ import { createHash, randomBytes as nodeRandomBytes, timingSafeEqual } from "nod
 
 /** Header carrying a short-lived, read-only dashboard session. */
 export const DASHBOARD_SESSION_HEADER = "X-LLM-Relay-Dashboard-Session" as const;
-/** Alias kept explicit for callers that name headers by their role. */
-export const DASHBOARD_SESSION_HEADER_NAME = DASHBOARD_SESSION_HEADER;
 
 export const DASHBOARD_SCOPE = "dashboard:read" as const;
 export const DASHBOARD_BOOTSTRAP_TTL_MS = 60_000;

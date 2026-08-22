@@ -1,5 +1,9 @@
 # Free provider setup — 2026-07-29
 
+> **HISTORICAL (2026-08-22).** This is a point-in-time snapshot of one machine's free capacity
+> from before pools were effort-tiered. The four to-do items below were fixed long ago, and every
+> version claim ("0.9.0 today") is stale. Kept as evidence only; do not act on it.
+
 Final state of llm-relay's free capacity, what was broken, and what remains.
 Backups: `~/.llm-relay/config.json.bak-2026-07-29`, `.bak2-2026-07-29`.
 

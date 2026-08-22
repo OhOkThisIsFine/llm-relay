@@ -35,6 +35,7 @@ import {
   ACCOUNTING_MINUTE_SCHEMA,
   ACCOUNTING_RECENT_SCHEMA,
   ACCOUNTING_STORE_VERSION,
+  freezeDeep,
   parseAccountingAttemptPacketV1,
   parseAccountingDayShardV1,
   parseAccountingLifetimeV1,
@@ -96,7 +97,8 @@ export type {
   AccountingRequestPacket,
 } from "./accounting-store-schema.js";
 
-export const ACCOUNTING_MAX_PENDING_REQUESTS = 64;
+/** Sized for a Claude Code session holding many parallel subagent streams in flight. */
+export const ACCOUNTING_MAX_PENDING_REQUESTS = 256;
 export const ACCOUNTING_MAX_PENDING_ATTEMPTS_PER_REQUEST = ACCOUNTING_MAX_PACKET_ATTEMPTS;
 export const ACCOUNTING_MAX_READ_DAYS = 31;
 export const ACCOUNTING_DEFAULT_RECENT_ROWS = ACCOUNTING_MAX_RECENT_ROWS;
@@ -306,13 +308,6 @@ function result(status: SnapshotMutationResult["status"], error: string | null =
   return { status, transactionId: null, lowerBoundLoss, error, quarantinedPath: null, retryable };
 }
 function clone<T>(value: T): T { return structuredClone(value); }
-function freezeDeep<T>(value: T): T {
-  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const child of Object.values(value as Record<string, unknown>)) freezeDeep(child);
-    Object.freeze(value);
-  }
-  return value;
-}
 function frozenClone<T>(value: T): T { return freezeDeep(clone(value)); }
 function positiveLimit(value: unknown, fallback: number, hard: number): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? Math.min(value, hard) : fallback;
@@ -529,6 +524,35 @@ function addAttempt(target: MutableAggregate, attempt: AccountingAttemptPacketV1
 function rowKey(row: Pick<MutableRow, "kind" | "role" | "provider" | "model" | "client" | "credentialId" | "attribution" | "outcome" | "failureKind">): string {
   return JSON.stringify([row.kind, row.role, row.provider, row.model, row.client, row.credentialId, row.attribution, row.outcome, row.failureKind]);
 }
+
+/**
+ * Dimension fields are fixed when a row is created (only aggregate counters move
+ * afterwards), so its serialized key is memoized rather than re-derived per scan.
+ */
+const rowKeys = new WeakMap<object, string>();
+function cachedRowKey(
+  row: Pick<MutableRow, "kind" | "role" | "provider" | "model" | "client" | "credentialId" | "attribution" | "outcome" | "failureKind">,
+): string {
+  const existing = rowKeys.get(row);
+  if (existing !== undefined) return existing;
+  const key = rowKey(row);
+  rowKeys.set(row, key);
+  return key;
+}
+
+/**
+ * In-memory membership index for a day's dedup array; the SORTED ARRAY remains
+ * the persisted form. Keyed weakly so an evicted or pruned day drops its index.
+ */
+const dedupMembership = new WeakMap<object, Set<string>>();
+function dedupSet(day: MutableDay): Set<string> {
+  let ids = dedupMembership.get(day);
+  if (ids === undefined) {
+    ids = new Set(day.dedup.requestIds);
+    dedupMembership.set(day, ids);
+  }
+  return ids;
+}
 interface DayRowBudget { remaining: number; }
 
 function countDayRows(day: MutableDay): number {
@@ -543,7 +567,7 @@ function findRow(
   budget: DayRowBudget,
 ): MutableRow | null {
   const key = rowKey(row);
-  const found = cell.rows.find((candidate) => rowKey(candidate) === key);
+  const found = cell.rows.find((candidate) => cachedRowKey(candidate) === key);
   if (found !== undefined) return found;
   if (cell.rows.length >= ACCOUNTING_MAX_ROWS_PER_CELL || budget.remaining <= 0) {
     increase(cell.coverage as unknown as Record<string, number>, "droppedRows");
@@ -806,7 +830,12 @@ class AccountingStoreImpl implements AccountingStore {
     const parsed = parsedRecent(this.recent);
     if (parsed === null) return { status: "corrupt", value: null, error: "schema" };
     const requested = typeof options === "number" ? options : options?.limit;
-    return { status: "ok", value: frozenClone(parsed.rows.slice(0, positiveLimit(requested, this.recentLimit, this.recentLimit))) };
+    // Unlike the constructor options, an EXPLICIT read limit is honoured exactly:
+    // 0 asks for zero rows, and only an omitted limit falls back to the default.
+    const limit = typeof requested === "number" && Number.isSafeInteger(requested)
+      ? Math.min(Math.max(requested, 0), this.recentLimit)
+      : this.recentLimit;
+    return { status: "ok", value: frozenClone(parsed.rows.slice(0, limit)) };
   }
 
   readDetail(requestId: string): AccountingReadResult<AccountingRequestPacket> {
@@ -876,7 +905,12 @@ class AccountingStoreImpl implements AccountingStore {
 
   private onAttemptCompleted(event: AttemptCompletedEvent): void {
     const attempt = makeAttempt(event);
-    if (attempt === null) return;
+    if (attempt === null) {
+      // A packet that fails validation is a measurement quietly disappearing
+      // unless the loss is announced like every other drop path.
+      this.markGlobalLoss("unknown", "truncated", "attempt_packet");
+      return;
+    }
     const pending = this.ensurePending(event.requestId);
     if (pending === null) return;
     pending.startedAttempts.delete(attempt.attemptId);
@@ -906,8 +940,20 @@ class AccountingStoreImpl implements AccountingStore {
     const existing = this.pending.get(requestId);
     if (existing !== undefined) return existing;
     if (this.pending.size >= this.pendingRequestLimit) {
-      const oldest = this.pending.keys().next().value as string | undefined;
-      if (oldest !== undefined) this.pending.delete(oldest);
+      // Evict the OLDEST-STARTED in-flight request, not merely the first
+      // inserted: parallel subagent streams do not start in insertion order.
+      // An entry whose start event has not arrived carries the least identity,
+      // so it is treated as older than every dated entry.
+      let victim: string | null = null;
+      let victimStartedAt: string | null = null;
+      for (const [key, entry] of this.pending) {
+        const startedAt = entry.started?.startedAt ?? null;
+        if (victim === null || startedAt === null || (victimStartedAt !== null && startedAt < victimStartedAt)) {
+          victim = key;
+          victimStartedAt = startedAt;
+        }
+      }
+      if (victim !== null) this.pending.delete(victim);
       this.markGlobalLoss("unknown", "truncated", "pending_requests");
     }
     if (this.pending.size >= this.pendingRequestLimit) return null;
@@ -928,7 +974,7 @@ class AccountingStoreImpl implements AccountingStore {
     if (date === null || !this.ensureTransactionRoom(date)) return false;
     const day = this.loadDayForWrite(date);
     if (day === null) return false;
-    if (day.dedup.requestIds.includes(work.event.requestId)) {
+    if (dedupSet(day).has(work.event.requestId)) {
       this.rememberKnownDay(date);
       return true;
     }
@@ -1110,7 +1156,8 @@ class AccountingStoreImpl implements AccountingStore {
   }
 
   private addDedup(day: MutableDay, requestId: string): boolean {
-    if (day.dedup.requestIds.includes(requestId)) return true;
+    const ids = dedupSet(day);
+    if (ids.has(requestId)) return true;
     if (day.dedup.requestIds.length >= ACCOUNTING_MAX_DEDUP_IDS) {
       increase(day.dedup as unknown as Record<string, number>, "dropped");
       day.dedup.complete = false;
@@ -1120,6 +1167,7 @@ class AccountingStoreImpl implements AccountingStore {
     }
     day.dedup.requestIds.push(requestId);
     day.dedup.requestIds.sort();
+    ids.add(requestId);
     return true;
   }
 

@@ -5,10 +5,13 @@
  * the stream.
  */
 
-export type UsageProtocol =
-  | "anthropic-messages"
-  | "openai-chat"
-  | "openai-responses";
+/**
+ * Protocols the USAGE observer actually parses. Deliberately narrower than
+ * `StreamCommitProtocol`: no call site observes a native OpenAI Responses body
+ * (Responses front-door traffic is translated to Anthropic before it is proxied),
+ * so there is no `"openai-responses"` member to re-add if one ever appears.
+ */
+export type UsageProtocol = "anthropic-messages" | "openai-chat";
 
 export interface UsageAccumulator {
   /** Provider-reported prompt/input tokens. */
@@ -78,11 +81,6 @@ function usageRecords(value: unknown, protocol: UsageProtocol): Record<string, u
     if (messageUsage) records.push(messageUsage);
   }
 
-  if (protocol === "openai-responses" && root.type === "response.completed") {
-    const response = asRecord(root.response);
-    const responseUsage = response && asRecord(response.usage);
-    if (responseUsage) records.push(responseUsage);
-  }
   return records;
 }
 
@@ -108,10 +106,8 @@ function inspectUsageRecord(
     return;
   }
 
-  const detailsName = protocol === "openai-chat"
-    ? "prompt_tokens_details"
-    : "input_tokens_details";
-  const details = asRecord(usage[detailsName]);
+  // openai-chat: cached tokens ride in prompt_tokens_details.
+  const details = asRecord(usage.prompt_tokens_details);
   if (details) recordField(accumulator, "cachedInputTokens", details.cached_tokens);
 }
 
@@ -153,18 +149,9 @@ function inspectSseFrame(
       if (root && (state.event === "message_start" || state.event === "message_delta" || root.type === "message_start" || root.type === "message_delta")) {
         inspectJson(root, protocol, accumulator);
       }
-    } else if (protocol === "openai-chat") {
-      inspectJson(value, protocol, accumulator);
     } else {
-      // Most Responses servers include `type` in the data object; some use
-      // the SSE event field as the discriminator instead.
-      const root = asRecord(value);
-      if (state.event === "response.completed" && root && root.type !== "response.completed") {
-        const response = asRecord(root.response);
-        if (response) inspectJson({ type: "response.completed", response }, protocol, accumulator);
-      } else if (root?.type === "response.completed") {
-        inspectJson(root, protocol, accumulator);
-      }
+      // The only non-Anthropic protocol is openai-chat: every frame is inspected.
+      inspectJson(value, protocol, accumulator);
     }
   } catch {
     // Malformed/incomplete SSE data is simply not a usage report.

@@ -11,7 +11,6 @@ import {
   ACCOUNTING_MAX_ROWS_PER_CELL,
   ACCOUNTING_MAX_SAMPLES,
   ACCOUNTING_RECENT_SCHEMA,
-  ACCOUNTING_STORE_SCHEMA,
   ACCOUNTING_STORE_VERSION,
   accountingSerializedBytes,
   type AccountingAggregateTokenTotalsV1,
@@ -180,7 +179,6 @@ describe("accounting persisted schema", () => {
     expect(ACCOUNTING_RECENT_SCHEMA).toBe("accounting.recent.v1");
     expect(ACCOUNTING_LIFETIME_SCHEMA).toBe("accounting.lifetime.v1");
     expect(ACCOUNTING_DEDUP_SCHEMA).toBe("accounting.dedup.v1");
-    expect(ACCOUNTING_STORE_SCHEMA).toBe("accounting.store.v1");
     expect(ACCOUNTING_MAX_DETAIL_ATTEMPTS).toBe(32);
     expect(ACCOUNTING_MAX_SAMPLES).toBeGreaterThan(0);
     expect(ACCOUNTING_MAX_ROWS_PER_CELL).toBeGreaterThan(ACCOUNTING_MAX_DETAIL_ATTEMPTS);

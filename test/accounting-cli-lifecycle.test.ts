@@ -154,6 +154,9 @@ describe("accounting store CLI lifecycle", () => {
     const server = runProxy();
 
     expect(mocks.createAccountingStore).toHaveBeenCalledTimes(1);
+    // M5 (approved 2026-08-21): production retention is 30 days; the store's own
+    // default stays null (off) for library callers.
+    expect(mocks.createAccountingStore).toHaveBeenCalledWith({ retentionDays: 30 });
     expect(mocks.createProxy).toHaveBeenCalledTimes(1);
     expect(mocks.createProxy).toHaveBeenCalledWith(expect.anything(), {
       catalog: expect.anything(),

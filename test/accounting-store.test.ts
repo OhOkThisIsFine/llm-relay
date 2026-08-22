@@ -15,6 +15,7 @@ import {
   createAccountingRequest,
   type AccountingEvent,
   type AccountingRecorder,
+  type AttemptCompletedEvent,
   type RequestCompletedEvent,
   type TokenFactsInput,
 } from "../src/accounting.js";
@@ -181,6 +182,12 @@ function lifetime(store: AccountingStore) {
   expect(read.status).toBe("ok");
   if (read.status !== "ok") throw new Error("lifetime was not readable");
   return read.value;
+}
+
+/** Losses announced on the persisted recent snapshot's coverage. */
+function recentLosses(directory: string) {
+  const raw = JSON.parse(readFileSync(join(directory, "recent.json"), "utf8")) as { coverage: { losses: readonly { kind: string; count: number; field: string | null }[] } };
+  return raw.coverage.losses;
 }
 
 describe("durable canonical accounting store", () => {
@@ -352,6 +359,82 @@ describe("durable canonical accounting store", () => {
     const raw = JSON.parse(readFileSync(join(directory, "recent.json"), "utf8")) as { coverage: { droppedRecent: number; droppedDetails: number } };
     expect(raw.coverage.droppedRecent).toBe(1);
     expect(raw.coverage.droppedDetails).toBeGreaterThanOrEqual(2);
+    store.close();
+  });
+
+  it("treats an explicit zero recent limit as zero rows, reserving the default for omission", () => {
+    const store = createAccountingStore({ rootDir: root() });
+    recordRequest(store, { startedAt: "2026-08-20T04:30:00.000Z", endedAt: "2026-08-20T04:30:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
+    recordRequest(store, { startedAt: "2026-08-20T04:31:00.000Z", endedAt: "2026-08-20T04:31:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
+
+    const defaulted = store.readRecent();
+    expect(defaulted.status).toBe("ok");
+    if (defaulted.status === "ok") expect(defaulted.value).toHaveLength(2);
+
+    const explicitZero = store.readRecent({ limit: 0 });
+    expect(explicitZero.status).toBe("ok");
+    if (explicitZero.status === "ok") expect(explicitZero.value).toHaveLength(0);
+
+    const positionalZero = store.readRecent(0);
+    expect(positionalZero.status).toBe("ok");
+    if (positionalZero.status === "ok") expect(positionalZero.value).toHaveLength(0);
+
+    const cappedToOne = store.readRecent({ limit: 1 });
+    expect(cappedToOne.status).toBe("ok");
+    if (cappedToOne.status === "ok") expect(cappedToOne.value).toHaveLength(1);
+
+    // A non-finite garbage limit is not a count; fall back to the default.
+    const nonsense = store.readRecent({ limit: Number.NaN });
+    expect(nonsense.status).toBe("ok");
+    if (nonsense.status === "ok") expect(nonsense.value).toHaveLength(2);
+    store.close();
+  });
+
+  it("announces an unparseable attempt packet as a loss instead of dropping it silently", () => {
+    const directory = root();
+    const store = createAccountingStore({ rootDir: directory });
+    const invalid: AttemptCompletedEvent = {
+      type: "attempt-completed",
+      requestId: "unsafe\nrequest",
+      attemptId: "attempt-0000000001",
+      role: "serve",
+      startedAt: "2026-08-20T09:00:00.000Z",
+      endedAt: "2026-08-20T09:00:01.000Z",
+      outcome: "error",
+      failureKind: "provider_error",
+      attribution: "relay_held",
+      latencyMs: 10,
+      commitMs: null,
+      provider: "provider-a",
+      model: "model-a",
+      credentialId: null,
+      tokens: {} as AttemptCompletedEvent["tokens"],
+      spend: null,
+    };
+    store.record(invalid);
+    expect(store.flush().status).toBe("committed");
+    // The same drop is announced on BOTH fixed snapshots, like every other
+    // markGlobalLoss path, so no reader sees a silently smaller measurement.
+    expect(lifetime(store).coverage.state).toBe("partial");
+    expect(lifetime(store).coverage.losses.some((loss) => loss.field === "attempt_packet")).toBe(true);
+    expect(recentLosses(directory).some((loss) => loss.field === "attempt_packet")).toBe(true);
+    store.close();
+  });
+
+  it("evicts the oldest-started pending request rather than the first-inserted", () => {
+    const store = createAccountingStore({ rootDir: root(), pendingRequestLimit: 2 });
+    const lateStart = requestId();
+    const earlyStart = requestId();
+    const third = requestId();
+    // Insertion order is deliberately the REVERSE of start order.
+    store.record(startedOnly(lateStart, "2026-08-20T09:10:20.000Z"));
+    store.record(startedOnly(earlyStart, "2026-08-20T09:10:10.000Z"));
+    store.record(startedOnly(third, "2026-08-20T09:10:30.000Z"));
+    // The eviction this forces must take the EARLIEST-STARTED entry
+    // (earlyStart), so the later-started first-inserted one keeps its detail.
+    store.record(terminalOnly(lateStart, "2026-08-20T09:11:00.000Z"));
+    expect(store.readDetail(lateStart).status).toBe("ok");
+    expect(lifetime(store).coverage.losses.some((loss) => loss.field === "pending_requests")).toBe(true);
     store.close();
   });
 

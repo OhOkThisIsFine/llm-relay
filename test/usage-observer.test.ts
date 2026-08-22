@@ -57,7 +57,7 @@ async function observedAccumulator(
 }
 
 describe("usage observer", () => {
-  it("observes buffered Anthropic, Chat, and Responses JSON", async () => {
+  it("observes buffered Anthropic and Chat JSON", async () => {
     await expect(observed('{"usage":{"output_tokens":0}}', "anthropic-messages", false)).resolves.toEqual({
       output: '{"usage":{"output_tokens":0}}',
       tokens: 0,
@@ -65,10 +65,6 @@ describe("usage observer", () => {
     await expect(observed('{"usage":{"completion_tokens":12}}', "openai-chat", false)).resolves.toEqual({
       output: '{"usage":{"completion_tokens":12}}',
       tokens: 12,
-    });
-    await expect(observed('{"usage":{"output_tokens":27}}', "openai-responses", false)).resolves.toEqual({
-      output: '{"usage":{"output_tokens":27}}',
-      tokens: 27,
     });
   });
 
@@ -95,16 +91,6 @@ describe("usage observer", () => {
       outputTokens: 5,
       completionTokens: 5,
       cachedInputTokens: 7,
-    });
-    await expect(observedAccumulator(
-      '{"type":"response.completed","response":{"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":9}}}}',
-      "openai-responses",
-      false,
-    )).resolves.toMatchObject({
-      inputTokens: 30,
-      outputTokens: 6,
-      completionTokens: 6,
-      cachedInputTokens: 9,
     });
   });
 
@@ -154,29 +140,17 @@ describe("usage observer", () => {
     });
   });
 
-  it("observes only Responses response.completed usage", async () => {
-    const input = [
-      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n',
-      'event: response.completed\ndata: {"response":{"usage":{"output_tokens":11}}}\n\n',
-    ].join("");
-    await expect(observed(input, "openai-responses", true, 3)).resolves.toEqual({ output: input, tokens: 11 });
-  });
+  /**
+   * No `"openai-responses"` protocol exists any more: no observeUsage call site ever
+   * passed one (Responses front-door traffic is translated before it is proxied), so
+   * the branch was dead. Removal is enforced by the type system — any call site or
+   * test passing the literal now fails `typecheck:test`.
+   */
 
-  it("captures Responses input/output/cache details only on response.completed", async () => {
-    const input = [
-      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","usage":{"input_tokens":99}}\n\n',
-      'event: response.completed\ndata: {"response":{"usage":{"input_tokens":14,"output_tokens":2,"input_tokens_details":{"cached_tokens":6}}}}\n\n',
-    ].join("");
-    await expect(observedAccumulator(input, "openai-responses", true, 3)).resolves.toMatchObject({
-      inputTokens: 14,
-      outputTokens: 2,
-      completionTokens: 2,
-      cachedInputTokens: 6,
-    });
-  });
-
-  it("keeps a CR until a split LF before dispatching a Responses event", async () => {
-    const input = 'event: response.completed\r\ndata: {"response":{"usage":{"output_tokens":13}}}\r\n\r\n';
+  it("keeps a CR until its split LF before dispatching a Chat frame", async () => {
+    // Same parser hazard the old Responses test covered, under a live protocol: a CR
+    // landing on a chunk boundary must not be flushed as a premature blank line.
+    const input = 'data: {"usage":{"completion_tokens":13}}\r\n\r\n';
     const bytes = new TextEncoder().encode(input);
     const split = input.indexOf("\r") + 1;
     const response = new Response(
@@ -189,7 +163,7 @@ describe("usage observer", () => {
       }),
     );
     const accumulator = createUsageAccumulator();
-    const observedResponse = observeUsage(response, "openai-responses", accumulator, { streamed: true });
+    const observedResponse = observeUsage(response, "openai-chat", accumulator, { streamed: true });
     await expect(observedResponse.text()).resolves.toBe(input);
     expect(accumulator.completionTokens).toBe(13);
   });

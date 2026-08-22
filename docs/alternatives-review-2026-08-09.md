@@ -1,5 +1,9 @@
 # Assessment: "Unified Multi-LLM Management and Orchestration" (ChatGPT deep research, 2026-08-09)
 
+> **SUPERSEDED 2026-08-13:** the trial concluded the other way — llm-relay stayed and the
+> alternatives were uninstalled. See [status-vs-freellmapi-2026-08-16.md](status-vs-freellmapi-2026-08-16.md).
+> The "adopt it on trial" recommendation below is historical record, not current guidance.
+
 Reviewed against the actual question asked: *"I'm tired of maintaining llm-relay. I want something
 someone else maintains that I can install and use."*
 

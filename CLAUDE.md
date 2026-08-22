@@ -33,11 +33,11 @@ never from an LLM's opinion inserted into the request path.
 
 ```bash
 npm install
-npm run build          # tsc -> dist/
+npm run build          # build:server (tsc -> dist/) + build:dashboard (vite, from dashboard/)
 npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
 npm run typecheck      # tsc --noEmit — src/ (tsconfig.json)
 npm run typecheck:test # tsc — the SUITE (tsconfig.test.json). See the note below.
-npm run check          # both typechecks + test. The one gate; CI runs exactly this.
+npm run check          # typecheck + typecheck:test + test + check:dashboard (tsc for dashboard/ + the dashboard suite's own vitest config) + check:package (bundle inventory check + packed smoke). The one gate; CI runs exactly this.
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
 
@@ -73,7 +73,7 @@ worktree's half-finished edit fails this tree's run, and a stale copy passes one
 **Static analysis is ADVISORY and deliberately outside the gate.** `npm run analysis:run`
 (eslint + sonarjs, knip, madge, dependency-cruiser, ts-prune, jscpd) writes to `analysis-reports/`
 (gitignored). It is **not** in `npm run check` and CI does not run it — the gate stays the two
-typechecks plus the suite. Several default rules contradict documented invariants here, so they
+typechecks, the server suite, the dashboard checks and the package checks. Several default rules contradict documented invariants here, so they
 are switched **off in `eslint.config.mjs` with the invariant named beside each**: this proxy is
 loopback-only so `http://127.0.0.1` is the architecture (`no-clear-text-protocols`); the dispatch
 ladder names agent CLIs for the HOST to resolve (`no-os-command-from-path`); the suite uses temp
@@ -106,19 +106,25 @@ in the workflow YAML, so don't judge the protection by the YAML alone.
 | `dotenv.ts` | Loads `~/.llm-relay/.env` into `process.env` at startup, **never overwriting an already-set variable**. `onboard` always wrote this file and nothing ever read it, so a wizard-saved key worked for one shell and then "stopped working". The real environment wins because it is the more explicit signal. |
 | `pool-health.ts` | `llm-relay pools --probe` — sends a REAL completion to every pool member. Config-time validation cannot see a model that is listed and still dead (de-listed behind the scenes, gated to a paid tier, routed to a missing function), and that is exactly how a pool ends up with one live member and paper failover. Probes at 400 max_tokens because reasoning models return an empty 200 at a low cap — `empty` is a distinct verdict from `missing`, not a synonym. |
 | `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …). Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. |
+| `credential-id.ts` | Stable identity for a configured credential slot — a branded `provider#label` string (`makeCredentialId`/`parseCredentialId`). Labels are bounded to `[A-Za-z0-9_.-]{1,32}` and the provider may not contain `#`, so an id always round-trips to exactly one (provider, label) pair. |
+| `credential-fleet.ts` | Normalizes a provider's declared credential slots (`credentials[].label/authEnv/models`) into non-secret descriptors plus resolvers for each. An empty `models` array deliberately matches NO models; slots from `credentials` resolve **declared-only** (no legacy alias fallback); only enabled + model-allowed + present slots produce an attempt. |
+| `resolved-attempt.ts` | The application-layer attempt shape with credential resolution performed exactly once (`ResolvedAttempt` = target + `credentialId` + resolution + slot). A missing slot still returns a frozen attempt carrying `declared-missing`, so legacy callers raise their established credential-config error before any egress. |
+| `credential-select.ts` | Ranks credentials WITHIN one deployment (never reorders deployments) and runs the request-local breadth-first `CredentialWalk`. Ranking bands: hard facts → health/cooling/fault → fresh provider-stated headroom (unknown ⇒ neutral band, never a guess) → cost (unknown ties with paid) → LRU → config order. `next()` only OFFERS a candidate; `recordStarted()` immediately before fetch is the sole budget/LRU mutation boundary. |
+| `key-import.ts` | Parses a dotenv file or the documented FreeLLMAPI v1 export envelope into `~/.llm-relay/.env`. Names match against a CLOSED per-provider alias list — there is no value-shape fallback (`sk-…`, length, entropy), because a guessed mapping ships one provider's credential to another's endpoint. Valid JSON of any other shape is rejected outright, not treated as dotenv. |
+| `secret-file-acl.ts` | Best-effort Windows hardening of secret files (`icacls /inheritance:r /grant:r <user>:F`). Fire-and-forget by design — a missing or broken icacls is a hardening failure, never a reason to make the secret unusable. Skipped under vitest unless the spawner is injected, so the suite can't lock itself out of its own fixtures. |
 | `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
 | `config.ts` | Load/validate config. `${ENV}` expansion, loopback enforcement, multi-candidate tier specs (`string | string[]`), **`pool/<name>` routing** (`routing.pools`; `pool` is a reserved provider name; an unknown pool is a loud `RoutingError`, never a silent fall-through to `routing.default`), **client-specific offload routing** (`isSubagentRequest` reads Claude/Codex child markers; `subagentSpec` applies `routing.subagents` through the originating client's `routing.offload` rule, with `scope: "subagents" | "all"`, or an `@relay:` directive read ONLY from the last text block of `messages[0]`; a rule may carry `freeOnly: true` — see the gotcha), reshaper auto-synthesis. Also `leave_me_alone` — the onboarding-nudge suppression list, whose entries are deliberately NOT validated against the known providers (see `onboarding.ts`). |
 | `session-pin.ts` | Ephemeral sticky-session affinity (`routing.sticky`, off by default): relay-owned `x-llm-relay-session` or a 16-hex SHA-256 first-user-message key, optionally compounded with the documented Claude agent id. Sliding 30m TTL, 1,000-entry LRU default, metadata only. No unverified client-session header is accepted, and request-path promotion is constrained by health and the pool's degrade boundary in `server.ts`. |
 | `offload.ts` | Client-specific offload state. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites the targeted `routing.offload.<client>` rule in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
 | `dispatch.ts` | The dispatch ladder (`GET/POST /dispatch`, `llm-relay dispatch`) — which LANE a host should hand a whole delegated task to, in order, with tier selection (`?tier=`), host override (`?lane=`), walk-past (`?after=`) and host-reported exhaustion (`POST {"exhausted"}`). `routing.ladders.<tier>` supports different CLI models for reasoning/coding/fast; the legacy `routing.ladder` remains valid. An exhaustion report may carry `outcome: "rate_limited"` (15m default) or `"quota_exhausted"` (1h default) and a vendor-stated `retryAfterMs` that beats both (`OUTCOME_DEFAULT_MS`); the relay still never invents the signal. A `cli` rung may declare `env` (string = set, `null` = unset — both needed for a relay-routed `claude -p` child: base URL set, nested-session vars unset), surfaced on `invoke.env` and rendered by the CLI per shell; the task placeholder is never substituted into env values. Distinct from `routing.subagents`, which routes one HTTP turn. **The relay never spawns a `cli` rung** — it owns the order, the host executes. |
-| `context-limits.ts` | Context ceilings LEARNED from what a deployment stated when it refused an over-length request (`~/.llm-relay/context-limits.json`). The top rung of `contextWindowResolver` — first-party evidence about the exact deployment, which a published catalogue figure can contradict by being generic or stale. ⚠ **Only an explicitly stated maximum is recorded**: "the request was too long" bounds the ceiling by this proxy's own chars/4 estimate, and a store whose value is that it holds measurements must not accept a guess. Keyed per (provider, model), newest observation wins in either direction, 30-day TTL. |
-| `target-facts.ts` | The ONE store for learned facts about targets (`~/.llm-relay/target-facts.json`), each carrying the **scope** it applies to: `deployment` → `group` (explicit member list) → `provider` (the credential) → `model` (cross-provider, reference-grade). Lookups resolve most-specific-first. Kinds: `not-servable` (existence), `subscription-required` (cost), `allowance-exhausted` (temporal), `credential-invalid` (the key). ⚠ The last two only ever DEMOTE — never evict — and any success clears every fact covering that deployment, including provider-scoped ones. |
+| `context-limits.ts` | Context ceilings LEARNED from what a deployment stated when it refused an over-length request. The top rung of `contextWindowResolver` — first-party evidence about the exact deployment, which a published catalogue figure can contradict by being generic or stale. ⚠ **Only an explicitly stated maximum is recorded**: "the request was too long" bounds the ceiling by this proxy's own chars/4 estimate, and a store whose value is that it holds measurements must not accept a guess. Stored as a `context-limit` **fact** in `target-facts.ts` (deployment scope, 30-day TTL) — there is no separate `context-limits.json`. |
+| `target-facts.ts` | The ONE store for learned facts about targets (`~/.llm-relay/target-facts.json`), each carrying the **scope** it applies to: `attempt` (one credential × model) → `group` (explicit member list) → `deployment` (provider + model) → `credential` (one slot) → `provider` (every credential for it) → `model` (cross-provider, reference-grade). Lookups resolve most-specific-first. Six kinds: `not-servable`, `subscription-required`, `allowance-exhausted`, `credential-invalid`, `rate-limited`, `context-limit`. ⚠ Only `not-servable`/`subscription-required` evict; the rest demote. ⚠ A success clears only CONDITIONS (`clearFacts` excludes `context-limit`) — a success disproves a condition, never a measurement. |
 | `refusal-interpretation.ts` | What a refusal MEANS — deterministic lookup on the request path, judgement strictly out of band. A refusal reduces to a signature (provider + model + message with uuids/ids/numbers/urls stripped); a hit applies, a **miss learns nothing** and queues the signature for offline research. Seeds (reviewed source, derived from first-party probes) bind immediately; a researched verdict binds only once accepted via `llm-relay eligibility`. |
 | `host-routing.ts` | Does the CALLING host's traffic reach this relay? `routed` / `bypassed` / `unknown`, decided on the caller's `ANTHROPIC_BASE_URL` (loopback ⇒ routed, so a chain like headroom in front still counts) and never on `CLAUDE_CODE_ENTRYPOINT`, which only names the host in the message. ⚠ Evaluated in the **CLI** process and forwarded as `?host=` — the server cannot detect a bypassing host, because a bypassing host sends it nothing. |
 | `claude-hook.ts` | The `PreToolUse(Agent)` hook that delivers `offload claude on` where HTTP rerouting cannot: it denies the `Agent` call and hands back the transposed command. **Forcing function, not a redirect** — no hook can move an in-process subagent's endpoint. Appends alongside the user's own hooks, refuses to rewrite an unparseable `settings.json`, and the generated script fails **open** on every error. |
 | `dynamic-pools.ts` | Materializes `{ preferred: [...], include: "free" }` pools as an invariant fixed prefix plus every catalog-discovered free target in benchmark order. Free-provider unknown prices are admitted unless known paid; mixed providers contribute only zero-priced or explicitly free-labelled models. Replaces the tail after catalog refresh so new models need no manual config edits. |
 | `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. |
-| `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/registry`, `/telemetry`, `/ping`, `/health`, `/health/stats`, `/candidates`, `/offload`, `/dispatch`). Front-door paths identify the originating client for offload. **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
+| `server.ts` | The proxy. Request routing, context length guardrails (`estimateRequestTokens`), detect vs repair paths, streaming vs buffered, endpoints (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/registry`, `/telemetry`, `/ping`, `/health`, `/health/stats`, `/candidates`, `/offload`, `/dispatch`, `/dashboard`, `/dashboard/assets/*`, `/dashboard/api/v1/{bootstrap,session,logout,snapshot,requests/:id}`). Front-door paths identify the originating client for offload. **Loopback is not authorization** — the mutating endpoints (`/offload`, `/dispatch`) carry admission checks; see the gotcha below. `buildForwardHeaders()` decides credential containment from the config **declaration** (`credentialState()`), never from key presence. |
 | `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough, `openai` translation via `llm-bridge`). `fetchOpenAiFront()` → bidirectional OpenAI Chat/Responses adapter: direct OpenAI Chat passthrough, or OpenAI↔Anthropic request/response/SSE translation for the other combinations. Also the wire-shape helpers both paths share: `parseRetryAfterMs()` (both RFC 9110 forms; null, never 0, for garbage) and `normalizeOpenAiErrorBody()` (passes a conforming `{error:{…}}` through byte-exact, unwraps gemini's array envelope, wraps everything else). |
 | `stream-commit.ts` | Final-wire SSE commit probe shared by both candidate loops. Buffers raw bytes until the client-facing Anthropic/Chat/Responses protocol carries meaningful text, reasoning, or a structured tool call; replays the prefix byte-exact; and classifies pre-content error/empty/cap/cancellation outcomes before any downstream head is written. The 64 KiB limit is shared with `backend.ts` structural preflight. |
 | `tool-dialects.ts` / `dialect-stream.ts` / `openai-dialect.ts` | Recovering tool calls a HOST failed to parse. Some free hosts return the model's native dialect as assistant TEXT instead of `tool_calls`, which reached the client as markup it treated as a final answer — no `tool_calls` ⇒ `end_turn` ⇒ zero `tool_use` ⇒ the validator passes ⇒ repair never engages. Parsing, not inference: a CLOSED envelope set, and prose naming a tool stays prose. An unparseable envelope yields `detected`, and the caller fails clean so failover reaches a host that parses. Anthropic-shaped translation uses `openAiResponseToAnthropic` / `dialect-stream.ts`; direct Chat uses `openai-dialect.ts`, emits native `tool_calls`, and joins the final-wire commit probe before headers. See [docs/tool-call-dialect-leak.md](docs/tool-call-dialect-leak.md). |
@@ -130,9 +136,9 @@ in the workflow YAML, so don't judge the protection by the YAML alone.
 | `emitSse.ts` | `emitSse()` / `emitSseTail()` — serialize a (repaired) message back to Anthropic SSE. `emitSseTail` re-emits only trailing blocks (streaming repair). |
 | `anthropic.ts` | Minimal Anthropic Messages shapes + `toolSchemaMap()`. Only the fields the proxy inspects. |
 | `documents.ts` | `transcodeDocuments()` — Anthropic `document` blocks → markdown text via **MarkItDown** (optional external Python CLI), applied to openai-kind targets before llm-bridge. Refuses (`DocumentError` → 400) rather than letting an unconvertible document through; llm-bridge would stringify it and inject raw base64 into the prompt. Uses a **temp file, not stdin** — pdfminer needs a seekable stream and every piped PDF dies with "No /Root object". |
-| `log.ts` | Metadata-only logger (never headers/bodies). "Metadata only" is enforced **at the sink**: `write()` projects each record through the `LOG_FIELDS` allow-list, and the bounded `attempts` walk through its own nested allow-list, so a caller that hands over a wider object cannot leak it and a new field is logged only when someone adds it deliberately. Log-write failure is swallowed — a full disk is a logging problem, never a request failure. Records the deployment that ANSWERED (`servedProvider`/`servedModel`, required), status-only `{provider,model,status,ms}` attempts, and `upstreamReportedModel` only when the raw response disagrees with the routed model; upstream claims never replace authoritative routed identity. The model the client asked for is deliberately not a field. |
+| `log.ts` | Metadata-only logger (never headers/bodies). "Metadata only" is enforced **at the sink**: `write()` projects each record through the `LOG_FIELDS` allow-list, and the bounded `attempts` walk through its own nested allow-list, so a caller that hands over a wider object cannot leak it and a new field is logged only when someone adds it deliberately. Rotates to one `.1` predecessor when the next record would exceed `maxBytes` (default 50 MB) — deliberately NOT token counters: the accounting store is the per-request ledger (see `accounting-store.ts`). Log-write failure is swallowed — a full disk is a logging problem, never a request failure. Records the deployment that ANSWERED (`servedProvider`/`servedModel`, required), status-only `{provider,model,status,ms}` attempts, and `upstreamReportedModel` only when the raw response disagrees with the routed model; upstream claims never replace authoritative routed identity. The model the client asked for is deliberately not a field. |
 | `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). Also harvests **per-(provider, model) limits + pricing** via `limitsFromRecord()` — a generic field-alias list (`context_window`/`max_context_length`/…), never a per-provider switch. `limits()` returns null when a provider publishes nothing (NIM), and that null must not be filled with another provider's numbers. |
-| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Orders targets by `getMeasuredStability()`, which returns **null when nothing has been measured** — the mid-band placeholder is applied locally in `getHealthyTargets`, not by an accessor. There is deliberately no scalar `getStabilityScore()`: a `number` return cannot say "unmeasured", so every caller got a plausible score and none could tell a guess from an observation. Credential faults (401/403) are a **separate axis** (`recordCredentialFault` / `hasCredentialFault`) that demotes without tripping and expires, because a revoked key is neither a sick backend nor a healthy one. A 429/503's `Retry-After` sets the cooldown in place of the flat guess. |
+| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. Orders targets by `getMeasuredStability()`, which returns **null when nothing has been measured** — the mid-band placeholder is applied locally in `getHealthyTargets`, not by an accessor. There is deliberately no scalar `getStabilityScore()`: a `number` return cannot say "unmeasured", so every caller got a plausible score and none could tell a guess from an observation. Credential faults (401/403) are a **separate axis** (`recordCredentialFault` / `hasCredentialFault`) that demotes without tripping and expires, because a revoked key is neither a sick backend nor a healthy one. A 429/503's `Retry-After` sets the cooldown in place of the flat guess; a 429 WITHOUT one escalates through a fixed ladder (`RATE_LIMIT_ESCALATION_MS`: 2m → 10m → 1h → 24h per consecutive unexplained 429), and 402 cools 1h. |
 | `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 strength from the best evidence available and **reports which**: synced snapshot → observed runtime telemetry (≥5 calls, so one lucky request can't promote a model) → neutral 50. `rankTargetsByBenchmark()` sorts by it (stable, so ties keep config order). The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
 | `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. |
 | `telemetry.ts` | Aggregates structured live JSON telemetry reports across configured providers. |
@@ -151,9 +157,22 @@ in the workflow YAML, so don't judge the protection by the YAML alone.
 | `ping/ping.ts` | Single probe executor for model latency, status codes, and rate-limit header quota extraction. |
 | `ping/probe-cache.ts` | Disk-cached background probe results (`probe-cache.json`) with TTL checks. Each entry keeps a **rolling window of samples** (`MAX_SAMPLES`) plus lifetime `totals` that outlive the window — a scalar `ms`/`code` made p95, jitter and spike rate all restatements of the most recent request. `loadPersistedSamples`/`loadTotals`/`persistedModels` are the read side `cadence.ts` rehydrates from. Under vitest the default path is redirected to a temp dir, because the suite was writing `openai_mock` entries into the user's live health data. |
 | `write-behind.ts` | `WriteBehindTimer` — the one debounced write-behind scheduler (short re-armed delay + max-age clock so steady touches can't defer a flush forever), shared by the catalog, probe cache and runtime telemetry instead of three hand-copies. |
+| `usage-observer.ts` | Observes provider-reported token usage by wrapping a response body in a byte-exact `TransformStream` — it never changes or buffers a chunk the client sees; parsing state rides alongside the stream (bounded SSE/JSON parser). Covers anthropic-messages / openai-chat on both fronts plus reshaper calls (no `openai-responses` — Responses traffic is translated before it is proxied); observer failures are isolated so they can never fail a request. |
+| `quota-observation.ts` | Typed quota observations extracted from response headers (`{axis, period, limit, remaining, resetsAt, observedAt, basis: "provider-stated"}`), replacing the old bare `quotaPercent`. Deliberately refuses ambiguity: a generic or malformed header name is declined rather than guessed into an axis/period, and only explicitly attributed limit+remaining pairs become observations. `headroomPercent` is a render-time derivation, never stored. |
+| `accounting.ts` | The accounting event vocabulary: typed request/attempt lifecycle packets (`request-started`, `attempt-started`, `attempt-completed`, `request-completed`) with reported vs estimated tokens kept as SEPARATE accumulators that are never summed into one number. `spend` is deliberately hard-typed `null` until pricing lands. |
+| `accounting-store.ts` | THE per-request ledger — event-sourced into `~/.llm-relay/usage/` (`lifetime.json`, `recent.json`, `YYYY-MM-DD.json` day shards with minute cells), with dedup, coverage/loss markers, bounded samples, optional day retention and a shutdown close. This superseded spec Gap 3's plan of widening `LOG_FIELDS`: do NOT duplicate token counters into the metadata log. Unknown stays `null` + an `unknown` counter, never 0. Under vitest the directory redirects to a temp dir. |
+| `accounting-store-schema.ts` | The persisted accounting schemas (`accounting.day.v1`, `.lifetime.v1`, `.recent.v1`, …) and their size/cap constants — deliberately separate from the dashboard wire contract, so the on-disk format can evolve without breaking clients. |
+| `accounting-store-io.ts` | The durability primitive under the store: writes a full snapshot journal (`snapshot-journal.json`) before replacing any target, so a later process replays after any crash prefix without applying a delta twice. Knows nothing about accounting's schemas; callers supply snapshots + an explicit target allow-list. |
+| `dashboard-contract.ts` | The versioned server-safe wire contract for the analytics dashboard (`dashboard.snapshot.v1`, media type, query spellings) — platform-free by rule, so route/auth/retention/pricing decisions stay with their owners. All request/response bounds are explicit constants here. |
+| `dashboard-auth.ts` | In-memory bootstrap/session authority for the dashboard: a control-authorized launcher mints a one-time bootstrap, exchanged exactly once for a read-only session (idle TTL 30m inside an absolute 8h cap; replay gets its own distinct failure). Only SHA-256 digests are retained, every candidate hashes to a fixed length before comparing, and a restart revokes everything. |
+| `dashboard-routes.ts` | Dependency-injected, platform-neutral dashboard API routes (`bootstrap`/`session`/`logout`/`snapshot`/`requests/:id`). The server owns socket admission, Host checks and body streaming; this module owns only endpoint policy and the wire contract — keeping it free of `IncomingMessage` makes its check order testable and stops a future catch-all becoming an API. |
+| `dashboard-snapshot.ts` | The bounded read-only projection from the accounting store to dashboard views. Knows only the persisted read model — quota/cooldown facts are injected as one already-captured snapshot, so the projection neither owns the store nor reaches into live provider/breaker state. |
+| `dashboard-static.ts` | Serves the SPA's static shell and manifest-owned assets with a locked-down CSP/security-header set. Owns the filesystem boundary deliberately, so a future catch-all route cannot accidentally serve the SPA. |
 | `winenv.ts` | Recovers Windows User/Machine-scope environment variables a **long-running** process never received (a User-scope var enters a process only at start; the relay launches at logon and runs for days). Fills gaps only — the real environment always wins, same contract as `dotenv.ts`. ⚠ Never imports `PATH`: the User scope holds a fragment, and importing it wholesale breaks executable lookup. |
 | `ping/quota.ts` | Provider-specific quota balance fetcher (e.g. OpenRouter key auth endpoint). |
 | `ping/runtime-telemetry.ts` | Real-world proxy request telemetry storage (`runtime-telemetry.json`) and real-world quality scoring. |
+| `process-safety-net.ts` | Process-level safety net for LATE transport errors: undici resolves `fetch()`, the request path moves on, then a CDN edge or a discarded failover candidate resets the socket, and the listener-less stream error escalates to an uncaughtException that would exit the whole proxy. Swallows ONLY a closed allow-list of transport codes/messages (pure `classifyProcessError`); everything else keeps Node's fail-fast so genuine bugs still crash loudly. Installed at the top of the serve path, idempotent. |
+| `think-tags.ts` | Conservative stripping of one message-opening `<think>…</think>` block from translated OpenAI text (native Anthropic thinking blocks never reach it). A bounded rollback buffer makes an unclosed/nested candidate lossless — every uncertain shape is released byte-for-byte as ordinary text rather than deleted; also the SSE variant `stripThinkTagsInStream`. |
 
 **Request flow:** `handle()` in `server.ts` → `orderByUsability()` → a candidate loop (BOTH paths —
 `openAiFrontPath` for the OpenAI front, the inline loop for `/v1/messages`) → `fetchBackend()` →
@@ -198,7 +217,12 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
   The refusal set is `DEFAULT_DESTRUCTIVE` in `config.ts` — **the single definition**; the CLI
   template spreads it, and `config.example.json` is asserted equal to it by
   `test/destructive-coverage.test.ts`. Don't hand-copy the names anywhere.
-- **Persistent storage directory:** Local configurations, keys, and probe caches are persisted under `~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`).
+- **Persistent storage directory:** Local configurations, keys, and caches are persisted under
+  `~/.llm-relay/`: `config.json`, `.env`, `models-cache.json`, `probe-cache.json`,
+  `runtime-telemetry.json`, `control-token` (control-plane capability), `target-facts.json`,
+  `refusal-interpretations.json`, `lane-manifest.json`, `update-check.json`, the `hooks/` script
+  (the Agent hook), and the accounting subtree `usage/` (`lifetime.json`, `recent.json`,
+  `YYYY-MM-DD.json` day shards, `snapshot-journal.json`). Under vitest every default path redirects to a temp dir.
 - **Hand-built `Config` objects in tests must include** `backend.kind` and
   `repair: { maxAttempts, destructiveTools }`.
 - **Commit trailer:** `Co-Authored-By: <the model doing the work> <noreply@anthropic.com>`
@@ -240,14 +264,13 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 - **`count_tokens` and non-`/v1/messages` paths** are handled locally for OpenAI backends (token
   estimate / clean 404) — they must NOT be routed to `/chat/completions`. See `server.ts` `handle()`.
 - Backends rate-limit (HTTP 429). The proxy passes it through; the client's retry/backoff handles it.
-- **Subagent detection uses TWO signals, either sufficient — keep it that way.** `routing.subagents`
-  applies when the request carries the documented `x-claude-code-agent-id` header (gateway protocol
+- **Subagent detection uses THREE signals, any one sufficient — keep it that way.** `routing.subagents`
+  applies when the request carries `cc_is_subagent=true` in its `system` block (verified against
+  Claude Code 2.1.220), the documented `x-claude-code-agent-id` header (gateway protocol
   reference: present only on requests from an agent Claude Code spawned in the session, and
-  gateways may route on it) **or** `cc_is_subagent=true` in its `system` block (verified against
-  2.1.220). Each covers the other's silent failure: the header dies to middleware that filters
-  unknown request headers (this relay runs behind one), the marker dies to
-  `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, which removes the attribution block that carries it. One
-  travels in the headers, the other in the body, so nothing drops both. If both ever go, every
+  gateways may route on it), or Codex's `x-codex-turn-metadata` with `request_kind: "subagent"`. Each covers the others' silent failure: a filtered header dies to the body marker, an attribution-block stripped by
+  `CLAUDE_CODE_ATTRIBUTION_HEADER=0` dies to the Claude header, and Codex has no Anthropic `system`
+  block at all so its marker cannot carry it. They travel in different carriers, so no single component drops all three. If all ever go, every
   subagent falls back to normal routing — safe (passthrough) but **silent**, so nothing will alert
   you. Re-verify with the capture recipe in
   [docs/subagent-routing.md](docs/subagent-routing.md#re-verifying), which reports each signal
@@ -397,7 +420,7 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   holds subscription-gated SKUs and models de-listed behind the scenes. Measured 2026-08-08:
   `pool/xhigh`'s 15 members were 6 huggingface + 4 ollama-cloud + 3 nim + 2 gemini, i.e. **four
   independent quota domains**, so failover spent 13 round-trips to discover 4 facts and the pool
-  went from serviceable to zero survivors in one step. `deployment-eligibility.ts` now records what
+  went from serviceable to zero survivors in one step. `target-facts.ts` now records what
   the deployments themselves stated and feeds it into pool admission and ordering. Full diagnosis
   and probe evidence: [docs/pool-eligibility.md](docs/pool-eligibility.md).
 - **An exhausted effort band degrades to weaker MEASURED members — automatically, and never
@@ -476,7 +499,7 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   `observeContextLimit` still clones — it is confined to 400/413 and has not been observed to bite,
   but it is the same hazard; don't copy the pattern into a new call site. Three pre-existing 402
   tests caught this, which is what the ≥2-candidate rule in `test/pool-failover.test.ts` is for.
-  ⚠ The learned stores are process-global: reset them per test (`resetEligibility` /
+  ⚠ The learned stores are process-global: reset them per test (`resetFacts` /
   `resetInterpretations`) like the breaker, or one test's refusal demotes another's first candidate.
 - **A pool's error is one member's error, so the walk is reported alongside it.** Every walk of ≥2
   candidates carries `x-llm-relay-pool-attempts: "13 tried, 0 served: 4×402, 5×429, 3×403, 1×400"`
@@ -597,22 +620,31 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 
 ## Status & open work
 
-✅ **The four confirmed defects are fixed (2026-08-14)** —
-[docs/audit-2026-08-09.md](docs/audit-2026-08-09.md). The `argValue()` parser confusion
-(`961a750`), missing Codex destructive-tool defaults (`55ae136`), credential-carrying ping redirects
-(`fcc1452`), and case-sensitive `winenv` scope merge (`7f6f6e4`) are closed with pinning tests.
-⚠ The run produced 676 findings but **only 6 were verified against source** — the
-rest are advisory output from the Codex offload lane and their severities are a model's estimate,
-so do not treat that report as a to-do list. Raw artifacts live in `.audit-tools/` and are
-deliberately untracked.
+**The accounting foundation and the Analytics SPA are landed (2026-08-22)** — `b4ec7ee` on
+`codex/stage-1-credential-pooling` carries the event-sourced accounting store (`~/.llm-relay/usage/`),
+the usage observer on both fronts, the protected dashboard API and the React SPA; same-day
+follow-ups sit in the working tree on top of it: review-driven fixes across the store, dashboard
+server and repair path, the effective `freeOnly` now rendered by `llm-relay offload status`
+(closing the last known transparency gap), removal of a dead bundled dependency, and the doc-drift
+pass that added 19 architecture-table rows and the `test/architecture-map.test.ts` guard.
+[docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is the
+ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`: metering Stages 0,
+1, 2 and 6 are delivered (through the accounting store and SPA, not the spec's pipeline shape);
+**Stage 3 availability (Gaps 5, 8), Stage 4 spend (Gap 11 + the cost roll-up) and Gap 12's
+enforcement term remain unbuilt**, as does widening `AssistantMessage.usage` (C3). ⚠ Do not
+"complete" Gap 3 by adding token fields to `LOG_FIELDS` — the accounting store superseded the
+JSONL-as-ledger plan; see the `log.ts` row above.
 
-**Otherwise nothing is pending in the code.** (Re-verified 2026-08-04 after the goals review: the
-half-adopted kernel contract surface — the one open item this line previously missed — was
-resolved by deletion; what remains of `src/kernel/` is fully adopted.) A full audit was
-remediated to completion and its follow-up list closed in v0.12.0; the audit apparatus, its
-artifacts and its handoff doc have all been deleted, because a finished run's ledger is just a
-stale to-do list. Anything that mattered from it is a code change, a test, or a paragraph in
-this file. The 2026-07-30 pool-failover symptoms are likewise fixed and closed — see
+✅ Earlier closed work, kept for its lessons: the four confirmed defects fixed 2026-08-14
+([docs/audit-2026-08-09.md](docs/audit-2026-08-09.md)) — the `argValue()` parser confusion
+(`961a750`), missing Codex destructive-tool defaults (`55ae136`), credential-carrying ping redirects
+(`fcc1452`), and case-sensitive `winenv` scope merge (`7f6f6e4`) — each closed with pinning tests.
+⚠ That run produced 676 findings but **only 6 were verified against source** — the rest are
+advisory output from an offload lane whose severities are a model's estimate, so do not treat such
+a report as a to-do list. A full audit was remediated to completion and its follow-up list closed
+in v0.12.0; the audit apparatus and handoff doc were then deleted, because a finished run's ledger
+is just a stale to-do list — anything that mattered became a code change, a test, or a paragraph
+in this file. The 2026-07-30 pool-failover symptoms are likewise fixed and closed — see
 [docs/pool-failover.md](docs/pool-failover.md) and the gotchas above.
 
 **Project goals are written down** — [docs/project-goals.md](docs/project-goals.md): personal
@@ -662,8 +694,8 @@ turn the suite red — read the failing test's stated reasoning before assuming 
 and change the test in the SAME commit as the source fix.
 
 Current: **usable end-to-end**, suite green, tsc clean — and verified by CI
-(`.github/workflows/ci.yml` runs `npm run check`, which type-checks `src/` AND `test/`) rather than
-by a local run only. A real `claude` agentic session completes through the proxy against NIM.
+(`.github/workflows/ci.yml` runs `npm run build` then `npm run check`: both typechecks, both suites,
+and the package checks) rather than by a local run only. A real `claude` agentic session completes through the proxy against NIM.
 (The point-in-time assessment doc that used to back this claim was deleted 2026-08-04 as a stale
 snapshot — CI and the suite are the living evidence.)
 
@@ -677,8 +709,10 @@ Every script in `scripts/` and every proxy endpoint has been exercised live agai
 `multimodal-probe.mjs` is 5/5 green.
 
 **Capability ranking now lives here** (0.5.0), no longer deferred to the router/auditor project:
-`npm run sync:tiers` merges OpenRouter + BFCL + LMArena + Aider + Artificial Analysis into
-`docs/tier-data.json` and `getStrength()` ranks pools off it. Source probe results, coverage per
+`npm run sync:tiers` merges four effective sources — OpenRouter + BFCL + LMArena + Aider; the fifth
+fetcher, Artificial Analysis, is key-gated and currently unconfigured so it contributes nothing
+(`docs/tier-data.json` records it `model_count: 0, configured: false`) — into `docs/tier-data.json`,
+and `getStrength()` ranks pools off it. Source probe results, coverage per
 source, and why EvalPlus / HF Open LLM / LiveCodeBench were rejected:
 [docs/capability-sources.md](docs/capability-sources.md).
 

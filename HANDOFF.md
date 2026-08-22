@@ -2,114 +2,29 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-**State as of 2026-08-21:** Stage 0 and Stage 1 env-backed multi-key pooling are complete on
-`codex/stage-1-credential-pooling`, and the invariant recalibration packet is applied and complete.
-Analytics SPA P0–P4 is implemented and independently reviewed in the commit containing this
-handoff. No prospective commit hash is claimed.
+## 0. State as of 2026-08-22
 
-The complete Analytics SPA packet is summarized below. Do not start custody/keystore work.
+Branch `codex/stage-1-credential-pooling`.
 
-- **P0:** canonical accounting/store/read model and both-front lifecycle coverage, including exact caller-visible early body-read terminals with no attempts.
-- **P1:** protected bootstrap/session/read-only surfaces and static security controls.
-- **P2:** bounded snapshot/detail projections with explicit unknown/null/provenance behavior.
-- **P3:** React SPA UX, accessibility, responsive layout, polling and detail coverage, plus
-  production CLI/server integration.
-- **P4:** graph-derived bundle inventory, third-party notices, security headers, content-hashed
-  assets, packed smoke verification, and size ratchets.
+- Env-backed multi-key credential pooling (Stage 0 + Stage 1) is complete; its packets landed as
+  `7217ce0` .. `3795e60` (see git history).
+- The accounting foundation + Analytics SPA (P0-P4) landed as `b4ec7ee` after being found
+  UNCOMMITTED by a prior worker; it was checkpoint-committed with the gate green. Same-day
+  follow-ups sit in the working tree on top of it: a metering reconciliation, a documentation
+  drift pass (19 architecture-table rows, gate description, storage list, fact kinds, subagent
+  signals, headers, stale-doc banners, plus a `test/architecture-map.test.ts` guard), removal of
+  a dead bundled dependency, and review-driven fixes in the accounting store, dashboard server,
+  repair path and CLI.
+- [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is THE
+  ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`. Open in one
+  line: Stage 3 availability (Gaps 5, 8), Stage 4 spend (Gap 11 + the cost roll-up), Gap 12's
+  enforcement term, and widening `AssistantMessage.usage` (C3).
+- `llm-relay offload status` now renders the EFFECTIVE `freeOnly` (explicit ON/OFF vs the
+  two-sided unset default); the last known transparency gap is closed.
+- Gate green at the commit that carries this handoff; CI is the living evidence. Do not start
+  custody/keystore work until the metering closeout is complete.
 
-The final authoritative Windows gate is green:
-`npm run build && npm run check` with the server suite at 90 files, 1,553 passed, and 4 expected
-Windows/POSIX-permission skips; the dashboard suite is 5 files, 30 passed. Packed measurements are
-dashboard raw 655,036 bytes; JS 638,565; CSS 11,824; packed 891,305; unpacked 4,350,301; and 254
-entries. The >500 KB Vite warning is measured and ratcheted, not a failed gate.
-
-The test-only refusal interpretation isolation fix makes the Vitest store per-run UUID to prevent
-stale PID collisions; the production persistence path and semantics are unchanged.
-
-## 0. Stage 1 completion checkpoint — read this first
-
-The branch builds on these landed packets, in order:
-
-| Commit | Packet |
-|---|---|
-| `7217ce0` | Stage 0 credential-aware attempt identity |
-| `024837e` | Normalized `credentials[]` provider fleets |
-| `5206d64` | Deterministic credential selection and breadth-first walk core |
-| `f8f7360` | Fleet-aware ancillary egress (keys, ping, pool probes, onboarding) |
-| `7d9eca2` | Both-front routing integration, credential leases and diagnostic surfaces |
-
-The commit containing this handoff closes Stage 1 with these settled behaviours:
-
-- explicit fleet slots resolve only their exact env name; legacy `authEnv` retains aliases;
-- providers declare either legacy `authEnv` or `credentials[]`; every explicit fleet, including
-  an empty one, is contained and cannot fall through to caller-credential passthrough;
-- empty, disabled, model-scoped-out and missing fleet slots cannot egress;
-- learned entitlement exclusions retain survivor fallback;
-- selection preserves deployment ordering and ranks credentials by health/demotion, fresh observed
-  headroom, free versus paid/unknown, credential-wide LRU, then config order;
-- credential expansion is breadth-first, and only credential-attributable outcomes unlock a
-  sibling slot; provider transport failures suppress that provider for the request;
-- in-flight concurrency is counted credential-wide across models and only demotes saturated slots;
-- attempt leases, LRU touches, walk budgets and usage binding begin only at real backend egress and
-  release exactly once across buffered, streaming, transport, cancellation and mapper exits;
-- Messages and OpenAI fronts emit credential identity/attempt headers for multi-slot providers and
-  record `servedCredential` through the metadata-only log sink; sticky ordering stays grouped by
-  deployment rather than splitting credential siblings;
-- `/candidates` renders one row per `(spec, credentialId)`, `/registry` nests credential
-  diagnostics, and `/telemetry` remains credential-free/provider-aggregate;
-- CLI candidate/key output distinguishes credential slots; ancillary probes use serviceable slots
-  without exceeding their existing real-egress budgets (`keys` checks every slot; pool probes spend
-  one completion per unique deployment through one serviceable slot);
-- dispatch reachability uses normalized passthrough/contained policy, and dynamic-pool discovery is
-  credential-neutral until a concrete slot is selected;
-- reshapers are request-local: self-repair reuses the exact serving credential snapshot, while
-  provider-backed static and dynamic reshaper pools re-expand current fleets;
-- public configuration examples, CLI help and operating guidance describe fleet configuration,
-  per-cell diagnostics, protected control reads and credential response headers.
-
-Do not start custody/keystore work in this branch. Stage 1 is deliberately env-backed pooling;
-custody is the next design stage now that routing and observability behaviour are closed.
-
----
-
-## 1. ⚠ READ THIS BEFORE YOU READ ANYTHING ELSE
-
-The 2026-08-20 invariant recalibration packet is applied. Rubric §2 is now authoritative in
-`CLAUDE.md` and `docs/project-goals.md`; do not reintroduce the retired rules or reasoning below.
-
-The retired rules and their replacement are recorded here for historical guardrails:
-
-| Former location | Former text | Replacement |
-|---|---|---|
-| `docs/project-goals.md:86` | "## Credentials stay user-operated (owner-ratified 2026-08-08)" | **REMOVED.** No longer a reason for anything. |
-| `docs/project-goals.md:39` | "One place per policy." | **REMOVED.** |
-| `CLAUDE.md:167` | "Provider/model agnostic. No hardcoded provider URLs, models, or keys in `src/`" | **REMOVED** as an absolute. (It was already false: `src/ping/ping.ts:59` hardcodes a provider list, and `src/presets.ts` is per-provider by design.) |
-| `CLAUDE.md:612` | describes the credentials invariant as ratified and binding | **Superseded.** |
-
-**Two reasoning patterns are also retired and may not be cited again:**
-
-- *"No client of this relay needs it."* The owner does not consider this useful reasoning.
-- *"We built this and deleted it before."* The 2026-08-04 `src/kernel/` deletion it appeals to was
-  caused by miscommunication between agents working in parallel across different IDEs, plus quota
-  limits causing data loss — **not** a design conclusion.
-
-**One rule survives but was narrowed:** *"a guess must never look like a measurement."* An unlabelled
-estimate presented as an observation is still forbidden. Needing a tunable default is **not** grounds
-to block a feature.
-
-**Reinstated as a founding goal: accounting and metering.** Owner scope is the full fleet model —
-metering + local key custody + multi-key pooling — serving observability, enforcement, routing input,
-and cost accounting.
-
-The replacement is grounded in **`docs/rubric-recalibration-2026-08-16.md` §2** and is now applied.
-
-Retired rules: credentials-stay-user-operated as a bar on an operator's own key pooling; one
-place per policy; absolute provider/model agnosticism; and the claim that accounting metering was
-outside this relay. The first three blocked the reinstated accounting goal or contradicted existing
-provider-specific data; the last was retired because metering is now a founding goal. For the related
-provenance recalibration—including tunable defaults and labelled provider facts—see rubric §2.
-
-## 2. What still binds
+## 1. What still binds
 
 These were **not** removed and are load-bearing. Do not relax them:
 
@@ -124,86 +39,51 @@ These were **not** removed and are load-bearing. Do not relax them:
 - **Health demotes, never drops.** Learned from a real outage where filtering unhealthy candidates
   narrowed a pool to nothing.
 
-## 3. Historical Stage 0 brief (complete at `7217ce0`)
+The invariant recalibration is applied and authoritative in `CLAUDE.md` §Invariants and
+`docs/project-goals.md`; the retired rules and their replacements are recorded in
+[docs/rubric-recalibration-2026-08-16.md](docs/rubric-recalibration-2026-08-16.md) §2 and in git
+history - do not reintroduce them.
 
-This section is retained as design history. Do not treat it as the current task; use §0 above.
+## 2. Where to read
 
-**Stage 0 of the credential fleet, with three counter defects folded in.** Full design:
-`docs/credential-fleet-design-2026-08-16.md` §8. Owner has approved this order (Stage 0, then
-multi-key pooling; custody follows).
+| Document | For |
+|---|---|
+| `CLAUDE.md` | Architecture map, file-to-responsibility table, gotchas. Invariants are authoritative there. |
+| `docs/metering-reconciliation-2026-08-22.md` | Implemented vs open against the quota-metering spec: gap/stage/decision tables, both-fronts and provenance checks, remaining-items list. |
+| `docs/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections |
+| `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting - components, staged build order |
+| `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline - metrics, collection sites, storage, stages |
+| `docs/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA implementation design, protocol, contract, staged gates |
+| `docs/open-decisions-2026-08-16.md` | Owner decisions; all recommendations approved 2026-08-21 |
+| `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind |
+| `docs/evidence-2026-08-16/` | Machine-readable audit trail |
+| `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
 
-Stage 0 is a precondition — without it custody cannot work at all, because a keystore-only provider
-would be dropped from routing entirely.
-
-1. **`credentialState` refactor.** `src/config.ts:729` filters targets on it and `src/server.ts`
-   throws on `declared-missing`. Touch points identified: `src/server.ts:2610,2638-2640`,
-   `src/catalog.ts:373-378`, `src/reshaper.ts:180-184`, `src/telemetry.ts:88`.
-2. **Per-credential keying.** New `src/credential-id.ts`, minting `CredentialId = "<provider>#<label>"`.
-   The identity is the **slot**, never the key material and never the storage location — deriving it
-   from storage means moving a key from env to keystore resets all of its accounting and health.
-   Single-slot providers get the implicit label `default`. Make the parameter **required**, not
-   optional, so the typecheck forces every call site to be triaged.
-3. **`target-facts` v2 store bump.** The existing `provider` scope is already documented at
-   `src/target-facts.ts:77` as "every deployment behind that credential" — the word in the source is
-   already *credential*; it was named after the provider only because the two were 1:1. So this is a
-   naming correction, not a new axis. v1 `p:` facts **cannot be migrated** (they never named a
-   credential), so bump the version and drop them. Related latent bug: `load()` does no schema
-   validation — `src/target-facts.ts:198-200` parses and casts, so stale entries keep loading silently.
-
-Fold in these three defects — they live in exactly the code Stage 0 touches:
-
-- **`src/ping/ping.ts:27-35`** collapses seven distinct rate-limit headers (`remaining-requests`,
-  `remaining-requests-day`, `remaining-tokens`, `remaining-tokens-minute`, …) into one untyped
-  percentage and discards which axis it was. Consecutive requests can render different quantities
-  under one label. Also `latestQuota` is keyed per *provider* but written from a per-*model* probe.
-- **`ModelTelemetry.totalCompletionTokens` has read `0` for the life of the file.**
-  `recordModelCall()` accepts a `completionTokens` argument that its sole production call site,
-  `src/server.ts:1262`, never passes.
-- **The OpenAI front accumulates nothing** on the streaming path (`src/server.ts:1974-1980` pipes
-  chunks straight to the socket), so half the traffic is invisible to every counter.
-
-⚠ **Both request paths, always.** This codebase has had the same bug three times: a policy wired into
-`/v1/messages` but not `openAiFrontPath`. Any counter, observer or gate must be wired into both.
-
-## 4. Verification — the one gate
+## 3. Verification — the one gate
 
 ```bash
 npm run build && npm run check
 ```
 
-`npm run check` is both typechecks (`src/` and `test/`) plus the full vitest suite. **CI runs exactly
-this and nothing else.** Green means green. The final authoritative Windows run for this packet was
-green with 90 server-suite files / 1,553 passed / 4 expected Windows/POSIX-permission skips and a
-5-file dashboard suite / 30 passed. Linux-only POSIX-permission coverage was not run locally.
+`npm run check` = both typechecks (`src/` and `test/`) + the server vitest suite + the dashboard
+checks (`tsc -p dashboard/tsconfig.json --noEmit` and the dashboard suite) + the package checks
+(bundle-inventory equality, size ratchets, packed smoke). **CI runs exactly this and nothing
+else.**
 
-- Tests read `src/` directly; `scripts/*.mjs` read `dist/` — rebuild before running any script.
-- 4 tests are `skipIf(win32)` POSIX-permission tests. A green local Windows run is **not** full
-  coverage of secret-file permissions; CI's ubuntu leg is the only place those run.
+- Bundle sizes live in `docs/dashboard-package-baseline.json` and are ratcheted: regenerate the
+  baseline in the SAME change that adds or removes bundle weight, or `check:package` goes red.
+- Tests read `src/` directly; `scripts/*.mjs` read `dist/` - rebuild before running any script.
+- Four POSIX-permission tests skip on Windows; CI's ubuntu leg is the only place they run, so a
+  green local Windows run is not full coverage of secret-file permissions.
 - A failing test may be pinning a defect it should have caught. Read its stated reasoning before
   assuming your change is wrong, and fix test and source in the same commit.
 - Static analysis (`npm run analysis:run`) is advisory and deliberately outside the gate.
 
-## 5. Where to read
+## 4. Things that will bite you
 
-| Document | For |
-|---|---|
-| `CLAUDE.md` | Architecture map, file→responsibility table, gotchas. Invariants are authoritative (§1); it carries ~12 known drift items. |
-| `docs/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections |
-| `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting — 12 components, staged build order |
-| `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline — 20 metrics, collection sites, storage, 6 stages |
-| `docs/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA implementation design, protocol, contract, and staged gates |
-| `docs/open-decisions-2026-08-16.md` | 18 owner decisions; 4 resolved, 14 with recommendations |
-| `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind |
-| `docs/evidence-2026-08-16/` | Machine-readable audit trail: 375 claim verdicts, 55 re-adjudications |
-| `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
-
-## 6. Things that will bite you
-
-- **Do not trust this repo's documentation without checking source.** That is not cynicism, it is the
-  finding of a 2026-08-16 audit: `CLAUDE.md` tells test authors to call `resetEligibility` (the
-  function is `resetFacts`), references a deleted module in four places including one that ships to
-  npm consumers in a `.d.ts`, documents 4 of 6 fact kinds, and lists 5 state files where source
-  writes 10. The evidence directory exists so you can check claims rather than inherit them.
+- **Do not trust this repo's documentation without checking source.** Drift here has been
+  recurrent; `test/architecture-map.test.ts` now pins every non-index `src/` file to a
+  `CLAUDE.md` table row, but only that one axis is guarded. Verify claims before inheriting them.
 - **A CLI process's environment is not the running relay's environment.** On Windows a User-scope var
   enters a process only at start, and the relay launches at logon. `llm-relay keys` reports *its own*
   env; `GET /registry` is authoritative. A whole "half the pool is dead" finding was once this.
@@ -214,8 +94,15 @@ green with 90 server-suite files / 1,553 passed / 4 expected Windows/POSIX-permi
   catch-all — its real route is `/api/health`.
 - **Never put `--permission-mode plan` in a `cliLane` template.** Headless `claude -p` has no
   `ExitPlanMode`, so the lane can never leave plan mode and looks healthy while completing nothing.
+- **Headless offload lanes must be told not to stop and ask.** An Ox-Alpha or `claude -p` lane
+  that ends its turn with a clarifying question reads as a completed task that did nothing.
+  Instruct it to decide and proceed on its own judgement, and to report rather than await approval.
+- **The owner's `cliLane` template places `{task}` after the variadic `--allowedTools`.** Some
+  shells let the variadic swallow what follows, so feed the task via stdin or reorder the
+  template - and confirm with a real invocation before trusting a lane built from it.
+- **Two heredoc groups in one Bash call break quoting in this harness.** One heredoc per call.
 
-## 7. Definition of done
+## 5. Definition of done
 
 - `npm run build && npm run check` green on a clean, committed tree.
 - Both request paths covered by any new policy.
@@ -226,18 +113,46 @@ green with 90 server-suite files / 1,553 passed / 4 expected Windows/POSIX-permi
 - No half-done state. Deliberate intermediate states must be called out explicitly so they are not
   mistaken for bugs.
 
-## 8. Outstanding, unclaimed
+## 6. Outstanding, unclaimed
 
-1. Re-audit the remaining documentation drift items in
-   `docs/status-vs-freellmapi-2026-08-16.md` §5 against current source; Stage 1 corrected its
-   credential-surface and phantom-header items.
-2. Render the **effective** `freeOnly` in `llm-relay offload status` (`grep freeOnly src/cli.ts` = 0
-   hits). ⚠ Not a raw field print: unset means **ON** for rerouted traffic and **OFF** for a directly
-   addressed pool, so printing the bare optional would be a new transparency bug.
-3. The owner approved all recommendations in `docs/open-decisions-2026-08-16.md` on 2026-08-21.
-   M4 remains evidence-gated and P4 remains purpose-gated exactly as their recommendations state;
-   neither is an unresolved implementation choice.
+From [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §6:
 
-Immediate next action: reconcile the implemented accounting foundation against the formal metering
-stage definitions, close or explicitly defer each remaining item, and keep custody/keystore work out
-of scope until that metering closeout is complete.
+- **OPEN — C3 / Gap 4.** Widen `AssistantMessage.usage` (`src/anthropic.ts`) so clients stop
+  receiving narrowed cache-token fields. Changes the emitted wire shape; needs its own reviewed
+  change, not a drive-by.
+- **OPEN — Stage 3/5 remainder (Gaps 5, 8, 12).** Configured limits on `ProviderConfig`, learned
+  rate-limit facts + parser, and a quota demotion term in `orderByUsability()`. The largest
+  genuine piece of the spec still missing; the availability ladders of spec §5 exist in no form.
+- **OPEN — Stage 4 (Gap 11 + C1 roll-up).** Spend x `resolveMetadata()` prices with compound
+  `spendBasis`; then `cost --include-repair`. Rebase `unpricedRequests` in the same change.
+- **Decision still to record — Gap 7 surface shape.** Plain `GET /usage`,`/quota` and
+  `usage`/`quota` CLI verbs do not exist; presentation is delivered by the dashboard snapshot API
+  + SPA instead. Amend the spec to name that delivery, or add thin read-only endpoints later.
+- **DEFER — Gap 10 / M4.** Estimated-output producer withheld until measured usage-absence rates
+  justify it (owner disposition, open-decisions.md).
+- **DEFER — Gap 13.** Catalog rate-limit harvesting: cheap, expected near-empty payoff; slot
+  after Stage 3.
+- **DEFER — Gaps 15/16, M3, P1, P4.** Superseded by the SPA choice / argued against in spec §5.4 /
+  mutation-with-no-consumer / custody-next-stage / purpose-gated respectively. Do not build
+  without a new decision.
+
+Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
+
+- Destructive-name filter at the dialect-rescue commit point - the one known safety-shaped code
+  gap (`docs/status-vs-freellmapi-2026-08-16.md` §3.1 / §6 rec 2).
+- Orphan `tmp-*` journal files are never swept (C1 RISK-1 residue; retention itself landed).
+- `methodSnapshot` accepts bounded arbitrary JSON as an estimation "method" (C1 NIT-6).
+- Dashboard session token rides `sessionStorage`; the mitigation is the strict CSP. Trade
+  recorded, not changed (C2 R2). Also standing: the type escape at `materializeDimensions`'
+  aggregate return (C2 N5), misleading error codes for body problems (C2 N8),
+  regex-sniffing `bodyReadErrorCode` (C2 N9), and `llm-relay dashboard <anything>` ignoring
+  extra positionals (C2 N10).
+- SPA/test nits standing (C3): flat 30 s poll with no failure backoff (mitigated by
+  abort-on-hide/offline), CSS-structure test mirroring styles.css, a few wall-clock-sleep tests,
+  dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
+  described-by, theme preference not persisted, SIGKILL leaking the test interpretations file.
+- Unverified residuals (reconciliation §3, §5): no test evidences an accounting assertion behind
+  a >=2-candidate walk on each front, and rotation-triggered fact clearing is verified only in
+  adjacent machinery, not the rotation path itself.
+
+Custody/keystore stays out of scope until the metering closeout is complete.

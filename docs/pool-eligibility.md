@@ -91,17 +91,27 @@ response *is* the walk.
 
 ## The fix: learned deployment eligibility
 
-Two new modules, modelled on `context-limits.ts` — first-party evidence about the exact deployment
-beats any published figure.
+Modelled on `context-limits.ts` — first-party evidence about the exact deployment beats any
+published figure. (2026-08-22 note: the original `deployment-eligibility.ts` module was folded into
+the shared learned-facts store, `src/target-facts.ts`; the design below survives as its kinds and
+scopes.)
 
-`src/deployment-eligibility.ts` stores verdicts and reports consequences. Three classes, and
-**they are not interchangeable**:
+`src/target-facts.ts` stores verdicts and reports consequences. Six kinds across six scopes —
+and **they are not interchangeable**:
 
-| Class | The fact | Scope | Consequence |
-|---|---|---|---|
-| `not-servable` | existence — 404/400 "does not exist" | deployment | excluded from pool admission |
-| `subscription-required` | cost — 403 "requires a subscription" | deployment | excluded from **free** pool admission |
-| `allowance-exhausted` | temporal — 402 "depleted your monthly included credits" | **account** | demoted, never excluded |
+| Kind | The fact | Consequence |
+|---|---|---|
+| `not-servable` | existence — 404/400 "does not exist" | excluded from pool admission |
+| `subscription-required` | cost — 403 "requires a subscription" | excluded from **free** pool admission |
+| `allowance-exhausted` | temporal — 402 "depleted your monthly included credits" | demoted (cooldown), never excluded |
+| `credential-invalid` | the key itself — a stated credential fault | demoted; cleared by a proven credential |
+| `rate-limited` | throughput back-pressure stated for an account/org/key | demoted (short cooldown) |
+| `context-limit` | a ceiling the deployment STATED when refusing over-length input | informs `{contextWindow}`; never evicted |
+
+Each fact carries one of six **scopes**, resolved most-specific-first: `attempt` (one credential ×
+model) → `group` (explicit member list) → `deployment` (provider + model) → `credential` (one slot)
+→ `provider` (every credential for it) → `model` (cross-provider, reference-grade). A group carries
+its own member list — no prefix inference.
 
 ⚠ **`allowance-exhausted` must never mean "paid".** A free-tier account that has spent this
 period's credits is the normal state of a working free lane, not a discovery about price.
@@ -110,14 +120,15 @@ the exhaustion that caused it. It is unreachable from the cost path by construct
 does not consider it, only `cooldownUntil()` reports it, and any success clears it — including the
 account record, so a topped-up balance recovers well before the TTL.
 
-`subscription-required` is scoped to the **deployment**, not the account: Ollama Cloud's message is
-about one model under a credential that works fine for its others. Only credit-balance refusals name
-an account-level fact, and that scope is what stops six HuggingFace members costing six round-trips
-to learn one balance.
+Only `not-servable` and `subscription-required` ever remove a deployment from a pool; everything
+else demotes. And a success clears only *conditions*: `clearFacts()` deliberately excludes
+`context-limit`, because a normally-sized request succeeding disproves nothing about a measured
+ceiling.
 
-TTLs (all three are reversible, so all three expire): 6h existence, 24h subscription, 1h allowance —
-the shortest, deliberately, because cooling a provider for a month on one 402 would be catastrophic
-if the balance were topped up an hour later. A vendor-stated `Retry-After` beats all of them.
+TTLs (all reversible, so all expire): 6h existence, 24h subscription, 1h allowance, 15m credential,
+2m rate-limit, 30 days context-limit — the allowance shortest of the conditions, deliberately,
+because cooling a provider for a month on one 402 would be catastrophic if the balance were topped
+up an hour later. A vendor-stated `Retry-After` beats the fixed windows where one exists.
 
 ## Interpretation: a two-tier design, and the boundary it respects
 

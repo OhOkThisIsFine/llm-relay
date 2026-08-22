@@ -41,6 +41,15 @@ export interface OffloadState {
   persistError?: string;
   /** Advisory: the targeted client name is one no request path ever produces (dead rule). */
   warning?: string;
+  /**
+   * Targeted view only: the `freeOnly` the rule governing this client actually DECLARED —
+   * a boolean when the operator wrote one, ABSENT when unset. Never defaulted here: the effective
+   * value is two-sided (`freeOnlyApplies` in server.ts — `rule.freeOnly ?? rerouted`; unset means
+   * ON for offload-rerouted traffic and OFF for a directly addressed `pool/<name>`), and materializing
+   * a single answer would misdescribe half of them. Same rule as `parseOffload` in config.ts:
+   * store exactly what was configured and apply the default where the flag is consulted.
+   */
+  freeOnlyDeclared?: boolean;
 }
 
 function normalizedClients(cfg: Config): Record<string, OffloadRule> {
@@ -73,7 +82,13 @@ export function offloadState(cfg: Config, client?: string): OffloadState {
   return {
     enabled,
     scope,
-    ...(client !== undefined ? { client } : {}),
+    ...(client !== undefined
+      ? {
+          client,
+          // Exactly what the rule declares, absent when unset — see `freeOnlyDeclared` above.
+          ...(targeted?.freeOnly !== undefined ? { freeOnlyDeclared: targeted.freeOnly } : {}),
+        }
+      : {}),
     subagents: cfg.routing.subagents ?? {},
     clients,
     persisted: true,

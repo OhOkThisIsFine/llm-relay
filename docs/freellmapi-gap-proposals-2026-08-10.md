@@ -144,7 +144,7 @@ this model needs a subscription this user does not have.
 **What llm-relay did.** Interpreted a provider's refusal text into one of three verdict classes
 (`not-servable`, `subscription-required`, `allowance-exhausted`) with distinct scope
 (deployment vs account) and consequence (exclude vs demote), TTL'd, keyed on a deterministic request
-signature. Source: `src/deployment-eligibility.ts`, `src/refusal-interpretation.ts`,
+signature. Source: `src/target-facts.ts`, `src/refusal-interpretation.ts`,
 `docs/pool-eligibility.md`.
 
 **The part actually worth proposing is the hardening, not the feature.** Provider error text is
