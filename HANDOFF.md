@@ -151,8 +151,9 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   abort-on-hide/offline), CSS-structure test mirroring styles.css, a few wall-clock-sleep tests,
   dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
   described-by, theme preference not persisted, SIGKILL leaking the test interpretations file.
-- Unverified residuals (reconciliation §3, §5): no test evidences an accounting assertion behind
-  a >=2-candidate walk on each front, and rotation-triggered fact clearing is verified only in
-  adjacent machinery, not the rotation path itself.
+- Unverified residual (reconciliation §5): rotation-triggered fact clearing is verified only in
+  adjacent machinery, not the rotation path itself. (The >=2-candidate accounting walk IS pinned on
+  both fronts: `test/accounting-lifecycle.test.ts` "records failed and committed winning serve
+  attempts" walks a 429 candidate then a winner for each front.)
 
 Custody/keystore stays out of scope until the metering closeout is complete.

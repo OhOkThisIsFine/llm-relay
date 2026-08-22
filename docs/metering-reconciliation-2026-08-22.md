@@ -40,7 +40,7 @@ deferred: default retention (M5) and the widened `AssistantMessage.usage` type (
 | Stage | Status | Gaps covered | Evidence |
 |---|---|---|---|
 | 0 Make the existing measurement legible | **implemented** (surface differs) | 1, 9, 14 | typed observations flow probes→cadence→breaker→candidates (`cadence.ts:179-181`; `circuit-breaker.ts:427-429`; `candidates.ts:474-476`); rendered with `-` for unmeasured (`cli.ts:1992-1993`). The spec's `GET /telemetry` quota block was *removed* instead (grep: 0 quota refs left in `src/telemetry.ts`) — candidates is now the typed surface |
-| 1 The metering primitive | **implemented** (via accounting store, not LOG_FIELDS) | 2, 14; 3 superseded | observer on both fronts (see §3); both-front lifecycle pinned by `it.each(["anthropic","openai"])` (`test/accounting-lifecycle.test.ts:243-247,323-342`) plus streamed-OpenAI-usage case (`:492-516`). ⚠ the spec's ≥2-candidate gate for the accounting site was **not verified** in any test I opened |
+| 1 The metering primitive | **implemented** (via accounting store, not LOG_FIELDS) | 2, 14; 3 superseded | observer on both fronts (see §3); both-front lifecycle pinned by `it.each(["anthropic","openai"])` (`test/accounting-lifecycle.test.ts:243-247,323-342`) plus streamed-OpenAI-usage case (`:492-516`). the spec's ≥2-candidate gate IS pinned: `test/accounting-lifecycle.test.ts:323-342` walks a 429 candidate then a winner on each front (orchestrator-verified 2026-08-22) |
 | 2 Windows and rollups | **implemented** in the store; **CLI/endpoint surface absent** | 6; 7 partial; 10 pending M4 | windows via day shards + lifetime months (`accounting-store.ts:751-794,1055-1082`); by-client dimension on rows (`:948,1033`); latency/commit distributions (`:176-185,481-500`) |
 | 3 Availability | **not-started** (display-only pieces shipped) | 5, 8; 7 remainder; 9 done | no discovery rungs (rows 5/8); remaining/resetsAt ladders of §5.1-5.2 do not exist; quota display = raw provider-stated observations only |
 | 4 Cost | **not-started** | 11 | `spend: null` everywhere (`accounting.ts:109,129`) |
@@ -65,7 +65,7 @@ Every counter is created once per request above the front split, so both fronts 
 | Repair-turn accounting (`role: "repair"`) | `withRepairAccounting` wired `:1398` | `:2769`; hooks defined `:677-704` |
 | Runtime-telemetry `completionTokens` | shared `recordCall` from the same terminal helpers (`:2511,:2567`) | same |
 
-No counter was found wired to one front only. Residual risk: the Stage-1 *gate* (an accounting assertion behind a ≥2-candidate walk on each front) is not evidenced in the tests I opened — `test/accounting-lifecycle.test.ts` exercises both fronts but the cases I read use a single backend.
+No counter was found wired to one front only. Stage-1 gate: `test/accounting-lifecycle.test.ts:323-342` ("records failed and committed winning serve attempts for the %s front") walks two candidates (a scripted 429, then the winner) on BOTH fronts — verified 2026-08-22, so the earlier single-backend caveat was wrong.
 
 ## 4. Provenance check
 
