@@ -200,8 +200,59 @@ describe("repair cancellation", () => {
       isDestructive: () => false,
       signal: controller.signal,
     });
-    expect(decision.outcome).toBe("failed");
+    // "cancelled", not "failed": the caller went away — a different fact about the
+    // turn from "nothing was reachable", and the log must keep them apart.
+    expect(decision.outcome).toBe("cancelled");
     expect(calls).toBe(1);
+  });
+
+  it("reports cancelled when the signal was ALREADY aborted before repair began", async () => {
+    // No reshaper egress may be paid for a caller that is already gone.
+    let called = false;
+    const spy: Reshaper = { reshape: async () => { called = true; return { kind: "message", message: fixedMsg }; } };
+    const controller = new AbortController();
+    controller.abort();
+    const decision = await repair(badCall, tools, {
+      validator,
+      reshaper: spy,
+      maxAttempts: 2,
+      isDestructive: () => false,
+      signal: controller.signal,
+    });
+    expect(decision.outcome).toBe("cancelled");
+    expect(called).toBe(false);
+  });
+
+  it("reports cancelled when the reshaper throws ReshaperTransportError kind cancelled", async () => {
+    // The in-tree reshapers classify caller cancellation this way (HttpReshaper's
+    // throwIfCallerCancelled / the failover walk's rethrow); repair() must not
+    // collapse that into "failed", which would log a client disconnect as an outage.
+    let calls = 0;
+    const cancelled: Reshaper = {
+      reshape: async () => {
+        calls += 1;
+        throw new ReshaperTransportError("reshaper cancelled by caller", { kind: "cancelled" });
+      },
+    };
+    const decision = await repair(badCall, tools, {
+      validator,
+      reshaper: cancelled,
+      maxAttempts: 2,
+      isDestructive: () => false,
+    });
+    expect(decision.outcome).toBe("cancelled");
+    expect(calls).toBe(1); // a cancelled walk is never retried against another candidate
+  });
+
+  it("still reports failed (never cancelled) when the reshaper throws a transport outage", async () => {
+    const dead: Reshaper = { reshape: async () => { throw new ReshaperTransportError("connection refused"); } };
+    const decision = await repair(badCall, tools, {
+      validator,
+      reshaper: dead,
+      maxAttempts: 2,
+      isDestructive: () => false,
+    });
+    expect(decision.outcome).toBe("failed");
   });
 });
 

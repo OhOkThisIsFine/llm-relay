@@ -960,4 +960,29 @@ describe("freeOnly offload guard", () => {
     const rules = offloadState(cfg, "claude").clients;
     expect(rules["claude"]).toEqual({ enabled: true, scope: "subagents", freeOnly: true });
   });
+
+  it("offloadState carries the DECLARED freeOnly, absent when unset — never a defaulted value", () => {
+    // The status renderer needs the declaration, not one collapsed answer: `freeOnlyApplies`
+    // (server.ts) is `rule.freeOnly ?? rerouted`, so unset is ON for rerouted traffic and OFF
+    // for a directly addressed pool. A defaulted boolean here would misdescribe half of that.
+    const path = join(dir, "freeonly-declared.json");
+    writeFileSync(path, JSON.stringify({
+      ...CONFIG,
+      routing: {
+        ...CONFIG.routing,
+        offload: {
+          claude: { enabled: true, scope: "subagents", freeOnly: true },
+          codex: { enabled: true, scope: "all", freeOnly: false },
+          openai: { enabled: true, scope: "subagents" },
+        },
+      },
+    }, null, 2));
+    const cfg = loadConfig(path);
+
+    expect(offloadState(cfg, "claude").freeOnlyDeclared).toBe(true);
+    expect(offloadState(cfg, "codex").freeOnlyDeclared).toBe(false);
+    expect(offloadState(cfg, "openai").freeOnlyDeclared).toBeUndefined();
+    // Aggregate view carries no per-client answer; the CLI reads `clients` for its table.
+    expect(offloadState(cfg).freeOnlyDeclared).toBeUndefined();
+  });
 });

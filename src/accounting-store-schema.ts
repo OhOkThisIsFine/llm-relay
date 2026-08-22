@@ -14,7 +14,6 @@ export const ACCOUNTING_MINUTE_SCHEMA = "accounting.minute.v1" as const;
 export const ACCOUNTING_RECENT_SCHEMA = "accounting.recent.v1" as const;
 export const ACCOUNTING_LIFETIME_SCHEMA = "accounting.lifetime.v1" as const;
 export const ACCOUNTING_DEDUP_SCHEMA = "accounting.dedup.v1" as const;
-export const ACCOUNTING_STORE_SCHEMA = "accounting.store.v1" as const;
 
 export const ACCOUNTING_MAX_SAMPLES = 25;
 export const ACCOUNTING_MAX_ROWS_PER_CELL = 512;
@@ -31,7 +30,6 @@ export const ACCOUNTING_MAX_METHOD_BYTES = 256;
 export const ACCOUNTING_MAX_COUNTER = Number.MAX_SAFE_INTEGER;
 /** Maximum JSON UTF-8 size accepted for any persisted shard/document. */
 export const ACCOUNTING_MAX_FILE_BYTES = 16 * 1024 * 1024;
-export const ACCOUNTING_MAX_SERIALIZED_BYTES = ACCOUNTING_MAX_FILE_BYTES;
 
 export type AccountingOutcome = "success" | "error" | "cancelled" | "unknown";
 export type AccountingFailureKind =
@@ -310,13 +308,9 @@ export interface AccountingRecentV1 {
   readonly coverage: AccountingCoverageV1;
 }
 
-export interface AccountingStoreEnvelopeV1 {
-  readonly schema: typeof ACCOUNTING_STORE_SCHEMA;
-  readonly version: typeof ACCOUNTING_STORE_VERSION;
-  readonly day: AccountingDayShardV1;
-  readonly lifetime: AccountingLifetimeV1;
-  readonly recent: AccountingRecentV1;
-}
+// NOTE: there is deliberately no whole-store envelope type. The pre-journal
+// "one file holds everything" format was replaced by journal-then-replace
+// shards, and its schema/guard were unreferenced leftovers.
 
 const MINUTE_SCHEMA = ACCOUNTING_MINUTE_SCHEMA;
 const MAX_ID_BYTES = 256;
@@ -1001,10 +995,6 @@ function isRecent(value: unknown): value is AccountingRecentV1 {
   return withinFileCeiling(value);
 }
 
-function isEnvelope(value: unknown): value is AccountingStoreEnvelopeV1 {
-  return hasExactKeys(value, ["schema", "version", "day", "lifetime", "recent"]) && value.schema === ACCOUNTING_STORE_SCHEMA && value.version === ACCOUNTING_STORE_VERSION && isDay(value.day) && isLifetime(value.lifetime) && isRecent(value.recent) && withinFileCeiling(value);
-}
-
 function cloneValue<T>(value: T): T {
   if (Array.isArray(value)) return value.map((item) => cloneValue(item)) as T;
   if (isPlainRecord(value)) {
@@ -1015,7 +1005,8 @@ function cloneValue<T>(value: T): T {
   return value;
 }
 
-function freezeDeep<T>(value: T): T {
+/** The one deep-freeze for the accounting modules; shared, not re-implemented. */
+export function freezeDeep<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     for (const item of Object.values(value as Record<string, unknown>)) freezeDeep(item);
     Object.freeze(value);
@@ -1079,10 +1070,6 @@ export const isAccountingRequestPacketV1 = (value: unknown): value is Accounting
 export const isAccountingRecentV1 = (value: unknown): value is AccountingRecentV1 => {
   try { return isRecent(value); } catch { return false; }
 };
-export const isAccountingStoreEnvelopeV1 = (value: unknown): value is AccountingStoreEnvelopeV1 => {
-  try { return isEnvelope(value); } catch { return false; }
-};
-
 export const parseAccountingAggregateTokenCellV1 = (value: unknown): AccountingParseResult<AccountingAggregateTokenCellV1> => parse(value, isAggregateTokenCell, "token-cell");
 export const parseAccountingEstimatedTokenCellV1 = (value: unknown): AccountingParseResult<AccountingEstimatedTokenCellV1> => parse(value, isEstimatedTokenCell, "estimated-token-cell");
 export const parseAccountingAggregateTokenTotalsV1 = (value: unknown): AccountingParseResult<AccountingAggregateTokenTotalsV1> => parse(value, isAggregateTokens, "token-totals");
@@ -1098,7 +1085,6 @@ export const parseAccountingLifetimeV1 = (value: unknown): AccountingParseResult
 export const parseAccountingAttemptPacketV1 = (value: unknown): AccountingParseResult<AccountingAttemptPacketV1> => parse(value, isAttemptPacket, "attempt-packet");
 export const parseAccountingRequestPacketV1 = (value: unknown): AccountingParseResult<AccountingRequestPacketV1> => parse(value, isRequestPacket, "request-packet");
 export const parseAccountingRecentV1 = (value: unknown): AccountingParseResult<AccountingRecentV1> => parse(value, isRecent, "recent");
-export const parseAccountingStoreEnvelopeV1 = (value: unknown): AccountingParseResult<AccountingStoreEnvelopeV1> => parse(value, isEnvelope, "store-envelope");
 
 export const parseAccountingTokenCell = parseAccountingAggregateTokenCellV1;
 export const parseAccountingEstimatedTokenCell = parseAccountingEstimatedTokenCellV1;

@@ -6,12 +6,14 @@ import { spawn } from "node:child_process";
 import {
   loadConfig,
   splitSpec,
+  offloadRule,
   unroutableOffloadClient,
   type Config,
   type ConfigOverrides,
   DEFAULT_DESTRUCTIVE,
   FRONT_DOOR_CLIENTS,
   CLAUDE_CLIENT,
+  type OffloadRule,
 } from "./config.js";
 import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
@@ -602,7 +604,10 @@ export function runProxy() {
       flushInterpretations();
     },
   });
-  accountingStore = createAccountingStore();
+  // M5 (open-decisions-2026-08-16.md row M5, approved 2026-08-21): prune usage day shards
+  // after 30 days. A tunable default, not a measurement — the store itself keeps retention
+  // off (null) for library callers.
+  accountingStore = createAccountingStore({ retentionDays: 30 });
   const server = createProxy(cfg, {
     catalog,
     accountingRecorder: accountingStore,
@@ -703,6 +708,18 @@ export async function runPingCommand(): Promise<void> {
 import { validateProviderKeys } from "./key-checker.js";
 import { getStrength } from "./benchmarks.js";
 
+/**
+ * Render the key checker's quota percent WITH its basis and limit/usage figures — never alone.
+ * The percent is the relay's own arithmetic over figures the provider stated
+ * (`fetchProviderQuota`: OpenRouter's credit `limit` and `usage`), not a typed observation,
+ * but the axis IS known because that endpoint is the only producer.
+ * Spec §6.1: every reported number carries its basis.
+ */
+export function formatKeyQuota(quotaPercent: number | null | undefined): string {
+  if (quotaPercent === undefined || quotaPercent === null) return "";
+  return ` | Quota: ${quotaPercent}% of credit limit left (relay-derived from provider-stated limit/usage)`;
+}
+
 /** `llm-relay check-keys` — pre-flight verification of provider environment keys. */
 export async function runCheckKeys(): Promise<void> {
   const cfg = loadOrExit();
@@ -713,7 +730,7 @@ export async function runCheckKeys(): Promise<void> {
     ["Provider", "Credential ID", "Label", "Env var", "Status", "Details"],
     ...results.map((r) => {
       const envStr = r.authEnv ?? "(none)";
-      const quotaStr = r.quotaPercent !== undefined && r.quotaPercent !== null ? ` | Quota: ${r.quotaPercent}%` : "";
+      const quotaStr = formatKeyQuota(r.quotaPercent);
       const modelsStr = r.modelsFound !== undefined ? ` | Models: ${r.modelsFound}` : "";
       const status = r.status === "no_models" ? "NO MODELS" : r.status.toUpperCase();
       return [r.provider, r.credentialId, r.label, envStr, status, `${r.message}${quotaStr}${modelsStr}`];
@@ -1464,6 +1481,19 @@ function syncAgentHook(enabled: boolean, host: HostRoutingState): void {
   }
 }
 
+/**
+ * The EFFECTIVE freeOnly of one rule, rendered for `offload status`.
+ *
+ * ⚠ Never print the bare optional. An UNSET flag is not one answer: `freeOnlyApplies` in
+ * server.ts is `rule.freeOnly ?? rerouted`, so unset means ON for offload-rerouted traffic
+ * (including an `@relay:` directive) and OFF for a directly addressed `pool/<name>` spec.
+ * Collapsing either way misdescribes half the traffic — printing "OFF" invites a spend the
+ * owner believes guarded; printing "ON" promises a refusal that never comes for a direct pool.
+ */
+function formatFreeOnly(declared: boolean | undefined): string {
+  return declared === undefined ? "ON (default)" : declared ? "ON (explicit)" : "OFF (explicit)";
+}
+
 /** `llm-relay offload [status]` or `llm-relay offload <client> [on|off|status]`. */
 export async function runOffload(arg: string | undefined, nextArg?: string): Promise<void> {
   const cfg = loadOrExit();
@@ -1579,21 +1609,32 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
         ? `  scope: all (the full ${client} conversation, including subagents)\n`
         : "  scope: subagents (marked child requests only)\n",
     );
+    // A live proxy predating the field omits it — same gap as a missing dead-rule warning, so fall
+    // back to the local config rather than labelling an explicitly-false rule "ON (default)".
+    const declared = state.freeOnlyDeclared ?? offloadRule(cfg, client).freeOnly;
+    process.stdout.write(`  freeOnly: ${formatFreeOnly(declared)}\n`);
   } else if (Object.keys(configuredClients).length > 0) {
     process.stdout.write(
       "\n" +
         formatTextTable(
           [
-            ["client", "enabled", "scope"],
-            ...Object.entries(configuredClients).map(([name, rule]) => [
+            ["client", "enabled", "scope", "freeOnly"],
+            ...Object.entries(configuredClients).map(([name, rule]: [string, OffloadRule]) => [
               FRONT_DOOR_CLIENTS.includes(name) ? name : `${name} ⚠`,
               rule.enabled ? "ON" : "OFF",
               rule.scope,
+              formatFreeOnly(rule.freeOnly),
             ]),
           ],
           "  ",
         ) +
         "\n",
+    );
+    // The legend is part of the table's contract: without it "ON (default)" reads as a bare ON
+    // and the two-sided unset default is exactly the transparency gap this column exists to close.
+    process.stdout.write(
+      `  freeOnly is the money guard. Unset defaults ON for offload-rerouted traffic\n` +
+        `  (subagent reroutes and \`@relay:\` directives) and OFF for a directly addressed \`pool/<name>\`.\n`,
     );
     for (const name of Object.keys(configuredClients)) {
       if (!FRONT_DOOR_CLIENTS.includes(name)) {

@@ -39,6 +39,12 @@ export interface ReshaperAccountingCompletion {
 }
 
 export interface ReshaperAccountingAttempt {
+  /**
+   * MUST be called exactly once, on EVERY exit path (success, refusal, transport
+   * error, cancellation). A dropped handle leaves the server-side request
+   * finalizer waiting on a still-active attempt, so the request never records
+   * its `request-completed` event and stalls until store eviction.
+   */
   complete(completion: ReshaperAccountingCompletion): void;
 }
 
@@ -47,6 +53,11 @@ export interface ReshaperAccountingAttempt {
  * making the reusable reshaper depend on server lifecycle state.
  */
 export interface ReshaperAccountingHooks {
+  /**
+   * The returned handle is load-bearing: it must be completed exactly once on
+   * every exit path, or request finalization stalls until LRU eviction. Return
+   * null only when no attempt was actually started.
+   */
   startRepairAttempt(options: {
     readonly resolvedAttempt: ResolvedAttempt | null;
     readonly credentialState: CredentialResolution["state"];
@@ -436,6 +447,9 @@ export class HttpReshaper implements Reshaper {
         const text = this.cfg.kind === "openai" ? openaiText(json) : anthropicText(json);
         const parsed = parseCorrectedInputsWire(text);
         if (parsed.kind === "invalid") throw new Error(parsed.reason);
+      // Accounted as SUCCESS deliberately: tokens were really spent on this egress.
+      // "refuse" here means the repair model declined the task, not that no call
+      // happened — do not "fix" this into an error outcome.
       accountingCompletion = { outcome: "success", failureKind: null };
       if (parsed.kind === "refuse") return { kind: "refuse", reason: parsed.reason };
       return { kind: "message", message: reconstruct(req.rawAssistant, parsed.inputs) };

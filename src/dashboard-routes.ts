@@ -22,6 +22,8 @@ import {
   isDashboardSafeId,
   isDashboardSnapshotV1,
   isDashboardWindowId,
+  mapDashboardQueryAttribution,
+  utf8ByteLength,
   type DetailV1,
   type FailureKind,
   type Outcome,
@@ -206,25 +208,6 @@ function oneHeader(headers: DashboardHeaderMap, name: string): string | null | u
   return read.values[0] ?? null;
 }
 
-function utf8ByteLength(value: string): number | null {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const unit = value.charCodeAt(index);
-    if (unit <= 0x1f || (unit >= 0x7f && unit <= 0x9f)) return null;
-    let point = unit;
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (Number.isNaN(next) || next < 0xdc00 || next > 0xdfff) return null;
-      point = 0x10000 + ((unit - 0xd800) << 10) + next - 0xdc00;
-      index += 1;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      return null;
-    }
-    bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
-  }
-  return bytes;
-}
-
 function classifyTarget(target: unknown): ClassifiedTarget | null {
   if (typeof target !== "string" || target.length === 0) return null;
   if (CONTROL_CHARACTER_PATTERN.test(target) || target.includes("#")) return null;
@@ -271,10 +254,6 @@ function admissionIsAllowed(admission: unknown): admission is DashboardAdmission
     admission.expectedOrigin.length > 0 &&
     typeof admission.controlAuthorized === "boolean"
   );
-}
-
-function admissionIsDenied(admission: unknown): admission is DashboardAdmissionDenied {
-  return isRecord(admission) && admission.hostAuthorized === false;
 }
 
 function originAllowed(
@@ -691,11 +670,9 @@ export async function handleDashboardRoute(
   if (target === null) return { handled: false };
 
   if (!admissionIsAllowed(request.admission)) {
-    // A malformed admission is still a server admission failure. Do not let a
-    // bad test seam accidentally turn into an unprotected dashboard route.
-    if (!admissionIsDenied(request.admission)) {
-      return errorResponse(403, "forbidden", request.method);
-    }
+    // Any admission the server did not allow — a denied host or a malformed test
+    // seam value — is an admission failure here. Do not let a bad seam accidentally
+    // turn into an unprotected dashboard route; both shapes fail identically closed.
     return errorResponse(403, "forbidden", request.method);
   }
   if (!target.methodAllowed.includes(request.method)) {
@@ -739,7 +716,7 @@ export async function handleDashboardRoute(
     const parsed = parseSnapshotQuery(target.rawQuery);
     if (!parsed.ok) return errorResponse(parsed.status, statusForQueryError(parsed.status), request.method);
     const session = await validateSession(dependencies, request.headers, request.method);
-    if (!session.ok) return { ...session.response, ...(request.method === "HEAD" ? {} : {}) };
+    if (!session.ok) return session.response;
     try {
       const value = await dependencies.read.readSnapshot(parsed.query);
       if (
@@ -747,12 +724,7 @@ export async function handleDashboardRoute(
         value.window !== parsed.query.window ||
         value.includeRepair !== parsed.query.includeRepair ||
         (parsed.query.attribution !== undefined &&
-          value.attribution !==
-            (parsed.query.attribution === "relay-held"
-              ? "relay_held"
-              : parsed.query.attribution === "caller-operated"
-                ? "caller_operated"
-                : "all"))
+          value.attribution !== mapDashboardQueryAttribution(parsed.query.attribution))
       ) {
         return errorResponse(500, "internal", request.method);
       }
@@ -788,7 +760,7 @@ export async function handleDashboardRoute(
 
   if (target.kind === "logout") {
     const session = await validateSession(dependencies, request.headers, request.method);
-    if (!session.ok) return { ...session.response, ...(request.method === "HEAD" ? {} : {}) };
+    if (!session.ok) return session.response;
     let body: Uint8Array;
     try {
       body = await request.readBody(DASHBOARD_MAX_BODY_BYTES);
@@ -876,8 +848,3 @@ export class DashboardRouteHandler {
 export function createDashboardRouteHandler(dependencies: DashboardRouteDependencies): DashboardRouteHandler {
   return new DashboardRouteHandler(dependencies);
 }
-
-// Naming aliases keep the narrow primitive convenient at integration seams
-// without introducing a second implementation.
-export const resolveDashboardRoute = handleDashboardRoute;
-export const handleDashboardRoutes = handleDashboardRoute;

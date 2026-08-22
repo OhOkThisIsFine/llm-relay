@@ -24,6 +24,7 @@ import {
   runRoutingCommand,
   runEligibility,
   formatCandidateQuota,
+  formatKeyQuota,
 } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { ModelCatalog } from "../src/catalog.js";
@@ -228,6 +229,17 @@ describe("cli helper utilities", () => {
 });
 
 describe("candidate quota rendering", () => {
+  it("never prints the key checker's percent without its basis and credit-limit figures", () => {
+    // `llm-relay keys` has no typed observation, only a relay-computed percent over the
+    // provider-stated credit limit/usage (`fetchProviderQuota`) — so it must say what it
+    // is rather than print a bare number.
+    expect(formatKeyQuota(80)).toBe(
+      " | Quota: 80% of credit limit left (relay-derived from provider-stated limit/usage)",
+    );
+    expect(formatKeyQuota(null)).toBe("");
+    expect(formatKeyQuota(undefined)).toBe("");
+  });
+
   it("prints each typed axis/period with raw values, basis, age, and unknown as dash", () => {
     expect(formatCandidateQuota([], 10_000)).toBe("-");
     expect(formatCandidateQuota([
@@ -516,6 +528,85 @@ describe("llm-relay dispatch — printed ladder", () => {
     // The defect: the raw join put `; report` outside the quotes as its own shell command.
     expect(printed).not.toContain(`${command} -p ${task} --model g-flash`);
     expect(printed).toMatch(/quoted for (PowerShell 7\+ \(pwsh\)|sh\/bash)/);
+  });
+});
+
+/**
+ * The status view must render the EFFECTIVE freeOnly, not the bare optional. `freeOnlyApplies`
+ * (server.ts) is `rule.freeOnly ?? rerouted`: an UNSET flag is ON for offload-rerouted traffic
+ * and OFF for a directly addressed `pool/<name>` — one printed boolean would misdescribe half.
+ */
+describe("llm-relay offload status — effective freeOnly", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-cli-offload-"));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  const origArgv = process.argv;
+  afterEach(() => {
+    process.argv = origArgv;
+    vi.restoreAllMocks();
+  });
+
+  const CONFIG = {
+    listen: "127.0.0.1:8791",
+    providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic" } },
+    routing: {
+      default: "anthropic",
+      tiers: { opus: "anthropic", sonnet: "anthropic", haiku: "anthropic", fable: "anthropic" },
+      benchmarkSort: false,
+      offload: {
+        claude: { enabled: true, scope: "subagents", freeOnly: true },
+        codex: { enabled: true, scope: "all", freeOnly: false },
+        openai: { enabled: true, scope: "subagents" },
+        // Dead rule on purpose: its ⚠ marker and warning must survive the new column.
+        "claude-desktop": { enabled: true, scope: "all" },
+      },
+    },
+    mode: "detect",
+    log: { level: "silent", file: null },
+  };
+
+  const captureStatus = async (args: string[]): Promise<string> => {
+    process.argv = ["node", "cli.ts", "--config", join(dir, "config.json"), ...args];
+    // No proxy is contacted: a real one may be listening on this developer's loopback, and a
+    // test that reads it would report whatever that process happens to think.
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("no proxy in tests"));
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    // runOffload receives the positionals AFTER the "offload" keyword.
+    const [, arg, nextArg] = args;
+    await runOffload(arg, nextArg);
+    return out.join("");
+  };
+
+  it("renders every declared state — explicit true, explicit false, unset — with the legend", async () => {
+    const cfgPath = join(dir, "config.json");
+    writeFileSync(cfgPath, JSON.stringify(CONFIG, null, 2));
+
+    const printed = await captureStatus(["offload", "status"]);
+
+    expect(printed).toContain("freeOnly"); // the column exists
+    expect(printed).toContain("ON (explicit)"); // claude: freeOnly: true
+    expect(printed).toContain("OFF (explicit)"); // codex: freeOnly: false
+    expect(printed).toContain("ON (default)"); // openai: unset — NOT a bare "OFF" or "ON"
+    // The legend states exactly how a directly addressed pool is governed (per freeOnlyApplies).
+    expect(printed).toContain("freeOnly is the money guard");
+    expect(printed).toContain("directly addressed `pool/<name>`");
+    // Existing columns and the dead-client warning are intact.
+    expect(printed).toContain("enabled");
+    expect(printed).toContain("scope");
+    expect(printed).toContain("claude-desktop ⚠");
+    expect(printed).toContain("no front door produces this client name");
+  });
+
+  it("a targeted status names the effective freeOnly for that client's rule", async () => {
+    const cfgPath = join(dir, "config.json");
+    writeFileSync(cfgPath, JSON.stringify(CONFIG, null, 2));
+
+    expect(await captureStatus(["offload", "claude", "status"])).toContain("freeOnly: ON (explicit)");
+    expect(await captureStatus(["offload", "codex", "status"])).toContain("freeOnly: OFF (explicit)");
+    expect(await captureStatus(["offload", "openai", "status"])).toContain("freeOnly: ON (default)");
   });
 });
 

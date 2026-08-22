@@ -286,6 +286,10 @@ Put sharply: **freellmapi answers "can I get an answer from somewhere free?"; ll
 
 ## 5. Drift — where this repo misdescribes itself
 
+> Re-audited 2026-08-22: items 2-10 and 12 are fixed in the tree, item 1 self-corrected in the
+> user's global file, item 11 was closed by rendering the effective `freeOnly` in `llm-relay
+> offload status`. That re-audit lived in an untracked scratchpad; it is not in this repo.
+
 This is where the real problem is. A fresh agent reading `CLAUDE.md` as "the map" would be
 misdirected at least eight times.
 
@@ -349,6 +353,11 @@ spot-checked numeric claims (30m/1000-entry sticky, 6h/2.5s update cache, 256-bi
 two runtime deps) all accurate.
 
 ## 6. Recommended next
+
+> **Re-audited 2026-08-22:** items 2-10 and 12 fixed in the tree; item 1 self-corrected in the
+> user's global file; item 11 closed by rendering the effective `freeOnly` in
+> `llm-relay offload status`. The re-audit report lived in an untracked scratchpad, not tracked
+> here.
 
 "Nothing is pending" is **almost true of the code** and **false of the documentation**. Defence: gate
 green, both typechecks clean, CI green at HEAD, no TODOs, no dead exports, 1135 tests passing. The

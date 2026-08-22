@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { freezeDeep } from "./accounting-store-schema.js";
 import {
   DASHBOARD_REQUEST_ID_PATTERN,
   isDashboardFailureKind,
@@ -285,14 +286,6 @@ function methodSnapshot(value: unknown): string | null {
 
 function definedOr<T>(preferred: T | undefined, fallback: T | undefined): T | undefined {
   return preferred === undefined ? fallback : preferred;
-}
-
-function freezeDeep<T>(value: T): T {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const item of Object.values(value as Record<string, unknown>)) freezeDeep(item);
-    Object.freeze(value);
-  }
-  return value;
 }
 
 function safeRecord(recorder: AccountingRecorder, event: AccountingEvent): void {

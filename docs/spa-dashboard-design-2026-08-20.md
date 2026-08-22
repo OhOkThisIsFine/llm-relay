@@ -274,8 +274,11 @@ motion, light/dark, and 320/768/1280 layouts without critical horizontal loss.
 | `dashboard/src/a11y.test.tsx` | Keyboard, focus, contrast, and reduced-motion tests. |
 | `scripts/packed-dashboard-smoke.mjs` | Packed-install static serving smoke gate. |
 
-Stack: React+TS, Vite, Recharts, Tailwind, Lucide, TanStack Query as build/dev dependencies;
-no Express/SQLite/router/CDN. Assets are self-hosted. `build:server` runs current
+Stack: React+TS, Vite, Tailwind, Lucide as build/dev dependencies; TanStack Query was removed
+2026-08-22 (imported and mounted in `main.tsx` but never used — no `useQuery`/`useMutation`
+call site existed, so it only shipped dead bytes in the bundle). Charts are hand-rolled in
+`MetricChart.tsx`; the Recharts named here was never installed. No Express/SQLite/router/CDN.
+Assets are self-hosted. `build:server` runs current
 `tsc -p tsconfig.json`; `build:dashboard` runs Vite and emits only dedicated
 `dist/dashboard`; `check:dashboard` runs dashboard `tsc --noEmit` plus its separate Vitest
 config. Root `build` runs build:server then build:dashboard; root `check` retains the existing

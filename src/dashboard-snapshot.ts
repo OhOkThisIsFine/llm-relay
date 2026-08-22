@@ -33,6 +33,7 @@ import {
   isCooldownRowV1,
   isDashboardAttributionPolicy,
   isQuotaRowV1,
+  mapDashboardQueryAttribution,
   type Attribution,
   type AttributionPolicy,
   type AttemptRowV1,
@@ -631,12 +632,6 @@ function bucketBounds(plan: WindowPlan): Array<{ from: Date; to: Date }> {
   return result;
 }
 
-function mapAttribution(value: DashboardSnapshotQuery["attribution"]): Attribution | "all" {
-  if (value === "relay-held") return "relay_held";
-  if (value === "caller-operated") return "caller_operated";
-  return "all";
-}
-
 interface TupleFact {
   readonly provider: string | null;
   readonly model: string | null;
@@ -648,7 +643,7 @@ interface TupleFact {
 }
 
 function matchesTuple(fact: TupleFact, query: DashboardSnapshotQuery): boolean {
-  const attribution = mapAttribution(query.attribution);
+  const attribution = mapDashboardQueryAttribution(query.attribution);
   return (
     (attribution === "all" || fact.attribution === attribution) &&
     (query.provider === undefined || fact.provider === query.provider) &&
@@ -1210,6 +1205,8 @@ export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOp
       const errors = new Map<string, ErrorDistributionRowV1>();
       let dataHealth: ProjectionHealth;
       let retentionFrom: string | null = null;
+      // Reserved at null: the accounting store exposes a retention start cursor but no end
+      // cursor, so this stays null until that exists. Never read it as "no pruning happened".
       let retentionTo: string | null = null;
 
       if (query.window === "lifetime") {
@@ -1274,7 +1271,7 @@ export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOp
         relayVersion,
         window: query.window,
         includeRepair: query.includeRepair === true,
-        attribution: mapAttribution(query.attribution),
+        attribution: mapDashboardQueryAttribution(query.attribution),
         attributionPolicy,
         generatedAt: generatedAt.toISOString(),
         asOf: plan.asOf.toISOString(),
@@ -1332,5 +1329,3 @@ export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOp
   });
 }
 
-/** Concise alias for callers that name the dependency by its route role. */
-export const createDashboardReadPort = createDashboardSnapshotReadPort;

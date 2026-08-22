@@ -61,8 +61,10 @@ export interface RequestLog {
   toolUseCount: number;
   uncheckableCount: number;
   errorKinds: string[];
-  /** Repair outcome (repair mode only); "none" when repair did not run. */
-  repair: "none" | "fixed" | "failed" | "refused" | "refused_destructive";
+  /** Repair outcome (repair mode only); "none" when repair did not run. "cancelled"
+   *  means the caller went away mid-repair — distinct from "failed" (nothing was
+   *  reachable), because the two call for opposite responses. */
+  repair: "none" | "fixed" | "failed" | "refused" | "refused_destructive" | "cancelled";
   latencyMs: number;
 }
 

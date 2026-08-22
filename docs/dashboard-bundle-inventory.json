@@ -2,8 +2,6 @@
   "schemaVersion": 1,
   "method": "Production Vite/Rollup module graph. dashboard/vite.config.ts emits dist/dashboard/.vite/dashboard-bundle-graph.json from every rendered chunk; scripts/dashboard-package-check.mjs requires this complete graph to equal this inventory.",
   "packages": [
-    { "packagePath": "node_modules/@tanstack/query-core", "name": "@tanstack/query-core", "version": "5.101.4", "license": "MIT" },
-    { "packagePath": "node_modules/@tanstack/react-query", "name": "@tanstack/react-query", "version": "5.101.4", "license": "MIT" },
     { "packagePath": "node_modules/lucide-react", "name": "lucide-react", "version": "0.468.0", "license": "ISC" },
     { "packagePath": "node_modules/react", "name": "react", "version": "19.2.8", "license": "MIT" },
     { "packagePath": "node_modules/react-dom", "name": "react-dom", "version": "19.2.8", "license": "MIT" },

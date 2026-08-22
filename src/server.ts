@@ -481,9 +481,12 @@ function recordEarlyTerminalAccounting(
   client: string,
 ): void {
   try {
+    // failureKind "unknown", not "protocol": the enum's only protocol kind means a
+    // PROVIDER answered with a malformed envelope, and this request never left the
+    // relay — nothing reached any provider to be protocol about.
     createAccountingRequest({ recorder, startedAt, client }).complete({
       outcome: "error",
-      failureKind: "protocol",
+      failureKind: "unknown",
       attribution: "unknown",
       endedAt: Date.now(),
     });
@@ -571,6 +574,20 @@ class RequestAccountingState {
     });
   }
 
+  /**
+   * CONTRACT: the returned handle MUST be completed exactly once, on every exit
+   * path (success, refusal, transport error, cancellation). Only `complete()`
+   * removes an entry from `active`, and `finalizeIfReady()` refuses to finish the
+   * request while `active` is non-empty — so a custom `Reshaper` that starts an
+   * attempt and drops the handle stalls this request's `request-completed` event
+   * until the store LRU-evicts it, and the day aggregate silently misses the turn.
+   *
+   * Deliberately NO eager sweep here: once the caller response is terminal, a
+   * still-active attempt is usually a REAL repair in flight being aborted by the
+   * disconnect, and its own `complete(cancelled/aborted)` lands a few ticks later.
+   * Sweeping at finalize time races that and would relabel honest cancellations as
+   * `error/unknown`; the in-tree reshapers all complete in `finally`.
+   */
   startRepair(options: {
     readonly resolvedAttempt: ResolvedAttempt | null;
     readonly credentialState: ResolvedAttempt["credential"]["state"];
@@ -650,7 +667,27 @@ class RequestAccountingState {
   }
 
   private finalizeIfReady(): void {
-    if (this.finalized || this.request === null || this.responseTerminal === null || this.active.size > 0) return;
+    if (this.finalized || this.request === null || this.responseTerminal === null) return;
+    if (this.active.size > 0) {
+      // Two very different reasons for a still-active attempt:
+      //
+      // - On "close" (client disconnect mid-turn) a REAL repair is usually still in
+      //   flight, being aborted by that same disconnect; its own
+      //   complete("cancelled"/"aborted") lands within a few ticks. Returning here
+      //   lets that honest completion happen instead of relabelling it.
+      // - On "finish" the handler has fully written, so every in-tree reshaper has
+      //   long since completed its handle in `finally`. Anything still active is a
+      //   DROPPED handle from a custom Reshaper that ignored the startRepair
+      //   contract; sweeping it keeps the request from stalling unfinalized until
+      //   store eviction. Recorded as error/unknown — the one honest statement,
+      //   since nothing observed how the abandoned egress ended. A late real
+      //   completion is harmlessly ignored: complete() is idempotent and this
+      //   object is finalized immediately after.
+      if (this.responseTerminal !== "finished") return;
+      for (const attempt of [...this.active]) {
+        this.complete(attempt, "error", "unknown", createUsageAccumulator());
+      }
+    }
     this.finalized = true;
     try {
       if (this.responseTerminal === "cancelled") {
@@ -755,6 +792,7 @@ async function handleDashboardAdapter(
   req: IncomingMessage,
   res: ServerResponse,
   path: string,
+  started: number,
   cfg: Config,
   h: Handlers,
 ): Promise<boolean> {
@@ -769,12 +807,14 @@ async function handleDashboardAdapter(
       : staticResponse.headers;
     res.writeHead(staticResponse.status, staticHeaders);
     res.end(staticResponse.body);
+    h.logger.write(baseLog(started, path, false, false, staticResponse.status, "skipped", null));
     return true;
   }
 
   const expectedOrigin = dashboardExpectedOrigin(h.server, cfg);
   if (expectedOrigin === null) {
     failDashboardClosed(res, 403, "listener authority is unavailable");
+    h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
     return true;
   }
 
@@ -796,12 +836,17 @@ async function handleDashboardAdapter(
   );
   if (response.handled) {
     writeDashboardResponse(res, response);
+    // One metadata record per dashboard answer, mirroring the admin-route convention:
+    // status + logSafePath(path) only. The session/bootstrap tokens travel as headers and
+    // body bytes, neither of which this record can carry (`served` is null, no attempts).
+    h.logger.write(baseLog(started, path, false, false, response.status, "skipped", null));
     return true;
   }
 
   // Do not let a dashboard lookalike reach proxy routing. This covers unknown API paths and
   // every other /dashboard/* spelling while preserving all existing non-dashboard routes.
   failDashboardClosed(res, 404, "dashboard route not found");
+  h.logger.write(baseLog(started, path, false, false, 404, "skipped", null));
   return true;
 }
 
@@ -822,7 +867,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // The dashboard owns a deliberately tiny route namespace.  It must run before the generic
   // proxy body reader: static GET/HEAD never buffer, and dashboard writes retain their 16 KiB
   // cap rather than inheriting the data-plane's 36 MiB allowance.
-  if (await handleDashboardAdapter(req, res, path, cfg, h)) return;
+  if (await handleDashboardAdapter(req, res, path, started, cfg, h)) return;
 
   let reqBuf: Buffer;
   try {
@@ -851,14 +896,23 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const handled = await handleAdminRoutes(req, res, pathname, path, started, reqJson, cfg, h);
   if (handled) return;
 
+  // ONE full-body token walk per request, shared with the context guardrail below.
+  // estimateRequestTokens walks the entire parsed body — potentially tens of MB — so
+  // computing it once per consumer paid that twice on every caller-visible request.
+  // ⚠ Reassigned below: a stripped `@relay:` directive shrinks the body, and the
+  // guardrail must judge the body that will actually reach the backend.
+  let estimatedRequestTokens = estimateRequestTokens(reqJson);
+
   // Only exact caller-visible inference routes create a request lifecycle.
   // Admin/control aliases and prefix lookalikes remain outside accounting.
+  // (Deliberately constructed even under the NOOP recorder: the lifecycle also owns
+  // `isRequestClosed()`, which is how a running repair learns the client went away.)
   const accounting = isCallerVisibleAccountingPath(req.method, pathname)
     ? new RequestAccountingState(
       h.accountingRecorder,
       res,
       started,
-      estimateRequestTokens(reqJson),
+      estimatedRequestTokens,
       requestClient,
     )
     : null;
@@ -896,7 +950,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     materializeDynamicPools(cfg, h.catalog);
     // Re-serialize whenever a subagent spec applied — the @relay: line was stripped from reqJson
     // in place, and it must not reach the backend even when the spec matches the nominal model.
-    if (subSpec !== null) reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
+    if (subSpec !== null) {
+      reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
+      // The body just shrank, so the shared token estimate is stale for anything downstream
+      // of this point — notably the context guardrail. Accounting already captured the
+      // pre-strip figure, which is correct there: that walk measured what the CLIENT sent.
+      estimatedRequestTokens = estimateRequestTokens(reqJson);
+    }
     targetCandidates = resolveTargets(routedModel, cfg);
     if (typeof routedModel === "string" && routedModel.startsWith("pool/")) {
       addressedPool = routedModel.slice("pool/".length);
@@ -1027,7 +1087,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // Candidates whose published context limits are exceeded by the estimated prompt tokens are pruned.
   // If all candidates are pruned, fail closed with 400 naming the context limit.
   if ((isMessages || openAiFrontProtocol) && reqJson) {
-    const estimatedTokens = estimateRequestTokens(reqJson);
+    // The single walk computed above (re-run here ONLY if an `@relay:` directive was
+    // stripped, which shrinks the body this guardrail is judging).
+    const estimatedTokens = estimatedRequestTokens;
     if (estimatedTokens > 0) {
       const remainingAttempts: ResolvedAttempt[] = [];
       let firstExceeded: { target: ResolvedTarget; limit: number } | null = null;

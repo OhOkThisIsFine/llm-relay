@@ -1143,3 +1143,83 @@ describe("logs stay metadata-only end to end", () => {
     }
   });
 });
+
+/**
+ * A custom Reshaper that starts an accounting attempt and DROPS the returned handle violates
+ * the startRepair contract documented on ReshaperAccountingHooks / RequestAccountingState.
+ * Without the sweep, that request never records `request-completed`; with it, finalization
+ * happens at response finish and records error/unknown — the only honest statement about an
+ * abandoned egress nobody observed ending. A REAL repair still in flight at "close" time is
+ * deliberately NOT swept: its own cancelled/aborted completion lands within ticks.
+ */
+describe("repair accounting: dropped attempt handle", () => {
+  let dir: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-drop-"));
+  });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it("sweeps a still-active repair attempt at finish so the request still finalizes", async () => {
+    const backend = await mockBackend(() => ({
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "message", role: "assistant", stop_reason: "tool_use",
+        content: [{ type: "tool_use", id: "t1", name: "get_weather", input: {} }],
+      }),
+    }));
+    // Starts an accounting attempt through the real hooks, then drops the handle —
+    // exactly the contract violation the sweep exists to contain.
+    const dropper: Reshaper = {
+      reshape: async (_req, hooks) => {
+        hooks?.startRepairAttempt({
+          resolvedAttempt: null,
+          credentialState: "declared-present",
+          provider: "up",
+          model: "mock-model",
+          credentialId: "up#default",
+          startedAt: Date.now(),
+        });
+        return {
+          kind: "message",
+          message: { content: [{ type: "tool_use", id: "t1", name: "get_weather", input: { city: "Paris" } }], stop_reason: "tool_use" } as AssistantMessage,
+        };
+      },
+    };
+    const events: Array<Record<string, unknown>> = [];
+    const recorder = { record: (event: unknown): void => { events.push(event as Record<string, unknown>); } };
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up", tiers: {} },
+      mode: "repair",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    const proxy = await startProxy(cfg, { reshaper: dropper, accountingRecorder: recorder });
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", stream: false, messages: [{ role: "user", content: "weather?" }], tools: weatherToolsForDropTest() }),
+    });
+    // Repair succeeded client-side; only accounting was affected by the dropped handle.
+    expect(resp.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const types = events.map((event) => event["type"]);
+    expect(types).toContain("request-completed");
+    expect(events.find((event) => event["type"] === "attempt-completed" && event["role"] === "repair")).toMatchObject({
+      outcome: "error",
+      failureKind: "unknown",
+    });
+    // The serve attempt really succeeded, so the sweep did not relabel the turn itself.
+    expect(events.find((event) => event["type"] === "request-completed")).toMatchObject({ outcome: "success" });
+  });
+});
+
+/** Kept local so the new describe cannot drift from the shared fixtures above it. */
+function weatherToolsForDropTest(): object[] {
+  return [
+    { name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
+  ];
+}

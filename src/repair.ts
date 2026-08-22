@@ -5,13 +5,14 @@ import {
   type JsonSchema,
 } from "./anthropic.js";
 import { stableStringify, type ToolUseValidator } from "./validator.js";
-import { type Reshaper } from "./reshaper.js";
+import { ReshaperTransportError, type Reshaper } from "./reshaper.js";
 
 export type RepairOutcome =
   | "fixed" // reshaped and now valid
   | "failed" // reshaper could not produce a valid message within maxAttempts
   | "refused" // reshaper declined (ambiguous intent)
-  | "refused_destructive"; // a failing call targeted a destructive tool — not reshaped
+  | "refused_destructive" // a failing call targeted a destructive tool — not reshaped
+  | "cancelled"; // the CALLER went away (signal aborted / reshaper saw the close)
 
 export interface RepairDecision {
   outcome: RepairOutcome;
@@ -49,7 +50,7 @@ export async function repair(
   tools: Map<string, JsonSchema | null>,
   deps: RepairDeps,
 ): Promise<RepairDecision> {
-  if (deps.signal?.aborted) return { outcome: "failed" };
+  if (deps.signal?.aborted) return { outcome: "cancelled" };
   const destructiveHit = assistant.content
     .filter(isToolUseBlock)
     .some((b) => deps.isDestructive(b.name));
@@ -97,7 +98,7 @@ export async function repair(
   }
 
   for (let attempt = 0; attempt < deps.maxAttempts; attempt++) {
-    if (deps.signal?.aborted) return { outcome: "failed" };
+    if (deps.signal?.aborted) return { outcome: "cancelled" };
     let result;
     try {
       result = await deps.reshaper.reshape({
@@ -107,12 +108,20 @@ export async function repair(
         backendModel: deps.backendModel ?? null,
         ...(deps.signal ? { signal: deps.signal } : {}),
       });
-    } catch {
+    } catch (e) {
       // Transport-level failure (single reshaper down, or every failover candidate down).
       // Nothing answered — not a refusal, but nothing to retry against either: fail clean.
+      // A caller cancellation is NOT that: the client went away mid-repair, which is a
+      // different fact about the turn and must stay distinguishable in the log.
+      if (
+        e instanceof ReshaperTransportError && e.outcome.kind === "cancelled"
+        || deps.signal?.aborted
+      ) {
+        return { outcome: "cancelled" };
+      }
       return { outcome: "failed" };
     }
-    if (deps.signal?.aborted) return { outcome: "failed" };
+    if (deps.signal?.aborted) return { outcome: "cancelled" };
     if (result.kind === "refuse") return { outcome: "refused" };
 
     const guard = guardReshaped(assistant, result.message, deps.isDestructive);

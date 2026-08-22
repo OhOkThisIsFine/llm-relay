@@ -438,7 +438,7 @@ export function refusalSignature(provider: string, model: string | null | undefi
  * the per-model keying rule above and the only one — a seed is reviewed source, whereas a
  * researched verdict is a model's opinion and gets the conservative key.
  *
- * ⚠ **`allowance-exhausted` is not a cost verdict.** See `deployment-eligibility.ts` — it means the
+ * ⚠ **`allowance-exhausted` is not a cost verdict.** See `target-facts.ts` — it means the
  * deployment is free and currently spent, and it must never evict anything from a free pool.
  */
 export const SEED_INTERPRETATIONS: Array<{

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -33,6 +33,13 @@ function expectDashboardHeaders(response: Response, cacheControl: string): void 
 const servers: Server[] = [];
 const directories: string[] = [];
 const stores: AccountingStore[] = [];
+
+function jsonLines(file: string): Array<Record<string, unknown>> {
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
 
 function address(server: Server): string {
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -427,5 +434,61 @@ describe("dashboard production adapter", () => {
     }
     expect((await fetch(`${url}/telemetry`)).status).toBe(200);
     expect((await fetch(`${url}/health`, { headers: { [CONTROL_AUTHORIZATION_HEADER]: CONTROL } })).status).toBe(200);
+  });
+
+  it("writes one metadata log record per dashboard answer, carrying no token material", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-relay-dashboard-log-"));
+    directories.push(dir);
+    const logFile = join(dir, "log.jsonl");
+    const server = await listen(createProxy({ ...config(), log: { level: "metadata", file: logFile } }, {
+      controlAuthorization: { validate: (token) => token === CONTROL },
+      dashboardAssetRoot: dashboardRoot(),
+    }));
+    const url = address(server);
+
+    // Static answer (200) and an unauthenticated API answer (401) — one record each.
+    const page = await fetch(`${url}/dashboard/`, { method: "HEAD" });
+    expect(page.status).toBe(200);
+    const denied = await fetch(`${url}/dashboard/api/v1/snapshot?window=1h&includeRepair=0`, {
+      headers: { Accept: DASHBOARD_MEDIA_TYPE },
+    });
+    expect(denied.status).toBe(401);
+    await denied.arrayBuffer();
+
+    // Mint a real session so the record can be checked against live token material.
+    const bootstrapResponse = await fetch(`${url}/dashboard/api/v1/bootstrap`, {
+      method: "POST", headers: bootstrapHeaders(), body: JSON.stringify({ schema: "dashboard.bootstrap.request.v1" }),
+    });
+    expect(bootstrapResponse.status).toBe(200);
+    const bootstrap = (await bootstrapResponse.json()) as { bootstrap: string };
+    const sessionResponse = await fetch(`${url}/dashboard/api/v1/session`, {
+      method: "POST",
+      headers: { Accept: DASHBOARD_MEDIA_TYPE, "Content-Type": "application/json", Origin: url, "Sec-Fetch-Site": "same-origin" },
+      body: JSON.stringify({ schema: "dashboard.session.request.v1", bootstrap: bootstrap.bootstrap }),
+    });
+    expect(sessionResponse.status).toBe(200);
+    const session = (await sessionResponse.json()) as { session: string };
+    const snapshot = await fetch(`${url}/dashboard/api/v1/snapshot?window=1h&includeRepair=0`, {
+      headers: { Accept: DASHBOARD_MEDIA_TYPE, "X-LLM-Relay-Dashboard-Session": session.session },
+    });
+    expect(snapshot.status).toBe(200);
+    await snapshot.arrayBuffer();
+
+    const records = jsonLines(logFile);
+    expect(records.length).toBe(5);
+    expect(records.map((record) => record.backendStatus)).toEqual([200, 401, 200, 200, 200]);
+    for (const record of records) {
+      expect(record.servedProvider).toBeNull();
+      expect(record.validated).toBe("skipped");
+      expect(String(record.path)).toMatch(/^\/dashboard(\/|$)/u);
+    }
+    // The two snapshot answers carried ?window=1h&includeRepair=0; logSafePath keeps
+    // the parameter NAMES and replaces each value with its length.
+    expect(String(records[1]!.path)).toContain("/snapshot?window=<2c>&includeRepair=<1c>");
+    expect(String(records[4]!.path)).toContain("/snapshot?window=<2c>&includeRepair=<1c>");
+    expect(JSON.stringify(records)).not.toContain("window=1h");
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toContain(session.session);
+    expect(serialized).not.toContain(bootstrap.bootstrap);
   });
 });

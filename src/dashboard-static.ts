@@ -182,13 +182,6 @@ function extensionMime(path: string): string | null {
   return dot < 0 ? null : MIME_TYPES[path.slice(dot).toLowerCase()] ?? null;
 }
 
-function rootRelativePath(value: string): string {
-  // Vite normally emits `assets/foo.js`; a manifest supplied by a test/build
-  // may use `foo.js`.  The latter is still mapped to its exact root-relative
-  // path, while its URL name remains `foo.js` under /dashboard/assets/.
-  return value;
-}
-
 function routeAssetName(value: string): string {
   return value.startsWith("assets/") ? value.slice("assets/".length) : value;
 }
@@ -202,7 +195,9 @@ function addArtifact(artifacts: Map<string, Artifact>, value: string): boolean {
   if (!isSafeManifestPath(value) || !isContentHashedArtifact(value)) return false;
   const routeName = routeAssetName(value);
   if (routeName.length === 0 || routeName.includes("/../") || routeName === "..") return false;
-  const target = rootRelativePath(value);
+  // The manifest `file` is already the exact root-relative path (Vite emits
+  // `assets/foo.js`), while its URL name stays `foo.js` under /dashboard/assets/.
+  const target = value;
   const mime = extensionMime(target);
   if (!mime) return false;
   const previous = artifacts.get(routeName);
@@ -371,8 +366,4 @@ export function createDashboardStaticHandler(options: DashboardStaticOptions): D
 /** Production helper; tests should inject a temporary root instead. */
 export function getProductionDashboardAssetRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "dashboard");
-}
-
-export function resolveDashboardStatic(handler: DashboardStaticHandler, request: DashboardStaticRequest): DashboardStaticResponse {
-  return handler.handle(request);
 }

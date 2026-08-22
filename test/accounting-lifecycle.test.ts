@@ -279,7 +279,10 @@ describe("proxy accounting lifecycle", () => {
     });
     expect(requestCompleted(events)).toMatchObject({
       outcome: "error",
-      failureKind: "protocol",
+      // "unknown", not "protocol": the request never reached a provider, so there is
+      // nothing protocol-shaped about it — the enum's protocol kind means a provider
+      // answered with a malformed envelope.
+      failureKind: "unknown",
       attribution: "unknown",
       attemptCount: 0,
       repairIncluded: false,
