@@ -4,14 +4,29 @@ import { homedir, tmpdir } from "node:os";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import { WriteBehindTimer } from "./write-behind.js";
 
-/** A learned condition or measurement about a routing target. */
+/**
+ * A learned condition or measurement about a routing target.
+ *
+ * The kinds split into two halves, and the split is load-bearing:
+ * - CONDITIONS (`not-servable`, `subscription-required`, `allowance-exhausted`, `credential-invalid`,
+ *   `rate-limited`) say "this target is currently unusable for a reason". A success disproves a
+ *   condition, so `clearFacts()` deletes them; they cool or cost-block through the sets below.
+ * - MEASUREMENTS (`context-limit`, `rate-limit-rpm|rpd|tpm|tpd`) say "here is a ceiling this
+ *   deployment stated". A success does not disprove a measurement, so they are in none of the sets
+ *   below and `clearFacts()` never touches them — they expire on their own TTL. They are
+ *   display-only today (see `rate-limits.ts`); acting on them is a separate, announced decision.
+ */
 export type FactKind =
   | "not-servable"
   | "subscription-required"
   | "allowance-exhausted"
   | "credential-invalid"
   | "rate-limited"
-  | "context-limit";
+  | "context-limit"
+  | "rate-limit-rpm"
+  | "rate-limit-rpd"
+  | "rate-limit-tpm"
+  | "rate-limit-tpd";
 
 /**
  * The evidence scope, in lookup order. `provider` deliberately means every credential for the
@@ -48,9 +63,19 @@ export const FACT_TTL_MS: Record<FactKind, number> = {
   "allowance-exhausted": 60 * 60 * 1000,
   "credential-invalid": 15 * 60 * 1000,
   "rate-limited": 2 * 60 * 1000,
+  // The measurement half (see FactKind above): a ceiling the deployment stated about itself.
+  // Same TTL as context-limit — provider rate structures change on the same timescale as
+  // published context windows do. A success neither clears nor refreshes these; only age does.
   "context-limit": 30 * 24 * 60 * 60 * 1000,
+  "rate-limit-rpm": 30 * 24 * 60 * 60 * 1000,
+  "rate-limit-rpd": 30 * 24 * 60 * 60 * 1000,
+  "rate-limit-tpm": 30 * 24 * 60 * 60 * 1000,
+  "rate-limit-tpd": 30 * 24 * 60 * 60 * 1000,
 };
 
+// The condition half only (see FactKind). The rate-limit-* / context-limit measurements are
+// deliberately absent from every set below: not cleared by clearFacts, never cooling, never
+// cost-blocking. They describe what the deployment is entitled to, not whether it is broken.
 const CONDITIONS: ReadonlySet<FactKind> = new Set([
   "not-servable", "subscription-required", "allowance-exhausted", "credential-invalid", "rate-limited",
 ]);
@@ -86,8 +111,23 @@ function canonicalMembers(members: string[]): string[] {
   return [...new Set(members)].sort();
 }
 
-/** Canonical persisted key. Kept exported so persistence tests cannot duplicate it. */
-export function keyOf(scope: FactScope): string {
+/**
+ * Canonical persisted key for a fact, INCLUDING its kind.
+ *
+ * ⚠ The kind is part of the key on purpose: one scope may legitimately carry several kinds at once
+ * (a real Groq 429 states both an RPM and a TPM ceiling), and a key of scope alone made four
+ * rate-limit measurements overwrite each other down to one. Conditions never collide this way in
+ * practice (a cell holds at most one condition verdict), but the measurement half made the
+ * omission a silent data loss, so the key is now `<kind>:<scope>` throughout.
+ *
+ * Exported so persistence tests cannot duplicate it.
+ */
+export function keyOf(kind: FactKind, scope: FactScope): string {
+  return `${kind}:${keyOfScope(scope)}`;
+}
+
+/** Scope-only key, kept for callers that key a single-slot cell by scope alone. */
+export function keyOfScope(scope: FactScope): string {
   switch (scope.kind) {
     case "attempt": return `a:${scope.credentialId}/${scope.model}`;
     case "group": return scope.credentialId
@@ -135,7 +175,10 @@ function isValidFact(key: string, value: unknown): value is StoredFact {
   if (!FACT_KINDS_SET.has(fact.kind as string) || !isValidScope(fact.scope) || !Number.isFinite(fact.at)) return false;
   if (fact.until !== undefined && !Number.isFinite(fact.until)) return false;
   if (fact.value !== undefined && !Number.isFinite(fact.value)) return false;
-  return key === keyOf(normalizeScope(fact.scope));
+  const scope = normalizeScope(fact.scope);
+  // Rows written before the kind joined the key carry the bare scope key; they are migrated to
+  // the canonical key by `load`, so refusing them here would wipe every learned fact on upgrade.
+  return key === keyOf(fact.kind as FactKind, scope) || key === keyOfScope(scope);
 }
 
 function load(path: string): FactStore {
@@ -149,7 +192,13 @@ function load(path: string): FactStore {
       const facts: Record<string, StoredFact> = {};
       if (rawFacts && typeof rawFacts === "object") {
         for (const [key, fact] of Object.entries(rawFacts)) {
-          if (isValidFact(key, fact)) facts[key] = { ...fact, scope: normalizeScope(fact.scope) };
+          if (!isValidFact(key, fact)) continue;
+          const stored: StoredFact = { ...fact, scope: normalizeScope(fact.scope) };
+          // Rows predating the kind-in-key format carry a bare scope key; rekey them to the
+          // canonical `<kind>:<scope>` so an upgrade keeps every learned fact. Where both forms
+          // exist the canonical one stays — it was written later by this version.
+          const canonical = keyOf(stored.kind, stored.scope);
+          facts[canonical] ??= stored;
         }
       }
       _store = { version: 2, facts };
@@ -199,7 +248,7 @@ export function recordFact(
   const stated = typeof opts.retryAfterMs === "number" && Number.isFinite(opts.retryAfterMs) && opts.retryAfterMs > 0
     ? opts.retryAfterMs : null;
   const normalized = normalizeScope(scope);
-  load(path).facts[keyOf(normalized)] = {
+  load(path).facts[keyOf(kind, normalized)] = {
     kind, scope: normalized, at: now,
     ...(stated === null ? {} : { until: now + stated }),
     ...(typeof opts.value === "number" && Number.isFinite(opts.value) ? { value: opts.value } : {}),
