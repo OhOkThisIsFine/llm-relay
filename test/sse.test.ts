@@ -52,6 +52,46 @@ describe("reconstructFromSse", () => {
     expect(m.usage).toEqual({ input_tokens: 5, output_tokens: 9 });
   });
 
+  it("keeps the cache token fields message_start reported", () => {
+    // Anthropic puts cache reads/writes on message_start; dropping them here meant a
+    // repaired response could never carry them again, and a heavy-cache-user's client
+    // saw its prompt billed as plain uncached input.
+    const raw = sse([
+      {
+        type: "message_start",
+        message: {
+          usage: { input_tokens: 3, output_tokens: 1, cache_creation_input_tokens: 100, cache_read_input_tokens: 500 },
+        },
+      },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9 } },
+    ]);
+    const m = reconstructFromSse(raw);
+    expect(m.usage).toEqual({
+      input_tokens: 3,
+      output_tokens: 9,
+      cache_creation_input_tokens: 100,
+      cache_read_input_tokens: 500,
+    });
+  });
+
+  it("leaves a cache field ABSENT when message_start never reported it", () => {
+    // Absent means "not reported"; synthesizing `0` would claim a measurement nobody made.
+    const raw = sse([
+      { type: "message_start", message: { usage: { input_tokens: 5 } } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
+    ]);
+    const m = reconstructFromSse(raw);
+    expect(m.usage).toEqual({ input_tokens: 5, output_tokens: 2 });
+    expect(m.usage?.cache_read_input_tokens).toBeUndefined();
+    expect(m.usage?.cache_creation_input_tokens).toBeUndefined();
+  });
+
   it("leaves usage ABSENT when the stream never reported any", () => {
     const raw = sse([
       { type: "message_start", message: { id: "m1" } },

@@ -378,6 +378,29 @@ until meaningful content, and semantic failures before that point are counted as
   read-only session token minted by the bootstrap exchange. It is consumed by the relay, never
   forwarded upstream, and never persisted (only its SHA-256 digest is held in memory).
 
+### Usage fields on repaired and translated responses
+
+A response that passes through untouched reaches you byte-for-byte — cache token figures included.
+When the relay re-emits a response it repaired or translated, it carries the same figures through:
+
+- **Anthropic front:** `cache_creation_input_tokens` and `cache_read_input_tokens` ride
+  `message_start` exactly as reported (never re-stated in `message_delta`, where Anthropic sends
+  only final `output_tokens`). A field the backend did not report stays absent — never emitted as
+  `0`. Reported zero is kept; absent means unknown.
+- **OpenAI front (Anthropic backend):** `prompt_tokens = input_tokens + cache_read +
+  cache_creation` (OpenAI's prompt figure INCLUDES cached tokens; Anthropic's excludes them),
+  with `prompt_tokens_details.cached_tokens = cache_read_input_tokens`.
+- **Anthropic front (OpenAI backend):** `input_tokens = prompt_tokens - cached_tokens`,
+  `cache_read_input_tokens = cached_tokens`. If a host reports `cached_tokens > prompt_tokens`
+  (malformed), the split is dropped and `prompt_tokens` passes through unchanged rather than
+  becoming negative.
+
+Only a cache READ becomes `cached_tokens`: a cache write is billed work, not a cache hit.
+This guarantee covers buffered repaired/translated responses and same-protocol paths; **streaming
+cross-protocol translation** (an OpenAI-front client streaming from an Anthropic-kind backend, or
+the reverse — translated inside the `llm-bridge` dependency) still drops the cache fields and
+zero-fills missing usage, because the translated stream is passed through as the dependency emits it.
+
 ### Context guardrail
 
 The relay estimates each request's prompt tokens against the target model's context limit and
