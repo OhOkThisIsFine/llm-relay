@@ -41,6 +41,24 @@ describe("repair orchestration", () => {
     expect(d.message?.usage).toEqual({ input_tokens: 91, output_tokens: 7 });
   });
 
+  it("carries the WHOLE usage object — cache fields included — through repair", async () => {
+    // Cache reads/writes are the figures a heavy-cache client meters on; a repair that kept
+    // only input/output would silently re-bill its cached prompt as uncached.
+    const withCacheUsage: AssistantMessage = {
+      ...badCall,
+      id: "msg_backend_abc",
+      usage: { input_tokens: 91, output_tokens: 7, cache_read_input_tokens: 4000, cache_creation_input_tokens: 12 },
+    };
+    const d = await repair(withCacheUsage, tools, { validator, reshaper: reshaperOf({ kind: "message", message: fixedMsg }), maxAttempts: 2, isDestructive: noDestruct });
+    expect(d.outcome).toBe("fixed");
+    expect(d.message?.usage).toEqual({
+      input_tokens: 91,
+      output_tokens: 7,
+      cache_read_input_tokens: 4000,
+      cache_creation_input_tokens: 12,
+    });
+  });
+
   it("does not let a reshaper substitute its OWN id, model or usage for the backend's", async () => {
     // A reshaper that filled these from its own completion would make the client meter and
     // attribute the turn to a model that never answered it.

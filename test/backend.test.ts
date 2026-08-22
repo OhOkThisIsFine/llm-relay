@@ -87,6 +87,56 @@ describe("openAiResponseToAnthropic", () => {
     ]);
     expect(anth.stop_reason).toBe("tool_use");
   });
+
+  it("splits cached tokens OUT of prompt_tokens into cache_read_input_tokens", () => {
+    // OpenAI's prompt_tokens INCLUDES the cached subset; Anthropic's input_tokens EXCLUDES it.
+    // Passing 10 straight through would make every reader of the Anthropic shape double-count.
+    const anth = openAiResponseToAnthropic({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 4,
+        prompt_tokens_details: { cached_tokens: 7 },
+      },
+    }, "m") as any;
+    expect(anth.usage).toEqual({ input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 7 });
+  });
+
+  it("passes prompt_tokens through unchanged and drops the cache field when cached > prompt (malformed)", () => {
+    // A negative input_tokens would be a figure nobody measured; the unmeasurable split is
+    // dropped rather than guessed at.
+    const anth = openAiResponseToAnthropic({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 4,
+        prompt_tokens_details: { cached_tokens: 11 },
+      },
+    }, "m") as any;
+    expect(anth.usage).toEqual({ input_tokens: 10, output_tokens: 4 });
+  });
+
+  it("treats a NEGATIVE cached_tokens as malformed too, not as a subtraction", () => {
+    // Subtracting -5 would publish input_tokens ABOVE the prompt the host stated, alongside a
+    // cache_read nobody measured — same malformed class as cached > prompt.
+    const anth = openAiResponseToAnthropic({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 4,
+        prompt_tokens_details: { cached_tokens: -5 },
+      },
+    }, "m") as any;
+    expect(anth.usage).toEqual({ input_tokens: 10, output_tokens: 4 });
+  });
+
+  it("keeps no cache field when the upstream reported none", () => {
+    const anth = openAiResponseToAnthropic({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    }, "m") as any;
+    expect(anth.usage).toEqual({ input_tokens: 10, output_tokens: 5 });
+  });
 });
 
 describe("anthropicMessageToOpenAi", () => {
@@ -124,6 +174,71 @@ describe("anthropicMessageToOpenAi", () => {
     expect(out.output[1]).toMatchObject({ type: "function_call", call_id: "call_1", name: "get_weather" });
     expect(out.output_text).toBe("hello");
     expect(out.usage.total_tokens).toBe(15);
+  });
+
+  it("sums cache traffic INTO prompt_tokens and reports cached_tokens for an OpenAI client", () => {
+    // Anthropic's input_tokens EXCLUDES cache reads/writes; OpenAI's prompt_tokens INCLUDES
+    // them. Mapping straight across would understate the prompt by exactly that amount.
+    const out = anthropicMessageToOpenAi({
+      ...message,
+      usage: { input_tokens: 3, output_tokens: 5, cache_read_input_tokens: 7 },
+    }, "chat") as any;
+    expect(out.usage).toEqual({
+      prompt_tokens: 10,
+      completion_tokens: 5,
+      total_tokens: 15,
+      prompt_tokens_details: { cached_tokens: 7 },
+    });
+  });
+
+  it("counts cache_creation_input_tokens into prompt_tokens too, without a cached_tokens claim", () => {
+    // A cache WRITE is real billed prompt work but is not a cache READ, so it joins
+    // prompt_tokens while `prompt_tokens_details` stays absent — emitting `{cached_tokens: 0}`
+    // would state a measurement nobody made.
+    const out = anthropicMessageToOpenAi({
+      ...message,
+      usage: { input_tokens: 3, output_tokens: 5, cache_creation_input_tokens: 7 },
+    }, "chat") as any;
+    expect(out.usage).toEqual({
+      prompt_tokens: 10,
+      completion_tokens: 5,
+      total_tokens: 15,
+    });
+    expect(out.usage.prompt_tokens_details).toBeUndefined();
+  });
+
+  it("ignores a NEGATIVE cache_read_input_tokens instead of shrinking prompt_tokens", () => {
+    // Folding -5 into the sum would publish a smaller prompt than input_tokens alone, plus a
+    // `{cached_tokens: -5}` claim — both figures nobody measured. Treated as unreported.
+    const out = anthropicMessageToOpenAi({
+      ...message,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: -5 },
+    }, "chat") as any;
+    expect(out.usage).toEqual({
+      prompt_tokens: 10,
+      completion_tokens: 5,
+      total_tokens: 15,
+    });
+    expect(out.usage.prompt_tokens_details).toBeUndefined();
+  });
+
+  it("keeps prompt_tokens unsplit when the Anthropic backend reported no cache fields", () => {
+    const out = anthropicMessageToOpenAi(message, "chat") as any;
+    expect(out.usage).toEqual({
+      prompt_tokens: 10,
+      completion_tokens: 5,
+      total_tokens: 15,
+    });
+    expect(out.usage.prompt_tokens_details).toBeUndefined();
+  });
+
+  it("leaves total_tokens absent when only one side of the usage is reported", () => {
+    const out = anthropicMessageToOpenAi({
+      ...message,
+      usage: { input_tokens: 10 },
+    }, "chat") as any;
+    expect(out.usage).toEqual({ prompt_tokens: 10 });
+    expect(out.usage.total_tokens).toBeUndefined();
   });
 });
 

@@ -26,10 +26,22 @@ export function syntheticMessageId(): string {
  * nobody made, and a consumer metering off the stream could not tell them from a call
  * that genuinely cost nothing. Same rule the rest of the proxy follows for an unknown
  * limit or price: absent, never guessed.
+ *
+ * Cache fields ride here (never in message_delta) because that is where Anthropic's own
+ * protocol puts them — they are prompt-side facts known before any output exists, and a
+ * client reading them from message_delta would see nothing until end-of-stream.
  */
 function startUsage(msg: AssistantMessage): Record<string, number> {
   const usage: Record<string, number> = {};
   if (typeof msg.usage?.input_tokens === "number") usage.input_tokens = msg.usage.input_tokens;
+  // Each cache field only when numerically reported: emitting `0` for an absent one would
+  // assert "this prompt used no cache", which is a measurement nobody made.
+  if (typeof msg.usage?.cache_creation_input_tokens === "number") {
+    usage.cache_creation_input_tokens = msg.usage.cache_creation_input_tokens;
+  }
+  if (typeof msg.usage?.cache_read_input_tokens === "number") {
+    usage.cache_read_input_tokens = msg.usage.cache_read_input_tokens;
+  }
   // output_tokens is 0 here BY PROTOCOL, not as a guess: at message_start no output has
   // been produced yet and Anthropic streaming fills the real figure in via message_delta.
   // Only stated at all when the backend reported usage — otherwise it is the same
@@ -41,7 +53,9 @@ function startUsage(msg: AssistantMessage): Record<string, number> {
 /**
  * The `message_delta` payload. `usage` is OMITTED when the backend never reported
  * output tokens — `{ output_tokens: 0 }` would assert the call was free, which is a
- * claim, not an absence.
+ * claim, not an absence. It carries ONLY `output_tokens`: Anthropic puts the cache
+ * fields on message_start (see startUsage), and repeating them here would make a
+ * client that merges deltas disagree with one that reads message_start alone.
  */
 function endDelta(msg: AssistantMessage): Record<string, unknown> {
   const payload: Record<string, unknown> = {

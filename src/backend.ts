@@ -741,7 +741,7 @@ export function openAiResponseToAnthropic(
   const usage = rawUsage &&
     (typeof rawUsage.prompt_tokens === "number" || typeof rawUsage.completion_tokens === "number")
     ? {
-        ...(typeof rawUsage.prompt_tokens === "number" ? { input_tokens: rawUsage.prompt_tokens } : {}),
+        ...openAiPromptUsageToAnthropic(rawUsage),
         ...(typeof rawUsage.completion_tokens === "number" ? { output_tokens: rawUsage.completion_tokens } : {}),
       }
     : null;
@@ -958,15 +958,80 @@ export function anthropicMessageToOpenAi(
   return out;
 }
 
-function openAiUsage(raw: unknown): { prompt_tokens?: number; completion_tokens?: number } | null {
+/**
+ * A cache figure this relay is willing to repeat downstream: a finite, non-negative number.
+ * Negative or non-finite is malformed host output, not a measurement, so it is treated exactly
+ * like an absent field — propagating it would shrink a prompt total or publish a negative
+ * `cached_tokens`, i.e. manufacture a figure nobody stated.
+ */
+function measuredCacheTokens(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+/**
+ * Anthropic→OpenAI prompt-side mapping (used when an anthropic-kind backend answers a
+ * Chat/Responses front-door request).
+ *
+ * The two protocols disagree on what "prompt tokens" means: OpenAI's `prompt_tokens` INCLUDES
+ * the cached subset; Anthropic's `input_tokens` EXCLUDES cache reads and cache writes, which
+ * ride in their own fields. Mapping input_tokens straight across therefore UNDER-STATES the
+ * prompt by exactly the cache traffic, so it is summed back here. `cache_read_input_tokens`
+ * additionally becomes `prompt_tokens_details.cached_tokens` — the field an OpenAI client
+ * reads to know how much of the prompt was served from cache — and each output field is
+ * emitted only when its source was actually reported, never zero-filled.
+ */
+function openAiUsage(raw: unknown): { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } | null {
   if (typeof raw !== "object" || raw === null) return null;
   const usage = raw as Record<string, unknown>;
+  const cacheRead = measuredCacheTokens(usage.cache_read_input_tokens);
+  const cacheCreation = measuredCacheTokens(usage.cache_creation_input_tokens);
+  const cacheSum = (cacheRead ?? 0) + (cacheCreation ?? 0);
+  const input = typeof usage.input_tokens === "number" ? usage.input_tokens : undefined;
   // A usage object with no numeric fields is not a measurement. Keep the relay's unknown-vs-zero
   // convention instead of manufacturing a cost report for an upstream that omitted usage.
-  if (typeof usage.input_tokens !== "number" && typeof usage.output_tokens !== "number") return null;
-  return {
-    ...(typeof usage.input_tokens === "number" ? { prompt_tokens: usage.input_tokens } : {}),
+  if (input === undefined && typeof usage.output_tokens !== "number") return null;
+  const out: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } = {
+    ...(input !== undefined ? { prompt_tokens: input + cacheSum } : {}),
     ...(typeof usage.output_tokens === "number" ? { completion_tokens: usage.output_tokens } : {}),
+  };
+  // The details object only when a cache read was actually reported — `{cached_tokens: 0}`
+  // would claim the backend stated something about caching that it did not.
+  if (cacheRead !== undefined) {
+    out.prompt_tokens_details = { cached_tokens: cacheRead };
+  }
+  return out;
+}
+
+/**
+ * OpenAI→Anthropic prompt-side mapping (the translated seam of `openAiResponseToAnthropic`).
+ *
+ * Mirror of `openAiUsage`: subtract the cached subset back OUT of `prompt_tokens`, because
+ * Anthropic's `input_tokens` must exclude it or every downstream reader of the Anthropic shape
+ * (validator, repair envelope re-attachment, SSE re-emission) sees a double-counted figure.
+ * Only mapped when the host actually reported `prompt_tokens_details.cached_tokens`, as a
+ * finite non-negative number; anything else (`cached_tokens > prompt_tokens`, negative,
+ * non-finite) is malformed host output rather than evidence, so the prompt figure passes
+ * through unchanged and the cache field is dropped — an unmeasurable split is not evidence
+ * either way, and inventing one would be worse than none.
+ */
+function openAiPromptUsageToAnthropic(
+  rawUsage: Record<string, unknown>,
+): { input_tokens?: number; cache_read_input_tokens?: number } {
+  if (typeof rawUsage.prompt_tokens !== "number") return {};
+  // Same trust rule as `measuredCacheTokens`, applied to the split direction: a negative or
+  // non-finite `cached_tokens` would make `input_tokens` EXCEED the prompt the host stated, so
+  // it is malformed exactly like `cached > prompt_tokens`.
+  const cached = (() => {
+    const details = rawUsage.prompt_tokens_details;
+    if (typeof details !== "object" || details === null) return undefined;
+    return measuredCacheTokens((details as Record<string, unknown>).cached_tokens);
+  })();
+  if (cached === undefined || cached > rawUsage.prompt_tokens) {
+    return { input_tokens: rawUsage.prompt_tokens };
+  }
+  return {
+    input_tokens: rawUsage.prompt_tokens - cached,
+    cache_read_input_tokens: cached,
   };
 }
 

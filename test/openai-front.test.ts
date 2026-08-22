@@ -167,6 +167,52 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(j.usage.total_tokens).toBe(5);
   });
 
+  it("folds Anthropic cache traffic into the Chat Completions usage it hands the client", async () => {
+    // An anthropic-kind backend reports input/output/cache separately; an OpenAI client reads
+    // ONE prompt figure that includes the cached subset plus `prompt_tokens_details`. Passing
+    // input_tokens straight through would understate the prompt by the whole cache read.
+    process.env.RP_FRONT_KEY = "sk-anthropic";
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "msg_cache",
+          model: "claude-sonnet",
+          content: [{ type: "text", text: "cached answer" }],
+          stop_reason: "end_turn",
+          usage: {
+            input_tokens: 20,
+            output_tokens: 4,
+            cache_read_input_tokens: 5000,
+            cache_creation_input_tokens: 300,
+          },
+        }));
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const c = cfg({ claude: {
+      base: `http://127.0.0.1:${port(backend)}`,
+      kind: "anthropic",
+      authHeader: "x-api-key",
+      timeoutMs: 5000,
+      authEnv: "RP_FRONT_KEY",
+    } }, "claude");
+    proxy = await startProxy(c);
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer CLIENT-SECRET" },
+      body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "hello" }] }),
+    });
+    const j = (await resp.json()) as any;
+    expect(resp.status).toBe(200);
+    // 20 uncached + 300 written + 5000 read from cache = the prompt the client asked about.
+    expect(j.usage.prompt_tokens).toBe(5320);
+    expect(j.usage.completion_tokens).toBe(4);
+    expect(j.usage.total_tokens).toBe(5324);
+    // Only a cache READ becomes cached_tokens — a write is billed work, not a cache hit.
+    expect(j.usage.prompt_tokens_details).toEqual({ cached_tokens: 5000 });
+  });
+
   it("serves Codex-style Responses requests through an Anthropic target", async () => {
     let seen: any;
     let seenCodexMetadata: string | string[] | undefined;

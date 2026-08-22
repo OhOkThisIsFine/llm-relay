@@ -65,8 +65,21 @@ export interface AssistantMessage {
   /**
    * Token usage as the backend reported it. An ABSENT field means "the backend did not
    * tell us", which is not the same claim as `0`; callers must not fill it with a zero.
+   *
+   * The two cache fields carry Anthropic's own semantics: `input_tokens` EXCLUDES cache
+   * reads and cache writes — they arrive separately here because they price differently,
+   * so folding them into a single prompt figure loses information the client meters on.
+   * Deliberately a closed shape (no index signature): unknown usage keys stay with the
+   * byte-transparent path rather than being modelled here.
    */
-  usage?: { input_tokens?: number; output_tokens?: number } | undefined;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    /** Tokens written TO the prompt cache this call (Anthropic reports it separately). */
+    cache_creation_input_tokens?: number;
+    /** Tokens served FROM the prompt cache this call (Anthropic reports it separately). */
+    cache_read_input_tokens?: number;
+  } | undefined;
 }
 
 export function isToolUseBlock(b: ContentBlock): b is ToolUseBlock {
