@@ -27,7 +27,7 @@ import {
 } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { ModelCatalog } from "../src/catalog.js";
-import { interpretRefusal, pendingRefusals, proposeInterpretation, recordUnknownRefusal, resetInterpretations } from "../src/refusal-interpretation.js";
+import { interpretRefusal, pendingRefusals, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations } from "../src/refusal-interpretation.js";
 
 describe("cli helper utilities", () => {
   const origArgv = process.argv;
@@ -594,6 +594,26 @@ describe("llm-relay eligibility scopes", () => {
     process.argv = originalArgv;
     vi.restoreAllMocks();
     resetInterpretations();
+  });
+
+  it("does not reuse a stale PID-only Vitest refusal store", () => {
+    const body = "stale namespace regression";
+    const signature = refusalSignature("provider", "model", 418, body);
+    const legacyPath = join(tmpdir(), `llm-relay-test-interpretations-${process.pid}.json`);
+    rmSync(legacyPath, { force: true });
+    writeFileSync(legacyPath, JSON.stringify({
+      version: 2,
+      confirmed: { [signature]: { class: "not-servable", scope: { kind: "provider" }, source: "seed" } },
+      unknown: {},
+      ignored: {},
+    }));
+    try {
+      resetInterpretations();
+      recordUnknownRefusal("provider", "model", 418, body);
+      expect(pendingRefusals().some((entry) => entry.signature === signature)).toBe(true);
+    } finally {
+      rmSync(legacyPath, { force: true });
+    }
   });
 
   function queue(body: string): string {

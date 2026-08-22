@@ -1,0 +1,7 @@
+import "@testing-library/jest-dom/vitest";
+import { cleanup } from "@testing-library/react";
+import { afterEach } from "vitest";
+
+class TestResizeObserver { observe(): void {} unobserve(): void {} disconnect(): void {} }
+Object.defineProperty(globalThis, "ResizeObserver", { value: TestResizeObserver, configurable: true });
+afterEach(cleanup);

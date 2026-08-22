@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { join } from "node:path";
 import {
   DEFAULT_ANTHROPIC_VERSION,
   resolveTargets,
@@ -31,7 +32,12 @@ import { ToolUseValidator } from "./validator.js";
 import { reconstructFromSse } from "./sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "./emitSse.js";
 import { repair, destructiveMatcher, type RepairOutcome } from "./repair.js";
-import { CredentialWalkReshaper, HttpReshaper, type Reshaper } from "./reshaper.js";
+import {
+  CredentialWalkReshaper,
+  HttpReshaper,
+  type Reshaper,
+  type ReshaperAccountingHooks,
+} from "./reshaper.js";
 import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
@@ -41,6 +47,24 @@ import type { RecoveredOpenAiChat, RecoveredOpenAiChatProcessor } from "./openai
 import { PingLoop } from "./ping/cadence.js";
 import { recordModelCall } from "./ping/runtime-telemetry.js";
 import { createUsageAccumulator, type UsageAccumulator } from "./usage-observer.js";
+import {
+  createAccountingRequest,
+  NOOP_ACCOUNTING_RECORDER,
+  type AccountingAttempt,
+  type AccountingRecorder,
+  type AccountingRequest,
+  type TokenFactsInput,
+} from "./accounting.js";
+import type { AccountingReader } from "./accounting-store.js";
+import { DashboardAuthManager } from "./dashboard-auth.js";
+import { handleDashboardRoute, type DashboardHeaderMap, type DashboardRouteHandled } from "./dashboard-routes.js";
+import { createDashboardSnapshotReadPort } from "./dashboard-snapshot.js";
+import {
+  DASHBOARD_STATIC_SECURITY_HEADERS,
+  DashboardStaticHandler,
+  getProductionDashboardAssetRoot,
+} from "./dashboard-static.js";
+import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens, assessCost } from "./metadata.js";
 import { specOfTarget } from "./benchmarks.js";
@@ -77,7 +101,12 @@ const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-encoding", "host",
 ]);
-const INTERNAL_REQUEST_HEADERS = new Set(["x-codex-turn-metadata", STICKY_SESSION_HEADER, CONTROL_AUTHORIZATION_HEADER]);
+const INTERNAL_REQUEST_HEADERS = new Set([
+  "x-codex-turn-metadata",
+  "x-llm-relay-dashboard-session",
+  STICKY_SESSION_HEADER,
+  CONTROL_AUTHORIZATION_HEADER,
+]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
 
 // `MAX_TASK_LEN` lived here until the admin routes moved to `routes/admin.ts`, which owns the
@@ -211,6 +240,22 @@ const MAX_VALIDATE_BYTES = 8 * 1024 * 1024;
 /** 25 MiB decoded document × base64 expansion, plus JSON-envelope headroom. */
 export const DEFAULT_MAX_BODY_BYTES = 36 * 1024 * 1024;
 
+/** A bare programmatic proxy has no persistence owner, so dashboard reads fail closed as empty. */
+const UNAVAILABLE_ACCOUNTING_READER: AccountingReader = Object.freeze({
+  readDay: () => ({ status: "missing" as const, value: null }),
+  readDays: () => ({
+    status: "missing" as const,
+    days: [],
+    results: [],
+    missingDates: [],
+    corruptDates: [],
+    capped: false,
+  }),
+  readLifetime: () => ({ status: "missing" as const, value: null }),
+  readRecent: () => ({ status: "missing" as const, value: null }),
+  readDetail: () => ({ status: "missing" as const, value: null }),
+});
+
 export interface ProxyDeps {
   reshaper?: Reshaper;
   catalog?: ModelCatalog;
@@ -218,6 +263,16 @@ export interface ProxyDeps {
   breaker?: CircuitBreaker;
   /** Optional per-attempt accounting seam; injected recorders always run. */
   modelCallRecorder?: ModelCallRecorder;
+  /** Request-scoped accounting is observational and never controls proxy flow. */
+  accountingRecorder?: AccountingRecorder;
+  /** The production accounting store supplies this same reader and recorder instance. */
+  accountingReader?: AccountingReader;
+  /** Test/dev-only explicit asset root; production resolves the compiled dashboard once. */
+  dashboardAssetRoot?: string;
+  /** Version shown by dashboard projections; a bare proxy deliberately remains unknown. */
+  dashboardRelayVersion?: string;
+  /** Explicit projection policy label; a bare proxy deliberately remains unknown. */
+  dashboardAttributionPolicy?: AttributionPolicy;
   /** null deliberately exercises fail-closed control authorization. */
   controlAuthorization?: ControlAuthorizationPort | null;
 }
@@ -238,6 +293,22 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   // Process-local and deliberately credential-wide: a deployment switch must not reset fairness.
   const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
+  const accountingRecorder = deps.accountingRecorder ?? NOOP_ACCOUNTING_RECORDER;
+  // Do not create a second persistence store here.  The CLI owns the production store lifecycle
+  // and supplies the same object as recorder and reader; a bare in-memory proxy reports no data.
+  const dashboardAuth = new DashboardAuthManager();
+  const dashboardAssetRoot = deps.dashboardAssetRoot ?? getProductionDashboardAssetRoot();
+  const dashboardStatic = new DashboardStaticHandler({
+    assetRoot: dashboardAssetRoot,
+    // Vite writes this only at build time. Source-driven runs therefore fail closed for assets
+    // rather than discovering or probing a development server on each request.
+    manifestPath: join(dashboardAssetRoot, ".vite", "manifest.json"),
+  });
+  const dashboardRead = createDashboardSnapshotReadPort({
+    accounting: deps.accountingReader ?? UNAVAILABLE_ACCOUNTING_READER,
+    relayVersion: deps.dashboardRelayVersion ?? "unknown",
+    attributionPolicy: deps.dashboardAttributionPolicy ?? "unknown",
+  });
   const stickyConfig = cfg.routing.sticky;
   const stickySessions = stickyConfig === true || (typeof stickyConfig === "object" && stickyConfig.enabled)
     ? new StickySessionManager(typeof stickyConfig === "object" ? stickyConfig : undefined)
@@ -314,7 +385,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
     }
 
     const spec = reshaperForTarget(servedAttempt.target);
-    return spec ? new HttpReshaper(spec, servedAttempt.credential) : undefined;
+    return spec ? new HttpReshaper(spec, servedAttempt.credential, fetch, undefined, servedAttempt) : undefined;
   };
 
   const server = createServer((req, res) => {
@@ -329,6 +400,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       breaker,
       credentialLru,
       ...(modelCallRecorder ? { modelCallRecorder } : {}),
+      accountingRecorder,
+      dashboardAuth,
+      dashboardStatic,
+      dashboardRead,
       ...(stickySessions ? { stickySessions } : {}),
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
@@ -378,22 +453,376 @@ interface Handlers {
   breaker: CircuitBreaker;
   credentialLru: CredentialLru;
   modelCallRecorder?: ModelCallRecorder;
+  accountingRecorder: AccountingRecorder;
+  dashboardAuth: DashboardAuthManager;
+  dashboardStatic: DashboardStaticHandler;
+  dashboardRead: ReturnType<typeof createDashboardSnapshotReadPort>;
   stickySessions?: StickySessionManager;
   controlAuthorization?: ControlAuthorizationPort;
   server: Server;
+}
+
+type ProxyAccountingAttribution = "relay_held" | "caller_operated" | "unknown";
+type ProxyAccountingFailureKind = "timeout" | "provider_error" | "auth_error" | "rate_limit" | "aborted" | "protocol" | "unknown";
+
+function isCallerVisibleAccountingPath(method: string | undefined, pathname: string): boolean {
+  if (method !== "POST") return false;
+  return pathname === "/v1/messages"
+    || pathname === "/v1/chat/completions"
+    || pathname === "/chat/completions"
+    || pathname === "/v1/responses"
+    || pathname === "/responses";
+}
+
+/** Records caller-visible terminals that occur before parsed-request accounting exists. */
+function recordEarlyTerminalAccounting(
+  recorder: AccountingRecorder,
+  startedAt: number,
+  client: string,
+): void {
+  try {
+    createAccountingRequest({ recorder, startedAt, client }).complete({
+      outcome: "error",
+      failureKind: "protocol",
+      attribution: "unknown",
+      endedAt: Date.now(),
+    });
+  } catch {
+    // Accounting is observational and must never change caller traffic.
+  }
+}
+
+function serveAccountingAttribution(attempt: ResolvedAttempt): ProxyAccountingAttribution {
+  if (attempt.credential.state === "declared-present") return "relay_held";
+  if (attempt.credential.state === "not-declared" && attempt.target.credentialMode !== "contained") {
+    return "caller_operated";
+  }
+  return "unknown";
+}
+
+function repairAccountingAttribution(state: ResolvedAttempt["credential"]["state"]): ProxyAccountingAttribution {
+  return state === "declared-present" ? "relay_held" : "unknown";
+}
+
+function accountingTokens(usage: UsageAccumulator, estimatedInputTokens: number): TokenFactsInput {
+  return {
+    reported: {
+      ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
+      ...(usage.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : {}),
+      ...(usage.cachedInputTokens !== undefined ? { cachedInputTokens: usage.cachedInputTokens } : {}),
+      ...(usage.cacheCreationInputTokens !== undefined
+        ? { cacheCreationInputTokens: usage.cacheCreationInputTokens }
+        : {}),
+      ...(usage.cacheReadInputTokens !== undefined ? { cacheReadInputTokens: usage.cacheReadInputTokens } : {}),
+    },
+    ...(estimatedInputTokens > 0
+      ? { estimated: { inputTokens: estimatedInputTokens, inputMethod: "relay_estimate" } }
+      : {}),
+  };
+}
+
+/**
+ * Request accounting is intentionally separate from health state: health owns
+ * routing decisions, while this helper only observes actual egress and the
+ * downstream response lifetime. Every method is fail-open for proxy traffic.
+ */
+class RequestAccountingState {
+  private readonly request: AccountingRequest | null;
+  private readonly active = new Set<AccountingAttempt>();
+  private responseTerminal: "finished" | "cancelled" | null = null;
+  private finalized = false;
+  private successfulServe = false;
+  private committedServeAttribution: ProxyAccountingAttribution | null = null;
+  private lastFailure: ProxyAccountingFailureKind = "unknown";
+  private lastAttribution: ProxyAccountingAttribution = "unknown";
+
+  constructor(
+    recorder: AccountingRecorder,
+    response: ServerResponse,
+    startedAt: number,
+    private readonly estimatedInputTokens: number,
+    client: string,
+  ) {
+    try {
+      this.request = createAccountingRequest({ recorder, startedAt, client });
+    } catch {
+      this.request = null;
+    }
+
+    response.once("finish", () => {
+      if (this.responseTerminal === null) this.responseTerminal = "finished";
+      this.finalizeIfReady();
+    });
+    response.once("close", () => {
+      if (this.responseTerminal === null) {
+        this.responseTerminal = response.writableFinished ? "finished" : "cancelled";
+      }
+      this.finalizeIfReady();
+    });
+  }
+
+  startServe(attempt: ResolvedAttempt, startedAt: number): AccountingAttempt | null {
+    return this.start("serve", {
+      startedAt,
+      attribution: serveAccountingAttribution(attempt),
+      provider: attempt.target.provider,
+      model: attempt.target.model ?? null,
+      credentialId: attempt.credentialId,
+    });
+  }
+
+  startRepair(options: {
+    readonly resolvedAttempt: ResolvedAttempt | null;
+    readonly credentialState: ResolvedAttempt["credential"]["state"];
+    readonly provider: string | null;
+    readonly model: string | null;
+    readonly credentialId: string | null;
+    readonly startedAt: number;
+  }): AccountingAttempt | null {
+    return this.start("repair", {
+      startedAt: options.startedAt,
+      attribution: repairAccountingAttribution(options.credentialState),
+      provider: options.resolvedAttempt?.target.provider ?? options.provider,
+      model: options.resolvedAttempt?.target.model ?? options.model,
+      credentialId: options.resolvedAttempt?.credentialId ?? options.credentialId,
+    });
+  }
+
+  markCommitted(attempt: AccountingAttempt | null, at: number): void {
+    if (attempt === null) return;
+    try {
+      if (attempt.markCommitted({ at }) && attempt.role === "serve") {
+        this.committedServeAttribution = attempt.attribution;
+      }
+    } catch {
+      // Accounting must not perturb a successful response write.
+    }
+  }
+
+  complete(
+    attempt: AccountingAttempt | null,
+    outcome: "success" | "error" | "cancelled",
+    failureKind: ProxyAccountingFailureKind | null,
+    usage: UsageAccumulator,
+    endedAt = Date.now(),
+  ): void {
+    if (attempt === null) return;
+    try {
+      attempt.complete({
+        outcome,
+        failureKind,
+        endedAt,
+        tokens: accountingTokens(usage, attempt.role === "serve" ? this.estimatedInputTokens : 0),
+      });
+    } catch {
+      // The recorder and its packets are strictly observational.
+    }
+    this.active.delete(attempt);
+    this.lastAttribution = attempt.attribution;
+    if (attempt.role === "serve" && outcome === "success") this.successfulServe = true;
+    if (outcome !== "success" && failureKind !== null) this.lastFailure = failureKind;
+    this.finalizeIfReady();
+  }
+
+  private start(
+    role: "serve" | "repair",
+    options: {
+      readonly startedAt: number;
+      readonly attribution: ProxyAccountingAttribution;
+      readonly provider: string | null;
+      readonly model: string | null;
+      readonly credentialId: string | null;
+    },
+  ): AccountingAttempt | null {
+    if (this.request === null || this.finalized || this.responseTerminal === "cancelled") return null;
+    try {
+      const attempt = this.request.startAttempt({ role, ...options });
+      this.active.add(attempt);
+      this.lastAttribution = options.attribution;
+      return attempt;
+    } catch {
+      return null;
+    }
+  }
+
+  isRequestClosed(): boolean {
+    return this.responseTerminal !== null || this.finalized;
+  }
+
+  private finalizeIfReady(): void {
+    if (this.finalized || this.request === null || this.responseTerminal === null || this.active.size > 0) return;
+    this.finalized = true;
+    try {
+      if (this.responseTerminal === "cancelled") {
+        this.request.complete({
+          outcome: "cancelled",
+          failureKind: "aborted",
+          attribution: this.committedServeAttribution ?? this.lastAttribution,
+        });
+      } else if (this.successfulServe) {
+        this.request.complete();
+      } else {
+        this.request.complete({
+          outcome: "error",
+          failureKind: this.lastFailure,
+          attribution: this.committedServeAttribution ?? this.lastAttribution,
+        });
+      }
+    } catch {
+      // A malformed accounting packet must never affect the caller response.
+    }
+  }
+}
+
+function withRepairAccounting(reshaper: Reshaper, accounting: RequestAccountingState | null): Reshaper {
+  if (accounting === null) return reshaper;
+  const hooks: ReshaperAccountingHooks = {
+    startRepairAttempt(options) {
+      const attempt = accounting.startRepair(options);
+      if (attempt === null) return null;
+      return {
+        complete(completion) {
+          accounting.complete(
+            attempt,
+            completion.outcome,
+            completion.failureKind,
+            completion.usage,
+            completion.endedAt,
+          );
+        },
+      };
+    },
+    isRequestClosed() {
+      return accounting.isRequestClosed();
+    },
+  };
+  return {
+    reshape(request) {
+      return reshaper.reshape(request, hooks);
+    },
+  };
+}
+
+function dashboardHeaders(req: IncomingMessage): DashboardHeaderMap {
+  const headers: Record<string, string[]> = {};
+  for (let index = 0; index < req.rawHeaders.length; index += 2) {
+    const name = req.rawHeaders[index];
+    const value = req.rawHeaders[index + 1];
+    if (name === undefined || value === undefined) continue;
+    const key = name.toLowerCase();
+    (headers[key] ??= []).push(value);
+  }
+  return headers;
+}
+
+/** Canonical dashboard origin synthesis, including the brackets required by IPv6 URLs. */
+export function dashboardExpectedOriginForAuthority(hostname: string, port: number): string {
+  const host = hostname.includes(":") ? `[${hostname}]` : hostname;
+  return `http://${host}:${port}`;
+}
+
+function dashboardExpectedOrigin(server: Server, cfg: Config): string | null {
+  const authority = listenerAuthority(server, cfg);
+  if (!authority) return null;
+  return dashboardExpectedOriginForAuthority(authority.hostname, authority.port);
+}
+
+/**
+ * Treat percent spellings of the dashboard namespace as dashboard requests even when malformed.
+ * They are never canonicalized or served; this is only a fail-closed egress boundary.
+ */
+function dashboardNamespaceTarget(path: string): boolean {
+  const rawPath = path.split("?", 1)[0] ?? "";
+  // Literal routes retain their deliberately narrow mount. Percent-bearing lookalikes take the
+  // stricter path below so an encoded separator/query/dot/backslash can never fall through.
+  if (!rawPath.includes("%")) return rawPath === "/dashboard" || rawPath.startsWith("/dashboard/");
+  const percentTolerant = rawPath.replace(/%([0-9a-fA-F]{2})/g, (_match, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  );
+  return percentTolerant.startsWith("/dashboard") || rawPath.startsWith("/dashboard%");
+}
+
+function writeDashboardResponse(res: ServerResponse, response: DashboardRouteHandled): void {
+  res.writeHead(response.status, response.headers);
+  res.end(response.body);
+}
+
+function failDashboardClosed(res: ServerResponse, status: number, message: string): void {
+  failClosed(res, status, message, { ...DASHBOARD_STATIC_SECURITY_HEADERS, "Cache-Control": "no-store" });
+}
+
+async function handleDashboardAdapter(
+  req: IncomingMessage,
+  res: ServerResponse,
+  path: string,
+  cfg: Config,
+  h: Handlers,
+): Promise<boolean> {
+  if (!dashboardNamespaceTarget(path)) return false;
+
+  // Static handling is synchronous and intentionally receives the raw target: query strings and
+  // alternate spellings are not cache variants on this tokenless surface.
+  const staticResponse = h.dashboardStatic.handle({ method: req.method ?? "GET", path });
+  if (staticResponse.handled) {
+    const staticHeaders = staticResponse.status === 404 || staticResponse.status === 405
+      ? { ...DASHBOARD_STATIC_SECURITY_HEADERS, "Cache-Control": "no-store", ...staticResponse.headers }
+      : staticResponse.headers;
+    res.writeHead(staticResponse.status, staticHeaders);
+    res.end(staticResponse.body);
+    return true;
+  }
+
+  const expectedOrigin = dashboardExpectedOrigin(h.server, cfg);
+  if (expectedOrigin === null) {
+    failDashboardClosed(res, 403, "listener authority is unavailable");
+    return true;
+  }
+
+  const response = await handleDashboardRoute(
+    {
+      method: req.method ?? "GET",
+      target: path,
+      headers: dashboardHeaders(req),
+      admission: {
+        hostAuthorized: true,
+        expectedOrigin,
+        // Bootstrap is a dashboard-specific control operation. The generic admission above
+        // remains unchanged for every existing route; this only supplies the route contract.
+        controlAuthorized: validateControlAuthorization(h.controlAuthorization, req.headers),
+      },
+      readBody: (maxBytes) => readBody(req, maxBytes),
+    },
+    { auth: h.dashboardAuth, read: h.dashboardRead },
+  );
+  if (response.handled) {
+    writeDashboardResponse(res, response);
+    return true;
+  }
+
+  // Do not let a dashboard lookalike reach proxy routing. This covers unknown API paths and
+  // every other /dashboard/* spelling while preserving all existing non-dashboard routes.
+  failDashboardClosed(res, 404, "dashboard route not found");
+  return true;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
   const started = Date.now();
   const path = req.url ?? "/";
   const pathname = path.split("?")[0] ?? path;
+  const requestClient = clientForPath(pathname);
 
   const admissionErr = admissionFailure(req, pathname, h.server, cfg, h.controlAuthorization);
   if (admissionErr) {
-    failClosed(res, 403, admissionErr);
+    if (dashboardNamespaceTarget(path)) failDashboardClosed(res, 403, admissionErr);
+    else failClosed(res, 403, admissionErr);
     h.logger.write(baseLog(started, path, false, false, 403, "skipped", null));
     return;
   }
+
+  // The dashboard owns a deliberately tiny route namespace.  It must run before the generic
+  // proxy body reader: static GET/HEAD never buffer, and dashboard writes retain their 16 KiB
+  // cap rather than inheriting the data-plane's 36 MiB allowance.
+  if (await handleDashboardAdapter(req, res, path, cfg, h)) return;
 
   let reqBuf: Buffer;
   try {
@@ -401,6 +830,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   } catch (e) {
     const msg = (e as Error).message;
     const status = msg.includes("too large") ? 413 : 400;
+    if (isCallerVisibleAccountingPath(req.method, pathname)) {
+      recordEarlyTerminalAccounting(h.accountingRecorder, started, requestClient);
+    }
     failClosed(res, status, msg);
     h.logger.write(baseLog(started, path, false, false, status, "skipped", null));
     return;
@@ -418,6 +850,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const wantsStream = pickBool(reqJson, "stream");
   const handled = await handleAdminRoutes(req, res, pathname, path, started, reqJson, cfg, h);
   if (handled) return;
+
+  // Only exact caller-visible inference routes create a request lifecycle.
+  // Admin/control aliases and prefix lookalikes remain outside accounting.
+  const accounting = isCallerVisibleAccountingPath(req.method, pathname)
+    ? new RequestAccountingState(
+      h.accountingRecorder,
+      res,
+      started,
+      estimateRequestTokens(reqJson),
+      requestClient,
+    )
+    : null;
 
 
 
@@ -447,7 +891,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     // `@relay: <spec>` in the dispatcher's prompt (stripped here, so the model never sees it),
     // Claude's cc_is_subagent marker, or Codex's request metadata header. Main-conversation
     // requests remain untouched unless that front door's rule explicitly uses scope "all".
-    const requestClient = clientForPath(pathname);
     const subSpec = subagentSpec(reqJson, model, cfg, req.headers, requestClient);
     const routedModel = subSpec ?? model;
     materializeDynamicPools(cfg, h.catalog);
@@ -648,6 +1091,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       degradedSpecs,
       sticky,
       cfg,
+      accounting,
     }, h);
     return;
   }
@@ -683,19 +1127,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     if (!resolvedAttempt) break;
     target = resolvedAttempt.target;
     const controller = new AbortController();
+    const callerController = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
     const onResClose = () => {
-      if (!res.writableEnded) controller.abort();
+      if (!res.writableEnded) {
+        callerController.abort();
+        controller.abort();
+      }
     };
     res.on("close", onResClose);
     let attempt: HealthAttempt | undefined;
     const usage = createUsageAccumulator();
-    let egressCallbackCalled = false;
-    const onEgress = () => {
-      egressCallbackCalled = true;
-      attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace, usage) ?? undefined;
-      if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
-      recordCredentialStarted(credentialWalk, credentialTrace, resolvedAttempt);
+      let egressCallbackCalled = false;
+      const onEgress = () => {
+        egressCallbackCalled = true;
+        const egressAt = Date.now();
+        attempt = beginHealthAttempt(h, resolvedAttempt, egressAt, attemptTrace, usage, accounting) ?? undefined;
+        if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
+        attempt.accountingAttempt = accounting?.startServe(resolvedAttempt, egressAt) ?? null;
+        recordCredentialStarted(credentialWalk, credentialTrace, resolvedAttempt);
       tried.push(specOfTarget(target));
     };
     let credentialRecorded = false;
@@ -942,9 +1392,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       }
 
       const willValidate = isMessages && hadTools && backendRes.status < 400;
-      const reshaper = cfg.mode === "repair" && willValidate
+      const rawReshaper = cfg.mode === "repair" && willValidate
         ? h.resolveReshaper(resolvedAttempt)
         : undefined;
+      const reshaper = rawReshaper ? withRepairAccounting(rawReshaper, accounting) : undefined;
       const doRepair = reshaper !== undefined;
       const streamCommitted = streamed && backendRes.status < 400;
       const responseCtx: Ctx = {
@@ -955,9 +1406,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         hadTools,
         req,
         target,
-        attempt,
-        signal: controller.signal,
-        reportedModelSource,
+      attempt,
+      signal: controller.signal,
+      callerSignal: callerController.signal,
+      reportedModelSource,
         retryAfterOverrideMs: pool429.overrideMs(backendRes.status, retryAfterMs),
         poolSummary: null,
         poolUnknownRefusals: pool429.unknownCount(),
@@ -1650,6 +2102,8 @@ interface Ctx {
   target: ResolvedTarget;
   attempt: HealthAttempt;
   signal: AbortSignal;
+  /** Actual client response lifetime, kept separate from provider deadlines. */
+  callerSignal: AbortSignal;
   /** Original adapter response retaining private raw-upstream provenance across stream wrappers. */
   reportedModelSource: Response;
 }
@@ -1682,6 +2136,8 @@ interface HealthAttempt {
   readonly started: number;
   readonly trace: RequestAttemptTrace;
   readonly usage: UsageAccumulator;
+  readonly accounting: RequestAccountingState | null;
+  accountingAttempt: AccountingAttempt | null;
   completed: boolean;
   terminal?: "succeeded" | "failed" | "cancelled";
 }
@@ -1703,6 +2159,7 @@ function beginHealthAttempt(
   started: number,
   trace: RequestAttemptTrace,
   usage: UsageAccumulator,
+  accounting: RequestAccountingState | null,
 ): HealthAttempt | null {
   const identity = targetIdentity(resolvedAttempt);
   const begun = h.breaker.beginAttempt(identity);
@@ -1715,6 +2172,8 @@ function beginHealthAttempt(
     started,
     trace,
     usage,
+    accounting,
+    accountingAttempt: null,
     completed: false,
   };
 }
@@ -2018,6 +2477,22 @@ function observeAttemptHeaders(
   if (!result.ok) throw new Error(`attempt header observation rejected: ${result.error.kind}`);
 }
 
+function accountingFailureForAttempt(options: {
+  readonly failure: AttemptFailed["failure"];
+  readonly provenance: OutcomeProvenance;
+  readonly status: number | null;
+}): ProxyAccountingFailureKind {
+  if (options.status === 401 || options.status === 403) return "auth_error";
+  if (options.status === 429) return "rate_limit";
+  if (options.failure === "protocol" || options.failure === "mapping") return "protocol";
+  if (options.failure === "transport" && options.provenance === "deadline") return "timeout";
+  return "provider_error";
+}
+
+function markAttemptCommitted(attempt: HealthAttempt): void {
+  attempt.accounting?.markCommitted(attempt.accountingAttempt, Date.now());
+}
+
 function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: number): void {
   if (attempt.completed) return;
   const completedAt = Date.now();
@@ -2034,6 +2509,7 @@ function completeAttemptSuccess(h: Handlers, attempt: HealthAttempt, status: num
   attempt.terminal = "succeeded";
   attempt.trace.record(attempt.target, status, attempt.started, completedAt);
   recordCall(h, attempt, true, completedAt);
+  attempt.accounting?.complete(attempt.accountingAttempt, "success", null, attempt.usage, completedAt);
   // A served request is first-party proof that this deployment exists and that the credential has
   // allowance RIGHT NOW — strictly better evidence than any stored refusal, so it clears the
   // record, including the account-scoped one. That is how a topped-up balance or a rolled-over
@@ -2089,6 +2565,13 @@ function completeAttemptFailure(
     completedAt,
   );
   recordCall(h, attempt, false, completedAt);
+  attempt.accounting?.complete(
+    attempt.accountingAttempt,
+    "error",
+    accountingFailureForAttempt(options),
+    attempt.usage,
+    completedAt,
+  );
 }
 
 function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: string | null): void {
@@ -2106,6 +2589,7 @@ function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: s
   attempt.completed = true;
   attempt.terminal = "cancelled";
   attempt.trace.record(attempt.target, "cancelled", attempt.started, completedAt);
+  attempt.accounting?.complete(attempt.accountingAttempt, "cancelled", "aborted", attempt.usage, completedAt);
 }
 
 type PostHeaderBodyDisposition = "cancelled" | "timeout" | "protocol";
@@ -2188,6 +2672,7 @@ async function openAiFrontPath(
     degradedSpecs?: Set<string> | null;
     sticky?: StickyRequestContext | null;
     cfg?: Config;
+    accounting: RequestAccountingState | null;
   },
   h: Handlers,
 ): Promise<void> {
@@ -2201,9 +2686,13 @@ async function openAiFrontPath(
     if (!resolvedAttempt) break;
     const target = resolvedAttempt.target;
     const controller = new AbortController();
+    const callerController = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
     const onResClose = () => {
-      if (!res.writableEnded) controller.abort();
+      if (!res.writableEnded) {
+        callerController.abort();
+        controller.abort();
+      }
     };
     res.on("close", onResClose);
     let attempt: HealthAttempt | undefined;
@@ -2211,8 +2700,10 @@ async function openAiFrontPath(
     let egressCallbackCalled = false;
     const onEgress = () => {
       egressCallbackCalled = true;
-      attempt = beginHealthAttempt(h, resolvedAttempt, Date.now(), attemptTrace, usage) ?? undefined;
+      const egressAt = Date.now();
+      attempt = beginHealthAttempt(h, resolvedAttempt, egressAt, attemptTrace, usage, ctx.accounting) ?? undefined;
       if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
+      attempt.accountingAttempt = ctx.accounting?.startServe(resolvedAttempt, egressAt) ?? null;
       recordCredentialStarted(credentialWalk, credentialTrace, resolvedAttempt);
       tried.push(specOfTarget(target));
     };
@@ -2274,7 +2765,8 @@ async function openAiFrontPath(
       };
       if (validation.valid || ctx.cfg?.mode !== "repair") return recovered;
 
-      const reshaper = h.resolveReshaper(resolvedAttempt);
+      const rawReshaper = h.resolveReshaper(resolvedAttempt);
+      const reshaper = rawReshaper ? withRepairAccounting(rawReshaper, ctx.accounting) : undefined;
       if (!reshaper) return recovered;
       const decision = await repair(assistant, directTools, {
         validator: h.validator,
@@ -2282,6 +2774,7 @@ async function openAiFrontPath(
         maxAttempts: ctx.cfg.repair.maxAttempts,
         isDestructive: h.isDestructive,
         backendModel: target.model ?? null,
+        signal: callerController.signal,
       });
       recoveryAudit.value.repair = decision.outcome;
       if (decision.outcome !== "fixed" || !decision.message) {
@@ -2645,7 +3138,9 @@ async function openAiFrontPath(
           if (upstream.body) {
             for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
               const bytes = Buffer.from(chunk);
-              if (!await writeChunk(res, bytes)) break;
+              if (!await writeChunk(res, bytes, () => {
+                if (attempt) markAttemptCommitted(attempt);
+              })) break;
               if (bytes.length > 0) responseBytesWritten = true;
             }
           }
@@ -2762,7 +3257,11 @@ async function transparentPath(
       let overflow = false;
       for await (const chunk of backendRes.body as unknown as AsyncIterable<Uint8Array>) {
         const bytes = Buffer.from(chunk);
-        if (!await writeChunk(res, bytes)) break;
+        if (!await writeChunk(
+          res,
+          bytes,
+          backendRes.status < 400 ? () => markAttemptCommitted(ctx.attempt) : undefined,
+        )) break;
         if (bytes.length > 0) responseBytesWritten = true;
         if (ctx.willValidate && !overflow) {
           acc += decoder.decode(chunk, { stream: true });
@@ -2773,7 +3272,10 @@ async function transparentPath(
       if (ctx.willValidate && !overflow) assistant = reconstructFromSse(acc + decoder.decode());
     } else {
       const bytes = Buffer.from(await backendRes.arrayBuffer());
-      if (!res.writableEnded) res.end(bytes);
+      if (!res.writableEnded) {
+        if (backendRes.status < 400 && bytes.length > 0) markAttemptCommitted(ctx.attempt);
+        res.end(bytes);
+      }
       // Same as the OpenAI front's terminal branch: the served response is the last candidate's,
       // and for a single-member pool the only refusal we will ever see. Errors are never streamed,
       // so this branch is where they land.
@@ -2927,7 +3429,7 @@ async function repairStreamingPath(
   };
   const forward = async (frame: Buffer) => {
     ensureHead();
-    if (await writeChunk(res, frame) && frame.length > 0) responseBytesWritten = true;
+    if (await writeChunk(res, frame, () => markAttemptCommitted(ctx.attempt)) && frame.length > 0) responseBytesWritten = true;
   };
   const flushHeld = async () => {
     for (const f of held) {
@@ -3047,11 +3549,16 @@ async function repairStreamingPath(
         maxAttempts: ctx.maxAttempts,
         isDestructive: h.isDestructive,
         backendModel: ctx.target.model ?? null,
+        signal: ctx.callerSignal,
       });
       repairOutcome = decision.outcome;
       ensureHead(); // message_start + leading text already forwarded
       if (decision.outcome === "fixed" && decision.message) {
-        if (!res.writableEnded) res.end(emitSseTail(decision.message, firstToolUseIndex));
+        if (!res.writableEnded) {
+          const tail = emitSseTail(decision.message, firstToolUseIndex);
+          if (tail.length > 0) markAttemptCommitted(ctx.attempt);
+          res.end(tail);
+        }
       } else {
         // Head already committed — surface a mid-stream SSE error, never a fabricated call.
         if (!res.writableEnded) res.end(sseError(`llm-relay: tool call could not be repaired (${decision.outcome})`));
@@ -3157,7 +3664,10 @@ async function repairBufferedPath(
     } else {
       recordFinalWalk(backendRes.status, filtered);
       res.writeHead(backendRes.status, filtered);
-      if (!res.writableEnded) res.end(bytes);
+          if (!res.writableEnded) {
+            if (backendRes.status < 400 && bytes.length > 0) markAttemptCommitted(ctx.attempt);
+            res.end(bytes);
+          }
     }
   } else {
     const r = h.validator.validate(assistant, ctx.tools);
@@ -3167,7 +3677,10 @@ async function repairBufferedPath(
       validated = r.uncheckableCount > 0 ? "uncheckable" : "pass";
       recordFinalWalk(backendRes.status, filtered);
       res.writeHead(backendRes.status, filtered); // pass through untouched
-      if (!res.writableEnded) res.end(bytes);
+        if (!res.writableEnded) {
+          if (backendRes.status < 400 && bytes.length > 0) markAttemptCommitted(ctx.attempt);
+          res.end(bytes);
+        }
     } else {
       validated = "fail";
       errorKinds = dedupe(r.errors.map((e) => e.kind));
@@ -3177,11 +3690,12 @@ async function repairBufferedPath(
         maxAttempts: ctx.maxAttempts,
         isDestructive: h.isDestructive,
         backendModel: ctx.target.model ?? null,
+        signal: ctx.callerSignal,
       });
       repairOutcome = decision.outcome;
       if (decision.outcome === "fixed" && decision.message) {
         recordFinalWalk(backendRes.status, filtered);
-        emitFixed(res, backendRes.status, filtered, decision.message, ctx.wantsStream);
+      emitFixed(res, backendRes.status, filtered, decision.message, ctx.wantsStream, () => markAttemptCommitted(ctx.attempt));
       } else if (decision.outcome === "failed") {
         // Nothing has been committed on the buffered path. The outer candidate loop decides
         // whether this request can resume or whether this remains the terminal fail-clean 502.
@@ -3246,13 +3760,22 @@ function emitFixed(
   filtered: Record<string, string | string[]>,
   message: AssistantMessage,
   wantsStream: boolean,
+  beforeBody?: () => void,
 ): void {
   if (wantsStream) {
     res.writeHead(status, { ...filtered, "content-type": "text/event-stream" });
-    if (!res.writableEnded) res.end(emitSse(message));
+    if (!res.writableEnded) {
+      const body = emitSse(message);
+      if (body.length > 0) beforeBody?.();
+      res.end(body);
+    }
   } else {
     res.writeHead(status, { ...filtered, "content-type": "application/json" });
-    if (!res.writableEnded) res.end(JSON.stringify(toAnthropicMessage(message)));
+    if (!res.writableEnded) {
+      const body = JSON.stringify(toAnthropicMessage(message));
+      if (body.length > 0) beforeBody?.();
+      res.end(body);
+    }
   }
 }
 
@@ -3593,9 +4116,10 @@ function readBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES): Prom
   });
 }
 
-async function writeChunk(res: ServerResponse, chunk: Buffer): Promise<boolean> {
+async function writeChunk(res: ServerResponse, chunk: Buffer, beforeWrite?: () => void): Promise<boolean> {
   if (res.destroyed || res.writableEnded) return false;
   try {
+    if (chunk.length > 0) beforeWrite?.();
     const ok = res.write(chunk);
     if (!ok && !res.destroyed && !res.writableEnded) {
       await new Promise<void>((resolve) => {

@@ -235,6 +235,179 @@ describe("reconstruct", () => {
   });
 });
 
+describe("HttpReshaper repair lifecycle", () => {
+  const config = {
+    base: "http://repair.invalid",
+    model: "repair-model",
+    kind: "openai" as const,
+    authHeader: "authorization" as const,
+    timeoutMs: 5_000,
+  };
+
+  it("bounds non-OK response draining while preserving usage from a small error envelope", async () => {
+    let streamedPulls = 0;
+    let streamedCancelled = 0;
+    const streamed = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        streamedPulls += 1;
+        controller.enqueue(new Uint8Array(512 * 1024));
+      },
+      cancel() {
+        streamedCancelled += 1;
+      },
+    });
+    const oversized = new HttpReshaper(config, KEYLESS, async () => new Response(streamed, { status: 503 }));
+    await expect(oversized.reshape(req)).rejects.toMatchObject({ outcome: { status: 503 } });
+    expect(streamedCancelled).toBe(1);
+    expect(streamedPulls).toBeLessThanOrEqual(3);
+
+    let statedPulls = 0;
+    let statedCancelled = 0;
+    const stated = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        statedPulls += 1;
+        controller.enqueue(new Uint8Array(1));
+      },
+      cancel() {
+        statedCancelled += 1;
+      },
+    });
+    const statedOversized = new HttpReshaper(config, KEYLESS, async () => new Response(stated, {
+      status: 503,
+      headers: { "content-length": String(1024 * 1024 + 1) },
+    }));
+    await expect(statedOversized.reshape(req)).rejects.toMatchObject({ outcome: { status: 503 } });
+    expect(statedCancelled).toBe(1);
+    // `Response` may begin one pull while it adopts a stream, but the drain
+    // itself must reject a valid oversized Content-Length before reading it.
+    expect(statedPulls).toBeLessThanOrEqual(1);
+
+    let reportedInput: number | undefined;
+    let reportedOutput: number | undefined;
+    const small = new HttpReshaper(config, KEYLESS, async () => new Response(JSON.stringify({
+      usage: { prompt_tokens: 17, completion_tokens: 5 },
+    }), { status: 503 }));
+    await expect(small.reshape(req, {
+      startRepairAttempt() {
+        return {
+          complete(completion) {
+            reportedInput = completion.usage.inputTokens;
+            reportedOutput = completion.usage.outputTokens;
+          },
+        };
+      },
+    })).rejects.toMatchObject({ outcome: { status: 503 } });
+    expect(reportedInput).toBe(17);
+    expect(reportedOutput).toBe(5);
+  });
+
+  it("does not start an accounting attempt or fetch when the caller already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let fetches = 0;
+    let beforeFetches = 0;
+    let starts = 0;
+    const reshaper = new HttpReshaper(config, KEYLESS, async () => {
+      fetches += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }));
+    }, () => { beforeFetches += 1; });
+    await expect(reshaper.reshape({ ...req, signal: controller.signal }, {
+      startRepairAttempt() {
+        starts += 1;
+        return { complete() {} };
+      },
+    })).rejects.toMatchObject({ outcome: { kind: "cancelled" } });
+    expect(fetches).toBe(0);
+    expect(beforeFetches).toBe(0);
+    expect(starts).toBe(0);
+  });
+
+  it("does not fetch after the accounting hook observes a closed request", async () => {
+    let fetches = 0;
+    let starts = 0;
+    let closed = false;
+    const reshaper = new HttpReshaper(config, KEYLESS, async () => {
+      fetches += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }));
+    });
+    await expect(reshaper.reshape(req, {
+      startRepairAttempt() {
+        starts += 1;
+        closed = true;
+        return null;
+      },
+      isRequestClosed() {
+        return closed;
+      },
+    })).rejects.toMatchObject({ outcome: { kind: "cancelled" } });
+    expect(starts).toBe(1);
+    expect(fetches).toBe(0);
+  });
+
+  it("classifies its own repair deadline as a timeout rather than a caller abort", async () => {
+    let outcome: string | undefined;
+    let failureKind: string | null | undefined;
+    const timed = new HttpReshaper({ ...config, timeoutMs: 10 }, KEYLESS, async (_url, init) => (
+      new Promise<Response>((_resolve, reject) => {
+        (init?.signal as AbortSignal).addEventListener("abort", () => reject(new Error("timed out")), { once: true });
+      })
+    ));
+    await expect(timed.reshape(req, {
+      startRepairAttempt() {
+        return {
+          complete(completion) {
+            outcome = completion.outcome;
+            failureKind = completion.failureKind;
+          },
+        };
+      },
+    })).rejects.toMatchObject({ outcome: { kind: "timeout" } });
+    expect(outcome).toBe("error");
+    expect(failureKind).toBe("timeout");
+  });
+
+  it("records one aborted repair and never fails over after caller cancellation", async () => {
+    const controller = new AbortController();
+    let firstFetches = 0;
+    let secondFetches = 0;
+    let starts = 0;
+    let outcome: string | undefined;
+    let failureKind: string | null | undefined;
+    let resolveFirstFetch!: () => void;
+    const firstFetch = new Promise<void>((resolve) => { resolveFirstFetch = resolve; });
+    const first = new HttpReshaper(config, KEYLESS, async (_url, init) => {
+      firstFetches += 1;
+      resolveFirstFetch();
+      return new Promise<Response>((_resolve, reject) => {
+        (init?.signal as AbortSignal).addEventListener("abort", () => reject(new Error("caller aborted")), { once: true });
+      });
+    });
+    const second = new HttpReshaper(config, KEYLESS, async () => {
+      secondFetches += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: CORRECTED } }] }));
+    });
+    const pending = new FailoverReshaper([first, second]).reshape({ ...req, signal: controller.signal }, {
+      startRepairAttempt() {
+        starts += 1;
+        return {
+          complete(completion) {
+            outcome = completion.outcome;
+            failureKind = completion.failureKind;
+          },
+        };
+      },
+    });
+    await firstFetch;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ outcome: { kind: "cancelled" } });
+    expect(firstFetches).toBe(1);
+    expect(secondFetches).toBe(0);
+    expect(starts).toBe(1);
+    expect(outcome).toBe("cancelled");
+    expect(failureKind).toBe("aborted");
+  });
+});
+
 describe("FailoverReshaper", () => {
   const req = {
     tools: new Map(),

@@ -2,16 +2,29 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-**State as of 2026-08-20:** Stage 0 and Stage 1 env-backed multi-key pooling are complete on
+**State as of 2026-08-21:** Stage 0 and Stage 1 env-backed multi-key pooling are complete on
 `codex/stage-1-credential-pooling`, and the invariant recalibration packet is applied and complete.
-The authoritative final gate is green:
-`npm run build && npm run check` completed on Windows with 77 test files, 1,351 passed and 4
-expected Windows/POSIX-permission skips. The Stage 1 completion point is the commit containing
-this handoff; no not-yet-created commit hash is claimed here.
+Analytics SPA P0–P4 is implemented and independently reviewed in the commit containing this
+handoff. No prospective commit hash is claimed.
 
-The full Analytics SPA implementation design is complete at
-[`docs/spa-dashboard-design-2026-08-20.md`](docs/spa-dashboard-design-2026-08-20.md). No SPA
-implementation, build dependencies, measurements, or green implementation gate is claimed.
+The complete Analytics SPA packet is summarized below. Do not start custody/keystore work.
+
+- **P0:** canonical accounting/store/read model and both-front lifecycle coverage, including exact caller-visible early body-read terminals with no attempts.
+- **P1:** protected bootstrap/session/read-only surfaces and static security controls.
+- **P2:** bounded snapshot/detail projections with explicit unknown/null/provenance behavior.
+- **P3:** React SPA UX, accessibility, responsive layout, polling and detail coverage, plus
+  production CLI/server integration.
+- **P4:** graph-derived bundle inventory, third-party notices, security headers, content-hashed
+  assets, packed smoke verification, and size ratchets.
+
+The final authoritative Windows gate is green:
+`npm run build && npm run check` with the server suite at 90 files, 1,553 passed, and 4 expected
+Windows/POSIX-permission skips; the dashboard suite is 5 files, 30 passed. Packed measurements are
+dashboard raw 655,036 bytes; JS 638,565; CSS 11,824; packed 891,305; unpacked 4,350,301; and 254
+entries. The >500 KB Vite warning is measured and ratcheted, not a failed gate.
+
+The test-only refusal interpretation isolation fix makes the Vitest store per-run UUID to prevent
+stale PID collisions; the production persistence path and semantics are unchanged.
 
 ## 0. Stage 1 completion checkpoint — read this first
 
@@ -159,7 +172,9 @@ npm run build && npm run check
 ```
 
 `npm run check` is both typechecks (`src/` and `test/`) plus the full vitest suite. **CI runs exactly
-this and nothing else.** Green means green.
+this and nothing else.** Green means green. The final authoritative Windows run for this packet was
+green with 90 server-suite files / 1,553 passed / 4 expected Windows/POSIX-permission skips and a
+5-file dashboard suite / 30 passed. Linux-only POSIX-permission coverage was not run locally.
 
 - Tests read `src/` directly; `scripts/*.mjs` read `dist/` — rebuild before running any script.
 - 4 tests are `skipIf(win32)` POSIX-permission tests. A green local Windows run is **not** full
@@ -213,13 +228,16 @@ this and nothing else.** Green means green.
 
 ## 8. Outstanding, unclaimed
 
-1. **Implement the Analytics SPA — design complete; implementation unclaimed.**
-   See [the design](docs/spa-dashboard-design-2026-08-20.md). Implementation is gated on canonical
-   meter/read P0, then P1–P3 before linking, and P4 before package/release.
-2. Re-audit the remaining documentation drift items in
+1. Re-audit the remaining documentation drift items in
    `docs/status-vs-freellmapi-2026-08-16.md` §5 against current source; Stage 1 corrected its
    credential-surface and phantom-header items.
-3. Render the **effective** `freeOnly` in `llm-relay offload status` (`grep freeOnly src/cli.ts` = 0
+2. Render the **effective** `freeOnly` in `llm-relay offload status` (`grep freeOnly src/cli.ts` = 0
    hits). ⚠ Not a raw field print: unset means **ON** for rerouted traffic and **OFF** for a directly
    addressed pool, so printing the bare optional would be a new transparency bug.
-4. The 14 unresolved decisions in `docs/open-decisions-2026-08-16.md`. None block the completed Stage 1 checkpoint.
+3. The owner approved all recommendations in `docs/open-decisions-2026-08-16.md` on 2026-08-21.
+   M4 remains evidence-gated and P4 remains purpose-gated exactly as their recommendations state;
+   neither is an unresolved implementation choice.
+
+Immediate next action: reconcile the implemented accounting foundation against the formal metering
+stage definitions, close or explicitly defer each remaining item, and keep custody/keystore work out
+of scope until that metering closeout is complete.

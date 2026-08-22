@@ -182,6 +182,29 @@ describe("repair: deterministic stop_reason normalisation", () => {
  * judgement about argument semantics, which would need a hardcoded content
  * blocklist, is evaded by quoting, and refuses legitimate calls when it misfires.
  */
+describe("repair cancellation", () => {
+  it("does not begin a semantic retry after the caller cancels", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const reshaper: Reshaper = {
+      async reshape() {
+        calls += 1;
+        controller.abort();
+        return { kind: "message", message: badCall };
+      },
+    };
+    const decision = await repair(badCall, tools, {
+      validator,
+      reshaper,
+      maxAttempts: 2,
+      isDestructive: () => false,
+      signal: controller.signal,
+    });
+    expect(decision.outcome).toBe("failed");
+    expect(calls).toBe(1);
+  });
+});
+
 describe("repair: post-reshape structural gate", () => {
   const noDestruct = () => false;
   const withText: AssistantMessage = {

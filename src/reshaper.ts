@@ -2,6 +2,7 @@ import { DEFAULT_ANTHROPIC_VERSION } from "./config.js";
 import { type AssistantMessage, type JsonSchema, isToolUseBlock } from "./anthropic.js";
 import { type ValidationError } from "./validator.js";
 import { buildAuthHeaders, type CredentialResolution } from "./authEnv.js";
+import { createUsageAccumulator, observeUsage, type UsageAccumulator } from "./usage-observer.js";
 import {
   CredentialLru,
   CredentialWalk,
@@ -18,6 +19,8 @@ export interface ReshapeRequest {
   /** Why it failed validation. */
   errors: ValidationError[];
   backendModel: string | null;
+  /** Caller response lifetime; deliberately distinct from this reshaper's timeout. */
+  signal?: AbortSignal;
 }
 
 export type ReshapeResult =
@@ -25,7 +28,35 @@ export type ReshapeResult =
   | { kind: "refuse"; reason: string };
 
 export interface Reshaper {
-  reshape(req: ReshapeRequest): Promise<ReshapeResult>;
+  reshape(req: ReshapeRequest, hooks?: ReshaperAccountingHooks): Promise<ReshapeResult>;
+}
+
+export interface ReshaperAccountingCompletion {
+  readonly outcome: "success" | "error" | "cancelled";
+  readonly failureKind: "timeout" | "provider_error" | "auth_error" | "rate_limit" | "aborted" | "protocol" | "unknown" | null;
+  readonly usage: UsageAccumulator;
+  readonly endedAt: number;
+}
+
+export interface ReshaperAccountingAttempt {
+  complete(completion: ReshaperAccountingCompletion): void;
+}
+
+/**
+ * Server-owned request accounting can observe real repair egress without
+ * making the reusable reshaper depend on server lifecycle state.
+ */
+export interface ReshaperAccountingHooks {
+  startRepairAttempt(options: {
+    readonly resolvedAttempt: ResolvedAttempt | null;
+    readonly credentialState: CredentialResolution["state"];
+    readonly provider: string | null;
+    readonly model: string | null;
+    readonly credentialId: string | null;
+    readonly startedAt: number;
+  }): ReshaperAccountingAttempt | null;
+  /** A closed caller response must never start a late repair egress. */
+  isRequestClosed?(): boolean;
 }
 
 /**
@@ -166,13 +197,17 @@ export class FailoverReshaper implements Reshaper {
     if (delegates.length === 0) throw new Error("FailoverReshaper needs at least one delegate");
   }
 
-  async reshape(req: ReshapeRequest): Promise<ReshapeResult> {
+  async reshape(req: ReshapeRequest, hooks?: ReshaperAccountingHooks): Promise<ReshapeResult> {
+    if (callerCancelled(req, hooks)) throw cancelledReshaperError();
     let lastError: Error | undefined;
     for (const d of this.delegates) {
       try {
         // A message OR a refusal is final — a refusal is a judgement, never shopped around.
-        return await d.reshape(req);
+        return await d.reshape(req, hooks);
       } catch (e) {
+        if (callerCancelled(req, hooks) || (e instanceof ReshaperTransportError && e.outcome.kind === "cancelled")) {
+          throw e;
+        }
         // transport/HTTP failure (model de-listed, 5xx, timeout) — try the next candidate
         lastError = e as Error;
         continue;
@@ -182,6 +217,77 @@ export class FailoverReshaper implements Reshaper {
       `all reshaper candidates failed to respond${lastError ? ` (last: ${lastError.message})` : ""}`,
     );
   }
+}
+
+function reshaperAccountingFailure(
+  error: unknown,
+  timedOut: boolean,
+): Pick<ReshaperAccountingCompletion, "outcome" | "failureKind"> {
+  if (error instanceof ReshaperTransportError) {
+    const { status, kind } = error.outcome;
+    if (kind === "cancelled") return { outcome: "cancelled", failureKind: "aborted" };
+    if (status === 401 || status === 403) return { outcome: "error", failureKind: "auth_error" };
+    if (status === 429) return { outcome: "error", failureKind: "rate_limit" };
+    if (kind === "timeout" || timedOut) return { outcome: "error", failureKind: "timeout" };
+    if (kind === "protocol") return { outcome: "error", failureKind: "protocol" };
+  }
+  return { outcome: "error", failureKind: timedOut ? "timeout" : "provider_error" };
+}
+
+const MAX_REPAIR_ERROR_DRAIN_BYTES = 1024 * 1024;
+
+function declaredContentLength(headers: Headers): number | undefined {
+  const value = headers.get("content-length");
+  if (value === null || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+/**
+ * Error bodies are never returned to the repair caller. Drain only enough to
+ * let the usage observer finish a normal provider envelope, then release the
+ * transport instead of retaining an unbounded hostile response in memory.
+ */
+async function drainRepairErrorResponse(response: Response): Promise<void> {
+  const contentLength = declaredContentLength(response.headers);
+  if (contentLength !== undefined && contentLength > MAX_REPAIR_ERROR_DRAIN_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    return;
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) return;
+
+  let read = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      read += value.byteLength;
+      if (read >= MAX_REPAIR_ERROR_DRAIN_BYTES) {
+        await reader.cancel().catch(() => {});
+        return;
+      }
+    }
+  } catch {
+    await reader.cancel().catch(() => {});
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function callerCancelled(req: ReshapeRequest, hooks: ReshaperAccountingHooks | undefined): boolean {
+  if (req.signal?.aborted === true) return true;
+  try {
+    return hooks?.isRequestClosed?.() === true;
+  } catch {
+    // A failing accounting observer remains strictly observational.
+    return false;
+  }
+}
+
+function cancelledReshaperError(): ReshaperTransportError {
+  return new ReshaperTransportError("reshaper cancelled by caller", { kind: "cancelled" });
 }
 
 interface HttpReshaperConfig {
@@ -201,9 +307,14 @@ export class HttpReshaper implements Reshaper {
     private readonly credential: CredentialResolution,
     private readonly fetchFn: typeof fetch = fetch,
     private readonly beforeFetch?: () => void,
+    private readonly resolvedAttempt: ResolvedAttempt | null = null,
   ) {}
 
-  async reshape(req: ReshapeRequest): Promise<ReshapeResult> {
+  async reshape(req: ReshapeRequest, hooks?: ReshaperAccountingHooks): Promise<ReshapeResult> {
+    const throwIfCallerCancelled = (): void => {
+      if (callerCancelled(req, hooks)) throw cancelledReshaperError();
+    };
+    throwIfCallerCancelled();
     if (this.credential.state === "declared-missing") {
       throw new ReshaperTransportError(
         `reshaper credential ${this.credential.envName ?? "<unknown>"} is not configured`,
@@ -212,7 +323,19 @@ export class HttpReshaper implements Reshaper {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.cfg.timeoutMs);
+    let timedOut = false;
+    const abortFromCaller = () => controller.abort();
+    req.signal?.addEventListener("abort", abortFromCaller, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.cfg.timeoutMs);
+    const usage = createUsageAccumulator();
+    let accountingAttempt: ReshaperAccountingAttempt | null = null;
+    let accountingCompletion: Pick<ReshaperAccountingCompletion, "outcome" | "failureKind"> = {
+      outcome: "error",
+      failureKind: "unknown",
+    };
     try {
       const headers: Record<string, string> = {
         "content-type": "application/json",
@@ -247,10 +370,28 @@ export class HttpReshaper implements Reshaper {
       // This hook is the sole CredentialWalk start/LRU boundary. Everything above is local
       // preparation and a declared-missing credential returned before reaching it.
       const bodyText = JSON.stringify(body);
+      throwIfCallerCancelled();
       this.beforeFetch?.();
+      throwIfCallerCancelled();
+      const egressAt = Date.now();
+      throwIfCallerCancelled();
+      try {
+        accountingAttempt = hooks?.startRepairAttempt({
+          resolvedAttempt: this.resolvedAttempt,
+          credentialState: this.credential.state,
+          provider: this.resolvedAttempt?.target.provider ?? null,
+          model: this.resolvedAttempt?.target.model ?? this.cfg.model,
+          credentialId: this.resolvedAttempt?.credentialId ?? null,
+          startedAt: egressAt,
+        }) ?? null;
+      } catch {
+        accountingAttempt = null;
+      }
+      throwIfCallerCancelled();
       let res: Response;
-    try {
-      res = await this.fetchFn(url, {
+      try {
+        throwIfCallerCancelled();
+        res = await this.fetchFn(url, {
         method: "POST",
         headers,
         body: bodyText,
@@ -259,10 +400,28 @@ export class HttpReshaper implements Reshaper {
     } catch (e) {
       throw new ReshaperTransportError(
         `reshaper unreachable: ${(e as Error).message}`,
-        { kind: controller.signal.aborted ? "timeout" : "provider-transport" },
+        { kind: callerCancelled(req, hooks) ? "cancelled" : timedOut ? "timeout" : "provider-transport" },
       );
     }
-      if (!res.ok) throw new ReshaperTransportError(`reshaper HTTP ${res.status}`, { status: res.status });
+    const declaredErrorLength = !res.ok ? declaredContentLength(res.headers) : undefined;
+    if (declaredErrorLength !== undefined && declaredErrorLength > MAX_REPAIR_ERROR_DRAIN_BYTES) {
+      await res.body?.cancel().catch(() => {});
+      throwIfCallerCancelled();
+      throw new ReshaperTransportError(`reshaper HTTP ${res.status}`, { status: res.status });
+    }
+    res = observeUsage(
+      res,
+      this.cfg.kind === "openai" ? "openai-chat" : "anthropic-messages",
+      usage,
+    );
+    if (!res.ok) {
+      // Consume the bounded error response so any provider-reported usage is
+      // observed before the terminal accounting event. The body was previously
+      // discarded, so this does not change caller-visible repair semantics.
+      await drainRepairErrorResponse(res);
+      throwIfCallerCancelled();
+      throw new ReshaperTransportError(`reshaper HTTP ${res.status}`, { status: res.status });
+    }
 
     let json: Record<string, unknown>;
     try {
@@ -270,23 +429,35 @@ export class HttpReshaper implements Reshaper {
     } catch (e) {
       throw new ReshaperTransportError(
         `reshaper returned non-JSON: ${(e as Error).message}`,
-        { kind: controller.signal.aborted ? "timeout" : "protocol" },
+        { kind: callerCancelled(req, hooks) ? "cancelled" : timedOut ? "timeout" : "protocol" },
       );
     }
       try {
         const text = this.cfg.kind === "openai" ? openaiText(json) : anthropicText(json);
         const parsed = parseCorrectedInputsWire(text);
         if (parsed.kind === "invalid") throw new Error(parsed.reason);
-        if (parsed.kind === "refuse") return { kind: "refuse", reason: parsed.reason };
-        return { kind: "message", message: reconstruct(req.rawAssistant, parsed.inputs) };
+      accountingCompletion = { outcome: "success", failureKind: null };
+      if (parsed.kind === "refuse") return { kind: "refuse", reason: parsed.reason };
+      return { kind: "message", message: reconstruct(req.rawAssistant, parsed.inputs) };
       } catch (e) {
         throw new ReshaperTransportError(
           `reshaper returned malformed response: ${(e as Error).message}`,
           { kind: "protocol" },
         );
       }
+    } catch (error) {
+      accountingCompletion = reshaperAccountingFailure(error, timedOut);
+      throw error;
     } finally {
+      if (accountingAttempt !== null) {
+        try {
+          accountingAttempt.complete({ ...accountingCompletion, usage, endedAt: Date.now() });
+        } catch {
+          // Accounting observers must never alter repair failure handling.
+        }
+      }
       clearTimeout(timer);
+      req.signal?.removeEventListener("abort", abortFromCaller);
     }
   }
 }
@@ -311,7 +482,8 @@ export class CredentialWalkReshaper implements Reshaper {
     this.walk = new CredentialWalk(attempts, { ...walkOptions, lru: this.lru });
   }
 
-  async reshape(req: ReshapeRequest): Promise<ReshapeResult> {
+  async reshape(req: ReshapeRequest, hooks?: ReshaperAccountingHooks): Promise<ReshapeResult> {
+    if (callerCancelled(req, hooks)) throw cancelledReshaperError();
     let lastError: ReshaperTransportError | undefined;
 
     for (let attempt = this.pinnedAttempt ?? this.walk.next(); attempt; attempt = this.walk.next()) {
@@ -333,20 +505,24 @@ export class CredentialWalkReshaper implements Reshaper {
         },
         attempt.credential,
         this.fetchFn,
-        () => {
-          if (alreadyStarted) this.lru.touch(attempt.credentialId);
-          else this.walk.recordStarted(attempt);
-        },
-      );
+      () => {
+        if (alreadyStarted) this.lru.touch(attempt.credentialId);
+        else this.walk.recordStarted(attempt);
+      },
+      attempt,
+    );
 
       try {
         // A message OR refusal is terminal. Shopping a refusal is never allowed.
-        const result = await reshaper.reshape(req);
+        const result = await reshaper.reshape(req, hooks);
         // Do not close the walk yet: a `message` is only wire-valid here. If `repair()` rejects its
         // corrected arguments and calls us again, the same credential remains authoritative.
         this.pinnedAttempt = attempt;
         return result;
       } catch (e) {
+        if (callerCancelled(req, hooks) || (e instanceof ReshaperTransportError && e.outcome.kind === "cancelled")) {
+          throw e;
+        }
         const error = e instanceof ReshaperTransportError
           ? e
           : new ReshaperTransportError(

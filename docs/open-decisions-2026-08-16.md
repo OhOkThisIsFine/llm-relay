@@ -1,7 +1,14 @@
 # Open owner decisions — metering / fleet / quota program (2026-08-16)
 
-Eighteen decisions surfaced across the three design tracks. **Four gate the work** and are asked
-directly; the rest have a recommendation and a safe default, and can be answered as they come up.
+**Owner disposition — 2026-08-21:** all recommendations in this document are approved as written.
+They are now implementation defaults, including their stated safety gates and deferrals. M4 remains
+evidence-gated until observed usage-absence rates are measured; P4 remains purpose-gated and must
+not be implemented until a concrete use case exists. Neither is an unresolved implementation
+choice.
+
+Eighteen decisions surfaced across the three design tracks. G1–G4 were resolved before
+implementation; the owner disposition above closes the recommended defaults for the remaining
+rows. The tables remain the rationale and implementation record.
 
 Source documents:
 - [rubric-recalibration-2026-08-16.md](rubric-recalibration-2026-08-16.md) — what was rejected, what voided it, 55 re-adjudications

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "method": "Production Vite/Rollup module graph. dashboard/vite.config.ts emits dist/dashboard/.vite/dashboard-bundle-graph.json from every rendered chunk; scripts/dashboard-package-check.mjs requires this complete graph to equal this inventory.",
+  "packages": [
+    { "packagePath": "node_modules/@tanstack/query-core", "name": "@tanstack/query-core", "version": "5.101.4", "license": "MIT" },
+    { "packagePath": "node_modules/@tanstack/react-query", "name": "@tanstack/react-query", "version": "5.101.4", "license": "MIT" },
+    { "packagePath": "node_modules/lucide-react", "name": "lucide-react", "version": "0.468.0", "license": "ISC" },
+    { "packagePath": "node_modules/react", "name": "react", "version": "19.2.8", "license": "MIT" },
+    { "packagePath": "node_modules/react-dom", "name": "react-dom", "version": "19.2.8", "license": "MIT" },
+    { "packagePath": "node_modules/scheduler", "name": "scheduler", "version": "0.27.0", "license": "MIT" }
+  ],
+  "generatedAssets": [
+    { "assetKind": "Tailwind-generated CSS (Preflight, components and utilities)", "source": "dashboard/src/styles.css", "attribution": { "packagePath": "node_modules/tailwindcss", "name": "tailwindcss", "version": "3.4.19", "license": "MIT" } }
+  ],
+  "virtualRuntime": [
+    { "moduleId": "vite/modulepreload-polyfill.js", "kind": "Vite module-preload runtime", "attribution": { "packagePath": "node_modules/vite", "name": "vite", "version": "6.4.3", "license": "MIT" } }
+  ]
+}
