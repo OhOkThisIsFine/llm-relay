@@ -1105,3 +1105,143 @@ describe("loadConfig — log.maxBytes", () => {
     },
   );
 });
+
+/**
+ * Operator-asserted rate limits (spec §4 rung 3). A malformed `limits` block is a HARD error at
+ * both declaration levels — unlike credentials[] slot fields, which drop with a warning — because
+ * a typo silently ignored reads as an asserted ceiling while bounding nothing.
+ */
+describe("loadConfig — provider limits (configured rate limits)", () => {
+  /** A one-provider config whose `nim` carries the given extra fields. */
+  function nimProvider(extra: Record<string, unknown>) {
+    return base({
+      providers: {
+        nim: { base: "https://nim.test/v1", kind: "openai", authEnv: "NVIDIA_API_KEY", ...extra },
+      },
+    });
+  }
+
+  function nimWithCredentials(credentials: Record<string, unknown>[]) {
+    // authEnv and credentials[] cannot both be declared on one provider.
+    return base({
+      providers: {
+        nim: { base: "https://nim.test/v1", kind: "openai", credentials },
+      },
+    });
+  }
+
+  it("accepts the block at provider level and carries it onto the provider", () => {
+    const c = loadConfig(write("limits-provider.json", nimProvider({
+      limits: { rpm: 40, rpd: 1000, tpm: 100000, tpd: 150000 },
+    })));
+    expect(c.providers.nim!.limits).toEqual({ rpm: 40, rpd: 1000, tpm: 100000, tpd: 150000 });
+  });
+
+  it("accepts the block inside credential slots", () => {
+    const c = loadConfig(write("limits-credential.json", nimWithCredentials([
+      { label: "a", authEnv: "NIM_A", limits: { rpd: 500 } },
+      { label: "b", authEnv: "NIM_B" },
+    ])));
+    expect(c.providers.nim!.credentials![0]!.limits).toEqual({ rpd: 500 });
+    expect(c.providers.nim!.credentials![1]!.limits).toBeUndefined();
+  });
+
+  it("accepts per-model overrides keyed by arbitrary backend model ids", () => {
+    const c = loadConfig(write("limits-models.json", nimProvider({
+      limits: { rpm: 40, models: { "meta/llama-3.1-8b-instruct": { rpm: 10 } } },
+    })));
+    expect(c.providers.nim!.limits).toEqual({
+      rpm: 40,
+      models: { "meta/llama-3.1-8b-instruct": { rpm: 10 } },
+    });
+  });
+
+  it.each(["RPM", "rps", "tph", "requestsPerMinute"])(
+    "rejects unknown axis key %s by name at provider level",
+    (axis) => {
+      expect(() =>
+        loadConfig(write(`limits-bad-axis-${axis}.json`, nimProvider({
+          limits: { rpm: 40, [axis]: 10 },
+        })),
+      )).toThrow(new RegExp(`limits\\.${axis}`));
+    },
+  );
+
+  it("rejects an unknown axis inside a model override, naming the model path", () => {
+    expect(() =>
+      loadConfig(write("limits-bad-model-axis.json", nimProvider({
+        limits: { rpm: 40, models: { "meta/llama-3.1-8b-instruct": { RPM: 10 } } },
+      })),
+    )).toThrow(/models\."meta\/llama-3.1-8b-instruct"\.RPM/);
+  });
+
+  it.each([0, -5, 1.5, Number.MAX_SAFE_INTEGER + 1, "40", null])(
+    "rejects non-positive/non-integer limit value %j and names the axis",
+    (value) => {
+      expect(() =>
+        loadConfig(write(`limits-bad-value-${String(value)}.json`, nimProvider({
+          limits: { rpm: value as number },
+        })),
+      )).toThrow(/limits\.rpm/);
+    },
+  );
+
+  it("rejects a non-object limits block", () => {
+    for (const bad of [["rpm"], "fast", 42]) {
+      expect(() =>
+        loadConfig(write(`limits-nonobject-${String(bad)}.json`, nimProvider({ limits: bad }))),
+      ).toThrow(/limits must be an object/);
+    }
+  });
+
+  it("rejects a non-object models map and a non-object model entry", () => {
+    expect(() =>
+      loadConfig(write("limits-models-array.json", nimProvider({
+        limits: { models: ["meta/llama-3.1-8b-instruct"] },
+      })),
+    )).toThrow(/limits\.models must be an object/);
+    expect(() =>
+      loadConfig(write("limits-model-entry.json", nimProvider({
+        limits: { models: { "m/x": 10 } },
+      })),
+    )).toThrow(/models\."m\/x" must be an object/);
+  });
+
+  it("rejects a malformed slot limits block with a HARD error, not a dropped slot", () => {
+    // Deliberately different from the other slot fields: dropping the slot would remove a whole
+    // key (and its quota domain) from the fleet over a typo, and ignoring it would leave the
+    // operator believing a ceiling is asserted when none is.
+    let threw = false;
+    try {
+      loadConfig(write("limits-slot-bad.json", nimWithCredentials([
+        { label: "a", authEnv: "NIM_A", limits: { rps: 10 } },
+      ])));
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+  });
+
+  it("rejects a malformed provider limits block even while the provider is env-disabled", () => {
+    // The unset-${ENV} soft disable must not become a place for a typo to hide: parse the limits
+    // block BEFORE that gate (mirroring credentials[]), so the error surfaces now instead of on
+    // the restart where the env var finally appears.
+    delete process.env.RP_MISSING_LIMITS_VAR;
+    expect(() =>
+      loadConfig(write("limits-env-disabled.json", {
+        listen: "127.0.0.1:8791",
+        providers: {
+          nim: { base: "${RP_MISSING_LIMITS_VAR}", kind: "openai", limits: { rps: 1 } },
+        },
+        routing: { default: "nim/m" },
+      })),
+    ).toThrow(/limits\.rps is not a known rate-limit axis/);
+  });
+
+  it("is absent when not configured; {} stays legal and declares nothing", () => {
+    expect(loadConfig(write("limits-absent.json", base())).providers.nim!.limits).toBeUndefined();
+    expect(
+      loadConfig(write("limits-empty.json", nimProvider({ limits: {} }))).providers.nim!.limits,
+    ).toEqual({});
+  });
+});

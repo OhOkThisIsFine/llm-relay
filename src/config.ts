@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
 import { resolveAuthEnv, credentialState } from "./authEnv.js";
 import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
+import { parseConfiguredLimits, type ProviderLimitsConfig } from "./configured-limits.js";
 import { providerCredentialSlots, type CredentialSlot, type ProviderCredentialConfig } from "./credential-fleet.js";
 
 export type Mode = "detect" | "repair" | "strict";
@@ -101,6 +102,14 @@ export interface ProviderConfig {
   stallTimeoutMs?: number;
   /** "free": wholly free/free-tier catalog. "mixed": catalog contains free and paid models. */
   tierType?: ProviderTierType;
+  /**
+   * Operator-asserted rate limits (spec §4 rung 3, basis "configured"). The provider-level block
+   * is the default for every credential of this provider; a slot's own `limits` overrides it per
+   * credential; a `models` entry overrides per deployment — each axis independently. See
+   * `src/configured-limits.ts`. These never refuse a request by themselves; they feed the
+   * availability/headroom surfaces.
+   */
+  limits?: ProviderLimitsConfig;
   /** Web URL where users can sign up or obtain API keys. */
   signupUrl?: string;
 }
@@ -1011,6 +1020,7 @@ function parseCredentialDeclarations(
       authEnv?: unknown;
       enabled?: unknown;
       models?: unknown;
+      limits?: unknown;
     };
     const label = typeof value.label === "string" ? value.label : "";
     const authEnv = typeof value.authEnv === "string" ? value.authEnv : "";
@@ -1038,6 +1048,12 @@ function parseCredentialDeclarations(
         models = Object.freeze([...new Set((value.models as string[]).map((model) => model.trim()).filter(Boolean))]);
       }
     }
+    // A malformed limits block THROWS rather than following the drop-with-a-warning convention
+    // above: dropping the slot would silently remove a whole key (and its quota domain) from the
+    // fleet, and keeping the slot while ignoring the block would leave the operator believing a
+    // ceiling is asserted when none is. Both failure modes are worse than refusing to start.
+    // parseConfiguredLimits throws naming the exact offending key/path.
+    const limits = parseConfiguredLimits(value.limits, `${where}.limits`);
     if (labels.has(label) || envNames.has(authEnv)) {
       const duplicate = labels.has(label) ? `label "${label}"` : `authEnv "${authEnv}"`;
       warnings.push(`${where} dropped — duplicate ${duplicate}; first valid slot wins`);
@@ -1050,6 +1066,7 @@ function parseCredentialDeclarations(
       authEnv,
       ...(value.enabled !== undefined ? { enabled: value.enabled } : {}),
       ...(models !== undefined ? { models } : {}),
+      ...(limits !== undefined ? { limits } : {}),
     });
   });
   return out;
@@ -1080,6 +1097,7 @@ function parseProviders(
       stallTimeoutMs?: unknown;
       tierType?: unknown;
       signupUrl?: unknown;
+      limits?: unknown;
     };
     try {
       makeCredentialId(name);
@@ -1147,6 +1165,12 @@ function parseProviders(
         maxConcurrent = p.maxConcurrent;
       }
     }
+    // Operator-asserted rate limits. Hard error on a malformed block — same reasoning as inside
+    // credentials[] above: an ignored typo reads as a ceiling nobody actually declared. Parsed
+    // BEFORE the unset-${ENV} soft disable below, mirroring the fleet precedent: the parse is
+    // purely syntactic (no provider-map lookups), so it cannot reintroduce the failure shape
+    // where a tier naming a degraded provider aborts startup.
+    const limits = parseConfiguredLimits(p.limits, `config.providers.${name}.limits`);
     if (expanded.missing.length > 0) {
       warnings.push(
         `provider "${name}" DISABLED — base references unset env var ` +
@@ -1186,6 +1210,7 @@ function parseProviders(
       ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
         ? { tierType: p.tierType }
         : {}),
+      ...(limits !== undefined ? { limits } : {}),
       ...(typeof p.signupUrl === "string" && p.signupUrl.length > 0 ? { signupUrl: p.signupUrl } : {}),
     };
   }
