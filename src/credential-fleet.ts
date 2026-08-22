@@ -1,6 +1,7 @@
 import type { CredentialResolution } from "./authEnv.js";
 import { resolveCredential, resolveCredentialExact } from "./authEnv.js";
 import { makeCredentialId, type CredentialId } from "./credential-id.js";
+import type { ProviderLimitsConfig } from "./configured-limits.js";
 import type { ProviderConfig, ResolvedTarget } from "./config.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 
@@ -11,6 +12,12 @@ export interface ProviderCredentialConfig {
   enabled?: boolean;
   /** `null` means all models; an empty array deliberately matches no models. */
   models?: readonly string[] | null;
+  /**
+   * This slot's own operator-asserted rate limits, overriding the provider-level `limits` for
+   * this key alone (each axis independently; see `resolveConfiguredLimits`). Keys of one account
+   * share that account's ceilings, so per-key figures can differ even under one provider.
+   */
+  limits?: ProviderLimitsConfig;
 }
 
 /** Non-secret identity and policy for one configured credential slot. */

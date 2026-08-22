@@ -160,6 +160,43 @@ Config strings may reference env vars as `${NAME}`. An unset `${NAME}` in a prov
 startup — losing *every* route is still fatal. CLI startup overrides (`--default`, `--mode`,
 `--listen`) win over the file.
 
+### Operator-declared rate limits (`limits`)
+
+A provider (or one of its credential slots) may carry a `limits` block asserting the rate
+ceilings **you** know that account has:
+
+```jsonc
+"nim": {
+  "base": "https://integrate.api.nvidia.com/v1",
+  "kind": "openai",
+  "limits": {
+    "rpm": 40, "rpd": 1000, "tpm": 100000, "tpd": 150000,
+    "models": { "meta/llama-3.1-8b-instruct": { "rpm": 10 } }
+  },
+  "credentials": [
+    { "label": "personal", "authEnv": "NVIDIA_API_KEY", "limits": { "rpd": 500 } }
+  ]
+}
+```
+
+- The axes are exactly `rpm`, `rpd`, `tpm`, `tpd` — requests or tokens per minute or per day.
+  Every figure must be a positive integer. Any other key (`RPM`, `rps`, `tph`) is a config
+  **error naming the key**, because a typo that were silently ignored would read as a ceiling
+  while bounding nothing.
+- Every limit is a **per-credential (per-key) ceiling** as you assert it. A provider-level
+  `limits` is the default for every credential of that provider; a slot's own `limits` overrides
+  it for that key; a `models["<backend model id>"]` entry overrides per deployment. Each axis is
+  resolved independently: a model override naming only `rpm` inherits `rpd`/`tpm`/`tpd` from
+  above. Per axis, most-specific wins: credential-level model override → provider-level model
+  override → credential-level → provider-level.
+- `models` keys are backend model ids, verbatim; they are never checked against any catalog.
+- The relay never sums limits across credentials and never infers a limit that is not declared.
+  An undeclared axis stays unknown — no default, no published-figure fill-in.
+- These figures feed the availability/headroom surfaces and are labelled **`configured`**
+  wherever they appear — operator-asserted evidence, distinct from `provider-stated` header
+  observations and from anything derived from the local ledger. They never refuse a request by
+  themselves.
+
 ### Model addressing (split on the first `/`, first match wins)
 
 1. **`pool/<name>`** — expands to the pool's candidate list, benchmark-ranked with failover. An
