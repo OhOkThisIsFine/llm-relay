@@ -199,15 +199,22 @@ describe("ModelCatalog", () => {
       JSON.stringify({
         p: {
           fetchedAt: 1000,
-          models: ["good", "bad", "hollow", "older"],
+          models: ["good", "bad", "hollow", "junky", "older", "preRate"],
           limits: {
-            good: { contextLength: 131072, maxOutputTokens: 4096, pricePromptPerToken: 0, priceCompletionPerToken: 0 },
+            good: { contextLength: 131072, maxOutputTokens: 4096, pricePromptPerToken: 0, priceCompletionPerToken: 0, rateLimits: { rpm: 30, rpd: null, tpm: null, tpd: null } },
             // A string ceiling would sail straight into the guardrail's `>` comparison.
-            bad: { contextLength: "lots", maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null },
+            bad: { contextLength: "lots", maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null },
             // Nothing usable at all → not a "publishes limits" entry.
-            hollow: { contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null },
+            hollow: { contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null },
+            // A garbage rate-limit block degrades per-axis to null; an all-null block is no block.
+            junky: {
+              contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null,
+              rateLimits: { rpm: "many", rpd: -5, tpm: 0, tpd: Number.NaN },
+            },
             // Written by a version before pricing existed: the newer keys are absent, not null.
             older: { contextLength: 32768, maxOutputTokens: 8192 },
+            // Written by a version before rate-limit harvesting existed.
+            preRate: { contextLength: null, maxOutputTokens: null, pricePromptPerToken: 0, priceCompletionPerToken: 0 },
           },
         },
       }) + "\n",
@@ -216,16 +223,85 @@ describe("ModelCatalog", () => {
     const c = new ModelCatalog({ cachePath, ttlMs: 10_000 });
     expect(c.cachedLimits("p", "good")).toEqual({
       contextLength: 131072, maxOutputTokens: 4096, pricePromptPerToken: 0, priceCompletionPerToken: 0,
+      rateLimits: { rpm: 30, rpd: null, tpm: null, tpd: null },
     });
     expect(c.cachedLimits("p", "bad")).toBeNull();
     expect(c.cachedLimits("p", "hollow")).toBeNull();
+    // Every axis of the junk block is non-numeric/negative/zero → no block at all, and nothing
+    // else was published either → not a "publishes limits" entry.
+    expect(c.cachedLimits("p", "junky")).toBeNull();
+    expect(c.publishedRateLimits("p", "junky")).toBeNull();
     // An older-schema row keeps what it really had and reports the rest as unknown — explicit
     // nulls, so `resolveMetadata()` sees "unpublished" rather than a hollow object of undefineds.
     expect(c.cachedLimits("p", "older")).toEqual({
       contextLength: 32768, maxOutputTokens: 8192, pricePromptPerToken: null, priceCompletionPerToken: null,
+      rateLimits: null,
+    });
+    // A row from before rate-limit harvesting existed keeps its pricing and reads no block at all.
+    expect(c.publishedRateLimits("p", "preRate")).toBeNull();
+    expect(c.cachedLimits("p", "preRate")).toEqual({
+      contextLength: null, maxOutputTokens: null, pricePromptPerToken: 0, priceCompletionPerToken: 0,
+      rateLimits: null,
     });
     // The models list still loads warm — sanitizing limits must not cost the cache its purpose.
-    expect(await c.list("p", provider, { now: 2000, fetchFn: throwFetch() })).toEqual(["good", "bad", "hollow", "older"]);
+    expect(await c.list("p", provider, { now: 2000, fetchFn: throwFetch() }))
+      .toEqual(["good", "bad", "hollow", "junky", "older", "preRate"]);
+  });
+
+  it("harvests published rate limits through the generic alias lists (spec §4 rung 2)", async () => {
+    const fetchFn = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            // Long-form names at the top level.
+            { id: "long/one", requests_per_minute: 60, requests_per_day: 1000, tokens_per_minute: 90000, tokens_per_day: 200000 },
+            // Short forms, mixed with an untouched context figure.
+            { id: "short/one", rpm: 30, rpd: 500, tpm: 50000, tpd: 150000, context_window: 131072 },
+            // One level of nesting under each wrapper spelling providers actually use.
+            { id: "nested/rate_limit", rate_limit: { requests_per_minute: 10, tokens_per_minute: 40000 } },
+            { id: "nested/rate_limits", rate_limits: { rpm: 20, rpd: 800 } },
+            { id: "nested/limits", limits: { tpm: 60000 } },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const catalog = new ModelCatalog({ cachePath: null });
+    await catalog.list("rl", provider, { fetchFn });
+
+    expect(catalog.publishedRateLimits("rl", "long/one")).toEqual({ rpm: 60, rpd: 1000, tpm: 90000, tpd: 200000 });
+    expect(catalog.publishedRateLimits("rl", "short/one")).toEqual({ rpm: 30, rpd: 500, tpm: 50000, tpd: 150000 });
+    expect(catalog.publishedRateLimits("rl", "nested/rate_limit")).toEqual({ rpm: 10, rpd: null, tpm: 40000, tpd: null });
+    expect(catalog.publishedRateLimits("rl", "nested/rate_limits")).toEqual({ rpm: 20, rpd: 800, tpm: null, tpd: null });
+    expect(catalog.publishedRateLimits("rl", "nested/limits")).toEqual({ rpm: null, rpd: null, tpm: 60000, tpd: null });
+    // The context figure on the same record still harvests beside them.
+    expect(catalog.cachedLimits("rl", "short/one")?.contextLength).toBe(131072);
+  });
+
+  it("declines to guess a rate limit the record did not clearly publish", async () => {
+    const fetchFn = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            // A bare "limit" has no stated period; binding it would fabricate a ceiling.
+            { id: "bare/limit", limit: 60, requests: 60 },
+            // Zero / negative / non-numeric are not ceilings.
+            { id: "junk/values", rpm: 0, rpd: -5, tpm: "many" },
+            // A same-named leaf under an UNRELATED parent must not bind via deep matching.
+            { id: "deep/mismatch", nested: { nested: { rpm: 99 } }, wrapper: { rpm: 77 } },
+            // Publishes nothing rate-limit-shaped at all (NIM's shape).
+            { id: "plain/model", object: "model", owned_by: "x" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const catalog = new ModelCatalog({ cachePath: null });
+    await catalog.list("ng", provider, { fetchFn });
+
+    for (const model of ["bare/limit", "junk/values", "deep/mismatch", "plain/model"]) {
+      expect(catalog.publishedRateLimits("ng", model), model).toBeNull();
+    }
+    // Unknown provider/model → null too; the accessor reads only the cache.
+    expect(catalog.publishedRateLimits("nope", "nope")).toBeNull();
   });
 
   it("enforces provider fetch timeout via signal", async () => {

@@ -59,12 +59,35 @@ async function readBoundedBody(res: Response, maxBytes: number): Promise<string>
  * another's. Null means "this provider does not publish it" — NIM's /models returns only
  * id/object/created/owned_by, while Groq and Mistral publish real limits.
  */
+/**
+ * Rate limits a provider publishes IN ITS `/models` RECORD about its own deployment.
+ *
+ * This is spec §4 rung 2 (PUBLISHED) and is expected to stay nearly empty — free providers publish
+ * even less here than they publish context windows. It is deliberately separate from
+ * `QuotaObservation` (point-in-time header state) and from configured limits (operator-asserted):
+ * a published ceiling is durable knowledge about the deployment, and its basis is
+ * provider-stated by construction. An omitted axis is unpublished, i.e. null, never guessed from
+ * a bare "limit"-shaped field — a number without a stated period bounds nothing.
+ */
+export interface ModelRateLimits {
+  /** Requests per minute. */
+  rpm: number | null;
+  /** Requests per day. */
+  rpd: number | null;
+  /** Tokens per minute. */
+  tpm: number | null;
+  /** Tokens per day. */
+  tpd: number | null;
+}
+
 export interface ModelLimits {
   contextLength: number | null;
   maxOutputTokens: number | null;
   /** Per-TOKEN price, as published. Per-provider for the same reason limits are. */
   pricePromptPerToken: number | null;
   priceCompletionPerToken: number | null;
+  /** null when the record published no rate-limit figure at all. Absent on older cache files. */
+  rateLimits: ModelRateLimits | null;
 }
 
 interface Entry {
@@ -83,6 +106,31 @@ const CONTEXT_FIELDS = ["context_length", "context_window", "max_context_length"
 const MAX_OUTPUT_FIELDS = ["max_completion_tokens", "max_output_length", "max_output_tokens", "max_tokens"];
 const PRICE_IN_FIELDS = ["prompt", "input", "input_tokens"];
 const PRICE_OUT_FIELDS = ["completion", "output", "output_tokens"];
+
+/**
+ * Published rate-limit aliases, one closed list per axis (spec §4 rung 2). Same rule as the lists
+ * above — never a per-provider switch — so a provider that starts publishing `requests_per_minute`
+ * is picked up with no code change. A dotted name is ONE level of nesting under a wrapper object,
+ * which is how providers that publish any rate limit usually spell it. There is deliberately no
+ * alias for a bare "limit"/"requests"/"tokens": a number without a STATED period bounds nothing,
+ * and guessing one would fabricate a ceiling.
+ */
+const RATE_RPM_FIELDS = [
+  "rate_limit.requests_per_minute", "requests_per_minute", "rpm",
+  "rate_limits.rpm", "limits.rpm",
+];
+const RATE_RPD_FIELDS = [
+  "rate_limit.requests_per_day", "requests_per_day", "rpd",
+  "rate_limits.rpd", "limits.rpd",
+];
+const RATE_TPM_FIELDS = [
+  "rate_limit.tokens_per_minute", "tokens_per_minute", "tpm",
+  "rate_limits.tpm", "limits.tpm",
+];
+const RATE_TPD_FIELDS = [
+  "rate_limit.tokens_per_day", "tokens_per_day", "tpd",
+  "rate_limits.tpd", "limits.tpd",
+];
 
 /** Providers publish prices as numeric STRINGS ("0.00000015") as often as numbers. */
 function pickNumber(rec: Record<string, unknown>, fields: string[], allowZero = false): number | null {
@@ -105,6 +153,46 @@ function asNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/** Rate limits are ceilings, so unlike prices a published zero is meaningless — a zero request
+ *  allowance is a closed lane, not a published limit, and 0/0/0/0 would read as a measurement.
+ *  Numbers only (no numeric-string rung like prices have): this rung is expected to be nearly
+ *  empty, so a missed string figure is the acceptable loss and a mis-parsed one is not. */
+function positiveNumber(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/**
+ * Read one rate-limit axis off a record through its alias list. A dotted alias is exactly ONE
+ * level of nesting under a wrapper object (`rate_limits.rpm`); deeper shapes are not matched —
+ * a generic walker would happily bind a same-named leaf under an unrelated parent.
+ */
+function pickRateField(rec: Record<string, unknown>, fields: string[]): number | null {
+  for (const f of fields) {
+    const dot = f.indexOf(".");
+    if (dot > 0) {
+      const wrapper = rec[f.slice(0, dot)];
+      if (typeof wrapper !== "object" || wrapper === null) continue;
+      const v = positiveNumber((wrapper as Record<string, unknown>)[f.slice(dot + 1)]);
+      if (v !== null) return v;
+      continue;
+    }
+    const v = positiveNumber(rec[f]);
+    if (v !== null) return v;
+  }
+  return null;
+}
+
+/** Harvest the four rate-limit axes, or null when the record published none of them. */
+function rateLimitsFromRecord(rec: Record<string, unknown>): ModelRateLimits | null {
+  const l: ModelRateLimits = {
+    rpm: pickRateField(rec, RATE_RPM_FIELDS),
+    rpd: pickRateField(rec, RATE_RPD_FIELDS),
+    tpm: pickRateField(rec, RATE_TPM_FIELDS),
+    tpd: pickRateField(rec, RATE_TPD_FIELDS),
+  };
+  return l.rpm !== null || l.rpd !== null || l.tpm !== null || l.tpd !== null ? l : null;
+}
+
 /** Read limits + pricing out of one `/models` record, including a nested `top_provider` (OpenRouter). */
 export function limitsFromRecord(rec: Record<string, unknown>): ModelLimits {
   const obj = (v: unknown) => (typeof v === "object" && v !== null ? (v as Record<string, unknown>) : {});
@@ -116,6 +204,7 @@ export function limitsFromRecord(rec: Record<string, unknown>): ModelLimits {
     // Zero is a real, meaningful price (free tiers) — not "unpublished".
     pricePromptPerToken: pickNumber(pricing, PRICE_IN_FIELDS, true),
     priceCompletionPerToken: pickNumber(pricing, PRICE_OUT_FIELDS, true),
+    rateLimits: rateLimitsFromRecord(rec),
   };
 }
 
@@ -125,12 +214,32 @@ export function limitsFromRecord(rec: Record<string, unknown>): ModelLimits {
  * Tests for "not a number" rather than `=== null`: a record read back from an OLDER cache schema
  * has the newer fields simply absent (`undefined`), and an `=== null` check called that "publishes
  * something", so `limits()` returned an object of undefineds instead of the null its contract
- * promises.
+ * promises. A lone published rate limit counts — otherwise this rung's one yield could never
+ * surface because an all-null scalar set would drop the entry before any reader saw it.
  */
 function isEmpty(l: ModelLimits): boolean {
-  return ![l.contextLength, l.maxOutputTokens, l.pricePromptPerToken, l.priceCompletionPerToken].some(
-    (v) => typeof v === "number",
-  );
+  return ![
+    l.contextLength,
+    l.maxOutputTokens,
+    l.pricePromptPerToken,
+    l.priceCompletionPerToken,
+    ...(l.rateLimits ? [l.rateLimits.rpm, l.rateLimits.rpd, l.rateLimits.tpm, l.rateLimits.tpd] : []),
+  ].some((v) => typeof v === "number");
+}
+
+/** Normalize one persisted rate-limit block: absent → null (older schema), invalid → dropped.
+ *  The SAME positive-finite predicate as harvest — a hand-edited cache must not be able to
+ *  round-trip a zero or negative "ceiling" the `/models` reader itself would have refused. */
+function sanitizeRateLimits(raw: unknown): ModelRateLimits | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  const l: ModelRateLimits = {
+    rpm: positiveNumber(r.rpm),
+    rpd: positiveNumber(r.rpd),
+    tpm: positiveNumber(r.tpm),
+    tpd: positiveNumber(r.tpd),
+  };
+  return l.rpm !== null || l.rpd !== null || l.tpm !== null || l.tpd !== null ? l : null;
 }
 
 /**
@@ -151,6 +260,7 @@ function sanitizeLimits(raw: unknown): Record<string, ModelLimits> {
       maxOutputTokens: asNumber(r.maxOutputTokens),
       pricePromptPerToken: asNumber(r.pricePromptPerToken),
       priceCompletionPerToken: asNumber(r.priceCompletionPerToken),
+      rateLimits: sanitizeRateLimits(r.rateLimits),
     };
     if (!isEmpty(l)) out[id] = l;
   }
@@ -348,6 +458,18 @@ export class ModelCatalog {
     this.loadDisk();
     const l = this.mem.get(name)?.limits?.[model];
     return l && !isEmpty(l) ? l : null;
+  }
+
+  /**
+   * Already-cached PUBLISHED rate limits for a model — synchronous, never fetches.
+   *
+   * Spec §4 rung 2's read side. Deliberately NOT folded into `resolveMetadata()`: rate limits are
+   * per-(provider, model) facts with no meaningful `reference` rung — another provider's request
+   * allowance says nothing about this deployment's — so there is nothing for the per-field
+   * provenance ladder to resolve and callers read this directly, basis provider-stated.
+   */
+  publishedRateLimits(name: string, model: string): ModelRateLimits | null {
+    return this.cachedLimits(name, model)?.rateLimits ?? null;
   }
 
   /**

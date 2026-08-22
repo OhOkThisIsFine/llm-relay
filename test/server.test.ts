@@ -93,7 +93,7 @@ function catalogWithLimits(dir: string, seed: Record<string, Record<string, Part
   for (const [provider, models] of Object.entries(seed)) {
     const limits: Record<string, ModelLimits> = {};
     for (const [model, l] of Object.entries(models)) {
-      limits[model] = { contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, ...l };
+      limits[model] = { contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null, ...l };
     }
     entries[provider] = { fetchedAt: Date.now(), models: Object.keys(models), limits };
   }

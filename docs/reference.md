@@ -877,6 +877,8 @@ through natively.
 Model ids are discovered live from each provider's `/models` endpoint — never hand-maintained —
 and cached in `~/.llm-relay/models-cache.json` (10-min TTL, fail-open). On startup the proxy
 warms routed and free providers and warns about any routing target its provider doesn't serve.
+Where a provider publishes rate limits in its `/models` records (rpm/rpd/tpm/tpd), those are
+harvested alongside the other limits; most providers publish none.
 
 ```bash
 llm-relay models                 # every provider
