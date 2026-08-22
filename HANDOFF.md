@@ -97,9 +97,11 @@ else.**
 - **Headless offload lanes must be told not to stop and ask.** An Ox-Alpha or `claude -p` lane
   that ends its turn with a clarifying question reads as a completed task that did nothing.
   Instruct it to decide and proceed on its own judgement, and to report rather than await approval.
-- **The owner's `cliLane` template places `{task}` after the variadic `--allowedTools`.** Some
-  shells let the variadic swallow what follows, so feed the task via stdin or reorder the
-  template - and confirm with a real invocation before trusting a lane built from it.
+- **FIXED 2026-08-22 — the owner's `cliLane` template no longer places `{task}` after the variadic
+  `--allowedTools`;** it now sits directly after `-p` (pre-order backup at
+  `~/.llm-relay/config.json.bak-2026-08-22-pre-clilane-task-order`). The lesson stays: some shells
+  let a variadic option swallow what follows it, so keep `{task}` BEFORE any variadic flag, and
+  confirm a template with one real headless run before trusting a lane built from it.
 - **Two heredoc groups in one Bash call break quoting in this harness.** One heredoc per call.
 
 ## 5. Definition of done
@@ -125,9 +127,7 @@ From [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2
   genuine piece of the spec still missing; the availability ladders of spec §5 exist in no form.
 - **OPEN — Stage 4 (Gap 11 + C1 roll-up).** Spend x `resolveMetadata()` prices with compound
   `spendBasis`; then `cost --include-repair`. Rebase `unpricedRequests` in the same change.
-- **Decision still to record — Gap 7 surface shape.** Plain `GET /usage`,`/quota` and
-  `usage`/`quota` CLI verbs do not exist; presentation is delivered by the dashboard snapshot API
-  + SPA instead. Amend the spec to name that delivery, or add thin read-only endpoints later.
+- **Gap 7:** resolved 2026-08-22 by spec amendment; no new endpoints.
 - **DEFER — Gap 10 / M4.** Estimated-output producer withheld until measured usage-absence rates
   justify it (owner disposition, open-decisions.md).
 - **DEFER — Gap 13.** Catalog rate-limit harvesting: cheap, expected near-empty payoff; slot

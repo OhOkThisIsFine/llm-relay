@@ -305,6 +305,16 @@ Corollary for any bar/meter: **do not draw a 0-of-0 track.** freellmapi made bot
 
 ## 6. PRESENTATION
 
+**Resolution (owner, 2026-08-22).** Gap 7 is resolved by amending this section rather than building
+its surface: the presentation it describes is delivered by the dashboard snapshot API
+(`GET /dashboard/api/v1/snapshot` plus the per-request detail route under
+`/dashboard/api/v1/requests/` — `src/dashboard-routes.ts:219-234`), by `llm-relay dashboard`
+(`src/cli.ts:957`), and by the typed quota rendering in `llm-relay candidates`
+(`src/cli.ts:1973` calling `formatCandidateQuota` at `src/cli.ts:2033-2041`, which prints
+axis/period/remaining/limit/basis/age per observation). The `usage`/`quota` CLI verbs and the plain
+`GET /usage` / `GET /quota` endpoints are **NOT planned**. The §6.1/§6.2 sketches below remain as
+the original design record; they do not describe shipped surface.
+
 ### 6.1 CLI — the pipeline's natural output
 
 Nine analytics endpoints collapse into two commands with a dimension flag, because the surface is a table, not a page.
@@ -420,7 +430,7 @@ Ranked by value per unit effort. S ≈ under a day, M ≈ a few days, L ≈ a we
 | 4 | **Widen `AssistantMessage.usage`** (`src/anthropic.ts:69`) for cache tokens | S | Cached prompt tokens are the largest single distortion in any spend figure. |
 | 5 | **Configured limits** on `ProviderConfig` (`src/config.ts:59`) | S | The only rung that can express an account-wide cap without inference. Unblocks `derived` remaining immediately. |
 | 6 | **Day-sharded usage store** + rollup reads | M | Windows, rates, lifetime totals. Two-tier shape already proven by `ProbeTotals` (`src/ping/probe-cache.ts:24-36`). |
-| 7 | **`llm-relay usage` / `quota` + `GET /usage` `/quota`** | M | The surface. Loopback-query-first with read-only file fallback (§3.1). |
+| 7 | **`llm-relay usage` / `quota` + `GET /usage` `/quota`** | M | The surface. Loopback-query-first with read-only file fallback (§3.1). (resolved by amendment 2026-08-22 — see §6) |
 | 8 | **Learned rate-limit facts** — 4 new `FactKind`s + `parseStatedRateLimit()` | M | Reuses `src/target-facts.ts` entirely; the parser is the only new code. Must land in the MEASUREMENT half. |
 | 9 | **`quota` sub-object on `Candidate`** (`src/candidates.ts`) | S | Un-blended, sibling to `breaker`/`facts`. No multiplier. |
 | 10 | **Estimated output tokens** — chars/4 byte counter in both write loops | S | Only meaningful once #2 exists and reveals how often `usage` is absent. Separate accumulator, always. |
@@ -446,11 +456,11 @@ Type the quota observation; fix the provider-keying scope drift; surface `{axis,
 Widen `AssistantMessage.usage`; add the bounded tail tap on both fronts; add token fields to `LOG_FIELDS`. The JSONL becomes the per-request ledger and `llm-relay usage --json` can read it directly with no aggregate store.
 *Gate:* a test asserting the accounting site is reached from `openAiFrontPath` with ≥2 candidates, not only from `/v1/messages`.
 
-**Stage 2 — Windows and rollups.** (Gaps 6, 7 partial, 10. Effort M.)
+**Stage 2 — Windows and rollups.** (Gaps 6, 7 partial, 10. Effort M.) (resolved by amendment 2026-08-22 for the Gap 7 portion — see §6)
 Day-sharded `usage/<date>.json` + `lifetime.json`; `llm-relay usage --window --by`; `GET /usage`. Add the estimated-output counter once Stage 1 has shown how often `usage` is absent.
 Now: requests, success rate, latency percentiles, token totals, per-provider / per-model / per-client breakdowns, all windowed.
 
-**Stage 3 — Availability.** (Gaps 5, 8, 7 remainder, 9. Effort M.)
+**Stage 3 — Availability.** (Gaps 5, 8, 7 remainder, 9. Effort M.) (resolved by amendment 2026-08-22 for the Gap 7 portion — see §6)
 Configured limits in config; learned rate-limit facts + parser; the remaining/resetsAt ladders; `llm-relay quota` + `GET /quota`.
 Now the freellmapi Quota Signals card exists as a table, with basis and observed-at beside every number.
 
