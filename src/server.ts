@@ -68,10 +68,11 @@ import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { estimateRequestTokens, assessCost } from "./metadata.js";
 import { specOfTarget } from "./benchmarks.js";
-import { extractQuotaObservations } from "./quota-observation.js";
+import { extractQuotaObservations, type QuotaObservation } from "./quota-observation.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
+import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact } from "./target-facts.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
@@ -2268,6 +2269,65 @@ function observeContextLimit(status: number, target: ResolvedTarget, body: strin
 }
 
 /**
+ * Record the durable half of provider-stated quota observations as learned rate-limit facts.
+ *
+ * A header pair like `x-ratelimit-limit-requests-day: 1000` is the deployment stating its own
+ * ceiling — first-party evidence, same standing as an error body that says it. The observation
+ * already had to be explicitly attributed (axis AND period named in the header, limit AND
+ * remaining in one bucket), so nothing here guesses.
+ *
+ * ⚠ minute/day only. `quota-observation.ts` also recognizes month and unknown periods; there is no
+ * measurement kind for either (a monthly ceiling is allowance territory, not rate), so they are
+ * skipped rather than forced into a kind that would misstate them.
+ */
+function observeStatedRateLimits(attempt: HealthAttempt, observations: QuotaObservation[]): void {
+  if (observations.length === 0) return;
+  const { target } = attempt;
+  if (target.model === undefined) return;
+  try {
+    for (const o of observations) {
+      if (!Number.isFinite(o.limit) || o.limit <= 0) continue;
+      // Month/unknown have no fact kind on purpose (see above); only minute/day are measurements.
+      if (o.period !== "minute" && o.period !== "day") continue;
+      recordObservedRateLimit(target.provider, attempt.resolvedAttempt.credentialId, target.model, [
+        { axis: o.axis, period: o.period, limit: Math.floor(o.limit) },
+      ]);
+    }
+  } catch {
+    // Learning is best-effort and never in the request's way — observeAttemptHeaders itself may
+    // throw when the breaker rejects an observation, but this must not.
+  }
+}
+
+/**
+ * Learn a deployment's stated rate limits from an error body it just returned.
+ *
+ * ⚠ Called from BOTH request paths beside `observeContextLimit`, for the same reason that helper
+ * documents: this repo has already shipped one defect where the OpenAI front had no copy of a
+ * policy the Anthropic path enforced ("two paths, two policies, one of them empty" — see
+ * docs/pool-failover.md). A learning loop that only ran on one front would silently know less
+ * about half the traffic. Called with bytes already buffered by `inspectCandidateResponse`, so it
+ * never tees or consumes the Response that may still become the client's terminal real error.
+ *
+ * ⚠ 429 only. A 402 (credits) or 403 (gating) is a different fact about a DIFFERENT axis, already
+ * handled by the eligibility/refusal machinery; scanning those bodies for rate wording risks
+ * recording a ceiling from prose that merely mentions one. Conservative default; revisit only with
+ * evidence of a real provider stating its limit on a non-429.
+ */
+function observeRateLimit(attempt: ResolvedAttempt, status: number, body: string): void {
+  if (status !== 429) return;
+  if (attempt.target.model === undefined) return;
+  try {
+    if (!looksLikeRateLimitError(body)) return;
+    const stated = parseStatedRateLimit(body);
+    if (stated === null) return;
+    recordObservedRateLimit(attempt.target.provider, attempt.credentialId, attempt.target.model, stated);
+  } catch {
+    // Learning is best-effort and never in the request's way.
+  }
+}
+
+/**
  * Learn what a refusal proved about a deployment — or, when nothing confirmed covers it, learn
  * NOTHING and queue the message for offline research.
  *
@@ -2487,6 +2547,7 @@ async function inspectCandidateResponse(
   }
   const body = bytes.toString("utf8");
   observeContextLimit(status, attempt.target, body);
+  observeRateLimit(attempt, status, body);
   const eligibility = carriesEligibilityFact(status) && body
     ? observeEligibility(attempt, status, retryAfterMs, body)
     : { unknown: false };
@@ -2528,6 +2589,11 @@ function observeAttemptHeaders(
   const quotaObservations = headers
     ? extractQuotaObservations(headers, { observedAt })
     : [];
+  // The `limit` half of a provider-stated quota observation is DURABLE — it is what the deployment
+  // says it allows — so it is also recorded as a learned rate-limit fact (spec §4 Rung 1: header
+  // observations are not their own rung; the limit IS the rung-1 measurement). `remaining` and
+  // `resetsAt` stay volatile here with the breaker.
+  observeStatedRateLimits(attempt, quotaObservations);
   const result = h.breaker.observeHeaders(attempt.handle, {
     target: attempt.identity,
     status,

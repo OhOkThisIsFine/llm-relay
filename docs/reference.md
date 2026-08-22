@@ -831,6 +831,12 @@ more accurate the more it is used:
 This is what makes the "unmeasured member" case self-correcting: the first over-length rejection
 from that member states its ceiling, and the next dispatch reports the corrected floor.
 
+Rate limits are learned the same way: a 429 whose body states an explicit ceiling ("limit 60
+requests per minute", "TPM: 6000") — or a response carrying attributed `x-ratelimit-*-limit` /
+`-remaining` header pairs for a minute/day period — is remembered as a `rate-limit-*` fact, shown
+per member in `/candidates`. Like learned context ceilings these are **display-only**: they never
+gate or reorder traffic on their own.
+
 `llm-relay dispatch --next-command -t "<task>"` prints just the runnable line for `next`, for
 callers that want something executable rather than the human ladder.
 

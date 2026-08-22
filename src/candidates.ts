@@ -100,7 +100,13 @@ export interface Candidate {
    * `breaker` alone, and they call for completely different responses — one is "wait or switch
    * provider", the other is "this deployment is sick".
    */
-  facts: Array<{ kind: string; scope: string; expiresInMs: number }>;
+  /**
+   * What this deployment (or its provider, or its group) has STATED about itself — the learned
+   * facts from `target-facts.ts`, each with the scope it applies at. The measurement kinds
+   * (`context-limit`, `rate-limit-rpm|rpd|tpm|tpd`) also carry `value`: the ceiling itself, as
+   * stated. Display-only — nothing here reorders or gates a candidate.
+   */
+  facts: Array<{ kind: string; scope: string; expiresInMs: number; value?: number }>;
   /** Observed real traffic through this proxy (not synthetic probes). */
   observed: {
     totalCalls: number;
@@ -490,6 +496,7 @@ export async function buildCandidates(
         kind: f.kind,
         scope: describeScope(f.scope),
         expiresInMs: Math.max(0, f.until - nowMs),
+        ...(f.value === undefined ? {} : { value: f.value }),
       })),
       observed: obs
         ? {

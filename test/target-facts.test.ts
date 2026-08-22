@@ -72,7 +72,7 @@ describe("credential-scoped v2 persistence", () => {
     writeFileSync(path, JSON.stringify({
       version: 2,
       facts: {
-        [keyOf(valid.scope)]: valid,
+        [keyOf(valid.kind, valid.scope)]: valid,
         "c:wrong-key": { ...valid, scope: { ...valid.scope, credentialId: work } },
         "d:p/m": { kind: "bogus", scope: { kind: "deployment", provider: "p", model: "m" }, at: 1 },
         "c:other#default": { ...valid, scope: { ...valid.scope, credentialId: makeCredentialId("other") } },
@@ -122,6 +122,32 @@ describe("credential-scoped v2 persistence", () => {
     recordFact("context-limit", { kind: "attempt", provider: "p", credentialId: personal, model: "m" }, { path, value: 4_096 });
     expect(clearFactsV2("p", personal, "m", { path })).toEqual(["credential-invalid"]);
     expect(factsForV2("p", personal, "m", { path }).map((fact) => fact.kind)).toEqual(["context-limit"]);
+  });
+
+  it("carries all ten kinds, five conditions plus five measurements", () => {
+    // The compiler already forces a TTL per kind (Record<FactKind, number>); this pins that the
+    // measurement half actually EXISTS — a silent drop back to six kinds would make the parser
+    // below record into a kind the store refuses to keep.
+    expect(FACT_TTL_MS).toHaveProperty("context-limit");
+    expect(FACT_TTL_MS).toHaveProperty("rate-limit-rpm");
+    expect(FACT_TTL_MS).toHaveProperty("rate-limit-rpd");
+    expect(FACT_TTL_MS).toHaveProperty("rate-limit-tpm");
+    expect(FACT_TTL_MS).toHaveProperty("rate-limit-tpd");
+    expect(Object.keys(FACT_TTL_MS)).toHaveLength(10);
+  });
+
+  it("never clears, cools, or cost-blocks on a rate-limit measurement", () => {
+    // The measurement half: a stated ceiling survives a success (a success disproves a condition,
+    // never a measurement), reports no cooldown (health demotes, measurements don't), and blocks
+    // no spend (a known limit is information, not an entitlement wall).
+    for (const kind of ["rate-limit-rpm", "rate-limit-rpd", "rate-limit-tpm", "rate-limit-tpd"] as const) {
+      recordFact(kind, { kind: "attempt", provider: "p", credentialId: personal, model: "m" }, { path, value: 60 });
+      recordFact(kind, { kind: "deployment", provider: "p", model: "m" }, { path, value: 60 });
+    }
+    expect(clearFactsV2("p", personal, "m", { path })).toEqual([]);
+    expect(factsForV2("p", personal, "m", { path })).toHaveLength(8);
+    expect(cooldownUntilV2("p", personal, "m", { path })).toBeNull();
+    expect(isCostBlockedV2("p", personal, "m", { path })).toBe(false);
   });
 
   it("reports a breaker-clearing signal only for credential-scoped conditions", () => {
