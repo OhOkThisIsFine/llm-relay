@@ -127,18 +127,18 @@ describe("per-provider limits", () => {
   it("reads limits out of the field names different providers actually use", () => {
     // Groq
     expect(limitsFromRecord({ id: "x", context_window: 131072, max_completion_tokens: 32768, pricing: { prompt: "0.00000015", completion: "0.0000006" } }))
-      .toEqual({ contextLength: 131072, maxOutputTokens: 32768, pricePromptPerToken: 1.5e-7, priceCompletionPerToken: 6e-7 });
+      .toEqual({ contextLength: 131072, maxOutputTokens: 32768, pricePromptPerToken: 1.5e-7, priceCompletionPerToken: 6e-7, rateLimits: null });
     // Mistral — publishes context only
     expect(limitsFromRecord({ id: "x", max_context_length: 32768 }))
-      .toEqual({ contextLength: 32768, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null });
+      .toEqual({ contextLength: 32768, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null });
     // OpenRouter — top-level context, per-deployment ceiling nested under top_provider
     expect(limitsFromRecord({ id: "x", context_length: 1048576, top_provider: { max_completion_tokens: 65536 } }))
-      .toEqual({ contextLength: 1048576, maxOutputTokens: 65536, pricePromptPerToken: null, priceCompletionPerToken: null });
+      .toEqual({ contextLength: 1048576, maxOutputTokens: 65536, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null });
     // A free tier publishes 0 — a real price, not "unpublished".
     expect(limitsFromRecord({ id: "x", pricing: { prompt: "0", completion: "0" } }).pricePromptPerToken).toBe(0);
     // NIM — publishes nothing but id/object/created/owned_by
     expect(limitsFromRecord({ id: "z-ai/glm-5.2", object: "model", owned_by: "z-ai" }))
-      .toEqual({ contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null });
+      .toEqual({ contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null });
   });
 
   it("treats a BLANK published price as unpublished, not as free", () => {
@@ -153,7 +153,7 @@ describe("per-provider limits", () => {
       .toMatchObject({ pricePromptPerToken: 0, priceCompletionPerToken: 0 });
     // And a record whose ONLY "figures" were blank publishes nothing at all, so the catalog
     // reports null rather than caching a hollow entry that reads as "this provider publishes limits".
-    expect(blank).toEqual({ contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null });
+    expect(blank).toEqual({ contextLength: null, maxOutputTokens: null, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null });
   });
 
   it("reports null — not a hollow object — when a blank-priced record is all a provider publishes", async () => {
@@ -187,7 +187,7 @@ describe("per-provider limits", () => {
     const rich = await catalog.limits("rich", cfg("http://rich.test/v1"), "shared/model-a", { fetchFn });
     const bare = await catalog.limits("bare", cfg("http://bare.test/v1"), "shared/model-a", { fetchFn });
 
-    expect(rich).toEqual({ contextLength: 131072, maxOutputTokens: 32768, pricePromptPerToken: null, priceCompletionPerToken: null });
+    expect(rich).toEqual({ contextLength: 131072, maxOutputTokens: 32768, pricePromptPerToken: null, priceCompletionPerToken: null, rateLimits: null });
     // null, NOT the other provider's numbers — that conflation is the bug this guards.
     expect(bare).toBeNull();
   });
