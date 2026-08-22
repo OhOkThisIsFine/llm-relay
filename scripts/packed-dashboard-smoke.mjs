@@ -21,7 +21,9 @@ try {
   const tarball = join(temp, packed.filename);
   const install = join(temp, "install");
   writeFileSync(join(temp, "package.json"), JSON.stringify({ private: true }), "utf8");
-  runNpm(["install", "--ignore-scripts", "--offline", "--no-audit", "--no-fund", tarball], temp);
+  // --prefer-offline, not --offline: a fresh CI runner's npm cache has nothing for this tarball's
+  // runtime deps, and --offline is ENOTCACHED there. The smoke proves the TARBALL is complete, not that the registry is unreachable.
+  runNpm(["install", "--ignore-scripts", "--prefer-offline", "--no-audit", "--no-fund", tarball], temp);
   const installed = join(temp, "node_modules", "llm-relay");
   for (const required of ["LICENSE", "THIRD_PARTY_NOTICES.md", "docs/dashboard-bundle-inventory.json", "dist/dashboard/index.html", "dist/dashboard/.vite/manifest.json"]) {
     if (!existsSync(join(installed, required))) throw new Error(`packed file missing: ${required}`);
