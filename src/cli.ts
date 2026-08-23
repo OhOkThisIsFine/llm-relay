@@ -1936,11 +1936,14 @@ export async function runCandidates(): Promise<void> {
     // because a credential fault is deliberately not health data and so never reached the
     // breaker's failure fields. It has its own axis now, and it is shown: the reason half a
     // pool can be unusable while every row looks fine is precisely this cell.
-    const breaker = c.breaker.open
-      ? `OPEN ${Math.round(c.breaker.cooldownRemainingMs / 1000)}s`
-      : c.breaker.credentialFault
-        ? `AUTH ${c.breaker.lastCredentialStatus ?? ""}`.trim()
-        : "closed";
+    const quota = quotaBreakerLabel(c);
+    const breaker = quota
+      ? quota
+      : c.breaker.open
+        ? `OPEN ${Math.round(c.breaker.cooldownRemainingMs / 1000)}s`
+        : c.breaker.credentialFault
+          ? `AUTH ${c.breaker.lastCredentialStatus ?? ""}`.trim()
+          : "closed";
     process.stdout.write(
       c.spec.slice(0, 31).padEnd(32) +
         `${credential.label} (${c.credentialId})`.padEnd(40) +
@@ -2011,6 +2014,8 @@ export async function runCandidates(): Promise<void> {
       `        before pointing bulk work at that pool.\n` +
       `  breaker: "OPEN 42s" = cooling after failures/429; "AUTH 401" = credential fault, demoted\n` +
       `           until it is retried (expires, so a rotated key recovers with no restart).\n` +
+      `           "QUOTA 30s (requests/minute, provider-stated)" = the stated/declared allowance is\n` +
+      `           SPENT, not sick — demoted behind live members and lifting on its own at the reset.\n` +
       `  fit = pool order: 75% capability + 20% measured operations + 5% task-fit metadata.\n` +
       `        Unknown operations/metadata are neutral, never zero; hard faults are demoted.\n` +
       `  raw = fixed 40% agentic + 35% coding + 25% general capability. Missing dimensions\n` +
@@ -2044,6 +2049,24 @@ export function formatCandidateQuota(quota: readonly Candidate["quota"][number][
     const period = observation.period === "unknown" ? "-" : observation.period;
     return `${observation.axis}/${period} ${observation.remaining}/${observation.limit} ${observation.basis} age ${age}`;
   }).join("; ");
+}
+
+/**
+ * A `quota` cooldown source reads differently from OPEN because it IS different: nothing failed,
+ * a stated/declared allowance is merely spent until a known reset. The axis/period/basis detail
+ * comes ONLY from this row's own availability ladder saying spent-and-gateable — when the ladder
+ * cannot confirm (its localUsed view differs from the router's), the label still renders, without
+ * inventing detail. Un-blended, no score: same contract as every column in this table.
+ */
+function quotaBreakerLabel(c: Candidate): string | null {
+  if (c.breaker.cooldownSource !== "quota") return null;
+  const seconds = Math.max(0, Math.round(c.breaker.cooldownRemainingMs / 1000));
+  const spent = c.availability
+    .filter((row) => row.remaining !== null && row.remaining <= 0 && row.routingEligible && row.resetsAt !== null)
+    .sort((a, b) => (a.resetsAt ?? 0) - (b.resetsAt ?? 0))[0];
+  return spent
+    ? `QUOTA ${seconds}s (${spent.axis}/${spent.period}, ${spent.remainingBasis ?? "unknown"})`
+    : `QUOTA ${seconds}s`;
 }
 
 /**

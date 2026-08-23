@@ -162,6 +162,16 @@ export interface Routing {
   /** Ephemeral session affinity. Boolean shorthand uses the 30m/1,000-entry defaults. */
   sticky?: StickyConfig;
   /**
+   * Quota-as-demotion enforcement (spec §5.4 / Gap 12). `enforce` (default true) lets a SPENT
+   * quota demote a candidate to the cooling band — provider-stated observations and
+   * operator-declared limits only. `enforceLearned` (default false) additionally admits limits
+   * LEARNED from vendor prose (decision M2): display-only until this is set to true.
+   *
+   * A demotion never drops and never refuses — it only reorders, expiring at the resetsAt the
+   * evidence stated. Unknown quota has no effect whatsoever.
+   */
+  quota?: QuotaEnforcementConfig;
+  /**
    * Ordered dispatch ladder consulted by `/dispatch` — which LANE a host agent should hand a
    * whole delegated task to, and in what order to fall back. Distinct from `subagents`, which
    * routes one HTTP turn: a ladder rung may be an agent CLI that never traverses this proxy,
@@ -192,6 +202,46 @@ export interface StickyRoutingConfig {
 }
 
 export type StickyConfig = boolean | StickyRoutingConfig;
+
+/**
+ * `routing.quota`. Both keys are optional booleans with deliberate defaults: enforcement of
+ * provider-stated/derived-from-configured figures is ON unless switched off (decision M1), and
+ * learned prose parses stay display-only unless explicitly admitted (decision M2). An object with
+ * neither key is legal and means exactly the defaults — writing it down is documentation, not a
+ * behaviour change.
+ */
+export interface QuotaEnforcementConfig {
+  /** Default true. false disables quota demotion entirely. */
+  enforce?: boolean;
+  /** Default false. true additionally lets `derived:learned` figures gate routing. */
+  enforceLearned?: boolean;
+}
+
+/**
+ * Validate `routing.quota`. A malformed block is a hard error rather than silently ignored:
+ * an operator who wrote `"enforceLearned": "yes"` believes they opted into gating on learned
+ * limits when they have not, which is precisely the silent-divergence shape this file's other
+ * parsers reject by name.
+ */
+function parseQuotaEnforcement(raw: unknown): QuotaEnforcementConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.quota must be an object");
+  }
+  const value = raw as Record<string, unknown>;
+  const out: QuotaEnforcementConfig = {};
+  if (value.enforce !== undefined) {
+    if (typeof value.enforce !== "boolean") throw new Error("config.routing.quota.enforce must be a boolean");
+    out.enforce = value.enforce;
+  }
+  if (value.enforceLearned !== undefined) {
+    if (typeof value.enforceLearned !== "boolean") {
+      throw new Error("config.routing.quota.enforceLearned must be a boolean");
+    }
+    out.enforceLearned = value.enforceLearned;
+  }
+  return out;
+}
 
 /**
  * Template for rendering a `relay` rung as a shelled-out CLI command.
@@ -1235,6 +1285,7 @@ function parseRouting(
     subagents?: unknown;
     benchmarkSort?: unknown;
     sticky?: unknown;
+    quota?: unknown;
     ladder?: unknown;
     ladders?: unknown;
     cliLane?: unknown;
@@ -1348,6 +1399,8 @@ function parseRouting(
   const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
   const sticky = parseSticky(r.sticky);
   if (sticky) routing.sticky = sticky;
+  const quota = parseQuotaEnforcement(r.quota);
+  if (quota) routing.quota = quota;
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;

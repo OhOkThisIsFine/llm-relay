@@ -38,7 +38,7 @@ import {
   type Reshaper,
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -77,6 +77,7 @@ import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
 import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact } from "./target-facts.js";
+import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
@@ -331,6 +332,18 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const stickySessions = stickyConfig === true || (typeof stickyConfig === "object" && stickyConfig.enabled)
     ? new StickySessionManager(typeof stickyConfig === "object" ? stickyConfig : undefined)
     : undefined;
+  // Gap 12: the deployment-level quota demotion term. Built once per proxy; each call re-reads
+  // live breaker state and the store's in-memory window. `deps.accountingReader` is narrowed the
+  // same way the dashboard producer above narrows it, so a bare programmatic proxy simply has no
+  // localUsed figure and the term stays inert.
+  const quotaDemotion = createQuotaDemotionFn({
+    cfg,
+    breaker,
+    accounting:
+      deps.accountingReader !== undefined && typeof (deps.accountingReader as { usedInWindow?: unknown }).usedInWindow === "function"
+        ? (deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow">)
+        : null,
+  });
   let controlAuthorization: ControlAuthorizationPort | undefined;
   if (deps.controlAuthorization !== undefined) {
     controlAuthorization = deps.controlAuthorization ?? undefined;
@@ -426,6 +439,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       ...(stickySessions ? { stickySessions } : {}),
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
+      quotaDemotion,
     }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
       // Last-resort net. `handle` logs every turn it terminates itself, so reaching
@@ -481,6 +495,12 @@ interface Handlers {
   stickySessions?: StickySessionManager;
   controlAuthorization?: ControlAuthorizationPort;
   server: Server;
+  /**
+   * Gap 12's deployment-level quota term (see `quota-demotion.ts`). Inert — returns null without
+   * touching any evidence — while `routing.quota.enforce` stays false, so an operator who opted
+   * out pays one property read per candidate and nothing else.
+   */
+  quotaDemotion: QuotaDemotionFn;
 }
 
 type ProxyAccountingAttribution = "relay_held" | "caller_operated" | "unknown";
@@ -1121,7 +1141,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const rankedAttempts = rankCredentialAttempts(attempts, h.credentialLru, {
     evidenceFor: (attempt) => credentialEvidence(attempt, cfg, h.breaker, routingNow),
   });
-  let walkAttempts = orderDeploymentGroupsByUsability(rankedAttempts, h.breaker, routingNow);
+  const { ordered: orderedAttempts, quotaDemotedFirst } = orderDeploymentGroupsByUsability(
+    rankedAttempts,
+    h.breaker,
+    routingNow,
+    h.quotaDemotion,
+  );
+  let walkAttempts = orderedAttempts;
   let sticky: StickyRequestContext | null = null;
   if ((isMessages || openAiFrontProtocol) && h.stickySessions) {
     const key = deriveSessionKey(req.headers, reqJson);
@@ -1139,6 +1165,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           h.breaker,
           degradedSpecs,
           routingNow,
+          h.quotaDemotion,
         );
         walkAttempts = applied.targets;
         sticky.provenance = `${pinnedSpec} (${applied.status})`;
@@ -1220,6 +1247,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       sticky,
       cfg,
       accounting,
+      quotaDemotedFirst,
     }, h);
     return;
   }
@@ -1542,6 +1570,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         poolSummary: null,
         poolUnknownRefusals: pool429.unknownCount(),
         degraded: degradedLabel(addressedPool, degradedSpecs, target),
+        quotaDemoted: quotaDemotedFirst,
         paid: paidLabel(cfg, h, target),
         credentialHeaders: backendRes.status < 400
           ? credentialTrace.headers(resolvedAttempt)
@@ -1732,13 +1761,43 @@ interface StickyRequestContext {
 
 type TargetUsability = "live" | "credential-fault" | "cooling";
 
+/**
+ * Gap 12: a SPENT quota demotes to the same cooling band as an outage (spec §5.4), because both
+ * mean "this cell cannot serve right now, and it comes back on its own". A spent allowance is not
+ * a sick backend, so the term never touches failure counters; registering the cooldown with
+ * source "quota" exists purely so `/candidates`, the dashboard Cooldowns panel and
+ * `llm-relay candidates` can SEE why the member stepped aside — and so a sticky pin or a degrade
+ * tail check later in this same request reads the demotion too, without a second resolver pass.
+ *
+ * Learned limits gate only under `routing.quota.enforceLearned`; unknown quota yields null here
+ * and has no effect whatsoever. Never throws, never drops, never refuses.
+ */
+function cooledByQuota(
+  attempt: ResolvedAttempt,
+  breaker: CircuitBreaker,
+  quotaDemotion: QuotaDemotionFn | null | undefined,
+  now: number,
+): boolean {
+  if (!quotaDemotion) return false;
+  const spent = quotaDemotion(attempt, now);
+  if (spent === null) return false;
+  breaker.recordQuotaCooldown(targetIdentity(attempt), spent.resetsAt, now);
+  return true;
+}
+
 function targetUsability(
   attempt: ResolvedAttempt,
   breaker: CircuitBreaker,
   now: number,
+  quotaDemotion?: QuotaDemotionFn | null,
 ): TargetUsability {
   const identity = targetIdentity(attempt);
-  if (!breaker.isHealthy(identity, now) || cooledByAllowance(attempt, now)) return "cooling";
+  if (!breaker.isHealthy(identity, now)) return "cooling";
+  if (cooledByAllowance(attempt, now)) return "cooling";
+  // A stated/declared quota at zero belongs in the SAME band as allowance-exhaustion above: both
+  // are temporary conditions on a deployment that is otherwise healthy, and ordering them ahead
+  // of live members is the whole point — the walk should spend its round-trips where capacity is.
+  if (cooledByQuota(attempt, breaker, quotaDemotion, now)) return "cooling";
   if (breaker.hasCredentialFault(identity, now)) return "credential-fault";
   return "live";
 }
@@ -1788,23 +1847,38 @@ function credentialEvidence(
 /**
  * Keep every credential row of a deployment together while ordering deployments by their
  * best-ranked row. CredentialWalk performs the breadth-first interleaving when it offers rows.
+ * Tracked like `orderByUsabilityTracked` so the request path can announce a displaced first choice.
  */
 function orderDeploymentGroupsByUsability(
   attempts: readonly ResolvedAttempt[],
   breaker: CircuitBreaker,
   now: number,
-): ResolvedAttempt[] {
+  quotaDemotion?: QuotaDemotionFn | null,
+): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null } {
   type Group = ReturnType<typeof groupCredentialAttempts>[number];
+  const preferred = groupCredentialAttempts(attempts)[0]?.attempts[0];
   const live: Group[] = [];
   const faulted: Group[] = [];
   const cooling: Group[] = [];
   for (const group of groupCredentialAttempts(attempts)) {
-    const usability = targetUsability(group.attempts[0]!, breaker, now);
+    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion);
     if (usability === "cooling") cooling.push(group);
     else if (usability === "credential-fault") faulted.push(group);
     else live.push(group);
   }
-  return [...live, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  const ordered = [...live, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  let quotaDemotedFirst: string | null = null;
+  if (
+    preferred !== undefined &&
+    quotaDemotion !== undefined &&
+    quotaDemotion !== null &&
+    ordered[0] !== undefined &&
+    ordered[0] !== preferred &&
+    quotaDemotion(preferred, now) !== null
+  ) {
+    quotaDemotedFirst = quotaDemotionLabel(specOfTarget(preferred.target), quotaDemotion(preferred, now)!);
+  }
+  return { ordered, quotaDemotedFirst };
 }
 
 type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
@@ -1917,6 +1991,7 @@ function applyStickyOrdering(
   breaker: CircuitBreaker,
   degraded: Set<string> | null,
   now: number,
+  quotaDemotion?: QuotaDemotionFn | null,
 ): { targets: ResolvedAttempt[]; status: string } {
   const groups = groupCredentialAttempts(ordered);
   const pinnedIndex = groups.findIndex((group) => specOfTarget(group.attempts[0]!.target) === pinnedSpec);
@@ -1925,14 +2000,15 @@ function applyStickyOrdering(
   if (!pinned || !pinnedGroup) return { targets: ordered, status: "bypassed: not-in-pool" };
 
   // The first row is the credential selector's best-ranked usable slot for this deployment.
-  const usability = targetUsability(pinned, breaker, now);
+  const usability = targetUsability(pinned, breaker, now, quotaDemotion);
   if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
 
   if (degraded?.has(pinnedSpec)) {
     const hasLiveInBand = groups.some(
       (group) => {
         const candidate = group.attempts[0]!;
-        return !degraded.has(specOfTarget(candidate.target)) && targetUsability(candidate, breaker, now) === "live";
+        return !degraded.has(specOfTarget(candidate.target)) &&
+          targetUsability(candidate, breaker, now, quotaDemotion) === "live";
       },
     );
     if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
@@ -1978,6 +2054,22 @@ export function orderByUsability(
   breaker = globalCircuitBreaker,
   now = Date.now(),
 ): ResolvedAttempt[] {
+  const { ordered } = orderByUsabilityTracked(attempts, breaker, now);
+  return ordered;
+}
+
+/**
+ * Gap 12's walk-order orderer. Kept pure: its exported shape must not change, and the
+ * quota-demotion ANNOUNCEMENT lives in exactly one place —
+ * `orderDeploymentGroupsByUsability` above — because two copies of the displacement check
+ * would drift silently (the first version of this block was unreachable here).
+ */
+function orderByUsabilityTracked(
+  attempts: ResolvedAttempt[],
+  breaker: CircuitBreaker,
+  now: number,
+  quotaDemotion?: QuotaDemotionFn | null,
+): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null } {
   const live: ResolvedAttempt[] = [];
   const faulted: ResolvedAttempt[] = [];
   const cooling: ResolvedAttempt[] = [];
@@ -1992,12 +2084,12 @@ export function orderByUsability(
     // Demotion, never exclusion — same contract as the rest of this function, and doubly so here:
     // an exhausted allowance is a temporary condition on a deployment that is still free, and a
     // pool with nothing else left must still be able to try it.
-    const usability = targetUsability(attempt, breaker, now);
+    const usability = targetUsability(attempt, breaker, now, quotaDemotion);
     if (usability === "cooling") cooling.push(attempt);
     else if (usability === "credential-fault") faulted.push(attempt);
     else live.push(attempt);
   }
-  return [...live, ...faulted, ...cooling];
+  return { ordered: [...live, ...faulted, ...cooling], quotaDemotedFirst: null };
 }
 
 /**
@@ -2216,6 +2308,11 @@ interface Ctx {
   credentialHeaders?: Record<string, string>;
   /** Set when the answering deployment came from the pool's degrade tail. See `degradedLabel`. */
   degraded?: string | null;
+  /**
+   * Set when the walk's ranked first choice was quota-demoted and a later candidate led instead.
+   * Computed once by `orderDeploymentGroupsByUsability`, beside the order it explains.
+   */
+  quotaDemoted?: string | null;
   /** Set when the answering deployment is not free. See `PAID_HEADER`. */
   paid?: string | null;
   /** Request-local sticky key and the previously stored pin's evaluation. */
@@ -2866,6 +2963,8 @@ async function openAiFrontPath(
     sticky?: StickyRequestContext | null;
     cfg?: Config;
     accounting: RequestAccountingState | null;
+    /** The walk's ranked first choice was quota-demoted; see `QUOTA_DEMOTED_HEADER`. */
+    quotaDemotedFirst?: string | null;
   },
   h: Handlers,
 ): Promise<void> {
@@ -3301,6 +3400,8 @@ async function openAiFrontPath(
           target,
         );
         if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
+        // The announcement computed at walk-order time, beside the same demotion that produced it.
+        if (ctx.quotaDemotedFirst) headers[QUOTA_DEMOTED_HEADER] = ctx.quotaDemotedFirst;
         const paidBy = ctx.cfg ? paidLabel(ctx.cfg, h, target) : null;
         if (paidBy) headers[PAID_HEADER] = paidBy;
         const stickyBy = stickyHeaderValue(ctx.sticky, target, upstream.status);
@@ -3423,6 +3524,7 @@ function responseHeadersForTarget(backendRes: Response, ctx: Ctx): Record<string
   // Counts only candidates stepped over: terminal refusal bodies are not buffered on this path.
   if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
+  if (ctx.quotaDemoted) responseHeaders[QUOTA_DEMOTED_HEADER] = ctx.quotaDemoted;
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
   if (ctx.credentialHeaders) Object.assign(responseHeaders, ctx.credentialHeaders);
   const sticky = stickyHeaderValue(ctx.sticky, ctx.target, backendRes.status);
