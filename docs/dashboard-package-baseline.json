@@ -10,14 +10,14 @@
   ],
   "observed": {
     "dashboardFiles": 5,
-    "dashboardRawBytes": 254052,
-    "jsBytes": 240154,
+    "dashboardRawBytes": 254170,
+    "jsBytes": 240272,
     "cssBytes": 12674,
     "htmlBytes": 383,
     "manifestBytes": 185,
-    "packBytes": 772753,
-    "unpackedBytes": 3915043,
-    "packageEntries": 245
+    "packBytes": 830263,
+    "unpackedBytes": 4128748,
+    "packageEntries": 257
   },
   "ceilings": {
     "dashboardRawBytes": 291600,
