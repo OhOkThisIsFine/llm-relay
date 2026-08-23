@@ -15,12 +15,25 @@ config, routing, pools, offload, repair, the CLI, endpoints, and the caveats.
   Destructive-tool calls are **refused, never fabricated**; unrepairable calls **fail clean**
   (502). Valid calls pass through untouched.
 - **OpenAI-compatible backends** (`kind: "openai"`) — front NIM / vLLM / OpenRouter / LM Studio.
-  Requests are translated Anthropic↔OpenAI via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge);
-  the validate/repair layer always sees Anthropic Messages regardless of backend.
+  The two REQUEST directions that carry tool calls are relay-owned (Anthropic→OpenAI-Chat and
+  OpenAI-Responses→Anthropic); the OpenAI-Chat request direction and every response/stream
+  direction are translated via [`llm-bridge`](https://github.com/supermemoryai/llm-bridge).
+  The validate/repair layer always sees Anthropic Messages regardless of backend.
 - **Bidirectional OpenAI front** — `POST /v1/chat/completions` and `POST /v1/responses` work
   against both `openai` and `anthropic` targets, streaming and tool calls included. Direct Chat
   recovers recognized tool-call dialect envelopes when the request declares functions; no-tools
-  traffic remains byte-exact.
+  traffic remains byte-exact. **Responses multi-turn tool conversations are supported**: a
+  `function_call` / `function_call_output` pair keeps its `call_id` all the way to the backend.
+  Responses input items the relay does not model are refused as a clean local 400 with no provider
+  egress rather than silently reshaped — `item_reference`, `local_shell_call`, `custom_tool_call`,
+  `web_search_call`, `computer_call`, `image_generation_call` and any future item type, plus
+  `previous_response_id` (the relay stores no responses) and a `text.format` of
+  `json_schema`/`json_object` (Anthropic Messages has no equivalent, and dropping it would return
+  prose to a caller that parses JSON). The same refusal covers a content part with no
+  representation — an `input_file` that is not a base64 PDF, a non-text part of a
+  `system`/`developer` item, an image the relay cannot resolve — and a `tools` field that is not a
+  list. `reasoning` items and `reasoning.effort` are dropped; hosted tool declarations
+  (`web_search_preview`, `file_search`, …) are dropped as before.
 - **Streaming repair** — text SSE frames stream to the client as they arrive; the proxy only
   withholds from the first `tool_use` block. Pure-text responses are byte-for-byte passthrough
   with zero added latency. A mid-stream repair failure surfaces as an SSE `error` event, never a

@@ -248,6 +248,41 @@ Coverage: outbound-shape tests in `test/backend.test.ts`, a ≥2-candidate walk 
 `test/pool-failover.test.ts` (the mapper runs once per candidate, so a single-candidate test would
 prove nothing), and the response-side contract test above.
 
+### The Responses-front sibling (2026-08-23)
+
+The same class of defect, on the other front, found while auditing the fix above. `/v1/responses`
+requests were handed to llm-bridge's `translateBetweenProviders("openai-responses", "anthropic", …)`,
+whose `openaiResponsesToUniversal` models exactly one tool-shaped input item — `function_call_output`.
+So on a Codex multi-turn tool conversation:
+
+- a `function_call` input item (the assistant's OWN tool call) carries no `role`. It was defaulted to
+  `"user"`, and its absent `content` became `[{type:"text", text: undefined}]`. **The tool call
+  vanished**, leaving the `tool_result` that followed with nothing to answer: an `anthropic`-kind
+  target 400s on a `tool_result` with no matching `tool_use`, and an `openai`-kind target received a
+  `role:"tool"` message with no `tool_calls` before it. Every Responses tool conversation was broken
+  past the first call, on both backend kinds;
+- an assistant `message` whose parts are `output_text` hit `parseResponsesContent`'s fall-through and
+  reached the backend as `JSON.stringify(part)` — **the assistant's own prior answer delivered as a
+  JSON string**, which is the leak above in miniature;
+- a `reasoning` item (Codex sends one before most turns) became a bogus user turn;
+- `instructions` — Codex's system prompt — was read by nobody and dropped entirely;
+- `reasoning.effort` became `thinking: {budget_tokens: 10240}`, a token budget nobody stated.
+
+**The fix is the same shape:** `src/responses-request.ts` (`openaiResponsesRequestToAnthropic`) owns
+that direction now, sharing `RequestMappingError` with `openai-request.ts`. `function_call.call_id`
+becomes `tool_use.id` and `function_call_output.call_id` becomes `tool_result.tool_use_id`, so the id
+this relay minted on the way out (`anthropicMessageToOpenAi` sets `call_id` = the Anthropic
+`tool_use` id) survives the whole round trip and reappears as `tool_calls[].id` /
+`tool_call_id` for an `openai`-kind target. Consecutive same-role items merge into one turn;
+`reasoning` and `reasoning.effort` are dropped; `previous_response_id`, a `text.format`
+structured-output contract and any unmodelled item type are REFUSED as a clean local 400 rather than
+silently reshaping the conversation. llm-bridge keeps the CHAT request direction — `openaiToUniversal`
+does handle `tool_calls` and `role:"tool"` — and every response/stream direction.
+
+Coverage: `test/responses-request.test.ts` (the pure mapper), and on the front,
+`test/openai-front.test.ts` §"Responses front — relay-owned request translation" (both backend
+kinds, buffered and streamed, a ≥2-candidate failover walk, and the two zero-egress refusals).
+
 ## Third mechanism (2026-08-23) — a non-unique identifier, not a leaked envelope
 
 A sibling of the two above, and the one they make easy to misread. Nothing is mangled here and no

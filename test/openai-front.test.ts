@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog, type ModelLimits } from "../src/catalog.js";
+import { globalCircuitBreaker } from "../src/circuit-breaker.js";
+import { resetFacts } from "../src/target-facts.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 
 function port(s: Server): number {
@@ -309,10 +311,9 @@ describe("OpenAI front (/chat/completions)", () => {
   });
 
   it("carries a Responses-front tool round-trip into an openai-kind backend as a linked role:\"tool\"", async () => {
-    // The non-obvious path that newly enters `anthropicRequestToOpenAi`: the Responses front
-    // translates responses -> anthropic (still llm-bridge's direction) and then calls
-    // `fetchBackend`, so a Codex-through-relay tool turn IS mapped by the new request mapper.
-    // Load-bearing and previously unasserted — the pre-existing coverage here is text-only.
+    // Both request directions are relay-owned now: `responses-request.ts` maps the Codex body to
+    // Anthropic Messages, then `anthropicRequestToOpenAi` maps that to Chat Completions. A
+    // Codex-through-relay tool turn crosses both, and the `call_id` must survive unchanged.
     let seen: any;
     backend = await new Promise<Server>((resolve) => {
       const s = createServer((req, res) => {
@@ -367,12 +368,23 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(JSON.stringify(seen)).not.toContain("_original");
     expect((await resp.json() as any).output_text).toBe("found it");
 
-    // ⚠ KNOWN GAP, and NOT the request mapper's: llm-bridge still owns the responses->anthropic
-    // direction, and `openaiResponsesToUniversal` has no case for a `function_call` INPUT item
-    // (only `function_call_output`), so the assistant's own tool call is flattened to an empty
-    // user turn before the mapper ever sees it — no `tool_calls` can be emitted from this front.
-    // Pinned as an observation so that the day that direction is fixed, this line says so.
-    expect(seen.messages.some((m: any) => m.tool_calls)).toBe(false);
+    // ⚠ THE FLIP. This line used to pin the gap: llm-bridge's `openaiResponsesToUniversal` has no
+    // case for a `function_call` INPUT item, so the assistant's own tool call was flattened into
+    // an empty user turn and no `tool_calls` could ever be emitted from this front. The relay owns
+    // that direction now, so exactly one assistant message carries the call — before the tool
+    // message that answers it, with the id the caller sent.
+    const assistants = seen.messages.filter((m: any) => m.tool_calls);
+    expect(assistants).toEqual([{
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "call_1",
+        type: "function",
+        function: { name: "Grep", arguments: JSON.stringify({ pattern: "protocol" }) },
+      }],
+    }]);
+    const roles = seen.messages.map((m: any) => m.role);
+    expect(roles).toEqual(["user", "assistant", "tool"]);
   });
 
   it("routes a Codex child Responses turn through routing.subagents", async () => {
@@ -588,5 +600,268 @@ describe("OpenAI front context guardrail", () => {
     const j = (await resp.json()) as { error?: { message?: string } };
     expect(j.error?.message).toMatch(/"up" publishes for "small"/);
     expect(mock.seen().model).toBeUndefined();
+  });
+});
+
+/**
+ * INV: the Responses REQUEST direction is relay-owned (`src/responses-request.ts`), on both
+ * backend kinds.
+ *
+ * llm-bridge's `openaiResponsesToUniversal` modelled `function_call_output` and nothing else, so
+ * a Codex multi-turn tool conversation arrived at the backend with the assistant's own tool call
+ * flattened into an empty user turn and its prior `output_text` stringified as JSON — the
+ * Responses-front sibling of the IR leak v0.39.0 fixed on the Chat direction. These pin the shape
+ * that reaches each backend kind, and that an unrepresentable item is refused with ZERO egress.
+ */
+describe("Responses front — relay-owned request translation", () => {
+  const servers: Server[] = [];
+  afterEach(() => {
+    for (const s of servers.splice(0)) s.close();
+    globalCircuitBreaker.reset();
+    resetFacts();
+  });
+
+  function track(s: Server): Server {
+    servers.push(s);
+    return s;
+  }
+
+  /** A backend that records every request body it was handed. */
+  function recording(
+    reply: () => { status?: number; body: string; headers?: Record<string, string> },
+  ): Promise<{ server: Server; seen: () => any[] }> {
+    const seen: any[] = [];
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          seen.push(JSON.parse(Buffer.concat(chunks).toString() || "{}"));
+          const r = reply();
+          res.writeHead(r.status ?? 200, { "content-type": "application/json", ...(r.headers ?? {}) });
+          res.end(r.body);
+        });
+      });
+      track(s).listen(0, "127.0.0.1", () => resolve({ server: s, seen: () => seen }));
+    });
+  }
+
+  const chatOk = (content: string) => JSON.stringify({
+    id: "cmpl_r",
+    model: "target-model",
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content } }],
+  });
+
+  function openaiCfg(backendPort: number): Config {
+    return cfg({ up: {
+      base: `http://127.0.0.1:${backendPort}`,
+      kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000,
+    } }, "up/target-model");
+  }
+
+  it("carries an assistant output_text as assistant TEXT, and drops a reasoning item", async () => {
+    // Both halves of the llm-bridge gap in one request: `parseResponsesContent` had no
+    // `output_text` case (fall-through => `JSON.stringify(part)`, so the assistant's own prior
+    // answer reached the model as a JSON string), and a `reasoning` item became a bogus user turn.
+    const backend = await recording(() => ({ body: chatOk("continued") }));
+    const proxy = track(await startProxy(openaiCfg(port(backend.server))));
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "up/target-model",
+        instructions: "be terse",
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+          { type: "reasoning", summary: [{ type: "summary_text", text: "thinking about it" }], encrypted_content: "opaque" },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "prior answer" }] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "go on" }] },
+        ],
+        max_output_tokens: 32,
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    const seen = backend.seen()[0];
+    expect(seen.messages).toEqual([
+      { role: "system", content: "be terse" },
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "prior answer" },
+      { role: "user", content: "go on" },
+    ]);
+    // The reasoning item left no turn, and no Responses vocabulary reached the prompt.
+    const wire = JSON.stringify(seen);
+    expect(wire).not.toContain("output_text");
+    expect(wire).not.toContain("thinking about it");
+    expect(wire).not.toContain("_original");
+  });
+
+  it("refuses an unmodelled input item, naming the type, with zero egress", async () => {
+    const backend = await recording(() => ({ body: chatOk("never") }));
+    const proxy = track(await startProxy(openaiCfg(port(backend.server))));
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "up/target-model",
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "hi" }] },
+          { type: "local_shell_call", call_id: "ls_1", action: { type: "exec", command: ["ls"] } },
+        ],
+      }),
+    });
+
+    expect(resp.status).toBe(400);
+    const j = await resp.json() as { error?: { message?: string } };
+    expect(j.error?.message).toContain("local_shell_call");
+    expect(backend.seen()).toEqual([]);
+  });
+
+  it("refuses previous_response_id rather than silently dropping the prefix it names", async () => {
+    const backend = await recording(() => ({ body: chatOk("never") }));
+    const proxy = track(await startProxy(openaiCfg(port(backend.server))));
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "up/target-model",
+        previous_response_id: "resp_abc",
+        input: [{ role: "user", content: [{ type: "input_text", text: "and then?" }] }],
+      }),
+    });
+
+    expect(resp.status).toBe(400);
+    expect((await resp.json() as any).error.message).toContain("previous_response_id");
+    expect(backend.seen()).toEqual([]);
+  });
+
+  it("hands an anthropic-kind target a linked tool_use/tool_result pair, system and max_tokens", async () => {
+    const backend = await recording(() => ({
+      body: JSON.stringify({
+        id: "msg_r", model: "claude-sonnet", role: "assistant", type: "message",
+        content: [{ type: "text", text: "done" }], stop_reason: "end_turn",
+      }),
+    }));
+    const c = cfg({ claude: {
+      base: `http://127.0.0.1:${port(backend.server)}`,
+      kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000,
+    } }, "claude");
+    const proxy = track(await startProxy(c));
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude",
+        instructions: "you are a grep",
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "find it" }] },
+          { type: "function_call", call_id: "call_1", name: "Grep", arguments: JSON.stringify({ pattern: "p" }) },
+          { type: "function_call_output", call_id: "call_1", output: "3 matches" },
+        ],
+        tools: [{ type: "function", name: "Grep", description: "g", parameters: { type: "object", properties: { pattern: { type: "string" } } }, strict: true }],
+        tool_choice: "required",
+        max_output_tokens: 128,
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    const seen = backend.seen()[0];
+    expect(seen.system).toBe("you are a grep");
+    expect(seen.max_tokens).toBe(128);
+    expect(seen.messages).toEqual([
+      { role: "user", content: [{ type: "text", text: "find it" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Grep", input: { pattern: "p" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "3 matches" }] },
+    ]);
+    expect(seen.tools).toEqual([{
+      name: "Grep", description: "g",
+      input_schema: { type: "object", properties: { pattern: { type: "string" } } },
+    }]);
+    // OpenAI's "required" is Anthropic's "any"; `strict` has no Anthropic spelling and is dropped.
+    expect(seen.tool_choice).toEqual({ type: "any" });
+    expect(JSON.stringify(seen)).not.toContain("strict");
+  });
+
+  it("maps the same shape on the FAILOVER candidate — the mapper runs per candidate", async () => {
+    // >=2 candidates on purpose: with one, "maps correctly on failover" and "never failed over"
+    // are the same observation.
+    const dead = await recording(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+    const alive = await recording(() => ({ body: chatOk("second served") }));
+    const c = cfg({
+      a: { base: `http://127.0.0.1:${port(dead.server)}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000 },
+      b: { base: `http://127.0.0.1:${port(alive.server)}`, kind: "openai", tierType: "free", authHeader: "authorization", timeoutMs: 5000 },
+    }, "pool/duo");
+    c.routing.pools = { duo: ["a/target-model", "b/target-model"] };
+    const proxy = track(await startProxy(c));
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "pool/duo",
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "find it" }] },
+          { type: "function_call", call_id: "call_9", name: "Grep", arguments: '{"pattern":"p"}' },
+          { type: "function_call_output", call_id: "call_9", output: "hit" },
+        ],
+        tools: [{ type: "function", name: "Grep", parameters: { type: "object", properties: {} } }],
+        max_output_tokens: 32,
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    const bodies = [...dead.seen(), ...alive.seen()];
+    expect(bodies.length).toBe(2);
+    for (const seen of bodies) {
+      expect(seen.messages.map((m: any) => m.role)).toEqual(["user", "assistant", "tool"]);
+      expect(seen.messages[1].tool_calls[0].id).toBe("call_9");
+      expect(seen.messages[2]).toEqual({ role: "tool", tool_call_id: "call_9", content: "hit" });
+    }
+  });
+
+  it("maps the request body on the STREAMING path too", async () => {
+    const sse = [
+      `data: ${JSON.stringify({ id: "c", model: "target-model", choices: [{ index: 0, delta: { role: "assistant", content: "streamed" }, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ id: "c", model: "target-model", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("");
+    const seen: any[] = [];
+    const backend = track(await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          seen.push(JSON.parse(Buffer.concat(chunks).toString() || "{}"));
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(sse);
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    }));
+    const proxy = track(await startProxy(openaiCfg(port(backend))));
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "up/target-model",
+        stream: true,
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "find it" }] },
+          { type: "function_call", call_id: "call_s", name: "Grep", arguments: "{}" },
+          { type: "function_call_output", call_id: "call_s", output: "hit" },
+        ],
+        tools: [{ type: "function", name: "Grep", parameters: { type: "object", properties: {} } }],
+        max_output_tokens: 32,
+      }),
+    });
+
+    const text = await resp.text();
+    expect(resp.status).toBe(200);
+    expect(text).toContain("response.output_text.delta");
+    expect(text).toContain("streamed");
+    expect(text).toContain("response.completed");
+    expect(seen[0].messages.map((m: any) => m.role)).toEqual(["user", "assistant", "tool"]);
+    expect(seen[0].messages[1].tool_calls[0]).toEqual({
+      id: "call_s", type: "function", function: { name: "Grep", arguments: "{}" },
+    });
   });
 });

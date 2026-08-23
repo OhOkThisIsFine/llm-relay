@@ -3,6 +3,7 @@ import { buildAuthHeaders } from "./authEnv.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 import { anthropicRequestToOpenAi, RequestMappingError } from "./openai-request.js";
+import { openaiResponsesRequestToAnthropic } from "./responses-request.js";
 import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
@@ -1376,11 +1377,21 @@ export async function fetchOpenAiFront(
 
   let anthropicBody: Record<string, unknown>;
   try {
-    const source = protocol === "responses" ? "openai-responses" : "openai";
-    anthropicBody = translateBetweenProviders(source, "anthropic", base as never) as Record<string, unknown>;
+    // The RESPONSES request direction is relay-owned (`responses-request.ts`), for the same
+    // reason the Anthropic→OpenAI direction is: llm-bridge's `openaiResponsesToUniversal` models
+    // only `function_call_output`, so an assistant `function_call` was flattened into an empty
+    // user turn and an assistant `output_text` reached the backend as a JSON string. The CHAT
+    // request direction stays llm-bridge's (`openaiToUniversal` does handle `tool_calls` and
+    // `role:"tool"`), as does every response/stream direction.
+    anthropicBody = protocol === "responses"
+      ? openaiResponsesRequestToAnthropic(base)
+      : translateBetweenProviders("openai", "anthropic", base as never) as Record<string, unknown>;
     if (target.model !== undefined) anthropicBody.model = target.model;
     anthropicBody.stream = args.wantsStream;
   } catch (e) {
+    // A shape we will not put on the wire is the caller's request being unrepresentable, not a
+    // provider failure — the same clean local 400 the Messages front raises.
+    if (e instanceof RequestMappingError) return openaiError(400, `llm-relay: ${e.message}`, "local");
     return openaiError(400, `llm-relay: request translation failed: ${(e as Error).message}`, "local");
   }
 
