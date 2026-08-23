@@ -24,6 +24,7 @@ import {
   runRoutingCommand,
   runEligibility,
   formatCandidateQuota,
+  formatCandidateHardCap,
   formatKeyQuota,
 } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
@@ -256,6 +257,27 @@ describe("candidate quota rendering", () => {
     ], 10_000)).toBe(
       "requests/day 25/100 provider-stated age 2s; tokens/minute 800/1000 provider-stated age 0s; requests/- 4/10 provider-stated age 0s",
     );
+  });
+
+  /**
+   * G2: the `CAPPED ...` line `llm-relay candidates` prints under a row whose operator-set hard
+   * cap is REACHED. Null when it is not — an unreached cap is config detail, and that table is
+   * routing state. Both provenance labels come off the wire object: `operator-declared` (this is
+   * an assertion, not a measurement) and the SCOPE the usage was counted at.
+   */
+  it("renders a reached hard cap with its basis and scope, and nothing when there is none", () => {
+    expect(formatCandidateHardCap(null, 10_000)).toBeNull();
+    expect(formatCandidateHardCap({
+      axis: "requests", period: "day", cap: 450, used: 450,
+      basis: "operator-declared", source: "credential", scope: "credential",
+      resetsAt: new Date(70_000).toISOString(), resetsAtBasis: "derived-boundary",
+    }, 10_000)).toBe("CAPPED requests/day 450/450 (operator-declared, credential-scope, resets in 60s)");
+    // A per-deployment cap says so, because "450 of 450" means something different at each scope.
+    expect(formatCandidateHardCap({
+      axis: "tokens", period: "minute", cap: 2_000_000, used: 2_400_000,
+      basis: "operator-declared", source: "credential-model", scope: "deployment",
+      resetsAt: new Date(10_000).toISOString(), resetsAtBasis: "derived-boundary",
+    }, 10_000)).toBe("CAPPED tokens/minute 2400000/2000000 (operator-declared, deployment-scope, resets in 0s)");
   });
 });
 

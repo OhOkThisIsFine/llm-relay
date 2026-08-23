@@ -197,6 +197,54 @@ ceilings **you** know that account has:
   wherever they appear — operator-asserted evidence, distinct from `provider-stated` header
   observations and from anything derived from the local ledger. They never refuse a request by
   themselves.
+- A `hard` sub-block turns selected axes into **refusal ceilings** — see
+  [Hard caps](#hard-caps-limitshard) just below for the shape, and
+  [Hard caps refuse, loudly](#hard-caps-refuse-loudly) for what the request path does with one.
+  The soft axes above demote; the `hard` axes refuse.
+
+#### Hard caps (`limits.hard`)
+
+Inside any `limits` block (provider level, credential slot, or a `models` entry), a `hard`
+sub-block declares the ceilings at which the relay **refuses** rather than fails over:
+
+```jsonc
+"nim": {
+  "limits": { "rpm": 40, "rpd": 1000 },
+  "credentials": [
+    { "label": "a", "authEnv": "NIM_KEY_A",
+      "limits": { "rpd": 500, "hard": { "rpd": 450, "tpd": 2000000 } } }
+  ]
+}
+```
+
+- A cap is an **operator assertion**, exactly like the soft limits: any positive integer above or
+  below whatever the provider publishes; the relay never infers one. Same closed axes
+  (`rpm`/`rpd`/`tpm`/`tpd`), same positive-integer rule, same per-axis precedence ladder
+  (credential-model → provider-model → credential → provider), same unknown-keys-are-a-hard-error
+  rule. A per-deployment cap rides inside that deployment's own `models` entry
+  (`"models": { "m/x": { "hard": { "rpd": 100 } } }`).
+- **Minute/day only.** `mpd`/`mpm` and every other spelling outside the four axes are rejected by
+  name at config load: the relay reads usage only from its own in-memory accounting window, which
+  measures minute and day and deliberately declines month (the lifetime rollup is not
+  per-credential), so a month cap could never fire and would bound nothing while looking like it
+  did.
+- The comparison is **inclusive**: `used >= cap` refuses, so a cap of 450 admits 450 requests and
+  stops the 451st. Usage comes ONLY from this relay's own ledger — never from a provider header,
+  never estimated forward. **Unknown usage (no store, no traffic recorded) refuses nothing** — a
+  guess must not be able to refuse.
+- **Where you declare a cap decides whose usage it counts**, per axis:
+  - a **flat** cap (`limits.hard.<axis>` on the provider block or on a credential slot) bounds
+    that credential as a whole, and is compared against the credential's usage **across all
+    models** it served this period;
+  - a **per-deployment** cap (`limits.models.<id>.hard.<axis>`, at either level) bounds one
+    deployment, and is compared against **that model's** usage on that credential only.
+
+  So `limits.models["m/x"].hard.rpd = 100` is not reached by 100 requests spent on `m/y`, while a
+  slot-level `limits.hard.rpd = 100` is reached by any 100 requests that slot served. The request
+  path, `/candidates` and the dashboard all read the ledger by this same rule, so a displayed cap
+  and an enforced cap cannot disagree.
+- `routing.quota.hardCaps: false` turns every declared cap back into an ordinary soft limit
+  (default is `true`: writing a `hard` block means it).
 
 ### Model addressing (split on the first `/`, first match wins)
 
@@ -379,6 +427,49 @@ x-llm-relay-quota-demoted: nim/z-ai/glm-5.2 (requests/minute remaining 0, provid
 
 `llm-relay candidates` shows the same fact per row as `QUOTA <seconds>s (<axis>/<period>, <basis>)`
 in the breaker column; the dashboard Cooldowns panel lists it with reason `rate_limit`.
+
+#### Hard caps refuse, loudly
+
+Everything above demotes — and then there is the one thing that may refuse: an operator-declared
+`hard` cap (see [Hard caps](#hard-caps-limitshard) for the config shape). The dividing line is
+provenance. A **derived** figure — provider headers, learned parses, published tables — may only
+demote a candidate, because a mis-parsed number must not be able to black-hole a healthy
+deployment. An **explicit operator-set cap** may refuse, because refusing on it is enforcing the
+operator's own instruction.
+
+The mechanics, per request:
+
+- The cap is evaluated **per attempt, before egress**. A candidate whose credential is at its cap
+  is skipped in-process: no provider request, no LRU touch, no breaker mutation, no accounting
+  attempt — the capped key spends literally nothing. The walk continues to the next credential or
+  deployment, so a partially capped pool serves from whoever remains.
+- The capped cell is still **listed everywhere** — health demotes, never drops, and a cap is not
+  health. It counts in `x-llm-relay-pool-attempts` as an `Nxcapped` tally beside the provider
+  outcomes (`3 tried, 1 served: 1xcapped, 1x429`), and appears in the metadata log as a
+  status-only `capped` attempt.
+- Only when **every walked candidate** was capped does the relay refuse the request itself, with
+  HTTP 429 and its own synthesized body in the front's native error shape (Anthropic
+  `{type:"error", error:{type:"rate_limit_error", …}}`; OpenAI
+  `{error:{type:"rate_limit_error", code:"llm_relay_capped", …}}`). The body names each cap —
+  credential/deployment, axis/period, inclusive used/cap, basis `operator-declared` — and states
+  that no provider was contacted. There is no upstream error to pass through, and staying silent
+  would hang the client; this is the one case where a synthesized body is the honest one.
+- **A MIXED walk keeps its upstream error.** If any walked candidate actually reached a provider —
+  even if every one of those attempts failed — the response is that last real upstream error, with
+  the caps counted beside it in `x-llm-relay-pool-attempts` and no `x-llm-relay-capped` header. A
+  true upstream error beats a synthesized one (the same maxim as the context guardrail and the
+  all-429 policy), and "no provider was contacted" must never be claimed when one was.
+- The refusal carries `x-llm-relay-capped` — one line per capped cell,
+  `a/nim/z-ai/glm-5.2 requests/day 450/450` (label/deployment, axis/period, used/cap; metadata
+  only, never key material) — and a `Retry-After` derived ONLY from the soonest UTC period
+  boundary any walked cap lifts at. When no boundary can be derived the header is omitted and the
+  body says so; a duration is never invented. **The header names at most 5 cells and counts the
+  rest** (`…; +K more`): a capped attempt costs no walk budget, so every member of a fully capped
+  30-member pool would otherwise land in it.
+- A cap never reorders anything by itself and never registers on the breaker: it is config, not
+  health. `llm-relay candidates` shows a reached cap on its row as
+  `CAPPED <axis>/<period> <used>/<cap> (operator-declared, <scope>-scope, resets in Ns)`; the
+  dashboard Cooldowns panel lists it with reason `manual`.
 
 ### Sticky sessions (opt-in)
 
@@ -985,7 +1076,9 @@ local usage over the current period; period boundaries are UTC (minute/day/month
 as "Unavailable", never 0, and a negative remaining means the credential overshot its ceiling.
 `learned` figures are display-only — routing acts on them only under the explicit opt-in
 `routing.quota.enforceLearned` (spec decision M2). Cooldown rows show WHY a member is cooling (`rate_limit`, `auth_error`,
-`provider_error`) and until when, with the real observation time where one exists.
+`provider_error`, or `manual` — a reached operator-set hard cap) and until when, with the real
+observation time where one exists; a `manual` row carries no observation time, because config load
+is not an observation.
 
 The same accounting read model is available **without a running relay** as a terminal roll-up:
 `llm-relay cost` reads `~/.llm-relay/usage/` directly and prints the four spend cells side by side

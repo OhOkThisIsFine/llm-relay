@@ -19,6 +19,7 @@ import {
   type RequestLog,
 } from "./log.js";
 import { buildAuthHeaders, resolveCredential } from "./authEnv.js";
+import { parseCredentialId } from "./credential-id.js";
 import { resolveAttempt, type ResolvedAttempt } from "./resolved-attempt.js";
 import { resolveAttemptForSlot } from "./credential-fleet.js";
 import {
@@ -38,7 +39,7 @@ import {
   type Reshaper,
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -78,6 +79,7 @@ import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedCon
 import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact } from "./target-facts.js";
 import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
+import { evaluateHardCap, hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
@@ -344,6 +346,46 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
         ? (deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow">)
         : null,
   });
+  // G2: the operator-set refusal ceilings. Narrowed to the SAME in-memory `usedInWindow` seam the
+  // demotion term reads — a bare programmatic proxy has no ledger and its caps simply never fire
+  // (unknown usage ⇒ no refusal). Built once per proxy; each call re-reads the live window.
+  //
+  // ⚠ The read is NARROWED BY THE CAP'S OWN SCOPE, which `evaluateHardCap` states per call: a
+  // `limits.models.<id>.hard` ceiling is compared against that deployment's usage, a flat
+  // credential/provider ceiling against the credential's usage across every model. Passing one
+  // fixed scope is how enforcement and `/candidates` drifted apart — they shared the evaluator
+  // but asked the ledger different questions, so a per-deployment cap refused `m/x` for requests
+  // spent entirely on `m/y`. All three consumers now narrow on exactly this rule (see
+  // `candidates.ts` and `availability-snapshot.ts`).
+  const hardCapEvaluator = (attempt: ResolvedAttempt, now: number): HardCapVerdict | null => {
+    try {
+      const parsed = parseCredentialId(attempt.credentialId);
+      const model = attempt.target.model ?? null;
+      return evaluateHardCap({
+        cfg,
+        provider: attempt.target.provider,
+        credentialLabel: parsed?.label ?? null,
+        model,
+        usedInWindow:
+          deps.accountingReader !== undefined && typeof (deps.accountingReader as { usedInWindow?: unknown }).usedInWindow === "function"
+            ? (axis, period, scope) => {
+                const window = (deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow">)
+                  .usedInWindow({
+                    credentialId: attempt.credentialId,
+                    ...(scope === "deployment" && model !== null ? { model } : {}),
+                    period,
+                    now,
+                  });
+                return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
+              }
+            : () => ({ value: null, basis: null }),
+        now,
+      });
+    } catch {
+      // A routing guard must not be able to fail a request; degrade to no opinion.
+      return null;
+    }
+  };
   let controlAuthorization: ControlAuthorizationPort | undefined;
   if (deps.controlAuthorization !== undefined) {
     controlAuthorization = deps.controlAuthorization ?? undefined;
@@ -432,6 +474,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       credentialLru,
       ...(modelCallRecorder ? { modelCallRecorder } : {}),
       accountingRecorder,
+      ...(deps.accountingReader !== undefined &&
+        typeof (deps.accountingReader as { usedInWindow?: unknown }).usedInWindow === "function"
+        ? { accountingReader: deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow"> }
+        : {}),
       accountingPricePort,
       dashboardAuth,
       dashboardStatic,
@@ -440,6 +486,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
       quotaDemotion,
+      hardCap: hardCapEvaluator,
     }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
       // Last-resort net. `handle` logs every turn it terminates itself, so reaching
@@ -487,6 +534,12 @@ interface Handlers {
   credentialLru: CredentialLru;
   modelCallRecorder?: ModelCallRecorder;
   accountingRecorder: AccountingRecorder;
+  /**
+   * The store's in-memory window read when a store was handed in (see ProxyDeps). Feeds
+   * `/candidates`' G2 cap column and nothing else on the admin surface — narrowed to exactly
+   * the seam the cap evaluator takes, so the display cannot read anything enforcement cannot.
+   */
+  readonly accountingReader?: Pick<AccountingStore, "usedInWindow">;
   /** Published-price lookup for spend; built once per proxy, shared by both fronts. */
   accountingPricePort: AccountingPricePort | undefined;
   dashboardAuth: DashboardAuthManager;
@@ -501,6 +554,12 @@ interface Handlers {
    * out pays one property read per candidate and nothing else.
    */
   quotaDemotion: QuotaDemotionFn;
+  /**
+   * G2's operator-set refusal ceilings (see `hard-cap.ts`). Null ⇒ no opinion; unlike the demotion
+   * term this may REFUSE, and only ever on a figure the operator declared plus this relay's own
+   * ledger reading — never on anything derived from a provider or catalogue.
+   */
+  hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null;
 }
 
 type ProxyAccountingAttribution = "relay_held" | "caller_operated" | "unknown";
@@ -1279,7 +1338,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const tried: string[] = [];
 
   while (!res.destroyed) {
-    const resolvedAttempt = credentialWalk.next();
+    // G2's attempt boundary: an offer whose operator-set hard cap is reached is refused here,
+    // before any egress, and the loop comes straight back for the next candidate.
+    const resolvedAttempt = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
     if (!resolvedAttempt) break;
     target = resolvedAttempt.target;
     const controller = new AbortController();
@@ -1297,6 +1358,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       let egressCallbackCalled = false;
       const onEgress = () => {
         egressCallbackCalled = true;
+        pool429.noteEgress();
         const egressAt = Date.now();
         attempt = beginHealthAttempt(h, resolvedAttempt, egressAt, attemptTrace, usage, accounting) ?? undefined;
         if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
@@ -1379,7 +1441,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           aborted ? { kind: "timeout" } : { kind: "provider-transport" },
         );
         credentialRecorded = true;
-        const next = credentialWalk.next();
+        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
         if (next && !res.writableEnded && !res.destroyed) {
           pool429.recordFailover(status, null);
           continue;
@@ -1415,7 +1477,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         credentialRecorded = true;
         if (disposition === "cancelled") return;
         const status = disposition === "timeout" ? 504 : 502;
-        const next = credentialWalk.next();
+        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
         if (next && !res.writableEnded && !res.destroyed) {
           pool429.recordFailover(status, null);
           continue;
@@ -1455,7 +1517,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         );
         credentialRecorded = true;
 
-        const next = tryNext && !res.destroyed ? credentialWalk.next() : undefined;
+        const next = tryNext && !res.destroyed ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429) : undefined;
         if (next) {
           await backendRes.body?.cancel().catch(() => {});
           pool429.recordFailover(backendRes.status, retryAfterMs);
@@ -1505,7 +1567,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         );
           credentialRecorded = true;
           const next = probe.provenance === "upstream" && !res.destroyed
-            ? credentialWalk.next()
+            ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429)
             : undefined;
           if (next) {
             pool429.recordFailover(502, null);
@@ -1610,7 +1672,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "protocol" });
           credentialRecorded = true;
           pool429.recordDeadTurn();
-          const next = !res.destroyed ? credentialWalk.next() : undefined;
+          const next = !res.destroyed ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429) : undefined;
           if (next) continue;
 
           const poolSummary = pool429.summary();
@@ -1698,6 +1760,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       clearTimeout(timer);
       res.off("close", onResClose);
     }
+  }
+
+  // THE all-capped refusal site — the only one on this front, deliberately.
+  //
+  // `allCapped()` requires `!egressed`, and every failover arm above runs only after a candidate
+  // egressed, so a check inside one could never be true: the loop exit is the sole place the
+  // condition can hold. (Eight such inner checks existed and were dead code on the request path;
+  // the rule they LOOK like they enforce — a walk that mixes caps with real failures keeps its
+  // last upstream error — is enforced by `egressed`, and pinned by the mixed-walk tests.) A walk
+  // that exhausted for any other reason reaches here with nothing capped and must stay silent:
+  // its caller already replied.
+  if (!res.headersSent && !res.destroyed && pool429.allCapped()) {
+    respondAllCapped(res, h, { started, path, hadTools, streamed: wantsStream }, "anthropic", pool429, attemptTrace.snapshot());
   }
 }
 
@@ -1982,6 +2057,92 @@ function recordCredentialOutcome(
 }
 
 /**
+ * G2's attempt boundary — EVERY `CredentialWalk.next()` on both public fronts goes through here.
+ *
+ * A candidate whose operator-set hard cap is reached is refused IN THIS PROCESS, before any
+ * egress and before `recordStarted()`: no provider request, no LRU touch, no breaker mutation,
+ * no accounting attempt — the capped key spends literally nothing. It is still announced three
+ * ways: a status-only `capped` entry in the metadata log's attempt list, an `Nxcapped` tally in
+ * `x-llm-relay-pool-attempts`, and the soonest cap boundary kept on the tracker so an ALL-CAPPED
+ * walk can state its Retry-After instead of inventing one. "Health demotes, never drops" still
+ * governs the WALK — the capped cell stays listed everywhere and lifts at the period boundary;
+ * only this attempt is refused.
+ */
+function nextUncappedAttempt(
+  h: Handlers,
+  walk: CredentialWalk,
+  attemptTrace: RequestAttemptTrace,
+  tracker: Pool429Tracker,
+): ResolvedAttempt | undefined {
+  const now = Date.now();
+  for (;;) {
+    const candidate = walk.next();
+    if (!candidate) return undefined;
+    const verdict = h.hardCap(candidate, now);
+    if (verdict === null) {
+      // Announce the offer BEFORE returning: the tracker needs to know a candidate is in flight so
+      // a cap it sees while the loop asks for the next one is ordered after this candidate.
+      tracker.noteOffered();
+      return candidate;
+    }
+    tracker.recordCapped(
+      hardCapLabel(parseCredentialId(candidate.credentialId)?.label ?? null, specOfTarget(candidate.target), verdict),
+      verdict.resetsAt,
+    );
+    attemptTrace.recordCapped(candidate.target, now);
+    walk.recordRejected(candidate);
+  }
+}
+
+/**
+ * The ALL-CAPPED refusal — the loud half of G2.
+ *
+ * Every walked candidate was refused by an operator-set cap, so the relay answers 429 itself:
+ * there is no upstream error to pass through, and staying silent would hang the client. The body
+ * names the caps (axis/period, inclusive used/cap, basis `operator-declared`) in each front's
+ * NATIVE error shape, so an ordinary client's rate-limit handling just works. `Retry-After` is
+ * derived ONLY from the soonest UTC period boundary any walked cap lifts at; when no boundary
+ * resolves the header is omitted and the body says so — a duration is never invented. Metadata
+ * only: labels, numbers, no message text, no key material.
+ */
+function respondAllCapped(
+  res: ServerResponse,
+  h: Handlers,
+  ctx: { started: number; path: string; hadTools: boolean; streamed: boolean },
+  front: "anthropic" | "openai",
+  tracker: Pool429Tracker,
+  attempts: readonly RequestAttemptLog[],
+): void {
+  if (res.headersSent) return;
+  const summary = tracker.summary();
+  // One rendering, shared by the body and the header: two calls could disagree about the bound.
+  const capped = tracker.cappedSummary();
+  const labels = capped ?? "every candidate";
+  const resetAt = tracker.cappedResetAt();
+  // The reset is a DERIVED UTC boundary (minute/day), so it always resolves for any cap this
+  // module can declare — but the fail-safe stays: when it somehow does not, the header is omitted
+  // and the body says the lift time is unknown rather than inventing a duration.
+  const message =
+    `llm-relay: request refused by operator-declared hard cap(s): ${labels}. ` +
+    `No provider was contacted.` +
+    (resetAt !== null
+      ? ` The earliest cap lifts at ${new Date(resetAt).toISOString()} (its UTC period boundary).`
+      : ` No reset boundary could be derived, so no retry-after is offered.`);
+  const headers: Record<string, string> = {};
+  if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+  if (capped !== null) headers[HARD_CAP_HEADER] = capped;
+  if (resetAt !== null && resetAt > Date.now()) {
+    headers["retry-after"] = String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000)));
+  }
+  const body = front === "openai"
+    ? { error: { message, type: "rate_limit_error", code: "llm_relay_capped" } }
+    : { type: "error" as const, error: { type: "rate_limit_error", message } };
+  res.writeHead(429, { ...headers, "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+  h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, 429, "skipped", null, attempts));
+}
+
+/**
  * Promote a pin only inside its live capability segment. In particular, a live degrade-tail pin
  * never jumps a live in-band member; the tail remains a fallback after the requested band.
  */
@@ -2174,6 +2335,15 @@ function withStallWatchdog(upstream: Response, controller: AbortController, stal
 }
 
 /**
+ * How many capped cells `x-llm-relay-capped` may NAME before the rest are counted (`+K more`).
+ *
+ * The header is diagnostic, not a manifest: five lines is enough to see which credentials and
+ * which axis stopped the request, and it keeps a fully capped 30-member dynamic pool from
+ * emitting a ~1.2 KB header — a capped attempt costs no walk budget, so every member reaches it.
+ */
+const MAX_CAPPED_HEADER_CELLS = 5;
+
+/**
  * All-429 exhaustion policy — one policy, both fronts (same maxim as `classifyStatus`).
  *
  * When the whole pool is rate-limited, the client is served the LAST candidate's real 429, but
@@ -2184,8 +2354,54 @@ function withStallWatchdog(upstream: Response, controller: AbortController, stal
 class Pool429Tracker {
   private minRetryAfterMs: number | null = null;
   private only429 = true;
-  /** status → how many candidates answered it, in first-seen order. */
+  /** status → how many candidates answered it. Ordering lives in `firstSeenAt`. */
   private readonly counts = new Map<number | "dead-turn", number>();
+  /**
+   * Outcome kind → the walk position it was FIRST seen at, so the breakdown reads in WALK order.
+   *
+   * ⚠ Positions are stamped, not appended, because the two kinds of outcome arrive out of order:
+   * a cap is recorded while the walk is being asked for the next candidate — i.e. BEFORE the
+   * candidate already in flight has been counted. Appending made a walk that went `A:429 →
+   * B:capped` render `1xcapped, 1x429`, reversing what actually happened. See `stampCapped`.
+   */
+  private readonly firstSeenAt = new Map<number | "dead-turn" | "capped", number>();
+  /** Monotonic walk position handed out by `stamp()`; never a candidate count. */
+  private order = 0;
+  /** True while a candidate has been offered and its provider outcome has not been counted yet. */
+  private inFlight = false;
+  /** Caps observed while a candidate was in flight: they follow that candidate's own outcome. */
+  private deferredCapped = false;
+  /** G2: candidates skipped before egress because an operator-set hard cap was reached. */
+  private readonly cappedLabels: string[] = [];
+  /** Soonest UTC boundary any walked cap lifts at — the pool's own next capacity instant. */
+  private soonestCapResetAt: number | null = null;
+  /** Set at the ONE true egress boundary (`onEgress`), so "no provider was contacted" stays provable. */
+  private egressed = false;
+
+  /** Called exactly where a backend request is about to start — see `onEgress` on both fronts. */
+  noteEgress(): void {
+    this.egressed = true;
+  }
+
+  /**
+   * A candidate was OFFERED to the loop (it passed the cap gate and will be attempted). Nothing
+   * is tallied here — this only marks that an outcome for it is still to come, which is what
+   * lets a cap seen in the meantime be stamped AFTER it.
+   */
+  noteOffered(): void {
+    this.inFlight = true;
+  }
+
+  private stamp(key: number | "dead-turn" | "capped"): void {
+    if (!this.firstSeenAt.has(key)) this.firstSeenAt.set(key, ++this.order);
+  }
+
+  /** Place the deferred `capped` term once the in-flight candidate's own outcome is counted. */
+  private stampCapped(): void {
+    if (!this.deferredCapped) return;
+    this.deferredCapped = false;
+    this.stamp("capped");
+  }
 
   /** Record a response being failed over past. */
   recordFailover(status: number, retryAfterMs: number | null): void {
@@ -2202,6 +2418,56 @@ class Pool429Tracker {
   /** Record the response actually served — the walk's last candidate, success or failure. */
   recordFinal(status: number): void {
     this.count(status);
+  }
+
+  /**
+   * Record a candidate skipped BEFORE egress by an operator-set hard cap (G2).
+   *
+   * Deliberately NOT folded into `recordFailover`: a cap is not a provider answer, so it must
+   * neither trip the breaker nor set `only429 = false` — when every candidate is capped, that
+   * flag's meaning ("nothing else went wrong") is exactly what licenses the synthesized refusal.
+   */
+  recordCapped(label: string, resetsAt: number): void {
+    // One tally entry per OUTCOME KIND, matching how statuses count: two distinct capped cells
+    // are still one `Nxcapped` term in the breakdown. Its POSITION waits for the candidate
+    // already in flight, whose outcome the loop has not counted yet.
+    if (this.inFlight) this.deferredCapped = true;
+    else this.stamp("capped");
+    this.cappedLabels.push(label);
+    this.soonestCapResetAt =
+      this.soonestCapResetAt === null ? resetsAt : Math.min(this.soonestCapResetAt, resetsAt);
+  }
+
+  /** The soonest cap boundary across the walk, for the all-capped Retry-After; null otherwise. */
+  cappedResetAt(): number | null {
+    return this.soonestCapResetAt;
+  }
+
+  /**
+   * True when this walk offered at least one candidate and EVERY one of them was refused by an
+   * operator-set hard cap before egress — no provider answered anything at all. That is the exact
+   * license for the relay-synthesized 429: any real provider outcome among the failures means the
+   * last real upstream error is the more honest body, and the caps ride beside it in the
+   * pool-attempts tally instead.
+   */
+  allCapped(): boolean {
+    return this.cappedLabels.length > 0 && this.counts.size === 0 && !this.egressed;
+  }
+
+  /**
+   * `"a/nim/m requests/day 450/450"` lines, in walk order — metadata only, and BOUNDED.
+   *
+   * A capped attempt consumes no walk start budget (`credential-select.ts` gates that on
+   * `#started`), so every member of a fully capped 30-member dynamic pool reaches this list and
+   * an unbounded join is a ~1.2 KB header. At most `MAX_CAPPED_HEADER_CELLS` cells are named and
+   * the remainder is counted — the client learns the shape of the refusal without the response
+   * carrying the whole roster.
+   */
+  cappedSummary(): string | null {
+    if (this.cappedLabels.length === 0) return null;
+    if (this.cappedLabels.length <= MAX_CAPPED_HEADER_CELLS) return this.cappedLabels.join("; ");
+    const shown = this.cappedLabels.slice(0, MAX_CAPPED_HEADER_CELLS).join("; ");
+    return `${shown}; +${this.cappedLabels.length - MAX_CAPPED_HEADER_CELLS} more`;
   }
 
   /** A backend answered 200, but its malformed tool call remained unusable after repair. */
@@ -2223,6 +2489,10 @@ class Pool429Tracker {
 
   private count(status: number | "dead-turn"): void {
     this.counts.set(status, (this.counts.get(status) ?? 0) + 1);
+    this.stamp(status);
+    // This candidate's outcome is in; anything capped while it was in flight comes next.
+    this.inFlight = false;
+    this.stampCapped();
   }
 
   /**
@@ -2239,6 +2509,9 @@ class Pool429Tracker {
    * header and in the log, where it costs the client nothing and answers "what actually happened"
    * without a round of manual probing.
    *
+   * G2 caps appear in the breakdown as `Nxcapped`, in walk order beside the provider outcomes:
+   * they ARE candidates this request consumed, even though no provider saw them.
+   *
    * Null for a single-candidate walk: there is no aggregate to report, and emitting one would
    * dress up an ordinary passthrough error as a pool exhaustion.
    */
@@ -2249,9 +2522,15 @@ class Pool429Tracker {
       tried += n;
       if (typeof status === "number" && status < 400) served += n;
     }
+    tried += this.cappedLabels.length;
     if (tried < 2) return null;
-    const breakdown = [...this.counts.entries()].map(([status, n]) => `${n}x${status}`).join(", ");
-    return `${tried} tried, ${served} served: ${breakdown}`;
+    // A walk that ended while a candidate was still in flight never counted its outcome, so a cap
+    // deferred behind it would otherwise be dropped from the breakdown entirely.
+    this.stampCapped();
+    const parts = [...this.firstSeenAt.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map(([key]) => (key === "capped" ? `${this.cappedLabels.length}xcapped` : `${this.counts.get(key) ?? 0}x${key}`));
+    return `${tried} tried, ${served} served: ${parts.join(", ")}`;
   }
 
   /** Retry-After (ms) to serve on the FINAL response, or undefined to leave its real header alone. */
@@ -2345,6 +2624,11 @@ class RequestAttemptTrace {
       status,
       ms: Math.max(0, completedAt - started),
     });
+  }
+
+  /** G2: an operator-set hard cap refused this candidate BEFORE any provider egress. */
+  recordCapped(target: ResolvedTarget, at: number): void {
+    this.record(target, "capped", at, at);
   }
 
   snapshot(): RequestAttemptLog[] {
@@ -2974,7 +3258,9 @@ async function openAiFrontPath(
   const pool429 = new Pool429Tracker();
 
   while (!res.destroyed) {
-    const resolvedAttempt = credentialWalk.next();
+    // G2's attempt boundary, shared with the Anthropic front: a capped offer is refused here
+    // before any egress and the loop comes straight back for the next candidate.
+    const resolvedAttempt = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
     if (!resolvedAttempt) break;
     const target = resolvedAttempt.target;
     const controller = new AbortController();
@@ -2992,6 +3278,7 @@ async function openAiFrontPath(
     let egressCallbackCalled = false;
     const onEgress = () => {
       egressCallbackCalled = true;
+      pool429.noteEgress();
       const egressAt = Date.now();
       attempt = beginHealthAttempt(h, resolvedAttempt, egressAt, attemptTrace, usage, ctx.accounting) ?? undefined;
       if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
@@ -3179,7 +3466,7 @@ async function openAiFrontPath(
           aborted ? { kind: "timeout" } : { kind: "provider-transport" },
         );
         credentialRecorded = true;
-        const next = credentialWalk.next();
+        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
         if (next && !res.writableEnded && !res.destroyed) {
           pool429.recordFailover(status, null);
           continue;
@@ -3232,7 +3519,7 @@ async function openAiFrontPath(
         credentialRecorded = true;
         if (disposition === "cancelled") return;
         const status = disposition === "timeout" ? 504 : 502;
-        const next = credentialWalk.next();
+        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
         if (next && !res.writableEnded && !res.destroyed) {
           pool429.recordFailover(status, null);
           continue;
@@ -3275,7 +3562,7 @@ async function openAiFrontPath(
         );
         credentialRecorded = true;
         const next = tryNext && !res.writableEnded && !res.destroyed
-          ? credentialWalk.next()
+          ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429)
           : undefined;
         if (next) {
           await upstream.body?.cancel().catch(() => {});
@@ -3329,7 +3616,7 @@ async function openAiFrontPath(
         );
           credentialRecorded = true;
           const next = probe.provenance === "upstream" && !res.writableEnded && !res.destroyed
-            ? credentialWalk.next()
+            ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429)
             : undefined;
           if (next) {
             pool429.recordFailover(502, null);
@@ -3511,6 +3798,13 @@ async function openAiFrontPath(
       clearTimeout(timer);
       res.off("close", onResClose);
     }
+  }
+
+  // Same single refusal site as the Anthropic front (see the note there): a walk whose every
+  // candidate was refused before the first egress reaches here with nothing sent, and owes the
+  // client its refusal. Anything that egressed keeps its own upstream error instead.
+  if (!res.headersSent && !res.destroyed && pool429.allCapped()) {
+    respondAllCapped(res, h, { started: ctx.started, path: ctx.path, hadTools: ctx.hadTools, streamed: ctx.wantsStream }, "openai", pool429, attemptTrace.snapshot());
   }
 }
 /** Winning-candidate response metadata, shared by transparent and repair streaming paths. */

@@ -1245,3 +1245,44 @@ describe("loadConfig — provider limits (configured rate limits)", () => {
     ).toEqual({});
   });
 });
+
+/**
+ * G2's master switch, beside its `routing.quota` siblings (`enforce`, `enforceLearned` — pinned in
+ * test/quota-demotion.test.ts). Default true: an operator who wrote a `hard` block meant it, so
+ * only an explicit `false` turns every refusal ceiling back into an ordinary soft limit. What the
+ * switch DOES to a request is pinned in test/hard-cap.test.ts; this is the parse contract.
+ */
+describe("loadConfig — routing.quota.hardCaps", () => {
+  function quotaCfg(quota: unknown) {
+    return base({
+      providers: {
+        nim: {
+          base: "https://nim.test/v1",
+          kind: "openai",
+          authEnv: "NVIDIA_API_KEY",
+          limits: { hard: { rpd: 5 } },
+        },
+      },
+      routing: { default: "nim/z-ai/glm-5.2", quota },
+    });
+  }
+
+  it("is absent by default and round-trips an explicit false", () => {
+    expect(loadConfig(write("hardcaps-absent.json", base())).routing.quota).toBeUndefined();
+    expect(loadConfig(write("hardcaps-off.json", quotaCfg({ hardCaps: false }))).routing.quota)
+      .toEqual({ hardCaps: false });
+    expect(loadConfig(write("hardcaps-on.json", quotaCfg({ hardCaps: true }))).routing.quota)
+      .toEqual({ hardCaps: true });
+  });
+
+  it("carries beside the other quota flags rather than replacing them", () => {
+    expect(
+      loadConfig(write("hardcaps-both.json", quotaCfg({ enforce: false, hardCaps: false }))).routing.quota,
+    ).toEqual({ enforce: false, hardCaps: false });
+  });
+
+  it.each([["no"], [0], [null], [{}]])("rejects non-boolean hardCaps %j by name", (value) => {
+    expect(() => loadConfig(write(`hardcaps-bad-${String(value)}.json`, quotaCfg({ hardCaps: value }))))
+      .toThrow(/routing\.quota\.hardCaps must be a boolean/);
+  });
+});

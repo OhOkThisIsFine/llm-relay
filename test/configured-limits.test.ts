@@ -203,6 +203,70 @@ describe("resolveConfiguredLimits", () => {
   });
 });
 
+
+describe("limits.hard — the G2 refusal ceilings", () => {
+  it("resolves hard axes through the same four-site ladder, beside the soft figures", () => {
+    const cfg = load("hard-ladder.json", {
+      nim: {
+        base: "https://nim.test/v1",
+        kind: "openai",
+        limits: {
+          rpd: 1000,
+          hard: { rpd: 900 },
+          models: { "m/x": { rpm: 5, hard: { rpm: 30 } } },
+        },
+        credentials: [
+          { label: "a", authEnv: "NIM_A", limits: { hard: { rpd: 450, tpd: 2_000_000 } } },
+        ],
+      },
+    });
+    // Slot flat beats provider flat on that axis; the slot's own tpd is credential-sourced too.
+    expect(resolveConfiguredLimits(cfg, "nim", "a", null)).toMatchObject({
+      hard: { rpd: 450, tpd: 2_000_000 },
+      hardSource: { rpd: "credential", tpd: "credential" },
+    });
+    // The model entry's OWN hard sub-block beats every flat site for its axis only.
+    expect(resolveConfiguredLimits(cfg, "nim", null, "m/x")).toMatchObject({
+      hard: { rpd: 900, rpm: 30 },
+      hardSource: { rpd: "provider", rpm: "provider-model" },
+    });
+    // A label naming no declared slot falls through to the provider level — same rule as the
+    // soft ladder: the relay narrows only what config declares, and inherits what it does not.
+    expect(resolveConfiguredLimits(cfg, "nim", "nope", null)?.hard).toEqual({ rpd: 900 });
+  });
+
+  it("keeps the soft-only result shape byte-identical when nothing hard was declared", () => {
+    const cfg = load("soft-only.json", {
+      nim: { base: "https://nim.test/v1", kind: "openai", limits: { rpm: 40 } },
+    });
+    const resolved = resolveConfiguredLimits(cfg, "nim", null, null)!;
+    expect(Object.keys(resolved).sort()).toEqual(["basis", "rpm", "source"]);
+    expect(resolved).toEqual({ rpm: 40, basis: "configured", source: { rpm: "provider" } });
+  });
+
+  it("rejects month spellings and non-positive figures inside a hard block", () => {
+    expect(() => load("hard-mpd.json", {
+      nim: { base: "https://nim.test/v1", kind: "openai", limits: { hard: { mpd: 5 } } },
+    })).toThrow(/mpd is not a known hard-cap axis/);
+    expect(() => load("hard-zero.json", {
+      nim: { base: "https://nim.test/v1", kind: "openai", limits: { hard: { rpm: -3 } } },
+    })).toThrow(/hard\.rpm must be a positive integer/);
+    expect(() => load("hard-model-bad.json", {
+      nim: {
+        base: "https://nim.test/v1", kind: "openai",
+        limits: { models: { "m/x": { hard: { weekly: 9 } } } },
+      },
+    })).toThrow(/weekly is not a known hard-cap axis/);
+    // `hard` inside `hard` is refused by the same closed-axis check — one grammar, no nesting.
+    expect(() => load("hard-nested.json", {
+      nim: {
+        base: "https://nim.test/v1", kind: "openai",
+        limits: { hard: { hard: { rpd: 9 } } as never },
+      },
+    })).toThrow(/hard is not a known hard-cap axis/);
+  });
+});
+
 describe("configuredLimitQuotaShape", () => {
   it("maps every axis onto the quota-observation vocabulary", () => {
     expect(configuredLimitQuotaShape("rpm")).toEqual({ axis: "requests", period: "minute" });

@@ -5,7 +5,14 @@
       "base": "https://integrate.api.nvidia.com/v1",
       "kind": "openai",
       "credentials": [
-        { "label": "personal", "authEnv": "NVIDIA_API_KEY", "limits": { "rpm": 40, "rpd": 1000, "tpd": 150000 } },
+        {
+          "label": "personal",
+          "authEnv": "NVIDIA_API_KEY",
+          "limits": {
+            "rpm": 40, "rpd": 1000, "tpd": 150000,
+            "hard": { "rpd": 900 }
+          }
+        },
         { "label": "work", "authEnv": "NVIDIA_WORK_API_KEY" }
       ],
       "tierType": "free"

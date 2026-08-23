@@ -2168,6 +2168,10 @@ export async function runCandidates(): Promise<void> {
     if (c.availability.length > 0) {
       process.stdout.write(`  availability: ${formatCandidateAvailability(c.availability)}\n`);
     }
+    // G2's operator-set refusal ceiling, only when it is REACHED right now — a cap that has not
+    // fired is config detail, not routing state, and this table is routing state.
+    const capped = formatCandidateHardCap(c.hardCap, Date.now());
+    if (capped !== null) process.stdout.write(`  ${capped}\n`);
   }
 
   const fuzzy = view.candidates.filter((c) => c.capabilityMatch?.match === "fuzzy");
@@ -2204,6 +2208,10 @@ export async function runCandidates(): Promise<void> {
       `           until it is retried (expires, so a rotated key recovers with no restart).\n` +
       `           "QUOTA 30s (requests/minute, provider-stated)" = the stated/declared allowance is\n` +
       `           SPENT, not sick — demoted behind live members and lifting on its own at the reset.\n` +
+      `  CAPPED <axis>/<period> <used>/<cap> = YOUR OWN operator-set hard cap (limits.hard) is\n` +
+      `           reached: this cell is refused before any egress and lifts at the UTC boundary.\n` +
+      `           "credential-scope" counts every model that key served this period;\n` +
+      `           "deployment-scope" counts only this model — whichever the cap was declared at.\n` +
       `  fit = pool order: 75% capability + 20% measured operations + 5% task-fit metadata.\n` +
       `        Unknown operations/metadata are neutral, never zero; hard faults are demoted.\n` +
       `  raw = fixed 40% agentic + 35% coding + 25% general capability. Missing dimensions\n` +
@@ -2237,6 +2245,24 @@ export function formatCandidateQuota(quota: readonly Candidate["quota"][number][
     const period = observation.period === "unknown" ? "-" : observation.period;
     return `${observation.axis}/${period} ${observation.remaining}/${observation.limit} ${observation.basis} age ${age}`;
   }).join("; ");
+}
+
+/**
+ * Render a REACHED operator-set hard cap (G2), or null when this row has none.
+ *
+ * The provenance labels are read off the wire object rather than re-typed here: `basis` says the
+ * ceiling is the operator's own assertion (not a measurement), and `scope` says whose usage
+ * `used` counts — the credential as a whole, or this one deployment — which is exactly where the
+ * cap was declared. A reader who cannot tell a declared ceiling from a measured one, or a
+ * credential-wide count from a per-model one, cannot act on either.
+ */
+export function formatCandidateHardCap(hardCap: Candidate["hardCap"], now: number): string | null {
+  if (hardCap === null) return null;
+  const resets = Math.max(0, Math.round((Date.parse(hardCap.resetsAt) - now) / 1000));
+  return (
+    `CAPPED ${hardCap.axis}/${hardCap.period} ${hardCap.used}/${hardCap.cap} ` +
+    `(${hardCap.basis}, ${hardCap.scope}-scope, resets in ${resets}s)`
+  );
 }
 
 /**
