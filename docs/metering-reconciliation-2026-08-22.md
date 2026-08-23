@@ -159,15 +159,18 @@ Still OPEN after the sprint:
   naming cap/basis `operator-declared` with its own header, outside `orderByUsability` (which may
   only reorder), never widened across credentials. Open design calls for the owner: per-request
   refusal vs fail-closed-for-the-walk, and whether a cap may exceed provider-stated figures.
-- **The reviewed-rule rung of `resolveResetsAt` is plumbed but fed null** (`availability.ts:286-288`;
-  the producer passes `reviewedRule: null` at `availability-snapshot.ts:148`). The request path
-  applies ResetRules but does not persist the resolved reset beside the observation; wiring needs
-  either a small persisted field or a deliberate re-parse decision — owner call.
-- **Streaming cross-protocol usage parity (llm-bridge).** An OpenAI-front client STREAMING from an
-  anthropic-kind backend (or the reverse) still drops cache fields and zero-fills missing usage:
-  the translated stream is passed through as the dependency emits it, and there is no seam after
-  llm-bridge hands back translated SSE. Options recorded by lane A: upstream/vendor patch, or
-  moving that translation seam in-repo. Buffered paths are correct today.
+- **The reviewed-rule rung of `resolveResetsAt` — DELIVERED 2026-08-23 (`a407ee0`).** Facts now
+  persist `untilBasis` (retry-after | reviewed-field | stated-body | reviewed-fixed) beside an
+  explicit expiry; `availability.ts`'s `factResetInputs` is the one gate turning a cell's covering
+  facts into rung-1 (`provider_stated`) / rung-2 (`reviewed_rule`) inputs, and both the dashboard
+  availability producer and `llm-relay candidates` resolve through it — additive required
+  `QuotaRowV1.resetsAtBasis`. Routing untouched: quota-demotion still passes `reviewedRule: null`
+  on purpose (spec M2, a separate decision).
+- **Streaming cross-protocol usage parity (llm-bridge) — ACCEPTED AS-IS (owner decision
+  2026-08-23).** The ledger observes the BACKEND stream, so accounting is correct regardless; only
+  the client-facing translated SSE loses cache fields when an OpenAI-front client streams from an
+  anthropic-kind backend or the reverse. Buffered paths are correct today. Closed as a recorded
+  decision, not a code change.
 - **Gaps 15/16, M3, P1, P4** — unchanged deferrals (see §6).
 
 ## 8. Verification note

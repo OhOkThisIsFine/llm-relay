@@ -733,12 +733,17 @@ provenance cells (Gap 11), the availability ladders + dashboard availability pro
 quota as a demotion term on both fronts (Stage 5 / Gap 12, learned opt-in via
 `routing.quota.enforceLearned`), and the `llm-relay cost --include-repair` roll-up.
 [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7 is the
-open list: M4/Gap 10 stays deferred, the G2 manual hard cap is delivered (`5e06a56`, v0.40.0), the
-reviewed-rule rung of `resolveResetsAt` is FED as of 2026-08-23 (persisted `untilBasis`), streaming cross-protocol usage in
-llm-bridge drops cache fields, plus the standing Gaps 15/16/M3/P1/P4 deferrals. The 2026-08-23
-sprint (v0.41.0) closed the dashboard/`cost` coverage-partial semantics (`50e8233`) and the OpenAI
-Responses front's dropped `function_call` (`3253a53`), and added tool-use id minting for
-repeated-id openai-kind hosts (`8473cb1`, `src/tool-use-ids.ts`). ⚠ Do not
+open list: M4/Gap 10 stays deferred, the G2 manual hard cap is delivered (`5e06a56`, v0.40.0), plus
+the standing Gaps 15/16/M3/P1/P4 deferrals. The 2026-08-23 sprint (v0.41.0) closed the dashboard/
+`cost` coverage-partial semantics (`50e8233`) and the OpenAI Responses front's dropped
+`function_call` (`3253a53`), and added tool-use id minting for repeated-id openai-kind hosts
+(`8473cb1`, `src/tool-use-ids.ts`). Two more commits landed after that, queued for **v0.42.0**:
+`a407ee0` feeds the reviewed-rule rung of `resolveResetsAt` (facts persist `untilBasis`; both the
+dashboard availability producer and `llm-relay candidates` resolve through it), and `d75b143`
+carries the caller's function `name` on outbound `role:"tool"` messages so gemini's
+OpenAI-compatible endpoint stops 400ing them. Streaming cross-protocol usage parity in llm-bridge
+is ACCEPTED AS-IS (owner decision 2026-08-23 — the ledger observes the backend stream so
+accounting is correct; only the client-facing translated SSE loses cache fields). ⚠ Do not
 "complete" Gap 3 by adding token fields to `LOG_FIELDS` — the accounting store superseded the
 JSONL-as-ledger plan; see the `log.ts` row above.
 
