@@ -143,7 +143,10 @@ Still OPEN after the sprint:
 - **Gap 10 / M4 remains DEFERRED** — estimated-output producer withheld until measured
   usage-absence rates justify it (owner disposition, open-decisions.md:4-7). Unchanged by this
   sprint.
-- **G2 manual per-credential hard cap — approved in principle, unbuilt.** The approved G2
+- **G2 manual per-credential hard cap — DELIVERED 2026-08-23 (`5e06a56`, v0.40.0): `limits.hard` on a
+  provider / credential slot / `models.<id>` override refuses before egress on both fronts (relay 429,
+  `x-llm-relay-capped`, Retry-After from the UTC boundary; `routing.quota.hardCaps: false` disables).
+  The original proposal is kept below as history.** The approved G2
   resolution permits an explicit operator cap that REFUSES loudly (its own status + header);
   everything built so far only demotes/reorders. Shape proposal from lane E: a `cap` block (or a
   `hard: true` marker inside the existing `limits` block) resolved like configured limits,

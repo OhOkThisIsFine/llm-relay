@@ -2,9 +2,12 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-22 (evening)
+## 0. State as of 2026-08-23
 
 Branch `main`. The metering closeout is **complete**: every sprint lane merged (nine commits).
+Since then: **v0.39.0** (`883a804`, released `cb273b0`) fixed the request-side tool-call IR leak with a
+relay-owned Anthropic→OpenAI request mapper (`src/openai-request.ts`), and the **G2 hard cap** landed
+(`5e06a56`, v0.40.0): `limits.hard` refuses before egress on both fronts.
 
 - The metering program is delivered through Stage 5. Merged lanes, by commit:
   - `7abdaf2` — C3 / Gap 4: `AssistantMessage.usage` widened; cache tokens survive repair and translation.
@@ -17,7 +20,7 @@ Branch `main`. The metering closeout is **complete**: every sprint lane merged (
   - `9fd9f36` — Stage 4 / C1: the `llm-relay cost` spend roll-up with `--include-repair`.
 - [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is THE
   ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`; its §7 lists what
-  remains open after the sprint (M4/Gap 10 deferral, the G2 hard cap unbuilt, the reviewed-rule rung
+  remains open after the sprint (M4/Gap 10 deferral, the reviewed-rule rung
   of `resolveResetsAt` fed null, streaming cross-protocol usage parity in llm-bridge).
 - Earlier state, for orientation: env-backed multi-key credential pooling landed as `7217ce0` ..
   `3795e60`; the accounting foundation + Analytics SPA (P0-P4) as `b4ec7ee`, followed by
@@ -152,10 +155,10 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   `openaiResponsesToUniversal` has no case for a `function_call` INPUT item, so the assistant turn is
   flattened to an empty user turn before the request mapper is reached (`test/openai-front.test.ts`
   pins the observation). Fix direction: own that translation too (a mirror of `src/openai-request.ts`).
-- **OPEN — ollama-cloud 403 "Pro plan" refusal** awaits acceptance as `subscription-required` via
-  `llm-relay eligibility`; until then the demotion machinery treats it as an ordinary refusal.
-- **OPEN — G2 hard cap / reviewed-rule rung / streaming cache usage** — see reconciliation §7 for
-  each with its owner call.
+- **Resolved —** the ollama-cloud 403 "Pro plan" refusal was learned by a seed interpretation as
+  `subscription-required` (`ollama-cloud#default/kimi-k3`, excluded from free pools); nothing to accept.
+- **OPEN — reviewed-rule rung / streaming cache usage** — see reconciliation §7 for each with its
+  owner call. (The G2 hard cap is delivered: `5e06a56`, `limits.hard`.)
 - **Known load-flaky test:** `test/accounting-cli-lifecycle.test.ts` "constructs one store…"
   can exceed its 5 s timeout under the full parallel suite; passes alone — rerun before calling
   it a regression.
