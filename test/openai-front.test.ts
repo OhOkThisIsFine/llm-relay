@@ -356,7 +356,7 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(resp.status).toBe(200);
     // The tool result reaches the backend as a LINKED OpenAI tool message, exactly once.
     expect(seen.messages.filter((m: any) => m.role === "tool")).toEqual([
-      { role: "tool", tool_call_id: "call_1", content: "SECRET-RESULT" },
+      { role: "tool", tool_call_id: "call_1", content: "SECRET-RESULT", name: "Grep" },
     ]);
     expect(JSON.stringify(seen).split("SECRET-RESULT").length - 1).toBe(1);
     // The granted tool survives as an OpenAI function declaration.
@@ -814,7 +814,7 @@ describe("Responses front — relay-owned request translation", () => {
     for (const seen of bodies) {
       expect(seen.messages.map((m: any) => m.role)).toEqual(["user", "assistant", "tool"]);
       expect(seen.messages[1].tool_calls[0].id).toBe("call_9");
-      expect(seen.messages[2]).toEqual({ role: "tool", tool_call_id: "call_9", content: "hit" });
+      expect(seen.messages[2]).toEqual({ role: "tool", tool_call_id: "call_9", content: "hit", name: "Grep" });
     }
   });
 

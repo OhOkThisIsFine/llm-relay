@@ -225,12 +225,22 @@ function toolResultParts(content: unknown): ToolResultParts {
  * `content: text || null` is the ASSISTANT shape, where OpenAI defines null; a tool message has
  * no such spelling.
  */
-function toolResultMessage(block: Rec): { message: Rec; images: Rec[] } {
+function toolResultMessage(block: Rec, toolNames?: ReadonlyMap<string, string>): { message: Rec; images: Rec[] } {
   if (typeof block.tool_use_id !== "string" || block.tool_use_id.length === 0) {
     throw new RequestMappingError("tool_result block without a tool_use_id");
   }
   const { text, images } = toolResultParts(block.content);
-  return { message: { role: "tool", tool_call_id: block.tool_use_id, content: text }, images };
+  const message: Rec = { role: "tool", tool_call_id: block.tool_use_id, content: text };
+  // Gemini's OpenAI-compatible layer folds a tool message into a `functionResponse` part whose
+  // `name` is REQUIRED and is never resolved from the preceding `tool_calls`, so a nameless tool
+  // message is a 400 there ("function_response.name: name cannot be empty"). The name here is the
+  // caller's OWN tool name, looked up from the assistant `tool_use` whose id this result answers
+  // (the conversation is walked in order, so the call has always been seen) — re-stated where
+  // another vendor needs it, not invented: an orphan result (no matching tool_use, e.g. its call
+  // sat in a dropped block) carries NO `name`.
+  const name = toolNames?.get(block.tool_use_id as string);
+  if (name !== undefined) message.name = name;
+  return { message, images };
 }
 
 /**
@@ -246,7 +256,7 @@ function toolResultMessage(block: Rec): { message: Rec; images: Rec[] } {
  * message cannot carry one, so the image rides on the user turn that follows it, keeping its
  * position relative to the turn's other leftover blocks (`toolResultParts`).
  */
-function userMessages(turn: Rec): Rec[] {
+function userMessages(turn: Rec, toolNames?: ReadonlyMap<string, string>): Rec[] {
   const content = turn.content;
   if (typeof content === "string") return [{ role: "user", content }];
   const toolMessages: Rec[] = [];
@@ -261,7 +271,7 @@ function userMessages(turn: Rec): Rec[] {
         parts.push(imagePart(raw));
         break;
       case "tool_result": {
-        const { message, images } = toolResultMessage(raw);
+        const { message, images } = toolResultMessage(raw, toolNames);
         toolMessages.push(message);
         // Appended HERE, not collected separately, so a result's images keep their place among
         // the turn's other leftover blocks.
@@ -353,13 +363,32 @@ export function anthropicRequestToOpenAi(
   const body = isRecord(reqJson) ? reqJson : {};
   const messages: Rec[] = [];
 
+  // Assistant `tool_use` id → name across the whole conversation, so each `role:"tool"` message
+  // can restate the name of the call it answers (see `toolResultMessage` — a gemini compat-layer
+  // requirement). Filled lazily on first `tool_use`; a no-tool request keeps `undefined`.
+  let toolNames: Map<string, string> | undefined;
+  const rememberToolNames = (turn: Rec): void => {
+    if (!Array.isArray(turn.content)) return;
+    for (const block of turn.content) {
+      if (!isRecord(block) || block.type !== "tool_use") continue;
+      if (typeof block.id === "string" && block.id.length > 0 &&
+          typeof block.name === "string" && block.name.length > 0) {
+        (toolNames ??= new Map()).set(block.id, block.name);
+      }
+    }
+  };
+
   const system = systemText(body.system);
   if (system.length > 0) messages.push({ role: "system", content: system });
 
   for (const raw of Array.isArray(body.messages) ? body.messages : []) {
     if (!isRecord(raw)) throw new RequestMappingError("message is not an object");
-    if (raw.role === "assistant") messages.push(assistantMessage(raw));
-    else messages.push(...userMessages(raw));
+    // Walked in order, so a `tool_result` is always emitted after its `tool_use` was recorded —
+    // and id minting (`tool-use-ids.ts`) is RESPONSE-side, so the echoed pair shares one id here.
+    if (raw.role === "assistant") {
+      rememberToolNames(raw);
+      messages.push(assistantMessage(raw));
+    } else messages.push(...userMessages(raw, toolNames));
   }
 
   const out: Rec = { messages };

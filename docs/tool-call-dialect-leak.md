@@ -223,7 +223,10 @@ contract test in `test/dialect-stream.test.ts` pins that such text reaches the c
 Every `openai`-kind target now receives a different (smaller, correctly linked) request body:
 
 - prompts shrink roughly threefold on agentic turns, and provider prompt caches miss once;
-- `role:"tool"` messages appear where there were none, so a stricter host may now behave
+- `role:"tool"` messages appear where there were none — each carrying the caller's own function
+  `name` (looked up from the `tool_use` it answers, never invented), because gemini's
+  OpenAI-compatible layer folds a tool message into a `functionResponse` part whose `name` is
+  required and never resolved from the preceding `tool_calls` — so a stricter host may now behave
   *differently* — better, but differently;
 - **`stop` is a NEW field.** llm-bridge never sent one — `universalToOpenAI` does not read
   `provider_params.stop_sequences` — so a caller's `stop_sequences` silently did nothing and now

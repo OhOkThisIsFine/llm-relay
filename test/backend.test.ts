@@ -957,8 +957,8 @@ describe("fetchBackend (openai kind) — the outbound request is the caller's co
     const seen = await outbound(AGENTIC);
     const tools = seen.messages.filter((m: any) => m.role === "tool");
     expect(tools).toEqual([
-      { role: "tool", tool_call_id: "toolu_01A", content: "SECRET-GREP-OUTPUT" },
-      { role: "tool", tool_call_id: "toolu_01B", content: "SECRET-FILE-BODY" },
+      { role: "tool", tool_call_id: "toolu_01A", content: "SECRET-GREP-OUTPUT", name: "Grep" },
+      { role: "tool", tool_call_id: "toolu_01B", content: "SECRET-FILE-BODY", name: "Read" },
     ]);
     // The old path triplicated each result (raw.content + metadata.content + result).
     const wire = JSON.stringify(seen);
@@ -980,7 +980,35 @@ describe("fetchBackend (openai kind) — the outbound request is the caller's co
     });
     // llm-bridge's one working case emitted `{role:"user", content:"r"}` — no IR, but the
     // tool_call_id linkage was gone, so the host could not tell which call this answered.
-    expect(seen.messages.at(-1)).toEqual({ role: "tool", tool_call_id: "toolu_solo", content: "r" });
+    expect(seen.messages.at(-1)).toEqual({ role: "tool", tool_call_id: "toolu_solo", content: "r", name: "Read" });
+  });
+
+  it("carries the function name on each tool message, looked up from the tool_use it answers", async () => {
+    // Gemini's OpenAI-compatible layer folds a tool message into a `functionResponse` part whose
+    // `name` is REQUIRED and never resolved from the preceding `tool_calls` — a nameless tool
+    // message is a 400 there ("function_response.name: name cannot be empty"). The name is the
+    // caller's OWN tool name, re-stated from the conversation, never invented.
+    const seen = await outbound(AGENTIC);
+    const tools = seen.messages.filter((m: any) => m.role === "tool");
+    expect(tools.map((m: any) => m.name)).toEqual(["Grep", "Read"]);
+    // …and each is its OWN call's name, not the turn's first or last.
+    expect(tools[0]).toMatchObject({ tool_call_id: "toolu_01A", name: "Grep" });
+    expect(tools[1]).toMatchObject({ tool_call_id: "toolu_01B", name: "Read" });
+  });
+
+  it("emits NO name for an orphan tool_result — never invents one", async () => {
+    // A result whose tool_use is absent from the conversation (a dropped block, a truncated
+    // history) has nothing to look up. Omitting `name` is the no-invention rule; fabricating one
+    // would be relay-authored content on the wire.
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ghost", content: "r" }] },
+      ],
+    });
+    expect(seen.messages.at(-1)).toEqual({ role: "tool", tool_call_id: "toolu_ghost", content: "r" });
+    expect(seen.messages.at(-1)).not.toHaveProperty("name");
   });
 
   it("emits the tool messages FIRST when a user turn mixes results with text", async () => {
@@ -1097,7 +1125,7 @@ describe("fetchBackend (openai kind) — the outbound request is the caller's co
     // The provider WAS called: no local 400, no dead request. That is the whole fix.
     expect(seen).not.toBeNull();
     expect(seen.messages.map((m: any) => m.role)).toEqual(["assistant", "tool", "user"]);
-    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_img", content: "Read 1 image" });
+    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_img", content: "Read 1 image", name: "Read" });
     expect(seen.messages[2]).toEqual({
       role: "user",
       content: [{ type: "image_url", image_url: { url: "data:image/png;base64,IMAGE-BYTES" } }],
@@ -1122,7 +1150,7 @@ describe("fetchBackend (openai kind) — the outbound request is the caller's co
     // The tool message still exists and still links — an unanswered `tool_call_id` is rejected
     // by strict hosts — and `content: ""` is what the Chat schema asks for (a required string).
     // A relay-authored placeholder would be words the caller never wrote.
-    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_shot", content: "" });
+    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_shot", content: "", name: "Screenshot" });
     expect(seen.messages[2].content).toEqual([
       { type: "image_url", image_url: { url: "data:image/png;base64,ONLY-IMAGE" } },
     ]);
@@ -1179,7 +1207,7 @@ describe("fetchBackend (openai kind) — the outbound request is the caller's co
     });
     // OpenAI has no error flag on a tool message, and an `Error:` prefix would be words the
     // caller never wrote; the failing tool's own output already says it failed.
-    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_e", content: "command not found" });
+    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_e", content: "command not found", name: "Bash" });
     expect(JSON.stringify(seen)).not.toContain("is_error");
   });
 

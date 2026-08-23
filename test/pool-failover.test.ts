@@ -1544,6 +1544,12 @@ describe("outbound request shape holds on the FAILOVER candidate too", () => {
     expect(b.bodies()).toHaveLength(1);
     assertCleanOutbound(a.bodies()[0]);
     assertCleanOutbound(b.bodies()[0]);
+    // The function name travels on each tool message on BOTH candidates — this is the fix for
+    // gemini's compat layer, and it must survive failover, not just the first try.
+    for (const seen of [a.bodies()[0], b.bodies()[0]]) {
+      const tools = seen.messages.filter((m: any) => m.role === "tool");
+      expect(tools.map((m: any) => m.name)).toEqual(["Grep", "Read"]);
+    }
     // Same translation both times — the mapper reads the caller's body, never a walk-local copy.
     expect(b.bodies()[0].messages).toEqual(a.bodies()[0].messages);
   });
@@ -1608,7 +1614,7 @@ describe("outbound request shape holds on the FAILOVER candidate too", () => {
     for (const seen of [a.bodies()[0], b.bodies()[0]]) {
       expect(seen.messages.map((m: any) => m.role)).toEqual(["assistant", "tool", "user"]);
       // Text on the tool message; the image on the user message that follows it.
-      expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_img", content: "Read 1 image" });
+      expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_img", content: "Read 1 image", name: "Read" });
       expect(seen.messages[2].content).toEqual([
         { type: "image_url", image_url: { url: "data:image/png;base64,IMAGE-BYTES" } },
       ]);
