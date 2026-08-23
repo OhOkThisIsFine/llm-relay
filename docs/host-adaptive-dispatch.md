@@ -87,7 +87,7 @@ what a `claude` binary is; the operator states it once and the relay substitutes
 "routing": {
   "cliLane": {
     "command": "claude",
-    "args": ["-p", "--model", "{spec}", "--permission-mode", "plan", "{task}"],
+    "args": ["-p", "--model", "{spec}", "{task}", "--permission-mode", "acceptEdits"],
     "env": {
       "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791",
       "CLAUDECODE": null,
