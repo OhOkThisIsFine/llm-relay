@@ -541,6 +541,7 @@ describe("dashboard snapshot projection", () => {
       limitBasis: "provider_stated",
       remainingBasis: "provider_stated",
       localUsedBasis: "reported",
+      resetsAtBasis: null,
     };
     const cooldown: CooldownRowV1 = {
       credentialId: "openai#primary",
@@ -589,6 +590,7 @@ describe("dashboard snapshot projection", () => {
       limitBasis: null,
       remainingBasis: null,
       localUsedBasis: null,
+      resetsAtBasis: null,
     }));
     const snapshot = await createDashboardSnapshotReadPort({
       accounting: store,
@@ -620,6 +622,7 @@ describe("dashboard snapshot projection", () => {
       limitBasis: null,
       remainingBasis: null,
       localUsedBasis: null,
+      resetsAtBasis: null,
     });
     const makeCooldown = (provider: string, index: number): CooldownRowV1 => ({
       credentialId: `${provider}#${index.toString().padStart(3, "0")}`,
@@ -757,6 +760,7 @@ describe("availability port - server-shaped construction", () => {
       limitBasis: "provider_stated",
       remainingBasis: "provider_stated",
       localUsedBasis: null,
+      resetsAtBasis: null,
     };
     const cooldown: CooldownRowV1 = {
       credentialId: "openai#primary",
@@ -799,6 +803,7 @@ describe("availability port - server-shaped construction", () => {
       limitBasis: "provider_stated",
       remainingBasis: "derived_provider_stated",
       localUsedBasis: "reported",
+      resetsAtBasis: null,
     };
     const snapshot = await createDashboardSnapshotReadPort({
       accounting: store,

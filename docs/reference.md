@@ -1099,7 +1099,15 @@ local ledger — no provider is contacted for them. Every quota figure carries i
 `provider_stated` (read off this deployment's own response headers), `configured` (operator-declared
 in config `limits`), `learned` (parsed from what the deployment stated when it refused), or
 `published` (catalog-harvested). A `derived_*` remaining means the relay computed it as limit minus
-local usage over the current period; period boundaries are UTC (minute/day/month). Unknown renders
+local usage over the current period; period boundaries are UTC (minute/day/month). A row's RESET
+carries its own basis too: `provider_stated` (a reset the response itself stated), `reviewed_rule`
+(a reset resolved through an accepted refusal interpretation and stored with the learned
+condition), or `derived_boundary` (the UTC period boundary the relay computed). A stored
+condition's reset only answers a bucket that is measured-spent and whose own response stated no
+reset — a credential-wide condition never invents a reset for a bucket with headroom, and only
+the two spent-allowance conditions (`allowance-exhausted`, `rate-limited`) may answer at all.
+`llm-relay candidates` prints the same basis in its `resets Ns (<basis>)` clause, so the terminal
+and the panel cannot disagree about one cell. Unknown renders
 as "Unavailable", never 0, and a negative remaining means the credential overshot its ceiling.
 `learned` figures are display-only — routing acts on them only under the explicit opt-in
 `routing.quota.enforceLearned` (spec decision M2). Cooldown rows show WHY a member is cooling (`rate_limit`, `auth_error`,

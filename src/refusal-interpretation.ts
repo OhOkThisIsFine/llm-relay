@@ -322,7 +322,7 @@ export function parseStatedResetMs(body: string): number | null {
 /**
  * Apply a reviewed reset rule to one response body.
  *
- * Ranked below anything the response itself states — see `resolveResetMs` in `server.ts`. A
+ * Ranked below anything the response itself states — see `resolveReset` in `server.ts`. A
  * `field` rule reads THIS response, so it is still a measurement; a `fixed` rule is the reviewer's
  * knowledge of a window and is the last word before falling back to the kind's TTL.
  */

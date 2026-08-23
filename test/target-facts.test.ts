@@ -416,6 +416,85 @@ describe("a quota is not a rate limit", () => {
     expect(cooldownUntil("gemini", "m", { path, now: now + 1000 })).toBe(now + 3_600_000);
   });
 
+  it("persists the reset's provenance (untilBasis) beside the expiry and reads it back", () => {
+    // The availability ladder's reviewed-rule rung is fed from this field; dropping it at the
+    // record seam is the defect packet P fixes.
+    const now = 9_000_000;
+    recordFact("allowance-exhausted", { kind: "provider", provider: "gemini" }, {
+      path, now, retryAfterMs: 60_000, untilBasis: "reviewed-field",
+    });
+    const hit = factsFor("gemini", "m", { path, now: now + 1 }).find((fact) => fact.kind === "allowance-exhausted");
+    expect(hit?.until).toBe(now + 60_000);
+    expect(hit?.untilBasis).toBe("reviewed-field");
+    expect(allFacts({ path, now: now + 1 }).find((fact) => fact.kind === "allowance-exhausted")?.untilBasis).toBe("reviewed-field");
+  });
+
+  it("ignores untilBasis when no positive retryAfterMs was given — the expiry is the default TTL", () => {
+    const now = 9_000_000;
+    recordFact("rate-limited", { kind: "provider", provider: "g" }, { path, now, untilBasis: "reviewed-field" });
+    recordFact("rate-limited", { kind: "provider", provider: "h" }, { path, now, retryAfterMs: 0, untilBasis: "retry-after" });
+    expect(factsFor("g", "m", { path, now: now + 1 })[0]?.untilBasis).toBeUndefined();
+    expect(factsFor("h", "m", { path, now: now + 1 })[0]?.untilBasis).toBeUndefined();
+  });
+
+  it("loads a legacy row without untilBasis unchanged, and expires it as before", () => {
+    const now = 9_000_000;
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      facts: {
+        [keyOf("allowance-exhausted", { kind: "provider", provider: "gemini" })]: {
+          kind: "allowance-exhausted", scope: { kind: "provider", provider: "gemini" },
+          at: now, until: now + 30_000,
+        },
+      },
+    }));
+    resetFacts();
+    const live = factsFor("gemini", "m", { path, now: now + 1 });
+    expect(live).toHaveLength(1);
+    expect(live[0]?.until).toBe(now + 30_000);
+    expect(live[0]?.untilBasis).toBeUndefined();
+    expect(cooldownUntil("gemini", "m", { path, now: now + 31_000 })).toBeNull();
+  });
+
+  it("drops a malformed untilBasis on load to absent rather than failing the row", () => {
+    const now = 9_000_000;
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      facts: {
+        [keyOf("allowance-exhausted", { kind: "provider", provider: "gemini" })]: {
+          kind: "allowance-exhausted", scope: { kind: "provider", provider: "gemini" },
+          at: now, until: now + 30_000, untilBasis: "vibes",
+        },
+      },
+    }));
+    resetFacts();
+    const live = factsFor("gemini", "m", { path, now: now + 1 });
+    expect(live).toHaveLength(1);
+    expect(live[0]?.untilBasis).toBeUndefined();
+    expect(cooldownUntil("gemini", "m", { path, now: now + 1 })).toBe(now + 30_000);
+  });
+
+  it("drops untilBasis on a row with no explicit until — a default TTL is not a stated reset", () => {
+    // Only reachable through a hand-edited or foreign file, but the field's whole contract is
+    // "this basis explains THIS expiry". With no `until`, `expiryOf` falls back to the kind's TTL,
+    // and handing that fallback out with a basis attached would label a guess as a measurement.
+    const now = 9_000_000;
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      facts: {
+        [keyOf("allowance-exhausted", { kind: "provider", provider: "gemini" })]: {
+          kind: "allowance-exhausted", scope: { kind: "provider", provider: "gemini" },
+          at: now, untilBasis: "reviewed-field",
+        },
+      },
+    }));
+    resetFacts();
+    const live = factsFor("gemini", "m", { path, now: now + 1 });
+    expect(live).toHaveLength(1);
+    expect(live[0]?.until).toBe(now + FACT_TTL_MS["allowance-exhausted"]);
+    expect(live[0]?.untilBasis).toBeUndefined();
+  });
+
   it("still treats a spent quota as FREE — it is spent, not priced", () => {
     recordFact("allowance-exhausted", { kind: "provider", provider: "gemini" }, { path });
     expect(isCostBlocked("gemini", "models/gemini-3.6-flash", { path })).toBe(false);

@@ -28,6 +28,7 @@ import { resolveConfiguredLimits, CONFIGURED_LIMIT_AXES, configuredLimitQuotaSha
 import { evaluateHardCap } from "./hard-cap.js";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import {
+  factResetInputs,
   resolveRemaining,
   resolveResetsAt,
   type LimitInputs,
@@ -363,6 +364,10 @@ function mergeCandidateQuota(
  * here — /candidates is served by the CLI against a possibly-remote proxy and has no ledger
  * handle, so rung 2 fires only when the caller passes `localUsed` in (tests, an in-process
  * server). Absent localUsed the ladder still resolves rung 1 and reports the limit.
+ *
+ * §5.2's fact-fed rungs go through `factResetInputs` — the SAME helper the dashboard's producer
+ * calls. Two implementations of "may this fact answer this bucket" is how one cell comes to read
+ * `reviewed-rule` in the dashboard and `derived-boundary` in `llm-relay candidates`.
  */
 function buildCandidateAvailability(
   cfg: Config,
@@ -376,6 +381,8 @@ function buildCandidateAvailability(
   if (parsed === null) return [];
   const configured = resolveConfiguredLimits(cfg, provider, parsed.label, model ?? null);
   const learned = model === undefined ? [] : observedRateLimits(provider, credentialId as CredentialId, model, { now: nowMs });
+  // One read per cell; the order (most-specific scope first) is load-bearing input below.
+  const cellFacts = factsFor(provider, credentialId as CredentialId, model ?? null, { now: nowMs });
 
   const buckets = new Map<string, { observations: QuotaObservation[]; limits: LimitInputs }>();
   const bucketFor = (axis: "requests" | "tokens", period: "minute" | "day" | "month") => {
@@ -415,8 +422,12 @@ function buildCandidateAvailability(
       now: nowMs,
     });
     const resets = resolveResetsAt({
-      providerStated: resolution.eligibleObservation?.resetsAt ?? null,
-      reviewedRule: null,
+      ...factResetInputs({
+        facts: cellFacts,
+        observationReset: resolution.eligibleObservation?.resetsAt ?? null,
+        remaining: resolution.remaining,
+        now: nowMs,
+      }),
       period: periodPart,
       now: nowMs,
     });

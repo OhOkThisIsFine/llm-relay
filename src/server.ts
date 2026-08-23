@@ -77,7 +77,7 @@ import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
 import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
-import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact } from "./target-facts.js";
+import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact, type FactResetBasis } from "./target-facts.js";
 import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
 import { evaluateHardCap, hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
@@ -2882,8 +2882,10 @@ function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfter
       attempt.credentialId,
       target.model,
     );
+    const reset = resolveReset(verdict, retryAfterMs, matchedBody);
     recordFact(verdict.class, scope, {
-      retryAfterMs: resolveResetMs(verdict, retryAfterMs, matchedBody),
+      retryAfterMs: reset?.ms ?? null,
+      ...(reset === null ? {} : { untilBasis: reset.basis }),
     });
     return { unknown: false, scope };
   } catch {
@@ -2927,16 +2929,27 @@ function freeOnlyApplies(rule: { freeOnly?: boolean }, rerouted: boolean): boole
  * ⚠ The ordering is the point. A reviewer may know MORE than the response (that a daily quota
  * resets in hours when the body says nothing), but never more than the response about itself — so
  * an assertion can fill a gap and can never overrule a statement.
+ *
+ * Returns the value AND which rung produced it, so `recordFact` can persist the provenance
+ * (`untilBasis`) beside the expiry rather than the availability producer having to re-derive it
+ * from vendor prose in a read path.
  */
-function resolveResetMs(interpretation: Interpretation, headerMs: number | null, body: string): number | null {
-  if (headerMs !== null) return headerMs;
+function resolveReset(
+  interpretation: Interpretation,
+  headerMs: number | null,
+  body: string,
+): { ms: number; basis: FactResetBasis } | null {
+  if (headerMs !== null) return { ms: headerMs, basis: "retry-after" };
   if (interpretation.reset?.kind === "field") {
     const fromField = applyResetRule(interpretation.reset, body);
-    if (fromField !== null) return fromField;
+    if (fromField !== null) return { ms: fromField, basis: "reviewed-field" };
   }
   const generic = parseStatedResetMs(body);
-  if (generic !== null) return generic;
-  if (interpretation.reset?.kind === "fixed") return applyResetRule(interpretation.reset, body);
+  if (generic !== null) return { ms: generic, basis: "stated-body" };
+  if (interpretation.reset?.kind === "fixed") {
+    const fixed = applyResetRule(interpretation.reset, body);
+    if (fixed !== null) return { ms: fixed, basis: "reviewed-fixed" };
+  }
   return null;
 }
 
