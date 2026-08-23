@@ -1052,6 +1052,14 @@ request detail, provider/model/client/credential dimensions, and available quota
 Missing coverage and unknown values stay explicit. Reads do not probe providers, perform egress,
 scan logs, or expose prompts, bodies, tool arguments, raw provider errors, or key material.
 
+**"Partial" means the store held data this projection could not surface** — a dropped row, an
+overflowed counter, a capped read, an unreadable shard — never merely a token kind nobody reported.
+A request whose backend never sends cache tokens, or that only carries an estimate with no reported
+usage at all, renders that cell as null with provenance `"unknown"` while the panel around it stays
+`"complete"`: nothing the store held is missing, a host simply never stated that figure. Only actual
+loss (or, for latency/commit, an unknown count in EXCESS of what an outcome like `cancelled` already
+explains) degrades a panel to `"partial"`.
+
 **Spend figures.** Each request is priced at completion from PUBLISHED per-(provider, model)
 prices only — the serving deployment's own publication where it exists, otherwise another
 provider's figure for the same model id (labelled `reference`). There is no fallback price, no
@@ -1141,6 +1149,8 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 - `--json` emits the same numbers as a stable `dashboard.cost.v1` object.
 - A store with no data yet prints "No accounting data" and exits 0; only a corrupt or unreadable
   store reports failure; a malformed flag prints a usage line and exits 1.
+- "Coverage: partial" means the store held (or should have held) data this report omits — never a
+  request that simply carried no token kind. See the coverage note above.
 
 ### Endpoints
 

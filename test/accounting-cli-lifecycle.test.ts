@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { currentVersion } from "../src/self-update.js";
 
 const mocks = vi.hoisted(() => {
@@ -121,6 +121,16 @@ async function loadRunProxy(): Promise<() => unknown> {
 }
 
 describe("accounting store CLI lifecycle", () => {
+  // `../src/cli.js` pulls in its whole module graph (config, benchmarks/tier-data,
+  // dashboard-snapshot, ...) on first import; under the full parallel suite that first
+  // `import()` can alone exceed the 5s default TEST timeout (passes alone in ~0.9s).
+  // Warming the module cache here charges that cost to THIS HOOK's own 20s budget
+  // (set below), not to whichever `it` happens to run first — the three tests below
+  // still each call `loadRunProxy()`, but resolve it from the now-warm module cache.
+  beforeAll(async () => {
+    await loadRunProxy();
+  }, 20_000);
+
   afterEach(() => {
     process.argv = originalArgv;
     process.exit = originalExit;

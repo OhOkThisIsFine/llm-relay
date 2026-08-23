@@ -287,6 +287,38 @@ describe("llm-relay cost CLI", () => {
     expect(output).not.toContain("No accounting data yet");
   });
 
+  it("keeps coverage complete and prints no partial line when a request simply lacks a token kind", async () => {
+    const usageDir = tempUsageDir();
+    seed(usageDir, {
+      pricePort: PUBLISHED_PRICE,
+      // No cache token fields at all — a host that never reports them, not a loss.
+      attempts: [{ role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    const { output: jsonOutput } = await runCost(["--json"], usageDir);
+    const report = parseJsonReport(jsonOutput);
+    expect(report.coverage).toBe("complete");
+    const rendered = await runCost([], usageDir);
+    expect(rendered.output).not.toContain("Coverage: partial");
+  });
+
+  it("prints Coverage: partial for a genuinely corrupt shard, distinct from an unmeasured token kind", async () => {
+    const usageDir = tempUsageDir();
+    seed(usageDir, {
+      pricePort: PUBLISHED_PRICE,
+      attempts: [{ role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    // A second day inside the default 24h window that EXISTS but cannot be parsed —
+    // real data the store should hold, unlike a request that simply carried no cache
+    // token kind.
+    writeFileSync(join(usageDir, "2026-08-19.json"), "{not json");
+    const { output: jsonOutput } = await runCost(["--json"], usageDir);
+    const report = parseJsonReport(jsonOutput);
+    expect(report.coverage).toBe("partial");
+    const rendered = await runCost([], usageDir);
+    expect(rendered.output).toContain("Coverage: partial");
+    expect(rendered.output).toContain("Some data the store held is not reflected in this report");
+  });
+
   it("rejects prototype member names as --window with the usage line, not an internal error", async () => {
     // `windowValue in COST_WINDOWS` used to be true for Object.prototype members, which
     // assigned an inherited function to windowId and died later inside

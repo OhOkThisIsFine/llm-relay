@@ -300,21 +300,143 @@ describe("dashboard snapshot projection", () => {
     store.close();
   });
 
-  it("retains valid totals when a requested day is missing or corrupt, but not when all days are unusable", async () => {
+  it("keeps summary complete on an exact 0/0 cache split -- nothing was cached, not a figure the store lost", async () => {
+    // Anthropic sends cache_creation/cache_read on essentially every response, often as
+    // an exact 0/0 when nothing was cached that turn. `known > 0` alone used to treat
+    // that as "a split was observed" and force the panel partial forever for any
+    // Anthropic-served traffic (review fix, finding 3).
     const store = createAccountingStore({ rootDir: root() });
-    record(store, { endedAt: "2026-08-20T12:29:00.000Z", attempts: [{ tokens: { reported: { inputTokens: 4 } } }] });
+    record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      attempts: [{ commitMs: 5, tokens: { reported: { inputTokens: 10, cachedInputTokens: 4, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } } }],
+    });
+    const snapshot = await port(store).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.summary.tokens.reported.reportedCachedInput.value).toBe(4);
+    expect(snapshot.panelCoverage.find((entry) => entry.panel === "summary")?.state).toBe("complete");
+    store.close();
+  });
+
+  it("keeps summary partial on a real nonzero cache split, forcing the one cached field null", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      attempts: [{ commitMs: 5, tokens: { reported: { inputTokens: 10, cachedInputTokens: 4, cacheCreationInputTokens: 12, cacheReadInputTokens: 0 } } }],
+    });
+    const snapshot = await port(store).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.summary.tokens.reported.reportedCachedInput.value).toBeNull();
+    const coverage = snapshot.panelCoverage.find((entry) => entry.panel === "summary");
+    expect(coverage?.state).toBe("partial");
+    expect(coverage?.provenance).toContain("unknown");
+    store.close();
+  });
+
+  it("keeps summary/token-timeline complete when a request simply never reports a cache token kind", async () => {
+    // Coverage-semantics fix: `unknown > 0` alone (no `lost`/`overflow`) is measurement
+    // incompleteness — a host that never sends a cache-token field — not data the store
+    // held and lost. It nulls the one cell with provenance "unknown"; it must NOT
+    // degrade the panel to "partial".
+    const store = createAccountingStore({ rootDir: root() });
+    record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      attempts: [{ commitMs: 5, tokens: { reported: { inputTokens: 10, outputTokens: 4 } } }],
+    });
+    const snapshot = await port(store).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.summary.tokens.reported.reportedInput.value).toBe(10);
+    expect(snapshot.summary.tokens.reported.reportedOutput.value).toBe(4);
+    expect(snapshot.summary.tokens.reported.reportedCachedInput.value).toBeNull();
+    const summaryCoverage = snapshot.panelCoverage.find((entry) => entry.panel === "summary");
+    const timelineCoverage = snapshot.panelCoverage.find((entry) => entry.panel === "token_timeline");
+    expect(summaryCoverage?.state).toBe("complete");
+    expect(timelineCoverage?.state).toBe("complete");
+    // The gap is still visible in provenance — it is just not spent as a coverage flag.
+    expect(summaryCoverage?.provenance).toContain("unknown");
+    store.close();
+  });
+
+  it("keeps summary complete when a request carries no reported usage at all (estimate only)", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      attempts: [{ commitMs: 5, tokens: { estimated: { inputTokens: 6, inputMethod: "chars/4" } } }],
+    });
+    const snapshot = await port(store).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.summary.tokens.reported.reportedInput.value).toBeNull();
+    expect(snapshot.summary.tokens.reported.reportedOutput.value).toBeNull();
+    expect(snapshot.summary.tokens.reported.reportedCachedInput.value).toBeNull();
+    expect(snapshot.summary.tokens.estimated.estimatedInput.value).toBe(6);
+    expect(snapshot.panelCoverage.find((entry) => entry.panel === "summary")?.state).toBe("complete");
+    store.close();
+  });
+
+  it("keeps summary partial on a genuine token loss, unlike a plain unmeasured kind", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      attempts: [{ commitMs: 5, tokens: { reported: { inputTokens: 10, outputTokens: 4 } } }],
+    });
+    const dayResult = store.readDay("2026-08-20");
+    expect(dayResult.status).toBe("ok");
+    if (dayResult.status !== "ok") throw new Error("test setup day missing");
+    const day = structuredClone(dayResult.value);
+    const minuteKey = Object.keys(day.cells)[0];
+    if (minuteKey === undefined) throw new Error("test setup minute missing");
+    const cell = day.cells[minuteKey]!;
+    // Simulate the store itself losing a count it once held (e.g. a counter drop),
+    // as opposed to a host simply never reporting the kind.
+    const alteredDay = {
+      ...day,
+      cells: {
+        ...day.cells,
+        [minuteKey]: {
+          ...cell,
+          aggregate: {
+            ...cell.aggregate,
+            requestTokens: {
+              ...cell.aggregate.requestTokens,
+              reported: {
+                ...cell.aggregate.requestTokens.reported,
+                reportedOutput: { ...cell.aggregate.requestTokens.reported.reportedOutput, value: null, lost: 1 },
+              },
+            },
+          },
+        },
+      },
+    };
+    const base = store.reader();
+    const reader = readerWithDays(base, [alteredDay], { "2026-08-20": "ok" });
+    const snapshot = await createDashboardSnapshotReadPort({ accounting: reader, relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" }).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.panelCoverage.find((entry) => entry.panel === "summary")?.state).toBe("partial");
+    store.close();
+  });
+
+  it("retains valid totals when a requested day is missing, still partial when corrupt, unavailable when all days are unusable", async () => {
+    // `commitMs` is set explicitly so this fixture isolates the day-status question:
+    // an omitted commitMs on a "success" request is its own (correct) unexpected-loss
+    // signal via hasUnexpectedMetricLoss and would confound a missing/corrupt
+    // comparison that is supposed to be about the day read alone (review fix, finding 1).
+    const store = createAccountingStore({ rootDir: root() });
+    record(store, { endedAt: "2026-08-20T12:29:00.000Z", attempts: [{ commitMs: 5, tokens: { reported: { inputTokens: 4 } } }] });
     const dayResult = store.readDay("2026-08-20");
     expect(dayResult.status).toBe("ok");
     if (dayResult.status !== "ok") throw new Error("test setup day missing");
     const base = store.reader();
-    for (const status of ["missing", "corrupt"] as const) {
-      const reader = readerWithDays(base, [dayResult.value], { "2026-08-19": status, "2026-08-20": "ok" });
-      const snapshot = await createDashboardSnapshotReadPort({ accounting: reader, relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" }).readSnapshot({ window: "24h", includeRepair: false });
-      const coverage = snapshot.panelCoverage.find((entry) => entry.panel === "summary");
-      expect(snapshot.summary.requests).toBe(1);
-      expect(coverage?.state).toBe("partial");
-      expect(coverage?.provenance).toContain("unknown");
-    }
+
+    // A MISSING day is the normal state of a window reaching past the store's history
+    // (a fresh install, a window wider than retention) -- the store never held it, so
+    // nothing was omitted from this report.
+    const missingReader = readerWithDays(base, [dayResult.value], { "2026-08-19": "missing", "2026-08-20": "ok" });
+    const missingSnapshot = await createDashboardSnapshotReadPort({ accounting: missingReader, relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" }).readSnapshot({ window: "24h", includeRepair: false });
+    expect(missingSnapshot.summary.requests).toBe(1);
+    expect(missingSnapshot.panelCoverage.find((entry) => entry.panel === "summary")?.state).toBe("complete");
+
+    // A CORRUPT day is real data the store held that this report cannot show.
+    const corruptReader = readerWithDays(base, [dayResult.value], { "2026-08-19": "corrupt", "2026-08-20": "ok" });
+    const corruptSnapshot = await createDashboardSnapshotReadPort({ accounting: corruptReader, relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" }).readSnapshot({ window: "24h", includeRepair: false });
+    const corruptCoverage = corruptSnapshot.panelCoverage.find((entry) => entry.panel === "summary");
+    expect(corruptSnapshot.summary.requests).toBe(1);
+    expect(corruptCoverage?.state).toBe("partial");
+    expect(corruptCoverage?.provenance).toContain("unknown");
+
     const unusable = readerWithDays(base, [], { "2026-08-19": "corrupt", "2026-08-20": "missing" });
     const unavailable = await createDashboardSnapshotReadPort({ accounting: unusable, relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" }).readSnapshot({ window: "24h", includeRepair: false });
     expect(unavailable.summary.requests).toBe(0);
@@ -322,7 +444,7 @@ describe("dashboard snapshot projection", () => {
     store.close();
   });
 
-  it("keeps uncertain detail tokens null, marks partial unknown, and preserves provider evidence provenance", async () => {
+  it("keeps uncertain detail tokens null, stays partial from the genuine lost/overflow cells (not the plain-unknown one), and preserves provider evidence provenance", async () => {
     const store = createAccountingStore({ rootDir: root() });
     const id = record(store, {
       endedAt: "2026-08-20T12:30:00.000Z",
@@ -363,6 +485,25 @@ describe("dashboard snapshot projection", () => {
     const coverage = detail?.panelCoverage[0];
     expect(coverage?.state).toBe("partial");
     expect(coverage?.provenance).toEqual(expect.arrayContaining(["provider_reported", "unknown"]));
+    store.close();
+  });
+
+  it("flags a successful request with no commit measurement as partial in its own detail, matching the summary panel", async () => {
+    // requestRow() must run the same unexpected-metric-loss check summaryFrom() applies
+    // via finalizeHealth (hasUnexpectedMetricLoss), or the detail panel and the summary
+    // panel disagree about the identical request (review fix, finding 2): before the
+    // fix this request's own detail read "complete" while the summary panel over the
+    // same request already read "partial".
+    const store = createAccountingStore({ rootDir: root() });
+    const id = record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      attempts: [{ tokens: { reported: { inputTokens: 10, outputTokens: 4 } } }],
+    });
+    const detail = await port(store).readDetail({ requestId: id, includeRepair: false });
+    expect(detail).not.toBeNull();
+    expect(detail?.panelCoverage[0]?.state).toBe("partial");
+    const snapshot = await port(store).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.panelCoverage.find((entry) => entry.panel === "summary")?.state).toBe("partial");
     store.close();
   });
 

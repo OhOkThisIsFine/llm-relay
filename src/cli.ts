@@ -1114,9 +1114,12 @@ function renderCostReport(
   }
 
   if (report.coverage === "partial") {
-    // The reason travels as-is rather than being re-explained here: "unknown" usually
-    // means a request carried token kinds the relay could not measure, not disk trouble.
-    write(`Coverage: partial${report.coverageReason ? ` (${report.coverageReason})` : ""}.\nSome figures could not be fully measured; the roll-up is a lower bound on real spend.\n`);
+    // "partial" means the store held (or should have held) data this report could not
+    // include — a dropped row, an overflowed counter, a capped read, an unreadable
+    // shard. A request that simply carried no token kind (e.g. no cache tokens
+    // reported) is NOT this: it shows as "-" on its own cell with provenance
+    // "unknown", and the report around it still reads "complete".
+    write(`Coverage: partial${report.coverageReason ? ` (${report.coverageReason})` : ""}.\nSome data the store held is not reflected in this report; the roll-up is a lower bound on real spend.\n`);
   }
   write(
     "\nPrices are each deployment's published per-(provider, model) figures, or another provider's\n" +
