@@ -23,6 +23,42 @@ import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./p
 import { loadTierData } from "./registry.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { type QuotaObservation } from "./quota-observation.js";
+import { observedRateLimits } from "./rate-limits.js";
+import { resolveConfiguredLimits, CONFIGURED_LIMIT_AXES, configuredLimitQuotaShape } from "./configured-limits.js";
+import { parseCredentialId, type CredentialId } from "./credential-id.js";
+import {
+  resolveRemaining,
+  resolveResetsAt,
+  type LimitInputs,
+  type LocalUsedReading,
+  type RemainingResolution,
+  type ResetsAtResolution,
+} from "./availability.js";
+
+/**
+ * The §5.1/§5.2 ladders resolved for ONE (axis, period) bucket of one credential cell.
+ *
+ * Kept raw and un-blended like every other Candidate dimension: remaining, limit and localUsed
+ * each travel with their own basis so a reader can tell a provider's stated figure from this
+ * relay's own arithmetic. `routingEligible` reports whether the figure MAY gate routing under
+ * spec M2 — it does not mean anything gates today.
+ */
+export interface CandidateAvailability {
+  axis: "requests" | "tokens";
+  period: "minute" | "day" | "month";
+  limit: number | null;
+  limitBasis: RemainingResolution["limitBasis"];
+  remaining: number | null;
+  remainingBasis: RemainingResolution["basis"];
+  localUsed: number | null;
+  localUsedBasis: LocalUsedReading["basis"];
+  resetsAt: number | null;
+  resetsAtBasis: ResetsAtResolution["basis"];
+  /** True when the observation rung 1 used is still inside the CURRENT period. */
+  observedInCurrentPeriod: boolean;
+  staleObservations: number;
+  routingEligible: boolean;
+}
 
 /**
  * Everything known about one offload destination, kept as SEPARATE raw dimensions.
@@ -68,6 +104,13 @@ export interface Candidate {
   } | null;
   /** Typed observations for this credential/model cell. Empty means not measured. */
   quota: QuotaObservation[];
+  /**
+   * The spec §5 ladders applied to this cell, one entry per (axis, period) bucket with any
+   * evidence. Beside `quota`, never blended into it: `quota` is what providers SAID,
+   * `availability` is what that leaves OVER after staleness and this proxy's own usage.
+   * Display-only; nothing here reorders a candidate (Gap 12 owns any routing use).
+   */
+  availability: CandidateAvailability[];
   breaker: {
     open: boolean;
     consecutiveFailures: number;
@@ -292,6 +335,90 @@ function mergeCandidateQuota(
   return [...merged.values()];
 }
 
+/**
+ * Apply the §5 ladders to one credential cell. Buckets come from the SAME merged observations
+ * the `quota` field shows; limits join from configured/learned sources; `localUsed` is null
+ * here — /candidates is served by the CLI against a possibly-remote proxy and has no ledger
+ * handle, so rung 2 fires only when the caller passes `localUsed` in (tests, an in-process
+ * server). Absent localUsed the ladder still resolves rung 1 and reports the limit.
+ */
+function buildCandidateAvailability(
+  cfg: Config,
+  provider: string,
+  credentialId: string,
+  model: string | undefined,
+  quota: readonly QuotaObservation[],
+  nowMs: number,
+): CandidateAvailability[] {
+  const parsed = parseCredentialId(credentialId);
+  if (parsed === null) return [];
+  const configured = resolveConfiguredLimits(cfg, provider, parsed.label, model ?? null);
+  const learned = model === undefined ? [] : observedRateLimits(provider, credentialId as CredentialId, model, { now: nowMs });
+
+  const buckets = new Map<string, { observations: QuotaObservation[]; limits: LimitInputs }>();
+  const bucketFor = (axis: "requests" | "tokens", period: "minute" | "day" | "month") => {
+    const key = `${axis}:${period}`;
+    let bucket = buckets.get(key);
+    if (bucket === undefined) {
+      bucket = { observations: [], limits: {} };
+      buckets.set(key, bucket);
+    }
+    return bucket;
+  };
+  for (const observation of quota) {
+    if (observation.period === "unknown") continue;
+    bucketFor(observation.axis, observation.period).observations.push(observation);
+  }
+  for (const entry of learned) bucketFor(entry.axis, entry.period).limits.learned = entry.limit;
+  if (configured !== null) {
+    for (const axis of CONFIGURED_LIMIT_AXES) {
+      const value = configured[axis];
+      if (value === undefined) continue;
+      const shape = configuredLimitQuotaShape(axis);
+      bucketFor(shape.axis, shape.period).limits.configured = value;
+    }
+  }
+
+  const rows: CandidateAvailability[] = [];
+  for (const [key, bucket] of buckets) {
+    const [axisPart, periodPart] = key.split(":") as ["requests" | "tokens", "minute" | "day" | "month"];
+    const hasLimits = bucket.limits.configured !== undefined || bucket.limits.learned !== undefined;
+    if (bucket.observations.length === 0 && !hasLimits) continue;
+    const resolution = resolveRemaining({
+      observations: bucket.observations,
+      axis: axisPart,
+      period: periodPart,
+      ...(hasLimits ? { limits: bucket.limits } : {}),
+      localUsed: { value: null, basis: null },
+      now: nowMs,
+    });
+    const resets = resolveResetsAt({
+      providerStated: resolution.eligibleObservation?.resetsAt ?? null,
+      reviewedRule: null,
+      period: periodPart,
+      now: nowMs,
+    });
+    rows.push({
+      axis: axisPart,
+      period: periodPart,
+      limit: resolution.limit,
+      limitBasis: resolution.limitBasis,
+      remaining: resolution.remaining,
+      remainingBasis: resolution.basis,
+      localUsed: null,
+      localUsedBasis: null,
+      resetsAt: resets.resetsAt,
+      resetsAtBasis: resets.basis,
+      // Rung 1's own eligibility verdict — do not re-derive the staleness rule here; a second
+      // implementation is how the two drift.
+      observedInCurrentPeriod: resolution.eligibleObservation !== null,
+      staleObservations: resolution.staleObservations,
+      routingEligible: resolution.routingEligible,
+    });
+  }
+  return rows;
+}
+
 /** Build the un-blended decision table for offload targets. */
 export async function buildCandidates(
   cfg: Config,
@@ -446,6 +573,12 @@ export async function buildCandidates(
       benchmarkTaskFitConfidence: Math.min(1, (exactTier?.task_fit_signal_count ?? 0) / 3),
     });
 
+    // One merge for BOTH the raw `quota` field and the resolved `availability` ladders, so the
+    // two views can never disagree about which observation is newest.
+    const cellQuota = mergeCandidateQuota(
+      opts.pingLoop && model ? opts.pingLoop.getQuotaObservations(credentialId, model) : [],
+      state?.quotaObservations ?? [],
+    );
     candidates.push({
       spec,
       provider,
@@ -477,10 +610,8 @@ export async function buildCandidates(
             lastPingMs: summary.lastPingMs,
           }
         : null,
-      quota: mergeCandidateQuota(
-        opts.pingLoop && model ? opts.pingLoop.getQuotaObservations(credentialId, model) : [],
-        state?.quotaObservations ?? [],
-      ),
+      quota: cellQuota,
+      availability: buildCandidateAvailability(cfg, provider, credentialId, model, cellQuota, nowMs),
       breaker: {
         open: !breaker.isHealthy(cellTarget, nowMs),
         consecutiveFailures: state?.consecutiveFailures ?? 0,

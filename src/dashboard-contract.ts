@@ -162,15 +162,23 @@ export type TokenSource = "provider_reported" | "relay_estimated";
 export type SpendPriceSource = "provider_published" | "reference";
 export type TokenBasis = "reported" | "estimated";
 export type SpendSource = "provider_reported" | "relay_estimated" | "unknown";
-export type LimitBasis = "provider_stated" | "configured" | "learned";
-export type RemainingBasis = "provider_stated" | "derived_configured" | "derived_learned";
+// `published` / `derived_published` were added 2026-08-22 when the availability producer landed:
+// a catalog-harvested rate limit (spec Gap 13) is a fourth limit provenance, and collapsing it
+// onto `configured` or `learned` would mislabel where the number came from.
+export type LimitBasis = "provider_stated" | "configured" | "learned" | "published";
+export type RemainingBasis =
+  | "provider_stated"
+  | "derived_provider_stated"
+  | "derived_configured"
+  | "derived_learned"
+  | "derived_published";
 export type LocalUsedBasis = "reported" | "estimated" | "mixed";
 export const TOKEN_SOURCES = Object.freeze(["provider_reported", "relay_estimated"] as const);
 export const SPEND_PRICE_SOURCES = Object.freeze(["provider_published", "reference"] as const);
 export const TOKEN_BASES = Object.freeze(["reported", "estimated"] as const);
 export const SPEND_SOURCES = Object.freeze(["provider_reported", "relay_estimated", "unknown"] as const);
-export const LIMIT_BASES = Object.freeze(["provider_stated", "configured", "learned"] as const);
-export const REMAINING_BASES = Object.freeze(["provider_stated", "derived_configured", "derived_learned"] as const);
+export const LIMIT_BASES = Object.freeze(["provider_stated", "configured", "learned", "published"] as const);
+export const REMAINING_BASES = Object.freeze(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"] as const);
 export const LOCAL_USED_BASES = Object.freeze(["reported", "estimated", "mixed"] as const);
 
 export type ResponseAttribution = Attribution | "all";
@@ -591,6 +599,15 @@ const isNullableTimestamp = (value: unknown): value is string | null =>
   isNullable(value, isDashboardUtcTimestamp);
 const isNullableNonNegativeInteger = (value: unknown): value is number | null =>
   isNullable(value, isNonNegativeInteger);
+/**
+ * A safe integer of either sign. Deliberately NOT folded into the non-negative guard above:
+ * only `QuotaRowV1.remaining` accepts negatives today (2026-08-22, additive semantics) — a
+ * credential that overshot its ceiling reports limit − used < 0, which IS the information; a
+ * producer that clamps it to zero would turn overshoot into a plausible-looking "exactly empty".
+ * Renderers clamp for display; this contract carries the measurement.
+ */
+const isNullableSafeInteger = (value: unknown): value is number | null =>
+  value === null || (typeof value === "number" && Number.isSafeInteger(value));
 const isSuccessRate = (value: unknown): value is number | null =>
   value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1);
 const isNullableString = (value: unknown): value is string | null => isNullable(value, isString);
@@ -916,7 +933,8 @@ export const isQuotaRowV1 = (value: unknown): value is QuotaRowV1 =>
   isDashboardQuotaAxis(value.axis) &&
   isDashboardQuotaPeriod(value.period) &&
   isNullableNonNegativeInteger(value.limit) &&
-  isNullableNonNegativeInteger(value.remaining) &&
+  // Negative remaining = overshoot (limit − used < 0), kept as information; see the guard above.
+  isNullableSafeInteger(value.remaining) &&
   isNullableNonNegativeInteger(value.localUsed) &&
   isNullableTimestamp(value.resetsAt) &&
   isNullableTimestamp(value.observedAt) &&

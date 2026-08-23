@@ -56,10 +56,11 @@ import {
   type AccountingRequest,
   type TokenFactsInput,
 } from "./accounting.js";
-import type { AccountingReader } from "./accounting-store.js";
+import type { AccountingReader, AccountingStore } from "./accounting-store.js";
 import { DashboardAuthManager } from "./dashboard-auth.js";
 import { handleDashboardRoute, type DashboardHeaderMap, type DashboardRouteHandled } from "./dashboard-routes.js";
 import { createDashboardSnapshotReadPort } from "./dashboard-snapshot.js";
+import { createAvailabilityProducer } from "./availability-snapshot.js";
 import {
   DASHBOARD_STATIC_SECURITY_HEADERS,
   DashboardStaticHandler,
@@ -315,6 +316,16 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
     accounting: deps.accountingReader ?? UNAVAILABLE_ACCOUNTING_READER,
     relayVersion: deps.dashboardRelayVersion ?? "unknown",
     attributionPolicy: deps.dashboardAttributionPolicy ?? "unknown",
+    // The Quota/Cooldown panels' producer. `usedInWindow` is store-only, so a bare in-memory
+    // proxy passes null and its quota rows simply carry localUsed null.
+    availability: createAvailabilityProducer({
+      breaker,
+      config: cfg,
+      accounting:
+        deps.accountingReader !== undefined && typeof (deps.accountingReader as { usedInWindow?: unknown }).usedInWindow === "function"
+          ? (deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow">)
+          : null,
+    }),
   });
   const stickyConfig = cfg.routing.sticky;
   const stickySessions = stickyConfig === true || (typeof stickyConfig === "object" && stickyConfig.enabled)

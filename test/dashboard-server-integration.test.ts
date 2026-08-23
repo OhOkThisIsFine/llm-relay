@@ -357,7 +357,11 @@ describe("dashboard production adapter", () => {
   it("projects successful proxy accounting from the one store used for recording and reading", async () => {
     const backend = await listen(createServer((request, response) => {
       request.resume();
-      response.writeHead(200, { "content-type": "application/json" });
+      response.writeHead(200, {
+        "content-type": "application/json",
+        "x-ratelimit-requests-limit-minute": "60",
+        "x-ratelimit-requests-remaining-minute": "59",
+      });
       response.end(JSON.stringify({ id: "msg_accounted", type: "message", role: "assistant", model: "m", stop_reason: "end_turn", content: [] }));
     }));
     const root = dashboardRoot();
@@ -398,11 +402,18 @@ describe("dashboard production adapter", () => {
     expect(snapshotResponse.status).toBe(200);
     const snapshot = await snapshotResponse.json() as {
       relayVersion: string; attributionPolicy: string; summary: { requests: number; served: number }; recentRequests: Array<{ requestId: string }>;
+      quotas: Array<{ provider: string; credentialId: string; limitBasis: string; remaining: number }>;
     };
     expect(snapshot.relayVersion).toBe("production-wiring-test");
     expect(snapshot.attributionPolicy).toBe("include_all_labeled");
     expect(snapshot.summary).toMatchObject({ requests: 1, served: 1 });
     expect(snapshot.recentRequests).toHaveLength(1);
+    // The availability producer is server-wired: the proxied request above observed quota
+    // headers on the backend response, so the Quota panel is no longer permanently empty.
+    expect(snapshot.quotas.length).toBeGreaterThan(0);
+    // This config routes through the anthropic default cell (model-less identity), so the
+    // observation lands on a deployment-null row — still attributed to its credential.
+    expect(snapshot.quotas[0]).toMatchObject({ provider: "up", credentialId: "up#default", limitBasis: "provider_stated", remaining: 59 });
     const detail = await fetch(`${url}/dashboard/api/v1/requests/${snapshot.recentRequests[0]!.requestId}?includeRepair=1`, { headers });
     expect(detail.status).toBe(200);
   });
