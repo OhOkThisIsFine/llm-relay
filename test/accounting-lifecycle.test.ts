@@ -6,7 +6,7 @@ import { ModelCatalog } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
-import type { AccountingEvent, AccountingRecorder, AttemptCompletedEvent, RequestCompletedEvent } from "../src/accounting.js";
+import type { AccountingEvent, AccountingPricePort, AccountingRecorder, AttemptCompletedEvent, RequestCompletedEvent } from "../src/accounting.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 
 const servers: Server[] = [];
@@ -419,6 +419,86 @@ describe("proxy accounting lifecycle", () => {
       expect(completed.commitAttemptId).toBe(winnerAttempt.attemptId);
       expect(completed.commitMs).toBe(winnerAttempt.commitMs);
       expect(completed.tokens).toEqual(winnerAttempt.tokens);
+    } finally {
+      if (oldOne === undefined) delete process.env[keyOne];
+      else process.env[keyOne] = oldOne;
+      if (oldTwo === undefined) delete process.env[keyTwo];
+      else process.env[keyTwo] = oldTwo;
+    }
+  });
+
+  it.each(["anthropic", "openai"] as const)("prices the winning deployment's spend on the %s front and leaves a priceless walk unpriced", async (kind) => {
+    const keyOne = "ACCOUNTING_SPEND_KEY_ONE";
+    const keyTwo = "ACCOUNTING_SPEND_KEY_TWO";
+    const oldOne = process.env[keyOne];
+    const oldTwo = process.env[keyTwo];
+    process.env[keyOne] = "first-secret";
+    process.env[keyTwo] = "winner-secret";
+    try {
+      // A ≥2-candidate walk: candidate one 429s, candidate two serves — so the
+      // request-level spend projects ONLY the winner, never the failed attempt.
+      const failed = await scripted(() => ({
+        status: 429,
+        body: JSON.stringify({ error: { type: "rate_limit_error", message: "busy" } }),
+      }));
+      const winner = await scripted(() => ({ body: winnerBody(kind) }));
+      const events: AccountingEvent[] = [];
+      const pricePort: AccountingPricePort = (_provider, model) =>
+        model === "m2"
+          ? { pricePerMillionIn: 2, pricePerMillionOut: 4, priceSource: "provider" }
+          : null; // m1 publishes no price ⇒ its failed attempt stays unpriced.
+      const proxy = await startProxy(poolConfig([
+        `http://127.0.0.1:${port(failed.server)}`,
+        `http://127.0.0.1:${port(winner.server)}`,
+      ], kind, [keyOne, keyTwo]), {
+        accountingRecorder: recorder(events),
+        accountingPricePortOverride: pricePort,
+      });
+      const response = await frontRequest(kind, port(proxy), "spend lifecycle prompt");
+      expect(response.status).toBe(200);
+      await response.text();
+      await waitForLifecycle(events);
+
+      const completedAttempts = attempts(events);
+      expect(completedAttempts).toHaveLength(2);
+      const [failedAttempt, winnerAttempt] = completedAttempts;
+      // The failed m1 attempt has no published price ⇒ null, never $0.
+      expect(failedAttempt?.provider).toBe("accounting-1");
+      expect(failedAttempt?.spend).toBeNull();
+      // The winning m2 attempt is priced from published figures.
+      expect(winnerAttempt?.provider).toBe("accounting-2");
+      if (kind === "anthropic") {
+        // 7 in x $2/M + 3 out x $4/M = 26 uUSD; cache creation/read ride UNPRICED.
+        expect(winnerAttempt?.spend).toMatchObject({
+          amountMicrousd: 26,
+          priceSource: "provider_published",
+          tokenBasis: "reported",
+          coverage: "partial",
+          unpricedTokens: { cacheRead: 13, cacheCreation: 11, cachedInput: null },
+        });
+      } else {
+        // (7 − 5 cached) in x $2/M + 3 out x $4/M = 16 uUSD; cached rides UNPRICED.
+        expect(winnerAttempt?.spend).toMatchObject({
+          amountMicrousd: 16,
+          priceSource: "provider_published",
+          tokenBasis: "reported",
+          coverage: "partial",
+          unpricedTokens: { cacheRead: null, cacheCreation: null, cachedInput: 5 },
+        });
+      }
+      // Request-level spend mirrors request tokens: the WINNING serve only.
+      // (observedAt legitimately differs — the request terminal lands after the
+      // attempt's — so compare the priced substance, not the timestamp.)
+      const completed = requestCompleted(events);
+      expect(completed.spend).toMatchObject({
+        ...(kind === "anthropic"
+          ? { amountMicrousd: 26, unpricedTokens: { cacheRead: 13, cacheCreation: 11, cachedInput: null } }
+          : { amountMicrousd: 16, unpricedTokens: { cacheRead: null, cacheCreation: null, cachedInput: 5 } }),
+        priceSource: "provider_published",
+        tokenBasis: "reported",
+        source: "provider_reported",
+        coverage: "partial",
+      });
     } finally {
       if (oldOne === undefined) delete process.env[keyOne];
       else process.env[keyOne] = oldOne;

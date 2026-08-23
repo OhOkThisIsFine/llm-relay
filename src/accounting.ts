@@ -10,11 +10,16 @@ import {
   type Attribution,
   type FailureKind,
   type Outcome,
+  type SpendPriceSource,
+  type TokenBasis,
   type TokenTotalsV1,
 } from "./dashboard-contract.js";
 
 /** Explicit provenance for estimates whose method was omitted or unusable. */
 export const ACCOUNTING_UNSPECIFIED_ESTIMATION_METHOD = "unspecified";
+
+/** Coverage of one priced spend; see {@link AccountingSpend}. */
+export type AccountingSpendCoverage = "full" | "input_only" | "partial";
 
 export type AccountingRequestId = string;
 export type AccountingAttemptId = string;
@@ -66,6 +71,84 @@ export type AccountingTokenTotals = TokenTotalsV1 & {
   };
 };
 
+/**
+ * The prices an attempt was priced with, PER TOKEN exactly as published. Carried on
+ * every priced spend so a reader can re-derive the amount and see whether it was this
+ * deployment's own publication or a reference.
+ */
+export interface AccountingSpendPrices {
+  /** Per-token input price, or null when that kind is unpublished. */
+  readonly perMillionIn: number | null;
+  /** Per-token output price, or null when that kind is unpublished. */
+  readonly perMillionOut: number | null;
+}
+
+/**
+ * Spend for ONE attempt, in integer micro-USD, with the provenance the provenance
+ * invariant demands. `null` (no price resolved, or no token count to price) is the
+ * honest "unpriced"; it is never rendered as $0 by any surface in this repo.
+ *
+ * Rounding: each token kind is computed in exact integer micro-USD
+ * (`tokens * pricePerMillion` is not generally integral, so it is scaled by 1e6 and
+ * rounded HALF-UP once), then kinds are summed as integers — floating error can
+ * never accumulate across requests because only integers are ever stored or summed.
+ *
+ * Coverage:
+ * - "full"       every priced token kind was priced; nothing unpriced rode alongside;
+ * - "input_only" estimated-basis pricing with no reported usage — estimated OUTPUT has no
+ *                producer today (Gap 10/M4, deliberately deferred), so the cell is a lower
+ *                bound by construction and says so rather than implying completeness;
+ * - "partial"    at least one token kind present in the usage went unpriced (cache kinds,
+ *                or one of in/out having no published price).
+ *
+ * Structurally identical to the store's persisted `AccountingSpendV1`; declared here
+ * against the CONTRACT vocabulary so this module keeps its platform-free imports,
+ * and re-declared there against the on-disk vocabulary. The lifecycle only ever emits
+ * the two concrete `source` values, so the two shapes are assignment-compatible.
+ */
+export interface AccountingSpend {
+  /** Exact integer micro-USD. A LOWER BOUND unless coverage is "full". */
+  readonly amountMicrousd: number;
+  readonly priceSource: SpendPriceSource;
+  /** Whose token counts were priced: provider-reported or relay-estimated. */
+  readonly tokenBasis: TokenBasis;
+  /** Whose token counts: provider-reported or relay-estimated (never unknown here). */
+  readonly source: "provider_reported" | "relay_estimated";
+  readonly coverage: AccountingSpendCoverage;
+  /**
+   * Token kinds observed but NOT priced, per kind. null means the kind itself was not
+   * reported; a number means it WAS reported and left out of the amount (cache kinds
+   * are discounted by an unpublished factor, so pricing them at the base rate would
+   * overstate spend).
+   */
+  readonly unpricedTokens: {
+    readonly cacheRead: number | null;
+    readonly cacheCreation: number | null;
+    readonly cachedInput: number | null;
+  };
+  /** Per-million prices actually used, so the amount stays re-derivable. */
+  readonly pricesUsed: AccountingSpendPrices;
+  readonly observedAt: string;
+}
+
+/**
+ * Injection point keeping THIS module free of catalog/metadata imports: the server
+ * builds one from `catalog.cachedLimits()` (which never fetches — request-path safe)
+ * plus `resolveMetadata()`, and hands it to `createAccountingRequest`.
+ *
+ * Prices are PER MILLION tokens, the shape `resolveMetadata()` resolves. That unit
+ * makes the arithmetic self-documenting: dollars-per-million-tokens equals
+ * micro-dollars-per-token, so `tokens x pricePerMillion` IS the micro-USD amount.
+ */
+export type AccountingPricePort = (
+  provider: string,
+  model: string,
+) => {
+  readonly pricePerMillionIn: number | null;
+  readonly pricePerMillionOut: number | null;
+  readonly priceSource: "provider" | "reference" | null;
+} | null;
+
 export interface AccountingRecorderEventBase {
   readonly requestId: AccountingRequestId;
 }
@@ -106,8 +189,8 @@ export interface AttemptCompletedEvent extends AccountingRecorderEventBase {
   readonly model: string | null;
   readonly credentialId: string | null;
   readonly tokens: AccountingTokenTotals;
-  /** Pricing is deliberately not part of this packet. */
-  readonly spend: null;
+  /** Priced from published per-(provider, model) prices only; null = unpriced. */
+  readonly spend: AccountingSpend | null;
 }
 
 export interface RequestCompletedEvent extends AccountingRecorderEventBase {
@@ -127,7 +210,7 @@ export interface RequestCompletedEvent extends AccountingRecorderEventBase {
   readonly credentialId: string | null;
   /** Only the winning serve attempt is projected here; repair is separate. */
   readonly tokens: AccountingTokenTotals;
-  readonly spend: null;
+  readonly spend: AccountingSpend | null;
 }
 
 export type AccountingEvent =
@@ -153,6 +236,11 @@ export interface AccountingRequestOptions {
   recorder?: AccountingRecorder;
   clock?: AccountingClock;
   idFactory?: AccountingIdFactory;
+  /**
+   * Published-price lookup for spend. Absent ⇒ every attempt is unpriced, never
+   * priced at a default. Must be synchronous and fetch-free (request path).
+   */
+  pricePort?: AccountingPricePort | undefined;
   requestId?: string;
   startedAt?: AccountingClockValue;
   client?: string | null;
@@ -231,6 +319,7 @@ interface InternalOptions {
   readonly recorder: AccountingRecorder;
   readonly clock: AccountingClock;
   readonly idFactory: AccountingIdFactory;
+  readonly pricePort?: AccountingPricePort;
 }
 
 function now(clock: AccountingClock): AccountingClockValue {
@@ -387,6 +476,193 @@ function normalizeTokens(input: TokenFactsInput | null | undefined, observedAt: 
   return freezeDeep(result);
 }
 
+/** Scale applied to a per-million price so half-up rounding happens on integers. */
+const PRICE_SCALE = 1_000_000;
+const PRICE_HALF = PRICE_SCALE / 2;
+
+/**
+ * Price ONE token kind in exact integer micro-USD from its PER-MILLION price.
+ *
+ * Dollars-per-million-tokens IS micro-dollars-per-token, so `tokens x pricePerMillion`
+ * is already the micro-USD amount; it is rounded HALF-UP once here (the product is not
+ * generally integral) and kinds are summed as integers downstream. Rounding per kind
+ * rather than at the end keeps every amount re-derivable from its recorded prices and
+ * never lets floating-point error accumulate across requests, because only integers
+ * are stored or summed.
+ *
+ * The rounding itself is integer arithmetic: the price is scaled by 1e6 and, while
+ * `tokens x scaledPrice` stays within a safe integer, the half-up step happens on
+ * exact integers. `Math.round` on the float product cannot be trusted at the boundary
+ * — a true `.5` whose representation lands just below rounds DOWN (100 x $0.145/M is
+ * exactly 14.5 µ$ but floats to 14.499999999999998). The integer path holds while
+ * `tokens <= (2^53 - 1 - PRICE_HALF) / (price x 1e6)` — e.g. ~3e9 tokens at $3/M,
+ * ~9e6 tokens at $1000/M, far past any single request. Beyond the bound, or for a
+ * price with more than six decimal digits (the scaled figure is not an integer), it
+ * falls back to the float product rounded once; there the documented error is at most
+ * 1 micro-USD per kind.
+ */
+function priceKind(tokens: number, pricePerMillion: number): number {
+  const scaledPrice = pricePerMillion * PRICE_SCALE;
+  if (Number.isSafeInteger(scaledPrice)) {
+    const product = tokens * scaledPrice;
+    if (Number.isSafeInteger(product) && product <= Number.MAX_SAFE_INTEGER - PRICE_HALF) {
+      return Math.floor((product + PRICE_HALF) / PRICE_SCALE);
+    }
+  }
+  return Math.round(tokens * pricePerMillion);
+}
+
+interface SpendComputationInput {
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly tokens: AccountingTokenTotals;
+  readonly endedAt: string;
+}
+
+/** A resolved published price pair; returning null means this deployment publishes none. */
+interface ResolvedPrice {
+  readonly perMillionIn: number | null;
+  readonly perMillionOut: number | null;
+  readonly source: SpendPriceSource;
+}
+
+function resolvePrice(port: AccountingPricePort | undefined, input: SpendComputationInput): ResolvedPrice | null {
+  if (port === undefined) return null;
+  const provider = input.provider;
+  const model = input.model;
+  if (provider === null || model === null || model.length === 0) return null;
+  let resolved: ReturnType<AccountingPricePort>;
+  try {
+    // The port reads cached catalog state only; a failure there must stay a
+    // measurement problem, never a request failure.
+    resolved = port(provider, model);
+  } catch {
+    return null;
+  }
+  if (resolved === null) return null;
+  const inPrice = typeof resolved.pricePerMillionIn === "number"
+      && Number.isFinite(resolved.pricePerMillionIn)
+      && resolved.pricePerMillionIn >= 0
+    ? resolved.pricePerMillionIn
+    : null;
+  const outPrice = typeof resolved.pricePerMillionOut === "number"
+      && Number.isFinite(resolved.pricePerMillionOut)
+      && resolved.pricePerMillionOut >= 0
+    ? resolved.pricePerMillionOut
+    : null;
+  if (inPrice === null && outPrice === null) return null;
+  // The metadata layer spells provenance "provider"; the wire contract spells it
+  // "provider_published". Map once here so every spend carries the contract value.
+  const source: SpendPriceSource | null =
+    resolved.priceSource === "provider" ? "provider_published"
+    : resolved.priceSource === "reference" ? "reference"
+    : null;
+  if (source === null) return null;
+  return { perMillionIn: inPrice, perMillionOut: outPrice, source };
+}
+
+/**
+ * Compute one attempt's spend from the token facts ALREADY normalized onto it.
+ *
+ * Pricing rules (the provenance invariant, applied to money):
+ * - Prices come only from the injected port's PUBLISHED figures — never a fallback
+ *   price, never a tunable default, never a cache multiplier. Cache read/write
+ *   discounts are unpublished, so cache tokens are counted as unpriced beside the
+ *   amount rather than priced at the base rate.
+ * - Reported and estimated counts are priced into separate cells upstream (this
+ *   function picks whichever basis has evidence, reported first) and are never summed.
+ * - anthropic-messages: input_tokens × in + output_tokens × out; cache_read /
+ *   cache_creation are NOT part of input_tokens and ride unpriced.
+ * - openai-chat: (prompt_tokens − cached_tokens) × in when a cache figure is reported,
+ *   because OpenAI INCLUDES cached tokens in prompt_tokens and bills them at an
+ *   unpublished discount; if cached > prompt that figure is malformed, so prompt_tokens
+ *   is priced in full and no unpriced cached count is recorded.
+ * - Estimated basis prices input ONLY (estimated output has no producer today), and
+ *   says so via coverage "input_only".
+ * - No price for either kind ⇒ null (unpriced). Unknown stays null, never 0.
+ */
+export function computeAccountingSpend(
+  port: AccountingPricePort | undefined,
+  input: SpendComputationInput,
+): AccountingSpend | null {
+  const price = resolvePrice(port, input);
+  if (price === null) return null;
+  const reported = input.tokens.reported;
+  const estimated = input.tokens.estimated;
+  const reportedInput = reported.reportedInput.value;
+  const reportedOutput = reported.reportedOutput.value;
+  const useReported = reportedInput !== null || reportedOutput !== null;
+
+  let amount = 0;
+  let partial = false;
+  const unpricedTokens: {
+    cacheRead: number | null;
+    cacheCreation: number | null;
+    cachedInput: number | null;
+  } = {
+    cacheRead: null,
+    cacheCreation: null,
+    cachedInput: null,
+  };
+
+  if (useReported) {
+    const cacheRead = reported.cacheReadInputTokens.value ?? null;
+    const cacheCreation = reported.cacheCreationInputTokens.value ?? null;
+    const cachedInput = reported.reportedCachedInput.value ?? null;
+    if (cacheRead !== null && cacheRead > 0) { unpricedTokens.cacheRead = cacheRead; partial = true; }
+    if (cacheCreation !== null && cacheCreation > 0) { unpricedTokens.cacheCreation = cacheCreation; partial = true; }
+    if (cachedInput !== null && cachedInput > 0) {
+      // Malformed cache figure (cached > prompt) ⇒ trust prompt_tokens alone.
+      if (reportedInput !== null && cachedInput <= reportedInput) {
+        unpricedTokens.cachedInput = cachedInput;
+        partial = true;
+      }
+    }
+    if (reportedInput !== null) {
+      if (price.perMillionIn === null) partial = true;
+      else {
+        const billable = cachedInput !== null && cachedInput > 0 && cachedInput <= reportedInput
+          ? reportedInput - cachedInput
+          : reportedInput;
+        amount += priceKind(billable, price.perMillionIn);
+      }
+    }
+    if (reportedOutput !== null) {
+      if (price.perMillionOut === null) partial = true;
+      else amount += priceKind(reportedOutput, price.perMillionOut);
+    }
+    if (amount === 0 && !partial) return null;
+    return freezeDeep({
+      amountMicrousd: amount,
+      priceSource: price.source,
+      tokenBasis: "reported",
+      source: "provider_reported",
+      coverage: partial ? "partial" : "full",
+      unpricedTokens,
+      pricesUsed: { perMillionIn: price.perMillionIn, perMillionOut: price.perMillionOut },
+      observedAt: input.endedAt,
+    } satisfies AccountingSpend);
+  }
+
+  // Estimated basis. Estimated OUTPUT has no producer today (Gap 10/M4 deferred),
+  // so this cell is input-only BY CONSTRUCTION and labels itself accordingly.
+  const estimatedInput = estimated.estimatedInput.value;
+  if (estimatedInput === null) return null;
+  if (price.perMillionIn === null) return null;
+  amount += priceKind(estimatedInput, price.perMillionIn);
+  if (amount === 0) return null;
+  return freezeDeep({
+    amountMicrousd: amount,
+    priceSource: price.source,
+    tokenBasis: "estimated",
+    source: "relay_estimated",
+    coverage: "input_only",
+    unpricedTokens,
+    pricesUsed: { perMillionIn: price.perMillionIn, perMillionOut: price.perMillionOut },
+    observedAt: input.endedAt,
+  } satisfies AccountingSpend);
+}
+
 function deriveLatency(startedAt: string, endedAt: string, supplied: number | null | undefined): number | null {
   if (supplied !== undefined) return nullableLatency(supplied);
   const start = Date.parse(startedAt);
@@ -422,6 +698,7 @@ class AccountingRequestLifecycle implements AccountingRequest {
       recorder: options.recorder ?? NOOP_ACCOUNTING_RECORDER,
       clock: options.clock ?? (() => Date.now()),
       idFactory: options.idFactory ?? randomId,
+      ...(options.pricePort === undefined ? {} : { pricePort: options.pricePort }),
     };
     this.usedIds = new Set<string>();
     this.requestId = options.requestId ?? makeId(this.options.idFactory, this.usedIds);
@@ -561,7 +838,14 @@ class AccountingRequestLifecycle implements AccountingRequest {
       model: state.model,
       credentialId: state.credentialId,
       tokens,
-      spend: null,
+      // Priced like any attempt and kept on its own row (C1); request-level spend
+      // projects ONLY the winning serve attempt.
+      spend: computeAccountingSpend(this.options.pricePort, {
+        provider: state.provider,
+        model: state.model,
+        tokens,
+        endedAt,
+      }),
     });
     state.completed = event;
     safeRecord(this.options.recorder, event);
@@ -635,6 +919,15 @@ class AccountingRequestLifecycle implements AccountingRequest {
       this.requestCommitMs = completion.commitMs;
     }
     const failureKind = suppliedFailureKind;
+    // Request spend projects ONLY the winning serve attempt — the same rule the
+    // request token totals already follow, so a retried-elsewhere request never
+    // double-counts. A request with no winning serve is unpriced, not $0.
+    const spend = computeAccountingSpend(this.options.pricePort, {
+      provider: winner?.provider ?? null,
+      model: winner?.model ?? null,
+      tokens,
+      endedAt,
+    });
     const event = freezeDeep({
       type: "request-completed" as const,
       requestId: this.requestId,
@@ -652,7 +945,7 @@ class AccountingRequestLifecycle implements AccountingRequest {
       model: winner?.model ?? this.model,
       credentialId: winner?.credentialId ?? this.credentialId,
       tokens,
-      spend: null,
+      spend,
     });
     this.requestCompleted = event;
     safeRecord(this.options.recorder, event);

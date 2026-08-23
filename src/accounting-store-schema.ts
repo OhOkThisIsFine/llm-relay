@@ -7,7 +7,18 @@ import {
   isDashboardUtcTimestamp,
 } from "./dashboard-contract.js";
 
-/** The persisted accounting format is deliberately separate from the dashboard wire format. */
+/**
+ * The persisted accounting format is deliberately separate from the dashboard wire format.
+ *
+ * SCHEMA NOTE (2026-08-22, Stage 4 spend): `spend` grew from a hard-typed `null` into real
+ * aggregate cells, and `requestSpend`/`partiallyPricedRequests` were added beside it as an
+ * optional pair. This is an ADDITIVE change and the schema constant stays `accounting.day.v1`:
+ * the guards below accept BOTH shapes — a pre-spend shard's `spend: null` loads as empty cells
+ * rather than quarantining a day of real traffic. Nothing rewrites old shards on read: the
+ * guards tolerate absence and every reader defaults it (`?? 0`, `mergeSpend(undefined)`), so a
+ * legacy shard reads correctly and gains the new fields only when new facts fold into it. A
+ * bump would have discarded every existing day shard for no gain.
+ */
 export const ACCOUNTING_STORE_VERSION = 1 as const;
 export const ACCOUNTING_DAY_SCHEMA = "accounting.day.v1" as const;
 export const ACCOUNTING_MINUTE_SCHEMA = "accounting.minute.v1" as const;
@@ -111,6 +122,69 @@ export interface AccountingMetricCellV1 {
   readonly observedAt: string | null;
 }
 
+/**
+ * PER-MILLION prices actually used to compute one spend figure, carried so every
+ * amount stays re-derivable from its own record. Dollars-per-million-tokens equals
+ * micro-dollars-per-token, so `tokens x perMillionIn` IS the micro-USD amount.
+ */
+export interface AccountingSpendPricesV1 {
+  readonly perMillionIn: number | null;
+  readonly perMillionOut: number | null;
+}
+
+/**
+ * Coverage of ONE priced spend: which token kinds went into the amount and which
+ * rode beside it unpriced.
+ * - "full": every reported token kind was priced at a published price.
+ * - "input_only": estimated-basis pricing — estimated OUTPUT has no producer today,
+ *   so the amount covers input alone BY CONSTRUCTION and says so.
+ * - "partial": at least one present token kind was left out (cache kinds, or one of
+ *   in/out unpublished). The amount is a lower bound.
+ */
+export type AccountingSpendCoverage = "full" | "input_only" | "partial";
+
+/** Token kinds observed but NOT priced, per kind; null when the kind itself was absent. */
+export interface AccountingUnpricedTokensV1 {
+  readonly cacheRead: number | null;
+  readonly cacheCreation: number | null;
+  readonly cachedInput: number | null;
+}
+
+/**
+ * One attempt's spend in exact integer micro-USD with full provenance. `null` spend
+ * means UNPRICED (no published price resolved, or nothing to price) — never $0.
+ * Amounts are integer micro-USD, rounded half-up once per token kind, summed as
+ * integers, so no floating-point error can accumulate across requests.
+ */
+export interface AccountingSpendV1 {
+  readonly amountMicrousd: number;
+  readonly priceSource: "provider_published" | "reference";
+  readonly tokenBasis: "reported" | "estimated";
+  readonly source: "provider_reported" | "relay_estimated";
+  readonly coverage: AccountingSpendCoverage;
+  readonly unpricedTokens: AccountingUnpricedTokensV1;
+  readonly pricesUsed: AccountingSpendPricesV1;
+  readonly observedAt: string;
+}
+
+/** Summing accumulator behind one wire spend cell inside an aggregate. */
+export interface AccountingAggregateSpendCellV1 {
+  /** Sum of integer micro-USD contributions; null once any contributor is uncertain or it overflows. */
+  readonly amountMicrousd: number | null;
+  /** How many spends were summed into this cell. */
+  readonly known: number;
+  /** Latest observation across contributors; non-null exactly when known > 0. */
+  readonly observedAt: string | null;
+}
+
+/** The four price-source x token-basis cells one aggregate carries for its scope. */
+export interface AccountingAggregateSpendV1 {
+  readonly providerPublishedReported: AccountingAggregateSpendCellV1;
+  readonly providerPublishedEstimated: AccountingAggregateSpendCellV1;
+  readonly referenceReported: AccountingAggregateSpendCellV1;
+  readonly referenceEstimated: AccountingAggregateSpendCellV1;
+}
+
 export interface AccountingAggregateV1 {
   readonly requests: number;
   readonly attempts: number;
@@ -122,8 +196,26 @@ export interface AccountingAggregateV1 {
   readonly requestTokens: AccountingAggregateTokenTotalsV1;
   readonly latency: AccountingMetricCellV1;
   readonly commit: AccountingMetricCellV1;
-  /** Pricing is intentionally not guessed by the accounting layer. */
-  readonly spend: null;
+  /**
+   * Attempt-side spend cells: every completed attempt priced at PUBLISHED prices,
+   * summed as integers. `null` is the LEGACY pre-spend shape, tolerated on read and
+   * defaulted to empty cells by readers — it never means "zero spend".
+   */
+  readonly spend: AccountingAggregateSpendV1 | null;
+  /**
+   * Request-side spend cells (winning serve attempt only), kept apart from
+   * `spend` for the same reason `requestTokens` is kept apart from `tokens`:
+   * a retried-elsewhere request must not double-count its failed attempts.
+   * Absent entirely on legacy shards.
+   */
+  readonly requestSpend?: AccountingAggregateSpendV1 | null;
+  /**
+   * Requests whose spend figure exists but left present token kinds unpriced
+   * (cache kinds, or one of in/out unpublished) — i.e. every amount above is a
+   * lower bound while this is > 0. Absent (= 0) on legacy shards.
+   */
+  readonly partiallyPricedRequests?: number;
+  /** Requests with NO spend figure at all: unserved, or a deployment publishing no price. */
   readonly unpricedRequests: number;
 }
 
@@ -264,7 +356,8 @@ export interface AccountingAttemptPacketV1 {
   readonly model: string | null;
   readonly credentialId: string | null;
   readonly tokens: AccountingAggregateTokenTotalsV1;
-  readonly spend: null;
+  /** This attempt's priced spend, or LEGACY/absent. `null` = unpriced, never $0. */
+  readonly spend: AccountingSpendV1 | null;
 }
 
 export type AccountingAttemptPacket = AccountingAttemptPacketV1;
@@ -293,7 +386,12 @@ export interface AccountingRequestPacketV1 {
   readonly model: string | null;
   readonly credentialId: string | null;
   readonly tokens: AccountingAggregateTokenTotalsV1;
-  readonly spend: null;
+  /**
+   * The WINNING SERVE attempt's spend, mirroring `tokens`. Repair spend stays on
+   * its own attempt rows (C1) so a later `--include-repair` roll-up can add it
+   * back without double-counting the serve.
+   */
+  readonly spend: AccountingSpendV1 | null;
   readonly attempts: readonly AccountingAttemptPacketV1[];
   readonly attemptMetadata: AccountingDetailAttemptMetadataV1;
 }
@@ -351,6 +449,30 @@ function hasExactArray<T>(value: unknown, max: number, guard: (item: unknown) =>
     if (!Object.prototype.hasOwnProperty.call(value, String(index)) || !guard(value[index])) return false;
   }
   return true;
+}
+
+/**
+ * Exact-key check tolerating a CLOSED set of optional keys, used by every owner of
+ * an aggregate: pre-spend shards carry neither `requestSpend` nor
+ * `partiallyPricedRequests`, and quarantining a whole day of real traffic over
+ * their absence would trade one additive field for the ledger itself.
+ */
+function hasExactKeysWithOptional(
+  value: unknown,
+  keys: readonly string[],
+  optional: readonly string[],
+): value is Record<string, unknown> {
+  if (!isPlainRecord(value) || Object.getOwnPropertySymbols(value).length !== 0) return false;
+  const names = Object.getOwnPropertyNames(value);
+  const enumerableNames = Object.keys(value);
+  if (names.length !== enumerableNames.length) return false;
+  // Any SUBSET of the closed optional set is accepted, not only all-or-none: a
+  // fully-priced request attaches `requestSpend` without ever creating
+  // `partiallyPricedRequests`, and a writer may legitimately persist either
+  // alone. Unknown names are still rejected.
+  if (names.length < keys.length || names.length > keys.length + optional.length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && names.every((name) => keys.includes(name) || optional.includes(name));
 }
 
 function hasOnlyEnumerableStringKeys(value: Record<string, unknown>): boolean {
@@ -586,6 +708,44 @@ function isMetric(value: unknown): value is AccountingMetricCellV1 {
 
 type AggregateOwner = "general" | "request" | "attempt";
 
+/**
+ * One summed spend cell inside an aggregate. `known === 0` ⇔ amount and timestamp are
+ * null; an amount can be null with known > 0 only when a contributor overflowed, which
+ * marks the owning aggregate partial through its own coverage path.
+ */
+function isAggregateSpendCell(value: unknown): value is AccountingAggregateSpendCellV1 {
+  return (
+    hasExactKeys(value, ["amountMicrousd", "known", "observedAt"]) &&
+    isNullableCounter(value.amountMicrousd) &&
+    isCounter(value.known) &&
+    isNullableTimestamp(value.observedAt) &&
+    ((value.known === 0 && value.amountMicrousd === null && value.observedAt === null) ||
+      (value.known > 0 && value.observedAt !== null))
+  );
+}
+
+const SPEND_CELL_KEYS = Object.freeze(["providerPublishedReported", "providerPublishedEstimated", "referenceReported", "referenceEstimated"] as const);
+
+function isAggregateSpend(value: unknown): value is AccountingAggregateSpendV1 {
+  if (!hasExactKeys(value, SPEND_CELL_KEYS)) return false;
+  for (const key of SPEND_CELL_KEYS) {
+    const cell = (value as Record<string, unknown>)[key];
+    // hasExactKeys guarantees every key present; the undefined case cannot occur,
+    // but the guard keeps the record access total.
+    if (cell === undefined || !isAggregateSpendCell(cell)) return false;
+  }
+  return true;
+}
+
+/** The legacy pre-spend shape (`spend: null`) is accepted beside the full cells. */
+function isAggregateSpendOrNull(value: unknown): value is AccountingAggregateSpendV1 | null {
+  return value === null || isAggregateSpend(value);
+}
+
+function isEmptyAggregateSpendCell(cell: AccountingAggregateSpendCellV1): boolean {
+  return cell.known === 0 && cell.amountMicrousd === null && cell.observedAt === null;
+}
+
 function isAggregateFields(value: Record<string, unknown>, owner: AggregateOwner = "general"): boolean {
   if (
     !isCounter(value.requests) ||
@@ -597,15 +757,20 @@ function isAggregateFields(value: Record<string, unknown>, owner: AggregateOwner
     !isAggregateTokens(value.requestTokens) ||
     !isMetric(value.latency) ||
     !isMetric(value.commit) ||
-    value.spend !== null ||
+    !isAggregateSpendOrNull(value.spend) ||
+    !(value.requestSpend === undefined || isAggregateSpendOrNull(value.requestSpend)) ||
+    !(value.partiallyPricedRequests === undefined || isCounter(value.partiallyPricedRequests)) ||
     !isCounter(value.unpricedRequests)
   ) return false;
   if (owner === "request") {
     if (value.attempts !== 0 || !isEmptyAggregateTokens(value.tokens)) return false;
     if (value.served + value.errored + value.cancelled > value.requests) return false;
+    if (value.spend !== null && !isEmptyAggregateSpend(value.spend)) return false;
   } else if (owner === "attempt") {
     if (value.requests !== 0 || !isEmptyAggregateTokens(value.requestTokens)) return false;
     if (value.served + value.errored + value.cancelled > value.attempts) return false;
+    // Attempt-side rows carry no REQUEST-scoped facts.
+    if (value.requestSpend !== undefined || value.partiallyPricedRequests !== undefined) return false;
   } else {
     if (value.served + value.errored + value.cancelled > value.requests) return false;
   }
@@ -617,51 +782,52 @@ function isAggregateFields(value: Record<string, unknown>, owner: AggregateOwner
     if (value.outcome === "cancelled" && (value.served !== 0 || value.errored !== 0 || value.cancelled !== count)) return false;
     if (value.outcome === "unknown" && (value.served !== 0 || value.errored !== 0 || value.cancelled !== 0)) return false;
   }
-  return value.unpricedRequests <= value.requests;
+  return (
+    value.unpricedRequests <= value.requests &&
+    (value.partiallyPricedRequests ?? 0) <= value.requests &&
+    (value.unpricedRequests + (value.partiallyPricedRequests ?? 0) <= value.requests)
+  );
 }
+
+function isEmptyAggregateSpend(spend: unknown): boolean {
+  return (
+    typeof spend === "object" &&
+    spend !== null &&
+    SPEND_CELL_KEYS.every((key) => {
+      const cell = (spend as Record<string, unknown>)[key];
+      return cell !== undefined && typeof cell === "object" && cell !== null && isEmptyAggregateSpendCell(cell as AccountingAggregateSpendCellV1);
+    })
+  );
+}
+
+/** Aggregate keys; `requestSpend`/`partiallyPricedRequests` are the additive optional pair. */
+const AGGREGATE_KEYS = Object.freeze([
+  "requests",
+  "attempts",
+  "served",
+  "errored",
+  "cancelled",
+  "tokens",
+  "requestTokens",
+  "latency",
+  "commit",
+  "spend",
+  "unpricedRequests",
+] as const);
+const AGGREGATE_OPTIONAL_KEYS = Object.freeze(["requestSpend", "partiallyPricedRequests"] as const);
 
 function isAggregate(value: unknown): value is AccountingAggregateV1 {
   return (
-    hasExactKeys(value, [
-      "requests",
-      "attempts",
-      "served",
-      "errored",
-      "cancelled",
-      "tokens",
-      "requestTokens",
-      "latency",
-      "commit",
-      "spend",
-      "unpricedRequests",
-    ]) && isAggregateFields(value)
+    hasExactKeysWithOptional(value, AGGREGATE_KEYS, AGGREGATE_OPTIONAL_KEYS) &&
+    isAggregateFields(value as Record<string, unknown>)
   );
 }
 
 function isDimensionRow(value: unknown): value is AccountingDimensionRowV1 {
+  const keys = [...AGGREGATE_KEYS, "kind", "role", "provider", "model", "client", "credentialId", "attribution", "outcome", "failureKind"];
+  const optional = [...AGGREGATE_OPTIONAL_KEYS];
   if (
-    !hasExactKeys(value, [
-      "requests",
-      "attempts",
-      "served",
-      "errored",
-      "cancelled",
-      "tokens",
-      "requestTokens",
-      "latency",
-      "commit",
-      "spend",
-      "unpricedRequests",
-      "kind",
-      "role",
-      "provider",
-      "model",
-      "client",
-      "credentialId",
-      "attribution",
-      "outcome",
-      "failureKind",
-    ]) ||
+    !hasExactKeysWithOptional(value, keys, optional) ||
     (value.kind !== "request" && value.kind !== "attempt") ||
     (value.kind === "request" && value.role !== "request") ||
     (value.kind === "attempt" && !isRole(value.role)) ||
@@ -674,8 +840,7 @@ function isDimensionRow(value: unknown): value is AccountingDimensionRowV1 {
     (value.failureKind !== null && !isFailure(value.failureKind)) ||
     !isFailureCoherent(value.outcome, value.failureKind)
   ) return false;
-  if (!isAggregateFields(value, value.kind === "request" ? "request" : "attempt")) return false;
-  return true;
+  return isAggregateFields(value, value.kind === "request" ? "request" : "attempt");
 }
 
 function isLossMarker(value: unknown): value is AccountingLossMarkerV1 {
@@ -818,6 +983,40 @@ function isLifetime(value: unknown): value is AccountingLifetimeV1 {
   return withinFileCeiling(value);
 }
 
+/** One attempt's priced spend, or LEGACY `null`. Guards every provenance field. */
+function isSpend(value: unknown): value is AccountingSpendV1 {
+  return (
+    hasExactKeys(value, [
+      "amountMicrousd",
+      "priceSource",
+      "tokenBasis",
+      "source",
+      "coverage",
+      "unpricedTokens",
+      "pricesUsed",
+      "observedAt",
+    ]) &&
+    isCounter(value.amountMicrousd) &&
+    (value.priceSource === "provider_published" || value.priceSource === "reference") &&
+    (value.tokenBasis === "reported" || value.tokenBasis === "estimated") &&
+    (value.source === "provider_reported" || value.source === "relay_estimated") &&
+    (value.coverage === "full" || value.coverage === "input_only" || value.coverage === "partial") &&
+    hasExactKeys(value.unpricedTokens, ["cacheRead", "cacheCreation", "cachedInput"]) &&
+    isNullableCounter(value.unpricedTokens.cacheRead) &&
+    isNullableCounter(value.unpricedTokens.cacheCreation) &&
+    isNullableCounter(value.unpricedTokens.cachedInput) &&
+    hasExactKeys(value.pricesUsed, ["perMillionIn", "perMillionOut"]) &&
+    isNullableNumber(value.pricesUsed.perMillionIn) &&
+    isNullableNumber(value.pricesUsed.perMillionOut) &&
+    isTimestamp(value.observedAt)
+  );
+}
+
+/** A finite non-negative number; prices are per-token decimals, not counters. */
+function isNullableNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
 function isAttemptPacket(value: unknown): value is AccountingAttemptPacketV1 {
   if (
     !hasExactKeys(value, [
@@ -853,7 +1052,7 @@ function isAttemptPacket(value: unknown): value is AccountingAttemptPacketV1 {
     !isNullableId(value.model) ||
     !isNullableId(value.credentialId) ||
     !isAggregateTokens(value.tokens) ||
-    value.spend !== null
+    !(value.spend === null || isSpend(value.spend))
   ) return false;
   if (value.commitMs !== null && value.role !== "serve") return false;
   return true;
@@ -910,7 +1109,7 @@ function isRequestPacket(value: unknown): value is AccountingRequestPacketV1 {
     !isNullableId(value.model) ||
     !isNullableId(value.credentialId) ||
     !isAggregateTokens(value.tokens) ||
-    value.spend !== null ||
+    !(value.spend === null || isSpend(value.spend)) ||
     !hasExactArray(value.attempts, ACCOUNTING_MAX_DETAIL_ATTEMPTS, isAttemptPacket) ||
     !isAttemptMetadata(value.attemptMetadata)
   ) return false;
@@ -1104,6 +1303,45 @@ export const parseAccountingRecent = parseAccountingRecentV1;
 export function checkedAddAccountingCounter(left: number, right: number): number | null {
   if (!isCounter(left) || !isCounter(right) || left > ACCOUNTING_MAX_COUNTER - right) return null;
   return left + right;
+}
+
+/**
+ * Sum two aggregate SPEND cells: integer micro-USD amounts, contributor counts,
+ * latest observation. Amounts stay null once any side is uncertain (overflow),
+ * mirroring how token cells degrade — a lost sum is never silently re-guessed.
+ */
+export function mergeAccountingSpendCells(
+  left: AccountingAggregateSpendCellV1,
+  right: AccountingAggregateSpendCellV1,
+): AccountingAggregateSpendCellV1 | null {
+  const known = checkedAddAccountingCounter(left.known, right.known);
+  if (known === null) return null;
+  let amountMicrousd: number | null = null;
+  if (
+    left.amountMicrousd !== null &&
+    right.amountMicrousd !== null &&
+    left.amountMicrousd <= ACCOUNTING_MAX_COUNTER - right.amountMicrousd
+  ) {
+    amountMicrousd = left.amountMicrousd + right.amountMicrousd;
+  }
+  return freezeDeep({
+    amountMicrousd: known > 0 ? amountMicrousd : null,
+    known,
+    observedAt: latestTimestamp(left.observedAt, right.observedAt),
+  });
+}
+
+export function emptyAccountingSpendCell(): AccountingAggregateSpendCellV1 {
+  return { amountMicrousd: null, known: 0, observedAt: null };
+}
+
+export function emptyAccountingAggregateSpend(): AccountingAggregateSpendV1 {
+  return {
+    providerPublishedReported: emptyAccountingSpendCell(),
+    providerPublishedEstimated: emptyAccountingSpendCell(),
+    referenceReported: emptyAccountingSpendCell(),
+    referenceEstimated: emptyAccountingSpendCell(),
+  };
 }
 
 function latestTimestamp(a: string | null, b: string | null): string | null {

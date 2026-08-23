@@ -1,16 +1,28 @@
 {
   "observedAt": "2026-08-22",
-  "exactMetrics": ["dashboardFiles", "dashboardRawBytes", "jsBytes", "cssBytes", "htmlBytes", "manifestBytes"],
+  "exactMetrics": [
+    "dashboardFiles",
+    "dashboardRawBytes",
+    "jsBytes",
+    "cssBytes",
+    "htmlBytes",
+    "manifestBytes"
+  ],
   "observed": {
     "dashboardFiles": 5,
-    "dashboardRawBytes": 253518,
-    "jsBytes": 239650,
-    "cssBytes": 12644,
+    "dashboardRawBytes": 254052,
+    "jsBytes": 240154,
+    "cssBytes": 12674,
     "htmlBytes": 383,
     "manifestBytes": 185,
     "packBytes": 772753,
     "unpackedBytes": 3915043,
     "packageEntries": 245
   },
-  "ceilings": { "dashboardRawBytes": 291600, "packBytes": 888700, "unpackedBytes": 4502300, "packageEntries": 282 }
+  "ceilings": {
+    "dashboardRawBytes": 291600,
+    "packBytes": 888700,
+    "unpackedBytes": 4502300,
+    "packageEntries": 282
+  }
 }

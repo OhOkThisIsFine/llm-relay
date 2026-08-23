@@ -176,7 +176,7 @@ interface ProviderPublishedReported { amountMicrousd: number | null; priceSource
 interface ProviderPublishedEstimated { amountMicrousd: number | null; priceSource: 'provider_published'; tokenBasis: 'estimated'; source: 'relay_estimated' | 'unknown'; observedAt: string | null; }
 interface ReferenceReported { amountMicrousd: number | null; priceSource: 'reference'; tokenBasis: 'reported'; source: 'provider_reported' | 'unknown'; observedAt: string | null; }
 interface ReferenceEstimated { amountMicrousd: number | null; priceSource: 'reference'; tokenBasis: 'estimated'; source: 'relay_estimated' | 'unknown'; observedAt: string | null; }
-interface SpendTotalsV1 { providerPublishedReported: ProviderPublishedReported; providerPublishedEstimated: ProviderPublishedEstimated; referenceReported: ReferenceReported; referenceEstimated: ReferenceEstimated; unpricedRequests: number; }
+interface SpendTotalsV1 { providerPublishedReported: ProviderPublishedReported; providerPublishedEstimated: ProviderPublishedEstimated; referenceReported: ReferenceReported; referenceEstimated: ReferenceEstimated; unpricedRequests: number; partiallyPricedRequests: number; }
 interface SummaryV1 { requests: number; attempts: number; served: number; errored: number; cancelled: number; successRate: number | null; tokens: TokenTotalsV1; spend: SpendTotalsV1; avgLatencyMs: number | null; p95LatencyMs: number | null; avgCommitMs: number | null; }
 interface BucketV1 { from: string; to: string; requests: number; attempts: number; served: number; errored: number; cancelled: number; successRate: number | null; tokens: TokenTotalsV1; spend: SpendTotalsV1; avgLatencyMs: number | null; p95LatencyMs: number | null; avgCommitMs: number | null; }
 interface DimensionSummaryV1 { requests: number; attempts: number; served: number; errored: number; cancelled: number; successRate: number | null; tokens: TokenTotalsV1; spend: SpendTotalsV1; avgLatencyMs: number | null; avgCommitMs: number | null; coverage: Coverage; }
@@ -216,6 +216,17 @@ magical HTTP 406. API errors differ from normalized provider failure kinds.
 
 Exactly eight cards: Requests; Success rate; Input tokens; Output tokens; Avg latency; P95 latency;
 Avg commitMs; Spend with adjacent unpriced count. Attempts/served remain contract metrics.
+
+> **2026-08-22 (Stage 4 / Gap 11, additive):** `SpendTotalsV1` gained `partiallyPricedRequests`.
+> Spend is now REAL: the relay prices each attempt at completion from PUBLISHED per-(provider,
+> model) prices only (`resolveMetadata` over `catalog.cachedLimits`, plus an exact-only snapshot
+> reference rung — no fallback price, no cache multiplier). Amounts are integer micro-USD.
+> `unpricedRequests` counts requests with NO spend figure (unserved, or a deployment publishing
+> no price); `partiallyPricedRequests` counts priced requests that carried token kinds no
+> published price covers (Anthropic cache creation/read, OpenAI cached input, or one of in/out
+> unpublished). While `partiallyPricedRequests` > 0 every spend amount is a LOWER BOUND, and the
+> SPA says so. A null price renders as "Unpriced", never $0. The producer and validator ship in
+> the same package, so `partiallyPricedRequests` is REQUIRED in `dashboard.snapshot.v1`.
 
 | Adapted upstream feature | Relay behavior/provenance |
 | --- | --- |

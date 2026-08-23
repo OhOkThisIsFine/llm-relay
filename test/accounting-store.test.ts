@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createAccountingRequest,
   type AccountingEvent,
+  type AccountingPricePort,
   type AccountingRecorder,
   type AttemptCompletedEvent,
   type RequestCompletedEvent,
@@ -31,6 +32,70 @@ import { SNAPSHOT_IO_HARD_MAX_JOURNAL_BYTES } from "../src/accounting-store-io.j
 
 function root(): string {
   return mkdtempSync(join(tmpdir(), "llm-relay-accounting-store-"));
+}
+
+/** Published/reported price port: $2/M in, $4/M out. */
+const PORT_PUBLISHED: AccountingPricePort = () => ({
+  pricePerMillionIn: 2,
+  pricePerMillionOut: 4,
+  priceSource: "provider",
+});
+/** Reference/in-only price port: $1/M in, no output price (partial coverage). */
+const PORT_REFERENCE: AccountingPricePort = () => ({
+  pricePerMillionIn: 1,
+  pricePerMillionOut: null,
+  priceSource: "reference",
+});
+
+function emptyAggregateTokenCell() {
+  return { value: null, known: 0, unknown: 0, lost: 0, overflow: false, observedAt: null };
+}
+
+function emptyAggregateTokens() {
+  return {
+    reported: {
+      reportedInput: emptyAggregateTokenCell(),
+      reportedOutput: emptyAggregateTokenCell(),
+      reportedCachedInput: emptyAggregateTokenCell(),
+      cacheCreationInputTokens: emptyAggregateTokenCell(),
+      cacheReadInputTokens: emptyAggregateTokenCell(),
+    },
+    estimated: {
+      estimatedInput: { ...emptyAggregateTokenCell(), method: null },
+      estimatedOutput: { ...emptyAggregateTokenCell(), method: null },
+    },
+  };
+}
+
+function emptyMetric() {
+  return { sumMs: null, known: 0, unknown: 0, lost: 0, overflow: false, samples: [], samplesDropped: 0, observedAt: null };
+}
+
+/** A minute cell in the LEGACY pre-spend shape (`spend: null`, no requestSpend). */
+function legacyMinuteCell() {
+  return {
+    schema: "accounting.minute.v1",
+    version: 1,
+    date: "2026-08-19",
+    minute: "10:00",
+    from: "2026-08-19T10:00:00.000Z",
+    to: "2026-08-19T10:01:00.000Z",
+    aggregate: {
+      requests: 1,
+      attempts: 0,
+      served: 1,
+      errored: 0,
+      cancelled: 0,
+      tokens: emptyAggregateTokens(),
+      requestTokens: emptyAggregateTokens(),
+      latency: emptyMetric(),
+      commit: emptyMetric(),
+      spend: null,
+      unpricedRequests: 1,
+    },
+    rows: [],
+    coverage: { state: "complete", reason: null, droppedRows: 0, losses: [] },
+  };
 }
 
 let requestSequence = 0;
@@ -65,6 +130,8 @@ interface AttemptPlan {
 
 interface RequestPlan {
   readonly requestId?: string;
+  /** Published-price lookup for the lifecycle; absent ⇒ unpriced. */
+  readonly pricePort?: AccountingPricePort | undefined;
   readonly startedAt: string;
   readonly endedAt: string;
   readonly client?: string | null;
@@ -99,6 +166,7 @@ function recordRequest(store: AccountingStore, plan: RequestPlan): RecordedReque
     startedAt: plan.startedAt,
     client: plan.client ?? "claude",
     attribution,
+    pricePort: plan.pricePort,
   });
   const attemptIds: string[] = [];
   for (const attemptPlan of plan.attempts ?? []) {
@@ -451,7 +519,13 @@ describe("durable canonical accounting store", () => {
     expect(aggregate.requestTokens.reported.reportedInput.unknown).toBe(1);
     expect(aggregate.requestTokens.estimated.estimatedOutput.value).toBeNull();
     expect(aggregate.requestTokens.estimated.estimatedOutput.method).toBe("unknown");
-    expect(aggregate.spend).toBeNull();
+    // Spend is now real aggregate cells; an unpriced request contributes NOTHING
+    // to them (amount null AND known 0) rather than a fabricated $0.
+    for (const cell of Object.values(aggregate.requestSpend ?? {})) {
+      expect(cell.amountMicrousd).toBeNull();
+      expect(cell.known).toBe(0);
+    }
+    expect(aggregate.unpricedRequests).toBe(1);
     store.close();
   });
 
@@ -1196,6 +1270,167 @@ describe("durable canonical accounting store", () => {
     const result = store.readDays(dates);
     expect(result.status).toBe("capped");
     expect(result.results).toHaveLength(2);
+    store.close();
+  });
+
+  it("loads a LEGACY pre-spend shard with spend: null as empty cells, not zeros or quarantine", () => {
+    const directory = root();
+    const legacyDay = {
+      schema: "accounting.day.v1",
+      version: 1,
+      date: "2026-08-19",
+      cells: {
+        "10:00": legacyMinuteCell(),
+      },
+      dedup: { schema: "accounting.dedup.v1", version: 1, date: "2026-08-19", requestIds: [], dropped: 0, complete: true },
+      coverage: { state: "complete", reason: null, droppedRows: 0, droppedRecent: 0, droppedDetails: 0, droppedDedup: 0, retentionFrom: null, retentionDays: null, losses: [] },
+    };
+    writeFileSync(join(directory, "2026-08-19.json"), JSON.stringify(legacyDay));
+    const store = createAccountingStore({ rootDir: directory });
+    const read = store.readDay("2026-08-19");
+    expect(read.status).toBe("ok");
+    if (read.status !== "ok") throw new Error("legacy day was not readable");
+    // The persisted form keeps the legacy null; readers normalize to empty cells.
+    expect(read.value.cells["10:00"]!.aggregate.spend).toBeNull();
+    // A NEW terminal event on the same day still lands beside the legacy cell.
+    recordRequest(store, {
+      requestId: requestId(),
+      startedAt: "2026-08-19T11:00:00.000Z",
+      endedAt: "2026-08-19T11:00:01.000Z",
+      outcome: "success",
+      pricePort: PORT_PUBLISHED,
+      attempts: [{ provider: "prov", model: "model-a", outcome: "success", tokens: { reported: { inputTokens: 1_000, outputTokens: 0 } } }],
+    });
+    expect(store.flush().status).toBe("committed");
+    const updated = store.readDay("2026-08-19");
+    if (updated.status !== "ok") throw new Error("updated day was not readable");
+    expect(updated.value.cells["11:00"]!.aggregate.requestSpend?.providerPublishedReported.amountMicrousd).toBe(2_000);
+    store.close();
+  });
+});
+
+describe("spend aggregation into the four cells (Stage 4 / Gap 11)", () => {
+  // Regression: a diff hunk replaced addRootAttempt's attempt-TOKEN fold with the
+  // spend fold, so root/day-cell/lifetime/month aggregates stopped accumulating
+  // attempt-side tokens while the spend cells looked complete. Two attempts, one of
+  // them the reported-input serve, must sum in BOTH the day cell and the lifetime.
+  it("folds attempt tokens into root aggregates beside attempt spend", () => {
+    const store = createAccountingStore({ rootDir: root() });
+    recordRequest(store, {
+      startedAt: "2026-08-20T07:00:00.000Z",
+      endedAt: "2026-08-20T07:00:02.000Z",
+      outcome: "success",
+      pricePort: PORT_PUBLISHED,
+      attempts: [
+        { outcome: "error", provider: "prov", model: "model-a", tokens: { reported: { inputTokens: 100, outputTokens: 0 } } },
+        { provider: "prov", model: "model-a", outcome: "success", tokens: { reported: { inputTokens: 900, outputTokens: 50 } } },
+      ],
+    });
+    store.flush();
+    // Day cell root: 100 + 900 reported input, 0 + 50 reported output.
+    const cell = day(store, "2026-08-20").cells["07:00"]!.aggregate;
+    expect(cell.attempts).toBe(2);
+    expect(cell.tokens.reported.reportedInput).toMatchObject({ value: 1_000, known: 2 });
+    expect(cell.tokens.reported.reportedOutput).toMatchObject({ value: 50, known: 2 });
+    // Attempt-side spend still folds beside the tokens (both axes, one walk):
+    // 100x$2 + (900x$2 + 50x$4) at PORT_PUBLISHED.
+    expect(cell.spend?.providerPublishedReported.amountMicrousd).toBe(100 * 2 + 900 * 2 + 50 * 4);
+    expect(cell.spend?.providerPublishedReported.known).toBe(2);
+    // Lifetime root sums the same two attempts.
+    const life = lifetime(store).aggregate;
+    expect(life.tokens.reported.reportedInput).toMatchObject({ value: 1_000, known: 2 });
+    expect(life.tokens.reported.reportedOutput.value).toBe(50);
+    expect(life.spend?.providerPublishedReported.amountMicrousd).toBe(100 * 2 + 900 * 2 + 50 * 4);
+    // Request-side axis untouched: only the winning serve's tokens/spend.
+    expect(life.requestTokens.reported.reportedInput.value).toBe(900);
+    expect(life.requestSpend?.providerPublishedReported.amountMicrousd).toBe(900 * 2 + 50 * 4);
+    store.close();
+  });
+
+  it("aggregates priced requests into the matching request-side cells and counts partial coverage", () => {
+    const store = createAccountingStore({ rootDir: root() });
+    // Two fully-priced provider-published/reported requests.
+    recordRequest(store, {
+      startedAt: "2026-08-20T04:00:00.000Z",
+      endedAt: "2026-08-20T04:00:01.000Z",
+      outcome: "success",
+      pricePort: PORT_PUBLISHED,
+      attempts: [{ provider: "prov", model: "model-a", outcome: "success", tokens: { reported: { inputTokens: 500, outputTokens: 250 } } }],
+    });
+    recordRequest(store, {
+      startedAt: "2026-08-20T04:01:00.000Z",
+      endedAt: "2026-08-20T04:01:01.000Z",
+      outcome: "success",
+      pricePort: PORT_PUBLISHED,
+      attempts: [{ provider: "prov", model: "model-a", outcome: "success", tokens: { reported: { inputTokens: 1_000, outputTokens: 250 } } }],
+    });
+    // One partially priced (reference, in-only) request in a different minute.
+    recordRequest(store, {
+      startedAt: "2026-08-20T04:02:00.000Z",
+      endedAt: "2026-08-20T04:02:01.000Z",
+      outcome: "success",
+      pricePort: PORT_REFERENCE,
+      attempts: [{ provider: "prov", model: "model-a", outcome: "success", tokens: { reported: { inputTokens: 2_000, outputTokens: 0 } } }],
+    });
+    store.flush();
+    // Minute cell holds only its own request's spend.
+    const firstMinute = day(store, "2026-08-20").cells["04:00"]!.aggregate;
+    expect(firstMinute.requestSpend?.providerPublishedReported).toEqual({
+      amountMicrousd: 2_000,
+      known: 1,
+      observedAt: "2026-08-20T04:00:01.000Z",
+    });
+    expect(firstMinute.requestSpend?.referenceReported.known).toBe(0);
+    // The lifetime carries all three.
+    const life = lifetime(store).aggregate;
+    expect(life.requestSpend?.providerPublishedReported.amountMicrousd).toBe(2_000 + 3_000);
+    expect(life.requestSpend?.referenceReported.amountMicrousd).toBe(2_000);
+    expect(life.partiallyPricedRequests).toBe(1);
+    expect(life.unpricedRequests).toBe(0);
+    store.close();
+  });
+
+  it("counts an unpriced request only in unpricedRequests, never as $0 spend", () => {
+    const store = createAccountingStore({ rootDir: root() });
+    recordRequest(store, {
+      startedAt: "2026-08-20T05:00:00.000Z",
+      endedAt: "2026-08-20T05:00:01.000Z",
+      outcome: "success",
+      attempts: [{ outcome: "success", tokens: { reported: { inputTokens: 900, outputTokens: 0 } } }],
+    });
+    store.flush();
+    const aggregate = day(store, "2026-08-20").cells["05:00"]!.aggregate;
+    expect(aggregate.unpricedRequests).toBe(1);
+    for (const cell of Object.values(aggregate.requestSpend ?? {})) {
+      expect(cell.amountMicrousd).toBeNull();
+      expect(cell.known).toBe(0);
+    }
+    store.close();
+  });
+
+  it("keeps repair spend on attempt-side cells without double-counting request-side cells", () => {
+    const store = createAccountingStore({ rootDir: root() });
+    recordRequest(store, {
+      startedAt: "2026-08-20T06:00:00.000Z",
+      endedAt: "2026-08-20T06:00:02.000Z",
+      outcome: "success",
+      pricePort: PORT_PUBLISHED,
+      attempts: [
+        { role: "repair", provider: "prov", model: "model-a", outcome: "success", tokens: { reported: { inputTokens: 100, outputTokens: 0 } } },
+        { role: "serve", provider: "prov", model: "model-a", outcome: "success", tokens: { reported: { inputTokens: 1_000, outputTokens: 0 } } },
+      ],
+    });
+    store.flush();
+    const aggregate = day(store, "2026-08-20").cells["06:00"]!.aggregate;
+    // Request side: the winning serve ONLY (same rule as request tokens).
+    expect(aggregate.requestSpend?.providerPublishedReported).toEqual({
+      amountMicrousd: 2_000,
+      known: 1,
+      observedAt: "2026-08-20T06:00:02.000Z",
+    });
+    // Attempt side: repair + serve both counted there (C1 keeps rows separate).
+    expect(aggregate.spend?.providerPublishedReported.amountMicrousd).toBe(2_200);
+    expect(aggregate.spend?.providerPublishedReported.known).toBe(2);
     store.close();
   });
 });

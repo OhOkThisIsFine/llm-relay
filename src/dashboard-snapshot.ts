@@ -10,6 +10,8 @@ import {
   parseAccountingDayShardV1,
   parseAccountingLifetimeV1,
   parseAccountingRequestPacketV1,
+  type AccountingAggregateSpendCellV1,
+  type AccountingAggregateSpendV1,
   type AccountingAggregateTokenCellV1,
   type AccountingAggregateTokenTotalsV1,
   type AccountingAggregateV1,
@@ -18,6 +20,7 @@ import {
   type AccountingLifetime,
   type AccountingMetricCellV1,
   type AccountingRequestPacket,
+  type AccountingSpendV1,
 } from "./accounting-store-schema.js";
 import {
   DASHBOARD_DETAIL_SCHEMA,
@@ -151,6 +154,20 @@ interface MutableMetric {
   observedAt: string | null;
 }
 
+interface MutableSpendCell {
+  seen: boolean;
+  amountMicrousd: number | null;
+  known: number;
+  observedAt: string | null;
+}
+
+interface MutableSpend {
+  providerPublishedReported: MutableSpendCell;
+  providerPublishedEstimated: MutableSpendCell;
+  referenceReported: MutableSpendCell;
+  referenceEstimated: MutableSpendCell;
+}
+
 interface MutableStats {
   requests: number;
   attempts: number;
@@ -158,7 +175,9 @@ interface MutableStats {
   errored: number;
   cancelled: number;
   unpricedRequests: number;
+  partiallyPricedRequests: number;
   readonly tokens: MutableTokens;
+  readonly spend: MutableSpend;
   readonly latency: MutableMetric;
   readonly commit: MutableMetric;
   readonly health: ProjectionHealth;
@@ -263,6 +282,19 @@ function newMetric(): MutableMetric {
   return { seen: false, sumMs: null, known: 0, unknown: 0, lost: 0, overflow: false, samples: [], samplesDropped: 0, observedAt: null };
 }
 
+function newSpendCell(): MutableSpendCell {
+  return { seen: false, amountMicrousd: null, known: 0, observedAt: null };
+}
+
+function newSpend(): MutableSpend {
+  return {
+    providerPublishedReported: newSpendCell(),
+    providerPublishedEstimated: newSpendCell(),
+    referenceReported: newSpendCell(),
+    referenceEstimated: newSpendCell(),
+  };
+}
+
 function newStats(): MutableStats {
   return {
     requests: 0,
@@ -271,7 +303,9 @@ function newStats(): MutableStats {
     errored: 0,
     cancelled: 0,
     unpricedRequests: 0,
+    partiallyPricedRequests: 0,
     tokens: newTokens(),
+    spend: newSpend(),
     latency: newMetric(),
     commit: newMetric(),
     health: newHealth(),
@@ -377,13 +411,65 @@ function mergeMetric(target: MutableMetric, source: AccountingMetricCellV1, heal
   }
 }
 
+/**
+ * Fold one persisted spend cell into the projection accumulator. Amounts are
+ * integer micro-USD and stay null once any contributor is uncertain (overflow),
+ * mirroring how token sums degrade; `known` still counts every contribution so a
+ * degraded cell is distinguishable from an empty one.
+ */
+function mergeSpendCell(target: MutableSpendCell, source: AccountingAggregateSpendCellV1, health: ProjectionHealth): void {
+  if (source.known === 0 && source.amountMicrousd === null && source.observedAt === null) return;
+  target.seen = true;
+  const knownBefore = target.known;
+  target.known = boundedAdd(target.known, safeInteger(source.known), health);
+  noteTimestamp(target, source.observedAt);
+  if (source.amountMicrousd === null) {
+    // A contributor that lost its own sum poisons the combined one.
+    if (knownBefore > 0) { target.amountMicrousd = null; health.partial = true; noteProvenance(health, "unknown"); }
+    return;
+  }
+  if (knownBefore === 0) {
+    target.amountMicrousd = source.amountMicrousd;
+    return;
+  }
+  if (target.amountMicrousd === null || target.amountMicrousd > Number.MAX_SAFE_INTEGER - source.amountMicrousd) {
+    target.amountMicrousd = null;
+    health.partial = true;
+    noteProvenance(health, "unknown");
+    return;
+  }
+  target.amountMicrousd += source.amountMicrousd;
+}
+
+const SPEND_CELL_PAIRS: ReadonlyArray<readonly [keyof AccountingAggregateSpendV1, keyof MutableSpend]> = [
+  ["providerPublishedReported", "providerPublishedReported"],
+  ["providerPublishedEstimated", "providerPublishedEstimated"],
+  ["referenceReported", "referenceReported"],
+  ["referenceEstimated", "referenceEstimated"],
+];
+
+function mergeSpend(target: MutableSpend, source: AccountingAggregateSpendV1 | null | undefined, health: ProjectionHealth): void {
+  if (!source) return;
+  for (const [sourceKey, targetKey] of SPEND_CELL_PAIRS) {
+    mergeSpendCell(target[targetKey], source[sourceKey], health);
+  }
+}
+
 function addRequestAggregate(target: MutableStats, aggregate: AccountingAggregateV1): void {
   target.requests = boundedAdd(target.requests, safeInteger(aggregate.requests), target.health);
   target.served = boundedAdd(target.served, safeInteger(aggregate.served), target.health);
   target.errored = boundedAdd(target.errored, safeInteger(aggregate.errored), target.health);
   target.cancelled = boundedAdd(target.cancelled, safeInteger(aggregate.cancelled), target.health);
   target.unpricedRequests = boundedAdd(target.unpricedRequests, safeInteger(aggregate.unpricedRequests), target.health);
+  target.partiallyPricedRequests = boundedAdd(
+    target.partiallyPricedRequests,
+    safeInteger(aggregate.partiallyPricedRequests ?? 0),
+    target.health,
+  );
   mergeTokens(target.tokens, aggregate.requestTokens, target.health);
+  // Request-scoped spend cells ride beside request tokens; a legacy shard without
+  // them contributes nothing rather than implying zero.
+  mergeSpend(target.spend, aggregate.requestSpend, target.health);
   mergeMetric(target.latency, aggregate.latency, target.health);
   mergeMetric(target.commit, aggregate.commit, target.health);
 }
@@ -423,16 +509,61 @@ function tokenTotals(source: MutableTokens): TokenTotalsV1 {
   };
 }
 
-function spendTotals(unpricedRequests: number): SpendTotalsV1 {
-  const unknownReported = { amountMicrousd: null, source: "unknown" as const, observedAt: null };
-  const unknownEstimated = { amountMicrousd: null, source: "unknown" as const, observedAt: null };
+/**
+ * Project one aggregate spend cell onto its wire shape. A cell nobody contributed
+ * to stays amount-null — "Unpriced" in the SPA, never "$0" — and an overflowed sum
+ * degrades to null exactly like an overflowed token sum does.
+ */
+function projectedSpendCell<T extends "provider_reported" | "relay_estimated">(
+  cell: MutableSpendCell,
+  source: T,
+): { amountMicrousd: number | null; source: T; observedAt: string | null } {
   return {
-    providerPublishedReported: { ...unknownReported, priceSource: "provider_published", tokenBasis: "reported" },
-    providerPublishedEstimated: { ...unknownEstimated, priceSource: "provider_published", tokenBasis: "estimated" },
-    referenceReported: { ...unknownReported, priceSource: "reference", tokenBasis: "reported" },
-    referenceEstimated: { ...unknownEstimated, priceSource: "reference", tokenBasis: "estimated" },
-    unpricedRequests,
+    amountMicrousd: cell.seen && cell.known > 0 ? cell.amountMicrousd : null,
+    source,
+    observedAt: cell.observedAt,
   };
+}
+
+function spendTotals(stats: MutableStats): SpendTotalsV1 {
+  const unknown = () => ({ amountMicrousd: null, source: "unknown" as const, observedAt: null });
+  const result: SpendTotalsV1 = {
+    providerPublishedReported: { ...unknown(), priceSource: "provider_published", tokenBasis: "reported" },
+    providerPublishedEstimated: { ...unknown(), priceSource: "provider_published", tokenBasis: "estimated" },
+    referenceReported: { ...unknown(), priceSource: "reference", tokenBasis: "reported" },
+    referenceEstimated: { ...unknown(), priceSource: "reference", tokenBasis: "estimated" },
+    unpricedRequests: stats.unpricedRequests,
+    partiallyPricedRequests: stats.partiallyPricedRequests,
+  };
+  if (stats.spend.providerPublishedReported.seen) {
+    result.providerPublishedReported = {
+      ...projectedSpendCell(stats.spend.providerPublishedReported, "provider_reported"),
+      priceSource: "provider_published",
+      tokenBasis: "reported",
+    };
+  }
+  if (stats.spend.providerPublishedEstimated.seen) {
+    result.providerPublishedEstimated = {
+      ...projectedSpendCell(stats.spend.providerPublishedEstimated, "relay_estimated"),
+      priceSource: "provider_published",
+      tokenBasis: "estimated",
+    };
+  }
+  if (stats.spend.referenceReported.seen) {
+    result.referenceReported = {
+      ...projectedSpendCell(stats.spend.referenceReported, "provider_reported"),
+      priceSource: "reference",
+      tokenBasis: "reported",
+    };
+  }
+  if (stats.spend.referenceEstimated.seen) {
+    result.referenceEstimated = {
+      ...projectedSpendCell(stats.spend.referenceEstimated, "relay_estimated"),
+      priceSource: "reference",
+      tokenBasis: "estimated",
+    };
+  }
+  return result;
 }
 
 function average(metric: MutableMetric, toleratedUnknown: number): number | null {
@@ -487,7 +618,7 @@ function summaryFrom(stats: MutableStats): SummaryV1 {
     cancelled: stats.cancelled,
     successRate: denominator === 0 ? null : stats.served / denominator,
     tokens: tokenTotals(stats.tokens),
-    spend: spendTotals(stats.unpricedRequests),
+    spend: spendTotals(stats),
     avgLatencyMs: average(stats.latency, stats.cancelled),
     p95LatencyMs: percentile95(stats.latency, stats.cancelled),
     avgCommitMs: average(stats.commit, Math.max(0, stats.requests - stats.served)),
@@ -823,8 +954,29 @@ function availabilityRows(
   return { quotas, cooldowns, quotaHealth, cooldownHealth };
 }
 
+/** Route one priced spend record onto its single wire cell inside a fresh aggregate. */
+function spendAggregateFor(record: AccountingSpendV1 | null): AccountingAggregateSpendV1 {
+  const emptyCell = (): AccountingAggregateSpendCellV1 => ({ amountMicrousd: null, known: 0, observedAt: null });
+  const cells: Record<keyof AccountingAggregateSpendV1, AccountingAggregateSpendCellV1> = {
+    providerPublishedReported: emptyCell(),
+    providerPublishedEstimated: emptyCell(),
+    referenceReported: emptyCell(),
+    referenceEstimated: emptyCell(),
+  };
+  if (record !== null) {
+    const key = record.priceSource === "provider_published"
+      ? (record.tokenBasis === "reported" ? "providerPublishedReported" : "providerPublishedEstimated")
+      : (record.tokenBasis === "reported" ? "referenceReported" : "referenceEstimated");
+    cells[key] = { amountMicrousd: record.amountMicrousd, known: 1, observedAt: record.observedAt };
+  }
+  return cells;
+}
+
 function requestRow(packet: AccountingRequestPacket, coverage?: ProjectionHealth): RequestRowV1 {
   const stats = newStats();
+  // A priced request counts as partially priced unless EVERY kind it reported was
+  // priced in full; an unpriced request counts only in `unpricedRequests`.
+  const partial = packet.spend !== null && packet.spend.coverage !== "full" ? 1 : 0;
   const aggregate: AccountingAggregateV1 = {
     requests: 1,
     attempts: 0,
@@ -854,7 +1006,9 @@ function requestRow(packet: AccountingRequestPacket, coverage?: ProjectionHealth
       observedAt: packet.endedAt,
     },
     spend: null,
-    unpricedRequests: 1,
+    requestSpend: spendAggregateFor(packet.spend),
+    ...(partial > 0 ? { partiallyPricedRequests: partial } : {}),
+    unpricedRequests: packet.spend === null ? 1 : 0,
   };
   addRequestAggregate(stats, aggregate);
   if (coverage !== undefined) mergeHealth(coverage, stats.health);
@@ -872,7 +1026,7 @@ function requestRow(packet: AccountingRequestPacket, coverage?: ProjectionHealth
     model: packet.model,
     credentialId: packet.credentialId,
     tokens: tokenTotals(stats.tokens),
-    spend: spendTotals(1),
+    spend: spendTotals(stats),
     repairIncluded: packet.repairIncluded,
   };
 }
@@ -880,6 +1034,7 @@ function requestRow(packet: AccountingRequestPacket, coverage?: ProjectionHealth
 function attemptRow(packet: AccountingRequestPacket["attempts"][number], coverage?: ProjectionHealth): AttemptRowV1 {
   const stats = newStats();
   mergeTokens(stats.tokens, packet.tokens, stats.health);
+  mergeSpend(stats.spend, spendAggregateFor(packet.spend), stats.health);
   if (coverage !== undefined) mergeHealth(coverage, stats.health);
   return {
     attemptId: packet.attemptId,
@@ -894,7 +1049,7 @@ function attemptRow(packet: AccountingRequestPacket["attempts"][number], coverag
     credentialId: packet.credentialId,
     failureKind: packet.failureKind,
     tokens: tokenTotals(stats.tokens),
-    spend: null,
+    spend: spendTotals(stats),
   };
 }
 
