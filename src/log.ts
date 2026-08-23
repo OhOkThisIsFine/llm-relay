@@ -72,6 +72,16 @@ export interface RequestLog {
    *  means the caller went away mid-repair — distinct from "failed" (nothing was
    *  reachable), because the two call for opposite responses. */
   repair: "none" | "fixed" | "failed" | "refused" | "refused_destructive" | "cancelled";
+  /**
+   * How many `tool_use` ids the relay had to mint because the serving host reused ones the
+   * conversation already carried (`src/tool-use-ids.ts`). Absent when none were — a host that
+   * mints unique ids leaves no trace here.
+   *
+   * ⚠ A COUNT, never an id. It is here because a streamed response cannot carry the
+   * `x-llm-relay-tool-use-ids` header (headers are written before the first tool call exists),
+   * so for stream traffic — which is all agentic traffic — this is the only place the pass shows.
+   */
+  toolUseIdRewrites?: number;
   latencyMs: number;
 }
 
@@ -101,6 +111,7 @@ const LOG_FIELDS = [
   "uncheckableCount",
   "errorKinds",
   "repair",
+  "toolUseIdRewrites",
   "latencyMs",
 ] as const satisfies readonly (keyof RequestLog)[];
 

@@ -39,7 +39,7 @@ import {
   type Reshaper,
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -3753,18 +3753,25 @@ async function openAiFrontPath(
       }
 
       const audit = recoveryAudit.value;
-      const log = baseLog(
-        ctx.started,
-        ctx.path,
-        ctx.hadTools,
-        streamed,
-        upstream.status,
-        audit?.validated ?? "skipped",
-        target,
-        attemptTrace.snapshot(),
-        upstreamReportedModel(reportedModelSource),
-        resolvedAttempt.credentialId,
-      );
+      const log = {
+        ...baseLog(
+          ctx.started,
+          ctx.path,
+          ctx.hadTools,
+          streamed,
+          upstream.status,
+          audit?.validated ?? "skipped",
+          target,
+          attemptTrace.snapshot(),
+          upstreamReportedModel(reportedModelSource),
+          resolvedAttempt.credentialId,
+        ),
+        // This front's TRANSLATED lane (anything but openai-kind + Chat) runs through
+        // `fetchBackend`, so a Codex `/v1/responses` turn on an openai-kind target gets the same
+        // id mint the Messages front does — and it must be reported on the SERVED turn, not only
+        // on the mid-stream error path that already carried it.
+        ...toolUseIdRewriteField(reportedModelSource),
+      };
       h.logger.write(audit ? {
         ...log,
         toolUseCount: audit.toolUseCount,
@@ -3807,6 +3814,19 @@ async function openAiFrontPath(
     respondAllCapped(res, h, { started: ctx.started, path: ctx.path, hadTools: ctx.hadTools, streamed: ctx.wantsStream }, "openai", pool429, attemptTrace.snapshot());
   }
 }
+/**
+ * The metadata-only `tool_use` id-minting counter for this response, or nothing when the host's
+ * own ids were already unique.
+ *
+ * Read from the response the backend adapter produced, and only at LOG time: on a stream the pass
+ * runs while the body drains, so the figure is final once the request is over and would be a guess
+ * any earlier. A count, never an id.
+ */
+function toolUseIdRewriteField(source: Response): { toolUseIdRewrites?: number } {
+  const rewrites = toolUseIdRewrites(source);
+  return rewrites === undefined ? {} : { toolUseIdRewrites: rewrites };
+}
+
 /** Winning-candidate response metadata, shared by transparent and repair streaming paths. */
 function responseHeadersForTarget(backendRes: Response, ctx: Ctx): Record<string, string | string[]> {
   const responseHeaders = filterResponseHeaders(backendRes.headers);
@@ -3944,6 +3964,7 @@ async function transparentPath(
       ctx.attempt.resolvedAttempt.credentialId,
     ),
     toolUseCount, uncheckableCount, errorKinds,
+    ...toolUseIdRewriteField(ctx.reportedModelSource),
   });
 }
 
@@ -4190,6 +4211,7 @@ async function repairStreamingPath(
       ctx.attempt.resolvedAttempt.credentialId,
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
+    ...toolUseIdRewriteField(ctx.reportedModelSource),
   });
 }
 
@@ -4339,6 +4361,7 @@ async function repairBufferedPath(
       ctx.attempt.terminal === "succeeded" ? ctx.attempt.resolvedAttempt.credentialId : null,
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
+    ...toolUseIdRewriteField(ctx.reportedModelSource),
   });
   return null;
 }
@@ -4647,6 +4670,7 @@ function handleMidStreamError(
       upstreamReportedModel(reportedModelSource),
     ),
     errorKinds: [MID_STREAM_ERROR_KIND],
+    ...toolUseIdRewriteField(reportedModelSource),
   });
 }
 

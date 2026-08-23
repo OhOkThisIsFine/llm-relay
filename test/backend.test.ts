@@ -10,6 +10,7 @@ import {
   normalizeOpenAiErrorBody,
   openAiResponseToAnthropic,
   parseRetryAfterMs,
+  toolUseIdRewrites,
   upstreamReportedModel,
 } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
@@ -1585,5 +1586,253 @@ describe("fetchBackend & fetchOpenAiFront — credential alias resolution", () =
         else delete process.env[k];
       }
     }
+  });
+});
+
+/**
+ * A weak host's REPEATED tool-call ids are the defect here, not a malformed one. Kimi-K3 on NIM
+ * emits `<ToolName>:<index in this response>`, so `Read:0` recurs on every turn that reads again;
+ * Claude Code's request-time conversation normalizer then DROPS the duplicate `tool_use`, empties
+ * the turn to `[Tool use interrupted]`, and the headless session dies with nothing to run.
+ */
+describe("fetchBackend (openai kind) — tool_use ids are unique against the conversation", () => {
+  const conversation = (assistantId: string) => ({
+    model: "claude-x",
+    stream: false,
+    messages: [
+      { role: "user", content: "read package.json" },
+      { role: "assistant", content: [{ type: "tool_use", id: assistantId, name: "Read", input: { file: "package.json" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: assistantId, content: "{...}" }] },
+      { role: "user", content: "now read README.md" },
+    ],
+    tools: [{ name: "Read", description: "r", input_schema: { type: "object", properties: { file: { type: "string" } } } }],
+  });
+
+  const openAiToolResponse = (id: string) => JSON.stringify({
+    id: "cmpl_2",
+    model: "moonshotai/kimi-k3",
+    choices: [{
+      finish_reason: "tool_calls",
+      message: { role: "assistant", content: null, tool_calls: [{ id, function: { name: "Read", arguments: '{"file":"README.md"}' } }] },
+    }],
+  });
+
+  it("mints a fresh id for a buffered tool call whose id the conversation already carries", async () => {
+    process.env.RP_BACKEND_KEY = "sk-nim";
+    try {
+      const req = conversation("Read:0");
+      const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from(JSON.stringify(req)),
+        reqJson: req,
+        anthropicHeaders: {},
+        wantsStream: false,
+        signal: AbortSignal.timeout(1000),
+      }, async () => new Response(openAiToolResponse("Read:0"), { headers: { "content-type": "application/json" } }));
+
+      const body = (await res.json()) as any;
+      expect(body.stop_reason).toBe("tool_use");
+      expect(body.content[0]).toEqual({
+        type: "tool_use", id: "Read:0_relay1", name: "Read", input: { file: "README.md" },
+      });
+      // Announced, like every other automatic fix on this path. A count, never an id.
+      expect(res.headers.get("x-llm-relay-tool-use-ids")).toBe("1 rewritten");
+      expect(toolUseIdRewrites(res)).toBe(1);
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  });
+
+  it("leaves an already-unique id alone and emits no header", async () => {
+    process.env.RP_BACKEND_KEY = "sk-nim";
+    try {
+      const req = conversation("Read:0");
+      const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from(JSON.stringify(req)),
+        reqJson: req,
+        anthropicHeaders: {},
+        wantsStream: false,
+        signal: AbortSignal.timeout(1000),
+      }, async () => new Response(openAiToolResponse("Read:1"), { headers: { "content-type": "application/json" } }));
+
+      const body = (await res.json()) as any;
+      expect(body.content[0].id).toBe("Read:1");
+      expect(res.headers.get("x-llm-relay-tool-use-ids")).toBeNull();
+      expect(toolUseIdRewrites(res)).toBeUndefined();
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  });
+
+  it("rewrites the streamed content_block_start id and leaves every other event byte-identical", async () => {
+    process.env.RP_BACKEND_KEY = "sk-nim";
+    try {
+      const chunk = (delta: object, finish: string | null = null) =>
+        `data: ${JSON.stringify({ id: "cmpl", model: "moonshotai/kimi-k3", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+      const openAiSse = [
+        chunk({ role: "assistant" }),
+        chunk({ tool_calls: [{ index: 0, id: "Read:0", function: { name: "Read", arguments: "" } }] }),
+        chunk({ tool_calls: [{ index: 0, function: { arguments: '{"file":"README.md"}' } }] }),
+        chunk({}, "tool_calls"),
+        "data: [DONE]\n\n",
+      ].join("");
+
+      const run = async (req: object) => {
+        const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+          path: "/v1/messages",
+          method: "POST",
+          reqBuf: Buffer.from(JSON.stringify(req)),
+          reqJson: req,
+          anthropicHeaders: {},
+          wantsStream: true,
+          signal: AbortSignal.timeout(1000),
+        }, async () => new Response(openAiSse, { status: 200, headers: { "content-type": "text/event-stream" } }));
+        const text = await res.text();
+        return { text, rewrites: toolUseIdRewrites(res) };
+      };
+
+      // Same response, two conversations: one that already used `Read:0` and one that has not.
+      const collides = await run({ ...conversation("Read:0"), stream: true });
+      const clean = await run({ ...conversation("Read:9"), stream: true });
+
+      expect(clean.text).toContain('"id":"Read:0"');
+      expect(clean.rewrites).toBeUndefined();
+      expect(collides.text).toContain('"id":"Read:0_relay1"');
+      expect(collides.text).not.toContain('"id":"Read:0"');
+      expect(collides.rewrites).toBe(1);
+      // Nothing but the one id differs — the SSE is otherwise the same stream.
+      expect(collides.text.replace('"id":"Read:0_relay1"', '"id":"Read:0"')).toBe(clean.text);
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  });
+
+  it("keeps a dialect-recovered tu_recovered_* id unless the conversation already holds it", async () => {
+    process.env.RP_BACKEND_KEY = "sk-nim";
+    try {
+      const envelope = '<tool_call>{"name":"Read","arguments":{"file":"README.md"}}</tool_call>';
+      const asText = JSON.stringify({
+        id: "cmpl_3", model: "m",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: envelope } }],
+      });
+      const call = async (req: object) => {
+        const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+          path: "/v1/messages",
+          method: "POST",
+          reqBuf: Buffer.from(JSON.stringify(req)),
+          reqJson: req,
+          anthropicHeaders: {},
+          wantsStream: false,
+          signal: AbortSignal.timeout(1000),
+        }, async () => new Response(asText, { headers: { "content-type": "application/json" } }));
+        return { id: ((await res.json()) as any).content[0].id, dialect: res.headers.get("x-llm-relay-tool-dialect") };
+      };
+
+      const untouched = await call(conversation("Read:0"));
+      expect(untouched.id).toBe("tu_recovered_0");
+      expect(untouched.dialect).toBe("recovered");
+
+      const colliding = await call(conversation("tu_recovered_0"));
+      expect(colliding.id).toBe("tu_recovered_0_relay1");
+      // Still announced as recovered: the marker survives the mint.
+      expect(colliding.dialect).toBe("recovered");
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  });
+
+  it("leaves a native Anthropic passthrough byte-identical, header included", async () => {
+    const anthropic: ResolvedTarget = {
+      provider: "anthropic",
+      base: "https://anthropic-backend.test",
+      kind: "anthropic",
+      model: "routed-model",
+      authHeader: "x-api-key",
+      timeoutMs: 1000,
+    };
+    const req = conversation("Read:0");
+    const raw = JSON.stringify({
+      id: "msg_1", type: "message", role: "assistant", model: "routed-model",
+      content: [{ type: "tool_use", id: "Read:0", name: "Read", input: { file: "README.md" } }],
+      stop_reason: "tool_use", stop_sequence: null,
+    });
+    const res = await fetchBackend(resolveAttempt(anthropic), {
+      path: "/v1/messages",
+      method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(req)),
+      reqJson: req,
+      anthropicHeaders: {},
+      wantsStream: false,
+      signal: AbortSignal.timeout(1000),
+    }, async () => new Response(raw, { headers: { "content-type": "application/json" } }));
+
+    // The pass is confined to the TRANSLATED seam: a vendor response is forwarded untouched.
+    expect(await res.text()).toBe(raw);
+    expect(res.headers.get("x-llm-relay-tool-use-ids")).toBeNull();
+    expect(toolUseIdRewrites(res)).toBeUndefined();
+  });
+
+  /**
+   * The OpenAI front takes its byte-exact direct branch ONLY for openai-kind + Chat. Every other
+   * combination — a Codex `/v1/responses` turn on an openai-kind target, i.e. the operator's
+   * codex→kimi offload lane — is translated through `fetchBackend`, so it inherits the mint. That
+   * is desirable, but it must be announced there too: the front rebuilds the response, and a
+   * rewrite nobody is told about is the thing the announcement rule forbids.
+   */
+  it("mints and announces on the front's translated lane (Responses → openai-kind)", async () => {
+    process.env.RP_BACKEND_KEY = "sk-nim";
+    try {
+      const res = await fetchOpenAiFront(
+        resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")),
+        {
+          // `function_call_output.call_id` survives the Responses→Anthropic translation as a
+          // `tool_result.tool_use_id`, so the conversation's ids are visible to the taken-set.
+          reqJson: {
+            model: "m",
+            input: [
+              { role: "user", content: [{ type: "input_text", text: "read package.json" }] },
+              { type: "function_call", call_id: "Read:0", name: "Read", arguments: '{"file":"package.json"}' },
+              { type: "function_call_output", call_id: "Read:0", output: "{...}" },
+              { role: "user", content: [{ type: "input_text", text: "now read README.md" }] },
+            ],
+            tools: [{ type: "function", name: "Read", parameters: { type: "object", properties: { file: { type: "string" } } } }],
+          },
+          wantsStream: false,
+          protocol: "responses",
+          signal: AbortSignal.timeout(1000),
+        },
+        async () => new Response(openAiToolResponse("Read:0"), { status: 200, headers: { "content-type": "application/json" } }),
+      );
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as any;
+      expect(JSON.stringify(body)).toContain("Read:0_relay1");
+      expect(JSON.stringify(body)).not.toContain('"Read:0"');
+      // Announced on the rebuilt front response, and countable by the server for its log record.
+      expect(res.headers.get("x-llm-relay-tool-use-ids")).toBe("1 rewritten");
+      expect(toolUseIdRewrites(res)).toBe(1);
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  });
+
+  it("round-trips: the echoed id needs no reverse mapping to reach the backend", () => {
+    // The client sends the minted id back in BOTH the assistant tool_use and the user
+    // tool_result, and the request mapper forwards both verbatim — so the backend sees a
+    // consistent pair and the relay remembers nothing between requests. By construction.
+    const followUp = {
+      model: "claude-x",
+      messages: [
+        { role: "user", content: "read README.md" },
+        { role: "assistant", content: [{ type: "tool_use", id: "Read:0_relay1", name: "Read", input: { file: "README.md" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "Read:0_relay1", content: "# readme" }] },
+      ],
+    };
+    const mapped = anthropicRequestToOpenAi(followUp, { model: "moonshotai/kimi-k3" }) as any;
+    expect(mapped.messages[1].tool_calls[0].id).toBe("Read:0_relay1");
+    expect(mapped.messages[2]).toMatchObject({ role: "tool", tool_call_id: "Read:0_relay1" });
   });
 });

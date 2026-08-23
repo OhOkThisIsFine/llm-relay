@@ -7,6 +7,7 @@ import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
 import { stripOpeningThinkTag, stripThinkTagsInStream } from "./think-tags.js";
+import { knownToolUseIds, rewriteToolUseIds, rewriteToolUseIdsInStream } from "./tool-use-ids.js";
 import { STREAM_PREFLIGHT_LIMIT } from "./stream-commit.js";
 import {
   inspectDialectInOpenAiChat,
@@ -165,6 +166,21 @@ export const PAID_HEADER = "x-llm-relay-paid";
 export const TOOL_DIALECT_HEADER = "x-llm-relay-tool-dialect";
 
 /**
+ * `tool_use` ids in this response were MINTED by the relay because the host reused ones the
+ * conversation already carried — value `"<n> rewritten"`.
+ *
+ * Same maxim as `DEGRADED_HEADER`: an automatic fix is acceptable only because it is announced.
+ * A count, never an id: the ids themselves are in the body the caller already has, and a header
+ * is not the place to restate content.
+ *
+ * ⚠ Buffered responses only. On a stream the headers are written before the first
+ * `content_block_start` exists, so a count there could only be a guess; the streaming pass
+ * reports through `toolUseIdRewrites()` instead, which the server reads for its log record after
+ * the stream drains. See `src/tool-use-ids.ts`.
+ */
+export const TOOL_USE_IDS_HEADER = "x-llm-relay-tool-use-ids";
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both
@@ -194,6 +210,12 @@ type ResponseProtocol = "openai-chat" | "anthropic-messages";
 
 interface UpstreamResponseMetadata {
   reportedModel?: string;
+  /**
+   * How many `tool_use` ids the relay had to mint for this response (`tool-use-ids.ts`). Mutable
+   * after the Response exists on purpose: on a stream the pass runs while the body drains, and the
+   * server reads this where it reports end-of-stream facts. A count, never an id.
+   */
+  toolUseIdRewrites?: number;
 }
 
 // Response provenance is private process state, not a wire header: callers can
@@ -227,6 +249,17 @@ export function postHeaderBodyFailure(response: Response): PostHeaderBodyFailure
 /** Raw model id stated by the upstream response, before any relay translation. */
 export function upstreamReportedModel(response: Response): string | undefined {
   return upstreamResponseMetadata.get(response)?.reportedModel;
+}
+
+/**
+ * How many `tool_use` ids this response had minted, or `undefined` when none were.
+ *
+ * On a streamed response the figure is final only once the body has drained — read it where the
+ * server reports end-of-stream facts, not before it writes headers.
+ */
+export function toolUseIdRewrites(response: Response): number | undefined {
+  const n = upstreamResponseMetadata.get(response)?.toolUseIdRewrites;
+  return n !== undefined && n > 0 ? n : undefined;
 }
 
 function attachUpstreamMetadata(response: Response, metadata: UpstreamResponseMetadata): Response {
@@ -652,10 +685,26 @@ export async function fetchBackend(
       // declaring tools: with none declared there is no call to recover, and wrapping the stream
       // would add holdback latency for nothing.
       const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
-      const body = schemas.size > 0 ? recoverDialectInStream(strippedStream, schemas) : strippedStream;
+      const recovered = schemas.size > 0 ? recoverDialectInStream(strippedStream, schemas) : strippedStream;
+      // AFTER recovery, so a call the relay reconstructed is covered too, and BEFORE anything that
+      // watches for the first `tool_use` — validation and repair must see the ids the client will.
+      // The taken-set is a thunk: a response with no tool call never walks the conversation.
+      // ⚠ Deliberately NOT gated on `schemas.size > 0` like the line above, and the asymmetry is
+      // the point: recovery needs a schema to parse a call out of text, uniqueness needs only an
+      // id to exist. A host may emit `tool_calls` a request never declared — Claude Code's compact
+      // turn declares none while the conversation it summarizes is full of tool_use ids — and that
+      // is exactly the turn the normalizer would empty to `[Tool use interrupted]`. The framing
+      // holdback is already paid by `stripThinkTagsInStream` above, and an event with no
+      // `tool_use` substring costs one scan, so the gate would buy little and lose that case.
+      const metadata = preflight.metadata;
+      const body = rewriteToolUseIdsInStream(
+        recovered,
+        () => knownToolUseIds(args.reqJson),
+        (count) => { metadata.toolUseIdRewrites = count; },
+      );
       return attachUpstreamMetadata(
         new Response(body, { status: res.status, headers: { "content-type": "text/event-stream" } }),
-        preflight.metadata,
+        metadata,
       );
     } catch (e) {
       return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
@@ -693,6 +742,12 @@ export async function fetchBackend(
     // the relay mapper rather than the provider or its failure budget.
     return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
   }
+  // A host that reuses a tool-call id across turns makes Claude Code drop the call while building
+  // its next request; mint a fresh one where it collides. The pass runs on the TRANSLATED message,
+  // so a dialect-recovered call is covered too and keeps its `tu_recovered_*` id unless that id is
+  // itself already in the conversation. See `src/tool-use-ids.ts`.
+  const mintedIds = mintUniqueToolUseIds(anthropicJson, args.reqJson);
+  if (mintedIds.message) anthropicJson = mintedIds.message;
   // Announce a recovered call for the same reason `x-llm-relay-degraded` is announced: a response
   // whose tool call the RELAY reconstructed is not the same as one that arrived correct, and an
   // unflagged reconstruction is indistinguishable from a host that worked.
@@ -702,11 +757,35 @@ export async function fetchBackend(
     headers: {
       "content-type": "application/json",
       ...(recoveredDialect ? { [TOOL_DIALECT_HEADER]: recoveredDialect } : {}),
+      ...(mintedIds.rewritten > 0
+        ? { [TOOL_USE_IDS_HEADER]: `${mintedIds.rewritten} rewritten` }
+        : {}),
     },
   });
   const metadata: UpstreamResponseMetadata = {};
   captureReportedModel(metadata, upstreamJson, "openai-chat", false);
+  if (mintedIds.rewritten > 0) metadata.toolUseIdRewrites = mintedIds.rewritten;
   return attachUpstreamMetadata(response, metadata);
+}
+
+/**
+ * Give a translated message's `tool_use` blocks ids the conversation has not already used.
+ *
+ * Lazy on purpose: a response with no `tool_use` block never walks the request's messages, so the
+ * ordinary text completion — the overwhelming majority of traffic — pays one array scan. `message`
+ * is null when nothing changed, so an untouched response is never re-built.
+ */
+function mintUniqueToolUseIds(
+  message: object,
+  reqJson: unknown,
+): { message: object | null; rewritten: number } {
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content) || !content.some((b) => isRecord(b) && b.type === "tool_use")) {
+    return { message: null, rewritten: 0 };
+  }
+  const out = rewriteToolUseIds(content, knownToolUseIds(reqJson));
+  if (out.rewritten === 0) return { message: null, rewritten: 0 };
+  return { message: { ...message, content: out.content }, rewritten: out.rewritten };
 }
 
 /** Did this translated message carry a tool call the relay reconstructed from text? */
@@ -1400,9 +1479,17 @@ export async function fetchOpenAiFront(
   }
 
   try {
+    // This front's TRANSLATED lane runs through `fetchBackend`, so an `openai`-kind target reached
+    // from `/v1/responses` inherits the id mint. Rebuilding the body must not swallow the
+    // announcement — an automatic fix is acceptable only because it is announced, and the count
+    // is as true here as it was one Response ago.
+    const minted = backendRes.headers.get(TOOL_USE_IDS_HEADER);
     const response = new Response(JSON.stringify(anthropicMessageToOpenAi(body as Record<string, unknown>, protocol, target.model ?? String(base.model ?? ""))), {
       status: backendRes.status,
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(minted ? { [TOOL_USE_IDS_HEADER]: minted } : {}),
+      },
     });
     return metadata ? attachUpstreamMetadata(response, metadata) : response;
   } catch (e) {

@@ -1616,3 +1616,79 @@ describe("outbound request shape holds on the FAILOVER candidate too", () => {
     }
   });
 });
+
+/**
+ * The id-minting pass runs on whichever candidate ACTUALLY serves — so it has to survive a walk,
+ * not just a single hop. Two candidates throughout (see the file header): with one, "the pass ran
+ * on the serving candidate" and "the pass ran on the only candidate" are the same observation.
+ */
+describe("Messages front — tool_use ids minted on the serving candidate", () => {
+  const TOOL_BODY = JSON.stringify({
+    id: "cmpl_tool",
+    choices: [{
+      finish_reason: "tool_calls",
+      message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "Read:0", function: { name: "Read", arguments: '{"file":"README.md"}' } }],
+      },
+    }],
+  });
+
+  const conversation = {
+    model: "pool/coding",
+    max_tokens: 64,
+    messages: [
+      { role: "user", content: "read package.json" },
+      { role: "assistant", content: [{ type: "tool_use", id: "Read:0", name: "Read", input: { file: "package.json" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "Read:0", content: "{}" }] },
+      { role: "user", content: "now read README.md" },
+    ],
+    tools: [{ name: "Read", description: "r", input_schema: { type: "object", properties: { file: { type: "string" } } } }],
+  };
+
+  it("rewrites the colliding id after a 429 on the first candidate", async () => {
+    const busy = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "TPM exceeded" } }) }));
+    const winner = await scripted(() => ({ body: TOOL_BODY }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(busy.server)}`,
+      `http://127.0.0.1:${port(winner.server)}`,
+    ])));
+
+    const response = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify(conversation),
+    });
+    const body = (await response.json()) as { content: Array<{ type: string; id?: string }>; stop_reason: string };
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+    expect(response.headers.get(POOL_ATTEMPTS_HEADER)).toContain("2 tried");
+    // The client never sees the id it already has in this conversation — which is what stops its
+    // request-time normalizer dropping the call and emptying the turn.
+    expect(body.stop_reason).toBe("tool_use");
+    expect(body.content[0]).toEqual({ type: "tool_use", id: "Read:0_relay1", name: "Read", input: { file: "README.md" } });
+    expect(response.headers.get("x-llm-relay-tool-use-ids")).toBe("1 rewritten");
+  });
+
+  it("leaves a non-colliding id alone on the same two-candidate walk", async () => {
+    const busy = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "TPM exceeded" } }) }));
+    const winner = await scripted(() => ({ body: TOOL_BODY }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(busy.server)}`,
+      `http://127.0.0.1:${port(winner.server)}`,
+    ])));
+
+    const response = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ ...conversation, messages: [{ role: "user", content: "read README.md" }] }),
+    });
+    const body = (await response.json()) as { content: Array<{ id?: string }> };
+
+    expect(response.status).toBe(200);
+    expect(body.content[0]!.id).toBe("Read:0");
+    expect(response.headers.get("x-llm-relay-tool-use-ids")).toBeNull();
+  });
+});

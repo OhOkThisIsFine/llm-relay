@@ -1223,3 +1223,139 @@ function weatherToolsForDropTest(): object[] {
     { name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
   ];
 }
+
+/**
+ * The streaming half of the id-minting pass, end to end.
+ *
+ * A stream cannot carry `x-llm-relay-tool-use-ids` — the headers are written long before the
+ * first `content_block_start` exists — so the honest surface there is the metadata-only log
+ * counter, written after the stream drains. This drives a real request through the proxy to pin
+ * both: the client's SSE carries the minted id, and the log line carries the COUNT (never an id).
+ */
+describe("tool_use id minting on the streamed Messages front", () => {
+  let dir: string;
+  let logFile: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-toolid-"));
+    logFile = join(dir, "log.jsonl");
+  });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it("rewrites a repeated streamed id and reports the count in the log, not in a header", async () => {
+    const chunk = (delta: object, finish: string | null = null) =>
+      `data: ${JSON.stringify({ id: "cmpl", model: "kimi", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+    const backend = await mockBackend(() => ({
+      headers: { "content-type": "text/event-stream" },
+      body: [
+        chunk({ role: "assistant" }),
+        chunk({ tool_calls: [{ index: 0, id: "Read:0", function: { name: "Read", arguments: "" } }] }),
+        chunk({ tool_calls: [{ index: 0, function: { arguments: '{"file":"README.md"}' } }] }),
+        chunk({}, "tool_calls"),
+        "data: [DONE]\n\n",
+      ].join(""),
+    }));
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { kimi: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
+      routing: { default: "kimi/moonshotai-kimi-k3", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "metadata", file: logFile },
+    };
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "kimi/moonshotai-kimi-k3",
+        stream: true,
+        max_tokens: 64,
+        messages: [
+          { role: "user", content: "read package.json" },
+          { role: "assistant", content: [{ type: "tool_use", id: "Read:0", name: "Read", input: { file: "package.json" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "Read:0", content: "{}" }] },
+          { role: "user", content: "now read README.md" },
+        ],
+        tools: [{ name: "Read", input_schema: { type: "object", properties: { file: { type: "string" } } } }],
+      }),
+    });
+    const sse = await resp.text();
+
+    expect(resp.status).toBe(200);
+    expect(sse).toContain('"id":"Read:0_relay1"');
+    expect(sse).not.toContain('"id":"Read:0"');
+    // Headers precede the first tool call, so nothing is claimed there.
+    expect(resp.headers.get("x-llm-relay-tool-use-ids")).toBeNull();
+
+    const rec = lastLogLine(logFile);
+    expect(rec["toolUseIdRewrites"]).toBe(1);
+    expect(JSON.stringify(rec)).not.toContain("Read:0");
+  });
+});
+
+/**
+ * The OpenAI front's TRANSLATED lane inherits the mint (it runs through `fetchBackend`), so it
+ * owes the same two announcements. This is the operator's codex→kimi offload shape: a
+ * `/v1/responses` turn resolved to an openai-kind target. Before this test the served log record
+ * on this front was the one site that did not carry the counter — a Codex lane reported the mint
+ * only when the stream FAILED.
+ */
+describe("tool_use id minting on the OpenAI Responses front", () => {
+  let dir: string;
+  let logFile: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-toolid-front-"));
+    logFile = join(dir, "log.jsonl");
+  });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it("mints a colliding id, announces it in the header and counts it in the served log line", async () => {
+    const backend = await mockBackend(() => ({
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "cmpl_1",
+        model: "kimi",
+        choices: [{
+          finish_reason: "tool_calls",
+          message: { role: "assistant", content: null, tool_calls: [{ id: "Read:0", function: { name: "Read", arguments: '{"file":"README.md"}' } }] },
+        }],
+      }),
+    }));
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { kimi: { base: `http://127.0.0.1:${port(backend)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
+      routing: { default: "kimi/moonshotai-kimi-k3", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "metadata", file: logFile },
+    };
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "kimi/moonshotai-kimi-k3",
+        max_output_tokens: 64,
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "read package.json" }] },
+          { type: "function_call", call_id: "Read:0", name: "Read", arguments: '{"file":"package.json"}' },
+          { type: "function_call_output", call_id: "Read:0", output: "{}" },
+          { role: "user", content: [{ type: "input_text", text: "now read README.md" }] },
+        ],
+        tools: [{ type: "function", name: "Read", parameters: { type: "object", properties: { file: { type: "string" } } } }],
+      }),
+    });
+    const out = await resp.text();
+
+    expect(resp.status).toBe(200);
+    expect(out).toContain("Read:0_relay1");
+    expect(resp.headers.get("x-llm-relay-tool-use-ids")).toBe("1 rewritten");
+
+    const rec = lastLogLine(logFile);
+    expect(rec["path"]).toBe("/v1/responses");
+    expect(rec["toolUseIdRewrites"]).toBe(1);
+    expect(JSON.stringify(rec)).not.toContain("Read:0");
+  });
+});
