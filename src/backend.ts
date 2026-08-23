@@ -2,6 +2,7 @@ import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bri
 import { buildAuthHeaders } from "./authEnv.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
+import { anthropicRequestToOpenAi, RequestMappingError } from "./openai-request.js";
 import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
@@ -534,8 +535,10 @@ export async function fetchBackend(
   }
 
   // kind === "openai"
-  // llm-bridge stringifies any block type it doesn't know, which would put a document's
-  // whole base64 payload in the prompt. Convert documents to markdown first, or refuse.
+  // Documents are transcoded to markdown BEFORE the request mapper, or refused: a `document`
+  // block has no OpenAI representation, and the pre-mapper behaviour put its whole base64
+  // payload into the prompt. The pre-pass walks the top level of each turn AND the content of
+  // each `tool_result`, so a document a tool returned is converted rather than refused.
   let reqJson = args.reqJson;
   try {
     reqJson = await transcodeDocuments(reqJson);
@@ -548,12 +551,17 @@ export async function fetchBackend(
 
   let openaiBody: Record<string, unknown>;
   try {
-    openaiBody = translateBetweenProviders("anthropic", "openai", (reqJson ?? {}) as never) as Record<string, unknown>;
+    // The REQUEST direction is relay-owned (`openai-request.ts`); only the RESPONSE direction is
+    // still llm-bridge's. llm-bridge's `universalToOpenAI` has no case for a tool_call/tool_result
+    // block, so it stringified its own IR envelope into the outbound prompt — see
+    // docs/tool-call-dialect-leak.md §"Second mechanism".
+    openaiBody = anthropicRequestToOpenAi(reqJson, { model: target.model, stream: args.wantsStream });
   } catch (e) {
+    // A block we will not put on the wire is the caller's request being unrepresentable, not a
+    // provider failure — same clean local 400 as an unconvertible document.
+    if (e instanceof RequestMappingError) return anthropicError(400, `llm-relay: ${e.message}`, "local");
     return anthropicError(502, `request translation failed: ${(e as Error).message}`, "local");
   }
-  openaiBody.model = target.model;
-  openaiBody.stream = args.wantsStream;
   // OpenAI-compatible backends omit usage from streamed responses unless asked. Without
   // this the translated `message_delta` reports output_tokens: 0 and anything metering
   // off the stream undercounts. Not universally supported — see the 400 retry below.

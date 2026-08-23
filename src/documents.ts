@@ -9,8 +9,12 @@
  * document is worse than refusing it.
  *
  * So for `kind: "openai"` targets we transcode documents to markdown BEFORE handing
- * the request to llm-bridge, and fail clean when we can't. Anthropic-kind targets are
- * untouched — they handle documents natively.
+ * the request to the request mapper (`openai-request.ts`), and fail clean when we
+ * can't. Anthropic-kind targets are untouched — they handle documents natively.
+ *
+ * The walk covers a document at the top level of a turn AND one nested inside a
+ * `tool_result` — a tool that returns a PDF puts the block one level down, where a
+ * top-level-only scan never saw it and the mapper then refused the whole turn.
  *
  * MarkItDown is an external Python CLI and deliberately an OPTIONAL dependency: a Node
  * package cannot assume a Python toolchain. When it is missing, a request carrying a
@@ -216,15 +220,39 @@ function replaceControlCharacters(value: string): string {
   return out;
 }
 
-/** True if the request carries at least one `document` content block. */
+/** True if this content block is a `document`. */
+function isDocument(block: unknown): boolean {
+  return (block as { type?: string })?.type === "document";
+}
+
+/**
+ * The nested content-block list a `tool_result` carries, or null for every other block.
+ *
+ * One level deep is the whole schema: a `tool_result` may hold text/image/document blocks, and
+ * nothing may hold a `tool_result`. So this is a generalization of the same walk, not a
+ * recursive descent.
+ */
+function nestedContent(block: unknown): unknown[] | null {
+  const b = block as { type?: string; content?: unknown };
+  return b?.type === "tool_result" && Array.isArray(b.content) ? b.content : null;
+}
+
+/** True if a content-block list carries a `document`, at its own level or inside a `tool_result`. */
+function listHasDocument(content: unknown[]): boolean {
+  return content.some((b) => isDocument(b) || (nestedContent(b)?.some(isDocument) ?? false));
+}
+
+/**
+ * True if the request carries at least one `document` content block — at the top level of a
+ * turn, or nested inside a `tool_result`.
+ */
 export function hasDocumentBlocks(body: unknown): boolean {
   const messages = (body as { messages?: unknown })?.messages;
   if (!Array.isArray(messages)) return false;
-  return messages.some(
-    (m) =>
-      Array.isArray((m as { content?: unknown })?.content) &&
-      (m as { content: unknown[] }).content.some((b) => (b as { type?: string })?.type === "document"),
-  );
+  return messages.some((m) => {
+    const content = (m as { content?: unknown })?.content;
+    return Array.isArray(content) && listHasDocument(content);
+  });
 }
 
 /**
@@ -241,32 +269,42 @@ export async function transcodeDocuments(body: unknown, opts: TranscodeOptions =
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const run = opts.runner ?? runMarkItDown;
 
+  /** One `document` block -> the fenced markdown `text` block that replaces it. */
+  const convert = async (block: unknown): Promise<unknown> => {
+    const b = block as Record<string, unknown>;
+    const decoded = decodeSource(b, maxBytes);
+    const text = "text" in decoded ? decoded.text : await run(decoded.buf, decoded.ext, { command, timeoutMs });
+    const title = labelTitle(b.title);
+    const converted = text.trim();
+    if (!converted) throw new DocumentError(`markitdown produced no text for ${title}`);
+    const tag = fenceTag(converted, title);
+    return {
+      type: "text",
+      // Fenced so the model reads it as an attachment, not as instructions from the
+      // user. The tag comes from `fenceTag` (content-derived) and NOT from the title:
+      // the delimiter must not be something the client can choose, or it can close
+      // the fence early and have the rest read as its own instructions.
+      text: `<${tag} title="${title}">\n${converted}\n</${tag}>`,
+      ...(b.cache_control ? { cache_control: b.cache_control } : {}),
+    };
+  };
+
   const src = body as { messages: unknown[] };
   const messages = await Promise.all(
     src.messages.map(async (msg) => {
       const content = (msg as { content?: unknown }).content;
       if (!Array.isArray(content)) return msg;
-      if (!content.some((b) => (b as { type?: string })?.type === "document")) return msg;
+      if (!listHasDocument(content)) return msg;
 
       const blocks = await Promise.all(
         content.map(async (block) => {
-          if ((block as { type?: string })?.type !== "document") return block;
-          const b = block as Record<string, unknown>;
-          const decoded = decodeSource(b, maxBytes);
-          const text = "text" in decoded ? decoded.text : await run(decoded.buf, decoded.ext, { command, timeoutMs });
-          const title = labelTitle(b.title);
-          const converted = text.trim();
-          if (!converted) throw new DocumentError(`markitdown produced no text for ${title}`);
-          const tag = fenceTag(converted, title);
-          return {
-            type: "text",
-            // Fenced so the model reads it as an attachment, not as instructions from the
-            // user. The tag comes from `fenceTag` (content-derived) and NOT from the title:
-            // the delimiter must not be something the client can choose, or it can close
-            // the fence early and have the rest read as its own instructions.
-            text: `<${tag} title="${title}">\n${converted}\n</${tag}>`,
-            ...(b.cache_control ? { cache_control: b.cache_control } : {}),
-          };
+          if (isDocument(block)) return convert(block);
+          const nested = nestedContent(block);
+          if (!nested || !nested.some(isDocument)) return block;
+          // Same conversion one level down. The `tool_result` keeps its `tool_use_id` and its
+          // other blocks; only the document is replaced, so the result still answers its call.
+          const inner = await Promise.all(nested.map(async (b) => (isDocument(b) ? convert(b) : b)));
+          return { ...(block as object), content: inner };
         }),
       );
       return { ...(msg as object), content: blocks };
