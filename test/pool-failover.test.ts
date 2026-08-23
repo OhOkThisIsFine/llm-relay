@@ -1470,3 +1470,149 @@ describe("first-event in-band error frames fail over pre-commit (adoption review
     expect(await resp.text()).toContain("Overloaded");
   });
 });
+
+/**
+ * The outbound request body survives a WALK — the ≥2-candidate half of the tool-call IR leak fix.
+ *
+ * ⚠ A request-side defect pinned on a single-candidate walk proves nothing, the same rule this
+ * file was written for: the mapper runs once per candidate, so "the first attempt is clean" and
+ * "every attempt is clean" are different claims. `src/openai-request.ts` is deterministic and
+ * takes the caller's body, not a per-attempt mutation of it, and this pins that.
+ */
+describe("outbound request shape holds on the FAILOVER candidate too", () => {
+  /** `scripted`, but keeping the request bodies — here the outbound wire shape IS the assertion. */
+  function recording(
+    reply: (n: number) => { status?: number; headers?: Record<string, string>; body: string },
+  ): Promise<{ server: Server; bodies: () => any[] }> {
+    const bodies: any[] = [];
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          try { bodies.push(JSON.parse(Buffer.concat(chunks).toString())); } catch { bodies.push(null); }
+          const out = reply(bodies.length);
+          res.writeHead(out.status ?? 200, { "content-type": "application/json", ...out.headers });
+          res.end(out.body);
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), bodies: () => bodies }));
+    });
+  }
+
+  const RATE_LIMITED = JSON.stringify({ error: { message: "rate limited", type: "rate_limit_error" } });
+
+  /** A Claude Code agentic turn: parallel tool_use answered by parallel tool_result. */
+  const AGENTIC_MESSAGES = [
+    { role: "user", content: "find and read it" },
+    { role: "assistant", content: [
+      { type: "text", text: "Searching." },
+      { type: "tool_use", id: "toolu_01A", name: "Grep", input: { pattern: "protocol" } },
+      { type: "tool_use", id: "toolu_01B", name: "Read", input: { file_path: "src/backend.ts" } },
+    ] },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_01A", content: "SECRET-GREP" },
+      { type: "tool_result", tool_use_id: "toolu_01B", content: "SECRET-BODY" },
+    ] },
+  ];
+
+  function assertCleanOutbound(body: any): void {
+    expect(JSON.stringify(body)).not.toContain("_original");
+    const asst = body.messages.find((m: any) => m.role === "assistant");
+    expect(asst.tool_calls.map((c: any) => c.id)).toEqual(["toolu_01A", "toolu_01B"]);
+    expect(body.messages.filter((m: any) => m.role === "tool").map((m: any) => m.tool_call_id))
+      .toEqual(["toolu_01A", "toolu_01B"]);
+    expect(JSON.stringify(body).split("SECRET-BODY").length - 1).toBe(1);
+  }
+
+  it("Anthropic front → openai-kind: the second candidate sees the same clean body as the first", async () => {
+    const a = await recording(() => ({ status: 429, body: RATE_LIMITED }));
+    const b = await recording(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "pool/coding", max_tokens: 64, messages: AGENTIC_MESSAGES,
+        tools: [{ name: "Grep", description: "g", input_schema: { type: "object", properties: { pattern: { type: "string" } } } }],
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(a.bodies()).toHaveLength(1);
+    expect(b.bodies()).toHaveLength(1);
+    assertCleanOutbound(a.bodies()[0]);
+    assertCleanOutbound(b.bodies()[0]);
+    // Same translation both times — the mapper reads the caller's body, never a walk-local copy.
+    expect(b.bodies()[0].messages).toEqual(a.bodies()[0].messages);
+  });
+
+  it("OpenAI front → openai-kind Chat stays byte-transparent on both candidates (the untouched front)", async () => {
+    // The Chat/Chat pair never enters `anthropicRequestToOpenAi`: `fetchOpenAiFront` proxies the
+    // caller's own OpenAI body. Pinned here so a future change to the request mapper cannot
+    // silently start rewriting a front that is supposed to pass through.
+    const a = await recording(() => ({ status: 429, body: RATE_LIMITED }));
+    const b = await recording(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const callerMessages = [
+      { role: "user", content: "find it" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "Grep", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "SECRET-BODY" },
+    ];
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", max_tokens: 20, messages: callerMessages }),
+    });
+
+    expect(resp.status).toBe(200);
+    for (const seen of [a.bodies()[0], b.bodies()[0]]) {
+      expect(seen.messages).toEqual(callerMessages);
+      expect(JSON.stringify(seen)).not.toContain("_original");
+      expect(JSON.stringify(seen).split("SECRET-BODY").length - 1).toBe(1);
+    }
+  });
+
+  it("an image inside a tool_result EGRESSES on both candidates instead of dying locally", async () => {
+    // The refusal this replaced raised a LOCAL 400, and `server.ts` sets `tryNext = false` for a
+    // local origin — so the walk never started and the client got a 400 it could not route
+    // around. Two candidates, because "it egressed once" and "it egresses on every candidate"
+    // are different claims and only the second one is the fix.
+    const a = await recording(() => ({ status: 429, body: RATE_LIMITED }));
+    const b = await recording(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "pool/coding", max_tokens: 64,
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_img", name: "Read", input: { file_path: "a.png" } }] },
+          { role: "user", content: [{
+            type: "tool_result", tool_use_id: "toolu_img",
+            content: [
+              { type: "text", text: "Read 1 image" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: "IMAGE-BYTES" } },
+            ],
+          }] },
+        ],
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(a.bodies()).toHaveLength(1);
+    expect(b.bodies()).toHaveLength(1);
+    for (const seen of [a.bodies()[0], b.bodies()[0]]) {
+      expect(seen.messages.map((m: any) => m.role)).toEqual(["assistant", "tool", "user"]);
+      // Text on the tool message; the image on the user message that follows it.
+      expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_img", content: "Read 1 image" });
+      expect(seen.messages[2].content).toEqual([
+        { type: "image_url", image_url: { url: "data:image/png;base64,IMAGE-BYTES" } },
+      ]);
+      expect(JSON.stringify(seen)).not.toContain("_original");
+    }
+  });
+});

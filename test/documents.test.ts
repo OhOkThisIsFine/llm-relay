@@ -12,6 +12,27 @@ function withDocument(source: Record<string, unknown>, extra: Record<string, unk
   };
 }
 
+/**
+ * The same document one level down, inside a `tool_result` — the shape a tool that returns a PDF
+ * produces. The top-level-only walk never reached it, so it survived to the request mapper and
+ * refused the whole turn with a clean-but-fatal local 400.
+ */
+function withNestedDocument(extra: Record<string, unknown> = {}) {
+  return {
+    model: "claude-3-5-sonnet",
+    messages: [
+      { role: "user", content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_doc",
+        content: [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: PDF_B64 }, ...extra },
+          { type: "text", text: "attached" },
+        ],
+      }] },
+    ],
+  };
+}
+
 const runner = async () => "# Heading\n\nExtracted body text.";
 
 /** The fence tag a converted block opened with. */
@@ -28,6 +49,17 @@ describe("hasDocumentBlocks", () => {
     expect(hasDocumentBlocks({ messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] })).toBe(false);
     expect(hasDocumentBlocks({})).toBe(false);
   });
+
+  it("sees a document nested inside a tool_result, and is not fooled by a plain one", () => {
+    expect(hasDocumentBlocks(withNestedDocument())).toBe(true);
+    expect(hasDocumentBlocks({ messages: [{ role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "text", text: "plain" }] },
+    ] }] })).toBe(false);
+    // A string-content tool_result has no blocks to walk.
+    expect(hasDocumentBlocks({ messages: [{ role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_1", content: "plain" },
+    ] }] })).toBe(false);
+  });
 });
 
 describe("transcodeDocuments", () => {
@@ -42,6 +74,21 @@ describe("transcodeDocuments", () => {
     expect(tag).toMatch(/^document-[0-9a-f]{12}$/);
     expect(doc.text).toBe(`<${tag} title="report">\n# Heading\n\nExtracted body text.\n</${tag}>`);
     expect(sibling).toEqual({ type: "text", text: "summarize" });
+  });
+
+  it("transcodes a document nested inside a tool_result, keeping the result's linkage", async () => {
+    const out = (await transcodeDocuments(withNestedDocument({ title: "report" }), { runner })) as any;
+    const result = out.messages[0].content[0];
+    // The tool_result survives as itself: dropping `tool_use_id` would detach the answer from
+    // the call it answers, which strict hosts reject outright.
+    expect(result.type).toBe("tool_result");
+    expect(result.tool_use_id).toBe("toolu_doc");
+    const [doc, sibling] = result.content;
+    const tag = openTag(doc.text);
+    expect(doc).toEqual({ type: "text", text: `<${tag} title="report">\n# Heading\n\nExtracted body text.\n</${tag}>` });
+    expect(sibling).toEqual({ type: "text", text: "attached" });
+    // And no base64 reaches the prompt — the whole point of the pre-pass.
+    expect(JSON.stringify(out)).not.toContain(PDF_B64);
   });
 
   it("derives the fence tag from the content, so identical documents fence identically", async () => {

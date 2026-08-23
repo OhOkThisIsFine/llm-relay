@@ -5,6 +5,15 @@ fixed for the translated buffered path in 0.33.0, translated streaming in **0.34
 OpenAI direct passthrough on main on 2026-08-14; the specific incident **not reproduced** (see
 Status and Coverage).
 
+⚠ **There are TWO mechanisms with the same symptom**, and they call for opposite fixes. The one
+below is *host-dependent*: a host failed to parse its model's native dialect, and the relay
+recovers it. The second — [§ Second mechanism](#second-mechanism-2026-08-23--relay-authored-notation-host-independent)
+— is *relay-caused and host-independent*: the relay taught every openai-kind backend a bogus
+notation by writing its own IR into the outbound prompt. Read that section first if the blob the
+client received is **JSON** rather than vendor markup. ⚠ Its diagnostic tell is at the end of this
+document; the "a dialect death produces almost none of the output" rule below **does not hold** for
+it — those runs did 474–1571 s of real work before leaking.
+
 ## The report
 
 Relay-pool dispatches were failing in a way first read as "long jobs die". They were not.
@@ -139,3 +148,102 @@ public host**: every known host that could reproduce the leak remains cost-block
 
 Detection itself is already correct for the truncated case: markers deliberately omit the `<` / `</`
 prefix so a tail of closing tags is recognized. A unit test pins exactly the observed 70-byte body.
+
+---
+
+## Second mechanism (2026-08-23) — relay-authored notation, host-independent
+
+**Different cause, same symptom.** The section above is about a HOST that failed to parse its
+model's dialect. This one is about the RELAY teaching every `openai`-kind backend a tool-call
+notation that does not exist, and then being unable to recognise it coming back.
+
+### What happened
+
+`fetchBackend()` handed the whole Anthropic conversation to llm-bridge's
+`translateBetweenProviders("anthropic", "openai", …)`. llm-bridge 2.0.1's `universalToOpenAI` has
+**no case for a `tool_call` or `tool_result` universal block**, so both fell through to its generic
+`JSON.stringify(content)` fallback (`node_modules/llm-bridge/dist/index.mjs:1275`) and became
+`{type:"text"}` parts of the OUTBOUND prompt, carrying llm-bridge's own IR envelope:
+
+```json
+{"_original":{"provider":"anthropic","raw":{"type":"tool_use","id":"toolu_01A", … }},
+ "tool_call":{"arguments":{…},"id":"toolu_01A","metadata":{"input":{…}},"name":"Grep"},
+ "type":"tool_call"}
+```
+
+The model read 4–24 copies of that in its own context and reproduced the pattern as literal
+assistant text; the relay forwarded it faithfully, the client rendered it as the final answer, and
+the harness ran no tool. Three side effects rode along on **every** openai-kind agentic request:
+
+- prompt inflation ~**3.1×** (a measured 6-turn transcript: 26,315 → 82,031 chars, 24 envelopes);
+- every tool result **triplicated** (`raw.content` + `metadata.content` + `result`);
+- `tool_calls` emitted with **no matching `role:"tool"` messages** — the OpenAI tool-result linkage
+  was lost entirely, so the host had nothing tying an answer to the call it answered.
+
+It fired deterministically on every assistant turn containing a `tool_use` and every user turn
+containing ≥2 `tool_result`s — i.e. essentially every agentic turn after the first. The model's
+echo is probabilistic, which is why it read as an intermittent model problem.
+
+### The diagnostic tell
+
+**The leaked ids are the model's own, never `toolu_*`.** Claude Code mints `toolu_…`; a serializer
+preserves it byte-for-byte. The fatal samples carried `"id":"Grep:0"` (Kimi's native `NAME:IDX`
+form) and RFC-4122 uuids, string-typed numerics (`"limit":"120"` — a serializer preserves JSON
+types, a model writing JSON prose does not), and one sample was structurally impossible for the
+serializer (`command`/`description` hoisted out of `input`, truncated mid-string, outer
+`"type":"text"`). That is the proof the text is the model echoing, not the relay flushing a buffer.
+
+Secondary tells: the client sees `stop_reason: end_turn` with a JSON blob as the answer; the run
+did substantial real work first; and a following `error/protocol` — "API Error: Server error
+mid-response" — is a *consequence*, not the leak. Committed text forecloses failover
+(`src/stream-commit.ts`), so any later upstream break lands post-commit. One captured run leaked
+with `exit=0` and no mid-stream error at all: **the leak alone destroys the run.**
+
+### The fix
+
+The request direction is now **relay-owned**: `src/openai-request.ts`
+(`anthropicRequestToOpenAi`) is a deterministic Anthropic-Messages → OpenAI-Chat request mapper,
+the mirror of the response-direction `anthropicMessageToOpenAi` already in `backend.ts`, and
+`fetchBackend()` calls it instead of llm-bridge. `tool_use` becomes `tool_calls`, each
+`tool_result` becomes its own `{role:"tool", tool_call_id, content}` message, and anything the
+mapper cannot represent is REFUSED with a clean local 400 — the `documents.ts` precedent, because
+a mangled prompt reads exactly like a working one. llm-bridge stays for the RESPONSE direction,
+where it is correct and heavily covered.
+
+Not fixed by patching llm-bridge: 2.0.1 is current and this is `universalToOpenAI`'s
+documented-by-omission behaviour, so the relay would stay one dependency bump from regressing.
+
+⚠ **And deliberately not fixed on the response side.** No JSON marker was added to
+`DIALECT_MARKERS`. An arbitrary JSON object is not a closed envelope, and promoting one to a
+`tool_use` would be fabricating intent — the one thing `src/tool-dialects.ts` must never do. A
+contract test in `test/dialect-stream.test.ts` pins that such text reaches the client as text.
+
+### What changed on the wire
+
+Every `openai`-kind target now receives a different (smaller, correctly linked) request body:
+
+- prompts shrink roughly threefold on agentic turns, and provider prompt caches miss once;
+- `role:"tool"` messages appear where there were none, so a stricter host may now behave
+  *differently* — better, but differently;
+- **`stop` is a NEW field.** llm-bridge never sent one — `universalToOpenAI` does not read
+  `provider_params.stop_sequences` — so a caller's `stop_sequences` silently did nothing and now
+  binds. It is forwarded uncapped: OpenAI Chat documents a maximum of **4**, so a request carrying
+  more can now be rejected by a strict host. That is an *upstream* 400, so it walks the pool (and
+  per CLAUDE.md records a breaker failure on each candidate) rather than dying locally — an honest
+  error, where silently dropping the 5th sequence would change what the model may emit;
+- **system text blocks now join with `\n\n`, not llm-bridge's single space.** That is the largest
+  and most cache-sensitive span of every request, so this is the change most likely to be visible
+  as a one-off prompt-cache miss. The blocks are independent documents (harness preamble, project
+  instructions) and a space ran the last word of one into the first word of the next;
+- an image inside a `tool_result` is no longer sent as a stringified blob **and is not refused
+  either**: an OpenAI tool message is text only, so the tool message carries the result's text and
+  the image rides as an `image_url` part on the `{role:"user"}` message that follows the turn's
+  tool messages. A host with no vision answers with its own upstream 400, which fails over;
+- a request carrying a content block the mapper does not model (a new Anthropic block type) now
+  returns a clean **400** naming the block instead of silently shipping a stringified blob.
+  `kind: "anthropic"` passthrough is untouched, and so is the OpenAI front's Chat→Chat
+  passthrough, which never enters this mapper.
+
+Coverage: outbound-shape tests in `test/backend.test.ts`, a ≥2-candidate walk in
+`test/pool-failover.test.ts` (the mapper runs once per candidate, so a single-candidate test would
+prove nothing), and the response-side contract test above.

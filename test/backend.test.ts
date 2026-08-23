@@ -13,6 +13,7 @@ import {
   upstreamReportedModel,
 } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
+import { anthropicRequestToOpenAi } from "../src/openai-request.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
 import { createUsageAccumulator } from "../src/usage-observer.js";
 
@@ -832,6 +833,397 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     expect(callCount).toBe(2);
     expect(canceled).toBe(true);
     expect(res.status).toBe(200);
+  });
+});
+
+/**
+ * The OUTBOUND request body for an openai-kind target — the half nothing asserted on before
+ * 2026-08-23, which is how the tool-call IR leak shipped.
+ *
+ * llm-bridge's `universalToOpenAI` had no case for a tool_call/tool_result universal block and
+ * fell through to `JSON.stringify(<universal block>)`, writing its own IR envelope
+ * (`{"_original":{"provider":"anthropic","raw":…},"tool_call":…,"type":"tool_call"}`) into
+ * `{type:"text"}` parts of the prompt. Models read the notation and echoed it back as their final
+ * answer; tool results were triplicated and no `role:"tool"` message was ever produced. See
+ * docs/tool-call-dialect-leak.md §"Second mechanism" and `src/openai-request.ts`.
+ */
+describe("fetchBackend (openai kind) — the outbound request is the caller's conversation", () => {
+  const OK_JSON = JSON.stringify({
+    id: "c", model: "m",
+    choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+  });
+
+  /** Exactly what the relay put on the wire for this Anthropic body. */
+  async function outbound(reqJson: Record<string, unknown>, wantsStream = false): Promise<any> {
+    let seen: any = null;
+    const res = await fetchBackend(resolveAttempt(openaiTarget("https://request-shape.test")), {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(reqJson)), reqJson,
+      anthropicHeaders: {}, wantsStream, signal: AbortSignal.timeout(5000),
+    }, async (_url, init) => {
+      seen = JSON.parse(String(init?.body));
+      return new Response(OK_JSON, { status: 200, headers: { "content-type": "application/json" } });
+    });
+    await res.text();
+    return seen;
+  }
+
+  /** Every relay-authored IR envelope recoverable from the outbound text parts. */
+  function leakedEnvelopes(body: any): any[] {
+    const out: any[] = [];
+    for (const m of body?.messages ?? []) {
+      const parts = Array.isArray(m.content) ? m.content : typeof m.content === "string" ? [{ text: m.content }] : [];
+      for (const p of parts) {
+        if (typeof p?.text !== "string") continue;
+        try {
+          const parsed = JSON.parse(p.text);
+          if (parsed && typeof parsed === "object" && "_original" in parsed) out.push(parsed);
+        } catch { /* prose, which is the point */ }
+      }
+    }
+    return out;
+  }
+
+  // A realistic Claude Code agentic transcript: parallel tool_use, then parallel tool_result.
+  const AGENTIC = {
+    model: "claude-x", max_tokens: 1024,
+    messages: [
+      { role: "user", content: "find and read it" },
+      { role: "assistant", content: [
+        { type: "text", text: "Searching now." },
+        { type: "tool_use", id: "toolu_01A", name: "Grep", input: { pattern: "protocol" } },
+        { type: "tool_use", id: "toolu_01B", name: "Read", input: { file_path: "src/backend.ts", limit: 120 } },
+      ] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_01A", content: "SECRET-GREP-OUTPUT" },
+        { type: "tool_result", tool_use_id: "toolu_01B", content: "SECRET-FILE-BODY" },
+      ] },
+    ],
+    tools: [{ name: "Grep", description: "g", input_schema: { type: "object", properties: { pattern: { type: "string" } } } }],
+  };
+
+  it("puts NO relay IR envelope into the prompt (the direct anti-regression)", async () => {
+    const seen = await outbound(AGENTIC);
+    expect(leakedEnvelopes(seen)).toEqual([]);
+    expect(JSON.stringify(seen)).not.toContain("_original");
+  });
+
+  it("maps one assistant tool_use to one tool_call, with the text intact and no IR", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "user", content: "read it" },
+        { role: "assistant", content: [
+          { type: "text", text: "Reading." },
+          { type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "a.ts" } },
+        ] },
+      ],
+    });
+    const asst = seen.messages.find((m: any) => m.role === "assistant");
+    expect(asst.tool_calls).toHaveLength(1);
+    expect(asst.tool_calls[0]).toEqual({
+      id: "toolu_1", type: "function",
+      function: { name: "Read", arguments: JSON.stringify({ file_path: "a.ts" }) },
+    });
+    expect(asst.content).toBe("Reading.");
+    expect(leakedEnvelopes(seen)).toEqual([]);
+  });
+
+  it("maps two parallel tool_use blocks to two tool_calls, content null when no text remains", async () => {
+    const seen = await outbound(AGENTIC);
+    const asst = seen.messages.find((m: any) => m.role === "assistant");
+    expect(asst.tool_calls.map((c: any) => c.id)).toEqual(["toolu_01A", "toolu_01B"]);
+    expect(asst.content).toBe("Searching now.");
+
+    const noText = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "private", signature: "s" },
+          { type: "tool_use", id: "toolu_9", name: "Read", input: {} },
+        ] },
+      ],
+    });
+    const bare = noText.messages.find((m: any) => m.role === "assistant");
+    expect(bare.content).toBeNull();
+    expect(bare.tool_calls).toHaveLength(1);
+    // Vendor-private reasoning is not representable and is never forwarded to another vendor.
+    expect(JSON.stringify(noText)).not.toContain("private");
+  });
+
+  it("turns two tool_results into two role:\"tool\" messages, each body appearing ONCE", async () => {
+    const seen = await outbound(AGENTIC);
+    const tools = seen.messages.filter((m: any) => m.role === "tool");
+    expect(tools).toEqual([
+      { role: "tool", tool_call_id: "toolu_01A", content: "SECRET-GREP-OUTPUT" },
+      { role: "tool", tool_call_id: "toolu_01B", content: "SECRET-FILE-BODY" },
+    ]);
+    // The old path triplicated each result (raw.content + metadata.content + result).
+    const wire = JSON.stringify(seen);
+    expect(wire.split("SECRET-FILE-BODY").length - 1).toBe(1);
+    expect(wire.split("SECRET-GREP-OUTPUT").length - 1).toBe(1);
+    // Every tool_call the assistant made is answered, and by the same id.
+    const asst = seen.messages.find((m: any) => m.role === "assistant");
+    expect(tools.map((m: any) => m.tool_call_id)).toEqual(asst.tool_calls.map((c: any) => c.id));
+  });
+
+  it("keeps a LONE tool_result clean — and now linked, which the old path lost", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_solo", name: "Read", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_solo", content: [{ type: "text", text: "r" }] }] },
+      ],
+    });
+    // llm-bridge's one working case emitted `{role:"user", content:"r"}` — no IR, but the
+    // tool_call_id linkage was gone, so the host could not tell which call this answered.
+    expect(seen.messages.at(-1)).toEqual({ role: "tool", tool_call_id: "toolu_solo", content: "r" });
+  });
+
+  it("emits the tool messages FIRST when a user turn mixes results with text", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_m", name: "Read", input: {} }] },
+        { role: "user", content: [
+          { type: "text", text: "and also do this" },
+          { type: "tool_result", tool_use_id: "toolu_m", content: "done" },
+        ] },
+      ],
+    });
+    expect(seen.messages.map((m: any) => m.role)).toEqual(["assistant", "tool", "user"]);
+    expect(seen.messages.at(-1)).toEqual({ role: "user", content: "and also do this" });
+  });
+
+  it("maps system, images, tools, tool_choice and stop_sequences", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 256, temperature: 0.2, top_p: 0.9,
+      stop_sequences: ["</done>", "STOP"],
+      system: [
+        { type: "text", text: "You are a relay.", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "Project rules." },
+      ],
+      messages: [{ role: "user", content: [
+        { type: "text", text: "what is this?" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+      ] }],
+      tools: [
+        { name: "Read", description: "read a file", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+        { name: "bash", type: "bash_20250124" },
+      ],
+      tool_choice: { type: "tool", name: "Read" },
+    });
+
+    expect(seen.messages[0]).toEqual({ role: "system", content: "You are a relay.\n\nProject rules." });
+    expect(seen.messages[1].content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ]);
+    expect(seen.tools).toEqual([
+      { type: "function", function: { name: "Read", description: "read a file", parameters: { type: "object", properties: { path: { type: "string" } } } } },
+      // A built-in typed tool declares no schema; the empty OBJECT schema is what it means.
+      { type: "function", function: { name: "bash", parameters: { type: "object", properties: {} } } },
+    ]);
+    expect(seen.tool_choice).toEqual({ type: "function", function: { name: "Read" } });
+    expect(seen.stop).toEqual(["</done>", "STOP"]);
+    expect(seen.max_tokens).toBe(256);
+    expect(seen.temperature).toBe(0.2);
+    expect(seen.top_p).toBe(0.9);
+    // Set by the relay from the resolved deployment, not by the caller's body.
+    expect(seen.model).toBe("meta/llama-3.1-70b-instruct");
+  });
+
+  it("maps Anthropic's tool_choice `any` to OpenAI's `required`, and drops it without tools", async () => {
+    const any = await outbound({
+      model: "claude-x", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "Read", input_schema: { type: "object", properties: {} } }],
+      tool_choice: { type: "any" },
+    });
+    expect(any.tool_choice).toBe("required");
+
+    const none = await outbound({
+      model: "claude-x", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+      tool_choice: { type: "any" },
+    });
+    expect(none).not.toHaveProperty("tool_choice");
+    expect(none).not.toHaveProperty("tools");
+  });
+
+  it("refuses an unrepresentable block with a clean 400 and no egress", async () => {
+    let egressed = 0;
+    const req = {
+      model: "claude-x", max_tokens: 16,
+      messages: [{ role: "user", content: [{ type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: {} }] }],
+    };
+    const res = await fetchBackend(resolveAttempt(openaiTarget("https://request-shape.test")), {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
+      anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
+      onEgress: () => { egressed += 1; },
+    }, async () => { throw new Error("must not reach the provider"); });
+
+    expect(res.status).toBe(400);
+    expect(errorOrigin(res)).toBe("local");
+    expect(((await res.json()) as any).error.message).toContain("server_tool_use");
+    expect(egressed).toBe(0);
+  });
+
+  /**
+   * An image inside a `tool_result` — `Read` on an image file, a screenshot tool — is a shape
+   * Claude Code produces routinely. Refusing it raised a LOCAL 400, which `server.ts` does not
+   * fail over (`tryNext = false`), so one image killed the whole request on every openai-kind
+   * lane. An OpenAI tool message is text only, so the image rides on the user message that
+   * follows the turn's tool messages: lossless, ordering-legal, and a host with no vision
+   * answers with its own UPSTREAM 400, which walks the pool.
+   */
+  it("carries a tool_result's image on the FOLLOWING user message, text on the tool message", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_img", name: "Read", input: { file_path: "a.png" } }] },
+        { role: "user", content: [{
+          type: "tool_result", tool_use_id: "toolu_img",
+          content: [
+            { type: "text", text: "Read 1 image" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "IMAGE-BYTES" } },
+          ],
+        }] },
+      ],
+    });
+
+    // The provider WAS called: no local 400, no dead request. That is the whole fix.
+    expect(seen).not.toBeNull();
+    expect(seen.messages.map((m: any) => m.role)).toEqual(["assistant", "tool", "user"]);
+    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_img", content: "Read 1 image" });
+    expect(seen.messages[2]).toEqual({
+      role: "user",
+      content: [{ type: "image_url", image_url: { url: "data:image/png;base64,IMAGE-BYTES" } }],
+    });
+    // Once, and only as the image part — never stringified into a text part.
+    expect(JSON.stringify(seen).split("IMAGE-BYTES").length - 1).toBe(1);
+  });
+
+  it("answers the call even when the tool_result is ONLY an image", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} }] },
+        { role: "user", content: [{
+          type: "tool_result", tool_use_id: "toolu_shot",
+          content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "ONLY-IMAGE" } }],
+        }] },
+      ],
+    });
+
+    expect(seen).not.toBeNull();
+    // The tool message still exists and still links — an unanswered `tool_call_id` is rejected
+    // by strict hosts — and `content: ""` is what the Chat schema asks for (a required string).
+    // A relay-authored placeholder would be words the caller never wrote.
+    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_shot", content: "" });
+    expect(seen.messages[2].content).toEqual([
+      { type: "image_url", image_url: { url: "data:image/png;base64,ONLY-IMAGE" } },
+    ]);
+  });
+
+  it("keeps a tool_result's images in place among the turn's other leftover blocks", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_mix", name: "Read", input: {} }] },
+        { role: "user", content: [
+          { type: "text", text: "before" },
+          { type: "tool_result", tool_use_id: "toolu_mix", content: [
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "FROM-RESULT" } },
+          ] },
+          { type: "text", text: "after" },
+        ] },
+      ],
+    });
+
+    expect(seen.messages.at(-1).content).toEqual([
+      { type: "text", text: "before" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,FROM-RESULT" } },
+      { type: "text", text: "after" },
+    ]);
+  });
+
+  /**
+   * The documented DROPS. Each is a decision recorded in `src/openai-request.ts`, and without an
+   * assertion a future edit reintroduces one with the suite green — reforwarding
+   * `metadata.user_id` would newly send a caller identifier to third-party providers.
+   */
+  it("does not forward request-level metadata (the caller identifier llm-bridge never sent either)", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      metadata: { user_id: "USER-IDENTIFIER" },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(seen).not.toHaveProperty("user");
+    expect(seen).not.toHaveProperty("metadata");
+    expect(JSON.stringify(seen)).not.toContain("USER-IDENTIFIER");
+  });
+
+  it("passes an is_error tool_result through as plain text, with no relay-authored prefix", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_e", name: "Bash", input: {} }] },
+        { role: "user", content: [{
+          type: "tool_result", tool_use_id: "toolu_e", is_error: true,
+          content: [{ type: "text", text: "command not found" }],
+        }] },
+      ],
+    });
+    // OpenAI has no error flag on a tool message, and an `Error:` prefix would be words the
+    // caller never wrote; the failing tool's own output already says it failed.
+    expect(seen.messages[1]).toEqual({ role: "tool", tool_call_id: "toolu_e", content: "command not found" });
+    expect(JSON.stringify(seen)).not.toContain("is_error");
+  });
+
+  it("drops thinking and redacted_thinking rather than refusing them", async () => {
+    const seen = await outbound({
+      model: "claude-x", max_tokens: 16,
+      messages: [
+        { role: "user", content: [
+          { type: "thinking", thinking: "USER-TURN-REASONING", signature: "s" },
+          { type: "text", text: "go" },
+        ] },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "ASSISTANT-REASONING", signature: "s" },
+          { type: "redacted_thinking", data: "REDACTED-BLOB" },
+          { type: "text", text: "done" },
+        ] },
+      ],
+    });
+    // Dropped, NOT refused: the request still egresses and both turns survive. Vendor-private
+    // reasoning is simply never forwarded to a different vendor.
+    expect(seen).not.toBeNull();
+    expect(seen.messages.map((m: any) => m.role)).toEqual(["user", "assistant"]);
+    expect(seen.messages[0]).toEqual({ role: "user", content: "go" });
+    expect(seen.messages[1]).toEqual({ role: "assistant", content: "done" });
+    for (const secret of ["USER-TURN-REASONING", "ASSISTANT-REASONING", "REDACTED-BLOB"]) {
+      expect(JSON.stringify(seen)).not.toContain(secret);
+    }
+  });
+
+  it("sends the relay's resolved model id and never the caller's", async () => {
+    const seen = await outbound({ model: "claude-opus-4-6", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+    expect(seen.model).toBe("meta/llama-3.1-70b-instruct");
+    // There is no `?? body.model` fallback: with no deployment model the mapper emits NO model
+    // key, exactly as the pre-2026-08-23 `openaiBody.model = target.model` assignment did.
+    // Falling back would ask the host for an Anthropic model id nobody selected.
+    expect(anthropicRequestToOpenAi({ model: "claude-opus-4-6", messages: [] })).not.toHaveProperty("model");
+    expect(anthropicRequestToOpenAi({ model: "claude-opus-4-6", messages: [] }, { model: "m" }).model).toBe("m");
+  });
+
+  it("preserves turn order and count, and adds only the system message", async () => {
+    const seen = await outbound(AGENTIC);
+    // user, assistant(+2 calls), then the two tool answers — nothing merged, nothing dropped.
+    expect(seen.messages.map((m: any) => m.role)).toEqual(["user", "assistant", "tool", "tool"]);
+    expect(seen.messages[0]).toEqual({ role: "user", content: "find and read it" });
+    expect(seen.stream).toBe(false);
   });
 });
 

@@ -308,6 +308,73 @@ describe("OpenAI front (/chat/completions)", () => {
     expect(j.usage.total_tokens).toBe(10);
   });
 
+  it("carries a Responses-front tool round-trip into an openai-kind backend as a linked role:\"tool\"", async () => {
+    // The non-obvious path that newly enters `anthropicRequestToOpenAi`: the Responses front
+    // translates responses -> anthropic (still llm-bridge's direction) and then calls
+    // `fetchBackend`, so a Codex-through-relay tool turn IS mapped by the new request mapper.
+    // Load-bearing and previously unasserted — the pre-existing coverage here is text-only.
+    let seen: any;
+    backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          seen = JSON.parse(Buffer.concat(chunks).toString());
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            id: "cmpl_tool",
+            model: "target-model",
+            choices: [{ finish_reason: "stop", message: { role: "assistant", content: "found it" } }],
+          }));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const c = cfg({ up: {
+      base: `http://127.0.0.1:${port(backend)}`,
+      kind: "openai", tierType: "free",
+      authHeader: "authorization",
+      timeoutMs: 5000,
+    } }, "up/target-model");
+    proxy = await startProxy(c);
+
+    const resp = await fetch(`http://127.0.0.1:${port(proxy)}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "up/target-model",
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "find it" }] },
+          { type: "function_call", call_id: "call_1", name: "Grep", arguments: JSON.stringify({ pattern: "protocol" }) },
+          { type: "function_call_output", call_id: "call_1", output: "SECRET-RESULT" },
+        ],
+        tools: [{ type: "function", name: "Grep", description: "g", parameters: { type: "object", properties: { pattern: { type: "string" } } } }],
+        max_output_tokens: 64,
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    // The tool result reaches the backend as a LINKED OpenAI tool message, exactly once.
+    expect(seen.messages.filter((m: any) => m.role === "tool")).toEqual([
+      { role: "tool", tool_call_id: "call_1", content: "SECRET-RESULT" },
+    ]);
+    expect(JSON.stringify(seen).split("SECRET-RESULT").length - 1).toBe(1);
+    // The granted tool survives as an OpenAI function declaration.
+    expect(seen.tools).toEqual([{
+      type: "function",
+      function: { name: "Grep", description: "g", parameters: { type: "object", properties: { pattern: { type: "string" } } } },
+    }]);
+    // The anti-regression, on this front too: no relay IR envelope in the prompt.
+    expect(JSON.stringify(seen)).not.toContain("_original");
+    expect((await resp.json() as any).output_text).toBe("found it");
+
+    // ⚠ KNOWN GAP, and NOT the request mapper's: llm-bridge still owns the responses->anthropic
+    // direction, and `openaiResponsesToUniversal` has no case for a `function_call` INPUT item
+    // (only `function_call_output`), so the assistant's own tool call is flattened to an empty
+    // user turn before the mapper ever sees it — no `tool_calls` can be emitted from this front.
+    // Pinned as an observation so that the day that direction is fixed, this line says so.
+    expect(seen.messages.some((m: any) => m.tool_calls)).toBe(false);
+  });
+
   it("routes a Codex child Responses turn through routing.subagents", async () => {
     const seenModels: string[] = [];
     backend = await new Promise<Server>((resolve) => {

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { recoverDialectInStream } from "../src/dialect-stream.js";
 import { scanForMarker } from "../src/tool-dialects.js";
+import { fetchBackend } from "../src/backend.js";
+import type { ResolvedTarget } from "../src/config.js";
+import { resolveAttempt } from "../src/resolved-attempt.js";
 
 const schemas = new Map([
   ["write_note", { type: "object", properties: { path: { type: "string" }, count: { type: "number" } } }],
@@ -111,5 +114,78 @@ describe("marker scanning", () => {
     expect(resolved.safeLen).toBe("hello <tool_cat> bye".length);
 
     expect(scanForMarker("x<tool_call>").hit).toBe(true);
+  });
+});
+
+/**
+ * CONTRACT: an unrecognised JSON envelope in model TEXT stays text.
+ *
+ * Ported from REPRO 2 of the 2026-08-23 leak investigation. The relay used to teach every
+ * openai-kind backend a bogus tool-call notation by stringifying llm-bridge's universal IR into
+ * the outbound prompt (fixed in `src/openai-request.ts`); models echoed the notation back, and
+ * this is what the client then received. The ids in the real samples were the MODEL's own
+ * (`"Grep:0"`, uuids) — never `toolu_*` — which is how the echo was told apart from a serializer.
+ *
+ * ⚠ The fix for that is on the REQUEST side, and this test exists so nobody is tempted to "also"
+ * fix it on the response side by adding a JSON marker to `DIALECT_MARKERS`. An arbitrary JSON
+ * object is not a closed envelope; promoting one to a `tool_use` would be fabricating intent,
+ * which is the one thing `src/tool-dialects.ts` must never do. Text in, text out.
+ */
+describe("unrecognised JSON envelope in model text", () => {
+  const ECHOED = JSON.stringify({
+    _original: { provider: "anthropic", raw: { type: "tool_use", id: "Grep:0", name: "Grep", input: { pattern: "x" } } },
+    tool_call: { arguments: { pattern: "x" }, id: "Grep:0", metadata: { input: { pattern: "x" } }, name: "Grep" },
+    type: "tool_call",
+  });
+
+  it("is streamed to the client as text and never promoted to a tool_use", async () => {
+    const out = await collect(recoverDialectInStream(streamOf([
+      OPEN,
+      textDelta(ECHOED.slice(0, 40)),
+      textDelta(ECHOED.slice(40)),
+      CLOSE,
+    ]), schemas));
+
+    expect(out).not.toContain('"type":"tool_use"');
+    expect(out).not.toContain("event: error");
+    expect(out).toContain('"stop_reason":"end_turn"');
+    const text = [...out.matchAll(/"text_delta","text":("(?:[^"\\]|\\.)*")/g)].map((m) => JSON.parse(m[1]!) as string).join("");
+    expect(text).toBe(ECHOED);
+  });
+
+  it("reaches the Anthropic front byte-exact through the translated openai stream", async () => {
+    // The full path REPRO 2 measured: openai-kind SSE -> llm-bridge response translation ->
+    // think-tag strip -> dialect recovery (tools ARE declared, so the scanner really runs).
+    const chunk = (content: string) =>
+      `data: ${JSON.stringify({ id: "c", model: "m", choices: [{ index: 0, delta: { content } }] })}\n\n`;
+    const sse =
+      `data: ${JSON.stringify({ id: "c", model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "" } }] })}\n\n` +
+      chunk(ECHOED.slice(0, 40)) +
+      chunk(ECHOED.slice(40)) +
+      `data: ${JSON.stringify({ id: "c", model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n` +
+      "data: [DONE]\n\n";
+
+    const target: ResolvedTarget = {
+      provider: "nim", base: "https://backend.test", kind: "openai", model: "m",
+      authHeader: "authorization", timeoutMs: 5000, authEnv: "RP_BACKEND_KEY",
+    };
+    const reqJson = {
+      model: "claude-x", max_tokens: 64, stream: true,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "write_note", input_schema: { type: "object", properties: { path: { type: "string" } } } }],
+    };
+    const res = await fetchBackend(resolveAttempt(target), {
+      path: "/v1/messages", method: "POST",
+      reqBuf: Buffer.from(JSON.stringify(reqJson)), reqJson,
+      anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
+    }, async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const out = await res.text();
+
+    expect(res.status).toBe(200);                                    // no protocol failure, no failover
+    expect(out).toContain("text_delta");                             // it is TEXT to the client
+    expect(out).not.toContain('"content_block":{"type":"tool_use"'); // never promoted to a tool call
+    expect(out).toContain('"stop_reason":"end_turn"');
+    const text = [...out.matchAll(/"text_delta","text":("(?:[^"\\]|\\.)*")/g)].map((m) => JSON.parse(m[1]!) as string).join("");
+    expect(text).toBe(ECHOED);
   });
 });
