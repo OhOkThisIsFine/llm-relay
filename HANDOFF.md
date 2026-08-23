@@ -108,14 +108,15 @@ else.**
   `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` and
   `API_FORCE_IDLE_TIMEOUT=0` so a lane child outlives its own thinking; set the same three in any
   hand-written CLI rung.
-- **A raw tool-call IR envelope has reached `claude -p` clients as TEXT through the relay**
-  (~4 of ~20 headless runs, two different backends: openrouter/stealth/ox-alpha and
-  nim/moonshotai/kimi-k3), shaped like
-  `{"_original":{"provider":"anthropic","raw":{…}},"tool_call":{…},"type":"tool_call"}` — sometimes
-  fatal (the run ends with the JSON as final text), sometimes partial (a real tool call follows).
-  Open investigation, same class as [docs/tool-call-dialect-leak.md](docs/tool-call-dialect-leak.md):
-  some path is serializing an internal tool-call representation instead of emitting native
-  `tool_use` blocks.
+- **FIXED in v0.39.0 — the tool-call IR envelope that reached `claude -p` clients as TEXT.** Root
+  cause was REQUEST-side (`docs/tool-call-dialect-leak.md` §"Second mechanism"): `backend.ts` handed the
+  Anthropic conversation to llm-bridge's `universalToOpenAI`, which stringified its IR envelope into the
+  outbound prompt (no `tool_call`/`tool_result` case), so models echoed the notation, agentic prompts
+  were ~3x inflated, tool results triplicated and no `role:"tool"` messages were sent.
+  `src/openai-request.ts` now owns the request direction; llm-bridge keeps responses. Expect prompts to
+  shrink ~3x (provider caches miss once) and `role:"tool"` messages to appear for every `openai`-kind
+  target; run `llm-relay pools --probe` after an upgrade. Diagnostic tell for any recurrence: leaked
+  ids are the model's own (uuid / `Grep:0`), never `toolu_*`.
 - **When the preferred pool member is rate-limited, `pool/xhigh` falls through to members with
   standing 402/403 refusals whose error ends a headless claude session.** Addressing a member
   directly (`--model openrouter/stealth/ox-alpha`) avoids the fall-through. Health demotes, never
@@ -147,9 +148,10 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   request did not carry, and `mergeTokenCell` treats any unknown as loss, so almost every report
   prints a Coverage-partial line whose cause is measurement incompleteness, not data loss.
   Fix direction: distinguish "kind absent because uncarried" from "kind measured as unknown".
-- **OPEN — tool-call IR envelope leak** (see the bite in §4): an internal tool-call representation
-  reaching clients as text on two backends. Investigate which serialization path emits it;
-  [docs/tool-call-dialect-leak.md](docs/tool-call-dialect-leak.md) is the precedent class.
+- **OPEN — OpenAI Responses front → `openai`-kind target loses the assistant's tool call:** llm-bridge's
+  `openaiResponsesToUniversal` has no case for a `function_call` INPUT item, so the assistant turn is
+  flattened to an empty user turn before the request mapper is reached (`test/openai-front.test.ts`
+  pins the observation). Fix direction: own that translation too (a mirror of `src/openai-request.ts`).
 - **OPEN — ollama-cloud 403 "Pro plan" refusal** awaits acceptance as `subscription-required` via
   `llm-relay eligibility`; until then the demotion machinery treats it as an ordinary refusal.
 - **OPEN — G2 hard cap / reviewed-rule rung / streaming cache usage** — see reconciliation §7 for
