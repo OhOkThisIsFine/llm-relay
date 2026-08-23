@@ -388,8 +388,8 @@ describe("dashboard v1 contract", () => {
     expect(SPEND_PRICE_SOURCES).toEqual(["provider_published", "reference"]);
     expect(TOKEN_BASES).toEqual(["reported", "estimated"]);
     expect(SPEND_SOURCES).toEqual(["provider_reported", "relay_estimated", "unknown"]);
-    expect(LIMIT_BASES).toEqual(["provider_stated", "configured", "learned"]);
-    expect(REMAINING_BASES).toEqual(["provider_stated", "derived_configured", "derived_learned"]);
+    expect(LIMIT_BASES).toEqual(["provider_stated", "configured", "learned", "published"]);
+    expect(REMAINING_BASES).toEqual(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"]);
     expect(LOCAL_USED_BASES).toEqual(["reported", "estimated", "mixed"]);
     expect(RESPONSE_ATTRIBUTIONS).toEqual(["relay_held", "caller_operated", "unknown", "all"]);
     expect(isDashboardAttribution("relay_held")).toBe(true);

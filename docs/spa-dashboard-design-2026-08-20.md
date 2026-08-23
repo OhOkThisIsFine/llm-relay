@@ -357,3 +357,35 @@ Authoritative implementation gate: `npm run build && npm run check`.
 | Open/reversible | C4 UTC boundaries and bucket mapping. |
 
 Recommendations are not resolutions. No open item is silently settled.
+
+## 2026-08-22 note — availability producer landed, contract extended additively
+
+`QuotaRowV1`/`CooldownRowV1` existed and the SPA rendered both panels, but nothing produced the
+rows, so the panels were permanently empty. The producer (`src/availability-snapshot.ts`) is now
+wired into the server's snapshot read port, and the contract grew three basis spellings ADDITIVELY
+(no shape change, no version bump):
+
+- `LimitBasis` gains `"published"` — a catalog-harvested rate limit (spec Gap 13, not yet built)
+  is a fourth provenance and must not masquerade as `configured` or `learned`.
+- `RemainingBasis` gains `"derived_provider_stated"` — a header-stated LIMIT minus local usage is
+  neither plain `provider_stated` nor a configured derivation; both halves of its provenance are
+  true at once.
+- `RemainingBasis` gains `"derived_published"` — same reasoning against the catalog rung.
+
+`LIMIT_BASES`/`REMAINING_BASES` and their type guards were extended in the same change; the
+dashboard.snapshot.v1 media type and schema name are unchanged, and consumers switching on the
+closed lists must treat the new members as additive. `test/dashboard/contract.test.ts` pins the
+extended lists.
+
+## 2026-08-22 note (fix) — `QuotaRowV1.remaining` may now be NEGATIVE
+
+Additive semantics change to one field: `remaining` accepts any safe integer, not only a
+non-negative one (`isNullableSafeInteger`, replacing `isNullableNonNegativeInteger` for that
+field alone — `limit` and `localUsed` stay non-negative). Reason: rung 2 of the §5.1 availability
+ladder computes `limit − localUsed` UNCLAMPED on purpose ("overshoot is information"), but this
+guard rejected negative rows at the projection boundary, so an overshot credential's row was
+silently dropped and only an anonymous `partial` flag survived — the exact state worth seeing was
+the one that never rendered. Renderers still clamp for display: `quotaHeadroom()` clamps to
+[0, 1] and shows 0%, while the raw Remaining cell prints the true negative number via
+`number()`. No shape or version change; a producer that clamps instead is wrong, not compatible.
+Pinned by the overshoot tests in `test/dashboard/snapshot.test.ts`.

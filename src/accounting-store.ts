@@ -44,6 +44,7 @@ import {
   parseAccountingLifetimeV1,
   parseAccountingRecentV1,
   parseAccountingRequestPacketV1,
+  type AccountingAggregateTokenCellV1,
   type AccountingAggregateTokenTotalsV1,
   type AccountingAggregateSpendCellV1,
   type AccountingAggregateSpendV1,
@@ -138,6 +139,28 @@ export interface AccountingReader {
   readDetail(requestId: string): AccountingReadResult<AccountingRequestPacket>;
 }
 
+/**
+ * What one credential (optionally narrowed to one deployment) consumed in the CURRENT period,
+ * read straight from in-memory state. Basis vocabulary shared with the dashboard contract's
+ * `localUsedBasis`.
+ */
+export interface UsedInWindowReading {
+  /** Completed requests attributed to this credential in the window; null when not visible. */
+  readonly requests: number | null;
+  /** Reported-or-estimated input+output tokens; null when nothing (or something uncertain) is visible. */
+  readonly tokens: number | null;
+  /** How the token figure was obtained; null alongside a null token figure. */
+  readonly basis: "reported" | "estimated" | "mixed" | null;
+}
+
+export interface UsedInWindowOptions {
+  readonly credentialId: string;
+  readonly model?: string | null;
+  readonly period: "minute" | "day" | "month";
+  /** Injected for deterministic tests; defaults to Date.now. */
+  readonly now?: number;
+}
+
 export interface AccountingStoreOptions {
   readonly rootDir?: string;
   readonly directory?: string;
@@ -160,6 +183,8 @@ export interface AccountingStore extends AccountingRecorder, AccountingReader {
   flush(): SnapshotMutationResult;
   close(): SnapshotMutationResult;
   reader(): AccountingReader;
+  /** The availability lane's narrow in-memory window read (see usedInWindow below). */
+  usedInWindow(options: UsedInWindowOptions): UsedInWindowReading;
 }
 
 type MutableTokenCell = {
@@ -458,6 +483,84 @@ function emptyDay(date: string): MutableDay {
 }
 function emptyLifetime(): MutableLifetime { return { schema: ACCOUNTING_LIFETIME_SCHEMA, version: ACCOUNTING_STORE_VERSION, firstRequestAt: null, lastRequestAt: null, aggregate: emptyAggregate(), months: {}, coverage: emptyCoverage() }; }
 function emptyRecent(): MutableRecent { return { schema: ACCOUNTING_RECENT_SCHEMA, version: ACCOUNTING_STORE_VERSION, rows: [], details: {}, coverage: emptyCoverage() }; }
+
+// ── usedInWindow: the availability lane's narrow in-memory read ────────────────────────────────
+// One accumulating side of a token split (reported vs estimated).
+interface UsageSide { seen: boolean; exact: boolean; value: number; }
+function newUsageSide(): UsageSide { return { seen: false, exact: true, value: 0 }; }
+
+/**
+ * Fold one token cell into a side. Any uncertainty marker (unknown/lost/overflow, or a null
+ * value despite evidence) poisons the WHOLE side rather than being dropped: presenting a partial
+ * sum as a measurement is exactly what the provenance invariant forbids.
+ * Returns whether THIS cell carried a measured amount (drives the estimated-only detection below).
+ */
+function noteUsageCell(side: UsageSide, cell: { readonly value: number | null; readonly known: number; readonly unknown: number; readonly lost: number; readonly overflow: boolean }): boolean {
+  // Only a MEASURED amount counts as usage. An all-unknown cell (the store's way of saying "no
+  // token facts arrived") is absence of evidence, not evidence of consumption — counting it
+  // would turn every unreported request into a phantom "mixed" reading.
+  if (!(cell.known > 0)) return false;
+  side.seen = true;
+  if (cell.unknown > 0 || cell.lost > 0 || cell.overflow || typeof cell.value !== "number") side.exact = false;
+  else side.value += cell.value;
+  return true;
+}
+
+/** Input + output only: cache creation/read cells are deliberately excluded from this figure. */
+function noteUsageTokens(
+  side: UsageSide,
+  input: AccountingAggregateTokenCellV1,
+  output: AccountingAggregateTokenCellV1,
+): boolean {
+  const inputMeasured = noteUsageCell(side, input);
+  const outputMeasured = noteUsageCell(side, output);
+  return inputMeasured || outputMeasured;
+}
+
+/** Non-negative safe-integer counter, else 0 (callers convert a 0 total back to null). */
+function windowCounter(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+const USED_WINDOW_EMPTY: UsedInWindowReading = { requests: null, tokens: null, basis: null };
+
+/**
+ * Combine the sides under the contract's reported/estimated/mixed vocabulary.
+ *
+ * Decision (review fix 2026-08-22): a window holding BOTH bases never sums them into one
+ * scalar — the accounting invariant keeps reported and estimated accumulators separate precisely
+ * so no total can quietly blend them, and a lone figure tagged "mixed" names the mix without
+ * showing its split. Instead:
+ * - every measured request carried reported tokens ⇒ the REPORTED figure stands alone, labelled
+ *   `reported` (the estimated cells on those same requests cover unreported halves of the same
+ *   requests, so the reported figure is a true measurement, merely narrower);
+ * - any ESTIMATED-ONLY request sits beside reported ones ⇒ no number: `tokens: null`,
+ *   `basis: "mixed"` — returning the reported figure alone would understate the window by every
+ *   estimated-only request, and the sum would blend bases. Naming the mix without inventing the
+ *   number is the provenance-safe direction.
+ */
+function usageReading(
+  requests: number | null,
+  reported: UsageSide,
+  estimated: UsageSide,
+  estimatedOnlyRequest: boolean,
+): UsedInWindowReading {
+  if (!reported.seen && !estimated.seen) return { requests, tokens: null, basis: null };
+  const blended = reported.seen && estimated.seen;
+  if (blended && estimatedOnlyRequest) return { requests, tokens: null, basis: "mixed" };
+  if (blended || reported.seen) {
+    return {
+      requests,
+      tokens: reported.exact ? reported.value : null,
+      basis: "reported",
+    };
+  }
+  return {
+    requests,
+    tokens: estimated.exact ? estimated.value : null,
+    basis: "estimated",
+  };
+}
 
 interface SourceCell { value: number | null; observedAt: string | null; method: string | null; }
 function sourceCell(value: unknown): SourceCell {
@@ -941,6 +1044,78 @@ class AccountingStoreImpl implements AccountingStore {
     if (parsed === null) return { status: "corrupt", value: null, error: "schema" };
     const packet = parsed.details[requestId];
     return packet === undefined ? { status: "missing", value: null } : { status: "ok", value: frozenClone(packet) };
+  }
+
+  /**
+   * Local usage for one credential in the CURRENT period — the `localUsed` half of spec §5.1
+   * rung 2. Reads ONLY in-memory state and never touches disk:
+   *
+   * - minute/day → this process's in-memory day shard (`this.days`, which holds today's shard
+   *   once any terminal request has been applied; a shard evicted from the read cache or not yet
+   *   reloaded after restart is invisible ⇒ null, never 0).
+   * - month → in-memory lifetime months only. Reading 31 day shards would put disk IO on the
+   *   availability path, so a month whose rollup was dropped by ACCOUNTING_MAX_MONTHS reports
+   *   null rather than a partial sum.
+   *
+   * Included: every TERMINAL event already applied to memory, including ones still awaiting the
+   * write-behind flush. NOT included: in-flight requests that have not completed, and anything
+   * recorded before this store instance loaded. Tokens are reported input+output when every
+   * measured request carried a provider report, estimated-only otherwise; a window holding both
+   * bases reports NO number (`basis: "mixed"`, tokens null) — see usageReading. An uncertain cell
+   * poisons its whole side instead of being silently dropped from the sum.
+   */
+  usedInWindow(options: UsedInWindowOptions): UsedInWindowReading {
+    const at = options.now ?? Date.now();
+    if (!Number.isFinite(at)) return USED_WINDOW_EMPTY;
+    const iso = new Date(at).toISOString();
+    const date = iso.slice(0, 10);
+    const minute = iso.slice(11, 16);
+    const model = options.model ?? null;
+
+    let requests: number | null = null;
+    const reported = newUsageSide();
+    const estimated = newUsageSide();
+    // True when at least one counted request carried ONLY estimated tokens — the case that turns
+    // a reported figure into an understatement and forces basis "mixed" with no value.
+    let estimatedOnlyRequest = false;
+
+    if (options.period !== "month") {
+      // Request rows carry kind "request"; their aggregate counts requests exactly once per row.
+      const day = this.days.get(date);
+      if (day !== undefined) {
+        // Both sides are bare HH:MM strings, so lexicographic order is chronological. The day
+        // shard only contains THIS date's cells; the bound just drops clock-skewed future ones.
+        const minuteKeys =
+          options.period === "minute" ? [minute] : Object.keys(day.cells).filter((cellMinute) => cellMinute <= minute);
+        let total = 0;
+        for (const cellMinute of minuteKeys) {
+          const cell = day.cells[cellMinute];
+          if (cell === undefined) continue;
+          for (const row of cell.rows) {
+            if (row.kind !== "request" || row.credentialId !== options.credentialId) continue;
+            // Unattributable traffic cannot be claimed by a named credential; a model filter
+            // narrows further when given.
+            if (row.credentialId === null || (model !== null && row.model !== model)) continue;
+            total += windowCounter(row.requests);
+            const reportedMeasured = noteUsageTokens(reported, row.requestTokens.reported.reportedInput, row.requestTokens.reported.reportedOutput);
+            const estimatedMeasured = noteUsageTokens(estimated, row.requestTokens.estimated.estimatedInput, row.requestTokens.estimated.estimatedOutput);
+            if (!reportedMeasured && estimatedMeasured) estimatedOnlyRequest = true;
+          }
+        }
+        if (total > 0) requests = total;
+      }
+    } else {
+      // The lifetime month rollup carries ROOT aggregates across ALL credentials — it cannot be
+      // narrowed to one slot. Feeding it to a per-credential rung-2 subtraction would charge every
+      // key's traffic to the one credential whose ceiling is being resolved, so BOTH figures
+      // decline until the rollup is per-credential: requests as well as tokens. A whole-relay
+      // count on a per-slot row is not "exact with stated scope" — the wire row has no scope
+      // marker to state it with, and a reader cannot tell. Null is the honest reading here; same
+      // fail-safe direction as everywhere else in this method.
+      return USED_WINDOW_EMPTY;
+    }
+
+    return usageReading(requests, reported, estimated, estimatedOnlyRequest);
   }
 
   /** Read paths may touch arbitrary dates; retain only a deterministic bounded hint. */

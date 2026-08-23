@@ -554,3 +554,77 @@ describe("dashboard snapshot projection", () => {
     store.close();
   });
 });
+
+describe("availability port - server-shaped construction", () => {
+  it("yields non-empty quotas and cooldowns that pass the contract guards", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    const quota: QuotaRowV1 = {
+      credentialId: "openai#primary",
+      label: "primary",
+      provider: "openai",
+      deployment: null,
+      axis: "requests",
+      period: "minute",
+      limit: 60,
+      remaining: 40,
+      localUsed: null,
+      resetsAt: "2026-08-20T13:00:00.000Z",
+      observedAt: "2026-08-20T12:30:00.000Z",
+      limitBasis: "provider_stated",
+      remainingBasis: "provider_stated",
+      localUsedBasis: null,
+    };
+    const cooldown: CooldownRowV1 = {
+      credentialId: "openai#primary",
+      provider: "openai",
+      deployment: null,
+      reason: "rate_limit",
+      until: "2026-08-20T13:00:00.000Z",
+      observedAt: "2026-08-20T12:30:00.000Z",
+    };
+    const snapshot = await createDashboardSnapshotReadPort({
+      accounting: store,
+      relayVersion: "test",
+      now: () => "2026-08-20T12:34:56.000Z",
+      // The shape the server's createAvailabilityProducer returns - an object with a snapshot().
+      availability: { snapshot: () => ({ quotas: [quota], cooldowns: [cooldown] }) },
+    }).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.quotas).toHaveLength(1);
+    expect(snapshot.cooldowns).toHaveLength(1);
+    expect(isSnapshotV1(snapshot)).toBe(true);
+    store.close();
+  });
+
+  it("keeps an OVERSHOT quota row through the projection instead of dropping it as partial", async () => {
+    // Rung 2 reports limit − localUsed UNCLAMPED; the contract's remaining guard must accept the
+    // negative or the one state worth seeing never reaches the SPA (only an anonymous partial
+    // flag would survive). Renderers clamp headroom to 0 and show the raw number as-is.
+    const store = createAccountingStore({ rootDir: root() });
+    const overshot: QuotaRowV1 = {
+      credentialId: "openai#primary",
+      label: "primary",
+      provider: "openai",
+      deployment: null,
+      axis: "requests",
+      period: "minute",
+      limit: 60,
+      remaining: -15,
+      localUsed: 75,
+      resetsAt: "2026-08-20T13:00:00.000Z",
+      observedAt: null,
+      limitBasis: "provider_stated",
+      remainingBasis: "derived_provider_stated",
+      localUsedBasis: "reported",
+    };
+    const snapshot = await createDashboardSnapshotReadPort({
+      accounting: store,
+      relayVersion: "test",
+      now: () => "2026-08-20T12:34:56.000Z",
+      availability: { snapshot: () => ({ quotas: [overshot], cooldowns: [] }) },
+    }).readSnapshot({ window: "1h", includeRepair: false });
+    expect(snapshot.quotas).toEqual([overshot]);
+    expect(snapshot.panelCoverage.find((coverage) => coverage.panel === "quotas")?.state).toBe("complete");
+    expect(isSnapshotV1(snapshot)).toBe(true);
+    store.close();
+  });
+});

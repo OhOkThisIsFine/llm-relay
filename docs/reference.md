@@ -926,6 +926,18 @@ amount is a **lower bound**, and the dashboard says so next to the figures. Requ
 mirrors request tokens: only the winning serve attempt is projected, so a retried-elsewhere
 request never double-counts its failed attempts; repair spend stays visible on the attempt rows.
 
+The **Quota headroom** and **Cooldowns** panels are populated from live relay state (circuit
+breaker observations, operator-declared limits, learned limits, target-fact conditions) plus the
+local ledger — no provider is contacted for them. Every quota figure carries its basis:
+`provider_stated` (read off this deployment's own response headers), `configured` (operator-declared
+in config `limits`), `learned` (parsed from what the deployment stated when it refused), or
+`published` (catalog-harvested). A `derived_*` remaining means the relay computed it as limit minus
+local usage over the current period; period boundaries are UTC (minute/day/month). Unknown renders
+as "Unavailable", never 0, and a negative remaining means the credential overshot its ceiling.
+`learned` figures are display-only — routing does not act on them unless you opt in later (spec
+decision M2). Cooldown rows show WHY a member is cooling (`rate_limit`, `auth_error`,
+`provider_error`) and until when, with the real observation time where one exists.
+
 ---
 
 ## CLI reference

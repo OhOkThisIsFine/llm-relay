@@ -18,7 +18,7 @@ import {
 import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
-import { buildCandidates, type CandidatesView, type Candidate } from "./candidates.js";
+import { buildCandidates, type CandidatesView, type Candidate, type CandidateAvailability } from "./candidates.js";
 import { makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
@@ -1970,7 +1970,13 @@ export async function runCandidates(): Promise<void> {
         (live === "NO" ? "  ⚠UNLISTED" : "") +
         "\n",
     );
+    // The resolved ladders print on their own line: raw observations first (what providers
+    // said), then the derived view with its basis, so a computed figure never appears without
+    // its provenance. Spec §5: unknown stays "-", and a negative remaining prints as-is.
     process.stdout.write(`  quota: ${formatCandidateQuota(c.quota, Date.now())}\n`);
+    if (c.availability.length > 0) {
+      process.stdout.write(`  availability: ${formatCandidateAvailability(c.availability)}\n`);
+    }
   }
 
   const fuzzy = view.candidates.filter((c) => c.capabilityMatch?.match === "fuzzy");
@@ -2037,6 +2043,27 @@ export function formatCandidateQuota(quota: readonly Candidate["quota"][number][
     const age = ageMs < 1_000 ? "0s" : `${Math.floor(ageMs / 1_000)}s`;
     const period = observation.period === "unknown" ? "-" : observation.period;
     return `${observation.axis}/${period} ${observation.remaining}/${observation.limit} ${observation.basis} age ${age}`;
+  }).join("; ");
+}
+
+/**
+ * Render the resolved availability ladders WITH every basis. Unknown stays "-" (never 0), a
+ * negative remaining prints as-is — overshoot is information — and a learned basis is labelled
+ * display-only so nobody reads it as something routing acts on.
+ */
+export function formatCandidateAvailability(availability: readonly CandidateAvailability[]): string {
+  if (availability.length === 0) return "-";
+  // One clock for the whole render so rows in a single line cannot disagree by milliseconds.
+  const now = Date.now();
+  return availability.map((row) => {
+    const remaining = row.remaining === null ? "-" : String(row.remaining);
+    const limit = row.limit === null ? "-" : String(row.limit);
+    const resets =
+      row.resetsAt === null
+        ? "-"
+        : `${Math.max(0, Math.round((row.resetsAt - now) / 1000))}s (${row.resetsAtBasis})`;
+    const stale = row.staleObservations > 0 ? ` ${row.staleObservations} stale` : "";
+    return `${row.axis}/${row.period} ${remaining} of ${limit} ${row.remainingBasis ?? "unknown"}${stale} resets ${resets}${row.routingEligible ? "" : " display-only"}`;
   }).join("; ");
 }
 
