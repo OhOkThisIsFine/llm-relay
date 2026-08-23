@@ -209,12 +209,18 @@ export type StickyConfig = boolean | StickyRoutingConfig;
  * learned prose parses stay display-only unless explicitly admitted (decision M2). An object with
  * neither key is legal and means exactly the defaults — writing it down is documentation, not a
  * behaviour change.
+ *
+ * G2 adds `hardCaps` (default true): an operator who wrote a `hard` block inside a `limits`
+ * declaration meant it, so the refusal ceilings are live unless this switch turns every one of
+ * them into a soft limit. false demotes nothing per request and logs nothing.
  */
 export interface QuotaEnforcementConfig {
   /** Default true. false disables quota demotion entirely. */
   enforce?: boolean;
   /** Default false. true additionally lets `derived:learned` figures gate routing. */
   enforceLearned?: boolean;
+  /** Default true. false treats every `hard` cap as an ordinary (soft) configured limit. */
+  hardCaps?: boolean;
 }
 
 /**
@@ -239,6 +245,12 @@ function parseQuotaEnforcement(raw: unknown): QuotaEnforcementConfig | undefined
       throw new Error("config.routing.quota.enforceLearned must be a boolean");
     }
     out.enforceLearned = value.enforceLearned;
+  }
+  if (value.hardCaps !== undefined) {
+    if (typeof value.hardCaps !== "boolean") {
+      throw new Error("config.routing.quota.hardCaps must be a boolean");
+    }
+    out.hardCaps = value.hardCaps;
   }
   return out;
 }

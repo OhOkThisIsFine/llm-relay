@@ -4,7 +4,14 @@ import type { Config } from "./config.js";
 export const DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024;
 export const MAX_LOG_ATTEMPTS = 64;
 
-export type RequestAttemptStatus = number | "failed" | "cancelled" | "committed" | "dead-turn";
+export type RequestAttemptStatus =
+  | number
+  | "failed"
+  | "cancelled"
+  | "committed"
+  | "dead-turn"
+  /** Skipped BEFORE egress by an operator-set hard cap (G2) — no provider saw this attempt. */
+  | "capped";
 
 /** Status-only metadata for one deployment visited during a bounded candidate walk. */
 export interface RequestAttemptLog {
@@ -114,7 +121,8 @@ function metadataOnlyAttempts(value: unknown): RequestAttemptLog[] {
       status === "failed" ||
       status === "cancelled" ||
       status === "committed" ||
-      status === "dead-turn";
+      status === "dead-turn" ||
+      status === "capped";
     if (
       typeof provider !== "string" ||
       (typeof model !== "string" && model !== null) ||

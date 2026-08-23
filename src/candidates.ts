@@ -25,6 +25,7 @@ import { materializeDynamicPools } from "./dynamic-pools.js";
 import { type QuotaObservation } from "./quota-observation.js";
 import { observedRateLimits } from "./rate-limits.js";
 import { resolveConfiguredLimits, CONFIGURED_LIMIT_AXES, configuredLimitQuotaShape } from "./configured-limits.js";
+import { evaluateHardCap } from "./hard-cap.js";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import {
   resolveRemaining,
@@ -150,6 +151,27 @@ export interface Candidate {
    * stated. Display-only — nothing here reorders or gates a candidate.
    */
   facts: Array<{ kind: string; scope: string; expiresInMs: number; value?: number }>;
+  /**
+   * G2's operator-set hard cap for this cell, as `evaluateHardCap` sees it RIGHT NOW — the same
+   * resolver the request path refuses on, so this view can never disagree with enforcement.
+   * Null when nothing is declared, the switch is off, or usage is unmeasured (unknown ⇒ no
+   * refusal ⇒ no row). Beside `availability` rather than inside it, because a cap is an
+   * OPERATOR instruction, not an observation about the deployment.
+   */
+  hardCap: {
+    axis: "requests" | "tokens";
+    period: "minute" | "day";
+    cap: number;
+    used: number;
+    /** The cap is an operator ASSERTION — labelled, so a machine consumer never reads it as measured. */
+    basis: "operator-declared";
+    /** Which declaration site supplied it, and so whose usage `used` counts (see `hard-cap.ts`). */
+    source: "provider" | "credential" | "provider-model" | "credential-model";
+    scope: "credential" | "deployment";
+    resetsAt: string;
+    /** The reset is a UTC period boundary this relay derived, never a figure anyone published. */
+    resetsAtBasis: "derived-boundary";
+  } | null;
   /** Observed real traffic through this proxy (not synthetic probes). */
   observed: {
     totalCalls: number;
@@ -435,6 +457,12 @@ export async function buildCandidates(
     tierData?: TierData | null;
     /** Runtime telemetry override for deterministic views/tests. Omitted ⇒ the live store. */
     telemetry?: TelemetryData;
+    /**
+     * The accounting store's in-memory window read (G2). Absent — the CLI against a remote
+     * proxy, or a bare programmatic proxy — means no cell can show a reached cap, because
+     * usage is unmeasured and unknown refuses nothing.
+     */
+    accounting?: Pick<import("./accounting-store.js").AccountingStore, "usedInWindow"> | null;
   } = {},
 ): Promise<CandidatesView> {
   if (opts.catalog) materializeDynamicPools(cfg, opts.catalog);
@@ -579,6 +607,31 @@ export async function buildCandidates(
       opts.pingLoop && model ? opts.pingLoop.getQuotaObservations(credentialId, model) : [],
       state?.quotaObservations ?? [],
     );
+    // G2's refusal ceiling for this cell — resolved through the SAME evaluator the request path
+    // refuses on, AND narrowed by the same rule: a `models.<id>.hard` ceiling reads that
+    // deployment's usage, a flat one reads the credential's usage across every model. Sharing the
+    // evaluator is not enough on its own — display and enforcement drifted apart precisely by
+    // asking the ledger two different questions through it.
+    const verdict = evaluateHardCap({
+      cfg,
+      provider,
+      credentialLabel: slot.label,
+      model: model ?? null,
+      usedInWindow:
+        opts.accounting === undefined || opts.accounting === null
+          ? () => ({ value: null, basis: null })
+          : (axis, period, scope) => {
+              const window = opts.accounting!.usedInWindow({
+                credentialId,
+                ...(scope === "deployment" && model !== undefined ? { model } : {}),
+                period,
+                now: nowMs,
+              });
+              return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
+            },
+      now: nowMs,
+    });
+
     candidates.push({
       spec,
       provider,
@@ -612,6 +665,20 @@ export async function buildCandidates(
         : null,
       quota: cellQuota,
       availability: buildCandidateAvailability(cfg, provider, credentialId, model, cellQuota, nowMs),
+      hardCap:
+        verdict === null
+          ? null
+          : {
+              axis: verdict.axis,
+              period: verdict.period,
+              cap: verdict.cap,
+              used: verdict.used,
+              basis: verdict.basis,
+              source: verdict.source,
+              scope: verdict.scope,
+              resetsAt: new Date(verdict.resetsAt).toISOString(),
+              resetsAtBasis: verdict.resetsAtBasis,
+            },
       breaker: {
         open: !breaker.isHealthy(cellTarget, nowMs),
         consecutiveFailures: state?.consecutiveFailures ?? 0,

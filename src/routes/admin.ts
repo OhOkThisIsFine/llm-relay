@@ -92,6 +92,12 @@ export interface AdminHandlers {
   pingLoop?: PingLoop;
   logger: MetadataLogger;
   breaker: CircuitBreaker;
+  /**
+   * The server's accounting ledger when it has one, narrowed to the same in-memory window read
+   * the availability producer and G2's cap evaluator take. Optional because a bare programmatic
+   * proxy has no store; its `/candidates` then reports no reached caps (unknown ⇒ no refusal).
+   */
+  accountingReader?: Pick<import("../accounting-store.js").AccountingStore, "usedInWindow">;
 }
 
 function failClosed(res: ServerResponse, status: number, message: string): void {
@@ -177,6 +183,9 @@ export async function handleAdminRoutes(
       breaker: h.breaker,
       ...(h.pingLoop ? { pingLoop: h.pingLoop } : {}),
       ...(providerFilter ? { provider: providerFilter } : {}),
+      // The server's own ledger, when it has one — G2's cap verdicts read the SAME in-memory
+      // window the request path refuses on. A CLI caller without a store sees no cap rows.
+      ...(h.accountingReader ? { accounting: h.accountingReader } : {}),
     });
     return ok(view, true);
   }

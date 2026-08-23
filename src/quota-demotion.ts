@@ -64,8 +64,13 @@ export interface QuotaDemotionDeps {
   readonly accounting?: Pick<import("./accounting-store.js").AccountingStore, "usedInWindow"> | null;
 }
 
-/** Canonical bucket order, so "first gating bucket" is deterministic across calls. */
-function bucketRank(axis: QuotaAxis, period: QuotaPeriod): number {
+/**
+ * Canonical bucket order, so "first gating bucket" is deterministic across calls.
+ *
+ * Exported for `hard-cap.ts`, which orders the same (axis, period) buckets for the same reason:
+ * one definition of "requests before tokens, minute before day" rather than two to keep in step.
+ */
+export function bucketRank(axis: QuotaAxis, period: QuotaPeriod): number {
   const axisRank = axis === "requests" ? 0 : 1;
   const periodRank = period === "minute" ? 0 : period === "day" ? 1 : 2;
   return axisRank * 10 + periodRank;

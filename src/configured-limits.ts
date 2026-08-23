@@ -22,12 +22,21 @@ export const CONFIGURED_LIMIT_AXES = ["rpm", "rpd", "tpm", "tpd"] as const;
 
 export type ConfiguredLimitAxis = (typeof CONFIGURED_LIMIT_AXES)[number];
 
+/** Flat hard-cap axes, as declared inside a `hard` block. */
+export type HardRateLimits = Partial<Record<ConfiguredLimitAxis, number>>;
+
 /** One rate-limit figure per axis; an omitted axis is simply undeclared, never guessed. */
 export interface ProviderRateLimits {
   rpm?: number;
   rpd?: number;
   tpm?: number;
   tpd?: number;
+  /**
+   * Operator-set REFUSAL ceilings (G2). Same closed axes; see `src/hard-cap.ts` for what acts on
+   * them. Declared beside the soft figures so one block states both what the account allows and
+   * what this relay may spend.
+   */
+  hard?: HardRateLimits;
 }
 
 /**
@@ -58,6 +67,55 @@ function parseAxisValues(raw: Record<string, unknown>, where: string): ProviderR
   return out;
 }
 
+/** The keys legal inside a `hard` block — the closed axes and nothing else. */
+function isHardKey(key: string): boolean {
+  return (CONFIGURED_LIMIT_AXES as readonly string[]).includes(key);
+}
+
+/**
+ * Validate one flat hard-axis set. Same positive-safe-integer rule as the soft axes, but NO
+ * nested `models` handling here — the caller splits that out first.
+ */
+function parseHardAxisValues(raw: Record<string, unknown>, where: string): HardRateLimits {
+  const out: HardRateLimits = {};
+  for (const key of Object.keys(raw)) {
+    const value = raw[key];
+    if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+      throw new Error(`${where}.${key} must be a positive integer; got ${JSON.stringify(value)}`);
+    }
+    out[key as ConfiguredLimitAxis] = value as number;
+  }
+  return out;
+}
+
+/**
+ * Validate the `hard` sub-block of a `limits` declaration at load time. FLAT AXES ONLY: a
+ * per-deployment cap rides inside that deployment's own limits entry
+ * (`limits.models.<id>.hard`), so every `limits` block — provider, slot or model override —
+ * carries exactly the same grammar and the resolver can mirror the soft ladder site for site.
+ * Month/hour/week spellings (`mpd`, `rph`) are not in the axis list, so they are rejected BY
+ * NAME rather than silently ignored: a cap the ledger cannot read could never fire, and its
+ * presence would lie about what this relay enforces.
+ */
+export function parseHardLimits(raw: unknown, where: string): HardRateLimits | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`${where} must be an object of rate-limit axes`);
+  }
+  for (const key of Object.keys(raw as Record<string, unknown>)) {
+    if (!isHardKey(key)) {
+      // Month ceilings are refused, not ignored: the ledger's window read declines month
+      // (`usedInWindow` returns no figure), so such a cap could never fire and its presence would
+      // be a lie about what this relay enforces. See docs/reference.md "Hard caps".
+      throw new Error(
+        `${where}.${key} is not a known hard-cap axis (expected ${CONFIGURED_LIMIT_AXES.join(", ")}); ` +
+          `minute/day periods only — a per-deployment cap belongs in that model's own limits entry`,
+      );
+    }
+  }
+  return parseHardAxisValues(raw as Record<string, unknown>, where);
+}
+
 /**
  * Validate a `limits` block at load time.
  *
@@ -79,9 +137,16 @@ export function parseConfiguredLimits(raw: unknown, where: string): ProviderLimi
   const value = raw as Record<string, unknown>;
   const axes: Record<string, unknown> = {};
   let modelsRaw: unknown;
+  let hardRaw: unknown;
   for (const [key, v] of Object.entries(value)) {
     if (key === "models") {
       modelsRaw = v;
+      continue;
+    }
+    if (key === "hard") {
+      // The refusal ceilings ride INSIDE the same block, validated by their own parser —
+      // which throws on the same typo hazards this one does.
+      hardRaw = v;
       continue;
     }
     if (!(CONFIGURED_LIMIT_AXES as readonly string[]).includes(key)) {
@@ -93,6 +158,8 @@ export function parseConfiguredLimits(raw: unknown, where: string): ProviderLimi
   }
 
   const out: ProviderLimitsConfig = parseAxisValues(axes, where);
+  const hard = parseHardLimits(hardRaw, `${where}.hard`);
+  if (hard !== undefined) out.hard = hard;
   if (modelsRaw !== undefined) {
     if (typeof modelsRaw !== "object" || modelsRaw === null || Array.isArray(modelsRaw)) {
       throw new Error(`${where}.models must be an object mapping backend model ids to limit axes`);
@@ -103,17 +170,31 @@ export function parseConfiguredLimits(raw: unknown, where: string): ProviderLimi
         throw new Error(`${where}.models.${JSON.stringify(modelId)} must be an object of rate-limit axes`);
       }
       // A model override goes through the SAME closed-axis check — an "RPM" inside a model entry
-      // is the same silent-typo hazard as one at the top level.
+      // is the same silent-typo hazard as one at the top level. `hard` splits out first and is
+      // validated by its own parser, so a nested ceiling rides beside the soft axes here too.
       const entryValue = entry as Record<string, unknown>;
-      for (const key of Object.keys(entryValue)) {
+      let entryHardRaw: unknown;
+      const entryAxes: Record<string, unknown> = {};
+      for (const [key, v] of Object.entries(entryValue)) {
+        if (key === "hard") {
+          entryHardRaw = v;
+          continue;
+        }
         if (!(CONFIGURED_LIMIT_AXES as readonly string[]).includes(key)) {
           throw new Error(
             `${where}.models.${JSON.stringify(modelId)}.${key} is not a known rate-limit axis ` +
               `(expected ${CONFIGURED_LIMIT_AXES.join(", ")})`,
           );
         }
+        entryAxes[key] = v;
       }
-      models[modelId] = parseAxisValues(entryValue, `${where}.models.${JSON.stringify(modelId)}`);
+      const parsedEntry = parseAxisValues(entryAxes, `${where}.models.${JSON.stringify(modelId)}`);
+      const entryHard = parseHardLimits(
+        entryHardRaw,
+        `${where}.models.${JSON.stringify(modelId)}.hard`,
+      );
+      if (entryHard !== undefined) parsedEntry.hard = entryHard;
+      models[modelId] = parsedEntry;
     }
     if (Object.keys(models).length > 0) out.models = models;
   }
@@ -127,12 +208,24 @@ export type ConfiguredLimitSource =
   | "provider-model"
   | "credential-model";
 
+/** Where one hard-cap axis' figure was found; same ladder as `ConfiguredLimitSource`. */
+export type HardCapSource = ConfiguredLimitSource;
+
 /** What `resolveConfiguredLimits` returns: figures plus WHICH declaration supplied each. */
 export interface ConfiguredLimits {
   rpm?: number;
   rpd?: number;
   tpm?: number;
   tpd?: number;
+  /**
+   * G2 refusal ceilings resolved through the SAME per-axis ladder as the soft figures. Present
+   * ONLY when something hard was declared anywhere on this provider/slot pair — a result with no
+   * caps carries no `hard` key at all, keeping the pre-G2 soft shape byte-identical for callers
+   * that never opted in.
+   */
+  hard?: HardRateLimits;
+  /** Which declaration level supplied each hard axis — provenance beside every ceiling. */
+  hardSource?: Partial<Record<ConfiguredLimitAxis, HardCapSource>>;
   /** Uniform by construction — every figure here came out of config, never from a probe. */
   basis: "configured";
   source: Partial<Record<ConfiguredLimitAxis, ConfiguredLimitSource>>;
@@ -168,6 +261,9 @@ export function resolveConfiguredLimits(
   if (providerLimits === undefined && credentialLimits === undefined) return null;
 
   const out: ConfiguredLimits = { basis: "configured", source: {} };
+  const hard: HardRateLimits = {};
+  const hardSource: Partial<Record<ConfiguredLimitAxis, HardCapSource>> = {};
+  let hardDeclared = false;
   for (const axis of CONFIGURED_LIMIT_AXES) {
     const fromCredentialModel =
       model !== null ? credentialLimits?.models?.[model]?.[axis] : undefined;
@@ -187,8 +283,38 @@ export function resolveConfiguredLimits(
       out[axis] = fromProvider;
       out.source[axis] = "provider";
     }
+
+    // The `hard` ladder mirrors the soft one EXACTLY — same four declaration sites, same
+    // most-specific-first order. A second grammar here would be a second thing to keep in step.
+    const fromCredentialHardModel =
+      model !== null ? credentialLimits?.models?.[model]?.hard?.[axis] : undefined;
+    const fromProviderHardModel =
+      model !== null ? providerLimits?.models?.[model]?.hard?.[axis] : undefined;
+    if (fromCredentialHardModel !== undefined) {
+      hard[axis] = fromCredentialHardModel;
+      hardSource[axis] = "credential-model";
+      hardDeclared = true;
+    } else if (fromProviderHardModel !== undefined) {
+      hard[axis] = fromProviderHardModel;
+      hardSource[axis] = "provider-model";
+      hardDeclared = true;
+    } else if (credentialLimits?.hard?.[axis] !== undefined) {
+      hard[axis] = credentialLimits.hard[axis]!;
+      hardSource[axis] = "credential";
+      hardDeclared = true;
+    } else if (providerLimits?.hard?.[axis] !== undefined) {
+      hard[axis] = providerLimits.hard[axis]!;
+      hardSource[axis] = "provider";
+      hardDeclared = true;
+    }
   }
-  if (Object.keys(out.source).length === 0) return null;
+  // Attached only when something was declared, so a no-cap resolution keeps the exact pre-G2
+  // shape (`{rpm, basis, source}`) and an absent axis stays indistinguishable from "no cap".
+  if (hardDeclared) {
+    out.hard = Object.freeze(hard);
+    out.hardSource = Object.freeze(hardSource);
+  }
+  if (Object.keys(out.source).length === 0 && !hardDeclared) return null;
   return Object.freeze(out);
 }
 

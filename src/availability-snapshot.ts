@@ -35,6 +35,7 @@ import {
   type LocalUsedReading,
 } from "./availability.js";
 import type { AccountingStore } from "./accounting-store.js";
+import { evaluateHardCap } from "./hard-cap.js";
 import { POOL_PREFIX, splitSpec, type Config } from "./config.js";
 import type { QuotaAxis, QuotaObservation } from "./quota-observation.js";
 import { factsFor } from "./target-facts.js";
@@ -206,13 +207,15 @@ function routableModels(cfg: Config): Map<string, Set<string>> {
 }
 
 /**
- * Cooldown rows from three sources, deduped per cell/reason keeping the LONGEST window:
+ * Cooldown rows from four sources, deduped per cell/reason keeping the LONGEST window:
  * breaker cooldowns (reason from the cooldown source / last status), credential faults
- * (auth_error), and the COOLING half of target-facts. Fact mapping is documented at use site.
+ * (auth_error), the COOLING half of target-facts, and REACHED operator-set hard caps
+ * (`manual` — G2). Fact mapping is documented at use site.
  */
 function buildCooldowns(
   cfg: Config,
   breaker: CircuitBreaker | undefined,
+  accounting: AvailabilityProducerOptions["accounting"],
   now: number,
 ): CooldownRowV1[] {
   const rows = new Map<string, CooldownRowV1>();
@@ -296,6 +299,42 @@ function buildCooldowns(
       for (const model of models.get(name) ?? []) {
         consult({ credentialId: slot.credentialId, provider: name, model });
       }
+
+      // G2: a REACHED operator-set hard cap is a self-lifting refusal condition too — the panel's
+      // reason vocabulary has `manual` precisely for "the operator stopped this, nothing is sick".
+      // The SAME evaluator the request path refuses on decides reachment, so panel and enforcement
+      // cannot disagree; no store ⇒ usage unknown ⇒ no row. observedAt stays null: config load is
+      // not an observation.
+      //
+      // This is the CREDENTIAL-WIDE cell (`model: null`): no `models.<id>` entry can win an axis
+      // without a model to key it, so the scope the evaluator asks for here is always
+      // `credential` and the read is deliberately un-narrowed. Narrowing to a model nobody named
+      // would be a fabricated read; the per-deployment cells belong to `/candidates`, which does
+      // carry a model and does honour the scope argument.
+      const verdict = evaluateHardCap({
+        cfg,
+        provider: name,
+        credentialLabel: slot.label,
+        model: null,
+        usedInWindow:
+          accounting === undefined || accounting === null
+            ? () => ({ value: null, basis: null })
+            : (axis, period) => {
+                const window = accounting.usedInWindow({
+                  credentialId: slot.credentialId,
+                  period,
+                  now,
+                });
+                return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
+              },
+        now,
+      });
+      if (verdict !== null) push(
+        { credentialId: slot.credentialId, provider: name, model: null },
+        "manual",
+        verdict.resetsAt,
+        null,
+      );
     }
   }
 
@@ -315,7 +354,7 @@ export function createAvailabilityProducer(options: AvailabilityProducerOptions)
         const now = clock();
         return {
           quotas: buildQuotas(config, breaker, accounting ?? null, now),
-          cooldowns: buildCooldowns(config, breaker, now),
+          cooldowns: buildCooldowns(config, breaker, accounting ?? null, now),
         };
       } catch {
         // A diagnostic producer must never fail a dashboard read; an empty result surfaces as

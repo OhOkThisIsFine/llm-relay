@@ -132,6 +132,23 @@ export const DEGRADED_HEADER = "x-llm-relay-degraded";
 export const QUOTA_DEMOTED_HEADER = "x-llm-relay-quota-demoted";
 
 /**
+ * This request was refused by an OPERATOR-SET HARD CAP (G2) — not by a provider.
+ *
+ * Value is one line per capped credential cell, e.g.
+ * `a/nim/z-ai/glm-5.2 requests/day 450/450` — label/deployment, axis/period, the inclusive
+ * used/cap pair. Present only when EVERY walked candidate was capped: a partial walk serves
+ * from whoever remained, and the pool-attempts header carries the `Nxcapped` tally beside the
+ * other outcomes instead. Nothing secret: the label is the config slot name, the figures are
+ * the operator's own declaration and this relay's own ledger reading.
+ *
+ * BOUNDED by cell count, not just by cell width: at most `MAX_CAPPED_HEADER_CELLS` (5) cells are
+ * named and the rest are counted as `+K more`. A capped attempt costs no walk start budget, so a
+ * fully capped 30-member dynamic pool reaches every one of them and an unbounded join would be a
+ * ~1.2 KB header. The header says what stopped the request; it is not a roster.
+ */
+export const HARD_CAP_HEADER = "x-llm-relay-capped";
+
+/**
  * This answer came from a deployment that is NOT free.
  *
  * Pools rank free capacity first but no longer exclude paid capacity, so a spent free lane is not
