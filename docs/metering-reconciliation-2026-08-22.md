@@ -140,6 +140,11 @@ Delivered by commit (branch `main`, `7abdaf2` .. `9fd9f36`):
 
 Still OPEN after the sprint:
 
+- **Dashboard/`cost` coverage-partial semantics — DELIVERED 2026-08-23 (`50e8233`).** Not carried
+  as a row in this reconciliation (it surfaced and was fixed in the 2026-08-23 follow-on sprint,
+  after this document's closeout pass): `mergeTokenCell`/`mergeMetric` now flip `partial` only on
+  `lost`/`overflow`/`samplesDropped`, never on a token kind that was merely uncarried. See
+  HANDOFF.md §6.
 - **Gap 10 / M4 remains DEFERRED** — estimated-output producer withheld until measured
   usage-absence rates justify it (owner disposition, open-decisions.md:4-7). Unchanged by this
   sprint.

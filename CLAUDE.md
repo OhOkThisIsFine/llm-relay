@@ -733,9 +733,12 @@ provenance cells (Gap 11), the availability ladders + dashboard availability pro
 quota as a demotion term on both fronts (Stage 5 / Gap 12, learned opt-in via
 `routing.quota.enforceLearned`), and the `llm-relay cost --include-repair` roll-up.
 [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7 is the
-open list: M4/Gap 10 stays deferred, the G2 manual hard cap is approved-but-unbuilt, the
+open list: M4/Gap 10 stays deferred, the G2 manual hard cap is delivered (`5e06a56`, v0.40.0), the
 reviewed-rule rung of `resolveResetsAt` is plumbed but fed null, streaming cross-protocol usage in
-llm-bridge drops cache fields, plus the standing Gaps 15/16/M3/P1/P4 deferrals. ⚠ Do not
+llm-bridge drops cache fields, plus the standing Gaps 15/16/M3/P1/P4 deferrals. The 2026-08-23
+sprint (v0.41.0) closed the dashboard/`cost` coverage-partial semantics (`50e8233`) and the OpenAI
+Responses front's dropped `function_call` (`3253a53`), and added tool-use id minting for
+repeated-id openai-kind hosts (`8473cb1`, `src/tool-use-ids.ts`). ⚠ Do not
 "complete" Gap 3 by adding token fields to `LOG_FIELDS` — the accounting store superseded the
 JSONL-as-ledger plan; see the `log.ts` row above.
 
