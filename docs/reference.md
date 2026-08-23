@@ -544,6 +544,12 @@ until meaningful content, and semantic failures before that point are counted as
 - `x-llm-relay-tool-dialect` — present when this response contains a tool call reconstructed from a
   recognized text dialect envelope (the host returned the model's native tool syntax as assistant
   TEXT and the relay recovered it as native tool calls).
+- `x-llm-relay-tool-use-ids: "<n> rewritten"` — the relay had to mint `<id>_relay<k>` for `n` tool
+  calls because the serving host reused ids the conversation already carried (kimi-style
+  `Read:0`), which makes Claude Code drop the call while building its next request. **Buffered
+  responses only**: a stream's headers are written before its first tool call exists, so there the
+  count is reported in the metadata-only `toolUseIdRewrites` log field instead. A count, never an
+  id — and only on `openai`-kind targets; a native Anthropic response is untouched.
 - `x-llm-relay-dashboard-session: <token>` — REQUEST header on dashboard API calls, carrying the
   read-only session token minted by the bootstrap exchange. It is consumed by the relay, never
   forwarded upstream, and never persisted (only its SHA-256 digest is held in memory).

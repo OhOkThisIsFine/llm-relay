@@ -247,3 +247,65 @@ Every `openai`-kind target now receives a different (smaller, correctly linked) 
 Coverage: outbound-shape tests in `test/backend.test.ts`, a ≥2-candidate walk in
 `test/pool-failover.test.ts` (the mapper runs once per candidate, so a single-candidate test would
 prove nothing), and the response-side contract test above.
+
+## Third mechanism (2026-08-23) — a non-unique identifier, not a leaked envelope
+
+A sibling of the two above, and the one they make easy to misread. Nothing is mangled here and no
+notation leaks: the wire shape is correct in both directions. What is wrong is an **identifier**.
+
+`nim/moonshotai/kimi-k3` — the relay's top free agentic target — emits OpenAI `tool_calls[].id`
+values of the form `<ToolName>:<index within this response>`: `Read:0`, `Bash:0`, `Read:1`. Those
+are unique inside one response and **collide across turns**: every turn that reads a file again
+calls its first tool call `Read:0`. The relay forwarded the id as the Anthropic `tool_use.id`
+(`openAiResponseToAnthropic`, and llm-bridge's SSE translation for streams).
+
+Claude Code (2.1.237) runs a conversation normalizer when it **builds every API request**: it walks
+the messages keeping a Set of `tool_use` ids, DROPS any `tool_use` whose id it has already seen,
+substitutes the text `[Tool use interrupted]` when that empties an assistant turn, and patches the
+now-orphaned `tool_result`s. Consequences, all observed on 2026-08-23:
+
+- the model never sees its own earlier tool calls on any turn after the first repeat — its context
+  is silently mangled. This is the "weak agentic loop" seen on kimi lanes: re-reading the same file
+  with overlapping offsets, and `No response requested.`;
+- eventually the freshly returned assistant message is itself emptied to `[Tool use interrupted]`
+  and a headless `claude -p` turn ends with no tool to run. Three lanes died exactly this way, with
+  ids `Bash:0, Read:0, Read:0, Read:0, …` and a final assistant content of
+  `[{"type":"text","text":"[Tool use interrupted]"}]`.
+
+### Why the fix is id minting at the seam, and not a `DIALECT_MARKERS` change
+
+Nothing about this is a dialect. The host populated `tool_calls` properly; the relay parsed them
+properly. Recovery machinery would have nothing to recover, and adding a marker for it would be the
+fabricated-intent mistake §"Second mechanism" already warns about.
+
+An identifier is **protocol form**, which is exactly what the repair boundary puts on the relay's
+side of the line: the proxy fixes form, never judgment. A minted id is relay metadata of the same
+kind as the `chatcmpl_relay`, `tool_call_${n}` and `tu_recovered_${i}` ids `backend.ts` already
+mints. So `src/tool-use-ids.ts` gives a colliding id the smallest free `<id>_relay<k>` —
+deterministic, no randomness — at the openai-kind translation seam only, buffered and streamed,
+after dialect recovery and before anything that watches for the first `tool_use` (validation,
+repair, and `guardReshaped`'s structural conservation check all see the ids the client will).
+
+**No reverse mapping exists, by construction.** The client echoes whatever id it received back in
+both the assistant `tool_use` and the user `tool_result` of the next request, and
+`src/openai-request.ts` forwards those verbatim as `tool_calls[].id` / `tool_call_id`. The backend
+therefore sees a self-consistent pair while the relay remembers nothing between requests — no
+store, nothing that can go stale, nothing to reconcile after a failover to a different candidate.
+
+Announced, because an automatic fix must be: `x-llm-relay-tool-use-ids: "<n> rewritten"` on a
+buffered response, and the metadata-only `toolUseIdRewrites` counter in the log for a stream, whose
+headers are written before its first tool call exists. A count, never an id.
+
+Confined deliberately: a native Anthropic response is byte-exact passthrough and never enters the
+pass, and the OpenAI front's direct Chat passthrough is left alone — a different client with no
+such normalizer, and byte-exactness there is the whole point of the path.
+
+Diagnostic tell: `[Tool use interrupted]` as the final assistant text of a headless run, with
+`Read:0`-style ids repeating across turns in the transcript. Contrast the second mechanism's tell —
+leaked ids that are the model's own (`Grep:0`, a uuid) rather than `toolu_*`.
+
+Coverage: `test/tool-use-ids.test.ts` (the pure table and the SSE transform),
+`test/backend.test.ts` (buffered, streamed, dialect-recovered, native passthrough, and the
+round-trip that pins "no reverse map needed"), a ≥2-candidate walk in `test/pool-failover.test.ts`
+(the pass runs on whichever candidate serves), and the streamed end-to-end log assertion in
+`test/server.test.ts`.

@@ -77,6 +77,43 @@ describe("metadata-only logging", () => {
   });
 
   /**
+   * The same guard, for the OPTIONAL fields — which the assertion above cannot see, because a
+   * field the fixture never sets is simply absent from the line. `Required<RequestLog>` is the
+   * load-bearing part: adding an optional field to `RequestLog` fails `npm run typecheck:test`
+   * here until the fixture populates it, and populating it then fails the key list below until
+   * someone states it. Optionality can therefore no longer slip a new column into a log this
+   * project promises carries no content.
+   */
+  it("emits exactly the allow-listed fields, in order, when every optional field is present", () => {
+    const full: Required<RequestLog> = {
+      ...record(),
+      upstreamReportedModel: "meta-router/actual-model",
+      toolUseIdRewrites: 2,
+    };
+    new MetadataLogger({ level: "metadata", file }).write(full);
+    const [line] = linesIn(file);
+    expect(Object.keys(line!)).toEqual([
+      "ts",
+      "path",
+      "servedProvider",
+      "servedModel",
+      "servedCredential",
+      "upstreamReportedModel",
+      "attempts",
+      "hadTools",
+      "streamed",
+      "backendStatus",
+      "validated",
+      "toolUseCount",
+      "uncheckableCount",
+      "errorKinds",
+      "repair",
+      "toolUseIdRewrites",
+      "latencyMs",
+    ]);
+  });
+
+  /**
    * The sink PROJECTS instead of serialising what it was handed, so the invariant
    * does not depend on every present and future call site being careful. A record
    * that has picked up a header map, a body, or an error string carrying a key
@@ -248,5 +285,21 @@ describe("metadata-only logging", () => {
       throw new Error("EPIPE");
     });
     expect(() => new MetadataLogger({ level: "metadata", file: null }).write(record())).not.toThrow();
+  });
+});
+
+describe("tool_use id minting counter", () => {
+  /**
+   * A streamed response cannot carry `x-llm-relay-tool-use-ids` (headers precede the first tool
+   * call), so this counter is the only place the pass is visible for stream traffic. It is on the
+   * allow-list deliberately and it is a COUNT — the ids themselves never reach a log line.
+   */
+  it("emits the count when the relay had to mint ids, and omits the field when it did not", () => {
+    const logger = new MetadataLogger({ level: "metadata", file });
+    logger.write(record({ toolUseIdRewrites: 3 }));
+    logger.write(record());
+    const [minted, untouched] = linesIn(file);
+    expect(minted!["toolUseIdRewrites"]).toBe(3);
+    expect(Object.keys(untouched!)).not.toContain("toolUseIdRewrites");
   });
 });
