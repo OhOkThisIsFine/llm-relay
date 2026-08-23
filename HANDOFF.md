@@ -16,6 +16,14 @@ when an openai-kind host repeats its own tool-call ids (NIM kimi-k3); `3253a53` 
 `src/responses-request.ts`, the OpenAI Responses→Anthropic request mapper that closes the s6
 dropped-`function_call` gap.
 
+Two more commits landed after that, queued for **v0.42.0**: `d75b143` fixed gemini's
+OpenAI-compatible tool messages — outbound `role:"tool"` messages now carry the caller's function
+`name`, looked up from the assistant `tool_use` the result answers (gemini requires
+`functionResponse.name` and never resolves it from `tool_calls`); `a407ee0` feeds the reviewed-rule
+rung of `resolveResetsAt` — facts persist `untilBasis` beside an explicit expiry, and both the
+dashboard availability producer and `llm-relay candidates` resolve through the new
+`factResetInputs` gate.
+
 - The metering program is delivered through Stage 5. Merged lanes, by commit:
   - `7abdaf2` — C3 / Gap 4: `AssistantMessage.usage` widened; cache tokens survive repair and translation.
   - `ca9e75e` — Gap 5: operator-declared rate limits (`limits`) on providers and credential slots.
@@ -27,8 +35,10 @@ dropped-`function_call` gap.
   - `9fd9f36` — Stage 4 / C1: the `llm-relay cost` spend roll-up with `--include-repair`.
 - [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is THE
   ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`; its §7 lists what
-  remains open after the sprint (M4/Gap 10 deferral, the reviewed-rule rung
-  of `resolveResetsAt` fed null, streaming cross-protocol usage parity in llm-bridge).
+  remains open after the sprint (M4/Gap 10 deferral, plus the standing Gaps 15/16/M3/P1/P4
+  deferrals) — the reviewed-rule rung of `resolveResetsAt` (`a407ee0`) and streaming
+  cross-protocol usage parity in llm-bridge are both closed as of 2026-08-23, delivered and
+  accepted-as-is respectively (§6 below).
 - Earlier state, for orientation: env-backed multi-key credential pooling landed as `7217ce0` ..
   `3795e60`; the accounting foundation + Analytics SPA (P0-P4) as `b4ec7ee`, followed by
   review-driven hardening (`3c3edd2`) and the Gap 7 spec amendment (`90e5e55`).
@@ -160,12 +170,22 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   (`3253a53`, `src/responses-request.ts`).
 - **Resolved —** the ollama-cloud 403 "Pro plan" refusal was learned by a seed interpretation as
   `subscription-required` (`ollama-cloud#default/kimi-k3`, excluded from free pools); nothing to accept.
-- **OPEN — gemini's OpenAI-compatible endpoint refuses tool messages with no `name`:**
-  `src/openai-request.ts` emits `role:"tool"` messages without a `name`; gemini returned 400
-  "function_response.name: name cannot be empty" (seen in the refusal-interpretations unknown
-  queue). Fix direction: look up the call's name from the preceding assistant `tool_use`.
-- **OPEN — reviewed-rule rung / streaming cache usage** — see reconciliation §7 for each with its
-  owner call. (The G2 hard cap is delivered: `5e06a56`, `limits.hard`.)
+- **Resolved 2026-08-23 (v0.42.0, `d75b143`)** — gemini's OpenAI-compatible endpoint refusing tool
+  messages with no `name`.
+- **DELIVERED (v0.42.0, `a407ee0`)** — the reviewed-rule rung of `resolveResetsAt` is fed: facts
+  persist `untilBasis`, and both the dashboard availability producer and `llm-relay candidates`
+  resolve through the new `factResetInputs` gate.
+- **ACCEPTED AS-IS (owner decision 2026-08-23)** — streaming cross-protocol usage parity in
+  llm-bridge: the ledger observes the BACKEND stream, so accounting is correct; only the
+  client-facing translated SSE loses cache fields. (The G2 hard cap is delivered: `5e06a56`,
+  `limits.hard`.)
+- **OPEN — gemini 3.6 requires a `thought_signature` (reasoning echo) on tool-calling turns,**
+  400ing without it before `name` is even inspected; pre-existing, separate from the name fix.
+  Fix direction: undecided.
+- **OPEN — mistral (medium-2505) enforces a 9-char alphanumeric `tool_call_id` shape,** 400ing
+  other id shapes on caller-side ids the relay forwards verbatim; interacts with
+  `tool-use-ids.ts` minted suffixes on failover from a repeated-id host to mistral. Fix direction:
+  undecided.
 - **Resolved:** Gap 7 by spec amendment 2026-08-22 (no new endpoints). **DEFER — Gap 10 / M4**
   (estimated-output producer, evidence-gated), **Gaps 15/16, M3, P1, P4** — do not build without
   a new decision.
