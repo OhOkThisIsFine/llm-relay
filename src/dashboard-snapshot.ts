@@ -23,6 +23,7 @@ import {
   type AccountingSpendV1,
 } from "./accounting-store-schema.js";
 import {
+  DASHBOARD_COST_SCHEMA,
   DASHBOARD_DETAIL_SCHEMA,
   DASHBOARD_MAX_BUCKETS,
   DASHBOARD_MAX_DETAIL_ATTEMPTS,
@@ -31,6 +32,7 @@ import {
   DASHBOARD_MAX_RECENT_ROWS,
   DASHBOARD_SNAPSHOT_SCHEMA,
   PANEL_IDS,
+  assertCostReportV1,
   assertDetailV1,
   assertSnapshotV1,
   isCooldownRowV1,
@@ -43,6 +45,10 @@ import {
   type BucketV1,
   type ClientDimensionRowV1,
   type CooldownRowV1,
+  type CostBy,
+  type CostReportV1,
+  type CostRowV1,
+  type RepairShareV1,
   type Coverage,
   type CoverageReason,
   type CredentialDimensionRowV1,
@@ -66,6 +72,23 @@ import {
   type WindowId,
 } from "./dashboard-contract.js";
 import type { DashboardDetailQuery, DashboardReadPort, DashboardSnapshotQuery } from "./dashboard-routes.js";
+
+/** What the cost roll-up accepts: the window, whether repair joins, and the grouping axis. */
+export interface CostReportQuery {
+  readonly window: WindowId;
+  /** Fold role:"repair" attempts into the report as their own labelled share (C1). */
+  readonly includeRepair: boolean;
+  readonly by?: CostBy;
+}
+
+/**
+ * The cost roll-up surface beside {@link DashboardReadPort}. Declared here rather than in
+ * `dashboard-routes.ts` because only producers and the CLI consume it; the dashboard API
+ * routes deliberately stay unaware of it (Gap 7: no HTTP endpoint for cost).
+ */
+export interface CostReportingPort {
+  readCostReport(query: CostReportQuery): Promise<CostReportV1>;
+}
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
@@ -954,6 +977,165 @@ function availabilityRows(
   return { quotas, cooldowns, quotaHealth, cooldownHealth };
 }
 
+/**
+ * Read the window's day shards WITHOUT quarantining anything and report how many were
+ * simply absent. Deliberately separate from `safeReadDays`: the cost roll-up must
+ * distinguish "this store has never recorded anything" (a friendly empty state) from
+ * "shards were unreadable" (a partial-coverage warning), which the snapshot path folds
+ * into one health flag because its panels can say it with more structure. A THROWN read
+ * is reported as `failed` so it can never masquerade as the absent case either — see the
+ * catch below.
+ */
+function readCostDays(reader: AccountingReader, dates: readonly string[]): {
+  days: AccountingDayShard[];
+  missing: number;
+  corrupt: number;
+  capped: boolean;
+  /** The read itself threw — a hard failure, distinct from every shard being absent. */
+  failed: boolean;
+} {
+  if (dates.length === 0) return { days: [], missing: 0, corrupt: 0, capped: false, failed: false };
+  try {
+    const result = reader.readDays(dates, { cap: MAX_READ_DAYS });
+    let missing = 0;
+    let corrupt = 0;
+    const days: AccountingDayShard[] = [];
+    const entries = new Map<string, unknown>();
+    for (const entry of result.results) {
+      if (entry === undefined || typeof entry.date !== "string") continue;
+      if (!entries.has(entry.date)) entries.set(entry.date, entry.result);
+    }
+    for (const date of dates) {
+      const entry = entries.get(date) as { status?: unknown; value?: unknown } | undefined;
+      if (entry === undefined || entry.status === "missing") {
+        missing += 1;
+        continue;
+      }
+      if (entry.status !== "ok" || entry.value === null || entry.value === undefined) {
+        corrupt += 1;
+        continue;
+      }
+      const parsed = parseAccountingDayShardV1(entry.value);
+      if (!parsed.ok) {
+        corrupt += 1;
+        continue;
+      }
+      days.push(parsed.value);
+    }
+    return { days, missing, corrupt, capped: result.capped || result.status === "capped", failed: false };
+  } catch {
+    // A throwing reader is a hard read failure (a denied directory, a diagnostic fault),
+    // never "all shards absent": folding it into `missing` rendered EACCES as the friendly
+    // "No accounting data yet" state. Corrupt + failed drives readable:false ⇒ unavailable,
+    // the same verdict the port's other readers give a throw.
+    return { days: [], missing: 0, corrupt: dates.length, capped: false, failed: true };
+  }
+}
+
+/** Which persisted row a cost dimension groups by, as its composite parts; null = ungroupable. */
+function costDimensionValues(
+  by: CostBy,
+  row: { provider: string | null; model: string | null; client: string | null; credentialId: string | null },
+): readonly string[] | null {
+  if (by === "provider") return row.provider === null ? null : [row.provider];
+  if (by === "model") return row.provider === null || row.model === null ? null : [row.provider, row.model];
+  if (by === "client") return row.client === null ? null : [row.client];
+  return row.provider === null || row.credentialId === null ? null : [row.provider, row.credentialId];
+}
+
+/** Render a dimension's composite parts as the spelling an operator routes with. */
+function costDimensionLabel(by: CostBy, values: readonly string[]): string {
+  if (by === "model") return `${values[0]}/${values[1]}`;
+  if (by === "credential") return `${values[0]}#${values[1]}`;
+  return values[0]!;
+}
+
+/**
+ * Accumulator for role:"repair" attempts. Kept apart from `MutableStats` because its
+ * counters are ATTEMPT-scoped and its lower-bound question differs: a repair attempt
+ * either produced a priced figure (it raised one cell's `known`) or did not, so
+ * `unpricedAttempts` is derivable per row as attempts minus priced contributions.
+ */
+interface RepairAccumulator {
+  attempts: number;
+  unpricedAttempts: number;
+  readonly spend: MutableSpend;
+}
+
+function newRepairAccumulator(): RepairAccumulator {
+  return { attempts: 0, unpricedAttempts: 0, spend: newSpend() };
+}
+
+function foldRepairAttempt(target: RepairAccumulator, row: AccountingAggregateV1 & { attempts: number }, health: ProjectionHealth): void {
+  target.attempts = boundedAdd(target.attempts, safeInteger(row.attempts), health);
+  const pricedContributions = SPEND_CELL_PAIRS.reduce(
+    (sum, [sourceKey]) => sum + safeInteger((row.spend as AccountingAggregateSpendV1 | null)?.[sourceKey]?.known ?? 0),
+    0,
+  );
+  target.unpricedAttempts = boundedAdd(
+    target.unpricedAttempts,
+    Math.max(0, safeInteger(row.attempts) - pricedContributions),
+    health,
+  );
+  mergeSpend(target.spend, row.spend, health);
+}
+
+function repairShareCells(spend: MutableSpend): RepairShareV1["spend"] {
+  return {
+    providerPublishedReported: {
+      ...projectedSpendCell(spend.providerPublishedReported, "provider_reported"),
+      priceSource: "provider_published",
+      tokenBasis: "reported",
+    },
+    providerPublishedEstimated: {
+      ...projectedSpendCell(spend.providerPublishedEstimated, "relay_estimated"),
+      priceSource: "provider_published",
+      tokenBasis: "estimated",
+    },
+    referenceReported: {
+      ...projectedSpendCell(spend.referenceReported, "provider_reported"),
+      priceSource: "reference",
+      tokenBasis: "reported",
+    },
+    referenceEstimated: {
+      ...projectedSpendCell(spend.referenceEstimated, "relay_estimated"),
+      priceSource: "reference",
+      tokenBasis: "estimated",
+    },
+  };
+}
+
+function costRowFrom(key: string, stats: MutableStats): CostRowV1 {
+  const summary = summaryFrom(stats);
+  return {
+    key,
+    requests: summary.requests,
+    pricedRequests: Math.max(0, summary.requests - summary.spend.unpricedRequests),
+    spend: summary.spend,
+  };
+}
+
+function materializeCostRows(source: Map<string, DimensionState>, by: CostBy, health: ProjectionHealth): CostRowV1[] {
+  const states = [...source.values()];
+  states.sort((left, right) => {
+    const requestDelta = right.stats.requests - left.stats.requests;
+    if (requestDelta !== 0) return requestDelta;
+    const attemptDelta = right.stats.attempts - left.stats.attempts;
+    return attemptDelta !== 0 ? attemptDelta : left.key.localeCompare(right.key);
+  });
+  const rows: CostRowV1[] = [];
+  for (const state of states) {
+    if (rows.length >= DASHBOARD_MAX_DIMENSION_ROWS) {
+      // The root total stays exact; only this dimension's tail is withheld.
+      health.partial = true;
+      noteProvenance(health, "unknown");
+      break;
+    }
+    rows.push(costRowFrom(costDimensionLabel(by, state.values), state.stats));
+  }
+  return rows;
+}
+
 /** Route one priced spend record onto its single wire cell inside a fresh aggregate. */
 function spendAggregateFor(record: AccountingSpendV1 | null): AccountingAggregateSpendV1 {
   const emptyCell = (): AccountingAggregateSpendCellV1 => ({ amountMicrousd: null, known: 0, observedAt: null });
@@ -1118,27 +1300,40 @@ function safeReadDays(reader: AccountingReader, dates: readonly string[]): ReadD
   }
 }
 
-function safeReadLifetime(reader: AccountingReader): { lifetime: AccountingLifetime | null; health: ProjectionHealth } {
+/**
+ * Read the lifetime rollup, carrying its underlying status so a caller can tell "this
+ * store has never recorded anything" (`missing`) from a broken one (`corrupt`/throw).
+ * The snapshot path ignores the distinction — its panels render both as unavailable — but
+ * `readCostReport` needs it, because coverageFor maps readable:false onto unavailable and
+ * a MISSING file is not a broken store.
+ */
+function safeReadLifetime(reader: AccountingReader): {
+  lifetime: AccountingLifetime | null;
+  status: "ok" | "missing" | "corrupt";
+  health: ProjectionHealth;
+} {
+  let status: "ok" | "missing" | "corrupt" = "corrupt";
   const health = newHealth();
   try {
     const result = reader.readLifetime();
+    if (result.status === "missing") status = "missing";
     if (result.status !== "ok") {
       health.readable = false;
       noteProvenance(health, "unknown");
-      return { lifetime: null, health };
+      return { lifetime: null, status, health };
     }
     const parsed = parseAccountingLifetimeV1(result.value);
     if (!parsed.ok) {
       health.readable = false;
       noteProvenance(health, "unknown");
-      return { lifetime: null, health };
+      return { lifetime: null, status: "corrupt", health };
     }
     noteAccountingCoverage(health, parsed.value.coverage);
-    return { lifetime: parsed.value, health };
+    return { lifetime: parsed.value, status: "ok", health };
   } catch {
     health.readable = false;
     noteProvenance(health, "unknown");
-    return { lifetime: null, health };
+    return { lifetime: null, status: "corrupt", health };
   }
 }
 
@@ -1339,12 +1534,141 @@ function deepFreeze<T>(value: T): T {
  * Create the read port consumed by dashboard routes.  The returned object has
  * no mutable aliases into the accounting reader or availability snapshot.
  */
-export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOptions): DashboardReadPort {
+export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOptions): DashboardReadPort & CostReportingPort {
   const reader = options.accounting;
   const relayVersion = typeof options.relayVersion === "string" ? options.relayVersion : "unknown";
   const attributionPolicy = isDashboardAttributionPolicy(options.attributionPolicy) ? options.attributionPolicy : "unknown";
 
   return Object.freeze({
+    /**
+     * The `llm-relay cost` roll-up (open-decisions C1). One aggregation, one policy: the
+     * window plan and day reads come from the SAME functions the snapshot uses, the TOTAL
+     * comes from the root minute-cell aggregates (exact under every row cap), and only the
+     * per-value rows walk dimension rows (capped, and marked partial when capped).
+     * Repair spend is folded from role:"repair" attempt rows — never derived by
+     * subtraction, because failed serve attempts also carry attempt-side spend.
+     */
+    async readCostReport(query: CostReportQuery): Promise<CostReportV1> {
+      const by: CostBy = query.by ?? "provider";
+      const includeRepair = query.includeRepair === true;
+      const generatedAt = clockDate(options.now);
+      const health = newHealth();
+      const total = newStats();
+      const dimensions = new Map<string, DimensionState>();
+      // The lifetime window declines the serve/repair split (month rollups mix both roles
+      // in one figure), so its accumulator is never built — leaving it built-but-unfilled
+      // would emit a zeroed share that reads as a measurement ("repair cost $0") when the
+      // truth is that the split cannot be proven there.
+      const repair = includeRepair && query.window !== "lifetime" ? newRepairAccumulator() : null;
+
+      let lifetimeResult: ReturnType<typeof safeReadLifetime> | null = null;
+      if (query.window === "lifetime") lifetimeResult = safeReadLifetime(reader);
+      const plan = windowPlan(query.window, generatedAt, lifetimeResult?.lifetime?.firstRequestAt ?? null);
+
+      if (query.window === "lifetime") {
+        // Month rollups mix serve and repair attempt spend in one root figure and carry no
+        // dimension rows, so this window reports only the exact request-scoped total; the
+        // repair split and the per-value rows decline rather than guess.
+        const lifetime = lifetimeResult?.lifetime ?? null;
+        if (lifetime !== null && plan.from !== null) {
+          noteAccountingCoverage(health, lifetime.coverage);
+          addRequestAggregate(total, lifetime.aggregate);
+          if (includeRepair) addAttemptAggregate(total, lifetime.aggregate);
+        } else if (lifetimeResult?.status === "missing") {
+          // A MISSING lifetime.json is an empty store, not a broken one: the cost report
+          // must reach the friendly "no accounting data yet" state, which coverageFor
+          // reaches only with readable intact and noMatchingRows set. Corrupt/throw keeps
+          // readable:false ⇒ unavailable.
+          health.noMatchingRows = true;
+        } else {
+          health.readable = false;
+        }
+      } else if (plan.from !== null && plan.to.valueOf() > plan.from.valueOf()) {
+        const dates = datesFor(plan);
+        const read = readCostDays(reader, dates);
+        for (const day of read.days) {
+          noteAccountingCoverage(health, day.coverage);
+          for (const minute of Object.keys(day.cells).sort()) {
+            const cell = day.cells[minute];
+            if (cell === undefined) continue;
+            const at = Date.parse(cell.from);
+            if (!Number.isFinite(at) || at < plan.from.valueOf() || at >= plan.to.valueOf()) continue;
+            noteAccountingCoverage(health, {
+              state: cell.coverage.state,
+              reason: cell.coverage.reason,
+              droppedRows: cell.coverage.droppedRows,
+              droppedRecent: 0,
+              droppedDetails: 0,
+              droppedDedup: 0,
+              retentionFrom: null,
+              retentionDays: null,
+              losses: cell.coverage.losses,
+            });
+            // Total: the root aggregate. Exact even when dimension rows hit their caps.
+            addRequestAggregate(total, cell.aggregate);
+            if (includeRepair) addAttemptAggregate(total, cell.aggregate);
+            for (const row of cell.rows) {
+              if (row.kind === "attempt") {
+                if (row.role === "repair" && repair !== null) foldRepairAttempt(repair, row, health);
+                continue;
+              }
+              const values = costDimensionValues(by, row);
+              if (values === null) {
+                // Ungroupable traffic still sits in the exact total above; naming the gap
+                // beats letting the per-value rows quietly fail to sum to it.
+                health.partial = true;
+                noteProvenance(health, "unknown");
+                continue;
+              }
+              addDimension(dimensions, values, row, health);
+            }
+          }
+        }
+        if (read.failed) {
+          // A thrown read is a hard failure, not an absent window — same verdict as
+          // safeReadLifetime/safeReadDays give a throw (unavailable, not empty).
+          health.readable = false;
+          noteProvenance(health, "unknown");
+        }
+        if (read.capped || read.corrupt > 0) {
+          health.partial = true;
+          noteProvenance(health, "unknown");
+        }
+        // Every shard ABSENT is an empty window, not a broken store: the cost report must be
+        // able to say "no accounting data yet", which coverageFor reaches only when readable
+        // stays true and noMatchingRows is set. Only a read failure or a corrupt shard means
+        // unavailable/partial — a missing file is the normal state of a fresh install.
+        if (read.days.length === 0 && read.missing === dates.length) health.noMatchingRows = true;
+      } else {
+        health.readable = false;
+      }
+
+      finalizeHealth(total);
+      mergeHealth(health, total.health);
+      const rows = materializeCostRows(dimensions, by, health);
+      const value: CostReportV1 = {
+        schema: DASHBOARD_COST_SCHEMA,
+        generatedAt: generatedAt.toISOString(),
+        from: plan.from?.toISOString() ?? null,
+        to: plan.to.toISOString(),
+        window: query.window,
+        includeRepair,
+        by,
+        rows,
+        total: costRowFrom("(total)", total),
+        repair: repair === null ? null : {
+          attempts: repair.attempts,
+          unpricedAttempts: repair.unpricedAttempts,
+          spend: repairShareCells(repair.spend),
+        },
+        coverage: coverageFor("spend", health).state,
+        coverageReason: coverageFor("spend", health).reason,
+        recentMinutesMayLag: true,
+      };
+      assertCostReportV1(value);
+      return deepFreeze(value);
+    },
+
     async readSnapshot(query: DashboardSnapshotQuery): Promise<SnapshotV1> {
       const generatedAt = clockDate(options.now);
       let lifetimeResult: ReturnType<typeof safeReadLifetime> | null = null;

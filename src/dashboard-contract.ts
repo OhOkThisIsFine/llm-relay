@@ -12,6 +12,7 @@ export const DASHBOARD_MEDIA_TYPE = `${DASHBOARD_MEDIA_TYPE_BASE}; version=${DAS
 
 export const DASHBOARD_SNAPSHOT_SCHEMA = "dashboard.snapshot.v1";
 export const DASHBOARD_DETAIL_SCHEMA = "dashboard.detail.v1";
+export const DASHBOARD_COST_SCHEMA = "dashboard.cost.v1";
 export const DASHBOARD_ERROR_SCHEMA = "dashboard.error.v1";
 
 /** The request/query and response body bounds are intentionally explicit. */
@@ -60,6 +61,13 @@ export type DashboardQueryFilterName = (typeof DASHBOARD_QUERY_FILTER_NAMES)[num
 
 export const WINDOW_IDS = Object.freeze(["1h", "24h", "7d", "30d", "today", "month", "lifetime"] as const);
 export type WindowId = (typeof WINDOW_IDS)[number];
+
+/**
+ * The `llm-relay cost --by` grouping axis. Closed here so the CLI's flag validation, the
+ * roll-up projection, and the wire guard cannot drift apart.
+ */
+export const COST_BY_VALUES = Object.freeze(["provider", "model", "client", "credential"] as const);
+export type CostBy = (typeof COST_BY_VALUES)[number];
 
 export const QUOTA_AXES = Object.freeze(["requests", "tokens"] as const);
 export type QuotaAxis = (typeof QUOTA_AXES)[number];
@@ -283,6 +291,72 @@ export interface SpendTotalsV1 {
    * Every amount above is a LOWER BOUND while this is greater than zero.
    */
   partiallyPricedRequests: number;
+}
+
+/**
+ * One row of the `llm-relay cost` roll-up (open-decisions C1): a dimension value's
+ * REQUEST-scoped spend in the four provenance-labelled cells, plus the counters the
+ * provenance story needs. Deliberately NOT a blended total — cells are printed side by
+ * side; a caller wanting one number must pick ONE cell (provider_published × reported)
+ * and say so.
+ */
+export interface CostRowV1 {
+  /** The dimension value this row aggregates: a provider, model id, client name, or credential id. */
+  readonly key: string;
+  readonly requests: number;
+  /** Requests minus {@link SpendTotalsV1.unpricedRequests}: a figure existed for the rest. */
+  readonly pricedRequests: number;
+  readonly spend: SpendTotalsV1;
+}
+
+/**
+ * The repair-attempt share of a cost report, present only under `--include-repair`.
+ *
+ * This is C1's direct answer to "what did tool-call repair cost me", and it is NOT
+ * derivable by subtracting serve-side figures: failed serve attempts also carry
+ * attempt-side spend, so only a direct fold of role:"repair" rows gives the true share.
+ * Its counters are ATTEMPT-scoped (unlike SpendTotalsV1's request-scoped ones) because
+ * that is what the persisted attempt aggregates can prove; per-attempt price coverage
+ * is not persisted, so this shape deliberately carries no lower-bound count — the
+ * renderer states the cache-token caveat in prose instead.
+ */
+export interface RepairShareV1 {
+  readonly attempts: number;
+  /** Repair attempts that produced no priced figure at all — never rendered as $0. */
+  readonly unpricedAttempts: number;
+  readonly spend: Omit<SpendTotalsV1, "unpricedRequests" | "partiallyPricedRequests">;
+}
+
+/** One window's roll-up as emitted by `llm-relay cost --json` (`dashboard.cost.v1`). */
+export interface CostReportV1 {
+  readonly schema: typeof DASHBOARD_COST_SCHEMA;
+  readonly generatedAt: string;
+  /** UTC start of the window; null exactly when the window has no bounded start. */
+  readonly from: string | null;
+  readonly to: string;
+  readonly window: WindowId;
+  /** Repair attempts were folded into the totals (C1's `--include-repair`). */
+  readonly includeRepair: boolean;
+  /** Which grouping produced {@link CostRowV1.key}. */
+  readonly by: CostBy;
+  /** Rows sorted by descending requests; capped at DASHBOARD_MAX_DIMENSION_ROWS. */
+  readonly rows: readonly CostRowV1[];
+  /** The all-dimensions total for this same period. Root aggregates, exact under row caps. */
+  readonly total: CostRowV1;
+  /**
+   * The repair-attempt share of the SAME period, present ONLY under includeRepair.
+   * Null also for the `lifetime` window: its month rollups mix serve and repair
+   * attempt spend in one figure, so the split cannot be proven there.
+   */
+  readonly repair: RepairShareV1 | null;
+  /** Same coverage vocabulary as the dashboard panels; `empty` = no accounting data yet. */
+  readonly coverage: Coverage;
+  readonly coverageReason: CoverageReason | null;
+  /**
+   * True when the store was read from disk while a relay process may still hold
+   * unflushed in-memory deltas: the last minutes of the window can lag until flush.
+   */
+  readonly recentMinutesMayLag: boolean;
 }
 
 export interface SummaryV1 {
@@ -677,6 +751,63 @@ export const isSpendTotalsV1 = (value: unknown): value is SpendTotalsV1 =>
   isNonNegativeInteger(value.unpricedRequests) &&
   isNonNegativeInteger(value.partiallyPricedRequests);
 
+export const isCostRowV1 = (value: unknown): value is CostRowV1 =>
+  isExactRecord(value, ["key", "requests", "pricedRequests", "spend"]) &&
+  isDashboardSafeId(value.key) &&
+  isNonNegativeInteger(value.requests) &&
+  isNonNegativeInteger(value.pricedRequests) &&
+  value.pricedRequests <= value.requests &&
+  isSpendTotalsV1(value.spend);
+
+const isSpendCellOnly = (
+  value: unknown,
+  priceSource: SpendPriceSource,
+  tokenBasis: TokenBasis,
+): boolean =>
+  isExactRecord(value, ["amountMicrousd", "priceSource", "tokenBasis", "source", "observedAt"]) &&
+  isNullableNonNegativeInteger(value.amountMicrousd) &&
+  value.priceSource === priceSource &&
+  value.tokenBasis === tokenBasis;
+const isRepairShareV1 = (value: unknown): value is RepairShareV1 =>
+  isExactRecord(value, ["attempts", "unpricedAttempts", "spend"]) &&
+  isNonNegativeInteger(value.attempts) &&
+  isNonNegativeInteger(value.unpricedAttempts) &&
+  value.unpricedAttempts <= value.attempts &&
+  isExactRecord(value.spend, ["providerPublishedReported", "providerPublishedEstimated", "referenceReported", "referenceEstimated"]) &&
+  isSpendCellOnly(value.spend.providerPublishedReported, "provider_published", "reported") &&
+  isSpendCellOnly(value.spend.providerPublishedEstimated, "provider_published", "estimated") &&
+  isSpendCellOnly(value.spend.referenceReported, "reference", "reported") &&
+  isSpendCellOnly(value.spend.referenceEstimated, "reference", "estimated");
+export const isCostReportV1 = (value: unknown): value is CostReportV1 =>
+  isExactRecord(value, [
+    "schema",
+    "generatedAt",
+    "from",
+    "to",
+    "window",
+    "includeRepair",
+    "by",
+    "rows",
+    "total",
+    "repair",
+    "coverage",
+    "coverageReason",
+    "recentMinutesMayLag",
+  ]) &&
+  value.schema === DASHBOARD_COST_SCHEMA &&
+  isDashboardUtcTimestamp(value.generatedAt) &&
+  isNullableTimestamp(value.from) &&
+  isDashboardUtcTimestamp(value.to) &&
+  isDashboardWindowId(value.window) &&
+  isBoolean(value.includeRepair) &&
+  isValueIn(COST_BY_VALUES, value.by) &&
+  isBoundedArray(value.rows, DASHBOARD_MAX_DIMENSION_ROWS, isCostRowV1) &&
+  isCostRowV1(value.total) &&
+  isNullable(value.repair, isRepairShareV1) &&
+  isDashboardCoverage(value.coverage) &&
+  isNullable(value.coverageReason, isDashboardCoverageReason) &&
+  isBoolean(value.recentMinutesMayLag);
+
 export const isPanelCoverageV1 = (value: unknown): value is PanelCoverageV1 =>
   isExactRecord(value, ["panel", "state", "reason", "provenance", "observedAt"]) &&
   isDashboardPanelId(value.panel) &&
@@ -1022,6 +1153,9 @@ export function assertSnapshotV1(value: unknown): asserts value is SnapshotV1 {
 }
 export function assertDetailV1(value: unknown): asserts value is DetailV1 {
   if (!isDetailV1(value)) throw new TypeError("Invalid dashboard.detail.v1 payload.");
+}
+export function assertCostReportV1(value: unknown): asserts value is CostReportV1 {
+  if (!isCostReportV1(value)) throw new TypeError("Invalid dashboard.cost.v1 payload.");
 }
 export function assertDashboardErrorV1(value: unknown): asserts value is DashboardErrorV1 {
   if (!isDashboardErrorV1(value)) throw new TypeError("Invalid dashboard.error.v1 payload.");

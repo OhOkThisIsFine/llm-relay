@@ -980,6 +980,11 @@ as "Unavailable", never 0, and a negative remaining means the credential oversho
 decision M2). Cooldown rows show WHY a member is cooling (`rate_limit`, `auth_error`,
 `provider_error`) and until when, with the real observation time where one exists.
 
+The same accounting read model is available **without a running relay** as a terminal roll-up:
+`llm-relay cost` reads `~/.llm-relay/usage/` directly and prints the four spend cells side by side
+per provider/model/client/credential, with the same provenance rules as the dashboard. See the
+CLI reference below.
+
 ---
 
 ## CLI reference
@@ -997,6 +1002,7 @@ decision M2). Cooldown rows show WHY a member is cooling (`rate_limit`, `auth_er
 | `llm-relay models [-p <name>] [-r]` | List live provider catalogs |
 | `llm-relay ping [-p <name>]` | Probe provider latency/health |
 | `llm-relay dashboard` | Open the read-only dashboard of an already-running relay |
+| `llm-relay cost [--window <w>] [--by <d>] [--include-repair] [--json]` | Summarise spend from the local accounting ledger; windows: 1h/24h/7d/30d/all (default 24h); group by provider/model/client/credential (default provider) |
 | `llm-relay telemetry` | Print telemetry/quota JSON |
 | `llm-relay offload [status \| <client> <on\|off> [--scope <scope>]]` | Show/toggle offload |
 | `llm-relay candidates [-p <name>]` | Compare deployment × credential-slot targets |
@@ -1013,6 +1019,28 @@ llm-relay routing default nim/z-ai/glm-5.2
 llm-relay routing tier sonnet pool/high
 llm-relay config set routing.offload.claude.freeOnly true
 ```
+
+### Cost roll-up
+
+`llm-relay cost [--window 1h|24h|7d|30d|all] [--by provider|model|client|credential] [--include-repair] [--json]`
+
+Reads the LOCAL accounting ledger (`~/.llm-relay/usage/`) directly — it works whether or not the
+proxy is running, and never talks HTTP. One row per dimension value plus a total: requests, priced
+requests, the four spend cells rendered as USD with their basis (e.g. `$0.0123 (published,
+reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
+`partiallyPricedRequests` counts.
+
+- The default window is **24h**, matching the dashboard's default view.
+- Cells are never blended into one number. The only single-figure total is
+  **published × reported**, printed with its basis.
+- `--include-repair` folds role:"repair" attempts into the report AND prints their share as its own
+  labelled table — the direct answer to "what did tool-call repair cost me". Without the flag,
+  repair attempts are excluded from every row. Under `--window all` the lifetime rollups mix serve
+  and repair spend in one figure, so the split cannot be proven: the command says so instead of
+  claiming "repair included", and a day-bounded window gives the share.
+- `--json` emits the same numbers as a stable `dashboard.cost.v1` object.
+- A store with no data yet prints "No accounting data" and exits 0; only a corrupt or unreadable
+  store reports failure; a malformed flag prints a usage line and exits 1.
 
 ### Endpoints
 

@@ -173,6 +173,14 @@ export interface AccountingStoreOptions {
   readonly pendingAttemptLimit?: number;
   readonly now?: () => number;
   readonly ioHooks?: SnapshotJournalHooks;
+  /**
+   * Out-of-process readers only (`llm-relay cost`): construct without the writer lease,
+   * without journal recovery, and without quarantine renames. Every one of those is a
+   * WRITE against a directory a live relay may be committing to, and cross-process
+   * writers are unsupported by the journal primitive — a reader observes only the
+   * committed snapshots and reports the resulting lag rather than repairing it.
+   */
+  readonly readOnly?: boolean;
 }
 
 export interface AccountingStore extends AccountingRecorder, AccountingReader {
@@ -830,6 +838,7 @@ class AccountingStoreImpl implements AccountingStore {
   private readonly pendingRequestLimit: number;
   private readonly pendingAttemptLimit: number;
   private readonly now: () => number;
+  private readonly readOnly: boolean;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly queued = new Array<TerminalWork>();
   private readonly days = new Map<string, MutableDay>();
@@ -874,6 +883,7 @@ class AccountingStoreImpl implements AccountingStore {
     this.pendingRequestLimit = positiveLimit(options.pendingRequestLimit, ACCOUNTING_MAX_PENDING_REQUESTS, ACCOUNTING_MAX_PENDING_REQUESTS);
     this.pendingAttemptLimit = positiveLimit(options.pendingAttemptLimit, ACCOUNTING_MAX_PENDING_ATTEMPTS_PER_REQUEST, ACCOUNTING_MAX_PENDING_ATTEMPTS_PER_REQUEST);
     this.now = options.now ?? (() => Date.now());
+    this.readOnly = options.readOnly === true;
     this.io = createSnapshotJournalIo({
       rootDir: this.directory,
       targets: [LIFETIME_TARGET, RECENT_TARGET],
@@ -883,6 +893,16 @@ class AccountingStoreImpl implements AccountingStore {
       maxTargets: 128,
       ...(options.ioHooks === undefined ? {} : { hooks: options.ioHooks }),
     });
+    // A read-only store never takes the writer lease and never replays or quarantines
+    // anything — every one of those is a write against a directory a live relay may be
+    // committing to. It observes committed snapshots only; unflushed in-memory deltas of
+    // the running process stay invisible, which the CLI reports as lag rather than repairing.
+    if (this.readOnly) {
+      this.writer = { status: "released", error: null, retryable: false };
+      this.last = result("none", null, false, false);
+      this.loadFixedSnapshotsReadOnly();
+      return;
+    }
     this.writer = this.io.acquireWriter();
     if (this.writer.status === "acquired") this.recoverAndLoad();
     else {
@@ -910,6 +930,9 @@ class AccountingStoreImpl implements AccountingStore {
 
   flush(): SnapshotMutationResult {
     if (this._closed) return result("invalid", "closed");
+    // Read-only: flushing is a write. Nothing is ever dirty here anyway because no
+    // record path runs; keep the answer explicit rather than relying on that accident.
+    if (this.readOnly) return result("none", null, false, false);
     this.timer.clear();
     this.clearRetry();
     if (this.writer.status !== "acquired") return this.setLast(result("failed", this.writer.error ?? "writer-busy", this.writer.retryable));
@@ -975,7 +998,9 @@ class AccountingStoreImpl implements AccountingStore {
       const parsed = parsedDay(cached);
       return parsed === null ? { status: "corrupt", value: null, error: "schema" } : { status: "ok", value: this.withDayLoss(parsed) };
     }
-    const read = this.io.readJson(targetForDay(date), (value): value is AccountingDayShard => parseAccountingDayShardV1(value).ok, { quarantineCorrupt: true });
+    // Quarantine renames a file; an out-of-process reader reports corruption instead of
+    // touching a shard a live relay may be about to rewrite.
+    const read = this.io.readJson(targetForDay(date), (value): value is AccountingDayShard => parseAccountingDayShardV1(value).ok, { quarantineCorrupt: !this.readOnly });
     if (read.status === "missing") return { status: "missing", value: null };
     if (read.status !== "ok" || read.value === null) return { status: "corrupt", value: null, error: read.error ?? read.status };
     const parsed = parseAccountingDayShardV1(read.value);
@@ -1501,6 +1526,35 @@ class AccountingStoreImpl implements AccountingStore {
   private flushDeferredGlobalLosses(): void {
     const losses = this.deferredGlobalLosses.splice(0);
     for (const loss of losses) this.markGlobalLoss(loss.reason, loss.kind, loss.field, loss.count);
+  }
+
+  /**
+   * Read-only constructor load: read the two fixed snapshots WITHOUT the writer lease and
+   * without any recovery/quarantine write. A corrupt or unreadable snapshot stays corrupt
+   * (reported by `readLifetime`/`readRecent`) rather than being renamed aside. Day shards
+   * are deliberately NOT preloaded — `readDay` reads them on demand through the same
+   * no-write readJson path.
+   */
+  private loadFixedSnapshotsReadOnly(): void {
+    const lifetime = this.io.readJson(
+      LIFETIME_TARGET,
+      (value): value is AccountingLifetime => parseAccountingLifetimeV1(value).ok,
+      { quarantineCorrupt: false },
+    );
+    this.lifetimeReadState = lifetime.status === "ok" && lifetime.value !== null
+      ? "ok"
+      : lifetime.status === "missing" ? "missing" : "corrupt";
+    if (this.lifetimeReadState === "ok") this.lifetime = mutableLifetime(lifetime.value!);
+
+    const recent = this.io.readJson(
+      RECENT_TARGET,
+      (value): value is AccountingRecentV1 => parseAccountingRecentV1(value).ok,
+      { quarantineCorrupt: false },
+    );
+    this.recentReadState = recent.status === "ok" && recent.value !== null
+      ? "ok"
+      : recent.status === "missing" ? "missing" : "corrupt";
+    if (this.recentReadState === "ok") this.recent = mutableRecent(recent.value!);
   }
 
   /** Recover a committed journal first, then load the two fixed snapshots. */

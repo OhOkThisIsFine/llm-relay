@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -552,6 +552,49 @@ describe("dashboard snapshot projection", () => {
     expect(filtered.summary.requests).toBe(0);
     expect(filtered.panelCoverage.find((coverage) => coverage.panel === "summary")?.state).toBe("unavailable");
     store.close();
+  });
+
+  it("cost roll-up reports a THROWING day read as unavailable, never as an empty window", async () => {
+    // readCostDays' catch used to report every date as merely absent, which the
+    // all-shards-absent rule then rendered as coverage "empty" — a hard read failure
+    // (a denied directory, a diagnostic fault) answering "No accounting data yet".
+    const store = createAccountingStore({ rootDir: root() });
+    const base = store.reader();
+    const throwing = {
+      readDay: (date: string) => base.readDay(date),
+      readDays: (() => {
+        throw new Error("denied");
+      }) as typeof base.readDays,
+      readLifetime: () => base.readLifetime(),
+      readRecent: (options?: { readonly limit?: number } | number) => base.readRecent(options),
+      readDetail: (requestId: string) => base.readDetail(requestId),
+    };
+    const port = createDashboardSnapshotReadPort({ accounting: throwing, relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" });
+    const report = await port.readCostReport({ window: "24h", includeRepair: false });
+    expect(report.coverage).toBe("unavailable");
+    expect(report.coverageReason).toBe("meter_not_implemented");
+    // No fabricated zero-total success either.
+    expect(report.rows).toHaveLength(0);
+    expect(report.total.requests).toBe(0);
+    store.close();
+  });
+
+  it("cost roll-up treats a MISSING lifetime.json as empty and a corrupt one as unavailable", async () => {
+    // Read-only stores throughout: that is exactly how `llm-relay cost` reads, and they
+    // never quarantine, so the corrupt file stays put while being reported.
+    const emptyStore = createAccountingStore({ rootDir: root(), readOnly: true });
+    const empty = await createDashboardSnapshotReadPort({ accounting: emptyStore.reader(), relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" }).readCostReport({ window: "lifetime", includeRepair: false });
+    expect(empty.coverage).toBe("empty");
+    expect(empty.from).toBeNull();
+    emptyStore.close();
+
+    const corruptDir = mkdtempSync(join(tmpdir(), "llm-relay-dashboard-snapshot-corrupt-"));
+    writeFileSync(join(corruptDir, "lifetime.json"), "{not json");
+    const corruptStore = createAccountingStore({ rootDir: corruptDir, readOnly: true });
+    const corrupt = await createDashboardSnapshotReadPort({ accounting: corruptStore.reader(), relayVersion: "test", now: () => "2026-08-20T12:34:56.000Z" }).readCostReport({ window: "lifetime", includeRepair: false });
+    expect(corrupt.coverage).toBe("unavailable");
+    corruptStore.close();
+    rmSync(corruptDir, { recursive: true, force: true });
   });
 });
 
