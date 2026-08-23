@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createAccountingRequest, type AccountingRecorder, type TokenFactsInput } from "../../src/accounting.js";
+import { createAccountingRequest, type AccountingPricePort, type AccountingRecorder, type TokenFactsInput } from "../../src/accounting.js";
 import { createAccountingStore, type AccountingReader } from "../../src/accounting-store.js";
 import { isAccountingRequestPacketV1 } from "../../src/accounting-store-schema.js";
 import type { AccountingDayShard } from "../../src/accounting-store-schema.js";
@@ -42,6 +42,8 @@ function record(
   options: {
     readonly endedAt: string;
     readonly client?: string;
+    /** Published-price lookup; absent ⇒ unpriced. */
+    readonly pricePort?: AccountingPricePort | undefined;
     readonly attribution?: "relay_held" | "caller_operated" | "unknown";
     readonly outcome?: "success" | "error" | "cancelled" | "unknown";
     readonly failureKind?: "timeout" | "provider_error" | "auth_error" | "rate_limit" | "aborted" | "protocol" | "unknown";
@@ -58,6 +60,7 @@ function record(
     startedAt: options.endedAt,
     client: options.client ?? "cli",
     attribution: options.attribution ?? "relay_held",
+    pricePort: options.pricePort,
   });
   for (const plan of options.attempts ?? []) {
     const attempt = request.startAttempt({
@@ -160,6 +163,47 @@ describe("dashboard snapshot projection", () => {
     const detail = await read.readDetail({ requestId: id, includeRepair: false });
     expect(detail?.attempts.map((attempt) => attempt.role)).toEqual(["serve"]);
     expect(isDetailV1(detail)).toBe(true);
+    store.close();
+  });
+
+  it("projects priced spend into the matching cell and unpriced requests into the counter", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    const publishedPort: AccountingPricePort = () => ({ pricePerMillionIn: 2, pricePerMillionOut: 4, priceSource: "provider" });
+    // Priced: 1_000 in x $2/M + 250 out x $4/M = 3_000 micro-USD.
+    record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      pricePort: publishedPort,
+      attempts: [{ provider: "openai", tokens: { reported: { inputTokens: 1_000, outputTokens: 250 } } }],
+    });
+    // Unpriced: no port ⇒ no spend figure.
+    record(store, {
+      endedAt: "2026-08-20T12:31:00.000Z",
+      attempts: [{ provider: "nim", tokens: { reported: { inputTokens: 5_000, outputTokens: 100 } } }],
+    });
+    const snapshot = await port(store).readSnapshot({ window: "1h", includeRepair: false });
+    const cells = snapshot.summary.spend;
+    expect(cells.providerPublishedReported.amountMicrousd).toBe(3_000);
+    expect(cells.providerPublishedReported.source).toBe("provider_reported");
+    expect(cells.unpricedRequests).toBe(1);
+    expect(cells.partiallyPricedRequests).toBe(0);
+    // The recent row carries the same priced figure.
+    const row = snapshot.recentRequests.find((candidate) => candidate.spend.providerPublishedReported.amountMicrousd === 3_000);
+    expect(row).toBeDefined();
+    store.close();
+  });
+
+  it("marks a partially priced request so the spend amounts read as lower bounds", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    const inOnlyPort: AccountingPricePort = () => ({ pricePerMillionIn: 2, pricePerMillionOut: null, priceSource: "provider" });
+    // Cache kinds are unpriced AND output has no price ⇒ partial.
+    record(store, {
+      endedAt: "2026-08-20T12:30:00.000Z",
+      pricePort: inOnlyPort,
+      attempts: [{ provider: "openai", tokens: { reported: { inputTokens: 1_000, outputTokens: 100, cacheReadInputTokens: 800 } } }],
+    });
+    const detail = await port(store).readSnapshot({ window: "1h", includeRepair: false });
+    expect(detail.summary.spend.partiallyPricedRequests).toBe(1);
+    expect(detail.summary.spend.providerPublishedReported.amountMicrousd).toBe(2_000);
     store.close();
   });
 

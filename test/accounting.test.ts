@@ -8,7 +8,9 @@ import {
   createAccountingRequest,
   NOOP_ACCOUNTING_RECORDER,
   type AccountingEvent,
+  type AccountingPricePort,
   type AccountingRecorder,
+  type AttemptCompletedEvent,
   type TokenFactsInput,
 } from "../src/accounting.js";
 
@@ -20,6 +22,155 @@ function deterministic(ids = ["request-id-123456", "attempt-id-123456", "attempt
 function recorder(events: AccountingEvent[]): AccountingRecorder {
   return { record: (event) => events.push(event) };
 }
+
+/** A completed serve attempt's spend through the real lifecycle, with a fixed id. */
+function pricedAttempt(
+  pricePort: AccountingPricePort | undefined,
+  tokens: TokenFactsInput,
+  provider = "prov",
+  model = "model-a",
+): AttemptCompletedEvent {
+  const request = createAccountingRequest({ idFactory: deterministic(), pricePort });
+  const attempt = request.startAttempt({ provider, model });
+  return attempt.complete({ outcome: "success", tokens })!;
+}
+
+const PORT_PUBLISHED: AccountingPricePort = () => ({
+  pricePerMillionIn: 2,
+  pricePerMillionOut: 8,
+  priceSource: "provider",
+});
+const PORT_REFERENCE: AccountingPricePort = () => ({
+  pricePerMillionIn: 2,
+  pricePerMillionOut: 8,
+  priceSource: "reference",
+});
+
+describe("spend pricing (Stage 4 / Gap 11)", () => {
+  it("prices the reported cell from published prices, in exact integer micro-USD", () => {
+    // 1_000 in x $2/M = 2_000 uUSD; 500 out x $8/M = 4_000 uUSD; total 6_000.
+    const event = pricedAttempt(PORT_PUBLISHED, { reported: { inputTokens: 1_000, outputTokens: 500 } });
+    expect(event.spend).toMatchObject({
+      amountMicrousd: 6_000,
+      priceSource: "provider_published",
+      tokenBasis: "reported",
+      source: "provider_reported",
+      coverage: "full",
+      pricesUsed: { perMillionIn: 2, perMillionOut: 8 },
+    });
+    expect(event.spend?.unpricedTokens).toEqual({ cacheRead: null, cacheCreation: null, cachedInput: null });
+  });
+
+  it("rounds HALF-UP per token kind and sums integers", () => {
+    // 1 token x $0.5/M = 0.5 uUSD -> 1 (half-up); 1 token x $1.5/M = 1.5 -> 2.
+    const port: AccountingPricePort = () => ({ pricePerMillionIn: 0.5, pricePerMillionOut: 1.5, priceSource: "provider" });
+    const event = pricedAttempt(port, { reported: { inputTokens: 1, outputTokens: 1 } });
+    expect(event.spend?.amountMicrousd).toBe(3);
+  });
+
+  it("rounds a true .5 product half-up even when the float product lands just below it", () => {
+    // 100 x $0.145/M is exactly 14.5 uUSD, but IEEE754 computes it as
+    // 14.499999999999998, so a float Math.round rounds DOWN to 14. The integer
+    // path scales the price first (145000 x 100) and half-up must give 15.
+    expect(Math.round(100 * 0.145)).toBe(14);
+    const port: AccountingPricePort = () => ({ pricePerMillionIn: 0.145, pricePerMillionOut: null, priceSource: "provider" });
+    const event = pricedAttempt(port, { reported: { inputTokens: 100 } });
+    expect(event.spend?.amountMicrousd).toBe(15);
+  });
+
+  it("prices the estimated cell input-only and labels it, never mixing with reported", () => {
+    const event = pricedAttempt(PORT_PUBLISHED, {
+      estimated: { inputTokens: 2_000, outputTokens: 9_999, inputMethod: "chars/4" },
+    });
+    expect(event.spend).toMatchObject({
+      amountMicrousd: 4_000,
+      priceSource: "provider_published",
+      tokenBasis: "estimated",
+      source: "relay_estimated",
+      coverage: "input_only",
+    });
+    // Estimated output has no producer today (Gap 10/M4): it must not be priced.
+    expect(event.spend?.amountMicrousd).not.toBe(2_000 + 9_999 * 8);
+  });
+
+  it("labels reference-priced spend as reference", () => {
+    const event = pricedAttempt(PORT_REFERENCE, { reported: { inputTokens: 1_000, outputTokens: 0 } });
+    expect(event.spend?.priceSource).toBe("reference");
+    expect(event.spend?.amountMicrousd).toBe(2_000);
+  });
+
+  it("leaves an attempt UNPRICED (null, never $0) when no published price resolves", () => {
+    const event = pricedAttempt(undefined, { reported: { inputTokens: 1_000, outputTokens: 500 } });
+    expect(event.spend).toBeNull();
+  });
+
+  it("marks anthropic cache kinds unpriced beside the amount with partial coverage", () => {
+    // Cache read/creation are NOT part of input_tokens; they ride unpriced.
+    const event = pricedAttempt(PORT_PUBLISHED, {
+      reported: { inputTokens: 1_000, outputTokens: 100, cacheReadInputTokens: 4_000, cacheCreationInputTokens: 500 },
+    });
+    expect(event.spend).toMatchObject({
+      amountMicrousd: 2_000 + 800,
+      coverage: "partial",
+      unpricedTokens: { cacheRead: 4_000, cacheCreation: 500, cachedInput: null },
+    });
+  });
+
+  it("subtracts openai cached tokens from prompt before pricing and records them unpriced", () => {
+    // OpenAI INCLUDES cached tokens in prompt_tokens; the discount is unpublished.
+    const event = pricedAttempt(PORT_PUBLISHED, { reported: { inputTokens: 1_000, outputTokens: 0, cachedInputTokens: 400 } });
+    expect(event.spend).toMatchObject({
+      amountMicrousd: 600 * 2,
+      coverage: "partial",
+      unpricedTokens: { cacheRead: null, cacheCreation: null, cachedInput: 400 },
+    });
+  });
+
+  it("treats a malformed cache figure (cached > prompt) as absent, pricing prompt in full", () => {
+    const event = pricedAttempt(PORT_PUBLISHED, { reported: { inputTokens: 1_000, outputTokens: 0, cachedInputTokens: 2_000 } });
+    expect(event.spend).toMatchObject({
+      amountMicrousd: 2_000,
+      coverage: "full",
+      unpricedTokens: { cacheRead: null, cacheCreation: null, cachedInput: null },
+    });
+  });
+
+  it("marks a reported attempt partial when one kind has no published price", () => {
+    const port: AccountingPricePort = () => ({ pricePerMillionIn: 2, pricePerMillionOut: null, priceSource: "provider" });
+    const event = pricedAttempt(port, { reported: { inputTokens: 1_000, outputTokens: 700 } });
+    expect(event.spend).toMatchObject({ amountMicrousd: 2_000, coverage: "partial" });
+  });
+
+  it("prices repair attempts on their own rows and projects only the winning serve at request level", () => {
+    const events: AccountingEvent[] = [];
+    const request = createAccountingRequest({ recorder: recorder(events), idFactory: deterministic(), pricePort: PORT_PUBLISHED });
+    const repair = request.startAttempt({ role: "repair", provider: "prov", model: "model-a" });
+    const repairEvent = repair.complete({
+      outcome: "success",
+      tokens: { reported: { inputTokens: 100, outputTokens: 0 } },
+    })!;
+    const serve = request.startAttempt({ provider: "prov", model: "model-a" });
+    const serveEvent = serve.complete({
+      outcome: "success",
+      tokens: { reported: { inputTokens: 1_000, outputTokens: 0 } },
+    })!;
+    const done = request.complete({ winningAttemptId: serve.attemptId })!;
+    // Repair is priced, on its own attempt row (C1).
+    expect(repairEvent.spend?.amountMicrousd).toBe(200);
+    expect(serveEvent.spend?.amountMicrousd).toBe(2_000);
+    // Request-level spend mirrors request tokens: the WINNING serve only.
+    expect(done.spend?.amountMicrousd).toBe(2_000);
+    expect(done.spend?.tokenBasis).toBe("reported");
+  });
+
+  it("leaves a failed request (no winning serve) unpriced even when a price exists", () => {
+    const request = createAccountingRequest({ idFactory: deterministic(), pricePort: PORT_PUBLISHED });
+    const serve = request.startAttempt({ provider: "prov", model: "model-a" });
+    serve.complete({ outcome: "error", failureKind: "rate_limit", tokens: { reported: { inputTokens: 5_000, outputTokens: 0 } } });
+    const done = request.complete({ outcome: "error", failureKind: "rate_limit" })!;
+    expect(done.spend).toBeNull();
+  });
+});
 
 describe("canonical accounting primitive", () => {
   it("creates opaque valid unique IDs and links lifecycle events", () => {

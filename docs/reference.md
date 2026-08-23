@@ -910,9 +910,21 @@ Views use the relay's bounded accounting read model: caller-visible requests, se
 attempts, reported versus estimated tokens, latency and commit timing, normalized outcomes, recent
 request detail, provider/model/client/credential dimensions, and available quota/cooldown facts.
 Missing coverage and unknown values stay explicit. Reads do not probe providers, perform egress,
-scan logs, or expose prompts, bodies, tool arguments, raw provider errors, or key material. Spend
-cells currently remain explicitly unavailable/unpriced because currency accounting is not yet
-implemented; the UI does not infer a price basis.
+scan logs, or expose prompts, bodies, tool arguments, raw provider errors, or key material.
+
+**Spend figures.** Each request is priced at completion from PUBLISHED per-(provider, model)
+prices only — the serving deployment's own publication where it exists, otherwise another
+provider's figure for the same model id (labelled `reference`). There is no fallback price, no
+tunable default, and no cache multiplier, so a deployment that publishes nothing is **Unpriced**
+(rendered as "Unpriced", never "$0") and its request counts in `unpricedRequests`. Amounts are
+integer micro-USD in four cells (provider-published/reference × reported/estimated), never blended.
+Cache token kinds are deliberately NOT priced: Anthropic's cache creation/read are separate from
+`input_tokens`, and OpenAI includes cached tokens in `prompt_tokens` at an unpublished discount —
+since no published price covers them they ride beside the amount as unpriced counts, and such
+requests count in `partiallyPricedRequests`. While `partiallyPricedRequests` > 0 every spend
+amount is a **lower bound**, and the dashboard says so next to the figures. Request-level spend
+mirrors request tokens: only the winning serve attempt is projected, so a retried-elsewhere
+request never double-counts its failed attempts; repair spend stays visible on the attempt rows.
 
 ---
 

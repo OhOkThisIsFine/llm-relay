@@ -19,6 +19,9 @@ import {
   type SnapshotWriterResult,
 } from "./accounting-store-io.js";
 import {
+  emptyAccountingAggregateSpend,
+  emptyAccountingSpendCell,
+  mergeAccountingSpendCells,
   ACCOUNTING_DAY_SCHEMA,
   ACCOUNTING_DEDUP_SCHEMA,
   ACCOUNTING_LIFETIME_SCHEMA,
@@ -42,6 +45,8 @@ import {
   parseAccountingRecentV1,
   parseAccountingRequestPacketV1,
   type AccountingAggregateTokenTotalsV1,
+  type AccountingAggregateSpendCellV1,
+  type AccountingAggregateSpendV1,
   type AccountingAttribution,
   type AccountingAttemptPacketV1,
   type AccountingAttemptRole,
@@ -54,6 +59,7 @@ import {
   type AccountingOutcome,
   type AccountingRecentV1,
   type AccountingRequestPacket,
+  type AccountingSpendV1,
 } from "./accounting-store-schema.js";
 import {
   DASHBOARD_REQUEST_ID_PATTERN,
@@ -185,6 +191,25 @@ interface MutableMetric {
   samplesDropped: number;
   observedAt: string | null;
 }
+type MutableSpendCell = {
+  amountMicrousd: number | null;
+  known: number;
+  observedAt: string | null;
+};
+type MutableSpend = {
+  providerPublishedReported: MutableSpendCell;
+  providerPublishedEstimated: MutableSpendCell;
+  referenceReported: MutableSpendCell;
+  referenceEstimated: MutableSpendCell;
+};
+/**
+ * In-memory aggregate. `spend` stays nullable because a LEGACY shard loads with
+ * `spend: null`; the add functions normalize lazily on first touch.
+ * `requestSpend`/`partiallyPricedRequests` are attached ONLY to request-owned
+ * aggregates (cell roots, request rows, lifetime/month roots) by `addRequest`;
+ * attempt rows deliberately never carry them, matching the schema guard that
+ * rejects request-scoped facts on attempt rows.
+ */
 interface MutableAggregate {
   requests: number;
   attempts: number;
@@ -195,7 +220,9 @@ interface MutableAggregate {
   requestTokens: MutableTokens;
   latency: MutableMetric;
   commit: MutableMetric;
-  spend: null;
+  spend: MutableSpend | null;
+  requestSpend?: MutableSpend;
+  partiallyPricedRequests?: number;
   unpricedRequests: number;
 }
 interface MutableRow extends MutableAggregate {
@@ -376,7 +403,55 @@ function emptyTokens(): MutableTokens {
 }
 function emptyMetric(): MutableMetric { return { sumMs: null, known: 0, unknown: 0, lost: 0, overflow: false, samples: [], samplesDropped: 0, observedAt: null }; }
 function emptyAggregate(): MutableAggregate {
-  return { requests: 0, attempts: 0, served: 0, errored: 0, cancelled: 0, tokens: emptyTokens(), requestTokens: emptyTokens(), latency: emptyMetric(), commit: emptyMetric(), spend: null, unpricedRequests: 0 };
+  return { requests: 0, attempts: 0, served: 0, errored: 0, cancelled: 0, tokens: emptyTokens(), requestTokens: emptyTokens(), latency: emptyMetric(), commit: emptyMetric(), spend: emptySpend(), unpricedRequests: 0 };
+}
+
+// Cell keys are owned by the schema module's SPEND_CELL_KEYS; the adders below
+// reach them through emptyAccountingAggregateSpend() rather than a second list.
+function emptySpend(): MutableSpend {
+  return {
+    providerPublishedReported: emptyAccountingSpendCell(),
+    providerPublishedEstimated: emptyAccountingSpendCell(),
+    referenceReported: emptyAccountingSpendCell(),
+    referenceEstimated: emptyAccountingSpendCell(),
+  };
+}
+
+/** Route one priced spend to its aggregate cell by (priceSource, tokenBasis). */
+function spendCell(spend: MutableSpend, record: AccountingSpendV1): MutableSpendCell {
+  if (record.priceSource === "provider_published") {
+    return record.tokenBasis === "reported" ? spend.providerPublishedReported : spend.providerPublishedEstimated;
+  }
+  return record.tokenBasis === "reported" ? spend.referenceReported : spend.referenceEstimated;
+}
+
+/**
+ * Fold one priced spend into an aggregate's ATTEMPT-side cells. First contributor
+ * seeds the cell; later ones merge through the schema's checked integer adder so a
+ * safe-integer overflow degrades the amount to null (announced by the caller's
+ * exact flag) rather than wrapping.
+ */
+function addAttemptSpend(target: MutableAggregate, record: AccountingSpendV1 | null): boolean {
+  if (record === null) return true;
+  target.spend ??= emptySpend();
+  return addSpendIntoCells(target.spend, record);
+}
+
+/** Cell-level fold shared by both scopes. */
+function addSpendIntoCells(cells: MutableSpend, record: AccountingSpendV1): boolean {
+  const cell = spendCell(cells, record);
+  const knownBefore = cell.known;
+  if (!increase(cell as unknown as Record<string, number>, "known")) return false;
+  if (knownBefore === 0) {
+    cell.amountMicrousd = record.amountMicrousd;
+    cell.observedAt = record.observedAt;
+    return true;
+  }
+  const merged = mergeAccountingSpendCells(cell, { amountMicrousd: record.amountMicrousd, known: 1, observedAt: record.observedAt });
+  if (merged === null) return false;
+  cell.amountMicrousd = merged.amountMicrousd;
+  cell.observedAt = merged.observedAt;
+  return true;
 }
 function emptyDay(date: string): MutableDay {
   return { schema: ACCOUNTING_DAY_SCHEMA, version: ACCOUNTING_STORE_VERSION, date, cells: {}, dedup: { schema: ACCOUNTING_DEDUP_SCHEMA, version: ACCOUNTING_STORE_VERSION, date, requestIds: [], dropped: 0, complete: true }, coverage: emptyCoverage() };
@@ -505,12 +580,27 @@ function addRequest(target: MutableAggregate, event: RequestCompletedEvent, outc
   exact &&= addMetric(target.latency, outcome === "cancelled" ? null : safeCounter(event.latencyMs), event.endedAt);
   exact &&= addMetric(target.commit, outcome === "success" ? safeCounter(event.commitMs) : null, event.endedAt);
   exact &&= addRawTokens(target.requestTokens, event.tokens, event.endedAt);
-  exact &&= increase(target as unknown as Record<string, number>, "unpricedRequests");
+  // Request spend mirrors request tokens: the WINNING serve only, so a
+  // retried-elsewhere request never double-counts its failed attempts.
+  if (event.spend !== null) {
+    target.requestSpend ??= emptySpend();
+    exact &&= addSpendIntoCells(target.requestSpend, event.spend);
+    // A partial figure (unpriced cache kinds etc.) is priced but a lower bound.
+    if (event.spend.coverage !== "full") {
+      exact &&= increase(target as unknown as Record<string, number>, "partiallyPricedRequests");
+    }
+  } else {
+    exact &&= increase(target as unknown as Record<string, number>, "unpricedRequests");
+  }
   return exact;
 }
 function addRootAttempt(target: MutableAggregate, attempt: AccountingAttemptPacketV1): boolean {
   let exact = increase(target as unknown as Record<string, number>, "attempts");
+  // Root aggregates accumulate BOTH attempt-side axes, exactly as the dimension
+  // attempt rows do: dropping the token fold made every root disagree with its
+  // own rows while the spend fold looked complete.
   exact &&= addAggregateTokens(target.tokens, attempt.tokens);
+  exact &&= addAttemptSpend(target, attempt.spend);
   return exact;
 }
 function addAttempt(target: MutableAggregate, attempt: AccountingAttemptPacketV1): boolean {
@@ -519,6 +609,7 @@ function addAttempt(target: MutableAggregate, attempt: AccountingAttemptPacketV1
   exact &&= addMetric(target.latency, attempt.outcome === "cancelled" ? null : attempt.latencyMs, attempt.endedAt);
   exact &&= addMetric(target.commit, attempt.outcome === "success" && attempt.role === "serve" ? attempt.commitMs : null, attempt.endedAt);
   exact &&= addAggregateTokens(target.tokens, attempt.tokens);
+  exact &&= addAttemptSpend(target, attempt.spend);
   return exact;
 }
 function rowKey(row: Pick<MutableRow, "kind" | "role" | "provider" | "model" | "client" | "credentialId" | "attribution" | "outcome" | "failureKind">): string {
@@ -610,7 +701,9 @@ function makeAttempt(event: AttemptCompletedEvent): AccountingAttemptPacketV1 | 
     model: safeId(event.model),
     credentialId: safeId(event.credentialId),
     tokens: tokenSnapshot(event.tokens, event.endedAt),
-    spend: null,
+    // The lifecycle already validated this record's provenance fields; a
+    // re-validation through the packet guard below keeps that guarantee total.
+    spend: event.spend,
   } satisfies AccountingAttemptPacketV1;
   const parsed = parseAccountingAttemptPacketV1(value);
   return parsed.ok ? parsed.value : null;
@@ -1090,7 +1183,9 @@ class AccountingStoreImpl implements AccountingStore {
       model: authoritative?.model ?? safeId(event.model),
       credentialId: authoritative?.credentialId ?? safeId(event.credentialId),
       tokens: authoritative?.tokens ?? tokenSnapshot(event.tokens, event.endedAt),
-      spend: null,
+      // The WINNING serve's spend mirrors its tokens. Repair spend stays on the
+      // repair attempt rows (C1) so a later roll-up can add it back exactly once.
+      spend: authoritative?.spend ?? null,
       attempts: retained,
       attemptMetadata: { total, stored: retained.length, dropped: total - retained.length },
     } satisfies AccountingRequestPacket;

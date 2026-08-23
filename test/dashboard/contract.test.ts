@@ -157,6 +157,7 @@ const spendTotals = (): SpendTotalsV1 => ({
     observedAt: null,
   },
   unpricedRequests: 0,
+  partiallyPricedRequests: 0,
 });
 
 const summary = (): SummaryV1 => ({

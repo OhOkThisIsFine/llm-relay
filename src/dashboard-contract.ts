@@ -263,7 +263,18 @@ export interface SpendTotalsV1 {
   providerPublishedEstimated: ProviderPublishedEstimated;
   referenceReported: ReferenceReported;
   referenceEstimated: ReferenceEstimated;
+  /**
+   * Requests that projected NO spend: never served, or served by a deployment that
+   * publishes no price for either token kind. Deliberately NOT every request — a
+   * free-model request is fully priced at $0 and must not read as a gap.
+   */
   unpricedRequests: number;
+  /**
+   * Requests WITH a spend figure that also carried token kinds no published price covers
+   * (Anthropic cache creation/read, OpenAI cached input, or an unpublished output price).
+   * Every amount above is a LOWER BOUND while this is greater than zero.
+   */
+  partiallyPricedRequests: number;
 }
 
 export interface SummaryV1 {
@@ -637,12 +648,17 @@ export const isSpendTotalsV1 = (value: unknown): value is SpendTotalsV1 =>
     "referenceReported",
     "referenceEstimated",
     "unpricedRequests",
+    // Required, not tolerated-absent: the producer (dashboard-snapshot.ts) and this
+    // validator ship in the same package, so a reader that silently accepted the
+    // pre-spend shape would report every priced request as unpriced.
+    "partiallyPricedRequests",
   ]) &&
   isProviderPublishedReported(value.providerPublishedReported) &&
   isProviderPublishedEstimated(value.providerPublishedEstimated) &&
   isReferenceReported(value.referenceReported) &&
   isReferenceEstimated(value.referenceEstimated) &&
-  isNonNegativeInteger(value.unpricedRequests);
+  isNonNegativeInteger(value.unpricedRequests) &&
+  isNonNegativeInteger(value.partiallyPricedRequests);
 
 export const isPanelCoverageV1 = (value: unknown): value is PanelCoverageV1 =>
   isExactRecord(value, ["panel", "state", "reason", "provenance", "observedAt"]) &&

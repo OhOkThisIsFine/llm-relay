@@ -28,5 +28,8 @@ export function SpendCells({ spend }: Readonly<{ spend: SpendTotalsV1 | null }>)
     ["Reference / reported", spend.referenceReported],
     ["Reference / estimated", spend.referenceEstimated],
   ] as const;
-  return <dl className="cell-list spend-cells">{cells.map(([label, cell]) => <div key={label}><dt>{label}</dt><dd>{currencyMicrousd(cell.amountMicrousd)} <small>({cell.priceSource}; {cell.tokenBasis}; {cell.source}; observed {stamp(cell.observedAt)})</small></dd></div>)}<div><dt>Unpriced requests</dt><dd>{number(spend.unpricedRequests)}</dd></div></dl>;
+  // A partially priced request leaves cache/unpublished token kinds out of the
+  // amounts, so every figure here is a LOWER BOUND until that count is zero.
+  const lowerBound = spend.partiallyPricedRequests > 0;
+  return <dl className="cell-list spend-cells">{cells.map(([label, cell]) => <div key={label}><dt>{label}</dt><dd>{currencyMicrousd(cell.amountMicrousd)}{lowerBound ? " (lower bound)" : ""} <small>({cell.priceSource}; {cell.tokenBasis}; {cell.source}; observed {stamp(cell.observedAt)})</small></dd></div>)}<div><dt>Unpriced requests</dt><dd>{number(spend.unpricedRequests)}</dd></div><div><dt>Partially priced requests</dt><dd>{number(spend.partiallyPricedRequests)}</dd></div></dl>;
 }

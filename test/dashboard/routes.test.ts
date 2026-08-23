@@ -109,6 +109,7 @@ function spend(): SpendTotalsV1 {
     referenceReported: { ...base, priceSource: "reference", tokenBasis: "reported", source: "unknown" },
     referenceEstimated: { ...base, priceSource: "reference", tokenBasis: "estimated", source: "unknown" },
     unpricedRequests: 1,
+    partiallyPricedRequests: 0,
   };
 }
 

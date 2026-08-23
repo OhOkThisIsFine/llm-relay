@@ -51,6 +51,7 @@ import {
   createAccountingRequest,
   NOOP_ACCOUNTING_RECORDER,
   type AccountingAttempt,
+  type AccountingPricePort,
   type AccountingRecorder,
   type AccountingRequest,
   type TokenFactsInput,
@@ -66,7 +67,8 @@ import {
 } from "./dashboard-static.js";
 import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
-import { estimateRequestTokens, assessCost } from "./metadata.js";
+import { estimateRequestTokens, assessCost, resolveMetadata } from "./metadata.js";
+import { findTierModel, loadTierData, type TierModel } from "./tier-data.js";
 import { specOfTarget } from "./benchmarks.js";
 import { extractQuotaObservations, type QuotaObservation } from "./quota-observation.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
@@ -268,6 +270,8 @@ export interface ProxyDeps {
   accountingRecorder?: AccountingRecorder;
   /** The production accounting store supplies this same reader and recorder instance. */
   accountingReader?: AccountingReader;
+  /** Test/dev override for the published-price lookup; production derives it from the catalog. */
+  accountingPricePortOverride?: AccountingPricePort | undefined;
   /** Test/dev-only explicit asset root; production resolves the compiled dashboard once. */
   dashboardAssetRoot?: string;
   /** Version shown by dashboard projections; a bare proxy deliberately remains unknown. */
@@ -295,6 +299,8 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
   const accountingRecorder = deps.accountingRecorder ?? NOOP_ACCOUNTING_RECORDER;
+  // One port per proxy: both request fronts price through the SAME published figures.
+  const accountingPricePort = deps.accountingPricePortOverride ?? buildAccountingPricePort(catalog, cfg);
   // Do not create a second persistence store here.  The CLI owns the production store lifecycle
   // and supplies the same object as recorder and reader; a bare in-memory proxy reports no data.
   const dashboardAuth = new DashboardAuthManager();
@@ -402,6 +408,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       credentialLru,
       ...(modelCallRecorder ? { modelCallRecorder } : {}),
       accountingRecorder,
+      accountingPricePort,
       dashboardAuth,
       dashboardStatic,
       dashboardRead,
@@ -455,6 +462,8 @@ interface Handlers {
   credentialLru: CredentialLru;
   modelCallRecorder?: ModelCallRecorder;
   accountingRecorder: AccountingRecorder;
+  /** Published-price lookup for spend; built once per proxy, shared by both fronts. */
+  accountingPricePort: AccountingPricePort | undefined;
   dashboardAuth: DashboardAuthManager;
   dashboardStatic: DashboardStaticHandler;
   dashboardRead: ReturnType<typeof createDashboardSnapshotReadPort>;
@@ -526,6 +535,49 @@ function accountingTokens(usage: UsageAccumulator, estimatedInputTokens: number)
 }
 
 /**
+ * Build the published-price lookup the accounting lifecycle prices spend through.
+ *
+ * Request-path safe by construction: `cachedLimits()` reads the in-memory catalog
+ * cache and NEVER fetches (same contract as the context guardrail's lookup), and the
+ * synced capability snapshot is memoized on its file mtime. A deployment that
+ * publishes no price resolves to null and stays UNPRICED — never priced at a
+ * fallback or a default. The reference rung uses the snapshot for the same model id,
+ * labelled `reference`, exactly as `/candidates` already labels it.
+ */
+function buildAccountingPricePort(catalog: ModelCatalog, cfg: Config): AccountingPricePort {
+  return (provider, model) => {
+    const p = cfg.providers[provider];
+    const providerLimits = p?.kind === "openai" && model
+      ? catalog.cachedLimits(provider, model)
+      : null;
+    const data = loadTierData();
+    const matched = data
+      ? findTierModel<TierModel>(model, data.byNorm, data.exactByNorm)
+      : null;
+    // A FUZZY match borrows a different SKU's row (`glm-5.2` → `glm-5.2-max`). A
+    // borrowed score mis-ranks a pool; a borrowed PRICE would mis-state spend — so
+    // this path takes the stricter exact-only rule, like `contextWindowResolver`.
+    const tier = matched?.match === "exact" ? matched.rec : undefined;
+    const meta = resolveMetadata(model, {
+      providerLimits,
+      reference: tier
+        ? {
+          pricePromptPerToken: typeof tier.price_prompt === "number" ? tier.price_prompt : null,
+          priceCompletionPerToken: typeof tier.price_completion === "number" ? tier.price_completion : null,
+          from: `openrouter:${tier.norm}`,
+        }
+        : null,
+    });
+    if (meta.priceSource === null) return null;
+    return {
+      pricePerMillionIn: meta.pricePerMTokIn,
+      pricePerMillionOut: meta.pricePerMTokOut,
+      priceSource: meta.priceSource,
+    };
+  };
+}
+
+/**
  * Request accounting is intentionally separate from health state: health owns
  * routing decisions, while this helper only observes actual egress and the
  * downstream response lifetime. Every method is fail-open for proxy traffic.
@@ -546,9 +598,10 @@ class RequestAccountingState {
     startedAt: number,
     private readonly estimatedInputTokens: number,
     client: string,
+    private readonly pricePort?: AccountingPricePort,
   ) {
     try {
-      this.request = createAccountingRequest({ recorder, startedAt, client });
+      this.request = createAccountingRequest({ recorder, startedAt, client, pricePort });
     } catch {
       this.request = null;
     }
@@ -915,6 +968,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       started,
       estimatedRequestTokens,
       requestClient,
+      h.accountingPricePort,
     )
     : null;
 
