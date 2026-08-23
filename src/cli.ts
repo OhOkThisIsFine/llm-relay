@@ -54,6 +54,7 @@ import {
   writeConfigPath,
 } from "./config-edit.js";
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
+import { createDashboardSnapshotReadPort, type CostReportQuery } from "./dashboard-snapshot.js";
 import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp } from "./dashboard-contract.js";
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
 import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
@@ -78,6 +79,8 @@ const VALUE_FLAGS = new Set<string>([
   "--client", "-client",
   "--scope", "-scope",
   "--include", "-include",
+  "--window", "-window",
+  "--by", "-by",
   "--effort", "-effort",
   "--shell", "-shell",
   "--class", "-class",
@@ -217,6 +220,7 @@ ${formatTextTable([
   ["llm-relay offload [status]", "Show current offload rules."],
   ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
   ["llm-relay candidates [-p <name>]", "Compare deployment x credential-slot targets."],
+  ["llm-relay cost [--window <w>] [--by <d>] [--include-repair]", "Summarise spend from the local accounting ledger."],
   ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
   ["llm-relay eligibility <propose|accept> <n> --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model."],
   ["llm-relay eligibility ... --scope group --members <id,id,...> [--all-credentials]", "Groups default to the current credential slot; the flag explicitly widens them."],
@@ -940,6 +944,190 @@ export async function runDashboardCommand(
   } catch {
     write(`llm-relay dashboard: browser unavailable. Open this one-use link before it expires:\n${url}\n`);
   }
+}
+
+export type CostWindow = "1h" | "24h" | "7d" | "30d" | "all";
+
+/** The cost roll-up's dependencies; every default is overridable for tests. */
+export interface CostCommandDependencies {
+  readonly now?: () => number | Date | string;
+  readonly write?: (message: string) => void;
+  readonly exit?: (code: number) => never;
+  /** Overrides the store directory; defaults to the production `~/.llm-relay/usage/`. */
+  readonly usageDir?: string;
+}
+
+/** `--window` spelling → the projector's WindowId. `all` is the CLI's lifetime alias. */
+const COST_WINDOWS: Readonly<Record<CostWindow, "1h" | "24h" | "7d" | "30d" | "today" | "month" | "lifetime">> = {
+  "1h": "1h",
+  "24h": "24h",
+  "7d": "7d",
+  "30d": "30d",
+  all: "lifetime",
+};
+
+/**
+ * Render one spend cell as USD WITH its basis. Null stays "-" — an unpriced figure is
+ * unknown, never $0.00 (the provenance invariant: a guess must not look like a measurement).
+ */
+function costCell(cell: { amountMicrousd: number | null }): string {
+  return cell.amountMicrousd === null ? "-" : `$${(cell.amountMicrousd / 1_000_000).toFixed(4)}`;
+}
+
+function costCellBasis(cell: { priceSource: string; tokenBasis: string }): string {
+  const price = cell.priceSource === "provider_published" ? "published" : "reference";
+  return `${price}, ${cell.tokenBasis}`;
+}
+
+/**
+ * `llm-relay cost` — the C1 roll-up (open-decisions-2026-08-16.md C1): what did this
+ * relay's traffic cost me, in the four provenance-labelled spend cells, optionally with
+ * tool-call repair shown as its own share.
+ *
+ * Reads the LOCAL accounting store files directly (Gap 7 resolution: no HTTP endpoint),
+ * so it answers whether or not the proxy is running — but a running proxy holds unflushed
+ * in-memory deltas, so recent minutes can lag until its write-behind flush lands.
+ */
+export async function runCostCommand(dependencies: CostCommandDependencies = {}): Promise<void> {
+  const write = dependencies.write ?? ((message: string) => process.stdout.write(message));
+  const fail = dependencies.exit ?? ((code: number): never => process.exit(code));
+  const windowValue = argValue("--window");
+  const byValue = argValue("--by");
+
+  let windowId: CostReportQuery["window"];
+  if (windowValue === undefined) windowId = "24h";
+  // Object.hasOwn, not `in`: `in` also matches Object.prototype members ("toString",
+  // "constructor", …), which would assign an inherited function to windowId and die later
+  // inside assertCostReportV1 with an internal message instead of this usage line.
+  else if (Object.hasOwn(COST_WINDOWS, windowValue)) windowId = COST_WINDOWS[windowValue as CostWindow];
+  else {
+    write(`llm-relay cost: --window expects 1h|24h|7d|30d|all (got "${windowValue}")\n`);
+    write("Usage: llm-relay cost [--window 1h|24h|7d|30d|all] [--by provider|model|client|credential] [--include-repair] [--json]\n");
+    fail(1);
+    return;
+  }
+
+  let by: CostReportQuery["by"];
+  if (byValue === undefined) by = "provider";
+  else if (byValue === "provider" || byValue === "model" || byValue === "client" || byValue === "credential") by = byValue;
+  else {
+    write(`llm-relay cost: --by expects provider|model|client|credential (got "${byValue}")\n`);
+    write("Usage: llm-relay cost [--window 1h|24h|7d|30d|all] [--by provider|model|client|credential] [--include-repair] [--json]\n");
+    fail(1);
+    return;
+  }
+
+  // Read-only on purpose: constructing a normal store here would take the writer lease,
+  // replay journals and quarantine corrupt shards — all writes against a directory a live
+  // relay may be committing to. This reader observes committed snapshots only.
+  const store = createAccountingStore({
+    ...(dependencies.usageDir !== undefined ? { rootDir: dependencies.usageDir } : {}),
+    readOnly: true,
+  });
+  const port = createDashboardSnapshotReadPort({ accounting: store, relayVersion: currentVersion(), ...(dependencies.now !== undefined ? { now: dependencies.now } : {}) });
+  try {
+    const report = await port.readCostReport({ window: windowId, includeRepair: hasFlag("--include-repair"), ...(by !== undefined ? { by } : {}) });
+    if (hasFlag("--json")) {
+      write(JSON.stringify(report, null, 2) + "\n");
+      return;
+    }
+    renderCostReport(report, write);
+  } finally {
+    store.close();
+  }
+}
+
+/** Human rendering of one cost report: cells side by side, never blended into one total. */
+function renderCostReport(
+  report: Awaited<ReturnType<ReturnType<typeof createDashboardSnapshotReadPort>["readCostReport"]>>,
+  write: (message: string) => void,
+): void {
+  if (report.coverage === "empty") {
+    write("No accounting data yet.\n\nThe relay records per-request usage under ~/.llm-relay/usage/ once it serves\ntraffic through configured providers. Run the proxy, send a request, then retry.\n");
+    return;
+  }
+  if (report.coverage === "unavailable") {
+    write(`llm-relay cost: the local accounting store could not be read${report.coverageReason ? ` (${report.coverageReason})` : ""}.\n`);
+    return;
+  }
+
+  const rows: TableRow[] = [
+    [
+      report.by === "credential" ? "Credential" : report.by === "model" ? "Provider/model" : report.by === "client" ? "Client" : "Provider",
+      "Requests",
+      "Priced",
+      "Published/reported",
+      "Published/estimated",
+      "Reference/reported",
+      "Reference/estimated",
+      "Unpriced",
+      "Partial",
+    ],
+    ...report.rows.map((row): TableRow => [
+      row.key,
+      String(row.requests),
+      String(row.pricedRequests),
+      `${costCell(row.spend.providerPublishedReported)} (${costCellBasis(row.spend.providerPublishedReported)})`,
+      `${costCell(row.spend.providerPublishedEstimated)} (${costCellBasis(row.spend.providerPublishedEstimated)})`,
+      `${costCell(row.spend.referenceReported)} (${costCellBasis(row.spend.referenceReported)})`,
+      `${costCell(row.spend.referenceEstimated)} (${costCellBasis(row.spend.referenceEstimated)})`,
+      String(row.spend.unpricedRequests),
+      String(row.spend.partiallyPricedRequests),
+    ]),
+    [
+      "TOTAL",
+      String(report.total.requests),
+      String(report.total.pricedRequests),
+      `${costCell(report.total.spend.providerPublishedReported)} (${costCellBasis(report.total.spend.providerPublishedReported)})`,
+      `${costCell(report.total.spend.providerPublishedEstimated)} (${costCellBasis(report.total.spend.providerPublishedEstimated)})`,
+      `${costCell(report.total.spend.referenceReported)} (${costCellBasis(report.total.spend.referenceReported)})`,
+      `${costCell(report.total.spend.referenceEstimated)} (${costCellBasis(report.total.spend.referenceEstimated)})`,
+      String(report.total.spend.unpricedRequests),
+      String(report.total.spend.partiallyPricedRequests),
+    ],
+  ];
+  // The lifetime window declines the serve/repair split (month rollups mix both roles in
+  // one figure), so "--include-repair" cannot be honoured there: announcing "repair
+  // included" while printing no share table would claim an answer the report does not have.
+  const repairDeclinedByWindow = report.includeRepair && report.repair === null && report.window === "lifetime";
+  write(`llm-relay cost — ${report.window}${report.includeRepair && !repairDeclinedByWindow ? ", repair included" : ""}\n`);
+  if (repairDeclinedByWindow) {
+    write("The lifetime window cannot prove the serve/repair split; use a day-bounded window (--window 1h|24h|7d|30d) for the repair share.\n");
+  }
+  write(`${formatTextTable(rows)}\n`);
+
+  if (report.repair !== null) {
+    const share = report.repair;
+    const repairRows: TableRow[] = [
+      ["Repair attempts", "Priced", "Published/reported", "Published/estimated", "Reference/reported", "Reference/estimated", "Unpriced"],
+      [
+        String(share.attempts),
+        String(Math.max(0, share.attempts - share.unpricedAttempts)),
+        `${costCell(share.spend.providerPublishedReported)} (${costCellBasis(share.spend.providerPublishedReported)})`,
+        `${costCell(share.spend.providerPublishedEstimated)} (${costCellBasis(share.spend.providerPublishedEstimated)})`,
+        `${costCell(share.spend.referenceReported)} (${costCellBasis(share.spend.referenceReported)})`,
+        `${costCell(share.spend.referenceEstimated)} (${costCellBasis(share.spend.referenceEstimated)})`,
+        String(share.unpricedAttempts),
+      ],
+    ];
+    write(`\nTool-call repair share (role:"repair" attempts only):\n${formatTextTable(repairRows)}\n`);
+  }
+
+  if (report.coverage === "partial") {
+    // The reason travels as-is rather than being re-explained here: "unknown" usually
+    // means a request carried token kinds the relay could not measure, not disk trouble.
+    write(`Coverage: partial${report.coverageReason ? ` (${report.coverageReason})` : ""}.\nSome figures could not be fully measured; the roll-up is a lower bound on real spend.\n`);
+  }
+  write(
+    "\nPrices are each deployment's published per-(provider, model) figures, or another provider's\n" +
+    "figure for the same model id (labelled reference); there is no fallback price. Cache token kinds\n" +
+    "are NOT priced (no published factor), so requests carrying them count under Partial and every\n" +
+    "amount is a LOWER BOUND while Partial > 0. Cells are never blended: the only single-figure total\n" +
+    "is Published/reported, printed above with its basis. Repair attempts are excluded unless\n" +
+    "--include-repair was given." +
+    (report.recentMinutesMayLag ? "\nA running relay flushes its ledger to disk shortly after each request; the most recent\nminutes may lag until then." : "") +
+    "\n",
+  );
 }
 
 export interface DashboardCommandRouteDependencies {
@@ -2555,6 +2743,13 @@ export function main(): void {
   if (arg2 === "candidates") {
     runCandidates().catch((e) => {
       process.stderr.write(`llm-relay candidates: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
+  if (arg2 === "cost") {
+    runCostCommand().catch((e) => {
+      process.stderr.write(`llm-relay cost: ${(e as Error).message}\n`);
       process.exit(1);
     });
     return;
