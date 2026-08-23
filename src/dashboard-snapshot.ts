@@ -265,6 +265,12 @@ function noteAccountingCoverage(target: ProjectionHealth, coverage: AccountingCo
   if (coverage.state === "stale") target.stale = true;
   if (coverage.state === "empty") target.noMatchingRows = true;
   if (coverage.reason === "retention_pruned") target.retention = true;
+  // Every non-null AccountingCoverageReason the store emits (row_cap, detail_cap,
+  // dedup_cap, counter_overflow, corrupt_recovery, or the truncated-months/retention
+  // "unknown" fallback in accounting-store.ts markCoverage()) names a genuine drop or
+  // corruption at the STORE layer — never "a request lacked a token kind", which is
+  // tracked per-cell via `unknown` counters instead. So flipping partial here is
+  // already the correct classification and needs no change (audited 2026-08-23).
   if (coverage.reason !== null && coverage.reason !== "retention_pruned") target.partial = true;
   if (coverage.droppedRows > 0 || coverage.droppedRecent > 0 || coverage.droppedDetails > 0 || coverage.droppedDedup > 0) {
     target.partial = true;
@@ -339,6 +345,21 @@ function cellHasEvidence(cell: AccountingAggregateTokenCellV1): boolean {
   return cell.known > 0 || cell.unknown > 0 || cell.lost > 0 || cell.overflow || cell.value !== null;
 }
 
+/**
+ * True only when this cache creation/read cell actually carries a split the wire's
+ * single cached field cannot represent: a real non-zero figure, or a figure the store
+ * held but could not sum (`value === null` despite `known > 0`, i.e. lost/overflow on
+ * this specific cell). `known === 0` means the field was never reported at all — the
+ * ordinary "unknown token kind" case already handled by `mergeTokenCell`, not a split
+ * to flag here. Anthropic sends both fields on essentially every response, often as an
+ * exact 0/0 when nothing was cached; that is not a figure to lose, so it must not read
+ * as partial (review fix, coverage-semantics packet finding 3).
+ */
+function cacheCellIndicatesSplit(cell: AccountingAggregateTokenCellV1): boolean {
+  if (cell.known === 0) return false;
+  return cell.value === null || cell.value !== 0;
+}
+
 function mergeMethod(target: MutableTokenCell, source: string | null): void {
   if (source === null) return;
   if (target.method === null) target.method = source;
@@ -362,8 +383,16 @@ function mergeTokenCell(
   mergeMethod(target, method);
   if (source.value === null || source.unknown > 0 || source.lost > 0 || source.overflow) {
     target.value = null;
-    if (source.unknown > 0 || source.lost > 0 || source.overflow) {
+    if (source.lost > 0 || source.overflow) {
+      // The store held this count and either dropped or could not sum it — a real
+      // gap in what this report can show, so the panel is a lower bound.
       health.partial = true;
+      noteProvenance(health, "unknown");
+    } else {
+      // `unknown` alone means no host reported this token kind for these requests
+      // (e.g. an openai-kind backend never sends cache tokens) — nothing the store
+      // held went missing. The cell renders null with provenance "unknown"; the
+      // panel around it stays "complete".
       noteProvenance(health, "unknown");
     }
   } else if (target.value === null && target.known === safeInteger(source.known)) {
@@ -383,14 +412,17 @@ function mergeTokens(target: MutableTokens, source: AccountingAggregateTokenTota
   mergeTokenCell(target.reportedOutput, source.reported.reportedOutput, health, "provider_reported");
   mergeTokenCell(target.reportedCachedInput, source.reported.reportedCachedInput, health, "provider_reported");
   if (
-    source.reported.cacheCreationInputTokens.known > 0 ||
-    source.reported.cacheReadInputTokens.known > 0 ||
-    source.reported.cacheCreationInputTokens.value !== null ||
-    source.reported.cacheReadInputTokens.value !== null
+    cacheCellIndicatesSplit(source.reported.cacheCreationInputTokens) ||
+    cacheCellIndicatesSplit(source.reported.cacheReadInputTokens)
   ) {
     target.cacheSplitObserved = true;
     // The dashboard wire format intentionally has one cached field.  It would
-    // be false precision to add Anthropic creation/read values into it.
+    // be false precision to add Anthropic creation/read values into it. Unlike a
+    // plain unmeasured kind, the store DOES hold a real figure here (split in two,
+    // or lost while summing one side of the split); the wire shape is what can't
+    // carry it, so this stays partial rather than merely "unknown". A 0/0 split
+    // (nothing was cached) is excluded by `cacheCellIndicatesSplit` — there is
+    // nothing held to lose (review fix, coverage-semantics packet finding 3).
     noteProvenance(health, "unknown");
     health.partial = true;
   }
@@ -428,8 +460,16 @@ function mergeMetric(target: MutableMetric, source: AccountingMetricCellV1, heal
       target.samples.push(sample);
     }
   }
-  if (source.unknown > 0 || source.lost > 0 || source.overflow || source.samplesDropped > 0) {
+  if (source.lost > 0 || source.overflow || source.samplesDropped > 0) {
+    // Dropped rows, an overflowed sum, or bucket-capped samples are data the store
+    // held that this report cannot show. A plain `unknown` count (a request that
+    // never got a latency/commit measurement at all) is noted below without
+    // flipping the panel partial; `finalizeHealth`/`hasUnexpectedMetricLoss` still
+    // catches unknown counts that exceed the EXPECTED amount (cancelled requests
+    // have no latency; unserved requests have no commit time) as real loss.
     health.partial = true;
+    noteProvenance(health, "unknown");
+  } else if (source.unknown > 0) {
     noteProvenance(health, "unknown");
   }
 }
@@ -447,7 +487,11 @@ function mergeSpendCell(target: MutableSpendCell, source: AccountingAggregateSpe
   target.known = boundedAdd(target.known, safeInteger(source.known), health);
   noteTimestamp(target, source.observedAt);
   if (source.amountMicrousd === null) {
-    // A contributor that lost its own sum poisons the combined one.
+    // A contributor that lost its own sum poisons the combined one. This is never the
+    // "unpriced" case (an individual AccountingSpendV1 record always carries a real
+    // amount; an unpriced request contributes no record at all, so its cell arrives
+    // empty and is skipped above) — a null amount here can only mean the STORE's own
+    // running sum overflowed, i.e. a real loss (audited 2026-08-23).
     if (knownBefore > 0) { target.amountMicrousd = null; health.partial = true; noteProvenance(health, "unknown"); }
     return;
   }
@@ -1193,6 +1237,12 @@ function requestRow(packet: AccountingRequestPacket, coverage?: ProjectionHealth
     unpricedRequests: packet.spend === null ? 1 : 0,
   };
   addRequestAggregate(stats, aggregate);
+  // Same unexpected-vs-expected metric-loss check summaryFrom() applies via
+  // finalizeHealth: a success with no commit time, or a non-cancelled request with
+  // no latency, is real loss here too — otherwise the detail panel and the summary
+  // panel disagree about the identical request (review fix, finding 2). Harmless on
+  // the recent-rows call site, which passes no `coverage` to merge into.
+  finalizeHealth(stats);
   if (coverage !== undefined) mergeHealth(coverage, stats.health);
   return {
     requestId: packet.requestId,
@@ -1272,7 +1322,15 @@ function safeReadDays(reader: AccountingReader, dates: readonly string[]): ReadD
     const days: AccountingDayShard[] = [];
     for (const date of dates) {
       const entry = entries.get(date) as { status?: unknown; value?: unknown } | undefined;
-      if (entry?.status !== "ok" || entry.value === null || entry.value === undefined) {
+      if (entry === undefined || entry.status === "missing") {
+        // A day shard simply doesn't exist yet (a fresh install, or a window reaching
+        // before the store's history) — the store never held this day, so nothing was
+        // omitted. Mirrors readCostDays's identical missing/corrupt split (review fix,
+        // coverage-semantics packet finding 1): only a genuinely corrupt/unreadable
+        // entry below is a real gap.
+        continue;
+      }
+      if (entry.status !== "ok" || entry.value === null || entry.value === undefined) {
         health.partial = true;
         noteProvenance(health, "unknown");
         continue;
@@ -1458,6 +1516,9 @@ function processRows(
           credential: row.provider === null || row.credentialId === null ? null : [row.provider, row.credentialId],
         };
         if (values.provider === null || values.model === null || values.client === null || values.credential === null) {
+          // A row missing one of its own identity fields (e.g. a synthesized all-capped
+          // 429 carries no credentialId) is genuinely omitted from that dimension's
+          // panel, not a token kind nobody reported — kept as partial (audited 2026-08-23).
           health.partial = true;
           noteProvenance(health, "unknown");
         }
