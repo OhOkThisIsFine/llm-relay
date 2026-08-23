@@ -2,12 +2,19 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-23
+## 0. State as of 2026-08-23 (afternoon)
 
 Branch `main`. The metering closeout is **complete**: every sprint lane merged (nine commits).
 Since then: **v0.39.0** (`883a804`, released `cb273b0`) fixed the request-side tool-call IR leak with a
 relay-owned Anthropic→OpenAI request mapper (`src/openai-request.ts`), and the **G2 hard cap** landed
 (`5e06a56`, v0.40.0): `limits.hard` refuses before egress on both fronts.
+
+This afternoon's sprint landed three more fixes, released as **v0.41.0**: `50e8233`
+fixed dashboard/`cost` coverage-partial semantics (partial now means lost/omitted data, never a
+merely-unmeasured token kind); `8473cb1` added `src/tool-use-ids.ts` to mint unique `tool_use` ids
+when an openai-kind host repeats its own tool-call ids (NIM kimi-k3); `3253a53` added
+`src/responses-request.ts`, the OpenAI Responses→Anthropic request mapper that closes the s6
+dropped-`function_call` gap.
 
 - The metering program is delivered through Stage 5. Merged lanes, by commit:
   - `7abdaf2` — C3 / Gap 4: `AssistantMessage.usage` widened; cache tokens survive repair and translation.
@@ -125,10 +132,11 @@ else.**
   directly (`--model openrouter/stealth/ox-alpha`) avoids the fall-through. Health demotes, never
   drops — so spent members stay walkable by design; the fix direction is eligibility facts or the
   G2 cap, not dropping.
-- **One known load-flaky test:** `test/accounting-cli-lifecycle.test.ts` "constructs one store,
-  injects it, and closes it once across close paths" can exceed its 5 s timeout under the full
-  parallel suite (the CLI module graph grew). It passes alone — rerun before calling it a
-  regression.
+- **Free-lane reliability, 2026-08-23:** NIM 429s a two-lane burst on one key; ollama-cloud free
+  tier returned 429 "weekly usage limit"; codex exec is at its ChatGPT usage limit until
+  2026-08-27. Kimi-k3's repeated tool-call ids (NIM emits `Read:0`/`Bash:0` every turn) are fixed
+  by the relay in v0.41.0 (`8473cb1`, `src/tool-use-ids.ts`) — a headless lane against that model
+  needs a relay >= 0.41.0.
 - **Two heredoc groups in one Bash call break quoting in this harness.** One heredoc per call.
 
 ## 5. Definition of done
@@ -146,22 +154,18 @@ else.**
 
 After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7:
 
-- **OPEN — dashboard/`cost` coverage marks a healthy store `partial` when a request merely lacked
-  a token KIND** (unmeasured != lost): store persistence writes `unknown: 1` into sub-cells the
-  request did not carry, and `mergeTokenCell` treats any unknown as loss, so almost every report
-  prints a Coverage-partial line whose cause is measurement incompleteness, not data loss.
-  Fix direction: distinguish "kind absent because uncarried" from "kind measured as unknown".
-- **OPEN — OpenAI Responses front → `openai`-kind target loses the assistant's tool call:** llm-bridge's
-  `openaiResponsesToUniversal` has no case for a `function_call` INPUT item, so the assistant turn is
-  flattened to an empty user turn before the request mapper is reached (`test/openai-front.test.ts`
-  pins the observation). Fix direction: own that translation too (a mirror of `src/openai-request.ts`).
+- **Resolved 2026-08-23 (v0.41.0)** — dashboard/`cost` coverage-partial semantics (`50e8233`):
+  partial now means lost/omitted data, never a merely-unmeasured token kind.
+- **Resolved 2026-08-23 (v0.41.0)** — OpenAI Responses front's dropped `function_call`
+  (`3253a53`, `src/responses-request.ts`).
 - **Resolved —** the ollama-cloud 403 "Pro plan" refusal was learned by a seed interpretation as
   `subscription-required` (`ollama-cloud#default/kimi-k3`, excluded from free pools); nothing to accept.
+- **OPEN — gemini's OpenAI-compatible endpoint refuses tool messages with no `name`:**
+  `src/openai-request.ts` emits `role:"tool"` messages without a `name`; gemini returned 400
+  "function_response.name: name cannot be empty" (seen in the refusal-interpretations unknown
+  queue). Fix direction: look up the call's name from the preceding assistant `tool_use`.
 - **OPEN — reviewed-rule rung / streaming cache usage** — see reconciliation §7 for each with its
   owner call. (The G2 hard cap is delivered: `5e06a56`, `limits.hard`.)
-- **Known load-flaky test:** `test/accounting-cli-lifecycle.test.ts` "constructs one store…"
-  can exceed its 5 s timeout under the full parallel suite; passes alone — rerun before calling
-  it a regression.
 - **Resolved:** Gap 7 by spec amendment 2026-08-22 (no new endpoints). **DEFER — Gap 10 / M4**
   (estimated-output producer, evidence-gated), **Gaps 15/16, M3, P1, P4** — do not build without
   a new decision.
