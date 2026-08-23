@@ -2,27 +2,26 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-22
+## 0. State as of 2026-08-22 (evening)
 
-Branch `codex/stage-1-credential-pooling`.
+Branch `main`. The metering closeout is **complete**: every sprint lane merged (nine commits).
 
-- Env-backed multi-key credential pooling (Stage 0 + Stage 1) is complete; its packets landed as
-  `7217ce0` .. `3795e60` (see git history).
-- The accounting foundation + Analytics SPA (P0-P4) landed as `b4ec7ee` after being found
-  UNCOMMITTED by a prior worker; it was checkpoint-committed with the gate green. Same-day
-  follow-ups sit in the working tree on top of it: a metering reconciliation, a documentation
-  drift pass (19 architecture-table rows, gate description, storage list, fact kinds, subagent
-  signals, headers, stale-doc banners, plus a `test/architecture-map.test.ts` guard), removal of
-  a dead bundled dependency, and review-driven fixes in the accounting store, dashboard server,
-  repair path and CLI.
+- The metering program is delivered through Stage 5. Merged lanes, by commit:
+  - `7abdaf2` — C3 / Gap 4: `AssistantMessage.usage` widened; cache tokens survive repair and translation.
+  - `ca9e75e` — Gap 5: operator-declared rate limits (`limits`) on providers and credential slots.
+  - `3611647` — Gap 8: learned rate-limit measurement facts on both fronts (display-only).
+  - `82cf8e9` — Gap 13: catalog harvesting of published rpm/rpd/tpm/tpd.
+  - `a386058` — Gap 11 / Stage 4: every attempt priced from published prices into four provenance cells.
+  - `a2cd375` (+ baseline regen `dd19780`) — Stage 3: availability ladders, in-memory usage window, dashboard availability producer.
+  - `f29e18e` — Stage 5 / Gap 12: quota joins both fronts' walk order as a demotion term.
+  - `9fd9f36` — Stage 4 / C1: the `llm-relay cost` spend roll-up with `--include-repair`.
 - [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is THE
-  ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`. Open in one
-  line: Stage 3 availability (Gaps 5, 8), Stage 4 spend (Gap 11 + the cost roll-up), Gap 12's
-  enforcement term, and widening `AssistantMessage.usage` (C3).
-- `llm-relay offload status` now renders the EFFECTIVE `freeOnly` (explicit ON/OFF vs the
-  two-sided unset default); the last known transparency gap is closed.
-- Gate green at the commit that carries this handoff; CI is the living evidence. Do not start
-  custody/keystore work until the metering closeout is complete.
+  ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`; its §7 lists what
+  remains open after the sprint (M4/Gap 10 deferral, the G2 hard cap unbuilt, the reviewed-rule rung
+  of `resolveResetsAt` fed null, streaming cross-protocol usage parity in llm-bridge).
+- Earlier state, for orientation: env-backed multi-key credential pooling landed as `7217ce0` ..
+  `3795e60`; the accounting foundation + Analytics SPA (P0-P4) as `b4ec7ee`, followed by
+  review-driven hardening (`3c3edd2`) and the Gap 7 spec amendment (`90e5e55`).
 
 ## 1. What still binds
 
@@ -102,6 +101,30 @@ else.**
   `~/.llm-relay/config.json.bak-2026-08-22-pre-clilane-task-order`). The lesson stays: some shells
   let a variadic option swallow what follows it, so keep `{task}` BEFORE any variadic flag, and
   confirm a template with one real headless run before trusting a lane built from it.
+- **Claude Code has THREE client-side idle timers that abort a long silent generation at ~300 s
+  on a custom base URL** — event-level + byte-level streaming watchdogs, and the body idle
+  timeout. The relay's commit probe (`src/stream-commit.ts`) holds bytes until meaningful
+  content, so a long think looks idle to all three. `routing.cliLane.env` now carries
+  `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` and
+  `API_FORCE_IDLE_TIMEOUT=0` so a lane child outlives its own thinking; set the same three in any
+  hand-written CLI rung.
+- **A raw tool-call IR envelope has reached `claude -p` clients as TEXT through the relay**
+  (~4 of ~20 headless runs, two different backends: openrouter/stealth/ox-alpha and
+  nim/moonshotai/kimi-k3), shaped like
+  `{"_original":{"provider":"anthropic","raw":{…}},"tool_call":{…},"type":"tool_call"}` — sometimes
+  fatal (the run ends with the JSON as final text), sometimes partial (a real tool call follows).
+  Open investigation, same class as [docs/tool-call-dialect-leak.md](docs/tool-call-dialect-leak.md):
+  some path is serializing an internal tool-call representation instead of emitting native
+  `tool_use` blocks.
+- **When the preferred pool member is rate-limited, `pool/xhigh` falls through to members with
+  standing 402/403 refusals whose error ends a headless claude session.** Addressing a member
+  directly (`--model openrouter/stealth/ox-alpha`) avoids the fall-through. Health demotes, never
+  drops — so spent members stay walkable by design; the fix direction is eligibility facts or the
+  G2 cap, not dropping.
+- **One known load-flaky test:** `test/accounting-cli-lifecycle.test.ts` "constructs one store,
+  injects it, and closes it once across close paths" can exceed its 5 s timeout under the full
+  parallel suite (the CLI module graph grew). It passes alone — rerun before calling it a
+  regression.
 - **Two heredoc groups in one Bash call break quoting in this harness.** One heredoc per call.
 
 ## 5. Definition of done
@@ -117,24 +140,26 @@ else.**
 
 ## 6. Outstanding, unclaimed
 
-From [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §6:
+After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7:
 
-- **OPEN — C3 / Gap 4.** Widen `AssistantMessage.usage` (`src/anthropic.ts`) so clients stop
-  receiving narrowed cache-token fields. Changes the emitted wire shape; needs its own reviewed
-  change, not a drive-by.
-- **OPEN — Stage 3/5 remainder (Gaps 5, 8, 12).** Configured limits on `ProviderConfig`, learned
-  rate-limit facts + parser, and a quota demotion term in `orderByUsability()`. The largest
-  genuine piece of the spec still missing; the availability ladders of spec §5 exist in no form.
-- **OPEN — Stage 4 (Gap 11 + C1 roll-up).** Spend x `resolveMetadata()` prices with compound
-  `spendBasis`; then `cost --include-repair`. Rebase `unpricedRequests` in the same change.
-- **Gap 7:** resolved 2026-08-22 by spec amendment; no new endpoints.
-- **DEFER — Gap 10 / M4.** Estimated-output producer withheld until measured usage-absence rates
-  justify it (owner disposition, open-decisions.md).
-- **DEFER — Gap 13.** Catalog rate-limit harvesting: cheap, expected near-empty payoff; slot
-  after Stage 3.
-- **DEFER — Gaps 15/16, M3, P1, P4.** Superseded by the SPA choice / argued against in spec §5.4 /
-  mutation-with-no-consumer / custody-next-stage / purpose-gated respectively. Do not build
-  without a new decision.
+- **OPEN — dashboard/`cost` coverage marks a healthy store `partial` when a request merely lacked
+  a token KIND** (unmeasured != lost): store persistence writes `unknown: 1` into sub-cells the
+  request did not carry, and `mergeTokenCell` treats any unknown as loss, so almost every report
+  prints a Coverage-partial line whose cause is measurement incompleteness, not data loss.
+  Fix direction: distinguish "kind absent because uncarried" from "kind measured as unknown".
+- **OPEN — tool-call IR envelope leak** (see the bite in §4): an internal tool-call representation
+  reaching clients as text on two backends. Investigate which serialization path emits it;
+  [docs/tool-call-dialect-leak.md](docs/tool-call-dialect-leak.md) is the precedent class.
+- **OPEN — ollama-cloud 403 "Pro plan" refusal** awaits acceptance as `subscription-required` via
+  `llm-relay eligibility`; until then the demotion machinery treats it as an ordinary refusal.
+- **OPEN — G2 hard cap / reviewed-rule rung / streaming cache usage** — see reconciliation §7 for
+  each with its owner call.
+- **Known load-flaky test:** `test/accounting-cli-lifecycle.test.ts` "constructs one store…"
+  can exceed its 5 s timeout under the full parallel suite; passes alone — rerun before calling
+  it a regression.
+- **Resolved:** Gap 7 by spec amendment 2026-08-22 (no new endpoints). **DEFER — Gap 10 / M4**
+  (estimated-output producer, evidence-gated), **Gaps 15/16, M3, P1, P4** — do not build without
+  a new decision.
 
 Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
 
@@ -156,4 +181,4 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   both fronts: `test/accounting-lifecycle.test.ts` "records failed and committed winning serve
   attempts" walks a 429 candidate then a winner for each front.)
 
-Custody/keystore stays out of scope until the metering closeout is complete.
+Custody/keystore was gated on the metering closeout; that gate is now lifted (the metering program is delivered through Stage 5), but custody remains a separate program needing its own owner decision before work starts.

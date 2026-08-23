@@ -446,6 +446,14 @@ Ranked by value per unit effort. S ≈ under a day, M ≈ a few days, L ≈ a we
 
 ## 9. STAGED BUILD ORDER
 
+> **Delivery status 2026-08-22:** Stages 0–5 and the Stage 6 SPA choice are DELIVERED — the
+> accounting store + SPA superseded the pipeline shape for Stages 0–2/6, the evening sprint
+> (`7abdaf2`..`9fd9f36`, branch `main`) landed Stages 3, 4, 5 and catalog harvesting (Gap 13),
+> with C1's `llm-relay cost --include-repair`. The authoritative implemented-vs-open ledger,
+> including what remains open after that sprint, is
+> [metering-reconciliation-2026-08-22.md](metering-reconciliation-2026-08-22.md) §7. The text
+> below is the original plan, kept as written.
+
 Each stage is independently shippable, leaves the tree green, and is useful on its own.
 
 **Stage 0 — Make the existing measurement legible.** (Gaps 1, 14. Effort S.)

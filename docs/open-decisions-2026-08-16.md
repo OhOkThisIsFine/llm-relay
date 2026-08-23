@@ -23,7 +23,7 @@ Source documents:
 | # | Decision | **Resolution** |
 |---|---|---|
 | G1 | Build order | **Stage 0, then pooling.** The `credentialState` refactor and per-credential keying first, then multi-key pooling on the env vars that already exist. Custody (Stage 3) follows once the resolver seam is proven rather than speculative. |
-| G2 | May metering refuse a request? | **Demote-only, plus a manual per-credential hard cap.** A *derived* number may only demote a candidate to last resort. An explicit operator-set cap may refuse, loudly, with its own status and header. Rationale on record: a candidate never dispatched never returns a usage frame, so an over-count is self-perpetuating and unobservable. |
+| G2 | May metering refuse a request? | **Demote-only, plus a manual per-credential hard cap.** A *derived* number may only demote a candidate to last resort. An explicit operator-set cap may refuse, loudly, with its own status and header. Rationale on record: a candidate never dispatched never returns a usage frame, so an over-count is self-perpetuating and unobservable. ⚠ **Status 2026-08-22:** the demote-only half is delivered (Stage 5 / Gap 12); the manual hard cap is approved in principle and UNBUILT — shape proposal and open design calls recorded in [metering-reconciliation-2026-08-22.md](metering-reconciliation-2026-08-22.md) §7. |
 | G3 | Dashboard | **Full SPA port of freellmapi's Analytics page.** ⚠ Chosen against the recommendation — see the budget note below; this is a deliberate, stated trade. The [implementation design](spa-dashboard-design-2026-08-20.md) is complete. |
 | G4 | Recover `repair-proxy-spec.md` | **Proceed on the reconstruction.** The commit evidence stands on its own: the day-one deferral, the same-day voiding of its premise, and the three unjoined mechanisms are all documented. No further provenance work. |
 
@@ -52,20 +52,20 @@ dependencies, measurements, or implementation gates claimed.
 
 | # | Decision | Recommendation |
 |---|---|---|
-| M1 | Should the headroom demotion band (ordering by provider-stated quota percent the relay already harvests) be **on by default** in the release that introduces it? | On, at a 10% floor. It is provider-stated — the strongest evidence class the project recognises — and it changes nothing today. Caveat: it silently changes routing order on upgrade. |
-| M2 | Should a **learned** limit (parsed from vendor prose) ever gate routing, or stay display-only? | Display-only by default. A mis-parsed axis would throttle a healthy deployment on a number nobody stated. Opt-in later. |
+| M1 | Should the headroom demotion band (ordering by provider-stated quota percent the relay already harvests) be **on by default** in the release that introduces it? | On, at a 10% floor. It is provider-stated — the strongest evidence class the project recognises — and it changes nothing today. Caveat: it silently changes routing order on upgrade. ✅ **Delivered** at the credential seam (`credential-select.ts` headroom banding), later joined at the deployment seam by Stage 5 / Gap 12. |
+| M2 | Should a **learned** limit (parsed from vendor prose) ever gate routing, or stay display-only? | Display-only by default. A mis-parsed axis would throttle a healthy deployment on a number nobody stated. Opt-in later. ✅ **Delivered** exactly so: learned rate-limit facts are display-only, gating only under the explicit `routing.quota.enforceLearned` opt-in (Stage 5). |
 | M3 | Should llm-relay ship an operator **"clear this cooldown"** mutation? | Only behind the control token plus the existing Origin/content-type/Host admission checks — never loopback alone. |
 | M4 | Estimated **output** tokens at all, or render `-` when a provider omits usage? | Decide after Stage 1 measures how often usage is actually absent. |
-| M5 | Retention horizon for `usage/<date>.json`. | 30 days — matches the widest window any surface offers; longer costs only disk. |
+| M5 | Retention horizon for `usage/<date>.json`. | 30 days — matches the widest window any surface offers; longer costs only disk. ✅ **Delivered** — production constructs the store with `retentionDays: 30` (`src/cli.ts`). |
 | M6 | A **savings counterfactual** tile (freellmapi's "estimated savings $")? | Not as freellmapi implements it — it mixes an unlabelled fallback price into the same sum as real published prices and extrapolates 30 days from a shorter span. A correctly-provenanced version is a separate ask. |
 
 ## Cost accounting
 
 | # | Decision | Recommendation |
 |---|---|---|
-| C1 | Is a **repair (reshaper) call's spend** charged to the request that triggered it, or reported separately? | Both — separate `role: "repair"` rows, with `llm-relay cost --include-repair` for the roll-up. Costs one flag, and "what did tool-call repair cost me" is worth being able to answer. |
+| C1 | Is a **repair (reshaper) call's spend** charged to the request that triggered it, or reported separately? | Both — separate `role: "repair"` rows, with `llm-relay cost --include-repair` for the roll-up. Costs one flag, and "what did tool-call repair cost me" is worth being able to answer. ✅ **Delivered** (`llm-relay cost --include-repair`, commit `9fd9f36`). |
 | C2 | How should the ledger treat the **Anthropic passthrough**, where the credential is the caller's own? | Record it, mark the row `caller-operated`, exclude from per-key totals and gates. ⚠ Without this it silently meters as a relay-held key, because `resolveAuthEnv` returns a name whenever `ANTHROPIC_API_KEY` is set even with no declared `authEnv`. |
-| C3 | Anthropic **prompt-cache tokens** are dropped by the relay's own type. Recover by widening `AssistantMessage.usage`, or by reading the raw frame before narrowing? | Widen the type. It fixes a second defect — clients currently receive narrowed usage — but it changes the wire shape the relay emits. Cache reads and writes price very differently and Claude Code is a heavy cache user, so folding them into plain input over-states cost on the lane most worth metering. |
+| C3 | Anthropic **prompt-cache tokens** are dropped by the relay's own type. Recover by widening `AssistantMessage.usage`, or by reading the raw frame before narrowing? | Widen the type. It fixes a second defect — clients currently receive narrowed usage — but it changes the wire shape the relay emits. Cache reads and writes price very differently and Claude Code is a heavy cache user, so folding them into plain input over-states cost on the lane most worth metering. ✅ **Delivered** — type widened (commit `7abdaf2`); residual: streaming cross-protocol translation inside llm-bridge still drops cache fields (reconciliation §7). |
 | C4 | Clock for period boundaries. | UTC for every provider-facing boundary, local only for human labels, with the surface stating which it used. freellmapi has both and they disagree. |
 
 ## Custody and pooling

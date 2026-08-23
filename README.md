@@ -49,7 +49,8 @@ at login.
 - **Both API fronts** — Anthropic `/v1/messages` plus OpenAI `/v1/chat/completions` and
   `/v1/responses`, translated in either direction, streaming included.
 - **Local analytics dashboard** — `llm-relay dashboard` opens bounded request/attempt, token,
-  latency, provider/model/client/credential, quota, and cooldown views. Unknown or unavailable
+  spend, latency, provider/model/client/credential, quota, and cooldown views (spend priced only
+  from published prices; `llm-relay cost` rolls it up in a terminal). Unknown or unavailable
   accounting remains explicit; the dashboard never guesses a value or starts provider probes.
 - **Honest metadata** — per-deployment limits and prices with provenance, capability scores
   synced from four leaderboards, metadata-only logging, loopback-only binding.
