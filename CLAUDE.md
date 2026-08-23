@@ -228,8 +228,12 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
   `refusal-interpretations.json`, `lane-manifest.json`, `update-check.json`, the `hooks/` script
   (the Agent hook), and the accounting subtree `usage/` (`lifetime.json`, `recent.json`,
   `YYYY-MM-DD.json` day shards, `snapshot-journal.json`). Under vitest every default path redirects to a temp dir.
-- **Hand-built `Config` objects in tests must include** `backend.kind` and
-  `repair: { maxAttempts, destructiveTools }`.
+- **Hand-built `Config` objects in tests must include** `repair: { maxAttempts,
+  destructiveTools }`, and every provider entry needs its `kind`
+  (`"anthropic"`/`"openai"` — load defaults an omitted kind to `"anthropic"`, so a hand-built
+  openai-kind fixture that omits it tests a different code path than it claims). The old
+  `config.backend.{base,kind}` field is gone since the registry refactor (`774ba18`) — there is no
+  top-level `backend` on `Config` any more.
 - **Commit trailer:** `Co-Authored-By: <the model doing the work> <noreply@anthropic.com>`
   (e.g. `Claude Fable 5`). Name the model that actually authored the change.
 
@@ -588,6 +592,13 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   still abort without it) for a working lane, or `dontAsk` for a read-only one that fails loudly
   instead of silently. Measured evidence and the alternatives others use:
   [docs/offload-agentic-capability.md](docs/offload-agentic-capability.md).
+  ⚠ **A lane child needs the client idle watchdogs raised, or a long think kills it.** Claude Code
+  has three CLIENT-side idle timers (event-level + byte-level streaming watchdogs and a body idle
+  timeout) that abort a silent generation at ~300 s on a custom base URL — and the relay's commit
+  probe (`stream-commit.ts`) holds bytes until meaningful content, so a long think IS silent to
+  them. The owner's `routing.cliLane.env` therefore sets
+  `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` and
+  `API_FORCE_IDLE_TIMEOUT=0`; put the same three in any hand-written `cli` rung's `env`.
   **`{contextWindow}` has THREE rungs, all real measurements** (`contextWindowResolver` in
   `metadata.ts`): a ceiling this deployment *stated when refusing an over-length request*
   (`context-limits.ts`), then its own published `contextLength`, then `context_length` from the
@@ -640,18 +651,20 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 
 ## Status & open work
 
-**The accounting foundation and the Analytics SPA are landed (2026-08-22)** — `b4ec7ee` on
-`codex/stage-1-credential-pooling` carries the event-sourced accounting store (`~/.llm-relay/usage/`),
-the usage observer on both fronts, the protected dashboard API and the React SPA; same-day
-follow-ups sit in the working tree on top of it: review-driven fixes across the store, dashboard
-server and repair path, the effective `freeOnly` now rendered by `llm-relay offload status`
-(closing the last known transparency gap), removal of a dead bundled dependency, and the doc-drift
-pass that added 19 architecture-table rows and the `test/architecture-map.test.ts` guard.
-[docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is the
-ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`: metering Stages 0,
-1, 2 and 6 are delivered (through the accounting store and SPA, not the spec's pipeline shape);
-**Stage 3 availability (Gaps 5, 8), Stage 4 spend (Gap 11 + the cost roll-up) and Gap 12's
-enforcement term remain unbuilt**, as does widening `AssistantMessage.usage` (C3). ⚠ Do not
+**The metering sprint is complete (2026-08-22, evening)** — Stages 0–6 of
+`docs/quota-metering-spec-2026-08-16.md` are delivered, through the event-sourced accounting store
+(`~/.llm-relay/usage/`, `b4ec7ee`), the usage observer on both fronts, the protected dashboard API
+and React SPA, and the nine-commit evening sprint (`7abdaf2`..`9fd9f36`) that closed the remainder:
+widened `AssistantMessage.usage` with cache fields (C3), operator-declared `limits`
+(Gap 5), learned rate-limit facts on both fronts (Gap 8, display-only), catalog harvesting of
+published rate limits (Gap 13), per-attempt spend priced from published prices into four
+provenance cells (Gap 11), the availability ladders + dashboard availability producer (Stage 3),
+quota as a demotion term on both fronts (Stage 5 / Gap 12, learned opt-in via
+`routing.quota.enforceLearned`), and the `llm-relay cost --include-repair` roll-up.
+[docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7 is the
+open list: M4/Gap 10 stays deferred, the G2 manual hard cap is approved-but-unbuilt, the
+reviewed-rule rung of `resolveResetsAt` is plumbed but fed null, streaming cross-protocol usage in
+llm-bridge drops cache fields, plus the standing Gaps 15/16/M3/P1/P4 deferrals. ⚠ Do not
 "complete" Gap 3 by adding token fields to `LOG_FIELDS` — the accounting store superseded the
 JSONL-as-ledger plan; see the `log.ts` row above.
 

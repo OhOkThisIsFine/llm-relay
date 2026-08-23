@@ -740,7 +740,7 @@ sh, `$env:`/`Remove-Item Env:` statements for PowerShell). This is what makes a 
 ```jsonc
 {
   "id": "claude-pool", "kind": "cli", "command": "claude",
-  "args": ["-p", "--model", "pool/medium", "--permission-mode", "plan", "{task}"],
+  "args": ["-p", "--model", "pool/medium", "--permission-mode", "acceptEdits", "{task}"],
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791",
     "ANTHROPIC_AUTH_TOKEN": "dummy",           // relay strips it for contained providers
@@ -773,7 +773,7 @@ per tier:
 "routing": {
   "cliLane": {
     "command": "claude",
-    "args": ["-p", "--model", "{spec}", "--permission-mode", "plan", "{task}"],
+    "args": ["-p", "{task}", "--model", "{spec}", "--permission-mode", "acceptEdits"],
     "env": {
       "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791",
       "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "{contextWindow}",   // dropped when unpublished
@@ -791,6 +791,13 @@ delegated task. `{contextWindow}` (optional) is the spec's published context win
 | `{spec}` | yes | yes | relay-resolved routing |
 | `{contextWindow}` | yes | yes | relay-resolved provider metadata |
 | `{task}` | yes | **rejected at config load** | request content must never become process configuration |
+
+**Idle watchdogs.** Claude Code aborts a long silent generation (~300 s on a custom base URL) via
+three client-side idle timers — event-level and byte-level streaming watchdogs plus a body idle
+timeout — and the relay's final-wire commit probe holds bytes back until meaningful content, so a
+long think looks idle to all three. A lane meant to run reasoning models should set
+`CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` and
+`API_FORCE_IDLE_TIMEOUT=0` in its `env`; this machine's own `routing.cliLane.env` does.
 
 A rung pointing at the plain Anthropic passthrough is **not** transposed — a bare `Agent(...)`
 reaches that from any host. With no template configured, such a rung is reported `unreachable` and
@@ -876,8 +883,8 @@ from that member states its ceiling, and the next dispatch reports the corrected
 Rate limits are learned the same way: a 429 whose body states an explicit ceiling ("limit 60
 requests per minute", "TPM: 6000") — or a response carrying attributed `x-ratelimit-*-limit` /
 `-remaining` header pairs for a minute/day period — is remembered as a `rate-limit-*` fact, shown
-per member in `/candidates`. Like learned context ceilings these are **display-only**: they never
-gate or reorder traffic on their own.
+per member in `/candidates`. Like learned context ceilings these are **display-only by default**:
+they never gate traffic unless you turn on the Stage 5 opt-in `routing.quota.enforceLearned`.
 
 `llm-relay dispatch --next-command -t "<task>"` prints just the runnable line for `next`, for
 callers that want something executable rather than the human ladder.
@@ -976,8 +983,8 @@ in config `limits`), `learned` (parsed from what the deployment stated when it r
 `published` (catalog-harvested). A `derived_*` remaining means the relay computed it as limit minus
 local usage over the current period; period boundaries are UTC (minute/day/month). Unknown renders
 as "Unavailable", never 0, and a negative remaining means the credential overshot its ceiling.
-`learned` figures are display-only — routing does not act on them unless you opt in later (spec
-decision M2). Cooldown rows show WHY a member is cooling (`rate_limit`, `auth_error`,
+`learned` figures are display-only — routing acts on them only under the explicit opt-in
+`routing.quota.enforceLearned` (spec decision M2). Cooldown rows show WHY a member is cooling (`rate_limit`, `auth_error`,
 `provider_error`) and until when, with the real observation time where one exists.
 
 The same accounting read model is available **without a running relay** as a terminal roll-up:
