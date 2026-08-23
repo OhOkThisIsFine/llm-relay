@@ -43,6 +43,7 @@ import {
   QUOTA_AXES,
   QUOTA_PERIODS,
   REMAINING_BASES,
+  RESETS_AT_BASES,
   RESPONSE_ATTRIBUTIONS,
   SPEND_PRICE_SOURCES,
   SPEND_SOURCES,
@@ -68,6 +69,7 @@ import {
   isDashboardQuotaAxis,
   isDashboardQuotaPeriod,
   isDashboardRemainingBasis,
+  isDashboardResetsAtBasis,
   isDashboardResponseAttribution,
   isDashboardSpendPriceSource,
   isDashboardSpendSource,
@@ -277,6 +279,7 @@ const quota = (): QuotaRowV1 => ({
   limitBasis: "provider_stated",
   remainingBasis: "derived_configured",
   localUsedBasis: "reported",
+  resetsAtBasis: null,
 });
 
 const cooldown = (): CooldownRowV1 => ({
@@ -391,6 +394,7 @@ describe("dashboard v1 contract", () => {
     expect(LIMIT_BASES).toEqual(["provider_stated", "configured", "learned", "published"]);
     expect(REMAINING_BASES).toEqual(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"]);
     expect(LOCAL_USED_BASES).toEqual(["reported", "estimated", "mixed"]);
+    expect(RESETS_AT_BASES).toEqual(["provider_stated", "reviewed_rule", "derived_boundary"]);
     expect(RESPONSE_ATTRIBUTIONS).toEqual(["relay_held", "caller_operated", "unknown", "all"]);
     expect(isDashboardAttribution("relay_held")).toBe(true);
     expect(isDashboardAttribution("relay-held")).toBe(false);
@@ -434,6 +438,7 @@ describe("dashboard v1 contract", () => {
       [LIMIT_BASES, isDashboardLimitBasis],
       [REMAINING_BASES, isDashboardRemainingBasis],
       [LOCAL_USED_BASES, isDashboardLocalUsedBasis],
+      [RESETS_AT_BASES, isDashboardResetsAtBasis],
       [DASHBOARD_ERROR_CODES, isDashboardErrorCode],
       [DASHBOARD_ERROR_MESSAGES, isDashboardErrorMessage],
     ];
@@ -487,6 +492,20 @@ describe("dashboard v1 contract", () => {
     expect(isDashboardQueryWithinLimit("a".repeat(DASHBOARD_MAX_QUERY_BYTES + 1))).toBe(false);
     expect(isDashboardRequestBytesWithinLimit(DASHBOARD_MAX_REQUEST_BYTES)).toBe(true);
     expect(isDashboardRequestBytesWithinLimit(DASHBOARD_MAX_REQUEST_BYTES + 1)).toBe(false);
+  });
+
+  it("carries the reviewed_rule reset basis additively and guards it", () => {
+    // 2026-08-23 additive contract change: the availability ladder's reviewed-rule rung is fed by
+    // persisted fact provenance, so its spelling must round-trip the wire and stay a closed enum.
+    const reviewed = clone(snapshot());
+    reviewed.quotas[0]!.resetsAtBasis = "reviewed_rule";
+    expect(isSnapshotV1(reviewed)).toBe(true);
+    const misspelt = clone(snapshot());
+    (misspelt.quotas[0] as unknown as Record<string, unknown>).resetsAtBasis = "reviewed-rule";
+    expect(isSnapshotV1(misspelt)).toBe(false);
+    const missing = clone(snapshot()) as unknown as { quotas: Array<Record<string, unknown>> };
+    delete missing.quotas[0]!.resetsAtBasis;
+    expect(isSnapshotV1(missing)).toBe(false);
   });
 
   it("accepts complete bounded snapshot/detail/error fixtures", () => {

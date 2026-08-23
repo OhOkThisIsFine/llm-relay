@@ -13,9 +13,11 @@
  * arithmetic step — rung 2's limit − localUsed — is labelled with WHERE its inputs came from
  * ("derived:<limit-provenance>"), so a reader can always tell a stated figure from a computed one.
  *
- * Pure: no IO, no clock of its own (`now` is an argument), no imports from server.ts. The next
- * packet (Gap 12) calls `resolveRemaining` from the routing path under `routingEligible`; nothing
- * here reorders or refuses anything today.
+ * Pure: no IO, no clock of its own (`now` is an argument), no imports from server.ts. It reads no
+ * store either — `factResetInputs` is handed facts a caller already read, and the only non-type
+ * import outside this file's own vocabulary is `target-facts.ts`'s closed kind set, so the set
+ * cannot be restated (and drift) in two consumers. Gap 12 calls `resolveRemaining` from the
+ * routing path under `routingEligible`; nothing here reorders or refuses anything today.
  */
 import type { QuotaAxis, QuotaObservation, QuotaPeriod } from "./quota-observation.js";
 
@@ -265,7 +267,7 @@ export type ResetsAtResolution = {
  * a stated reset must still be in the future, else it is declined and the next rung answers.
  *
  * `providerStated` / `reviewedRule` arrive pre-resolved: the request path already applies
- * ResetRules beside header parses (`server.ts` resolveResetMs), and re-parsing vendor prose here
+ * ResetRules beside header parses (`server.ts` resolveReset), and re-parsing vendor prose here
  * would risk two readers disagreeing about one response. This module only decides WHICH rung wins
  * and computes the fallback boundary.
  */
@@ -291,9 +293,87 @@ export function resolveResetsAt(input: {
   return { resetsAt: null, basis: null };
 }
 
+// ── §5.2 rung inputs from persisted target-facts ────────────────────────────────────────────────
+
+import { QUOTA_RESET_FACT_KINDS, type FactKind, type FactResetBasis } from "./target-facts.js";
+
+/**
+ * One covering fact, in exactly the shape `factsFor()` returns (wider objects satisfy it).
+ * Type-only coupling to the store plus its closed kind set — this module still reads nothing.
+ */
+export interface FactResetCandidate {
+  readonly kind: FactKind;
+  readonly until: number;
+  readonly untilBasis?: FactResetBasis;
+}
+
+/**
+ * Turn the facts covering ONE credential×deployment cell into this bucket's rung-1/rung-2 inputs.
+ *
+ * The ONE place that policy lives, because both the dashboard producer (`availability-snapshot.ts`)
+ * and `llm-relay candidates` (`candidates.ts`) resolve the same cell: two implementations is how
+ * the two surfaces come to disagree about one row (the shape CLAUDE.md's "two paths, one policy
+ * empty" gotcha names). Neither caller re-parses vendor prose — a fact already carries the reset
+ * the request path resolved AND the rung it came from (`untilBasis`, minted by `server.ts`
+ * `resolveReset`).
+ *
+ * A fact may answer a bucket only when EVERY one of these holds; each clause is a provenance
+ * guard, not a nicety:
+ * - the fact's kind is one the QUOTA vocabulary can speak about (`QUOTA_RESET_FACT_KINDS`): an
+ *   evicting condition ("this deployment is removed from selection") is not a statement about when
+ *   an allowance refills, and rendering it as one is a category error dressed as a measurement;
+ * - the fact carries an explicit `untilBasis`: a legacy row or a kind's default TTL is the relay's
+ *   own fallback, never something anybody stated;
+ * - its `until` is still in the future (rung 2 has no eligibility test of its own, so it gets one
+ *   here rather than rendering a reset that has already passed);
+ * - the bucket is MEASURED-SPENT (`remaining !== null && remaining <= 0`). Unknown remaining has no
+ *   effect whatsoever — the same rule quota demotion follows — and a bucket with headroom must
+ *   never be handed a credential-wide reset: that would invent availability for a bucket nobody
+ *   made a claim about, which is precisely the provenance invariant;
+ * - the ladder would otherwise fall through to the derived boundary (`observationReset === null`).
+ *   A reset this response stated about this bucket always outranks a stored one.
+ *
+ * Within those gates the MOST-SPECIFIC scope wins per basis class, not the soonest expiry: callers
+ * pass `facts` in `factsFor()` order (attempt → group → deployment → credential → provider →
+ * model), and the first hit of each class is taken. Racing the two classes on recency would let an
+ * unrelated short fact pre-empt rung 2 entirely, so both inputs are returned independently and
+ * `resolveResetsAt` picks the rung.
+ *
+ * ⚠ Residual, stated rather than papered over: a fact carries no axis/period attribution, so a
+ * fact admitted here answers whichever spent bucket of the cell asked. The conjunction above IS
+ * the containment (same cell, measured-spent, and the provider said nothing about this bucket
+ * itself); an axis/period mapping inferred from the fact's kind would be exactly the invention
+ * `target-facts.ts` refuses ("scope comes from evidence, never from counting").
+ */
+export function factResetInputs(input: {
+  /** Covering facts in `factsFor()` order — most-specific scope first. */
+  facts: readonly FactResetCandidate[];
+  /** Rung 1's own input: the reset the eligible observation stated, if any. */
+  observationReset: number | null;
+  remaining: number | null;
+  now: number;
+}): { providerStated: number | null; reviewedRule: number | null } {
+  const spent = input.remaining !== null && input.remaining <= 0;
+  if (!spent || input.observationReset !== null) {
+    return { providerStated: input.observationReset, reviewedRule: null };
+  }
+  let stated: number | null = null;
+  let reviewed: number | null = null;
+  for (const fact of input.facts) {
+    if (fact.untilBasis === undefined) continue;
+    if (!QUOTA_RESET_FACT_KINDS.has(fact.kind)) continue;
+    if (!Number.isFinite(fact.until) || fact.until <= input.now) continue;
+    // `retry-after` / `stated-body` came out of the provider's own response, so they belong on
+    // rung 1; the reviewed rungs are a reviewer's assertion and belong on rung 2.
+    if (fact.untilBasis === "reviewed-field" || fact.untilBasis === "reviewed-fixed") reviewed ??= fact.until;
+    else stated ??= fact.until;
+  }
+  return { providerStated: stated, reviewedRule: reviewed };
+}
+
 // ── Dashboard-contract vocabulary mapping ───────────────────────────────────────────────────────
 
-import type { LimitBasis, LocalUsedBasis, RemainingBasis } from "./dashboard-contract.js";
+import type { LimitBasis, LocalUsedBasis, RemainingBasis, ResetsAtBasis } from "./dashboard-contract.js";
 
 /**
  * Map internal bases onto the dashboard wire vocabulary in ONE place, so the producer and the
@@ -327,6 +407,19 @@ export function mapLimitBasis(basis: RemainingResolution["limitBasis"]): LimitBa
       return "learned";
     case "published":
       return "published";
+    default:
+      return null;
+  }
+}
+
+export function mapResetsAtBasis(basis: ResetsAtResolution["basis"]): ResetsAtBasis | null {
+  switch (basis) {
+    case "provider-stated":
+      return "provider_stated";
+    case "reviewed-rule":
+      return "reviewed_rule";
+    case "derived-boundary":
+      return "derived_boundary";
     default:
       return null;
   }

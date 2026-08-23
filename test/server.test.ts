@@ -13,6 +13,8 @@ import type { Reshaper } from "../src/reshaper.js";
 import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
 import { reconstructFromSse } from "../src/sse.js";
 import { reconstruct } from "../src/reshaper.js";
+import { allFacts, resetFacts } from "../src/target-facts.js";
+import { acceptInterpretation, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations } from "../src/refusal-interpretation.js";
 
 const breakerIdentity = (provider: string, model: string | null) => ({
   provider,
@@ -1357,5 +1359,149 @@ describe("tool_use id minting on the OpenAI Responses front", () => {
     expect(rec["path"]).toBe("/v1/responses");
     expect(rec["toolUseIdRewrites"]).toBe(1);
     expect(JSON.stringify(rec)).not.toContain("Read:0");
+  });
+});
+
+/**
+ * The wiring `observeEligibility` owes `recordFact`: the rung `resolveReset` selected must land on
+ * the stored row as `untilBasis`, so the availability producer's reviewed-rule rung can read a
+ * reset's provenance off the fact rather than re-deriving it from vendor prose in the read path.
+ * Pure-function coverage for that already lives beside the store
+ * (`test/target-facts.test.ts` "persists the reset's provenance"); this is the request-path half —
+ * body reaches the wire, response is a refusal, and the fact the walk records is the readback.
+ *
+ * Hermetic note: the eligibility stores are process-global, so each test resets them on BOTH sides
+ * of the assertion (`beforeEach` + `afterEach`); `allFacts()` uses the redirected vitest default
+ * path, so no `~/.llm-relay/target-facts.json` is ever touched.
+ */
+describe("eligibility → untilBasis wiring", () => {
+  beforeEach(() => {
+    resetFacts();
+    resetInterpretations();
+  });
+  afterEach(() => {
+    resetFacts();
+    resetInterpretations();
+  });
+
+  /**
+   * Run one refusal through a single-candidate proxy and return the fact it recorded. The backend
+   * status/body are parameterized so each case drives `resolveReset` to a different rung; the
+   * routing spec is "up/m" (not bare "up") because `observeEligibility` declines a target with no
+   * model — the embodied-unit gotcha, not a property under test.
+   */
+  async function refusalFact(
+    status: number,
+    body: string,
+    headers: Record<string, string> = {},
+  ): Promise<{ kind: string; untilBasis: string | undefined; until: number }> {
+    const backend = await mockBackend(() => ({
+      status,
+      headers: { "content-type": "application/json", ...headers },
+      body,
+    }));
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up/m", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 1, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: REQUEST_BODY,
+    });
+    expect(resp.status).toBe(status);
+
+    const facts = allFacts();
+    expect(facts.length).toBeGreaterThan(0);
+    const fact = facts.find((f) => f.scope.kind === "credential" && f.scope.provider === "up");
+    expect(fact).toBeDefined();
+    return { kind: fact!.kind, untilBasis: fact!.untilBasis, until: fact!.until };
+  }
+
+  it("labels a Retry-After-derived expiry 'retry-after'", async () => {
+    // The rung-1 case: the response states the cooldown in its header, the strongest evidence
+    // `resolveReset` can have. The seed account-scope rate-limit wording is what makes a 429
+    // produce a fact at all (an ordinary 429 is the breaker's per-target business).
+    const fact = await refusalFact(
+      429,
+      JSON.stringify({ error: { message: "rate limit for your account exceeded" } }),
+      { "retry-after": "30" },
+    );
+    expect(fact.kind).toBe("rate-limited");
+    expect(fact.untilBasis).toBe("retry-after");
+    expect(fact.until).toBeGreaterThan(Date.now() + 29_000);
+  });
+
+  it("labels a body-stated expiry 'stated-body' when no header or field resolves", async () => {
+    // Same seed, no Retry-After, but the body carries a JSON retry_after — the generic parse
+    // (`parseStatedResetMs`) is `resolveReset`'s rung 3, above a reviewed fixed window and below
+    // anything a header or reviewed field said.
+    const fact = await refusalFact(
+      429,
+      JSON.stringify({ error: { message: "rate limit for your account exceeded", retry_after: 45 } }),
+    );
+    expect(fact.kind).toBe("rate-limited");
+    expect(fact.untilBasis).toBe("stated-body");
+    expect(fact.until).toBeGreaterThan(Date.now() + 44_000);
+  });
+
+  it("labels a reviewed-field reset 'reviewed-field' when the rule fires on this response", async () => {
+    // The reviewer-recorded path: an interpretation carrying a `field` rule, so the reset is read
+    // from THIS response at a place only a reviewer knew to look (google.rpc.RetryInfo's shape).
+    const body = JSON.stringify({ error: { message: "quota exhausted, retry tomorrow", retryDelay: "120s" } });
+    const signature = refusalSignature("up", "m", 429, body);
+    recordUnknownRefusal("up", "m", 429, body);
+    proposeInterpretation(signature, {
+      class: "allowance-exhausted",
+      scope: { kind: "credential" },
+      rationale: "test fixture",
+      reset: { kind: "field", field: "retryDelay" },
+    });
+    expect(acceptInterpretation(signature)).toBe(true);
+
+    const fact = await refusalFact(429, body);
+    expect(fact.kind).toBe("allowance-exhausted");
+    expect(fact.untilBasis).toBe("reviewed-field");
+    expect(fact.until).toBeGreaterThan(Date.now() + 119_000);
+  });
+
+  it("labels a reviewed-fixed reset 'reviewed-fixed' when the response says nothing itself", async () => {
+    // The lowest reviewed rung: a fixed reviewer's window, which only binds because the body
+    // genuinely said nothing about duration — no header, no field rule firing, no stated-body parse.
+    const body = JSON.stringify({ error: { message: "quota exhausted, no timing stated" } });
+    const signature = refusalSignature("up", "m", 429, body);
+    recordUnknownRefusal("up", "m", 429, body);
+    proposeInterpretation(signature, {
+      class: "allowance-exhausted",
+      scope: { kind: "credential" },
+      rationale: "test fixture",
+      reset: { kind: "fixed", ms: 90_000 },
+    });
+    expect(acceptInterpretation(signature)).toBe(true);
+
+    const fact = await refusalFact(429, body);
+    expect(fact.kind).toBe("allowance-exhausted");
+    expect(fact.untilBasis).toBe("reviewed-fixed");
+    expect(fact.until).toBeGreaterThan(Date.now() + 89_000);
+  });
+
+  it("leaves the kind's default TTL unattributed when nothing resolves the reset", async () => {
+    // No header, no stated body, no reviewed rule: `resolveReset` returns null, `recordFact` is
+    // called without `untilBasis`, and the fact inherits the kind's default TTL (2m for
+    // rate-limited). Absence must stay absence — never a guessed basis.
+    const fact = await refusalFact(
+      429,
+      JSON.stringify({ error: { message: "rate limit for your account exceeded" } }),
+    );
+    expect(fact.kind).toBe("rate-limited");
+    expect(fact.untilBasis).toBeUndefined();
+    expect(fact.until).toBeGreaterThan(Date.now() + 100_000);
+    expect(fact.until).toBeLessThan(Date.now() + 150_000);
   });
 });

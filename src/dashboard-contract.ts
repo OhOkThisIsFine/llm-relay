@@ -181,6 +181,13 @@ export type RemainingBasis =
   | "derived_learned"
   | "derived_published";
 export type LocalUsedBasis = "reported" | "estimated" | "mixed";
+/**
+ * Where a quota row's `resetsAt` came from (spec §5.2 ladder). `provider_stated` is the response's
+ * own header/observation; `reviewed_rule` is a persisted reviewed refusal-interpretation rule
+ * (added 2026-08-23, additive — the rung existed unfed until the fact store started persisting
+ * reset provenance); `derived_boundary` is the UTC period boundary this relay computed.
+ */
+export type ResetsAtBasis = "provider_stated" | "reviewed_rule" | "derived_boundary";
 export const TOKEN_SOURCES = Object.freeze(["provider_reported", "relay_estimated"] as const);
 export const SPEND_PRICE_SOURCES = Object.freeze(["provider_published", "reference"] as const);
 export const TOKEN_BASES = Object.freeze(["reported", "estimated"] as const);
@@ -188,6 +195,7 @@ export const SPEND_SOURCES = Object.freeze(["provider_reported", "relay_estimate
 export const LIMIT_BASES = Object.freeze(["provider_stated", "configured", "learned", "published"] as const);
 export const REMAINING_BASES = Object.freeze(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"] as const);
 export const LOCAL_USED_BASES = Object.freeze(["reported", "estimated", "mixed"] as const);
+export const RESETS_AT_BASES = Object.freeze(["provider_stated", "reviewed_rule", "derived_boundary"] as const);
 
 export type ResponseAttribution = Attribution | "all";
 export const RESPONSE_ATTRIBUTIONS = Object.freeze(["relay_held", "caller_operated", "unknown", "all"] as const);
@@ -487,6 +495,11 @@ export interface QuotaRowV1 {
   limitBasis: LimitBasis | null;
   remainingBasis: RemainingBasis | null;
   localUsedBasis: LocalUsedBasis | null;
+  /**
+   * Where `resetsAt` came from (spec §5.2 ladder); null when the row has no reset at all. Added
+   * 2026-08-23, additive — the rung existed unfed until the fact store persisted reset provenance.
+   */
+  resetsAtBasis: ResetsAtBasis | null;
 }
 
 export interface CooldownRowV1 {
@@ -572,6 +585,8 @@ export const isDashboardRemainingBasis = (value: unknown): value is RemainingBas
   isValueIn(REMAINING_BASES, value);
 export const isDashboardLocalUsedBasis = (value: unknown): value is LocalUsedBasis =>
   isValueIn(LOCAL_USED_BASES, value);
+export const isDashboardResetsAtBasis = (value: unknown): value is ResetsAtBasis =>
+  isValueIn(RESETS_AT_BASES, value);
 export const isDashboardErrorCode = (value: unknown): value is DashboardErrorCode =>
   isValueIn(DASHBOARD_ERROR_CODES, value);
 export const isDashboardErrorMessage = (value: unknown): value is DashboardErrorMessage =>
@@ -1056,6 +1071,7 @@ export const isQuotaRowV1 = (value: unknown): value is QuotaRowV1 =>
     "limitBasis",
     "remainingBasis",
     "localUsedBasis",
+    "resetsAtBasis",
   ]) &&
   isDashboardSafeId(value.credentialId) &&
   isDashboardSafeId(value.label) &&
@@ -1071,7 +1087,8 @@ export const isQuotaRowV1 = (value: unknown): value is QuotaRowV1 =>
   isNullableTimestamp(value.observedAt) &&
   isNullable(value.limitBasis, isDashboardLimitBasis) &&
   isNullable(value.remainingBasis, isDashboardRemainingBasis) &&
-  isNullable(value.localUsedBasis, isDashboardLocalUsedBasis);
+  isNullable(value.localUsedBasis, isDashboardLocalUsedBasis) &&
+  isNullable(value.resetsAtBasis, isDashboardResetsAtBasis);
 export const isCooldownRowV1 = (value: unknown): value is CooldownRowV1 =>
   isExactRecord(value, ["credentialId", "provider", "deployment", "reason", "until", "observedAt"]) &&
   isDashboardSafeId(value.credentialId) &&

@@ -44,12 +44,33 @@ export const SCOPE_PRECEDENCE: Array<FactScope["kind"]> = [
   "attempt", "group", "deployment", "credential", "provider", "model",
 ];
 
+/**
+ * How a fact's explicit `until` was resolved against the response that produced it. Mirrors the
+ * rung order of `resolveReset` in `server.ts` — the one place these values are minted:
+ *
+ *   retry-after    — the response's own `Retry-After` header.
+ *   reviewed-field — a reviewed `field` ResetRule read out of THIS response's body
+ *                    (Google's `retryDelay`): a measurement from a place only a reviewer knew.
+ *   stated-body    — the generic body parse; the response stated a reset, unprompted.
+ *   reviewed-fixed — a reviewer-asserted window; knowledge of the provider, not of this response.
+ *
+ * ABSENT means a legacy row or the kind's default TTL — the relay declined to record why, so the
+ * absence must never be read as a basis by a consumer. Never written as a guess: `recordFact`
+ * accepts it only alongside a positive finite `retryAfterMs`.
+ */
+export type FactResetBasis = "retry-after" | "reviewed-field" | "stated-body" | "reviewed-fixed";
+
+const UNTIL_BASES: ReadonlySet<string> = new Set([
+  "retry-after", "reviewed-field", "stated-body", "reviewed-fixed",
+]);
+
 interface StoredFact {
   kind: FactKind;
   scope: FactScope;
   at: number;
   until?: number;
   value?: number;
+  untilBasis?: FactResetBasis;
 }
 
 interface FactStore {
@@ -81,6 +102,20 @@ const CONDITIONS: ReadonlySet<FactKind> = new Set([
 ]);
 const COST_BLOCKING: ReadonlySet<FactKind> = new Set(["not-servable", "subscription-required"]);
 const COOLING: ReadonlySet<FactKind> = new Set(["allowance-exhausted", "credential-invalid", "rate-limited"]);
+/**
+ * The kinds whose `until` may answer a QUOTA row's `resetsAt` (`availability.ts`
+ * `factResetInputs`). Exported so the availability ladder and `llm-relay candidates` share one
+ * definition instead of each restating a kind list.
+ *
+ * It is COOLING minus `credential-invalid` on purpose, and the narrowing is the point: the two
+ * kinds here say "this allowance/throughput is spent and refills at T", which is what a quota row
+ * asks. A revoked or faulted credential's expiry says when the RELAY will next try the key — a
+ * different question, on a different axis, and answering the quota one with it would label an
+ * auth cooldown as a quota reset. The evicting conditions (`not-servable`,
+ * `subscription-required`) are excluded for the same reason: removal from selection is not
+ * replenishment. Those all still render in the Cooldowns panel, which is where they belong.
+ */
+export const QUOTA_RESET_FACT_KINDS: ReadonlySet<FactKind> = new Set(["allowance-exhausted", "rate-limited"]);
 const FACT_KINDS_SET: ReadonlySet<string> = new Set(Object.keys(FACT_TTL_MS));
 export const FACT_KINDS = Object.keys(FACT_TTL_MS) as FactKind[];
 
@@ -193,7 +228,18 @@ function load(path: string): FactStore {
       if (rawFacts && typeof rawFacts === "object") {
         for (const [key, fact] of Object.entries(rawFacts)) {
           if (!isValidFact(key, fact)) continue;
-          const stored: StoredFact = { ...fact, scope: normalizeScope(fact.scope) };
+          // Drop a basis outside the closed enum rather than failing the load: an unknown spelling
+          // must behave exactly like the legacy rows that never carried one. A basis with NO
+          // explicit `until` goes the same way — `expiryOf` would then fall back to the kind's
+          // default TTL, and handing a consumer that fallback with a basis attached is the exact
+          // "a guess labelled a measurement" the field exists to prevent.
+          const { untilBasis, ...rest } = fact;
+          const attributable = Number.isFinite(fact.until) && UNTIL_BASES.has(untilBasis as string);
+          const stored: StoredFact = {
+            ...rest,
+            scope: normalizeScope(fact.scope),
+            ...(attributable ? { untilBasis: untilBasis as FactResetBasis } : {}),
+          };
           // Rows predating the kind-in-key format carry a bare scope key; rekey them to the
           // canonical `<kind>:<scope>` so an upgrade keeps every learned fact. Where both forms
           // exist the canonical one stays — it was written later by this version.
@@ -239,7 +285,7 @@ function covers(fact: StoredFact, provider: string, credentialId: CredentialId |
 export function recordFact(
   kind: FactKind,
   scope: FactScope,
-  opts: { path?: string; now?: number; retryAfterMs?: number | null; value?: number } = {},
+  opts: { path?: string; now?: number; retryAfterMs?: number | null; untilBasis?: FactResetBasis; value?: number } = {},
 ): void {
   if (!isValidScope(scope)) return;
   const path = opts.path ?? defaultPath();
@@ -247,10 +293,16 @@ export function recordFact(
   if (!Number.isFinite(now)) return;
   const stated = typeof opts.retryAfterMs === "number" && Number.isFinite(opts.retryAfterMs) && opts.retryAfterMs > 0
     ? opts.retryAfterMs : null;
+  // The basis is bound to the explicit expiry it explains: with no positive `retryAfterMs` the
+  // kind's default TTL is what applied, and a basis recorded beside it would mislabel a fallback.
+  const basis = stated !== null && opts.untilBasis !== undefined && UNTIL_BASES.has(opts.untilBasis)
+    ? opts.untilBasis
+    : null;
   const normalized = normalizeScope(scope);
   load(path).facts[keyOf(kind, normalized)] = {
     kind, scope: normalized, at: now,
     ...(stated === null ? {} : { until: now + stated }),
+    ...(basis === null ? {} : { untilBasis: basis }),
     ...(typeof opts.value === "number" && Number.isFinite(opts.value) ? { value: opts.value } : {}),
   };
   writer.touch(() => persist(path));
@@ -261,14 +313,18 @@ export function factsFor(
   credentialId: CredentialId | null,
   model: string | null | undefined,
   opts: { path?: string; now?: number } = {},
-): Array<{ kind: FactKind; scope: FactScope; until: number; value?: number }> {
+): Array<{ kind: FactKind; scope: FactScope; until: number; untilBasis?: FactResetBasis; value?: number }> {
   const now = opts.now ?? Date.now();
   const m = typeof model === "string" ? model : null;
-  const hits: Array<{ kind: FactKind; scope: FactScope; until: number; value?: number }> = [];
+  const hits: Array<{ kind: FactKind; scope: FactScope; until: number; untilBasis?: FactResetBasis; value?: number }> = [];
   for (const fact of Object.values(load(opts.path ?? defaultPath()).facts)) {
     const until = expiryOf(fact);
     if (now < until && covers(fact, provider, credentialId, m)) {
-      hits.push({ kind: fact.kind, scope: fact.scope, until, ...(fact.value === undefined ? {} : { value: fact.value }) });
+      hits.push({
+        kind: fact.kind, scope: fact.scope, until,
+        ...(fact.untilBasis === undefined ? {} : { untilBasis: fact.untilBasis }),
+        ...(fact.value === undefined ? {} : { value: fact.value }),
+      });
     }
   }
   return hits.sort((a, b) => SCOPE_PRECEDENCE.indexOf(a.scope.kind) - SCOPE_PRECEDENCE.indexOf(b.scope.kind));
@@ -305,11 +361,14 @@ export function clearFacts(provider: string, credentialId: CredentialId | null, 
   return cleared;
 }
 
-export function allFacts(opts: { path?: string; now?: number } = {}): Array<{ kind: FactKind; scope: FactScope; at: number; until: number }> {
+export function allFacts(opts: { path?: string; now?: number } = {}): Array<{ kind: FactKind; scope: FactScope; at: number; until: number; untilBasis?: FactResetBasis }> {
   const now = opts.now ?? Date.now();
   return Object.values(load(opts.path ?? defaultPath()).facts)
     .filter((fact) => now < expiryOf(fact))
-    .map((fact) => ({ kind: fact.kind, scope: fact.scope, at: fact.at, until: expiryOf(fact) }))
+    .map((fact) => ({
+      kind: fact.kind, scope: fact.scope, at: fact.at, until: expiryOf(fact),
+      ...(fact.untilBasis === undefined ? {} : { untilBasis: fact.untilBasis }),
+    }))
     .sort((a, b) => b.at - a.at);
 }
 

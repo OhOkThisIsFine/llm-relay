@@ -27,8 +27,10 @@ import { CONFIGURED_LIMIT_AXES, configuredLimitQuotaShape, resolveConfiguredLimi
 import { providerCredentialSlots } from "./credential-fleet.js";
 import { observedRateLimits } from "./rate-limits.js";
 import {
+  factResetInputs,
   mapLimitBasis,
   mapRemainingBasis,
+  mapResetsAtBasis,
   resolveRemaining,
   resolveResetsAt,
   type LimitInputs,
@@ -52,6 +54,13 @@ export interface AvailabilityProducerOptions {
   readonly accounting?: Pick<AccountingStore, "usedInWindow"> | null;
   /** Injected for deterministic tests; defaults to Date.now(). */
   readonly now?: () => number;
+  /**
+   * The facts read seam; defaults to `factsFor`. Covers BOTH halves of the snapshot (quota resets
+   * and the cooldown panel) — a seam only one consumer honours implies coverage it does not have.
+   * Injected by tests to exercise the never-throws guarantee against a throwing reader; the
+   * production default never throws.
+   */
+  readonly readFacts?: typeof factsFor;
 }
 
 /** Shape-compatible with `DashboardAvailabilityPort`; typed locally so server.ts stays decoupled. */
@@ -75,6 +84,7 @@ function buildQuotas(
   breaker: CircuitBreaker | undefined,
   accounting: AvailabilityProducerOptions["accounting"],
   now: number,
+  readFacts: typeof factsFor,
 ): QuotaRowV1[] {
   const rows: QuotaRowV1[] = [];
   if (breaker === undefined) return rows;
@@ -86,6 +96,11 @@ function buildQuotas(
     const provider = parsed.provider;
     const model = state.target.model;
     const credentialId = state.target.credentialId;
+
+    // ONE fact read per cell, not per bucket: `factsFor` walks and sorts the whole table, and
+    // every bucket of this cell asks it the same question. The ordering it returns
+    // (most-specific scope first) is load-bearing input to `factResetInputs`.
+    const cellFacts = readFacts(provider, credentialId as CredentialId, model, { now });
 
     const buckets = new Map<string, Bucket>();
     const bucketFor = (axis: QuotaAxis, period: Exclude<QuotaPeriod, "unknown">): Bucket => {
@@ -144,9 +159,15 @@ function buildQuotas(
         localUsed,
         now,
       });
+      // The §5.2 rung inputs, resolved by the SAME helper `llm-relay candidates` calls, so the
+      // two surfaces cannot report different provenance for one cell.
       const resets = resolveResetsAt({
-        providerStated: resolution.eligibleObservation?.resetsAt ?? null,
-        reviewedRule: null,
+        ...factResetInputs({
+          facts: cellFacts,
+          observationReset: resolution.eligibleObservation?.resetsAt ?? null,
+          remaining: resolution.remaining,
+          now,
+        }),
         period: periodPart,
         now,
       });
@@ -168,6 +189,7 @@ function buildQuotas(
         limitBasis: mapLimitBasis(resolution.limitBasis),
         remainingBasis: mapRemainingBasis(resolution.basis),
         localUsedBasis: resolution.localUsedBasis,
+        resetsAtBasis: mapResetsAtBasis(resets.basis),
       });
     }
   }
@@ -217,6 +239,7 @@ function buildCooldowns(
   breaker: CircuitBreaker | undefined,
   accounting: AvailabilityProducerOptions["accounting"],
   now: number,
+  readFacts: typeof factsFor,
 ): CooldownRowV1[] {
   const rows = new Map<string, CooldownRowV1>();
   const push = (
@@ -278,7 +301,7 @@ function buildCooldowns(
     const key = `${cell.provider} ${cell.credentialId} ${cell.model ?? ""}`;
     if (seen.has(key)) return;
     seen.add(key);
-    for (const fact of factsFor(cell.provider, cell.credentialId as CredentialId, cell.model, { now })) {
+    for (const fact of readFacts(cell.provider, cell.credentialId as CredentialId, cell.model, { now })) {
       let reason: CooldownReason | null = null;
       if (fact.kind === "allowance-exhausted" || fact.kind === "rate-limited") reason = "rate_limit";
       else if (fact.kind === "credential-invalid") reason = "auth_error";
@@ -348,13 +371,14 @@ function buildCooldowns(
 export function createAvailabilityProducer(options: AvailabilityProducerOptions): AvailabilitySnapshot {
   const { breaker, config, accounting } = options;
   const clock = options.now ?? (() => Date.now());
+  const readFacts = options.readFacts ?? factsFor;
   return {
     snapshot() {
       try {
         const now = clock();
         return {
-          quotas: buildQuotas(config, breaker, accounting ?? null, now),
-          cooldowns: buildCooldowns(config, breaker, accounting ?? null, now),
+          quotas: buildQuotas(config, breaker, accounting ?? null, now, readFacts),
+          cooldowns: buildCooldowns(config, breaker, accounting ?? null, now, readFacts),
         };
       } catch {
         // A diagnostic producer must never fail a dashboard read; an empty result surfaces as
