@@ -117,7 +117,8 @@ block. All state lives under `~/.llm-relay/` (`config.json`, `.env`, `models-cac
       "high":   { "preferred": [], "include": "free", "effort": "high" },
       "xhigh":  { "preferred": [], "include": "free", "effort": "xhigh" }
     },
-    "sticky": false                         // opt-in session affinity; see below
+    "sticky": false,                        // opt-in session affinity; see below
+    "quota": { "enforce": true }            // spent-quota demotion; see Failover below
   },
   "mode": "repair",                        // detect | repair
   "repair": { "maxAttempts": 2, "destructiveTools": ["Bash", "Write", "Edit", "..."] },
@@ -337,6 +338,47 @@ included: unassessed is not the same as weaker.
 Ordering also **interleaves providers** within a rank band, so the first N attempts land in N
 distinct quota domains rather than N members sharing one credential. The top-ranked candidate is
 still tried first; interleaving only decides who is tried second.
+
+#### Quota as a demotion term (`routing.quota`)
+
+When a candidate's own quota evidence says its allowance is **spent** (`remaining ≤ 0`), that
+candidate joins the cooling band — demoted behind live members, never dropped, never refused — and
+lifts on its own at the reset the evidence stated. This is on by default for figures the relay can
+trust:
+
+```jsonc
+"quota": {
+  "enforce": true,          // default. false disables quota demotion entirely.
+  "enforceLearned": false   // default. true also lets LEARNED limits gate routing.
+}
+```
+
+- Three bases gate by default: `provider-stated` (a limit/remaining pair read from this
+  deployment's response headers, still inside the current period), `derived:provider-stated`
+  (a **stale** observation's stated limit minus what the local ledger says this credential used
+  this period — the limit was first-party and a header limit states entitlement rather than
+  point-in-time state, so only the subtraction is ours), and `derived:configured` (the
+  operator-declared `limits` block minus that same ledger reading). In each case something the
+  provider or operator asserted bounds the figure; the arithmetic alone does not.
+- `derived:learned` — a ceiling parsed from a provider's refusal prose — is **display-only unless
+  you set `enforceLearned: true`**. A regex over vendor prose must not throttle a healthy
+  deployment on a mis-parsed number. `derived:published` (a catalogue figure for the model id)
+  **never gates**, under any setting.
+- **Unknown quota has no effect whatsoever**: a candidate with no observations and no resolvable
+  limit keeps exactly its pre-quota position.
+- The cooldown expires at `resetsAt` — what the provider stated, or the UTC period boundary when
+  the ladder derived one. If neither exists (no stated reset, unknown period), there is **no
+  demotion at all**: the relay does not invent a duration.
+- Demotion reorders only. Failure counters stay untouched; any success clears it through the
+  ordinary breaker path; a pool whose every member is spent still serves from the cooling band.
+- When the walk's ranked first choice was displaced this way, the response announces it:
+
+```
+x-llm-relay-quota-demoted: nim/z-ai/glm-5.2 (requests/minute remaining 0, provider-stated)
+```
+
+`llm-relay candidates` shows the same fact per row as `QUOTA <seconds>s (<axis>/<period>, <basis>)`
+in the breaker column; the dashboard Cooldowns panel lists it with reason `rate_limit`.
 
 ### Sticky sessions (opt-in)
 

@@ -120,6 +120,17 @@ function oneShotFetch(
 export const DEGRADED_HEADER = "x-llm-relay-degraded";
 
 /**
+ * The walk's FIRST choice was demoted for a spent quota and the answer came from further down.
+ *
+ * Same maxim as `DEGRADED_HEADER` — automatic degradation is acceptable only because it is
+ * announced — but a different fact: capability fell below the requested band there, while here a
+ * quota figure said the first choice was spent until a known reset. Value is one bounded line,
+ * e.g. `groq/llama-3.3-70b (requests/minute remaining 0, provider-stated)` — axis/period/remaining
+ * plus the basis, no credential values, nothing secret.
+ */
+export const QUOTA_DEMOTED_HEADER = "x-llm-relay-quota-demoted";
+
+/**
  * This answer came from a deployment that is NOT free.
  *
  * Pools rank free capacity first but no longer exclude paid capacity, so a spent free lane is not

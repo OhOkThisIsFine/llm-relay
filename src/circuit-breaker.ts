@@ -76,7 +76,7 @@ export interface DeploymentMeasurement {
 }
 
 export type CooldownSource =
-  "default" | "escalation" | "retry-after" | "loopback";
+  "default" | "escalation" | "retry-after" | "loopback" | "quota";
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 const RATE_LIMIT_ESCALATION_MS = [
@@ -472,6 +472,30 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   ): boolean {
     const state = this.states.get(this.getKey(target));
     return state !== undefined && state.credentialFaultUntil > now;
+  }
+
+  /**
+   * A quota demotion is a cooldown with a KNOWN end: the `resetsAt` the evidence stated, or the
+   * period boundary derived from it (availability's `derived-boundary` rung). It never touches the
+   * failure counters — a spent allowance is not a sick backend — and it is cleared by any success
+   * through the same path as every other cooldown (`applyHealthOutcome`), which also means it can
+   * never trip the breaker or drop the candidate; `orderByUsability` only ever reads
+   * `cooldownUntil`.
+   *
+   * `until <= now` is declined outright rather than clamped to some minimum: a reset already in
+   * the past means the evidence is stale, and cooling a healthy cell on stale evidence is worse
+   * than doing nothing.
+   */
+  recordQuotaCooldown(
+    target: ProviderTargetIdentity,
+    until: number,
+    at = Date.now(),
+  ): void {
+    if (!Number.isFinite(until) || until <= at) return;
+    const state = this.getOrCreate(target);
+    if (state.cooldownUntil >= until) return; // an existing longer cooldown keeps its own source
+    state.cooldownUntil = until;
+    state.cooldownSource = "quota";
   }
 
   /** Active backend attempts for one credential slot across all of its deployments. */

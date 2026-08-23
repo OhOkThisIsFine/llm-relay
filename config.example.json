@@ -81,6 +81,7 @@
       "claude": { "enabled": false, "scope": "subagents" },
       "codex": { "enabled": false, "scope": "subagents" }
     },
+    "quota": { "enforce": true },
     "sticky": false
   },
   "mode": "repair",

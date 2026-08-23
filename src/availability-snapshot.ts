@@ -247,9 +247,13 @@ function buildCooldowns(
       };
       const failureObservedAt = state.lastFailureTime > 0 ? state.lastFailureTime : null;
       if (state.cooldownUntil > now) {
+        // "quota" joins rate_limit: Gap 12's demotion IS a spent-quota cooldown, which is what
+        // this panel exists to show — labelling it provider_error would hide the one fact the
+        // operator needs (the quota resets on its own; nothing is sick).
         const rateLimited =
           state.cooldownSource === "retry-after" ||
           state.cooldownSource === "escalation" ||
+          state.cooldownSource === "quota" ||
           state.lastStatus === 429 ||
           state.lastStatus === 402;
         push(source, rateLimited ? "rate_limit" : "provider_error", state.cooldownUntil, failureObservedAt);
