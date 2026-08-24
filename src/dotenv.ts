@@ -58,7 +58,7 @@ export function wasEnvNameLoadedFromFile(name: string): boolean {
 
 /** Merge the env file into `env`, never overwriting a variable that is already set. */
 export function loadEnvFile(path: string = defaultEnvPath(), env: NodeJS.ProcessEnv = process.env): DotEnvResult {
-  loadedIntoProcessEnv.clear();
+  if (env === process.env) loadedIntoProcessEnv.clear();
   const result: DotEnvResult = { path, loaded: [], skipped: [] };
   if (!existsSync(path)) return result;
   let text: string;

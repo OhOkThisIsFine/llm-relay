@@ -1,5 +1,5 @@
-import { describe, it, expect, afterAll } from "vitest";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { describe, it, expect, afterAll, vi } from "vitest";
+import { readFileSync, statSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -13,6 +13,8 @@ import {
   clientForPath,
 } from "../src/config.js";
 import { candidateEnvNames } from "../src/authEnv.js";
+import { addEntry, lock, type KeystoreOptions } from "../src/keystore.js";
+import type { KeyringSpawnSync } from "../src/os-keyring.js";
 
 // Eager (not in beforeAll) so describe-body loadConfig(write(...)) calls work at collection.
 const dir = mkdtempSync(join(tmpdir(), "rp-cfg-"));
@@ -50,7 +52,225 @@ function restoreEnv(saved: Record<string, string | undefined>): void {
   }
 }
 
+function keystoreFileStat(path: string): { mtimeMs: number; size: number; ino: number } {
+  const stat = statSync(path);
+  return { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+}
+
 const geminiEnvSaved = saveAndClearEnv(candidateEnvNames("gemini", "GEMINI_API_KEY"));
+
+describe("config keystore diagnostics and resolution scope", () => {
+  it("threads one custom store/clock/filesystem seam through list, slot resolution, and status", () => {
+    const envName = "CONFIG_CUSTOM_STORE_KEY";
+    const saved = saveAndClearEnv(candidateEnvNames("custom", envName));
+    const storePath = join(dir, "custom-warning-keystore.json");
+    const passphrase = "custom warning store passphrase";
+    try {
+      addEntry({
+        id: "custom#stored",
+        provider: "custom",
+        envName,
+        value: "custom-store-secret",
+        expiresAt: 1_000,
+      }, {
+        path: storePath,
+        mode: "passphrase",
+        passphrase,
+        now: 100,
+      });
+      lock({ path: storePath });
+
+      const statFile = vi.fn((candidatePath: string) => keystoreFileStat(candidatePath));
+      const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+      const keystoreOptions: KeystoreOptions = {
+        path: storePath,
+        mode: "passphrase",
+        passphrase: "wrong passphrase",
+        now: 500,
+        statFile,
+        readFile,
+      };
+      const configPath = write("custom-warning-store.json", {
+        listen: "127.0.0.1:8791",
+        providers: {
+          custom: { base: "https://custom.test/v1", kind: "openai", authEnv: envName },
+        },
+        routing: { default: "custom/model" },
+      });
+
+      const cfg = loadConfig(configPath, {}, keystoreOptions);
+      expect((cfg.warnings ?? []).join("\n")).toMatch(
+        /provider "custom" credential custody locked.*relay retries automatically/is,
+      );
+      // listEntries, resolveCredentialSlot, and keystoreStatus each observe this exact custom
+      // path. The parsed store itself is read only once because its stat token is unchanged.
+      expect(statFile).toHaveBeenCalledTimes(3);
+      expect(readFile).toHaveBeenCalledTimes(1);
+
+      const afterExpiry = loadConfig(configPath, {}, { ...keystoreOptions, now: 1_000 });
+      expect((afterExpiry.warnings ?? []).some((warning) => warning.includes("credential custody")))
+        .toBe(false);
+    } finally {
+      lock({ path: storePath });
+      restoreEnv(saved);
+    }
+  });
+
+  it("does not unwrap or query status when no provider is affected", () => {
+    const envName = "CONFIG_STATUS_GATE_KEY";
+    const saved = saveAndClearEnv(candidateEnvNames("status-gate", envName));
+    const storePath = join(dir, "status-gate-keystore.json");
+    const createSpawn = vi.fn<KeyringSpawnSync>(() => ({
+      status: 0,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    }));
+    try {
+      addEntry({
+        id: "status-gate#stored",
+        provider: "status-gate",
+        envName,
+        value: "stored-status-gate-secret",
+      }, {
+        path: storePath,
+        mode: "libsecret",
+        platform: "linux",
+        spawnSync: createSpawn,
+        randomBytes: (size) => Buffer.alloc(size, 0x42),
+        now: 100,
+      });
+      lock({ path: storePath });
+      process.env[envName] = "present-in-env";
+
+      const unwrapSpawn = vi.fn<KeyringSpawnSync>(() => {
+        throw new Error("status must not unwrap an unaffected store");
+      });
+      const cfg = loadConfig(write("status-gate.json", {
+        listen: "127.0.0.1:8791",
+        providers: {
+          "status-gate": {
+            base: "https://status-gate.test/v1",
+            kind: "openai",
+            authEnv: envName,
+          },
+        },
+        routing: { default: "status-gate/model" },
+      }), {}, {
+        path: storePath,
+        mode: "libsecret",
+        platform: "linux",
+        spawnSync: unwrapSpawn,
+        now: 200,
+      });
+
+      expect(unwrapSpawn).not.toHaveBeenCalled();
+      expect((cfg.warnings ?? []).some((warning) => warning.includes("keystore"))).toBe(false);
+    } finally {
+      lock({ path: storePath });
+      restoreEnv(saved);
+    }
+  });
+
+  it("shares one store observation across every target in a walk and re-stats on the next walk", () => {
+    const providerCount = 8;
+    const envNames = Array.from({ length: providerCount }, (_, index) => `CONFIG_WALK_KEY_${index}`);
+    const saved = saveAndClearEnv(envNames);
+    const storePath = join(dir, "resolve-targets-walk-keystore.json");
+    const passphrase = "resolve targets walk passphrase";
+    try {
+      const providers = Object.fromEntries(envNames.map((authEnv, index) => [
+        `walk${index}`,
+        { base: `https://walk${index}.test/v1`, kind: "openai", authEnv },
+      ]));
+      const specs = envNames.map((_authEnv, index) => `walk${index}/model`);
+      const cfg = loadConfig(write("resolve-targets-walk.json", {
+        listen: "127.0.0.1:8791",
+        providers,
+        routing: { default: specs, benchmarkSort: false },
+      }));
+
+      addEntry({
+        id: `walk${providerCount - 1}#stored`,
+        provider: `walk${providerCount - 1}`,
+        envName: envNames[providerCount - 1]!,
+        value: "walk-scoped-secret",
+      }, {
+        path: storePath,
+        mode: "passphrase",
+        passphrase,
+      });
+      lock({ path: storePath });
+
+      const statFile = vi.fn((candidatePath: string) => keystoreFileStat(candidatePath));
+      const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+      const keystoreOptions: KeystoreOptions = {
+        path: storePath,
+        mode: "passphrase",
+        passphrase,
+        statFile,
+        readFile,
+      };
+
+      for (let request = 0; request < 3; request += 1) {
+        expect(resolveTargets(null, cfg, keystoreOptions).map((target) => target.provider))
+          .toEqual([`walk${providerCount - 1}`]);
+      }
+
+      expect(statFile).toHaveBeenCalledTimes(3);
+      expect(readFile).toHaveBeenCalledTimes(1);
+      expect(keystoreOptions.resolutionWalk).toBeUndefined();
+    } finally {
+      lock({ path: storePath });
+      restoreEnv(saved);
+    }
+  });
+
+  it("shares an unreadable verdict across every target in each request walk", () => {
+    const providerCount = 8;
+    const envNames = Array.from(
+      { length: providerCount },
+      (_, index) => `CONFIG_UNREADABLE_WALK_KEY_${index}`,
+    );
+    const saved = saveAndClearEnv(envNames);
+    const storePath = join(dir, "resolve-targets-unreadable-walk-keystore.json");
+    try {
+      const providers = Object.fromEntries(envNames.map((authEnv, index) => [
+        `unreadable-walk${index}`,
+        { base: `https://unreadable-walk${index}.test/v1`, kind: "openai", authEnv },
+      ]));
+      const specs = envNames.map((_authEnv, index) => `unreadable-walk${index}/model`);
+      const cfg = loadConfig(write("resolve-targets-unreadable-walk.json", {
+        listen: "127.0.0.1:8791",
+        providers,
+        routing: { default: specs, benchmarkSort: false },
+      }));
+      writeFileSync(storePath, "{", "utf8");
+
+      const statFile = vi.fn((candidatePath: string) => keystoreFileStat(candidatePath));
+      const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+      const keystoreOptions: KeystoreOptions = {
+        path: storePath,
+        mode: "passphrase",
+        passphrase: "unused for an unreadable store",
+        now: 0,
+        statFile,
+        readFile,
+      };
+
+      for (let request = 0; request < 3; request += 1) {
+        expect(resolveTargets(null, cfg, keystoreOptions).map((target) => target.provider))
+          .toEqual(envNames.map((_envName, index) => `unreadable-walk${index}`));
+      }
+
+      expect(statFile).toHaveBeenCalledTimes(3);
+      expect(readFile).toHaveBeenCalledTimes(1);
+      expect(keystoreOptions.resolutionWalk).toBeUndefined();
+    } finally {
+      lock({ path: storePath });
+      restoreEnv(saved);
+    }
+  });
+});
 
 describe("loadConfig — sticky session affinity", () => {
   it("is off by default and normalizes boolean shorthand", () => {
