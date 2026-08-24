@@ -8,7 +8,7 @@ import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog, type ModelLimits } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
 import { makeCredentialId } from "../src/credential-id.js";
-import type { Config, ProviderConfig } from "../src/config.js";
+import type { Config, ProviderCompatConfig, ProviderConfig } from "../src/config.js";
 import type { Reshaper } from "../src/reshaper.js";
 import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
 import { reconstructFromSse } from "../src/sse.js";
@@ -1386,14 +1386,16 @@ describe("outbound tool-call id rewriting (compat.toolCallIds strict9)", () => {
     choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }],
   });
 
-  function cfgFor(backendPort: number, compat: unknown): Config {
+  // Typed against the REAL config shapes: `compat` is the field under test, so casting the fixture
+  // would exempt exactly the surface these tests exist to hold still.
+  function cfgFor(backendPort: number, compat?: ProviderCompatConfig): Config {
     return {
       host: "127.0.0.1", port: 0,
       providers: {
         mistral: {
           base: `http://127.0.0.1:${backendPort}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000,
           ...(compat !== undefined ? { compat } : {}),
-        } as never,
+        },
       },
       routing: { default: "mistral/mistral-medium-2505", tiers: {} },
       mode: "detect",
@@ -1435,11 +1437,27 @@ describe("outbound tool-call id rewriting (compat.toolCallIds strict9)", () => {
     expect(JSON.stringify(rec)).not.toContain("toolu_01");
   });
 
-  it("carries both announcements across the Responses front's rebuild", async () => {
-    const backend = await mockBackend(() => ({
-      headers: { "content-type": "application/json" },
-      body: BUFFERED,
-    }));
+  /** The Codex shape: a `function_call` and the `function_call_output` that answers it. */
+  const RESPONSES_INPUT = [
+    { role: "user", content: [{ type: "input_text", text: "read it" }] },
+    { type: "function_call", call_id: "call_abc123", name: "Read", arguments: '{"file":"a"}' },
+    { type: "function_call_output", call_id: "call_abc123", output: "ok" },
+  ];
+  const RESPONSES_TOOLS = [
+    { type: "function", name: "Read", parameters: { type: "object", properties: { file: { type: "string" } } } },
+  ];
+
+  it("rewrites BOTH halves of the pair through the Responses front's two mappers", async () => {
+    // ⚠ Two mappers chain here — `responses-request.ts` (Responses → Anthropic) then
+    // `openai-request.ts` (Anthropic → Chat) — which is exactly where pair LINKAGE can break
+    // while the count still reads 1. Asserting only the header would pass a regression that
+    // rewrote the assistant id and left the answering `tool_call_id` behind, so the outbound
+    // bytes are read here.
+    let seen: any = null;
+    const backend = await mockBackend((_path, raw) => {
+      seen = JSON.parse(raw);
+      return { headers: { "content-type": "application/json" }, body: BUFFERED };
+    });
     const p = port(await startProxy(cfgFor(port(backend), { toolCallIds: "strict9" })));
 
     const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
@@ -1448,20 +1466,72 @@ describe("outbound tool-call id rewriting (compat.toolCallIds strict9)", () => {
       body: JSON.stringify({
         model: "mistral/mistral-medium-2505",
         max_output_tokens: 64,
-        input: [
-          { role: "user", content: [{ type: "input_text", text: "read it" }] },
-          { type: "function_call", call_id: "call_abc123", name: "Read", arguments: '{"file":"a"}' },
-          { type: "function_call_output", call_id: "call_abc123", output: "ok" },
-        ],
-        tools: [{ type: "function", name: "Read", parameters: { type: "object", properties: { file: { type: "string" } } } }],
+        input: RESPONSES_INPUT,
+        tools: RESPONSES_TOOLS,
       }),
     });
     await resp.text();
 
     expect(resp.status).toBe(200);
+    const assistant = seen.messages.find((m: any) => m.role === "assistant");
+    const tool = seen.messages.find((m: any) => m.role === "tool");
+    expect(assistant.tool_calls[0].id).toMatch(/^[a-zA-Z0-9]{9}$/);
+    expect(tool.tool_call_id).toMatch(/^[a-zA-Z0-9]{9}$/);
+    // The linkage IS the id — mistral-common v13 rejects a tool message answering an id no prior
+    // `tool_calls` entry carries.
+    expect(tool.tool_call_id).toBe(assistant.tool_calls[0].id);
+    expect(JSON.stringify(seen)).not.toContain("call_abc123");
     // The Responses front re-enters `fetchBackend`, so it inherits the rewrite — and rebuilding
     // its response must not swallow the announcement.
     expect(resp.headers.get("x-llm-relay-tool-call-ids")).toBe("1 rewritten");
+    const rec = lastLogLine(logFile);
+    expect(rec["path"]).toBe("/v1/responses");
+    expect(rec["toolCallIdRewrites"]).toBe(1);
+  });
+
+  it("carries the announcement across the STREAMED Responses rebuild — the shape Codex actually sends", async () => {
+    // ⚠ The streamed rebuild is a SEPARATE `new Response(…)` from the buffered one, and every
+    // other test on this front uses a non-streamed backend — so the branch that forwards the
+    // header onto a translated SSE stream had no coverage at all, on the one path every real
+    // Codex turn takes.
+    let seen: any = null;
+    const backend = await mockBackend((_path, raw) => {
+      seen = JSON.parse(raw);
+      return {
+        headers: { "content-type": "text/event-stream" },
+        body: [
+          'data: {"id":"c","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+          'data: {"id":"c","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}\n\n',
+          'data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          "data: [DONE]\n\n",
+        ].join(""),
+      };
+    });
+    const p = port(await startProxy(cfgFor(port(backend), { toolCallIds: "strict9" })));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "mistral/mistral-medium-2505",
+        max_output_tokens: 64,
+        stream: true,
+        input: RESPONSES_INPUT,
+        tools: RESPONSES_TOOLS,
+      }),
+    });
+    const sse = await resp.text();
+
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toContain("text/event-stream");
+    expect(sse).toContain("done");
+    // The count is a REQUEST fact, final before a byte was sent, so a stream can announce it
+    // honestly — unlike the response-direction mint, whose header precedes its own evidence.
+    expect(resp.headers.get("x-llm-relay-tool-call-ids")).toBe("1 rewritten");
+    // …and the rewrite really did happen on the wire, on both halves of the pair.
+    const assistant = seen.messages.find((m: any) => m.role === "assistant");
+    expect(assistant.tool_calls[0].id).toMatch(/^[a-zA-Z0-9]{9}$/);
+    expect(seen.messages.find((m: any) => m.role === "tool").tool_call_id).toBe(assistant.tool_calls[0].id);
     const rec = lastLogLine(logFile);
     expect(rec["path"]).toBe("/v1/responses");
     expect(rec["toolCallIdRewrites"]).toBe(1);
@@ -1473,7 +1543,7 @@ describe("outbound tool-call id rewriting (compat.toolCallIds strict9)", () => {
       seen = JSON.parse(raw);
       return { headers: { "content-type": "application/json" }, body: BUFFERED };
     });
-    const p = port(await startProxy(cfgFor(port(backend), undefined)));
+    const p = port(await startProxy(cfgFor(port(backend))));
 
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
       method: "POST",
@@ -1516,14 +1586,15 @@ describe("gemini thought-signature sentinel (compat.thoughtSignature)", () => {
     choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }],
   });
 
-  function cfgFor(backendPort: number, compat: unknown): Config {
+  // Typed against the REAL config shapes — same reason as the sibling describe above.
+  function cfgFor(backendPort: number, compat?: ProviderCompatConfig): Config {
     return {
       host: "127.0.0.1", port: 0,
       providers: {
         gemini: {
           base: `http://127.0.0.1:${backendPort}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000,
           ...(compat !== undefined ? { compat } : {}),
-        } as never,
+        },
       },
       routing: { default: "gemini/models/gemini-3.6-flash", tiers: {} },
       mode: "detect",
@@ -1580,7 +1651,7 @@ describe("gemini thought-signature sentinel (compat.thoughtSignature)", () => {
       seen = JSON.parse(raw);
       return { headers: { "content-type": "application/json" }, body: BUFFERED };
     });
-    const p = port(await startProxy(cfgFor(port(backend), undefined)));
+    const p = port(await startProxy(cfgFor(port(backend))));
 
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
       method: "POST",

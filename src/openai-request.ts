@@ -132,6 +132,22 @@ const STRICT9 = /^[a-zA-Z0-9]{9}$/;
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /**
+ * The hash `strict9` derives an outbound id from — SHA-256 in production, and the ONLY reason this
+ * is a parameter at all is the collision policy below.
+ *
+ * ⚠ **TEST-ONLY SEAM, and it exists because the policy is otherwise unverifiable.** The `#k`
+ * re-hash in `ToolCallIds.map` fires when two source ids land on the same 9-character base62
+ * value, i.e. at odds of 62⁻⁹, so reaching that branch against real SHA-256 would take a preimage
+ * — the documented behaviour ("collisions resolve deterministically by FIRST-APPEARANCE order")
+ * could regress in either direction with nothing turning red. Injecting the digest lets
+ * `test/tool-call-ids.test.ts` construct the collision directly. Production never passes one: the
+ * default IS SHA-256, and the same test pins a real-SHA mapping so the default path stays covered.
+ */
+export type ToolCallIdDigest = (input: string) => Uint8Array;
+
+const sha256Digest: ToolCallIdDigest = (input) => createHash("sha256").update(input, "utf8").digest();
+
+/**
  * A deterministic 9-char base62 id for one source id.
  *
  * SHA-256 of the UTF-8 id (plus `#<k>` on a collision retry), one base62 character per digest
@@ -140,10 +156,10 @@ const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
  * and on every candidate of a pool walk. A random id would detach a `tool_result` from the call
  * it answers the moment the conversation was replayed.
  */
-function strict9(source: string, salt: number): string {
-  const digest = createHash("sha256").update(salt === 0 ? source : `${source}#${salt}`, "utf8").digest();
+function strict9(source: string, salt: number, digest: ToolCallIdDigest): string {
+  const bytes = digest(salt === 0 ? source : `${source}#${salt}`);
   let out = "";
-  for (let i = 0; i < 9; i++) out += BASE62[digest[i]! % 62];
+  for (let i = 0; i < 9; i++) out += BASE62[bytes[i]! % 62];
   return out;
 }
 
@@ -155,11 +171,17 @@ function strict9(source: string, salt: number): string {
  * turn round-trips unchanged. Collisions resolve deterministically by FIRST-APPEARANCE order:
  * the run is a single in-order walk of the conversation, so the same conversation always produces
  * the same assignment.
+ *
+ * ⚠ Exported ONLY so a test can hand it a colliding digest — see `ToolCallIdDigest`. Nothing
+ * outside this module constructs one on the request path; `anthropicRequestToOpenAi` owns the
+ * per-run instance and hands it to both halves of the pair itself.
  */
-class ToolCallIds {
+export class ToolCallIds {
   private readonly bySource = new Map<string, string>();
   private readonly taken = new Set<string>();
   private rewritten = 0;
+
+  constructor(private readonly digest: ToolCallIdDigest = sha256Digest) {}
 
   map(id: string): string {
     const existing = this.bySource.get(id);
@@ -170,8 +192,8 @@ class ToolCallIds {
     // exists to satisfy. (62^-9; the branch is correctness, not a case anyone will meet.)
     if (STRICT9.test(id) && !this.taken.has(id)) out = id;
     else {
-      out = strict9(id, 0);
-      for (let k = 1; this.taken.has(out); k++) out = strict9(id, k);
+      out = strict9(id, 0, this.digest);
+      for (let k = 1; this.taken.has(out); k++) out = strict9(id, k, this.digest);
     }
     this.taken.add(out);
     this.bySource.set(id, out);

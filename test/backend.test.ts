@@ -12,6 +12,7 @@ import {
   parseRetryAfterMs,
   toolUseIdRewrites,
   toolCallIdRewrites,
+  thoughtSignatureSentinels,
   upstreamReportedModel,
 } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
@@ -1952,5 +1953,124 @@ describe("fetchBackend (openai kind) — outbound tool-call ids under strict9", 
     const { res, sent } = await send(undefined);
     expect(sent.messages[1].tool_calls[0].id).toBe("toolu_01A");
     expect(res.headers.get("x-llm-relay-tool-call-ids")).toBeNull();
+  });
+});
+
+/**
+ * The sibling REQUEST-direction pass at the same seam: `compat.thoughtSignature: "sentinel"`,
+ * resolved onto the target and reported through the metadata WeakMap.
+ *
+ * `models/gemini-3.6-flash` on generativelanguage.googleapis.com answers HTTP 400 — "Function call
+ * is missing a thought_signature in functionCall parts…" — to a replayed assistant `tool_calls`
+ * turn; Google's documented escape is the raw string `skip_thought_signature_validator` at
+ * `tool_calls[N].extra_content.google.thought_signature`, verified accepted against the live
+ * endpoint on 2026-08-23.
+ *
+ * Pure-mapper coverage lives in `test/thought-signature.test.ts`; what is pinned HERE is the
+ * fetchBackend wiring the mapper tests cannot see — that the resolved target mode reaches the
+ * mapper, that the count lands on the metadata `thoughtSignatureSentinels()` reads, and that it
+ * does so on the STREAMED branch as well as the buffered one (the two branches build the metadata
+ * in different places, which is exactly where one of them comes to be forgotten).
+ *
+ * ⚠ And that there is NO response header, deliberately: the sentinel is vendor-protocol padding on
+ * the relay's own outbound shape and changes nothing about the caller's data, so the operator gets
+ * a log counter and the client is told nothing it could act on.
+ */
+describe("fetchBackend (openai kind) — the gemini thought-signature sentinel", () => {
+  const SENTINEL = "skip_thought_signature_validator";
+
+  /** Two calls in ONE assistant turn — the every-entry placement the live check verified. */
+  const parallel = {
+    model: "claude-x",
+    stream: false,
+    messages: [
+      { role: "user", content: "weather in Paris and Berlin?" },
+      { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_01A", name: "get_weather", input: { city: "Paris" } },
+        { type: "tool_use", id: "toolu_01B", name: "get_weather", input: { city: "Berlin" } },
+      ] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_01A", content: "22C sunny" },
+        { type: "tool_result", tool_use_id: "toolu_01B", content: "15C rain" },
+      ] },
+    ],
+  };
+
+  const OK = JSON.stringify({
+    id: "cmpl_1",
+    model: "models/gemini-3.6-flash",
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }],
+  });
+
+  async function send(mode: "none" | "sentinel" | undefined, stream = false) {
+    process.env.RP_BACKEND_KEY = "sk-gemini";
+    let sent: any = null;
+    try {
+      const target = {
+        ...openaiTarget("https://generativelanguage.googleapis.com/v1beta/openai", "models/gemini-3.6-flash"),
+        ...(mode !== undefined ? { thoughtSignature: mode } : {}),
+      };
+      const res = await fetchBackend(resolveAttempt(target), {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from(JSON.stringify({ ...parallel, stream })),
+        reqJson: { ...parallel, stream },
+        anthropicHeaders: {},
+        wantsStream: stream,
+        signal: AbortSignal.timeout(1000),
+      }, async (_url, init) => {
+        sent = JSON.parse(String((init as RequestInit).body));
+        return stream
+          ? new Response(
+              'data: {"id":"c","choices":[{"delta":{"content":"hi"},"index":0}]}\n\ndata: [DONE]\n\n',
+              { headers: { "content-type": "text/event-stream" } },
+            )
+          : new Response(OK, { headers: { "content-type": "application/json" } });
+      });
+      return { res, sent };
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  }
+
+  it("stamps every replayed call at the documented path and reports the count", async () => {
+    const { res, sent } = await send("sentinel");
+    const calls = sent.messages[1].tool_calls;
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      // The exact documented JSON path, and a RAW string — an encoded value would be a malformed
+      // signature rather than the vendor's opt-out token.
+      expect(call.extra_content).toEqual({ google: { thought_signature: SENTINEL } });
+    }
+    // The caller's own ids are untouched: this pass adds a sibling field and nothing else.
+    expect(calls.map((c: any) => c.id)).toEqual(["toolu_01A", "toolu_01B"]);
+    expect(thoughtSignatureSentinels(res)).toBe(2);
+    // A count, never a signature — and no header at all for this one.
+    expect(res.headers.get("x-llm-relay-thought-signature")).toBeNull();
+    expect([...res.headers.keys()].filter((h) => h.includes("thought"))).toEqual([]);
+  });
+
+  it("stamps and reports on a STREAMED response too — the count is final before egress", async () => {
+    const { res, sent } = await send("sentinel", true);
+    // The stream branch builds its metadata from the preflight rather than from scratch, so the
+    // wiring is genuinely separate from the buffered one above.
+    for (const call of sent.messages[1].tool_calls) {
+      expect(call.extra_content).toEqual({ google: { thought_signature: SENTINEL } });
+    }
+    expect(thoughtSignatureSentinels(res)).toBe(2);
+    expect([...res.headers.keys()].filter((h) => h.includes("thought"))).toEqual([]);
+  });
+
+  it('adds nothing and reports nothing under "none"', async () => {
+    const { res, sent } = await send("none");
+    expect(JSON.stringify(sent)).not.toContain("thought_signature");
+    for (const call of sent.messages[1].tool_calls) expect(call).not.toHaveProperty("extra_content");
+    expect(thoughtSignatureSentinels(res)).toBeUndefined();
+  });
+
+  it('treats a target with no resolved mode as "none" — a hand-built target changes nothing', async () => {
+    const { res, sent } = await send(undefined);
+    expect(JSON.stringify(sent)).not.toContain("thought_signature");
+    expect(thoughtSignatureSentinels(res)).toBeUndefined();
   });
 });
