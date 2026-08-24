@@ -3,10 +3,11 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
+import { addEntry, lock, resolveKeystorePath } from "../src/keystore.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ProviderConfig, ReshaperConfig } from "../src/config.js";
@@ -249,7 +250,132 @@ function metadataLines(): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+const KEYSTORE_GLOBAL_ENV = "RESHAPER_BIND_KEYSTORE_GLOBAL";
+const KEYSTORE_PROVIDER_ENV = "RESHAPER_BIND_KEYSTORE_PROVIDER";
+const KEYSTORE_PASSPHRASE = "reshaper binding test passphrase";
+
+function removeWorkerDefaultKeystore(path: string): void {
+  const parent = dirname(path);
+  if (
+    path !== resolveKeystorePath()
+    || dirname(parent) !== tmpdir()
+    || !basename(parent).startsWith(`llm-relay-test-keystore-${process.pid}-`)
+  ) {
+    throw new Error("refusing to remove a non-worker keystore path");
+  }
+  rmSync(parent, { recursive: true, force: true });
+}
+
 describe("reshaper credential binding", () => {
+  describe("keystore-backed reshaper custody", () => {
+    const envNames = [KEYSTORE_GLOBAL_ENV, KEYSTORE_PROVIDER_ENV] as const;
+    const originalEnv = new Map<string, string | undefined>();
+    const path = resolveKeystorePath();
+    const storeOptions = {
+      path,
+      mode: "passphrase" as const,
+      passphrase: KEYSTORE_PASSPHRASE,
+    };
+
+    beforeEach(() => {
+      for (const name of envNames) {
+        originalEnv.set(name, process.env[name]);
+        delete process.env[name];
+      }
+      lock({ path });
+      removeWorkerDefaultKeystore(path);
+    });
+
+    afterEach(() => {
+      lock({ path });
+      removeWorkerDefaultKeystore(path);
+      for (const name of envNames) {
+        const value = originalEnv.get(name);
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      originalEnv.clear();
+    });
+
+    it("repairs through a keystore-only standalone reshaper without mutating process.env", async () => {
+      const storedValue = "standalone-keystore-test-credential";
+      const main = await badMessagesBackend();
+      const seen: Array<{ auth: string; model: string }> = [];
+      const reshaper = await jsonServer((req, body) => {
+        seen.push({
+          auth: authorization(req) ?? "<none>",
+          model: String(body.model),
+        });
+        return { body: corrected() };
+      });
+      addEntry({
+        id: "reshaper-global#stored",
+        provider: "reshaper-global",
+        envName: KEYSTORE_GLOBAL_ENV,
+        value: storedValue,
+      }, storeOptions);
+
+      const cfg = repairConfig(main);
+      cfg.reshaper = {
+        base: base(reshaper),
+        model: "repair-model",
+        kind: "openai",
+        authEnv: KEYSTORE_GLOBAL_ENV,
+        authHeader: "authorization",
+        timeoutMs: 2_000,
+      };
+      const proxy = await startTestProxy(cfg);
+
+      expectRepairedMessage(await sendMessages(proxy));
+      expect(seen).toEqual([{
+        auth: `Bearer ${storedValue}`,
+        model: "repair-model",
+      }]);
+      expect(process.env[KEYSTORE_GLOBAL_ENV]).toBeUndefined();
+    });
+
+    it("shares one keystore-only legacy credential between serving and provider-backed reshaping in the same request", async () => {
+      const storedValue = "shared-keystore-test-credential";
+      const seen: Array<{ auth: string; model: string }> = [];
+      const backend = await jsonServer((req, body) => {
+        const model = String(body.model);
+        seen.push({ auth: authorization(req) ?? "<none>", model });
+        return model === "served-model"
+          ? { body: malformedOpenAiToolCall() }
+          : { body: corrected() };
+      });
+      addEntry({
+        id: "stored-provenance#repair",
+        provider: "stored-provenance",
+        envName: KEYSTORE_PROVIDER_ENV,
+        value: storedValue,
+      }, storeOptions);
+
+      const provider: ProviderConfig = {
+        base: base(backend),
+        kind: "openai",
+        credentialMode: "contained",
+        authEnv: KEYSTORE_PROVIDER_ENV,
+        authHeader: "authorization",
+        timeoutMs: 2_000,
+      };
+      const cfg: Config = {
+        ...repairConfig(backend),
+        providers: { work: provider },
+        routing: { default: "work/served-model", tiers: {}, benchmarkSort: false },
+      };
+      cfg.reshaper = candidate("work", backend, "repair-model");
+      const proxy = await startTestProxy(cfg);
+
+      expectRepairedMessage(await sendMessages(proxy));
+      expect(seen).toEqual([
+        { auth: `Bearer ${storedValue}`, model: "served-model" },
+        { auth: `Bearer ${storedValue}`, model: "repair-model" },
+      ]);
+      expect(process.env[KEYSTORE_PROVIDER_ENV]).toBeUndefined();
+    });
+  });
+
   it("reuses the exact Messages-front attempt credential and rotates A/A then B/B", async () => {
     process.env.RESHAPER_BIND_MESSAGES_A = "messages-a";
     process.env.RESHAPER_BIND_MESSAGES_B = "messages-b";

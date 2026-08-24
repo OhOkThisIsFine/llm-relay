@@ -20,6 +20,8 @@ import { makeCredentialId } from "../src/credential-id.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import type { PingLoop } from "../src/ping/cadence.js";
+import { loadEnvFile } from "../src/dotenv.js";
+import { addEntry, lock, resolveKeystorePath } from "../src/keystore.js";
 
 const CONTROL_TOKEN = "offload-test-control-token";
 const CONTROL_AUTHORIZATION = { validate: (candidate: unknown) => candidate === CONTROL_TOKEN };
@@ -502,14 +504,16 @@ describe("candidates view", () => {
       )!;
       expect(workM1.credential).toMatchObject({
         label: "work", authEnv: "CANDIDATE_WORK", enabled: true,
-        models: ["m1"], state: "declared-missing", modelAllowed: true,
+        models: ["m1"], state: "declared-missing", source: null, modelAllowed: true,
       });
       expect(workM1.hasKey).toBe(false);
+      expect(view.candidates.find((candidate) => candidate.credentialId === "nim#personal")!.credential)
+        .toMatchObject({ state: "declared-present", source: "env" });
       expect(view.candidates.find((candidate) =>
         candidate.spec === "nim/m2" && candidate.credentialId === "nim#work"
       )!.credential.modelAllowed).toBe(false);
       expect(view.candidates.find((candidate) => candidate.credentialId === "nim#spare")!.credential)
-        .toMatchObject({ enabled: false, state: "declared-present" });
+        .toMatchObject({ enabled: false, state: "declared-present", source: "env" });
       expect(view.candidates.find((candidate) => candidate.credentialId === "nim#none")!.credential.modelAllowed)
         .toBe(false);
       expect(JSON.stringify(view)).not.toContain("candidate-secret-");
@@ -517,6 +521,64 @@ describe("candidates view", () => {
       delete process.env.CANDIDATE_PERSONAL;
       delete process.env.CANDIDATE_SPARE;
       delete process.env.CANDIDATE_NONE;
+    }
+  });
+
+  it("reports env, env-file, and keystore provenance on candidate credential cells", async () => {
+    const cfg = freshConfig("credential-provenance.json", {
+      pools: { coding: ["nim/m1"] },
+      subagents: { default: "pool/coding" },
+    });
+    const provider = cfg.providers.nim!;
+    delete provider.authEnv;
+    provider.credentials = [
+      { label: "environment", authEnv: "CANDIDATE_SOURCE_ENV" },
+      { label: "file", authEnv: "CANDIDATE_SOURCE_ENV_FILE" },
+      { label: "stored", authEnv: "CANDIDATE_SOURCE_KEYSTORE" },
+    ];
+
+    const names = ["CANDIDATE_SOURCE_ENV", "CANDIDATE_SOURCE_ENV_FILE", "CANDIDATE_SOURCE_KEYSTORE"];
+    const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    const envFile = join(dir, "candidate-sources.env");
+    const storePath = resolveKeystorePath();
+    for (const name of names) delete process.env[name];
+    lock({ path: storePath });
+    rmSync(storePath, { force: true });
+
+    try {
+      process.env.CANDIDATE_SOURCE_ENV = "candidate-env-secret";
+      writeFileSync(envFile, "CANDIDATE_SOURCE_ENV_FILE=candidate-file-secret\n");
+      loadEnvFile(envFile);
+      addEntry({
+        id: "origin#candidates",
+        provider: "origin",
+        envName: "CANDIDATE_SOURCE_KEYSTORE",
+        value: "candidate-keystore-secret",
+      }, {
+        path: storePath,
+        mode: "passphrase",
+        passphrase: "candidate-provenance-passphrase",
+      });
+
+      const view = await buildCandidates(cfg, { breaker: new CircuitBreaker(), tierData: null });
+      expect(Object.fromEntries(
+        view.candidates.map((candidate) => [candidate.credential.label, candidate.credential.source]),
+      )).toEqual({
+        environment: "env",
+        file: "env-file",
+        stored: "keystore",
+      });
+      expect(view.candidates.find((candidate) => candidate.credential.label === "stored")?.credentialId)
+        .toBe("nim#stored");
+      expect(JSON.stringify(view)).not.toMatch(/candidate-(?:env|file|keystore)-secret/);
+    } finally {
+      for (const name of names) {
+        if (saved[name] === undefined) delete process.env[name];
+        else process.env[name] = saved[name];
+      }
+      loadEnvFile(join(dir, "missing-candidate-source-reset.env"));
+      lock({ path: storePath });
+      rmSync(storePath, { force: true });
     }
   });
 

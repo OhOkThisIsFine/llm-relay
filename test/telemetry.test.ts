@@ -241,7 +241,10 @@ describe("telemetry", () => {
     const serialized = JSON.stringify(report);
     expect(serialized).not.toContain("personal");
     expect(serialized).not.toContain("work");
+    expect(serialized).not.toContain('"credentials"');
     expect(serialized).not.toContain("credentialId");
+    expect(serialized).not.toContain('"entryId"');
+    expect(serialized).not.toContain('"source"');
     expect(serialized).not.toContain("nim#");
     expect(serialized).not.toContain("quota");
   });

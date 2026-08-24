@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
-import { buildForwardHeaders, createProxy, logSafePath } from "../src/server.js";
+import {
+  buildForwardHeaders,
+  createProxy,
+  logSafePath,
+  TOKENLESS_CONTROL_READ_PATHS,
+} from "../src/server.js";
 import type { Config } from "../src/config.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
@@ -85,6 +90,23 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     // The no-restart behaviour the CLI depends on must survive the hardening.
     const body = (await res.json()) as { enabled?: boolean };
     expect(typeof body.enabled).toBe("boolean");
+  });
+
+  it("keeps exactly five GET control reads tokenless and protects every existing diagnostic read", async () => {
+    const url = await boot();
+    const tokenlessReads = [...TOKENLESS_CONTROL_READ_PATHS];
+    const protectedReads = ["/registry", "/ping", "/health/stats", "/health", "/candidates"];
+
+    expect(Object.isFrozen(TOKENLESS_CONTROL_READ_PATHS)).toBe(true);
+    expect(tokenlessReads).toEqual(["/v1/models", "/models", "/offload", "/dispatch", "/telemetry"]);
+    for (const path of tokenlessReads) {
+      const res = await fetch(`${url}${path}`);
+      expect(res.status, `${path} must remain tokenless for GET`).not.toBe(403);
+    }
+    for (const path of protectedReads) {
+      const res = await fetch(`${url}${path}`);
+      expect(res.status, `${path} must require a control capability`).toBe(403);
+    }
   });
 
   it("allows a same-origin loopback POST with a JSON content-type", async () => {

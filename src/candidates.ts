@@ -1,5 +1,6 @@
 import { anyOffloadEnabled, splitSpec, type Config, type OffloadRule, type ProviderConfig } from "./config.js";
 import { POOL_PREFIX } from "./config.js";
+import type { CredentialSource } from "./authEnv.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
 import { deploymentFitness, getStrength, type StrengthBasis } from "./benchmarks.js";
@@ -82,6 +83,7 @@ export interface Candidate {
     enabled: boolean;
     models: readonly string[] | null;
     state: "not-declared" | "declared-present" | "declared-missing";
+    source: CredentialSource | null;
     /** Whether this slot's optional model allow-list includes the row's deployment. */
     modelAllowed: boolean;
   };
@@ -537,7 +539,7 @@ export async function buildCandidates(
     const credentialId = slot.credentialId;
     const credentialResolution = p
       ? resolveCredentialSlot(slot)
-      : { state: "not-declared" as const, value: undefined, envName: undefined };
+      : { state: "not-declared" as const, value: undefined, envName: undefined, source: undefined };
     const modelAllowed = slotAllowsModel(slot, model);
     // This is the exact credential-cell identity. Cell-only breaker operations below
     // must receive the identity, never the display spec or a serialized provider/model key.
@@ -659,6 +661,7 @@ export async function buildCandidates(
         enabled: slot.enabled,
         models: slot.models,
         state: credentialResolution.state,
+        source: credentialResolution.source ?? null,
         modelAllowed,
       },
       listed,

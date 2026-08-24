@@ -21,6 +21,7 @@ describe("resolved attempts", () => {
       state: "declared-present",
       value: "secret",
       envName: "OPENAI_API_KEY",
+      source: "env",
     });
     expect(attempt.target).toBe(target);
   });

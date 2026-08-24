@@ -15,6 +15,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { keyIsPresent } from "./authEnv.js";
 
+const loadedIntoProcessEnv = new Set<string>();
+
 export interface DotEnvResult {
   /** Path consulted, whether or not it existed. */
   path: string;
@@ -49,8 +51,14 @@ export function defaultEnvPath(): string {
   return join(homedir(), ".llm-relay", ".env");
 }
 
+/** Display-only provenance for credential resolution; never a precedence input. */
+export function wasEnvNameLoadedFromFile(name: string): boolean {
+  return loadedIntoProcessEnv.has(name);
+}
+
 /** Merge the env file into `env`, never overwriting a variable that is already set. */
 export function loadEnvFile(path: string = defaultEnvPath(), env: NodeJS.ProcessEnv = process.env): DotEnvResult {
+  loadedIntoProcessEnv.clear();
   const result: DotEnvResult = { path, loaded: [], skipped: [] };
   if (!existsSync(path)) return result;
   let text: string;
@@ -70,6 +78,7 @@ export function loadEnvFile(path: string = defaultEnvPath(), env: NodeJS.Process
     }
     env[k] = v;
     result.loaded.push(k);
+    if (env === process.env) loadedIntoProcessEnv.add(k);
   }
   return result;
 }

@@ -11,6 +11,7 @@ import {
   slotAllowsModel,
 } from "../src/credential-fleet.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
+import { addEntry, lock } from "../src/keystore.js";
 
 const dir = mkdtempSync(join(tmpdir(), "relay-fleet-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -39,6 +40,41 @@ describe("credential fleet normalization", () => {
     expect(resolveCredentialSlot(explicit, { GOOGLEAI_API_KEY: "alias" }).state).toBe("declared-missing");
     const old = providerCredentialSlots("legacy", cfg.providers.legacy!)[0]!;
     expect(resolveCredentialSlot(old, { GOOGLEAI_API_KEY: "alias" }).value).toBe("alias");
+  });
+
+  it("keeps attempt credentialId from the config slot while keystore entry identity is provenance only", () => {
+    const storePath = join(dir, "identity-keystore.json");
+    const keystoreOptions = {
+      path: storePath,
+      mode: "passphrase" as const,
+      passphrase: "fleet-identity-test-passphrase",
+    };
+    try {
+      addEntry({
+        id: "origin#vault",
+        provider: "origin",
+        envName: "CONSUMER_WORK_KEY",
+        value: "stored-named-value",
+      }, keystoreOptions);
+      const cfg = load("identity.json", {
+        consumer: {
+          base: "https://consumer.test",
+          kind: "openai",
+          credentials: [{ label: "work", authEnv: "CONSUMER_WORK_KEY" }],
+        },
+      }, "consumer/model");
+      const slot = providerCredentialSlots("consumer", cfg.providers.consumer!)[0]!;
+      const attempt = resolveAttemptForSlot(resolveTarget("consumer/model", cfg), slot, {}, keystoreOptions);
+
+      expect(attempt?.credentialId).toBe("consumer#work");
+      expect(attempt?.credential).toMatchObject({
+        source: "keystore",
+        provenance: { entryId: "origin#vault", provider: "origin" },
+      });
+    } finally {
+      lock({ path: storePath });
+      rmSync(storePath, { force: true });
+    }
   });
 
   it("keeps disabled slots visible and drops later duplicate label/env slots with warnings", () => {

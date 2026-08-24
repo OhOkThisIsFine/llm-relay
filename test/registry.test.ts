@@ -1,12 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { type Server } from "node:http";
 import { AddressInfo } from "node:net";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildRegistry, loadTierData, joinCapability } from "../src/registry.js";
 import { createProxy } from "../src/server.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import { candidateEnvNames } from "../src/authEnv.js";
+import { loadEnvFile } from "../src/dotenv.js";
+import { addEntry, lock, resolveKeystorePath } from "../src/keystore.js";
 
 /** Stub catalog: returns canned model ids per provider, no network. */
 function stubCatalog(byProvider: Record<string, string[]>): ModelCatalog {
@@ -95,6 +100,7 @@ describe("buildRegistry", () => {
     expect(view.providers.claude!.reachable).toBeNull();
     expect(view.providers.claude!.models).toEqual([]);
     expect(view.providers.claude!.has_key).toBe(true); // no authEnv → configured
+    expect(view.providers.claude!.credentials[0]?.source).toBeNull();
   });
 
   it("reports nested credential slots without values and keeps aggregate has_key compatible", async () => {
@@ -123,21 +129,84 @@ describe("buildRegistry", () => {
       expect(view.providers.fleet!.credentials).toEqual([
         {
           credentialId: "fleet#personal", label: "personal", authEnv: "REG_FLEET_PRESENT",
-          enabled: true, models: null, state: "declared-present", has_key: true,
+          enabled: true, models: null, state: "declared-present", source: "env", has_key: true,
         },
         {
           credentialId: "fleet#work", label: "work", authEnv: "REG_FLEET_MISSING",
-          enabled: true, models: ["m"], state: "declared-missing", has_key: false,
+          enabled: true, models: ["m"], state: "declared-missing", source: null, has_key: false,
         },
         {
           credentialId: "fleet#spare", label: "spare", authEnv: "REG_FLEET_DISABLED",
-          enabled: false, models: [], state: "declared-present", has_key: true,
+          enabled: false, models: [], state: "declared-present", source: "env", has_key: true,
         },
       ]);
       expect(JSON.stringify(view)).not.toContain("registry-secret-");
     } finally {
       delete process.env.REG_FLEET_PRESENT;
       delete process.env.REG_FLEET_DISABLED;
+    }
+  });
+
+  it("reports env, env-file, and keystore provenance on credential snapshots without exposing values", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "llm-relay-registry-sources-"));
+    const envFile = join(directory, "sources.env");
+    const storePath = resolveKeystorePath();
+    const names = ["REG_SOURCE_ENV", "REG_SOURCE_ENV_FILE", "REG_SOURCE_KEYSTORE"];
+    const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    for (const name of names) delete process.env[name];
+    lock({ path: storePath });
+    rmSync(storePath, { force: true });
+
+    try {
+      process.env.REG_SOURCE_ENV = "registry-env-secret";
+      writeFileSync(envFile, "REG_SOURCE_ENV_FILE=registry-file-secret\n");
+      loadEnvFile(envFile);
+      addEntry({
+        id: "origin#registry",
+        provider: "origin",
+        envName: "REG_SOURCE_KEYSTORE",
+        value: "registry-keystore-secret",
+      }, {
+        path: storePath,
+        mode: "passphrase",
+        passphrase: "registry-provenance-passphrase",
+      });
+
+      const sources: ProviderConfig = {
+        base: "https://sources.test/v1",
+        kind: "openai",
+        authHeader: "authorization",
+        timeoutMs: 5000,
+        credentials: [
+          { label: "environment", authEnv: "REG_SOURCE_ENV" },
+          { label: "file", authEnv: "REG_SOURCE_ENV_FILE" },
+          { label: "stored", authEnv: "REG_SOURCE_KEYSTORE" },
+        ],
+      };
+      const view = await buildRegistry(
+        cfg({ sources }, { default: "sources/model", tiers: {} }),
+        stubCatalog({ sources: ["model"] }),
+      );
+
+      expect(Object.fromEntries(
+        view.providers.sources!.credentials.map((credential) => [credential.label, credential.source]),
+      )).toEqual({
+        environment: "env",
+        file: "env-file",
+        stored: "keystore",
+      });
+      expect(view.providers.sources!.credentials.find((credential) => credential.label === "stored")?.credentialId)
+        .toBe("sources#stored");
+      expect(JSON.stringify(view)).not.toMatch(/registry-(?:env|file|keystore)-secret/);
+    } finally {
+      for (const name of names) {
+        if (saved[name] === undefined) delete process.env[name];
+        else process.env[name] = saved[name];
+      }
+      loadEnvFile(join(directory, "missing-reset.env"));
+      lock({ path: storePath });
+      rmSync(storePath, { force: true });
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 

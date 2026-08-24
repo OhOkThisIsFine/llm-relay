@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseDotEnv, loadEnvFile } from "../src/dotenv.js";
+import { loadEnvFile, parseDotEnv, wasEnvNameLoadedFromFile } from "../src/dotenv.js";
 
 describe("parseDotEnv", () => {
   it("parses KEY=value, ignoring blanks and comments", () => {
@@ -31,7 +31,10 @@ describe("loadEnvFile", () => {
     dir = mkdtempSync(join(tmpdir(), "relay-env-"));
     file = join(dir, ".env");
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => {
+    loadEnvFile(join(dir, "provenance-reset-missing.env"), {});
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it("loads variables that are not already set", () => {
     writeFileSync(file, "NEW_KEY=fromfile\n");
@@ -39,6 +42,7 @@ describe("loadEnvFile", () => {
     const res = loadEnvFile(file, env);
     expect(env.NEW_KEY).toBe("fromfile");
     expect(res.loaded).toEqual(["NEW_KEY"]);
+    expect(wasEnvNameLoadedFromFile("NEW_KEY")).toBe(false);
   });
 
   // The real environment is the more explicit signal; a stale file silently overriding it
@@ -75,5 +79,53 @@ describe("loadEnvFile", () => {
     const res = loadEnvFile(join(dir, "nope.env"), env);
     expect(res.loaded).toEqual([]);
     expect(env).toEqual({});
+  });
+
+  it("records only names populated into the actual process.env, while a preexisting winenv-like name remains env", () => {
+    const names = ["DOTENV_PROVENANCE_LOADED", "DOTENV_PROVENANCE_PREEXISTING"];
+    const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    for (const name of names) delete process.env[name];
+    try {
+      process.env.DOTENV_PROVENANCE_PREEXISTING = "recovered-before-dotenv";
+      writeFileSync(file, [
+        "DOTENV_PROVENANCE_LOADED=from-file",
+        "DOTENV_PROVENANCE_PREEXISTING=file-must-not-win",
+      ].join("\n"));
+
+      const result = loadEnvFile(file);
+      expect(result.loaded).toEqual(["DOTENV_PROVENANCE_LOADED"]);
+      expect(result.skipped).toEqual(["DOTENV_PROVENANCE_PREEXISTING"]);
+      expect(wasEnvNameLoadedFromFile("DOTENV_PROVENANCE_LOADED")).toBe(true);
+      expect(wasEnvNameLoadedFromFile("DOTENV_PROVENANCE_PREEXISTING")).toBe(false);
+    } finally {
+      for (const name of names) {
+        const value = saved[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it("clears recorded provenance on every reload, including absent and unreadable files", () => {
+    const name = "DOTENV_PROVENANCE_RESET";
+    const saved = process.env[name];
+    delete process.env[name];
+    try {
+      writeFileSync(file, `${name}=from-file\n`);
+      loadEnvFile(file);
+      expect(wasEnvNameLoadedFromFile(name)).toBe(true);
+
+      loadEnvFile(join(dir, "absent.env"));
+      expect(wasEnvNameLoadedFromFile(name)).toBe(false);
+
+      delete process.env[name];
+      loadEnvFile(file);
+      expect(wasEnvNameLoadedFromFile(name)).toBe(true);
+      loadEnvFile(dir);
+      expect(wasEnvNameLoadedFromFile(name)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[name];
+      else process.env[name] = saved;
+    }
   });
 });
