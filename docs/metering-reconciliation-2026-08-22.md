@@ -95,7 +95,7 @@ Conforms. The three exceptions the original reconciliation named are closed or r
 | C2 | Passthrough recorded, marked caller-operated, excluded from per-key totals | `attribution: "caller_operated"` derived from declared credential state/mode (`server.ts:495-505`), carried on every event/row (`accounting.ts:261-265,618`); dashboard policy string `include_all_labeled` (`cli.ts:612`) | **matches** (per-key exclusion semantics not independently verified beyond the attribution field) |
 | C3 | Widen `AssistantMessage.usage` | **adopted 2026-08-22 (commit `7abdaf2`)** — the two cache fields ride the client-facing type (`anthropic.ts:75-83`), re-emission, and both cross-protocol buffered translation seams; streaming cross-protocol translation inside llm-bridge remains the residual (§7) | **matches** |
 | C4 | UTC boundaries, local only for labels | canonical UTC timestamps enforced (`accounting.ts:239-247`); day/minute/month slicing is pure UTC-string math (`accounting-store.ts:330-333`) | **matches** |
-| P1 | Custody Windows/macOS | explicitly out of scope this branch (HANDOFF.md:70-71) | **deferred as instructed** |
+| P1 | Custody Windows/macOS | **DELIVERED 2026-08-24 (custody sprint, queued v0.45.0)** — Windows DPAPI live-verified incl. fresh-process unwrap; Linux passphrase mode CI-real; macOS/`secret-tool` injected-double only (stated residual). Plan: `docs/custody-sprint-plan-2026-08-24.md` D2 | **delivered in-build** |
 | P2 | Rotation-triggered clearing ratified | adjacent machinery verified: a served request clears facts incl. `credential-invalid` and the breaker's per-credential faults (`server.ts:2519-2529`); the rotation-specific widening was not located | **indirect / unverified** |
 | P3 | Opaque `credentialId` keying from day one | end-to-end: events, packets, rows, log sink, candidate identity (`accounting.ts:79,90,106`; `accounting-store.ts:205,970`; HANDOFF.md:55-58) | **matches** |
 | P4 | `client_profiles` part 2 needs a purpose first | correctly absent | **matches (purpose-gated)** |
@@ -193,9 +193,12 @@ Still OPEN after the sprint:
   deferred.** Gap 15 (single-file HTML dashboard) superseded by the shipped SPA; Gap 16 (in-flight
   quota leases) argued against by spec §5.4 with no measured overshoot; P4 (server-enforced system
   prompts / `client_profiles` part 2) never acquired a purpose.
-- **P1 / custody** — the custody/keystore program is APPROVED and queued as the next sprint (owner
-  decision 2026-08-23), work starting from `docs/credential-fleet-design-2026-08-16.md`'s staged
-  build order; P1's platform-coverage question resolves as part of that build, not separately.
+- **P1 / custody — DELIVERED 2026-08-24 (queued for v0.45.0).** Stage 3 of
+  `docs/credential-fleet-design-2026-08-16.md` shipped as six commits (`a83eef8`..`b7129fa`), three
+  adversarially reviewed packets; P1's platform-coverage question resolved in-build
+  (`docs/custody-sprint-plan-2026-08-24.md` D2). Residuals and deliberately-unfixed review
+  findings: HANDOFF §6. Rotation-triggered clearing (this ledger's P2 "unverified" row) is now the
+  pinned narrowed `/cooldowns/clear` `kinds: ["credential-fault"]` path.
 
 ## 8. Verification note
 

@@ -2,18 +2,43 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-24
+## 0. State as of 2026-08-24 (evening)
 
-The 2026-08-24 sprint delivered two commits queued for **v0.44.0**. `32f31c3` delivered Gap 10 /
-M4: attempt-scoped estimated output now lands from the usage observer in its own `relay_estimate`
-cell, and the completed input+output `usedInWindow` scalar means an operator's own tpm/tpd hard cap
-refuses sooner and the `derived:configured` demotion rung moves instead of both acting on the old
-systematic input-only undercount. `1ee1ad2` delivered M3: `POST /cooldowns/clear` and
-`llm-relay cooldowns clear` share the existing control-route admission path, fail closed on scope
-grammar, clear only cooling state and retain measurements, history and accounting. Both were
-implemented by Codex (GPT-5.6 Sol) and adversarially reviewed: native Opus returned
-MERGE-WITH-FIXES on M4 with every fix applied; fresh-context Codex returned REWORK on M3 and all
-four findings, including both fail-open scope-widening majors, were fixed and pinned.
+**The custody sprint is delivered — Stage 3 of
+[docs/credential-fleet-design-2026-08-16.md](docs/credential-fleet-design-2026-08-16.md), queued
+for v0.45.0.** Six commits in three packets, each implemented by Codex (GPT-5.6 Sol) and
+adversarially reviewed by fresh-context native Opus (every verdict MERGE-WITH-FIXES; every gate
+finding fixed and pinned in a same-day fix commit). The plan, the recon corrections to the design
+doc, and the seven build decisions live in
+[docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md):
+
+- `a83eef8` + `b1e704b` — custody core: `src/os-keyring.ts` (KEK wrap/unwrap for
+  dpapi/keychain/libsecret/passphrase; KEK crosses process boundaries over stdin/stdout ONLY;
+  sanitized spawn failures) and `src/keystore.ts` (v1 AES-256-GCM store, AAD
+  `version|provider|entryId|envName`, KEK-keyed HMAC fingerprint, **mutation-refusal on
+  dropped/unparseable stores** — degrade-to-fresh is for re-learnable data, and keystore rows are
+  the only copy of the operator's keys — plus a persisted KEK verifier so a wrong passphrase can
+  never fork the store); SID-based ACL hardening retaining SYSTEM/Administrators.
+- `5604fea` + `d8447eb` — the resolver keystore rung at BOTH leaf resolvers (source-major
+  precedence: env > `.env` > keystore), admission coverage for the two dispatcher-bypassing seams,
+  §2.10 degrade-never-outage, `source` provenance on `/registry`+`/candidates`, and a
+  staleness-keyed store memo (steady state: one stat, zero reads per request) with TTL-bound
+  unreadable/unlock verdicts that self-heal without a restart.
+- `bf909b7` + `b7129fa` — the `keys` lifecycle CLI (add/list/rotate/revoke/remove/disable/enable/
+  export/import/unlock; masked prompt; shadow refusals; encrypted-only ACL-hardened export;
+  narrowed rotation clearing via the token-gated `/cooldowns/clear` `kinds: ["credential-fault"]`
+  extension) and its review fixes.
+
+P1's platform question resolved in-build: Windows DPAPI live-verified twice independently
+(including a fresh-process unwrap), the Linux passphrase mode is real in CI, macOS/`secret-tool`
+ship as injected-double coverage only — stated, not papered over. Design §2.6/§2.7 carry dated
+amendments (shipped `add` stores-and-warns on a shadow; `rotate`'s narrowed live clear is the one
+deliberate HTTP touch, carrying no secret). ⚠ The owner's 12 live keys are still in env vars —
+migration (`llm-relay keys import`/`add`) is an OPERATOR action, deliberately not part of the
+sprint.
+
+Earlier the same day, **v0.44.0** shipped M4/Gap 10 (`32f31c3`, attempt-scoped estimated output)
+and M3 (`1ee1ad2`, the cooldown-clear mutation) — see the reconciliation ledger §7.
 
 Branch `main`. The metering closeout is **complete**: every sprint lane merged (nine commits).
 Since then: **v0.39.0** (`883a804`, released `cb273b0`) fixed the request-side tool-call IR leak with a
@@ -268,7 +293,20 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   both fronts: `test/accounting-lifecycle.test.ts` "records failed and committed winning serve
   attempts" walks a 429 candidate then a winner for each front.)
 
-Custody/keystore was gated on the metering closeout; that gate was already lifted (the metering
-program is delivered through Stage 5). **The owner decision itself landed 2026-08-23: APPROVED,
-queued as the next sprint** — work starts from `docs/credential-fleet-design-2026-08-16.md`'s
-staged build order (which carries P1's platform-coverage question along with it), not tonight.
+**DELIVERED 2026-08-24 (queued for v0.45.0) — the custody program** (§0). P1's platform-coverage
+question resolved in-build. Custody review findings deliberately NOT fixed, standing (each judged
+in the packet reviews, recorded here so nobody re-litigates them as discoveries):
+
+- `keys rotate` mints `~/.llm-relay/control-token` when no relay runs and the clear ends
+  `unreachable` — same side effect as `cooldowns clear` today; noted, not a defect.
+- The keystore read surface walks the full legacy candidate family (derived names included, env
+  parity) while the `keys add`/`import` write gate stays strict (declared + curated only, §2.6) —
+  a deliberate, documented asymmetry (`docs/reference.md` custody section).
+- macOS `security` and Linux `secret-tool` lanes have injected-double coverage only — no CI leg
+  and no machine here can run them (plan D2). Any "CI-verified" claim about them would be false.
+- The server-side integration tests share the worker-default keystore path (no injection seam
+  through `createProxy`); the hand-written guard in `test/reshaper-credential-binding.test.ts`
+  stands.
+- `keystoreStatus` retains the KEK after a successful status read (deliberate, serves the
+  spawn-once discipline; documented in the `keystore.ts` CLAUDE.md row).
+- The owner's 12 live keys remain in env vars until the operator migrates by hand.
