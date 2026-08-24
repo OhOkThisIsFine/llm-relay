@@ -51,7 +51,7 @@ const GCM_TAG_LENGTH = 16;
 const GCM_IV_LENGTH = 12;
 const FINGERPRINT_SALT_LENGTH = 32;
 const ITEM_ID_LENGTH = 16;
-const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const PROVIDER_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
 const FINGERPRINT_PATTERN = /^hmac:[0-9a-f]{8}$/;
 const ITEM_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -117,6 +117,9 @@ export interface KeystoreOptions extends KeyringOptions {
 
 export interface KeystoreStatus {
   status: "ok" | "absent" | "unreadable" | "locked" | "degraded";
+  /** Retained descriptors whose authenticated ciphertext cannot be decrypted. */
+  undecryptableCount: number;
+  /** Total structurally dropped plus cryptographically undecryptable rows. */
   droppedCount: number;
 }
 
@@ -1021,9 +1024,15 @@ export function keystoreStatus(opts: KeystoreOptions = {}): KeystoreStatus {
   try {
     const path = resolveKeystorePath(opts);
     const loaded = loadStore(path, opts);
-    if (loaded.status === "fresh") return { status: "absent", droppedCount: 0 };
+    if (loaded.status === "fresh") {
+      return { status: "absent", undecryptableCount: 0, droppedCount: 0 };
+    }
     if (loaded.status === "unreadable") {
-      return { status: "unreadable", droppedCount: loaded.droppedCount };
+      return {
+        status: "unreadable",
+        undecryptableCount: 0,
+        droppedCount: loaded.droppedCount,
+      };
     }
     const store = loaded.store;
     let recovered: RecoveredKek | null = null;
@@ -1039,14 +1048,22 @@ export function keystoreStatus(opts: KeystoreOptions = {}): KeystoreStatus {
         recovered.kek,
       );
       const droppedCount = loaded.droppedCount + cryptographicallyUnreadable;
-      return { status: droppedCount > 0 ? "degraded" : "ok", droppedCount };
+      return {
+        status: droppedCount > 0 ? "degraded" : "ok",
+        undecryptableCount: cryptographicallyUnreadable,
+        droppedCount,
+      };
     } catch {
-      return { status: "locked", droppedCount: loaded.droppedCount };
+      return {
+        status: "locked",
+        undecryptableCount: 0,
+        droppedCount: loaded.droppedCount,
+      };
     } finally {
       if (recovered !== null && !recovered.cached && !retained) recovered.kek.fill(0);
     }
   } catch {
-    return { status: "unreadable", droppedCount: 0 };
+    return { status: "unreadable", undecryptableCount: 0, droppedCount: 0 };
   }
 }
 

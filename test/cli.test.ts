@@ -988,11 +988,11 @@ describe("classifyCommand — the update-check gate", () => {
     expect(classifyCommand(argv("cooldowns", "clear", "anthropic"))).toBe("mutating");
   });
 
-  it("classifies keys lifecycle mutations while keeping status and export read-only", () => {
-    for (const subcommand of ["add", "rotate", "revoke", "remove", "disable", "enable", "import", "unlock"]) {
+  it("classifies keys lifecycle mutations while keeping status and unlock read-only", () => {
+    for (const subcommand of ["add", "rotate", "revoke", "remove", "disable", "enable", "export", "import"]) {
       expect(classifyCommand(argv("keys", subcommand))).toBe("mutating");
     }
-    for (const subcommand of ["list", "export", "check"]) {
+    for (const subcommand of ["list", "unlock", "check"]) {
       expect(classifyCommand(argv("keys", subcommand))).toBe("read-only");
     }
     expect(classifyCommand(argv("keys"))).toBe("read-only");

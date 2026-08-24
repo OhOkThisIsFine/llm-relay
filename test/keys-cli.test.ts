@@ -121,11 +121,16 @@ describe("keys lifecycle CLI", () => {
       join(process.cwd(), "docs", "credential-fleet-design-2026-08-16.md"),
       "utf8",
     ).split(/\r?\n/u);
+    const findBullet = (leadingText: string): string => {
+      const bullet = design.find((line) => line.startsWith(leadingText));
+      expect(bullet, `missing design bullet: ${leadingText}`).toBeDefined();
+      return bullet!;
+    };
     expect(KEY_CUSTODY_THREAT_BOUNDARY).toBe([
-      design[137],
-      design[138],
-      design[139],
-      design[145],
+      findBullet("- **What it stops:**"),
+      findBullet("- **What it does not stop:**"),
+      findBullet("- **What nothing user-side stops:**"),
+      findBullet("- An **admin-forced password reset**"),
     ].join("\n"));
   });
 
@@ -188,6 +193,30 @@ describe("keys lifecycle CLI", () => {
     expect(modes.at(-1)).toBe(false);
   });
 
+  it("preserves the named end-of-input refusal through readSecret", async () => {
+    const terminal = new PassThrough() as PassThrough & {
+      isTTY: boolean;
+      isRaw: boolean;
+      setRawMode: (mode: boolean) => typeof terminal;
+    };
+    terminal.isTTY = true;
+    terminal.isRaw = false;
+    terminal.setRawMode = (mode: boolean) => {
+      terminal.isRaw = mode;
+      return terminal;
+    };
+
+    const pending = runKeysAddLocal(cfg, "nim", {}, {
+      keystore: store,
+      env: {},
+      stdin: terminal as unknown as NodeJS.ReadStream,
+      promptOutput: { write: () => undefined },
+    });
+    terminal.end();
+
+    await expect(pending).rejects.toThrow("secret input ended before a line was read");
+  });
+
   it("adds from one piped line, round-trips, prints the exact threat boundary, and never leaks", async () => {
     const secret = "Q7vZ2mX9cB4nL8pR6tK3";
     const pipe = new PassThrough();
@@ -236,28 +265,37 @@ describe("keys lifecycle CLI", () => {
     expect(leaks(output.join(""), "N8fR4xL7bQ2zW6jK9pC5")).toBe(false);
   });
 
-  it("keeps an added row when the opt-in provider check fails", async () => {
+  it("labels a shadowed --check with the credential actually probed and threads env", async () => {
     const secret = "C8mR2vQ7xN4kT9pL5zW3";
+    const shadow = "H3qP8wY2dN6rT9kC5mV7";
+    const checkEnv = { NIM_KEY: shadow };
     const output: string[] = [];
-    await runKeysAddLocal(cfg, "nim", { check: true }, {
-      keystore: store,
-      env: {},
-      readSecret: async () => secret,
-      validateKeys: async () => [{
-        provider: "nim",
-        credentialId: "nim#default",
-        label: "default",
-        authEnv: "NVIDIA_API_KEY",
-        hasEnvKey: true,
-        status: "invalid_key",
-        httpStatus: 401,
-        message: "Credential was rejected",
-      }],
-      write: (line) => output.push(line),
-    });
+    const priorShadow = process.env.NIM_KEY;
+    delete process.env.NIM_KEY;
+    const keyCheckFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${shadow}`);
+      return new Response(JSON.stringify({ error: "rejected" }), { status: 401 });
+    }) as unknown as typeof fetch;
+    try {
+      await runKeysAddLocal(cfg, "nim", { check: true }, {
+        keystore: store,
+        env: checkEnv,
+        readSecret: async () => secret,
+        keyCheckFetch,
+        write: (line) => output.push(line),
+      });
+    } finally {
+      if (priorShadow === undefined) delete process.env.NIM_KEY;
+      else process.env.NIM_KEY = priorShadow;
+    }
     expect(lookupByEnvName("NVIDIA_API_KEY", store)?.value).toBe(secret);
-    expect(output.join("")).toContain("INVALID");
+    expect(keyCheckFetch).toHaveBeenCalled();
+    expect(output.join("")).toContain(
+      "Checked $NIM_KEY from the process environment — the stored key was NOT probed: INVALID_KEY — Authentication failed (HTTP 401)",
+    );
+    expect(output.join("")).not.toContain("Check nim#default");
     expect(leaks(output.join(""), secret)).toBe(false);
+    expect(leaks(output.join(""), shadow)).toBe(false);
   });
 
   it("refuses an empty secret before creating the store", async () => {
@@ -596,13 +634,13 @@ describe("keys lifecycle CLI", () => {
       new Date(expiresAt).toISOString(),
       "active",
     ].join("\t"));
-    expect(rendered).toContain("Store: ok.");
+    expect(rendered).toContain("Store: ok — 1 listed, 0 undecryptable, 0 dropped.");
     expect(rendered).toContain("this reflects the CLI process's view, not the running relay's");
     expect(leaks(rendered, originalSecret)).toBe(false);
     expect(leaks(rendered, rotatedSecret)).toBe(false);
   });
 
-  it("surfaces degraded store status and the shown/unreadable count", () => {
+  it("reports listed, undecryptable, and dropped rows without double-counting", () => {
     addEntry({
       id: "nim#default",
       provider: "nim",
@@ -610,20 +648,26 @@ describe("keys lifecycle CLI", () => {
       value: "status-secret",
     }, store);
     const document = JSON.parse(readFileSync(storePath, "utf8")) as { entries: unknown[] };
+    const row = document.entries[0] as { ct: string };
+    row.ct = `${row.ct[0] === "A" ? "B" : "A"}${row.ct.slice(1)}`;
     document.entries.push({ malformed: true });
     writeFileSync(storePath, JSON.stringify(document, null, 2));
     lock({ path: storePath });
     const output: string[] = [];
     runKeysListLocal(cfg, { keystore: store, env: {}, write: (line) => output.push(line) });
-    expect(output.join("")).toContain("1 shown, 1 unreadable");
-    expect(output.join("")).toContain("Store: degraded");
+    expect(output.join("")).toContain("nim\tnim#default\t—");
+    expect(output.join("")).toContain(
+      "Store: degraded — 1 listed, 1 undecryptable, 1 dropped.",
+    );
   });
 
   it("surfaces an unreadable store without trying to print secret-bearing rows", () => {
     writeFileSync(storePath, "not-json");
     const output: string[] = [];
     runKeysListLocal(cfg, { keystore: store, env: {}, write: (line) => output.push(line) });
-    expect(output.join("")).toContain("Store: unreadable.");
+    expect(output.join("")).toContain(
+      "Store: unreadable — 0 listed, 0 undecryptable, 0 dropped.",
+    );
     expect(output.join("")).toContain(
       "provider\tcredential id\tsource\tfingerprint\tadded\trotated\texpiry\tstate",
     );
@@ -643,6 +687,148 @@ describe("keys lifecycle CLI", () => {
       readSecret: async () => EXPORT_PASSPHRASE,
     })).rejects.toThrow("keystore unlock failed");
     expect(() => readFileSync(outPath)).toThrow();
+  });
+
+  it("shares one piped reader across export passphrase and confirmation", async () => {
+    const secret = "T7mQ2vN9xR4kC8pL5zW3";
+    addEntry({
+      id: "nim#default",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: secret,
+    }, store);
+    const pipe = new PassThrough();
+    pipe.end(`${EXPORT_PASSPHRASE}\n${EXPORT_PASSPHRASE}\n`);
+    const outPath = join(directory, "piped-export.json");
+    const output: string[] = [];
+
+    await runKeysExportLocal(outPath, {
+      keystore: store,
+      stdin: pipe as unknown as NodeJS.ReadStream,
+      write: (line) => output.push(line),
+    });
+
+    expect(decryptEncryptedKeystoreExport(
+      readFileSync(outPath, "utf8"),
+      EXPORT_PASSPHRASE,
+    )[0]?.value).toBe(secret);
+    expect(output.join("")).toContain(
+      "The export passphrase is the file's entire protection off-machine; keep it separate from the export.",
+    );
+  });
+
+  it("fails closed without hanging when piped export confirmation reaches end-of-input", async () => {
+    const pipe = new PassThrough();
+    pipe.end(`${EXPORT_PASSPHRASE}\n`);
+    const outPath = join(directory, "exhausted-export.json");
+
+    await expect(runKeysExportLocal(outPath, {
+      keystore: store,
+      stdin: pipe as unknown as NodeJS.ReadStream,
+    })).rejects.toThrow("empty secret refused");
+    expect(() => readFileSync(outPath)).toThrow();
+  });
+
+  it("maps exhausted piped export input to CLI exit 1 with the named refusal", async () => {
+    const pipe = new PassThrough();
+    pipe.end(`${EXPORT_PASSPHRASE}\n`);
+    const outPath = join(directory, "exhausted-cli-export.json");
+    const stderr: string[] = [];
+    const originalArgv = process.argv;
+    type ExitCode = Parameters<typeof process.exit>[0];
+    let resolveExit!: (code: ExitCode) => void;
+    const exited = new Promise<ExitCode>((resolve) => {
+      resolveExit = resolve;
+    });
+
+    process.argv = ["node", "cli.ts", "keys", "export", "--out", outPath];
+    vi.spyOn(process, "stdin", "get").mockReturnValue(
+      pipe as unknown as NodeJS.ReadStream & typeof process.stdin,
+    );
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      resolveExit(code);
+      return undefined as never;
+    });
+
+    try {
+      main();
+      await expect(exited).resolves.toBe(1);
+      expect(stderr.join("")).toContain("llm-relay keys: empty secret refused");
+      expect(() => readFileSync(outPath)).toThrow();
+    } finally {
+      process.argv = originalArgv;
+    }
+  });
+
+  it("refuses an export passphrase confirmation mismatch without writing", async () => {
+    const outPath = join(directory, "mismatched-export.json");
+    const secrets = [EXPORT_PASSPHRASE, "different-export-passphrase"];
+
+    await expect(runKeysExportLocal(outPath, {
+      keystore: store,
+      readSecret: async () => secrets.shift()!,
+    })).rejects.toThrow("export passphrase confirmation mismatch: export refused");
+    expect(() => readFileSync(outPath)).toThrow();
+  });
+
+  it("refuses a whitespace-only export passphrase before writing", async () => {
+    const outPath = join(directory, "whitespace-export.json");
+    const readSecret = vi.fn(async () => " \t ");
+
+    await expect(runKeysExportLocal(outPath, {
+      keystore: store,
+      readSecret,
+    })).rejects.toThrow("empty secret refused");
+    expect(readSecret).toHaveBeenCalledTimes(1);
+    expect(() => readFileSync(outPath)).toThrow();
+  });
+
+  it("restricts a Windows export with the keystore ACL seam and exact argv", async () => {
+    const ownerSid = "S-1-5-21-111-222-333-1001";
+    const aclSpawnSync = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    const outPath = join(directory, "windows-export.json");
+    addEntry({
+      id: "nim#default",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: "windows-export-secret",
+    }, store);
+
+    await runKeysExportLocal(outPath, {
+      keystore: {
+        ...store,
+        acl: {
+          platform: "win32",
+          ownerSid,
+          systemRoot: "D:\\Windows",
+          spawnSync: aclSpawnSync,
+        },
+      },
+      readSecret: async () => EXPORT_PASSPHRASE,
+      write: () => undefined,
+    });
+
+    expect(aclSpawnSync).toHaveBeenCalledTimes(1);
+    expect(aclSpawnSync).toHaveBeenCalledWith(
+      "D:\\Windows\\System32\\icacls.exe",
+      [
+        outPath,
+        "/inheritance:r",
+        "/grant:r",
+        `*${ownerSid}:F`,
+        "*S-1-5-18:F",
+        "*S-1-5-32-544:F",
+      ],
+      {
+        windowsHide: true,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
   });
 
   it("round-trips an encrypted export into a fresh store without plaintext in the file", async () => {
@@ -940,10 +1126,10 @@ describe("keys lifecycle CLI", () => {
 
   it("pins keys command mutation classification", () => {
     const argv = (...args: string[]): string[] => ["node", "cli.ts", ...args];
-    for (const subcommand of ["add", "rotate", "revoke", "remove", "disable", "enable", "import", "unlock"]) {
+    for (const subcommand of ["add", "rotate", "revoke", "remove", "disable", "enable", "export", "import"]) {
       expect(classifyCommand(argv("keys", subcommand))).toBe("mutating");
     }
-    for (const subcommand of [undefined, "list", "export", "check"]) {
+    for (const subcommand of [undefined, "list", "unlock", "check"]) {
       expect(classifyCommand(argv("keys", ...(subcommand === undefined ? [] : [subcommand])))).toBe("read-only");
     }
   });

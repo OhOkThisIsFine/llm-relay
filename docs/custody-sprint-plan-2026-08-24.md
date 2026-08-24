@@ -109,6 +109,7 @@ Target release: **v0.45.0**.
   add/rotate/revoke/remove/import/unlock, read-only for bare/list/export/check. All keys
   subcommands are CLI-local only — no `tryServer`, no HTTP (design §2.7); the relay picks up
   changes at its own next resolution (attempt-time resolution already re-reads state per request).
+  Amended post-review: `add` stores-and-warns on a shadow (rotate still refuses), and rotate's narrowed live clear through the token-gated `/cooldowns/clear` is the one deliberate HTTP touch — both recorded as amendments in the design doc §2.6/§2.7.
 - **D7 — keyring spawn discipline.** `powershell.exe` (Windows PowerShell 5.1) and `icacls` resolve
   from `%SystemRoot%\System32` absolutely — a NEW pattern, deliberate (design §2.1: a PATH shim
   shadowing the binary that handles the secret is itself a hijack vector); `security` and
