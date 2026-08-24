@@ -136,8 +136,8 @@ export interface AccountingSpendPricesV1 {
  * Coverage of ONE priced spend: which token kinds went into the amount and which
  * rode beside it unpriced.
  * - "full": every reported token kind was priced at a published price.
- * - "input_only": estimated-basis pricing — estimated OUTPUT has no producer today,
- *   so the amount covers input alone BY CONSTRUCTION and says so.
+ * - "input_only": estimated-basis pricing intentionally covers input alone;
+ *   separate estimated-output metering never silently widens spend.
  * - "partial": at least one present token kind was left out (cache kinds, or one of
  *   in/out unpublished). The amount is a lower bound.
  */

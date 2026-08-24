@@ -128,6 +128,11 @@ export function assessCost(
   return { costClass: "unknown", basis: "unpublished" };
 }
 
+/** Shared chars/4 convention for relay-authored token estimates. */
+export function estimateTokensFromCharacters(characters: number): number {
+  return Math.ceil(characters / 4);
+}
+
 /**
  * Estimate input prompt token count from a request object.
  *
@@ -167,7 +172,7 @@ export function estimateRequestTokens(reqJson: unknown): number {
   walk(obj.tools);
   walk(obj.instructions);
   walk(obj.input);
-  return Math.ceil(chars / 4);
+  return estimateTokensFromCharacters(chars);
 }
 
 /** Where a context window came from, in descending order of authority. */
