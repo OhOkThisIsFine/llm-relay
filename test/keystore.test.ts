@@ -1,11 +1,13 @@
-import { createHmac } from "node:crypto";
+import { createCipheriv, createHmac } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -13,6 +15,7 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addEntry,
+  createKeystoreResolutionWalk,
   keystoreStatus,
   KeystoreMutationRefusedError,
   KeystoreReadError,
@@ -22,6 +25,7 @@ import {
   listEntries,
   lock,
   lookupByEnvName,
+  lookupByEnvNames,
   removeEntry,
   resolveKeystorePath,
   revokeEntry,
@@ -133,6 +137,32 @@ describe("encrypted credential keystore", () => {
 
   const writeRaw = (raw: RawStore): void => {
     writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+  };
+
+  const replaceRawValue = (
+    raw: RawStore,
+    entry: RawEntry,
+    value: string,
+    kek: Buffer,
+    ivByte: number,
+  ): void => {
+    const plaintext = Buffer.from(value, "utf8");
+    const iv = Buffer.alloc(12, ivByte);
+    try {
+      const cipher = createCipheriv("aes-256-gcm", kek, iv, { authTagLength: 16 });
+      cipher.setAAD(Buffer.from(`1|${entry.provider}|${entry.id}|${entry.envName}`, "utf8"));
+      entry.ct = Buffer.concat([cipher.update(plaintext), cipher.final()]).toString("base64");
+      entry.iv = iv.toString("base64");
+      entry.tag = cipher.getAuthTag().toString("base64");
+      entry.fingerprint = `hmac:${createHmac("sha256", kek)
+        .update(Buffer.from(raw.fpSalt, "base64"))
+        .update(plaintext)
+        .digest("hex")
+        .slice(0, 8)}`;
+    } finally {
+      plaintext.fill(0);
+      iv.fill(0);
+    }
   };
 
   const seedTwoRows = (): RawStore => {
@@ -262,15 +292,132 @@ describe("encrypted credential keystore", () => {
     expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
   });
 
-  it("optionally filters environment lookup by provider", () => {
+  it("keeps the legacy provider argument compatibility-only while envName owns identity", () => {
     addEntry({
       id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: FIRST_SECRET,
     }, options());
 
     expect(lookupByEnvName("NVIDIA_API_KEY", "nim", options())?.value).toBe(FIRST_SECRET);
-    expect(lookupByEnvName("NVIDIA_API_KEY", "openai", options())).toBeNull();
+    expect(lookupByEnvName("NVIDIA_API_KEY", "openai", options())?.value).toBe(FIRST_SECRET);
+    expect(lookupByEnvName("NVIDIA_API_KEY", "not a provider!", options())?.value)
+      .toBe(FIRST_SECRET);
     expect(lookupByEnvName("NVIDIA_API_KEY", options(), "nim")?.value).toBe(FIRST_SECRET);
-    expect(lookupByEnvName("NVIDIA_API_KEY", options(), "openai")).toBeNull();
+    expect(lookupByEnvName("NVIDIA_API_KEY", options(), "openai")?.value).toBe(FIRST_SECRET);
+  });
+
+  it("loads once for a candidate batch, scans candidate order, and rereads only after staleness", () => {
+    seedTwoRows();
+    const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+    const statFile = vi.fn((candidatePath: string) => {
+      const { mtimeMs, size, ino } = statSync(candidatePath);
+      return { mtimeMs, size, ino };
+    });
+    const counted = options({ readFile, statFile });
+
+    expect(lookupByEnvNames(
+      ["OPENAI_API_KEY", "NVIDIA_API_KEY"],
+      counted,
+    )).toMatchObject({
+      envName: "OPENAI_API_KEY",
+      value: SECOND_SECRET,
+      entryId: "openai#work",
+      provider: "openai",
+    });
+    expect(statFile).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledTimes(1);
+
+    const aliasPath = join(directory, "unused", "..", "keystore.json");
+    expect(lookupByEnvName("NVIDIA_API_KEY", { ...counted, path: aliasPath })?.value)
+      .toBe(FIRST_SECRET);
+    expect(lookupByEnvName("NVIDIA_API_KEY", counted)?.value).toBe(FIRST_SECRET);
+    expect(lookupByEnvName("NVIDIA_API_KEY", counted)?.value).toBe(FIRST_SECRET);
+    expect(statFile).toHaveBeenCalledTimes(4);
+    expect(readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares one store observation across consumers in an opaque resolution walk", () => {
+    seedTwoRows();
+    const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+    const statFile = vi.fn((candidatePath: string) => {
+      const { mtimeMs, size, ino } = statSync(candidatePath);
+      return { mtimeMs, size, ino };
+    });
+    const scoped = options({
+      readFile,
+      statFile,
+      resolutionWalk: createKeystoreResolutionWalk(),
+    });
+
+    expect(lookupByEnvNames(["NVIDIA_API_KEY"], scoped)?.value).toBe(FIRST_SECRET);
+    expect(listEntries(scoped)).toHaveLength(2);
+    expect(keystoreStatus(scoped)).toEqual({ status: "ok", droppedCount: 0 });
+    expect(statFile).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a legacy whitespace-only candidate and returns the next usable named value", () => {
+    const knownKek = Buffer.alloc(32, 0x42);
+    const spawnSync = vi.fn<KeyringSpawnSync>(() => ({
+      status: 0,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    }));
+    const knownKekOptions: KeystoreOptions = {
+      path,
+      mode: "libsecret",
+      platform: "linux",
+      spawnSync,
+      randomBytes: (size) => Buffer.alloc(size, 0x42),
+    };
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, knownKekOptions);
+    addEntry({
+      id: "openai#work",
+      provider: "openai",
+      envName: "OPENAI_API_KEY",
+      value: SECOND_SECRET,
+    }, knownKekOptions);
+    const raw = readRaw();
+    replaceRawValue(raw, raw.entries[0]!, " \t\n ", knownKek, 0x33);
+    writeRaw(raw);
+
+    expect(lookupByEnvNames(
+      ["NVIDIA_API_KEY", "OPENAI_API_KEY"],
+      knownKekOptions,
+    )).toMatchObject({
+      envName: "OPENAI_API_KEY",
+      value: SECOND_SECRET,
+      entryId: "openai#work",
+      provider: "openai",
+    });
+  });
+
+  it("uses one presence definition to reject whitespace-only add and rotate values", () => {
+    const addError = captureError(() => addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: " \t\n ",
+    }, options()));
+    expect(addError).toBeInstanceOf(KeystoreValidationError);
+    expect(addError.message).toBe("invalid keystore entry value");
+    expect(existsSync(path)).toBe(false);
+
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, options());
+    const before = readFileSync(path);
+    const rotateError = captureError(() => rotateEntry("nim#personal", "\r\n\t", options()));
+    expect(rotateError).toBeInstanceOf(KeystoreValidationError);
+    expect(rotateError.message).toBe("invalid keystore entry value");
+    expect(readFileSync(path)).toEqual(before);
   });
 
   it("deduplicates envName globally in deterministic file order and reports the dropped row", () => {
@@ -280,7 +427,7 @@ describe("encrypted credential keystore", () => {
 
     expect(listEntries(options()).map((entry) => entry.id)).toEqual(["nim#personal"]);
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
-    expect(lookupByEnvName("NVIDIA_API_KEY", "openai", options())).toBeNull();
+    expect(lookupByEnvName("NVIDIA_API_KEY", "openai", options())?.value).toBe(FIRST_SECRET);
     expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
   });
 
@@ -427,7 +574,7 @@ describe("encrypted credential keystore", () => {
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(SECOND_SECRET);
   });
 
-  it("memoizes a wrong passphrase failure until explicit lock, without persisting it", () => {
+  it("self-heals wrong-passphrase reads and writes after the 60-second cooldown", () => {
     addEntry({
       id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: FIRST_SECRET,
     }, options());
@@ -437,31 +584,77 @@ describe("encrypted credential keystore", () => {
     expect(lookupByEnvName("NVIDIA_API_KEY", {
       ...options(),
       passphrase: "wrong passphrase",
+      now: 0,
     })).toBeNull();
-    expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
-    lock({ path });
-    expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
-    lock({ path });
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({ now: 59_999 }))).toBeNull();
+    expect(readFileSync(path)).toEqual(before);
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({ now: 60_000 }))?.value)
+      .toBe(FIRST_SECRET);
 
-    const addError = captureError(() => addEntry({
+    addEntry({
       id: "nim#work",
       provider: "nim",
       envName: "NVIDIA_WORK_API_KEY",
-      value: ATTEMPTED_SECRET,
-    }, { ...options(), passphrase: "wrong passphrase" }));
-    expect(addError).toBeInstanceOf(KeystoreUnlockError);
-    const rotateError = captureError(() => rotateEntry(
-      "nim#personal",
-      ATTEMPTED_SECRET,
-      { ...options(), passphrase: "wrong passphrase" },
-    ));
-    expect(rotateError).toBeInstanceOf(KeystoreUnlockError);
-    expect(readFileSync(path)).toEqual(before);
-    expectNoSecretLeaks(addError, FIRST_SECRET, ATTEMPTED_SECRET);
-    expectNoSecretLeaks(rotateError, FIRST_SECRET, ATTEMPTED_SECRET);
-    expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
+      value: SECOND_SECRET,
+    }, options({ now: 60_001 }));
+    expect(lookupByEnvName("NVIDIA_WORK_API_KEY", options({ now: 60_002 }))?.value)
+      .toBe(SECOND_SECRET);
+  });
+
+  it("does not bypass the unlock cooldown for a same-descriptor stat-token change", () => {
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, options());
     lock({ path });
-    expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
+    expect(lookupByEnvName("NVIDIA_API_KEY", {
+      ...options(),
+      passphrase: "wrong passphrase",
+      now: 0,
+    })).toBeNull();
+
+    const raw = readRaw();
+    const kdf = raw.kek.kdf as Record<string, unknown>;
+    raw.kek = {
+      kdf: { salt: kdf.salt, p: kdf.p, r: kdf.r, n: kdf.n },
+      wrap: "passphrase",
+    };
+    writeRaw(raw);
+    utimesSync(path, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
+
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({ now: 1 }))).toBeNull();
+    expect(keystoreStatus(options({ now: 1 }))).toEqual({ status: "locked", droppedCount: 0 });
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({ now: 60_000 }))?.value)
+      .toBe(FIRST_SECRET);
+  });
+
+  it("retries immediately when a replacement store has a different KEK descriptor identity", () => {
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, options());
+    lock({ path });
+    expect(lookupByEnvName("NVIDIA_API_KEY", {
+      ...options(),
+      passphrase: "wrong passphrase",
+      now: 0,
+    })).toBeNull();
+
+    const replacementPath = join(directory, "replacement.json");
+    addEntry({
+      id: "nim#replacement",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: SECOND_SECRET,
+    }, options({ path: replacementPath, now: 1 }));
+    writeFileSync(path, readFileSync(replacementPath));
+    utimesSync(path, new Date(1_700_000_000_000), new Date(1_700_000_000_000));
+
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({ now: 2 }))?.value).toBe(SECOND_SECRET);
   });
 
   it.each([
@@ -596,6 +789,118 @@ describe("encrypted credential keystore", () => {
     expect(keystoreStatus(options())).toEqual({ status: "absent", droppedCount: 0 });
   });
 
+  it("memoizes absence with one stat and zero reads per independent resolution", () => {
+    const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+    const statFile = vi.fn((candidatePath: string) => {
+      const { mtimeMs, size, ino } = statSync(candidatePath);
+      return { mtimeMs, size, ino };
+    });
+    const counted = options({ readFile, statFile });
+
+    for (let request = 0; request < 5; request += 1) {
+      expect(lookupByEnvNames(["NVIDIA_API_KEY", "NIM_API_KEY"], counted)).toBeNull();
+    }
+    expect(statFile).toHaveBeenCalledTimes(5);
+    expect(readFile).not.toHaveBeenCalled();
+  });
+
+  it("recovers an unreadable store immediately when its stat token changes", () => {
+    seedTwoRows();
+    const validStore = readFileSync(path, "utf8");
+    const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+    const statFile = vi.fn((candidatePath: string) => {
+      const { mtimeMs, size, ino } = statSync(candidatePath);
+      return { mtimeMs, size, ino };
+    });
+    const unreadableWalk = createKeystoreResolutionWalk();
+    writeFileSync(path, "{", "utf8");
+
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({
+      now: 0,
+      readFile,
+      statFile,
+      resolutionWalk: unreadableWalk,
+    }))).toBeNull();
+    expect(keystoreStatus(options({
+      now: 1,
+      readFile,
+      statFile,
+      resolutionWalk: unreadableWalk,
+    }))).toEqual({
+      status: "unreadable",
+      droppedCount: 0,
+    });
+    expect(statFile).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledTimes(1);
+
+    writeFileSync(path, validStore, "utf8");
+    const repairedWalk = createKeystoreResolutionWalk();
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({
+      now: 2,
+      readFile,
+      statFile,
+      resolutionWalk: repairedWalk,
+    }))?.value)
+      .toBe(FIRST_SECRET);
+    expect(keystoreStatus(options({
+      now: 2,
+      readFile,
+      statFile,
+      resolutionWalk: repairedWalk,
+    }))).toEqual({
+      status: "ok",
+      droppedCount: 0,
+    });
+    expect(statFile).toHaveBeenCalledTimes(2);
+    expect(readFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a same-token transient read failure after 30 seconds without wall sleeps", () => {
+    seedTwoRows();
+    const observed = statSync(path);
+    const statFile = vi.fn(() => ({
+      mtimeMs: observed.mtimeMs,
+      size: observed.size,
+      ino: observed.ino,
+    }));
+    const readFile = vi.fn()
+      .mockImplementationOnce((): never => {
+        throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      })
+      .mockImplementation((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+    const initialWalk = createKeystoreResolutionWalk();
+
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({
+      now: 0,
+      readFile,
+      statFile,
+      resolutionWalk: initialWalk,
+    }))).toBeNull();
+    const cooldownWalk = createKeystoreResolutionWalk();
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({
+      now: 29_999,
+      readFile,
+      statFile,
+      resolutionWalk: cooldownWalk,
+    }))).toBeNull();
+    expect(readFile).toHaveBeenCalledTimes(1);
+    const retryWalk = createKeystoreResolutionWalk();
+    expect(lookupByEnvName("NVIDIA_API_KEY", options({
+      now: 30_000,
+      readFile,
+      statFile,
+      resolutionWalk: retryWalk,
+    }))?.value).toBe(FIRST_SECRET);
+    expect(keystoreStatus(options({
+      now: 30_000,
+      readFile,
+      statFile,
+      resolutionWalk: retryWalk,
+    }))).toEqual({ status: "ok", droppedCount: 0 });
+    expect(readFile).toHaveBeenCalledTimes(2);
+    expect(statFile).toHaveBeenCalledTimes(3);
+  });
+
   it("treats ENOENT as fresh only when the store path entry is genuinely absent", () => {
     seedTwoRows();
     const before = readFileSync(path);
@@ -636,10 +941,10 @@ describe("encrypted credential keystore", () => {
   });
 
   it("surfaces a sanitized EACCES errno on metadata reads while resolver reads stay non-throwing", () => {
-    const readFile = vi.fn((): string => {
+    const statFile = vi.fn((): never => {
       throw Object.assign(new Error(`denied ${FIRST_SECRET}`), { code: "EACCES" });
     });
-    const denied = options({ readFile });
+    const denied = options({ statFile });
 
     expect(() => lookupByEnvName("NVIDIA_API_KEY", denied)).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", denied)).toBeNull();
@@ -682,6 +987,57 @@ describe("encrypted credential keystore", () => {
     expect(keystoreStatus(options())).toEqual({ status: "ok", droppedCount: 0 });
   });
 
+  it("lets explicit lock end an unlock cooldown and permits exactly one fresh unwrap", () => {
+    const knownKek = Buffer.alloc(32, 0x42);
+    const createSpawn = vi.fn<KeyringSpawnSync>(() => ({
+      status: 0,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    }));
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, {
+      path,
+      mode: "libsecret",
+      platform: "linux",
+      spawnSync: createSpawn,
+      randomBytes: (size) => Buffer.alloc(size, 0x42),
+    });
+    lock({ path });
+
+    const retrySpawn = vi.fn<KeyringSpawnSync>()
+      .mockReturnValueOnce({
+        status: 1,
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+      })
+      .mockReturnValue({
+        status: 0,
+        stdout: Buffer.from(`${knownKek.toString("base64")}\n`, "ascii"),
+        stderr: Buffer.alloc(0),
+      });
+    const retryOptions: KeystoreOptions = {
+      path,
+      mode: "libsecret",
+      platform: "linux",
+      spawnSync: retrySpawn,
+    };
+
+    expect(lookupByEnvName("NVIDIA_API_KEY", { ...retryOptions, now: 0 })).toBeNull();
+    expect(retrySpawn).toHaveBeenCalledTimes(1);
+    lock({ path });
+    expect(lookupByEnvName("NVIDIA_API_KEY", { ...retryOptions, now: 2 })?.value)
+      .toBe(FIRST_SECRET);
+    expect(keystoreStatus({ ...retryOptions, now: 2 })).toEqual({
+      status: "ok",
+      droppedCount: 0,
+    });
+    expect(retrySpawn).toHaveBeenCalledTimes(2);
+  });
+
   it("memoizes a failing keyring across two sequential credential resolutions and status", () => {
     const createSpawn = vi.fn<KeyringSpawnSync>(() => ({
       status: 0,
@@ -714,12 +1070,30 @@ describe("encrypted credential keystore", () => {
       spawnSync: failingSpawn,
     };
 
-    const first = resolveCredential("NVIDIA_API_KEY", {}, "nim", failingOptions);
-    const second = resolveCredential("NVIDIA_API_KEY", {}, "nim", failingOptions);
+    const first = resolveCredential("NVIDIA_API_KEY", {}, "nim", {
+      ...failingOptions,
+      now: 0,
+    });
+    const second = resolveCredential("NVIDIA_API_KEY", {}, "nim", {
+      ...failingOptions,
+      now: 59_999,
+    });
     expect(first).toMatchObject({ state: "declared-missing", source: undefined });
     expect(second).toEqual(first);
-    expect(keystoreStatus(failingOptions)).toEqual({ status: "locked", droppedCount: 0 });
+    expect(keystoreStatus({ ...failingOptions, now: 59_999 })).toEqual({
+      status: "locked",
+      droppedCount: 0,
+    });
     expect(failingSpawn).toHaveBeenCalledTimes(1);
+    expect(resolveCredential("NVIDIA_API_KEY", {}, "nim", {
+      ...failingOptions,
+      now: 60_000,
+    })).toMatchObject({ state: "declared-missing", source: undefined });
+    expect(resolveCredential("NVIDIA_API_KEY", {}, "nim", {
+      ...failingOptions,
+      now: 60_001,
+    })).toMatchObject({ state: "declared-missing", source: undefined });
+    expect(failingSpawn).toHaveBeenCalledTimes(2);
   });
 
   it("memoizes a successful keyring unwrap across later resolutions and status", () => {
@@ -776,6 +1150,37 @@ describe("encrypted credential keystore", () => {
     expectNoSecretLeaks(error, ATTEMPTED_SECRET);
   });
 
+  it("does not poison a memoized parsed store when an existing-store write fails", () => {
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, options());
+    expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
+    const before = readFileSync(path);
+    const backupPath = join(directory, "keystore-before-failed-write.json");
+    const statFile = vi.fn((candidatePath: string) => {
+      const { mtimeMs, size, ino } = statSync(candidatePath);
+      renameSync(candidatePath, backupPath);
+      mkdirSync(candidatePath);
+      return { mtimeMs, size, ino };
+    });
+
+    const error = captureError(() => rotateEntry(
+      "nim#personal",
+      ATTEMPTED_SECRET,
+      options({ statFile }),
+    ));
+    expect(error).toBeInstanceOf(KeystoreWriteError);
+    rmSync(path, { recursive: true, force: true });
+    renameSync(backupPath, path);
+    expect(readFileSync(path)).toEqual(before);
+    expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
+    expect(statFile).toHaveBeenCalledTimes(1);
+    expectNoSecretLeaks(readFileSync(path, "utf8"), ATTEMPTED_SECRET);
+  });
+
   it("keeps lifecycle cleanup available when the KEK cannot be unwrapped", () => {
     addEntry({
       id: "nim#personal",
@@ -819,7 +1224,7 @@ describe("encrypted credential keystore", () => {
     expect(listEntries(options())).toEqual([]);
   });
 
-  it("rereads lifecycle metadata and ciphertext on every lookup while retaining only the KEK", () => {
+  it("rereads external lifecycle and ciphertext changes when the stat token changes", () => {
     addEntry({
       id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: FIRST_SECRET,
     }, options());
@@ -828,6 +1233,7 @@ describe("encrypted credential keystore", () => {
     const disabled = readRaw();
     disabled.entries[0]!.disabled = true;
     writeRaw(disabled);
+    utimesSync(path, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
 
     const corrupted = readRaw();
@@ -835,6 +1241,7 @@ describe("encrypted credential keystore", () => {
     const ct = corrupted.entries[0]!.ct;
     corrupted.entries[0]!.ct = `${ct[0] === "A" ? "B" : "A"}${ct.slice(1)}`;
     writeRaw(corrupted);
+    utimesSync(path, new Date(1_700_000_000_000), new Date(1_700_000_000_000));
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
     expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
   });

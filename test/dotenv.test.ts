@@ -32,7 +32,7 @@ describe("loadEnvFile", () => {
     file = join(dir, ".env");
   });
   afterEach(() => {
-    loadEnvFile(join(dir, "provenance-reset-missing.env"), {});
+    loadEnvFile(join(dir, "provenance-reset-missing.env"));
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -103,6 +103,31 @@ describe("loadEnvFile", () => {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
+    }
+  });
+
+  it("keeps real process.env provenance when loading a foreign target", () => {
+    const name = "DOTENV_PROVENANCE_SURVIVES_FOREIGN_LOAD";
+    const saved = process.env[name];
+    delete process.env[name];
+
+    try {
+      writeFileSync(file, `${name}=from-file\n`);
+      loadEnvFile(file);
+      expect(wasEnvNameLoadedFromFile(name)).toBe(true);
+
+      const foreignFile = join(dir, "foreign.env");
+      const foreignEnv: NodeJS.ProcessEnv = {};
+      writeFileSync(foreignFile, "FOREIGN_ONLY=from-foreign-file\n");
+      const result = loadEnvFile(foreignFile, foreignEnv);
+
+      expect(result.loaded).toEqual(["FOREIGN_ONLY"]);
+      expect(foreignEnv.FOREIGN_ONLY).toBe("from-foreign-file");
+      expect(wasEnvNameLoadedFromFile(name)).toBe(true);
+      expect(wasEnvNameLoadedFromFile("FOREIGN_ONLY")).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[name];
+      else process.env[name] = saved;
     }
   });
 

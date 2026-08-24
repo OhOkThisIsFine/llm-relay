@@ -14,7 +14,12 @@ import {
   type CredentialSlot,
   type ProviderCredentialConfig,
 } from "./credential-fleet.js";
-import { keystoreStatus, listEntries } from "./keystore.js";
+import {
+  createKeystoreResolutionWalk,
+  keystoreStatus,
+  listEntries,
+  type KeystoreOptions,
+} from "./keystore.js";
 
 export type Mode = "detect" | "repair" | "strict";
 
@@ -962,7 +967,19 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
 /**
  * Resolve an inbound `model` to an array of concrete targets (primary + fallbacks).
  */
-export function resolveTargets(model: string | null, cfg: Config): ResolvedTarget[] {
+export function resolveTargets(
+  model: string | null,
+  cfg: Config,
+  keystoreOptions: KeystoreOptions = {},
+): ResolvedTarget[] {
+  // One request-resolution walk owns one filesystem observation per store path. Never reuse a
+  // caller-provided scope or mutate its options: separate resolveTargets calls must re-stat so an
+  // out-of-process store replacement becomes visible, while every credentialState call below
+  // shares this invocation's parsed in-memory snapshot.
+  const scopedKeystoreOptions: KeystoreOptions = {
+    ...keystoreOptions,
+    resolutionWalk: createKeystoreResolutionWalk(),
+  };
   const picked = pickSpecs(model, cfg);
   const specs = expandPoolSpecs(picked, cfg);
   let targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
@@ -977,7 +994,9 @@ export function resolveTargets(model: string | null, cfg: Config): ResolvedTarge
   // keep-everything fallback below never ran, and the request went to a provider the proxy could
   // not authenticate to. Any drift between the two answers reopens that gap, so both must keep
   // calling the one predicate.
-  const activeTargets = targets.filter((t) => credentialState(t.authEnv, process.env, t.provider) !== "declared-missing");
+  const activeTargets = targets.filter((t) =>
+    credentialState(t.authEnv, process.env, t.provider, scopedKeystoreOptions) !== "declared-missing"
+  );
   if (activeTargets.length > 0) {
     targets = activeTargets;
   }
@@ -996,8 +1015,12 @@ export function resolveTargets(model: string | null, cfg: Config): ResolvedTarge
 /**
  * Resolve an inbound `model` to the primary concrete target.
  */
-export function resolveTarget(model: string | null, cfg: Config): ResolvedTarget {
-  const targets = resolveTargets(model, cfg);
+export function resolveTarget(
+  model: string | null,
+  cfg: Config,
+  keystoreOptions: KeystoreOptions = {},
+): ResolvedTarget {
+  const targets = resolveTargets(model, cfg, keystoreOptions);
   if (targets.length === 0) {
     throw new RoutingError(`could not resolve any target for model "${model ?? "<none>"}"`);
   }
@@ -1070,25 +1093,26 @@ function parseAuthHeader(raw: unknown, dflt: AuthHeader): AuthHeader {
 const KEYSTORE_UNREADABLE_WARNING =
   "keystore unreadable — keystore-only providers resolve declared-missing and are unavailable " +
   "to routing; where alternatives exist, traffic falls through to remaining candidates. " +
-  "Relay startup continues.";
+  "The relay retries automatically; startup continues.";
 
 /** Append custody availability diagnostics without ever changing admission or refusing startup. */
 function appendKeystoreDegradationWarnings(
   providers: Record<string, ProviderConfig>,
   warnings: string[],
   env: NodeJS.ProcessEnv = process.env,
+  keystoreOptions: KeystoreOptions = {},
 ): void {
   try {
     let entries: ReturnType<typeof listEntries>;
     try {
-      entries = listEntries();
+      entries = listEntries(keystoreOptions);
     } catch {
       warnings.push(KEYSTORE_UNREADABLE_WARNING);
       return;
     }
     if (entries.length === 0) return;
 
-    const now = Date.now();
+    const now = keystoreOptions.now ?? Date.now();
     const liveEnvNames = new Set(entries
       .filter((entry) => !entry.disabled
         && entry.revokedAt === null
@@ -1107,23 +1131,19 @@ function appendKeystoreDegradationWarnings(
         // Custody has env-var parity: descriptor provider/id are provenance only. Coverage and
         // resolution both match the operator-declared NAME, exactly as a real env var would.
         if (!candidates.some((name) => liveEnvNames.has(name))) continue;
-        if (resolveCredentialSlot(slot, env).state === "declared-missing") {
+        if (resolveCredentialSlot(slot, env, keystoreOptions).state === "declared-missing") {
           affectedProviders.add(provider);
         }
       }
     }
 
-    const status = keystoreStatus();
+    // A status read verifies/decrypts the store and may unwrap its KEK. If no provider can be
+    // affected, diagnostics have no reason to pay that cost (notably a DPAPI spawn on Windows).
+    if (affectedProviders.size === 0) return;
+
+    const status = keystoreStatus(keystoreOptions);
     if (status.status === "unreadable") {
       warnings.push(KEYSTORE_UNREADABLE_WARNING);
-      return;
-    }
-    if (status.status === "degraded" && affectedProviders.size === 0) {
-      warnings.push(
-        `keystore degraded (${status.droppedCount} unreadable row${status.droppedCount === 1 ? "" : "s"}) — ` +
-        "some keystore-only credentials may resolve declared-missing and be unavailable to routing; " +
-        "where alternatives exist, traffic falls through to remaining candidates. Relay startup continues.",
-      );
       return;
     }
     if (status.status !== "locked" && status.status !== "degraded") return;
@@ -1135,7 +1155,8 @@ function appendKeystoreDegradationWarnings(
       warnings.push(
         `provider "${provider}" credential custody ${status.status}${detail} — its env-missing ` +
         "keystore credential(s) resolve declared-missing and are unavailable to routing; where " +
-        "alternatives exist, traffic falls through to remaining candidates. Relay startup continues.",
+        "alternatives exist, traffic falls through to remaining candidates. The relay retries " +
+        "automatically; startup continues.",
       );
     }
   } catch {
@@ -1146,7 +1167,11 @@ function appendKeystoreDegradationWarnings(
 }
 
 /** Load + validate a config file, failing loudly on anything unusable. */
-export function loadConfig(path: string, overrides: ConfigOverrides = {}): Config {
+export function loadConfig(
+  path: string,
+  overrides: ConfigOverrides = {},
+  keystoreOptions: KeystoreOptions = {},
+): Config {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -1179,7 +1204,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   const warnings: string[] = [];
   const disabledProviders = new Set<string>();
   const providers = parseProviders(c.providers, warnings, disabledProviders);
-  appendKeystoreDegradationWarnings(providers, warnings);
+  appendKeystoreDegradationWarnings(providers, warnings, process.env, keystoreOptions);
   const routing = parseRouting(c.routing, providers, overrides.routeDefault, warnings, disabledProviders);
 
   const mode = normalizeMode(c.mode);

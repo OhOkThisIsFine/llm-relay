@@ -14,8 +14,15 @@
  */
 
 import type { CredentialId } from "./credential-id.js";
-import { lookupByEnvName, type KeystoreOptions } from "./keystore.js";
+import {
+  keyIsPresent,
+  lookupByEnvNames,
+  type KeystoreOptions,
+} from "./keystore.js";
 import { wasEnvNameLoadedFromFile } from "./dotenv.js";
+
+/** The one credential-presence predicate, owned by the lower-level keystore surface. */
+export { keyIsPresent };
 
 /** Known alternate spellings, per provider, in preference order after the declared name. */
 const PROVIDER_ENV_ALIASES: Record<string, string[]> = {
@@ -119,17 +126,6 @@ export interface CredentialResolution {
 export type CredentialSource = "env" | "env-file" | "keystore";
 
 /**
- * Whether a credential value counts as PRESENT. The single predicate — three
- * call sites used to disagree (config.ts tested Boolean() with no trim while
- * server.ts and candidates.ts trimmed), so a whitespace-only key read present
- * to the active-key filter and absent to header construction. That gap is how a
- * blank credential slipped past containment entirely.
- */
-export function keyIsPresent(value: string | undefined): boolean {
-  return (value ?? "").trim().length > 0;
-}
-
-/**
  * Whether a provider's credential handling is DECLARED, and if so whether the
  * key is actually there.
  *
@@ -163,23 +159,19 @@ function resolveKeystoreCandidates(
   candidates: readonly string[],
   keystoreOptions?: KeystoreOptions,
 ): CredentialResolution | null {
-  for (const envName of candidates) {
-    // The keystore is a third source of NAMED VALUES with env-var parity. A
-    // provider declaring this name in operator-authored config expresses the
-    // same intent as an env var, which would serve every provider declaring it.
-    // AAD authenticates envName against tampering; entry id/provider are
-    // provenance metadata only, never lookup filters or credential identity.
-    const stored = lookupByEnvName(envName, keystoreOptions);
-    if (stored === null || !keyIsPresent(stored.value)) continue;
-    return {
-      state: "declared-present",
-      value: stored.value.trim(),
-      envName,
-      source: "keystore",
-      provenance: { entryId: stored.entryId, provider: stored.provider },
-    };
-  }
-  return null;
+  // The keystore is a third source of NAMED VALUES with env-var parity. A provider declaring this
+  // name in operator-authored config expresses the same intent as an env var, which would serve
+  // every provider declaring it. AAD authenticates envName against tampering; entry id/provider
+  // are provenance metadata only, never lookup filters or credential identity.
+  const stored = lookupByEnvNames(candidates, keystoreOptions);
+  if (stored === null || !keyIsPresent(stored.value)) return null;
+  return {
+    state: "declared-present",
+    value: stored.value.trim(),
+    envName: stored.envName,
+    source: "keystore",
+    provenance: { entryId: stored.entryId, provider: stored.provider },
+  };
 }
 
 export function credentialState(

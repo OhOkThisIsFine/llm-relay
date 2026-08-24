@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -86,12 +86,12 @@ describe("credential resolution sources", () => {
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), "llm-relay-auth-env-"));
     lock();
-    loadEnvFile(join(directory, "provenance-reset-missing.env"), {});
+    loadEnvFile(join(directory, "provenance-reset-missing.env"));
   });
 
   afterEach(() => {
     lock();
-    loadEnvFile(join(directory, "provenance-reset-missing.env"), {});
+    loadEnvFile(join(directory, "provenance-reset-missing.env"));
     rmSync(directory, { recursive: true, force: true });
   });
 
@@ -125,12 +125,12 @@ describe("credential resolution sources", () => {
       envName: "MATRIX_KEYSTORE_PRESENT",
       value: " stored-present ",
     }, store);
-    addEntry({
+    expect(() => addEntry({
       id: "matrix#whitespace",
       provider: "matrix",
       envName: "MATRIX_KEYSTORE_WHITESPACE",
       value: " \t ",
-    }, store);
+    }, store)).toThrow("invalid keystore entry value");
     expect(() => addEntry({
       id: "matrix#blank",
       provider: "matrix",
@@ -277,12 +277,12 @@ describe("credential resolution sources", () => {
     });
 
     const whitespaceStore = options("legacy-whitespace-keystore.json");
-    addEntry({
+    expect(() => addEntry({
       id: "anthropic#declared",
       provider: "anthropic",
       envName: "ANTHROPIC_API_KEY",
       value: " \t ",
-    }, whitespaceStore);
+    }, whitespaceStore)).toThrow("invalid keystore entry value");
     addEntry({
       id: "anthropic#alias",
       provider: "anthropic",
@@ -294,6 +294,40 @@ describe("credential resolution sources", () => {
       envName: "ANTHROPIC_AUTH_TOKEN",
       source: "keystore",
     });
+  });
+
+  it("consults the store once for the complete candidate array and never for no declaration", () => {
+    const store = options("batch-keystore.json");
+    addEntry({
+      id: "gemini#late-alias",
+      provider: "gemini",
+      envName: "GOOGLE_API_KEY",
+      value: "stored-late-alias",
+    }, store);
+    const readFile = vi.fn((candidatePath: string) => readFileSync(candidatePath, "utf8"));
+    const statFile = vi.fn((candidatePath: string) => {
+      const { mtimeMs, size, ino } = statSync(candidatePath);
+      return { mtimeMs, size, ino };
+    });
+    const counted: KeystoreOptions = { ...store, readFile, statFile };
+
+    expect(resolveCredential("GEMINI_API_KEY", {}, "gemini", counted)).toMatchObject({
+      state: "declared-present",
+      value: "stored-late-alias",
+      envName: "GOOGLE_API_KEY",
+      source: "keystore",
+    });
+    expect(statFile).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledTimes(1);
+
+    expect(resolveCredential(undefined, {}, "gemini", counted)).toEqual({
+      state: "not-declared",
+      value: undefined,
+      envName: undefined,
+      source: undefined,
+    });
+    expect(statFile).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledTimes(1);
   });
 
   it("resolveCredentialExact consults only the declared keystore name and never serves an alias", () => {
