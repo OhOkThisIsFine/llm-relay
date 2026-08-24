@@ -1489,6 +1489,114 @@ describe("outbound tool-call id rewriting (compat.toolCallIds strict9)", () => {
 });
 
 /**
+ * The gemini thought-signature sentinel end to end (`compat.thoughtSignature: "sentinel"`).
+ *
+ * `models/gemini-3.6-flash` on generativelanguage.googleapis.com answers HTTP 400 — "Function call
+ * is missing a thought_signature in functionCall parts…" — to a replayed assistant `tool_calls`
+ * turn. Google's documented escape is the raw string `skip_thought_signature_validator` at
+ * `tool_calls[N].extra_content.google.thought_signature`, verified accepted against the live
+ * endpoint on 2026-08-23 for a single call and for both entries of a parallel pair.
+ *
+ * ⚠ Deliberately NO response header: this pass adds vendor-protocol padding to the relay's own
+ * outbound shape rather than altering the caller's data, so the log counter is the whole
+ * announcement. Both facts are pinned below.
+ */
+describe("gemini thought-signature sentinel (compat.thoughtSignature)", () => {
+  let dir: string;
+  let logFile: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-thoughtsig-"));
+    logFile = join(dir, "log.jsonl");
+  });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const BUFFERED = JSON.stringify({
+    id: "cmpl_1",
+    model: "models/gemini-3.6-flash",
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }],
+  });
+
+  function cfgFor(backendPort: number, compat: unknown): Config {
+    return {
+      host: "127.0.0.1", port: 0,
+      providers: {
+        gemini: {
+          base: `http://127.0.0.1:${backendPort}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000,
+          ...(compat !== undefined ? { compat } : {}),
+        } as never,
+      },
+      routing: { default: "gemini/models/gemini-3.6-flash", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "metadata", file: logFile },
+    };
+  }
+
+  /** Two parallel calls in one assistant turn — the every-entry placement the live check verified. */
+  const CONVERSATION = [
+    { role: "user", content: "weather in Paris and Berlin?" },
+    { role: "assistant", content: [
+      { type: "tool_use", id: "toolu_01A", name: "get_weather", input: { city: "Paris" } },
+      { type: "tool_use", id: "toolu_01B", name: "get_weather", input: { city: "Berlin" } },
+    ] },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_01A", content: "22C sunny" },
+      { type: "tool_result", tool_use_id: "toolu_01B", content: "15C rain" },
+    ] },
+  ];
+
+  it("stamps every replayed tool call and counts it in the log, with NO response header", async () => {
+    let seen: any = null;
+    const backend = await mockBackend((_path, raw) => {
+      seen = JSON.parse(raw);
+      return { headers: { "content-type": "application/json" }, body: BUFFERED };
+    });
+    const p = port(await startProxy(cfgFor(port(backend), { thoughtSignature: "sentinel" })));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "gemini/models/gemini-3.6-flash", max_tokens: 64, messages: CONVERSATION,
+        tools: [{ name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } } } }],
+      }),
+    });
+    await resp.text();
+
+    expect(resp.status).toBe(200);
+    const calls = seen.messages[1].tool_calls;
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.extra_content).toEqual({ google: { thought_signature: "skip_thought_signature_validator" } });
+    }
+    // The ids the caller wrote are untouched — this pass adds a sibling field and nothing else.
+    expect(calls.map((c: any) => c.id)).toEqual(["toolu_01A", "toolu_01B"]);
+    expect(lastLogLine(logFile)["thoughtSignatureSentinels"]).toBe(2);
+  });
+
+  it("says nothing at all for a provider that states no such rule", async () => {
+    let seen: any = null;
+    const backend = await mockBackend((_path, raw) => {
+      seen = JSON.parse(raw);
+      return { headers: { "content-type": "application/json" }, body: BUFFERED };
+    });
+    const p = port(await startProxy(cfgFor(port(backend), undefined)));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "gemini/models/gemini-3.6-flash", max_tokens: 64, messages: CONVERSATION }),
+    });
+    await resp.text();
+
+    // A loopback base host is not generativelanguage.googleapis.com, so the labelled default is
+    // "none" and the outbound bytes carry no padding whatsoever.
+    expect(JSON.stringify(seen)).not.toContain("thought_signature");
+    expect(Object.keys(lastLogLine(logFile))).not.toContain("thoughtSignatureSentinels");
+  });
+});
+
+/**
  * The wiring `observeEligibility` owes `recordFact`: the rung `resolveReset` selected must land on
  * the stored row as `untilBasis`, so the availability producer's reviewed-rule rung can read a
  * reset's provenance off the fact rather than re-deriving it from vendor prose in the read path.

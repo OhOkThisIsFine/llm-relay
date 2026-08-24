@@ -90,6 +90,7 @@ describe("metadata-only logging", () => {
       upstreamReportedModel: "meta-router/actual-model",
       toolUseIdRewrites: 2,
       toolCallIdRewrites: 3,
+      thoughtSignatureSentinels: 4,
     };
     new MetadataLogger({ level: "metadata", file }).write(full);
     const [line] = linesIn(file);
@@ -111,6 +112,7 @@ describe("metadata-only logging", () => {
       "repair",
       "toolUseIdRewrites",
       "toolCallIdRewrites",
+      "thoughtSignatureSentinels",
       "latencyMs",
     ]);
   });
@@ -317,5 +319,20 @@ describe("tool_use id minting counter", () => {
     const [rewritten, untouched] = linesIn(file);
     expect(rewritten!["toolCallIdRewrites"]).toBe(2);
     expect(Object.keys(untouched!)).not.toContain("toolCallIdRewrites");
+  });
+
+  /**
+   * The other request-direction pass: gemini's thought-signature sentinel
+   * (`compat.thoughtSignature: "sentinel"`). This one has NO response header at all — it adds
+   * vendor-protocol padding rather than changing the caller's data — so the log counter is the
+   * ONLY surface it shows on. Still a COUNT, never a signature.
+   */
+  it("emits the sentinel stamp count, and omits the field when the provider states no such rule", () => {
+    const logger = new MetadataLogger({ level: "metadata", file });
+    logger.write(record({ thoughtSignatureSentinels: 2 }));
+    logger.write(record());
+    const [stamped, untouched] = linesIn(file);
+    expect(stamped!["thoughtSignatureSentinels"]).toBe(2);
+    expect(Object.keys(untouched!)).not.toContain("thoughtSignatureSentinels");
   });
 });

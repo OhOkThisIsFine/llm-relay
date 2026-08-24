@@ -1603,6 +1603,59 @@ describe("outbound request shape holds on the FAILOVER candidate too", () => {
     expect(stripIds(strict)).toEqual(stripIds(generic));
   });
 
+  it("stamps the thought-signature sentinel per CANDIDATE — the gemini-shaped member only", async () => {
+    // gemini 3.6-flash on generativelanguage.googleapis.com answers HTTP 400 "Function call is
+    // missing a thought_signature in functionCall parts…" to a replayed tool call, so the relay
+    // stamps Google's own documented opt-out token for a provider that states that rule.
+    //
+    // ⚠ The mapper runs once PER CANDIDATE, so a one-candidate fixture cannot tell "stamped for
+    // the right member" from "stamped for everyone" — the ≥2 rule this file exists for.
+    //
+    // The mode is set explicitly rather than via the labelled base-host default because these
+    // candidates are loopback HTTP servers; the default itself is pinned in test/config.test.ts.
+    const a = await recording(() => ({ status: 429, body: RATE_LIMITED }));
+    const b = await recording(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`]);
+    cfg.providers.p1!.compat = { thoughtSignature: "sentinel" };
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "pool/coding", max_tokens: 64, messages: AGENTIC_MESSAGES,
+        tools: [{ name: "Grep", description: "g", input_schema: { type: "object", properties: { pattern: { type: "string" } } } }],
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    const gemini = a.bodies()[0];
+    const generic = b.bodies()[0];
+
+    // EVERY entry of the replayed turn — the placement verified live on 2026-08-23, single call
+    // and parallel pair alike.
+    const stamped = gemini.messages.find((m: any) => m.role === "assistant").tool_calls;
+    expect(stamped).toHaveLength(2);
+    for (const call of stamped) {
+      expect(call.extra_content).toEqual({ google: { thought_signature: "skip_thought_signature_validator" } });
+    }
+    // Ids are untouched by this pass — it adds a sibling field and nothing else.
+    assertCleanOutbound(generic);
+    expect(gemini.messages.find((m: any) => m.role === "assistant").tool_calls.map((c: any) => c.id))
+      .toEqual(["toolu_01A", "toolu_01B"]);
+
+    // The generic candidate gets no padding at all: not merely a different value, but no key.
+    for (const call of generic.messages.find((m: any) => m.role === "assistant").tool_calls) {
+      expect(call).not.toHaveProperty("extra_content");
+    }
+    expect(JSON.stringify(generic)).not.toContain("thought_signature");
+
+    // Everything OTHER than the stamp is the same translation on both candidates.
+    const strip = (body: any) =>
+      JSON.parse(JSON.stringify(body.messages).replace(/,"extra_content":\{"google":\{"thought_signature":"[^"]*"\}\}/g, ""));
+    expect(strip(gemini)).toEqual(strip(generic));
+  });
+
   it("OpenAI front → openai-kind Chat stays byte-transparent on both candidates (the untouched front)", async () => {
     // The Chat/Chat pair never enters `anthropicRequestToOpenAi`: `fetchOpenAiFront` proxies the
     // caller's own OpenAI body. Pinned here so a future change to the request mapper cannot

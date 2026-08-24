@@ -1340,3 +1340,64 @@ describe("loadConfig — provider compat (tool-call id shape)", () => {
       .toThrow(/config\.providers\.x\.compat must be an object/);
   });
 });
+
+/**
+ * `providers.<name>.compat.thoughtSignature` — the second wire-shape quirk, on the same mechanism.
+ *
+ * The default is again a LABELLED PROVIDER FACT: gemini 3.x on Google's Generative Language API
+ * answers 400 "Function call is missing a thought_signature in functionCall parts…" to a replayed
+ * tool call, so that ONE host defaults to `"sentinel"`. Config overrides it in both directions,
+ * which is the condition the "Provider knowledge is data" invariant attaches.
+ */
+describe("loadConfig — provider compat (thought signature)", () => {
+  const provider = (p: Record<string, unknown>) => (name: string) =>
+    loadConfig(write(name, base({ providers: { x: { kind: "openai", ...p } }, routing: { default: "x/m" } })));
+
+  it("defaults Google's Generative Language API to sentinel and everything else to none", () => {
+    expect(resolveTarget("m", provider({
+      base: "https://generativelanguage.googleapis.com/v1beta/openai",
+    })("ts-gemini.json")).thoughtSignature).toBe("sentinel");
+    expect(resolveTarget("m", provider({ base: "https://nim.test/v1" })("ts-nim.json")).thoughtSignature)
+      .toBe("none");
+    // Deliberately the ONE exact host, not `*.googleapis.com`: Vertex and every other Google
+    // surface are different products with different validators.
+    expect(resolveTarget("m", provider({
+      base: "https://aiplatform.googleapis.com/v1",
+    })("ts-vertex.json")).thoughtSignature).toBe("none");
+    // …and a lookalike suffix is not it either.
+    expect(resolveTarget("m", provider({
+      base: "https://notgenerativelanguage.googleapis.com.evil.test/v1",
+    })("ts-lookalike.json")).thoughtSignature).toBe("none");
+  });
+
+  it("lets an explicit value win in BOTH directions", () => {
+    expect(resolveTarget("m", provider({
+      base: "https://generativelanguage.googleapis.com/v1beta/openai",
+      compat: { thoughtSignature: "none" },
+    })("ts-off.json")).thoughtSignature).toBe("none");
+    expect(resolveTarget("m", provider({
+      base: "https://nim.test/v1", compat: { thoughtSignature: "sentinel" },
+    })("ts-on.json")).thoughtSignature).toBe("sentinel");
+  });
+
+  it("round-trips the declared key, and carries beside the sibling key", () => {
+    const c = provider({
+      base: "https://nim.test/v1", compat: { toolCallIds: "strict9", thoughtSignature: "sentinel" },
+    })("ts-roundtrip.json");
+    expect(c.providers.x!.compat).toEqual({ toolCallIds: "strict9", thoughtSignature: "sentinel" });
+    const t = resolveTarget("m", c);
+    expect(t.toolCallIds).toBe("strict9");
+    expect(t.thoughtSignature).toBe("sentinel");
+  });
+
+  it("rejects an unknown VALUE by name, and names both known keys on an unknown KEY", () => {
+    expect(() => provider({
+      base: "https://nim.test/v1", compat: { thoughtSignature: "skip" },
+    })("ts-value.json")).toThrow(/compat\.thoughtSignature must be one of: none, sentinel/);
+    expect(() => provider({
+      base: "https://nim.test/v1", compat: { thoughtSignatures: "sentinel" },
+    })("ts-key.json")).toThrow(
+      /config\.providers\.x\.compat\.thoughtSignatures is not a known compat option \(known: toolCallIds, thoughtSignature\)/,
+    );
+  });
+});
