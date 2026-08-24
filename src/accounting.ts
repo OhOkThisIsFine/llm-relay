@@ -95,9 +95,9 @@ export interface AccountingSpendPrices {
  *
  * Coverage:
  * - "full"       every priced token kind was priced; nothing unpriced rode alongside;
- * - "input_only" estimated-basis pricing with no reported usage — estimated OUTPUT has no
- *                producer today (Gap 10/M4, deliberately deferred), so the cell is a lower
- *                bound by construction and says so rather than implying completeness;
+ * - "input_only" estimated-basis pricing with no reported usage — current spend policy
+ *                intentionally prices estimated input alone; separate estimated-output
+ *                metering never silently widens the amount;
  * - "partial"    at least one token kind present in the usage went unpriced (cache kinds,
  *                or one of in/out having no published price).
  *
@@ -577,8 +577,8 @@ function resolvePrice(port: AccountingPricePort | undefined, input: SpendComputa
  *   because OpenAI INCLUDES cached tokens in prompt_tokens and bills them at an
  *   unpublished discount; if cached > prompt that figure is malformed, so prompt_tokens
  *   is priced in full and no unpriced cached count is recorded.
- * - Estimated basis prices input ONLY (estimated output has no producer today), and
- *   says so via coverage "input_only".
+ * - Estimated basis prices input ONLY by current spend policy; estimated output
+ *   remains a separate metering fact. Coverage says "input_only".
  * - No price for either kind ⇒ null (unpriced). Unknown stays null, never 0.
  */
 export function computeAccountingSpend(
@@ -644,8 +644,8 @@ export function computeAccountingSpend(
     } satisfies AccountingSpend);
   }
 
-  // Estimated basis. Estimated OUTPUT has no producer today (Gap 10/M4 deferred),
-  // so this cell is input-only BY CONSTRUCTION and labels itself accordingly.
+  // Estimated output remains a separate metering cell. Current spend policy prices
+  // estimated input only and labels the narrower amount accordingly.
   const estimatedInput = estimated.estimatedInput.value;
   if (estimatedInput === null) return null;
   if (price.perMillionIn === null) return null;

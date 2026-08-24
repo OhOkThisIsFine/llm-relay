@@ -245,6 +245,8 @@ sub-block declares the ceilings at which the relay **refuses** rather than fails
   stops the 451st. Usage comes ONLY from this relay's own ledger — never from a provider header,
   never estimated forward. **Unknown usage (no store, no traffic recorded) refuses nothing** — a
   guess must not be able to refuse.
+  For an estimated-only request, the token window is estimated input plus estimated output; token
+  hard caps read that completed estimated basis, correcting the pre-M4 input-only undercount.
 - **Where you declare a cap decides whose usage it counts**, per axis:
   - a **flat** cap (`limits.hard.<axis>` on the provider block or on a credential slot) bounds
     that credential as a whole, and is compared against the credential's usage **across all
@@ -1131,6 +1133,14 @@ dashboard never receives the persistent control capability.
 Views use the relay's bounded accounting read model: caller-visible requests, serving and repair
 attempts, reported versus estimated tokens, latency and commit timing, normalized outcomes, recent
 request detail, provider/model/client/credential dimensions, and available quota/cooldown facts.
+Every committed serving attempt (and every repair attempt) whose model-authored content is safely
+parsed within the observer's bounds carries a separate `relay_estimate` output figure: chars/4 over
+decoded text, thinking/reasoning, and tool-call argument JSON, excluding SSE/JSON framing and base64
+payloads. With no parsed content, the estimate remains unknown rather than zero; a malformed or
+oversized content-capable frame also leaves the estimate unknown. That taint discards the whole
+attempt's count, including content from earlier valid frames, not just the offending frame. This
+estimate never replaces or changes a provider-reported output figure, reported window basis, or
+current spend pricing.
 Missing coverage and unknown values stay explicit. Reads do not probe providers, perform egress,
 scan logs, or expose prompts, bodies, tool arguments, raw provider errors, or key material.
 

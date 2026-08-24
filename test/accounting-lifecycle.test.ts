@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { globalCircuitBreaker } from "../src/circuit-breaker.js";
+import { createAccountingStore, type AccountingStore } from "../src/accounting-store.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
+import { estimateTokensFromCharacters } from "../src/metadata.js";
 import type { AccountingEvent, AccountingPricePort, AccountingRecorder, AttemptCompletedEvent, RequestCompletedEvent } from "../src/accounting.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 
@@ -180,6 +185,15 @@ function recorder(events: AccountingEvent[]): AccountingRecorder {
   return { record: (event) => events.push(event) };
 }
 
+function storeRecorder(events: AccountingEvent[], store: AccountingStore): AccountingRecorder {
+  return {
+    record(event) {
+      events.push(event);
+      store.record(event);
+    },
+  };
+}
+
 function attempts(events: AccountingEvent[]): AttemptCompletedEvent[] {
   return events.filter((event): event is AttemptCompletedEvent => event.type === "attempt-completed");
 }
@@ -237,6 +251,158 @@ function winnerBody(kind: "anthropic" | "openai"): string {
     object: "chat.completion",
     choices: [{ message: { role: "assistant", content: "served" }, finish_reason: "stop" }],
     usage: { prompt_tokens: 7, completion_tokens: 3, prompt_tokens_details: { cached_tokens: 5 } },
+  });
+}
+
+type EstimatedOutputScenario =
+  | "messages-buffered"
+  | "messages-streamed"
+  | "chat-buffered"
+  | "chat-streamed"
+  | "responses-buffered";
+
+function estimatedOutputReply(scenario: EstimatedOutputScenario, text: string): ScriptedReply {
+  if (scenario === "messages-streamed") {
+    return {
+      headers: { "content-type": "text/event-stream" },
+      body: [
+        `event: message_start\ndata: ${JSON.stringify({
+          type: "message_start",
+          message: { id: "msg_estimate", type: "message", role: "assistant", model: "m1", content: [] },
+        })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text },
+        })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+        })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+      ].join(""),
+    };
+  }
+  if (scenario === "chat-streamed") {
+    return {
+      headers: { "content-type": "text/event-stream" },
+      body: [
+        `data: ${JSON.stringify({
+          id: "chatcmpl_estimate",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+        })}\n\n`,
+        `data: ${JSON.stringify({
+          id: "chatcmpl_estimate",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })}\n\n`,
+        "data: [DONE]\n\n",
+      ].join(""),
+    };
+  }
+  if (scenario === "chat-buffered") {
+    return {
+      body: JSON.stringify({
+        id: "chatcmpl_estimate",
+        object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      }),
+    };
+  }
+  return {
+    body: JSON.stringify({
+      id: "msg_estimate",
+      type: "message",
+      role: "assistant",
+      model: "m1",
+      content: [{ type: "text", text }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+    }),
+  };
+}
+
+function whitespaceOnlyStream(kind: "anthropic" | "openai"): ScriptedReply {
+  if (kind === "anthropic") {
+    return {
+      headers: { "content-type": "text/event-stream" },
+      body: [
+        `event: message_start\ndata: ${JSON.stringify({
+          type: "message_start",
+          message: { id: "msg_empty", type: "message", role: "assistant", model: "m1", content: [] },
+        })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "   " },
+        })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: 0 },
+        })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+      ].join(""),
+    };
+  }
+  return {
+    headers: { "content-type": "text/event-stream" },
+    body: [
+      `data: ${JSON.stringify({
+        id: "chatcmpl_empty",
+        choices: [{ index: 0, delta: { content: "   " }, finish_reason: null }],
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        id: "chatcmpl_empty",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""),
+  };
+}
+
+function estimatedOutputRequest(
+  scenario: EstimatedOutputScenario,
+  proxyPort: number,
+): Promise<Response> {
+  const streamed = scenario.endsWith("streamed");
+  const pathname = scenario.startsWith("messages")
+    ? "/v1/messages"
+    : scenario.startsWith("chat")
+      ? "/v1/chat/completions"
+      : "/v1/responses";
+  const body = scenario.startsWith("messages")
+    ? {
+      model: "pool/coding",
+      max_tokens: 20,
+      stream: streamed,
+      messages: [{ role: "user", content: "estimate output" }],
+    }
+    : scenario.startsWith("chat")
+      ? {
+        model: "pool/coding",
+        max_tokens: 20,
+        stream: streamed,
+        messages: [{ role: "user", content: "estimate output" }],
+      }
+      : { model: "pool/coding", max_output_tokens: 20, input: "estimate output" };
+  return fetch(`http://127.0.0.1:${proxyPort}${pathname}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 
@@ -323,6 +489,66 @@ describe("proxy accounting lifecycle", () => {
     },
   );
 
+  it.each([
+    "messages-buffered",
+    "messages-streamed",
+    "chat-buffered",
+    "chat-streamed",
+    "responses-buffered",
+  ] as const)("stores content-only estimated output for %s without reported usage", async (scenario) => {
+    const key = `ACCOUNTING_ESTIMATED_OUTPUT_${scenario.replaceAll("-", "_").toUpperCase()}`;
+    const prior = process.env[key];
+    process.env[key] = "estimated-output-secret";
+    const store = createAccountingStore({
+      rootDir: mkdtempSync(join(tmpdir(), "llm-relay-estimated-output-")),
+    });
+    try {
+      const text = "estimated output";
+      const backend = await scripted(() => estimatedOutputReply(scenario, text));
+      const events: AccountingEvent[] = [];
+      const backendKind = scenario.startsWith("chat") ? "openai" : "anthropic";
+      const proxy = await startProxy(
+        poolConfig([`http://127.0.0.1:${port(backend.server)}`], backendKind, [key]),
+        { accountingRecorder: storeRecorder(events, store) },
+      );
+
+      const response = await estimatedOutputRequest(scenario, port(proxy));
+      expect(response.status).toBe(200);
+      await response.text();
+      await waitForLifecycle(events);
+      expect(backend.calls()).toBe(1);
+
+      const completed = attempts(events);
+      expect(completed).toHaveLength(1);
+      expect(completed[0]?.tokens.reported.reportedOutput.value).toBeNull();
+      expect(completed[0]?.tokens.estimated.estimatedOutput).toMatchObject({
+        value: estimateTokensFromCharacters(text.length),
+        source: "relay_estimated",
+        method: "relay_estimate",
+      });
+
+      const recent = store.readRecent();
+      expect(recent.status).toBe("ok");
+      if (recent.status !== "ok") throw new Error("estimated-output request was not stored");
+      const stored = recent.value[0];
+      if (!stored) throw new Error("estimated-output request detail was absent");
+      expect(stored.attempts).toHaveLength(1);
+      expect(stored.attempts[0]?.tokens.reported.reportedOutput.value).toBeNull();
+      expect(stored.attempts[0]?.tokens.estimated.estimatedOutput).toMatchObject({
+        value: estimateTokensFromCharacters(text.length),
+        method: "relay_estimate",
+      });
+      expect(stored.tokens.estimated.estimatedOutput).toMatchObject({
+        value: estimateTokensFromCharacters(text.length),
+        method: "relay_estimate",
+      });
+    } finally {
+      store.close();
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
+  });
+
   it.each(["anthropic", "openai"] as const)("records failed and committed winning serve attempts for the %s front", async (kind) => {
     const keyOne = "ACCOUNTING_LIFECYCLE_KEY_ONE";
     const keyTwo = "ACCOUNTING_LIFECYCLE_KEY_TWO";
@@ -330,6 +556,9 @@ describe("proxy accounting lifecycle", () => {
     const oldTwo = process.env[keyTwo];
     process.env[keyOne] = "first-secret";
     process.env[keyTwo] = "winner-secret";
+    const store = createAccountingStore({
+      rootDir: mkdtempSync(join(tmpdir(), "llm-relay-estimated-output-walk-")),
+    });
     try {
       const failed = await scripted(() => ({
         status: 429,
@@ -340,7 +569,7 @@ describe("proxy accounting lifecycle", () => {
       const proxy = await startProxy(poolConfig([
         `http://127.0.0.1:${port(failed.server)}`,
         `http://127.0.0.1:${port(winner.server)}`,
-      ], kind, [keyOne, keyTwo]), { accountingRecorder: recorder(events) });
+      ], kind, [keyOne, keyTwo]), { accountingRecorder: storeRecorder(events, store) });
       const prompt = "accounting lifecycle prompt";
       const response = await frontRequest(kind, port(proxy), prompt);
 
@@ -377,6 +606,10 @@ describe("proxy accounting lifecycle", () => {
         credentialId: "accounting-1#default",
         commitMs: null,
       });
+      expect(failedAttempt.tokens.estimated.estimatedOutput).toMatchObject({
+        value: null,
+        method: null,
+      });
       expect(winnerAttempt).toMatchObject({
         role: "serve",
         outcome: "success",
@@ -392,7 +625,10 @@ describe("proxy accounting lifecycle", () => {
       // The shared estimator traverses message roles as well as their content.
       expect(winnerAttempt.tokens.estimated.estimatedInput.value).toBe(Math.ceil((prompt.length + "user".length) / 4));
       expect(winnerAttempt.tokens.estimated.estimatedInput.method).toBe("relay_estimate");
-      expect(winnerAttempt.tokens.estimated.estimatedOutput.value).toBeNull();
+      expect(winnerAttempt.tokens.estimated.estimatedOutput).toMatchObject({
+        value: 2,
+        method: "relay_estimate",
+      });
 
       if (kind === "anthropic") {
         expect(winnerAttempt.tokens.reported.cacheCreationInputTokens.value).toBe(11);
@@ -419,13 +655,91 @@ describe("proxy accounting lifecycle", () => {
       expect(completed.commitAttemptId).toBe(winnerAttempt.attemptId);
       expect(completed.commitMs).toBe(winnerAttempt.commitMs);
       expect(completed.tokens).toEqual(winnerAttempt.tokens);
+
+      const recent = store.readRecent();
+      expect(recent.status).toBe("ok");
+      if (recent.status !== "ok") throw new Error("walk request was not stored");
+      const stored = recent.value[0];
+      if (!stored) throw new Error("walk request detail was absent");
+      expect(stored.attempts.map((attempt) => ({
+        provider: attempt.provider,
+        output: attempt.tokens.estimated.estimatedOutput.value,
+      }))).toEqual([
+        { provider: "accounting-1", output: null },
+        { provider: "accounting-2", output: 2 },
+      ]);
+      expect(store.usedInWindow({
+        credentialId: "accounting-2#default",
+        model: "m2",
+        period: "minute",
+        now: Date.parse(completed.endedAt),
+      })).toEqual({ requests: 1, tokens: 10, basis: "reported" });
     } finally {
+      store.close();
       if (oldOne === undefined) delete process.env[keyOne];
       else process.env[keyOne] = oldOne;
       if (oldTwo === undefined) delete process.env[keyTwo];
       else process.env[keyTwo] = oldTwo;
     }
   });
+
+  it.each(["anthropic", "openai"] as const)(
+    "does not meter whitespace-only output withheld before %s-front failover",
+    async (kind) => {
+      const keyOne = "ACCOUNTING_WITHHELD_OUTPUT_KEY_ONE";
+      const keyTwo = "ACCOUNTING_WITHHELD_OUTPUT_KEY_TWO";
+      const oldOne = process.env[keyOne];
+      const oldTwo = process.env[keyTwo];
+      process.env[keyOne] = "withheld-secret";
+      process.env[keyTwo] = "winner-secret";
+      try {
+        const withheld = await scripted(() => whitespaceOnlyStream(kind));
+        const winner = await scripted(() => estimatedOutputReply(
+          kind === "anthropic" ? "messages-streamed" : "chat-streamed",
+          "served",
+        ));
+        const events: AccountingEvent[] = [];
+        const proxy = await startProxy(
+          poolConfig([
+            `http://127.0.0.1:${port(withheld.server)}`,
+            `http://127.0.0.1:${port(winner.server)}`,
+          ], kind, [keyOne, keyTwo]),
+          { accountingRecorder: recorder(events) },
+        );
+        const pathname = kind === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
+        const response = await fetch(`http://127.0.0.1:${port(proxy)}${pathname}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "pool/coding",
+            max_tokens: 20,
+            stream: true,
+            messages: [{ role: "user", content: "withhold empty prefix" }],
+          }),
+        });
+
+        expect(response.status).toBe(200);
+        await response.text();
+        await waitForLifecycle(events);
+        expect(withheld.calls()).toBe(1);
+        expect(winner.calls()).toBe(1);
+        const completed = attempts(events);
+        expect(completed).toHaveLength(2);
+        expect(completed[0]?.commitMs).toBeNull();
+        expect(completed[0]?.tokens.estimated.estimatedOutput.value).toBeNull();
+        expect(completed[1]?.commitMs).not.toBeNull();
+        expect(completed[1]?.tokens.estimated.estimatedOutput).toMatchObject({
+          value: estimateTokensFromCharacters("served".length),
+          method: "relay_estimate",
+        });
+      } finally {
+        if (oldOne === undefined) delete process.env[keyOne];
+        else process.env[keyOne] = oldOne;
+        if (oldTwo === undefined) delete process.env[keyTwo];
+        else process.env[keyTwo] = oldTwo;
+      }
+    },
+  );
 
   it.each(["anthropic", "openai"] as const)("prices the winning deployment's spend on the %s front and leaves a priceless walk unpriced", async (kind) => {
     const keyOne = "ACCOUNTING_SPEND_KEY_ONE";
@@ -617,7 +931,10 @@ describe("proxy accounting lifecycle", () => {
       expect(served.tokens.reported.reportedInput.value).toBe(4);
       expect(served.tokens.reported.reportedOutput.value).toBe(2);
       expect(served.tokens.reported.reportedCachedInput.value).toBe(1);
-      expect(served.tokens.estimated.estimatedOutput.value).toBeNull();
+      expect(served.tokens.estimated.estimatedOutput).toMatchObject({
+        value: 2,
+        method: "relay_estimate",
+      });
       expect(requestCompleted(events).commitAttemptId).toBe(served.attemptId);
     } finally {
       if (prior === undefined) delete process.env[key];
@@ -635,6 +952,9 @@ describe("proxy accounting lifecycle", () => {
         '<｜DSML｜parameter name="path">a.txt</｜DSML｜parameter>' +
         '<｜DSML｜parameter name="count">not-a-number</｜DSML｜parameter>' +
         '</｜DSML｜invoke></｜DSML｜tool_calls>';
+      const repairContent = JSON.stringify({
+        inputs: { call_recovered_0_0: { path: "a.txt", count: 7 } },
+      });
       const backend = await scripted((call) => call === 1
         ? {
           body: JSON.stringify({
@@ -644,9 +964,7 @@ describe("proxy accounting lifecycle", () => {
         }
         : {
           body: JSON.stringify({
-            choices: [{ message: { content: JSON.stringify({
-              inputs: { call_recovered_0_0: { path: "a.txt", count: 7 } },
-            }) } }],
+            choices: [{ message: { content: repairContent } }],
             usage: { prompt_tokens: 17, completion_tokens: 5 },
           }),
         });
@@ -694,7 +1012,10 @@ describe("proxy accounting lifecycle", () => {
       expect(repair.tokens.reported.reportedInput.value).toBe(17);
       expect(repair.tokens.reported.reportedOutput.value).toBe(5);
       expect(repair.tokens.estimated.estimatedInput.value).toBeNull();
-      expect(repair.tokens.estimated.estimatedOutput.value).toBeNull();
+      expect(repair.tokens.estimated.estimatedOutput).toMatchObject({
+        value: estimateTokensFromCharacters(repairContent.length),
+        method: "relay_estimate",
+      });
       expect(requestCompleted(events)).toMatchObject({ repairIncluded: true, outcome: "success" });
     } finally {
       if (prior === undefined) delete process.env[key];
@@ -1086,6 +1407,10 @@ describe("proxy accounting lifecycle", () => {
         credentialId: "accounting-1#default",
       });
       expect(served.commitMs).not.toBeNull();
+      expect(served.tokens.estimated.estimatedOutput).toMatchObject({
+        value: estimateTokensFromCharacters("partial".length),
+        method: "relay_estimate",
+      });
       const completed = requestCompleted(events);
       expect(completed).toMatchObject({
         outcome: "error",

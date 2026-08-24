@@ -607,7 +607,23 @@ function repairAccountingAttribution(state: ResolvedAttempt["credential"]["state
   return state === "declared-present" ? "relay_held" : "unknown";
 }
 
-function accountingTokens(usage: UsageAccumulator, estimatedInputTokens: number): TokenFactsInput {
+function accountingTokens(
+  usage: UsageAccumulator,
+  estimatedInputTokens: number,
+  includeEstimatedOutput: boolean,
+): TokenFactsInput {
+  const estimatedOutputTokens = includeEstimatedOutput ? usage.estimatedOutputTokens : undefined;
+  const hasEstimatedOutput = typeof estimatedOutputTokens === "number"
+    && Number.isSafeInteger(estimatedOutputTokens)
+    && estimatedOutputTokens > 0;
+  const estimated = {
+    ...(estimatedInputTokens > 0
+      ? { inputTokens: estimatedInputTokens, inputMethod: "relay_estimate" }
+      : {}),
+    ...(hasEstimatedOutput
+      ? { outputTokens: estimatedOutputTokens, outputMethod: "relay_estimate" }
+      : {}),
+  };
   return {
     reported: {
       ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
@@ -618,8 +634,8 @@ function accountingTokens(usage: UsageAccumulator, estimatedInputTokens: number)
         : {}),
       ...(usage.cacheReadInputTokens !== undefined ? { cacheReadInputTokens: usage.cacheReadInputTokens } : {}),
     },
-    ...(estimatedInputTokens > 0
-      ? { estimated: { inputTokens: estimatedInputTokens, inputMethod: "relay_estimate" } }
+    ...(estimatedInputTokens > 0 || hasEstimatedOutput
+      ? { estimated }
       : {}),
   };
 }
@@ -675,6 +691,7 @@ function buildAccountingPricePort(catalog: ModelCatalog, cfg: Config): Accountin
 class RequestAccountingState {
   private readonly request: AccountingRequest | null;
   private readonly active = new Set<AccountingAttempt>();
+  private readonly committed = new Set<AccountingAttempt>();
   private responseTerminal: "finished" | "cancelled" | null = null;
   private finalized = false;
   private successfulServe = false;
@@ -752,8 +769,9 @@ class RequestAccountingState {
   markCommitted(attempt: AccountingAttempt | null, at: number): void {
     if (attempt === null) return;
     try {
-      if (attempt.markCommitted({ at }) && attempt.role === "serve") {
-        this.committedServeAttribution = attempt.attribution;
+      if (attempt.markCommitted({ at })) {
+        this.committed.add(attempt);
+        if (attempt.role === "serve") this.committedServeAttribution = attempt.attribution;
       }
     } catch {
       // Accounting must not perturb a successful response write.
@@ -769,16 +787,24 @@ class RequestAccountingState {
   ): void {
     if (attempt === null) return;
     try {
+      // The backend observer also sees a provisional prefix that stream-commit may
+      // withhold for failover. Only a committed serve attempt actually forwarded it;
+      // repair output is consumed internally and remains independently metered.
       attempt.complete({
         outcome,
         failureKind,
         endedAt,
-        tokens: accountingTokens(usage, attempt.role === "serve" ? this.estimatedInputTokens : 0),
+        tokens: accountingTokens(
+          usage,
+          attempt.role === "serve" ? this.estimatedInputTokens : 0,
+          attempt.role === "repair" || this.committed.has(attempt),
+        ),
       });
     } catch {
       // The recorder and its packets are strictly observational.
     }
     this.active.delete(attempt);
+    this.committed.delete(attempt);
     this.lastAttribution = attempt.attribution;
     if (attempt.role === "serve" && outcome === "success") this.successfulServe = true;
     if (outcome !== "success" && failureKind !== null) this.lastFailure = failureKind;

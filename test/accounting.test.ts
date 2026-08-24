@@ -89,7 +89,7 @@ describe("spend pricing (Stage 4 / Gap 11)", () => {
       source: "relay_estimated",
       coverage: "input_only",
     });
-    // Estimated output has no producer today (Gap 10/M4): it must not be priced.
+    // Estimated output is a separate metering fact; current spend policy must not price it.
     expect(event.spend?.amountMicrousd).not.toBe(2_000 + 9_999 * 8);
   });
 

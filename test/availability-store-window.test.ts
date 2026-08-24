@@ -129,9 +129,35 @@ describe("usedInWindow", () => {
     store.close();
   });
 
-  it("keeps the reported figure when both bases exist but only on the SAME requests", () => {
-    // One request whose input was reported and output only estimated: every measured request DID
-    // carry a report, so the reported half stands alone as a true (narrower) measurement.
+  it("reports M4 estimated input plus output through usedInWindow", () => {
+    const store = createAccountingStore({ directory: root() });
+    record(store, {
+      startedAt: NOW_ISO,
+      endedAt: NOW_ISO,
+      provider: "nim",
+      credentialId: "nim#m4-estimated",
+      model: "m-a",
+      tokens: {
+        estimated: {
+          inputTokens: 50,
+          outputTokens: 25,
+          inputMethod: "relay_estimate",
+          outputMethod: "relay_estimate",
+        },
+      },
+    });
+
+    expect(store.usedInWindow({
+      credentialId: "nim#m4-estimated",
+      period: "minute",
+      now: NOW,
+    })).toEqual({ requests: 1, tokens: 75, basis: "estimated" });
+    store.close();
+  });
+
+  it("keeps the narrower reported figure when only the same request's output is estimated", () => {
+    // Every measured request carries a report, so its reported half remains a true, narrower
+    // measurement. The estimated output is not blended into that scalar.
     const store = createAccountingStore({ directory: root() });
     record(store, {
       startedAt: NOW_ISO,
@@ -141,7 +167,42 @@ describe("usedInWindow", () => {
       model: "m-a",
       tokens: { reported: { inputTokens: 100 }, estimated: { outputTokens: 25 } },
     });
-    expect(store.usedInWindow({ credentialId: "nim#half", period: "minute", now: NOW })).toEqual({ requests: 1, tokens: 100, basis: "reported" });
+    expect(store.usedInWindow({ credentialId: "nim#half", period: "minute", now: NOW })).toEqual({
+      requests: 1,
+      tokens: 100,
+      basis: "reported",
+    });
+    store.close();
+  });
+
+  it("keeps complete reported output authoritative beside M4's separate estimate", () => {
+    // M4 records an output estimate even beside provider-reported output. The estimate remains a
+    // separate cell: the complete reported figure and basis must stay exactly authoritative.
+    const store = createAccountingStore({ directory: root() });
+    record(store, {
+      startedAt: NOW_ISO,
+      endedAt: NOW_ISO,
+      provider: "nim",
+      credentialId: "nim#half",
+      model: "m-a",
+      tokens: {
+        reported: { inputTokens: 100, outputTokens: 40 },
+        estimated: { outputTokens: 25, outputMethod: "relay_estimate" },
+      },
+    });
+    expect(store.usedInWindow({ credentialId: "nim#half", period: "minute", now: NOW })).toEqual({
+      requests: 1,
+      tokens: 140,
+      basis: "reported",
+    });
+    const recent = store.readRecent();
+    expect(recent.status).toBe("ok");
+    if (recent.status === "ok") {
+      expect(recent.value[0]?.tokens.estimated.estimatedOutput).toMatchObject({
+        value: 25,
+        method: "relay_estimate",
+      });
+    }
     store.close();
   });
 
