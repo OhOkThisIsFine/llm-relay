@@ -65,6 +65,11 @@ describe("Windows secret-file ACL hardening", () => {
     expect(parseOwnerSid("unexpected output")).toBeNull();
   });
 
+  it("takes the last SID-shaped CSV cell when the username also resembles a SID", () => {
+    expect(parseOwnerSid('"S-1-5-21-999-888-777-1000","S-1-5-21-111-222-333-1001"\r\n'))
+      .toBe("S-1-5-21-111-222-333-1001");
+  });
+
   it("resolves the owner SID through captured whoami and caches it", () => {
     const spawnSync = vi.fn<SecretFileAclSpawnSync>(() => ({
       status: 0,

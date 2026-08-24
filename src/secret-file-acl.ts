@@ -73,7 +73,11 @@ export function ownerSidWhoamiArgs(): string[] {
 
 /** Parse only the numeric SID cell from `whoami /user /fo csv /nh`. */
 export function parseOwnerSid(stdout: string): string | null {
-  return /"(S-\d+(?:-\d+)+)"/iu.exec(stdout)?.[1] ?? null;
+  let sid: string | null = null;
+  for (const match of stdout.matchAll(/"(S-\d+(?:-\d+)+)"/giu)) {
+    sid = match[1] ?? sid;
+  }
+  return sid;
 }
 
 function icaclsPrincipal(owner: string): string {

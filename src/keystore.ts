@@ -1,8 +1,15 @@
+/**
+ * Encrypted credential custody is single-writer by convention. Mutations are read-modify-write,
+ * no inter-process lock is built, and concurrent CLI writers therefore have last-write-wins
+ * semantics. An envName is globally unique within a store; malformed or duplicate rows are
+ * skipped in file order, so the first valid row deterministically wins read-side deduplication.
+ */
 import {
   chmodSync,
   closeSync,
   constants,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -29,6 +36,7 @@ import {
 import {
   restrictSecretDirectoryOnWindowsSync,
   restrictSecretFileOnWindowsSync,
+  type SecretFileAclOptions,
 } from "./secret-file-acl.js";
 
 const STORE_VERSION = 1 as const;
@@ -37,8 +45,13 @@ const DIRECTORY_MODE = 0o700;
 const GCM_TAG_LENGTH = 16;
 const GCM_IV_LENGTH = 12;
 const FINGERPRINT_SALT_LENGTH = 32;
+const ITEM_ID_LENGTH = 16;
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const PROVIDER_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
 const FINGERPRINT_PATTERN = /^hmac:[0-9a-f]{8}$/;
+const ITEM_ID_PATTERN = /^[0-9a-f]{32}$/;
+const KEK_CHECK_PATTERN = /^[0-9a-f]{64}$/;
+const KEK_CHECK_CONTEXT = "llm-relay-kek-v1";
 
 interface StoredEntry {
   id: string;
@@ -59,17 +72,28 @@ interface StoredKeystore {
   version: typeof STORE_VERSION;
   kek: KekDescriptor;
   fpSalt: string;
+  itemId: string;
+  kekCheck: string;
   entries: StoredEntry[];
 }
 
 type StoreLoadResult =
-  | { kind: "valid"; store: StoredKeystore }
-  | { kind: "fresh" }
-  | { kind: "unreadable" };
+  | { status: "ok" | "degraded"; droppedCount: number; store: StoredKeystore }
+  | { status: "fresh"; droppedCount: 0 }
+  | { status: "unreadable"; droppedCount: 0; errno?: string | undefined };
 
 export interface KeystoreOptions extends KeyringOptions {
   path?: string;
   now?: number;
+  /** Injected Windows ACL process/platform seam; separate from the keyring spawner. */
+  acl?: SecretFileAclOptions;
+  /** Read seam for deterministic filesystem-failure tests. */
+  readFile?: (path: string) => string;
+}
+
+export interface KeystoreStatus {
+  status: "ok" | "absent" | "unreadable" | "locked" | "degraded";
+  droppedCount: number;
 }
 
 export interface AddEntryInput {
@@ -120,15 +144,15 @@ export class KeystoreValidationError extends Error {
 }
 
 export class KeystoreWriteError extends Error {
-  constructor() {
-    super("keystore write failed");
+  constructor(errno?: string) {
+    super(`keystore write failed${errno === undefined ? "" : ` (${errno})`}`);
     this.name = "KeystoreWriteError";
   }
 }
 
 export class KeystoreReadError extends Error {
-  constructor() {
-    super("keystore read failed");
+  constructor(errno?: string) {
+    super(`keystore read failed${errno === undefined ? "" : ` (${errno})`}`);
     this.name = "KeystoreReadError";
   }
 }
@@ -137,6 +161,20 @@ export class KeystoreUnlockError extends Error {
   constructor() {
     super("keystore unlock failed");
     this.name = "KeystoreUnlockError";
+  }
+}
+
+export class KeystoreMutationRefusedError extends Error {
+  readonly status: "unreadable" | "degraded";
+  readonly droppedCount: number;
+
+  constructor(status: "unreadable" | "degraded", droppedCount = 0, errno?: string) {
+    const count = droppedCount > 0 ? `; ${droppedCount} unreadable row${droppedCount === 1 ? "" : "s"}` : "";
+    const code = errno === undefined ? "" : `; ${errno}`;
+    super(`keystore mutation refused: ${status}${count}${code}`);
+    this.name = "KeystoreMutationRefusedError";
+    this.status = status;
+    this.droppedCount = droppedCount;
   }
 }
 
@@ -221,12 +259,11 @@ function validStoredEntry(value: unknown): value is StoredEntry {
   const parsedId = typeof value.id === "string" ? parseCredentialId(value.id) : null;
   return parsedId !== null
     && typeof value.provider === "string"
-    && value.provider.length > 0
-    && !value.provider.includes("#")
+    && PROVIDER_PATTERN.test(value.provider)
     && parsedId.provider === value.provider
     && typeof value.envName === "string"
     && ENV_NAME_PATTERN.test(value.envName)
-    && decodeBase64(value.ct) !== null
+    && (decodeBase64(value.ct)?.length ?? 0) > 0
     && decodeBase64(value.iv, GCM_IV_LENGTH) !== null
     && decodeBase64(value.tag, GCM_TAG_LENGTH) !== null
     && typeof value.fingerprint === "string"
@@ -238,55 +275,97 @@ function validStoredEntry(value: unknown): value is StoredEntry {
     && typeof value.disabled === "boolean";
 }
 
-function parseStore(raw: unknown): StoredKeystore | null {
-  if (!isObject(raw) || !hasExactKeys(raw, ["version", "kek", "fpSalt", "entries"])) return null;
+function parseStore(raw: unknown): { store: StoredKeystore; droppedCount: number } | null {
+  if (!isObject(raw) || !hasExactKeys(raw, [
+    "version",
+    "kek",
+    "fpSalt",
+    "itemId",
+    "kekCheck",
+    "entries",
+  ])) return null;
   if (raw.version !== STORE_VERSION || !validKekDescriptor(raw.kek)) return null;
-  if (decodeBase64(raw.fpSalt, FINGERPRINT_SALT_LENGTH) === null || !Array.isArray(raw.entries)) return null;
+  if (
+    decodeBase64(raw.fpSalt, FINGERPRINT_SALT_LENGTH) === null
+    || typeof raw.itemId !== "string"
+    || !ITEM_ID_PATTERN.test(raw.itemId)
+    || typeof raw.kekCheck !== "string"
+    || !KEK_CHECK_PATTERN.test(raw.kekCheck)
+    || !Array.isArray(raw.entries)
+  ) return null;
   const entries: StoredEntry[] = [];
   const seenIds = new Set<string>();
   const seenEnvNames = new Set<string>();
+  let droppedCount = 0;
   for (const candidate of raw.entries) {
-    if (!validStoredEntry(candidate)) continue;
-    if (seenIds.has(candidate.id) || seenEnvNames.has(candidate.envName)) continue;
+    if (!validStoredEntry(candidate)) {
+      droppedCount += 1;
+      continue;
+    }
+    if (seenIds.has(candidate.id) || seenEnvNames.has(candidate.envName)) {
+      droppedCount += 1;
+      continue;
+    }
     seenIds.add(candidate.id);
     seenEnvNames.add(candidate.envName);
     entries.push(candidate);
   }
   return {
-    version: STORE_VERSION,
-    kek: raw.kek,
-    fpSalt: raw.fpSalt as string,
-    entries,
+    droppedCount,
+    store: {
+      version: STORE_VERSION,
+      kek: raw.kek,
+      fpSalt: raw.fpSalt as string,
+      itemId: raw.itemId,
+      kekCheck: raw.kekCheck,
+      entries,
+    },
   };
 }
 
 function errorCode(error: unknown): string | undefined {
-  return error && typeof error === "object" && "code" in error
-    ? String((error as { code?: unknown }).code)
-    : undefined;
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  const code = String((error as { code?: unknown }).code);
+  return /^[A-Z][A-Z0-9_]{0,31}$/u.test(code) ? code : undefined;
 }
 
-function loadStore(path: string): StoreLoadResult {
+function loadStore(path: string, opts: Pick<KeystoreOptions, "readFile"> = {}): StoreLoadResult {
   let serialized: string;
   try {
-    serialized = readFileSync(path, "utf8");
+    serialized = opts.readFile?.(path) ?? readFileSync(path, "utf8");
   } catch (error) {
-    // Absence and corruption are a fresh store. Other IO failures stay distinguishable so a
-    // mutation cannot overwrite the OS-held KEK while an existing file is merely unreadable.
-    return errorCode(error) === "ENOENT" ? { kind: "fresh" } : { kind: "unreadable" };
+    const errno = errorCode(error);
+    if (errno !== "ENOENT") return { status: "unreadable", droppedCount: 0, errno };
+    try {
+      // readFile reports ENOENT for a dangling symlink too. Only an absent directory entry may
+      // create a fresh store; replacing any present path could orphan an existing custody cell.
+      lstatSync(path);
+      return { status: "unreadable", droppedCount: 0, errno };
+    } catch (lstatError) {
+      const lstatErrno = errorCode(lstatError);
+      return lstatErrno === "ENOENT"
+        ? { status: "fresh", droppedCount: 0 }
+        : { status: "unreadable", droppedCount: 0, errno: lstatErrno };
+    }
   }
   try {
-    const store = parseStore(JSON.parse(serialized) as unknown);
-    return store === null ? { kind: "fresh" } : { kind: "valid", store };
+    const parsed = parseStore(JSON.parse(serialized) as unknown);
+    if (parsed === null) return { status: "unreadable", droppedCount: 0 };
+    return {
+      status: parsed.droppedCount > 0 ? "degraded" : "ok",
+      droppedCount: parsed.droppedCount,
+      store: parsed.store,
+    };
   } catch {
-    return { kind: "fresh" };
+    // A present but malformed document is never equivalent to an absent, creatable store.
+    return { status: "unreadable", droppedCount: 0 };
   }
 }
 
 function validateEntryIdentity(id: string, provider: string, envName: string): void {
   const parsedId = parseCredentialId(id);
   if (parsedId === null) throw new KeystoreValidationError("id");
-  if (!provider || provider.includes("#")) throw new KeystoreValidationError("provider");
+  if (!PROVIDER_PATTERN.test(provider)) throw new KeystoreValidationError("provider");
   if (parsedId.provider !== provider) throw new KeystoreValidationError("provider");
   if (!ENV_NAME_PATTERN.test(envName)) throw new KeystoreValidationError("envName");
 }
@@ -305,27 +384,39 @@ function writeTime(opts: { now?: number }): number {
   return now;
 }
 
-function fingerprint(value: Buffer, kek: Buffer): string {
-  return `hmac:${createHmac("sha256", kek).update(value).digest("hex").slice(0, 8)}`;
+function fingerprint(value: Buffer, kek: Buffer, fpSalt: string): string {
+  const salt = Buffer.from(fpSalt, "base64");
+  try {
+    return `hmac:${createHmac("sha256", kek).update(salt).update(value).digest("hex").slice(0, 8)}`;
+  } finally {
+    salt.fill(0);
+  }
 }
 
-function aad(provider: string, entryId: string): Buffer {
-  return Buffer.from(`${STORE_VERSION}|${provider}|${entryId}`, "utf8");
+function aad(provider: string, entryId: string, envName: string): Buffer {
+  return Buffer.from(`${STORE_VERSION}|${provider}|${entryId}|${envName}`, "utf8");
 }
 
-function encryptEntryValue(value: string, provider: string, entryId: string, kek: Buffer): Pick<StoredEntry, "ct" | "iv" | "tag" | "fingerprint"> {
+function encryptEntryValue(
+  value: string,
+  provider: string,
+  entryId: string,
+  envName: string,
+  kek: Buffer,
+  fpSalt: string,
+): Pick<StoredEntry, "ct" | "iv" | "tag" | "fingerprint"> {
   const plaintext = Buffer.from(value, "utf8");
   const iv = randomBytes(GCM_IV_LENGTH);
   try {
     const cipher = createCipheriv("aes-256-gcm", kek, iv, { authTagLength: GCM_TAG_LENGTH });
-    cipher.setAAD(aad(provider, entryId));
+    cipher.setAAD(aad(provider, entryId, envName));
     const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
     const tag = cipher.getAuthTag();
     return {
       ct: ct.toString("base64"),
       iv: iv.toString("base64"),
       tag: tag.toString("base64"),
-      fingerprint: fingerprint(plaintext, kek),
+      fingerprint: fingerprint(plaintext, kek, fpSalt),
     };
   } finally {
     plaintext.fill(0);
@@ -333,17 +424,17 @@ function encryptEntryValue(value: string, provider: string, entryId: string, kek
   }
 }
 
-function decryptEntryBytes(entry: StoredEntry, kek: Buffer): Buffer | null {
+function decryptEntryBytes(entry: StoredEntry, kek: Buffer, fpSalt: string): Buffer | null {
   const ct = decodeBase64(entry.ct);
   const iv = decodeBase64(entry.iv, GCM_IV_LENGTH);
   const tag = decodeBase64(entry.tag, GCM_TAG_LENGTH);
   if (ct === null || iv === null || tag === null) return null;
   try {
     const decipher = createDecipheriv("aes-256-gcm", kek, iv, { authTagLength: GCM_TAG_LENGTH });
-    decipher.setAAD(aad(entry.provider, entry.id));
+    decipher.setAAD(aad(entry.provider, entry.id, entry.envName));
     decipher.setAuthTag(tag);
     const plaintext = Buffer.concat([decipher.update(ct), decipher.final()]);
-    const expected = fingerprint(plaintext, kek);
+    const expected = fingerprint(plaintext, kek, fpSalt);
     if (!timingSafeEqual(Buffer.from(expected), Buffer.from(entry.fingerprint))) {
       plaintext.fill(0);
       return null;
@@ -359,8 +450,8 @@ function decryptEntryBytes(entry: StoredEntry, kek: Buffer): Buffer | null {
   }
 }
 
-function decryptEntryValue(entry: StoredEntry, kek: Buffer): string | null {
-  const plaintext = decryptEntryBytes(entry, kek);
+function decryptEntryValue(entry: StoredEntry, kek: Buffer, fpSalt: string): string | null {
+  const plaintext = decryptEntryBytes(entry, kek, fpSalt);
   if (plaintext === null) return null;
   try {
     return plaintext.toString("utf8");
@@ -369,8 +460,8 @@ function decryptEntryValue(entry: StoredEntry, kek: Buffer): string | null {
   }
 }
 
-function entryAuthenticates(entry: StoredEntry, kek: Buffer): boolean {
-  const plaintext = decryptEntryBytes(entry, kek);
+function entryAuthenticates(entry: StoredEntry, kek: Buffer, fpSalt: string): boolean {
+  const plaintext = decryptEntryBytes(entry, kek, fpSalt);
   if (plaintext === null) return false;
   plaintext.fill(0);
   return true;
@@ -381,8 +472,23 @@ function clearUnlocked(): void {
   unlocked = null;
 }
 
-function keyringItemId(fpSalt: string): string {
-  return `keystore-${Buffer.from(fpSalt, "base64").toString("hex").slice(0, 32)}`;
+function keyringItemId(itemId: string): string {
+  return `keystore-${itemId}`;
+}
+
+function calculateKekCheck(kek: Buffer): string {
+  return createHmac("sha256", kek).update(KEK_CHECK_CONTEXT, "utf8").digest("hex");
+}
+
+function validKekCheck(kek: Buffer, expected: string): boolean {
+  const actual = Buffer.from(calculateKekCheck(kek), "hex");
+  const persisted = Buffer.from(expected, "hex");
+  try {
+    return actual.length === persisted.length && timingSafeEqual(actual, persisted);
+  } finally {
+    actual.fill(0);
+    persisted.fill(0);
+  }
 }
 
 function descriptorIdentity(descriptor: KekDescriptor, keyId: string): string {
@@ -392,7 +498,7 @@ function descriptorIdentity(descriptor: KekDescriptor, keyId: string): string {
 function cacheKek(path: string, identity: string, kek: Buffer): Buffer {
   if (kek.length !== 32) {
     kek.fill(0);
-    throw new Error("keyring unwrap failed: invalid-key");
+    throw new KeystoreUnlockError();
   }
   clearUnlocked();
   unlocked = { path, descriptor: identity, kek };
@@ -406,7 +512,7 @@ interface RecoveredKek {
 }
 
 function recoverStoreKek(store: StoredKeystore, path: string, opts: KeystoreOptions): RecoveredKek {
-  const keyId = keyringItemId(store.fpSalt);
+  const keyId = keyringItemId(store.itemId);
   const identity = descriptorIdentity(store.kek, keyId);
   if (unlocked?.path === path && unlocked.descriptor === identity) {
     return { kek: unlocked.kek, identity, cached: true };
@@ -417,24 +523,72 @@ function recoverStoreKek(store: StoredKeystore, path: string, opts: KeystoreOpti
   const kek = unwrapKek(store.kek, { ...opts, keyId });
   if (kek.length !== 32) {
     kek.fill(0);
-    throw new Error("keyring unwrap failed: invalid-key");
+    throw new KeystoreUnlockError();
   }
   return { kek, identity, cached: false };
 }
 
-function unlockStoreForWrite(store: StoredKeystore, path: string, opts: KeystoreOptions): Buffer {
+function discardRecoveredKek(recovered: RecoveredKek): void {
+  if (recovered.cached) clearUnlocked();
+  else recovered.kek.fill(0);
+}
+
+function recoverVerifiedStoreKek(
+  store: StoredKeystore,
+  path: string,
+  opts: KeystoreOptions,
+): RecoveredKek {
   const recovered = recoverStoreKek(store, path, opts);
-  if (recovered.cached) return recovered.kek;
-  if (store.entries.length > 0 && !store.entries.some((entry) => entryAuthenticates(entry, recovered.kek))) {
-    recovered.kek.fill(0);
+  if (!validKekCheck(recovered.kek, store.kekCheck)) {
+    discardRecoveredKek(recovered);
     throw new KeystoreUnlockError();
   }
+  return recovered;
+}
+
+function cryptographicallyUnreadableCount(store: StoredKeystore, kek: Buffer): number {
+  return store.entries.filter(
+    (entry) => !entryAuthenticates(entry, kek, store.fpSalt),
+  ).length;
+}
+
+function unlockStoreForWrite(store: StoredKeystore, path: string, opts: KeystoreOptions): Buffer {
+  const recovered = recoverVerifiedStoreKek(store, path, opts);
+  const unreadableRows = cryptographicallyUnreadableCount(store, recovered.kek);
+  if (unreadableRows > 0) {
+    discardRecoveredKek(recovered);
+    throw new KeystoreMutationRefusedError("degraded", unreadableRows);
+  }
+  if (recovered.cached) return recovered.kek;
   return cacheKek(path, recovered.identity, recovered.kek);
+}
+
+function refuseCryptographicDegradationWhenUnlockable(
+  store: StoredKeystore,
+  path: string,
+  opts: KeystoreOptions,
+): void {
+  let recovered: RecoveredKek;
+  try {
+    recovered = recoverVerifiedStoreKek(store, path, opts);
+  } catch {
+    // Lifecycle cleanup must remain possible when custody cannot be unwrapped.
+    return;
+  }
+  try {
+    const unreadableRows = cryptographicallyUnreadableCount(store, recovered.kek);
+    if (unreadableRows > 0) {
+      throw new KeystoreMutationRefusedError("degraded", unreadableRows);
+    }
+  } finally {
+    if (!recovered.cached) recovered.kek.fill(0);
+  }
 }
 
 function createStore(path: string, opts: KeystoreOptions): { store: StoredKeystore; kek: Buffer } {
   const fpSalt = randomBytes(FINGERPRINT_SALT_LENGTH).toString("base64");
-  const keyId = keyringItemId(fpSalt);
+  const itemId = randomBytes(ITEM_ID_LENGTH).toString("hex");
+  const keyId = keyringItemId(itemId);
   const created = createKek({ ...opts, keyId });
   const kek = cacheKek(path, descriptorIdentity(created.descriptor, keyId), created.kek);
   return {
@@ -442,29 +596,35 @@ function createStore(path: string, opts: KeystoreOptions): { store: StoredKeysto
       version: STORE_VERSION,
       kek: created.descriptor,
       fpSalt,
+      itemId,
+      kekCheck: calculateKekCheck(kek),
       entries: [],
     },
     kek,
   };
 }
 
-function hardenDirectory(path: string): void {
-  if (process.platform === "win32") {
-    restrictSecretDirectoryOnWindowsSync(path);
+function hardeningPlatform(opts: KeystoreOptions): NodeJS.Platform {
+  return opts.acl?.platform ?? process.platform;
+}
+
+function hardenDirectory(path: string, opts: KeystoreOptions): void {
+  if (hardeningPlatform(opts) === "win32") {
+    restrictSecretDirectoryOnWindowsSync(path, opts.acl);
   } else {
     chmodSync(path, DIRECTORY_MODE);
   }
 }
 
-function hardenFile(path: string): void {
-  if (process.platform === "win32") {
-    restrictSecretFileOnWindowsSync(path);
+function hardenFile(path: string, opts: KeystoreOptions): void {
+  if (hardeningPlatform(opts) === "win32") {
+    restrictSecretFileOnWindowsSync(path, opts.acl);
   } else {
     chmodSync(path, FILE_MODE);
   }
 }
 
-function persistStore(path: string, store: StoredKeystore): void {
+function persistStore(path: string, store: StoredKeystore, opts: KeystoreOptions): void {
   const directory = dirname(path);
   const temporaryPath = join(
     directory,
@@ -472,8 +632,8 @@ function persistStore(path: string, store: StoredKeystore): void {
   );
   let descriptor: number | undefined;
   try {
-    mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
-    hardenDirectory(directory);
+    const createdDirectory = mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
+    if (createdDirectory !== undefined) hardenDirectory(directory, opts);
     descriptor = openSync(
       temporaryPath,
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
@@ -483,11 +643,11 @@ function persistStore(path: string, store: StoredKeystore): void {
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
-    hardenFile(temporaryPath);
+    hardenFile(temporaryPath, opts);
     renameSync(temporaryPath, path);
-    hardenFile(path);
-  } catch {
-    throw new KeystoreWriteError();
+    hardenFile(path, opts);
+  } catch (error) {
+    throw new KeystoreWriteError(errorCode(error));
   } finally {
     if (descriptor !== undefined) {
       try { closeSync(descriptor); } catch { /* preserve the normalized write failure */ }
@@ -510,10 +670,16 @@ function descriptorOf(entry: StoredEntry): KeystoreEntryDescriptor {
   };
 }
 
-function requireStore(path: string): StoredKeystore {
-  const loaded = loadStore(path);
-  if (loaded.kind === "unreadable") throw new KeystoreReadError();
-  if (loaded.kind === "fresh") throw new KeystoreEntryNotFoundError();
+function refuseMutation(loaded: StoreLoadResult): never {
+  const status = loaded.status === "degraded" ? "degraded" : "unreadable";
+  const errno = loaded.status === "unreadable" ? loaded.errno : undefined;
+  throw new KeystoreMutationRefusedError(status, loaded.droppedCount, errno);
+}
+
+function requireStoreForMutation(path: string, opts: KeystoreOptions): StoredKeystore {
+  const loaded = loadStore(path, opts);
+  if (loaded.status === "fresh") throw new KeystoreEntryNotFoundError();
+  if (loaded.status === "unreadable" || loaded.status === "degraded") refuseMutation(loaded);
   return loaded.store;
 }
 
@@ -523,34 +689,95 @@ function findEntry(store: StoredKeystore, entryId: string): StoredEntry {
   return entry;
 }
 
-export function lookupByEnvName(envName: string, opts: KeystoreOptions = {}): KeystoreLookup | null {
+export function lookupByEnvName(
+  envName: string,
+  opts?: KeystoreOptions,
+  provider?: string,
+): KeystoreLookup | null;
+export function lookupByEnvName(
+  envName: string,
+  provider: string,
+  opts?: KeystoreOptions,
+): KeystoreLookup | null;
+export function lookupByEnvName(
+  envName: string,
+  optsOrProvider: KeystoreOptions | string = {},
+  providerOrOpts?: string | KeystoreOptions,
+): KeystoreLookup | null {
+  const opts = typeof optsOrProvider === "string"
+    ? (typeof providerOrOpts === "object" && providerOrOpts !== null ? providerOrOpts : {})
+    : optsOrProvider;
+  const provider = typeof optsOrProvider === "string"
+    ? optsOrProvider
+    : (typeof providerOrOpts === "string" ? providerOrOpts : undefined);
   if (!ENV_NAME_PATTERN.test(envName)) return null;
-  const path = resolveKeystorePath(opts);
-  const loaded = loadStore(path);
-  if (loaded.kind === "unreadable") throw new KeystoreReadError();
-  if (loaded.kind === "fresh") return null;
-  const store = loaded.store;
-  const now = opts.now ?? Date.now();
-  if (!validTimestamp(now)) throw new KeystoreValidationError("timestamp");
+  if (provider !== undefined && !PROVIDER_PATTERN.test(provider)) return null;
   let recovered: RecoveredKek | null = null;
-  for (const entry of store.entries) {
-    if (entry.envName !== envName || entry.disabled || entry.revokedAt !== null) continue;
-    if (entry.expiresAt !== null && entry.expiresAt <= now) continue;
-    recovered ??= recoverStoreKek(store, path, opts);
-    const value = decryptEntryValue(entry, recovered.kek);
-    if (value !== null) {
-      if (!recovered.cached) cacheKek(path, recovered.identity, recovered.kek);
-      return { value, entryId: entry.id as CredentialId, provider: entry.provider };
+  let retained = false;
+  try {
+    const path = resolveKeystorePath(opts);
+    const loaded = loadStore(path, opts);
+    if (loaded.status === "fresh" || loaded.status === "unreadable") {
+      return null;
     }
+    const store = loaded.store;
+    const now = opts.now ?? Date.now();
+    if (!validTimestamp(now)) return null;
+    for (const entry of store.entries) {
+      if (entry.envName !== envName || (provider !== undefined && entry.provider !== provider)) continue;
+      if (entry.disabled || entry.revokedAt !== null) continue;
+      if (entry.expiresAt !== null && entry.expiresAt <= now) continue;
+      recovered ??= recoverVerifiedStoreKek(store, path, opts);
+      const value = decryptEntryValue(entry, recovered.kek, store.fpSalt);
+      if (value !== null) {
+        if (!recovered.cached) cacheKek(path, recovered.identity, recovered.kek);
+        retained = true;
+        return { value, entryId: entry.id as CredentialId, provider: entry.provider };
+      }
+    }
+    return null;
+  } catch {
+    // Resolver reads are fail-closed: custody failure degrades the provider, never process boot.
+    return null;
+  } finally {
+    if (recovered !== null && !recovered.cached && !retained) recovered.kek.fill(0);
   }
-  if (recovered !== null && !recovered.cached) recovered.kek.fill(0);
-  return null;
 }
 
 export function listEntries(opts: KeystoreOptions = {}): KeystoreEntryDescriptor[] {
-  const loaded = loadStore(resolveKeystorePath(opts));
-  if (loaded.kind === "unreadable") throw new KeystoreReadError();
-  return loaded.kind === "valid" ? loaded.store.entries.map(descriptorOf) : [];
+  const loaded = loadStore(resolveKeystorePath(opts), opts);
+  if (loaded.status === "unreadable") throw new KeystoreReadError(loaded.errno);
+  if (loaded.status === "fresh") return [];
+  return loaded.store.entries.map(descriptorOf);
+}
+
+/** Report resolver-readable custody state without throwing or exposing key material. */
+export function keystoreStatus(opts: KeystoreOptions = {}): KeystoreStatus {
+  try {
+    const path = resolveKeystorePath(opts);
+    const loaded = loadStore(path, opts);
+    if (loaded.status === "fresh") return { status: "absent", droppedCount: 0 };
+    if (loaded.status === "unreadable") {
+      return { status: "unreadable", droppedCount: loaded.droppedCount };
+    }
+    const store = loaded.store;
+    let recovered: RecoveredKek | null = null;
+    try {
+      recovered = recoverVerifiedStoreKek(store, path, opts);
+      const cryptographicallyUnreadable = cryptographicallyUnreadableCount(
+        store,
+        recovered.kek,
+      );
+      const droppedCount = loaded.droppedCount + cryptographicallyUnreadable;
+      return { status: droppedCount > 0 ? "degraded" : "ok", droppedCount };
+    } catch {
+      return { status: "locked", droppedCount: loaded.droppedCount };
+    } finally {
+      if (recovered !== null && !recovered.cached) recovered.kek.fill(0);
+    }
+  } catch {
+    return { status: "unreadable", droppedCount: 0 };
+  }
 }
 
 export function addEntry(input: AddEntryInput, opts: KeystoreOptions = {}): KeystoreEntryDescriptor {
@@ -559,9 +786,9 @@ export function addEntry(input: AddEntryInput, opts: KeystoreOptions = {}): Keys
   validateExpiresAt(input.expiresAt);
   const now = writeTime(opts);
   const path = resolveKeystorePath(opts);
-  const loaded = loadStore(path);
-  if (loaded.kind === "unreadable") throw new KeystoreReadError();
-  const existing = loaded.kind === "valid" ? loaded.store : null;
+  const loaded = loadStore(path, opts);
+  if (loaded.status === "unreadable" || loaded.status === "degraded") refuseMutation(loaded);
+  const existing = loaded.status === "fresh" ? null : loaded.store;
   if (existing?.entries.some((entry) => entry.id === input.id || entry.envName === input.envName)) {
     throw new KeystoreEntryExistsError();
   }
@@ -573,7 +800,14 @@ export function addEntry(input: AddEntryInput, opts: KeystoreOptions = {}): Keys
     id: input.id,
     provider: input.provider,
     envName: input.envName,
-    ...encryptEntryValue(input.value, input.provider, input.id, initialized.kek),
+    ...encryptEntryValue(
+      input.value,
+      input.provider,
+      input.id,
+      input.envName,
+      initialized.kek,
+      initialized.store.fpSalt,
+    ),
     addedAt: now,
     rotatedAt: null,
     expiresAt: input.expiresAt ?? null,
@@ -581,10 +815,11 @@ export function addEntry(input: AddEntryInput, opts: KeystoreOptions = {}): Keys
     disabled: false,
   };
   initialized.store.entries.push(entry);
-  persistStore(path, initialized.store);
+  persistStore(path, initialized.store, opts);
   return descriptorOf(entry);
 }
 
+/** Rotate installs a live replacement key; it deliberately un-revokes a revoked entry. */
 export function rotateEntry(
   entryId: string,
   value: string,
@@ -595,18 +830,20 @@ export function rotateEntry(
   validateExpiresAt(opts.expiresAt);
   const now = writeTime(opts);
   const path = resolveKeystorePath(opts);
-  const store = requireStore(path);
+  const store = requireStoreForMutation(path, opts);
   const entry = findEntry(store, entryId);
   Object.assign(entry, encryptEntryValue(
     value,
     entry.provider,
     entry.id,
+    entry.envName,
     unlockStoreForWrite(store, path, opts),
+    store.fpSalt,
   ));
   entry.rotatedAt = now;
   entry.revokedAt = null;
   if (opts.expiresAt !== undefined) entry.expiresAt = opts.expiresAt;
-  persistStore(path, store);
+  persistStore(path, store, opts);
   return descriptorOf(entry);
 }
 
@@ -614,23 +851,29 @@ export function revokeEntry(entryId: string, opts: KeystoreOptions = {}): Keysto
   if (parseCredentialId(entryId) === null) throw new KeystoreValidationError("id");
   const now = writeTime(opts);
   const path = resolveKeystorePath(opts);
-  const store = requireStore(path);
-  // Lifecycle metadata is intentionally editable without unwrapping the KEK. These fields are
-  // not authenticated by the v1 AAD, and cleanup must remain possible for an unwrappable store.
+  const store = requireStoreForMutation(path, opts);
   const entry = findEntry(store, entryId);
+  refuseCryptographicDegradationWhenUnlockable(store, path, opts);
+  // Lifecycle metadata stays outside v1 AAD so cleanup remains possible when KEK unwrap fails.
+  // When custody is available we authenticate every row before rewriting; the deliberate trade
+  // on an unwrappable store is that a file writer can change descriptor/lifecycle metadata and
+  // availability, but cannot retarget authenticated provider/id/envName identity or recover
+  // plaintext. addedAt, rotatedAt, expiresAt, revokedAt, and disabled remain outside AAD;
+  // envName is inside it.
   entry.revokedAt = now;
-  persistStore(path, store);
+  persistStore(path, store, opts);
   return descriptorOf(entry);
 }
 
 export function removeEntry(entryId: string, opts: KeystoreOptions = {}): boolean {
   if (parseCredentialId(entryId) === null) throw new KeystoreValidationError("id");
   const path = resolveKeystorePath(opts);
-  const store = requireStore(path);
+  const store = requireStoreForMutation(path, opts);
   const index = store.entries.findIndex((entry) => entry.id === entryId);
   if (index < 0) throw new KeystoreEntryNotFoundError();
+  refuseCryptographicDegradationWhenUnlockable(store, path, opts);
   store.entries.splice(index, 1);
-  persistStore(path, store);
+  persistStore(path, store, opts);
   return true;
 }
 
@@ -638,10 +881,11 @@ export function setDisabled(entryId: string, disabled: boolean, opts: KeystoreOp
   if (parseCredentialId(entryId) === null) throw new KeystoreValidationError("id");
   if (typeof disabled !== "boolean") throw new KeystoreValidationError("value");
   const path = resolveKeystorePath(opts);
-  const store = requireStore(path);
+  const store = requireStoreForMutation(path, opts);
   const entry = findEntry(store, entryId);
+  refuseCryptographicDegradationWhenUnlockable(store, path, opts);
   entry.disabled = disabled;
-  persistStore(path, store);
+  persistStore(path, store, opts);
   return descriptorOf(entry);
 }
 
