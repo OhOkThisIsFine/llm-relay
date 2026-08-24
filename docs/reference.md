@@ -299,6 +299,64 @@ explicit alongside provider-owned auth. `openai`-kind providers never receive in
 at all: their upstream headers are built from scratch, which is why a keyless `ollama` needs no
 declaration and gets no warning.
 
+### Provider wire-shape quirks (`compat`)
+
+Some hosts enforce request rules the OpenAI protocol itself does not, and reject a conversation
+that every other provider accepts. `compat` states what a provider demands:
+
+```jsonc
+"providers": {
+  "mistral": { "base": "https://api.mistral.ai/v1", "kind": "openai",
+               "compat": { "toolCallIds": "strict9" } },
+  "gemini":  { "base": "https://generativelanguage.googleapis.com/v1beta/openai", "kind": "openai",
+               "compat": { "thoughtSignature": "sentinel" } }
+}
+```
+
+- **`toolCallIds`: `"preserve"` (default) | `"strict9"`.** Mistral's `mistral-common` validator
+  requires `^[a-zA-Z0-9]{9}$` on both the assistant `tool_calls[].id` and the answering
+  `tool_call_id` (and, from v13, that the pair is linked and that ids are unique), so every id shape
+  a client produces — `toolu_01…`, `Read:0`, `call_…` — is HTTP 400 there:
+  `Tool call id was … but must be a-z, A-Z, 0-9, with a length of 9`. Under `strict9` the relay
+  rewrites both halves of each pair through one per-request map: deterministic (SHA-256 → base62,
+  no randomness, so a replayed or retried turn maps identically and a `tool_result` never loses the
+  call it answers), an already-conforming id kept as-is, collisions resolved in first-appearance
+  order. Under `preserve` the outbound bytes are unchanged.
+- **`thoughtSignature`: `"none"` (default) | `"sentinel"`.** Gemini 3.x on Google's Generative
+  Language API answers HTTP 400 — *"Function call is missing a thought_signature in functionCall
+  parts…"* — to a replayed assistant tool call. Under `sentinel` the relay stamps Google's own
+  documented opt-out, the raw string `skip_thought_signature_validator`, at
+  `tool_calls[N].extra_content.google.thought_signature` on every replayed call. The relay does not
+  store or echo a real signature: keeping vendor-private reasoning between turns is not something
+  this proxy does, and inventing one would be a fabrication. Under `none` nothing is added.
+
+**Defaults are labelled provider facts, and config always wins.** An absent key resolves from the
+provider's base host — `*.mistral.ai` ⇒ `strict9`, the exact host
+`generativelanguage.googleapis.com` ⇒ `sentinel` (not `*.googleapis.com`: Vertex is a different
+product with a different validator), everything else ⇒ `preserve` / `none`. An explicit value beats
+the default in **both** directions, so `"toolCallIds": "preserve"` on a mistral host and
+`"toolCallIds": "strict9"` on any other host both do exactly what they say.
+
+**An unknown `compat` key or value is a hard startup error naming it** — same rule as `limits`. A
+typo that were merely ignored would read as a declaration that took effect while the wire was
+unchanged.
+
+**What it announces.** An id rewrite sets `x-llm-relay-tool-call-ids: "<n> rewritten"` on the
+response — buffered *and* streamed, because unlike the response-direction mint the count is final
+before the request is sent — plus the `toolCallIdRewrites` log field. The sentinel is counted in
+the log as `thoughtSignatureSentinels` and deliberately has **no** response header: it is
+vendor-protocol padding on the relay's own outbound shape, not a change to your data, so there is
+nothing a client could act on. Both are counts, never ids or signatures.
+
+⚠ **`compat` shapes only request bodies the relay AUTHORS.** Those are the translated lanes — an
+Anthropic `/v1/messages` request going to an `openai`-kind target, and a `/v1/responses` request
+doing the same. The OpenAI front's **direct Chat passthrough** (an `openai`-kind target reached
+over `/v1/chat/completions`) forwards the caller's own body essentially byte-for-byte and is left
+alone, so a declared compat mode is **inert there by design** — not an unfinished path. Same
+deliberate asymmetry as tool-use-id minting, and for the same reason: responsibility tracks
+authorship. An OpenAI-native client wrote its own ids and sees mistral's 400 verbatim, which is
+its own to fix; on a translated lane the client cannot fix what the relay wrote.
+
 ### Pools — static and dynamic
 
 A pool is either a static array of specs, or a dynamic free pool:
@@ -563,6 +621,11 @@ until meaningful content, and semantic failures before that point are counted as
   responses only**: a stream's headers are written before its first tool call exists, so there the
   count is reported in the metadata-only `toolUseIdRewrites` log field instead. A count, never an
   id — and only on `openai`-kind targets; a native Anthropic response is untouched.
+- `x-llm-relay-tool-call-ids: "<n> rewritten"` — the REQUEST-direction sibling: `n` outbound
+  tool-call ids were rewritten to the shape the serving provider's validator states
+  (`compat.toolCallIds`, [above](#provider-wire-shape-quirks-compat)). Present on **buffered and
+  streamed** responses alike, because this count is final before the request is even sent. Also a
+  count, never an id.
 - `x-llm-relay-dashboard-session: <token>` — REQUEST header on dashboard API calls, carrying the
   read-only session token minted by the bootstrap exchange. It is consumed by the relay, never
   forwarded upstream, and never persisted (only its SHA-256 digest is held in memory).

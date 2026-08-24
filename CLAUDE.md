@@ -747,6 +747,18 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   so a pool walk can legitimately send DIFFERENT ids to different candidates — the
   `test/pool-failover.test.ts` "same translation both times" assertion is scoped to a same-compat
   fixture and stays true.
+  ⚠ **SCOPE — `compat` shapes only request bodies the RELAY AUTHORS, and that is a decision, not a
+  gap.** Both keys hang off `anthropicRequestToOpenAi`, so they reach the TRANSLATED lanes (an
+  Anthropic `/v1/messages` request to an `openai`-kind target, and a `/v1/responses` request doing
+  the same via `responses-request.ts` → this mapper). The OpenAI front's **direct Chat passthrough**
+  — `openai`-kind target + `chat` protocol, `backend.ts` `fetchOpenAiFront`'s first branch — posts
+  `{...base, model, stream}`, i.e. the caller's own body, and never enters the mapper; a declared
+  compat mode is therefore **inert there BY DESIGN**. Do not read that as the "two paths, one policy
+  empty" defect shape and go "finish" it: this is the same deliberate asymmetry as the
+  response-direction id mint, and the reason is that responsibility tracks AUTHORSHIP. An
+  OpenAI-native client wrote its own ids into its own body and gets mistral's 400 verbatim, which is
+  its to fix and which byte-exactness exists to preserve; on a translated lane the client cannot fix
+  what the relay wrote. State this whenever the question comes up rather than re-deriving it.
 - **Gemini 3.x REFUSES a replayed tool call that carries no `thought_signature`, and the relay
   stamps Google's own opt-out token rather than inventing or storing one.** First-party,
   `models/gemini-3.6-flash` via the OpenAI-compatible endpoint on
@@ -780,7 +792,19 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
   counted — `thoughtSignatureSentinels` on the `LOG_FIELDS` allow-list, a COUNT and never a
   signature — so the operator can see it fired. ⚠ Under `"none"` (everyone else) the outbound bytes
   are byte-identical to before this existed, and the RESPONSE direction is untouched: nothing
-  captures `extra_content`, no store exists.
+  captures `extra_content`, no store exists. ⚠ The authored-bodies SCOPE in the mistral gotcha above
+  governs this key too — the direct Chat passthrough is never stamped, deliberately.
+  ⚠ **RESIDUAL, stated so nobody mistakes it for verified: the default is HOST-scoped while the
+  evidence is MODEL-scoped.** First-party verification covered `models/gemini-3.6-flash` only, but
+  `resolveThoughtSignatureMode()` defaults the whole `generativelanguage.googleapis.com` host to
+  `sentinel`, so every gemini model routed through that base — 2.5-era included — gets the field.
+  Google's `extra_content` is an ENDPOINT-level extension of the OpenAI-compatible layer, so a model
+  whose validator does not ask for a signature is expected to ignore it; that expectation is
+  UNTESTED here. If a 2.5-era (or any other) model on that host starts 400ing on the extra field,
+  the escape hatch is per-provider config, not a code change:
+  `compat: { "thoughtSignature": "none" }` — which is precisely why the labelled fact is allowed to
+  live in `src` at all. Narrowing the default to a model-id test would need first-party evidence per
+  model, and inventing that test without it would be the guess the fact rule forbids.
 
 ## Status & open work
 
@@ -803,7 +827,14 @@ the standing Gaps 15/16/M3/P1/P4 deferrals. The 2026-08-23 sprint (v0.41.0) clos
 `a407ee0` feeds the reviewed-rule rung of `resolveResetsAt` (facts persist `untilBasis`; both the
 dashboard availability producer and `llm-relay candidates` resolve through it), and `d75b143`
 carries the caller's function `name` on outbound `role:"tool"` messages so gemini's
-OpenAI-compatible endpoint stops 400ing them. Streaming cross-protocol usage parity in llm-bridge
+OpenAI-compatible endpoint stops 400ing them. Queued for **v0.43.0**: the `providers.<name>.compat`
+field and the two vendor rules it carries — `a509cab` rewrites outbound tool-call ids to mistral's
+stated `^[a-zA-Z0-9]{9}$` (`toolCallIds: "strict9"`) and `405602f` stamps gemini's documented
+`thought_signature` sentinel on replayed tool calls (`thoughtSignature: "sentinel"`), both
+base-host-defaulted labelled facts that config overrides in either direction — closing the last two
+open findings of HANDOFF §6; `0de0584` then closed the review of those two (streamed Responses
+rebuild, Responses-front wire bytes, the sentinel's fetchBackend wiring, the `#k` collision policy
+behind an injected-digest seam, and two `as never` fixture casts). Streaming cross-protocol usage parity in llm-bridge
 is ACCEPTED AS-IS (owner decision 2026-08-23 — the ledger observes the backend stream so
 accounting is correct; only the client-facing translated SSE loses cache fields). ⚠ Do not
 "complete" Gap 3 by adding token fields to `LOG_FIELDS` — the accounting store superseded the
