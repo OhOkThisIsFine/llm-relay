@@ -835,9 +835,13 @@ quota as a demotion term on both fronts (Stage 5 / Gap 12, learned opt-in via
 `routing.quota.enforceLearned`), and the `llm-relay cost --include-repair` roll-up.
 [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7 is the
 closeout ledger; the G2 manual hard cap is delivered (`5e06a56`, v0.40.0). The 2026-08-24 sprint
-delivered M4/Gap 10 (`32f31c3`) and M3 (`1ee1ad2`), queued for **v0.44.0**; Gaps 15/16/P4 were
-dropped outright, and custody (`docs/credential-fleet-design-2026-08-16.md`) remains the next
-sprint. The 2026-08-23 sprint (v0.41.0) closed the dashboard/
+delivered M4/Gap 10 (`32f31c3`) and M3 (`1ee1ad2`), released as **v0.44.0**; Gaps 15/16/P4 were
+dropped outright. **The custody sprint then delivered Stage 3 the same evening (queued for
+v0.45.0)** — `src/os-keyring.ts` + `src/keystore.ts` + the resolver keystore rung + the `keys`
+lifecycle CLI, six commits (`a83eef8`..`b7129fa`), each packet adversarially reviewed with all
+gate findings fixed; plan, recon corrections and decisions in
+[docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md), residuals in
+HANDOFF §6. The 2026-08-23 sprint (v0.41.0) closed the dashboard/
 `cost` coverage-partial semantics (`50e8233`) and the OpenAI Responses front's dropped
 `function_call` (`3253a53`), and added tool-use id minting for repeated-id openai-kind hosts
 (`8473cb1`, `src/tool-use-ids.ts`). Two more commits landed after that, queued for **v0.42.0**:
