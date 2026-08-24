@@ -74,24 +74,41 @@ export type CredentialMode = "passthrough" | "contained";
 export type ToolCallIdMode = "preserve" | "strict9";
 
 /**
+ * Whether a replayed assistant tool call must carry gemini 3.x's `thought_signature` field.
+ *
+ *  - `"none"` — emit nothing. The default everywhere, and byte for byte what this relay put on the
+ *    wire before 2026-08-23.
+ *  - `"sentinel"` — stamp Google's own documented opt-out token,
+ *    `skip_thought_signature_validator`, at `tool_calls[].extra_content.google.thought_signature`
+ *    on every replayed tool call. See `src/openai-request.ts` for the 400 that states the rule and
+ *    for why echoing a REAL signature is not an option here.
+ */
+export type ThoughtSignatureMode = "none" | "sentinel";
+
+/**
  * Per-provider WIRE-SHAPE quirks — things a specific host's request validator demands that the
  * protocol itself does not. Deliberately not routing configuration and deliberately not a
  * per-provider switch in `src/`: a labelled provider fact may live in code only while config can
  * override it (see the "Provider knowledge is data" invariant), which is exactly the shape here —
  * a base-host default that any explicit value beats in both directions.
  *
- * One key today. An unknown key or value is a HARD load error naming it: the `configured-limits`
- * precedent — an ignored typo silently no-ops while reading like a declaration that took effect.
+ * Two keys today, one per vendor rule the relay has first-party evidence for. An unknown key or
+ * value is a HARD load error naming it: the `configured-limits` precedent — an ignored typo
+ * silently no-ops while reading like a declaration that took effect.
  */
 export interface ProviderCompatConfig {
   /** Absent ⇒ resolved from the base host by `resolveToolCallIdMode`. */
   toolCallIds?: ToolCallIdMode;
+  /** Absent ⇒ resolved from the base host by `resolveThoughtSignatureMode`. */
+  thoughtSignature?: ThoughtSignatureMode;
 }
 
 /** The closed set of `compat` keys, so an unknown one can be named in the error. */
-const COMPAT_KEYS = ["toolCallIds"] as const satisfies readonly (keyof ProviderCompatConfig)[];
+const COMPAT_KEYS = ["toolCallIds", "thoughtSignature"] as const satisfies readonly (keyof ProviderCompatConfig)[];
 
 const TOOL_CALL_ID_MODES: readonly ToolCallIdMode[] = ["preserve", "strict9"];
+
+const THOUGHT_SIGNATURE_MODES: readonly ThoughtSignatureMode[] = ["none", "sentinel"];
 
 /**
  * Parse a provider's `compat` block. Adding the next key is one entry in `COMPAT_KEYS` plus its
@@ -115,19 +132,39 @@ function parseProviderCompat(raw: unknown, where: string): ProviderCompatConfig 
       }
       out.toolCallIds = value as ToolCallIdMode;
     }
+    if (key === "thoughtSignature") {
+      if (typeof value !== "string" || !THOUGHT_SIGNATURE_MODES.includes(value as ThoughtSignatureMode)) {
+        throw new Error(`${where}.thoughtSignature must be one of: ${THOUGHT_SIGNATURE_MODES.join(", ")}`);
+      }
+      out.thoughtSignature = value as ThoughtSignatureMode;
+    }
   }
   return Object.keys(out).length > 0 ? out : {};
 }
 
+/** The host of a base URL, lowercased — or null when it is not a URL at all. */
+function baseHost(base: string): string | null {
+  try {
+    return new URL(base).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
 /** Is this base URL's host mistral's — `api.mistral.ai`, `codestral.mistral.ai`, any of them? */
 function isMistralHost(base: string): boolean {
-  let host: string;
-  try {
-    host = new URL(base).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
+  const host = baseHost(base);
+  if (host === null) return false;
   return host === "mistral.ai" || host.endsWith(".mistral.ai");
+}
+
+/**
+ * Is this base URL Google's Generative Language API — the host whose gemini 3.x models enforce the
+ * `thought_signature` rule? Deliberately the ONE exact host, not `*.googleapis.com`: Vertex and
+ * every other Google surface are different products with different validators.
+ */
+function isGoogleGenerativeLanguageHost(base: string): boolean {
+  return baseHost(base) === "generativelanguage.googleapis.com";
 }
 
 /**
@@ -142,6 +179,21 @@ function isMistralHost(base: string): boolean {
 export function resolveToolCallIdMode(p: { base: string; compat?: ProviderCompatConfig }): ToolCallIdMode {
   if (p.compat?.toolCallIds !== undefined) return p.compat.toolCallIds;
   return isMistralHost(p.base) ? "strict9" : "preserve";
+}
+
+/**
+ * The resolved thought-signature mode for one provider.
+ *
+ * The SAME labelled-fact mechanism as `resolveToolCallIdMode`, and allowed by the SAME invariant —
+ * "Provider knowledge is data, not routing configuration" permits a labelled provider fact in
+ * `src/` only while config can override it. Google's Generative Language API states the rule (its
+ * gemini 3.x models 400 a replayed tool call carrying no signature; first-party evidence in
+ * `src/openai-request.ts`), so that base host defaults to `"sentinel"` and every other host to
+ * `"none"`. An explicit `compat.thoughtSignature` wins in BOTH directions.
+ */
+export function resolveThoughtSignatureMode(p: { base: string; compat?: ProviderCompatConfig }): ThoughtSignatureMode {
+  if (p.compat?.thoughtSignature !== undefined) return p.compat.thoughtSignature;
+  return isGoogleGenerativeLanguageHost(p.base) ? "sentinel" : "none";
 }
 
 /** One HTTP backend provider in the registry (NIM, OpenRouter, Gemini API, …). */
@@ -196,7 +248,8 @@ export interface ProviderConfig {
   limits?: ProviderLimitsConfig;
   /**
    * Wire-shape quirks this host's own request validator enforces. Absent keys fall back to a
-   * labelled base-host default (`resolveToolCallIdMode`); an explicit value always wins.
+   * labelled base-host default (`resolveToolCallIdMode`, `resolveThoughtSignatureMode`); an
+   * explicit value always wins.
    */
   compat?: ProviderCompatConfig;
   /** Web URL where users can sign up or obtain API keys. */
@@ -695,6 +748,13 @@ export interface ResolvedTarget {
    * target) reads as `"preserve"`, which is the pre-2026-08-23 behaviour byte for byte.
    */
   toolCallIds?: ToolCallIdMode;
+  /**
+   * RESOLVED thought-signature mode (`resolveThoughtSignatureMode`) — an explicit
+   * `compat.thoughtSignature` or the labelled base-host default. Resolved here for the same reason
+   * as `toolCallIds`: the request mapper is handed a mode, never a provider identity to sniff one
+   * from. Absent (a hand-built target) reads as `"none"` — the pre-2026-08-23 bytes exactly.
+   */
+  thoughtSignature?: ThoughtSignatureMode;
 }
 
 export interface Config {
@@ -884,6 +944,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     credentialSlots: providerCredentialSlots(provider, p),
     ...(p.credentialMode !== undefined ? { credentialMode: p.credentialMode } : {}),
     toolCallIds: resolveToolCallIdMode(p),
+    thoughtSignature: resolveThoughtSignatureMode(p),
   };
 }
 

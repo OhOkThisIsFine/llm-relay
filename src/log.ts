@@ -90,6 +90,16 @@ export interface RequestLog {
    * ⚠ A COUNT, never an id — the same rule as `toolUseIdRewrites`.
    */
   toolCallIdRewrites?: number;
+  /**
+   * How many replayed tool calls the request mapper stamped with gemini's documented
+   * thought-signature sentinel (`src/openai-request.ts`, `compat.thoughtSignature: "sentinel"`).
+   * Absent when none were, which is every provider but Google's Generative Language API.
+   *
+   * ⚠ A COUNT, never a signature. This one has NO response header at all — the sentinel is
+   * vendor-protocol padding on the relay's own outbound shape, not a change to the caller's data,
+   * so the log is the one place the pass shows.
+   */
+  thoughtSignatureSentinels?: number;
   latencyMs: number;
 }
 
@@ -121,6 +131,7 @@ const LOG_FIELDS = [
   "repair",
   "toolUseIdRewrites",
   "toolCallIdRewrites",
+  "thoughtSignatureSentinels",
   "latencyMs",
 ] as const satisfies readonly (keyof RequestLog)[];
 

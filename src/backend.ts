@@ -235,6 +235,16 @@ interface UpstreamResponseMetadata {
    * egress, so it is set once when the metadata is built.
    */
   toolCallIdRewrites?: number;
+  /**
+   * How many replayed tool calls the request mapper stamped with gemini's documented
+   * thought-signature sentinel (`openai-request.ts`, `compat.thoughtSignature: "sentinel"`). A
+   * count, never a signature. Known before egress, like `toolCallIdRewrites`.
+   *
+   * Deliberately NOT announced as a response header: this one adds vendor-protocol padding to the
+   * relay's own outbound shape and changes nothing about the caller's data, so the operator sees
+   * it in the log and the client is told nothing it could act on.
+   */
+  thoughtSignatureSentinels?: number;
 }
 
 // Response provenance is private process state, not a wire header: callers can
@@ -288,6 +298,15 @@ export function toolUseIdRewrites(response: Response): number | undefined {
  */
 export function toolCallIdRewrites(response: Response): number | undefined {
   const n = upstreamResponseMetadata.get(response)?.toolCallIdRewrites;
+  return n !== undefined && n > 0 ? n : undefined;
+}
+
+/**
+ * How many replayed tool calls this request carried gemini's thought-signature sentinel on, or
+ * `undefined` when none did. Final at request-mapping time, like `toolCallIdRewrites`.
+ */
+export function thoughtSignatureSentinels(response: Response): number | undefined {
+  const n = upstreamResponseMetadata.get(response)?.thoughtSignatureSentinels;
   return n !== undefined && n > 0 ? n : undefined;
 }
 
@@ -633,6 +652,9 @@ export async function fetchBackend(
   // decision, never a provider name to re-derive one from. `preserve` (everyone but mistral)
   // leaves this 0 and the outbound bytes untouched.
   let toolCallIdsRewritten = 0;
+  // The sibling pass, resolved the same way: `none` (everyone but Google's Generative Language
+  // API) leaves this 0 and adds nothing to the body.
+  let sentinelsStamped = 0;
   try {
     // The REQUEST direction is relay-owned (`openai-request.ts`); only the RESPONSE direction is
     // still llm-bridge's. llm-bridge's `universalToOpenAI` has no case for a tool_call/tool_result
@@ -643,6 +665,8 @@ export async function fetchBackend(
       stream: args.wantsStream,
       ...(target.toolCallIds !== undefined ? { toolCallIds: target.toolCallIds } : {}),
       onToolCallIdsRewritten: (n) => { toolCallIdsRewritten = n; },
+      ...(target.thoughtSignature !== undefined ? { thoughtSignature: target.thoughtSignature } : {}),
+      onThoughtSignatureSentinels: (n) => { sentinelsStamped = n; },
     });
   } catch (e) {
     // A block we will not put on the wire is the caller's request being unrepresentable, not a
@@ -736,6 +760,7 @@ export async function fetchBackend(
       // `tool_use` substring costs one scan, so the gate would buy little and lose that case.
       const metadata = preflight.metadata;
       if (toolCallIdsRewritten > 0) metadata.toolCallIdRewrites = toolCallIdsRewritten;
+      if (sentinelsStamped > 0) metadata.thoughtSignatureSentinels = sentinelsStamped;
       const body = rewriteToolUseIdsInStream(
         recovered,
         () => knownToolUseIds(args.reqJson),
@@ -816,6 +841,8 @@ export async function fetchBackend(
   captureReportedModel(metadata, upstreamJson, "openai-chat", false);
   if (mintedIds.rewritten > 0) metadata.toolUseIdRewrites = mintedIds.rewritten;
   if (toolCallIdsRewritten > 0) metadata.toolCallIdRewrites = toolCallIdsRewritten;
+  // No header for this one — see `UpstreamResponseMetadata.thoughtSignatureSentinels`.
+  if (sentinelsStamped > 0) metadata.thoughtSignatureSentinels = sentinelsStamped;
   return attachUpstreamMetadata(response, metadata);
 }
 

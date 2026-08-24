@@ -63,10 +63,57 @@ export interface AnthropicToOpenAiOptions {
    * about the translation, not part of the body it returns.
    */
   onToolCallIdsRewritten?: ((count: number) => void) | undefined;
+  /**
+   * The RESOLVED thought-signature mode for this deployment (`config.ts`
+   * `resolveThoughtSignatureMode`). Absent ⇒ `"none"` ⇒ the outbound bytes are identical to what
+   * this mapper emitted before the mode existed. Never a provider name, same rule as
+   * `toolCallIds`.
+   */
+  thoughtSignature?: ThoughtSignatureMode | undefined;
+  /**
+   * Called once per run with how many tool calls the `"sentinel"` pass stamped (0 included). Same
+   * out-param idiom as `onToolCallIdsRewritten`, and the count is metadata about the translation,
+   * not part of the body it returns.
+   */
+  onThoughtSignatureSentinels?: ((count: number) => void) | undefined;
 }
 
 /** Mirrors `config.ts`'s `ToolCallIdMode`, restated so this module imports no config surface. */
 export type ToolCallIdMode = "preserve" | "strict9";
+
+/** Mirrors `config.ts`'s `ThoughtSignatureMode`, restated for the same reason. */
+export type ThoughtSignatureMode = "none" | "sentinel";
+
+/**
+ * Google's documented opt-out token for a replayed tool call that carries no real thought
+ * signature.
+ *
+ * FIRST-PARTY EVIDENCE (2026-08-23, `models/gemini-3.6-flash` via the OpenAI-compatible endpoint
+ * at `generativelanguage.googleapis.com`): replaying an assistant `tool_calls` turn answers HTTP
+ * 400 — "Function call is missing a thought_signature in functionCall parts…". Stamping this
+ * string at `tool_calls[N].extra_content.google.thought_signature` was verified accepted on the
+ * live endpoint the same day, for a single call and for BOTH entries of a parallel pair; the
+ * model then answered correctly from the tool results. It is a RAW string and is never
+ * base64-encoded — encoding it makes it an unparseable signature rather than the opt-out.
+ *
+ * WHY THE SENTINEL AND NOT THE REAL SIGNATURE. Echoing gemini's own signature back would need one
+ * of two things this relay refuses to build:
+ *
+ *  - a conversation store keyed by tool-call id, holding vendor-private reasoning between turns —
+ *    the reverse map `tool-use-ids.ts` deliberately does not have ("no reverse map, by
+ *    construction": the client echoes what it was given and the relay remembers nothing); or
+ *  - a fabricated `thinking` block smuggled back through the caller's conversation, which would
+ *    poison every anthropic-kind failover candidate with content the caller never wrote.
+ *
+ * Meanwhile this mapper DROPS `thinking` / `redacted_thinking` cross-vendor by rule (see
+ * `assistantMessage` and `userMessages` below, and the module header's "mapping it to
+ * `reasoning_effort` would be a guess" precedent), so no real signature is in hand to echo in the
+ * first place. The sentinel is the vendor's OWN token for exactly this state — a labelled
+ * parameter quirk, not an invented measurement — and it is config-overridable
+ * (`compat.thoughtSignature`), which is the condition the "Provider knowledge is data" invariant
+ * attaches to any provider fact living in `src/`.
+ */
+const THOUGHT_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
 
 /**
  * Mistral's stated tool-call-id shape.
@@ -137,6 +184,33 @@ class ToolCallIds {
   }
 }
 
+/**
+ * The per-run thought-signature stamper — `null` under `"none"`, which is every provider but
+ * Google's Generative Language API.
+ *
+ * EVERY replayed tool call is stamped, not just the first of a turn. That is the placement the
+ * 2026-08-23 live check verified: the sentinel on the single call of a one-call turn was accepted,
+ * and the sentinel on BOTH entries of a parallel pair was accepted too (which contradicts a public
+ * report that a parallel pair rejects it — against this endpoint and model, on that date, it did
+ * not). Stamping every entry is also the only placement whose correctness does not depend on which
+ * entry the validator happens to inspect.
+ */
+class ThoughtSignatures {
+  private stamped = 0;
+
+  stamp(call: Rec): Rec {
+    // A RAW string — never base64. Encoding it would make it a malformed signature instead of the
+    // vendor's documented "there is no signature" token.
+    call.extra_content = { google: { thought_signature: THOUGHT_SIGNATURE_SENTINEL } };
+    this.stamped += 1;
+    return call;
+  }
+
+  count(): number {
+    return this.stamped;
+  }
+}
+
 type Rec = Record<string, unknown>;
 
 function isRecord(v: unknown): v is Rec {
@@ -171,7 +245,7 @@ function systemText(system: unknown): string {
 }
 
 /** One Anthropic `tool_use` block → one OpenAI `tool_calls[]` entry. */
-function toolCall(block: Rec, ids: ToolCallIds | null): Rec {
+function toolCall(block: Rec, ids: ToolCallIds | null, sigs: ThoughtSignatures | null): Rec {
   // A synthesized id would be unmatchable: the linkage to the `role:"tool"` message that answers
   // it is the id itself, so inventing one silently detaches the result from the call.
   if (typeof block.id !== "string" || block.id.length === 0) {
@@ -181,7 +255,7 @@ function toolCall(block: Rec, ids: ToolCallIds | null): Rec {
     throw new RequestMappingError("tool_use block without a name");
   }
   const input = block.input ?? {};
-  return {
+  const call: Rec = {
     // Under `"preserve"` (`ids === null`) this is the caller's own id, byte for byte.
     id: ids === null ? block.id : ids.map(block.id),
     type: "function",
@@ -191,6 +265,11 @@ function toolCall(block: Rec, ids: ToolCallIds | null): Rec {
       arguments: typeof input === "string" ? input : JSON.stringify(input),
     },
   };
+  // Under `"none"` (`sigs === null`) NOTHING is added and this object is byte-identical to the one
+  // this mapper emitted before the mode existed. See `THOUGHT_SIGNATURE_SENTINEL` for the 400 that
+  // makes the other branch necessary and for why the vendor's opt-out token is the only honest
+  // value the relay can put here.
+  return sigs === null ? call : sigs.stamp(call);
 }
 
 /**
@@ -200,7 +279,7 @@ function toolCall(block: Rec, ids: ToolCallIds | null): Rec {
  * `tool_use` blocks become `tool_calls`, and `content` is `null` when nothing but tool calls
  * remains — the shape OpenAI defines for a tool-calling turn.
  */
-function assistantMessage(turn: Rec, ids: ToolCallIds | null): Rec {
+function assistantMessage(turn: Rec, ids: ToolCallIds | null, sigs: ThoughtSignatures | null): Rec {
   const content = turn.content;
   if (typeof content === "string") return { role: "assistant", content };
   const texts: string[] = [];
@@ -212,7 +291,7 @@ function assistantMessage(turn: Rec, ids: ToolCallIds | null): Rec {
         texts.push(textOf(raw));
         break;
       case "tool_use":
-        toolCalls.push(toolCall(raw, ids));
+        toolCalls.push(toolCall(raw, ids, sigs));
         break;
       case "thinking":
       case "redacted_thinking":
@@ -462,6 +541,9 @@ export function anthropicRequestToOpenAi(
   // `null` is the "preserve" mode, and it is the mode for every provider but mistral: no map is
   // built and every id reaches the wire exactly as the caller wrote it.
   const ids = opts.toolCallIds === "strict9" ? new ToolCallIds() : null;
+  // Same shape, and independent of it — a provider may set both keys, and the two passes touch
+  // different parts of the same `tool_calls[]` entry (its `id`, and a sibling `extra_content`).
+  const sigs = opts.thoughtSignature === "sentinel" ? new ThoughtSignatures() : null;
 
   // Assistant `tool_use` id → name across the whole conversation, so each `role:"tool"` message
   // can restate the name of the call it answers (see `toolResultMessage` — a gemini compat-layer
@@ -487,11 +569,15 @@ export function anthropicRequestToOpenAi(
     // and id minting (`tool-use-ids.ts`) is RESPONSE-side, so the echoed pair shares one id here.
     if (raw.role === "assistant") {
       rememberToolNames(raw);
-      messages.push(assistantMessage(raw, ids));
+      messages.push(assistantMessage(raw, ids, sigs));
     } else messages.push(...userMessages(raw, toolNames, ids));
   }
   // Announced for the same reason every other automatic fix on this path is: a count, never an id.
   if (ids !== null) opts.onToolCallIdsRewritten?.(ids.count());
+  // Counted, not headered: the sentinel is vendor-protocol padding on the relay's own outbound
+  // shape and alters nothing about the caller's data, so the operator gets a log counter rather
+  // than a response header. A count, same rule.
+  if (sigs !== null) opts.onThoughtSignatureSentinels?.(sigs.count());
 
   const out: Rec = { messages };
   // The relay's resolved deployment id, never the caller's — see `AnthropicToOpenAiOptions`.
