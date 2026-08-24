@@ -40,6 +40,17 @@ export type FactScope =
   | { kind: "provider"; provider: string }
   | { kind: "model"; model: string };
 
+export interface CooldownFactClearSelector {
+  readonly provider: string;
+  readonly model?: string;
+  readonly credentialId?: CredentialId;
+}
+
+export interface ClearedCooldownFact {
+  readonly kind: FactKind;
+  readonly scope: FactScope;
+}
+
 export const SCOPE_PRECEDENCE: Array<FactScope["kind"]> = [
   "attempt", "group", "deployment", "credential", "provider", "model",
 ];
@@ -282,6 +293,42 @@ function covers(fact: StoredFact, provider: string, credentialId: CredentialId |
   }
 }
 
+/**
+ * Retract a fact only when its entire scope fits inside the operator's selection. Unlike a real
+ * success, an operator clear is not evidence that can disprove a broader condition; retaining a
+ * wider row prevents a narrow clear from reviving sibling deployments or credential cells.
+ */
+function matchesClearSelector(scope: FactScope, selector: CooldownFactClearSelector): boolean {
+  switch (scope.kind) {
+    case "attempt":
+      return scope.provider === selector.provider &&
+        (selector.model === undefined || scope.model === selector.model) &&
+        (selector.credentialId === undefined || scope.credentialId === selector.credentialId);
+    case "group":
+      if (scope.provider !== selector.provider) return false;
+      if (
+        selector.model !== undefined &&
+        !scope.members.every((member) => member === selector.model)
+      ) return false;
+      return selector.credentialId === undefined || scope.credentialId === selector.credentialId;
+    case "deployment":
+      return scope.provider === selector.provider &&
+        selector.credentialId === undefined &&
+        (selector.model === undefined || scope.model === selector.model);
+    case "credential":
+      return scope.provider === selector.provider &&
+        selector.model === undefined &&
+        (selector.credentialId === undefined || scope.credentialId === selector.credentialId);
+    case "provider":
+      return scope.provider === selector.provider &&
+        selector.model === undefined &&
+        selector.credentialId === undefined;
+    case "model":
+      // A provider-qualified mutation must not retract a cross-provider row for its siblings.
+      return false;
+  }
+}
+
 export function recordFact(
   kind: FactKind,
   scope: FactScope,
@@ -359,6 +406,35 @@ export function clearFacts(provider: string, credentialId: CredentialId | null, 
   }
   if (changed) writer.touch(() => persist(path));
   return cleared;
+}
+
+/** Operator retraction of active cooling conditions only; never success evidence or eviction. */
+export function clearCooldownFacts(
+  selector: CooldownFactClearSelector,
+  opts: { path?: string; now?: number } = {},
+): ClearedCooldownFact[] {
+  const path = opts.path ?? defaultPath();
+  const now = opts.now ?? Date.now();
+  const store = load(path);
+  const cleared: ClearedCooldownFact[] = [];
+  for (const [key, fact] of Object.entries(store.facts)) {
+    if (
+      !COOLING.has(fact.kind) ||
+      now >= expiryOf(fact) ||
+      !matchesClearSelector(fact.scope, selector)
+    ) continue;
+    delete store.facts[key];
+    cleared.push({
+      kind: fact.kind,
+      scope: fact.scope.kind === "group"
+        ? { ...fact.scope, members: [...fact.scope.members] }
+        : { ...fact.scope },
+    });
+  }
+  if (cleared.length > 0) writer.touch(() => persist(path));
+  return cleared.sort((a, b) =>
+    a.kind.localeCompare(b.kind) || keyOfScope(a.scope).localeCompare(keyOfScope(b.scope))
+  );
 }
 
 export function allFacts(opts: { path?: string; now?: number } = {}): Array<{ kind: FactKind; scope: FactScope; at: number; until: number; untilBasis?: FactResetBasis }> {

@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import {
   argValue,
   hasFlag,
@@ -17,7 +18,9 @@ import {
   classifyCommand,
   normalizeDispatchCommands,
   proxyUrl,
+  run,
   runDispatch,
+  runCooldowns,
   runOffload,
   runConfigCommand,
   runPools,
@@ -192,6 +195,8 @@ describe("cli helper utilities", () => {
     expect(new Set(aligned).size).toBe(1);
     expect(help).toContain("GET|POST /dispatch");
     expect(help).toContain('POST {"exhausted":"<lane>"}');
+    expect(help).toContain("llm-relay cooldowns clear <provider>[/<model>] [--credential <label>]");
+    expect(help).toContain("POST /cooldowns/clear");
     expect(help).not.toContain("Commands:");
     expect(help).not.toContain("llm-relay offload on|off");
     expect(help).not.toContain("                                                   the command");
@@ -553,6 +558,339 @@ describe("llm-relay dispatch — printed ladder", () => {
   });
 });
 
+describe("llm-relay cooldowns clear — live control mutation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-cli-cooldowns-"));
+  const originalArgv = process.argv;
+  const responseBody = {
+    target: { provider: "anthropic", model: "claude-sonnet", credential: "backup" },
+    cleared: {
+      breakerCells: {
+        count: 1,
+        items: [{ provider: "anthropic", model: "claude-sonnet", credential: "backup" }],
+      },
+      credentialFaults: { count: 0, items: [] },
+      facts: {
+        count: 1,
+        items: [{
+          kind: "rate-limited",
+          scope: {
+            kind: "attempt",
+            provider: "anthropic",
+            model: "claude-sonnet",
+            credentialId: "anthropic#backup",
+          },
+        }],
+      },
+    },
+  };
+
+  const configAt = (listen: string) => ({
+    listen,
+    providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic" } },
+    routing: {
+      default: "anthropic/claude-sonnet",
+      tiers: {
+        opus: "anthropic/claude-sonnet",
+        sonnet: "anthropic/claude-sonnet",
+        haiku: "anthropic/claude-sonnet",
+        fable: "anthropic/claude-sonnet",
+      },
+      benchmarkSort: false,
+    },
+    repair: { maxAttempts: 2, destructiveTools: [] },
+    mode: "detect",
+    log: { level: "silent", file: null },
+  });
+
+  afterEach(() => {
+    process.argv = originalArgv;
+    vi.restoreAllMocks();
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("posts the scoped clear to a running relay with its installed control token", async () => {
+    type CapturedRequest = {
+      method: string | undefined;
+      url: string | undefined;
+      headers: Record<string, string | string[] | undefined>;
+      body: string;
+    };
+    let completeRequest!: (request: CapturedRequest) => void;
+    const requestReceived = new Promise<CapturedRequest>((resolve) => {
+      completeRequest = resolve;
+    });
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        completeRequest({
+          method: req.method,
+          url: req.url,
+          headers: req.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(responseBody));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("missing test listener");
+      const configPath = join(dir, "config.json");
+      writeFileSync(configPath, JSON.stringify(configAt(`127.0.0.1:${address.port}`), null, 2));
+      process.argv = [
+        "node", "cli.ts", "--config", configPath,
+        "cooldowns", "clear", "anthropic/claude-sonnet", "--credential", "backup",
+      ];
+      const output: string[] = [];
+      vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        output.push(String(chunk));
+        return true;
+      });
+
+      await runCooldowns("clear", "anthropic/claude-sonnet");
+
+      const request = await requestReceived;
+      expect(request.method).toBe("POST");
+      expect(request.url).toBe("/cooldowns/clear");
+      expect(request.headers["content-type"]).toBe("application/json");
+      expect(request.headers["x-llm-relay-control-token"]).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(JSON.parse(request.body)).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet",
+        credential: "backup",
+      });
+      expect(output.join("")).toContain("Cleared cooldown state for anthropic/claude-sonnet [credential backup]");
+      expect(output.join("")).toContain("breaker cells: 1");
+      expect(output.join("")).toContain("cooling facts: 1");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("exits 1 when no relay answers", async () => {
+    const configPath = join(dir, "offline-config.json");
+    writeFileSync(configPath, JSON.stringify(configAt("127.0.0.1:65534"), null, 2));
+    process.argv = ["node", "cli.ts", "--config", configPath, "cooldowns", "clear", "anthropic"];
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(runCooldowns("clear", "anthropic")).rejects.toThrow("exit:1");
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("relay must be running"));
+  });
+
+  it("rejects a missing credential label instead of widening the clear", async () => {
+    process.argv = ["node", "cli.ts", "cooldowns", "clear", "anthropic", "--credential"];
+    const request = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("must not fetch"));
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(runCooldowns("clear", "anthropic")).rejects.toThrow("exit:1");
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("--credential requires a value"));
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "an unknown flag",
+      ["cooldowns", "clear", "anthropic", "--credentail=backup"],
+      "unknown option",
+    ],
+    [
+      "duplicate command flags",
+      ["cooldowns", "clear", "anthropic", "--credential", "backup", "--credential=primary"],
+      "duplicate option",
+    ],
+    [
+      "duplicate aliases for one global flag",
+      ["--config", "one.json", "-c", "two.json", "cooldowns", "clear", "anthropic"],
+      "duplicate option",
+    ],
+    [
+      "a boolean flag with a value",
+      ["cooldowns", "clear", "anthropic", "--json=true"],
+      "does not take a value",
+    ],
+    [
+      "an extra positional",
+      ["cooldowns", "clear", "anthropic", "claude-sonnet"],
+      "usage:",
+    ],
+    [
+      "a missing target positional",
+      ["cooldowns", "clear"],
+      "usage:",
+    ],
+  ])("rejects %s before sending a clear request", async (_case, args, message) => {
+    process.argv = ["node", "cli.ts", ...args];
+    const request = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("must not fetch"));
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(runCooldowns(undefined, undefined)).rejects.toThrow("exit:1");
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining(message));
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a typoed flag and its stray value", ["--credentail", "backup", "cooldowns", "clear", "anthropic"]],
+    ["a missing value for a recognized flag", ["--credential", "cooldowns", "clear", "anthropic"]],
+  ])("routes %s before the command into fail-closed entrypoint parsing", (_case, args) => {
+    process.argv = ["node", "cli.ts", ...args];
+    const request = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("must not fetch"));
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    expect(() => main()).toThrow("exit:1");
+    expect(stderr).toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed clear argv before the update gate can send any request", async () => {
+    process.argv = ["node", "cli.ts", "cooldowns", "clear", "anthropic", "extra"];
+    const request = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("must not fetch"));
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(run()).rejects.toThrow("exit:1");
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "a target missing one requested optional field",
+      {
+        ...responseBody,
+        target: { provider: "anthropic", model: "claude-sonnet" },
+      },
+    ],
+    [
+      "a same-shape target with a mismatched selector value",
+      {
+        ...responseBody,
+        target: { provider: "anthropic", model: "claude-sonnet", credential: "primary" },
+      },
+    ],
+    [
+      "a malformed breaker cell",
+      {
+        ...responseBody,
+        cleared: {
+          ...responseBody.cleared,
+          breakerCells: { count: 1, items: [null] },
+        },
+      },
+    ],
+    [
+      "a fact outside the cooling-kind allow-list",
+      {
+        ...responseBody,
+        cleared: {
+          ...responseBody.cleared,
+          facts: {
+            count: 1,
+            items: [{
+              kind: "context-limit",
+              scope: responseBody.cleared.facts.items[0]!.scope,
+            }],
+          },
+        },
+      },
+    ],
+    [
+      "a malformed discriminated fact scope",
+      {
+        ...responseBody,
+        cleared: {
+          ...responseBody.cleared,
+          facts: {
+            count: 1,
+            items: [{
+              kind: "rate-limited",
+              scope: {
+                kind: "attempt",
+                provider: "anthropic",
+                model: "claude-sonnet",
+              },
+            }],
+          },
+        },
+      },
+    ],
+    [
+      "a structurally valid item outside the requested target",
+      {
+        ...responseBody,
+        cleared: {
+          ...responseBody.cleared,
+          breakerCells: {
+            count: 1,
+            items: [{ provider: "anthropic", model: "other-model", credential: "backup" }],
+          },
+        },
+      },
+    ],
+    [
+      "a structurally valid fact scope outside the requested target",
+      {
+        ...responseBody,
+        cleared: {
+          ...responseBody.cleared,
+          facts: {
+            count: 1,
+            items: [{
+              kind: "rate-limited",
+              scope: {
+                kind: "attempt",
+                provider: "anthropic",
+                model: "claude-sonnet",
+                credentialId: "anthropic#primary",
+              },
+            }],
+          },
+        },
+      },
+    ],
+  ])("fails cleanly when a 2xx response contains %s", async (_case, payload) => {
+    const configPath = join(dir, "invalid-response-config.json");
+    writeFileSync(configPath, JSON.stringify(configAt("127.0.0.1:8791"), null, 2));
+    process.argv = [
+      "node", "cli.ts", "--config", configPath,
+      "cooldowns", "clear", "anthropic/claude-sonnet", "--credential", "backup",
+    ];
+    const request = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify(payload),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(runCooldowns("clear", "anthropic/claude-sonnet")).rejects.toThrow("exit:1");
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("invalid cooldown-clear response"));
+    expect(stdout).not.toHaveBeenCalled();
+  });
+});
+
 /**
  * The status view must render the EFFECTIVE freeOnly, not the bare optional. `freeOnlyApplies`
  * (server.ts) is `rule.freeOnly ?? rerouted`: an UNSET flag is ON for offload-rerouted traffic
@@ -646,6 +984,8 @@ describe("classifyCommand — the update-check gate", () => {
     }
     // Reporting spend changes a running proxy's in-memory cooldowns, nothing on this machine.
     expect(classifyCommand(argv("dispatch", "-x", "codex"))).toBe("read-only");
+    expect(classifyCommand(argv("cooldowns"))).toBe("read-only");
+    expect(classifyCommand(argv("cooldowns", "clear", "anthropic"))).toBe("mutating");
   });
 
   it("classifies a bare proxy start mutating", () => {

@@ -78,6 +78,23 @@ export interface DeploymentMeasurement {
 export type CooldownSource =
   "default" | "escalation" | "retry-after" | "loopback" | "quota";
 
+export interface CooldownClearSelector {
+  readonly provider: string;
+  readonly model?: string;
+  readonly credentialId?: string;
+}
+
+export interface ClearedCircuitCell {
+  readonly provider: string;
+  readonly model: string | null;
+  readonly credentialId: string;
+}
+
+export interface CircuitCooldownClearResult {
+  readonly breakerCells: ClearedCircuitCell[];
+  readonly credentialFaults: ClearedCircuitCell[];
+}
+
 const DEFAULT_COOLDOWN_MS = 60_000;
 const RATE_LIMIT_ESCALATION_MS = [
   120_000, 600_000, 3_600_000, 86_400_000,
@@ -131,6 +148,29 @@ function sameDeployment(
   return (
     target.provider === deployment.provider && target.model === deployment.model
   );
+}
+
+function matchesClearSelector(
+  target: ProviderTargetIdentity,
+  selector: CooldownClearSelector,
+): boolean {
+  return target.provider === selector.provider &&
+    (selector.model === undefined || target.model === selector.model) &&
+    (selector.credentialId === undefined || target.credentialId === selector.credentialId);
+}
+
+function clearedCell(target: ProviderTargetIdentity): ClearedCircuitCell {
+  return {
+    provider: target.provider,
+    model: target.model,
+    credentialId: target.credentialId,
+  };
+}
+
+function compareClearedCells(a: ClearedCircuitCell, b: ClearedCircuitCell): number {
+  return a.provider.localeCompare(b.provider) ||
+    a.credentialId.localeCompare(b.credentialId) ||
+    (a.model ?? "").localeCompare(b.model ?? "");
 }
 
 const breakerHandleOwners = new WeakMap<object, object>();
@@ -463,6 +503,44 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       cleared += 1;
     }
     return cleared;
+  }
+
+  /**
+   * Clear operator-addressed cooling state without manufacturing a successful observation.
+   * Failure/stability history and quota measurements remain evidence; only the fields that
+   * currently demote a cell, plus the unexplained-429 ladder, are reset.
+   */
+  clearCooldownState(selector: CooldownClearSelector): CircuitCooldownClearResult {
+    const breakerCells: ClearedCircuitCell[] = [];
+    const credentialFaults: ClearedCircuitCell[] = [];
+    for (const state of this.states.values()) {
+      if (!matchesClearSelector(state.target, selector)) continue;
+
+      if (
+        state.cooldownUntil !== 0 ||
+        state.cooldownSource !== null ||
+        state.unexplained429s !== 0
+      ) {
+        state.cooldownUntil = 0;
+        state.cooldownSource = null;
+        state.unexplained429s = 0;
+        breakerCells.push(clearedCell(state.target));
+      }
+
+      if (
+        state.credentialFaultUntil !== 0 ||
+        state.credentialFailures !== 0 ||
+        state.lastCredentialStatus !== undefined
+      ) {
+        state.credentialFaultUntil = 0;
+        state.credentialFailures = 0;
+        delete state.lastCredentialStatus;
+        credentialFaults.push(clearedCell(state.target));
+      }
+    }
+    breakerCells.sort(compareClearedCells);
+    credentialFaults.sort(compareClearedCells);
+    return { breakerCells, credentialFaults };
   }
 
   /** Exact-cell credential fault only. */
