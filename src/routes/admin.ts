@@ -199,8 +199,9 @@ export async function handleAdminRoutes(
       provider?: unknown;
       model?: unknown;
       credential?: unknown;
+      kinds?: unknown;
     };
-    const allowedKeys = new Set(["provider", "model", "credential"]);
+    const allowedKeys = new Set(["provider", "model", "credential", "kinds"]);
     const unknownKey = Object.keys(body).find((key) => !allowedKeys.has(key));
     if (unknownKey !== undefined) {
       return bad(400, `POST /cooldowns/clear does not accept property "${unknownKey}"`);
@@ -214,6 +215,14 @@ export async function handleAdminRoutes(
     if (body.credential !== undefined && (typeof body.credential !== "string" || body.credential.length === 0)) {
       return bad(400, `POST /cooldowns/clear credential must be a non-empty string when provided`);
     }
+    if (
+      body.kinds !== undefined &&
+      (!Array.isArray(body.kinds) ||
+        body.kinds.length !== 1 ||
+        body.kinds[0] !== "credential-fault")
+    ) {
+      return bad(400, `POST /cooldowns/clear kinds must be exactly ["credential-fault"] when provided`);
+    }
     if (!Object.hasOwn(cfg.providers, body.provider)) {
       return bad(400, `POST /cooldowns/clear: no provider "${body.provider}" configured`);
     }
@@ -222,6 +231,7 @@ export async function handleAdminRoutes(
         provider: body.provider,
         ...(body.model === undefined ? {} : { model: body.model }),
         ...(body.credential === undefined ? {} : { credential: body.credential }),
+        ...(body.kinds === undefined ? {} : { kinds: ["credential-fault"] as const }),
       }), true);
     } catch (error) {
       return bad(400, `POST /cooldowns/clear: ${(error as Error).message}`);

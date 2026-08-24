@@ -29,10 +29,14 @@ import {
 } from "node:crypto";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import {
+  createPassphraseKek,
   createKek,
+  derivePassphraseKek,
   unwrapKek,
   type KekDescriptor,
+  type KekWrapMode,
   type KeyringOptions,
+  type ScryptKdfDescriptor,
 } from "./os-keyring.js";
 import {
   restrictSecretDirectoryOnWindowsSync,
@@ -53,6 +57,8 @@ const FINGERPRINT_PATTERN = /^hmac:[0-9a-f]{8}$/;
 const ITEM_ID_PATTERN = /^[0-9a-f]{32}$/;
 const KEK_CHECK_PATTERN = /^[0-9a-f]{64}$/;
 const KEK_CHECK_CONTEXT = "llm-relay-kek-v1";
+const EXPORT_AAD = Buffer.from("llm-relay-keystore-export-v1", "utf8");
+const EXPORT_SOURCE = "llm-relay-keystore";
 const UNREADABLE_RETRY_MS = 30_000;
 const UNLOCK_RETRY_MS = 60_000;
 
@@ -112,6 +118,21 @@ export interface KeystoreOptions extends KeyringOptions {
 export interface KeystoreStatus {
   status: "ok" | "absent" | "unreadable" | "locked" | "degraded";
   droppedCount: number;
+}
+
+export interface KeystoreExportEntry extends KeystoreEntryDescriptor {
+  /** Secret-bearing. This type is only returned after decrypting an encrypted export. */
+  value: string;
+}
+
+interface KeystoreExportEnvelope {
+  version: 1;
+  source: typeof EXPORT_SOURCE;
+  kdf: ScryptKdfDescriptor;
+  cipher: "aes-256-gcm";
+  iv: string;
+  tag: string;
+  ciphertext: string;
 }
 
 export interface AddEntryInput {
@@ -183,6 +204,13 @@ export class KeystoreUnlockError extends Error {
   constructor() {
     super("keystore unlock failed");
     this.name = "KeystoreUnlockError";
+  }
+}
+
+export class KeystoreExportError extends Error {
+  constructor(message = "encrypted keystore export is invalid or cannot be decrypted") {
+    super(message);
+    this.name = "KeystoreExportError";
   }
 }
 
@@ -1128,6 +1156,255 @@ export function setDisabled(entryId: string, disabled: boolean, opts: KeystoreOp
   refuseCryptographicDegradationWhenUnlockable(store, path, opts);
   entry.disabled = disabled;
   persistStore(path, store, opts);
+  return descriptorOf(entry);
+}
+
+/** Read only the wrapping mode; passphrase bytes and KEK recovery are deliberately not involved. */
+export function keystoreWrapMode(opts: KeystoreOptions = {}): KekWrapMode | null {
+  const path = resolveKeystorePath(opts);
+  const loaded = loadStore(path, opts);
+  if (loaded.status === "fresh") return null;
+  if (loaded.status === "unreadable") throw new KeystoreReadError(loaded.errno);
+  return loaded.store.kek.wrap;
+}
+
+/**
+ * Explicitly verify a passphrase store against its persisted KEK verifier.
+ * Other wrap modes are a metadata-only no-op.
+ */
+export function verifyKeystoreUnlock(opts: KeystoreOptions = {}): KekWrapMode | null {
+  const path = resolveKeystorePath(opts);
+  const loaded = loadStore(path, opts);
+  if (loaded.status === "fresh") return null;
+  if (loaded.status === "unreadable") throw new KeystoreReadError(loaded.errno);
+  const mode = loaded.store.kek.wrap;
+  if (mode !== "passphrase") return mode;
+
+  // An explicit operator retry starts a fresh verifier attempt. Otherwise the resolver's
+  // bounded wrong-passphrase cooldown could reject a corrected passphrase in this process.
+  lock({ path });
+  const recovered = recoverVerifiedStoreKek(loaded.store, path, opts);
+  try {
+    return mode;
+  } finally {
+    if (!recovered.cached) recovered.kek.fill(0);
+    lock({ path });
+  }
+}
+
+interface KeystoreExportPayload {
+  version: 1;
+  entries: KeystoreExportEntry[];
+}
+
+function parseExportEnvelope(text: string): KeystoreExportEnvelope | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isObject(parsed) || !hasExactKeys(parsed, [
+    "version", "source", "kdf", "cipher", "iv", "tag", "ciphertext",
+  ])) return null;
+  if (
+    parsed.version !== 1 ||
+    parsed.source !== EXPORT_SOURCE ||
+    parsed.cipher !== "aes-256-gcm" ||
+    !isObject(parsed.kdf) ||
+    !hasExactKeys(parsed.kdf, ["n", "r", "p", "salt"]) ||
+    parsed.kdf.n !== 16_384 ||
+    parsed.kdf.r !== 8 ||
+    parsed.kdf.p !== 1 ||
+    typeof parsed.kdf.salt !== "string" ||
+    decodeBase64(parsed.kdf.salt, 32) === null ||
+    typeof parsed.iv !== "string" ||
+    decodeBase64(parsed.iv, GCM_IV_LENGTH) === null ||
+    typeof parsed.tag !== "string" ||
+    decodeBase64(parsed.tag, GCM_TAG_LENGTH) === null ||
+    typeof parsed.ciphertext !== "string" ||
+    (decodeBase64(parsed.ciphertext)?.length ?? 0) === 0
+  ) return null;
+  return parsed as unknown as KeystoreExportEnvelope;
+}
+
+function validExportEntry(value: unknown): value is KeystoreExportEntry {
+  if (!isObject(value) || !hasExactKeys(value, [
+    "id", "provider", "envName", "fingerprint", "addedAt", "rotatedAt", "expiresAt",
+    "revokedAt", "disabled", "value",
+  ])) return false;
+  const parsedId = typeof value.id === "string" ? parseCredentialId(value.id) : null;
+  return parsedId !== null &&
+    typeof value.provider === "string" && PROVIDER_PATTERN.test(value.provider) &&
+    parsedId.provider === value.provider &&
+    typeof value.envName === "string" && ENV_NAME_PATTERN.test(value.envName) &&
+    typeof value.fingerprint === "string" && FINGERPRINT_PATTERN.test(value.fingerprint) &&
+    validTimestamp(value.addedAt) &&
+    validNullableTimestamp(value.rotatedAt) &&
+    validNullableTimestamp(value.expiresAt) &&
+    validNullableTimestamp(value.revokedAt) &&
+    typeof value.disabled === "boolean" &&
+    typeof value.value === "string" && keyIsPresent(value.value);
+}
+
+function parseExportPayload(value: unknown): KeystoreExportPayload | null {
+  if (!isObject(value) || !hasExactKeys(value, ["version", "entries"]) ||
+      value.version !== 1 || !Array.isArray(value.entries)) return null;
+  const entries: KeystoreExportEntry[] = [];
+  const ids = new Set<string>();
+  const envNames = new Set<string>();
+  for (const candidate of value.entries) {
+    if (!validExportEntry(candidate) || ids.has(candidate.id) || envNames.has(candidate.envName)) {
+      return null;
+    }
+    ids.add(candidate.id);
+    envNames.add(candidate.envName);
+    entries.push(candidate);
+  }
+  return { version: 1, entries };
+}
+
+/** True only for this CLI's closed, versioned encrypted-export envelope. */
+export function isEncryptedKeystoreExport(text: string): boolean {
+  return parseExportEnvelope(text) !== null;
+}
+
+/**
+ * Decrypt every usable row and immediately re-encrypt the whole logical payload under an
+ * export-time passphrase. A plaintext export API deliberately does not exist.
+ */
+export function createEncryptedKeystoreExport(
+  exportPassphrase: string | Buffer,
+  opts: KeystoreOptions = {},
+): string {
+  const path = resolveKeystorePath(opts);
+  const loaded = loadStore(path, opts);
+  if (loaded.status === "fresh") throw new KeystoreReadError("ENOENT");
+  if (loaded.status === "unreadable") throw new KeystoreReadError(loaded.errno);
+  if (loaded.status === "degraded") {
+    throw new KeystoreMutationRefusedError("degraded", loaded.droppedCount);
+  }
+  // Derive the export key before decrypting any row, so KDF failure cannot strand an owned
+  // plaintext payload buffer. Every Buffer below enters the outer cleanup scope immediately.
+  const created = createPassphraseKek(exportPassphrase);
+  let iv: Buffer | undefined;
+  let plaintext: Buffer | undefined;
+  let ciphertext: Buffer | undefined;
+  let tag: Buffer | undefined;
+  try {
+    iv = randomBytes(GCM_IV_LENGTH);
+    const recovered = recoverVerifiedStoreKek(loaded.store, path, opts);
+    const entries: KeystoreExportEntry[] = [];
+    try {
+      for (const entry of loaded.store.entries) {
+        const value = decryptEntryValue(entry, recovered.kek, loaded.store.fpSalt);
+        if (value === null) throw new KeystoreMutationRefusedError("degraded", 1);
+        entries.push({ ...descriptorOf(entry), value });
+      }
+    } finally {
+      if (!recovered.cached) recovered.kek.fill(0);
+    }
+    const payload: KeystoreExportPayload = { version: 1, entries };
+    plaintext = Buffer.from(JSON.stringify(payload), "utf8");
+    const cipher = createCipheriv("aes-256-gcm", created.kek, iv);
+    cipher.setAAD(EXPORT_AAD);
+    ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    tag = cipher.getAuthTag();
+    const kdf = created.descriptor.kdf;
+    if (created.descriptor.wrap !== "passphrase" || kdf === undefined) {
+      throw new KeystoreExportError();
+    }
+    const envelope: KeystoreExportEnvelope = {
+      version: 1,
+      source: EXPORT_SOURCE,
+      kdf,
+      cipher: "aes-256-gcm",
+      iv: iv.toString("base64"),
+      tag: tag.toString("base64"),
+      ciphertext: ciphertext.toString("base64"),
+    };
+    return `${JSON.stringify(envelope, null, 2)}\n`;
+  } finally {
+    tag?.fill(0);
+    ciphertext?.fill(0);
+    plaintext?.fill(0);
+    iv?.fill(0);
+    created.kek.fill(0);
+  }
+}
+
+/** Decrypt an encrypted export for immediate insertion into another keystore. */
+export function decryptEncryptedKeystoreExport(
+  text: string,
+  passphrase: string | Buffer,
+): KeystoreExportEntry[] {
+  const envelope = parseExportEnvelope(text);
+  if (envelope === null) throw new KeystoreExportError();
+  let key: Buffer | undefined;
+  let iv: Buffer | undefined;
+  let tag: Buffer | undefined;
+  let ciphertext: Buffer | undefined;
+  let plaintext: Buffer | undefined;
+  try {
+    key = derivePassphraseKek(passphrase, envelope.kdf);
+    iv = Buffer.from(envelope.iv, "base64");
+    tag = Buffer.from(envelope.tag, "base64");
+    ciphertext = Buffer.from(envelope.ciphertext, "base64");
+    const decipher = createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAAD(EXPORT_AAD);
+    decipher.setAuthTag(tag);
+    plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    const parsed = parseExportPayload(JSON.parse(plaintext.toString("utf8")) as unknown);
+    if (parsed === null) throw new KeystoreExportError();
+    return parsed.entries;
+  } catch (error) {
+    if (error instanceof KeystoreExportError) throw error;
+    throw new KeystoreExportError();
+  } finally {
+    key?.fill(0);
+    iv?.fill(0);
+    tag?.fill(0);
+    ciphertext?.fill(0);
+    plaintext?.fill(0);
+  }
+}
+
+/** Restore one authenticated export row, re-encrypting under the destination store's KEK. */
+export function restoreEntryFromExport(
+  input: KeystoreExportEntry,
+  opts: KeystoreOptions = {},
+): KeystoreEntryDescriptor {
+  if (!validExportEntry(input)) throw new KeystoreExportError();
+  const path = resolveKeystorePath(opts);
+  const loaded = loadStore(path, opts);
+  if (loaded.status === "unreadable" || loaded.status === "degraded") refuseMutation(loaded);
+  const existing = loaded.status === "fresh" ? null : cloneStoreForMutation(loaded.store);
+  if (existing?.entries.some((entry) => entry.id === input.id || entry.envName === input.envName)) {
+    throw new KeystoreEntryExistsError();
+  }
+  const initialized = existing === null
+    ? createStore(path, opts)
+    : { store: existing, kek: unlockStoreForWrite(existing, path, opts) };
+  const entry: StoredEntry = {
+    id: input.id,
+    provider: input.provider,
+    envName: input.envName,
+    ...encryptEntryValue(
+      input.value,
+      input.provider,
+      input.id,
+      input.envName,
+      initialized.kek,
+      initialized.store.fpSalt,
+    ),
+    addedAt: input.addedAt,
+    rotatedAt: input.rotatedAt,
+    expiresAt: input.expiresAt,
+    revokedAt: input.revokedAt,
+    disabled: input.disabled,
+  };
+  initialized.store.entries.push(entry);
+  persistStore(path, initialized.store, opts);
   return descriptorOf(entry);
 }
 

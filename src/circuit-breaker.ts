@@ -505,6 +505,24 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     return cleared;
   }
 
+  /** Clear only credential-fault fields inside an operator-addressed selection. */
+  clearCredentialFaultState(selector: CooldownClearSelector): ClearedCircuitCell[] {
+    const credentialFaults: ClearedCircuitCell[] = [];
+    for (const state of this.states.values()) {
+      if (!matchesClearSelector(state.target, selector)) continue;
+      if (
+        state.credentialFaultUntil === 0 &&
+        state.credentialFailures === 0 &&
+        state.lastCredentialStatus === undefined
+      ) continue;
+      state.credentialFaultUntil = 0;
+      state.credentialFailures = 0;
+      delete state.lastCredentialStatus;
+      credentialFaults.push(clearedCell(state.target));
+    }
+    return credentialFaults.sort(compareClearedCells);
+  }
+
   /**
    * Clear operator-addressed cooling state without manufacturing a successful observation.
    * Failure/stability history and quota measurements remain evidence; only the fields that

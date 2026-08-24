@@ -174,6 +174,105 @@ Config strings may reference env vars as `${NAME}`. An unset `${NAME}` in a prov
 startup — losing *every* route is still fatal. CLI startup overrides (`--default`, `--mode`,
 `--listen`) win over the file.
 
+### Key custody
+
+`llm-relay keys` manages an encrypted keystore at `~/.llm-relay/keystore.json`. Secrets are
+encrypted individually with AES-256-GCM under a store key recovered through the platform
+mechanism or scrypt passphrase mode below. A secret is never accepted on argv: an interactive
+command uses an echo-off prompt, and automation may pipe exactly one line on stdin.
+
+The threat boundary is deliberately narrow:
+
+- **What it stops:** a copy of `keystore.json` alone — committed in a repo, synced to cloud
+  storage, pulled from a partial backup, or moved to another machine — is useless.
+- **What it does not stop:** a copy of the **whole user profile together with the account
+  password**. `%APPDATA%\Microsoft\Protect` travels in a whole-profile backup, and an offline
+  attacker holding it plus the password (or its hash, or a domain backup key) can decrypt
+  CurrentUser blobs. This is routine, not exotic.
+- **What nothing user-side stops:** code already running as you.
+- An **admin-forced password reset** on a non-domain machine destroys the DPAPI master key and
+  every entry becomes undecryptable. A normal password change is fine.
+
+Design 1's phrasing — "there is no key file at all", "lifted out of a backup is undecryptable" —
+was overstated and is corrected here. The DPAPI master key *is* a file, in the same profile; what
+changes is that it is wrapped by the logon credential. That remains a strict improvement over a
+master key sitting beside the ciphertext, and saying so precisely costs nothing.
+
+⚠ **Measured, do not re-derive:** `ProtectedData.Unprotect(blob, null, 'LocalMachine')` on a
+`CurrentUser`-protected blob **succeeds**. The scope argument is not validated on unprotect; the
+blob carries its own scope. Do not treat passing it as a safety check.
+
+The authenticated entry metadata protects against a writer that has **not** unlocked the store
+key, such as a restored backup, sync service, repo checkout, torn write, or hand edit. Code already
+running as the user can unwrap the key and re-encrypt with valid metadata. Envelope encryption
+also leaves the unwrapped key subject to JavaScript garbage-collector lifetime; do not run a
+credential-bearing relay with `--inspect`, `--heapsnapshot-signal`, or `--report-on-fatalerror`.
+
+#### Resolution and coexistence
+
+Credential precedence is source-major: **process environment > `~/.llm-relay/.env` > keystore**.
+The first two sources therefore shadow a stored entry. `keys add` still stores the new entry but
+prints the winning variable and whether it came from the process environment or the dotenv file.
+`keys rotate` is stricter: it refuses without changing the store or live state unless the keystore
+entry is what actually resolves. Otherwise rotation would change nothing on the wire while
+deleting learned facts about the credential that is still serving.
+
+There is a deliberate read/write asymmetry. A legacy read walks the full existing candidate-name
+family, including provider-derived names, to preserve environment compatibility. `keys add` and
+`keys import` accept only names declared by the loaded provider configuration plus that provider's
+closed curated alias list. An inferred or guessed name is never accepted for a write. Explicit
+`credentials[]` slots remain exact-name reads.
+
+`keys list` shows the provider, credential id, winning source (`env`, `env-file`, or `keystore`),
+fingerprint-derived mask, added/rotated dates, expiry, and revoked/disabled state. It never derives
+a mask from secret bytes and never prints a secret. When rows were dropped it prints the exact
+store summary `N shown, M unreadable`; it also names a degraded, locked, or unreadable store state.
+This is the newly started CLI process's view; it is not proof of what environment a relay process
+that started earlier can see.
+
+#### Lifecycle commands
+
+| Command | Behaviour |
+| :--- | :--- |
+| `llm-relay keys` / `llm-relay keys check` / `llm-relay check-keys` | Check every configured credential slot; bare `keys` and `check-keys` retain the historical status output. |
+| `llm-relay keys add <provider> [--label <label>] [--env-name <NAME>] [--check]` | Store one stdin/prompted secret. The provider must exist, declare an auth environment name or matching credential slot, and not be passthrough; the name must pass the strict write gate above. The default label is `default`, or the matching slot label; the default name is the provider/slot declaration. `--check` validates after storing, and a failed or inconclusive check never rolls storage back. Every successful add prints the threat boundary above. |
+| `llm-relay keys list` | List non-secret resolution and lifecycle metadata plus store status. |
+| `llm-relay keys rotate <provider[#label]>` | Replace ciphertext under the same id and set `rotatedAt`; a bare provider means `provider#default`. Rotation deliberately un-revokes an entry and says so when it does. It refuses a shadowed entry. |
+| `llm-relay keys revoke <id>` | Set `revokedAt` and retain the row, so the missing credential remains explained. |
+| `llm-relay keys disable <id>` / `llm-relay keys enable <id>` | Toggle selection without deleting the row. |
+| `llm-relay keys remove <id> [--purge]` | Remove the row. Even overwrite-then-unlink would be theatre on a journaling filesystem or SSD; `--purge` does **not** claim secure erase. |
+| `llm-relay keys export --out <file>` | Export only a versioned encrypted envelope: scrypt with the keystore passphrase parameters, then AES-256-GCM over the full decrypted entries payload. The export passphrase is typed with echo off. There is no plaintext export path, and the store must be unlockable. |
+| `llm-relay keys import <file>` | Import an encrypted custody export, a plaintext FreeLLMAPI v1 envelope, or dotenv using the closed alias matcher. The destination is the keystore, and output names providers and environment variables but never values. After a plaintext import, remove/shred the source yourself; old contents may still survive in backups, filesystem journals, or unallocated SSD blocks. |
+| `llm-relay keys unlock` | Verify the passphrase-mode store verifier. Other wrap modes need no CLI unlock, so this is a no-op there. There is no cross-process KEK cache; each new command prompts when its selected wrap mode requires a passphrase. |
+
+Any other `keys` subcommand exits 1 and names the valid set. Older releases silently treated an
+unknown word as the status check; failing loudly avoids disguising a mistyped mutation.
+
+Revocation, removal, disabling, and enabling work even while secret material is locked because those
+lifecycle fields are not part of an entry's authenticated identity.
+
+All custody commands operate locally; there is no secret-bearing HTTP endpoint. The sole HTTP
+touch is after a successful, unshadowed rotation: when a relay is running, the CLI sends the
+credential selector and `kinds:["credential-fault"]` to the existing token-gated
+`POST /cooldowns/clear`. The request contains no secret and still passes the existing exact Host,
+Origin, content-type, and control-token admission checks. This narrow clear retracts breaker
+credential-fault state and `credential-invalid` cooling facts only. It does **not** clear
+`allowance-exhausted`, `not-servable`, `subscription-required`, rate-limit cooldowns, or the
+escalation ladder: replacing a key disproves an authentication fact, not an account allowance or
+back-pressure observation. If no relay is running, rotation still succeeds; live faults converge
+through their normal expiry or the relay's next successful use. The CLI never edits
+`target-facts.json` behind a running relay's write-behind cache.
+
+#### Platform and verification matrix
+
+| Platform / mode | KEK protection | Honest coverage label |
+| :--- | :--- | :--- |
+| Windows | DPAPI CurrentUser through Windows PowerShell 5.1 | Shipped and live-verifiable on the Windows development machine; this is real DPAPI coverage, not a portable claim. |
+| macOS | Login Keychain through `security` | Shipped; exercised with injected process doubles only. There is no macOS CI leg or live machine measurement. |
+| Linux with `secret-tool` | Desktop libsecret/keyring | Shipped; exercised with injected process doubles only. The Ubuntu CI leg does not provide a real desktop keyring. |
+| Linux passphrase mode | scrypt-derived KEK, prompted as needed | Shipped; the real cryptography path is exercised on Ubuntu CI. |
+| Linux without an available keyring or usable passphrase mode | None | Storage is refused. There is no plaintext or beside-the-ciphertext fallback. |
+
 ### Operator-declared rate limits (`limits`)
 
 A provider (or one of its credential slots) may carry a `limits` block asserting the rate
@@ -1202,7 +1301,7 @@ CLI reference below.
 | `llm-relay` | Start the proxy |
 | `llm-relay onboard [--import <file>] [--force]` | Set up or import provider keys |
 | `llm-relay setup <claude-cli\|claude-desktop>` | Point a client at the relay |
-| `llm-relay keys` | Check every configured credential slot |
+| `llm-relay keys [check\|add\|list\|rotate\|revoke\|remove\|disable\|enable\|export\|import\|unlock]` | Check or manage encrypted provider credentials; see [Key custody](#key-custody) |
 | `llm-relay pools [--probe]` | List pool members; `--probe` spends one completion per unique deployment through one serviceable slot |
 | `llm-relay pools <set\|add\|remove\|delete> <name> [spec...]` | Edit a pool |
 | `llm-relay routing <show\|get\|default\|tier\|subagent\|sort\|benchmark\|set\|unset>` | Edit routing |
@@ -1310,13 +1409,18 @@ read-only.
 ```
 
 The body must be a non-null, non-array JSON object. Its only permitted own keys are `provider`,
-`model`, and `credential`; every other own key, including a misspelled selector, is rejected.
-`provider` is required, must be a non-empty string, and must name a configured provider. `model`
-and `credential` are optional, but each must be a non-empty string when present and the credential
-must match the configured-label shape `[A-Za-z0-9_.-]{1,32}`. Non-object bodies, unknown keys,
-invalid values, and unknown providers return 400 before any breaker or fact mutation. A successful
-response groups only the state actually cleared and reports each group as an exact `count` plus
-`items`:
+`model`, `credential`, and `kinds`; every other own key, including a misspelled selector, is
+rejected. `provider` is required, must be a non-empty string, and must name a configured provider.
+`model` and `credential` are optional, but each must be a non-empty string when present and the
+credential must match the configured-label shape `[A-Za-z0-9_.-]{1,32}`. `kinds` is also optional,
+but its only accepted value is the exact one-element array `["credential-fault"]`. That form is
+reserved for `keys rotate`: it narrows mutation to breaker credential faults and active
+`credential-invalid` facts for the selector, leaving breaker cooldowns, the escalation ladder,
+and every other fact kind untouched. The ordinary `cooldowns clear` CLI omits `kinds` and retains
+the broad behaviour documented above. Non-object bodies, unknown keys, invalid values, unknown
+providers, and every other `kinds` value return 400 before any breaker or fact mutation. A
+successful response groups only the state actually cleared and reports each group as an exact
+`count` plus `items`:
 
 ```json
 {
@@ -1362,7 +1466,8 @@ CLI output renders the same three group counts and identifiers; `--json` prints 
 Neither form is rendered as success until the CLI validates the complete response contract:
 
 - the envelope has exactly `target` and `cleared`, and `target` has exactly the requested provider,
-  optional model, and optional credential, with the same optional-key presence as the request;
+  optional model, optional credential, and optional `kinds`, with the same optional-key presence as
+  the request;
 - `cleared` has exactly the breaker-cell, credential-fault, and fact groups; every `count` is a
   non-negative safe integer equal to its `items` array length;
 - every breaker or credential-fault item has exactly the provider/model/credential cell shape and
