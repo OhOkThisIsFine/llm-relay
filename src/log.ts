@@ -82,6 +82,14 @@ export interface RequestLog {
    * so for stream traffic — which is all agentic traffic — this is the only place the pass shows.
    */
   toolUseIdRewrites?: number;
+  /**
+   * How many OUTBOUND tool-call ids the request mapper rewrote to the serving provider's stated
+   * shape (`src/openai-request.ts`, `compat.toolCallIds: "strict9"` — mistral's
+   * `^[a-zA-Z0-9]{9}$`). Absent when none were, which is every provider that states no such rule.
+   *
+   * ⚠ A COUNT, never an id — the same rule as `toolUseIdRewrites`.
+   */
+  toolCallIdRewrites?: number;
   latencyMs: number;
 }
 
@@ -112,6 +120,7 @@ const LOG_FIELDS = [
   "errorKinds",
   "repair",
   "toolUseIdRewrites",
+  "toolCallIdRewrites",
   "latencyMs",
 ] as const satisfies readonly (keyof RequestLog)[];
 

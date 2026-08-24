@@ -1363,6 +1363,132 @@ describe("tool_use id minting on the OpenAI Responses front", () => {
 });
 
 /**
+ * The REQUEST-direction sibling, end to end on both fronts: outbound tool-call ids rewritten to
+ * the shape the serving provider's own validator states.
+ *
+ * mistral-medium-2505 answers HTTP 400 `invalid_function_call` (code 3280) — "Tool call id was
+ * toolu_01AAAAAAAAAAAAAAAAAAAAAA but must be a-z, A-Z, 0-9, with a length of 9" — for every id
+ * shape this relay forwards. Unlike the response-direction mint the count is final BEFORE egress,
+ * so a stream can announce it in a header honestly; the log counter is pinned alongside it.
+ */
+describe("outbound tool-call id rewriting (compat.toolCallIds strict9)", () => {
+  let dir: string;
+  let logFile: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "rp-toolcallid-"));
+    logFile = join(dir, "log.jsonl");
+  });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const BUFFERED = JSON.stringify({
+    id: "cmpl_1",
+    model: "mistral-medium-2505",
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }],
+  });
+
+  function cfgFor(backendPort: number, compat: unknown): Config {
+    return {
+      host: "127.0.0.1", port: 0,
+      providers: {
+        mistral: {
+          base: `http://127.0.0.1:${backendPort}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000,
+          ...(compat !== undefined ? { compat } : {}),
+        } as never,
+      },
+      routing: { default: "mistral/mistral-medium-2505", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "metadata", file: logFile },
+    };
+  }
+
+  const CONVERSATION = [
+    { role: "user", content: "read it" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_01AAAAAAAAAAAAAAAAAAAAAA", name: "Read", input: { file: "a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01AAAAAAAAAAAAAAAAAAAAAA", content: "ok" }] },
+  ];
+
+  it("announces in a header and counts in the log on the Messages front", async () => {
+    let seen: any = null;
+    const backend = await mockBackend((_path, raw) => {
+      seen = JSON.parse(raw);
+      return { headers: { "content-type": "application/json" }, body: BUFFERED };
+    });
+    const p = port(await startProxy(cfgFor(port(backend), { toolCallIds: "strict9" })));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "mistral/mistral-medium-2505", max_tokens: 64, messages: CONVERSATION,
+        tools: [{ name: "Read", input_schema: { type: "object", properties: { file: { type: "string" } } } }],
+      }),
+    });
+    await resp.text();
+
+    expect(resp.status).toBe(200);
+    expect(seen.messages[1].tool_calls[0].id).toMatch(/^[a-zA-Z0-9]{9}$/);
+    expect(resp.headers.get("x-llm-relay-tool-call-ids")).toBe("1 rewritten");
+    const rec = lastLogLine(logFile);
+    expect(rec["toolCallIdRewrites"]).toBe(1);
+    // A COUNT, never an id — neither the caller's nor the one the relay produced.
+    expect(JSON.stringify(rec)).not.toContain("toolu_01");
+  });
+
+  it("carries both announcements across the Responses front's rebuild", async () => {
+    const backend = await mockBackend(() => ({
+      headers: { "content-type": "application/json" },
+      body: BUFFERED,
+    }));
+    const p = port(await startProxy(cfgFor(port(backend), { toolCallIds: "strict9" })));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "mistral/mistral-medium-2505",
+        max_output_tokens: 64,
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "read it" }] },
+          { type: "function_call", call_id: "call_abc123", name: "Read", arguments: '{"file":"a"}' },
+          { type: "function_call_output", call_id: "call_abc123", output: "ok" },
+        ],
+        tools: [{ type: "function", name: "Read", parameters: { type: "object", properties: { file: { type: "string" } } } }],
+      }),
+    });
+    await resp.text();
+
+    expect(resp.status).toBe(200);
+    // The Responses front re-enters `fetchBackend`, so it inherits the rewrite — and rebuilding
+    // its response must not swallow the announcement.
+    expect(resp.headers.get("x-llm-relay-tool-call-ids")).toBe("1 rewritten");
+    const rec = lastLogLine(logFile);
+    expect(rec["path"]).toBe("/v1/responses");
+    expect(rec["toolCallIdRewrites"]).toBe(1);
+  });
+
+  it("says nothing at all for a provider that states no such rule", async () => {
+    let seen: any = null;
+    const backend = await mockBackend((_path, raw) => {
+      seen = JSON.parse(raw);
+      return { headers: { "content-type": "application/json" }, body: BUFFERED };
+    });
+    const p = port(await startProxy(cfgFor(port(backend), undefined)));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "mistral/mistral-medium-2505", max_tokens: 64, messages: CONVERSATION }),
+    });
+    await resp.text();
+
+    expect(seen.messages[1].tool_calls[0].id).toBe("toolu_01AAAAAAAAAAAAAAAAAAAAAA");
+    expect(resp.headers.get("x-llm-relay-tool-call-ids")).toBeNull();
+    expect(Object.keys(lastLogLine(logFile))).not.toContain("toolCallIdRewrites");
+  });
+});
+
+/**
  * The wiring `observeEligibility` owes `recordFact`: the rung `resolveReset` selected must land on
  * the stored row as `untilBasis`, so the availability producer's reviewed-rule rung can read a
  * reset's provenance off the fact rather than re-deriving it from vendor prose in the read path.

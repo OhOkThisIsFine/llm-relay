@@ -39,7 +39,7 @@ import {
   type Reshaper,
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -3835,9 +3835,16 @@ async function openAiFrontPath(
  * runs while the body drains, so the figure is final once the request is over and would be a guess
  * any earlier. A count, never an id.
  */
-function toolUseIdRewriteField(source: Response): { toolUseIdRewrites?: number } {
+function toolUseIdRewriteField(source: Response): { toolUseIdRewrites?: number; toolCallIdRewrites?: number } {
   const rewrites = toolUseIdRewrites(source);
-  return rewrites === undefined ? {} : { toolUseIdRewrites: rewrites };
+  // The REQUEST-direction sibling: ids the mapper rewrote to the provider's stated shape
+  // (`compat.toolCallIds: "strict9"`). Final before egress, but read here so both counters travel
+  // together and a stream reports both in the one place it can.
+  const outbound = toolCallIdRewrites(source);
+  return {
+    ...(rewrites === undefined ? {} : { toolUseIdRewrites: rewrites }),
+    ...(outbound === undefined ? {} : { toolCallIdRewrites: outbound }),
+  };
 }
 
 /** Winning-candidate response metadata, shared by transparent and repair streaming paths. */

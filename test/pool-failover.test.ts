@@ -1554,6 +1554,55 @@ describe("outbound request shape holds on the FAILOVER candidate too", () => {
     expect(b.bodies()[0].messages).toEqual(a.bodies()[0].messages);
   });
 
+  it("rewrites outbound tool-call ids per CANDIDATE — the strict9 member only, the generic one verbatim", async () => {
+    // mistral-medium-2505 answers HTTP 400 `invalid_function_call` (code 3280) — "Tool call id
+    // was toolu_01AAAAAAAAAAAAAAAAAAAAAA but must be a-z, A-Z, 0-9, with a length of 9" — so the
+    // relay rewrites outbound ids for a provider whose validator states that rule.
+    //
+    // ⚠ The rule the test above pins ("same translation both times") holds for a SAME-COMPAT
+    // fixture and is unchanged. Here the two candidates deliberately resolve DIFFERENT compat
+    // modes, so the new rule is: the outbound body is a pure function of (caller body, that
+    // candidate's resolved compat) — never of walk position or of what an earlier candidate saw.
+    //
+    // The mode is set explicitly rather than via the labelled `*.mistral.ai` base-host default,
+    // because these candidates are loopback HTTP servers; the base-host default itself is pinned
+    // in test/config.test.ts, and both paths converge on the same resolved value.
+    const a = await recording(() => ({ status: 429, body: RATE_LIMITED }));
+    const b = await recording(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`]);
+    cfg.providers.p1!.compat = { toolCallIds: "strict9" };
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "pool/coding", max_tokens: 64, messages: AGENTIC_MESSAGES,
+        tools: [{ name: "Grep", description: "g", input_schema: { type: "object", properties: { pattern: { type: "string" } } } }],
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    const strict = a.bodies()[0];
+    const generic = b.bodies()[0];
+
+    const strictIds = strict.messages.find((m: any) => m.role === "assistant").tool_calls.map((c: any) => c.id);
+    for (const id of strictIds) expect(id).toMatch(/^[a-zA-Z0-9]{9}$/);
+    expect(new Set(strictIds).size).toBe(2);
+    // Linkage survives: each tool message answers the id its call was actually given.
+    expect(strict.messages.filter((m: any) => m.role === "tool").map((m: any) => m.tool_call_id)).toEqual(strictIds);
+    expect(JSON.stringify(strict)).not.toContain("toolu_01A");
+
+    // The generic candidate is untouched — a provider that states no such rule gets the caller's
+    // own ids, byte for byte.
+    assertCleanOutbound(generic);
+
+    // Everything OTHER than the ids is the same translation on both candidates.
+    const stripIds = (body: any) =>
+      JSON.parse(JSON.stringify(body.messages).replace(/"(?:id|tool_call_id)":"[^"]*"/g, '"id":"X"'));
+    expect(stripIds(strict)).toEqual(stripIds(generic));
+  });
+
   it("OpenAI front → openai-kind Chat stays byte-transparent on both candidates (the untouched front)", async () => {
     // The Chat/Chat pair never enters `anthropicRequestToOpenAi`: `fetchOpenAiFront` proxies the
     // caller's own OpenAI body. Pinned here so a future change to the request mapper cannot
