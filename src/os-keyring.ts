@@ -2,6 +2,7 @@ import { randomBytes as nodeRandomBytes, scryptSync, timingSafeEqual } from "nod
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 import { accessSync, constants as fsConstants } from "node:fs";
 import { delimiter, join, win32 } from "node:path";
+import { windowsSystem32Executable } from "./secret-file-acl.js";
 
 const KEK_BYTES = 32;
 const SCRYPT_SALT_BYTES = 32;
@@ -116,9 +117,11 @@ export class KeyringPassphraseRequiredError extends Error {
 
 /** Resolve Windows PowerShell 5.1 without consulting PATH. */
 export function windowsPowerShellPath(env: NodeJS.ProcessEnv = process.env): string {
-  const candidate = env.SystemRoot?.trim() || env.SYSTEMROOT?.trim() || "C:\\Windows";
-  const systemRoot = win32.isAbsolute(candidate) ? candidate : "C:\\Windows";
-  return win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const systemRoot = env.SystemRoot?.trim() || env.SYSTEMROOT?.trim() || "";
+  return windowsSystem32Executable(
+    win32.join("WindowsPowerShell", "v1.0", "powershell.exe"),
+    systemRoot,
+  );
 }
 
 function keyringId(keyId?: string): string {
@@ -189,8 +192,12 @@ export function commandExistsOnPath(
   return false;
 }
 
-const spawnCaptured: KeyringSpawnSync = (command, args, options) =>
-  nodeSpawnSync(command, args, options);
+const spawnCaptured: KeyringSpawnSync = (command, args, options) => {
+  // Unit tests must inject a captured-stdio seam. Never let an omitted double reach a real
+  // OS credential store (most critically, a macOS Keychain write).
+  if (process.env.VITEST !== undefined) throw new KeyringUnavailableError();
+  return nodeSpawnSync(command, args, options);
+};
 
 type KeyringOperation = "wrap" | "unwrap";
 type FailureClass = "descriptor" | "exit" | "input" | "kdf" | "launch" | "output";
@@ -230,7 +237,8 @@ function runCaptured(
   let result: KeyringSpawnSyncResult;
   try {
     result = spawn(command, args, options);
-  } catch {
+  } catch (error) {
+    if (error instanceof KeyringUnavailableError) throw new KeyringUnavailableError();
     // Never retain a child error as cause: child messages commonly contain argv and stdio.
     throw keyringFailure(operation, "launch");
   }

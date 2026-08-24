@@ -21,30 +21,6 @@ import {
 const KEK = Buffer.from("0123456789abcdef0123456789abcdef", "ascii");
 const WRAPPED = Buffer.from("dpapi-wrapped-test-value", "ascii");
 
-const WRAP_SCRIPT = [
-  "Add-Type -AssemblyName System.Security;",
-  "$stdin=[Console]::OpenStandardInput();",
-  "$memory=New-Object System.IO.MemoryStream;",
-  "$stdin.CopyTo($memory);",
-  "$plain=$memory.ToArray();",
-  "$wrapped=[Security.Cryptography.ProtectedData]::Protect($plain,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);",
-  "$stdout=[Console]::OpenStandardOutput();",
-  "$stdout.Write($wrapped,0,$wrapped.Length);",
-  "$stdout.Flush();",
-].join("");
-
-const UNWRAP_SCRIPT = [
-  "Add-Type -AssemblyName System.Security;",
-  "$stdin=[Console]::OpenStandardInput();",
-  "$memory=New-Object System.IO.MemoryStream;",
-  "$stdin.CopyTo($memory);",
-  "$wrapped=$memory.ToArray();",
-  "$plain=[Security.Cryptography.ProtectedData]::Unprotect($wrapped,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);",
-  "$stdout=[Console]::OpenStandardOutput();",
-  "$stdout.Write($plain,0,$plain.Length);",
-  "$stdout.Flush();",
-].join("");
-
 function leaks(text: string, ...needles: string[]): boolean {
   for (const needle of needles) {
     for (let index = 0; index + 4 <= needle.length; index += 1) {
@@ -116,20 +92,40 @@ describe("DPAPI custody", () => {
 
     expect(descriptor).toEqual({ wrap: "dpapi", blob: WRAPPED.toString("base64") });
     expect(recovered).toEqual(KEK);
-    expect(spawn).toHaveBeenNthCalledWith(
-      1,
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(spawn.mock.calls[0]?.[0]).toBe(
       "D:\\Win Root\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", WRAP_SCRIPT],
-      { windowsHide: true, stdio: "pipe", encoding: "buffer", input: KEK },
     );
-    expect(spawn).toHaveBeenNthCalledWith(
-      2,
+    expect(spawn.mock.calls[0]?.[2]).toEqual({
+      windowsHide: true,
+      stdio: "pipe",
+      encoding: "buffer",
+      input: KEK,
+    });
+    expect(spawn.mock.calls[1]?.[0]).toBe(
       "D:\\Win Root\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", UNWRAP_SCRIPT],
-      { windowsHide: true, stdio: "pipe", encoding: "buffer", input: WRAPPED },
     );
-    for (const call of spawn.mock.calls) {
-      expect(call[1].join("\0")).not.toContain(KEK.toString("ascii"));
+    expect(spawn.mock.calls[1]?.[2]).toEqual({
+      windowsHide: true,
+      stdio: "pipe",
+      encoding: "buffer",
+      input: WRAPPED,
+    });
+    for (const [, argv] of spawn.mock.calls) {
+      expect(argv).toContain("-NoProfile");
+      expect(argv).toContain("-NonInteractive");
+      const commandIndex = argv.indexOf("-Command");
+      expect(commandIndex).toBeGreaterThanOrEqual(0);
+      const script = argv[commandIndex + 1] ?? "";
+      expect(script).toContain("[Console]::OpenStandardInput()");
+      expect(script).toContain("[Console]::OpenStandardOutput()");
+      expect(script).not.toMatch(/Write-(?:Output|Host)/iu);
+      expect(leaks(
+        script,
+        KEK.toString("ascii"),
+        KEK.toString("base64"),
+        KEK.toString("hex"),
+      )).toBe(false);
     }
   });
 
@@ -200,6 +196,11 @@ describe("DPAPI custody", () => {
 });
 
 describe("portable and Unix custody modes", () => {
+  it("refuses a real OS-keyring spawn under Vitest when no double is injected", () => {
+    expect(process.env.VITEST).toBeDefined();
+    expect(() => wrapKek(KEK, { mode: "keychain" })).toThrow(KeyringUnavailableError);
+  });
+
   it("round-trips passphrase mode through real node:crypto", () => {
     const passphrase = Buffer.from("correct horse battery staple", "utf8");
     const originalPassphrase = Buffer.from(passphrase);
