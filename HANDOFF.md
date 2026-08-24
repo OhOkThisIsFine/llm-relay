@@ -24,6 +24,17 @@ rung of `resolveResetsAt` — facts persist `untilBasis` beside an explicit expi
 dashboard availability producer and `llm-relay candidates` resolve through the new
 `factResetInputs` gate.
 
+Queued for **v0.43.0**: `providers.<name>.compat`, which closes the last two open findings in §6.
+`a509cab` rewrites outbound tool-call ids to mistral's stated `^[a-zA-Z0-9]{9}$`
+(`toolCallIds: "strict9"`, deterministic SHA-256→base62, announced as `x-llm-relay-tool-call-ids`);
+`405602f` stamps gemini's documented `skip_thought_signature_validator` sentinel on replayed tool
+calls (`thoughtSignature: "sentinel"`, live-verified). Both are base-host-defaulted labelled
+provider facts that config overrides in either direction, and both shape only bodies the relay
+AUTHORS — the direct Chat passthrough stays byte-exact by design (`docs/reference.md`
+§"Provider wire-shape quirks"). `0de0584` closed the review of the pair: the streamed Responses
+rebuild, the Responses front's outbound wire bytes, the sentinel's fetchBackend wiring, the `#k`
+collision policy (injected-digest seam) and two `as never` fixture casts.
+
 - The metering program is delivered through Stage 5. Merged lanes, by commit:
   - `7abdaf2` — C3 / Gap 4: `AssistantMessage.usage` widened; cache tokens survive repair and translation.
   - `ca9e75e` — Gap 5: operator-declared rate limits (`limits`) on providers and credential slots.
@@ -179,13 +190,22 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   llm-bridge: the ledger observes the BACKEND stream, so accounting is correct; only the
   client-facing translated SSE loses cache fields. (The G2 hard cap is delivered: `5e06a56`,
   `limits.hard`.)
-- **OPEN — gemini 3.6 requires a `thought_signature` (reasoning echo) on tool-calling turns,**
-  400ing without it before `name` is even inspected; pre-existing, separate from the name fix.
-  Fix direction: undecided.
-- **OPEN — mistral (medium-2505) enforces a 9-char alphanumeric `tool_call_id` shape,** 400ing
-  other id shapes on caller-side ids the relay forwards verbatim; interacts with
-  `tool-use-ids.ts` minted suffixes on failover from a repeated-id host to mistral. Fix direction:
-  undecided.
+- **Resolved 2026-08-23 (queued for v0.43.0, `405602f` + review fix-up `0de0584`)** — gemini 3.6
+  requiring a `thought_signature` on tool-calling turns. `compat.thoughtSignature: "sentinel"`
+  stamps Google's own documented opt-out token at
+  `tool_calls[N].extra_content.google.thought_signature`, defaulted for the base host
+  `generativelanguage.googleapis.com`. Live-verified against the real endpoint: single and parallel
+  placements all 200, contradicting the public report that a parallel pair rejects the sentinel.
+  No real signature is stored or echoed. Residual (stated in `CLAUDE.md`): the default is
+  host-scoped while verification covered `models/gemini-3.6-flash` only; the override is
+  `compat: { "thoughtSignature": "none" }`.
+- **Resolved 2026-08-23 (queued for v0.43.0, `a509cab` + review fix-up `0de0584`)** — mistral
+  (medium-2505) enforcing a 9-char alphanumeric `tool_call_id`. `compat.toolCallIds: "strict9"`
+  rewrites both halves of every pair to `^[a-zA-Z0-9]{9}$` — deterministic SHA-256→base62, no
+  randomness, so a replayed turn and a failover retry map identically — defaulted for a
+  `*.mistral.ai` base host and announced as `x-llm-relay-tool-call-ids` plus the
+  `toolCallIdRewrites` log counter. This also subsumes the `tool-use-ids.ts` interaction: a minted
+  `Read:0_relay1` id is rewritten like any other shape.
 - **Resolved:** Gap 7 by spec amendment 2026-08-22 (no new endpoints). **DEFER — Gap 10 / M4**
   (estimated-output producer, evidence-gated), **Gaps 15/16, M3, P1, P4** — do not build without
   a new decision.
