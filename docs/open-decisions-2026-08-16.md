@@ -85,3 +85,19 @@ dependencies, measurements, or implementation gates claimed.
 counters". That field has read `0` for the life of the file: `recordModelCall()` accepts a
 `completionTokens` argument that its sole production call site never passes. Corrected in place, with
 the error recorded rather than deleted.
+
+---
+
+## 2026-08-23 decisions
+
+Made after the v0.43.0 release. Where these conflict with the rows above, these supersede — the P4
+row above stays in place as history.
+
+| # | Decision | **Resolution** |
+|---|---|---|
+| — | Custody/keystore program | **APPROVED — queued as the next sprint.** The metering gate was already lifted; work starts from [credential-fleet-design-2026-08-16.md](credential-fleet-design-2026-08-16.md)'s staged build order, not tonight. |
+| M4 | Estimated-output producer (Gap 10) | **QUEUED FOR BUILD.** The "measure usage-absence rates first" evidence gate is explicitly waived by the owner — "we're not waiting to measure." Sanctioned work. |
+| M3 | Cooldown-clear mutation | **RE-OPENED — queued for build.** Security precondition unchanged: control token plus the same Origin/content-type/Host admission checks as `/offload` and `/dispatch` ([quota-metering-spec-2026-08-16.md](quota-metering-spec-2026-08-16.md) §6.2). Loopback is not authorization. |
+| Gap 15 | Single-file HTML dashboard | **DROPPED**, not deferred — superseded by the shipped SPA (G3). Removed from the program of record. |
+| Gap 16 | In-flight quota leases | **DROPPED**, not deferred — spec §5.4 already argued against it with no measured overshoot. Removed from the program of record. |
+| P4 | Server-enforced system prompts (`client_profiles` part 2) | **DROPPED** — never acquired a purpose. Removed from the program of record. |
