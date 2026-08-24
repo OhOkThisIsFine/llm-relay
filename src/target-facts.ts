@@ -408,10 +408,10 @@ export function clearFacts(provider: string, credentialId: CredentialId | null, 
   return cleared;
 }
 
-/** Operator retraction of active cooling conditions only; never success evidence or eviction. */
-export function clearCooldownFacts(
+function clearMatchingActiveFacts(
   selector: CooldownFactClearSelector,
-  opts: { path?: string; now?: number } = {},
+  opts: { path?: string; now?: number },
+  matchesKind: (kind: FactKind) => boolean,
 ): ClearedCooldownFact[] {
   const path = opts.path ?? defaultPath();
   const now = opts.now ?? Date.now();
@@ -419,7 +419,7 @@ export function clearCooldownFacts(
   const cleared: ClearedCooldownFact[] = [];
   for (const [key, fact] of Object.entries(store.facts)) {
     if (
-      !COOLING.has(fact.kind) ||
+      !matchesKind(fact.kind) ||
       now >= expiryOf(fact) ||
       !matchesClearSelector(fact.scope, selector)
     ) continue;
@@ -435,6 +435,22 @@ export function clearCooldownFacts(
   return cleared.sort((a, b) =>
     a.kind.localeCompare(b.kind) || keyOfScope(a.scope).localeCompare(keyOfScope(b.scope))
   );
+}
+
+/** Operator retraction of active cooling conditions only; never success evidence or eviction. */
+export function clearCooldownFacts(
+  selector: CooldownFactClearSelector,
+  opts: { path?: string; now?: number } = {},
+): ClearedCooldownFact[] {
+  return clearMatchingActiveFacts(selector, opts, (kind) => COOLING.has(kind));
+}
+
+/** Rotation retraction of active credential-invalid facts only. */
+export function clearCredentialInvalidFacts(
+  selector: CooldownFactClearSelector,
+  opts: { path?: string; now?: number } = {},
+): ClearedCooldownFact[] {
+  return clearMatchingActiveFacts(selector, opts, (kind) => kind === "credential-invalid");
 }
 
 export function allFacts(opts: { path?: string; now?: number } = {}): Array<{ kind: FactKind; scope: FactScope; at: number; until: number; untilBasis?: FactResetBasis }> {

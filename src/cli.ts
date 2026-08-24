@@ -60,6 +60,19 @@ import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp } from "./dashboard-contr
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
 import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { flushProbeCache } from "./ping/probe-cache.js";
+import {
+  runKeysAddLocal,
+  runKeysDisableLocal,
+  runKeysEnableLocal,
+  runKeysExportLocal,
+  runKeysImportLocal,
+  runKeysListLocal,
+  runKeysRemoveLocal,
+  runKeysRevokeLocal,
+  runKeysRotateLocal,
+  runKeysUnlockLocal,
+  type KeysCliDependencies,
+} from "./keys-cli.js";
 
 const VALUE_FLAGS = new Set<string>([
   "--config", "-config", "-c",
@@ -91,6 +104,9 @@ const VALUE_FLAGS = new Set<string>([
   "--reset-field", "-reset-field",
   "--reset-ms", "-reset-ms",
   "--import", "-import",
+  "--label", "-label",
+  "--env-name", "-env-name",
+  "--out", "-out",
 ]);
 
 interface ParsedCliArgs {
@@ -210,7 +226,8 @@ ${formatTextTable([
   ["llm-relay [options]", "Start proxy."],
   ["llm-relay onboard [--import <file>] [--force]", "Set up or import provider keys."],
   ["llm-relay setup [target]", "target: claude-cli | claude-desktop."],
-  ["llm-relay keys | check-keys", "Check every configured credential slot."],
+  ["llm-relay keys | keys check | check-keys", "Check every configured credential slot."],
+  ["llm-relay keys <action> ...", "action: add|list|rotate|revoke|remove|disable|enable|export|import|unlock."],
   ["llm-relay pools [--probe]", "List members; --probe tests each deployment once."],
   ["llm-relay pools <action> <name> [<spec>...]", "action: set|add|remove|delete."],
   ["llm-relay routing <action> ...", "action: show|get|default|tier|subagent|sort|benchmark|set|unset."],
@@ -745,6 +762,76 @@ export async function runCheckKeys(): Promise<void> {
     }),
   ];
   process.stdout.write(formatTextTable(rows) + "\n");
+}
+
+/** `llm-relay keys add` — CLI-local credential insertion; secret input is never argv. */
+export async function runKeysAdd(
+  provider = getPositionalArgs(process.argv)[2],
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  await runKeysAddLocal(deps.config ?? loadOrExit(), provider, {
+    ...(argValue("--label", "-label") === undefined
+      ? {} : { label: argValue("--label", "-label")! }),
+    ...(argValue("--env-name", "-env-name") === undefined
+      ? {} : { envName: argValue("--env-name", "-env-name")! }),
+    check: hasFlag("--check", "-check"),
+  }, deps);
+}
+
+export async function runKeysList(deps: KeysCliDependencies = {}): Promise<void> {
+  runKeysListLocal(deps.config ?? loadOrExit(), deps);
+}
+
+export async function runKeysRotate(
+  credential = getPositionalArgs(process.argv)[2],
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  await runKeysRotateLocal(deps.config ?? loadOrExit(), credential, deps);
+}
+
+export async function runKeysRevoke(
+  credential = getPositionalArgs(process.argv)[2],
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  runKeysRevokeLocal(credential, deps);
+}
+
+export async function runKeysRemove(
+  credential = getPositionalArgs(process.argv)[2],
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  runKeysRemoveLocal(credential, hasFlag("--purge", "-purge"), deps);
+}
+
+export async function runKeysDisable(
+  credential = getPositionalArgs(process.argv)[2],
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  runKeysDisableLocal(credential, deps);
+}
+
+export async function runKeysEnable(
+  credential = getPositionalArgs(process.argv)[2],
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  runKeysEnableLocal(credential, deps);
+}
+
+export async function runKeysExport(
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  await runKeysExportLocal(argValue("--out", "-out"), deps);
+}
+
+export async function runKeysImport(
+  importPath = getPositionalArgs(process.argv)[2],
+  deps: KeysCliDependencies = {},
+): Promise<void> {
+  await runKeysImportLocal(deps.config ?? loadOrExit(), importPath, deps);
+}
+
+export async function runKeysUnlock(deps: KeysCliDependencies = {}): Promise<void> {
+  await runKeysUnlockLocal(deps);
 }
 
 /**
@@ -3015,12 +3102,102 @@ import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
 import { getTelemetryReport } from "./telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
 
+const KEYS_SUBCOMMANDS = [
+  "add", "list", "rotate", "revoke", "remove", "disable", "enable", "export", "import",
+  "unlock", "check",
+] as const;
+
+type KeysSubcommand = typeof KEYS_SUBCOMMANDS[number];
+
+const KEYS_GLOBAL_FLAGS = ["--config", "-config", "-c"] as const;
+const KEYS_FLAGS: Readonly<Record<KeysSubcommand, readonly string[]>> = {
+  add: ["--label", "-label", "--env-name", "-env-name", "--check", "-check"],
+  list: [],
+  rotate: [],
+  revoke: [],
+  remove: ["--purge", "-purge"],
+  disable: [],
+  enable: [],
+  export: ["--out", "-out"],
+  import: [],
+  unlock: [],
+  check: [],
+};
+
+const KEYS_POSITIONAL_COUNT: Readonly<Record<KeysSubcommand, number>> = {
+  add: 3,
+  list: 2,
+  rotate: 3,
+  revoke: 3,
+  remove: 3,
+  disable: 3,
+  enable: 3,
+  export: 2,
+  import: 3,
+  unlock: 2,
+  check: 2,
+};
+
+/** Strict, secret-safe keys parser. Diagnostics deliberately never echo rejected argv tokens. */
+export function validateKeysCommandArgs(argv: string[]): string | null {
+  const positionals = getPositionalArgs(argv);
+  const candidate = positionals[1];
+  if (candidate !== undefined && !KEYS_SUBCOMMANDS.includes(candidate as KeysSubcommand)) {
+    return `unknown subcommand; valid subcommands: ${KEYS_SUBCOMMANDS.join(", ")}`;
+  }
+  const subcommand = candidate as KeysSubcommand | undefined;
+  const allowed = new Set<string>(KEYS_GLOBAL_FLAGS);
+  if (subcommand !== undefined) {
+    for (const flag of KEYS_FLAGS[subcommand]) allowed.add(flag);
+  }
+
+  for (let index = 2; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === undefined || !arg.startsWith("-")) continue;
+    const equalsAt = arg.indexOf("=");
+    const flag = equalsAt === -1 ? arg : arg.slice(0, equalsAt);
+    if (!allowed.has(flag)) return "unsupported option";
+    if (VALUE_FLAGS.has(flag)) {
+      if (equalsAt !== -1) {
+        if (arg.slice(equalsAt + 1).length === 0) return "invalid arguments";
+      } else {
+        const value = argv[index + 1];
+        if (value === undefined || value.startsWith("-")) return "invalid arguments";
+        index += 1;
+      }
+    } else if (equalsAt !== -1) {
+      return "invalid arguments";
+    }
+  }
+
+  const expected = subcommand === undefined ? 1 : KEYS_POSITIONAL_COUNT[subcommand];
+  return positionals.length === expected ? null : "invalid arguments";
+}
+
+function reportKeysCommandError(error: unknown): void {
+  process.stderr.write(`llm-relay keys: ${(error as Error).message}\n`);
+  process.exit(1);
+}
+
+function runKeysPromise(operation: Promise<void>): void {
+  operation.catch(reportKeysCommandError);
+}
+
 export function main(): void {
   const rawCommand = rawCliCommand(process.argv);
   const positionals = getPositionalArgs(process.argv);
   const arg2 = positionals[0];
   const arg3 = positionals[1];
   const arg4 = positionals[2];
+
+  if (arg2 === "keys") {
+    const validationError = validateKeysCommandArgs(process.argv);
+    if (validationError !== null) {
+      process.stderr.write(`llm-relay keys: ${validationError}\n`);
+      process.exit(1);
+      return;
+    }
+  }
 
   // Mutation parsing owns its raw argv so help/version-shaped typos cannot bypass fail-closed
   // validation and turn a scoped clear into a wider request.
@@ -3078,12 +3255,60 @@ export function main(): void {
     process.stdout.write(JSON.stringify(report, null, 2) + "\n");
     return;
   }
-  if (arg2 === "keys" || arg2 === "check-keys") {
+  if (arg2 === "check-keys") {
     runCheckKeys().catch((e) => {
       process.stderr.write(`llm-relay check-keys: ${(e as Error).message}\n`);
       process.exit(1);
     });
     return;
+  }
+  if (arg2 === "keys") {
+    switch (arg3) {
+      case undefined:
+      case "check":
+        // Bare `keys` remains byte-for-byte the same status command as `check-keys`.
+        runCheckKeys().catch((e) => {
+          process.stderr.write(`llm-relay check-keys: ${(e as Error).message}\n`);
+          process.exit(1);
+        });
+        return;
+      case "add":
+        runKeysPromise(runKeysAdd(arg4));
+        return;
+      case "list":
+        runKeysPromise(runKeysList());
+        return;
+      case "rotate":
+        runKeysPromise(runKeysRotate(arg4));
+        return;
+      case "revoke":
+        runKeysPromise(runKeysRevoke(arg4));
+        return;
+      case "remove":
+        runKeysPromise(runKeysRemove(arg4));
+        return;
+      case "disable":
+        runKeysPromise(runKeysDisable(arg4));
+        return;
+      case "enable":
+        runKeysPromise(runKeysEnable(arg4));
+        return;
+      case "export":
+        runKeysPromise(runKeysExport());
+        return;
+      case "import":
+        runKeysPromise(runKeysImport(arg4));
+        return;
+      case "unlock":
+        runKeysPromise(runKeysUnlock());
+        return;
+    default:
+      process.stderr.write(
+        `llm-relay keys: unknown subcommand; valid subcommands: ${KEYS_SUBCOMMANDS.join(", ")}\n`,
+      );
+        process.exit(1);
+        return;
+    }
   }
   if (arg2 === "models") {
     runModels().catch((e) => {
@@ -3230,6 +3455,12 @@ export function classifyCommand(argv: string[]): CommandEffect {
     // Clears process-local relay state through the authenticated mutation plane.
     case "cooldowns":
       return arg3 === "clear" ? "mutating" : "read-only";
+    case "keys":
+      return arg3 === "add" || arg3 === "rotate" || arg3 === "revoke" ||
+        arg3 === "remove" || arg3 === "disable" || arg3 === "enable" ||
+        arg3 === "import" || arg3 === "unlock"
+        ? "mutating"
+        : "read-only";
     case "config":
       return arg3 === "set" || arg3 === "unset" ? "mutating" : "read-only";
     case "routing":
@@ -3248,7 +3479,7 @@ export function classifyCommand(argv: string[]): CommandEffect {
       return arg3 === "accept" || arg3 === "reject" || arg3 === "propose" ? "mutating" : "read-only";
     case "dashboard":
       return "read-only";
-    // keys, check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
+    // check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
     // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a
     // running proxy's in-memory cooldowns and changes nothing on this machine.
     default:
@@ -3261,8 +3492,18 @@ export function classifyCommand(argv: string[]): CommandEffect {
  * and re-exec), then the command itself. `main` stays synchronous so its exit paths are direct.
  */
 export async function run(): Promise<void> {
-  // Reject malformed mutation argv before the self-update gate can perform any network request.
-  if (rawCliCommand(process.argv) === "cooldowns") parseCooldownClearArgs(process.argv);
+  // Reject malformed mutation argv before the self-update gate can perform any network request
+  // or replace the installed CLI. Keys diagnostics stay generic so rejected argv is never echoed.
+  const command = rawCliCommand(process.argv);
+  if (command === "cooldowns") parseCooldownClearArgs(process.argv);
+  if (command === "keys") {
+    const validationError = validateKeysCommandArgs(process.argv);
+    if (validationError !== null) {
+      process.stderr.write(`llm-relay keys: ${validationError}\n`);
+      process.exit(1);
+      return;
+    }
+  }
   if (shouldCheckUpdates(process.argv, process.env, classifyCommand(process.argv))) {
     try {
       await ensureUpToDate();

@@ -209,6 +209,168 @@ describe("operator cooldown clearing", () => {
     });
   });
 
+  it.each([
+    { kind: "null", kinds: null },
+    { kind: "string", kinds: "credential-fault" },
+    { kind: "empty array", kinds: [] },
+    { kind: "duplicate", kinds: ["credential-fault", "credential-fault"] },
+    { kind: "unknown value", kinds: ["rate-limit"] },
+    { kind: "non-string value", kinds: [1] },
+  ])("rejects $kind kinds without mutating credential faults or facts", async ({ kinds }) => {
+    const at = Date.now();
+    const breaker = new CircuitBreaker();
+    const identity = target("p", "m-kinds", "work");
+    const credentialId = makeCredentialId("p", "work");
+    breaker.recordCredentialFault(identity, 401, at);
+    recordFact("credential-invalid", {
+      kind: "attempt",
+      provider: "p",
+      credentialId,
+      model: "m-kinds",
+    }, { now: at });
+    const beforeBreaker = structuredClone(breaker.getState(identity));
+    const beforeFacts = structuredClone(allFacts({ now: at + 1 }));
+    const url = await boot(breaker);
+
+    const response = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: CONTROL_HEADERS,
+      body: JSON.stringify({ provider: "p", credential: "work", kinds }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: {
+        message: `POST /cooldowns/clear kinds must be exactly ["credential-fault"] when provided`,
+      },
+    });
+    expect(breaker.getState(identity)).toEqual(beforeBreaker);
+    expect(allFacts({ now: at + 1 })).toEqual(beforeFacts);
+  });
+
+  it.each([
+    {
+      admission: "a control token",
+      headers: { "content-type": "application/json" },
+    },
+    {
+      admission: "application/json content type",
+      headers: {
+        [CONTROL_AUTHORIZATION_HEADER]: CONTROL_TOKEN,
+        "content-type": "text/plain",
+      },
+    },
+    {
+      admission: "a same-listener Origin",
+      headers: { ...CONTROL_HEADERS, origin: "https://attacker.example" },
+    },
+  ])("keeps narrowed clears behind $admission admission", async ({ headers }) => {
+    const at = Date.now();
+    const breaker = new CircuitBreaker();
+    const identity = target("p", "m-admission", "work");
+    breaker.recordCredentialFault(identity, 401, at);
+    const before = structuredClone(breaker.getState(identity));
+    const url = await boot(breaker);
+
+    const response = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        provider: "p",
+        credential: "work",
+        kinds: ["credential-fault"],
+      }),
+    });
+
+    expect(response.status).toBe(403);
+    expect(breaker.getState(identity)).toEqual(before);
+  });
+
+  it("narrows rotation clearing to credential faults and credential-invalid facts", async () => {
+    const at = Date.now();
+    const breaker = new CircuitBreaker();
+    const identity = target("p", "m-rotation", "work");
+    const credentialId = makeCredentialId("p", "work");
+    fail429(breaker, identity, at);
+    fail429(breaker, identity, at + 1);
+    breaker.recordCredentialFault(identity, 401, at + 2);
+    const scope: FactScope = {
+      kind: "attempt",
+      provider: "p",
+      credentialId,
+      model: "m-rotation",
+    };
+    for (const kind of [
+      "credential-invalid",
+      "allowance-exhausted",
+      "rate-limited",
+      "not-servable",
+      "subscription-required",
+    ] as const) {
+      recordFact(kind, scope, { now: at });
+    }
+    recordFact("context-limit", scope, { now: at, value: 128_000 });
+
+    const before = structuredClone(breaker.getState(identity))!;
+    expect(before).toMatchObject({
+      cooldownSource: "escalation",
+      unexplained429s: 2,
+      credentialFailures: 1,
+      lastCredentialStatus: 401,
+    });
+    const url = await boot(breaker);
+    const response = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: CONTROL_HEADERS,
+      body: JSON.stringify({
+        provider: "p",
+        credential: "work",
+        kinds: ["credential-fault"],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      target: {
+        provider: "p",
+        credential: "work",
+        kinds: ["credential-fault"],
+      },
+      cleared: {
+        breakerCells: { count: 0, items: [] },
+        credentialFaults: {
+          count: 1,
+          items: [{ provider: "p", model: "m-rotation", credential: "work" }],
+        },
+        facts: {
+          count: 1,
+          items: [{ kind: "credential-invalid", scope }],
+        },
+      },
+    });
+
+    const after = breaker.getState(identity)!;
+    expect(after).toMatchObject({
+      cooldownUntil: before.cooldownUntil,
+      cooldownSource: "escalation",
+      unexplained429s: 2,
+      consecutiveFailures: 2,
+      lastFailureTime: at + 1,
+      lastStatus: 429,
+      credentialFaultUntil: 0,
+      credentialFailures: 0,
+    });
+    expect(after.lastCredentialStatus).toBeUndefined();
+    expect(after.pings).toEqual(before.pings);
+    expect(allFacts({ now: at + 3 }).map(({ kind }) => kind).sort()).toEqual([
+      "allowance-exhausted",
+      "context-limit",
+      "not-servable",
+      "rate-limited",
+      "subscription-required",
+    ]);
+  });
+
   it("retains the seeded accounting store byte-for-byte across an HTTP clear", async () => {
     const accountingAt = "2026-08-24T12:34:56.000Z";
     const accountingNow = Date.parse(accountingAt);

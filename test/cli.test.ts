@@ -988,6 +988,16 @@ describe("classifyCommand — the update-check gate", () => {
     expect(classifyCommand(argv("cooldowns", "clear", "anthropic"))).toBe("mutating");
   });
 
+  it("classifies keys lifecycle mutations while keeping status and export read-only", () => {
+    for (const subcommand of ["add", "rotate", "revoke", "remove", "disable", "enable", "import", "unlock"]) {
+      expect(classifyCommand(argv("keys", subcommand))).toBe("mutating");
+    }
+    for (const subcommand of ["list", "export", "check"]) {
+      expect(classifyCommand(argv("keys", subcommand))).toBe("read-only");
+    }
+    expect(classifyCommand(argv("keys"))).toBe("read-only");
+  });
+
   it("classifies a bare proxy start mutating", () => {
     expect(classifyCommand(argv())).toBe("mutating");
     expect(classifyCommand(argv("--config", "c.json"))).toBe("mutating");
@@ -1435,5 +1445,100 @@ describe("CLI configuration editing", () => {
     process.argv = ["node", "cli.ts", "--config", configPath, "routing", "default", "missing/model"];
     expect(() => runRoutingCommand()).toThrow(/unknown provider/);
     expect(document().routing.default).toBe("test/base");
+  });
+});
+
+describe("keys subcommand router", () => {
+  let directory: string;
+  let configPath: string;
+  const originalArgv = process.argv;
+
+  beforeEach(() => {
+    directory = mkdtempSync(join(tmpdir(), "llm-relay-cli-keys-router-"));
+    configPath = join(directory, "config.json");
+    writeFileSync(configPath, JSON.stringify({
+      listen: "127.0.0.1:18792",
+      providers: {
+        passthrough: {
+          base: "https://api.anthropic.com",
+          kind: "anthropic",
+          credentialMode: "passthrough",
+        },
+        keyless: {
+          base: "http://127.0.0.1:11434/v1",
+          kind: "openai",
+          credentialMode: "contained",
+        },
+        declared: {
+          base: "https://declared.invalid/v1",
+          kind: "openai",
+          authEnv: "DECLARED_API_KEY",
+        },
+      },
+      routing: { default: "keyless/test", tiers: {} },
+      mode: "detect",
+      log: { level: "silent", file: null },
+    }, null, 2));
+  });
+
+  afterEach(() => {
+    process.argv = originalArgv;
+    vi.restoreAllMocks();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["missing", [], "unknown provider"],
+    ["passthrough", [], "passthrough provider"],
+    ["keyless", [], "no auth declaration"],
+    ["declared", ["--env-name", "GUESSED_API_KEY"], "undeclared env name"],
+  ])("routes add refusal %s through the prefixed exit-1 path", async (provider, extra, reason) => {
+    const stderr: string[] = [];
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    process.argv = [
+      "node", "cli.ts", "--config", configPath, "keys", "add", provider, ...extra,
+    ];
+    main();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(stderr.join("")).toContain(`llm-relay keys: ${reason}`);
+  });
+
+  it("fails an unknown subcommand synchronously and names every valid subcommand", () => {
+    const stderr: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+    process.argv = ["node", "cli.ts", "keys", "typo"];
+    expect(() => main()).toThrow("exit:1");
+    expect(stderr.join("")).toContain("valid subcommands: add, list, rotate, revoke, remove, disable, enable, export, import, unlock, check");
+  });
+
+  it("keeps bare keys, keys check, and check-keys on the historical status path", async () => {
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    const capture = async (command: string[]): Promise<string> => {
+      stdout.length = 0;
+      process.argv = ["node", "cli.ts", "--config", configPath, ...command];
+      main();
+      await vi.waitFor(() => expect(stdout.join("")).toContain("Validating configured provider API keys"));
+      await vi.waitFor(() => expect(stdout.join("")).toContain("Credential ID"));
+      return stdout.join("");
+    };
+
+    const bare = await capture(["keys"]);
+    expect(await capture(["keys", "check"])).toBe(bare);
+    expect(await capture(["check-keys"])).toBe(bare);
   });
 });

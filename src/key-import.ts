@@ -29,7 +29,7 @@ export interface CredentialImportResult {
   outcomes: CredentialImportOutcome[];
 }
 
-interface ImportProvider {
+export interface CredentialImportTarget {
   provider: string;
   envName: string;
   aliases: string[];
@@ -56,9 +56,9 @@ function normalizeName(name: string): string {
   return name.trim().toLowerCase();
 }
 
-function importProviders(cfg?: Config): ImportProvider[] {
+function importProviders(cfg?: Config): CredentialImportTarget[] {
   const providers = cfg?.providers ?? ALL_PROVIDER_PRESETS;
-  const result: ImportProvider[] = [];
+  const result: CredentialImportTarget[] = [];
   for (const [provider, configured] of Object.entries(providers)) {
     const envName = configured.authEnv ?? ALL_PROVIDER_PRESETS[provider]?.authEnv;
     if (!envName?.trim()) continue;
@@ -70,6 +70,62 @@ function importProviders(cfg?: Config): ImportProvider[] {
     result.push({ provider, envName, aliases: [...new Set(aliases.map(normalizeName))] });
   }
   return result;
+}
+
+/** Match only the same closed name table used by onboarding imports. */
+export function matchCredentialImportName(
+  name: string,
+  cfg?: Config,
+): CredentialImportTarget | undefined {
+  const normalized = normalizeName(name);
+  if (cfg === undefined) {
+    return importProviders().find((candidate) => candidate.aliases.includes(normalized));
+  }
+
+  // CLI-to-keystore imports are stricter than legacy onboarding: only declarations in the
+  // loaded config can become destinations. The onboarding helper intentionally retains its
+  // preset fallback, but using that here would invent an authEnv for keyless/passthrough or
+  // fleet-only providers whose slug happens to equal a preset name.
+  const exactTargets: CredentialImportTarget[] = [];
+  const aliasTargets: CredentialImportTarget[] = [];
+  for (const [provider, configured] of Object.entries(cfg.providers)) {
+    if (configured.authEnv !== undefined) {
+      const aliases = [...new Set([
+        ...curatedEnvNames(provider),
+        ...(IMPORT_NAME_ALIASES[provider.toLowerCase()] ?? []),
+      ].map(normalizeName))];
+      const target = { provider, envName: configured.authEnv, aliases };
+      if (normalizeName(configured.authEnv) === normalized) exactTargets.push(target);
+      if (aliases.includes(normalized)) aliasTargets.push(target);
+      continue;
+    }
+
+    const slots = configured.credentials ?? [];
+    for (const slot of slots) {
+      if (normalizeName(slot.authEnv) === normalized) {
+        exactTargets.push({ provider, envName: slot.authEnv, aliases: [normalized] });
+      }
+    }
+    // An exporter often names only the provider. That closed alias is safe when there is one
+    // declared destination, but ambiguous fleets require the exact slot authEnv name.
+    if (slots.length === 1) {
+      const aliases = [...new Set([
+        ...curatedEnvNames(provider),
+        ...(IMPORT_NAME_ALIASES[provider.toLowerCase()] ?? []),
+      ].map(normalizeName))];
+      if (aliases.includes(normalized)) {
+        aliasTargets.push({ provider, envName: slots[0]!.authEnv, aliases });
+      }
+    }
+  }
+  // Exact loaded declarations outrank every alias across the whole provider map. Duplicate exact
+  // declarations and alias collisions are ambiguous and therefore never select by insertion order.
+  if (exactTargets.length === 1) return exactTargets[0];
+  if (exactTargets.length > 1) return undefined;
+  const uniqueAliases = [...new Map(
+    aliasTargets.map((target) => [`${target.provider}\0${target.envName}`, target]),
+  ).values()];
+  return uniqueAliases.length === 1 ? uniqueAliases[0] : undefined;
 }
 
 /** Parse only the documented FreeLLMAPI v1 export envelope. */
