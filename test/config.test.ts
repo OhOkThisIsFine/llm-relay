@@ -1286,3 +1286,57 @@ describe("loadConfig — routing.quota.hardCaps", () => {
       .toThrow(/routing\.quota\.hardCaps must be a boolean/);
   });
 });
+
+/**
+ * `providers.<name>.compat` — per-provider WIRE-SHAPE quirks, and the labelled base-host default
+ * behind them.
+ *
+ * The default is a LABELLED PROVIDER FACT, which the "Provider knowledge is data, not routing
+ * configuration" invariant admits only because config overrides it — so both directions are
+ * pinned here, not just the convenient one.
+ */
+describe("loadConfig — provider compat (tool-call id shape)", () => {
+  const provider = (p: Record<string, unknown>) => (name: string) =>
+    loadConfig(write(name, base({ providers: { x: { kind: "openai", ...p } }, routing: { default: "x/m" } })));
+
+  it("defaults a mistral base host to strict9 and everything else to preserve", () => {
+    // mistral-common enforces ^[a-zA-Z0-9]{9}$ and answers 400 invalid_function_call otherwise.
+    expect(resolveTarget("m", provider({ base: "https://api.mistral.ai/v1" })("compat-mistral.json")).toolCallIds)
+      .toBe("strict9");
+    // The operator's own second mistral endpoint — the rule is the vendor's, not one hostname's.
+    expect(resolveTarget("m", provider({ base: "https://codestral.mistral.ai/v1" })("compat-codestral.json")).toolCallIds)
+      .toBe("strict9");
+    expect(resolveTarget("m", provider({ base: "https://nim.test/v1" })("compat-nim.json")).toolCallIds)
+      .toBe("preserve");
+    // A lookalike host is NOT mistral's: the suffix match is on a dot-bounded label.
+    expect(resolveTarget("m", provider({ base: "https://notmistral.ai/v1" })("compat-lookalike.json")).toolCallIds)
+      .toBe("preserve");
+  });
+
+  it("lets an explicit value win in BOTH directions", () => {
+    expect(resolveTarget("m", provider({
+      base: "https://api.mistral.ai/v1", compat: { toolCallIds: "preserve" },
+    })("compat-off.json")).toolCallIds).toBe("preserve");
+    expect(resolveTarget("m", provider({
+      base: "https://nim.test/v1", compat: { toolCallIds: "strict9" },
+    })("compat-on.json")).toolCallIds).toBe("strict9");
+  });
+
+  it("round-trips the declared block onto the provider", () => {
+    const c = provider({ base: "https://nim.test/v1", compat: { toolCallIds: "strict9" } })("compat-roundtrip.json");
+    expect(c.providers.x!.compat).toEqual({ toolCallIds: "strict9" });
+    expect(provider({ base: "https://nim.test/v1" })("compat-absent.json").providers.x!.compat).toBeUndefined();
+  });
+
+  it("rejects an unknown compat KEY by name — an ignored typo reads as a declaration that took effect", () => {
+    expect(() => provider({ base: "https://nim.test/v1", compat: { toolCallIDs: "strict9" } })("compat-key.json"))
+      .toThrow(/config\.providers\.x\.compat\.toolCallIDs is not a known compat option/);
+  });
+
+  it("rejects an unknown compat VALUE, and a non-object block", () => {
+    expect(() => provider({ base: "https://nim.test/v1", compat: { toolCallIds: "strict-9" } })("compat-value.json"))
+      .toThrow(/compat\.toolCallIds must be one of: preserve, strict9/);
+    expect(() => provider({ base: "https://nim.test/v1", compat: "strict9" })("compat-scalar.json"))
+      .toThrow(/config\.providers\.x\.compat must be an object/);
+  });
+});

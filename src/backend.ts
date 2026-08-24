@@ -182,6 +182,18 @@ export const TOOL_DIALECT_HEADER = "x-llm-relay-tool-dialect";
 export const TOOL_USE_IDS_HEADER = "x-llm-relay-tool-use-ids";
 
 /**
+ * OUTBOUND tool-call ids were rewritten to this provider's stated id shape — value
+ * `"<n> rewritten"`. Today that is only mistral's `^[a-zA-Z0-9]{9}$` (`compat.toolCallIds:
+ * "strict9"`; see `src/openai-request.ts` for the 400 that states the rule).
+ *
+ * The request-direction sibling of `TOOL_USE_IDS_HEADER`, and the same maxim: an automatic fix is
+ * acceptable only because it is announced, a count and never an id. Unlike the response-direction
+ * mint the figure is final BEFORE the request is even sent, so it rides a streamed response's
+ * headers too.
+ */
+export const TOOL_CALL_IDS_HEADER = "x-llm-relay-tool-call-ids";
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both
@@ -217,6 +229,12 @@ interface UpstreamResponseMetadata {
    * server reads this where it reports end-of-stream facts. A count, never an id.
    */
   toolUseIdRewrites?: number;
+  /**
+   * How many OUTBOUND tool-call ids the request mapper rewrote to this provider's stated shape
+   * (`openai-request.ts`, `compat.toolCallIds: "strict9"`). A count, never an id. Known before
+   * egress, so it is set once when the metadata is built.
+   */
+  toolCallIdRewrites?: number;
 }
 
 // Response provenance is private process state, not a wire header: callers can
@@ -260,6 +278,16 @@ export function upstreamReportedModel(response: Response): string | undefined {
  */
 export function toolUseIdRewrites(response: Response): number | undefined {
   const n = upstreamResponseMetadata.get(response)?.toolUseIdRewrites;
+  return n !== undefined && n > 0 ? n : undefined;
+}
+
+/**
+ * How many OUTBOUND tool-call ids this request had rewritten to the provider's stated shape, or
+ * `undefined` when none were. Final at request-mapping time, so it is readable as soon as the
+ * Response exists.
+ */
+export function toolCallIdRewrites(response: Response): number | undefined {
+  const n = upstreamResponseMetadata.get(response)?.toolCallIdRewrites;
   return n !== undefined && n > 0 ? n : undefined;
 }
 
@@ -601,12 +629,21 @@ export async function fetchBackend(
   }
 
   let openaiBody: Record<string, unknown>;
+  // Outbound id rewrites, from the RESOLVED compat mode on the target — the mapper is handed a
+  // decision, never a provider name to re-derive one from. `preserve` (everyone but mistral)
+  // leaves this 0 and the outbound bytes untouched.
+  let toolCallIdsRewritten = 0;
   try {
     // The REQUEST direction is relay-owned (`openai-request.ts`); only the RESPONSE direction is
     // still llm-bridge's. llm-bridge's `universalToOpenAI` has no case for a tool_call/tool_result
     // block, so it stringified its own IR envelope into the outbound prompt — see
     // docs/tool-call-dialect-leak.md §"Second mechanism".
-    openaiBody = anthropicRequestToOpenAi(reqJson, { model: target.model, stream: args.wantsStream });
+    openaiBody = anthropicRequestToOpenAi(reqJson, {
+      model: target.model,
+      stream: args.wantsStream,
+      ...(target.toolCallIds !== undefined ? { toolCallIds: target.toolCallIds } : {}),
+      onToolCallIdsRewritten: (n) => { toolCallIdsRewritten = n; },
+    });
   } catch (e) {
     // A block we will not put on the wire is the caller's request being unrepresentable, not a
     // provider failure — same clean local 400 as an unconvertible document.
@@ -698,13 +735,22 @@ export async function fetchBackend(
       // holdback is already paid by `stripThinkTagsInStream` above, and an event with no
       // `tool_use` substring costs one scan, so the gate would buy little and lose that case.
       const metadata = preflight.metadata;
+      if (toolCallIdsRewritten > 0) metadata.toolCallIdRewrites = toolCallIdsRewritten;
       const body = rewriteToolUseIdsInStream(
         recovered,
         () => knownToolUseIds(args.reqJson),
         (count) => { metadata.toolUseIdRewrites = count; },
       );
       return attachUpstreamMetadata(
-        new Response(body, { status: res.status, headers: { "content-type": "text/event-stream" } }),
+        new Response(body, {
+          status: res.status,
+          headers: {
+            "content-type": "text/event-stream",
+            // Unlike the response-direction mint, this count is a REQUEST fact and was final
+            // before a byte was sent — so a stream can announce it honestly.
+            ...(toolCallIdsRewritten > 0 ? { [TOOL_CALL_IDS_HEADER]: `${toolCallIdsRewritten} rewritten` } : {}),
+          },
+        }),
         metadata,
       );
     } catch (e) {
@@ -761,11 +807,15 @@ export async function fetchBackend(
       ...(mintedIds.rewritten > 0
         ? { [TOOL_USE_IDS_HEADER]: `${mintedIds.rewritten} rewritten` }
         : {}),
+      ...(toolCallIdsRewritten > 0
+        ? { [TOOL_CALL_IDS_HEADER]: `${toolCallIdsRewritten} rewritten` }
+        : {}),
     },
   });
   const metadata: UpstreamResponseMetadata = {};
   captureReportedModel(metadata, upstreamJson, "openai-chat", false);
   if (mintedIds.rewritten > 0) metadata.toolUseIdRewrites = mintedIds.rewritten;
+  if (toolCallIdsRewritten > 0) metadata.toolCallIdRewrites = toolCallIdsRewritten;
   return attachUpstreamMetadata(response, metadata);
 }
 
@@ -1454,7 +1504,16 @@ export async function fetchOpenAiFront(
     const targetProtocol = protocol === "responses" ? "openai-responses" : "openai";
     try {
       const output = handleUniversalStreamRequest(preflight.body, "anthropic", targetProtocol);
-      const response = new Response(output, { status: backendRes.status, headers: { "content-type": "text/event-stream" } });
+      // Same rule as the buffered rebuild below: rebuilding the response must not swallow the
+      // announcement of a fix the relay applied one Response ago.
+      const rewritten = backendRes.headers.get(TOOL_CALL_IDS_HEADER);
+      const response = new Response(output, {
+        status: backendRes.status,
+        headers: {
+          "content-type": "text/event-stream",
+          ...(rewritten ? { [TOOL_CALL_IDS_HEADER]: rewritten } : {}),
+        },
+      });
       return metadata ? attachUpstreamMetadata(response, metadata) : response;
     } catch (e) {
       return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", "relay_mapper_defect");
@@ -1495,11 +1554,14 @@ export async function fetchOpenAiFront(
     // announcement — an automatic fix is acceptable only because it is announced, and the count
     // is as true here as it was one Response ago.
     const minted = backendRes.headers.get(TOOL_USE_IDS_HEADER);
+    // …and the outbound-id rewrite the same request mapper applied on the way IN.
+    const rewritten = backendRes.headers.get(TOOL_CALL_IDS_HEADER);
     const response = new Response(JSON.stringify(anthropicMessageToOpenAi(body as Record<string, unknown>, protocol, target.model ?? String(base.model ?? ""))), {
       status: backendRes.status,
       headers: {
         "content-type": "application/json",
         ...(minted ? { [TOOL_USE_IDS_HEADER]: minted } : {}),
+        ...(rewritten ? { [TOOL_CALL_IDS_HEADER]: rewritten } : {}),
       },
     });
     return metadata ? attachUpstreamMetadata(response, metadata) : response;

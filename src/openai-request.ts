@@ -25,6 +25,8 @@
  * request-level `thinking` budget is dropped (mapping it to `reasoning_effort` would be a guess).
  */
 
+import { createHash } from "node:crypto";
+
 /**
  * A request shape this mapper will not put on the wire. The caller turns it into a clean 400,
  * exactly as `DocumentError` does — local origin, provider never asked.
@@ -48,6 +50,91 @@ export interface AnthropicToOpenAiOptions {
   model?: string | undefined;
   /** Whether THIS hop streams — a relay decision, not the caller's. Falls back to the body. */
   stream?: boolean | undefined;
+  /**
+   * The RESOLVED outbound tool-call-id shape for this deployment (`config.ts`
+   * `resolveToolCallIdMode`). Absent ⇒ `"preserve"` ⇒ the outbound bytes are identical to what
+   * this mapper emitted before the mode existed. Never a provider name: the mapper is handed a
+   * decision, it does not make one.
+   */
+  toolCallIds?: ToolCallIdMode | undefined;
+  /**
+   * Called once per run with how many ids the `"strict9"` pass rewrote (0 included). The same
+   * out-param idiom `backend.ts` uses for the streamed `tool_use` mint — the count is metadata
+   * about the translation, not part of the body it returns.
+   */
+  onToolCallIdsRewritten?: ((count: number) => void) | undefined;
+}
+
+/** Mirrors `config.ts`'s `ToolCallIdMode`, restated so this module imports no config surface. */
+export type ToolCallIdMode = "preserve" | "strict9";
+
+/**
+ * Mistral's stated tool-call-id shape.
+ *
+ * First-party evidence (2026-08-23, `mistral-medium-2505`): forwarding a caller-side id verbatim
+ * answers HTTP 400
+ * `{"object":"error","message":"Tool call id was toolu_01AAAAAAAAAAAAAAAAAAAAAA but must be a-z, A-Z, 0-9, with a length of 9.","type":"invalid_function_call","code":"3280"}`.
+ * `mistral-common` enforces it on BOTH the assistant `tool_calls[].id` and the answering tool
+ * message's `tool_call_id`, and from v13 also enforces linkage (a tool message must answer an id
+ * a prior assistant turn actually called) and uniqueness. Every id shape that reaches this mapper
+ * violates it: `toolu_01…` (Anthropic), `Read:0` (nim kimi-k3), `Read:0_relay1` (relay-minted),
+ * `call_…` (Codex via the Responses front), `tu_recovered_0` (dialect rescue).
+ */
+const STRICT9 = /^[a-zA-Z0-9]{9}$/;
+
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/**
+ * A deterministic 9-char base62 id for one source id.
+ *
+ * SHA-256 of the UTF-8 id (plus `#<k>` on a collision retry), one base62 character per digest
+ * byte. **No randomness** — the same precedent as `tool-use-ids.ts`: a conversation only ever
+ * appends, so the same source id must map to the same outbound id on the next turn, on a retry,
+ * and on every candidate of a pool walk. A random id would detach a `tool_result` from the call
+ * it answers the moment the conversation was replayed.
+ */
+function strict9(source: string, salt: number): string {
+  const digest = createHash("sha256").update(salt === 0 ? source : `${source}#${salt}`, "utf8").digest();
+  let out = "";
+  for (let i = 0; i < 9; i++) out += BASE62[digest[i]! % 62];
+  return out;
+}
+
+/**
+ * The one per-run source-id → outbound-id map, shared by `toolCall` and `toolResultMessage` so
+ * both halves of a pair always land on the same value (mistral v13 checks that linkage).
+ *
+ * An id that already conforms is kept as-is, so a mistral-native id coming back through a later
+ * turn round-trips unchanged. Collisions resolve deterministically by FIRST-APPEARANCE order:
+ * the run is a single in-order walk of the conversation, so the same conversation always produces
+ * the same assignment.
+ */
+class ToolCallIds {
+  private readonly bySource = new Map<string, string>();
+  private readonly taken = new Set<string>();
+  private rewritten = 0;
+
+  map(id: string): string {
+    const existing = this.bySource.get(id);
+    if (existing !== undefined) return existing;
+    let out: string;
+    // A conforming id is kept — unless some earlier source already holds it, in which case
+    // keeping it would map two different calls onto one id and break the uniqueness rule this
+    // exists to satisfy. (62^-9; the branch is correctness, not a case anyone will meet.)
+    if (STRICT9.test(id) && !this.taken.has(id)) out = id;
+    else {
+      out = strict9(id, 0);
+      for (let k = 1; this.taken.has(out); k++) out = strict9(id, k);
+    }
+    this.taken.add(out);
+    this.bySource.set(id, out);
+    if (out !== id) this.rewritten += 1;
+    return out;
+  }
+
+  count(): number {
+    return this.rewritten;
+  }
 }
 
 type Rec = Record<string, unknown>;
@@ -84,7 +171,7 @@ function systemText(system: unknown): string {
 }
 
 /** One Anthropic `tool_use` block → one OpenAI `tool_calls[]` entry. */
-function toolCall(block: Rec): Rec {
+function toolCall(block: Rec, ids: ToolCallIds | null): Rec {
   // A synthesized id would be unmatchable: the linkage to the `role:"tool"` message that answers
   // it is the id itself, so inventing one silently detaches the result from the call.
   if (typeof block.id !== "string" || block.id.length === 0) {
@@ -95,7 +182,8 @@ function toolCall(block: Rec): Rec {
   }
   const input = block.input ?? {};
   return {
-    id: block.id,
+    // Under `"preserve"` (`ids === null`) this is the caller's own id, byte for byte.
+    id: ids === null ? block.id : ids.map(block.id),
     type: "function",
     function: {
       name: block.name,
@@ -112,7 +200,7 @@ function toolCall(block: Rec): Rec {
  * `tool_use` blocks become `tool_calls`, and `content` is `null` when nothing but tool calls
  * remains — the shape OpenAI defines for a tool-calling turn.
  */
-function assistantMessage(turn: Rec): Rec {
+function assistantMessage(turn: Rec, ids: ToolCallIds | null): Rec {
   const content = turn.content;
   if (typeof content === "string") return { role: "assistant", content };
   const texts: string[] = [];
@@ -124,7 +212,7 @@ function assistantMessage(turn: Rec): Rec {
         texts.push(textOf(raw));
         break;
       case "tool_use":
-        toolCalls.push(toolCall(raw));
+        toolCalls.push(toolCall(raw, ids));
         break;
       case "thinking":
       case "redacted_thinking":
@@ -225,12 +313,19 @@ function toolResultParts(content: unknown): ToolResultParts {
  * `content: text || null` is the ASSISTANT shape, where OpenAI defines null; a tool message has
  * no such spelling.
  */
-function toolResultMessage(block: Rec, toolNames?: ReadonlyMap<string, string>): { message: Rec; images: Rec[] } {
+function toolResultMessage(
+  block: Rec,
+  toolNames: ReadonlyMap<string, string> | undefined,
+  ids: ToolCallIds | null,
+): { message: Rec; images: Rec[] } {
   if (typeof block.tool_use_id !== "string" || block.tool_use_id.length === 0) {
     throw new RequestMappingError("tool_result block without a tool_use_id");
   }
   const { text, images } = toolResultParts(block.content);
-  const message: Rec = { role: "tool", tool_call_id: block.tool_use_id, content: text };
+  // The SAME map the assistant turn used, so the pair still points at itself — mistral's v13
+  // validator rejects a tool message whose id no prior `tool_calls` entry carries.
+  const toolCallId = ids === null ? block.tool_use_id : ids.map(block.tool_use_id);
+  const message: Rec = { role: "tool", tool_call_id: toolCallId, content: text };
   // Gemini's OpenAI-compatible layer folds a tool message into a `functionResponse` part whose
   // `name` is REQUIRED and is never resolved from the preceding `tool_calls`, so a nameless tool
   // message is a 400 there ("function_response.name: name cannot be empty"). The name here is the
@@ -238,6 +333,8 @@ function toolResultMessage(block: Rec, toolNames?: ReadonlyMap<string, string>):
   // (the conversation is walked in order, so the call has always been seen) — re-stated where
   // another vendor needs it, not invented: an orphan result (no matching tool_use, e.g. its call
   // sat in a dropped block) carries NO `name`.
+  // ⚠ Keyed by the ORIGINAL id: the name table is built from the caller's conversation, which the
+  // id rewrite deliberately does not touch.
   const name = toolNames?.get(block.tool_use_id as string);
   if (name !== undefined) message.name = name;
   return { message, images };
@@ -256,7 +353,7 @@ function toolResultMessage(block: Rec, toolNames?: ReadonlyMap<string, string>):
  * message cannot carry one, so the image rides on the user turn that follows it, keeping its
  * position relative to the turn's other leftover blocks (`toolResultParts`).
  */
-function userMessages(turn: Rec, toolNames?: ReadonlyMap<string, string>): Rec[] {
+function userMessages(turn: Rec, toolNames: ReadonlyMap<string, string> | undefined, ids: ToolCallIds | null): Rec[] {
   const content = turn.content;
   if (typeof content === "string") return [{ role: "user", content }];
   const toolMessages: Rec[] = [];
@@ -271,7 +368,7 @@ function userMessages(turn: Rec, toolNames?: ReadonlyMap<string, string>): Rec[]
         parts.push(imagePart(raw));
         break;
       case "tool_result": {
-        const { message, images } = toolResultMessage(raw, toolNames);
+        const { message, images } = toolResultMessage(raw, toolNames, ids);
         toolMessages.push(message);
         // Appended HERE, not collected separately, so a result's images keep their place among
         // the turn's other leftover blocks.
@@ -362,6 +459,9 @@ export function anthropicRequestToOpenAi(
 ): Record<string, unknown> {
   const body = isRecord(reqJson) ? reqJson : {};
   const messages: Rec[] = [];
+  // `null` is the "preserve" mode, and it is the mode for every provider but mistral: no map is
+  // built and every id reaches the wire exactly as the caller wrote it.
+  const ids = opts.toolCallIds === "strict9" ? new ToolCallIds() : null;
 
   // Assistant `tool_use` id → name across the whole conversation, so each `role:"tool"` message
   // can restate the name of the call it answers (see `toolResultMessage` — a gemini compat-layer
@@ -387,9 +487,11 @@ export function anthropicRequestToOpenAi(
     // and id minting (`tool-use-ids.ts`) is RESPONSE-side, so the echoed pair shares one id here.
     if (raw.role === "assistant") {
       rememberToolNames(raw);
-      messages.push(assistantMessage(raw));
-    } else messages.push(...userMessages(raw, toolNames));
+      messages.push(assistantMessage(raw, ids));
+    } else messages.push(...userMessages(raw, toolNames, ids));
   }
+  // Announced for the same reason every other automatic fix on this path is: a count, never an id.
+  if (ids !== null) opts.onToolCallIdsRewritten?.(ids.count());
 
   const out: Rec = { messages };
   // The relay's resolved deployment id, never the caller's — see `AnthropicToOpenAiOptions`.

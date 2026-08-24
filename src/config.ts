@@ -60,6 +60,90 @@ export interface ReshaperConfig {
  */
 export type CredentialMode = "passthrough" | "contained";
 
+/**
+ * What shape a provider's own validator demands of the tool-call ids the relay puts on the wire.
+ *
+ *  - `"preserve"` — forward the caller's ids verbatim. The default everywhere, and what the relay
+ *    did for its whole life before 2026-08-23: an id is linkage, so not touching it is the safest
+ *    thing a translation can do.
+ *  - `"strict9"` — rewrite every outbound `tool_calls[].id` / `tool_call_id` to mistral's stated
+ *    `^[a-zA-Z0-9]{9}$` shape. Mistral's `mistral-common` validator enforces it on BOTH halves of
+ *    the pair (and, from v13, linkage and uniqueness on top), so an Anthropic `toolu_01…` id is a
+ *    hard 400 there — see `src/openai-request.ts`.
+ */
+export type ToolCallIdMode = "preserve" | "strict9";
+
+/**
+ * Per-provider WIRE-SHAPE quirks — things a specific host's request validator demands that the
+ * protocol itself does not. Deliberately not routing configuration and deliberately not a
+ * per-provider switch in `src/`: a labelled provider fact may live in code only while config can
+ * override it (see the "Provider knowledge is data" invariant), which is exactly the shape here —
+ * a base-host default that any explicit value beats in both directions.
+ *
+ * One key today. An unknown key or value is a HARD load error naming it: the `configured-limits`
+ * precedent — an ignored typo silently no-ops while reading like a declaration that took effect.
+ */
+export interface ProviderCompatConfig {
+  /** Absent ⇒ resolved from the base host by `resolveToolCallIdMode`. */
+  toolCallIds?: ToolCallIdMode;
+}
+
+/** The closed set of `compat` keys, so an unknown one can be named in the error. */
+const COMPAT_KEYS = ["toolCallIds"] as const satisfies readonly (keyof ProviderCompatConfig)[];
+
+const TOOL_CALL_ID_MODES: readonly ToolCallIdMode[] = ["preserve", "strict9"];
+
+/**
+ * Parse a provider's `compat` block. Adding the next key is one entry in `COMPAT_KEYS` plus its
+ * own value check below.
+ */
+function parseProviderCompat(raw: unknown, where: string): ProviderCompatConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`${where} must be an object`);
+  }
+  const out: ProviderCompatConfig = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!(COMPAT_KEYS as readonly string[]).includes(key)) {
+      throw new Error(
+        `${where}.${key} is not a known compat option (known: ${COMPAT_KEYS.join(", ")})`,
+      );
+    }
+    if (key === "toolCallIds") {
+      if (typeof value !== "string" || !TOOL_CALL_ID_MODES.includes(value as ToolCallIdMode)) {
+        throw new Error(`${where}.toolCallIds must be one of: ${TOOL_CALL_ID_MODES.join(", ")}`);
+      }
+      out.toolCallIds = value as ToolCallIdMode;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : {};
+}
+
+/** Is this base URL's host mistral's — `api.mistral.ai`, `codestral.mistral.ai`, any of them? */
+function isMistralHost(base: string): boolean {
+  let host: string;
+  try {
+    host = new URL(base).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return host === "mistral.ai" || host.endsWith(".mistral.ai");
+}
+
+/**
+ * The resolved outbound tool-call-id shape for one provider.
+ *
+ * A LABELLED PROVIDER FACT, allowed by the "Provider knowledge is data, not routing configuration"
+ * invariant precisely because config overrides it: mistral's own validator states the rule
+ * (`^[a-zA-Z0-9]{9}$`, first-party evidence in `src/openai-request.ts`), so a mistral base host
+ * defaults to `"strict9"` and every other host to `"preserve"`. An explicit `compat.toolCallIds`
+ * wins in BOTH directions — `"preserve"` on a mistral host, `"strict9"` on anything else.
+ */
+export function resolveToolCallIdMode(p: { base: string; compat?: ProviderCompatConfig }): ToolCallIdMode {
+  if (p.compat?.toolCallIds !== undefined) return p.compat.toolCallIds;
+  return isMistralHost(p.base) ? "strict9" : "preserve";
+}
+
 /** One HTTP backend provider in the registry (NIM, OpenRouter, Gemini API, …). */
 export interface ProviderConfig {
   base: string;
@@ -110,6 +194,11 @@ export interface ProviderConfig {
    * availability/headroom surfaces.
    */
   limits?: ProviderLimitsConfig;
+  /**
+   * Wire-shape quirks this host's own request validator enforces. Absent keys fall back to a
+   * labelled base-host default (`resolveToolCallIdMode`); an explicit value always wins.
+   */
+  compat?: ProviderCompatConfig;
   /** Web URL where users can sign up or obtain API keys. */
   signupUrl?: string;
 }
@@ -599,6 +688,13 @@ export interface ResolvedTarget {
   timeoutMs: number;
   /** Carried from the provider: inter-byte stall watchdog for streamed responses. */
   stallTimeoutMs?: number;
+  /**
+   * RESOLVED outbound tool-call-id shape (`resolveToolCallIdMode`) — an explicit
+   * `compat.toolCallIds` or the labelled base-host default. Resolved here so the request mapper
+   * is handed a mode and never a provider identity to re-derive one from. Absent (a hand-built
+   * target) reads as `"preserve"`, which is the pre-2026-08-23 behaviour byte for byte.
+   */
+  toolCallIds?: ToolCallIdMode;
 }
 
 export interface Config {
@@ -787,6 +883,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     ...(p.authEnv ? { authEnv: p.authEnv } : {}),
     credentialSlots: providerCredentialSlots(provider, p),
     ...(p.credentialMode !== undefined ? { credentialMode: p.credentialMode } : {}),
+    toolCallIds: resolveToolCallIdMode(p),
   };
 }
 
@@ -1160,6 +1257,7 @@ function parseProviders(
       tierType?: unknown;
       signupUrl?: unknown;
       limits?: unknown;
+      compat?: unknown;
     };
     try {
       makeCredentialId(name);
@@ -1233,6 +1331,9 @@ function parseProviders(
     // purely syntactic (no provider-map lookups), so it cannot reintroduce the failure shape
     // where a tier naming a degraded provider aborts startup.
     const limits = parseConfiguredLimits(p.limits, `config.providers.${name}.limits`);
+    // Same reasoning, same placement: a compat typo that were merely ignored would read as a
+    // declaration that took effect while changing nothing on the wire.
+    const compat = parseProviderCompat(p.compat, `config.providers.${name}.compat`);
     if (expanded.missing.length > 0) {
       warnings.push(
         `provider "${name}" DISABLED — base references unset env var ` +
@@ -1273,6 +1374,7 @@ function parseProviders(
         ? { tierType: p.tierType }
         : {}),
       ...(limits !== undefined ? { limits } : {}),
+      ...(compat !== undefined ? { compat } : {}),
       ...(typeof p.signupUrl === "string" && p.signupUrl.length > 0 ? { signupUrl: p.signupUrl } : {}),
     };
   }

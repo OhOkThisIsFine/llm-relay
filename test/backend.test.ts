@@ -11,6 +11,7 @@ import {
   openAiResponseToAnthropic,
   parseRetryAfterMs,
   toolUseIdRewrites,
+  toolCallIdRewrites,
   upstreamReportedModel,
 } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
@@ -1862,5 +1863,94 @@ describe("fetchBackend (openai kind) — tool_use ids are unique against the con
     const mapped = anthropicRequestToOpenAi(followUp, { model: "moonshotai/kimi-k3" }) as any;
     expect(mapped.messages[1].tool_calls[0].id).toBe("Read:0_relay1");
     expect(mapped.messages[2]).toMatchObject({ role: "tool", tool_call_id: "Read:0_relay1" });
+  });
+});
+
+/**
+ * The REQUEST direction's id rewrite: `compat.toolCallIds: "strict9"`, resolved onto the target,
+ * announced on the response.
+ *
+ * mistral-medium-2505 answers HTTP 400 `invalid_function_call` (code 3280) — "Tool call id was
+ * toolu_01AAAAAAAAAAAAAAAAAAAAAA but must be a-z, A-Z, 0-9, with a length of 9" — for the ids
+ * Claude Code, kimi-k3, Codex and the dialect rescue all produce.
+ */
+describe("fetchBackend (openai kind) — outbound tool-call ids under strict9", () => {
+  const STRICT9 = /^[a-zA-Z0-9]{9}$/;
+
+  const agentic = {
+    model: "claude-x",
+    stream: false,
+    messages: [
+      { role: "user", content: "read it" },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_01A", name: "Read", input: { file: "a" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01A", content: "ok" }] },
+    ],
+  };
+
+  const OK = JSON.stringify({
+    id: "cmpl_1",
+    model: "mistral-medium-2505",
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }],
+  });
+
+  async function send(mode: "preserve" | "strict9" | undefined, stream = false) {
+    process.env.RP_BACKEND_KEY = "sk-mistral";
+    let sent: any = null;
+    try {
+      const target = {
+        ...openaiTarget("https://api.mistral.ai/v1", "mistral-medium-2505"),
+        ...(mode !== undefined ? { toolCallIds: mode } : {}),
+      };
+      const res = await fetchBackend(resolveAttempt(target), {
+        path: "/v1/messages",
+        method: "POST",
+        reqBuf: Buffer.from(JSON.stringify({ ...agentic, stream })),
+        reqJson: { ...agentic, stream },
+        anthropicHeaders: {},
+        wantsStream: stream,
+        signal: AbortSignal.timeout(1000),
+      }, async (_url, init) => {
+        sent = JSON.parse(String((init as RequestInit).body));
+        return stream
+          ? new Response(
+              'data: {"id":"c","choices":[{"delta":{"content":"hi"},"index":0}]}\n\ndata: [DONE]\n\n',
+              { headers: { "content-type": "text/event-stream" } },
+            )
+          : new Response(OK, { headers: { "content-type": "application/json" } });
+      });
+      return { res, sent };
+    } finally {
+      delete process.env.RP_BACKEND_KEY;
+    }
+  }
+
+  it("rewrites both halves of the pair on the wire and announces the count", async () => {
+    const { res, sent } = await send("strict9");
+    expect(sent.messages[1].tool_calls[0].id).toMatch(STRICT9);
+    expect(sent.messages[2].tool_call_id).toBe(sent.messages[1].tool_calls[0].id);
+    expect(JSON.stringify(sent)).not.toContain("toolu_01A");
+    // A count, never an id — the same rule as the response-direction mint.
+    expect(res.headers.get("x-llm-relay-tool-call-ids")).toBe("1 rewritten");
+    expect(toolCallIdRewrites(res)).toBe(1);
+  });
+
+  it("announces on a STREAMED response too — the count is final before egress", async () => {
+    const { res } = await send("strict9", true);
+    expect(res.headers.get("x-llm-relay-tool-call-ids")).toBe("1 rewritten");
+    expect(toolCallIdRewrites(res)).toBe(1);
+  });
+
+  it("leaves the wire untouched and announces nothing under preserve", async () => {
+    const { res, sent } = await send("preserve");
+    expect(sent.messages[1].tool_calls[0].id).toBe("toolu_01A");
+    expect(sent.messages[2].tool_call_id).toBe("toolu_01A");
+    expect(res.headers.get("x-llm-relay-tool-call-ids")).toBeNull();
+    expect(toolCallIdRewrites(res)).toBeUndefined();
+  });
+
+  it("treats a target with no resolved mode as preserve — a hand-built target changes nothing", async () => {
+    const { res, sent } = await send(undefined);
+    expect(sent.messages[1].tool_calls[0].id).toBe("toolu_01A");
+    expect(res.headers.get("x-llm-relay-tool-call-ids")).toBeNull();
   });
 });

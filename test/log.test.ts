@@ -89,6 +89,7 @@ describe("metadata-only logging", () => {
       ...record(),
       upstreamReportedModel: "meta-router/actual-model",
       toolUseIdRewrites: 2,
+      toolCallIdRewrites: 3,
     };
     new MetadataLogger({ level: "metadata", file }).write(full);
     const [line] = linesIn(file);
@@ -109,6 +110,7 @@ describe("metadata-only logging", () => {
       "errorKinds",
       "repair",
       "toolUseIdRewrites",
+      "toolCallIdRewrites",
       "latencyMs",
     ]);
   });
@@ -301,5 +303,19 @@ describe("tool_use id minting counter", () => {
     const [minted, untouched] = linesIn(file);
     expect(minted!["toolUseIdRewrites"]).toBe(3);
     expect(Object.keys(untouched!)).not.toContain("toolUseIdRewrites");
+  });
+
+  /**
+   * Its REQUEST-direction sibling: ids rewritten to the provider's own stated shape
+   * (`compat.toolCallIds: "strict9"` — mistral's `^[a-zA-Z0-9]{9}$`). Same rule, same reason it
+   * is on the allow-list: a COUNT, so the fix is announced without any id reaching a log line.
+   */
+  it("emits the outbound rewrite count, and omits the field when the provider states no such rule", () => {
+    const logger = new MetadataLogger({ level: "metadata", file });
+    logger.write(record({ toolCallIdRewrites: 2 }));
+    logger.write(record());
+    const [rewritten, untouched] = linesIn(file);
+    expect(rewritten!["toolCallIdRewrites"]).toBe(2);
+    expect(Object.keys(untouched!)).not.toContain("toolCallIdRewrites");
   });
 });
