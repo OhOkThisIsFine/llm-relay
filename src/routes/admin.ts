@@ -14,6 +14,7 @@ import { snapshotContextWindow } from "../tier-data.js";
 import { observedContextLimit } from "../context-limits.js";
 import { getTelemetryReport } from "../telemetry.js";
 import type { CircuitBreaker } from "../circuit-breaker.js";
+import { clearCooldowns } from "../cooldown-clear.js";
 import { baseLog } from "../request-log.js";
 
 const MAX_TASK_LEN = 4096;
@@ -188,6 +189,43 @@ export async function handleAdminRoutes(
       ...(h.accountingReader ? { accounting: h.accountingReader } : {}),
     });
     return ok(view, true);
+  }
+
+  if (req.method === "POST" && pathname === "/cooldowns/clear") {
+    if (typeof reqJson !== "object" || reqJson === null || Array.isArray(reqJson)) {
+      return bad(400, `POST /cooldowns/clear body must be a JSON object`);
+    }
+    const body = reqJson as {
+      provider?: unknown;
+      model?: unknown;
+      credential?: unknown;
+    };
+    const allowedKeys = new Set(["provider", "model", "credential"]);
+    const unknownKey = Object.keys(body).find((key) => !allowedKeys.has(key));
+    if (unknownKey !== undefined) {
+      return bad(400, `POST /cooldowns/clear does not accept property "${unknownKey}"`);
+    }
+    if (typeof body.provider !== "string" || body.provider.length === 0) {
+      return bad(400, `POST /cooldowns/clear provider must be a non-empty string`);
+    }
+    if (body.model !== undefined && (typeof body.model !== "string" || body.model.length === 0)) {
+      return bad(400, `POST /cooldowns/clear model must be a non-empty string when provided`);
+    }
+    if (body.credential !== undefined && (typeof body.credential !== "string" || body.credential.length === 0)) {
+      return bad(400, `POST /cooldowns/clear credential must be a non-empty string when provided`);
+    }
+    if (!Object.hasOwn(cfg.providers, body.provider)) {
+      return bad(400, `POST /cooldowns/clear: no provider "${body.provider}" configured`);
+    }
+    try {
+      return ok(clearCooldowns(h.breaker, {
+        provider: body.provider,
+        ...(body.model === undefined ? {} : { model: body.model }),
+        ...(body.credential === undefined ? {} : { credential: body.credential }),
+      }), true);
+    } catch (error) {
+      return bad(400, `POST /cooldowns/clear: ${(error as Error).message}`);
+    }
   }
 
   if ((req.method === "GET" || req.method === "POST") && pathname === "/offload") {

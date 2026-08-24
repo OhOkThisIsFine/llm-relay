@@ -130,6 +130,7 @@ const TOKENLESS_CONTROL_READS = new Set([
 
 const CONTROL_ROUTES = new Set([
   ...TOKENLESS_CONTROL_READS,
+  "/cooldowns/clear",
   "/registry",
   "/ping",
   "/health/stats",

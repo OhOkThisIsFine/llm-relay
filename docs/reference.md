@@ -1213,12 +1213,13 @@ CLI reference below.
 | `llm-relay cost [--window <w>] [--by <d>] [--include-repair] [--json]` | Summarise spend from the local accounting ledger; windows: 1h/24h/7d/30d/all (default 24h); group by provider/model/client/credential (default provider) |
 | `llm-relay telemetry` | Print telemetry/quota JSON |
 | `llm-relay offload [status \| <client> <on\|off> [--scope <scope>]]` | Show/toggle offload |
+| `llm-relay cooldowns clear <provider>[/<model>] [--credential <label>] [--json]` | Clear scoped cooling state in the running relay; print grouped results or raw JSON |
 | `llm-relay candidates [-p <name>]` | Compare deployment × credential-slot targets |
 | `llm-relay dispatch [lane] [options]` | Choose the next dispatch lane |
 | `llm-relay help` / `llm-relay version` | Help / version |
 
 Config editors validate the complete JSON before writing and need a proxy restart; the offload
-toggle and dispatch queries talk to a running proxy and apply immediately.
+toggle, cooldown clear, and dispatch queries talk to a running proxy and apply immediately.
 
 ```bash
 llm-relay pools set medium nim/z-ai/glm-5.2 openrouter/openai/gpt-5.2-codex
@@ -1227,6 +1228,160 @@ llm-relay routing default nim/z-ai/glm-5.2
 llm-relay routing tier sonnet pool/high
 llm-relay config set routing.offload.claude.freeOnly true
 ```
+
+### Clearing live cooldowns
+
+`llm-relay cooldowns clear <provider>[/<model>] [--credential <label>] [--json]`
+
+Retracts cooling state for a configured provider from the **running** relay. The provider is
+required. Add `/model` to address one deployment, `--credential <label>` to address one configured
+credential slot, or both to address one deployment × credential cell. The credential value is a
+non-secret configured label, not an environment variable name or key. An unknown provider is an
+error rather than a successful no-op. Model and syntactically valid credential selectors that match
+no state, and a second clear of the same scope, are idempotent successes with zero counts.
+
+Parsing is fail-closed. Apart from option values, the invocation must contain exactly the three
+positionals `cooldowns`, `clear`, and one `<provider>[/<model>]` spec. The only accepted options are
+`--credential <label>` and `--json`, plus the documented global `-c`/`--config <path>`,
+`-p`/`--provider <name>`, and `-r`/`--refresh` flags. Unknown options, duplicate options (including
+the short and long spelling of the same global), missing or empty option values, values supplied to
+`--json` or `-r`/`--refresh`, and missing or extra positionals all exit 1 before any request is sent.
+The clear selector itself still comes from the one required spec and optional `--credential`.
+
+```bash
+llm-relay cooldowns clear nim
+llm-relay cooldowns clear nim/meta/llama-3.3-70b-instruct --credential primary
+llm-relay cooldowns clear nim/meta/llama-3.3-70b-instruct --credential primary --json
+```
+
+The clear removes only state that currently demotes the addressed target:
+
+- breaker cooldowns created by failures, 402s, 429 escalation, `Retry-After`, or quota demotion;
+- the consecutive unexplained-429 counter, so the next unexplained 429 starts again at the
+  2-minute rung rather than advancing the ladder;
+- 401/403 credential-fault state; and
+- active `allowance-exhausted`, `rate-limited`, and `credential-invalid` target facts.
+
+It retains every non-cooling axis:
+
+- breaker failure, status/ping, and measured-stability history (apart from the dedicated
+  consecutive-429 escalation counter named above);
+- configured and learned quota observations plus the `context-limit` and
+  `rate-limit-rpm|rpd|tpm|tpd` measurement facts;
+- the `not-servable` and `subscription-required` eviction facts; and
+- all accounting-store state, including its usage history, windows, and roll-ups.
+
+A clear is a retraction of cooling state, not a fabricated successful measurement; an underlying
+condition can cool the target again through ordinary routing.
+
+Breaker cells narrow by every supplied selector. A persisted fact is retracted only when its
+entire atomic scope fits inside the requested scope; a narrow operator mutation is not evidence
+that can disprove a broader condition, and facts are never fabricated into narrower rows:
+
+| Stored fact scope | How the provider-qualified selector matches it |
+| :--- | :--- |
+| `attempt` | Provider plus each supplied model and credential |
+| `group` | Provider; with a model selector every member must be that model, and with a credential selector the group must be bound to that credential |
+| `deployment` | Provider plus a supplied model, but only when no credential selector would split the row |
+| `credential` | Provider plus a supplied credential, but only when no model selector would split the row |
+| `provider` | Provider only, and only when neither model nor credential narrows the request |
+| cross-provider `model` | Never matched by this command |
+
+A matching row is retracted as a whole and its original scope is returned. Broader and independent
+rows remain untouched and can keep the selected target cooled; explicitly rerun the command with a
+broader selector to retract those rows.
+
+There is deliberately **no file fallback**. Breaker and credential-fault state exists only inside
+the running process; editing `target-facts.json` from a separate CLI process would leave the live
+breaker and persisted facts disagreeing. If the relay does not answer, the command exits 1 and says
+that the relay must be running. No dashboard mutation is exposed; the analytics dashboard remains
+read-only.
+
+#### HTTP contract
+
+`POST /cooldowns/clear` accepts this JSON body:
+
+```json
+{
+  "provider": "nim",
+  "model": "meta/llama-3.3-70b-instruct",
+  "credential": "primary"
+}
+```
+
+The body must be a non-null, non-array JSON object. Its only permitted own keys are `provider`,
+`model`, and `credential`; every other own key, including a misspelled selector, is rejected.
+`provider` is required, must be a non-empty string, and must name a configured provider. `model`
+and `credential` are optional, but each must be a non-empty string when present and the credential
+must match the configured-label shape `[A-Za-z0-9_.-]{1,32}`. Non-object bodies, unknown keys,
+invalid values, and unknown providers return 400 before any breaker or fact mutation. A successful
+response groups only the state actually cleared and reports each group as an exact `count` plus
+`items`:
+
+```json
+{
+  "target": {
+    "provider": "nim",
+    "model": "meta/llama-3.3-70b-instruct",
+    "credential": "primary"
+  },
+  "cleared": {
+    "breakerCells": {
+      "count": 1,
+      "items": [
+        {
+          "provider": "nim",
+          "model": "meta/llama-3.3-70b-instruct",
+          "credential": "primary"
+        }
+      ]
+    },
+    "credentialFaults": { "count": 0, "items": [] },
+    "facts": {
+      "count": 1,
+      "items": [
+        {
+          "kind": "rate-limited",
+          "scope": {
+            "kind": "attempt",
+            "provider": "nim",
+            "credentialId": "nim#primary",
+            "model": "meta/llama-3.3-70b-instruct"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+The response contains identifiers only: provider/model names, credential labels or credential ids,
+fact kinds, and fact scopes. It contains no refusal bodies, headers, keys, or other secrets. Normal
+CLI output renders the same three group counts and identifiers; `--json` prints the raw response.
+
+Neither form is rendered as success until the CLI validates the complete response contract:
+
+- the envelope has exactly `target` and `cleared`, and `target` has exactly the requested provider,
+  optional model, and optional credential, with the same optional-key presence as the request;
+- `cleared` has exactly the breaker-cell, credential-fault, and fact groups; every `count` is a
+  non-negative safe integer equal to its `items` array length;
+- every breaker or credential-fault item has exactly the provider/model/credential cell shape and
+  is contained by the requested target; and
+- every fact item has an allowed cooling kind (`allowance-exhausted`, `rate-limited`, or
+  `credential-invalid`) and a valid discriminated attempt/group/deployment/credential/provider
+  scope wholly contained by the requested target. A cross-provider `model` scope cannot satisfy
+  that containment rule.
+
+A malformed or target-mismatched response exits 1 with an invalid-response error; the CLI does not
+print a success heading, grouped summary, or raw JSON for it.
+
+This mutation has the same admission boundary as `/offload` and `/dispatch`: the request's `Host`
+must exactly match the bound listener authority; a present `Origin` must be the exact loopback
+scheme, host, and effective port (`Origin: null` is rejected); the media type must be
+`application/json`; and `x-llm-relay-control-token` must carry the per-install capability from
+`~/.llm-relay/control-token`. An absent `Origin` is allowed intentionally for non-browser clients,
+including this CLI, which attaches the token automatically. These shared admission checks and the
+closed body validation complete before the mutation is reached; loopback alone is not authorization.
 
 ### Cost roll-up
 
@@ -1263,6 +1418,7 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 | `GET /candidates` | Deployment × credential policy/state/quota/breaker data |
 | `GET\|POST /offload` | Read/set offload rules |
 | `GET\|POST /dispatch` | Read/advance the dispatch ladder |
+| `POST /cooldowns/clear` | Clear scoped live cooling state; identifiers-only grouped response |
 | `GET /telemetry`, `GET /ping`, `GET /health` | Telemetry, probe, health |
 | `GET /dashboard/`, `GET /dashboard/assets/*` | Read-only SPA shell and manifest-owned assets |
 | `POST /dashboard/api/v1/bootstrap`, `POST /dashboard/api/v1/session` | Mint and exchange a one-use dashboard bootstrap |
@@ -1273,9 +1429,11 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 materialize provider state (`/registry`, `/candidates`, `/ping`, `/health`) require the per-install
 256-bit capability token (`~/.llm-relay/control-token` — the CLI carries it automatically). Every
 request's `Host` must exactly equal the bound listener authority; any present `Origin` must match
-the exact scheme, host, and effective port, and `Origin: null` is rejected. Writes also require
-`content-type: application/json`. `/telemetry` remains tokenless provider-aggregate data. Response
-attribution and walk headers are documented under Failover above.
+the exact scheme, host, and effective port, and `Origin: null` is rejected. An absent `Origin` is
+allowed for non-browser clients such as the CLI. Writes also require `content-type:
+application/json`; the capability travels in `x-llm-relay-control-token`. `/telemetry` remains
+tokenless provider-aggregate data. Response attribution and walk headers are documented under
+Failover above.
 
 ---
 

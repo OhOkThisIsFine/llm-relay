@@ -5,6 +5,7 @@ import { buildForwardHeaders, createProxy, logSafePath } from "../src/server.js"
 import type { Config } from "../src/config.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
+import { resetFacts } from "../src/target-facts.js";
 
 const CONTROL_TOKEN = "test-control-capability";
 const CONTROL_HEADERS = { [CONTROL_AUTHORIZATION_HEADER]: CONTROL_TOKEN };
@@ -33,6 +34,7 @@ let server: Server | undefined;
 afterEach(async () => {
   if (server) await new Promise<void>((r) => server!.close(() => r()));
   server = undefined;
+  resetFacts();
 });
 
 async function boot(): Promise<string> {
@@ -169,6 +171,115 @@ describe("loopback admission (ARC-c9155ca2)", () => {
       req.end();
     });
     expect(status).toBe(403);
+  });
+
+  it("rejects a cross-origin cooldown clear even with a valid capability", async () => {
+    const url = await boot();
+    const res = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: { origin: "https://evil.example", "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({ provider: "anthropic" }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("requires JSON content-type for cooldown clears", async () => {
+    const url = await boot();
+    const missing = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: CONTROL_HEADERS,
+    });
+    const wrong = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: { "content-type": "text/plain", ...CONTROL_HEADERS },
+      body: JSON.stringify({ provider: "anthropic" }),
+    });
+    expect(missing.status).toBe(403);
+    expect(wrong.status).toBe(403);
+  });
+
+  it("requires a valid capability for cooldown clears", async () => {
+    const url = await boot();
+    const missing = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: "anthropic" }),
+    });
+    const wrong = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [CONTROL_AUTHORIZATION_HEADER]: "wrong",
+      },
+      body: JSON.stringify({ provider: "anthropic" }),
+    });
+    expect(missing.status).toBe(403);
+    expect(wrong.status).toBe(403);
+  });
+
+  it("rejects a cooldown clear with a non-loopback Host header", async () => {
+    await boot();
+    const { port } = server!.address() as AddressInfo;
+    const body = JSON.stringify({ provider: "anthropic" });
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: "127.0.0.1",
+          port,
+          path: "/cooldowns/clear",
+          method: "POST",
+          headers: {
+            Host: "attacker.example",
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            [CONTROL_AUTHORIZATION_HEADER]: CONTROL_TOKEN,
+          },
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        },
+      );
+      req.on("error", reject);
+      req.end(body);
+    });
+    expect(status).toBe(403);
+  });
+
+  it("allows an Origin-less authorized cooldown clear and is idempotent", async () => {
+    const url = await boot();
+    const request = () => fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({ provider: "anthropic" }),
+    });
+
+    const first = await request();
+    expect(first.status).toBe(200);
+    expect((await first.json()) as unknown).toMatchObject({ target: { provider: "anthropic" } });
+
+    const second = await request();
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({
+      target: { provider: "anthropic" },
+      cleared: {
+        breakerCells: { count: 0, items: [] },
+        credentialFaults: { count: 0, items: [] },
+        facts: { count: 0, items: [] },
+      },
+    });
+  });
+
+  it("rejects an unknown cooldown-clear provider and names it", async () => {
+    const url = await boot();
+    const res = await fetch(`${url}/cooldowns/clear`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({ provider: "typo-provider" }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: { message?: string } };
+    expect(body.error?.message).toContain('no provider "typo-provider" configured');
   });
 
   it("bounds the ?task= query parameter", async () => {

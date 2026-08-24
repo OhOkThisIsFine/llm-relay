@@ -19,7 +19,7 @@ import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate, type CandidateAvailability } from "./candidates.js";
-import { makeCredentialId } from "./credential-id.js";
+import { CREDENTIAL_LABEL_PATTERN, makeCredentialId, parseCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
@@ -54,6 +54,7 @@ import {
   writeConfigPath,
 } from "./config-edit.js";
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
+import type { CooldownClearResult } from "./cooldown-clear.js";
 import { createDashboardSnapshotReadPort, type CostReportQuery } from "./dashboard-snapshot.js";
 import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp } from "./dashboard-contract.js";
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
@@ -78,6 +79,7 @@ const VALUE_FLAGS = new Set<string>([
   "--host", "-host",
   "--client", "-client",
   "--scope", "-scope",
+  "--credential", "-credential",
   "--include", "-include",
   "--window", "-window",
   "--by", "-by",
@@ -219,6 +221,7 @@ ${formatTextTable([
   ["llm-relay telemetry", "Print telemetry JSON."],
   ["llm-relay offload [status]", "Show current offload rules."],
   ["llm-relay offload <harness> <on|off> [--scope <scope>]", "Toggle one harness (claude | codex); scope: subagents | all."],
+  ["llm-relay cooldowns clear <provider>[/<model>] [--credential <label>]", "Clear live cooling state; requires the running relay."],
   ["llm-relay candidates [-p <name>]", "Compare deployment x credential-slot targets."],
   ["llm-relay cost [--window <w>] [--by <d>] [--include-repair]", "Summarise spend from the local accounting ledger."],
   ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
@@ -313,6 +316,7 @@ ${formatTextTable([
   ["GET /candidates", "Deployment x credential policy/state/quota/breaker cells."],
   ["GET|POST /offload", "Read/set rules; accepts ?client=<name>."],
   ["GET|POST /dispatch", "Read/set next lane; POST {\"exhausted\":\"<lane>\"}."],
+  ["POST /cooldowns/clear", "Clear scoped live cooling state."],
   ["GET /telemetry", "Provider telemetry."],
   ["GET /ping", "Run health probe."],
   ["GET /health", "Provider health."],
@@ -775,6 +779,347 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
 export function proxyUrl(cfg: Pick<Config, "host" | "port">, path: string): string {
   const host = cfg.host.includes(":") ? `[${cfg.host}]` : cfg.host;
   return `http://${host}:${cfg.port}${path}`;
+}
+
+function cooldownCommandFailure(message: string): never {
+  process.stderr.write(`llm-relay cooldowns: ${message}\n`);
+  process.exit(1);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && actual.every((key) => keys.includes(key));
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+type CooldownClearCell = CooldownClearResult["cleared"]["breakerCells"]["items"][number];
+type CooldownClearFact = CooldownClearResult["cleared"]["facts"]["items"][number];
+type CooldownFactScope = CooldownClearFact["scope"];
+
+const COOLING_FACT_KINDS: ReadonlySet<FactKind> = new Set([
+  "allowance-exhausted",
+  "rate-limited",
+  "credential-invalid",
+]);
+
+function credentialIdBelongsTo(provider: string, value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  return parseCredentialId(value)?.provider === provider;
+}
+
+function isCooldownFactScope(value: unknown): value is CooldownFactScope {
+  if (!isRecord(value)) return false;
+  switch (value.kind) {
+    case "attempt":
+      return hasExactKeys(value, ["kind", "provider", "credentialId", "model"]) &&
+        nonEmptyString(value.provider) &&
+        credentialIdBelongsTo(value.provider, value.credentialId) &&
+        nonEmptyString(value.model);
+    case "group": {
+      const keys = Object.hasOwn(value, "credentialId")
+        ? ["kind", "provider", "credentialId", "members"]
+        : ["kind", "provider", "members"];
+      return hasExactKeys(value, keys) &&
+        nonEmptyString(value.provider) &&
+        Array.isArray(value.members) &&
+        value.members.length > 0 &&
+        value.members.every(nonEmptyString) &&
+        (!Object.hasOwn(value, "credentialId") || credentialIdBelongsTo(value.provider, value.credentialId));
+    }
+    case "deployment":
+      return hasExactKeys(value, ["kind", "provider", "model"]) &&
+        nonEmptyString(value.provider) && nonEmptyString(value.model);
+    case "credential":
+      return hasExactKeys(value, ["kind", "provider", "credentialId"]) &&
+        nonEmptyString(value.provider) && credentialIdBelongsTo(value.provider, value.credentialId);
+    case "provider":
+      return hasExactKeys(value, ["kind", "provider"]) && nonEmptyString(value.provider);
+    case "model":
+      return hasExactKeys(value, ["kind", "model"]) && nonEmptyString(value.model);
+    default:
+      return false;
+  }
+}
+
+function scopeIsContainedByTarget(
+  scope: CooldownFactScope,
+  target: CooldownClearResult["target"],
+): boolean {
+  const credentialId = target.credential === undefined
+    ? undefined
+    : makeCredentialId(target.provider, target.credential);
+  switch (scope.kind) {
+    case "attempt":
+      return scope.provider === target.provider &&
+        (target.model === undefined || scope.model === target.model) &&
+        (credentialId === undefined || scope.credentialId === credentialId);
+    case "group":
+      return scope.provider === target.provider &&
+        (target.model === undefined || scope.members.every((member) => member === target.model)) &&
+        (credentialId === undefined || scope.credentialId === credentialId);
+    case "deployment":
+      return scope.provider === target.provider && credentialId === undefined &&
+        (target.model === undefined || scope.model === target.model);
+    case "credential":
+      return scope.provider === target.provider && target.model === undefined &&
+        (credentialId === undefined || scope.credentialId === credentialId);
+    case "provider":
+      return scope.provider === target.provider && target.model === undefined && credentialId === undefined;
+    case "model":
+      return false;
+  }
+}
+
+function isCooldownCell(
+  value: unknown,
+  target: CooldownClearResult["target"],
+): value is CooldownClearCell {
+  if (!isRecord(value) || !hasExactKeys(value, ["provider", "model", "credential"])) return false;
+  if (!nonEmptyString(value.provider) || value.provider !== target.provider) return false;
+  if (!(value.model === null || nonEmptyString(value.model))) return false;
+  if (!nonEmptyString(value.credential) || !CREDENTIAL_LABEL_PATTERN.test(value.credential)) return false;
+  return (target.model === undefined || value.model === target.model) &&
+    (target.credential === undefined || value.credential === target.credential);
+}
+
+function isCooldownFact(
+  value: unknown,
+  target: CooldownClearResult["target"],
+): value is CooldownClearFact {
+  return isRecord(value) &&
+    hasExactKeys(value, ["kind", "scope"]) &&
+    typeof value.kind === "string" &&
+    COOLING_FACT_KINDS.has(value.kind as FactKind) &&
+    isCooldownFactScope(value.scope) &&
+    scopeIsContainedByTarget(value.scope, target);
+}
+
+function isClearedGroup<T>(
+  value: unknown,
+  isItem: (item: unknown) => item is T,
+): value is { count: number; items: T[] } {
+  if (!isRecord(value) || !hasExactKeys(value, ["count", "items"]) ||
+      typeof value.count !== "number" || !Number.isSafeInteger(value.count) ||
+      value.count < 0 || !Array.isArray(value.items)) {
+    return false;
+  }
+  return value.count === value.items.length && value.items.every(isItem);
+}
+
+function isExactCooldownTarget(
+  value: unknown,
+  expected: CooldownClearResult["target"],
+): value is CooldownClearResult["target"] {
+  if (!isRecord(value)) return false;
+  const keys = [
+    "provider",
+    ...(expected.model === undefined ? [] : ["model"]),
+    ...(expected.credential === undefined ? [] : ["credential"]),
+  ];
+  return hasExactKeys(value, keys) &&
+    value.provider === expected.provider &&
+    (expected.model === undefined || value.model === expected.model) &&
+    (expected.credential === undefined || value.credential === expected.credential);
+}
+
+function isCooldownClearResult(
+  value: unknown,
+  target: CooldownClearResult["target"],
+): value is CooldownClearResult {
+  if (!isRecord(value) || !hasExactKeys(value, ["target", "cleared"]) ||
+      !isExactCooldownTarget(value.target, target) || !isRecord(value.cleared) ||
+      !hasExactKeys(value.cleared, ["breakerCells", "credentialFaults", "facts"])) {
+    return false;
+  }
+  return isClearedGroup(value.cleared.breakerCells, (item): item is CooldownClearCell =>
+    isCooldownCell(item, target)) &&
+    isClearedGroup(value.cleared.credentialFaults, (item): item is CooldownClearCell =>
+      isCooldownCell(item, target)) &&
+    isClearedGroup(value.cleared.facts, (item): item is CooldownClearFact =>
+      isCooldownFact(item, target));
+}
+
+type CooldownClearOption =
+  | { readonly semantic: "credential" | "config" | "provider"; readonly takesValue: true }
+  | { readonly semantic: "json" | "refresh"; readonly takesValue: false };
+
+const COOLDOWN_CLEAR_OPTIONS: ReadonlyMap<string, CooldownClearOption> = new Map([
+  ["--credential", { semantic: "credential", takesValue: true }],
+  ["--json", { semantic: "json", takesValue: false }],
+  ["--config", { semantic: "config", takesValue: true }],
+  ["-c", { semantic: "config", takesValue: true }],
+  ["--provider", { semantic: "provider", takesValue: true }],
+  ["-p", { semantic: "provider", takesValue: true }],
+  ["--refresh", { semantic: "refresh", takesValue: false }],
+  ["-r", { semantic: "refresh", takesValue: false }],
+]);
+
+const CLI_COMMAND_NAMES: ReadonlySet<string> = new Set([
+  "onboard", "setup", "keys", "check-keys", "models", "ping", "dashboard", "telemetry",
+  "offload", "lanes", "dispatch", "cooldowns", "eligibility", "candidates", "cost", "pools",
+  "routing", "route", "config", "help", "version",
+]);
+
+/** Find a real command token without letting a typoed option/value pair hide a later mutation. */
+function rawCliCommand(argv: readonly string[]): string | undefined {
+  for (let index = 2; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (!arg.startsWith("-")) {
+      if (CLI_COMMAND_NAMES.has(arg)) return arg;
+      continue;
+    }
+    const equalsAt = arg.indexOf("=");
+    const flag = equalsAt === -1 ? arg : arg.slice(0, equalsAt);
+    if (equalsAt === -1 && VALUE_FLAGS.has(flag)) {
+      // A missing value before the mutation must reach the strict parser, where it exits 1.
+      if (argv[index + 1] === "cooldowns" && argv[index + 2] === "clear") return "cooldowns";
+      index += 1;
+    }
+  }
+  return undefined;
+}
+
+interface ParsedCooldownClearArgs {
+  readonly spec: string;
+  readonly credential?: string;
+  readonly json: boolean;
+}
+
+function parseCooldownClearArgs(argv: readonly string[]): ParsedCooldownClearArgs {
+  const positionals: string[] = [];
+  const seen = new Set<CooldownClearOption["semantic"]>();
+  let credential: string | undefined;
+  let json = false;
+
+  for (let index = 2; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (!arg.startsWith("-")) {
+      positionals.push(arg);
+      continue;
+    }
+
+    const equalsAt = arg.indexOf("=");
+    const flag = equalsAt === -1 ? arg : arg.slice(0, equalsAt);
+    const option = COOLDOWN_CLEAR_OPTIONS.get(flag);
+    if (option === undefined) cooldownCommandFailure(`unknown option "${flag}"`);
+    if (seen.has(option.semantic)) cooldownCommandFailure(`duplicate option "${flag}"`);
+    seen.add(option.semantic);
+
+    if (!option.takesValue) {
+      if (equalsAt !== -1) cooldownCommandFailure(`${flag} does not take a value`);
+      if (option.semantic === "json") json = true;
+      continue;
+    }
+
+    const value = equalsAt === -1 ? argv[index + 1] : arg.slice(equalsAt + 1);
+    if (value === undefined || value.length === 0 || (equalsAt === -1 && value.startsWith("-"))) {
+      cooldownCommandFailure(`${flag} requires a value`);
+    }
+    if (equalsAt === -1) index += 1;
+    if (option.semantic === "credential") credential = value;
+  }
+
+  if (positionals.length !== 3 || positionals[0] !== "cooldowns" || positionals[1] !== "clear") {
+    cooldownCommandFailure("usage: llm-relay cooldowns clear <provider>[/<model>] [--credential <label>] [--json]");
+  }
+  return {
+    spec: positionals[2]!,
+    ...(credential === undefined ? {} : { credential }),
+    json,
+  };
+}
+
+function controlErrorMessage(value: unknown): string | null {
+  if (!isRecord(value) || !isRecord(value.error) || typeof value.error.message !== "string") return null;
+  return value.error.message;
+}
+
+/** Clear process-local routing cooldowns through the protected live control plane only. */
+export async function runCooldowns(_action: string | undefined, _spec: string | undefined): Promise<void> {
+  const parsed = parseCooldownClearArgs(process.argv);
+  const { spec, credential } = parsed;
+  const { provider, model } = splitSpec(spec);
+  if (provider.length === 0 || model === "") {
+    cooldownCommandFailure("target must be <provider> or <provider>/<model>");
+  }
+  if (credential !== undefined && !CREDENTIAL_LABEL_PATTERN.test(credential)) {
+    cooldownCommandFailure("--credential must match [A-Za-z0-9_.-]{1,32}");
+  }
+  const target = {
+    provider,
+    ...(model === undefined ? {} : { model }),
+    ...(credential === undefined ? {} : { credential }),
+  };
+
+  const cfg = loadOrExit();
+  if (!Object.hasOwn(cfg.providers, provider)) {
+    cooldownCommandFailure(`no provider "${provider}" configured`);
+  }
+
+  let authorization;
+  try {
+    authorization = createControlAuthorization(resolveControlAuthorizationConfigDir(cfg.sourcePath));
+  } catch {
+    cooldownCommandFailure("control authorization is unavailable; the relay must be running with this config");
+  }
+
+  let response: Response | null = null;
+  try {
+    response = await fetch(proxyUrl(cfg, "/cooldowns/clear"), {
+      method: "POST",
+      headers: authorization.attach({ "content-type": "application/json" }),
+      body: JSON.stringify(target),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // Report below with the same explicit no-file-fallback outcome for every transport failure.
+  }
+  if (response === null) {
+    cooldownCommandFailure("the relay must be running to clear cooldowns");
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    cooldownCommandFailure("the running relay returned an invalid cooldown-clear response");
+  }
+  if (!response.ok) {
+    const detail = controlErrorMessage(payload);
+    cooldownCommandFailure(`the running relay rejected the clear${detail === null ? "" : `: ${detail}`}`);
+  }
+  if (!isCooldownClearResult(payload, target)) {
+    cooldownCommandFailure("the running relay returned an invalid cooldown-clear response");
+  }
+
+  if (parsed.json) {
+    process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+    return;
+  }
+
+  const targetLabel = `${provider}${model === undefined ? "" : `/${model}`}${credential === undefined ? "" : ` [credential ${credential}]`}`;
+  process.stdout.write(`Cleared cooldown state for ${targetLabel}\n`);
+  const groups = [
+    ["breaker cells", payload.cleared.breakerCells] as const,
+    ["credential faults", payload.cleared.credentialFaults] as const,
+  ];
+  for (const [label, group] of groups) {
+    process.stdout.write(`  ${label}: ${group.count}\n`);
+    for (const cell of group.items) {
+      process.stdout.write(`    ${cell.provider}/${cell.model ?? "*"} [credential ${cell.credential}]\n`);
+    }
+  }
+  process.stdout.write(`  cooling facts: ${payload.cleared.facts.count}\n`);
+  for (const fact of payload.cleared.facts.items) {
+    process.stdout.write(`    ${fact.kind} ${describeScope(fact.scope)}\n`);
+  }
 }
 
 export type DashboardBrowserOpener = (url: string) => Promise<void> | void;
@@ -2671,10 +3016,21 @@ import { getTelemetryReport } from "./telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
 
 export function main(): void {
+  const rawCommand = rawCliCommand(process.argv);
   const positionals = getPositionalArgs(process.argv);
   const arg2 = positionals[0];
   const arg3 = positionals[1];
   const arg4 = positionals[2];
+
+  // Mutation parsing owns its raw argv so help/version-shaped typos cannot bypass fail-closed
+  // validation and turn a scoped clear into a wider request.
+  if (rawCommand === "cooldowns" || arg2 === "cooldowns") {
+    // Keep validation synchronous at the entrypoint; `runCooldowns` is async, and otherwise a
+    // parser failure would become an unobserved rejected promise after main returned.
+    parseCooldownClearArgs(process.argv);
+    void runCooldowns(arg3, arg4);
+    return;
+  }
 
   if (hasFlag("--help", "-h") || arg2 === "help") {
     process.stdout.write(HELP);
@@ -2871,6 +3227,9 @@ export function classifyCommand(argv: string[]): CommandEffect {
       return arg4 === "on" || arg4 === "enable" || arg4 === "off" || arg4 === "disable"
         ? "mutating"
         : "read-only";
+    // Clears process-local relay state through the authenticated mutation plane.
+    case "cooldowns":
+      return arg3 === "clear" ? "mutating" : "read-only";
     case "config":
       return arg3 === "set" || arg3 === "unset" ? "mutating" : "read-only";
     case "routing":
@@ -2898,10 +3257,12 @@ export function classifyCommand(argv: string[]): CommandEffect {
 }
 
 /**
- * Entrypoint: currency gate first (may replace this install and re-exec), then
- * the command itself. `main` stays synchronous so its exit paths are direct.
+ * Entrypoint: fail-closed mutation syntax, then the currency gate (which may replace this install
+ * and re-exec), then the command itself. `main` stays synchronous so its exit paths are direct.
  */
 export async function run(): Promise<void> {
+  // Reject malformed mutation argv before the self-update gate can perform any network request.
+  if (rawCliCommand(process.argv) === "cooldowns") parseCooldownClearArgs(process.argv);
   if (shouldCheckUpdates(process.argv, process.env, classifyCommand(process.argv))) {
     try {
       await ensureUpToDate();
