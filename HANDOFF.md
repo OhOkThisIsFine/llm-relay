@@ -170,9 +170,11 @@ else.**
   luna stay parked (backup `config.json.bak-2026-08-23-pre-codex-reenable`). NIM is DOWN for this
   account since ~21:51 PT 2026-08-23: every kimi-k3 and minimax-m3 completion returns 403
   `{"detail":"Authorization failed"}` identically through the relay and direct with the same key,
-  while `/models` still authenticates, so `llm-relay keys` reports VALID. This is account-wide at
-  NVIDIA and relay-blameless; Kimi lanes are unusable until it clears, and NIM must be re-probed
-  before relying on it. Kimi-k3's repeated tool-call ids are still fixed in v0.41.0 (`8473cb1`,
+  while `/models` still authenticates, so `llm-relay keys` reports VALID. This was account-wide at
+  NVIDIA and relay-blameless — RESOLVED 2026-08-24 by rotating the NVIDIA key: kimi-k3 and
+  minimax-m3 answer 200 again, direct and through the relay (relay restarted with the fresh key —
+  note a User-scope rotation reaches a process only at start, so the relay and any old shell must
+  be restarted to see it). Kimi-k3's repeated tool-call ids are still fixed in v0.41.0 (`8473cb1`,
   `src/tool-use-ids.ts`) once NIM recovers.
   `openrouter/nvidia/nemotron-3-ultra-556b-v2` is also de-listed on OpenRouter (400 "not a valid
   model ID"); cached candidates can be stale about both failures.
