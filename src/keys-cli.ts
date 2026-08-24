@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 import type { Config, ProviderConfig } from "./config.js";
@@ -49,6 +49,7 @@ import {
   createControlAuthorization,
   resolveControlAuthorizationConfigDir,
 } from "./control-authorization.js";
+import { restrictSecretFileOnWindowsSync } from "./secret-file-acl.js";
 
 export type KeysSecretPurpose =
   | "credential"
@@ -77,7 +78,10 @@ export interface KeysCliDependencies {
   readonly fetch?: typeof fetch;
   readonly keyCheckFetch?: typeof fetch;
   /** Test/embedding seam; production deliberately defaults to the existing key checker. */
-  readonly validateKeys?: (cfg: Config) => Promise<KeyCheckResult[]>;
+  readonly validateKeys?: (
+    cfg: Config,
+    env: NodeJS.ProcessEnv,
+  ) => Promise<KeyCheckResult[]>;
   readonly envFilePath?: string;
   readonly attachControlHeaders?: (
     cfg: Config,
@@ -120,10 +124,61 @@ class MutedPromptOutput extends Writable {
   }
 }
 
+interface PipedLineWaiter {
+  readonly resolve: (value: string) => void;
+  readonly reject: (error: KeysCliError) => void;
+}
+
+interface PipedLineReader {
+  readonly values: string[];
+  readonly waiters: PipedLineWaiter[];
+  ended: boolean;
+  failure?: KeysCliError;
+}
+
+const pipedLineReaders = new WeakMap<NodeJS.ReadStream, PipedLineReader>();
+
+function sharedPipedLineReader(input: NodeJS.ReadStream): PipedLineReader {
+  const existing = pipedLineReaders.get(input);
+  if (existing !== undefined) return existing;
+
+  const state: PipedLineReader = {
+    values: [],
+    waiters: [],
+    ended: input.readableEnded,
+  };
+  pipedLineReaders.set(input, state);
+  if (state.ended) return state;
+
+  const line = createInterface({ input, crlfDelay: Infinity, terminal: false });
+  const fail = (): void => {
+    if (state.failure !== undefined) return;
+    const failure = new KeysCliError("secret input failed");
+    state.failure = failure;
+    state.values.length = 0;
+    for (const waiter of state.waiters.splice(0)) waiter.reject(failure);
+    line.close();
+  };
+  line.on("line", (value) => {
+    const waiter = state.waiters.shift();
+    if (waiter === undefined) state.values.push(value);
+    else waiter.resolve(value);
+  });
+  line.once("close", () => {
+    state.ended = true;
+    input.removeListener("error", fail);
+    if (state.failure !== undefined) return;
+    for (const waiter of state.waiters.splice(0)) waiter.resolve("");
+  });
+  line.once("error", fail);
+  input.once("error", fail);
+  return state;
+}
+
 /**
  * One-line secret input. TTY input is handled by readline in terminal/raw mode while its output
  * is muted after the prompt; closing and every failure path restore the caller's raw-mode state.
- * Piped input reads one logical line and never prints a prompt.
+ * Each piped prompt consumes one logical line from a shared reader and never prints a prompt.
  */
 export async function readMaskedOrPipedLine(
   prompt: string,
@@ -131,18 +186,13 @@ export async function readMaskedOrPipedLine(
   output: PromptWriter = process.stderr,
 ): Promise<string> {
   if (input.isTTY !== true) {
-    const line = createInterface({ input, crlfDelay: Infinity, terminal: false });
+    const reader = sharedPipedLineReader(input);
+    const buffered = reader.values.shift();
+    if (buffered !== undefined) return buffered;
+    if (reader.failure !== undefined) throw reader.failure;
+    if (reader.ended || input.readableEnded) return "";
     return await new Promise<string>((resolve, reject) => {
-      let settled = false;
-      line.once("line", (value) => {
-        settled = true;
-        line.close();
-        resolve(value);
-      });
-      line.once("close", () => {
-        if (!settled) resolve("");
-      });
-      line.once("error", () => reject(new KeysCliError("secret input failed")));
+      reader.waiters.push({ resolve, reject });
     });
   }
 
@@ -194,8 +244,9 @@ async function readSecret(
       deps.stdin ?? process.stdin,
       deps.promptOutput ?? process.stderr,
     )))(prompt, purpose);
-  } catch {
-    throw new KeysCliError("secret input interrupted");
+  } catch (error) {
+    if (error instanceof KeysCliError) throw error;
+    throw new KeysCliError("secret input failed");
   }
   if (value.endsWith("\r\n")) value = value.slice(0, -2);
   else if (value.endsWith("\n")) value = value.slice(0, -1);
@@ -294,8 +345,9 @@ function selectAddTarget(
     );
   }
 
-  // Fleet slots resolve declared-only. A curated alias is accepted as input vocabulary, but is
-  // normalized to the selected slot's declared authEnv so the row cannot be inert at runtime.
+  // credentials[] fleet slots resolve declared-only. For those slots, a curated alias is accepted
+  // as input vocabulary but normalized to the selected slot's declared authEnv; legacy authEnv
+  // providers retain an explicitly requested curated alias.
   const envName = configured.credentials !== undefined
     ? slot.authEnv
     : (requestedEnvName ?? slot.authEnv);
@@ -414,13 +466,26 @@ export async function runKeysAddLocal(
   output(deps, `${KEY_CUSTODY_THREAT_BOUNDARY}\n`);
 
   if (options.check === true) {
-    const checkCfg: Config = { ...cfg, providers: { [provider]: target.config } };
-    const results = await (deps.validateKeys?.(checkCfg) ??
-      validateProviderKeys(checkCfg, deps.keyCheckFetch ?? fetch));
-    for (const result of results) {
+    if (winning.source === undefined) {
       output(
         deps,
-        `Check ${result.credentialId}: ${result.status.toUpperCase()} — ${result.message}\n`,
+        `Check skipped: the stored key ${target.credentialId} was NOT probed because the credential resolver selected no source.\n`,
+      );
+      return;
+    }
+    const checkCfg: Config = { ...cfg, providers: { [provider]: target.config } };
+    const results = await (deps.validateKeys?.(checkCfg, deps.env ?? process.env) ??
+      validateProviderKeys(checkCfg, deps.keyCheckFetch ?? fetch, {
+        env: deps.env ?? process.env,
+      }));
+    for (const result of results) {
+      const subject = result.credentialId === target.credentialId &&
+          (winning.source === "env" || winning.source === "env-file")
+        ? `Checked ${describeShadow(winning, deps)} — the stored key was NOT probed`
+        : `Check ${result.credentialId}`;
+      output(
+        deps,
+        `${subject}: ${result.status.toUpperCase()} — ${result.message}\n`,
       );
     }
   }
@@ -466,14 +531,13 @@ export function runKeysListLocal(
     }),
   ];
   output(deps, `${rows.map((row) => row.join("\t")).join("\n")}\n`);
-  if (status.droppedCount > 0) {
-    output(
-      deps,
-      `Store: ${status.status} — ${entries.length} shown, ${status.droppedCount} unreadable.\n`,
-    );
-  } else {
-    output(deps, `Store: ${status.status}.\n`);
-  }
+  const undecryptableCount = status.undecryptableCount;
+  const listedCount = entries.length;
+  const droppedCount = Math.max(0, status.droppedCount - undecryptableCount);
+  output(
+    deps,
+    `Store: ${status.status} — ${listedCount} listed, ${undecryptableCount} undecryptable, ${droppedCount} dropped.\n`,
+  );
   output(deps, "Note: this reflects the CLI process's view, not the running relay's.\n");
 }
 
@@ -746,10 +810,27 @@ export async function runKeysExportLocal(
   }
   if (existsSync(outPath)) throw new KeysCliError(`export destination already exists: ${outPath}`);
   const store = await storeOptionsForWrite(deps);
-  const passphrase = await readSecret(deps, "Export passphrase: ", "export-passphrase", true);
+  const passphrase = await readSecret(deps, "Export passphrase: ", "export-passphrase");
+  const confirmation = await readSecret(
+    deps,
+    "Confirm export passphrase: ",
+    "export-passphrase",
+  );
+  if (confirmation !== passphrase) {
+    throw new KeysCliError("export passphrase confirmation mismatch: export refused");
+  }
   const envelope = createEncryptedKeystoreExport(passphrase, store);
   writeFileSync(outPath, envelope, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  if ((store.acl?.platform ?? process.platform) === "win32") {
+    restrictSecretFileOnWindowsSync(outPath, store.acl);
+  } else {
+    chmodSync(outPath, 0o600);
+  }
   output(deps, `Encrypted keystore export written to ${outPath}. A plaintext export path does not exist.\n`);
+  output(
+    deps,
+    "The export passphrase is the file's entire protection off-machine; keep it separate from the export.\n",
+  );
 }
 
 async function importWriteOptions(deps: KeysCliDependencies): Promise<KeystoreOptions> {

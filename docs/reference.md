@@ -179,7 +179,8 @@ startup — losing *every* route is still fatal. CLI startup overrides (`--defau
 `llm-relay keys` manages an encrypted keystore at `~/.llm-relay/keystore.json`. Secrets are
 encrypted individually with AES-256-GCM under a store key recovered through the platform
 mechanism or scrypt passphrase mode below. A secret is never accepted on argv: an interactive
-command uses an echo-off prompt, and automation may pipe exactly one line on stdin.
+command uses an echo-off prompt, and automation may pipe one line per secret prompt on stdin; each
+prompt consumes exactly one line, and end-of-input before a line is refused.
 
 The threat boundary is deliberately narrow:
 
@@ -225,8 +226,10 @@ closed curated alias list. An inferred or guessed name is never accepted for a w
 
 `keys list` shows the provider, credential id, winning source (`env`, `env-file`, or `keystore`),
 fingerprint-derived mask, added/rotated dates, expiry, and revoked/disabled state. It never derives
-a mask from secret bytes and never prints a secret. When rows were dropped it prints the exact
-store summary `N shown, M unreadable`; it also names a degraded, locked, or unreadable store state.
+a mask from secret bytes and never prints a secret. Its store summary always reports the three-way
+count `N listed, C undecryptable, D dropped`; `C` is the subset of listed metadata rows whose
+ciphertext cannot be decrypted, while `D` rows were rejected before listing. It also names a
+degraded, locked, or unreadable store state.
 This is the newly started CLI process's view; it is not proof of what environment a relay process
 that started earlier can see.
 
@@ -235,15 +238,18 @@ that started earlier can see.
 | Command | Behaviour |
 | :--- | :--- |
 | `llm-relay keys` / `llm-relay keys check` / `llm-relay check-keys` | Check every configured credential slot; bare `keys` and `check-keys` retain the historical status output. |
-| `llm-relay keys add <provider> [--label <label>] [--env-name <NAME>] [--check]` | Store one stdin/prompted secret. The provider must exist, declare an auth environment name or matching credential slot, and not be passthrough; the name must pass the strict write gate above. The default label is `default`, or the matching slot label; the default name is the provider/slot declaration. `--check` validates after storing, and a failed or inconclusive check never rolls storage back. Every successful add prints the threat boundary above. |
+| `llm-relay keys add <provider> [--label <label>] [--env-name <NAME>] [--check]` | Store one stdin/prompted secret. The provider must exist, declare an auth environment name or matching credential slot, and not be passthrough; the name must pass the strict write gate above. The default label is `default`, or the matching slot label; the default name is the provider/slot declaration. `--check` validates after storing, and a failed or inconclusive check never rolls storage back. If an environment or env-file value shadows the stored row, the check names that winning variable and source and says the stored key was not probed. Every successful add prints the threat boundary above. |
 | `llm-relay keys list` | List non-secret resolution and lifecycle metadata plus store status. |
 | `llm-relay keys rotate <provider[#label]>` | Replace ciphertext under the same id and set `rotatedAt`; a bare provider means `provider#default`. Rotation deliberately un-revokes an entry and says so when it does. It refuses a shadowed entry. |
 | `llm-relay keys revoke <id>` | Set `revokedAt` and retain the row, so the missing credential remains explained. |
 | `llm-relay keys disable <id>` / `llm-relay keys enable <id>` | Toggle selection without deleting the row. |
 | `llm-relay keys remove <id> [--purge]` | Remove the row. Even overwrite-then-unlink would be theatre on a journaling filesystem or SSD; `--purge` does **not** claim secure erase. |
-| `llm-relay keys export --out <file>` | Export only a versioned encrypted envelope: scrypt with the keystore passphrase parameters, then AES-256-GCM over the full decrypted entries payload. The export passphrase is typed with echo off. There is no plaintext export path, and the store must be unlockable. |
+| `llm-relay keys export --out <file>` | Export only a versioned encrypted envelope: scrypt with the keystore passphrase parameters, then AES-256-GCM over the full decrypted entries payload. The non-whitespace export passphrase is typed with echo off and confirmed before anything is written. There is no plaintext export path, and the store must be unlockable. |
 | `llm-relay keys import <file>` | Import an encrypted custody export, a plaintext FreeLLMAPI v1 envelope, or dotenv using the closed alias matcher. The destination is the keystore, and output names providers and environment variables but never values. After a plaintext import, remove/shred the source yourself; old contents may still survive in backups, filesystem journals, or unallocated SSD blocks. |
 | `llm-relay keys unlock` | Verify the passphrase-mode store verifier. Other wrap modes need no CLI unlock, so this is a no-op there. There is no cross-process KEK cache; each new command prompts when its selected wrap mode requires a passphrase. |
+
+The export file is protected by a restricted ACL on Windows and mode `0600` elsewhere; once it is
+moved off-machine, its confidentiality rests entirely on the export passphrase.
 
 Any other `keys` subcommand exits 1 and names the valid set. Older releases silently treated an
 unknown word as the status check; failing loudly avoids disguising a mistyped mutation.
@@ -1463,11 +1469,13 @@ The response contains identifiers only: provider/model names, credential labels 
 fact kinds, and fact scopes. It contains no refusal bodies, headers, keys, or other secrets. Normal
 CLI output renders the same three group counts and identifiers; `--json` prints the raw response.
 
-Neither form is rendered as success until the CLI validates the complete response contract:
+Neither form is rendered as success until its caller validates the complete response contract.
+The broad `cooldowns clear` CLI validator rejects a `kinds` target; the narrowed `keys rotate`
+validator requires the exact `kinds:["credential-fault"]` target it sent:
 
 - the envelope has exactly `target` and `cleared`, and `target` has exactly the requested provider,
-  optional model, optional credential, and optional `kinds`, with the same optional-key presence as
-  the request;
+  optional model, optional credential, and, only for the narrowed rotation call, exact `kinds`,
+  with the same optional-key presence as the request;
 - `cleared` has exactly the breaker-cell, credential-fault, and fact groups; every `count` is a
   non-negative safe integer equal to its `items` array length;
 - every breaker or credential-fault item has exactly the provider/model/credential cell shape and

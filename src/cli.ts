@@ -3302,12 +3302,8 @@ export function main(): void {
       case "unlock":
         runKeysPromise(runKeysUnlock());
         return;
-    default:
-      process.stderr.write(
-        `llm-relay keys: unknown subcommand; valid subcommands: ${KEYS_SUBCOMMANDS.join(", ")}\n`,
-      );
-        process.exit(1);
-        return;
+      default:
+        throw new Error("unreachable keys subcommand after validation");
     }
   }
   if (arg2 === "models") {
@@ -3458,7 +3454,7 @@ export function classifyCommand(argv: string[]): CommandEffect {
     case "keys":
       return arg3 === "add" || arg3 === "rotate" || arg3 === "revoke" ||
         arg3 === "remove" || arg3 === "disable" || arg3 === "enable" ||
-        arg3 === "import" || arg3 === "unlock"
+        arg3 === "export" || arg3 === "import"
         ? "mutating"
         : "read-only";
     case "config":

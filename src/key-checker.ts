@@ -220,16 +220,17 @@ function routedModelsByProvider(cfg: Config): Map<string, string> {
 export async function validateProviderKeys(
   cfg: Config,
   fetchFn: typeof fetch = fetch,
-  opts: { budgetMs?: number } = {},
+  opts: { budgetMs?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<KeyCheckResult[]> {
   const entries = Object.entries(cfg.providers);
   const routed = routedModelsByProvider(cfg);
   const budgetMs = opts.budgetMs ?? PROVIDER_CHECK_BUDGET_MS;
+  const env = opts.env ?? process.env;
 
  const checkOne = async (name: string, p: ProviderConfig, slot: CredentialSlot): Promise<KeyCheckResult> => {
   const envVarName = slot.authEnv;
   const identity = { credentialId: slot.credentialId, label: slot.label };
-  const resolution = resolveCredentialSlot(slot, process.env);
+  const resolution = resolveCredentialSlot(slot, env);
   const hasEnvKey = resolution.state === "declared-present";
   if (!slot.enabled) {
   return { provider: name, ...identity, authEnv: envVarName, hasEnvKey, status: "disabled", message: "Credential slot is disabled" };
@@ -392,7 +393,7 @@ export async function validateProviderKeys(
           credentialId: slot.credentialId,
           label: slot.label,
           authEnv: slot.authEnv,
-          hasEnvKey: resolveCredentialSlot(slot, process.env).state === "declared-present",
+          hasEnvKey: resolveCredentialSlot(slot, env).state === "declared-present",
           status: "unreachable" as const,
           message: `No answer within ${budgetMs}ms`,
         }),

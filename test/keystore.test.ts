@@ -247,7 +247,7 @@ describe("encrypted credential keystore", () => {
     expect(listEntries(options())).toEqual([descriptor]);
     expect(listEntries(options())[0]).not.toHaveProperty("ct");
     expect(listEntries(options())[0]).not.toHaveProperty("value");
-    expect(keystoreStatus(options())).toEqual({ status: "ok", droppedCount: 0 });
+    expect(keystoreStatus(options())).toEqual({ status: "ok", droppedCount: 0, undecryptableCount: 0 });
   });
 
   it("uses a fresh 12-byte IV and a 16-byte authentication tag for every encryption", () => {
@@ -276,7 +276,7 @@ describe("encrypted credential keystore", () => {
 
     expect(() => lookupByEnvName("NVIDIA_API_KEY", options())).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1, undecryptableCount: 1 });
   });
 
   it("binds envName into AES-GCM AAD so a file writer cannot retarget a secret", () => {
@@ -289,7 +289,7 @@ describe("encrypted credential keystore", () => {
 
     expect(lookupByEnvName("OPENAI_API_KEY", options())).toBeNull();
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1, undecryptableCount: 1 });
   });
 
   it("keeps the legacy provider argument compatibility-only while envName owns identity", () => {
@@ -350,7 +350,7 @@ describe("encrypted credential keystore", () => {
 
     expect(lookupByEnvNames(["NVIDIA_API_KEY"], scoped)?.value).toBe(FIRST_SECRET);
     expect(listEntries(scoped)).toHaveLength(2);
-    expect(keystoreStatus(scoped)).toEqual({ status: "ok", droppedCount: 0 });
+    expect(keystoreStatus(scoped)).toEqual({ status: "ok", droppedCount: 0, undecryptableCount: 0 });
     expect(statFile).toHaveBeenCalledTimes(1);
     expect(readFile).toHaveBeenCalledTimes(1);
   });
@@ -428,7 +428,7 @@ describe("encrypted credential keystore", () => {
     expect(listEntries(options()).map((entry) => entry.id)).toEqual(["nim#personal"]);
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
     expect(lookupByEnvName("NVIDIA_API_KEY", "openai", options())?.value).toBe(FIRST_SECRET);
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1, undecryptableCount: 0 });
   });
 
   const mutationCases: Array<{
@@ -513,7 +513,11 @@ describe("encrypted credential keystore", () => {
         expect(() => listEntries(options())).toThrow(KeystoreReadError);
         expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
       }
-      expect(keystoreStatus(options())).toEqual({ status: expectedStatus, droppedCount });
+      expect(keystoreStatus(options())).toEqual({
+        status: expectedStatus,
+        droppedCount,
+        undecryptableCount: 0,
+      });
 
       const error = captureError(() => mutate(options()));
       expect(error).toBeInstanceOf(KeystoreMutationRefusedError);
@@ -534,7 +538,11 @@ describe("encrypted credential keystore", () => {
       const before = readFileSync(path);
 
       expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
-      expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+      expect(keystoreStatus(options())).toEqual({
+        status: "degraded",
+        droppedCount: 1,
+        undecryptableCount: 1,
+      });
       lock({ path });
       const error = captureError(() => mutate(options()));
       expect(error).toBeInstanceOf(KeystoreMutationRefusedError);
@@ -625,7 +633,11 @@ describe("encrypted credential keystore", () => {
     utimesSync(path, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
 
     expect(lookupByEnvName("NVIDIA_API_KEY", options({ now: 1 }))).toBeNull();
-    expect(keystoreStatus(options({ now: 1 }))).toEqual({ status: "locked", droppedCount: 0 });
+    expect(keystoreStatus(options({ now: 1 }))).toEqual({
+      status: "locked",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
     expect(lookupByEnvName("NVIDIA_API_KEY", options({ now: 60_000 }))?.value)
       .toBe(FIRST_SECRET);
   });
@@ -670,6 +682,25 @@ describe("encrypted credential keystore", () => {
     expect(existsSync(path)).toBe(false);
   });
 
+  it("bounds environment names at 128 characters", () => {
+    const maximumName = `A${"B".repeat(127)}`;
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: maximumName,
+      value: FIRST_SECRET,
+    }, options());
+
+    const hostileName = `${maximumName}C`;
+    expect(() => addEntry({
+      id: "nim#work",
+      provider: "nim",
+      envName: hostileName,
+      value: SECOND_SECRET,
+    }, options())).toThrow(KeystoreValidationError);
+    expect(listEntries(options()).map((entry) => entry.envName)).toEqual([maximumName]);
+  });
+
   it.each([
     ["provider CRLF", "nim\r\nX-Injected: 1"],
     ["provider terminal escape", "nim\u001b[31m"],
@@ -697,7 +728,11 @@ describe("encrypted credential keystore", () => {
     expect(listEntries(options()).map((entry) => entry.id)).toEqual(["nim#personal"]);
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
     expect(lookupByEnvName("OPENAI_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "degraded",
+      droppedCount: 1,
+      undecryptableCount: 0,
+    });
   });
 
   it("refuses a credential id whose provider does not match the entry provider", () => {
@@ -746,7 +781,11 @@ describe("encrypted credential keystore", () => {
 
     expect(listEntries(options()).map((entry) => entry.id)).toEqual(["nim#personal"]);
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "degraded",
+      droppedCount: 1,
+      undecryptableCount: 0,
+    });
   });
 
   it("drops a loaded entry whose credential id belongs to another provider", () => {
@@ -755,7 +794,11 @@ describe("encrypted credential keystore", () => {
     writeRaw(raw);
 
     expect(listEntries(options()).map((entry) => entry.id)).toEqual(["nim#personal"]);
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "degraded",
+      droppedCount: 1,
+      undecryptableCount: 0,
+    });
   });
 
   it("rejects a zero-length ciphertext at load", () => {
@@ -765,7 +808,11 @@ describe("encrypted credential keystore", () => {
 
     expect(listEntries(options()).map((entry) => entry.id)).toEqual(["nim#personal"]);
     expect(lookupByEnvName("OPENAI_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "degraded",
+      droppedCount: 1,
+      undecryptableCount: 0,
+    });
   });
 
   it.each([
@@ -779,14 +826,22 @@ describe("encrypted credential keystore", () => {
     expect(() => listEntries(options())).toThrow(KeystoreReadError);
     expect(() => lookupByEnvName("NVIDIA_API_KEY", options())).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "unreadable", droppedCount: 0 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "unreadable",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
   });
 
   it("resolver reads return absent without throwing when the store does not exist", () => {
     expect(existsSync(path)).toBe(false);
     expect(() => lookupByEnvName("NVIDIA_API_KEY", options())).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "absent", droppedCount: 0 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "absent",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
   });
 
   it("memoizes absence with one stat and zero reads per independent resolution", () => {
@@ -829,6 +884,7 @@ describe("encrypted credential keystore", () => {
     }))).toEqual({
       status: "unreadable",
       droppedCount: 0,
+      undecryptableCount: 0,
     });
     expect(statFile).toHaveBeenCalledTimes(1);
     expect(readFile).toHaveBeenCalledTimes(1);
@@ -850,6 +906,7 @@ describe("encrypted credential keystore", () => {
     }))).toEqual({
       status: "ok",
       droppedCount: 0,
+      undecryptableCount: 0,
     });
     expect(statFile).toHaveBeenCalledTimes(2);
     expect(readFile).toHaveBeenCalledTimes(2);
@@ -896,7 +953,7 @@ describe("encrypted credential keystore", () => {
       readFile,
       statFile,
       resolutionWalk: retryWalk,
-    }))).toEqual({ status: "ok", droppedCount: 0 });
+    }))).toEqual({ status: "ok", droppedCount: 0, undecryptableCount: 0 });
     expect(readFile).toHaveBeenCalledTimes(2);
     expect(statFile).toHaveBeenCalledTimes(3);
   });
@@ -914,6 +971,7 @@ describe("encrypted credential keystore", () => {
     expect(keystoreStatus(presentButUnreadable)).toEqual({
       status: "unreadable",
       droppedCount: 0,
+      undecryptableCount: 0,
     });
     const error = captureError(() => addEntry({
       id: "anthropic#third",
@@ -932,7 +990,11 @@ describe("encrypted credential keystore", () => {
 
     expect(() => lookupByEnvName("NVIDIA_API_KEY", options())).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "unreadable", droppedCount: 0 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "unreadable",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
     expect(() => listEntries(options())).toThrow(KeystoreReadError);
     const mutationError = captureError(() => addEntry({
       id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: ATTEMPTED_SECRET,
@@ -948,7 +1010,11 @@ describe("encrypted credential keystore", () => {
 
     expect(() => lookupByEnvName("NVIDIA_API_KEY", denied)).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", denied)).toBeNull();
-    expect(keystoreStatus(denied)).toEqual({ status: "unreadable", droppedCount: 0 });
+    expect(keystoreStatus(denied)).toEqual({
+      status: "unreadable",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
     const readError = captureError(() => listEntries(denied));
     expect(readError).toBeInstanceOf(KeystoreReadError);
     expect(readError.message).toBe("keystore read failed (EACCES)");
@@ -974,17 +1040,29 @@ describe("encrypted credential keystore", () => {
     const missingPassphrase = { path } satisfies KeystoreOptions;
     expect(() => lookupByEnvName("NVIDIA_API_KEY", missingPassphrase)).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", missingPassphrase)).toBeNull();
-    expect(keystoreStatus(missingPassphrase)).toEqual({ status: "locked", droppedCount: 0 });
+    expect(keystoreStatus(missingPassphrase)).toEqual({
+      status: "locked",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
     lock({ path });
 
     const wrongPassphrase = { ...options(), passphrase: "wrong passphrase" };
     expect(() => lookupByEnvName("NVIDIA_API_KEY", wrongPassphrase)).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", wrongPassphrase)).toBeNull();
-    expect(keystoreStatus(wrongPassphrase)).toEqual({ status: "locked", droppedCount: 0 });
+    expect(keystoreStatus(wrongPassphrase)).toEqual({
+      status: "locked",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
     lock({ path });
 
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
-    expect(keystoreStatus(options())).toEqual({ status: "ok", droppedCount: 0 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "ok",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
   });
 
   it("lets explicit lock end an unlock cooldown and permits exactly one fresh unwrap", () => {
@@ -1034,6 +1112,7 @@ describe("encrypted credential keystore", () => {
     expect(keystoreStatus({ ...retryOptions, now: 2 })).toEqual({
       status: "ok",
       droppedCount: 0,
+      undecryptableCount: 0,
     });
     expect(retrySpawn).toHaveBeenCalledTimes(2);
   });
@@ -1083,6 +1162,7 @@ describe("encrypted credential keystore", () => {
     expect(keystoreStatus({ ...failingOptions, now: 59_999 })).toEqual({
       status: "locked",
       droppedCount: 0,
+      undecryptableCount: 0,
     });
     expect(failingSpawn).toHaveBeenCalledTimes(1);
     expect(resolveCredential("NVIDIA_API_KEY", {}, "nim", {
@@ -1133,7 +1213,11 @@ describe("encrypted credential keystore", () => {
     const second = resolveCredential("NVIDIA_API_KEY", {}, "nim", lookupOptions);
     expect(first).toMatchObject({ state: "declared-present", value: FIRST_SECRET, source: "keystore" });
     expect(second).toEqual(first);
-    expect(keystoreStatus(lookupOptions)).toEqual({ status: "ok", droppedCount: 0 });
+    expect(keystoreStatus(lookupOptions)).toEqual({
+      status: "ok",
+      droppedCount: 0,
+      undecryptableCount: 0,
+    });
     expect(successfulSpawn).toHaveBeenCalledTimes(1);
   });
 
@@ -1243,7 +1327,11 @@ describe("encrypted credential keystore", () => {
     writeRaw(corrupted);
     utimesSync(path, new Date(1_700_000_000_000), new Date(1_700_000_000_000));
     expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
-    expect(keystoreStatus(options())).toEqual({ status: "degraded", droppedCount: 1 });
+    expect(keystoreStatus(options())).toEqual({
+      status: "degraded",
+      droppedCount: 1,
+      undecryptableCount: 1,
+    });
   });
 
   it("zeroizes the real cached KEK buffer on lock", () => {
