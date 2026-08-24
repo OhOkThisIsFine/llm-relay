@@ -2,7 +2,18 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-23 (afternoon)
+## 0. State as of 2026-08-24
+
+The 2026-08-24 sprint delivered two commits queued for **v0.44.0**. `32f31c3` delivered Gap 10 /
+M4: attempt-scoped estimated output now lands from the usage observer in its own `relay_estimate`
+cell, and the completed input+output `usedInWindow` scalar means an operator's own tpm/tpd hard cap
+refuses sooner and the `derived:configured` demotion rung moves instead of both acting on the old
+systematic input-only undercount. `1ee1ad2` delivered M3: `POST /cooldowns/clear` and
+`llm-relay cooldowns clear` share the existing control-route admission path, fail closed on scope
+grammar, clear only cooling state and retain measurements, history and accounting. Both were
+implemented by Codex (GPT-5.6 Sol) and adversarially reviewed: native Opus returned
+MERGE-WITH-FIXES on M4 with every fix applied; fresh-context Codex returned REWORK on M3 and all
+four findings, including both fail-open scope-widening majors, were fixed and pinned.
 
 Branch `main`. The metering closeout is **complete**: every sprint lane merged (nine commits).
 Since then: **v0.39.0** (`883a804`, released `cb273b0`) fixed the request-side tool-call IR leak with a
@@ -45,11 +56,11 @@ collision policy (injected-digest seam) and two `as never` fixture casts.
   - `f29e18e` — Stage 5 / Gap 12: quota joins both fronts' walk order as a demotion term.
   - `9fd9f36` — Stage 4 / C1: the `llm-relay cost` spend roll-up with `--include-repair`.
 - [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is THE
-  ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`; its §7 lists what
-  remains open after the sprint (M4/Gap 10 deferral, plus the standing Gaps 15/16/M3/P1/P4
-  deferrals) — the reviewed-rule rung of `resolveResetsAt` (`a407ee0`) and streaming
-  cross-protocol usage parity in llm-bridge are both closed as of 2026-08-23, delivered and
-  accepted-as-is respectively (§6 below).
+  ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`; its §7 records
+  the closeout: M4/Gap 10 and M3 are delivered for v0.44.0, Gaps 15/16/P4 were dropped, and P1
+  rolls into the approved custody program. The reviewed-rule rung of `resolveResetsAt` (`a407ee0`)
+  and streaming cross-protocol usage parity in llm-bridge are both closed as of 2026-08-23,
+  delivered and accepted-as-is respectively (§6 below).
 - Earlier state, for orientation: env-backed multi-key credential pooling landed as `7217ce0` ..
   `3795e60`; the accounting foundation + Analytics SPA (P0-P4) as `b4ec7ee`, followed by
   review-driven hardening (`3c3edd2`) and the Gap 7 spec amendment (`90e5e55`).
@@ -153,11 +164,18 @@ else.**
   directly (`--model openrouter/stealth/ox-alpha`) avoids the fall-through. Health demotes, never
   drops — so spent members stay walkable by design; the fix direction is eligibility facts or the
   G2 cap, not dropping.
-- **Free-lane reliability, 2026-08-23:** NIM 429s a two-lane burst on one key; ollama-cloud free
-  tier returned 429 "weekly usage limit"; codex exec is at its ChatGPT usage limit until
-  2026-08-27. Kimi-k3's repeated tool-call ids (NIM emits `Read:0`/`Bash:0` every turn) are fixed
-  by the relay in v0.41.0 (`8473cb1`, `src/tool-use-ids.ts`) — a headless lane against that model
-  needs a relay >= 0.41.0.
+- **Free-lane reliability, 2026-08-24:** ollama-cloud free tier returned 429 "weekly usage limit".
+  Codex quota reset on 2026-08-24 (live-probed), so the dispatch ladders are back to the 2026-08-08
+  promotion arrangement: codex-sol leads every tier; spark is second in low/medium only; terra and
+  luna stay parked (backup `config.json.bak-2026-08-23-pre-codex-reenable`). NIM is DOWN for this
+  account since ~21:51 PT 2026-08-23: every kimi-k3 and minimax-m3 completion returns 403
+  `{"detail":"Authorization failed"}` identically through the relay and direct with the same key,
+  while `/models` still authenticates, so `llm-relay keys` reports VALID. This is account-wide at
+  NVIDIA and relay-blameless; Kimi lanes are unusable until it clears, and NIM must be re-probed
+  before relying on it. Kimi-k3's repeated tool-call ids are still fixed in v0.41.0 (`8473cb1`,
+  `src/tool-use-ids.ts`) once NIM recovers.
+  `openrouter/nvidia/nemotron-3-ultra-556b-v2` is also de-listed on OpenRouter (400 "not a valid
+  model ID"); cached candidates can be stale about both failures.
 - **Two heredoc groups in one Bash call break quoting in this harness.** One heredoc per call.
 
 ## 5. Definition of done
@@ -207,13 +225,21 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   `toolCallIdRewrites` log counter. This also subsumes the `tool-use-ids.ts` interaction: a minted
   `Read:0_relay1` id is rewritten like any other shape.
 - **Resolved:** Gap 7 by spec amendment 2026-08-22 (no new endpoints).
-- **QUEUED FOR BUILD (owner decision 2026-08-23) — Gap 10 / M4**, the estimated-output producer:
-  the owner explicitly waived the "measure usage-absence rates first" evidence gate — "we're not
-  waiting to measure." Sanctioned work, not yet started.
-- **RE-OPENED, QUEUED FOR BUILD (owner decision 2026-08-23) — M3**, the cooldown-clear mutation:
-  its security precondition is unchanged and must ship with it — control token plus the same
-  Origin/content-type/Host admission checks as `/offload` and `/dispatch`
-  (`docs/quota-metering-spec-2026-08-16.md` §6.2, ~line 375). Loopback is not authorization.
+- **DELIVERED (v0.44.0, `32f31c3`) — Gap 10 / M4.** The attempt-scoped usage observer now records
+  model-authored text, thinking/reasoning and whole tool-argument JSON through one chars/4
+  `relay_estimate` cell, separate from reported usage; base64 is skipped, any taint nulls the whole
+  estimate, serve estimates require final-wire commit and repair attempts are metered
+  unconditionally. Consequence: `usedInWindow` now completes estimated-basis tokens to
+  input+output, so an operator tpm/tpd `limits.hard` cap refuses sooner and the
+  `derived:configured` demotion rung moves; the old input-only scalar fired both late.
+- **DELIVERED (v0.44.0, `1ee1ad2`) — M3.** `POST /cooldowns/clear` and
+  `llm-relay cooldowns clear <provider>[/<model>] [--credential <label>]` shipped with the §6.2
+  security precondition through the same `admissionFailure()` path as `/offload` and `/dispatch`.
+  The body rejects every unknown key and the CLI enforces exact arity plus a flag allow-list before
+  sending; the clear removes breaker/Retry-After/escalation cooldowns, credential faults,
+  quota-sourced cooldowns and cooling condition facts, while retaining measurement/eviction facts,
+  failure/stability history and the accounting store. No running relay means exit 1, never a file
+  fallback.
 - **DROPPED (owner decision 2026-08-23), not deferred — Gaps 15/16, P4.** Removed from the program
   of record entirely, not a future ask: Gap 15 (single-file HTML dashboard) was superseded by the
   shipped SPA, Gap 16 (in-flight quota leases) had spec §5.4 arguing against it with no measured

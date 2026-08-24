@@ -1,10 +1,9 @@
 # Open owner decisions — metering / fleet / quota program (2026-08-16)
 
-**Owner disposition — 2026-08-21:** all recommendations in this document are approved as written.
-They are now implementation defaults, including their stated safety gates and deferrals. M4 remains
-evidence-gated until observed usage-absence rates are measured; P4 remains purpose-gated and must
-not be implemented until a concrete use case exists. Neither is an unresolved implementation
-choice.
+**Owner disposition — 2026-08-21:** all recommendations in this document were approved as written.
+They became implementation defaults, including their stated safety gates and deferrals. The later
+2026-08-23 decisions recorded below waived M4's evidence gate and dropped P4; M4 and M3 were then
+delivered on 2026-08-24. Neither is an unresolved implementation choice.
 
 Eighteen decisions surfaced across the three design tracks. G1–G4 were resolved before
 implementation; the owner disposition above closes the recommended defaults for the remaining
@@ -96,8 +95,8 @@ row above stays in place as history.
 | # | Decision | **Resolution** |
 |---|---|---|
 | — | Custody/keystore program | **APPROVED — queued as the next sprint.** The metering gate was already lifted; work starts from [credential-fleet-design-2026-08-16.md](credential-fleet-design-2026-08-16.md)'s staged build order, not tonight. |
-| M4 | Estimated-output producer (Gap 10) | **QUEUED FOR BUILD.** The "measure usage-absence rates first" evidence gate is explicitly waived by the owner — "we're not waiting to measure." Sanctioned work. |
-| M3 | Cooldown-clear mutation | **RE-OPENED — queued for build.** Security precondition unchanged: control token plus the same Origin/content-type/Host admission checks as `/offload` and `/dispatch` ([quota-metering-spec-2026-08-16.md](quota-metering-spec-2026-08-16.md) §6.2). Loopback is not authorization. |
+| M4 | Estimated-output producer (Gap 10) | **DELIVERED (`32f31c3`).** Attempt-scoped at the usage observer, separate from reported usage; the owner-waived producer is queued for v0.44.0. |
+| M3 | Cooldown-clear mutation | **DELIVERED (`1ee1ad2`).** The route ships behind the control token plus the same Origin/content-type/Host admission checks as `/offload` and `/dispatch`; its scope grammar fails closed and it clears only cooling state. Queued for v0.44.0. |
 | Gap 15 | Single-file HTML dashboard | **DROPPED**, not deferred — superseded by the shipped SPA (G3). Removed from the program of record. |
 | Gap 16 | In-flight quota leases | **DROPPED**, not deferred — spec §5.4 already argued against it with no measured overshoot. Removed from the program of record. |
 | P4 | Server-enforced system prompts (`client_profiles` part 2) | **DROPPED** — never acquired a purpose. Removed from the program of record. |

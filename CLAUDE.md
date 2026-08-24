@@ -822,11 +822,10 @@ provenance cells (Gap 11), the availability ladders + dashboard availability pro
 quota as a demotion term on both fronts (Stage 5 / Gap 12, learned opt-in via
 `routing.quota.enforceLearned`), and the `llm-relay cost --include-repair` roll-up.
 [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7 is the
-pre-M4 open list: the G2 manual hard cap is delivered (`5e06a56`, v0.40.0). This sprint delivered
-M4/Gap 10's attempt-scoped estimated-output producer (evidence gate waived). Owner decisions
-2026-08-23 queued M3 for build with its §6.2 admission-check precondition, dropped Gaps 15/16/P4
-outright, and approved the custody program
-(`docs/credential-fleet-design-2026-08-16.md`) as the next sprint. The 2026-08-23 sprint (v0.41.0) closed the dashboard/
+closeout ledger; the G2 manual hard cap is delivered (`5e06a56`, v0.40.0). The 2026-08-24 sprint
+delivered M4/Gap 10 (`32f31c3`) and M3 (`1ee1ad2`), queued for **v0.44.0**; Gaps 15/16/P4 were
+dropped outright, and custody (`docs/credential-fleet-design-2026-08-16.md`) remains the next
+sprint. The 2026-08-23 sprint (v0.41.0) closed the dashboard/
 `cost` coverage-partial semantics (`50e8233`) and the OpenAI Responses front's dropped
 `function_call` (`3253a53`), and added tool-use id minting for repeated-id openai-kind hosts
 (`8473cb1`, `src/tool-use-ids.ts`). Two more commits landed after that, queued for **v0.42.0**:
