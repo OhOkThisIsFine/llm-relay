@@ -13,6 +13,10 @@
  * provider's endpoint, which is a credential leak, not a convenience.
  */
 
+import type { CredentialId } from "./credential-id.js";
+import { lookupByEnvName, type KeystoreOptions } from "./keystore.js";
+import { wasEnvNameLoadedFromFile } from "./dotenv.js";
+
 /** Known alternate spellings, per provider, in preference order after the declared name. */
 const PROVIDER_ENV_ALIASES: Record<string, string[]> = {
   gemini: [
@@ -62,6 +66,36 @@ export function candidateEnvNames(providerName: string, declared?: string): stri
   return [...new Set(ordered)];
 }
 
+/**
+ * The complete legacy credential-name walk, shared by resolution and custody
+ * coverage diagnostics. An env-name-implied provider family is considered before
+ * candidates derived from the configured provider name.
+ */
+export function credentialCandidateEnvNames(
+  declaredAuthEnv: string | undefined,
+  providerName?: string,
+): string[] {
+  if (!declaredAuthEnv) return [];
+
+  // A configured provider can be named differently from the provider family
+  // implied by its declared env name (for example, `claude` declaring
+  // `ANTHROPIC_API_KEY`). Search the declared family first so that a curated
+  // alias is not hidden by the explicit provider name's derived candidates.
+  let declaredFamily: string | undefined;
+  for (const [provider, aliases] of Object.entries(PROVIDER_ENV_ALIASES)) {
+    if (aliases.includes(declaredAuthEnv)) {
+      declaredFamily = provider;
+      break;
+    }
+  }
+
+  return [...new Set([
+    declaredAuthEnv,
+    ...(declaredFamily ? PROVIDER_ENV_ALIASES[declaredFamily] ?? [] : []),
+    ...(providerName ? candidateEnvNames(providerName).filter((name) => name !== declaredAuthEnv) : []),
+  ])];
+}
+
 export interface AuthEnvResolution {
   /** The name to read the key from — the first candidate that is set, else the declared name. */
   name: string | undefined;
@@ -75,7 +109,14 @@ export interface CredentialResolution {
   state: CredentialState;
   value: string | undefined;
   envName: string | undefined;
+  source: CredentialSource | undefined;
+  provenance?: {
+    entryId: CredentialId;
+    provider: string;
+  };
 }
+
+export type CredentialSource = "env" | "env-file" | "keystore";
 
 /**
  * Whether a credential value counts as PRESENT. The single predicate — three
@@ -109,58 +150,81 @@ export function resolveTargetAuthEnv(
   providerName?: string,
 ): string | undefined {
   if (!declaredAuthEnv) return undefined;
-  // A configured provider can be named differently from the provider family
-  // implied by its declared env name (for example, `claude` declaring
-  // `ANTHROPIC_API_KEY`). Search the declared family first so that a curated
-  // alias is not hidden by the explicit provider name's derived candidates.
-  let declaredFamily: string | undefined;
-  for (const [provider, aliases] of Object.entries(PROVIDER_ENV_ALIASES)) {
-    if (aliases.includes(declaredAuthEnv)) {
-      declaredFamily = provider;
-      break;
-    }
-  }
-  const candidates = [
-    declaredAuthEnv,
-    ...(declaredFamily ? PROVIDER_ENV_ALIASES[declaredFamily] ?? [] : []),
-    ...(providerName ? candidateEnvNames(providerName).filter((name) => name !== declaredAuthEnv) : []),
-  ];
-  const found = [...new Set(candidates)].find((name) => keyIsPresent(env[name]));
+  const candidates = credentialCandidateEnvNames(declaredAuthEnv, providerName);
+  const found = candidates.find((name) => keyIsPresent(env[name]));
   return found ?? declaredAuthEnv;
+}
+
+function envCredentialSource(envName: string, env: NodeJS.ProcessEnv): CredentialSource {
+  return env === process.env && wasEnvNameLoadedFromFile(envName) ? "env-file" : "env";
+}
+
+function resolveKeystoreCandidates(
+  candidates: readonly string[],
+  keystoreOptions?: KeystoreOptions,
+): CredentialResolution | null {
+  for (const envName of candidates) {
+    // The keystore is a third source of NAMED VALUES with env-var parity. A
+    // provider declaring this name in operator-authored config expresses the
+    // same intent as an env var, which would serve every provider declaring it.
+    // AAD authenticates envName against tampering; entry id/provider are
+    // provenance metadata only, never lookup filters or credential identity.
+    const stored = lookupByEnvName(envName, keystoreOptions);
+    if (stored === null || !keyIsPresent(stored.value)) continue;
+    return {
+      state: "declared-present",
+      value: stored.value.trim(),
+      envName,
+      source: "keystore",
+      provenance: { entryId: stored.entryId, provider: stored.provider },
+    };
+  }
+  return null;
 }
 
 export function credentialState(
   declaredAuthEnv: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
   providerName?: string,
+  keystoreOptions?: KeystoreOptions,
 ): CredentialState {
-  return resolveCredential(declaredAuthEnv, env, providerName).state;
+  return resolveCredential(declaredAuthEnv, env, providerName, keystoreOptions).state;
 }
 
 export function readCredential(
   declaredAuthEnv: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
   providerName?: string,
+  keystoreOptions?: KeystoreOptions,
 ): string | undefined {
-  return resolveCredential(declaredAuthEnv, env, providerName).value;
+  return resolveCredential(declaredAuthEnv, env, providerName, keystoreOptions).value;
 }
 
 export function resolveCredential(
   declaredAuthEnv: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
   providerName?: string,
+  keystoreOptions?: KeystoreOptions,
 ): CredentialResolution {
   const normalized = declaredAuthEnv?.trim();
   if (!normalized) {
-    return { state: "not-declared", value: undefined, envName: undefined };
+    return { state: "not-declared", value: undefined, envName: undefined, source: undefined };
   }
-  const envName = resolveTargetAuthEnv(normalized, env, providerName);
-  const raw = envName ? env[envName] : undefined;
-  const value = keyIsPresent(raw) ? raw!.trim() : undefined;
-  return {
-    state: value ? "declared-present" : "declared-missing",
-    value,
-    envName,
+  const candidates = credentialCandidateEnvNames(normalized, providerName);
+  const envName = candidates.find((name) => keyIsPresent(env[name]));
+  if (envName !== undefined) {
+    return {
+      state: "declared-present",
+      value: env[envName]!.trim(),
+      envName,
+      source: envCredentialSource(envName, env),
+    };
+  }
+  return resolveKeystoreCandidates(candidates, keystoreOptions) ?? {
+    state: "declared-missing",
+    value: undefined,
+    envName: normalized,
+    source: undefined,
   };
 }
 
@@ -172,15 +236,26 @@ export function resolveCredential(
 export function resolveCredentialExact(
   declaredAuthEnv: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  keystoreOptions?: KeystoreOptions,
 ): CredentialResolution {
   const normalized = declaredAuthEnv?.trim();
-  if (!normalized) return { state: "not-declared", value: undefined, envName: undefined };
+  if (!normalized) {
+    return { state: "not-declared", value: undefined, envName: undefined, source: undefined };
+  }
   const raw = env[normalized];
-  const value = keyIsPresent(raw) ? raw!.trim() : undefined;
-  return {
-    state: value ? "declared-present" : "declared-missing",
-    value,
+  if (keyIsPresent(raw)) {
+    return {
+      state: "declared-present",
+      value: raw!.trim(),
+      envName: normalized,
+      source: envCredentialSource(normalized, env),
+    };
+  }
+  return resolveKeystoreCandidates([normalized], keystoreOptions) ?? {
+    state: "declared-missing",
+    value: undefined,
     envName: normalized,
+    source: undefined,
   };
 }
 

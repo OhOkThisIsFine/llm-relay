@@ -13,9 +13,10 @@ import {
   resolveAuthEnv,
   resolveCredential,
 } from "../src/authEnv.js";
-import { loadConfig, type Config, type ProviderConfig } from "../src/config.js";
+import { loadConfig, resolveTargets, type Config, type ProviderConfig } from "../src/config.js";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
+import { addEntry, lock, resolveKeystorePath } from "../src/keystore.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "rp-cred-containment-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -167,22 +168,22 @@ describe("credential containment declared, not inferred", () => {
 describe("resolveCredential atomics", () => {
   it("keeps undeclared ambient credentials out of resolution", () => {
     expect(resolveCredential(undefined, { AMBIENT_API_KEY: "sk-ambient" }, "ambient")).toEqual({
-      state: "not-declared", value: undefined, envName: undefined,
+      state: "not-declared", value: undefined, envName: undefined, source: undefined,
     });
   });
 
   it("distinguishes missing, blank, whitespace, and trimmed direct values", () => {
     expect(resolveCredential("GEMINI_API_KEY", {}, "gemini")).toEqual({
-      state: "declared-missing", value: undefined, envName: "GEMINI_API_KEY",
+      state: "declared-missing", value: undefined, envName: "GEMINI_API_KEY", source: undefined,
     });
     expect(resolveCredential("GEMINI_API_KEY", { GEMINI_API_KEY: "" }, "gemini")).toEqual({
-      state: "declared-missing", value: undefined, envName: "GEMINI_API_KEY",
+      state: "declared-missing", value: undefined, envName: "GEMINI_API_KEY", source: undefined,
     });
     expect(resolveCredential("GEMINI_API_KEY", { GEMINI_API_KEY: "  \t" }, "gemini")).toEqual({
-      state: "declared-missing", value: undefined, envName: "GEMINI_API_KEY",
+      state: "declared-missing", value: undefined, envName: "GEMINI_API_KEY", source: undefined,
     });
     expect(resolveCredential("GEMINI_API_KEY", { GEMINI_API_KEY: "  sk-direct  " }, "gemini")).toEqual({
-      state: "declared-present", value: "sk-direct", envName: "GEMINI_API_KEY",
+      state: "declared-present", value: "sk-direct", envName: "GEMINI_API_KEY", source: "env",
     });
   });
 
@@ -192,6 +193,7 @@ describe("resolveCredential atomics", () => {
       state: "declared-present",
       envName: "GEMINI_API_KEY",
       value: "sk-declared",
+      source: "env",
     });
   });
 
@@ -201,6 +203,7 @@ describe("resolveCredential atomics", () => {
       state: "declared-present",
       envName: "GOOGLEAI_API_KEY",
       value: "sk-alias",
+      source: "env",
     });
   });
 
@@ -210,6 +213,7 @@ describe("resolveCredential atomics", () => {
       state: "declared-missing",
       envName: "GEMINI_API_KEY",
       value: undefined,
+      source: undefined,
     });
   });
 
@@ -218,6 +222,7 @@ describe("resolveCredential atomics", () => {
       state: "declared-present",
       envName: "CUSTOM_PROVIDER_API_KEY",
       value: "sk-derived",
+      source: "env",
     });
   });
 });
@@ -409,6 +414,183 @@ describe("public HTTP fronts resolve provider-derived aliases", () => {
       expect(response.status).toBe(200);
       expect(mock.seen().auth).toBe("Bearer sk-custom-derived");
       expect(mock.seen().model).toBe("custom-model");
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+});
+
+describe("keystore custody on public HTTP fronts", () => {
+  const passphrase = "packet-2-headline-passphrase";
+  const storePath = resolveKeystorePath();
+  const storedNames = candidateEnvNames("consumer", "STORED_ONLY_KEY");
+  const fallbackNames = candidateEnvNames("fallback", "FALLBACK_ONLY_KEY");
+  let backend: Server;
+  let proxy: Server;
+
+  afterEach(() => {
+    backend?.close();
+    proxy?.close();
+    lock({ path: storePath });
+    rmSync(storePath, { force: true });
+  });
+
+  it("keystore-only legacy auth survives resolveTargets and authenticates both public fronts", async () => {
+    const saved = backupEnv([...new Set([...storedNames, ...fallbackNames])]);
+    process.env.FALLBACK_ONLY_KEY = "fallback-env-key";
+    try {
+      addEntry({
+        id: "vault#stored",
+        provider: "vault",
+        envName: "STORED_ONLY_KEY",
+        value: "keystore-only-secret",
+      }, { path: storePath, mode: "passphrase", passphrase });
+      const mock = await mockOpenAiBackend();
+      backend = mock.server;
+      const configPath = write("keystore-both-fronts.json", {
+        listen: "127.0.0.1:8791",
+        providers: {
+          consumer: {
+            base: `http://127.0.0.1:${port(backend)}`,
+            kind: "openai",
+            authEnv: "STORED_ONLY_KEY",
+            authHeader: "authorization",
+            timeoutMs: 5000,
+          },
+          fallback: {
+            base: `http://127.0.0.1:${port(backend)}`,
+            kind: "openai",
+            authEnv: "FALLBACK_ONLY_KEY",
+            authHeader: "authorization",
+            timeoutMs: 5000,
+          },
+        },
+        routing: {
+          default: ["consumer/served-model", "fallback/fallback-model"],
+          tiers: {},
+          benchmarkSort: false,
+        },
+      });
+      const cfg = loadConfig(configPath);
+
+      expect(resolveTargets(null, cfg).map((target) => target.provider)).toEqual(["consumer", "fallback"]);
+      proxy = await startProxy(configPath);
+
+      const messages = await fetch(`http://127.0.0.1:${port(proxy)}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer caller-secret" },
+        body: JSON.stringify({
+          model: "client-unknown-model",
+          max_tokens: 32,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      expect(messages.status).toBe(200);
+      expect(mock.seen()).toMatchObject({ auth: "Bearer keystore-only-secret", model: "served-model" });
+
+      const chat = await fetch(`http://127.0.0.1:${port(proxy)}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer caller-secret" },
+        body: JSON.stringify({
+          model: "client-unknown-model",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      expect(chat.status).toBe(200);
+      expect(mock.seen()).toMatchObject({ auth: "Bearer keystore-only-secret", model: "served-model" });
+      expect(process.env.STORED_ONLY_KEY).toBeUndefined();
+      expect(storedNames.every((name) => process.env[name] === undefined)).toBe(true);
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("locked custody warns with consequence, boots, and serves through the remaining candidate", async () => {
+    const saved = backupEnv([...new Set([...storedNames, ...fallbackNames])]);
+    process.env.FALLBACK_ONLY_KEY = "fallback-env-key";
+    try {
+      addEntry({
+        id: "vault#locked",
+        provider: "vault",
+        envName: "STORED_ONLY_KEY",
+        value: "locked-keystore-secret",
+      }, { path: storePath, mode: "passphrase", passphrase });
+      lock({ path: storePath });
+      const mock = await mockOpenAiBackend();
+      backend = mock.server;
+      const configPath = write("locked-keystore-fallthrough.json", {
+        listen: "127.0.0.1:8791",
+        providers: {
+          consumer: {
+            base: `http://127.0.0.1:${port(backend)}`,
+            kind: "openai",
+            authEnv: "STORED_ONLY_KEY",
+            authHeader: "authorization",
+          },
+          fallback: {
+            base: `http://127.0.0.1:${port(backend)}`,
+            kind: "openai",
+            authEnv: "FALLBACK_ONLY_KEY",
+            authHeader: "authorization",
+          },
+        },
+        routing: {
+          default: ["consumer/served-model", "fallback/fallback-model"],
+          tiers: {},
+          benchmarkSort: false,
+        },
+      });
+
+      const cfg = loadConfig(configPath);
+      expect(cfg.warnings).toEqual(expect.arrayContaining([
+        expect.stringMatching(/provider "consumer" credential custody locked.*declared-missing.*traffic falls through.*startup continues/is),
+      ]));
+      expect(resolveTargets(null, cfg).map((target) => target.provider)).toEqual(["fallback"]);
+      expect(() => createProxy(cfg, { catalog: new ModelCatalog({ cachePath: null }) })).not.toThrow();
+      proxy = await startProxy(configPath);
+
+      const response = await fetch(`http://127.0.0.1:${port(proxy)}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "client-unknown-model",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(mock.seen()).toMatchObject({ auth: "Bearer fallback-env-key", model: "fallback-model" });
+      expect(process.env.STORED_ONLY_KEY).toBeUndefined();
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("an unreadable store emits one aggregate consequence warning and loadConfig never throws", () => {
+    const saved = backupEnv([...new Set([...storedNames, ...fallbackNames])]);
+    process.env.FALLBACK_ONLY_KEY = "fallback-env-key";
+    try {
+      addEntry({
+        id: "vault#corrupt",
+        provider: "vault",
+        envName: "STORED_ONLY_KEY",
+        value: "will-be-unreadable",
+      }, { path: storePath, mode: "passphrase", passphrase });
+      lock({ path: storePath });
+      writeFileSync(storePath, "{not-json", "utf8");
+      const configPath = write("unreadable-keystore.json", {
+        listen: "127.0.0.1:8791",
+        providers: {
+          consumer: { base: "https://consumer.test", kind: "openai", authEnv: "STORED_ONLY_KEY" },
+          fallback: { base: "https://fallback.test", kind: "openai", authEnv: "FALLBACK_ONLY_KEY" },
+        },
+        routing: { default: ["consumer/model", "fallback/model"], tiers: {}, benchmarkSort: false },
+      });
+
+      expect(() => loadConfig(configPath)).not.toThrow();
+      const cfg = loadConfig(configPath);
+      const custodyWarnings = cfg.warnings?.filter((warning) => warning.includes("keystore unreadable")) ?? [];
+      expect(custodyWarnings).toHaveLength(1);
+      expect(custodyWarnings[0]).toMatch(/declared-missing.*traffic falls through.*startup continues/is);
     } finally {
       restoreEnv(saved);
     }

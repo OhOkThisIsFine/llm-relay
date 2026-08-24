@@ -4,6 +4,7 @@ import { makeCredentialId, type CredentialId } from "./credential-id.js";
 import type { ProviderLimitsConfig } from "./configured-limits.js";
 import type { ProviderConfig, ResolvedTarget } from "./config.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
+import type { KeystoreOptions } from "./keystore.js";
 
 /** A normalized provider credential declaration. Secrets are never held here. */
 export interface ProviderCredentialConfig {
@@ -95,20 +96,22 @@ export function slotAllowsModel(slot: CredentialSlot, model: string | undefined)
 export function resolveCredentialSlot(
   slot: CredentialSlot,
   env: NodeJS.ProcessEnv = process.env,
+  keystoreOptions?: KeystoreOptions,
 ): CredentialResolution {
   return slot.resolutionMode === "declared-only"
-    ? resolveCredentialExact(slot.authEnv, env)
-    : resolveCredential(slot.authEnv, env, slot.provider);
+    ? resolveCredentialExact(slot.authEnv, env, keystoreOptions)
+    : resolveCredential(slot.authEnv, env, slot.provider, keystoreOptions);
 }
 
 export function snapshotProviderCredentials(
   provider: string,
   config: ProviderConfig,
   env: NodeJS.ProcessEnv = process.env,
+  keystoreOptions?: KeystoreOptions,
 ): readonly ResolvedCredentialSlot[] {
   return Object.freeze(providerCredentialSlots(provider, config).map((slot) => Object.freeze({
     slot,
-    resolution: resolveCredentialSlot(slot, env),
+    resolution: resolveCredentialSlot(slot, env, keystoreOptions),
   })));
 }
 
@@ -117,8 +120,9 @@ export function aggregateHasKey(
   provider: string,
   config: ProviderConfig,
   env: NodeJS.ProcessEnv = process.env,
+  keystoreOptions?: KeystoreOptions,
 ): boolean {
-  return snapshotProviderCredentials(provider, config, env).some(({ slot, resolution }) =>
+  return snapshotProviderCredentials(provider, config, env, keystoreOptions).some(({ slot, resolution }) =>
     slot.enabled && (slot.models === null || slot.models.length > 0) && resolution.state !== "declared-missing",
   );
 }
@@ -128,9 +132,10 @@ export function resolveAttemptForSlot(
   target: ResolvedTarget,
   slot: CredentialSlot,
   env: NodeJS.ProcessEnv = process.env,
+  keystoreOptions?: KeystoreOptions,
 ): ResolvedAttempt | undefined {
   if (slot.provider !== target.provider || !slot.enabled || !slotAllowsModel(slot, target.model)) return undefined;
-  const credential = resolveCredentialSlot(slot, env);
+  const credential = resolveCredentialSlot(slot, env, keystoreOptions);
   if (credential.state === "declared-missing") return undefined;
   return Object.freeze({ target, credentialId: slot.credentialId, credential, slot });
 }

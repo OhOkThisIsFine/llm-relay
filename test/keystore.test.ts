@@ -31,6 +31,7 @@ import {
 } from "../src/keystore.js";
 import type { KeyringSpawnSync } from "../src/os-keyring.js";
 import type { SecretFileAclSpawnSync } from "../src/secret-file-acl.js";
+import { resolveCredential } from "../src/authEnv.js";
 
 const PASSPHRASE = "correct horse battery staple";
 const FIRST_SECRET = "sk_A7vQ2mX9pL4rT8uN6wC3";
@@ -419,13 +420,14 @@ describe("encrypted credential keystore", () => {
     expect(readFileSync(path)).toEqual(before);
     expectNoSecretLeaks(error, FIRST_SECRET, ATTEMPTED_SECRET);
 
+    lock({ path });
     addEntry({
       id: "nim#replacement", provider: "nim", envName: "NVIDIA_API_KEY", value: SECOND_SECRET,
     }, options());
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(SECOND_SECRET);
   });
 
-  it("does not cache or persist a wrong passphrase-derived KEK", () => {
+  it("memoizes a wrong passphrase failure until explicit lock, without persisting it", () => {
     addEntry({
       id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: FIRST_SECRET,
     }, options());
@@ -436,6 +438,8 @@ describe("encrypted credential keystore", () => {
       ...options(),
       passphrase: "wrong passphrase",
     })).toBeNull();
+    expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
+    lock({ path });
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
     lock({ path });
 
@@ -455,6 +459,8 @@ describe("encrypted credential keystore", () => {
     expect(readFileSync(path)).toEqual(before);
     expectNoSecretLeaks(addError, FIRST_SECRET, ATTEMPTED_SECRET);
     expectNoSecretLeaks(rotateError, FIRST_SECRET, ATTEMPTED_SECRET);
+    expect(lookupByEnvName("NVIDIA_API_KEY", options())).toBeNull();
+    lock({ path });
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
   });
 
@@ -664,14 +670,97 @@ describe("encrypted credential keystore", () => {
     expect(() => lookupByEnvName("NVIDIA_API_KEY", missingPassphrase)).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", missingPassphrase)).toBeNull();
     expect(keystoreStatus(missingPassphrase)).toEqual({ status: "locked", droppedCount: 0 });
+    lock({ path });
 
     const wrongPassphrase = { ...options(), passphrase: "wrong passphrase" };
     expect(() => lookupByEnvName("NVIDIA_API_KEY", wrongPassphrase)).not.toThrow();
     expect(lookupByEnvName("NVIDIA_API_KEY", wrongPassphrase)).toBeNull();
     expect(keystoreStatus(wrongPassphrase)).toEqual({ status: "locked", droppedCount: 0 });
+    lock({ path });
 
     expect(lookupByEnvName("NVIDIA_API_KEY", options())?.value).toBe(FIRST_SECRET);
     expect(keystoreStatus(options())).toEqual({ status: "ok", droppedCount: 0 });
+  });
+
+  it("memoizes a failing keyring across two sequential credential resolutions and status", () => {
+    const createSpawn = vi.fn<KeyringSpawnSync>(() => ({
+      status: 0,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    }));
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, {
+      path,
+      mode: "libsecret",
+      platform: "linux",
+      spawnSync: createSpawn,
+      randomBytes: () => Buffer.alloc(32, 0x42),
+    });
+    lock({ path });
+
+    const failingSpawn = vi.fn<KeyringSpawnSync>(() => ({
+      status: 1,
+      stdout: Buffer.from("child-output-must-not-escape"),
+      stderr: Buffer.from("child-error-must-not-escape"),
+    }));
+    const failingOptions: KeystoreOptions = {
+      path,
+      mode: "libsecret",
+      platform: "linux",
+      spawnSync: failingSpawn,
+    };
+
+    const first = resolveCredential("NVIDIA_API_KEY", {}, "nim", failingOptions);
+    const second = resolveCredential("NVIDIA_API_KEY", {}, "nim", failingOptions);
+    expect(first).toMatchObject({ state: "declared-missing", source: undefined });
+    expect(second).toEqual(first);
+    expect(keystoreStatus(failingOptions)).toEqual({ status: "locked", droppedCount: 0 });
+    expect(failingSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("memoizes a successful keyring unwrap across later resolutions and status", () => {
+    const knownKek = Buffer.alloc(32, 0x42);
+    const createSpawn = vi.fn<KeyringSpawnSync>(() => ({
+      status: 0,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    }));
+    addEntry({
+      id: "nim#personal",
+      provider: "nim",
+      envName: "NVIDIA_API_KEY",
+      value: FIRST_SECRET,
+    }, {
+      path,
+      mode: "libsecret",
+      platform: "linux",
+      spawnSync: createSpawn,
+      randomBytes: (size) => Buffer.alloc(size, 0x42),
+    });
+    lock({ path });
+
+    const successfulSpawn = vi.fn<KeyringSpawnSync>(() => ({
+      status: 0,
+      stdout: Buffer.from(`${knownKek.toString("base64")}\n`, "ascii"),
+      stderr: Buffer.alloc(0),
+    }));
+    const lookupOptions: KeystoreOptions = {
+      path,
+      mode: "libsecret",
+      platform: "linux",
+      spawnSync: successfulSpawn,
+    };
+
+    const first = resolveCredential("NVIDIA_API_KEY", {}, "nim", lookupOptions);
+    const second = resolveCredential("NVIDIA_API_KEY", {}, "nim", lookupOptions);
+    expect(first).toMatchObject({ state: "declared-present", value: FIRST_SECRET, source: "keystore" });
+    expect(second).toEqual(first);
+    expect(keystoreStatus(lookupOptions)).toEqual({ status: "ok", droppedCount: 0 });
+    expect(successfulSpawn).toHaveBeenCalledTimes(1);
   });
 
   it("includes a non-secret filesystem errno in normalized write failures", () => {
@@ -964,9 +1053,11 @@ describe("encrypted credential keystore", () => {
     ]);
   });
 
-  it("redirects the default path under VITEST into a pid-specific temporary path", () => {
+  it("redirects the default path under VITEST into a process-and-worker-specific temporary path", () => {
     const defaultPath = resolveKeystorePath();
-    const expectedDirectory = join(tmpdir(), `llm-relay-test-keystore-${process.pid}`);
+    const pool = process.env.VITEST_POOL_ID ?? "pool";
+    const worker = process.env.VITEST_WORKER_ID ?? "worker";
+    const expectedDirectory = join(tmpdir(), `llm-relay-test-keystore-${process.pid}-${pool}-${worker}`);
     expect(process.env.VITEST).toBeDefined();
     expect(defaultPath).toContain(tmpdir());
     expect(defaultPath).toContain(String(process.pid));

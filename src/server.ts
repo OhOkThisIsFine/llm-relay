@@ -120,13 +120,14 @@ const INBOUND_AUTH = ["authorization", "x-api-key"];
 // `?task=` bound now. Two copies of a limit drift; the one at the boundary that accepts the
 // request is the one that counts.
 
-const TOKENLESS_CONTROL_READS = new Set([
+export const TOKENLESS_CONTROL_READ_PATHS = Object.freeze([
   "/v1/models",
   "/models",
   "/offload",
   "/dispatch",
   "/telemetry",
-]);
+] as const);
+const TOKENLESS_CONTROL_READS = new Set<string>(TOKENLESS_CONTROL_READ_PATHS);
 
 const CONTROL_ROUTES = new Set([
   ...TOKENLESS_CONTROL_READS,

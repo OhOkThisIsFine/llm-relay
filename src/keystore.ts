@@ -179,12 +179,25 @@ export class KeystoreMutationRefusedError extends Error {
 }
 
 let unlocked: { path: string; descriptor: string; kek: Buffer } | null = null;
+interface MemoizedUnlockFailure {
+  path: string;
+  descriptor: string;
+  status: "locked" | "unreadable";
+}
+const unlockFailures = new Map<string, MemoizedUnlockFailure>();
+const unreadablePaths = new Set<string>();
+
+function unlockFailureKey(path: string, descriptor: string): string {
+  return `${path}\0${descriptor}`;
+}
 
 /** Resolve the live store path without ever letting tests touch the user's real store. */
 export function resolveKeystorePath(opts: { path?: string } = {}): string {
   if (opts.path !== undefined) return opts.path;
   if (process.env.VITEST !== undefined) {
-    return join(tmpdir(), `llm-relay-test-keystore-${process.pid}`, "keystore.json");
+    const pool = process.env.VITEST_POOL_ID ?? "pool";
+    const worker = process.env.VITEST_WORKER_ID ?? "worker";
+    return join(tmpdir(), `llm-relay-test-keystore-${process.pid}-${pool}-${worker}`, "keystore.json");
   }
   return join(homedir(), ".llm-relay", "keystore.json");
 }
@@ -501,6 +514,8 @@ function cacheKek(path: string, identity: string, kek: Buffer): Buffer {
     throw new KeystoreUnlockError();
   }
   clearUnlocked();
+  unreadablePaths.delete(path);
+  unlockFailures.delete(unlockFailureKey(path, identity));
   unlocked = { path, descriptor: identity, kek };
   return kek;
 }
@@ -517,15 +532,25 @@ function recoverStoreKek(store: StoredKeystore, path: string, opts: KeystoreOpti
   if (unlocked?.path === path && unlocked.descriptor === identity) {
     return { kek: unlocked.kek, identity, cached: true };
   }
-  // A changed path or wrapper identifies a different custody cell. Do not retain the old KEK if
-  // recovery of the replacement fails; a later lookup can retry from the persisted descriptor.
-  clearUnlocked();
-  const kek = unwrapKek(store.kek, { ...opts, keyId });
-  if (kek.length !== 32) {
-    kek.fill(0);
+  if (unlockFailures.has(unlockFailureKey(path, identity))) {
     throw new KeystoreUnlockError();
   }
-  return { kek, identity, cached: false };
+  // A changed path or wrapper identifies a different custody cell. Do not retain the old KEK if
+  // recovery of the replacement fails.
+  clearUnlocked();
+  try {
+    const kek = unwrapKek(store.kek, { ...opts, keyId });
+    if (kek.length !== 32) {
+      kek.fill(0);
+      throw new KeystoreUnlockError();
+    }
+    return { kek, identity, cached: false };
+  } catch {
+    // Lazy request-path custody memoizes a sanitized failure just as firmly as a successful KEK:
+    // later resolutions degrade from memory instead of respawning the OS keyring per request.
+    unlockFailures.set(unlockFailureKey(path, identity), { path, descriptor: identity, status: "locked" });
+    throw new KeystoreUnlockError();
+  }
 }
 
 function discardRecoveredKek(recovered: RecoveredKek): void {
@@ -541,6 +566,10 @@ function recoverVerifiedStoreKek(
   const recovered = recoverStoreKek(store, path, opts);
   if (!validKekCheck(recovered.kek, store.kekCheck)) {
     discardRecoveredKek(recovered);
+    unlockFailures.set(
+      unlockFailureKey(path, recovered.identity),
+      { path, descriptor: recovered.identity, status: "locked" },
+    );
     throw new KeystoreUnlockError();
   }
   return recovered;
@@ -646,6 +675,7 @@ function persistStore(path: string, store: StoredKeystore, opts: KeystoreOptions
     hardenFile(temporaryPath, opts);
     renameSync(temporaryPath, path);
     hardenFile(path, opts);
+    unreadablePaths.delete(path);
   } catch (error) {
     throw new KeystoreWriteError(errorCode(error));
   } finally {
@@ -716,10 +746,13 @@ export function lookupByEnvName(
   let retained = false;
   try {
     const path = resolveKeystorePath(opts);
+    if (unreadablePaths.has(path)) return null;
     const loaded = loadStore(path, opts);
     if (loaded.status === "fresh" || loaded.status === "unreadable") {
+      if (loaded.status === "unreadable") unreadablePaths.add(path);
       return null;
     }
+    unreadablePaths.delete(path);
     const store = loaded.store;
     const now = opts.now ?? Date.now();
     if (!validTimestamp(now)) return null;
@@ -728,10 +761,12 @@ export function lookupByEnvName(
       if (entry.disabled || entry.revokedAt !== null) continue;
       if (entry.expiresAt !== null && entry.expiresAt <= now) continue;
       recovered ??= recoverVerifiedStoreKek(store, path, opts);
+      if (!recovered.cached && !retained) {
+        cacheKek(path, recovered.identity, recovered.kek);
+        retained = true;
+      }
       const value = decryptEntryValue(entry, recovered.kek, store.fpSalt);
       if (value !== null) {
-        if (!recovered.cached) cacheKek(path, recovered.identity, recovered.kek);
-        retained = true;
         return { value, entryId: entry.id as CredentialId, provider: entry.provider };
       }
     }
@@ -745,8 +780,13 @@ export function lookupByEnvName(
 }
 
 export function listEntries(opts: KeystoreOptions = {}): KeystoreEntryDescriptor[] {
-  const loaded = loadStore(resolveKeystorePath(opts), opts);
-  if (loaded.status === "unreadable") throw new KeystoreReadError(loaded.errno);
+  const path = resolveKeystorePath(opts);
+  const loaded = loadStore(path, opts);
+  if (loaded.status === "unreadable") {
+    unreadablePaths.add(path);
+    throw new KeystoreReadError(loaded.errno);
+  }
+  unreadablePaths.delete(path);
   if (loaded.status === "fresh") return [];
   return loaded.store.entries.map(descriptorOf);
 }
@@ -755,15 +795,23 @@ export function listEntries(opts: KeystoreOptions = {}): KeystoreEntryDescriptor
 export function keystoreStatus(opts: KeystoreOptions = {}): KeystoreStatus {
   try {
     const path = resolveKeystorePath(opts);
+    if (unreadablePaths.has(path)) return { status: "unreadable", droppedCount: 0 };
     const loaded = loadStore(path, opts);
     if (loaded.status === "fresh") return { status: "absent", droppedCount: 0 };
     if (loaded.status === "unreadable") {
+      unreadablePaths.add(path);
       return { status: "unreadable", droppedCount: loaded.droppedCount };
     }
+    unreadablePaths.delete(path);
     const store = loaded.store;
     let recovered: RecoveredKek | null = null;
+    let retained = false;
     try {
       recovered = recoverVerifiedStoreKek(store, path, opts);
+      if (!recovered.cached) {
+        cacheKek(path, recovered.identity, recovered.kek);
+        retained = true;
+      }
       const cryptographicallyUnreadable = cryptographicallyUnreadableCount(
         store,
         recovered.kek,
@@ -773,7 +821,7 @@ export function keystoreStatus(opts: KeystoreOptions = {}): KeystoreStatus {
     } catch {
       return { status: "locked", droppedCount: loaded.droppedCount };
     } finally {
-      if (recovered !== null && !recovered.cached) recovered.kek.fill(0);
+      if (recovered !== null && !recovered.cached && !retained) recovered.kek.fill(0);
     }
   } catch {
     return { status: "unreadable", droppedCount: 0 };
@@ -889,9 +937,13 @@ export function setDisabled(entryId: string, disabled: boolean, opts: KeystoreOp
   return descriptorOf(entry);
 }
 
-/** Zeroize the process-held KEK. A later lookup unwraps it again lazily. */
+/** Zeroize a process-held KEK or clear a memoized unlock failure so a later lookup retries. */
 export function lock(opts: { path?: string } = {}): void {
-  if (unlocked === null) return;
-  if (opts.path !== undefined && unlocked.path !== resolveKeystorePath(opts)) return;
-  clearUnlocked();
+  const path = opts.path === undefined ? undefined : resolveKeystorePath(opts);
+  if (unlocked !== null && (path === undefined || unlocked.path === path)) clearUnlocked();
+  for (const [key, failure] of unlockFailures) {
+    if (path === undefined || failure.path === path) unlockFailures.delete(key);
+  }
+  if (path === undefined) unreadablePaths.clear();
+  else unreadablePaths.delete(path);
 }

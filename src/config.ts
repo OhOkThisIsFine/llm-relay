@@ -1,9 +1,20 @@
 import { readFileSync } from "node:fs";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
-import { resolveAuthEnv, credentialState } from "./authEnv.js";
+import {
+  credentialCandidateEnvNames,
+  credentialState,
+  keyIsPresent,
+  resolveAuthEnv,
+} from "./authEnv.js";
 import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { parseConfiguredLimits, type ProviderLimitsConfig } from "./configured-limits.js";
-import { providerCredentialSlots, type CredentialSlot, type ProviderCredentialConfig } from "./credential-fleet.js";
+import {
+  providerCredentialSlots,
+  resolveCredentialSlot,
+  type CredentialSlot,
+  type ProviderCredentialConfig,
+} from "./credential-fleet.js";
+import { keystoreStatus, listEntries } from "./keystore.js";
 
 export type Mode = "detect" | "repair" | "strict";
 
@@ -1056,6 +1067,84 @@ function parseAuthHeader(raw: unknown, dflt: AuthHeader): AuthHeader {
   return raw === "authorization" ? "authorization" : raw === "x-api-key" ? "x-api-key" : dflt;
 }
 
+const KEYSTORE_UNREADABLE_WARNING =
+  "keystore unreadable — keystore-only providers resolve declared-missing and are unavailable " +
+  "to routing; where alternatives exist, traffic falls through to remaining candidates. " +
+  "Relay startup continues.";
+
+/** Append custody availability diagnostics without ever changing admission or refusing startup. */
+function appendKeystoreDegradationWarnings(
+  providers: Record<string, ProviderConfig>,
+  warnings: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  try {
+    let entries: ReturnType<typeof listEntries>;
+    try {
+      entries = listEntries();
+    } catch {
+      warnings.push(KEYSTORE_UNREADABLE_WARNING);
+      return;
+    }
+    if (entries.length === 0) return;
+
+    const now = Date.now();
+    const liveEnvNames = new Set(entries
+      .filter((entry) => !entry.disabled
+        && entry.revokedAt === null
+        && (entry.expiresAt === null || entry.expiresAt > now))
+      .map((entry) => entry.envName));
+    if (liveEnvNames.size === 0) return;
+
+    const affectedProviders = new Set<string>();
+    for (const [provider, config] of Object.entries(providers)) {
+      for (const slot of providerCredentialSlots(provider, config)) {
+        if (!slot.enabled || slot.authEnv === undefined || slot.models?.length === 0) continue;
+        const candidates = slot.resolutionMode === "declared-only"
+          ? [slot.authEnv]
+          : credentialCandidateEnvNames(slot.authEnv, slot.provider);
+        if (candidates.some((name) => keyIsPresent(env[name]))) continue;
+        // Custody has env-var parity: descriptor provider/id are provenance only. Coverage and
+        // resolution both match the operator-declared NAME, exactly as a real env var would.
+        if (!candidates.some((name) => liveEnvNames.has(name))) continue;
+        if (resolveCredentialSlot(slot, env).state === "declared-missing") {
+          affectedProviders.add(provider);
+        }
+      }
+    }
+
+    const status = keystoreStatus();
+    if (status.status === "unreadable") {
+      warnings.push(KEYSTORE_UNREADABLE_WARNING);
+      return;
+    }
+    if (status.status === "degraded" && affectedProviders.size === 0) {
+      warnings.push(
+        `keystore degraded (${status.droppedCount} unreadable row${status.droppedCount === 1 ? "" : "s"}) — ` +
+        "some keystore-only credentials may resolve declared-missing and be unavailable to routing; " +
+        "where alternatives exist, traffic falls through to remaining candidates. Relay startup continues.",
+      );
+      return;
+    }
+    if (status.status !== "locked" && status.status !== "degraded") return;
+
+    const detail = status.status === "degraded"
+      ? ` (${status.droppedCount} unreadable row${status.droppedCount === 1 ? "" : "s"})`
+      : "";
+    for (const provider of affectedProviders) {
+      warnings.push(
+        `provider "${provider}" credential custody ${status.status}${detail} — its env-missing ` +
+        "keystore credential(s) resolve declared-missing and are unavailable to routing; where " +
+        "alternatives exist, traffic falls through to remaining candidates. Relay startup continues.",
+      );
+    }
+  } catch {
+    // A custody diagnostic must never become a relay outage. This is deliberately aggregate:
+    // if metadata cannot be trusted, attributing failure to a provider would be a guess.
+    warnings.push(KEYSTORE_UNREADABLE_WARNING);
+  }
+}
+
 /** Load + validate a config file, failing loudly on anything unusable. */
 export function loadConfig(path: string, overrides: ConfigOverrides = {}): Config {
   let parsed: unknown;
@@ -1090,6 +1179,7 @@ export function loadConfig(path: string, overrides: ConfigOverrides = {}): Confi
   const warnings: string[] = [];
   const disabledProviders = new Set<string>();
   const providers = parseProviders(c.providers, warnings, disabledProviders);
+  appendKeystoreDegradationWarnings(providers, warnings);
   const routing = parseRouting(c.routing, providers, overrides.routeDefault, warnings, disabledProviders);
 
   const mode = normalizeMode(c.mode);
@@ -2056,4 +2146,3 @@ function normalizeMode(v: unknown): Mode {
   if (v === "detect" || v === "repair" || v === "strict") return v;
   return "detect";
 }
-

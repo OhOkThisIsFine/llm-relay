@@ -3,7 +3,7 @@ import { loadTierData, findTierModel } from "./tier-data.js";
 export { loadTierData };
 import type { Config, ProviderConfig } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
-import type { CredentialState } from "./authEnv.js";
+import type { CredentialSource, CredentialState } from "./authEnv.js";
 import { aggregateHasKey, snapshotProviderCredentials } from "./credential-fleet.js";
 
 import type { PingLoop, ModelHealthSummary } from "./ping/cadence.js";
@@ -39,6 +39,7 @@ export interface RegistryCredential {
   enabled: boolean;
   models: readonly string[] | null;
   state: CredentialState;
+  source: CredentialSource | null;
   has_key: boolean;
 }
 
@@ -124,6 +125,7 @@ export async function buildRegistry(
       enabled: slot.enabled,
       models: slot.models,
       state: resolution.state,
+      source: resolution.source ?? null,
       has_key: resolution.state !== "declared-missing",
     }));
     let models: RegistryModel[] = [];

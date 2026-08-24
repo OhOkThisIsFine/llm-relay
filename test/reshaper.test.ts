@@ -25,10 +25,11 @@ const KEYLESS: CredentialResolution = {
   state: "not-declared",
   value: undefined,
   envName: undefined,
+  source: undefined,
 };
 
 function presentCredential(value: string, envName = "RESHAPER_KEY"): CredentialResolution {
-  return { state: "declared-present", value, envName };
+  return { state: "declared-present", value, envName, source: "env" };
 }
 
 function startServer(handler: (path: string, body: string) => { status?: number; body: string }): Promise<string> {
@@ -159,7 +160,7 @@ describe("HttpReshaper", () => {
     let fetchCalls = 0;
     const r = new HttpReshaper(
       { base: "https://must-not-egress.test", model: "m", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
-      { state: "declared-missing", value: undefined, envName: "MISSING_RESHAPER_KEY" },
+      { state: "declared-missing", value: undefined, envName: "MISSING_RESHAPER_KEY", source: undefined },
       (async () => {
         fetchCalls++;
         throw new Error("must not fetch");

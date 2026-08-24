@@ -4,8 +4,8 @@ import { implicitCredentialSlot, type CredentialSlot } from "../src/credential-f
 import { CredentialLru, CredentialWalk, groupCredentialAttempts, rankCredentialAttempts, type CredentialFact } from "../src/credential-select.js";
 import type { ResolvedAttempt } from "../src/resolved-attempt.js";
 
-const present = { state: "declared-present" as const, value: "secret", envName: "KEY" };
-const missing = { state: "declared-missing" as const, value: undefined, envName: "KEY" };
+const present = { state: "declared-present" as const, value: "secret", envName: "KEY", source: "env" as const };
+const missing = { state: "declared-missing" as const, value: undefined, envName: "KEY", source: undefined };
 
 function attempt(provider: string, model: string, label = "default", opts: { missing?: boolean; base?: string; configIndex?: number } = {}): ResolvedAttempt {
   const implicit = implicitCredentialSlot(provider, "KEY");
