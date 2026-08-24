@@ -206,9 +206,19 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   `*.mistral.ai` base host and announced as `x-llm-relay-tool-call-ids` plus the
   `toolCallIdRewrites` log counter. This also subsumes the `tool-use-ids.ts` interaction: a minted
   `Read:0_relay1` id is rewritten like any other shape.
-- **Resolved:** Gap 7 by spec amendment 2026-08-22 (no new endpoints). **DEFER — Gap 10 / M4**
-  (estimated-output producer, evidence-gated), **Gaps 15/16, M3, P1, P4** — do not build without
-  a new decision.
+- **Resolved:** Gap 7 by spec amendment 2026-08-22 (no new endpoints).
+- **QUEUED FOR BUILD (owner decision 2026-08-23) — Gap 10 / M4**, the estimated-output producer:
+  the owner explicitly waived the "measure usage-absence rates first" evidence gate — "we're not
+  waiting to measure." Sanctioned work, not yet started.
+- **RE-OPENED, QUEUED FOR BUILD (owner decision 2026-08-23) — M3**, the cooldown-clear mutation:
+  its security precondition is unchanged and must ship with it — control token plus the same
+  Origin/content-type/Host admission checks as `/offload` and `/dispatch`
+  (`docs/quota-metering-spec-2026-08-16.md` §6.2, ~line 375). Loopback is not authorization.
+- **DROPPED (owner decision 2026-08-23), not deferred — Gaps 15/16, P4.** Removed from the program
+  of record entirely, not a future ask: Gap 15 (single-file HTML dashboard) was superseded by the
+  shipped SPA, Gap 16 (in-flight quota leases) had spec §5.4 arguing against it with no measured
+  overshoot, P4 (server-enforced system prompts / `client_profiles` part 2) never acquired a
+  purpose.
 
 Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
 
@@ -230,4 +240,7 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   both fronts: `test/accounting-lifecycle.test.ts` "records failed and committed winning serve
   attempts" walks a 429 candidate then a winner for each front.)
 
-Custody/keystore was gated on the metering closeout; that gate is now lifted (the metering program is delivered through Stage 5), but custody remains a separate program needing its own owner decision before work starts.
+Custody/keystore was gated on the metering closeout; that gate was already lifted (the metering
+program is delivered through Stage 5). **The owner decision itself landed 2026-08-23: APPROVED,
+queued as the next sprint** — work starts from `docs/credential-fleet-design-2026-08-16.md`'s
+staged build order (which carries P1's platform-coverage question along with it), not tonight.

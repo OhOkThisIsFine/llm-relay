@@ -120,8 +120,9 @@ what remains is re-listed with its current disposition in **§7 Sprint 2026-08-2
   - *Closed 2026-08-22:* recorded in the CLAUDE.md `accounting-store.ts` row ("This superseded spec Gap 3's plan of widening `LOG_FIELDS`: do NOT duplicate token counters into the metadata log").
 - **CLOSE (decision) — Gap 7 surface shape.** Either amend the spec to name the dashboard snapshot API + `llm-relay dashboard`/`candidates` as the delivery of §6, or add thin read-only `GET /usage`/`/quota` later. Today the spec text and the implementation disagree about where the numbers live.
   - *CLOSED 2026-08-22 — spec amended (§6 Resolution):* the owner chose amendment; the dashboard snapshot API (`GET /dashboard/api/v1/snapshot` + `requests/:id`), `llm-relay dashboard`, and typed quota rendering in `llm-relay candidates` are named as the delivery, and no new endpoints will be added.
-- **DEFER — Gap 10 / M4.** Estimated-output producer stays withheld until measured usage-absence rates justify it (owner disposition, open-decisions.md:4-7). Still deferred after the sprint.
-- **DEFER — Gaps 15/16, M3, P1, P4.** Superseded by the SPA choice, argued against in §5.4, mutation-with-no-consumer, custody-next-stage, purpose-gated respectively. Do not build without a new decision.
+- **QUEUED FOR BUILD (owner decision 2026-08-23) — Gap 10 / M4.** The evidence gate (measure usage-absence rates first, open-decisions.md:4-7) is explicitly waived by the owner; the estimated-output producer is now sanctioned work. See §7.
+- **RE-OPENED, QUEUED FOR BUILD (owner decision 2026-08-23) — M3.** The cooldown-clear mutation goes forward with its security precondition unchanged: control token plus the same Origin/content-type/Host admission checks as `/offload` and `/dispatch` (`quota-metering-spec-2026-08-16.md` §6.2). See §7.
+- **DROPPED (owner decision 2026-08-23), not deferred — Gaps 15/16, P4.** Removed from the program of record: Gap 15 superseded by the shipped SPA, Gap 16 argued against by spec §5.4 with no measured overshoot, P4 never acquired a purpose. **P1** rolls into the now-approved custody program (§7) rather than being resolved separately.
 
 ## 7. Sprint 2026-08-22 (evening) — what the sprint delivered, what remains
 
@@ -145,9 +146,9 @@ Still OPEN after the sprint:
   after this document's closeout pass): `mergeTokenCell`/`mergeMetric` now flip `partial` only on
   `lost`/`overflow`/`samplesDropped`, never on a token kind that was merely uncarried. See
   HANDOFF.md §6.
-- **Gap 10 / M4 remains DEFERRED** — estimated-output producer withheld until measured
-  usage-absence rates justify it (owner disposition, open-decisions.md:4-7). Unchanged by this
-  sprint.
+- **Gap 10 / M4 — QUEUED FOR BUILD (owner decision 2026-08-23).** The owner explicitly waived the
+  "measure usage-absence rates first" evidence gate ("we're not waiting to measure"); the
+  estimated-output producer is now sanctioned work, not yet started.
 - **G2 manual per-credential hard cap — DELIVERED 2026-08-23 (`5e06a56`, v0.40.0): `limits.hard` on a
   provider / credential slot / `models.<id>` override refuses before egress on both fronts (relay 429,
   `x-llm-relay-capped`, Retry-After from the UTC boundary; `routing.quota.hardCaps: false` disables).
@@ -171,7 +172,17 @@ Still OPEN after the sprint:
   the client-facing translated SSE loses cache fields when an OpenAI-front client streams from an
   anthropic-kind backend or the reverse. Buffered paths are correct today. Closed as a recorded
   decision, not a code change.
-- **Gaps 15/16, M3, P1, P4** — unchanged deferrals (see §6).
+- **M3 — RE-OPENED, QUEUED FOR BUILD (owner decision 2026-08-23).** The cooldown-clear mutation
+  goes forward; its security precondition is unchanged and must ship with it — control token plus
+  the same Origin/content-type/Host admission checks as `/offload` and `/dispatch`
+  (`quota-metering-spec-2026-08-16.md` §6.2, ~line 375). Loopback is not authorization.
+- **Gaps 15/16, P4 — DROPPED (owner decision 2026-08-23), removed from the program of record, not
+  deferred.** Gap 15 (single-file HTML dashboard) superseded by the shipped SPA; Gap 16 (in-flight
+  quota leases) argued against by spec §5.4 with no measured overshoot; P4 (server-enforced system
+  prompts / `client_profiles` part 2) never acquired a purpose.
+- **P1 / custody** — the custody/keystore program is APPROVED and queued as the next sprint (owner
+  decision 2026-08-23), work starting from `docs/credential-fleet-design-2026-08-16.md`'s staged
+  build order; P1's platform-coverage question resolves as part of that build, not separately.
 
 ## 8. Verification note
 
