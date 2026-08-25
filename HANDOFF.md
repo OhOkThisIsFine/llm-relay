@@ -4,7 +4,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-24 (evening)
 
-**Latest, unreleased on `main`: the dialect-rescue destructive filter.** This closes the last item
+**Latest, released as v0.46.0 (`091cf7c`): the dialect-rescue destructive filter.** This closes the last item
 in §6 that was a code gap rather than a recorded trade — the one known safety-shaped one. A
 WELL-FORMED destructive call the relay reconstructed out of assistant prose used to be served
 unfiltered, because `destructive` reached none of `tool-dialects.ts`, `openai-dialect.ts`,
