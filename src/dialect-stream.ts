@@ -1,6 +1,6 @@
 import { emitSseTail } from "./emitSse.js";
 import type { AssistantMessage, ContentBlock } from "./anthropic.js";
-import { markerStart, recoverToolCalls, scanForMarker } from "./tool-dialects.js";
+import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, markerStart, recoverToolCalls, scanForMarker, type DialectRefusalSignal } from "./tool-dialects.js";
 
 /**
  * Dialect recovery for the STREAMING path.
@@ -56,6 +56,8 @@ function placeholders(count: number): ContentBlock[] {
 export function recoverDialectInStream(
   upstream: ReadableStream<Uint8Array>,
   schemas: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>,
+  isDestructive: (name: string) => boolean,
+  refusalSignal?: DialectRefusalSignal,
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -73,7 +75,15 @@ export function recoverDialectInStream(
       const push: Push = (s) => controller.enqueue(encoder.encode(s));
       const reader = upstream.getReader();
 
+      let finished = false;
       const finish = () => {
+        // ⚠ `finish()` is reached twice on any capture that also sees `message_stop` — once there,
+        // once after the read loop — and `capturing` is never cleared. Without this guard every
+        // branch emitted twice: two `error` frames, or a recovered tail duplicated down to a second
+        // `tu_recovered_0`, i.e. exactly the repeated tool_use id `tool-use-ids.ts` exists to
+        // prevent. `openai-dialect.ts` `settleChoice` has had the equivalent guard all along.
+        if (finished) return;
+        finished = true;
         if (!capturing) {
           // Flush any holdback that never became a marker.
           if (blockText.length > emittedLen) {
@@ -83,7 +93,7 @@ export function recoverDialectInStream(
           return;
         }
 
-        const out = recoverToolCalls(envelope, schemas);
+        const out = recoverToolCalls(envelope, schemas, isDestructive);
         if (out.status === "parsed") {
           // Close the text block we withheld from, then emit the recovered calls as the tail.
           push(sseEvent("content_block_stop", { index: blockIndex }));
@@ -99,6 +109,25 @@ export function recoverDialectInStream(
             ...(messageDeltaSeen?.usage ? { usage: messageDeltaSeen.usage as AssistantMessage["usage"] } : {}),
           } as AssistantMessage;
           push(emitSseTail(msg, blockIndex + 1));
+          return;
+        }
+
+        // The envelope parsed, but a recovered call names a tool the operator listed as
+        // destructive. Refuse it whole instead of committing it: rescue is the relay deciding that
+        // model TEXT is a tool call, and doing that for `Bash`/`Write`/`Edit` is the fabrication
+        // "refused, never fabricated" forbids. The head is already flushed on this path, so the
+        // announcement is the error event — the same shape the unparseable case uses, with its own
+        // code so the two are distinguishable.
+        if (out.status === "refused-destructive") {
+          // Declared provenance: only this wrapper may mark the refusal as the relay's, because
+          // only it knows it wrote the event. `stream-commit.ts` will not read the wire code alone.
+          if (refusalSignal) refusalSignal.refused = true;
+          push(sseEvent("error", {
+            error: {
+              type: DIALECT_REFUSED_DESTRUCTIVE_CODE,
+              message: `llm-relay: refused a ${out.dialect} tool call recovered from text because it names a destructive tool: ${describeRefused(out.refused)}`,
+            },
+          }));
           return;
         }
 

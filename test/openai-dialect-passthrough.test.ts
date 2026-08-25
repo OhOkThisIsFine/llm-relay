@@ -15,6 +15,15 @@ import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ResolvedTarget } from "../src/config.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
 
+/**
+ * The destructive-tool filter these fixtures pass at the dialect-rescue commit points. Refusing
+ * nothing is the right default HERE: these tests cover translation and recovery, and the refusal
+ * itself has its own suite (test/dialect-destructive-refusal.test.ts). It is a REQUIRED parameter
+ * on `recoverToolCalls` / `fetchBackend` / `fetchOpenAiFront` so a new rescue seam cannot omit the
+ * policy silently — which is exactly why it has to be spelled out here rather than defaulted.
+ */
+const NO_DESTRUCTIVE = (): boolean => false;
+
 const servers: Server[] = [];
 
 function listen(server: Server): Promise<Server> {
@@ -103,7 +112,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       choices: [{ index: 0, message: { role: "assistant", content: dialect }, finish_reason: "stop" }],
     });
 
-    const response = await fetchOpenAiFront(resolveAttempt(target()), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), { isDestructive: NO_DESTRUCTIVE,
       reqJson: request(false),
       wantsStream: false,
       protocol: "chat",
@@ -136,7 +145,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       STOP,
     ].join("");
 
-    const response = await fetchOpenAiFront(resolveAttempt(target()), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), { isDestructive: NO_DESTRUCTIVE,
       reqJson: request(true),
       wantsStream: true,
       protocol: "chat",
@@ -155,7 +164,10 @@ describe("OpenAI direct passthrough dialect recovery", () => {
     expect(body.match(/data: \[DONE\]/g)).toHaveLength(1);
   });
 
-  it("validates a recovered destructive call without refusing or reshaping it", async () => {
+  // ⚠ This test used to be named "validates a recovered destructive call without refusing or
+  // reshaping it" and asserted HTTP 200 — a test written to pin the defect it should have caught.
+  // Flipped in the same commit as the source fix, per CLAUDE.md's standing rule.
+  it("refuses a recovered destructive call instead of committing or reshaping it", async () => {
     let reshaperCalls = 0;
     const backend = await listen(createServer((req, res) => {
       req.resume();
@@ -210,9 +222,12 @@ describe("OpenAI direct passthrough dialect recovery", () => {
     });
     const body = await response.text();
 
-    expect(response.status, body).toBe(200);
-    expect(response.headers.get(TOOL_DIALECT_HEADER)).toBe("recovered");
-    expect(body).toContain('"name":"write_note"');
+    // The relay reconstructed a `write_note` call out of assistant TEXT, and the operator listed
+    // that tool as destructive — "refused, never fabricated". Refused whole, and never reshaped:
+    // repair is not a second chance at a call the config already rejected.
+    expect(response.status, body).toBe(502);
+    expect(body).toContain("destructive tool: write_note");
+    expect(body).not.toContain('"tool_calls"');
     expect(reshaperCalls).toBe(0);
   });
 
@@ -299,7 +314,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       }],
     }, null, 2);
 
-    const response = await fetchOpenAiFront(resolveAttempt(target()), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), { isDestructive: NO_DESTRUCTIVE,
       reqJson: request(false),
       wantsStream: false,
       protocol: "chat",
@@ -318,7 +333,7 @@ describe("OpenAI direct passthrough dialect recovery", () => {
       chatChunk({ content: "literal <tool_call> text" }).replaceAll("\n", "\r\n") +
       STOP.replaceAll("\n", "\r\n");
 
-    const response = await fetchOpenAiFront(resolveAttempt(target()), {
+    const response = await fetchOpenAiFront(resolveAttempt(target()), { isDestructive: NO_DESTRUCTIVE,
       reqJson: request(true, false),
       wantsStream: true,
       protocol: "chat",

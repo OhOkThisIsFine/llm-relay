@@ -1,3 +1,5 @@
+import { DIALECT_REFUSED_DESTRUCTIVE_CODE, type DialectRefusalSignal } from "./tool-dialects.js";
+
 /**
  * Final-wire streamed response commit probe.
  *
@@ -21,6 +23,12 @@ export interface StreamCommitProbeOptions {
   malformedProvenance?: "upstream" | "local";
   /** A rejected body read is normally transport/upstream even when parsing is mapper-local. */
   readFailureProvenance?: "upstream" | "local";
+  /**
+   * Set by the dialect-rescue wrapper on THIS stream when it refused a recovered destructive call.
+   * Absent on every lane the relay did not wrap, which is what stops an upstream minting `local`
+   * provenance for itself by echoing the code. See `DialectRefusalSignal`.
+   */
+  relayRefusal?: DialectRefusalSignal;
 }
 
 /** Shared by structural preflight and final-wire commit probing. */
@@ -60,10 +68,32 @@ function boundedError(value: Record<string, unknown>): string {
   return message ? `in-band error before meaningful content: ${message}` : "in-band error before meaningful content";
 }
 
-function anthropicVerdict(value: Record<string, unknown>): EventVerdict {
+/**
+ * An in-band error is the PROVIDER's by default, so it is retriable and the walk rerolls. An error
+ * this relay authored is not: a dialect-rescue destructive refusal is a config decision, terminal
+ * on the buffered lanes, and it must be terminal here too or the streamed pre-commit case would
+ * quietly reroll the same refusal across the whole pool.
+ *
+ * ⚠ BOTH halves are required, and the SIGNAL is the load-bearing one. The code alone travels on
+ * the wire, so an upstream can emit it — on an `anthropic`-kind target the dialect wrapper never
+ * runs and every occurrence is the upstream's. Trusting the bytes let a counterparty mint `local`
+ * for itself and thereby suppress failover AND escape breaker accounting. The signal is set only
+ * by the wrapper that pushed the event, so it cannot be forged from the wire.
+ */
+function relayAuthored(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): boolean {
+  if (!signal?.refused) return false;
+  const error = isRecord(value.error) ? value.error : value;
+  return error.type === DIALECT_REFUSED_DESTRUCTIVE_CODE || error.code === DIALECT_REFUSED_DESTRUCTIVE_CODE;
+}
+
+function errorVerdict(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): EventVerdict {
+  return { kind: "dead", reason: boundedError(value), provenance: relayAuthored(value, signal) ? "local" : "upstream" };
+}
+
+function anthropicVerdict(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): EventVerdict {
   const type = typeof value.type === "string" ? value.type : "";
   if (type === "error" || isRecord(value.error)) {
-    return { kind: "dead", reason: boundedError(value), provenance: "upstream" };
+    return errorVerdict(value, signal);
   }
 
   if (type === "message_stop") {
@@ -111,9 +141,9 @@ function chatToolCallMeaningful(value: unknown): boolean {
   return nonWhitespace(value.function.name) || nonWhitespace(value.function.arguments);
 }
 
-function openAiChatVerdict(value: Record<string, unknown>): EventVerdict {
+function openAiChatVerdict(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): EventVerdict {
   if (isRecord(value.error) || value.type === "error") {
-    return { kind: "dead", reason: boundedError(value), provenance: "upstream" };
+    return errorVerdict(value, signal);
   }
   if (!Array.isArray(value.choices)) {
     return { kind: "dead", reason: "OpenAI stream event is missing choices", provenance: "upstream" };
@@ -158,10 +188,10 @@ function responsesItemMeaningful(value: unknown): boolean {
   return substantiveFields(value, new Set(["type", "id", "status", "role", "index"]));
 }
 
-function openAiResponsesVerdict(value: Record<string, unknown>): EventVerdict {
+function openAiResponsesVerdict(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): EventVerdict {
   const type = typeof value.type === "string" ? value.type : "";
   if (type === "error" || type === "response.failed" || isRecord(value.error)) {
-    return { kind: "dead", reason: boundedError(value), provenance: "upstream" };
+    return errorVerdict(value, signal);
   }
   if (type === "response.incomplete" || type === "response.cancelled") {
     return { kind: "dead", reason: `${type} before meaningful content`, provenance: "upstream" };
@@ -207,6 +237,7 @@ function classifyEvent(
   event: string,
   protocol: StreamCommitProtocol,
   malformedProvenance: "upstream" | "local",
+  signal: DialectRefusalSignal | undefined,
 ): EventVerdict {
   const lines = event.split(/\r?\n/);
   const eventName = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() ?? "";
@@ -233,13 +264,13 @@ function classifyEvent(
     return { kind: "dead", reason: "stream event before meaningful content is not an object", provenance: malformedProvenance };
   }
   if (eventName === "error" && parsed.type !== "error" && !isRecord(parsed.error)) {
-    return { kind: "dead", reason: boundedError(parsed), provenance: "upstream" };
+    return errorVerdict(parsed, signal);
   }
 
   switch (protocol) {
-    case "anthropic-messages": return anthropicVerdict(parsed);
-    case "openai-chat": return openAiChatVerdict(parsed);
-    case "openai-responses": return openAiResponsesVerdict(parsed);
+    case "anthropic-messages": return anthropicVerdict(parsed, signal);
+    case "openai-chat": return openAiChatVerdict(parsed, signal);
+    case "openai-responses": return openAiResponsesVerdict(parsed, signal);
   }
 }
 
@@ -262,6 +293,7 @@ export async function probeStreamForCommit(
   const decoder = new TextDecoder();
   const malformedProvenance = options.malformedProvenance ?? "upstream";
   const readFailureProvenance = options.readFailureProvenance ?? "upstream";
+  const relayRefusal = options.relayRefusal;
   let buffered = "";
   let inspectedBytes = 0;
 
@@ -309,13 +341,13 @@ export async function probeStreamForCommit(
       if (!boundary) break;
       const event = buffered.slice(0, boundary.index);
       buffered = buffered.slice(boundary.index + boundary.length);
-      const verdict = classifyEvent(event, protocol, malformedProvenance);
+      const verdict = classifyEvent(event, protocol, malformedProvenance, relayRefusal);
       if (verdict.kind !== "hold") return verdict;
     }
     if (final && buffered.trim().length > 0) {
       const event = buffered;
       buffered = "";
-      return classifyEvent(event, protocol, malformedProvenance);
+      return classifyEvent(event, protocol, malformedProvenance, relayRefusal);
     }
     return HOLD;
   };

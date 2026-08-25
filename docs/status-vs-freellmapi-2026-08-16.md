@@ -110,7 +110,13 @@ pinned at `823bc34` (2026-08-10):
 
 Ranked. Every absence was confirmed by grep, not by an inventory omission.
 
-### 3.1 Destructive-tool refusal at the dialect-rescue commit point — **ADOPT** (high)
+### 3.1 Destructive-tool refusal at the dialect-rescue commit point — **ADOPT** (high) — ✅ DELIVERED 2026-08-24
+
+**Closed.** `recoverToolCalls` now takes the matcher as a REQUIRED parameter and returns
+`refused-destructive`; all four rescue commit points refuse whole and terminally. Design, policy
+and the consequences to expect:
+[dialect-rescue-destructive-refusal-2026-08-24.md](dialect-rescue-destructive-refusal-2026-08-24.md).
+The finding as originally written is kept below unedited, because it is the evidence for the fix.
 
 **The only genuine code gap found, and the only one with a safety consequence.** `destructive`
 appears in exactly five `src/` files — `cli.ts`, `config.ts`, `log.ts`, `repair.ts`, `server.ts` —
@@ -367,7 +373,7 @@ code exceptions are exactly two — one transparency bug (`freeOnly`) and one ne
 | # | Action | Where | Why |
 |---|---|---|---|
 | 1 | Correct the retirement framing | `~/.claude/CLAUDE.md:72-73` | Highest blast radius; contradicts the memory index loaded beside it. **User's own config — ask first.** |
-| 2 | Add destructive-name filter at the dialect-rescue commit point | `src/tool-dialects.ts`, `src/openai-dialect.ts` | The only genuine code gap with a safety consequence (§3.1) |
+| 2 | ✅ DONE 2026-08-24 — destructive-name filter at the dialect-rescue commit point | `src/tool-dialects.ts`, `src/openai-dialect.ts`, `src/dialect-stream.ts`, `src/backend.ts`, `src/stream-commit.ts` | The only genuine code gap with a safety consequence (§3.1). Delivered across all FOUR rescue commit points, not the two named here |
 | 3 | Render the **effective** `freeOnly` in `offload status` | `src/cli.ts` | ⚠ Not cosmetic and not a raw field print: an unset flag is **ON for rerouted traffic, OFF for a directly addressed pool** ([server.ts:1457](../src/server.ts:1457)). Printing the bare optional would be a *new* transparency bug. Today an operator cannot tell whether a lane may spend money. |
 | 4 | One `CLAUDE.md` accuracy pass | `CLAUDE.md` | Drift items 2-11 and the `lanes`/`eligibility` command omissions |
 | 5 | Fix the phantom headers | `docs/reference.md:768` | User-facing; an integrator would build against them |

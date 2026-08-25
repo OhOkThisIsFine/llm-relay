@@ -20,6 +20,15 @@ import { anthropicRequestToOpenAi } from "../src/openai-request.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
 import { createUsageAccumulator } from "../src/usage-observer.js";
 
+/**
+ * The destructive-tool filter these fixtures pass at the dialect-rescue commit points. Refusing
+ * nothing is the right default HERE: these tests cover translation and recovery, and the refusal
+ * itself has its own suite (test/dialect-destructive-refusal.test.ts). It is a REQUIRED parameter
+ * on `recoverToolCalls` / `fetchBackend` / `fetchOpenAiFront` so a new rescue seam cannot omit the
+ * policy silently — which is exactly why it has to be spelled out here rather than defaulted.
+ */
+const NO_DESTRUCTIVE = (): boolean => false;
+
 function openaiTarget(base: string, model = "meta/llama-3.1-70b-instruct"): ResolvedTarget {
   return {
     provider: "nim",
@@ -36,7 +45,7 @@ describe("openAiResponseToAnthropic", () => {
   it("keeps usage absent when the upstream omitted it", () => {
     const anth = openAiResponseToAnthropic({
       choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
-    }, "target") as Record<string, unknown>;
+    }, "target", undefined, NO_DESTRUCTIVE) as Record<string, unknown>;
     expect(anth).not.toHaveProperty("usage");
   });
 
@@ -45,7 +54,7 @@ describe("openAiResponseToAnthropic", () => {
       id: "cmpl_1", model: "x",
       choices: [{ finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "call_1", function: { name: "get_weather", arguments: '{"city":"Paris"}' } }] } }],
       usage: { prompt_tokens: 10, completion_tokens: 5 },
-    }, "target-model") as any;
+    }, "target-model", undefined, NO_DESTRUCTIVE) as any;
     expect(anth.type).toBe("message");
     expect(anth.stop_reason).toBe("tool_use");
     expect(anth.model).toBe("target-model");
@@ -56,7 +65,7 @@ describe("openAiResponseToAnthropic", () => {
   it("maps a plain text completion to a text block with end_turn", () => {
     const anth = openAiResponseToAnthropic({
       choices: [{ finish_reason: "stop", message: { role: "assistant", content: "hello there" } }],
-    }, "m") as any;
+    }, "m", undefined, NO_DESTRUCTIVE) as any;
     expect(anth.content).toEqual([{ type: "text", text: "hello there" }]);
     expect(anth.stop_reason).toBe("end_turn");
   });
@@ -67,7 +76,7 @@ describe("openAiResponseToAnthropic", () => {
         finish_reason: "stop",
         message: { role: "assistant", content: "<think>private reasoning</think>Visible answer" },
       }],
-    }, "m") as any;
+    }, "m", undefined, NO_DESTRUCTIVE) as any;
 
     expect(anth.content).toEqual([{ type: "text", text: "Visible answer" }]);
   });
@@ -84,7 +93,7 @@ describe("openAiResponseToAnthropic", () => {
           content: '<think>choose a path</think><tool_call>{"name":"write_note","arguments":{"path":"a.txt"}}</tool_call>',
         },
       }],
-    }, "m", schemas) as any;
+    }, "m", schemas, NO_DESTRUCTIVE) as any;
 
     expect(anth.content).toEqual([
       { type: "tool_use", id: "tu_recovered_0", name: "write_note", input: { path: "a.txt" } },
@@ -102,7 +111,7 @@ describe("openAiResponseToAnthropic", () => {
         completion_tokens: 4,
         prompt_tokens_details: { cached_tokens: 7 },
       },
-    }, "m") as any;
+    }, "m", undefined, NO_DESTRUCTIVE) as any;
     expect(anth.usage).toEqual({ input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 7 });
   });
 
@@ -116,7 +125,7 @@ describe("openAiResponseToAnthropic", () => {
         completion_tokens: 4,
         prompt_tokens_details: { cached_tokens: 11 },
       },
-    }, "m") as any;
+    }, "m", undefined, NO_DESTRUCTIVE) as any;
     expect(anth.usage).toEqual({ input_tokens: 10, output_tokens: 4 });
   });
 
@@ -130,7 +139,7 @@ describe("openAiResponseToAnthropic", () => {
         completion_tokens: 4,
         prompt_tokens_details: { cached_tokens: -5 },
       },
-    }, "m") as any;
+    }, "m", undefined, NO_DESTRUCTIVE) as any;
     expect(anth.usage).toEqual({ input_tokens: 10, output_tokens: 4 });
   });
 
@@ -138,7 +147,7 @@ describe("openAiResponseToAnthropic", () => {
     const anth = openAiResponseToAnthropic({
       choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
       usage: { prompt_tokens: 10, completion_tokens: 5 },
-    }, "m") as any;
+    }, "m", undefined, NO_DESTRUCTIVE) as any;
     expect(anth.usage).toEqual({ input_tokens: 10, output_tokens: 5 });
   });
 });
@@ -273,7 +282,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const anthropicReq = { model: "claude-x", stream: false, messages: [{ role: "user", content: "weather in Rome?" }], tools: [{ name: "get_weather", description: "w", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }] };
 
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -309,7 +318,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
         "data: [DONE]\n\n",
       ].join("");
 
-      const res = await fetchBackend(resolveAttempt(target), {
+      const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)),
@@ -345,7 +354,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_stream", model: "upstream-substitute" } })}\n\n`,
       `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
     ].join("");
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages",
       method: "POST",
       reqBuf: Buffer.from("{}"),
@@ -378,7 +387,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       stop_reason: "end_turn",
       usage: { input_tokens: 1, output_tokens: 1 },
     });
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages",
       method: "POST",
       reqBuf: Buffer.from("{}"),
@@ -412,7 +421,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x.invalid/a.pdf" } }] }],
     };
 
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(anthropicReq)), reqJson: anthropicReq,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -440,7 +449,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const req = { model: "claude-x", messages: [{ role: "user", content: "hi" }] };
 
-    const upstream = await fetchBackend(resolveAttempt(target), {
+    const upstream = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -451,7 +460,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     // Same fetchBackend, same shape of Response, opposite meaning: without the marker a
     // caller counting failures records both as "the provider is unhealthy" and fails over
     // to a second provider that would refuse this document identically.
-    const local = await fetchBackend(resolveAttempt(target), {
+    const local = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from("{}"),
       reqJson: { model: "claude-x", messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x.invalid/a.pdf" } }] }] },
@@ -464,7 +473,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
   it("rejects a malformed buffered OpenAI 2xx as an upstream envelope failure", async () => {
     const target = openaiTarget("https://openai-backend.test");
     const req = { model: "claude-x", messages: [{ role: "user", content: "hi" }] };
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(1000),
@@ -482,7 +491,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
   it("rejects the equivalent malformed OpenAI SSE 2xx before stream translation", async () => {
     const target = openaiTarget("https://openai-backend.test");
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(1000),
@@ -503,7 +512,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     };
     for (const wantsStream of [false, true]) {
       const raw = wantsStream ? "event: message_start\ndata: {}\n\n" : "{}";
-      const res = await fetchBackend(resolveAttempt(target), {
+      const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from("{}"),
@@ -528,7 +537,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       const target = openaiTarget("https://openai-backend.test");
       for (const wantsStream of [false, true]) {
         const raw = wantsStream ? "data: {}\n\n" : "{}";
-        const res = await fetchOpenAiFront(resolveAttempt(target), {
+        const res = await fetchOpenAiFront(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
           reqJson: { model: "requested", messages: [{ role: "user", content: "hi" }] },
           wantsStream,
           signal: AbortSignal.timeout(1000),
@@ -558,7 +567,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete anthropicKind.authEnv;
     const res = await fetchOpenAiFront(
       resolveAttempt(anthropicKind),
-      {
+      { isDestructive: NO_DESTRUCTIVE,
         reqJson: { model: "m", messages: [{ role: "user", content: "hello" }] },
         wantsStream: false,
         signal: AbortSignal.timeout(1000),
@@ -595,7 +604,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
 
     const res = await fetchOpenAiFront(
       resolveAttempt(anthropicKind),
-      {
+      { isDestructive: NO_DESTRUCTIVE,
         reqJson: { model: "m", input: [null] },
         wantsStream: false,
         protocol: "responses",
@@ -620,7 +629,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete anthropicKind.authEnv;
     for (const wantsStream of [false, true]) {
       const raw = wantsStream ? "event: message_start\ndata: {}\n\n" : "{}";
-      const res = await fetchOpenAiFront(resolveAttempt(anthropicKind), {
+      const res = await fetchOpenAiFront(resolveAttempt(anthropicKind), { isDestructive: NO_DESTRUCTIVE,
         reqJson: { model: "m", messages: [{ role: "user", content: "hello" }], stream: wantsStream },
         wantsStream,
         signal: AbortSignal.timeout(1000),
@@ -646,7 +655,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
       value: async () => ({ content: [{ type: "tool_use", id: "call_1", name: "tool", input: circular }] }),
     });
 
-      const res = await fetchOpenAiFront(resolveAttempt(anthropicKind), {
+      const res = await fetchOpenAiFront(resolveAttempt(anthropicKind), { isDestructive: NO_DESTRUCTIVE,
       reqJson: { model: "m", messages: [{ role: "user", content: "hello" }] },
       wantsStream: false,
       signal: AbortSignal.timeout(1000),
@@ -674,7 +683,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     delete anthropicKind.authEnv;
     const res = await fetchOpenAiFront(
       resolveAttempt(anthropicKind),
-      {
+      { isDestructive: NO_DESTRUCTIVE,
         reqJson: { model: "claude", input: "hello", stream: true },
         wantsStream: true,
         protocol: "responses",
@@ -700,7 +709,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget("https://openai-backend.test", "target");
     const res = await fetchOpenAiFront(
       resolveAttempt(target),
-      {
+      { isDestructive: NO_DESTRUCTIVE,
         reqJson: { model: "target", input: "hello", stream: true },
         wantsStream: true,
         protocol: "responses",
@@ -740,7 +749,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
 
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
@@ -779,7 +788,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
 
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),
@@ -821,7 +830,7 @@ describe("fetchBackend (openai kind) — request translation + response mapping"
     const req = { model: "claude-x", stream: true, messages: [{ role: "user", content: "hi" }] };
     const res = await fetchBackend(
       resolveAttempt(target),
-      {
+      { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)),
@@ -859,7 +868,7 @@ describe("fetchBackend (openai kind) — the outbound request is the caller's co
   /** Exactly what the relay put on the wire for this Anthropic body. */
   async function outbound(reqJson: Record<string, unknown>, wantsStream = false): Promise<any> {
     let seen: any = null;
-    const res = await fetchBackend(resolveAttempt(openaiTarget("https://request-shape.test")), {
+    const res = await fetchBackend(resolveAttempt(openaiTarget("https://request-shape.test")), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(reqJson)), reqJson,
       anthropicHeaders: {}, wantsStream, signal: AbortSignal.timeout(5000),
@@ -1088,7 +1097,7 @@ describe("fetchBackend (openai kind) — the outbound request is the caller's co
       model: "claude-x", max_tokens: 16,
       messages: [{ role: "user", content: [{ type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: {} }] }],
     };
-    const res = await fetchBackend(resolveAttempt(openaiTarget("https://request-shape.test")), {
+    const res = await fetchBackend(resolveAttempt(openaiTarget("https://request-shape.test")), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
       anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -1329,7 +1338,7 @@ describe("direct OpenAI stream usage integration", () => {
   it("observes but suppresses the relay-added usage event", async () => {
     const seen: Record<string, unknown>[] = [];
     const accumulator = createUsageAccumulator();
-    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), { isDestructive: NO_DESTRUCTIVE,
       reqJson: { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] },
       wantsStream: true,
       usage: accumulator,
@@ -1345,7 +1354,7 @@ describe("direct OpenAI stream usage integration", () => {
 
   it("preserves a caller-requested usage event", async () => {
     const accumulator = createUsageAccumulator();
-    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), { isDestructive: NO_DESTRUCTIVE,
       reqJson: {
         model: "m",
         stream: true,
@@ -1369,7 +1378,7 @@ describe("direct OpenAI stream usage integration", () => {
     raw.set(first);
     raw.set(opaque, first.byteLength);
     raw.set(usage, first.byteLength + opaque.byteLength);
-    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), { isDestructive: NO_DESTRUCTIVE,
       reqJson: { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] },
       wantsStream: true,
       usage: createUsageAccumulator(),
@@ -1387,7 +1396,7 @@ describe("direct OpenAI stream usage integration", () => {
     const bodies: Record<string, unknown>[] = [];
     const accumulator = createUsageAccumulator();
     let egresses = 0;
-    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+    const response = await fetchOpenAiFront(resolveAttempt(openaiTarget("https://backend.test", "m")), { isDestructive: NO_DESTRUCTIVE,
       reqJson: { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] },
       wantsStream: true,
       usage: accumulator,
@@ -1423,7 +1432,7 @@ describe("usage observation survives backend adapters", () => {
 
   it("captures buffered Messages-front OpenAI usage before response mapping", async () => {
     const accumulator = createUsageAccumulator();
-    const response = await fetchBackend(resolveAttempt(openaiTarget("https://backend.test", "m")), {
+    const response = await fetchBackend(resolveAttempt(openaiTarget("https://backend.test", "m")), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages",
       method: "POST",
       reqBuf: Buffer.from(JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] })),
@@ -1442,7 +1451,7 @@ describe("usage observation survives backend adapters", () => {
 
   it("captures streamed native Anthropic usage before stream validation", async () => {
     const accumulator = createUsageAccumulator();
-    const response = await fetchBackend(resolveAttempt(anthropicTarget), {
+    const response = await fetchBackend(resolveAttempt(anthropicTarget), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages",
       method: "POST",
       reqBuf: Buffer.from("{}"),
@@ -1461,7 +1470,7 @@ describe("usage observation survives backend adapters", () => {
 
   it("captures Responses-front completion usage through an Anthropic backend", async () => {
     const accumulator = createUsageAccumulator();
-    const response = await fetchOpenAiFront(resolveAttempt(anthropicTarget), {
+    const response = await fetchOpenAiFront(resolveAttempt(anthropicTarget), { isDestructive: NO_DESTRUCTIVE,
       protocol: "responses",
       reqJson: { model: "claude-test", input: "hi" },
       wantsStream: false,
@@ -1498,7 +1507,7 @@ describe("fetchBackend carries Retry-After onto its synthesized error", () => {
     try {
       const target = openaiTarget(`http://127.0.0.1:${(backend.address() as AddressInfo).port}`);
       const req = { model: "m", messages: [{ role: "user", content: "hi" }] };
-      const res = await fetchBackend(resolveAttempt(target), {
+      const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages", method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)), reqJson: req,
         anthropicHeaders: {}, wantsStream: false, signal: AbortSignal.timeout(5000),
@@ -1550,7 +1559,7 @@ describe("fetchBackend & fetchOpenAiFront — credential alias resolution", () =
 
     const req = { model: "gemini-2.0-flash", stream: false, messages: [{ role: "user", content: "hello" }] };
     try {
-      await fetchBackend(resolveAttempt(target), {
+      await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)),
@@ -1603,7 +1612,7 @@ describe("fetchBackend & fetchOpenAiFront — credential alias resolution", () =
 
     const req = { model: "gemini-2.0-flash", messages: [{ role: "user", content: "hello" }] };
     try {
-      await fetchOpenAiFront(resolveAttempt(target), {
+      await fetchOpenAiFront(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
         reqJson: req,
         wantsStream: false,
         signal: AbortSignal.timeout(5000),
@@ -1651,7 +1660,7 @@ describe("fetchBackend (openai kind) — tool_use ids are unique against the con
     process.env.RP_BACKEND_KEY = "sk-nim";
     try {
       const req = conversation("Read:0");
-      const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+      const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)),
@@ -1678,7 +1687,7 @@ describe("fetchBackend (openai kind) — tool_use ids are unique against the con
     process.env.RP_BACKEND_KEY = "sk-nim";
     try {
       const req = conversation("Read:0");
-      const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+      const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify(req)),
@@ -1711,7 +1720,7 @@ describe("fetchBackend (openai kind) — tool_use ids are unique against the con
       ].join("");
 
       const run = async (req: object) => {
-        const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+        const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), { isDestructive: NO_DESTRUCTIVE,
           path: "/v1/messages",
           method: "POST",
           reqBuf: Buffer.from(JSON.stringify(req)),
@@ -1749,7 +1758,7 @@ describe("fetchBackend (openai kind) — tool_use ids are unique against the con
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: envelope } }],
       });
       const call = async (req: object) => {
-        const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), {
+        const res = await fetchBackend(resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")), { isDestructive: NO_DESTRUCTIVE,
           path: "/v1/messages",
           method: "POST",
           reqBuf: Buffer.from(JSON.stringify(req)),
@@ -1789,7 +1798,7 @@ describe("fetchBackend (openai kind) — tool_use ids are unique against the con
       content: [{ type: "tool_use", id: "Read:0", name: "Read", input: { file: "README.md" } }],
       stop_reason: "tool_use", stop_sequence: null,
     });
-    const res = await fetchBackend(resolveAttempt(anthropic), {
+    const res = await fetchBackend(resolveAttempt(anthropic), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages",
       method: "POST",
       reqBuf: Buffer.from(JSON.stringify(req)),
@@ -1817,7 +1826,7 @@ describe("fetchBackend (openai kind) — tool_use ids are unique against the con
     try {
       const res = await fetchOpenAiFront(
         resolveAttempt(openaiTarget("https://kimi.test", "moonshotai/kimi-k3")),
-        {
+        { isDestructive: NO_DESTRUCTIVE,
           // `function_call_output.call_id` survives the Responses→Anthropic translation as a
           // `tool_result.tool_use_id`, so the conversation's ids are visible to the taken-set.
           reqJson: {
@@ -1902,7 +1911,7 @@ describe("fetchBackend (openai kind) — outbound tool-call ids under strict9", 
         ...openaiTarget("https://api.mistral.ai/v1", "mistral-medium-2505"),
         ...(mode !== undefined ? { toolCallIds: mode } : {}),
       };
-      const res = await fetchBackend(resolveAttempt(target), {
+      const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify({ ...agentic, stream })),
@@ -2010,7 +2019,7 @@ describe("fetchBackend (openai kind) — the gemini thought-signature sentinel",
         ...openaiTarget("https://generativelanguage.googleapis.com/v1beta/openai", "models/gemini-3.6-flash"),
         ...(mode !== undefined ? { thoughtSignature: mode } : {}),
       };
-      const res = await fetchBackend(resolveAttempt(target), {
+      const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
         path: "/v1/messages",
         method: "POST",
         reqBuf: Buffer.from(JSON.stringify({ ...parallel, stream })),
