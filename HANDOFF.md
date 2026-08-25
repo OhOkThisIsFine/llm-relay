@@ -33,9 +33,21 @@ P1's platform question resolved in-build: Windows DPAPI live-verified twice inde
 (including a fresh-process unwrap), the Linux passphrase mode is real in CI, macOS/`secret-tool`
 ship as injected-double coverage only — stated, not papered over. Design §2.6/§2.7 carry dated
 amendments (shipped `add` stores-and-warns on a shadow; `rotate`'s narrowed live clear is the one
-deliberate HTTP touch, carrying no secret). ⚠ The owner's 12 live keys are still in env vars —
-migration (`llm-relay keys import`/`add`) is an OPERATOR action, deliberately not part of the
-sprint.
+deliberate HTTP touch, carrying no secret). **The key migration was executed 2026-08-24 evening
+(owner-approved):** all 12 provider keys imported into the keystore (`keys list`: 12 active, 0
+undecryptable), the 12 User-scope env vars removed (`FREELLMAPI_API_KEY`/`VERCEL_API_KEY` left —
+not llm-relay's), no `.env` file exists, and the relay restarted on a scrubbed environment —
+verified end-to-end by a groq completion (HTTP 200) through a relay that provably holds no env
+keys. ⚠ **One casualty: the NVIDIA key in the keystore is 403-dead** ("Authorization failed" on
+completions while `/models` authenticates — the exact 2026-08-23 outage signature). Most likely
+cause: the migrating session's inherited environment PREDATED that morning's key rotation, so the
+stale pre-rotation key was imported and the fresh one was then removed from HKCU with the sweep.
+The fresh key was NOT recoverable from this machine; recovery is `llm-relay keys rotate nim`
+(stdin) with the key from the NVIDIA console or a freellmapi export. Until then nim's cells
+credential-fault and demote; the relay serves around NIM by design. Lesson recorded: verify each
+migrated credential LIVE (a real completion) before deleting its env source — a User-scope
+rotation invisible to an old session is exactly the `winenv` class of bug, on the operator side
+this time.
 
 Earlier the same day, **v0.44.0** shipped M4/Gap 10 (`32f31c3`, attempt-scoped estimated output)
 and M3 (`1ee1ad2`, the cooldown-clear mutation) — see the reconciliation ledger §7.
