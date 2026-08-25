@@ -169,6 +169,13 @@ export interface AccountingStoreOptions {
   readonly retentionDays?: number | null;
   readonly recentLimit?: number;
   readonly detailLimit?: number;
+  /**
+   * Test seam for the durable per-day dedup cap, the `recentLimit` pattern: filling the real
+   * 16,384-entry cap costs seconds of insert-sorting, which put the cap test's worst case over
+   * vitest's budget under full-suite load. Bounded by ACCOUNTING_MAX_DEDUP_IDS, which stays the
+   * default — production callers pass nothing.
+   */
+  readonly dedupLimit?: number;
   readonly readDaysCap?: number;
   readonly pendingRequestLimit?: number;
   readonly pendingAttemptLimit?: number;
@@ -836,6 +843,7 @@ class AccountingStoreImpl implements AccountingStore {
   private readonly retentionDays: number | null;
   private readonly recentLimit: number;
   private readonly detailLimit: number;
+  private readonly dedupLimit: number;
   private readonly readDaysCap: number;
   private readonly knownDaysCap: number;
   private readonly pendingRequestLimit: number;
@@ -881,6 +889,7 @@ class AccountingStoreImpl implements AccountingStore {
     this.retentionDays = typeof options.retentionDays === "number" && Number.isSafeInteger(options.retentionDays) && options.retentionDays > 0 ? options.retentionDays : null;
     this.recentLimit = positiveLimit(options.recentLimit, ACCOUNTING_DEFAULT_RECENT_ROWS, ACCOUNTING_MAX_RECENT_ROWS);
     this.detailLimit = positiveLimit(options.detailLimit, ACCOUNTING_DEFAULT_DETAIL_ROWS, ACCOUNTING_MAX_RECENT_ROWS);
+    this.dedupLimit = positiveLimit(options.dedupLimit, ACCOUNTING_MAX_DEDUP_IDS, ACCOUNTING_MAX_DEDUP_IDS);
     this.readDaysCap = positiveLimit(options.readDaysCap, ACCOUNTING_MAX_READ_DAYS, ACCOUNTING_MAX_READ_DAYS);
     this.knownDaysCap = this.readDaysCap;
     this.pendingRequestLimit = positiveLimit(options.pendingRequestLimit, ACCOUNTING_MAX_PENDING_REQUESTS, ACCOUNTING_MAX_PENDING_REQUESTS);
@@ -1456,7 +1465,7 @@ class AccountingStoreImpl implements AccountingStore {
   private addDedup(day: MutableDay, requestId: string): boolean {
     const ids = dedupSet(day);
     if (ids.has(requestId)) return true;
-    if (day.dedup.requestIds.length >= ACCOUNTING_MAX_DEDUP_IDS) {
+    if (day.dedup.requestIds.length >= this.dedupLimit) {
       increase(day.dedup as unknown as Record<string, number>, "dropped");
       day.dedup.complete = false;
       increase(day.coverage as unknown as Record<string, number>, "droppedDedup");
