@@ -1526,6 +1526,11 @@ describe("keys subcommand router", () => {
   });
 
   it("keeps bare keys, keys check, and check-keys on the historical status path", async () => {
+    // This test pins ROUTER equivalence (three spellings, one output), not live key checking.
+    // Unmocked, key-checker fetches the fixture's real hosts (api.anthropic.com, a dead local
+    // port, an invalid DNS name), so the table header raced vi.waitFor's 1s budget against live
+    // network latency under full-suite load — the winenv class of flake, on the network axis.
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("hermetic: no live key probes"));
     const stdout: string[] = [];
     vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
       stdout.push(String(chunk));

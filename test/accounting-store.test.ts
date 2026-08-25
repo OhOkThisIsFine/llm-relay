@@ -22,7 +22,6 @@ import {
 } from "../src/accounting.js";
 import {
   ACCOUNTING_MAX_DAY_ROWS,
-  ACCOUNTING_MAX_DEDUP_IDS,
   ACCOUNTING_MAX_DETAIL_ATTEMPTS,
   ACCOUNTING_MAX_ROWS_PER_CELL,
   createAccountingStore,
@@ -733,16 +732,21 @@ describe("durable canonical accounting store", () => {
   });
 
   it("stops claiming exact replay suppression after the durable dedup index cap", () => {
-    const store = createAccountingStore({ rootDir: root(), recentLimit: 1, detailLimit: 1 });
+    // The cap POLICY is what this pins, so it runs against the injected `dedupLimit` seam:
+    // filling the real 16,384-entry cap re-sorts the id array on every insert, and that worst
+    // case overran vitest's budget under full-suite load. Production passes no dedupLimit and
+    // keeps ACCOUNTING_MAX_DEDUP_IDS.
+    const cap = 64;
+    const store = createAccountingStore({ rootDir: root(), recentLimit: 1, detailLimit: 1, dedupLimit: cap });
     const endedAt = "2026-08-21T00:00:00.000Z";
-    for (let index = 0; index <= ACCOUNTING_MAX_DEDUP_IDS; index += 1) {
+    for (let index = 0; index <= cap; index += 1) {
       store.record(terminalOnly(`dedup-${index.toString().padStart(16, "0")}`, endedAt));
     }
     const dedup = day(store, "2026-08-21").dedup;
-    expect(dedup.requestIds).toHaveLength(ACCOUNTING_MAX_DEDUP_IDS);
+    expect(dedup.requestIds).toHaveLength(cap);
     expect(dedup.complete).toBe(false);
     expect(dedup.dropped).toBe(1);
-    store.record(terminalOnly(`dedup-${ACCOUNTING_MAX_DEDUP_IDS.toString().padStart(16, "0")}`, endedAt));
+    store.record(terminalOnly(`dedup-${cap.toString().padStart(16, "0")}`, endedAt));
     expect(day(store, "2026-08-21").dedup.dropped).toBe(2);
     store.close();
   });
