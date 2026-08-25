@@ -4,6 +4,15 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-24 (evening)
 
+**Latest, unreleased on `main`: the dialect-rescue destructive filter.** This closes the last item
+in §6 that was a code gap rather than a recorded trade — the one known safety-shaped one. A
+WELL-FORMED destructive call the relay reconstructed out of assistant prose used to be served
+unfiltered, because `destructive` reached none of `tool-dialects.ts`, `openai-dialect.ts`,
+`dialect-stream.ts`. It is now refused whole and terminally at all four rescue commit points. Full
+entry, including the deliberately recorded announcement residual on the streamed pre-commit lane:
+§6 below.
+
+
 **The custody sprint is delivered — Stage 3 of
 [docs/credential-fleet-design-2026-08-16.md](docs/credential-fleet-design-2026-08-16.md), queued
 for v0.45.0.** Six commits in three packets, each implemented by Codex (GPT-5.6 Sol) and
@@ -291,8 +300,22 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
 
 Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
 
-- Destructive-name filter at the dialect-rescue commit point - the one known safety-shaped code
-  gap (`docs/status-vs-freellmapi-2026-08-16.md` §3.1 / §6 rec 2).
+- ~~Destructive-name filter at the dialect-rescue commit point - the one known safety-shaped code
+  gap (`docs/status-vs-freellmapi-2026-08-16.md` §3.1 / §6 rec 2).~~ **DELIVERED 2026-08-24.**
+  `recoverToolCalls` takes the matcher as a REQUIRED parameter and returns `refused-destructive`;
+  the refusal binds at all **four** rescue commit points (buffered/streamed x Anthropic-translated/
+  direct-Chat), refuses the envelope WHOLE, and is TERMINAL — `origin: "local"`, so the walk does
+  not reroll and the deployment's failure budget is untouched. Announced as
+  `x-llm-relay-tool-dialect: refused-destructive` plus a `tool_dialect_refused_destructive` body on
+  the buffered lanes, and as the mid-stream SSE `error` event once the head is flushed.
+  ⚠ **Known residual, deliberately recorded rather than papered over:** on a *streamed pre-commit*
+  refusal (nothing meaningful emitted before the envelope) `stream-commit.ts` classifies the
+  relay-authored error and both fronts synthesize their own 502, so the served body is the generic
+  `api_error` shape and neither `x-llm-relay-tool-dialect` nor `x-llm-relay-error-origin` is
+  written. The refusal is still correct and still terminal — only the announcement degrades — and
+  the refused tool names still reach the message. Design, policy, and the consequences to expect:
+  [docs/dialect-rescue-destructive-refusal-2026-08-24.md](docs/dialect-rescue-destructive-refusal-2026-08-24.md);
+  suite: `test/dialect-destructive-refusal.test.ts`.
 - Orphan `tmp-*` journal files are never swept (C1 RISK-1 residue; retention itself landed).
 - `methodSnapshot` accepts bounded arbitrary JSON as an estimation "method" (C1 NIT-6).
 - Dashboard session token rides `sessionStorage`; the mitigation is the strict CSP. Trade
@@ -325,4 +348,6 @@ in the packet reviews, recorded here so nobody re-litigates them as discoveries)
   stands.
 - `keystoreStatus` retains the KEK after a successful status read (deliberate, serves the
   spawn-once discipline; documented in the `keystore.ts` CLAUDE.md row).
-- The owner's 12 live keys remain in env vars until the operator migrates by hand.
+- ~~The owner's 12 live keys remain in env vars until the operator migrates by hand.~~
+  **Superseded the same evening** — the migration was executed (§0): all 12 keys live in the
+  keystore, the 12 User-scope env vars are gone, and the relay runs keyless off the keystore.

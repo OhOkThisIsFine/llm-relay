@@ -24,6 +24,58 @@ interface SchemaLike {
   items?: SchemaLike;
 }
 
+/**
+ * The relay-owned error code for a dialect-rescue destructive refusal, on every surface that can
+ * carry one: the buffered error bodies, the mid-stream SSE `error` event, and the commit probe's
+ * classifier.
+ *
+ * It has ONE job beyond naming the failure: the probe must read it as RELAY-authored, not
+ * upstream. An in-band error is provenance `upstream` by default and therefore retriable, which
+ * would let a streamed pre-commit refusal reroll onto the next candidate while the buffered lanes
+ * treat the same refusal as terminal — two paths, one policy. See
+ * docs/dialect-rescue-destructive-refusal-2026-08-24.md §3.
+ */
+export const DIALECT_REFUSED_DESTRUCTIVE_CODE = "tool_dialect_refused_destructive";
+
+/**
+ * Proof that the refusal event on a stream is the RELAY's, set by the wrapper that emitted it.
+ *
+ * ⚠ The code above is not that proof. It travels on the wire, so a stream can carry it without the
+ * relay having written it — on an `anthropic`-kind target the body is a byte passthrough and the
+ * dialect wrapper never runs at all, so EVERY occurrence there is the upstream's. Classifying on
+ * the bytes let a counterparty mint `local` provenance for itself, which suppresses failover AND
+ * exempts it from breaker accounting (`relay-mapper-defect` outcomes are dropped): a hostile member
+ * could black-hole a request a healthy sibling would have served, and take no health hit for it.
+ *
+ * So provenance is DECLARED, never inferred from the counterparty's bytes — the same rule
+ * `credentialState()` follows for credential containment. Only the wrapper that pushed the event
+ * sets `refused`, and `stream-commit.ts` requires BOTH the flag and the code before it will call a
+ * dead verdict `local`.
+ */
+export interface DialectRefusalSignal {
+  refused: boolean;
+}
+
+/** A fresh, un-refused signal for one wrapped stream. */
+export function dialectRefusalSignal(): DialectRefusalSignal {
+  return { refused: false };
+}
+
+/**
+ * Render the refused tool names for an error message, bounded.
+ *
+ * The names are model-authored: an envelope's `name="…"` attribute, admitted only because it
+ * MATCHED the operator's list — and a prefix pattern (`git_*`) admits arbitrary text after the
+ * prefix. So the wording is bounded here rather than at each of the four seams, the same reasoning
+ * as `stream-commit.ts` `boundedError`. One definition, because a message that is truncated on
+ * three lanes and unbounded on the fourth is the asymmetry this whole change exists to remove.
+ */
+export function describeRefused(refused: readonly string[]): string {
+  const shown = refused.slice(0, 5).map((name) => (name.length > 64 ? `${name.slice(0, 64)}…` : name));
+  const extra = refused.length - shown.length;
+  return extra > 0 ? `${shown.join(", ")}, +${extra} more` : shown.join(", ");
+}
+
 export interface DialectToolCall {
   name: string;
   input: Record<string, unknown>;
@@ -38,7 +90,21 @@ export type DialectOutcome =
    * Framing markers present but unparseable — truncated mid-stream, or a dialect variant we do not
    * model. NEVER guessed at: the caller fails clean so failover reaches a host that parses.
    */
-  | { status: "detected"; dialect: string };
+  | { status: "detected"; dialect: string }
+  /**
+   * Framing parsed, but a recovered call names a tool the operator listed as destructive.
+   *
+   * A backend emitting native `tool_calls` has stated its own protocol intent and the destructive
+   * list has never governed that. Rescue is the relay deciding that model TEXT is a tool call —
+   * for `Bash`/`Write`/`Edit` under `--dangerously-skip-permissions` that is the relay authoring a
+   * destructive call the host never made, which "refused, never fabricated" forbids.
+   *
+   * Refused WHOLE, never partially: committing the surviving calls and dropping this one would
+   * silently change the model's intent, the same reasoning `guardReshaped`'s structural
+   * conservation rests on. `refused` carries the offending names — they come from the operator's
+   * own configured list, so announcing them leaks nothing; the recovered ARGUMENTS never travel.
+   */
+  | { status: "refused-destructive"; dialect: string; refused: string[] };
 
 /**
  * Marker substrings that mean "a tool-call envelope is present". Detection is deliberately broader
@@ -273,10 +339,18 @@ function stripEnvelopes(text: string): string {
  * `schemas` supplies declared parameter types for the dialects that carry parameters as strings;
  * without it those values stay strings and the validator reports the type error, which is the
  * correct visible failure rather than a silent coercion.
+ *
+ * `isDestructive` is the operator's configured refusal set (`destructiveMatcher`), and it is
+ * REQUIRED on purpose. There are four rescue commit points — buffered and streamed, on each of the
+ * Anthropic-translated and direct-Chat lanes — and an optional parameter would let a fifth be
+ * added that silently omits the policy, which is the exact failure this call site exists to close.
+ * Making it required puts the decision in ONE place and lets the compiler enumerate the callers.
+ * Still parsing, not judgment: a set-membership test on a name the operator wrote down.
  */
 export function recoverToolCalls(
   text: string,
-  schemas: Map<string, SchemaLike> = new Map(),
+  schemas: Map<string, SchemaLike>,
+  isDestructive: (name: string) => boolean,
 ): DialectOutcome {
   const dialect = detectDialect(text);
   if (!dialect) return { status: "none" };
@@ -289,5 +363,7 @@ export function recoverToolCalls(
   ].filter((c) => c.name.length > 0);
 
   if (calls.length === 0) return { status: "detected", dialect };
+  const refused = [...new Set(calls.filter((c) => isDestructive(c.name)).map((c) => c.name))];
+  if (refused.length > 0) return { status: "refused-destructive", dialect, refused };
   return { status: "parsed", calls, text: stripEnvelopes(text), dialect };
 }

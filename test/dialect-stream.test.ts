@@ -5,6 +5,15 @@ import { fetchBackend } from "../src/backend.js";
 import type { ResolvedTarget } from "../src/config.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
 
+/**
+ * The destructive-tool filter these fixtures pass at the dialect-rescue commit points. Refusing
+ * nothing is the right default HERE: these tests cover translation and recovery, and the refusal
+ * itself has its own suite (test/dialect-destructive-refusal.test.ts). It is a REQUIRED parameter
+ * on `recoverToolCalls` / `fetchBackend` / `fetchOpenAiFront` so a new rescue seam cannot omit the
+ * policy silently — which is exactly why it has to be spelled out here rather than defaulted.
+ */
+const NO_DESTRUCTIVE = (): boolean => false;
+
 const schemas = new Map([
   ["write_note", { type: "object", properties: { path: { type: "string" }, count: { type: "number" } } }],
 ]);
@@ -49,7 +58,7 @@ describe("streaming dialect recovery", () => {
       textDelta("note\"><｜DSML｜parameter name=\"path\">a.txt</｜DSML｜parameter>"),
       textDelta("<｜DSML｜parameter name=\"count\">42</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"),
       CLOSE,
-    ]), schemas));
+    ]), schemas, NO_DESTRUCTIVE));
 
     expect(out).toContain('"type":"tool_use"');
     expect(out).toContain('"name":"write_note"');
@@ -68,7 +77,7 @@ describe("streaming dialect recovery", () => {
       OPEN,
       textDelta("</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"),
       CLOSE,
-    ]), schemas));
+    ]), schemas, NO_DESTRUCTIVE));
 
     expect(out).toContain("event: error");
     expect(out).toContain("unparseable dsml tool-call envelope");
@@ -82,7 +91,7 @@ describe("streaming dialect recovery", () => {
       OPEN,
       textDelta("Use <b>bold</b> and compare a < b."),
       CLOSE,
-    ]), schemas));
+    ]), schemas, NO_DESTRUCTIVE));
 
     const text = [...out.matchAll(/"text":"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).join("");
     expect(text).toContain("Use <b>bold</b> and compare a < b.");
@@ -95,7 +104,7 @@ describe("streaming dialect recovery", () => {
     const out = await collect(recoverDialectInStream(streamOf([
       OPEN,
       textDelta("<tool_call>{\"name\":\"write_note\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>"),
-    ]), schemas));
+    ]), schemas, NO_DESTRUCTIVE));
     expect(out).toContain('"type":"tool_use"');
     expect(out).toContain('"stop_reason":"tool_use"');
   });
@@ -144,7 +153,7 @@ describe("unrecognised JSON envelope in model text", () => {
       textDelta(ECHOED.slice(0, 40)),
       textDelta(ECHOED.slice(40)),
       CLOSE,
-    ]), schemas));
+    ]), schemas, NO_DESTRUCTIVE));
 
     expect(out).not.toContain('"type":"tool_use"');
     expect(out).not.toContain("event: error");
@@ -174,7 +183,7 @@ describe("unrecognised JSON envelope in model text", () => {
       messages: [{ role: "user", content: "hi" }],
       tools: [{ name: "write_note", input_schema: { type: "object", properties: { path: { type: "string" } } } }],
     };
-    const res = await fetchBackend(resolveAttempt(target), {
+    const res = await fetchBackend(resolveAttempt(target), { isDestructive: NO_DESTRUCTIVE,
       path: "/v1/messages", method: "POST",
       reqBuf: Buffer.from(JSON.stringify(reqJson)), reqJson,
       anthropicHeaders: {}, wantsStream: true, signal: AbortSignal.timeout(5000),

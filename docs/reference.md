@@ -719,9 +719,34 @@ until meaningful content, and semantic failures before that point are counted as
   free, e.g. `openrouter/anthropic/claude-sonnet-5 (paid, published-price)`. Pools rank free
   capacity first but no longer exclude paid, so an unflagged paid response would be
   indistinguishable from a free one — and the difference is money.
-- `x-llm-relay-tool-dialect` — present when this response contains a tool call reconstructed from a
-  recognized text dialect envelope (the host returned the model's native tool syntax as assistant
-  TEXT and the relay recovered it as native tool calls).
+- `x-llm-relay-tool-dialect` — `recovered` when this response contains a tool call reconstructed
+  from a recognized text dialect envelope (the host returned the model's native tool syntax as
+  assistant TEXT and the relay recovered it as native tool calls), or `refused-destructive` when
+  the relay refused to commit such a reconstruction because it named a tool in
+  `repair.destructiveTools`.
+
+  A **refusal** is a 502 whose body is typed `tool_dialect_refused_destructive` and names the
+  refused tools; when the response head is already flushed (a streamed rescue past the first
+  meaningful content) the same code arrives as a mid-stream SSE `error` event instead, since there
+  are no headers left to write. The refusal is **terminal**: the request is not retried against
+  another pool member and the deployment's failure budget is untouched (`x-llm-relay-error-origin:
+  local`) — it is a decision about your configuration, not a statement about the backend.
+
+  ⚠ One case announces less, and it is stated here rather than left to be discovered. On a
+  **streamed refusal before the stream commits** — the envelope arrived before any meaningful
+  content, so no head has been written — the relay's own commit probe turns the refusal into the
+  synthesized 502 it uses for every dead pre-commit stream. That body is the generic `api_error`
+  shape and carries neither header, though the message still names the refused tools. The refusal
+  itself is unchanged: refused whole, terminal, and never charged to the deployment. Match on the
+  message rather than the code if you need to detect this case programmatically.
+
+  Why rescue is treated differently from an ordinary tool call: a backend that emits real
+  `tool_calls` has stated its own intent, and `repair.destructiveTools` has never governed that.
+  Recovery is the relay deciding that model *text* is a tool call — doing that for `Bash`, `Write`
+  or `Edit`, whose output may run under `--dangerously-skip-permissions`, would be the relay
+  authoring a destructive call the host never made. An **empty** `repair.destructiveTools` refuses
+  nothing, and the whole envelope is refused rather than partially stripped, because dropping one
+  call and committing the rest would silently change what the model asked for.
 - `x-llm-relay-tool-use-ids: "<n> rewritten"` — the relay had to mint `<id>_relay<k>` for `n` tool
   calls because the serving host reused ids the conversation already carried (kimi-style
   `Read:0`), which makes Claude Code drop the call while building its next request. **Buffered

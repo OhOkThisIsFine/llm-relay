@@ -1,12 +1,14 @@
 import type { JsonSchema } from "./anthropic.js";
 import { STREAM_PREFLIGHT_LIMIT } from "./stream-commit.js";
-import { markerStart, recoverToolCalls, scanForMarker } from "./tool-dialects.js";
+import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, markerStart, recoverToolCalls, scanForMarker, type DialectRefusalSignal } from "./tool-dialects.js";
 
 /** Result of inspecting a buffered native Chat completion for leaked dialect text. */
 export type OpenAiChatDialectOutcome =
   | { status: "none" }
   | { status: "parsed"; body: Record<string, unknown>; dialect: string }
-  | { status: "detected"; dialect: string };
+  | { status: "detected"; dialect: string }
+  /** A recovered call names a tool on the operator's destructive list — refused, never committed. */
+  | { status: "refused-destructive"; dialect: string; refused: string[] };
 
 type ToolSchemas = Map<string, JsonSchema | null>;
 
@@ -62,6 +64,7 @@ function recoveredValue(
 export async function inspectDialectInOpenAiChat(
   input: Record<string, unknown>,
   schemas: ToolSchemas,
+  isDestructive: (name: string) => boolean,
   processRecovered?: RecoveredOpenAiChatProcessor,
 ): Promise<OpenAiChatDialectOutcome> {
   if (schemas.size === 0 || !Array.isArray(input.choices)) return { status: "none" };
@@ -82,8 +85,14 @@ export async function inspectDialectInOpenAiChat(
     if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) continue;
     if (typeof message.content !== "string" || message.content.length === 0) continue;
 
-    const outcome = recoverToolCalls(message.content, typedSchemas);
+    const outcome = recoverToolCalls(message.content, typedSchemas, isDestructive);
     if (outcome.status === "detected") return { status: "detected", dialect: outcome.dialect };
+    // Refuse the WHOLE completion, and refuse it here — before the `pending` loop spends a
+    // reshaper call on any choice. Same ordering reason as the detected branch: one unusable
+    // choice makes the completion unusable, so nothing downstream may run first.
+    if (outcome.status === "refused-destructive") {
+      return { status: "refused-destructive", dialect: outcome.dialect, refused: outcome.refused };
+    }
     if (outcome.status === "none") continue;
 
     recoveredDialect ??= outcome.dialect;
@@ -186,11 +195,16 @@ function withoutContent(choice: Record<string, unknown>): Record<string, unknown
   return hasOtherDelta || hasFinish ? { ...choice, delta } : null;
 }
 
-function errorEvent(message: string, code: string): string {
+/**
+ * `type` defaults to `upstream_error` because that is what an in-band stream failure normally is.
+ * A relay-authored refusal passes its own type so the commit probe reads it as LOCAL and the walk
+ * does not reroll a decision the relay already made.
+ */
+function errorEvent(message: string, code: string, type = "upstream_error"): string {
   return encodeEvent("", {
     error: {
       message,
-      type: "upstream_error",
+      type,
       code,
     },
   });
@@ -233,8 +247,10 @@ function recoveredEvents(
 export function recoverDialectInOpenAiChatStream(
   upstream: ReadableStream<Uint8Array>,
   schemas: ToolSchemas,
+  isDestructive: (name: string) => boolean,
   onRecovered: (dialect: string) => void = () => {},
   processRecovered?: RecoveredOpenAiChatProcessor,
+  refusalSignal?: DialectRefusalSignal,
 ): ReadableStream<Uint8Array> {
   if (schemas.size === 0) return upstream;
 
@@ -263,10 +279,10 @@ export function recoverDialectInOpenAiChatStream(
         return state;
       };
 
-      const fail = async (message: string, code: string) => {
+      const fail = async (message: string, code: string, type?: string) => {
         if (terminated) return;
         terminated = true;
-        push(errorEvent(message, code));
+        push(type === undefined ? errorEvent(message, code) : errorEvent(message, code, type));
         await reader.cancel(message).catch(() => {});
       };
 
@@ -284,7 +300,20 @@ export function recoverDialectInOpenAiChatStream(
           return [encodeEvent(eventName, withChoices(state.lastChunk, [withContent(state.lastChoice, tail)]))];
         }
 
-        const outcome = recoverToolCalls(state.envelope, typedSchemas);
+        const outcome = recoverToolCalls(state.envelope, typedSchemas, isDestructive);
+        if (outcome.status === "refused-destructive") {
+          // Declared provenance — see `DialectRefusalSignal`. The wire code alone is forgeable.
+          if (refusalSignal) refusalSignal.refused = true;
+          // Headers are already flushed here, so the refusal travels as the mid-stream error event
+          // — the shape the unparseable case uses, with its own code. Refused whole: the surviving
+          // calls are not committed, because dropping one silently changes the model's intent.
+          await fail(
+            `llm-relay: refused a ${outcome.dialect} tool call recovered from text because it names a destructive tool: ${describeRefused(outcome.refused)}`,
+            DIALECT_REFUSED_DESTRUCTIVE_CODE,
+            DIALECT_REFUSED_DESTRUCTIVE_CODE,
+          );
+          return [];
+        }
         if (outcome.status !== "parsed") {
           const dialect = outcome.status === "detected" ? outcome.dialect : "unknown";
           await fail(

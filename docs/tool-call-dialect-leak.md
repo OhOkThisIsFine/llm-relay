@@ -14,6 +14,14 @@ client received is **JSON** rather than vendor markup. ⚠ Its diagnostic tell i
 document; the "a dialect death produces almost none of the output" rule below **does not hold** for
 it — those runs did 474–1571 s of real work before leaking.
 
+> **2026-08-24 — the rescue path now refuses destructive calls.** Everything below describes
+> RECOVERING a tool call a host leaked as text. One case is deliberately not recovered: a call
+> naming a tool in `repair.destructiveTools`. Rescue is the relay deciding that model text IS a
+> tool call, and doing that for `Bash`/`Write`/`Edit` is the fabrication "refused, never
+> fabricated" forbids. A backend that emits native `tool_calls` is untouched. See
+> [dialect-rescue-destructive-refusal-2026-08-24.md](dialect-rescue-destructive-refusal-2026-08-24.md).
+
+
 ## The report
 
 Relay-pool dispatches were failing in a way first read as "long jobs die". They were not.

@@ -4,7 +4,7 @@ import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 import { anthropicRequestToOpenAi, RequestMappingError } from "./openai-request.js";
 import { openaiResponsesRequestToAnthropic } from "./responses-request.js";
-import { recoverToolCalls, type DialectToolCall } from "./tool-dialects.js";
+import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, dialectRefusalSignal, recoverToolCalls, type DialectRefusalSignal, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
 import { stripOpeningThinkTag, stripThinkTagsInStream } from "./think-tags.js";
@@ -27,6 +27,24 @@ export class DialectUnparseableError extends Error {
   constructor(public readonly dialect: string) {
     super(`backend returned an unparseable ${dialect} tool-call envelope as text`);
     this.name = "DialectUnparseableError";
+  }
+}
+
+/**
+ * A tool call recovered from assistant TEXT names a tool on the operator's destructive list.
+ *
+ * Unlike `DialectUnparseableError` this is NOT a statement about the host: the envelope parsed
+ * fine. It is a config decision, so it is carried as a LOCAL failure — the walk must not fail over
+ * (re-asking N models to produce the same refused action) and the deployment must not be charged,
+ * the same rule under which a hard cap "never registers on the breaker — it is config, not
+ * health". See docs/dialect-rescue-destructive-refusal-2026-08-24.md.
+ */
+export class DialectDestructiveError extends Error {
+  constructor(public readonly dialect: string, public readonly refused: string[]) {
+    super(
+      `refused a ${dialect} tool call recovered from text because it names a destructive tool: ${describeRefused(refused)}`,
+    );
+    this.name = "DialectDestructiveError";
   }
 }
 
@@ -165,6 +183,21 @@ export const PAID_HEADER = "x-llm-relay-paid";
 
 /** This response contains a tool call reconstructed from a recognized text dialect envelope. */
 export const TOOL_DIALECT_HEADER = "x-llm-relay-tool-dialect";
+
+/**
+ * Per-response proof that a streamed dialect refusal was the RELAY's, not the upstream's.
+ *
+ * A WeakMap rather than a header or a body field, for the reason the signal exists at all: anything
+ * on the wire can be echoed by a counterparty. The server hands this to `probeStreamForCommit`, and
+ * a lane the relay never wrapped simply has no entry — so its bytes can never earn `local`
+ * provenance. Same shape as `attachUpstreamMetadata`, and deliberately not merged into it: that
+ * carries log METADATA about a finished response, this is live state for one in-flight stream.
+ */
+const dialectRefusalSignals = new WeakMap<Response, DialectRefusalSignal>();
+
+export function dialectRefusalSignalOf(response: Response): DialectRefusalSignal | undefined {
+  return dialectRefusalSignals.get(response);
+}
 
 /**
  * `tool_use` ids in this response were MINTED by the relay because the host reused ones the
@@ -573,6 +606,12 @@ export async function fetchBackend(
     reqJson: unknown;
     anthropicHeaders: Record<string, string>;
     wantsStream: boolean;
+    /**
+     * The operator's configured destructive-tool set (`destructiveMatcher`). REQUIRED, not
+     * optional: it reaches the four dialect-rescue commit points, and an optional field here would
+     * let a caller silently disable the refusal — the failure mode that gap existed as.
+     */
+    isDestructive: (name: string) => boolean;
     usage?: UsageAccumulator;
     signal: AbortSignal;
     onEgress?: OnEgress;
@@ -747,7 +786,10 @@ export async function fetchBackend(
       // declaring tools: with none declared there is no call to recover, and wrapping the stream
       // would add holdback latency for nothing.
       const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
-      const recovered = schemas.size > 0 ? recoverDialectInStream(strippedStream, schemas) : strippedStream;
+      const refusalSignal = dialectRefusalSignal();
+      const recovered = schemas.size > 0
+        ? recoverDialectInStream(strippedStream, schemas, args.isDestructive, refusalSignal)
+        : strippedStream;
       // AFTER recovery, so a call the relay reconstructed is covered too, and BEFORE anything that
       // watches for the first `tool_use` — validation and repair must see the ids the client will.
       // The taken-set is a thunk: a response with no tool call never walks the conversation.
@@ -766,7 +808,7 @@ export async function fetchBackend(
         () => knownToolUseIds(args.reqJson),
         (count) => { metadata.toolUseIdRewrites = count; },
       );
-      return attachUpstreamMetadata(
+      const streamResponse = attachUpstreamMetadata(
         new Response(body, {
           status: res.status,
           headers: {
@@ -778,6 +820,8 @@ export async function fetchBackend(
         }),
         metadata,
       );
+      dialectRefusalSignals.set(streamResponse, refusalSignal);
+      return streamResponse;
     } catch (e) {
       return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
     }
@@ -802,13 +846,25 @@ export async function fetchBackend(
   let anthropicJson: object;
   try {
     const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
-    anthropicJson = openAiResponseToAnthropic(upstreamJson as Record<string, unknown>, target.model ?? "", schemas);
+    anthropicJson = openAiResponseToAnthropic(upstreamJson as Record<string, unknown>, target.model ?? "", schemas, args.isDestructive);
   } catch (e) {
     if (e instanceof DialectUnparseableError) {
       // NOT a mapper defect — the translation is fine and the HOST returned an unusable body. It
       // counts against this deployment so the breaker sees it and the pool fails over to a host
       // that parses its models' dialect. 502 is retriable, which is what drives the walk.
       return anthropicError(502, `llm-relay: ${e.message}`, "upstream", {}, "tool_dialect_unparseable");
+    }
+    if (e instanceof DialectDestructiveError) {
+      // "local" is the load-bearing part: it makes `localFailure` true in the walk, so the request
+      // is NOT rerolled onto another candidate and the deployment is not blamed. A refusal is a
+      // config decision, not a health signal — the same line the hard cap draws.
+      return anthropicError(
+        502,
+        `llm-relay: ${e.message}`,
+        "local",
+        { [TOOL_DIALECT_HEADER]: "refused-destructive" },
+        DIALECT_REFUSED_DESTRUCTIVE_CODE,
+      );
     }
     // The provider returned a valid source envelope, so a failure after this point belongs to
     // the relay mapper rather than the provider or its failure budget.
@@ -885,7 +941,8 @@ function recoveredDialectOf(message: object): string | null {
 export function openAiResponseToAnthropic(
   j: Record<string, unknown>,
   model: string,
-  schemas?: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>,
+  schemas: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }> | undefined,
+  isDestructive: (name: string) => boolean,
 ): object {
   const choice = (j.choices as Array<Record<string, unknown>> | undefined)?.[0] ?? {};
   const msg = (choice.message as Record<string, unknown> | undefined) ?? {};
@@ -899,10 +956,14 @@ export function openAiResponseToAnthropic(
   // spoken; second-guessing it here would be inference, not translation.
   let recovered: DialectToolCall[] = [];
   if (toolCalls.length === 0 && messageText !== null && messageText.length > 0) {
-    const out = recoverToolCalls(messageText, schemas ?? new Map());
+    const out = recoverToolCalls(messageText, schemas ?? new Map(), isDestructive);
     if (out.status === "parsed") {
       recovered = out.calls;
       if (out.text.length > 0) content.push({ type: "text", text: out.text });
+    } else if (out.status === "refused-destructive") {
+      // The relay reconstructed a destructive call out of prose. Refuse it whole rather than
+      // commit it — "refused, never fabricated". Terminal, not retriable: see the error class.
+      throw new DialectDestructiveError(out.dialect, out.refused);
     } else if (out.status === "detected") {
       // Framing present, nothing parseable — a truncated or unmodelled envelope. Fail clean so
       // failover reaches a host that parses, exactly as repair fails clean on an unrepairable
@@ -1337,6 +1398,8 @@ export async function fetchOpenAiFront(
     signal: AbortSignal;
     protocol?: OpenAiFrontProtocol;
     anthropicHeaders?: Record<string, string>;
+    /** See `fetchBackend`'s field of the same name: required so no caller can silently opt out. */
+    isDestructive: (name: string) => boolean;
     processRecoveredChat?: RecoveredOpenAiChatProcessor;
     usage?: UsageAccumulator;
     onEgress?: OnEgress;
@@ -1390,17 +1453,19 @@ export async function fetchOpenAiFront(
       }
       let response: Response | null = null;
       let recovered = false;
+      const chatRefusalSignal = dialectRefusalSignal();
       const responseBody = schemas.size > 0
-        ? recoverDialectInOpenAiChatStream(preflight.body, schemas, () => {
+        ? recoverDialectInOpenAiChatStream(preflight.body, schemas, args.isDestructive, () => {
             recovered = true;
             response?.headers.set(TOOL_DIALECT_HEADER, "recovered");
-          }, args.processRecoveredChat)
+          }, args.processRecoveredChat, chatRefusalSignal)
         : preflight.body;
       response = new Response(
         relayAddedUsage ? suppressRelayAddedOpenAiUsageFrames(responseBody) : responseBody,
         { status: res.status, headers: res.headers },
       );
       if (recovered) response.headers.set(TOOL_DIALECT_HEADER, "recovered");
+      dialectRefusalSignals.set(response, chatRefusalSignal);
       return attachUpstreamMetadata(response, preflight.metadata);
     }
 
@@ -1420,6 +1485,7 @@ export async function fetchOpenAiFront(
       recovery = await inspectDialectInOpenAiChat(
         responseBody as Record<string, unknown>,
         schemas,
+        args.isDestructive,
         args.processRecoveredChat,
       );
     } catch (error) {
@@ -1428,6 +1494,18 @@ export async function fetchOpenAiFront(
         `llm-relay: ${error instanceof Error ? error.message : String(error)}`,
         "upstream",
         "tool_call_recovery_failed",
+      );
+    }
+    if (recovery.status === "refused-destructive") {
+      // "local" keeps this out of the failover walk and off the deployment's failure budget: the
+      // envelope parsed fine, the relay refused to commit what it reconstructed. Config, not
+      // health — the same line the hard cap draws.
+      return openaiError(
+        502,
+        `llm-relay: refused a ${recovery.dialect} tool call recovered from text because it names a destructive tool: ${describeRefused(recovery.refused)}`,
+        "local",
+        DIALECT_REFUSED_DESTRUCTIVE_CODE,
+        { [TOOL_DIALECT_HEADER]: "refused-destructive" },
       );
     }
     if (recovery.status === "detected") {
@@ -1480,6 +1558,7 @@ export async function fetchOpenAiFront(
     reqJson: anthropicBody,
     anthropicHeaders: args.anthropicHeaders ?? {},
     wantsStream: args.wantsStream,
+    isDestructive: args.isDestructive,
     ...(args.usage ? { usage: args.usage } : {}),
     signal: args.signal,
     ...(args.onEgress ? { onEgress: args.onEgress } : {}),
@@ -1495,9 +1574,15 @@ export async function fetchOpenAiFront(
       return attachPostHeaderBodyFailure(backendRes, cause);
     }
     const origin = errorOrigin(backendRes) ?? "upstream";
+    // Same rule as the two id-rewrite counters below: rebuilding the response must not swallow the
+    // announcement of a decision the relay made one Response ago. A dialect-rescue destructive
+    // refusal arrives here as a 502 from `fetchBackend` carrying `refused-destructive`, and a
+    // Responses/Messages-front client is entitled to the same marker the Messages front gets.
+    const dialect = backendRes.headers.get(TOOL_DIALECT_HEADER);
     const headers: Record<string, string> = {
       "content-type": "application/json",
       [ERROR_ORIGIN_HEADER]: origin,
+      ...(dialect ? { [TOOL_DIALECT_HEADER]: dialect } : {}),
       ...retryAfterHeader(backendRes.headers),
     };
     return new Response(anthropicErrorToOpenAi(raw, backendRes.status), { status: backendRes.status, headers });
@@ -1541,6 +1626,12 @@ export async function fetchOpenAiFront(
           ...(rewritten ? { [TOOL_CALL_IDS_HEADER]: rewritten } : {}),
         },
       });
+      // Carry the refusal SIGNAL across the rebuild for the same reason as the header above: this
+      // Response is the one the server probes, and the object it must consult was registered
+      // against the inner Response one hop ago. The signal is the same live object, so a refusal
+      // the wrapper marks after this line is still visible.
+      const innerRefusal = dialectRefusalSignals.get(backendRes);
+      if (innerRefusal) dialectRefusalSignals.set(response, innerRefusal);
       return metadata ? attachUpstreamMetadata(response, metadata) : response;
     } catch (e) {
       return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", "relay_mapper_defect");

@@ -39,7 +39,7 @@ import {
   type Reshaper,
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
-import { fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { dialectRefusalSignalOf, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -1419,6 +1419,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           reqJson,
           anthropicHeaders: forwardHeaders,
           wantsStream,
+          // Reaches the dialect-rescue commit points: a tool call the relay reconstructs out of
+          // model TEXT is refused when it names a destructive tool.
+          isDestructive: h.isDestructive,
           usage,
           signal: controller.signal,
           onEgress,
@@ -1565,6 +1568,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           ? await probeStreamForCommit(backendRes.body, "anthropic-messages", {
               isCancelled: () => res.destroyed,
               malformedProvenance: target.kind === "openai" ? "local" : "upstream",
+              // Declared, never inferred from the wire: only a stream the dialect wrapper actually
+              // wrapped has a signal, so an upstream echoing the refusal code cannot mint `local`
+              // provenance for itself and thereby dodge both failover and breaker accounting.
+              ...(dialectRefusalSignalOf(backendRes) ? { relayRefusal: dialectRefusalSignalOf(backendRes)! } : {}),
             })
           : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
 
@@ -3430,6 +3437,7 @@ async function openAiFrontPath(
           protocol: ctx.protocol,
           anthropicHeaders: forwardHeaders,
           signal: controller.signal,
+          isDestructive: h.isDestructive,
           processRecoveredChat,
           usage,
           onEgress,
@@ -3627,6 +3635,7 @@ async function openAiFrontPath(
               isCancelled: () => res.destroyed,
               malformedProvenance:
                 target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
+              ...(dialectRefusalSignalOf(upstream) ? { relayRefusal: dialectRefusalSignalOf(upstream)! } : {}),
             })
           : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
 
