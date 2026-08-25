@@ -369,10 +369,22 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
     the routes file (mutation-checked) instead of a silent divergence. Pinned by "the error-code
     vocabulary has ONE definition — routes must not restate it", the same mechanical guard as
     `test/destructive-coverage.test.ts`'s "cli.ts no longer hand-copies the list".
-  - **N10** itself is kept: ignoring extra positionals is the house style for the whole read-only
-    command family (`candidates`, `cost`, `pools`, `models`, `telemetry`, `ping`); exact arity
-    exists only on the mutating/custody surfaces, and tightening `dashboard` alone would make it
-    the odd one out. ✅ The adjacent behaviour it sat next to — an UNRECOGNIZED command falling
+  - ~~**N10**~~ — **FIXED 2026-08-25, across the whole family** (owner's call: "checking
+    everywhere"). It was kept one release because tightening `dashboard` alone would have made it
+    the odd one out; the answer was to stop it being odd. `COMMAND_ARITY` + the pure
+    `commandArityError` bound every command, so `cost --window 1h 7d` no longer reports 24h and
+    `models nim` no longer lists every provider. Bounds come from what the DISPATCHER reads, never
+    from HELP — which omits `lanes` and the `route` alias entirely and documents a `setup` target
+    that matches no branch, so a help-derived table would have left two commands unguarded.
+    `pools`/`routing`/`route` are VARIADIC and stay unbounded (multi-candidate specs are a routing
+    feature; any finite max is a guaranteed false positive). `keys`/`cooldowns`/`help`/`version`
+    are exempt and say why in `ARITY_EXEMPT`. ⚠ The guard runs after help/version — so
+    `llm-relay <cmd> --help` still works — and before the first side effect, which matters because
+    the very next branch's `loadOrExit()` CREATES `~/.llm-relay/config.json`. ⚠ It does not echo
+    the stray token, unlike the unknown-command guard: an unknown COMMAND is not a secret-bearing
+    position and naming it IS the diagnostic, while a stray positional can be anything pasted —
+    and `check-keys` is the same command as `keys check`, whose parser never echoes argv. Verified
+    against the built binary with a 16-case before/after baseline: all identical. ✅ The adjacent behaviour it sat next to — an UNRECOGNIZED command falling
     through to `runProxy()`, so a mistyped command started a relay instead of reporting the typo —
     is **FIXED (2026-08-25)** as the shared guard this line asked for: `dispatchDashboardOrProxy`
     refuses a positional that is not in `CLI_COMMAND_NAMES` (exit 1, naming the token, bounded),

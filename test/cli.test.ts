@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import {
+  ARITY_EXEMPT,
+  ARITY_GUARDED_COMMANDS,
+  CLI_COMMAND_NAMES,
+  commandArityError,
   argValue,
   hasFlag,
   splitSpec,
@@ -1540,5 +1544,108 @@ describe("keys subcommand router", () => {
     const bare = await capture(["keys"]);
     expect(await capture(["keys", "check"])).toBe(bare);
     expect(await capture(["check-keys"])).toBe(bare);
+  });
+});
+
+describe("llm-relay command arity — an ignored argument is a lie", () => {
+  /**
+   * The gap: exact arity existed only on the mutating/custody surfaces, so the whole read-only
+   * family accepted and DISCARDED whatever it did not understand. `llm-relay cost --window 1h 7d`
+   * silently dropped `7d` and reported 24h; `llm-relay models nim` listed every provider. The user
+   * is told nothing, which is the same failure shape as a config typo that "took effect".
+   *
+   * Counts INCLUDE the command token, matching `getPositionalArgs`.
+   */
+  it("refuses extra positionals across the whole read-only family", () => {
+    for (const argv of [
+      ["models", "nim"],
+      ["ping", "nim"],
+      ["candidates", "nim"],
+      ["telemetry", "nim"],
+      ["check-keys", "nim"],
+      ["lanes", "codex"],
+      ["dashboard", "open"],
+      ["onboard", "extra"],
+      // The motivating case: the flag VALUE is consumed, the stray token is not.
+      ["cost", "7d"],
+    ]) {
+      expect(commandArityError(argv), argv.join(" ")).toMatch(/takes no arguments after the command/u);
+    }
+
+    // Commands with a legal positional are bounded one higher, not exempted.
+    expect(commandArityError(["setup", "claude-desktop", "extra"])).toMatch(/at most 1 argument/u);
+    expect(commandArityError(["dispatch", "codex", "extra"])).toMatch(/at most 1 argument/u);
+    expect(commandArityError(["offload", "claude", "on", "extra"])).toMatch(/at most 2 arguments/u);
+    expect(commandArityError(["eligibility", "accept", "1", "extra"])).toMatch(/at most 2 arguments/u);
+  });
+
+  it("leaves every legal form alone, including the ones that look wrong", () => {
+    for (const argv of [
+      [],                                   // bare `llm-relay` starts the proxy — the primary usage
+      ["models"], ["ping"], ["telemetry"], ["candidates"], ["cost"], ["lanes"], ["dashboard"],
+      ["onboard"], ["check-keys"],
+      ["setup"], ["setup", "claude-desktop"],
+      ["dispatch"], ["dispatch", "codex"],
+      ["offload"], ["offload", "status"], ["offload", "claude", "on"],
+      ["eligibility"], ["eligibility", "accept", "1"],
+      ["config", "show"], ["config", "set", "a.b", "1"],
+    ]) {
+      expect(commandArityError(argv), argv.join(" ") || "(no args)").toBeNull();
+    }
+  });
+
+  it("never bounds a VARIADIC command — multi-candidate specs are a routing feature", () => {
+    // `routing default <spec> [<spec>...]` and `pools set <name> <spec> [<spec>...]` slice the
+    // positional array. Any finite max here is a guaranteed false positive on real config edits.
+    expect(commandArityError(["routing", "default", "a/b", "c/d", "e/f", "g/h"])).toBeNull();
+    expect(commandArityError(["route", "default", "a/b", "c/d"])).toBeNull();
+    expect(commandArityError(["pools", "set", "high", "a/b", "c/d", "e/f"])).toBeNull();
+  });
+
+  it("defers to the parsers that already own their arity, and to the unknown-command guard", () => {
+    // `keys` and `cooldowns` run their own strict, fail-closed, secret-safe parsers ABOVE this
+    // guard — `keys` deliberately never echoes argv, since a pasted credential can land there.
+    // A second, laxer refusal here would be worse than none.
+    expect(commandArityError(["keys", "add", "nim", "extra", "more"])).toBeNull();
+    expect(commandArityError(["cooldowns", "clear", "nim", "extra"])).toBeNull();
+    // `help`/`version` exit above this point, so a bound could never fire.
+    expect(commandArityError(["help", "extra"])).toBeNull();
+    expect(commandArityError(["version", "extra"])).toBeNull();
+    // An unknown COMMAND belongs to dispatchDashboardOrProxy; two refusals for one mistake is worse.
+    expect(commandArityError(["dashbaord", "x"])).toBeNull();
+  });
+
+  it("does not echo the stray token — it can be anything the user pasted", () => {
+    // Unlike the unknown-COMMAND guard, which names the token because that IS the diagnostic. A
+    // stray positional is unconstrained, and `check-keys` is the same command as `keys check`,
+    // whose parser never echoes argv for exactly this reason.
+    const secret = "sk-live-DEADBEEF";
+    const message = commandArityError(["check-keys", secret]);
+    expect(message).not.toBeNull();
+    expect(message).not.toContain(secret);
+    expect(message).not.toContain("DEADBEEF");
+  });
+
+  it("hints only where the flag actually exists", () => {
+    // Verified against the code, not the help text: models/ping/candidates read
+    // `argValue("--provider","-p")`, and `dispatch` takes a positional lane while `lanes` does not.
+    expect(commandArityError(["models", "x"])).toContain("-p <name>");
+    expect(commandArityError(["lanes", "x"])).toContain("llm-relay dispatch <lane>");
+    // ⚠ check-keys hands the WHOLE config to validateProviderKeys — there is no provider filter,
+    // and telemetry is provider-aggregate by design. Hinting `-p` would name a flag that does
+    // nothing, which is worse than no hint.
+    expect(commandArityError(["check-keys", "x"])).not.toContain("-p");
+    expect(commandArityError(["telemetry", "x"])).not.toContain("-p");
+  });
+
+  it("covers every command name — a new command cannot silently miss the guard", () => {
+    // The mechanical half. Same precedent as test/offload.test.ts pinning the valid client names
+    // to `clientForPath`: two sets that must agree are pinned to each other, not to a hand-copy.
+    const guarded = new Set(ARITY_GUARDED_COMMANDS);
+    const uncovered = [...CLI_COMMAND_NAMES].filter((name) => !guarded.has(name) && !ARITY_EXEMPT.has(name));
+    expect(uncovered, `add these to COMMAND_ARITY or ARITY_EXEMPT: ${uncovered.join(", ")}`).toEqual([]);
+    // ... and nothing in the table is a command the dispatcher does not know.
+    const unknown = ARITY_GUARDED_COMMANDS.filter((name) => !CLI_COMMAND_NAMES.has(name));
+    expect(unknown, `not real commands: ${unknown.join(", ")}`).toEqual([]);
   });
 });

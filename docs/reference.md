@@ -1324,6 +1324,19 @@ CLI reference below.
 
 ## CLI reference
 
+**Unrecognized commands and stray arguments are refused, not ignored.** A command name the CLI does
+not know exits 1 naming it, rather than starting the proxy — so a typo reports itself instead of
+launching a second relay. Every command also bounds how many positional arguments it takes, so an
+argument that would have been silently discarded exits 1 before anything happens: `llm-relay cost
+--window 1h 7d` no longer reports the 24h window while ignoring `7d`, and `llm-relay models nim` no
+longer lists every provider while ignoring `nim` (it is `-p nim`).
+
+Three details worth knowing. `--help` and `--version` still short-circuit, so `llm-relay <command>
+--help` works even when the rest of the line is wrong. `pools`, `routing` and `route` take an
+unbounded list of specs and are deliberately unbounded here too. And the refusal names the command
+and the count but never echoes the offending token — a stray argument can be anything you pasted,
+and `keys` diagnostics have always refused to echo argv for that reason.
+
 | Command | Description |
 | :--- | :--- |
 | `llm-relay` | Start the proxy |
