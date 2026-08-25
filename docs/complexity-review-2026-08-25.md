@@ -334,6 +334,37 @@ Nineteen further findings were produced by the area reviewers and **not** checke
 because the verification stage did not run. They are listed so the work is not lost. Each needs the
 same treatment the seven above received before anyone acts on it.
 
+**Second verification pass, 2026-08-25 (later the same day).** The lost verification stage was
+re-run by three read-only lanes: two relay free-pool `pool/high` sessions covering items 15-26, and
+a third covering 8-14 after two AGY attempts lost their reports to a reproducible print-mode
+failure (full narration, no final answer — even with subagents and timers prohibited). Every item
+below now carries a verdict against `main` at `05e2408`. Lane output is advisory; nothing from this
+table was implemented in this sprint — it stands as owner-decision material with the churn priced.
+
+| # | Verdict | Corrections / conditions |
+|---|---|---|
+| 8 | CONFIRMED | ~-25 real, not -60 (`projectedSpendCell` is already factored); keep the `seen` guard verbatim |
+| 9 | PARTIAL | a row's dimension values already have ONE definition at HEAD; only the row-to-stats accumulator duplicates (~-20); not worth doing alone |
+| 10 | CONFIRMED | the policy table must stay ordered (the module's stated testability); ~-35 |
+| 11 | PARTIAL | share the traversal + the cell-coverage projection only; the per-row bodies deliberately differ (~-15) |
+| 12 | PARTIAL | counts wrong: 5 sites in the cited range (4 collapsible `generated`-ternary + 1 structurally different), 15 `openaiError(` calls file-wide — not 14/16; ~-10 |
+| 13 | PARTIAL | five parsers, not three: 2 boundary copies + 3 data-line copies (collapsible) + 1 deliberately byte-level (`suppressRelayAddedOpenAiUsageFrames`); do after finding 3's `sse-frames.ts` lands |
+| 14 | CONFIRMED | ~-8 |
+| 15 | CONFIRMED | three copies, not four (`quota-demotion`'s `localUsedFor` is adjacent but a different shape); keep the credential-wide cell's no-narrowing comment at its call site; ~-20 |
+| 16+18 | CONFIRMED | one observation reported twice; ~-45 |
+| 17 | PARTIAL | do NOT reuse as proposed — the private copy is freshest-`observedAt`-wins, the exported helper is last-set-wins; add a strategy variant, and switch the private key derivation to `bucketKey()` |
+| 19 | PARTIAL | half delivered by v0.47.0's `COMMAND_ARITY`; the remaining dispatch-table fold (~-100) is polish — defer; carve-outs needed for `keys`, `cooldowns`, and the `ping`/`--ping` OR-dispatch |
+| 20 | CONFIRMED | ~-30; the table needs a no-pad trailing column and one content-bearing width |
+| 21 | CONFIRMED | ~-15; the two tail behaviours after the scans genuinely differ and stay |
+| 22 | PARTIAL | real, but a naive `responseHeadersForTarget` call from the OpenAI front loses the per-attempt credential attribution on success; needs a ctx adapter; belongs beside finding 2 |
+| 23 | PARTIAL | direction right, but `CredentialWalk` exposes neither `wasStarted` nor `wasSettled`; one local flag (health-attempt lifetime) survives regardless; ~25 lines + two walk accessors + a both-fronts pinning test — defer |
+| 24 | PARTIAL | the key table needs per-key validator association — `isAggregateTokenCell` vs `isEstimatedTokenCell` must stay distinct (`method` rule); ~-20 |
+| 25 | CONFIRMED | overcounted: the validator already walks `SPEND_CELL_KEYS`; only the empty-factory ladder remains (~-8); keep the hand-written type declaration |
+| 26 | CONFIRMED | ~-12; each validator keeps its own key set and loss formula, only the state machine is shared |
+
+Lane-ranked recommendation: 10 and 14 first, then 8, 21, 25, 26, 16+18, 15, 20; items 9, 11, 12,
+13 are not worth the churn yet; 17 and 23 only in their corrected shapes; 19's remainder is polish.
+
 | # | Reported finding | Primary site | Claimed delta |
 |---|---|---|---|
 | 8 | Collapse the four spend cells into one table instead of five hand-expansions | `dashboard-snapshot.ts:584-635` | -60 |
@@ -370,7 +401,8 @@ auth-header construction, the vitest temp-dir guards, spec parsing, and fetch re
 before returning. Finding 5 above was produced by hand afterwards and is the only cross-cutting result
 in this document. That area is otherwise unexamined.
 
-**Not verified.** Section 5, all nineteen items.
+**Not verified.** ~~Section 5, all nineteen items.~~ Closed by the second pass of 2026-08-25 —
+every §5 item now carries a source-checked verdict (see the table in §5).
 
 **Index gaps.** Three files are only partially parsed in the knowledge graph and were reviewed by text
 search where they mattered: `dashboard/src/styles.css`, `scripts/claude-proxied.ps1`, and
