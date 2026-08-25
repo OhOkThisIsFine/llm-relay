@@ -866,6 +866,14 @@ under `scripts/`). The one thing to know from outside that directory: `scripts/*
 
 ## Status & open work
 
+**v0.46.0 (2026-08-24) closed the last known safety-shaped code gap** — the dialect-rescue
+destructive filter (`091cf7c`). `destructive` had reached none of `tool-dialects.ts`,
+`openai-dialect.ts`, `dialect-stream.ts`, so a WELL-FORMED destructive call the relay reconstructed
+out of assistant prose was served unfiltered. It is now refused whole and terminally at all four
+rescue commit points, with provenance declared rather than read off the wire; see the gotcha above
+and [docs/dialect-rescue-destructive-refusal-2026-08-24.md](docs/dialect-rescue-destructive-refusal-2026-08-24.md).
+HANDOFF §6 now lists only recorded trades — no open code gaps.
+
 **The metering sprint is complete (2026-08-22, evening)** — Stages 0–6 of
 `docs/quota-metering-spec-2026-08-16.md` are delivered, through the event-sourced accounting store
 (`~/.llm-relay/usage/`, `b4ec7ee`), the usage observer on both fronts, the protected dashboard API
