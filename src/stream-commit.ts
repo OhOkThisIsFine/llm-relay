@@ -13,7 +13,17 @@ export type StreamCommitProtocol = "anthropic-messages" | "openai-chat" | "opena
 
 export type StreamCommitProbe =
   | { kind: "ready"; body: ReadableStream<Uint8Array> }
-  | { kind: "dead"; reason: string; provenance: "upstream" | "local" }
+  | {
+      kind: "dead";
+      reason: string;
+      provenance: "upstream" | "local";
+      /**
+       * The relay's own error code, when this dead verdict is the relay's decision rather than an
+       * upstream failure. Absent for every ordinary dead stream, so a front that ignores it keeps
+       * serving exactly the generic `api_error` it always did.
+       */
+      errorType?: string;
+    }
   | { kind: "cancelled" };
 
 export interface StreamCommitProbeOptions {
@@ -37,7 +47,7 @@ export const STREAM_PREFLIGHT_LIMIT = 64 * 1024;
 type EventVerdict =
   | { kind: "hold" }
   | { kind: "ready" }
-  | { kind: "dead"; reason: string; provenance: "upstream" | "local" };
+  | { kind: "dead"; reason: string; provenance: "upstream" | "local"; errorType?: string };
 
 const HOLD: EventVerdict = { kind: "hold" };
 const READY: EventVerdict = { kind: "ready" };
@@ -87,7 +97,21 @@ function relayAuthored(value: Record<string, unknown>, signal: DialectRefusalSig
 }
 
 function errorVerdict(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): EventVerdict {
-  return { kind: "dead", reason: boundedError(value), provenance: relayAuthored(value, signal) ? "local" : "upstream" };
+  if (!relayAuthored(value, signal)) {
+    return { kind: "dead", reason: boundedError(value), provenance: "upstream" };
+  }
+  // The relay's own refusal, not an upstream in-band error. It keeps its own message (the
+  // "in-band error before meaningful content" wrapper would misattribute it) and carries its code
+  // out to the front, so a pre-commit refusal is announced like its buffered twin instead of
+  // arriving as an anonymous `api_error`.
+  const error = isRecord(value.error) ? value.error : value;
+  const message = typeof error.message === "string" ? error.message.trim().slice(0, 200) : "";
+  return {
+    kind: "dead",
+    reason: message || "refused a tool call recovered from text because it names a destructive tool",
+    provenance: "local",
+    errorType: DIALECT_REFUSED_DESTRUCTIVE_CODE,
+  };
 }
 
 function anthropicVerdict(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): EventVerdict {
@@ -304,10 +328,14 @@ export async function probeStreamForCommit(
     return { kind: "cancelled" };
   };
 
-  const dead = async (reason: string, provenance: "upstream" | "local" = "upstream"): Promise<StreamCommitProbe> => {
+  const dead = async (
+    reason: string,
+    provenance: "upstream" | "local" = "upstream",
+    errorType?: string,
+  ): Promise<StreamCommitProbe> => {
     if (isCancelled()) return cancelled();
     await reader.cancel(reason).catch(() => {});
-    return { kind: "dead", reason, provenance };
+    return { kind: "dead", reason, provenance, ...(errorType ? { errorType } : {}) };
   };
 
   const ready = (): StreamCommitProbe => {
@@ -366,7 +394,7 @@ export async function probeStreamForCommit(
       buffered += decoder.decode();
       const verdict = inspectCompleteEvents(true);
       if (verdict.kind === "ready") return ready();
-      if (verdict.kind === "dead") return dead(verdict.reason, verdict.provenance);
+      if (verdict.kind === "dead") return dead(verdict.reason, verdict.provenance, verdict.errorType);
       return dead("stream ended before meaningful content");
     }
 
@@ -378,7 +406,7 @@ export async function probeStreamForCommit(
 
     const verdict = inspectCompleteEvents();
     if (verdict.kind === "ready") return isCancelled() ? cancelled() : ready();
-    if (verdict.kind === "dead") return dead(verdict.reason, verdict.provenance);
+    if (verdict.kind === "dead") return dead(verdict.reason, verdict.provenance, verdict.errorType);
     if (next.value.byteLength > inspectBytes.byteLength) {
       return dead("no meaningful content within commit probe limit");
     }

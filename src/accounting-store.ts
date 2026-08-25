@@ -61,6 +61,7 @@ import {
   type AccountingRecentV1,
   type AccountingRequestPacket,
   type AccountingSpendV1,
+  isLoadableId,
 } from "./accounting-store-schema.js";
 import {
   DASHBOARD_REQUEST_ID_PATTERN,
@@ -577,7 +578,9 @@ function sourceCell(value: unknown): SourceCell {
   return {
     value: safeCounter(source.value),
     observedAt: validTimestamp(source.observedAt) ? source.observedAt : null,
-    method: typeof source.method === "string" && isDashboardSafeId(source.method) && Buffer.byteLength(source.method, "utf8") <= 256 ? source.method : null,
+    // `isLoadableId`, not `isDashboardSafeId` — see `methodSnapshot`: the accept side must not
+    // admit what the loader will reject, or the whole day shard is quarantined on the next read.
+    method: typeof source.method === "string" && isLoadableId(source.method) && Buffer.byteLength(source.method, "utf8") <= 256 ? source.method : null,
   };
 }
 function addRawTokenCell(target: MutableTokenCell, source: SourceCell, fallback: string): boolean {

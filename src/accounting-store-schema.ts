@@ -497,6 +497,21 @@ function withinFileCeiling(value: unknown): boolean {
   return bytes !== null && bytes <= ACCOUNTING_MAX_FILE_BYTES;
 }
 
+/**
+ * Will the LOADER accept this string?
+ *
+ * Exported because the ACCEPT side must not be laxer than the load side. `isDashboardSafeId`
+ * bounds length and bytes but permits C0/C1 control characters, while `isSafeId` below rejects
+ * them — so a value admitted at record time could be merged into a cell, written to a day shard,
+ * and then fail `parseAccountingDayShardV1` on the next load, QUARANTINING that shard and losing
+ * the day's ledger. Latent rather than live (the one production caller passes a literal, and
+ * `JSON.stringify` escapes control characters), but the asymmetry is the defect: a persisted
+ * value's admission test belongs to whoever will have to read it back.
+ */
+export function isLoadableId(value: unknown): value is string {
+  return isSafeId(value);
+}
+
 function isSafeId(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > MAX_ID_BYTES) {
     return false;

@@ -373,6 +373,12 @@ describe("dialect rescue: the destructive filter (seam B — streamed, Anthropic
     expect(response.status, body).toBe(502);
     expect(body).toContain("destructive tool: write_note");
     expect(second.calls()).toBe(0);
+    // A pre-commit refusal is re-authored by the shared fail-closed path, so it used to arrive as
+    // an anonymous `api_error` with neither header. The probe now carries the relay's own code out,
+    // and both fronts announce it — the buffered and streamed lanes say the same thing.
+    expect(body).toContain("tool_dialect_refused_destructive");
+    expect(response.headers.get("x-llm-relay-tool-dialect")).toBe("refused-destructive");
+    expect(response.headers.get("x-llm-relay-error-origin")).toBe("local");
   });
 });
 
@@ -487,6 +493,9 @@ describe("dialect rescue: the destructive filter (seams C/D — direct OpenAI Ch
     expect(response.status, body).toBe(502);
     expect(body).toContain("destructive tool: write_note");
     expect(second.calls()).toBe(0);
+    expect(body).toContain("tool_dialect_refused_destructive");
+    expect(response.headers.get("x-llm-relay-tool-dialect")).toBe("refused-destructive");
+    expect(response.headers.get("x-llm-relay-error-origin")).toBe("local");
   });
 });
 
@@ -532,5 +541,10 @@ describe("dialect rescue: the destructive filter (OpenAI Responses front)", () =
     expect(response.status, body).toBe(502);
     expect(body).toContain("destructive tool: write_note");
     expect(second.calls()).toBe(0);
+    // Seam B's refusal, reaching the Responses front's own commit probe through the SSE rebuild —
+    // the third front, announcing exactly what the other two do.
+    expect(body).toContain("tool_dialect_refused_destructive");
+    expect(response.headers.get("x-llm-relay-tool-dialect")).toBe("refused-destructive");
+    expect(response.headers.get("x-llm-relay-error-origin")).toBe("local");
   });
 });

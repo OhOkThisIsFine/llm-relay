@@ -58,15 +58,18 @@ A recovered call whose name matches `destructiveMatcher(cfg.repair.destructiveTo
   announcement is the mid-stream SSE `error` event carrying the same code — the shape the
   unparseable case already uses.
 
-  ⚠ **Residual, recorded rather than papered over: the streamed PRE-COMMIT case announces less.**
-  When the envelope arrives before any meaningful content, no head has been written, so the commit
-  probe classifies the refusal and each front synthesizes its own 502 through the generic
-  `failClosed` path — a body typed `api_error`, with neither `x-llm-relay-tool-dialect` nor
-  `x-llm-relay-error-origin`. The refused tool names still reach the message, and the refusal
-  itself is unchanged: whole, terminal, uncharged. Propagating the code would mean widening the
-  probe's dead verdict and the shared `failClosed` helper, which both fronts and every other
-  pre-commit failure use; the announcement is degraded, not the decision, so the cost was judged
-  not worth it. Stated in `docs/reference.md` so a client is not surprised by it.
+  ⚠ **The streamed PRE-COMMIT case needed extra work to say the same thing, and it was done**
+  (2026-08-25, after the v0.46.0 release). When the envelope arrives before any meaningful content
+  no head has been written, so the commit probe classifies the refusal and each front synthesizes
+  its own 502 through the shared fail-closed path — which produced an anonymous `api_error` with
+  neither header, while the buffered lanes announced properly. That is the asymmetry this whole
+  change exists to remove, so the fix is the plumbing, not a caveat: the probe's dead verdict
+  carries an optional `errorType`, set only by `errorVerdict` and only for a relay-authored
+  refusal; `failClosed` takes it with `api_error` as the default, so every other caller is
+  byte-identical to before; and both fronts add `x-llm-relay-tool-dialect: refused-destructive`.
+  While there, both fronts now also write `x-llm-relay-error-origin` from `probe.provenance` on
+  ANY dead pre-commit stream — that header's documented job is to say who produced the status, and
+  this path had simply never written it.
 
   ⚠ **The provenance that makes the refusal terminal is DECLARED, never read off the wire.** The
   error code travels on the stream, so an upstream can emit it — on an `anthropic`-kind target the
