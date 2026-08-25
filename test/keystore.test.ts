@@ -1225,12 +1225,19 @@ describe("encrypted credential keystore", () => {
     const obstruction = join(directory, "not-a-directory");
     writeFileSync(obstruction, "obstruction", "utf8");
     path = join(obstruction, "keystore.json");
+    const statFile = vi.fn((): never => {
+      // Statting the nested store reports ENOENT on Windows but ENOTDIR on Linux. Make
+      // loadStore observe the store entry itself as absent on both; persistStore still uses the
+      // real filesystem and fails when it tries to write through the regular-file parent.
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    });
 
     const error = captureError(() => addEntry({
       id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: ATTEMPTED_SECRET,
-    }, options()));
+    }, options({ statFile })));
     expect(error).toBeInstanceOf(KeystoreWriteError);
     expect(error.message).toMatch(/^keystore write failed \([A-Z][A-Z0-9_]*\)$/);
+    expect(statFile).toHaveBeenCalledTimes(1);
     expectNoSecretLeaks(error, ATTEMPTED_SECRET);
   });
 

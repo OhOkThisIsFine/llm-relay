@@ -140,7 +140,9 @@ else.**
   baseline in the SAME change that adds or removes bundle weight, or `check:package` goes red.
 - Tests read `src/` directly; `scripts/*.mjs` read `dist/` - rebuild before running any script.
 - Four POSIX-permission tests skip on Windows; CI's ubuntu leg is the only place they run, so a
-  green local Windows run is not full coverage of secret-file permissions.
+  green local Windows run is not full coverage of secret-file permissions. A store path nested
+  under a regular file reads as `ENOENT` on Windows but `ENOTDIR` on Linux, so fixtures that
+  require an absent load must inject the stat/read seam rather than relying on that filesystem shape.
 - A failing test may be pinning a defect it should have caught. Read its stated reasoning before
   assuming your change is wrong, and fix test and source in the same commit.
 - Static analysis (`npm run analysis:run`) is advisory and deliberately outside the gate.
