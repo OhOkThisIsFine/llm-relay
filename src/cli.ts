@@ -1570,9 +1570,31 @@ export interface DashboardCommandRouteDependencies {
   readonly runDashboard: (cfg: Config) => Promise<void>;
   readonly reportError: (error: unknown) => void;
   readonly runProxy: () => unknown;
+  /**
+   * How to refuse a bare token that is not a command. REQUIRED, not optional — an optional
+   * reporter would let a future caller silently reinstate the fall-through this exists to close.
+   */
+  readonly reportUnknownCommand: (name: string) => void;
 }
 
-/** The real final command dispatch: dashboard returns before any proxy/store/signal lifecycle. */
+/**
+ * The real final command dispatch: dashboard returns before any proxy/store/signal lifecycle.
+ *
+ * ⚠ This is the END of `main`'s ladder, so ANY positional no branch above claimed lands here — and
+ * it used to mean "start the proxy". A mistyped command therefore started a second relay instead
+ * of reporting the typo: loud where a relay is already running (`EADDRINUSE`), silent where none
+ * is, and in both cases nothing said the command was not understood.
+ *
+ * The guard is gated on `CLI_COMMAND_NAMES`, the set that already exists, so it is ONE shared
+ * check rather than a special case per command: a KNOWN name that reaches here still falls through
+ * to `runProxy()` exactly as before — nothing that worked changes — while an unknown one is
+ * refused. A bare `llm-relay` (no positional) still starts the proxy, the documented primary usage.
+ *
+ * ⚠ Consequence worth knowing, and an improvement rather than a cost: a value-taking flag missing
+ * from `VALUE_FLAGS` has its VALUE read as a positional — the hazard that constant's own comment
+ * warns about, after `--host routed` was once parsed as the lane id "routed". That case now fails
+ * loudly instead of quietly starting a proxy or selecting the wrong lane.
+ */
 export function dispatchDashboardOrProxy(
   positional: string | undefined,
   dependencies: DashboardCommandRouteDependencies,
@@ -1580,6 +1602,10 @@ export function dispatchDashboardOrProxy(
   if (positional === "dashboard") {
     const cfg = dependencies.loadConfig();
     void dependencies.runDashboard(cfg).catch(dependencies.reportError);
+    return undefined;
+  }
+  if (positional !== undefined && !CLI_COMMAND_NAMES.has(positional)) {
+    dependencies.reportUnknownCommand(positional);
     return undefined;
   }
   return dependencies.runProxy();
@@ -3395,6 +3421,12 @@ export function main(): void {
   dispatchDashboardOrProxy(arg2, {
     loadConfig: loadOrExit,
     runDashboard: runDashboardCommand,
+    // Bounded, because an unlisted value flag can push its VALUE into command position. The token
+    // is the user's own and belongs in their own terminal, but it is not worth echoing unbounded.
+    reportUnknownCommand: (name) => {
+      process.stderr.write(`llm-relay: unknown command "${name.slice(0, 40)}". Run 'llm-relay help' for usage.\n`);
+      process.exit(1);
+    },
     reportError: (e) => {
       process.stderr.write(`llm-relay dashboard: ${(e as Error).message}\n`);
       process.exit(1);

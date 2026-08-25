@@ -104,10 +104,48 @@ describe("dashboard CLI launcher", () => {
       loadConfig: () => { loaded += 1; return config(); },
       runDashboard: async () => { launched += 1; },
       reportError: () => undefined,
+      reportUnknownCommand: () => undefined,
       runProxy: () => { fallback += 1; },
     });
     await new Promise<void>((resolve) => queueMicrotask(() => resolve()));
     expect({ loaded, launched, fallback }).toEqual({ loaded: 1, launched: 1, fallback: 0 });
+  });
+
+  /**
+   * ⚠ This is the END of `main`'s ladder: any positional no earlier branch claimed lands here, and
+   * it used to mean "start the proxy". A mistyped command therefore started a second relay rather
+   * than reporting the typo — `EADDRINUSE` where one was already running, silence where none was,
+   * and in neither case anything saying the command was not understood.
+   *
+   * The guard reads `CLI_COMMAND_NAMES`, the set that already existed, so it is one shared check:
+   * a KNOWN name still falls through to the proxy exactly as before, and no positional at all is
+   * still the documented way to start it.
+   */
+  it("refuses an unknown command instead of silently starting the proxy", () => {
+    const run = (positional: string | undefined) => {
+      const seen: string[] = [];
+      let fallback = 0;
+      dispatchDashboardOrProxy(positional, {
+        loadConfig: () => config(),
+        runDashboard: async () => undefined,
+        reportError: () => undefined,
+        reportUnknownCommand: (name) => { seen.push(name); },
+        runProxy: () => { fallback += 1; },
+      });
+      return { seen, fallback };
+    };
+
+    // A typo is refused, and NAMED — the whole diagnostic value.
+    expect(run("dashbaord")).toEqual({ seen: ["dashbaord"], fallback: 0 });
+    expect(run("stats")).toEqual({ seen: ["stats"], fallback: 0 });
+
+    // No positional at all still starts the proxy: `llm-relay [options]` is the primary usage.
+    expect(run(undefined)).toEqual({ seen: [], fallback: 1 });
+
+    // A KNOWN command that reaches the tail keeps falling through, so nothing that worked changes.
+    // `onboard` is in CLI_COMMAND_NAMES and is claimed by an earlier branch in the real ladder;
+    // reaching here directly proves the guard is gated on the name set, not on the ladder.
+    expect(run("onboard")).toEqual({ seen: [], fallback: 1 });
   });
 
   it("waits for native opener success and rejects spawn/nonzero failures", async () => {
