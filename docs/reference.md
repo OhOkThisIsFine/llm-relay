@@ -732,13 +732,10 @@ until meaningful content, and semantic failures before that point are counted as
   another pool member and the deployment's failure budget is untouched (`x-llm-relay-error-origin:
   local`) — it is a decision about your configuration, not a statement about the backend.
 
-  ⚠ One case announces less, and it is stated here rather than left to be discovered. On a
-  **streamed refusal before the stream commits** — the envelope arrived before any meaningful
-  content, so no head has been written — the relay's own commit probe turns the refusal into the
-  synthesized 502 it uses for every dead pre-commit stream. That body is the generic `api_error`
-  shape and carries neither header, though the message still names the refused tools. The refusal
-  itself is unchanged: refused whole, terminal, and never charged to the deployment. Match on the
-  message rather than the code if you need to detect this case programmatically.
+  A **streamed refusal before the stream commits** — the envelope arrived before any meaningful
+  content, so no head had been written yet — is served as a 502 like the buffered case rather than
+  as a mid-stream event, and carries the same code and the same two headers. All three fronts
+  (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) say the same thing.
 
   Why rescue is treated differently from an ordinary tool call: a backend that emits real
   `tool_calls` has stated its own intent, and `repair.destructiveTools` has never governed that.

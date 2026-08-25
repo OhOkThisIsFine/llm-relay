@@ -106,6 +106,24 @@ export function recoverWindowsEnv(
   }
 
   const read = opts.read ?? readScope;
+  // ⚠ Under vitest, never spawn `reg` — the same rule and the same shape as
+  // `secret-file-acl.ts` and `os-keyring.ts`: skip the real child process unless the seam is
+  // injected. This was the LAST unguarded real-world side effect in `src/`, and it cost twice.
+  //
+  // Latency: `readScope` runs `execFileSync` TWICE with `timeout: 5000` EACH, on the
+  // `loadOrExit()` path every CLI test file reaches. vitest's default test budget is also 5000ms,
+  // so one contended spawn consumes a whole test. Measured on this machine: ~50-70ms idle,
+  // 2806/3041/4045ms while the 108-file suite competed for process creation, and one run at
+  // 5265ms — which is exactly the intermittent "passes alone, fails under load" timeout seen in
+  // `test/cli.test.ts` and `test/accounting-cli-lifecycle.test.ts`.
+  //
+  // Hermeticity: it also merged the DEVELOPER'S real User/Machine registry environment into the
+  // worker's `process.env`, so a suite run depended on what happened to be set on the machine.
+  //
+  // `opts.read` still runs, so `test/winenv.test.ts` exercises the whole merge/skip/never-import
+  // policy exactly as before; only the literal `reg query` invocation is unreachable from tests,
+  // which is the accepted trade the two modules above already make.
+  if (process.env.VITEST !== undefined && opts.read === undefined) return result;
   // Machine first, then User — User wins on a conflict, matching how Windows itself composes them.
   const merged = mergeScopes(
     read("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"),

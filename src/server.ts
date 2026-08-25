@@ -39,7 +39,8 @@ import {
   type Reshaper,
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
-import { dialectRefusalSignalOf, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { DIALECT_REFUSED_DESTRUCTIVE_CODE } from "./tool-dialects.js";
+import { dialectRefusalSignalOf, ERROR_ORIGIN_HEADER, TOOL_DIALECT_HEADER, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -59,7 +60,7 @@ import {
 } from "./accounting.js";
 import type { AccountingReader, AccountingStore } from "./accounting-store.js";
 import { DashboardAuthManager } from "./dashboard-auth.js";
-import { handleDashboardRoute, type DashboardHeaderMap, type DashboardRouteHandled } from "./dashboard-routes.js";
+import { BODY_TOO_LARGE_CODE, handleDashboardRoute, type DashboardHeaderMap, type DashboardRouteHandled } from "./dashboard-routes.js";
 import { createDashboardSnapshotReadPort } from "./dashboard-snapshot.js";
 import { createAvailabilityProducer } from "./availability-snapshot.js";
 import {
@@ -1612,12 +1613,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           pool429.recordFinal(502);
           const headers: Record<string, string> = {
             [SERVED_BY_HEADER]: tried.join(", "),
+            // Who produced this status. A dead PRE-COMMIT stream the relay judged `local` is the
+            // proxy's own verdict, and saying so is the header's documented job — it was simply
+            // never written on this path.
+            [ERROR_ORIGIN_HEADER]: probe.provenance,
             ...(stickyProvenanceHeaders(sticky) ?? {}),
             ...credentialTrace.headers(),
+            ...(probe.errorType === DIALECT_REFUSED_DESTRUCTIVE_CODE
+              ? { [TOOL_DIALECT_HEADER]: "refused-destructive" }
+              : {}),
           };
           const summary = pool429.summary();
           if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-          failClosed(res, 502, `llm-relay: ${probe.reason}`, headers);
+          failClosed(res, 502, `llm-relay: ${probe.reason}`, headers, probe.errorType);
           h.logger.write(baseLog(
             started,
             path,
@@ -3677,14 +3685,18 @@ async function openAiFrontPath(
           const headers: Record<string, string> = {
             "content-type": "application/json",
             [SERVED_BY_HEADER]: tried.join(", "),
+            [ERROR_ORIGIN_HEADER]: probe.provenance,
             ...(stickyProvenanceHeaders(ctx.sticky) ?? {}),
             ...credentialTrace.headers(),
+            ...(probe.errorType === DIALECT_REFUSED_DESTRUCTIVE_CODE
+              ? { [TOOL_DIALECT_HEADER]: "refused-destructive" }
+              : {}),
           };
           const summary = pool429.summary();
           if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
           res.writeHead(502, headers);
           res.end(JSON.stringify({
-            error: { message: `llm-relay: ${probe.reason}`, type: "api_error" },
+            error: { message: `llm-relay: ${probe.reason}`, type: probe.errorType ?? "api_error" },
           }));
           h.logger.write(baseLog(
             ctx.started,
@@ -4768,7 +4780,10 @@ function readBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES): Prom
         cleanup();
         // Drain without retaining the rest so the client can receive the explicit 413 response.
         req.resume();
-        reject(new Error("request body too large"));
+        // Tagged, not described: the dashboard route classifies 413-vs-500 from this CODE. It used
+        // to regex-match this very message string, i.e. the relay inferring its own intent from
+        // prose — see `BODY_TOO_LARGE_CODE`. Harmless for the other caller, which ignores it.
+        reject(Object.assign(new Error("request body too large"), { code: BODY_TOO_LARGE_CODE }));
         return;
       }
       chunks.push(c);
@@ -4826,13 +4841,18 @@ function failClosed(
   status: number,
   message: string,
   headers?: Record<string, string | string[]>,
+  /**
+   * Error type for the body. Defaults to `api_error`, which is what every caller wanted before a
+   * relay-authored refusal could reach here — so an omitted argument is byte-identical to before.
+   */
+  errorType = "api_error",
 ): void {
   if (res.headersSent) {
     if (!res.writableEnded) res.end();
     return;
   }
   res.writeHead(status, { ...headers, "content-type": "application/json" });
-  res.end(JSON.stringify({ type: "error", error: { type: "api_error", message } }));
+  res.end(JSON.stringify({ type: "error", error: { type: errorType, message } }));
 }
 
 /**

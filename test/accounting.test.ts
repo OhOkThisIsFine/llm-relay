@@ -514,6 +514,33 @@ describe("canonical accounting primitive", () => {
     expect(Object.isFrozen(event?.tokens.estimated.estimatedInput)).toBe(true);
   });
 
+  it("refuses a method the day-shard LOADER would reject, instead of quarantining the shard later", () => {
+    // The accept side must never be laxer than the load side. `isDashboardSafeId` bounds length
+    // and bytes but permits C0/C1 control characters; the schema's `isSafeId` rejects them. A
+    // method admitted here but refused on load would be merged into a cell, written to the day
+    // shard, and then fail `parseAccountingDayShardV1` on the next read — quarantining the shard
+    // and losing that day's ledger. Dropping one field now is strictly better than losing a day
+    // later, so `methodSnapshot` admits through the LOADER's predicate.
+    const request = createAccountingRequest({ idFactory: deterministic() });
+    const attempt = request.startAttempt();
+    const source = {
+      estimated: { inputTokens: 2, inputMethod: "chars/4" },
+    } as unknown as TokenFactsInput;
+    const event = attempt.complete({ outcome: "success", tokens: source });
+    // Dropped to the safe default rather than persisted — the control character never reaches the
+    // shard, which is the whole point; what it degrades to is the pipeline's existing convention.
+    const method = event?.tokens.estimated.estimatedInput.method;
+    expect(method).not.toContain("");
+    expect(method).toBe("unspecified");
+
+    // ... and an ordinary method still lands, so this is a control-character rule, not a ban.
+    const ok = createAccountingRequest({ idFactory: deterministic() }).startAttempt().complete({
+      outcome: "success",
+      tokens: { estimated: { inputTokens: 2, inputMethod: "relay_estimate" } } as unknown as TokenFactsInput,
+    });
+    expect(ok?.tokens.estimated.estimatedInput.method).toBe("relay_estimate");
+  });
+
   it("isolates recorder getter and apply traps", () => {
     const getterTrap = new Proxy({}, { get: () => { throw new Error("getter down"); } }) as AccountingRecorder;
     expect(() => {

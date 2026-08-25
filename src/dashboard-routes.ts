@@ -614,15 +614,22 @@ function statusForQueryError(status: 400 | 413): DashboardErrorCode {
   return status === 413 ? "oversized" : "malformed_query";
 }
 
+/**
+ * The code a body reader sets when it refused a body for exceeding the cap.
+ *
+ * Exported so the PRODUCER and this consumer share one definition. Until 2026-08-25 the accepted
+ * set was three codes that nothing in the repo ever set, so the only live classifier was a regex
+ * over the error MESSAGE — the relay sniffing prose it had written itself, one line away from
+ * deciding 413-vs-500. That is the inference this codebase refuses everywhere else
+ * (`rate-limits.ts` needs an explicit axis and period; `refusal-interpretation.ts` is lookup,
+ * never inference), and it was wrong in both directions: any unrelated rejection whose message
+ * happened to contain "exceeded" — a timeout wrapper, a RangeError — was served as `oversized`,
+ * and a future reader with different wording would silently become `internal`.
+ */
+export const BODY_TOO_LARGE_CODE = "ERR_DASHBOARD_BODY_TOO_LARGE";
+
 function bodyReadErrorCode(error: unknown): DashboardErrorCode {
-  if (
-    isRecord(error) &&
-    (error.code === "ERR_DASHBOARD_BODY_TOO_LARGE" || error.code === "LIMIT_BYTES" || error.code === "PAYLOAD_TOO_LARGE")
-  ) {
-    return "oversized";
-  }
-  if (error instanceof Error && /too\s*large|exceed(?:ed)?|payload\s*size|body\s*limit/iu.test(error.message)) return "oversized";
-  return "internal";
+  return isRecord(error) && error.code === BODY_TOO_LARGE_CODE ? "oversized" : "internal";
 }
 
 function isPlainJsonContentType(headers: DashboardHeaderMap): boolean {

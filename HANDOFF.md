@@ -8,9 +8,8 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 in §6 that was a code gap rather than a recorded trade — the one known safety-shaped one. A
 WELL-FORMED destructive call the relay reconstructed out of assistant prose used to be served
 unfiltered, because `destructive` reached none of `tool-dialects.ts`, `openai-dialect.ts`,
-`dialect-stream.ts`. It is now refused whole and terminally at all four rescue commit points. Full
-entry, including the deliberately recorded announcement residual on the streamed pre-commit lane:
-§6 below.
+`dialect-stream.ts`. It is now refused whole and terminally at all four rescue commit points, and
+announced identically on all three fronts. Full entry: §6 below.
 
 
 **The custody sprint is delivered — Stage 3 of
@@ -168,6 +167,20 @@ else.**
   require an absent load must inject the stat/read seam rather than relying on that filesystem shape.
 - A failing test may be pinning a defect it should have caught. Read its stated reasoning before
   assuming your change is wrong, and fix test and source in the same commit.
+- **A test that does real machine work has the machine's worst case in its 5 s budget.** Two CLI
+  tests flaked for weeks — `test/cli.test.ts` "quotes the task…" and
+  `test/accounting-cli-lifecycle.test.ts` "constructs one store…" — always passing alone, failing
+  only under a loaded `npm run check`. Root cause (2026-08-25): `src/winenv.ts` `readScope` spawned
+  `reg query` TWICE with `timeout: 5000` **each**, on the `loadOrExit()` path every CLI test file
+  reaches, while vitest's default test budget is also 5000 ms. Measured ~50–70 ms idle but
+  2806–4045 ms with the 108-file suite competing for process creation, and one run at 5265 ms. It
+  was also the last unguarded real-world side effect in `src/` — it merged the developer's own
+  registry environment into worker `process.env`. Fixed at the root with the VITEST guard every
+  sibling module already had (`secret-file-acl.ts`, `os-keyring.ts`): skip the spawn unless the
+  `read` seam is injected, which `test/winenv.test.ts` always does. Both tests now run in 7–10 ms,
+  flat. ⚠ The lesson generalizes: a fix that only raises one test's timeout moves the flake to
+  whichever test next becomes its file's first `loadOrExit()` caller — which is exactly what an
+  earlier partial fix (`50e8233`, a `beforeAll` import warm-up) left behind.
 - Static analysis (`npm run analysis:run`) is advisory and deliberately outside the gate.
 
 ## 4. Things that will bite you
@@ -308,21 +321,56 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   not reroll and the deployment's failure budget is untouched. Announced as
   `x-llm-relay-tool-dialect: refused-destructive` plus a `tool_dialect_refused_destructive` body on
   the buffered lanes, and as the mid-stream SSE `error` event once the head is flushed.
-  ⚠ **Known residual, deliberately recorded rather than papered over:** on a *streamed pre-commit*
-  refusal (nothing meaningful emitted before the envelope) `stream-commit.ts` classifies the
-  relay-authored error and both fronts synthesize their own 502, so the served body is the generic
-  `api_error` shape and neither `x-llm-relay-tool-dialect` nor `x-llm-relay-error-origin` is
-  written. The refusal is still correct and still terminal — only the announcement degrades — and
-  the refused tool names still reach the message. Design, policy, and the consequences to expect:
+  The *streamed pre-commit* case (nothing meaningful emitted before the envelope) is served as a
+  502 rather than a mid-stream event, and **closed 2026-08-25** so it announces identically: the
+  probe's dead verdict carries an optional `errorType`, `failClosed` takes it (defaulting to
+  `api_error`, so every other caller is unchanged), and both fronts add the dialect header. Both
+  also now write `x-llm-relay-error-origin` from `probe.provenance` on any dead pre-commit stream,
+  which that header always should have said. Design, policy, and the consequences to expect:
   [docs/dialect-rescue-destructive-refusal-2026-08-24.md](docs/dialect-rescue-destructive-refusal-2026-08-24.md);
   suite: `test/dialect-destructive-refusal.test.ts`.
 - Orphan `tmp-*` journal files are never swept (C1 RISK-1 residue; retention itself landed).
-- `methodSnapshot` accepts bounded arbitrary JSON as an estimation "method" (C1 NIT-6).
+  **Re-verified 2026-08-25, KEPT.** Narrower than the title: `atomicReplace` unlinks its own temp
+  on any in-process throw (pinned by `test/accounting-store-io.test.ts`), so the only residue is a
+  process KILLED between `writeFileSync(temp,…,{flag:"wx"})` and `renameSync` — at most one orphan
+  per hard kill, bounded by the file caps, and unreadable by anything (every read is by exact
+  name, and the nonce plus `wx` makes collision a non-event). A sweeper would have to add a
+  readdir+age gate to a durability primitive whose threat model explicitly excludes concurrent
+  writers, and prove an orphan is not another process's in-flight temp. If it is ever built: gate
+  on prefix + inside-root + age > 24h, and leave `.corrupt-*` alone — that is deliberate evidence.
+- ~~`methodSnapshot` accepts bounded arbitrary JSON as an estimation "method" (C1 NIT-6).~~
+  **Re-verified 2026-08-25: the JSON acceptance is deliberate and pinned** (it snapshots a
+  structured descriptor away from later caller mutation — `test/accounting.test.ts` asserts
+  exactly that), so it stays. But the re-verification surfaced a real latent one beside it and
+  **that is FIXED**: the accept side used `isDashboardSafeId`, which permits C0/C1 control
+  characters, while the day-shard LOADER's `isSafeId` rejects them — so an admitted method would
+  be written and then fail `parseAccountingDayShardV1` on the next read, quarantining the shard
+  and losing that day's ledger. Both accept sites now admit through the loader's own predicate
+  (`isLoadableId`), pinned by "refuses a method the day-shard LOADER would reject".
+- ~~The type escape at `materializeDimensions`' aggregate return (C2 N5)~~ — **FIXED 2026-08-25.**
+  Generic over the kind with a `DimensionRowByKind` map, so pairing a source with the wrong kind is
+  a compile error instead of a silent `undefined` behind a non-null assertion; five casts removed,
+  no runtime change. (Mutation-checked: a swapped call site now fails tsc.)
+- ~~Regex-sniffing `bodyReadErrorCode` (C2 N9)~~ — **FIXED 2026-08-25.** Its structured rung tested
+  three codes nothing in the repo ever set, so the only live classifier was a regex over the error
+  MESSAGE — the relay deciding 413-vs-500 by sniffing prose it had written itself, wrong in both
+  directions (any rejection containing "exceeded" read as oversized; a reworded reader would
+  silently become `internal`). The producer now tags the rejection with the shared
+  `BODY_TOO_LARGE_CODE` and the regex is gone.
 - Dashboard session token rides `sessionStorage`; the mitigation is the strict CSP. Trade
-  recorded, not changed (C2 R2). Also standing: the type escape at `materializeDimensions`'
-  aggregate return (C2 N5), misleading error codes for body problems (C2 N8),
-  regex-sniffing `bodyReadErrorCode` (C2 N9), and `llm-relay dashboard <anything>` ignoring
-  extra positionals (C2 N10).
+  recorded, not changed (C2 R2). Also standing: misleading error codes for body problems (C2 N8)
+  and `llm-relay dashboard <anything>` ignoring extra positionals (C2 N10). Both re-verified
+  2026-08-25 and kept, with the reasons worth knowing:
+  - **N8** would be a versioned WIRE change (`malformed_body` added to a frozen enum) for a code
+    no consumer reads — the SPA never looks at it and the route tests assert status only. ⚠ The
+    real hazard in that area is not the code but the **duplicate union at
+    `src/dashboard-routes.ts` restating the contract's codes by hand**, which would drift silently.
+  - **N10** is the house style for the whole read-only command family (`candidates`, `cost`,
+    `pools`, `models`, `telemetry`, `ping` all ignore extras); exact arity exists only on the
+    mutating/custody surfaces. Tightening `dashboard` alone makes it the odd one out. ⚠ The
+    adjacent behaviour worth a guard is that an UNRECOGNIZED command falls through to `runProxy()`,
+    so `llm-relay dashbaord` starts the proxy — loud (banner or EADDRINUSE), but wrong. If this is
+    ever done, build one shared unknown-command guard off `CLI_COMMAND_NAMES`, not a special case.
 - SPA/test nits standing (C3): flat 30 s poll with no failure backoff (mitigated by
   abort-on-hide/offline), CSS-structure test mirroring styles.css, a few wall-clock-sleep tests,
   dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than

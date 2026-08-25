@@ -96,4 +96,32 @@ describe("recoverWindowsEnv", () => {
     expect(r.skippedPlatform).toBe(true);
     expect(env.ANYTHING).toBeUndefined();
   });
+
+  /**
+   * ⚠ The guard this pins is why the suite is hermetic AND why two CLI tests stopped flaking.
+   *
+   * `readScope` shells out to `reg query` TWICE with `timeout: 5000` each, on the `loadOrExit()`
+   * path that `cli.test.ts`, `accounting-cli-lifecycle.test.ts`, `keys-cli.test.ts` and
+   * `dashboard-cli.test.ts` all reach. vitest's default test budget is also 5000ms, so ONE
+   * contended spawn eats a whole test: measured ~50-70ms idle but 2806-4045ms while the full
+   * suite competed for process creation, with a run at 5265ms — the intermittent
+   * "passes alone, fails under load" timeout. It also merged the developer's real registry
+   * environment into the worker's `process.env`.
+   *
+   * Same shape as `secret-file-acl.ts` and `os-keyring.ts`: under VITEST the real child process is
+   * skipped unless the seam is injected — and every test above injects `read`, so the merge/skip/
+   * never-import policy stays fully covered. Only the literal `reg query` call is unreachable.
+   */
+  it("does not touch the real registry under vitest unless a reader is injected", () => {
+    expect(process.env.VITEST).toBeDefined();
+    const env: NodeJS.ProcessEnv = {};
+    // No `read` — the production path. Must return empty without spawning anything.
+    const r = recoverWindowsEnv(env, { platform: "win32" });
+    expect(r).toEqual({ loaded: [], skipped: [], skippedPlatform: false });
+    expect(Object.keys(env)).toHaveLength(0);
+
+    // An injected reader still runs the whole policy, so nothing above loses coverage.
+    const injected = recoverWindowsEnv({}, { platform: "win32", read: read({ SOME_KEY: "v" }) });
+    expect(injected.loaded).toEqual(["SOME_KEY"]);
+  });
 });

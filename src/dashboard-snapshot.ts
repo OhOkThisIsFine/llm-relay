@@ -897,10 +897,28 @@ function credentialLabel(credentialId: string): string {
   return label.length > 0 ? label : credentialId;
 }
 
-function materializeDimensions(
+/** The row each dimension kind produces, so the kind and the row type cannot be paired wrongly. */
+interface DimensionRowByKind {
+  provider: ProviderDimensionRowV1;
+  model: ModelDimensionRowV1;
+  client: ClientDimensionRowV1;
+  credential: CredentialDimensionRowV1;
+}
+
+/**
+ * ⚠ Generic over the kind on purpose. This used to declare a UNION of the four array types while
+ * the body produced an array of the four ROW types — not assignable, so it ended in
+ * `as unknown as …` and each of the four call sites re-cast the result. That laundered away the
+ * one correlation worth checking: pass `models` with `"provider"`, or swap two call sites, and
+ * tsc said nothing while `state.values[1]!` handed back `undefined` through a non-null assertion.
+ * `assertSnapshotV1` would have caught it at runtime as a thrown read, which is a poor substitute
+ * for a compile error — and this repo already has a scar about type-level assertions that assert
+ * nothing (the inert `@ts-expect-error`, CLAUDE.md). No runtime change; five casts removed.
+ */
+function materializeDimensions<K extends keyof DimensionRowByKind>(
   source: Map<string, DimensionState>,
-  kind: "provider" | "model" | "client" | "credential",
-): ProviderDimensionRowV1[] | ModelDimensionRowV1[] | ClientDimensionRowV1[] | CredentialDimensionRowV1[] {
+  kind: K,
+): DimensionRowByKind[K][] {
   const states = [...source.values()];
   states.sort((left, right) => {
     const requestDelta = right.stats.requests - left.stats.requests;
@@ -910,7 +928,7 @@ function materializeDimensions(
   });
   return states.map((state) => {
     const { p95LatencyMs: _p95LatencyMs, ...summary } = summaryFrom(state.stats);
-    const coverage = coverageFor(kind === "provider" ? "provider" : kind === "model" ? "model" : kind === "client" ? "client" : "credential", state.stats.health).state;
+    const coverage = coverageFor(kind, state.stats.health).state;
     if (kind === "provider") return { ...summary, coverage, dimension: "provider", provider: state.values[0]! } satisfies ProviderDimensionRowV1;
     if (kind === "model") return { ...summary, coverage, dimension: "model", provider: state.values[0]!, model: state.values[1]! } satisfies ModelDimensionRowV1;
     if (kind === "client") return { ...summary, coverage, dimension: "client", client: state.values[0]! } satisfies ClientDimensionRowV1;
@@ -922,7 +940,11 @@ function materializeDimensions(
       credentialId: state.values[1]!,
       label: credentialLabel(state.values[1]!),
     } satisfies CredentialDimensionRowV1;
-  }) as unknown as ProviderDimensionRowV1[] | ModelDimensionRowV1[] | ClientDimensionRowV1[] | CredentialDimensionRowV1[];
+    // One cast remains and it is the irreducible one: TypeScript cannot narrow the RETURN type
+    // from a runtime `kind` comparison inside `map`. It is scoped to this line rather than
+    // laundering the whole function's signature, and the four `satisfies` above still check every
+    // row's shape.
+  }) as DimensionRowByKind[K][];
 }
 
 function emptyAvailabilityHealth(): ProjectionHealth {
@@ -1822,10 +1844,10 @@ export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOp
         panelCoverage,
         summary,
         buckets: bucketRows,
-        providers: materializeDimensions(providers, "provider") as ProviderDimensionRowV1[],
-        models: materializeDimensions(models, "model") as ModelDimensionRowV1[],
-        clients: materializeDimensions(clients, "client") as ClientDimensionRowV1[],
-        credentials: materializeDimensions(credentials, "credential") as CredentialDimensionRowV1[],
+        providers: materializeDimensions(providers, "provider"),
+        models: materializeDimensions(models, "model"),
+        clients: materializeDimensions(clients, "client"),
+        credentials: materializeDimensions(credentials, "credential"),
         errors: errorRows,
         quotas: availabilityOutput.quotas,
         cooldowns: availabilityOutput.cooldowns,

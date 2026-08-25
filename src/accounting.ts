@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { freezeDeep } from "./accounting-store-schema.js";
+import { freezeDeep, isLoadableId } from "./accounting-store-schema.js";
 import {
   DASHBOARD_REQUEST_ID_PATTERN,
   isDashboardFailureKind,
@@ -362,12 +362,21 @@ function nullableLatency(value: unknown): number | null {
   return nullableInteger(value);
 }
 
+/**
+ * Freeze an estimation method into a string the LOADER will accept.
+ *
+ * A structured descriptor is snapshotted through `JSON.stringify` on purpose — it is stored away
+ * from later caller mutation, which `test/accounting.test.ts` pins. The admission test is
+ * `isLoadableId`, not `isDashboardSafeId`: the two differ on control characters, and the loader is
+ * the one that gets to refuse. Admitting what the loader rejects means quarantining a whole day
+ * shard later instead of dropping one field now.
+ */
 function methodSnapshot(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  if (typeof value === "string") return isDashboardSafeId(value) ? value : null;
+  if (typeof value === "string") return isLoadableId(value) ? value : null;
   try {
     const serialized = JSON.stringify(value);
-    return isDashboardSafeId(serialized) ? serialized : null;
+    return isLoadableId(serialized) ? serialized : null;
   } catch {
     return null;
   }
