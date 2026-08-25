@@ -1048,11 +1048,131 @@ const COOLDOWN_CLEAR_OPTIONS: ReadonlyMap<string, CooldownClearOption> = new Map
   ["-r", { semantic: "refresh", takesValue: false }],
 ]);
 
-const CLI_COMMAND_NAMES: ReadonlySet<string> = new Set([
+export const CLI_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "onboard", "setup", "keys", "check-keys", "models", "ping", "dashboard", "telemetry",
   "offload", "lanes", "dispatch", "cooldowns", "eligibility", "candidates", "cost", "pools",
   "routing", "route", "config", "help", "version",
 ]);
+
+interface CommandArity {
+  /** Minimum positional count, COUNTING the command token itself. */
+  readonly min: number;
+  /** Maximum positional count, counting the command token. `-1` means genuinely variadic. */
+  readonly max: number;
+  /** Where the highest-probability mistake actually belongs. Verified against the code, not HELP. */
+  readonly hint?: string;
+}
+
+/**
+ * Positional-ARITY bounds per command — the shared half of "an ignored argument is a lie".
+ *
+ * `llm-relay cost --window 1h 7d` silently dropped `7d` and reported 24h; `llm-relay models nim`
+ * listed every provider. Exact arity existed only on the mutating/custody surfaces, so the whole
+ * read-only family accepted and discarded whatever it did not understand. Counting INCLUDES the
+ * command token: `llm-relay cost` is 1, `llm-relay config set a b` is 4.
+ *
+ * ⚠ Every bound is derived from what the DISPATCHER READS — `arg3`/`arg4`/`positionals[n]`/
+ * `.slice()` — never from HELP, which drifts: `lanes` and the `route` alias appear nowhere in it,
+ * and `setup`'s documented `claude-cli` target matches no branch at all (it works by fall-through).
+ * A table built from the help text would have left two commands unguarded and mis-bounded a third.
+ *
+ * ⚠ DELIBERATELY ABSENT — do not "complete" this table with them:
+ *   `keys`      — `validateKeysCommandArgs` is EXACT per subcommand and runs above this guard. It
+ *                 is also secret-safe by design ("diagnostics deliberately never echo rejected
+ *                 argv tokens", since a pasted credential can land in argv). A generic entry would
+ *                 be dead code at best and a second, laxer refusal at worst.
+ *   `cooldowns` — `parseCooldownClearArgs` requires exactly 3 and its branch RETURNS before this
+ *                 guard; it is also reachable through `rawCliCommand`'s special case, which keys
+ *                 on raw argv this guard cannot see.
+ *   `help` /    — both `process.exit(0)` above this guard, which is what makes `llm-relay <cmd>
+ *   `version`     --help` work for every command. A bound here could never fire.
+ */
+const COMMAND_ARITY: Readonly<Record<string, CommandArity>> = {
+  // Reads no positional; `--import` is a VALUE_FLAG and `--force` is a boolean.
+  onboard: { min: 1, max: 1 },
+  // `arg3` is the last slot read: `claude-desktop` / `desktop`, else fall-through to the CLI setup.
+  setup: { min: 1, max: 2 },
+  // Handled inline in main(); arg3/arg4 are in scope and never referenced.
+  telemetry: { min: 1, max: 1 },
+  // `runCheckKeys()` takes no arguments. ⚠ No hint: it has no provider filter — it hands the whole
+  // config to `validateProviderKeys`, so suggesting `-p` would point at a flag that does nothing.
+  "check-keys": { min: 1, max: 1 },
+  models: { min: 1, max: 1, hint: "llm-relay models -p <name>" },
+  ping: { min: 1, max: 1, hint: "llm-relay ping -p <name>" },
+  candidates: { min: 1, max: 1, hint: "llm-relay candidates -p <name>" },
+  // `runCostCommand` takes only a test seam; window/by/include-repair are all flags.
+  cost: { min: 1, max: 1, hint: "llm-relay cost --window <w> --by <d>" },
+  // ⚠ Absent from HELP entirely, so its users cannot check usage — and the adjacent `dispatch`
+  // DOES take a positional lane, which is exactly the confusion worth naming.
+  lanes: { min: 1, max: 1, hint: "llm-relay dispatch <lane>" },
+  dashboard: { min: 1, max: 1 },
+  // `runDispatch(arg3)` — one optional lane positional.
+  dispatch: { min: 1, max: 2 },
+  // `runOffload(arg3, arg4)`. The semantic checks inside it (refusing a bare `offload on`, and
+  // `offload status <anything>`) sit INSIDE this bound and stay where they are.
+  offload: { min: 1, max: 3 },
+  // `runEligibility(arg3, arg4)`.
+  eligibility: { min: 1, max: 3 },
+  // `positionals[3]` is the highest fixed slot anywhere in this file. `config set`/`unset` cap
+  // themselves tighter; this is the outer bound only.
+  config: { min: 1, max: 4 },
+  // VARIADIC: `positionals.slice(3)` — `pools set <name> <spec> [<spec>...]`.
+  pools: { min: 1, max: -1 },
+  // VARIADIC twice over: `slice(2)` for `routing default`, `slice(3)` for `routing tier`.
+  // Multi-candidate specs are a documented routing feature, so any finite max is a false positive.
+  routing: { min: 1, max: -1 },
+  // Same handler as `routing`; omitting the alias would leave it unguarded.
+  route: { min: 1, max: -1 },
+};
+
+/**
+ * Refuse a command given more positionals than it can read, or fewer than it needs.
+ *
+ * Pure and exported so the whole table is testable without driving `main()`.
+ *
+ * ⚠ Returns null on an EMPTY positional list. That is bare `llm-relay` — the documented way to
+ * start the proxy — and also the `--ping` flag entry, which reaches the ping command with no
+ * positional at all. Applying a minimum there is the one guaranteed false positive available.
+ *
+ * ⚠ Returns null on a table MISS. An unknown command name belongs to `dispatchDashboardOrProxy`,
+ * which already refuses it against `CLI_COMMAND_NAMES`; two refusals for one mistake would be
+ * worse than one.
+ *
+ * ⚠ The extra token is deliberately NOT echoed, unlike the unknown-command guard. An unknown
+ * COMMAND is by definition not a secret-bearing position and naming it is the whole diagnostic;
+ * a stray POSITIONAL can be anything the user pasted — and `check-keys` here is the same command
+ * as `keys check`, whose parser never echoes argv for exactly that reason. The count plus a
+ * verified hint is enough to act on, and the user can still see what they typed.
+ */
+/**
+ * Commands whose arity is owned elsewhere, exported so the coverage test can state WHY each is
+ * absent from `COMMAND_ARITY` rather than letting a future omission look identical to an oversight.
+ */
+export const ARITY_EXEMPT: ReadonlySet<string> = new Set(["keys", "cooldowns", "help", "version"]);
+
+/** The commands this guard bounds — exported for the drift test, not for dispatch. */
+export const ARITY_GUARDED_COMMANDS: readonly string[] = Object.keys(COMMAND_ARITY);
+
+export function commandArityError(positionals: readonly string[]): string | null {
+  const name = positionals[0];
+  if (name === undefined) return null;
+  const arity = COMMAND_ARITY[name];
+  if (!arity) return null;
+
+  const hint = arity.hint ? ` Did you mean \`${arity.hint}\`?` : "";
+  if (arity.max >= 0 && positionals.length > arity.max) {
+    const extra = positionals.length - arity.max;
+    const allowed = arity.max - 1;
+    const takes = allowed === 0
+      ? "takes no arguments after the command"
+      : `takes at most ${allowed} argument${allowed === 1 ? "" : "s"} after the command`;
+    return `llm-relay ${name}: ${takes} (got ${extra} too many).${hint} Run 'llm-relay help' for usage.`;
+  }
+  if (positionals.length < arity.min) {
+    return `llm-relay ${name}: missing required argument.${hint} Run 'llm-relay help' for usage.`;
+  }
+  return null;
+}
 
 /** Find a real command token without letting a typoed option/value pair hide a later mutation. */
 function rawCliCommand(argv: readonly string[]): string | undefined {
@@ -3243,6 +3363,30 @@ export function main(): void {
     process.stdout.write(`${currentVersion()}\n`);
     process.exit(0);
   }
+
+  // ⚠ THIS LINE, not one earlier and not one later.
+  //
+  // BELOW it is the first side effect in the whole ladder: the very next branch calls
+  // `loadOrExit()`, whose `resolveConfigPath` fall-through CREATES `~/.llm-relay/config.json`. Past
+  // that lie probes of every model (`ping`), authenticated provider calls (`check-keys`), spawned
+  // lane commands (`lanes --probe`), POSTs to the running relay, a minted one-use dashboard
+  // bootstrap, and the accounting store. Refusing here costs none of them.
+  //
+  // ABOVE it, nothing durable has happened — but two things MUST stay above: `keys` and
+  // `cooldowns` own strict, fail-closed, secret-safe parsers (and cooldowns returns), and
+  // `--help`/`--version` short-circuit, which is what makes `llm-relay <cmd> --help` work for
+  // every command. Moving this check above them would flip `llm-relay cost extra --help` from
+  // printing help to exit 1.
+  //
+  // Keyed on `positionals[0]`, never on `rawCliCommand`: that scans PAST a leading non-command
+  // token, so `llm-relay bogus cost` would arity-check `cost` while main() dispatches `bogus`.
+  const arityError = commandArityError(positionals);
+  if (arityError !== null) {
+    process.stderr.write(`${arityError}\n`);
+    process.exit(1);
+    return;
+  }
+
   if (arg2 === "onboard") {
     const cfg = loadOrExit();
     if (hasFlag("--import", "-import")) {
