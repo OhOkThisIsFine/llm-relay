@@ -2,6 +2,11 @@ node_modules/
 dist/
 analysis-reports/
 config.json
+# The per-install control-plane capability token. It normally lives in ~/.llm-relay/, but the
+# token directory is resolved from the CONFIG's own path — so `llm-relay --config ./config.json`
+# run inside this checkout mints one right here, beside the config.json already ignored above.
+# A 256-bit capability that `git add -A` would happily stage.
+control-token
 *.local.json
 *.log
 # /audit-code run output — multi-MB reports regenerated per run. Durable conclusions

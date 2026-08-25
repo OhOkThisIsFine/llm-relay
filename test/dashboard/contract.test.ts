@@ -448,6 +448,22 @@ describe("dashboard v1 contract", () => {
     }
   });
 
+  it("the error-code vocabulary has ONE definition — routes must not restate it", async () => {
+    // `src/dashboard-routes.ts` used to declare its own local union of all ten codes. Two
+    // definitions of one closed set, drifting invisibly: add a code to the contract and the routes
+    // file silently cannot name it; drop one there and a route emits a code the validator rejects.
+    // The same rule and the same mechanical guard as `test/destructive-coverage.test.ts`'s
+    // "cli.ts no longer hand-copies the list".
+    const { readFileSync } = await import("node:fs");
+    const routes = readFileSync("src/dashboard-routes.ts", "utf8");
+    expect(routes).toContain("type DashboardErrorCode,");
+    expect(routes).not.toMatch(/^type DashboardErrorCode =/mu);
+    // And every code the contract owns is still reachable from the routes module's own type.
+    for (const code of DASHBOARD_ERROR_CODES) {
+      expect(isDashboardErrorCode(code)).toBe(true);
+    }
+  });
+
   it("keeps query vocabulary separate from response enums and pins byte boundaries", () => {
     expect(DASHBOARD_QUERY_INCLUDE_REPAIR_VALUES).toEqual(["0", "1"]);
     expect(DASHBOARD_QUERY_ATTRIBUTION_VALUES).toEqual(["relay-held", "caller-operated", "all"]);

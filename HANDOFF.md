@@ -362,15 +362,30 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   and `llm-relay dashboard <anything>` ignoring extra positionals (C2 N10). Both re-verified
   2026-08-25 and kept, with the reasons worth knowing:
   - **N8** would be a versioned WIRE change (`malformed_body` added to a frozen enum) for a code
-    no consumer reads — the SPA never looks at it and the route tests assert status only. ⚠ The
-    real hazard in that area is not the code but the **duplicate union at
-    `src/dashboard-routes.ts` restating the contract's codes by hand**, which would drift silently.
-  - **N10** is the house style for the whole read-only command family (`candidates`, `cost`,
-    `pools`, `models`, `telemetry`, `ping` all ignore extras); exact arity exists only on the
-    mutating/custody surfaces. Tightening `dashboard` alone makes it the odd one out. ⚠ The
-    adjacent behaviour worth a guard is that an UNRECOGNIZED command falls through to `runProxy()`,
-    so `llm-relay dashbaord` starts the proxy — loud (banner or EADDRINUSE), but wrong. If this is
-    ever done, build one shared unknown-command guard off `CLI_COMMAND_NAMES`, not a special case.
+    no consumer reads — the SPA never looks at it and the route tests assert status only. ✅ The
+    real hazard in that area was not the code but the duplicate union in `src/dashboard-routes.ts`
+    restating the contract's ten codes by hand, and **that is FIXED (2026-08-25)**: the module now
+    imports `DashboardErrorCode` from the contract, so removing a code there is a compile error in
+    the routes file (mutation-checked) instead of a silent divergence. Pinned by "the error-code
+    vocabulary has ONE definition — routes must not restate it", the same mechanical guard as
+    `test/destructive-coverage.test.ts`'s "cli.ts no longer hand-copies the list".
+  - **N10** itself is kept: ignoring extra positionals is the house style for the whole read-only
+    command family (`candidates`, `cost`, `pools`, `models`, `telemetry`, `ping`); exact arity
+    exists only on the mutating/custody surfaces, and tightening `dashboard` alone would make it
+    the odd one out. ✅ The adjacent behaviour it sat next to — an UNRECOGNIZED command falling
+    through to `runProxy()`, so a mistyped command started a relay instead of reporting the typo —
+    is **FIXED (2026-08-25)** as the shared guard this line asked for: `dispatchDashboardOrProxy`
+    refuses a positional that is not in `CLI_COMMAND_NAMES` (exit 1, naming the token, bounded),
+    while a KNOWN name still falls through exactly as before and a bare `llm-relay` still starts
+    the proxy. ⚠ Second-order benefit: a value-taking flag missing from `VALUE_FLAGS` pushes its
+    VALUE into command position — the hazard that constant's comment warns about after `--host
+    routed` was parsed as a lane id — and that now fails loudly rather than quietly starting a
+    proxy or selecting the wrong lane.
+- **Found while exercising the CLI on 2026-08-25, fixed:** the control token was not gitignored.
+  It normally lives in `~/.llm-relay/`, but its directory is resolved from the CONFIG's own path,
+  so `llm-relay --config ./config.json` run inside this checkout mints a 256-bit capability into
+  the repo root — beside the `config.json` that .gitignore already covers for the same reason.
+  `git add -A` would have staged it. `control-token` is now ignored.
 - SPA/test nits standing (C3): flat 30 s poll with no failure backoff (mitigated by
   abort-on-hide/offline), CSS-structure test mirroring styles.css, a few wall-clock-sleep tests,
   dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than

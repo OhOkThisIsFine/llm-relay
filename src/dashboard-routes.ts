@@ -13,6 +13,11 @@ import {
   DASHBOARD_MEDIA_TYPE,
   DASHBOARD_ERROR_SCHEMA,
   DASHBOARD_ERROR_MESSAGES,
+  // ⚠ The CONTRACT owns this vocabulary. This module used to restate all ten codes as its own
+  // local union — two definitions of one closed set, in the one place a drift is invisible: adding
+  // a code to the contract left this file silently unable to name it, and dropping one here left a
+  // route emitting a code the validator would reject. Import it; never re-type it.
+  type DashboardErrorCode,
   isDashboardDetailV1,
   isDashboardFailureKind,
   isDashboardMediaType,
@@ -548,18 +553,6 @@ function errorMessage(code: DashboardErrorCode): (typeof DASHBOARD_ERROR_MESSAGE
   if (code === "not_found") return "Requested dashboard data was not found.";
   return "Request could not be completed.";
 }
-
-type DashboardErrorCode =
-  | "malformed_query"
-  | "invalid_auth"
-  | "forbidden"
-  | "not_found"
-  | "method_not_allowed"
-  | "unsupported_version"
-  | "replay"
-  | "oversized"
-  | "unsupported_content_type"
-  | "internal";
 
 function jsonBytes(value: unknown): Uint8Array {
   return Buffer.from(JSON.stringify(value), "utf8");
