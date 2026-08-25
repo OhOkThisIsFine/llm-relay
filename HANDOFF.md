@@ -42,9 +42,11 @@ keys. ⚠ **One casualty: the NVIDIA key in the keystore is 403-dead** ("Authori
 completions while `/models` authenticates — the exact 2026-08-23 outage signature). Most likely
 cause: the migrating session's inherited environment PREDATED that morning's key rotation, so the
 stale pre-rotation key was imported and the fresh one was then removed from HKCU with the sweep.
-The fresh key was NOT recoverable from this machine; recovery is `llm-relay keys rotate nim`
-(stdin) with the key from the NVIDIA console or a freellmapi export. Until then nim's cells
-credential-fault and demote; the relay serves around NIM by design. Lesson recorded: verify each
+**RESOLVED the same evening:** the owner supplied the fresh key; `llm-relay keys rotate nim`
+(piped stdin, from a shadow-free process) stored it, the rotation's narrowed live clear dropped
+nim's credential faults through the token-gated endpoint leaving other cooldowns untouched, and
+kimi-k3 answered HTTP 200 through the relay — the full Packet 3 lifecycle exercised in production.
+Lesson recorded: verify each
 migrated credential LIVE (a real completion) before deleting its env source — a User-scope
 rotation invisible to an old session is exactly the `winenv` class of bug, on the operator side
 this time.
