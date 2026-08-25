@@ -28,7 +28,7 @@ anywhere else in `src/`.
 
 | # | Finding | Site | Kind | Delta | Risk |
 |---|---|---|---|---|---|
-| 1 | Dialect rescue emits two `finish_reason`s, dropping the rescued tool call | `src/openai-dialect.ts:418-424` | correctness | ~+3 | low |
+| 1 | Dialect rescue emits two `finish_reason`s, dropping the rescued tool call — **FIXED 2026-08-25** | `src/openai-dialect.ts` | correctness | +16 (landed) | low |
 | 2 | Seven walk-exhaustion exits hand-copied across the two fronts | `src/server.ts` (6 sites) | duplication | ~-150 | medium |
 | 3 | Four SSE boundary detectors, two of which disagree | 4 modules | duplication + drift | ~-40 | low |
 | 4 | 35 exported bindings with zero callers | `src/accounting-store-schema.ts` | dead code | ~-75 | low |
@@ -41,12 +41,12 @@ rejected, and none of these findings need it.
 
 ## 2. The one defect
 
-### 1. Dialect rescue emits `finish_reason` twice, and the client keeps the first — VERIFIED
+### 1. Dialect rescue emits `finish_reason` twice, and the client keeps the first — VERIFIED; FIXED 2026-08-25
 
-**Site:** [src/openai-dialect.ts:418-424](../src/openai-dialect.ts#L418-L424), inside
-`recoverDialectInOpenAiChatStream`'s `processEvent`. Supporting shapes:
-[`withoutContent`, lines 190-197](../src/openai-dialect.ts#L190-L197) and
-[`recoveredEvents`, lines 213-236](../src/openai-dialect.ts#L213-L236).
+**Site:** `src/openai-dialect.ts`, inside `recoverDialectInOpenAiChatStream`'s `processEvent`.
+Supporting shapes: `withoutContent` and `recoveredEvents`. (All line references in this section are
+to the PRE-FIX source at `05e2408`; the defect description below is kept as the record of what was
+wrong.)
 
 **What happens now.** When a chunk closes a choice, the code removes that choice from the outgoing
 chunk so the recovered `tool_calls` can carry the terminal `finish_reason` instead:
@@ -102,6 +102,49 @@ never invents a tool call. Byte-exactness does not apply — this lane is alread
 
 A runnable reproduction is saved outside the repository at
 `…/scratchpad/finishreason-repro.test.ts`; it belongs in `test/` as a pinning test if this is fixed.
+(Superseded: the fix landed with pinning tests — see the Resolution below.)
+
+**Resolution, 2026-08-25.** `processEvent` now records the output slot for each choice on every push
+and resets it for every `rawChoice`. When settlement supersedes an upstream finish, the slot is
+rewritten with `finish_reason: null` if its delta still carries content or another key; only an
+empty-delta shell is removed. This preserves the safe prefix when a marker and finish land together,
+while the existing content-free `STOP` shape keeps its prior wire output. The recovered `tool_calls`
+delta is followed by exactly one terminal `finish_reason: "tool_calls"`.
+
+The two adjacent hazards were both reachable and are fixed in the same change:
+
+- A finish-bearing settle with trailing prose produces non-empty `recovered.text` after
+  `stripEnvelopes`; `recoveredEvents` used to copy the upstream `"stop"` onto that prose event.
+  Recovered prose now explicitly carries `finish_reason: null`.
+- A final suffix such as `｜DSML` is a proper prefix of a marker, so `scanForMarker` withholds it
+  (`safeLen < text.length`) without entering capture. The safe-text choice used to retain the
+  finish, while `settleChoice` generated the tail before it with a second finish. The outgoing slot
+  now has its finish stripped and the generated tail is emitted after the safe text, retaining the
+  choice's sole `"stop"` on the last event.
+
+`test/openai-dialect-passthrough.test.ts` pins all three shapes, including tool-call-before-terminal
+ordering and prefix-before-tail order, plus (added in adversarial review) the non-capturing splice
+of an empty finish shell and per-choice slot independence in a two-choice chunk. No existing assertion pinned the broken shape.
+`src/dialect-stream.ts` needed no change: it does not search an output array by identity; capture
+suppresses upstream `message_delta` / `message_stop`, `finish()` emits one relay-authored tail, and
+its `finished` guard prevents the `message_stop` plus end-of-stream paths from emitting that tail
+twice.
+
+Final gate:
+
+```text
+Test Files 108 passed (108)
+Tests 2281 passed | 5 skipped (2286)
+Test Files 5 passed (5)
+Tests 32 passed (32)
+{"assets":2,"dashboardFiles":5,"dashboardRawBytes":254345,"jsBytes":240447,"cssBytes":12674,"htmlBytes":383,"manifestBytes":185,"packBytes":1000759,"unpackedBytes":4844747,"packageEntries":284}
+packed dashboard smoke passed: llm-relay-0.47.0.tgz
+```
+
+Deliberately not done: no `dialect-stream.ts` edit — it does not share the defect class (no
+identity lookup; capture suppresses the upstream terminal events; a `finished` guard covers the
+double-settle paths). Reviewed adversarially (fresh-context native Opus, verdict MERGE): the
+reviewer reconstructed the pre-fix code and measured all three pinned shapes failing on it.
 
 ## 3. Confirmed duplication
 

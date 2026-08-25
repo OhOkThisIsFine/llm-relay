@@ -195,6 +195,11 @@ function withoutContent(choice: Record<string, unknown>): Record<string, unknown
   return hasOtherDelta || hasFinish ? { ...choice, delta } : null;
 }
 
+function withoutFinishReason(choice: Record<string, unknown>): Record<string, unknown> | null {
+  const delta = isRecord(choice.delta) ? choice.delta : {};
+  return Object.keys(delta).length > 0 ? { ...choice, finish_reason: null } : null;
+}
+
 /**
  * `type` defaults to `upstream_error` because that is what an in-band stream failure normally is.
  * A relay-authored refusal passes its own type so the commit probe reads it as LOCAL and the walk
@@ -218,7 +223,9 @@ function recoveredEvents(
 ): string[] {
   const chunks: string[] = [];
   if (recovered.text.length > 0) {
-    chunks.push(encodeEvent(eventName, withChoices(template, [withContent(choice, recovered.text)])));
+    chunks.push(encodeEvent(eventName, withChoices(template, [
+      withContent({ ...choice, finish_reason: null }, recovered.text),
+    ])));
   }
   chunks.push(encodeEvent(eventName, withChoices(template, [{
     ...choice,
@@ -359,12 +366,25 @@ export function recoverDialectInOpenAiChatStream(
 
         let modified = false;
         const outputChoices: unknown[] = [];
-        const generatedBefore: string[] = [];
         const generatedAfter: string[] = [];
 
         for (const [position, rawChoice] of event.data.choices.entries()) {
+          let outputSlot: number | null = null;
+          const pushOutputChoice = (choice: unknown) => {
+            outputSlot = outputChoices.length;
+            outputChoices.push(choice);
+          };
+          const stripOutputFinishReason = () => {
+            if (outputSlot === null) return;
+            const choice = outputChoices[outputSlot];
+            if (!isRecord(choice)) return;
+            const residual = withoutFinishReason(choice);
+            if (residual) outputChoices[outputSlot] = residual;
+            else outputChoices.splice(outputSlot, 1);
+            if (!residual) outputSlot = null;
+          };
           if (!isRecord(rawChoice)) {
-            outputChoices.push(rawChoice);
+            pushOutputChoice(rawChoice);
             continue;
           }
           const index = typeof rawChoice.index === "number" ? rawChoice.index : position;
@@ -381,13 +401,13 @@ export function recoverDialectInOpenAiChatStream(
               state.envelope += content;
               modified = true;
               const residual = withoutContent(rawChoice);
-              if (residual) outputChoices.push(residual);
+              if (residual) pushOutputChoice(residual);
             } else {
               const { safeLen, hit } = scanForMarker(state.text);
               if (hit) {
                 const start = markerStart(state.text);
                 const safe = state.text.slice(state.emittedLen, start);
-                if (safe) outputChoices.push(withContent(rawChoice, safe));
+                if (safe) pushOutputChoice(withContent(rawChoice, safe));
                 state.emittedLen = Math.max(start, 0);
                 state.capturing = true;
                 state.envelope = state.text.slice(state.emittedLen);
@@ -395,13 +415,13 @@ export function recoverDialectInOpenAiChatStream(
               } else {
                 const safe = state.text.slice(state.emittedLen, safeLen);
                 const unchanged = safe === content && state.emittedLen === previousLength;
-                if (safe) outputChoices.push(unchanged ? rawChoice : withContent(rawChoice, safe));
+                if (safe) pushOutputChoice(unchanged ? rawChoice : withContent(rawChoice, safe));
                 state.emittedLen = safeLen;
                 if (!unchanged) modified = true;
               }
             }
           } else if (!state.finished) {
-            outputChoices.push(rawChoice);
+            pushOutputChoice(rawChoice);
           }
 
           if (state.capturing && encoder.encode(state.envelope).byteLength > STREAM_PREFLIGHT_LIMIT) {
@@ -414,20 +434,17 @@ export function recoverDialectInOpenAiChatStream(
 
           if (rawChoice.finish_reason !== null && rawChoice.finish_reason !== undefined && !state.finished) {
             modified = true;
-            const wasCapturing = state.capturing;
             const generated = await settleChoice(index, state, event.eventName);
             if (terminated) return;
-            if (wasCapturing) {
-              const outputIndex = outputChoices.indexOf(rawChoice);
-              if (outputIndex >= 0) outputChoices.splice(outputIndex, 1);
+            // Strip only when settlement produced replacement events: stripping with nothing
+            // generated would leave the choice with no terminal finish_reason at all.
+            if (generated.length > 0) {
+              stripOutputFinishReason();
               generatedAfter.push(...generated);
-            } else {
-              generatedBefore.push(...generated);
             }
           }
         }
 
-        for (const generated of generatedBefore) push(generated);
         if (!modified) push(event.raw);
         else if (outputChoices.length > 0) push(encodeEvent(event.eventName, withChoices(event.data, outputChoices)));
         for (const generated of generatedAfter) push(generated);
