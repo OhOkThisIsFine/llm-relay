@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAccountingRequest } from "../src/accounting.js";
 import { createAccountingStore, type AccountingStore } from "../src/accounting-store.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
-import { clearCooldowns } from "../src/cooldown-clear.js";
+import { clearCooldowns, isCooldownClearResult } from "../src/cooldown-clear.js";
 import type { Config } from "../src/config.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import { makeCredentialId } from "../src/credential-id.js";
@@ -96,6 +96,96 @@ function scopeSignature(scope: FactScope): string {
       return `model:${scope.model}`;
   }
 }
+
+describe("cooldown-clear wire validation", () => {
+  it("shares the cleared envelope while caller-owned target-key policies stay distinct", () => {
+    const cleared = {
+      breakerCells: { count: 0, items: [] },
+      credentialFaults: {
+        count: 1,
+        items: [{ provider: "p", model: "m", credential: "work" }],
+      },
+      facts: {
+        count: 1,
+        items: [{
+          kind: "credential-invalid",
+          scope: { kind: "attempt", provider: "p", credentialId: "p#work", model: "m" },
+        }],
+      },
+    };
+    const cliTarget = { provider: "p", credential: "work" };
+    const rotationTarget = {
+      provider: "p",
+      credential: "work",
+      kinds: ["credential-fault"] as const,
+    };
+    const cliPayload = { target: cliTarget, cleared };
+    const rotationPayload = { target: rotationTarget, cleared };
+
+    expect(isCooldownClearResult(cliPayload, cliTarget, ["provider", "credential"])).toBe(true);
+    expect(isCooldownClearResult(rotationPayload, cliTarget, ["provider", "credential"])).toBe(false);
+    expect(isCooldownClearResult(cliPayload, rotationTarget, ["provider", "credential", "kinds"])).toBe(false);
+    expect(isCooldownClearResult(
+      rotationPayload,
+      rotationTarget,
+      ["provider", "credential", "kinds"],
+    )).toBe(true);
+  });
+
+  it("pins the cleared-half rules where the narrowed policy genuinely diverges", () => {
+    // Rotation must retract only credential faults; allowance-exhausted, rate-limit cooldowns
+    // and the escalation ladder survive. These two payloads are the divergence: each is a valid
+    // WIDE clear and an invalid NARROWED one, so a regression that widened the narrowed policy
+    // flips exactly these assertions.
+    const rotationTarget = {
+      provider: "p",
+      credential: "work",
+      kinds: ["credential-fault"] as const,
+    };
+    const rotationKeys = ["provider", "credential", "kinds"] as const;
+    const wideTarget = { provider: "p", credential: "work" };
+    const wideKeys = ["provider", "credential"] as const;
+    const empty = { count: 0, items: [] };
+
+    const breakerCellsCleared = {
+      breakerCells: { count: 1, items: [{ provider: "p", model: "m", credential: "work" }] },
+      credentialFaults: empty,
+      facts: empty,
+    };
+    expect(isCooldownClearResult(
+      { target: rotationTarget, cleared: breakerCellsCleared },
+      rotationTarget,
+      rotationKeys,
+    )).toBe(false);
+    expect(isCooldownClearResult(
+      { target: wideTarget, cleared: breakerCellsCleared },
+      wideTarget,
+      wideKeys,
+    )).toBe(true);
+
+    const coolingFactCleared = {
+      breakerCells: empty,
+      credentialFaults: empty,
+      facts: {
+        count: 1,
+        items: [{
+          kind: "rate-limited",
+          scope: { kind: "attempt", provider: "p", credentialId: "p#work", model: "m" },
+        }],
+      },
+    };
+    expect(isCooldownClearResult(
+      { target: rotationTarget, cleared: coolingFactCleared },
+      rotationTarget,
+      rotationKeys,
+    )).toBe(false);
+    expect(isCooldownClearResult(
+      { target: wideTarget, cleared: coolingFactCleared },
+      wideTarget,
+      wideKeys,
+    )).toBe(true);
+  });
+});
 
 describe("operator cooldown clearing", () => {
   let dir: string;

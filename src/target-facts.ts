@@ -113,7 +113,13 @@ const CONDITIONS: ReadonlySet<FactKind> = new Set([
   "not-servable", "subscription-required", "allowance-exhausted", "credential-invalid", "rate-limited",
 ]);
 const COST_BLOCKING: ReadonlySet<FactKind> = new Set(["not-servable", "subscription-required"]);
-const COOLING: ReadonlySet<FactKind> = new Set(["allowance-exhausted", "credential-invalid", "rate-limited"]);
+/**
+ * Exported so consumers validating cleared-fact echoes (`cooldown-clear.ts`) import the set
+ * rather than re-typing it — the `DashboardErrorCode` precedent. A hand copy that lagged this
+ * set would reject the relay's own valid response as malformed.
+ */
+export const COOLING_FACT_KINDS: ReadonlySet<FactKind> = new Set(["allowance-exhausted", "credential-invalid", "rate-limited"]);
+const COOLING = COOLING_FACT_KINDS;
 /**
  * The kinds whose `until` may answer a QUOTA row's `resetsAt` (`availability.ts`
  * `factResetInputs`). Exported so the availability ladder and `llm-relay candidates` share one
