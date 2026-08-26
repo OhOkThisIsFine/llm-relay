@@ -26,7 +26,7 @@ import { materializeDynamicPools } from "./dynamic-pools.js";
 import { type QuotaObservation } from "./quota-observation.js";
 import { observedRateLimits } from "./rate-limits.js";
 import { resolveConfiguredLimits } from "./configured-limits.js";
-import { evaluateHardCap } from "./hard-cap.js";
+import { createHardCapLedgerReader, evaluateHardCap } from "./hard-cap.js";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import {
   collectQuotaBuckets,
@@ -609,18 +609,7 @@ export async function buildCandidates(
       provider,
       credentialLabel: slot.label,
       model: model ?? null,
-      usedInWindow:
-        opts.accounting === undefined || opts.accounting === null
-          ? () => ({ value: null, basis: null })
-          : (axis, period, scope) => {
-              const window = opts.accounting!.usedInWindow({
-                credentialId,
-                ...(scope === "deployment" && model !== undefined ? { model } : {}),
-                period,
-                now: nowMs,
-              });
-              return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
-            },
+      usedInWindow: createHardCapLedgerReader(opts.accounting, credentialId, model, nowMs),
       now: nowMs,
     });
 

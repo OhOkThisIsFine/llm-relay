@@ -39,6 +39,7 @@
  * read, never a network call.
  */
 import type { Config } from "./config.js";
+import type { AccountingReader, AccountingStore } from "./accounting-store.js";
 import type { QuotaAxis } from "./quota-observation.js";
 import {
   CONFIGURED_LIMIT_AXES,
@@ -88,7 +89,7 @@ export type HardCapScope = "credential" | "deployment";
  *
  * Axis-aware on purpose: a requests cap must be compared against a requests reading, never
  * against the token figure for the same window — merging the two would compare a count against a
- * token total. Scope-aware for the same reason at the other dimension: the caller narrows its
+ * token total. Scope-aware for the same reason at the other dimension: the factory narrows its
  * `usedInWindow` call to the attempt's model when, and only when, this module says the winning
  * declaration was per-deployment.
  */
@@ -97,6 +98,22 @@ export type HardCapUsedInWindow = (
   period: "minute" | "day",
   scope: HardCapScope,
 ) => LocalUsedReading;
+
+export function createHardCapLedgerReader(
+  accounting: AccountingReader | Pick<AccountingStore, "usedInWindow"> | null | undefined,
+  credentialId: string,
+  model: string | null | undefined,
+  now: number,
+): HardCapUsedInWindow {
+  const ledger = accounting as Pick<AccountingStore, "usedInWindow"> | null | undefined;
+  if (typeof ledger?.usedInWindow !== "function") return () => ({ value: null, basis: null });
+  return (axis, period, scope) => {
+    const window = ledger.usedInWindow({
+      credentialId, ...(scope === "deployment" && model !== null && model !== undefined ? { model } : {}), period, now,
+    });
+    return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
+  };
+}
 
 export interface HardCapInput {
   readonly cfg: Config;
