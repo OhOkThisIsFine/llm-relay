@@ -84,6 +84,24 @@ function scripted(
   });
 }
 
+/** Sends headers and a partial body, then resets so fetch resolves but body consumption fails. */
+function truncatedAfterHeaders(): Promise<{ server: Server; calls: () => number }> {
+  let n = 0;
+  return new Promise((resolve) => {
+    const s = createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        n++;
+        res.writeHead(200, { "content-type": "application/json", "content-length": "1000" });
+        res.flushHeaders();
+        res.write('{"partial":');
+        setTimeout(() => res.destroy(), 10);
+      });
+    });
+    s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+  });
+}
+
 const OK_BODY = JSON.stringify({
   id: "cmpl_ok",
   object: "chat.completion",
@@ -294,6 +312,54 @@ describe("OpenAI front — failover across pool candidates", () => {
     expect(((await resp.json()) as { error: { message: string } }).error.message).toContain("TPM exceeded");
     expect(resp.headers.get("retry-after")).toBe("7"); // the caller can still honour it
     expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p1/m1, p2/m2"); // everything that was tried
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+  });
+
+  it("pins post-header body-failure exhaustion headers and OpenAI error bytes", async () => {
+    // NEW COVERAGE: this previously unpinned shape passes on HEAD too; it is not a regression pin.
+    const a = await truncatedAfterHeaders();
+    const b = await truncatedAfterHeaders();
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+    ])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(502);
+    expect(resp.headers.get("content-type")).toBe("application/json");
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p1/m1, p2/m2");
+    expect(resp.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 0 served: 2x502");
+    expect(await resp.text()).toBe(JSON.stringify({
+      error: {
+        message: "llm-relay: provider response body failed after headers",
+        type: "api_error",
+      },
+    }));
+    expect(a.calls()).toBe(1);
+    expect(b.calls()).toBe(1);
+  });
+
+  it("anthropic front: pins post-header body-failure exhaustion headers and error bytes", async () => {
+    const a = await truncatedAfterHeaders();
+    const b = await truncatedAfterHeaders();
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+    ])));
+
+    const resp = await messages(p);
+    expect(resp.status).toBe(502);
+    expect(resp.headers.get("content-type")).toBe("application/json");
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p1/m1, p2/m2");
+    expect(resp.headers.get(POOL_ATTEMPTS_HEADER)).toBe("2 tried, 0 served: 2x502");
+    expect(await resp.text()).toBe(JSON.stringify({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "llm-relay: provider response body failed after headers",
+      },
+    }));
     expect(a.calls()).toBe(1);
     expect(b.calls()).toBe(1);
   });

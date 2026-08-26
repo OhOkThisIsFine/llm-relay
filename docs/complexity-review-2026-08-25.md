@@ -185,6 +185,21 @@ pre-rejected refactor does not cover. Header content, log fields, and the rule t
 stays the last candidate's real upstream error are all preserved, because the callback keeps each
 front's body shape verbatim.
 
+**Resolution, 2026-08-25.** The six regular exits now pass exit data to `endWalk`, which owns walk
+advancement, unconditional final recording, native-front error emission, and the shared
+`walkExitHeaders` policy. The seventh repair-failure holdout uses `walkExitHeaders` without entering
+`endWalk`, because its dead-turn accounting intentionally differs.
+
+**Recorded residue:** `handle`'s transport-failure exit still emits no `SERVED_BY_HEADER`, while the
+OpenAI front's twin does; this predates the refactor and is now a one-line `servedBy` follow-up. The
+dead-stream exits also preserve their prior liveness spellings: `handle` uses `!res.destroyed`, while
+the OpenAI front uses `!res.writableEnded && !res.destroyed`. One deliberate hardening beyond
+parity, from the delta re-check: the OpenAI dead-stream emission now sits behind a
+`!res.headersSent` guard the old inline site lacked (unreachable pre-commit; matches the sibling
+OpenAI exits), and the helper forces the finalize path when the response died mid-walk even with a
+next candidate in hand — the pre-refactor shape, kept explicit so a relaxed caller guard cannot
+turn it into a silent walk-on.
+
 ### 3. Four SSE boundary detectors, and two of them disagree — VERIFIED; FIXED 2026-08-25
 
 **Sites:** `firstBoundary` at [src/openai-dialect.ts:153](../src/openai-dialect.ts#L153) and
