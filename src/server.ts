@@ -80,7 +80,7 @@ import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedCon
 import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact, type FactResetBasis } from "./target-facts.js";
 import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
-import { evaluateHardCap, hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
+import { createHardCapLedgerReader, evaluateHardCap, hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
   AttemptFailed,
@@ -369,19 +369,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
         provider: attempt.target.provider,
         credentialLabel: parsed?.label ?? null,
         model,
-        usedInWindow:
-          deps.accountingReader !== undefined && typeof (deps.accountingReader as { usedInWindow?: unknown }).usedInWindow === "function"
-            ? (axis, period, scope) => {
-                const window = (deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow">)
-                  .usedInWindow({
-                    credentialId: attempt.credentialId,
-                    ...(scope === "deployment" && model !== null ? { model } : {}),
-                    period,
-                    now,
-                  });
-                return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
-              }
-            : () => ({ value: null, basis: null }),
+        usedInWindow: createHardCapLedgerReader(deps.accountingReader, attempt.credentialId, model, now),
         now,
       });
     } catch {

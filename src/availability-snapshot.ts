@@ -36,7 +36,7 @@ import {
   type LocalUsedReading,
 } from "./availability.js";
 import type { AccountingStore } from "./accounting-store.js";
-import { evaluateHardCap } from "./hard-cap.js";
+import { createHardCapLedgerReader, evaluateHardCap } from "./hard-cap.js";
 import { POOL_PREFIX, splitSpec, type Config } from "./config.js";
 import { factsFor } from "./target-facts.js";
 
@@ -311,17 +311,7 @@ function buildCooldowns(
         provider: name,
         credentialLabel: slot.label,
         model: null,
-        usedInWindow:
-          accounting === undefined || accounting === null
-            ? () => ({ value: null, basis: null })
-            : (axis, period) => {
-                const window = accounting.usedInWindow({
-                  credentialId: slot.credentialId,
-                  period,
-                  now,
-                });
-                return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
-              },
+        usedInWindow: createHardCapLedgerReader(accounting, slot.credentialId, null, now),
         now,
       });
       if (verdict !== null) push(

@@ -26,13 +26,13 @@ import {
   SERVED_BY_HEADER,
 } from "../src/backend.js";
 import { buildCandidates } from "../src/candidates.js";
-import { evaluateHardCap, hardCapLabel } from "../src/hard-cap.js";
+import { createHardCapLedgerReader, evaluateHardCap, hardCapLabel } from "../src/hard-cap.js";
 import { resolveConfiguredLimits } from "../src/configured-limits.js";
 import { loadConfig } from "../src/config.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import { createAccountingRequest } from "../src/accounting.js";
-import { createAccountingStore } from "../src/accounting-store.js";
+import { createAccountingStore, type UsedInWindowOptions } from "../src/accounting-store.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
 import type { Config, ProviderConfig } from "../src/config.js";
 
@@ -974,7 +974,7 @@ describe("ordering and /candidates surface", () => {
     const now = Date.now();
     const cfg = baseCfg({ pools: { coding: ["a/m"] } }, { limits: { models: { m: { hard: { rpd: 3 } } } } });
     // 9 requests on this credential today, every one of them on a different deployment.
-    const usedInWindow = (options: { credentialId: string; model?: string; period: string }) =>
+    const usedInWindow = (options: UsedInWindowOptions) =>
       options.model === "m"
         ? { requests: 0, tokens: null, basis: "reported" as const }
         : { requests: 9, tokens: null, basis: "reported" as const };
@@ -983,25 +983,24 @@ describe("ordering and /candidates surface", () => {
       breaker: new CircuitBreaker(),
       tierData: null,
       nowMs: now,
-      accounting: { usedInWindow } as never,
+      accounting: { usedInWindow },
     });
     const row = view.candidates.find((c) => c.provider === "a" && c.model === "m")!;
     expect(row.hardCap).toBeNull();
 
-    // The request path's own wiring, verbatim from server.ts: narrow by the scope the evaluator asks
+    // Request path and /candidates share this adapter: narrow by the scope the evaluator asks
     // for, never by a scope the caller picked.
+    const ledgerReader = createHardCapLedgerReader({ usedInWindow }, "a#default", "m", now);
     const enforced = evaluateHardCap({
       cfg,
       provider: "a",
       credentialLabel: "default",
       model: "m",
-      usedInWindow: (axis, period, scope) => {
-        const w = usedInWindow({ credentialId: "a#default", ...(scope === "deployment" ? { model: "m" } : {}), period });
-        return { value: axis === "requests" ? w.requests : w.tokens, basis: w.basis };
-      },
+      usedInWindow: ledgerReader,
       now,
     });
     expect(enforced).toBeNull();
+    expect(ledgerReader("requests", "day", "credential").value).toBe(9);
   });
 
   it("/candidates shows the reached cap for its cell, resolved like enforcement resolves it", async () => {
