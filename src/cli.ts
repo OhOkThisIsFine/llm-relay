@@ -2518,31 +2518,7 @@ export async function runCandidates(): Promise<void> {
   process.stdout.write(`Offload targets — ${clientState || `legacy/global: ${view.offload_enabled ? "on" : "off"}`}\n`);
   process.stdout.write(`${view.note}\n\n`);
 
-  const head =
-    "target".padEnd(32) +
-    "credential".padEnd(40) +
-    "pools / tiers".padEnd(24) +
-    "fit".padEnd(7) +
-    "raw".padEnd(7) +
-    "cap".padEnd(11) +
-    "agentic".padEnd(9) +
-    "coding".padEnd(8) +
-    "BFCL".padEnd(7) +
-    "aider".padEnd(7) +
-    "arena".padEnd(7) +
-    "$/Mout".padEnd(8) +
-    "verdict".padEnd(10) +
-    "p95".padEnd(8) +
-    // Latency actually observed on this proxy's own traffic. The synthetic-probe p95 beside it is
-    // routinely blank, so the table could show the first pool member with NO latency signal at all
-    // while the proxy had already measured it at 60+ seconds per call — which is the difference
-    // between a pool that suits mechanical batch work and one that does not.
-    "obs".padEnd(8) +
-    "breaker".padEnd(9) +
-    "ctx";
-  process.stdout.write(head + "\n" + "-".repeat(head.length) + "\n");
-
-  for (const c of view.candidates) {
+  for (const [index, c] of view.candidates.entries()) {
     const credential = candidateCredential(c);
     const tags = [...c.pools, ...c.subagentTiers.map((t) => `@${t}`)].join(",") || "-";
     const live = c.listed === null ? "?" : c.listed ? "yes" : "NO";
@@ -2559,35 +2535,47 @@ export async function runCandidates(): Promise<void> {
         : c.breaker.credentialFault
           ? `AUTH ${c.breaker.lastCredentialStatus ?? ""}`.trim()
           : "closed";
-    process.stdout.write(
-      c.spec.slice(0, 31).padEnd(32) +
-        `${credential.label} (${c.credentialId})`.padEnd(40) +
-        tags.slice(0, 23).padEnd(24) +
-        c.sortInputs.fitness.toFixed(1).padEnd(7) +
-        c.sortInputs.rawStrength.toFixed(1).padEnd(7) +
-        // Capability plus how well-evidenced it is: "76.6/4" = 4 published signals behind it,
-        // "50.0 neut" = nothing known. Never show the number alone.
-        `${c.sortInputs.strength.toFixed(1)}${strengthTag(c)}`.padEnd(11) +
-        fmt(c.scores.aaAgentic).padEnd(9) +
-        fmt(c.scores.aaCoding).padEnd(8) +
-        fmt(c.scores.bfclOverall).padEnd(7) +
-        fmt(c.scores.aiderPassRate).padEnd(7) +
-        (c.scores.arenaRating ? String(Math.round(c.scores.arenaRating)) : "-").padEnd(7) +
-        (c.pricePerMTokOut !== null
-          ? `$${c.pricePerMTokOut}${c.priceSource === "reference" ? "~" : ""}`
-          : "-"
-        ).padEnd(8) +
-        (c.health?.verdict ?? "-").padEnd(10) +
-        fmt(c.health?.p95Ms ?? null, "ms").padEnd(8) +
-        obsLatency(c.observed).padEnd(8) +
-        breaker.padEnd(9) +
-        // Provenance inline: "~" = another provider's figure for this model id. A NIM row must
-        // never present OpenRouter's ceiling as its own.
-        ctx +
+    const columns = [
+      ["target", 32, c.spec.slice(0, 31)],
+      ["credential", 40, `${credential.label} (${c.credentialId})`],
+      ["pools / tiers", 24, tags.slice(0, 23)],
+      ["fit", 7, c.sortInputs.fitness.toFixed(1)],
+      ["raw", 7, c.sortInputs.rawStrength.toFixed(1)],
+      // Capability plus how well-evidenced it is: "76.6/4" = 4 published signals behind it,
+      // "50.0 neut" = nothing known. Never show the number alone.
+      ["cap", 11, `${c.sortInputs.strength.toFixed(1)}${strengthTag(c)}`],
+      ["agentic", 9, fmt(c.scores.aaAgentic)],
+      ["coding", 8, fmt(c.scores.aaCoding)],
+      ["BFCL", 7, fmt(c.scores.bfclOverall)],
+      ["aider", 7, fmt(c.scores.aiderPassRate)],
+      ["arena", 7, c.scores.arenaRating ? String(Math.round(c.scores.arenaRating)) : "-"],
+      ["$/Mout", 8, c.pricePerMTokOut !== null
+        ? `$${c.pricePerMTokOut}${c.priceSource === "reference" ? "~" : ""}`
+        : "-"],
+      ["verdict", 10, c.health?.verdict ?? "-"],
+      ["p95", 8, fmt(c.health?.p95Ms ?? null, "ms")],
+      // Latency actually observed on this proxy's own traffic. The synthetic-probe p95 beside it is
+      // routinely blank, so the table could show the first pool member with NO latency signal at all
+      // while the proxy had already measured it at 60+ seconds per call — which is the difference
+      // between a pool that suits mechanical batch work and one that does not.
+      ["obs", 8, obsLatency(c.observed)],
+      ["breaker", 9, breaker],
+      // Provenance inline: "~" = another provider's figure for this model id. A NIM row must
+      // never present OpenRouter's ceiling as its own. `content` keeps this trailing column unpadded.
+      ["ctx", "content", ctx +
         (c.contextLengthSource === "reference" ? "~" : "") +
-        (live === "NO" ? "  ⚠UNLISTED" : "") +
-        "\n",
-    );
+        (live === "NO" ? "  ⚠UNLISTED" : "")],
+    ] as const;
+    const formatColumns = (part: "heading" | "cell"): string =>
+      columns.map(([heading, width, cell]) => {
+        const content = part === "heading" ? heading : cell;
+        return width === "content" ? content : content.padEnd(width);
+      }).join("");
+    if (index === 0) {
+      const head = formatColumns("heading");
+      process.stdout.write(head + "\n" + "-".repeat(head.length) + "\n");
+    }
+    process.stdout.write(`${formatColumns("cell")}\n`);
     // The resolved ladders print on their own line: raw observations first (what providers
     // said), then the derived view with its basis, so a computed figure never appears without
     // its provenance. Spec §5: unknown stays "-", and a negative remaining prints as-is.
