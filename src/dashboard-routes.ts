@@ -132,15 +132,11 @@ export interface DashboardRouteNotHandled {
 
 export type DashboardRouteResponse = DashboardRouteHandled | DashboardRouteNotHandled;
 
-type RouteKind = "bootstrap" | "session" | "logout" | "snapshot" | "detail";
-
 interface ClassifiedTarget {
-  readonly kind: RouteKind;
-  readonly methodAllowed: readonly string[];
-  readonly path: string;
+  readonly policy: (typeof ROUTE_POLICIES)[number];
   readonly rawQuery: string;
   readonly hasQuery: boolean;
-  readonly requestId?: string;
+  readonly requestId: string | undefined;
 }
 
 interface HeaderRead {
@@ -173,13 +169,13 @@ interface BodyLengthError {
 
 type BodyLengthResult = BodyLengthOk | BodyLengthError;
 
-const ALLOW = Object.freeze({
-  bootstrap: ["POST"] as const,
-  session: ["POST"] as const,
-  logout: ["POST"] as const,
-  snapshot: ["GET", "HEAD"] as const,
-  detail: ["GET", "HEAD"] as const,
-});
+const ROUTE_POLICIES = [
+  { kind: "bootstrap", path: "/dashboard/api/v1/bootstrap", methods: ["POST"], originRequired: false, fetchSite: "read", readsBody: true, controlRequired: true },
+  { kind: "session", path: "/dashboard/api/v1/session", methods: ["POST"], originRequired: true, fetchSite: "write", readsBody: true, controlRequired: false },
+  { kind: "logout", path: "/dashboard/api/v1/logout", methods: ["POST"], originRequired: true, fetchSite: "write", readsBody: true, controlRequired: false },
+  { kind: "snapshot", path: "/dashboard/api/v1/snapshot", methods: ["GET", "HEAD"], originRequired: false, fetchSite: "read", readsBody: false, controlRequired: false },
+  { kind: "detail", path: "/dashboard/api/v1/requests/", methods: ["GET", "HEAD"], originRequired: false, fetchSite: "read", readsBody: false, controlRequired: false },
+] as const;
 
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/u;
 const JSON_CONTENT_TYPE = "application/json";
@@ -212,34 +208,15 @@ function classifyTarget(target: unknown): ClassifiedTarget | null {
   const rawQuery = queryIndex < 0 ? "" : target.slice(queryIndex + 1);
   if (!path.startsWith("/") || path.includes("%") || path.includes("\\") || path.includes("//")) return null;
 
-  if (path === "/dashboard/api/v1/bootstrap") {
-    return { kind: "bootstrap", methodAllowed: ALLOW.bootstrap, path, rawQuery, hasQuery: queryIndex >= 0 };
-  }
-  if (path === "/dashboard/api/v1/session") {
-    return { kind: "session", methodAllowed: ALLOW.session, path, rawQuery, hasQuery: queryIndex >= 0 };
-  }
-  if (path === "/dashboard/api/v1/logout") {
-    return { kind: "logout", methodAllowed: ALLOW.logout, path, rawQuery, hasQuery: queryIndex >= 0 };
-  }
-  if (path === "/dashboard/api/v1/snapshot") {
-    return { kind: "snapshot", methodAllowed: ALLOW.snapshot, path, rawQuery, hasQuery: queryIndex >= 0 };
-  }
+  const policy = ROUTE_POLICIES.find((candidate) => candidate.kind === "detail"
+    ? path.startsWith(candidate.path)
+    : path === candidate.path);
+  if (policy === undefined) return null;
 
-  const detailPrefix = "/dashboard/api/v1/requests/";
-  if (path.startsWith(detailPrefix)) {
-    const suffix = path.slice(detailPrefix.length);
-    if (!isDashboardSafeId(suffix) || suffix.includes("/")) return null;
-    if (!isDashboardRequestId(suffix)) return null;
-    return {
-      kind: "detail",
-      methodAllowed: ALLOW.detail,
-      path,
-      rawQuery,
-      hasQuery: queryIndex >= 0,
-      requestId: suffix,
-    };
-  }
-  return null;
+  const requestId = policy.kind === "detail" ? path.slice(policy.path.length) : undefined;
+  if (requestId !== undefined && (!isDashboardSafeId(requestId) || requestId.includes("/"))) return null;
+  if (requestId !== undefined && !isDashboardRequestId(requestId)) return null;
+  return { policy, rawQuery, hasQuery: queryIndex >= 0, requestId };
 }
 
 function admissionIsAllowed(admission: unknown): admission is DashboardAdmissionAllowed {
@@ -666,8 +643,8 @@ export async function handleDashboardRoute(
     // turn into an unprotected dashboard route; both shapes fail identically closed.
     return errorResponse(403, "forbidden", request.method);
   }
-  if (!target.methodAllowed.includes(request.method)) {
-    return errorResponse(405, "method_not_allowed", request.method, target.methodAllowed);
+  if (!target.policy.methods.some((method) => method === request.method)) {
+    return errorResponse(405, "method_not_allowed", request.method, target.policy.methods);
   }
 
   const accept = readHeader(request.headers, "accept");
@@ -675,17 +652,15 @@ export async function handleDashboardRoute(
     return errorResponse(406, "unsupported_version", request.method);
   }
 
-  const isWrite = target.kind === "bootstrap" || target.kind === "session" || target.kind === "logout";
-  const originRequired = target.kind === "session" || target.kind === "logout";
-  if (!originAllowed(request.headers, request.admission.expectedOrigin, originRequired)) {
+  if (!originAllowed(request.headers, request.admission.expectedOrigin, target.policy.originRequired)) {
     return errorResponse(403, "forbidden", request.method);
   }
-  if (!fetchSiteAllowed(request.headers, isWrite && target.kind !== "bootstrap" ? "write" : "read")) {
+  if (!fetchSiteAllowed(request.headers, target.policy.fetchSite)) {
     return errorResponse(403, "forbidden", request.method);
   }
 
   let declaredBodyLength: number | undefined;
-  if (isWrite) {
+  if (target.policy.readsBody) {
     if (!isPlainJsonContentType(request.headers)) {
       return errorResponse(415, "unsupported_content_type", request.method);
     }
@@ -699,11 +674,11 @@ export async function handleDashboardRoute(
     return errorResponse(queryLimit.status, statusForQueryError(queryLimit.status), request.method);
   }
 
-  if (target.kind === "bootstrap" && !request.admission.controlAuthorized) {
+  if (target.policy.controlRequired && !request.admission.controlAuthorized) {
     return errorResponse(403, "forbidden", request.method);
   }
 
-  if (target.kind === "snapshot") {
+  if (target.policy.kind === "snapshot") {
     const parsed = parseSnapshotQuery(target.rawQuery);
     if (!parsed.ok) return errorResponse(parsed.status, statusForQueryError(parsed.status), request.method);
     const session = await validateSession(dependencies, request.headers, request.method);
@@ -725,7 +700,7 @@ export async function handleDashboardRoute(
     }
   }
 
-  if (target.kind === "detail") {
+  if (target.policy.kind === "detail") {
     const parsed = parseDetailQuery(target.rawQuery, target.requestId ?? "");
     if (!parsed.ok) return errorResponse(parsed.status, statusForQueryError(parsed.status), request.method);
     const session = await validateSession(dependencies, request.headers, request.method);
@@ -749,7 +724,7 @@ export async function handleDashboardRoute(
   const emptyQuery = noQueryAllowed(target);
   if (!emptyQuery.ok) return errorResponse(400, "malformed_query", request.method);
 
-  if (target.kind === "logout") {
+  if (target.policy.kind === "logout") {
     const session = await validateSession(dependencies, request.headers, request.method);
     if (!session.ok) return session.response;
     let body: Uint8Array;
@@ -783,7 +758,7 @@ export async function handleDashboardRoute(
   if (body.byteLength > DASHBOARD_MAX_BODY_BYTES) return errorResponse(413, "oversized", request.method);
   if (declaredBodyLength !== body.byteLength) return errorResponse(400, "malformed_query", request.method);
   const parsedBody = parseJsonBody(body);
-  if (target.kind === "bootstrap") {
+  if (target.policy.kind === "bootstrap") {
     if (!isBootstrapRequest(parsedBody)) return errorResponse(400, "malformed_query", request.method);
     try {
       const result = await dependencies.auth.createBootstrap();
