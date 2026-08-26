@@ -40,7 +40,7 @@ import {
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE } from "./tool-dialects.js";
-import { dialectRefusalSignalOf, ERROR_ORIGIN_HEADER, TOOL_DIALECT_HEADER, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { dialectRefusalSignalOf, ERROR_ORIGIN_HEADER, TOOL_DIALECT_HEADER, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type ErrorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -1473,26 +1473,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           aborted ? { kind: "timeout" } : { kind: "provider-transport" },
         );
         credentialRecorded = true;
-        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
-        if (next && !res.writableEnded && !res.destroyed) {
-          pool429.recordFailover(status, null);
-          continue;
-        }
-
-        pool429.recordFinal(status);
-        const headers: Record<string, string> = {
-          ...(stickyProvenanceHeaders(sticky) ?? {}),
-          ...credentialTrace.headers(),
-        };
-        const summary = pool429.summary();
-        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-        failClosed(
+        const walkEnd = endWalk(
+          h,
           res,
+          "anthropic",
+          credentialWalk,
+          attemptTrace,
+          pool429,
           status,
-          aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
-          Object.keys(headers).length > 0 ? headers : undefined,
+          sticky,
+          credentialTrace,
+          () => baseLog(started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot()),
+          {
+            kind: "transport",
+            message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
+            // Preserved cross-front residue: this handle exit omits served-by while its OpenAI
+            // twin includes it. Unifying it is now a one-line `servedBy` follow-up.
+          },
         );
-        h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot()));
+        if (walkEnd) continue;
         return;
       }
 
@@ -1509,30 +1508,28 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         credentialRecorded = true;
         if (disposition === "cancelled") return;
         const status = disposition === "timeout" ? 504 : 502;
-        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
-        if (next && !res.writableEnded && !res.destroyed) {
-          pool429.recordFailover(status, null);
-          continue;
-        }
-        pool429.recordFinal(status);
-        const headers: Record<string, string> = {
-          [SERVED_BY_HEADER]: tried.join(", "),
-          ...(stickyProvenanceHeaders(sticky) ?? {}),
-          ...credentialTrace.headers(),
-        };
-        const summary = pool429.summary();
-        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-        failClosed(
+        const walkEnd = endWalk(
+          h,
           res,
+          "anthropic",
+          credentialWalk,
+          attemptTrace,
+          pool429,
           status,
-          disposition === "timeout"
-            ? "backend timed out while reading response body"
-            : "llm-relay: provider response body failed after headers",
-          headers,
+          sticky,
+          credentialTrace,
+          () => baseLog(
+            started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot(),
+          ),
+          {
+            kind: "post-header-body-failure",
+            message: disposition === "timeout"
+              ? "backend timed out while reading response body"
+              : "llm-relay: provider response body failed after headers",
+            servedBy: tried.join(", "),
+          },
         );
-        h.logger.write(baseLog(
-          started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot(),
-        ));
+        if (walkEnd) continue;
         return;
       }
       backendRes = inspected.response;
@@ -1602,41 +1599,42 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
             : probe.provenance === "local" ? { kind: "local" } : { kind: "protocol" },
         );
           credentialRecorded = true;
-          const next = probe.provenance === "upstream" && !res.destroyed
-            ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429)
-            : undefined;
-          if (next) {
-            pool429.recordFailover(502, null);
-            continue;
-          }
-
-          pool429.recordFinal(502);
-          const headers: Record<string, string> = {
-            [SERVED_BY_HEADER]: tried.join(", "),
-            // Who produced this status. A dead PRE-COMMIT stream the relay judged `local` is the
-            // proxy's own verdict, and saying so is the header's documented job — it was simply
-            // never written on this path.
-            [ERROR_ORIGIN_HEADER]: probe.provenance,
-            ...(stickyProvenanceHeaders(sticky) ?? {}),
-            ...credentialTrace.headers(),
-            ...(probe.errorType === DIALECT_REFUSED_DESTRUCTIVE_CODE
-              ? { [TOOL_DIALECT_HEADER]: "refused-destructive" }
-              : {}),
-          };
-          const summary = pool429.summary();
-          if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-          failClosed(res, 502, `llm-relay: ${probe.reason}`, headers, probe.errorType);
-          h.logger.write(baseLog(
-            started,
-            path,
-            hadTools,
-            true,
+          const walkEnd = endWalk(
+            h,
+            res,
+            "anthropic",
+            credentialWalk,
+            attemptTrace,
+            pool429,
             502,
-            "skipped",
-            target,
-            attemptTrace.snapshot(),
-            upstreamReportedModel(reportedModelSource),
-          ));
+            sticky,
+            credentialTrace,
+            () => baseLog(
+              started,
+              path,
+              hadTools,
+              true,
+              502,
+              "skipped",
+              target,
+              attemptTrace.snapshot(),
+              upstreamReportedModel(reportedModelSource),
+            ),
+            {
+              kind: "dead-stream",
+              message: `llm-relay: ${probe.reason}`,
+              errorType: probe.errorType,
+                // Who produced this status. A dead PRE-COMMIT stream the relay judged `local` is the
+                // proxy's own verdict, and saying so is the header's documented job — it was simply
+                // never written on this path.
+              errorOrigin: probe.provenance,
+              servedBy: tried.join(", "),
+              shouldTryNext: probe.provenance === "upstream",
+              // Preserved residue: handle gates dead streams on `!res.destroyed`; the OpenAI
+              // front additionally requires `!res.writableEnded`.
+            },
+          );
+          if (walkEnd) continue;
           return;
         }
 
@@ -1711,19 +1709,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           },
           h,
         );
-        if (repairResult !== null) {
-          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "protocol" });
-          credentialRecorded = true;
-          pool429.recordDeadTurn();
+      if (repairResult !== null) {
+        recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "protocol" });
+        credentialRecorded = true;
+        // Deliberate endWalk holdout: this records a dead turn, never records final, and its
+        // continue branch never records failover because recordDeadTurn already counted the cell
+        // and cleared only429. Converting it would need skipFinal/skipFailover flags — exactly the
+        // silent-skip hazard endWalk exists to prevent.
+        pool429.recordDeadTurn();
           const next = !res.destroyed ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429) : undefined;
           if (next) continue;
 
-          const poolSummary = pool429.summary();
-          const headers: Record<string, string> = {
-            ...(stickyProvenanceHeaders(sticky) ?? {}),
-            ...credentialTrace.headers(),
-          };
-          if (poolSummary) headers[POOL_ATTEMPTS_HEADER] = poolSummary;
+        const headers = walkExitHeaders(pool429, sticky, credentialTrace);
           failClosed(
             res,
             502,
@@ -2135,6 +2132,107 @@ function nextUncappedAttempt(
     attemptTrace.recordCapped(candidate.target, now);
     walk.recordRejected(candidate);
   }
+}
+
+type WalkExitKind = "transport" | "post-header-body-failure" | "dead-stream";
+
+interface WalkExitData {
+  kind: WalkExitKind;
+  message: string;
+  errorType?: string | undefined;
+  errorOrigin?: ErrorOrigin;
+  servedBy?: string;
+  shouldTryNext?: boolean;
+}
+
+function walkExitHeaders(
+  tracker: Pool429Tracker,
+  sticky: StickyRequestContext | null | undefined,
+  credentialTrace: CredentialAttemptTrace,
+  {
+    errorOrigin,
+    errorType,
+    servedBy,
+  }: Pick<WalkExitData, "errorOrigin" | "errorType" | "servedBy"> = {},
+): Record<string, string> {
+  const before: Record<string, string> = {};
+  if (servedBy !== undefined) before[SERVED_BY_HEADER] = servedBy;
+  if (errorOrigin !== undefined) before[ERROR_ORIGIN_HEADER] = errorOrigin;
+
+  const after = errorType === DIALECT_REFUSED_DESTRUCTIVE_CODE
+    ? { [TOOL_DIALECT_HEADER]: "refused-destructive" }
+    : {};
+  const headers: Record<string, string> = {
+    ...before,
+    ...(stickyProvenanceHeaders(sticky) ?? {}),
+    ...credentialTrace.headers(),
+    ...after,
+  };
+  const summary = tracker.summary();
+  if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+  return headers;
+}
+
+function endWalk(
+  h: Handlers,
+  res: ServerResponse,
+  front: "anthropic" | "openai",
+  walk: CredentialWalk,
+  attemptTrace: RequestAttemptTrace,
+  tracker: Pool429Tracker,
+  status: number,
+  sticky: StickyRequestContext | null | undefined,
+  credentialTrace: CredentialAttemptTrace,
+  log: () => RequestLog,
+  exit: WalkExitData,
+): boolean {
+  const shouldTryNext = exit.shouldTryNext ?? true;
+  let next: ResolvedAttempt | undefined;
+
+  if (exit.kind === "dead-stream") {
+    // Dead streams gate liveness BEFORE advancing the walk. That preserves the old lazy policy:
+    // capped/rejected cells are not recorded after the client side is already dead. The two
+    // fronts' liveness spellings intentionally remain different pending a separate unification.
+    const canContinue = front === "anthropic"
+      ? !res.destroyed
+      : !res.writableEnded && !res.destroyed;
+    next = shouldTryNext && canContinue
+      ? nextUncappedAttempt(h, walk, attemptTrace, tracker)
+      : undefined;
+  } else {
+    // Transport and post-header failures advance BEFORE checking response liveness. Preserve that
+    // eager ordering: recordCapped/walk.recordRejected must still fire for skipped capped cells.
+    next = shouldTryNext ? nextUncappedAttempt(h, walk, attemptTrace, tracker) : undefined;
+    // A response that died mid-walk forces the FINALIZE path even with a next candidate in hand
+    // (the pre-refactor shape): walking on for a gone client would spend another upstream request
+    // with no recordFinal and no log record at this exit. Unreachable today only because every
+    // eager caller pre-guards on res liveness — this keeps the helper safe if one stops.
+    if (res.writableEnded || res.destroyed) next = undefined;
+  }
+
+  if (next) {
+    tracker.recordFailover(status, null);
+    return true;
+  }
+
+  tracker.recordFinal(status);
+  const headers = walkExitHeaders(tracker, sticky, credentialTrace, exit);
+  if (front === "anthropic") {
+    failClosed(
+      res,
+      status,
+      exit.message,
+      Object.keys(headers).length > 0 ? headers : undefined,
+      exit.errorType,
+    );
+  } else if (!res.headersSent) {
+    res.writeHead(status, { "content-type": "application/json", ...headers });
+    res.end(JSON.stringify({
+      error: { message: exit.message, type: exit.errorType ?? "api_error" },
+    }));
+  }
+  h.logger.write(log());
+  return false;
 }
 
 /**
@@ -3523,42 +3621,33 @@ async function openAiFrontPath(
           aborted ? { kind: "timeout" } : { kind: "provider-transport" },
         );
         credentialRecorded = true;
-        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
-        if (next && !res.writableEnded && !res.destroyed) {
-          pool429.recordFailover(status, null);
-          continue;
-        }
-
-        pool429.recordFinal(status);
-        const headers: Record<string, string> = {
-          "content-type": "application/json",
-          [SERVED_BY_HEADER]: tried.join(", "),
-          ...(stickyProvenanceHeaders(ctx.sticky) ?? {}),
-          ...credentialTrace.headers(),
-        };
-        const summary = pool429.summary();
-        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-        if (!res.headersSent) {
-          res.writeHead(status, headers);
-          res.end(JSON.stringify({
-            error: {
-              message: aborted
-                ? "backend timed out"
-                : `backend unreachable: ${(e as Error).message}`,
-              type: "api_error",
-            },
-          }));
-        }
-        h.logger.write(baseLog(
-          ctx.started,
-          ctx.path,
-          ctx.hadTools,
-          false,
+        const walkEnd = endWalk(
+          h,
+          res,
+          "openai",
+          credentialWalk,
+          attemptTrace,
+          pool429,
           status,
-          "skipped",
-          target,
-          attemptTrace.snapshot(),
-        ));
+          ctx.sticky,
+          credentialTrace,
+          () => baseLog(
+            ctx.started,
+            ctx.path,
+            ctx.hadTools,
+            false,
+            status,
+            "skipped",
+            target,
+            attemptTrace.snapshot(),
+          ),
+          {
+            kind: "transport",
+            message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
+            servedBy: tried.join(", "),
+          },
+        );
+        if (walkEnd) continue;
         return;
       }
 
@@ -3576,34 +3665,28 @@ async function openAiFrontPath(
         credentialRecorded = true;
         if (disposition === "cancelled") return;
         const status = disposition === "timeout" ? 504 : 502;
-        const next = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
-        if (next && !res.writableEnded && !res.destroyed) {
-          pool429.recordFailover(status, null);
-          continue;
-        }
-        pool429.recordFinal(status);
-        const headers: Record<string, string> = {
-          "content-type": "application/json",
-          [SERVED_BY_HEADER]: tried.join(", "),
-          ...(stickyProvenanceHeaders(ctx.sticky) ?? {}),
-          ...credentialTrace.headers(),
-        };
-        const summary = pool429.summary();
-        if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-        if (!res.headersSent) {
-          res.writeHead(status, headers);
-          res.end(JSON.stringify({
-            error: {
-              message: disposition === "timeout"
-                ? "backend timed out while reading response body"
-                : "llm-relay: provider response body failed after headers",
-              type: "api_error",
-            },
-          }));
-        }
-        h.logger.write(baseLog(
-          ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target, attemptTrace.snapshot(),
-        ));
+        const walkEnd = endWalk(
+          h,
+          res,
+          "openai",
+          credentialWalk,
+          attemptTrace,
+          pool429,
+          status,
+          ctx.sticky,
+          credentialTrace,
+          () => baseLog(
+            ctx.started, ctx.path, ctx.hadTools, false, status, "skipped", target, attemptTrace.snapshot(),
+          ),
+          {
+            kind: "post-header-body-failure",
+            message: disposition === "timeout"
+              ? "backend timed out while reading response body"
+              : "llm-relay: provider response body failed after headers",
+            servedBy: tried.join(", "),
+          },
+        );
+        if (walkEnd) continue;
         return;
       }
       upstream = inspected.response;
@@ -3673,42 +3756,39 @@ async function openAiFrontPath(
             : probe.provenance === "local" ? { kind: "local" } : { kind: "protocol" },
         );
           credentialRecorded = true;
-          const next = probe.provenance === "upstream" && !res.writableEnded && !res.destroyed
-            ? nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429)
-            : undefined;
-          if (next) {
-            pool429.recordFailover(502, null);
-            continue;
-          }
-
-          pool429.recordFinal(502);
-          const headers: Record<string, string> = {
-            "content-type": "application/json",
-            [SERVED_BY_HEADER]: tried.join(", "),
-            [ERROR_ORIGIN_HEADER]: probe.provenance,
-            ...(stickyProvenanceHeaders(ctx.sticky) ?? {}),
-            ...credentialTrace.headers(),
-            ...(probe.errorType === DIALECT_REFUSED_DESTRUCTIVE_CODE
-              ? { [TOOL_DIALECT_HEADER]: "refused-destructive" }
-              : {}),
-          };
-          const summary = pool429.summary();
-          if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
-          res.writeHead(502, headers);
-          res.end(JSON.stringify({
-            error: { message: `llm-relay: ${probe.reason}`, type: probe.errorType ?? "api_error" },
-          }));
-          h.logger.write(baseLog(
-            ctx.started,
-            ctx.path,
-            ctx.hadTools,
-            true,
+          const walkEnd = endWalk(
+            h,
+            res,
+            "openai",
+            credentialWalk,
+            attemptTrace,
+            pool429,
             502,
-            "skipped",
-            target,
-            attemptTrace.snapshot(),
-            upstreamReportedModel(reportedModelSource),
-          ));
+            ctx.sticky,
+            credentialTrace,
+            () => baseLog(
+              ctx.started,
+              ctx.path,
+              ctx.hadTools,
+              true,
+              502,
+              "skipped",
+              target,
+              attemptTrace.snapshot(),
+              upstreamReportedModel(reportedModelSource),
+            ),
+            {
+              kind: "dead-stream",
+              message: `llm-relay: ${probe.reason}`,
+              errorType: probe.errorType,
+              errorOrigin: probe.provenance,
+              servedBy: tried.join(", "),
+              shouldTryNext: probe.provenance === "upstream",
+              // Preserved residue: OpenAI dead streams require both writable-open and not
+              // destroyed; handle's Anthropic path checks only `!res.destroyed`.
+            },
+          );
+          if (walkEnd) continue;
           return;
         }
 
