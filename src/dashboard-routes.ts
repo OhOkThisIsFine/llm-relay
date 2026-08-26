@@ -47,6 +47,7 @@ import {
   type DashboardSessionResult,
 } from "./dashboard-auth.js";
 import { DASHBOARD_STATIC_SECURITY_HEADERS } from "./dashboard-static.js";
+import { hasExactKeys, isRecord } from "./json-shape.js";
 
 export { DASHBOARD_MEDIA_TYPE } from "./dashboard-contract.js";
 
@@ -183,16 +184,6 @@ const ALLOW = Object.freeze({
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/u;
 const JSON_CONTENT_TYPE = "application/json";
 const SAFE_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/u;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  if (!isRecord(value) || Object.getOwnPropertySymbols(value).length !== 0) return false;
-  const own = Object.keys(value);
-  return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
-}
 
 function readHeader(headers: DashboardHeaderMap, name: string): HeaderRead {
   if (!Object.prototype.hasOwnProperty.call(headers, name)) {

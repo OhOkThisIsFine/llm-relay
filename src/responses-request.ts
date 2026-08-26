@@ -1,3 +1,5 @@
+import { isRecord } from "./json-shape.js";
+
 /**
  * OpenAI Responses REQUEST → Anthropic Messages REQUEST.
  *
@@ -78,10 +80,6 @@
 import { RequestMappingError } from "./openai-request.js";
 
 type Rec = Record<string, unknown>;
-
-function isRecord(v: unknown): v is Rec {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
 
 /** Name an unexpected type in an error without echoing an arbitrary payload back at the caller. */
 function describeType(t: unknown): string {

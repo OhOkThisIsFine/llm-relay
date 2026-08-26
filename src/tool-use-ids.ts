@@ -1,3 +1,5 @@
+import { isRecord } from "./json-shape.js";
+
 /**
  * Make a translated response's `tool_use` ids unique against the conversation that produced it.
  *
@@ -31,10 +33,6 @@
  */
 
 type Rec = Record<string, unknown>;
-
-function isRecord(value: unknown): value is Rec {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /** How deep a conversation is walked for ids. A `tool_result`'s own content is the only nesting. */
 const MAX_BLOCK_DEPTH = 2;

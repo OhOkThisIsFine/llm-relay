@@ -362,10 +362,11 @@ function mergeCandidateQuota(
 
 /**
  * Apply the §5 ladders to one credential cell. Buckets come from the SAME merged observations
- * the `quota` field shows; limits join from configured/learned sources; `localUsed` is null
- * here — /candidates is served by the CLI against a possibly-remote proxy and has no ledger
- * handle, so rung 2 fires only when the caller passes `localUsed` in (tests, an in-process
- * server). Absent localUsed the ladder still resolves rung 1 and reports the limit.
+ * the `quota` field shows; limits join from configured/learned sources. These rows always carry
+ * a null `localUsed`: `buildCandidateAvailability` takes no ledger input, so the local-arithmetic
+ * rung does not run — the `opts.accounting` reader that G2's hard cap uses elsewhere in this file
+ * is deliberately not threaded here. The ladder still resolves provider-stated remaining (rung 1)
+ * and reports the applicable limit.
  *
  * §5.2's fact-fed rungs go through `factResetInputs` — the SAME helper the dashboard's producer
  * calls. Two implementations of "may this fact answer this bucket" is how one cell comes to read

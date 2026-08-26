@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { hasExactKeys } from "./json-shape.js";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
@@ -146,11 +147,6 @@ function validText(value: unknown): value is string {
 
 function credentialBelongsTo(provider: string, credentialId: unknown): credentialId is CredentialId {
   return typeof credentialId === "string" && parseCredentialId(credentialId)?.provider === provider;
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value);
-  return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 function canonicalMembers(members: string[]): string[] {

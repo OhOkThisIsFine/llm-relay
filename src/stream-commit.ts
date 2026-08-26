@@ -1,4 +1,5 @@
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, type DialectRefusalSignal } from "./tool-dialects.js";
+import { isRecord } from "./json-shape.js";
 
 /**
  * Final-wire streamed response commit probe.
@@ -51,10 +52,6 @@ type EventVerdict =
 
 const HOLD: EventVerdict = { kind: "hold" };
 const READY: EventVerdict = { kind: "ready" };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function nonWhitespace(value: unknown): boolean {
   return typeof value === "string" && value.trim().length > 0;

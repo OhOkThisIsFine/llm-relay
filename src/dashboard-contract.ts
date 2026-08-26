@@ -1,3 +1,5 @@
+import { hasExactKeys as isExactRecord, isRecord } from "./json-shape.js";
+
 /**
  * Server-safe wire contract shared by the analytics dashboard and relay.
  *
@@ -650,13 +652,6 @@ export const DASHBOARD_REQUEST_ID_PATTERN_SOURCE = DASHBOARD_REQUEST_ID_PATTERN.
 export const isDashboardRequestId = (value: unknown): value is string =>
   typeof value === "string" && DASHBOARD_REQUEST_ID_PATTERN.test(value);
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-const isExactRecord = (value: unknown, keys: readonly string[]): value is Record<string, unknown> =>
-  isRecord(value) &&
-  Object.getOwnPropertySymbols(value).length === 0 &&
-  Object.getOwnPropertyNames(value).length === keys.length &&
-  keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 const isString = (value: unknown): value is string => typeof value === "string";
 const isBoolean = (value: unknown): value is boolean => typeof value === "boolean";
 const isNullable = <T>(value: unknown, guard: (candidate: unknown) => candidate is T): value is T | null =>

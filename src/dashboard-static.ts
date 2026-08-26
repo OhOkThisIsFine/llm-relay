@@ -6,6 +6,7 @@
  * can write to a Node response.  Keeping the filesystem boundary here makes
  * it difficult for a future catch-all route to accidentally serve the SPA.
  */
+import { isRecord } from "./json-shape.js";
 import {
   existsSync,
   lstatSync,
@@ -106,10 +107,6 @@ export interface DashboardStaticNotHandled {
 export type DashboardStaticResponse = DashboardStaticHandled | DashboardStaticNotHandled;
 
 type Artifact = { readonly target: string; readonly mime: string | null };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isSafeManifestPath(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0 || value.length > MAX_MANIFEST_STRING) return false;
