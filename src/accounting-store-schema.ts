@@ -856,6 +856,12 @@ function isLossMarker(value: unknown): value is AccountingLossMarkerV1 {
   );
 }
 
+function isCoverageState(state: unknown, reason: unknown, hasLoss: boolean): boolean {
+  if (state !== "complete" && state !== "partial" && state !== "unavailable" && state !== "stale" && state !== "empty") return false;
+  if (reason !== null && reason !== "retention_pruned" && reason !== "row_cap" && reason !== "detail_cap" && reason !== "dedup_cap" && reason !== "counter_overflow" && reason !== "corrupt_recovery" && reason !== "unknown") return false;
+  return state === "complete" || state === "empty" ? reason === null && !hasLoss : reason !== null || hasLoss;
+}
+
 function isCoverage(value: unknown): value is AccountingCoverageV1 {
   if (
     !hasExactKeys(value, [
@@ -869,8 +875,6 @@ function isCoverage(value: unknown): value is AccountingCoverageV1 {
       "retentionDays",
       "losses",
     ]) ||
-    (value.state !== "complete" && value.state !== "partial" && value.state !== "unavailable" && value.state !== "stale" && value.state !== "empty") ||
-    (value.reason !== null && value.reason !== "retention_pruned" && value.reason !== "row_cap" && value.reason !== "detail_cap" && value.reason !== "dedup_cap" && value.reason !== "counter_overflow" && value.reason !== "corrupt_recovery" && value.reason !== "unknown") ||
     !isCounter(value.droppedRows) ||
     !isCounter(value.droppedRecent) ||
     !isCounter(value.droppedDetails) ||
@@ -882,25 +886,17 @@ function isCoverage(value: unknown): value is AccountingCoverageV1 {
   ) return false;
 
   const hasLoss = value.droppedRows + value.droppedRecent + value.droppedDetails + value.droppedDedup > 0 || value.losses.length > 0;
-  if (value.state === "complete" && (value.reason !== null || hasLoss)) return false;
-  if (value.state === "empty" && (value.reason !== null || hasLoss)) return false;
-  if ((value.state === "partial" || value.state === "unavailable" || value.state === "stale") && value.reason === null && !hasLoss) return false;
-  return true;
+  return isCoverageState(value.state, value.reason, hasLoss);
 }
 
 function isCellCoverage(value: unknown): value is AccountingCellCoverageV1 {
   if (
     !hasExactKeys(value, ["state", "reason", "droppedRows", "losses"]) ||
-    (value.state !== "complete" && value.state !== "partial" && value.state !== "unavailable" && value.state !== "stale" && value.state !== "empty") ||
-    (value.reason !== null && value.reason !== "retention_pruned" && value.reason !== "row_cap" && value.reason !== "detail_cap" && value.reason !== "dedup_cap" && value.reason !== "counter_overflow" && value.reason !== "corrupt_recovery" && value.reason !== "unknown") ||
     !isCounter(value.droppedRows) ||
     !hasExactArray(value.losses, ACCOUNTING_MAX_LOSS_MARKERS, isLossMarker)
   ) return false;
   const hasLoss = value.droppedRows > 0 || value.losses.length > 0;
-  if (value.state === "complete" && (value.reason !== null || hasLoss)) return false;
-  if (value.state === "empty" && (value.reason !== null || hasLoss)) return false;
-  if ((value.state === "partial" || value.state === "unavailable" || value.state === "stale") && value.reason === null && !hasLoss) return false;
-  return true;
+  return isCoverageState(value.state, value.reason, hasLoss);
 }
 
 function isMinuteShard(value: unknown): value is AccountingMinuteShardV1 {
@@ -1304,12 +1300,9 @@ export function emptyAccountingSpendCell(): AccountingAggregateSpendCellV1 {
 }
 
 export function emptyAccountingAggregateSpend(): AccountingAggregateSpendV1 {
-  return {
-    providerPublishedReported: emptyAccountingSpendCell(),
-    providerPublishedEstimated: emptyAccountingSpendCell(),
-    referenceReported: emptyAccountingSpendCell(),
-    referenceEstimated: emptyAccountingSpendCell(),
-  };
+  return Object.fromEntries(
+    SPEND_CELL_KEYS.map((key) => [key, emptyAccountingSpendCell()]),
+  ) as unknown as AccountingAggregateSpendV1;
 }
 
 function latestTimestamp(a: string | null, b: string | null): string | null {
