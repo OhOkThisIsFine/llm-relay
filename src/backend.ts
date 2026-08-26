@@ -1,5 +1,6 @@
 import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bridge";
 import { buildAuthHeaders } from "./authEnv.js";
+import { isRecord } from "./json-shape.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 import { anthropicRequestToOpenAi, RequestMappingError } from "./openai-request.js";
@@ -346,10 +347,6 @@ export function thoughtSignatureSentinels(response: Response): number | undefine
 function attachUpstreamMetadata(response: Response, metadata: UpstreamResponseMetadata): Response {
   upstreamResponseMetadata.set(response, metadata);
   return response;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

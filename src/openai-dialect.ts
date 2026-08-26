@@ -1,4 +1,5 @@
 import type { JsonSchema } from "./anthropic.js";
+import { isRecord } from "./json-shape.js";
 import { STREAM_PREFLIGHT_LIMIT } from "./stream-commit.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, markerStart, recoverToolCalls, scanForMarker, type DialectRefusalSignal } from "./tool-dialects.js";
 
@@ -21,10 +22,6 @@ export interface RecoveredOpenAiChat {
 export type RecoveredOpenAiChatProcessor = (
   recovered: RecoveredOpenAiChat,
 ) => Promise<RecoveredOpenAiChat>;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function recoverySchemas(schemas: ToolSchemas): Map<string, JsonSchema> {
   return new Map([...schemas].filter((entry): entry is [string, JsonSchema] => entry[1] !== null));

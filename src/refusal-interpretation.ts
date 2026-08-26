@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { hasExactKeys } from "./json-shape.js";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -557,11 +558,6 @@ function signatureParts(signature: string): { provider: string; model: string | 
   const status = Number(match[3]);
   if (!Number.isInteger(status)) return null;
   return { provider: match[1], model: match[2] === "-" ? null : match[2], status, sample: match[4] };
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value);
-  return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 function validTemplate(value: unknown): value is ScopeTemplate {

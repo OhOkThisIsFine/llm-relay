@@ -6,6 +6,7 @@ import {
   isDashboardSafeId,
   isDashboardUtcTimestamp,
 } from "./dashboard-contract.js";
+import { hasExactKeys } from "./json-shape.js";
 
 /**
  * The persisted accounting format is deliberately separate from the dashboard wire format.
@@ -426,19 +427,6 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  if (!isPlainRecord(value) || Object.getOwnPropertySymbols(value).length !== 0) {
-    return false;
-  }
-  const names = Object.getOwnPropertyNames(value);
-  const enumerableNames = Object.keys(value);
-  return (
-    names.length === keys.length &&
-    enumerableNames.length === keys.length &&
-    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
-  );
-}
-
 function hasExactArray<T>(value: unknown, max: number, guard: (item: unknown) => item is T): value is T[] {
   if (!Array.isArray(value) || value.length > max || Object.getOwnPropertySymbols(value).length !== 0) {
     return false;
@@ -457,7 +445,7 @@ function hasExactArray<T>(value: unknown, max: number, guard: (item: unknown) =>
  * `partiallyPricedRequests`, and quarantining a whole day of real traffic over
  * their absence would trade one additive field for the ledger itself.
  */
-function hasExactKeysWithOptional(
+function hasExactPlainKeysWithOptional(
   value: unknown,
   keys: readonly string[],
   optional: readonly string[],
@@ -833,7 +821,7 @@ const AGGREGATE_OPTIONAL_KEYS = Object.freeze(["requestSpend", "partiallyPricedR
 
 function isAggregate(value: unknown): value is AccountingAggregateV1 {
   return (
-    hasExactKeysWithOptional(value, AGGREGATE_KEYS, AGGREGATE_OPTIONAL_KEYS) &&
+    hasExactPlainKeysWithOptional(value, AGGREGATE_KEYS, AGGREGATE_OPTIONAL_KEYS) &&
     isAggregateFields(value as Record<string, unknown>)
   );
 }
@@ -842,7 +830,7 @@ function isDimensionRow(value: unknown): value is AccountingDimensionRowV1 {
   const keys = [...AGGREGATE_KEYS, "kind", "role", "provider", "model", "client", "credentialId", "attribution", "outcome", "failureKind"];
   const optional = [...AGGREGATE_OPTIONAL_KEYS];
   if (
-    !hasExactKeysWithOptional(value, keys, optional) ||
+    !hasExactPlainKeysWithOptional(value, keys, optional) ||
     (value.kind !== "request" && value.kind !== "attempt") ||
     (value.kind === "request" && value.role !== "request") ||
     (value.kind === "attempt" && !isRole(value.role)) ||
@@ -1242,9 +1230,6 @@ function parse<T>(value: unknown, guard: (candidate: unknown) => candidate is T,
 export const isAccountingAggregateTokenCellV1 = (value: unknown): value is AccountingAggregateTokenCellV1 => {
   try { return isAggregateTokenCell(value); } catch { return false; }
 };
-export const isAccountingEstimatedTokenCellV1 = (value: unknown): value is AccountingEstimatedTokenCellV1 => {
-  try { return isEstimatedTokenCell(value); } catch { return false; }
-};
 export const isAccountingAggregateTokenTotalsV1 = (value: unknown): value is AccountingAggregateTokenTotalsV1 => {
   try { return isAggregateTokens(value); } catch { return false; }
 };
@@ -1257,20 +1242,11 @@ export const isAccountingAggregateV1 = (value: unknown): value is AccountingAggr
 export const isAccountingDimensionRowV1 = (value: unknown): value is AccountingDimensionRowV1 => {
   try { return isDimensionRow(value); } catch { return false; }
 };
-export const isAccountingCoverageV1 = (value: unknown): value is AccountingCoverageV1 => {
-  try { return isCoverage(value); } catch { return false; }
-};
-export const isAccountingMinuteShardV1 = (value: unknown): value is AccountingMinuteShardV1 => {
-  try { return isMinuteShard(value); } catch { return false; }
-};
 export const isAccountingCompletedRequestDedupV1 = (value: unknown): value is AccountingCompletedRequestDedupV1 => {
   try { return isDedup(value); } catch { return false; }
 };
 export const isAccountingDayShardV1 = (value: unknown): value is AccountingDayShardV1 => {
   try { return isDay(value); } catch { return false; }
-};
-export const isAccountingMonthAggregateV1 = (value: unknown): value is AccountingMonthAggregateV1 => {
-  try { return isMonthAggregate(value); } catch { return false; }
 };
 export const isAccountingLifetimeV1 = (value: unknown): value is AccountingLifetimeV1 => {
   try { return isLifetime(value); } catch { return false; }
@@ -1285,34 +1261,11 @@ export const isAccountingRecentV1 = (value: unknown): value is AccountingRecentV
   try { return isRecent(value); } catch { return false; }
 };
 export const parseAccountingAggregateTokenCellV1 = (value: unknown): AccountingParseResult<AccountingAggregateTokenCellV1> => parse(value, isAggregateTokenCell, "token-cell");
-export const parseAccountingEstimatedTokenCellV1 = (value: unknown): AccountingParseResult<AccountingEstimatedTokenCellV1> => parse(value, isEstimatedTokenCell, "estimated-token-cell");
-export const parseAccountingAggregateTokenTotalsV1 = (value: unknown): AccountingParseResult<AccountingAggregateTokenTotalsV1> => parse(value, isAggregateTokens, "token-totals");
-export const parseAccountingMetricCellV1 = (value: unknown): AccountingParseResult<AccountingMetricCellV1> => parse(value, isMetric, "metric-cell");
-export const parseAccountingAggregateV1 = (value: unknown): AccountingParseResult<AccountingAggregateV1> => parse(value, isAggregate, "aggregate");
-export const parseAccountingDimensionRowV1 = (value: unknown): AccountingParseResult<AccountingDimensionRowV1> => parse(value, isDimensionRow, "dimension-row");
-export const parseAccountingCoverageV1 = (value: unknown): AccountingParseResult<AccountingCoverageV1> => parse(value, isCoverage, "coverage");
-export const parseAccountingMinuteShardV1 = (value: unknown): AccountingParseResult<AccountingMinuteShardV1> => parse(value, isMinuteShard, "minute-shard");
-export const parseAccountingCompletedRequestDedupV1 = (value: unknown): AccountingParseResult<AccountingCompletedRequestDedupV1> => parse(value, isDedup, "dedup");
 export const parseAccountingDayShardV1 = (value: unknown): AccountingParseResult<AccountingDayShardV1> => parse(value, isDay, "day-shard");
-export const parseAccountingMonthAggregateV1 = (value: unknown): AccountingParseResult<AccountingMonthAggregateV1> => parse(value, isMonthAggregate, "month-aggregate");
 export const parseAccountingLifetimeV1 = (value: unknown): AccountingParseResult<AccountingLifetimeV1> => parse(value, isLifetime, "lifetime");
 export const parseAccountingAttemptPacketV1 = (value: unknown): AccountingParseResult<AccountingAttemptPacketV1> => parse(value, isAttemptPacket, "attempt-packet");
 export const parseAccountingRequestPacketV1 = (value: unknown): AccountingParseResult<AccountingRequestPacketV1> => parse(value, isRequestPacket, "request-packet");
 export const parseAccountingRecentV1 = (value: unknown): AccountingParseResult<AccountingRecentV1> => parse(value, isRecent, "recent");
-
-export const parseAccountingTokenCell = parseAccountingAggregateTokenCellV1;
-export const parseAccountingEstimatedTokenCell = parseAccountingEstimatedTokenCellV1;
-export const parseAccountingTokenTotals = parseAccountingAggregateTokenTotalsV1;
-export const parseAccountingMetricCell = parseAccountingMetricCellV1;
-export const parseAccountingAggregate = parseAccountingAggregateV1;
-export const parseAccountingDimensionRow = parseAccountingDimensionRowV1;
-export const parseAccountingCoverage = parseAccountingCoverageV1;
-export const parseAccountingMinuteShard = parseAccountingMinuteShardV1;
-export const parseAccountingDayShard = parseAccountingDayShardV1;
-export const parseAccountingLifetime = parseAccountingLifetimeV1;
-export const parseAccountingAttemptPacket = parseAccountingAttemptPacketV1;
-export const parseAccountingRequestPacket = parseAccountingRequestPacketV1;
-export const parseAccountingRecent = parseAccountingRecentV1;
 
 /** Checked addition for counters. null means the exact safe-integer domain overflowed. */
 export function checkedAddAccountingCounter(left: number, right: number): number | null {
@@ -1478,14 +1431,3 @@ export function mergeAccountingMetricCells(
     return null;
   }
 }
-
-// Short aliases make the codec convenient in the store without weakening its explicit v1 names.
-export const isAggregateTokenTotals = isAccountingAggregateTokenTotalsV1;
-export const isMetricCell = isAccountingMetricCellV1;
-export const isAccountingAggregate = isAccountingAggregateV1;
-export const isAccountingAggregateRow = isAccountingDimensionRowV1;
-export const isAccountingCoverage = isAccountingCoverageV1;
-export const isAccountingDay = isAccountingDayShardV1;
-export const isAccountingLifetime = isAccountingLifetimeV1;
-export const isAccountingRecent = isAccountingRecentV1;
-export const isAccountingDetailPacket = isAccountingRequestPacketV1;

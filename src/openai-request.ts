@@ -1,3 +1,5 @@
+import { isRecord } from "./json-shape.js";
+
 /**
  * Anthropic Messages REQUEST → OpenAI Chat Completions REQUEST.
  *
@@ -234,10 +236,6 @@ class ThoughtSignatures {
 }
 
 type Rec = Record<string, unknown>;
-
-function isRecord(v: unknown): v is Rec {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
 
 /** Name an unexpected block type in an error without echoing an arbitrary payload back. */
 function describeType(t: unknown): string {

@@ -28,6 +28,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
+import { hasExactKeysWithOptional, isRecord as isObject } from "./json-shape.js";
 import {
   createPassphraseKek,
   createKek,
@@ -293,16 +294,6 @@ export function resolveKeystorePath(opts: { path?: string } = {}): string {
   return resolve(join(homedir(), ".llm-relay", "keystore.json"));
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
-  const permitted = new Set([...required, ...optional]);
-  return required.every((key) => Object.hasOwn(value, key))
-    && Object.keys(value).every((key) => permitted.has(key));
-}
-
 function decodeBase64(value: unknown, expectedLength?: number): Buffer | null {
   if (typeof value !== "string") return null;
   try {
@@ -327,14 +318,14 @@ function validKekDescriptor(value: unknown): value is KekDescriptor {
   if (!isObject(value) || typeof value.wrap !== "string") return false;
   switch (value.wrap) {
     case "dpapi":
-      return hasExactKeys(value, ["wrap", "blob"])
+      return hasExactKeysWithOptional(value, ["wrap", "blob"])
         && (decodeBase64(value.blob)?.length ?? 0) > 0;
     case "keychain":
     case "libsecret":
-      return hasExactKeys(value, ["wrap"]);
+      return hasExactKeysWithOptional(value, ["wrap"]);
     case "passphrase": {
-      if (!hasExactKeys(value, ["wrap", "kdf"]) || !isObject(value.kdf)) return false;
-      return hasExactKeys(value.kdf, ["n", "r", "p", "salt"])
+      if (!hasExactKeysWithOptional(value, ["wrap", "kdf"]) || !isObject(value.kdf)) return false;
+      return hasExactKeysWithOptional(value.kdf, ["n", "r", "p", "salt"])
         && value.kdf.n === 16_384
         && value.kdf.r === 8
         && value.kdf.p === 1
@@ -346,7 +337,7 @@ function validKekDescriptor(value: unknown): value is KekDescriptor {
 }
 
 function validStoredEntry(value: unknown): value is StoredEntry {
-  if (!isObject(value) || !hasExactKeys(value, [
+  if (!isObject(value) || !hasExactKeysWithOptional(value, [
     "id",
     "provider",
     "envName",
@@ -380,7 +371,7 @@ function validStoredEntry(value: unknown): value is StoredEntry {
 }
 
 function parseStore(raw: unknown): { store: StoredKeystore; droppedCount: number } | null {
-  if (!isObject(raw) || !hasExactKeys(raw, [
+  if (!isObject(raw) || !hasExactKeysWithOptional(raw, [
     "version",
     "kek",
     "fpSalt",
@@ -1221,7 +1212,7 @@ function parseExportEnvelope(text: string): KeystoreExportEnvelope | null {
   } catch {
     return null;
   }
-  if (!isObject(parsed) || !hasExactKeys(parsed, [
+  if (!isObject(parsed) || !hasExactKeysWithOptional(parsed, [
     "version", "source", "kdf", "cipher", "iv", "tag", "ciphertext",
   ])) return null;
   if (
@@ -1229,7 +1220,7 @@ function parseExportEnvelope(text: string): KeystoreExportEnvelope | null {
     parsed.source !== EXPORT_SOURCE ||
     parsed.cipher !== "aes-256-gcm" ||
     !isObject(parsed.kdf) ||
-    !hasExactKeys(parsed.kdf, ["n", "r", "p", "salt"]) ||
+    !hasExactKeysWithOptional(parsed.kdf, ["n", "r", "p", "salt"]) ||
     parsed.kdf.n !== 16_384 ||
     parsed.kdf.r !== 8 ||
     parsed.kdf.p !== 1 ||
@@ -1246,7 +1237,7 @@ function parseExportEnvelope(text: string): KeystoreExportEnvelope | null {
 }
 
 function validExportEntry(value: unknown): value is KeystoreExportEntry {
-  if (!isObject(value) || !hasExactKeys(value, [
+  if (!isObject(value) || !hasExactKeysWithOptional(value, [
     "id", "provider", "envName", "fingerprint", "addedAt", "rotatedAt", "expiresAt",
     "revokedAt", "disabled", "value",
   ])) return false;
@@ -1265,7 +1256,7 @@ function validExportEntry(value: unknown): value is KeystoreExportEntry {
 }
 
 function parseExportPayload(value: unknown): KeystoreExportPayload | null {
-  if (!isObject(value) || !hasExactKeys(value, ["version", "entries"]) ||
+  if (!isObject(value) || !hasExactKeysWithOptional(value, ["version", "entries"]) ||
       value.version !== 1 || !Array.isArray(value.entries)) return null;
   const entries: KeystoreExportEntry[] = [];
   const ids = new Set<string>();

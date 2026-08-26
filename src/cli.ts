@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { hasExactKeys, isRecord } from "./json-shape.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -871,15 +872,6 @@ export function proxyUrl(cfg: Pick<Config, "host" | "port">, path: string): stri
 function cooldownCommandFailure(message: string): never {
   process.stderr.write(`llm-relay cooldowns: ${message}\n`);
   process.exit(1);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value);
-  return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 function nonEmptyString(value: unknown): value is string {

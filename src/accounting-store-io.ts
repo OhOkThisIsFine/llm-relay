@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { hasExactKeys as isExactRecord, isRecord } from "./json-shape.js";
 
 /**
  * A deliberately small durability primitive for accounting's multi-file read model.
@@ -223,16 +224,6 @@ const RESERVED_WINDOWS_NAMES = new Set([
   "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ]);
 const rootWriterLeases = new Map<string, object>();
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  if (!isRecord(value) || Object.getOwnPropertySymbols(value).length !== 0) return false;
-  const names = Object.keys(value);
-  return names.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
-}
 
 function safeError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error);

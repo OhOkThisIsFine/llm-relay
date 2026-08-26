@@ -689,11 +689,21 @@ describe("dashboard v1 contract", () => {
     expect(isNonNegativeInteger("1")).toBe(false);
   });
 
-  it("has no DOM imports or platform globals", () => {
+  it("imports only shared platform-free shape guards and has no platform globals", () => {
     const sourcePath = resolve(dirname(fileURLToPath(import.meta.url)), "../../src/dashboard-contract.ts");
     const source = readFileSync(sourcePath, "utf8");
-    expect(source).not.toMatch(/^\s*import\s/m);
+    const withoutJsonShapeImport = source.replace(
+      /^import \{ hasExactKeys as isExactRecord, isRecord \} from "\.\/json-shape\.js";\r?\n/m,
+      "",
+    );
+    expect(withoutJsonShapeImport).not.toMatch(/^\s*import\s/m);
     expect(source).not.toMatch(/\b(?:document|window|globalThis|HTMLElement|HTML\w+|DOM\w*|fetch|localStorage|sessionStorage)\s*[.(\[]/);
+    // The platform-free invariant is transitive: json-shape.ts is bundled into the browser SPA
+    // through this import, so the file it admits must itself stay import-free and global-free —
+    // otherwise this test's title claims a property nothing checks.
+    const shapeSource = readFileSync(resolve(dirname(sourcePath), "json-shape.ts"), "utf8");
+    expect(shapeSource).not.toMatch(/^\s*import\s/m);
+    expect(shapeSource).not.toMatch(/\b(?:document|window|globalThis|HTMLElement|HTML\w+|DOM\w*|fetch|localStorage|sessionStorage)\s*[.(\[]/);
     const tsconfig = JSON.parse(readFileSync(resolve(dirname(sourcePath), "../tsconfig.json"), "utf8")) as {
       compilerOptions?: { lib?: string[] };
     };

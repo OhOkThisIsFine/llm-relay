@@ -2,6 +2,7 @@ import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 import type { Config, ProviderConfig } from "./config.js";
+import { hasExactKeys, isRecord } from "./json-shape.js";
 import {
   curatedEnvNames,
   resolveCredential,
@@ -568,15 +569,6 @@ function runtimeSlotForEntry(cfg: Config, entry: KeystoreEntryDescriptor): Crede
 function proxyUrl(cfg: Config, path: string): string {
   const host = cfg.host.includes(":") ? `[${cfg.host}]` : cfg.host;
   return `http://${host}:${cfg.port}${path}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value);
-  return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 function validClearedGroup(
