@@ -70,6 +70,23 @@ describe("streaming dialect recovery", () => {
     expect(out).not.toContain("DSML");
   });
 
+  it("forwards a CRLF-terminated upstream instead of swallowing it whole", async () => {
+    // Before sse-frames.ts this module's inline pure-"\n\n" scan could not match "\r\n\r\n", and
+    // the leftover buffer was never flushed at end of stream — a CRLF upstream produced an EMPTY
+    // output stream (measured against the pre-fix source). Latent, not shipped: llm-bridge's
+    // Anthropic emitter hardcodes "\n\n". This pin is what keeps a dependency bump from making
+    // that data loss live.
+    const crlf = (frame: string) => frame.replaceAll("\n", "\r\n");
+    const out = await collect(recoverDialectInStream(streamOf([
+      crlf(OPEN),
+      crlf(textDelta("plain prose, no markers here.")),
+      crlf(CLOSE),
+    ]), schemas, NO_DESTRUCTIVE));
+
+    expect(out).toContain("plain prose, no markers here.");
+    expect(out).toContain("message_stop");
+  });
+
   it("fails clean mid-stream on a TRUNCATED envelope instead of releasing the fragment", async () => {
     // The measured 70-byte body. There is no call to recover, and handing back the tail is what
     // made this read as "the job died" — so it becomes an SSE error and the pool fails over.
