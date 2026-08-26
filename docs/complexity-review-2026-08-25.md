@@ -390,6 +390,13 @@ failure (full narration, no final answer — even with subagents and timers proh
 below now carries a verdict against `main` at `05e2408`. Lane output is advisory; nothing from this
 table was implemented in this sprint — it stands as owner-decision material with the churn priced.
 
+**Implemented 2026-08-26 (v0.48.0), on the owner's "pick up the open work":** the lane-ranked
+queue below, in full — items 10 (`23a87c5`), 14 (`3561bb4`), 8 (`0cdf45c`), 21 (`c9430bb`),
+25+26 (`caa762c`), 16+18 (`3598885`), 15 (`915c983`), 20 (`b9409e3`). Every packet was
+Codex-implemented, gate-verified twice, and independently reviewed (relay free-pool lane, every
+verdict MERGE). Still open by the same verdicts: 9, 11, 12, 13 (not worth the churn), 17 and 23
+(only in their corrected shapes), 19's remainder (polish), and unranked 22 and 24.
+
 | # | Verdict | Corrections / conditions |
 |---|---|---|
 | 8 | CONFIRMED | ~-25 real, not -60 (`projectedSpendCell` is already factored); keep the `seen` guard verbatim |
