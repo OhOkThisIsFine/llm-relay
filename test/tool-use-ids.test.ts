@@ -197,6 +197,23 @@ describe("rewriteToolUseIdsInStream", () => {
     expect(out.endsWith("\r\n\r\n")).toBe(true);
   });
 
+  it("preserves a mixed CRLF/LF separator when rewriting the frame before it", async () => {
+    const mixed = `event: content_block_start\ndata: ${JSON.stringify({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "Read:0", name: "Read", input: {} },
+    })}\r\n\n`;
+    const following = ev("content_block_stop", { index: 0 });
+    const out = await collect(rewriteToolUseIdsInStream(
+      streamOf([mixed + following]),
+      () => new Set(["Read:0"]),
+    ));
+
+    expect(out).toContain('"id":"Read:0_relay1"');
+    expect(out).toContain("\r\n\nevent: content_block_stop");
+    expect(out).not.toContain("\revent: content_block_stop");
+  });
+
   it("preserves a truncated final event verbatim", async () => {
     const tail = 'event: content_block_start\ndata: {"type":"content_block_start"';
     const out = await collect(rewriteToolUseIdsInStream(streamOf([tail]), () => new Set()));

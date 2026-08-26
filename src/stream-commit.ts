@@ -1,5 +1,6 @@
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, type DialectRefusalSignal } from "./tool-dialects.js";
 import { isRecord } from "./json-shape.js";
+import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
 
 /**
  * Final-wire streamed response commit probe.
@@ -260,11 +261,10 @@ function classifyEvent(
   malformedProvenance: "upstream" | "local",
   signal: DialectRefusalSignal | undefined,
 ): EventVerdict {
-  const lines = event.split(/\r?\n/);
-  const eventName = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() ?? "";
-  const data = lines
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).replace(/^ /, ""))
+  const fields = sseEventFields(event);
+  const eventName = fields.eventLines[0]?.trim() ?? "";
+  const data = fields.dataLines
+    .map((line) => line.replace(/^ /, ""))
     .join("\n")
     .trim();
 
@@ -295,11 +295,6 @@ function classifyEvent(
   }
 }
 
-function firstBoundary(value: string): { index: number; length: number } | null {
-  const match = /\r?\n\r?\n/.exec(value);
-  return match ? { index: match.index, length: match[0].length } : null;
-}
-
 /**
  * Read through metadata-only SSE events until the final wire contains meaningful assistant output.
  * The returned stream replays the exact raw chunks and continues on the same locked reader.
@@ -315,7 +310,7 @@ export async function probeStreamForCommit(
   const malformedProvenance = options.malformedProvenance ?? "upstream";
   const readFailureProvenance = options.readFailureProvenance ?? "upstream";
   const relayRefusal = options.relayRefusal;
-  let buffered = "";
+  const frames = new BufferedSseFrames();
   let inspectedBytes = 0;
 
   const isCancelled = (): boolean => options.isCancelled?.() ?? false;
@@ -361,17 +356,13 @@ export async function probeStreamForCommit(
   };
 
   const inspectCompleteEvents = (final = false): EventVerdict => {
-    while (true) {
-      const boundary = firstBoundary(buffered);
-      if (!boundary) break;
-      const event = buffered.slice(0, boundary.index);
-      buffered = buffered.slice(boundary.index + boundary.length);
+    for (const { frame: event } of frames) {
       const verdict = classifyEvent(event, protocol, malformedProvenance, relayRefusal);
       if (verdict.kind !== "hold") return verdict;
     }
-    if (final && buffered.trim().length > 0) {
-      const event = buffered;
-      buffered = "";
+    if (final) {
+      const event = frames.takeRemainder();
+      if (event.trim().length === 0) return HOLD;
       return classifyEvent(event, protocol, malformedProvenance, relayRefusal);
     }
     return HOLD;
@@ -388,7 +379,7 @@ export async function probeStreamForCommit(
 
     if (isCancelled()) return cancelled();
     if (next.done) {
-      buffered += decoder.decode();
+      frames.append(decoder.decode());
       const verdict = inspectCompleteEvents(true);
       if (verdict.kind === "ready") return ready();
       if (verdict.kind === "dead") return dead(verdict.reason, verdict.provenance, verdict.errorType);
@@ -399,7 +390,7 @@ export async function probeStreamForCommit(
     const remaining = STREAM_PREFLIGHT_LIMIT - inspectedBytes;
     const inspectBytes = next.value.byteLength > remaining ? next.value.subarray(0, remaining) : next.value;
     inspectedBytes += inspectBytes.byteLength;
-    buffered += decoder.decode(inspectBytes, { stream: true });
+    frames.append(decoder.decode(inspectBytes, { stream: true }));
 
     const verdict = inspectCompleteEvents();
     if (verdict.kind === "ready") return isCancelled() ? cancelled() : ready();

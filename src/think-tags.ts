@@ -6,6 +6,8 @@
  * unnested block; every uncertain shape is released byte-for-byte as ordinary text.
  */
 
+import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
+
 const OPEN_TAG = "<think>";
 const CLOSE_TAG = "</think>";
 export const MAX_THINK_LEAD_BYTES = 512;
@@ -119,26 +121,15 @@ interface SseEvent {
 
 function parseEvent(block: string): SseEvent | null {
   if (!block.trim()) return null;
-  let type = "";
-  const dataLines: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
-    if (line.startsWith("event:")) type = line.slice(6).trim();
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-  }
+  const fields = sseEventFields(block);
+  const type = fields.eventLines.at(-1)?.trim() ?? "";
+  const dataLines = fields.dataLines.map((line) => line.trim());
   if (dataLines.length === 0) return { raw: block, type, data: null };
   try {
     return { raw: block, type, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> };
   } catch {
     return { raw: block, type, data: null };
   }
-}
-
-function eventSeparator(text: string): { at: number; length: number } | null {
-  const lf = text.indexOf("\n\n");
-  const crlf = text.indexOf("\r\n\r\n");
-  if (lf < 0 && crlf < 0) return null;
-  if (crlf >= 0 && (lf < 0 || crlf < lf)) return { at: crlf, length: 4 };
-  return { at: lf, length: 2 };
 }
 
 function sseDelta(index: number, text: string): string {
@@ -156,7 +147,7 @@ export function stripThinkTagsInStream(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const filter = new ThinkTagStripFilter();
-  let buffered = "";
+  const frames = new BufferedSseFrames();
   let blockIndex = 0;
 
   return new ReadableStream<Uint8Array>({
@@ -171,12 +162,7 @@ export function stripThinkTagsInStream(
       const reader = upstream.getReader();
 
       const processFrames = () => {
-        for (;;) {
-          const separator = eventSeparator(buffered);
-          if (!separator) return;
-          const block = buffered.slice(0, separator.at);
-          const raw = buffered.slice(0, separator.at + separator.length);
-          buffered = buffered.slice(separator.at + separator.length);
+        for (const { frame: block, raw } of frames) {
           const ev = parseEvent(block);
           if (!ev) {
             push(raw);
@@ -208,21 +194,21 @@ export function stripThinkTagsInStream(
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          buffered += decoder.decode(value, { stream: true });
+          frames.append(decoder.decode(value, { stream: true }));
           processFrames();
         }
-        buffered += decoder.decode();
+        frames.append(decoder.decode());
         processFrames();
         flushHeld();
         // A truncated non-event tail is outside the filter's text seam; preserve it verbatim.
-        push(buffered);
+        push(frames.takeRemainder());
       } catch (e) {
         // A broken upstream is also an unclosed candidate. Release held text before reporting the
         // stream error so this filter never turns transport doubt into silent content deletion.
-        buffered += decoder.decode();
+        frames.append(decoder.decode());
         processFrames();
         flushHeld();
-        push(buffered);
+        push(frames.takeRemainder());
         const message = e instanceof Error ? e.message : String(e);
         push(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `llm-relay: stream failed: ${message}` } })}\n\n`);
       } finally {

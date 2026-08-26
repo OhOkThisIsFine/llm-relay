@@ -1,5 +1,6 @@
 import { emitSseTail } from "./emitSse.js";
 import type { AssistantMessage, ContentBlock } from "./anthropic.js";
+import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, markerStart, recoverToolCalls, scanForMarker, type DialectRefusalSignal } from "./tool-dialects.js";
 
 /**
@@ -29,12 +30,9 @@ interface SseEvent {
 
 function parseEvent(block: string): SseEvent | null {
   if (!block.trim()) return null;
-  let type = "";
-  const dataLines: string[] = [];
-  for (const line of block.split("\n")) {
-    if (line.startsWith("event:")) type = line.slice(6).trim();
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-  }
+  const fields = sseEventFields(block);
+  const type = fields.eventLines.at(-1)?.trim() ?? "";
+  const dataLines = fields.dataLines.map((line) => line.trim());
   if (dataLines.length === 0) return { raw: block, type, data: null };
   try {
     return { raw: block, type, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> };
@@ -62,7 +60,7 @@ export function recoverDialectInStream(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
-  let buffered = "";       // incomplete SSE tail between chunks
+  const frames = new BufferedSseFrames();
   let blockIndex = 0;      // index of the content block currently open
   let blockText = "";      // full text seen for the open block
   let emittedLen = 0;      // how much of blockText has been forwarded
@@ -149,12 +147,7 @@ export function recoverDialectInStream(
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          buffered += decoder.decode(value, { stream: true });
-
-          let sep: number;
-          while ((sep = buffered.indexOf("\n\n")) >= 0) {
-            const block = buffered.slice(0, sep);
-            buffered = buffered.slice(sep + 2);
+          for (const { frame: block, separator } of frames.append(decoder.decode(value, { stream: true }))) {
             const ev = parseEvent(block);
             if (!ev) continue;
 
@@ -162,7 +155,7 @@ export function recoverDialectInStream(
               blockIndex = typeof ev.data?.index === "number" ? ev.data.index : blockIndex;
               blockText = "";
               emittedLen = 0;
-              push(block + "\n\n");
+              push(block + separator);
               continue;
             }
 
@@ -186,7 +179,7 @@ export function recoverDialectInStream(
                 }
                 continue; // never forward the original delta — we re-emit what is safe
               }
-              push(block + "\n\n");
+              push(block + separator);
               continue;
             }
 
@@ -197,7 +190,7 @@ export function recoverDialectInStream(
                 envelope += delta.text;
                 continue; // withheld
               }
-              push(block + "\n\n");
+              push(block + separator);
               continue;
             }
 
@@ -207,24 +200,24 @@ export function recoverDialectInStream(
                 push(sseDelta(blockIndex, blockText.slice(emittedLen)));
                 emittedLen = blockText.length;
               }
-              push(block + "\n\n");
+              push(block + separator);
               continue;
             }
 
             if (ev.type === "message_delta") {
               messageDeltaSeen = ev.data;
               if (capturing) continue; // superseded by the tail
-              push(block + "\n\n");
+              push(block + separator);
               continue;
             }
 
             if (ev.type === "message_stop") {
               finish();
-              if (!capturing) push(block + "\n\n");
+              if (!capturing) push(block + separator);
               continue;
             }
 
-            push(block + "\n\n");
+            push(block + separator);
           }
         }
         // Stream ended without message_stop (a truncated upstream) — still settle what we hold.

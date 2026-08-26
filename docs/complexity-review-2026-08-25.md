@@ -30,7 +30,7 @@ anywhere else in `src/`.
 |---|---|---|---|---|---|
 | 1 | Dialect rescue emits two `finish_reason`s, dropping the rescued tool call — **FIXED 2026-08-25** | `src/openai-dialect.ts` | correctness | +16 (landed) | low |
 | 2 | Seven walk-exhaustion exits hand-copied across the two fronts | `src/server.ts` (6 sites) | duplication | ~-150 | medium |
-| 3 | Four SSE boundary detectors, two of which disagree | 4 modules | duplication + drift | ~-40 | low |
+| 3 | Four SSE boundary detectors, two of which disagree — **FIXED 2026-08-25** | 4 modules | duplication + drift | consolidated | low |
 | 4 | 35 exported bindings with zero callers | `src/accounting-store-schema.ts` | dead code | ~-75 | low |
 | 5 | `isRecord` defined 12 times; exact-keys helper 8 times, 3 signatures | 20 sites | duplication | ~-60 | low |
 | 6 | Quota-bucket gathering written three times | 3 modules | duplication | ~-45 | medium |
@@ -185,7 +185,7 @@ pre-rejected refactor does not cover. Header content, log fields, and the rule t
 stays the last candidate's real upstream error are all preserved, because the callback keeps each
 front's body shape verbatim.
 
-### 3. Four SSE boundary detectors, and two of them disagree — VERIFIED
+### 3. Four SSE boundary detectors, and two of them disagree — VERIFIED; FIXED 2026-08-25
 
 **Sites:** `firstBoundary` at [src/openai-dialect.ts:153](../src/openai-dialect.ts#L153) and
 [src/stream-commit.ts:301](../src/stream-commit.ts#L301); `eventSeparator` at
@@ -206,14 +206,32 @@ radius is small, because providers are consistent about line endings. But this i
 [CLAUDE.md](../CLAUDE.md) names for `factResetInputs`: two implementations is how one cell comes to
 read one provenance on one surface and another on the other.
 
-**Proposed shape.** One small `sse-frames.ts` exporting the boundary rule and a buffered frame
+**Implemented shape.** One small `sse-frames.ts` exports the boundary rule and a buffered frame
 iterator. Each of the five stream modules keeps only its own policy: `think-tags` keeps its rollback
 buffer, `stream-commit` its commit classification, `tool-use-ids` its id minting, and the two dialect
-modules their envelope capture. No new dependency. Roughly -40 lines, and one definition of where an
-SSE event ends.
+modules their envelope capture. No new dependency, and one definition of where an SSE event ends.
 
 **Invariants checked.** Byte-exactness obligations are per-module and unaffected — the shared
 primitive reports offsets, it does not rewrite bytes.
+
+`findSseBoundary` now reports the exact separator string, `BufferedSseFrames` owns chunk-spanning
+iteration, and `sseEventFields` extracts raw field values for caller-owned parsing policy. A
+`\r\n\n` regression in `test/sse-frames.test.ts` pins clean frame strings with no leaked carriage
+return; `test/tool-use-ids.test.ts` additionally pins the former divergent path while it rewrites an
+event.
+
+**Corrections from the adversarial review of the fix (2026-08-25).** The finding undercounted:
+there were FIVE detectors carrying THREE semantics, not four carrying two. `dialect-stream.ts`'s
+inline `indexOf("\n\n")` was a third rule — pure LF only — and, combined with never flushing its
+leftover buffer at end of stream, it swallowed a CRLF-terminated upstream WHOLE: measured against
+the pre-fix source, a `\r\n\r\n` stream produced an EMPTY output stream. Unreachable today
+(llm-bridge's Anthropic emitter hardcodes `\n\n`), so latent, not shipped — but one dependency bump
+from live; the adoption fixes it and `test/dialect-stream.test.ts` now pins CRLF passthrough.
+The differential harness measured ~31,000 old-vs-new comparisons across the five modules with
+zero unintended byte differences. **Residue, stated:** `server.ts` `frameEnd` keeps its own
+byte-level `Buffer` scan on purpose (multibyte UTF-8 must never split mid-frame) and still carries
+the pure-terminator semantics; `sse.ts` and `usage-observer.ts` keep internal field parsers; both
+join `backend.ts`'s parsers under finding 13's deferral.
 
 ### 4. Thirty-five exported bindings with no callers — VERIFIED
 

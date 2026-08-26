@@ -1,5 +1,6 @@
 import type { JsonSchema } from "./anthropic.js";
 import { isRecord } from "./json-shape.js";
+import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
 import { STREAM_PREFLIGHT_LIMIT } from "./stream-commit.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, markerStart, recoverToolCalls, scanForMarker, type DialectRefusalSignal } from "./tool-dialects.js";
 
@@ -147,17 +148,11 @@ function choiceState(): ChoiceState {
   };
 }
 
-function firstBoundary(value: string): { index: number; length: number } | null {
-  const match = /\r?\n\r?\n/.exec(value);
-  return match ? { index: match.index, length: match[0].length } : null;
-}
-
 function parseEvent(raw: string): ParsedSseEvent {
-  const lines = raw.split(/\r?\n/);
-  const eventName = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() ?? "";
-  const data = lines
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).replace(/^ /, ""))
+  const fields = sseEventFields(raw);
+  const eventName = fields.eventLines[0]?.trim() ?? "";
+  const data = fields.dataLines
+    .map((line) => line.replace(/^ /, ""))
     .join("\n")
     .trim();
   if (!data) return { raw, eventName, data: null };
@@ -262,7 +257,7 @@ export function recoverDialectInOpenAiChatStream(
   const encoder = new TextEncoder();
   const typedSchemas = recoverySchemas(schemas);
   const states = new Map<number, ChoiceState>();
-  let buffered = "";
+  const frames = new BufferedSseFrames();
   let lastEventName = "";
   let terminated = false;
   let cancelled = false;
@@ -451,19 +446,14 @@ export function recoverDialectInOpenAiChatStream(
         while (!terminated) {
           const next = await reader.read();
           if (next.done) break;
-          buffered += decoder.decode(next.value, { stream: true });
-          while (true) {
-            const boundary = firstBoundary(buffered);
-            if (!boundary) break;
-            const raw = buffered.slice(0, boundary.index + boundary.length);
-            buffered = buffered.slice(boundary.index + boundary.length);
+          for (const { raw } of frames.append(decoder.decode(next.value, { stream: true }))) {
             await processEvent(raw);
             if (terminated) break;
           }
         }
         if (!terminated) {
-          buffered += decoder.decode();
-          if (buffered.length > 0) await processEvent(buffered);
+          const remainder = frames.takeRemainder(decoder.decode());
+          if (remainder.length > 0) await processEvent(remainder);
         }
         if (!terminated) {
           let recovered = false;

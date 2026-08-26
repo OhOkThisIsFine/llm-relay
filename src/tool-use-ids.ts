@@ -1,4 +1,5 @@
 import { isRecord } from "./json-shape.js";
+import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
 
 /**
  * Make a translated response's `tool_use` ids unique against the conversation that produced it.
@@ -147,15 +148,6 @@ export function rewriteToolUseIds(content: unknown, taken: ReadonlySet<string>):
   return { content: rewritten > 0 ? out : blocks, rewritten, map };
 }
 
-/** The SSE event framing shared with `think-tags.ts` — both separator spellings are legal. */
-function eventSeparator(text: string): { at: number; length: number } | null {
-  const lf = text.indexOf("\n\n");
-  const crlf = text.indexOf("\r\n\r\n");
-  if (lf < 0 && crlf < 0) return null;
-  if (crlf >= 0 && (lf < 0 || crlf < lf)) return { at: crlf, length: 4 };
-  return { at: lf, length: 2 };
-}
-
 /** Re-serialize one event, replacing its `data:` payload and keeping every other line in place. */
 function replaceEventData(block: string, data: string): string {
   const eol = block.includes("\r\n") ? "\r\n" : "\n";
@@ -195,7 +187,7 @@ export function rewriteToolUseIdsInStream(
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  let buffered = "";
+  const frames = new BufferedSseFrames();
   let minter: ToolUseIdMinter | null = null;
 
   return new ReadableStream<Uint8Array>({
@@ -209,10 +201,7 @@ export function rewriteToolUseIdsInStream(
         // Cheap gate: a tool_use content_block_start always spells the type literally, so ordinary
         // text deltas cost a substring scan rather than a JSON parse.
         if (!block.includes("tool_use")) return null;
-        const dataLines: string[] = [];
-        for (const line of block.split(/\r?\n/)) {
-          if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-        }
+        const dataLines = sseEventFields(block).dataLines.map((line) => line.trim());
         if (dataLines.length === 0) return null;
         let parsed: unknown;
         try {
@@ -231,14 +220,9 @@ export function rewriteToolUseIdsInStream(
       };
 
       const processFrames = () => {
-        for (;;) {
-          const separator = eventSeparator(buffered);
-          if (!separator) return;
-          const block = buffered.slice(0, separator.at);
-          const tail = buffered.slice(separator.at, separator.at + separator.length);
-          buffered = buffered.slice(separator.at + separator.length);
+        for (const { frame: block, separator } of frames) {
           const rewritten = rewriteOne(block);
-          push((rewritten ?? block) + tail);
+          push((rewritten ?? block) + separator);
         }
       };
 
@@ -246,19 +230,19 @@ export function rewriteToolUseIdsInStream(
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          buffered += decoder.decode(value, { stream: true });
+          frames.append(decoder.decode(value, { stream: true }));
           processFrames();
         }
-        buffered += decoder.decode();
+        frames.append(decoder.decode());
         processFrames();
         // A truncated final event is outside this seam; preserve it verbatim.
-        push(buffered);
+        push(frames.takeRemainder());
       } catch (e) {
         // Release what is held before reporting: an id fix must never turn a transport failure
         // into deleted content. Same contract as `stripThinkTagsInStream`.
-        buffered += decoder.decode();
+        frames.append(decoder.decode());
         processFrames();
-        push(buffered);
+        push(frames.takeRemainder());
         const message = e instanceof Error ? e.message : String(e);
         push(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `llm-relay: stream failed: ${message}` } })}\n\n`);
       } finally {
