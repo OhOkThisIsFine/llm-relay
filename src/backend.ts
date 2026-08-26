@@ -349,6 +349,12 @@ function attachUpstreamMetadata(response: Response, metadata: UpstreamResponseMe
   return response;
 }
 
+const ANTHROPIC_STREAM_EVENT_FIELDS = new Map<string, string | null>([
+  ["ping", null], ["message_stop", null], ["content_block_stop", null],
+  ["message_start", "message"], ["content_block_start", "content_block"],
+  ["content_block_delta", "delta"], ["message_delta", "delta"], ["error", "error"],
+]);
+
 /**
  * Validate only the protocol structure the response mappers rely on. Optional identifiers,
  * model names and usage remain optional because several compatible providers legitimately omit
@@ -410,23 +416,10 @@ function invalidEnvelopeReason(value: unknown, protocol: ResponseProtocol, strea
     return null;
   }
 
-  switch (value.type) {
-    case "ping":
-    case "message_stop":
-    case "content_block_stop":
-      return null;
-    case "message_start":
-      return isRecord(value.message) ? null : "message_start is missing message";
-    case "content_block_start":
-      return isRecord(value.content_block) ? null : "content_block_start is missing content_block";
-    case "content_block_delta":
-    case "message_delta":
-      return isRecord(value.delta) ? null : `${String(value.type)} is missing delta`;
-    case "error":
-      return isRecord(value.error) ? null : "error event is missing error";
-    default:
-      return "missing or unknown Anthropic event type";
-  }
+  const field = typeof value.type === "string" ? ANTHROPIC_STREAM_EVENT_FIELDS.get(value.type) : undefined;
+  if (field === undefined) return "missing or unknown Anthropic event type";
+  if (field === null || isRecord(value[field])) return null;
+  return `${value.type === "error" ? "error event" : String(value.type)} is missing ${field}`;
 }
 
 type StreamPreflight =
