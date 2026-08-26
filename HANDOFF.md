@@ -2,7 +2,42 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-24 (evening)
+## 0. State as of 2026-08-26
+
+**Latest — the 2026-08-25/26 complexity sprint, released as v0.48.0.** All seven verified findings
+of [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md) are closed, and its
+nineteen unverified §5 findings now carry source-checked verdicts (owner-decision material, none
+implemented — the verdict table with corrected counts and conditions is in that doc's §5):
+
+- `06d4581` fix(dialect): the streamed rescue's double `finish_reason` defect, plus two ADJACENT
+  hazards found in-session (recovered-text finish leak; non-capturing tail misorder with a doubled
+  finish). Five pinning tests; the adversarial review measured old-vs-new wire bytes.
+- `9964213` `src/json-shape.ts` + 35 dead schema exports deleted; every switched call site proven
+  acceptance-equivalent by differential fuzzing over a hostile-value corpus.
+- `f1f69c6` one `/cooldowns/clear` validator beside the owning type (665,980-combination fuzz, zero
+  acceptance differences; `COOLING_FACT_KINDS` exported so the set has one home).
+- `78b1913` `src/sse-frames.ts`: FIVE boundary detectors carried THREE semantics, not the four/two
+  the finding claimed — and `dialect-stream`'s pure-`\n\n` scan silently swallowed a CRLF upstream
+  WHOLE (latent; now pinned). ~31,000 old-vs-new comparisons, zero unintended diffs.
+- `36de89d` `endWalk` + `walkExitHeaders`: one owner for walk-exhaustion policy on both fronts (two
+  review rounds; net +160 against a -150 forecast — the win is one owner, recorded). Two
+  pre-existing cross-front residues RECORDED, not changed: `handle`'s transport exit emits no
+  `SERVED_BY_HEADER`, and the two dead-stream liveness spellings differ.
+- `99eb472` `collectQuotaBuckets` in `availability.ts`; caller policies stayed at callers; verified
+  first-hand plus a relay free-pool lane (PARITY-CONFIRMED) after the Opus lane hit the spend cap.
+- `adbd5c4` two load-sensitive tests fixed at the root — the winenv flake class on two NEW axes:
+  `keys` status probed LIVE hosts inside vi.waitFor's 1s budget (now mocked; the test pins router
+  equivalence), and the dedup-cap test insert-sorted 16,384 ids inside 5s (store gained a
+  `dedupLimit` test seam on the `recentLimit` pattern; production unchanged).
+
+Process notes that generalize: every packet was Codex-implemented and independently reviewed with
+the gate green before its commit; agy dropped TWO long-report answers end-to-end (reproducible
+print-mode failure — full narration, no final report, mitigations did not help), so long-report
+verification belongs on relay free-pool lanes; and reviewer subagent shells leaked zero-byte junk
+files into the repo root twice (`git add -A` staged them once — amended out; stage with explicit
+pathspecs).
+
+## 0.1 Earlier: state as of 2026-08-24 (evening)
 
 **Latest, released as v0.46.0 (`091cf7c`): the dialect-rescue destructive filter.** This closes the last item
 in §6 that was a code gap rather than a recorded trade — the one known safety-shaped one. A

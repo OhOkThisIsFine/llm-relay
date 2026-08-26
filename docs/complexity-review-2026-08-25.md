@@ -29,11 +29,11 @@ anywhere else in `src/`.
 | # | Finding | Site | Kind | Delta | Risk |
 |---|---|---|---|---|---|
 | 1 | Dialect rescue emits two `finish_reason`s, dropping the rescued tool call — **FIXED 2026-08-25** | `src/openai-dialect.ts` | correctness | +16 (landed) | low |
-| 2 | Seven walk-exhaustion exits hand-copied across the two fronts | `src/server.ts` (6 sites) | duplication | ~-150 | medium |
-| 3 | Four SSE boundary detectors, two of which disagree — **FIXED 2026-08-25** | 4 modules | duplication + drift | consolidated | low |
-| 4 | 35 exported bindings with zero callers | `src/accounting-store-schema.ts` | dead code | ~-75 | low |
-| 5 | `isRecord` defined 12 times; exact-keys helper 8 times, 3 signatures | 20 sites | duplication | ~-60 | low |
-| 6 | Quota-bucket gathering written three times | 3 modules | duplication | ~-45 | medium |
+| 2 | Seven walk-exhaustion exits hand-copied across the two fronts — **FIXED 2026-08-25** | `src/server.ts` (6 sites) | duplication | +160 (landed; forecast ~-150 — one owner for the five never-diverge behaviors, not lines) | medium |
+| 3 | Four SSE boundary detectors, two of which disagree — **FIXED 2026-08-25** | 4 modules | duplication + drift | -33 (landed; five detectors, three semantics — see the section) | low |
+| 4 | 35 exported bindings with zero callers — **FIXED 2026-08-25** | `src/accounting-store-schema.ts` | dead code | ~-75 (landed) | low |
+| 5 | `isRecord` defined 12 times; exact-keys helper 8 times, 3 signatures — **FIXED 2026-08-25** | 20 sites | duplication | ~-60 (landed) | low |
+| 6 | Quota-bucket gathering written three times — **FIXED 2026-08-26** | 3 modules | duplication | -11 (landed; forecast ~-45) | medium |
 | 7 | The `/cooldowns/clear` wire shape validated twice by hand — **FIXED 2026-08-25** | `src/cli.ts`, `src/keys-cli.ts` | duplication | -8 (landed; forecast ~-75 — the narrowed path needed its own branches, so the win is one owner, not lines) | low |
 
 Nothing here proposes splitting `server.ts` or `config.ts` into modules. That refactor is already
@@ -148,7 +148,7 @@ reviewer reconstructed the pre-fix code and measured all three pinned shapes fai
 
 ## 3. Confirmed duplication
 
-### 2. Seven walk-exhaustion exits, hand-copied across the two fronts — VERIFIED
+### 2. Seven walk-exhaustion exits, hand-copied across the two fronts — VERIFIED; FIXED 2026-08-25
 
 **Sites:** [src/server.ts](../src/server.ts) — `handle` at lines 1476-1500, 1512-1546, 1600-1651,
 1714-1750; `openAiFrontPath` at 3526-3563, 3579-3607, 3677-3713.
@@ -296,7 +296,7 @@ function under the same name. That is the real cost, more than the roughly 60 du
 **Proposed shape.** One small `json-shape.ts` exporting `isRecord`, `hasExactKeys` in guard form, and
 `hasExactKeysWithOptional`. Mechanical, no behaviour change, and it retires a naming trap.
 
-### 6. Quota-bucket gathering written three times — VERIFIED
+### 6. Quota-bucket gathering written three times — VERIFIED; FIXED 2026-08-26
 
 **Sites:** [src/availability-snapshot.ts:106](../src/availability-snapshot.ts#L106),
 [src/candidates.ts:390](../src/candidates.ts#L390) and
@@ -321,7 +321,19 @@ caller's gating, ordering and ledger policy where it is. Roughly -45 lines.
 rung 2 fires only when the caller passes `localUsed` in, naming tests and an in-process server. The
 `buildCandidateAvailability` signature is `(cfg, provider, credentialId, model, quota, nowMs)`. There
 is no `localUsed` parameter and no way to pass one. The comment describes an escape hatch that does
-not exist.
+not exist. (Rewritten with findings 4/5; it now also names the deliberate non-threading of the
+ledger reader.)
+
+**Resolution, 2026-08-26.** Landed exactly as proposed: `collectQuotaBuckets` in `availability.ts`
+(net -11 across the four files), with each caller's gating, ordering and ledger policy preserved
+verbatim at the caller — the `enforceLearned` gate, `bucketRank` sorting (which makes the builder's
+population order unobservable at quota-demotion), and all three ledger policies. Learned and
+configured are disjoint assignment sites in the builder, so a display-only learned ceiling cannot
+be relabeled an operator declaration. Verified by a loop-by-loop first-hand read plus an
+independent relay free-pool lane's differential pass (PARITY-CONFIRMED; the usual fresh-context
+reviewer lane was unavailable on a spend cap). The lane's coverage probe found month-period
+observations pinned nowhere in the consumer suites, so `test/availability.test.ts` now pins the
+month bucket, the unknown-period drop, and the learned/configured split directly on the builder.
 
 ### 7. The cooldown-clear wire shape validated twice — VERIFIED; FIXED 2026-08-25
 
