@@ -220,8 +220,11 @@ describe("limits.hard — the G2 refusal ceilings", () => {
         ],
       },
     });
-    // Slot flat beats provider flat on that axis; the slot's own tpd is credential-sourced too.
+    // Soft and hard winners stay independent: provider soft rpd survives while slot hard rpd
+    // beats provider hard rpd; the slot's own hard tpd is credential-sourced too.
     expect(resolveConfiguredLimits(cfg, "nim", "a", null)).toMatchObject({
+      rpd: 1000,
+      source: { rpd: "provider" },
       hard: { rpd: 450, tpd: 2_000_000 },
       hardSource: { rpd: "credential", tpd: "credential" },
     });
