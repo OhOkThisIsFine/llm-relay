@@ -4,7 +4,38 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-26
 
-**Latest — the 2026-08-25/26 complexity sprint, released as v0.48.0.** All seven verified findings
+**Latest — the 2026-08-26 §5 implementation sprint, released as v0.48.0.** The nine §5 items the
+second verification pass ranked worth the churn (10, 14, 8, 21, 25, 26, 16+18, 15, 20) are
+implemented as eight commits (`3561bb4`..`b9409e3`):
+
+- `3561bb4` backend stream-event validation as a field table (item 14).
+- `23a87c5` dashboard route ladder as an ordered per-route policy table (item 10).
+- `0cdf45c` one SPEND_CELLS table for the snapshot projection's four spend cells (item 8);
+  a key-correlated union makes a wrong provenance pairing a compile error.
+- `c9430bb` one line-terminator scan in the usage observer's SSE drain; the discard and overflow
+  tails stay distinct (item 21).
+- `caa762c` the coverage state machine shared and the spend empty-factory folded onto
+  SPEND_CELL_KEYS; each validator keeps its own key set and loss formula (items 25+26).
+- `3598885` configured-limits: one axis grammar (parseLimitEntry) and one four-rung ladder walked
+  once per axis with soft and hard figures resolved independently (items 16+18); a test now pins
+  that the two winners on one axis stay independent.
+- `915c983` createHardCapLedgerReader in hard-cap.ts — enforcement, `/candidates` and the
+  availability producer now ask the ledger the literally same scope-narrowed question (item 15);
+  test/hard-cap.test.ts exercises the factory itself and drops an `as never`.
+- `b9409e3` the candidates table's 17 columns declared once; stdout byte-identical
+  (3,184-character before/after diff of the built CLI) (item 20).
+
+Process: every packet Codex-implemented (GPT-5.6 Sol), gate green twice per packet (implementer
+and orchestrator runs), independently reviewed by a relay free-pool `pool/high` read lane (every
+verdict MERGE; one retry on a HuggingFace 402, one on a bare-verdict report), with AGY second
+lenses on the route table and the ledger-reader guard. §5 items NOT picked, per the same pass's
+verdicts (status marks in the review doc §5): 9, 11, 12, 13 (not worth the churn), 17 and 23
+(only in their corrected shapes, deferred), 19's remainder (polish), 22 and 24 (unranked; 22
+belongs beside finding 2 and needs a ctx adapter).
+
+**Earlier — the 2026-08-25/26 complexity sprint, released across v0.47.0 and v0.47.1.** (An
+earlier revision of this line claimed v0.48.0; no such release existed — the sprint shipped as
+v0.47.1, with the CLI arity guard preceding it as v0.47.0.) All seven verified findings
 of [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md) are closed, and its
 nineteen unverified §5 findings now carry source-checked verdicts (owner-decision material, none
 implemented — the verdict table with corrected counts and conditions is in that doc's §5):
