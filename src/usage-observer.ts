@@ -678,45 +678,29 @@ function makeSseObserver(
   const state = newSseState();
 
   const drain = (final: boolean): void => {
-    if (discardUntilBreak) {
+    while (discardUntilBreak || text.length > 0) {
       let index = -1;
       let terminatorLength = 0;
       for (let i = 0; i < text.length; i += 1) {
         const code = text.charCodeAt(i);
-        if (code === 10 || code === 13) {
-          // CRLF may be split over two provider chunks.  Keep a trailing CR
-          // until the LF arrives so it cannot dispatch a false blank frame.
-          if (code === 13 && i === text.length - 1 && !final) break;
-          index = i;
-          terminatorLength = code === 13 && text.charCodeAt(i + 1) === 10 ? 2 : 1;
-          break;
-        }
+        if (code !== 10 && code !== 13) continue;
+        // CRLF may be split over two provider chunks. Keep a trailing CR
+        // until LF arrives so it cannot dispatch a false blank frame.
+        if (code === 13 && i === text.length - 1 && !final) break;
+        index = i;
+        terminatorLength = code === 13 && text.charCodeAt(i + 1) === 10 ? 2 : 1;
+        break;
       }
       if (index < 0) {
-        // An oversized line can end in a CR whose LF arrives next chunk.
-        // Retain that one byte so the frame separator remains intact.
-        text = text.endsWith("\r") && !final ? "\r" : "";
-        if (final) discardUntilBreak = false;
-        return;
-      }
-      text = text.slice(index + terminatorLength);
-      discardUntilBreak = false;
-    }
-    while (text.length > 0) {
-      let index = -1;
-      let terminatorLength = 0;
-      for (let i = 0; i < text.length; i += 1) {
-        const code = text.charCodeAt(i);
-        if (code === 10 || code === 13) {
-          if (code === 13 && i === text.length - 1 && !final) break;
-          index = i;
-          terminatorLength = code === 13 && text.charCodeAt(i + 1) === 10 ? 2 : 1;
-          break;
+        if (discardUntilBreak) {
+          // An oversized line can end in CR whose LF arrives in the next chunk.
+          // Retain one byte so the frame separator remains intact.
+          text = text.endsWith("\r") && !final ? "\r" : "";
+          if (final) discardUntilBreak = false;
+          return;
         }
-      }
-      if (index < 0) {
         if (state.size + new TextEncoder().encode(text).byteLength > MAX_SSE_FRAME) {
-          // Do not retain an unterminated oversized line.  The next blank
+          // Do not retain an unterminated oversized line. The next blank
           // line will reset the poisoned frame and permit recovery.
           state.overflow = true;
           text = "";
@@ -724,6 +708,11 @@ function makeSseObserver(
           taintOutputEstimate(accumulator, estimate);
         }
         break;
+      }
+      if (discardUntilBreak) {
+        text = text.slice(index + terminatorLength);
+        discardUntilBreak = false;
+        continue;
       }
       const line = text.slice(0, index);
       text = text.slice(index + terminatorLength);
