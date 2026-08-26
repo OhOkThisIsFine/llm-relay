@@ -17,29 +17,27 @@
 import {
   type CooldownReason,
   type CooldownRowV1,
-  type QuotaPeriod,
   type QuotaRowV1,
 } from "./dashboard-contract.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
 import type { CredentialId } from "./credential-id.js";
 import { parseCredentialId } from "./credential-id.js";
-import { CONFIGURED_LIMIT_AXES, configuredLimitQuotaShape, resolveConfiguredLimits } from "./configured-limits.js";
+import { resolveConfiguredLimits } from "./configured-limits.js";
 import { providerCredentialSlots } from "./credential-fleet.js";
 import { observedRateLimits } from "./rate-limits.js";
 import {
+  collectQuotaBuckets,
   factResetInputs,
   mapLimitBasis,
   mapRemainingBasis,
   mapResetsAtBasis,
   resolveRemaining,
   resolveResetsAt,
-  type LimitInputs,
   type LocalUsedReading,
 } from "./availability.js";
 import type { AccountingStore } from "./accounting-store.js";
 import { evaluateHardCap } from "./hard-cap.js";
 import { POOL_PREFIX, splitSpec, type Config } from "./config.js";
-import type { QuotaAxis, QuotaObservation } from "./quota-observation.js";
 import { factsFor } from "./target-facts.js";
 
 /**
@@ -66,11 +64,6 @@ export interface AvailabilityProducerOptions {
 /** Shape-compatible with `DashboardAvailabilityPort`; typed locally so server.ts stays decoupled. */
 export interface AvailabilitySnapshot {
   snapshot(): { quotas: QuotaRowV1[]; cooldowns: CooldownRowV1[] };
-}
-
-interface Bucket {
-  observations: QuotaObservation[];
-  limits: LimitInputs;
 }
 
 /**
@@ -102,42 +95,21 @@ function buildQuotas(
     // (most-specific scope first) is load-bearing input to `factResetInputs`.
     const cellFacts = readFacts(provider, credentialId as CredentialId, model, { now });
 
-    const buckets = new Map<string, Bucket>();
-    const bucketFor = (axis: QuotaAxis, period: Exclude<QuotaPeriod, "unknown">): Bucket => {
-      const key = `${axis}:${period}`;
-      let bucket = buckets.get(key);
-      if (bucket === undefined) {
-        bucket = { observations: [], limits: {} };
-        buckets.set(key, bucket);
-      }
-      return bucket;
-    };
-
-    for (const observation of state.quotaObservations) {
-      if (observation.period === "unknown") continue;
-      bucketFor(observation.axis, observation.period).observations.push(observation);
-    }
-
     // Learned ceilings (packet C's store) cover this attempt/credential/deployment by scope.
-    if (model !== null) {
-      for (const entry of observedRateLimits(provider, credentialId as CredentialId, model, { now })) {
-        bucketFor(entry.axis, entry.period).limits.learned = entry.limit;
-      }
-    }
+    const learned = model === null
+      ? []
+      : observedRateLimits(provider, credentialId as CredentialId, model, { now });
 
     // Operator-declared ceilings resolve per axis through packet B's ladder.
     const configured = resolveConfiguredLimits(cfg, provider, parsed.label, model);
-    if (configured !== null) {
-      for (const axis of CONFIGURED_LIMIT_AXES) {
-        const value = configured[axis];
-        if (value === undefined) continue;
-        const shape = configuredLimitQuotaShape(axis);
-        bucketFor(shape.axis, shape.period).limits.configured = value;
-      }
-    }
+    const buckets = collectQuotaBuckets({
+      observations: state.quotaObservations,
+      learned,
+      configured,
+    });
 
-    for (const [key, bucket] of buckets) {
-      const [axisPart, periodPart] = key.split(":") as [QuotaAxis, Exclude<QuotaPeriod, "unknown">];
+    for (const bucket of buckets.values()) {
+      const { axis: axisPart, period: periodPart } = bucket;
       // The ledger reports {requests, tokens}; the ladder consumes one figure — tokens for the
       // token axes (what a TPM/TPD ceiling bounds) and the request count otherwise.
       const windowReading =

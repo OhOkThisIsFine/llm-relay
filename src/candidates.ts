@@ -25,14 +25,14 @@ import { loadTierData } from "./registry.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { type QuotaObservation } from "./quota-observation.js";
 import { observedRateLimits } from "./rate-limits.js";
-import { resolveConfiguredLimits, CONFIGURED_LIMIT_AXES, configuredLimitQuotaShape } from "./configured-limits.js";
+import { resolveConfiguredLimits } from "./configured-limits.js";
 import { evaluateHardCap } from "./hard-cap.js";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import {
+  collectQuotaBuckets,
   factResetInputs,
   resolveRemaining,
   resolveResetsAt,
-  type LimitInputs,
   type LocalUsedReading,
   type RemainingResolution,
   type ResetsAtResolution,
@@ -387,33 +387,11 @@ function buildCandidateAvailability(
   // One read per cell; the order (most-specific scope first) is load-bearing input below.
   const cellFacts = factsFor(provider, credentialId as CredentialId, model ?? null, { now: nowMs });
 
-  const buckets = new Map<string, { observations: QuotaObservation[]; limits: LimitInputs }>();
-  const bucketFor = (axis: "requests" | "tokens", period: "minute" | "day" | "month") => {
-    const key = `${axis}:${period}`;
-    let bucket = buckets.get(key);
-    if (bucket === undefined) {
-      bucket = { observations: [], limits: {} };
-      buckets.set(key, bucket);
-    }
-    return bucket;
-  };
-  for (const observation of quota) {
-    if (observation.period === "unknown") continue;
-    bucketFor(observation.axis, observation.period).observations.push(observation);
-  }
-  for (const entry of learned) bucketFor(entry.axis, entry.period).limits.learned = entry.limit;
-  if (configured !== null) {
-    for (const axis of CONFIGURED_LIMIT_AXES) {
-      const value = configured[axis];
-      if (value === undefined) continue;
-      const shape = configuredLimitQuotaShape(axis);
-      bucketFor(shape.axis, shape.period).limits.configured = value;
-    }
-  }
+  const buckets = collectQuotaBuckets({ observations: quota, learned, configured });
 
   const rows: CandidateAvailability[] = [];
-  for (const [key, bucket] of buckets) {
-    const [axisPart, periodPart] = key.split(":") as ["requests" | "tokens", "minute" | "day" | "month"];
+  for (const bucket of buckets.values()) {
+    const { axis: axisPart, period: periodPart } = bucket;
     const hasLimits = bucket.limits.configured !== undefined || bucket.limits.learned !== undefined;
     if (bucket.observations.length === 0 && !hasLimits) continue;
     const resolution = resolveRemaining({

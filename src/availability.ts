@@ -14,12 +14,18 @@
  * ("derived:<limit-provenance>"), so a reader can always tell a stated figure from a computed one.
  *
  * Pure: no IO, no clock of its own (`now` is an argument), no imports from server.ts. It reads no
- * store either — `factResetInputs` is handed facts a caller already read, and the only non-type
- * import outside this file's own vocabulary is `target-facts.ts`'s closed kind set, so the set
- * cannot be restated (and drift) in two consumers. Gap 12 calls `resolveRemaining` from the
- * routing path under `routingEligible`; nothing here reorders or refuses anything today.
+ * store either — callers hand it observations, limits, usage and facts they already read. Its
+ * runtime imports are pure vocabularies: configured-limit axes/mapping and `target-facts.ts`'s
+ * closed kind set, so neither can be restated (and drift) in consumers. Gap 12 calls
+ * `resolveRemaining` from the routing path under `routingEligible`; nothing here reorders or
+ * refuses anything today.
  */
 import type { QuotaAxis, QuotaObservation, QuotaPeriod } from "./quota-observation.js";
+import {
+  CONFIGURED_LIMIT_AXES,
+  configuredLimitQuotaShape,
+  type ConfiguredLimitAxis,
+} from "./configured-limits.js";
 
 /** Where a rung-2 limit may come from, in precedence order (see resolveRemaining). */
 export type LimitProvenance = "provider-stated" | "configured" | "learned" | "published";
@@ -40,6 +46,63 @@ export interface LimitInputs {
    * ladder does not need to change shape when the rung lands.
    */
   published?: number | null;
+}
+
+/**
+ * ⚠ `quota-observation.ts` keeps a PRIVATE interface of the same name for its own header
+ * parsing; this exported shape is the one consumers see. Exporting the other would collide.
+ */
+export interface QuotaBucket {
+  readonly axis: QuotaAxis;
+  readonly period: Exclude<QuotaPeriod, "unknown">;
+  readonly observations: QuotaObservation[];
+  readonly limits: LimitInputs;
+}
+
+export interface CollectQuotaBucketsInput {
+  readonly observations: readonly QuotaObservation[];
+  readonly learned: readonly {
+    readonly axis: QuotaAxis;
+    readonly period: Exclude<QuotaPeriod, "unknown">;
+    readonly limit: number;
+  }[];
+  readonly configured: Partial<Record<ConfiguredLimitAxis, number>> | null;
+}
+
+/**
+ * Gather every (axis, period) carrying admissible quota evidence into insertion order.
+ * Callers still choose whether learned figures participate, how buckets are ordered after
+ * collection, and which local ledger reading feeds resolution.
+ */
+export function collectQuotaBuckets(input: CollectQuotaBucketsInput): Map<string, QuotaBucket> {
+  const buckets = new Map<string, QuotaBucket>();
+  const bucketFor = (axis: QuotaAxis, period: Exclude<QuotaPeriod, "unknown">): QuotaBucket => {
+    const key = `${axis}:${period}`;
+    let bucket = buckets.get(key);
+    if (bucket === undefined) {
+      bucket = { axis, period, observations: [], limits: {} };
+      buckets.set(key, bucket);
+    }
+    return bucket;
+  };
+
+  for (const observation of input.observations) {
+    if (observation.period === "unknown") continue;
+    bucketFor(observation.axis, observation.period).observations.push(observation);
+  }
+  for (const entry of input.learned) {
+    bucketFor(entry.axis, entry.period).limits.learned = entry.limit;
+  }
+  if (input.configured !== null) {
+    for (const axis of CONFIGURED_LIMIT_AXES) {
+      const value = input.configured[axis];
+      if (value === undefined) continue;
+      const shape = configuredLimitQuotaShape(axis);
+      bucketFor(shape.axis, shape.period).limits.configured = value;
+    }
+  }
+
+  return buckets;
 }
 
 export interface ResolveRemainingInput {
