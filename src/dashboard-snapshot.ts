@@ -508,17 +508,23 @@ function mergeSpendCell(target: MutableSpendCell, source: AccountingAggregateSpe
   target.amountMicrousd += source.amountMicrousd;
 }
 
-const SPEND_CELL_PAIRS: ReadonlyArray<readonly [keyof AccountingAggregateSpendV1, keyof MutableSpend]> = [
-  ["providerPublishedReported", "providerPublishedReported"],
-  ["providerPublishedEstimated", "providerPublishedEstimated"],
-  ["referenceReported", "referenceReported"],
-  ["referenceEstimated", "referenceEstimated"],
-];
+type SpendCellDefinition = {
+  [K in keyof MutableSpend]: readonly [K, SpendTotalsV1[K]["priceSource"], SpendTotalsV1[K]["tokenBasis"], Exclude<SpendTotalsV1[K]["source"], "unknown">];
+}[keyof MutableSpend];
+
+const SPEND_CELLS = [
+  ["providerPublishedReported", "provider_published", "reported", "provider_reported"],
+  ["providerPublishedEstimated", "provider_published", "estimated", "relay_estimated"],
+  ["referenceReported", "reference", "reported", "provider_reported"],
+  ["referenceEstimated", "reference", "estimated", "relay_estimated"],
+] as const satisfies readonly SpendCellDefinition[];
+type SpendCellKey = (typeof SPEND_CELLS)[number][0];
+type ProjectedSpendCell = Pick<SpendTotalsV1[SpendCellKey], "amountMicrousd" | "source" | "observedAt">;
 
 function mergeSpend(target: MutableSpend, source: AccountingAggregateSpendV1 | null | undefined, health: ProjectionHealth): void {
   if (!source) return;
-  for (const [sourceKey, targetKey] of SPEND_CELL_PAIRS) {
-    mergeSpendCell(target[targetKey], source[sourceKey], health);
+  for (const [key] of SPEND_CELLS) {
+    mergeSpendCell(target[key], source[key], health);
   }
 }
 
@@ -594,43 +600,18 @@ function projectedSpendCell<T extends "provider_reported" | "relay_estimated">(
 
 function spendTotals(stats: MutableStats): SpendTotalsV1 {
   const unknown = () => ({ amountMicrousd: null, source: "unknown" as const, observedAt: null });
-  const result: SpendTotalsV1 = {
-    providerPublishedReported: { ...unknown(), priceSource: "provider_published", tokenBasis: "reported" },
-    providerPublishedEstimated: { ...unknown(), priceSource: "provider_published", tokenBasis: "estimated" },
-    referenceReported: { ...unknown(), priceSource: "reference", tokenBasis: "reported" },
-    referenceEstimated: { ...unknown(), priceSource: "reference", tokenBasis: "estimated" },
+  const cells = Object.fromEntries(SPEND_CELLS.map(([key, priceSource, tokenBasis, source]) => {
+    let projected: ProjectedSpendCell = unknown();
+    if (stats.spend[key].seen) {
+      projected = projectedSpendCell(stats.spend[key], source);
+    }
+    return [key, { ...projected, priceSource, tokenBasis }];
+  })) as Pick<SpendTotalsV1, SpendCellKey>;
+  return {
+    ...cells,
     unpricedRequests: stats.unpricedRequests,
     partiallyPricedRequests: stats.partiallyPricedRequests,
   };
-  if (stats.spend.providerPublishedReported.seen) {
-    result.providerPublishedReported = {
-      ...projectedSpendCell(stats.spend.providerPublishedReported, "provider_reported"),
-      priceSource: "provider_published",
-      tokenBasis: "reported",
-    };
-  }
-  if (stats.spend.providerPublishedEstimated.seen) {
-    result.providerPublishedEstimated = {
-      ...projectedSpendCell(stats.spend.providerPublishedEstimated, "relay_estimated"),
-      priceSource: "provider_published",
-      tokenBasis: "estimated",
-    };
-  }
-  if (stats.spend.referenceReported.seen) {
-    result.referenceReported = {
-      ...projectedSpendCell(stats.spend.referenceReported, "provider_reported"),
-      priceSource: "reference",
-      tokenBasis: "reported",
-    };
-  }
-  if (stats.spend.referenceEstimated.seen) {
-    result.referenceEstimated = {
-      ...projectedSpendCell(stats.spend.referenceEstimated, "relay_estimated"),
-      priceSource: "reference",
-      tokenBasis: "estimated",
-    };
-  }
-  return result;
 }
 
 function average(metric: MutableMetric, toleratedUnknown: number): number | null {
@@ -1134,8 +1115,8 @@ function newRepairAccumulator(): RepairAccumulator {
 
 function foldRepairAttempt(target: RepairAccumulator, row: AccountingAggregateV1 & { attempts: number }, health: ProjectionHealth): void {
   target.attempts = boundedAdd(target.attempts, safeInteger(row.attempts), health);
-  const pricedContributions = SPEND_CELL_PAIRS.reduce(
-    (sum, [sourceKey]) => sum + safeInteger((row.spend as AccountingAggregateSpendV1 | null)?.[sourceKey]?.known ?? 0),
+  const pricedContributions = SPEND_CELLS.reduce(
+    (sum, [key]) => sum + safeInteger((row.spend as AccountingAggregateSpendV1 | null)?.[key]?.known ?? 0),
     0,
   );
   target.unpricedAttempts = boundedAdd(
@@ -1890,4 +1871,3 @@ export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOp
     },
   });
 }
-
