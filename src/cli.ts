@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { hasExactKeys, isRecord } from "./json-shape.js";
+import { isRecord } from "./json-shape.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -20,7 +20,7 @@ import { loadEnvFile } from "./dotenv.js";
 import { recoverWindowsEnv } from "./winenv.js";
 import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate, type CandidateAvailability } from "./candidates.js";
-import { CREDENTIAL_LABEL_PATTERN, makeCredentialId, parseCredentialId } from "./credential-id.js";
+import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
@@ -55,7 +55,7 @@ import {
   writeConfigPath,
 } from "./config-edit.js";
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
-import type { CooldownClearResult } from "./cooldown-clear.js";
+import { isCooldownClearResult, type CooldownClearTargetKey } from "./cooldown-clear.js";
 import { createDashboardSnapshotReadPort, type CostReportQuery } from "./dashboard-snapshot.js";
 import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp } from "./dashboard-contract.js";
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
@@ -874,157 +874,6 @@ function cooldownCommandFailure(message: string): never {
   process.exit(1);
 }
 
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
-type CooldownClearCell = CooldownClearResult["cleared"]["breakerCells"]["items"][number];
-type CooldownClearFact = CooldownClearResult["cleared"]["facts"]["items"][number];
-type CooldownFactScope = CooldownClearFact["scope"];
-
-const COOLING_FACT_KINDS: ReadonlySet<FactKind> = new Set([
-  "allowance-exhausted",
-  "rate-limited",
-  "credential-invalid",
-]);
-
-function credentialIdBelongsTo(provider: string, value: unknown): value is string {
-  if (typeof value !== "string") return false;
-  return parseCredentialId(value)?.provider === provider;
-}
-
-function isCooldownFactScope(value: unknown): value is CooldownFactScope {
-  if (!isRecord(value)) return false;
-  switch (value.kind) {
-    case "attempt":
-      return hasExactKeys(value, ["kind", "provider", "credentialId", "model"]) &&
-        nonEmptyString(value.provider) &&
-        credentialIdBelongsTo(value.provider, value.credentialId) &&
-        nonEmptyString(value.model);
-    case "group": {
-      const keys = Object.hasOwn(value, "credentialId")
-        ? ["kind", "provider", "credentialId", "members"]
-        : ["kind", "provider", "members"];
-      return hasExactKeys(value, keys) &&
-        nonEmptyString(value.provider) &&
-        Array.isArray(value.members) &&
-        value.members.length > 0 &&
-        value.members.every(nonEmptyString) &&
-        (!Object.hasOwn(value, "credentialId") || credentialIdBelongsTo(value.provider, value.credentialId));
-    }
-    case "deployment":
-      return hasExactKeys(value, ["kind", "provider", "model"]) &&
-        nonEmptyString(value.provider) && nonEmptyString(value.model);
-    case "credential":
-      return hasExactKeys(value, ["kind", "provider", "credentialId"]) &&
-        nonEmptyString(value.provider) && credentialIdBelongsTo(value.provider, value.credentialId);
-    case "provider":
-      return hasExactKeys(value, ["kind", "provider"]) && nonEmptyString(value.provider);
-    case "model":
-      return hasExactKeys(value, ["kind", "model"]) && nonEmptyString(value.model);
-    default:
-      return false;
-  }
-}
-
-function scopeIsContainedByTarget(
-  scope: CooldownFactScope,
-  target: CooldownClearResult["target"],
-): boolean {
-  const credentialId = target.credential === undefined
-    ? undefined
-    : makeCredentialId(target.provider, target.credential);
-  switch (scope.kind) {
-    case "attempt":
-      return scope.provider === target.provider &&
-        (target.model === undefined || scope.model === target.model) &&
-        (credentialId === undefined || scope.credentialId === credentialId);
-    case "group":
-      return scope.provider === target.provider &&
-        (target.model === undefined || scope.members.every((member) => member === target.model)) &&
-        (credentialId === undefined || scope.credentialId === credentialId);
-    case "deployment":
-      return scope.provider === target.provider && credentialId === undefined &&
-        (target.model === undefined || scope.model === target.model);
-    case "credential":
-      return scope.provider === target.provider && target.model === undefined &&
-        (credentialId === undefined || scope.credentialId === credentialId);
-    case "provider":
-      return scope.provider === target.provider && target.model === undefined && credentialId === undefined;
-    case "model":
-      return false;
-  }
-}
-
-function isCooldownCell(
-  value: unknown,
-  target: CooldownClearResult["target"],
-): value is CooldownClearCell {
-  if (!isRecord(value) || !hasExactKeys(value, ["provider", "model", "credential"])) return false;
-  if (!nonEmptyString(value.provider) || value.provider !== target.provider) return false;
-  if (!(value.model === null || nonEmptyString(value.model))) return false;
-  if (!nonEmptyString(value.credential) || !CREDENTIAL_LABEL_PATTERN.test(value.credential)) return false;
-  return (target.model === undefined || value.model === target.model) &&
-    (target.credential === undefined || value.credential === target.credential);
-}
-
-function isCooldownFact(
-  value: unknown,
-  target: CooldownClearResult["target"],
-): value is CooldownClearFact {
-  return isRecord(value) &&
-    hasExactKeys(value, ["kind", "scope"]) &&
-    typeof value.kind === "string" &&
-    COOLING_FACT_KINDS.has(value.kind as FactKind) &&
-    isCooldownFactScope(value.scope) &&
-    scopeIsContainedByTarget(value.scope, target);
-}
-
-function isClearedGroup<T>(
-  value: unknown,
-  isItem: (item: unknown) => item is T,
-): value is { count: number; items: T[] } {
-  if (!isRecord(value) || !hasExactKeys(value, ["count", "items"]) ||
-      typeof value.count !== "number" || !Number.isSafeInteger(value.count) ||
-      value.count < 0 || !Array.isArray(value.items)) {
-    return false;
-  }
-  return value.count === value.items.length && value.items.every(isItem);
-}
-
-function isExactCooldownTarget(
-  value: unknown,
-  expected: CooldownClearResult["target"],
-): value is CooldownClearResult["target"] {
-  if (!isRecord(value)) return false;
-  const keys = [
-    "provider",
-    ...(expected.model === undefined ? [] : ["model"]),
-    ...(expected.credential === undefined ? [] : ["credential"]),
-  ];
-  return hasExactKeys(value, keys) &&
-    value.provider === expected.provider &&
-    (expected.model === undefined || value.model === expected.model) &&
-    (expected.credential === undefined || value.credential === expected.credential);
-}
-
-function isCooldownClearResult(
-  value: unknown,
-  target: CooldownClearResult["target"],
-): value is CooldownClearResult {
-  if (!isRecord(value) || !hasExactKeys(value, ["target", "cleared"]) ||
-      !isExactCooldownTarget(value.target, target) || !isRecord(value.cleared) ||
-      !hasExactKeys(value.cleared, ["breakerCells", "credentialFaults", "facts"])) {
-    return false;
-  }
-  return isClearedGroup(value.cleared.breakerCells, (item): item is CooldownClearCell =>
-    isCooldownCell(item, target)) &&
-    isClearedGroup(value.cleared.credentialFaults, (item): item is CooldownClearCell =>
-      isCooldownCell(item, target)) &&
-    isClearedGroup(value.cleared.facts, (item): item is CooldownClearFact =>
-      isCooldownFact(item, target));
-}
-
 type CooldownClearOption =
   | { readonly semantic: "credential" | "config" | "provider"; readonly takesValue: true }
   | { readonly semantic: "json" | "refresh"; readonly takesValue: false };
@@ -1256,6 +1105,11 @@ export async function runCooldowns(_action: string | undefined, _spec: string | 
     ...(model === undefined ? {} : { model }),
     ...(credential === undefined ? {} : { credential }),
   };
+  const acceptedTargetKeys: CooldownClearTargetKey[] = [
+    "provider",
+    ...(model === undefined ? [] : ["model" as const]),
+    ...(credential === undefined ? [] : ["credential" as const]),
+  ];
 
   const cfg = loadOrExit();
   if (!Object.hasOwn(cfg.providers, provider)) {
@@ -1294,7 +1148,7 @@ export async function runCooldowns(_action: string | undefined, _spec: string | 
     const detail = controlErrorMessage(payload);
     cooldownCommandFailure(`the running relay rejected the clear${detail === null ? "" : `: ${detail}`}`);
   }
-  if (!isCooldownClearResult(payload, target)) {
+  if (!isCooldownClearResult(payload, target, acceptedTargetKeys)) {
     cooldownCommandFailure("the running relay returned an invalid cooldown-clear response");
   }
 

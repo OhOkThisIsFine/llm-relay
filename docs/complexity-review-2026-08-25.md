@@ -34,7 +34,7 @@ anywhere else in `src/`.
 | 4 | 35 exported bindings with zero callers | `src/accounting-store-schema.ts` | dead code | ~-75 | low |
 | 5 | `isRecord` defined 12 times; exact-keys helper 8 times, 3 signatures | 20 sites | duplication | ~-60 | low |
 | 6 | Quota-bucket gathering written three times | 3 modules | duplication | ~-45 | medium |
-| 7 | The `/cooldowns/clear` wire shape validated twice by hand | `src/cli.ts`, `src/keys-cli.ts` | duplication | ~-75 | low |
+| 7 | The `/cooldowns/clear` wire shape validated twice by hand — **FIXED 2026-08-25** | `src/cli.ts`, `src/keys-cli.ts` | duplication | -8 (landed; forecast ~-75 — the narrowed path needed its own branches, so the win is one owner, not lines) | low |
 
 Nothing here proposes splitting `server.ts` or `config.ts` into modules. That refactor is already
 rejected, and none of these findings need it.
@@ -290,21 +290,25 @@ rung 2 fires only when the caller passes `localUsed` in, naming tests and an in-
 is no `localUsed` parameter and no way to pass one. The comment describes an escape hatch that does
 not exist.
 
-### 7. The cooldown-clear wire shape validated twice — VERIFIED
+### 7. The cooldown-clear wire shape validated twice — VERIFIED; FIXED 2026-08-25
 
-**Sites:** [src/cli.ts:1019](../src/cli.ts#L1019) (`isCooldownClearResult`) and
-[src/keys-cli.ts:594](../src/keys-cli.ts#L594) (`validNarrowedClearResponse`), each carrying its own
-`isRecord` and `hasExactKeys` pair and its own cleared-group validator.
+**Pre-fix sites:** `src/cli.ts` (`isCooldownClearResult`) and `src/keys-cli.ts`
+(`validNarrowedClearResponse`), each carrying its own `isRecord` and `hasExactKeys` pair and its own
+cleared-group validator.
 
 Both check the same envelope: a `target` plus a `cleared` object holding exactly `breakerCells`,
 `credentialFaults` and `facts`, with items shaped as provider, model and credential. The type that
-owns that shape already exists in
-[src/cooldown-clear.ts:12-39](../src/cooldown-clear.ts#L12-L39). The two validators differ only in
-which `target` keys they accept.
+owns that shape already exists in `src/cooldown-clear.ts`. The two validators differ only in which
+`target` keys they accept.
 
-**Proposed shape.** One exported validator beside the type that owns the shape, parameterised by the
-accepted target keys. Roughly -75 lines. This is a security-adjacent surface: two hand-maintained
-validators for one wire contract is how one of them comes to accept a shape the other rejects.
+**Fixed shape.** `isCooldownClearResult(value, expectedTarget, acceptedTargetKeys)` is now exported
+beside `CooldownClearResult` in `src/cooldown-clear.ts`. `cli.ts` supplies the exact dynamic key set
+for its provider/model/credential selector; `keys-cli.ts` supplies the exact static
+`["provider", "credential", "kinds"]` rotation policy. The envelope, cleared-group, cell, fact and
+scope validation now have one owner, while each caller retains its prior acceptance contract. A
+shared-envelope test pins the target-key split, and a second test pins the two rules where the
+policies genuinely diverge beyond target keys: the narrowed (rotation) policy also refuses a
+cleared response carrying breaker cells or any cooling fact other than `credential-invalid`.
 
 ## 4. What came back clean
 

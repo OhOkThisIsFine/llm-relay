@@ -2,7 +2,6 @@ import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 import type { Config, ProviderConfig } from "./config.js";
-import { hasExactKeys, isRecord } from "./json-shape.js";
 import {
   curatedEnvNames,
   resolveCredential,
@@ -50,6 +49,7 @@ import {
   createControlAuthorization,
   resolveControlAuthorizationConfigDir,
 } from "./control-authorization.js";
+import { isCooldownClearResult } from "./cooldown-clear.js";
 import { restrictSecretFileOnWindowsSync } from "./secret-file-acl.js";
 
 export type KeysSecretPurpose =
@@ -571,65 +571,6 @@ function proxyUrl(cfg: Config, path: string): string {
   return `http://${host}:${cfg.port}${path}`;
 }
 
-function validClearedGroup(
-  value: unknown,
-  item: (candidate: unknown) => boolean,
-): boolean {
-  if (!isRecord(value) || !hasExactKeys(value, ["count", "items"]) ||
-      typeof value.count !== "number" || !Number.isSafeInteger(value.count) ||
-      value.count < 0 || !Array.isArray(value.items) || value.count !== value.items.length) {
-    return false;
-  }
-  return value.items.every(item);
-}
-
-function validNarrowedClearResponse(
-  value: unknown,
-  provider: string,
-  label: string,
-): boolean {
-  if (!isRecord(value) || !hasExactKeys(value, ["target", "cleared"]) ||
-      !isRecord(value.target) || !hasExactKeys(value.target, ["provider", "credential", "kinds"]) ||
-      value.target.provider !== provider || value.target.credential !== label ||
-      !Array.isArray(value.target.kinds) || value.target.kinds.length !== 1 ||
-      value.target.kinds[0] !== "credential-fault" ||
-      !isRecord(value.cleared) ||
-      !hasExactKeys(value.cleared, ["breakerCells", "credentialFaults", "facts"])) {
-    return false;
-  }
-  const validCell = (candidate: unknown): boolean => isRecord(candidate) &&
-    hasExactKeys(candidate, ["provider", "model", "credential"]) &&
-    candidate.provider === provider && candidate.credential === label &&
-    (candidate.model === null || typeof candidate.model === "string");
-  const credentialId = makeCredentialId(provider, label);
-  const validScope = (scope: unknown): boolean => {
-    if (!isRecord(scope) || typeof scope.kind !== "string") return false;
-    switch (scope.kind) {
-      case "attempt":
-        return hasExactKeys(scope, ["kind", "provider", "credentialId", "model"]) &&
-          scope.provider === provider && scope.credentialId === credentialId &&
-          typeof scope.model === "string";
-      case "group":
-        return hasExactKeys(scope, ["kind", "provider", "credentialId", "members"]) &&
-          scope.provider === provider && scope.credentialId === credentialId &&
-          Array.isArray(scope.members) && scope.members.length > 0 &&
-          scope.members.every((member) => typeof member === "string" && member.length > 0);
-      case "credential":
-        return hasExactKeys(scope, ["kind", "provider", "credentialId"]) &&
-          scope.provider === provider && scope.credentialId === credentialId;
-      default:
-        return false;
-    }
-  };
-  const validFact = (candidate: unknown): boolean => isRecord(candidate) &&
-    hasExactKeys(candidate, ["kind", "scope"]) &&
-    candidate.kind === "credential-invalid" && validScope(candidate.scope);
-  return validClearedGroup(value.cleared.breakerCells, () => false) &&
-    (value.cleared.breakerCells as { count: number }).count === 0 &&
-    validClearedGroup(value.cleared.credentialFaults, validCell) &&
-    validClearedGroup(value.cleared.facts, validFact);
-}
-
 type RotationClearOutcome =
   | { readonly status: "cleared" }
   | { readonly status: "unreachable" }
@@ -649,11 +590,12 @@ async function clearRotatedLiveState(
   } catch {
     return { status: "failed", reason: "control authorization is unavailable" };
   }
+  const target = { provider, credential: label, kinds: ["credential-fault"] as const };
   try {
     const response = await (deps.fetch ?? fetch)(proxyUrl(cfg, "/cooldowns/clear"), {
       method: "POST",
       headers,
-      body: JSON.stringify({ provider, credential: label, kinds: ["credential-fault"] }),
+      body: JSON.stringify(target),
       signal: AbortSignal.timeout(5_000),
     });
     if (!response.ok) {
@@ -665,7 +607,7 @@ async function clearRotatedLiveState(
     } catch {
       return { status: "failed", reason: "running relay returned malformed JSON" };
     }
-    return validNarrowedClearResponse(payload, provider, label)
+    return isCooldownClearResult(payload, target, ["provider", "credential", "kinds"])
       ? { status: "cleared" }
       : { status: "failed", reason: "running relay returned an invalid narrowed-clear response" };
   } catch {
