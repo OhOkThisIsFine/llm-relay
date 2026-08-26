@@ -30,10 +30,16 @@ import type { ProviderTargetIdentity } from "./kernel/contracts.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { parseCredentialId } from "./credential-id.js";
 import type { CredentialId } from "./credential-id.js";
-import type { QuotaAxis, QuotaObservation, QuotaPeriod } from "./quota-observation.js";
-import { CONFIGURED_LIMIT_AXES, configuredLimitQuotaShape, resolveConfiguredLimits } from "./configured-limits.js";
+import type { QuotaAxis, QuotaPeriod } from "./quota-observation.js";
+import { resolveConfiguredLimits } from "./configured-limits.js";
 import { observedRateLimits } from "./rate-limits.js";
-import { resolveRemaining, resolveResetsAt, type LimitInputs, type LocalUsedReading, type RemainingResolution } from "./availability.js";
+import {
+  collectQuotaBuckets,
+  resolveRemaining,
+  resolveResetsAt,
+  type LocalUsedReading,
+  type RemainingResolution,
+} from "./availability.js";
 
 /** One spent, gateable bucket — the smallest honest statement of "why this cell steps aside". */
 export interface QuotaDemotion {
@@ -88,20 +94,6 @@ function resolveQuotaDemotion(deps: QuotaDemotionDeps, attempt: ResolvedAttempt,
   const model = target.model ?? null;
   const parsed = parseCredentialId(attempt.credentialId);
 
-  // Buckets gather every (axis, period) with ANY admissible evidence. Learned ceilings are
-  // consulted only when the operator opted in — resolving them otherwise would be work whose
-  // only possible outcome is a demotion M2 forbids.
-  const buckets = new Map<string, { axis: QuotaAxis; period: Exclude<QuotaPeriod, "unknown">; observations: QuotaObservation[]; limits: LimitInputs }>();
-  const bucketFor = (axis: QuotaAxis, period: Exclude<QuotaPeriod, "unknown">) => {
-    const key = `${axis}:${period}`;
-    let bucket = buckets.get(key);
-    if (bucket === undefined) {
-      bucket = { axis, period, observations: [], limits: {} };
-      buckets.set(key, bucket);
-    }
-    return bucket;
-  };
-
   const identity: ProviderTargetIdentity = {
     provider: target.provider,
     model,
@@ -109,26 +101,14 @@ function resolveQuotaDemotion(deps: QuotaDemotionDeps, attempt: ResolvedAttempt,
     credentialId: attempt.credentialId,
     ...(target.base ? { base: target.base } : {}),
   };
-  for (const observation of deps.breaker.getState(identity)?.quotaObservations ?? []) {
-    if (observation.period === "unknown") continue;
-    bucketFor(observation.axis, observation.period).observations.push(observation);
-  }
-
+  const observations = deps.breaker.getState(identity)?.quotaObservations ?? [];
   const configured = resolveConfiguredLimits(deps.cfg, target.provider, parsed?.label ?? null, model);
-  if (configured !== null) {
-    for (const axis of CONFIGURED_LIMIT_AXES) {
-      const value = configured[axis];
-      if (value === undefined) continue;
-      const shape = configuredLimitQuotaShape(axis);
-      bucketFor(shape.axis, shape.period).limits.configured = value;
-    }
-  }
-
-  if (enforceLearned && model !== null) {
-    for (const entry of observedRateLimits(target.provider, attempt.credentialId as CredentialId, model, { now })) {
-      bucketFor(entry.axis, entry.period).limits.learned = entry.limit;
-    }
-  }
+  // Learned ceilings are consulted only when the operator opts in — resolving them otherwise
+  // would be work whose only possible outcome is a demotion M2 forbids.
+  const learned = enforceLearned && model !== null
+    ? observedRateLimits(target.provider, attempt.credentialId as CredentialId, model, { now })
+    : [];
+  const buckets = collectQuotaBuckets({ observations, learned, configured });
 
   // The ledger read is keyed by PERIOD, not axis, so at most one read per period serves every
   // bucket of that period — the bound that keeps this term flat as evidence accumulates.

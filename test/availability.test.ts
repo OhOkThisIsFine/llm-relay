@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  collectQuotaBuckets,
   mapLimitBasis,
   mapRemainingBasis,
   periodEnd,
@@ -44,6 +45,37 @@ function resolutionFor(overrides: Partial<Parameters<typeof resolveRemaining>[0]
     ...overrides,
   });
 }
+
+describe("collectQuotaBuckets — the one bucket builder", () => {
+  it("keeps month observations, drops unknown periods, and keeps learned and configured apart", () => {
+    // Month-period observations had no pin anywhere before the builder existed; the consumer
+    // suites exercise minute/day only, so a builder that dropped "month" would have passed them.
+    const monthObservation: QuotaObservation = {
+      axis: "requests",
+      period: "month",
+      limit: 1_000,
+      remaining: 5,
+      resetsAt: NOW + DAY_MS,
+      observedAt: NOW,
+      basis: "provider-stated",
+    };
+    const unknownPeriod = { ...observation(NOW), period: "unknown" } as unknown as QuotaObservation;
+
+    const buckets = collectQuotaBuckets({
+      observations: [monthObservation, unknownPeriod, observation(NOW)],
+      learned: [{ axis: "requests", period: "day", limit: 2_000 }],
+      configured: { rpm: 50 },
+    });
+
+    expect([...buckets.keys()]).toEqual(["requests:month", "requests:minute", "requests:day"]);
+    expect(buckets.get("requests:month")!.observations).toEqual([monthObservation]);
+    // Learned and configured are DISJOINT assignment sites — a swap here would relabel a
+    // display-only learned ceiling as an operator declaration downstream.
+    expect(buckets.get("requests:day")!.limits).toEqual({ learned: 2_000 });
+    expect(buckets.get("requests:minute")!.limits.configured).toBe(50);
+    expect(buckets.get("requests:minute")!.limits.learned).toBeUndefined();
+  });
+});
 
 describe("periodStart / periodEnd (UTC only)", () => {
   it("floors minutes and days on UTC", () => {
