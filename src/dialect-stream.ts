@@ -1,6 +1,6 @@
 import { emitSseTail } from "./emitSse.js";
 import type { AssistantMessage, ContentBlock } from "./anthropic.js";
-import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
+import { BufferedSseFrames, parseSseEvent } from "./sse-frames.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, markerStart, recoverToolCalls, scanForMarker, type DialectRefusalSignal } from "./tool-dialects.js";
 
 /**
@@ -21,25 +21,6 @@ import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, markerStart, recover
  */
 
 type Push = (chunk: string) => void;
-
-interface SseEvent {
-  raw: string;
-  type: string;
-  data: Record<string, unknown> | null;
-}
-
-function parseEvent(block: string): SseEvent | null {
-  if (!block.trim()) return null;
-  const fields = sseEventFields(block);
-  const type = fields.eventLines.at(-1)?.trim() ?? "";
-  const dataLines = fields.dataLines.map((line) => line.trim());
-  if (dataLines.length === 0) return { raw: block, type, data: null };
-  try {
-    return { raw: block, type, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> };
-  } catch {
-    return { raw: block, type, data: null };
-  }
-}
 
 /** A block index high enough that placeholders never collide with real content. */
 function placeholders(count: number): ContentBlock[] {
@@ -148,7 +129,7 @@ export function recoverDialectInStream(
           const { done, value } = await reader.read();
           if (done) break;
           for (const { frame: block, separator } of frames.append(decoder.decode(value, { stream: true }))) {
-            const ev = parseEvent(block);
+            const ev = parseSseEvent(block);
             if (!ev) continue;
 
             if (ev.type === "content_block_start") {

@@ -71,6 +71,37 @@ export class BufferedSseFrames implements IterableIterator<SseFrame> {
   }
 }
 
+export interface SseEvent {
+  raw: string;
+  type: string;
+  data: Record<string, unknown> | null;
+}
+
+/**
+ * The Anthropic-shaped event parse: LAST `event:` line wins, data lines trimmed and joined, an
+ * unparseable body degrading to `data: null` rather than throwing, and an all-whitespace block
+ * declined outright.
+ *
+ * ⚠ It lives here because `dialect-stream.ts` and `think-tags.ts` held BYTE-IDENTICAL private
+ * copies of it — the same hand-copy shape this file was created to end one layer down, at
+ * `sseEventFields`. ⚠ `openai-dialect.ts` deliberately keeps its own: its policy differs on four
+ * points (FIRST event line, a leading space stripped per data line, a `[DONE]` sentinel, and a
+ * non-nullable return), so sharing this one would change its wire behaviour. That is the
+ * "each adopter keeps its own trimming/event-name policy" boundary, not an omission.
+ */
+export function parseSseEvent(block: string): SseEvent | null {
+  if (!block.trim()) return null;
+  const fields = sseEventFields(block);
+  const type = fields.eventLines.at(-1)?.trim() ?? "";
+  const dataLines = fields.dataLines.map((line) => line.trim());
+  if (dataLines.length === 0) return { raw: block, type, data: null };
+  try {
+    return { raw: block, type, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> };
+  } catch {
+    return { raw: block, type, data: null };
+  }
+}
+
 /** Extract raw SSE field values; callers retain whitespace, JSON and event-name policy. */
 export function sseEventFields(frame: string): SseEventFields {
   const eventLines: string[] = [];

@@ -6,7 +6,7 @@
  * unnested block; every uncertain shape is released byte-for-byte as ordinary text.
  */
 
-import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
+import { BufferedSseFrames, parseSseEvent } from "./sse-frames.js";
 
 const OPEN_TAG = "<think>";
 const CLOSE_TAG = "</think>";
@@ -113,25 +113,6 @@ export function stripOpeningThinkTag(text: string): string {
   return filter.push(text) + filter.flush();
 }
 
-interface SseEvent {
-  raw: string;
-  type: string;
-  data: Record<string, unknown> | null;
-}
-
-function parseEvent(block: string): SseEvent | null {
-  if (!block.trim()) return null;
-  const fields = sseEventFields(block);
-  const type = fields.eventLines.at(-1)?.trim() ?? "";
-  const dataLines = fields.dataLines.map((line) => line.trim());
-  if (dataLines.length === 0) return { raw: block, type, data: null };
-  try {
-    return { raw: block, type, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> };
-  } catch {
-    return { raw: block, type, data: null };
-  }
-}
-
 function sseDelta(index: number, text: string): string {
   const data = { type: "content_block_delta", index, delta: { type: "text_delta", text } };
   return `event: content_block_delta\ndata: ${JSON.stringify(data)}\n\n`;
@@ -163,7 +144,7 @@ export function stripThinkTagsInStream(
 
       const processFrames = () => {
         for (const { frame: block, raw } of frames) {
-          const ev = parseEvent(block);
+          const ev = parseSseEvent(block);
           if (!ev) {
             push(raw);
             continue;
