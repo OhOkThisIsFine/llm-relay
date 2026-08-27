@@ -115,8 +115,30 @@ unless `--force` is supplied. CSV, JSONC, generic JSON and value-shape guessing 
 ## Config
 
 `~/.llm-relay/config.json` (or `--config <path>`): a `providers{}` registry plus a `routing`
-block. All state lives under `~/.llm-relay/` (`config.json`, `.env`, `models-cache.json`,
-`probe-cache.json`, `runtime-telemetry.json`).
+block. State lives under `~/.llm-relay/`: `config.json`, `.env`, `keystore.json`,
+`control-token`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`,
+`target-facts.json`, `refusal-interpretations.json`, `lane-manifest.json`, `update-check.json`,
+the `hooks/` script, and the `usage/` accounting subtree.
+
+### Where state actually lives
+
+⚠ **`~/.llm-relay/` is the answer only when no XDG base variable is set.** Five artifacts honour
+one, and each of the two variables moves a different subset:
+
+| Honours | Artifacts |
+|---|---|
+| `XDG_CACHE_HOME` | `usage/`, `probe-cache.json`, `runtime-telemetry.json` |
+| `XDG_CONFIG_HOME` | `target-facts.json`, `refusal-interpretations.json` |
+| Neither — always `~/.llm-relay/` | `config.json`, `.env`, `keystore.json`, `control-token`, `models-cache.json`, `lane-manifest.json`, `update-check.json`, the `hooks/` script |
+
+So on a machine with either variable set, the relay's state directory **splits in two**: setting
+`XDG_CACHE_HOME` moves the health caches while `models-cache.json` stays behind, and setting
+`XDG_CONFIG_HOME` moves the learned facts while `config.json` and the keystore stay behind.
+Nothing breaks — every resolver is internally consistent — but "back up `~/.llm-relay/`" stops
+being a complete backup, which is the reason to state it rather than leave it discovered.
+
+If you want one directory, leave both variables unset, or pass `--config` and keep the rest of the
+default layout beside it.
 
 ```jsonc
 {
@@ -950,7 +972,7 @@ backends have since stated, and what has not been understood yet:
 llm-relay eligibility
 ```
 
-Four verdicts, and they are **not interchangeable**:
+Five condition verdicts, and they are **not interchangeable**:
 
 | Verdict | Means | Effect |
 |---|---|---|
@@ -958,6 +980,14 @@ Four verdicts, and they are **not interchangeable**:
 | `subscription-required` | exists, but is not covered by our plan | excluded from **free** pools |
 | `allowance-exhausted` | free, but spent until it refreshes | **demoted only**, expires by itself |
 | `credential-invalid` | the provider says this key is bad | **demoted only**, cleared by any success |
+| `rate-limited` | the provider is throttling throughput | **demoted only**, expires by itself |
+
+`--class` also accepts the five MEASUREMENT kinds the relay learns for itself — `context-limit`
+and `rate-limit-rpm|rpd|tpm|tpd`. They record what a deployment stated about its own ceilings and
+are display-only: a measurement never demotes, never cools, and never blocks a free pool. You would
+rarely propose one by hand; the list is open because it is derived from the store rather than
+retyped here, which is how `rate-limited` came to be accepted by the store and rejected by the CLI
+for a release.
 
 Each is stored at the **scope its evidence supports**, and lookups resolve most-specific-first:
 

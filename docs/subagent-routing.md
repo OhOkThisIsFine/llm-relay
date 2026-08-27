@@ -53,12 +53,17 @@ conversation to protect there, so nothing is silently downgraded. The failure mo
 precisely when the two are mixed: an Anthropic passthrough in the config *and* a tier pointed
 somewhere else.
 
-## The signals: `x-claude-code-agent-id` **and** `cc_is_subagent=true`
+## The signals: `cc_is_subagent=true`, `x-claude-code-agent-id`, `x-codex-turn-metadata`
 
-Two independent signals, either one sufficient (`isSubagentRequest`). They are checked together
-because each covers the other's silent failure, and the shared failure mode is expensive: an
+**THREE** independent signals, any one sufficient (`isSubagentRequest`). They are checked together
+because each covers the others' silent failure, and the shared failure mode is expensive: an
 undetected subagent falls through to the passthrough and spends **primary quota** while the
 dispatcher believes it offloaded.
+
+The third arrived with Codex support and is the reason the set is not two: a Codex
+`/v1/responses` turn has no Anthropic `system` field at all, so it cannot carry the marker.
+`x-codex-turn-metadata` is a JSON header whose `request_kind: "subagent"` identifies a child turn;
+it is parsed defensively, fails open for anything unrecognized, and is never forwarded upstream.
 
 **`x-claude-code-agent-id`** (adopted 2026-08-05) is the documented one. Anthropic's
 [gateway protocol reference](https://code.claude.com/docs/en/llm-gateway-protocol) defines it as the
@@ -71,8 +76,9 @@ behind, and Anthropic's advice is to treat the set as open and growing.
 
 **The system-block marker** below is the original signal, kept because it travels *inside the body*
 and so survives header filtering. It has its own kill switch: `CLAUDE_CODE_ATTRIBUTION_HEADER=0`
-removes the attribution block, and therefore the marker, from the system prompt entirely. No single
-component drops both signals.
+removes the attribution block, and therefore the marker, from the system prompt entirely. The three
+signals travel in three different carriers — a body block, an Anthropic-side header, and a
+Codex-side header — so no single component drops them all.
 
 ### The marker: `cc_is_subagent=true`
 
@@ -278,12 +284,18 @@ http.createServer((req, res) => {
     try {
       const p = JSON.parse(raw.toString("utf8"));
       const sys = Array.isArray(p.system) ? p.system.map(s => s.text ?? s).join("\n") : (p.system ?? "");
-      if (req.url?.startsWith("/v1/messages")) {
-        // Both signals, reported separately — either one alone still routes, but a signal that
-        // has quietly stopped arriving is exactly what this check exists to surface.
+      // All THREE signals, reported separately — any one alone still routes, but a signal that
+      // has quietly stopped arriving is exactly what this check exists to surface. Codex speaks
+      // /v1/responses and carries neither of the Claude-side signals, so do not filter by path.
+      if (req.url?.startsWith("/v1/messages") || req.url?.startsWith("/v1/responses")) {
         const marker = sys.includes("cc_is_subagent=true");
         const header = Boolean(req.headers["x-claude-code-agent-id"]);
-        console.log(marker || header ? "SUB" : "main", `marker=${marker} header=${header}`, p.model);
+        let codex = false;
+        try {
+          codex = JSON.parse(req.headers["x-codex-turn-metadata"] ?? "{}").request_kind === "subagent";
+        } catch {}
+        const sub = marker || header || codex;
+        console.log(sub ? "SUB" : "main", `marker=${marker} header=${header} codex=${codex}`, p.model);
       }
     } catch {}
     const up = http.request(
@@ -296,9 +308,12 @@ http.createServer((req, res) => {
 ```
 
 Point a session at it (`ANTHROPIC_BASE_URL=http://127.0.0.1:8890`) and dispatch a subagent. You want
-to see at least one `SUB` line. If every line says `main`, both signals are gone and
-`routing.subagents` has silently stopped applying. A `SUB` line reporting only one of
-`marker=true`/`header=true` is still working, but it is now single-signal — worth knowing before the
+to see at least one `SUB` line. If every line says `main`, every signal a client of that kind can
+send is gone and `routing.subagents` has silently stopped applying. Judge each client against the
+signals it can actually carry: a Claude session should show `marker=true` and/or `header=true` and
+never `codex`; a Codex session can only ever show `codex=true`, so for Codex that one IS the whole
+set and there is nothing left to fall back on. A Claude `SUB` line reporting only one of
+`marker`/`header` is still working, but it is now single-signal — worth knowing before the
 remaining one goes too. (Note the capture proxy forwards `req.headers` verbatim; a real middleware
 in that position may not.)
 
