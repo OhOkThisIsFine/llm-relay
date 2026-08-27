@@ -429,3 +429,61 @@ imported WITH its null); an in-place mutation of a shared record; a test asserti
   whitespace-only reformat would have obscured the real diff, so it stands.
 - **The 13 cross-cutting and 19 type-level lane findings not listed above remain advisory** and
   unverified. Do not treat them as a work queue.
+
+## Friction hit during this sprint
+
+Rewalked from the transcript, not from recall. Host-level items also live in agent memory.
+
+
+1. **The relay has no autostart entry and went down mid-sprint.** `Startup/` holds `Ollama.lnk`,
+   `freellmapi.vbs` and `headroom.vbs` — no `llm-relay.vbs`. The relay was up at session start and
+   was gone by the time packet 2 retried; `llm-relay dispatch -x` reported "no proxy running", and
+   every free-pool lane fails with it down. Restart used:
+   `node C:/Users/<user>/AppData/Roaming/npm/node_modules/llm-relay/dist/cli.js`.
+2. **A relay restart loses in-memory breaker state, so the first heavy walk burns the dead
+   members.** Immediately after the restart, two packet-2 dispatches died on paid-gated 402s
+   (Kilo, then ollama-cloud) that exhausted the whole walk. Three cheap `Reply with exactly: OK`
+   probes across pool/high, xhigh and medium then all returned OK, and the next real dispatch
+   proceeded. Mitigation: warm the pool with one trivial probe after any relay restart, before
+   spending a long packet on it.
+3. **`git diff` shows nothing when a Codex lane leaves its work STAGED.** The first adversarial
+   review lane was dispatched with a brief telling it to run `git diff`, saw an empty diff, and had
+   to be stopped and re-dispatched with `git diff HEAD`. Any brief that inspects a lane's output
+   must say `git diff HEAD`.
+4. **Codex quota is MODEL-scoped, not account-scoped.** `gpt-5.6-sol` hit its limit with a stated
+   reset five days out while `gpt-5.3-codex-spark` still answered. Probing the sibling model before
+   declaring the lane dead was worth doing. Spark then hit its own limit a few hours later.
+5. **Codex Spark ran out of CONTEXT on a server.ts packet** and left a half-done, mis-indented tree
+   with no tests and no gate run — discarded with `git checkout --`. The brief had not forbidden
+   reading whole files. Every later brief carries a CONTEXT DISCIPLINE block (never read a large
+   file whole; grep then `sed -n`; stop and revert rather than leave a half-done tree).
+6. **A relay free-pool `pool/high` lane is a working WRITE lane for in-repo packets.** Memory said
+   this was unproven. It implemented packet 3 end to end — two source files, a new test file, the
+   pre-fix-failure confirmation, and a green gate — with a report as good as Codex's. Record it.
+7. **`--model pool/high` makes Claude Code log `[claude-code:unrecognized_model]` for its session
+   title generation** on every lane launch. Cosmetic, appears on stderr, harmless — but it is the
+   first line of every lane log and reads like a failure.
+8. **The lane review verdict must be judged, not taken.** The Codex adversarial review returned
+   MERGE-WITH-FIXES over a "wire break" that is bounded: `index.html` is served `no-store` and the
+   hashed assets are immutable, and this project had already documented the same additive
+   vocabulary growth on 2026-08-22. Its two NITs were both real and were fixed.
+
+9. **A slow-failing first candidate spends the whole walk budget, and the walk then gets exactly
+   one more try.** Measured from `~/.llm-relay/relay-restart.log` during this sprint: healthy
+   requests were served 200 by `nim/deepseek-ai/deepseek-v4-flash-0731`, but whenever that member
+   answered **504** the walk showed only TWO attempts and surfaced the second one's error to the
+   client — `402 <- nim:504 | ollama-cloud/kimi-k2.6:402`, `404 <- nim:504 | nim/kimi-k2.6:404`.
+   One unaffected walk in the same log ran **60+** candidates, so the pool is deep.
+   ⚠ **This is `DEFAULT_WALK_BUDGET_MS` (45 s) working exactly as documented**, not a defect: the
+   budget bounds STARTING further attempts, and "the first TWO attempts are always allowed, so a
+   slow-failing first candidate cannot starve the request of its one retry". A 504 that takes ~45 s
+   consumes the budget, and the guaranteed second attempt is all that remains.
+   Operationally this made free-pool lane dispatch fail intermittently for ~an hour. The lever, if
+   the owner wants one, is that nim member's health rather than the budget — it is both the
+   most-served member and the one producing the 504s, so the breaker's stability score stays mixed
+   and it keeps being ranked first. Verified before concluding; recorded here so the next session
+   does not re-diagnose it as a failover bug.
+
+10. **A free-pool lane can return a two-word answer and exit 0.** One packet-6 dispatch replied
+    "Let's look" and stopped, leaving a clean tree. Treat a short reply as a lane failure and
+    retry, rather than reading it as "nothing to do".
