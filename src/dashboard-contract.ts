@@ -182,7 +182,8 @@ export type RemainingBasis =
   | "derived_configured"
   | "derived_learned"
   | "derived_published";
-export type LocalUsedBasis = "reported" | "estimated" | "mixed";
+/** `relay_counted` is a completed-request total observed by the relay, not provider reporting. */
+export type LocalUsedBasis = "reported" | "estimated" | "mixed" | "relay_counted";
 /**
  * Where a quota row's `resetsAt` came from (spec §5.2 ladder). `provider_stated` is the response's
  * own header/observation; `reviewed_rule` is a persisted reviewed refusal-interpretation rule
@@ -196,7 +197,7 @@ export const TOKEN_BASES = Object.freeze(["reported", "estimated"] as const);
 export const SPEND_SOURCES = Object.freeze(["provider_reported", "relay_estimated", "unknown"] as const);
 export const LIMIT_BASES = Object.freeze(["provider_stated", "configured", "learned", "published"] as const);
 export const REMAINING_BASES = Object.freeze(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"] as const);
-export const LOCAL_USED_BASES = Object.freeze(["reported", "estimated", "mixed"] as const);
+export const LOCAL_USED_BASES = Object.freeze(["reported", "estimated", "mixed", "relay_counted"] as const);
 export const RESETS_AT_BASES = Object.freeze(["provider_stated", "reviewed_rule", "derived_boundary"] as const);
 
 export type ResponseAttribution = Attribution | "all";

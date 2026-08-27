@@ -115,18 +115,18 @@ describe("createAvailabilityProducer — quotas", () => {
     expect(row?.remainingBasis ?? null).toBeNull();
   });
 
-  it("carries localUsed through when a store is supplied", () => {
+  it("labels a relay-counted request total without borrowing the token basis", () => {
     const breaker = new CircuitBreaker();
     breaker.recordOutcome(target(), { ok: true, elapsedMs: 5, at: NOW - 1_000 });
     const snapshot = createAvailabilityProducer({
       breaker,
       config: config({ rpm: 50 }),
       now: () => NOW,
-      accounting: { usedInWindow: () => ({ requests: 12, tokens: null, basis: "reported" }) },
+      accounting: { usedInWindow: () => ({ requests: 12, tokens: null, basis: "mixed" }) },
     }).snapshot();
     const row = snapshot.quotas.find((candidate) => candidate.axis === "requests")!;
     expect(row.localUsed).toBe(12);
-    expect(row.localUsedBasis).toBe("reported");
+    expect(row.localUsedBasis).toBe("relay_counted");
     expect(row.remaining).toBe(38);
     expect(row.remainingBasis).toBe("derived_configured");
   });

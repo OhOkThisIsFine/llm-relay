@@ -19,8 +19,9 @@
  * - unknown ⇒ NO EFFECT WHATSOEVER — same rule as the context guardrail. A bucket with neither
  *   an eligible observation nor a resolvable limit-plus-usage produces no opinion here.
  *
- * Pure and bounded: no IO, no clock of its own, a handful of (axis, period) pairs per cell, and
- * the one ledger read it may make (`usedInWindow`) is the store's IN-MEMORY window read. The
+ * Pure and bounded: no IO, no clock of its own, and a handful of (axis, period) pairs per cell.
+ * Every ledger read it may make (`usedInWindow`) is the store's IN-MEMORY window read, memoized
+ * to at most one read per period. The
  * factory wraps everything in try/catch — this runs on the request path, and a routing hint must
  * never be able to fail a request. It logs nothing: routing is not an error stream.
  */
@@ -30,14 +31,15 @@ import type { ProviderTargetIdentity } from "./kernel/contracts.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { parseCredentialId } from "./credential-id.js";
 import type { CredentialId } from "./credential-id.js";
+import type { UsedInWindowReading } from "./accounting-store.js";
 import type { QuotaAxis, QuotaPeriod } from "./quota-observation.js";
 import { resolveConfiguredLimits } from "./configured-limits.js";
 import { observedRateLimits } from "./rate-limits.js";
 import {
   collectQuotaBuckets,
+  projectLocalUsed,
   resolveRemaining,
   resolveResetsAt,
-  type LocalUsedReading,
   type RemainingResolution,
 } from "./availability.js";
 
@@ -82,8 +84,6 @@ export function bucketRank(axis: QuotaAxis, period: QuotaPeriod): number {
   return axisRank * 10 + periodRank;
 }
 
-const EMPTY_USED: LocalUsedReading = { value: null, basis: null };
-
 /** The §5.4 verdict for ONE credential×deployment cell, from whatever evidence exists. */
 function resolveQuotaDemotion(deps: QuotaDemotionDeps, attempt: ResolvedAttempt, now: number): QuotaDemotion | null {
   const quotaCfg = deps.cfg.routing.quota;
@@ -110,13 +110,13 @@ function resolveQuotaDemotion(deps: QuotaDemotionDeps, attempt: ResolvedAttempt,
     : [];
   const buckets = collectQuotaBuckets({ observations, learned, configured });
 
-  // The ledger read is keyed by PERIOD, not axis, so at most one read per period serves every
-  // bucket of that period — the bound that keeps this term flat as evidence accumulates.
-  const windowCache = new Map<string, LocalUsedReading>();
-  const localUsedFor = (period: Exclude<QuotaPeriod, "unknown">, axis: QuotaAxis): LocalUsedReading => {
-    let reading = windowCache.get(period);
-    if (reading === undefined) {
-      const window =
+  // Cache the RAW ledger window by period, so at most one read per period serves every axis
+  // projection without storing an already-projected value under an axis-free key.
+  const windowCache = new Map<Exclude<QuotaPeriod, "unknown">, UsedInWindowReading | null>();
+  const localUsedFor = (period: Exclude<QuotaPeriod, "unknown">, axis: QuotaAxis) => {
+    let window = windowCache.get(period);
+    if (window === undefined) {
+      window =
         deps.accounting === undefined || deps.accounting === null
           ? null
           : deps.accounting.usedInWindow({
@@ -125,13 +125,9 @@ function resolveQuotaDemotion(deps: QuotaDemotionDeps, attempt: ResolvedAttempt,
               period,
               now,
             });
-      reading =
-        window === null
-          ? EMPTY_USED
-          : { value: axis === "tokens" ? window.tokens : window.requests, basis: window.basis };
-      windowCache.set(period, reading);
+      windowCache.set(period, window);
     }
-    return reading;
+    return projectLocalUsed(window, axis);
   };
 
   let best: QuotaDemotion | null = null;

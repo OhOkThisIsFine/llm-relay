@@ -200,6 +200,30 @@ describe("quota demotion resolver — the §5.4 gates", () => {
     expect(queried).toBeGreaterThan(0);
   });
 
+  it("keeps request and token usage separate when both configured buckets share one period", () => {
+    const now = Math.floor(Date.now() / MINUTE) * MINUTE + 30_000;
+    let queried = 0;
+    const fn = createQuotaDemotionFn({
+      cfg: baseCfg({}, { limits: { rpm: 1_000, tpm: 100 } }),
+      breaker: new CircuitBreaker(),
+      accounting: {
+        usedInWindow: () => {
+          queried += 1;
+          return { requests: 1, tokens: 100, basis: "reported" };
+        },
+      },
+    });
+
+    expect(fn(resolveAttempt(t("a")), now)).toMatchObject({
+      axis: "tokens",
+      period: "minute",
+      remaining: 0,
+      basis: "derived:configured",
+    });
+    // The raw window serves both axis projections; the request-path bound stays one read/period.
+    expect(queried).toBe(1);
+  });
+
   it("a LEARNED limit has no effect by default and demotes only under enforceLearned", () => {
     const now = Date.now();
     recordObservedRateLimit("a", makeCredentialId("a"), "m", { axis: "tokens", period: "minute", limit: 100 }, { now });

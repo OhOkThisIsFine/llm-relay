@@ -47,8 +47,7 @@ import {
   resolveConfiguredLimits,
   type HardCapSource,
 } from "./configured-limits.js";
-import type { LocalUsedReading } from "./availability.js";
-import { periodEnd } from "./availability.js";
+import { periodEnd, projectLocalUsed, type LocalUsedReading } from "./availability.js";
 // Canonical bucket order is the demotion term's, imported rather than re-stated: two copies of
 // "requests before tokens, minute before day" is two things to keep in step for no gain.
 import { bucketRank } from "./quota-demotion.js";
@@ -111,7 +110,7 @@ export function createHardCapLedgerReader(
     const window = ledger.usedInWindow({
       credentialId, ...(scope === "deployment" && model !== null && model !== undefined ? { model } : {}), period, now,
     });
-    return { value: axis === "requests" ? window.requests : window.tokens, basis: window.basis };
+    return projectLocalUsed(window, axis);
   };
 }
 
