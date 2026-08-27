@@ -79,9 +79,6 @@ function scopeMatches(scope: FactScope, attempt: ResolvedAttempt): boolean {
   }
 }
 
-/** Public scope predicate for adapters that materialize accepted facts before a walk. */
-export const credentialFactMatches = scopeMatches;
-
 function factsFor(attempt: ResolvedAttempt, evidence: CredentialSelectionEvidence | undefined): CredentialFact[] {
   return evidence?.facts?.filter((fact) => scopeMatches(fact.scope, attempt)) ?? [];
 }
@@ -360,6 +357,3 @@ export class CredentialWalk {
     this.#deploymentClosed.add(group.key);
   }
 }
-
-/** Short alias used by request-front adapters. */
-export const selectCredentialAttempts = rankCredentialAttempts;
