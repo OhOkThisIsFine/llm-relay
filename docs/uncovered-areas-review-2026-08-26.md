@@ -374,3 +374,58 @@ five walks are real, but three of them (`emptyTokens`, `addRawTokens`, `addAggre
 `src/accounting-store.ts`) carry different responsibilities — construction, raw addition with
 `updateMethod`, aggregate addition with `updateMethod` — and are not candidates for one table.
 **Do not implement item 24.**
+
+## What landed
+
+Seven packets, `2920365`..`8192b43`. Every packet was gate-verified twice — once by the
+implementer, once by the orchestrating session on a clean tree — and every new test was confirmed
+to FAIL against the pre-fix tree before its commit.
+
+| commit | defect | implemented by |
+|---|---|---|
+| `2920365` | D1 — quota demotion read the requests count as the token usage | Codex (GPT-5.6 Sol, ultra) |
+| `330f475` | D2 + D6 — credential to an inferred origin; base URL in a log | relay free-pool `pool/high` |
+| `b7d2311` | D3 + D4 — probe verdicts claiming more than their evidence | relay free-pool `pool/high` |
+| `5bbe788` | D8 + D9 — the two cross-front announcement drifts | main session |
+| `6f8608b` | D7 + S1 — four drift seams in the availability vocabulary | relay free-pool `pool/medium` |
+| `b34e731` | D5 — the vitest redirect invariant, made true and pinned | relay free-pool `pool/medium` |
+| `8192b43` | D10 — an accepted interpretation reaching a running relay | relay free-pool `pool/medium` |
+
+**Every packet needed correction in review, and each correction is in its own commit message.** The
+recurring ones are worth naming, because they are what a reviewer should look for next time:
+a lane's new code introducing the SAME seam the packet was closing (`mapLocalUsedBasis` shipped
+with the open `default: return null` that packet 5 then had to fix; `persist` grew a second copy
+of the store parser); a widened type quietly losing a guarantee (`ResetsAtResolution["basis"]`
+imported WITH its null); an in-place mutation of a shared record; a test asserting
+`expect(true).toBe(true)`; and `/`-separated regexes that can never match on Windows.
+
+### Lane notes
+
+- **A relay free-pool lane is a working WRITE lane for in-repo packets.** Five of the seven were
+  implemented on one, with reports as good as Codex's. That was previously recorded as unproven.
+- **Codex quota is MODEL-scoped.** `gpt-5.6-sol` hit a limit with a five-day reset while
+  `gpt-5.3-codex-spark` still answered; Spark then hit its own. Probe the sibling model before
+  declaring the lane dead.
+- **Codex Spark ran out of CONTEXT** on the `server.ts` packet and left a half-done, mis-indented
+  tree — discarded, and every later brief carries a context-discipline block.
+- **D8/D9 was implemented in the main session, not delegated**, because both Codex lanes were spent
+  and three free-pool attempts failed for lane reasons. Its independent review is the weakest of
+  the seven: a compact free-pool pass returned a bare MERGE with no evidence. The real checks there
+  are the two pre-fix failures and an AGY structural pass over the diff.
+
+### Not fixed, and why
+
+- **§5 item 24 — REJECT.** Priced at about +5 lines, not the claimed −20. See above.
+- **§5 items 9, 11, 12, 13, 19-remainder, 23** — unchanged from the 2026-08-25 verdicts.
+- **The `key-checker` initial-probe 401/403 → `invalid_key` branch** was left. That probe is a
+  `/models` GET, not model-specific, so a 401/403 there is not the entitlement-wall case the
+  invariant names. Recorded rather than changed.
+- **An anthropic-kind provider WITH a key can now only report `unverified`** from
+  `llm-relay keys check`: its initial probe is a GET returning 405, and the authenticated
+  escalation is gated on a `/models` URL. Honest but unhelpful. No impact here — the only
+  anthropic-kind provider is the keyless passthrough — so it is recorded, not fixed.
+- **The pre-existing mis-indentation in `src/key-checker.ts`** (a `checkOne` body and the final
+  `else` at column 0) predates this sprint; confirmed against HEAD before the packet. A
+  whitespace-only reformat would have obscured the real diff, so it stands.
+- **The 13 cross-cutting and 19 type-level lane findings not listed above remain advisory** and
+  unverified. Do not treat them as a work queue.
