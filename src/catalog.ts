@@ -550,7 +550,7 @@ export class ModelCatalog {
     let records = Array.isArray(j.data) ? j.data : [];
     if (records.length > MAX_CATALOG_MODELS) {
       console.warn(
-        `llm-relay: ${cfg.base} listed ${records.length} models; keeping the first ${MAX_CATALOG_MODELS}`,
+        `llm-relay: provider "${name}" listed ${records.length} models; keeping the first ${MAX_CATALOG_MODELS}`,
       );
       records = records.slice(0, MAX_CATALOG_MODELS);
     }

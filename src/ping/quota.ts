@@ -1,5 +1,20 @@
 import type { ProviderConfig } from "../config.js";
 
+/**
+ * Is this base URL OpenRouter's — the EXACT host `openrouter.ai`, not a substring.
+ * Deliberately the config.ts `isGoogleGenerativeLanguageHost` shape (one exact host),
+ * not the mistral suffix form: the auth/key endpoint exists only on `openrouter.ai`,
+ * and a suffix test would admit `openrouter.ai.evil.test`. An unparseable base fails
+ * closed: do not send this provider's credential anywhere.
+ */
+function isOpenRouterBase(base: string): boolean {
+  try {
+    return new URL(base).hostname.toLowerCase() === "openrouter.ai";
+  } catch {
+    return false;
+  }
+}
+
 export interface QuotaInfo {
   provider: string;
   ok: boolean;
@@ -24,10 +39,20 @@ export async function fetchProviderQuota(
     return { provider: providerName, ok: false, statusText: "No API key configured" };
   }
 
-  // OpenRouter key management API
-  if (providerName.toLowerCase().includes("openrouter") || cfg.base.includes("openrouter.ai")) {
+  // OpenRouter key management API. Recognition is an EXACT-host test against the
+  // provider's own configured base (the authEnv.ts precedent: never a substring
+  // heuristic, which could ship one provider's credential to another's endpoint),
+  // and the auth-key request is built from that same parsed origin, so the
+  // credential can never egress to a host the operator did not configure.
+  if (isOpenRouterBase(cfg.base)) {
     try {
-      const resp = await fetchFn("https://openrouter.ai/api/v1/auth/key", {
+      const quotaUrl = new URL(cfg.base);
+      quotaUrl.pathname = "/api/v1/auth/key";
+      quotaUrl.search = "";
+      quotaUrl.hash = "";
+      quotaUrl.username = "";
+      quotaUrl.password = "";
+      const resp = await fetchFn(quotaUrl.toString(), {
         headers: { Authorization: apiKey.startsWith("Bearer ") ? apiKey : `Bearer ${apiKey}` },
       });
       if (!resp.ok) {
