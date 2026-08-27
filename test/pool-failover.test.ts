@@ -874,6 +874,41 @@ describe("402 is quota exhaustion — a monthly-window 429, not a client error",
     expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).not.toContain("region");
   });
 
+  it("the Anthropic front names every deployment tried on a terminal error, like the OpenAI front", async () => {
+    // The header's own declaration is the contract: "When every candidate fails it carries the
+    // list that was tried instead, so an exhausted pool is self-describing", and docs/reference.md
+    // states the same to users — "the deployment that served, or on error every deployment tried,
+    // in order". The OpenAI front delivered it; `responseHeadersForTarget` wrote SERVED_BY only
+    // below 400, so `/v1/messages` omitted it entirely on a terminal upstream error. Two paths,
+    // one policy empty — the shape this file exists to catch.
+    // ⚠ NOT the transport-exit omission, which is a recorded deliberate residue: that one has no
+    // HTTP response to describe. This is an ordinary served upstream error.
+    const a = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "slow down" } }) }));
+    const b = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await messages(p);
+    expect(resp.status).toBe(402);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p1/m1, p2/m2");
+  });
+
+  it("the OpenAI front reports an uninterpretable refusal even when a later candidate SUCCEEDED", async () => {
+    // The count is the push half of the eligibility queue: "a NEW kind of refusal just appeared,
+    // run `llm-relay eligibility` while the context is still in hand". A later candidate answering
+    // does not un-see it. The Anthropic front emitted it on success; the OpenAI front computed it
+    // only inside its own `status >= 400` branch and so swallowed exactly this case.
+    const odd = `{"error":{"message":"your organization is not permitted to use this model in this region"}}`;
+    const a = await scripted(() => ({ status: 403, body: odd }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([`http://127.0.0.1:${port(a.server)}`, `http://127.0.0.1:${port(b.server)}`])));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).toBe("1");
+    // The winner still names itself; the refusal count rides beside it, not instead of it.
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+  });
+
   it("says nothing when every refusal was understood", async () => {
     const a = await scripted(() => ({ status: 402, body: QUOTA_BODY }));
     const b = await scripted(() => ({ body: OK_BODY }));
