@@ -798,3 +798,165 @@ describe("nothing is known until something is recorded", () => {
     expect(cooldownUntil("nim", "z-ai/glm-5.2", { path })).toBeNull();
   });
 });
+
+describe("staleness-keyed memoization and lost-update prevention", () => {
+  it("external write (simulating CLI accept) is observed by next read in same process without restart", () => {
+    // Simulate a running relay process that has loaded the store
+    recordUnknownRefusal("p", "m", 403, `{"error":{"message":"unfamiliar message"}}`, { path: interpPath });
+    const sig = pendingRefusals({ path: interpPath })[0]!.signature;
+
+    // Simulate CLI accept writing to the file directly (bypassing the relay's in-memory store)
+    const body = `{"error":{"message":"unfamiliar message"}}`;
+    const confirmedEntry = {
+      class: "not-servable",
+      scope: { kind: "deployment" },
+      source: "researched" as const,
+      acceptedAt: Date.now(),
+    };
+    writeFileSync(interpPath, JSON.stringify({
+      version: 2,
+      confirmed: { [sig]: confirmedEntry },
+      unknown: {},
+      ignored: {},
+    }));
+
+    // Next read in the SAME process must observe the external write
+    const v = interpretRefusal("p", "m", 403, body, { path: interpPath });
+    expect(v?.class).toBe("not-servable");
+    expect(v?.scope).toEqual({ kind: "deployment" });
+    expect(v?.source).toBe("researched");
+  });
+
+  it("persist after external write does not drop externally-added confirmed row", () => {
+    // Simulate running relay with some in-memory state
+    recordUnknownRefusal("p", "m", 403, `{"error":{"message":"another message"}}`, { path: interpPath });
+    const sig = pendingRefusals({ path: interpPath })[0]!.signature;
+
+    // Simulate external CLI accept
+    const body = `{"error":{"message":"another message"}}`;
+    const confirmedEntry = {
+      class: "credential-invalid",
+      scope: { kind: "credential" },
+      source: "researched" as const,
+      acceptedAt: Date.now(),
+    };
+    writeFileSync(interpPath, JSON.stringify({
+      version: 2,
+      confirmed: { [sig]: confirmedEntry },
+      unknown: {},
+      ignored: {},
+    }));
+
+    // Now the relay's in-memory store has the old unknown entry. Trigger a persist
+    // (e.g., via recordUnknownRefusal or another write operation)
+    // This simulates the debounced writer firing after the external write
+    recordUnknownRefusal("other", "m", 403, `{"error":{"message":"third message"}}`, { path: interpPath });
+    flushInterpretations({ path: interpPath });
+
+    // The external confirmed entry must survive the merge
+    const v = interpretRefusal("p", "m", 403, body, { path: interpPath });
+    expect(v?.class).toBe("credential-invalid");
+    expect(v?.scope).toEqual({ kind: "credential" });
+    expect(v?.source).toBe("researched");
+  });
+
+  it("unknown rows are unioned on merge, counts summed", () => {
+    // Set up initial file with an unknown entry
+    const sig = "p|m|403|shared message";
+    writeFileSync(interpPath, JSON.stringify({
+      version: 2,
+      confirmed: {},
+      unknown: {
+        [sig]: {
+          provider: "p",
+          model: "m",
+          status: 403,
+          normalized: "shared message",
+          sample: "shared message",
+          count: 3,
+          firstSeen: 1000,
+          lastSeen: 2000,
+        },
+      },
+      ignored: {},
+    }));
+    resetInterpretations();
+
+    // Simulate relay adding more occurrences in memory
+    recordUnknownRefusal("p", "m", 403, `{"error":{"message":"shared message"}}`, { path: interpPath });
+    recordUnknownRefusal("p", "m", 403, `{"error":{"message":"shared message"}}`, { path: interpPath });
+    flushInterpretations({ path: interpPath });
+
+    // Reload and verify counts were summed
+    const reloaded = pendingRefusals({ path: interpPath });
+    const entry = reloaded.find((e) => e.signature === sig);
+    expect(entry).toBeDefined();
+    expect(entry!.count).toBe(5); // 3 (disk) + 2 (memory)
+    expect(entry!.firstSeen).toBe(1000);
+    expect(entry!.lastSeen).toBeGreaterThanOrEqual(2000);
+  });
+
+  it("confirmed wins over unknown for same signature (no resurrection)", () => {
+    // File has a confirmed entry
+    const sig = "p|m|403|confirmed wins";
+    const body = `{"error":{"message":"confirmed wins"}}`;
+    writeFileSync(interpPath, JSON.stringify({
+      version: 2,
+      confirmed: {
+        [sig]: {
+          class: "subscription-required",
+          scope: { kind: "deployment" },
+          source: "researched",
+          acceptedAt: Date.now(),
+        },
+      },
+      unknown: {},
+      ignored: {},
+    }));
+    resetInterpretations();
+
+    // Reload to get confirmed entry in memory
+    interpretRefusal("p", "m", 403, body, { path: interpPath });
+
+    // Now simulate an external process adding the SAME signature to unknown
+    // (this simulates the race where the file is externally modified to have both)
+    writeFileSync(interpPath, JSON.stringify({
+      version: 2,
+      confirmed: {
+        [sig]: {
+          class: "subscription-required",
+          scope: { kind: "deployment" },
+          source: "researched",
+          acceptedAt: Date.now(),
+        },
+      },
+      unknown: {
+        [sig]: {
+          provider: "p",
+          model: "m",
+          status: 403,
+          normalized: "confirmed wins",
+          sample: "confirmed wins",
+          count: 1,
+          firstSeen: Date.now(),
+          lastSeen: Date.now(),
+        },
+      },
+      ignored: {},
+    }));
+
+    // Trigger a persist from the relay side
+    recordUnknownRefusal("other", "m", 403, `{"error":{"message":"unrelated"}}`, { path: interpPath });
+    flushInterpretations({ path: interpPath });
+
+    // The confirmed entry must still be there and unknown must not have resurrected it
+    const v = interpretRefusal("p", "m", 403, body, { path: interpPath });
+    expect(v?.class).toBe("subscription-required");
+    expect(v?.source).toBe("researched");
+
+    // And the unknown should not have the confirmed signature
+    const pending = pendingRefusals({ path: interpPath });
+    const hasConfirmedSig = pending.some((e) => e.signature === sig);
+    expect(hasConfirmedSig).toBe(false);
+  });
+});
