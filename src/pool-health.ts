@@ -15,7 +15,7 @@ import { splitSpec } from "./config.js";
 import { buildAuthHeaders } from "./authEnv.js";
 import { providerCredentialSlots, resolveCredentialSlot, slotAllowsModel, type CredentialSlot } from "./credential-fleet.js";
 
-export type MemberVerdict = "live" | "empty" | "auth" | "rate_limited" | "missing" | "error";
+export type MemberVerdict = "live" | "empty" | "auth" | "denied" | "rate_limited" | "missing" | "error";
 
 export interface MemberHealth {
   pool: string;
@@ -28,8 +28,16 @@ export interface MemberHealth {
   detail?: string | undefined;
 }
 
-/** Verdicts that mean "this member will never answer until someone changes something". */
-export const DEAD_VERDICTS: ReadonlySet<MemberVerdict> = new Set<MemberVerdict>(["missing", "auth"]);
+/**
+ * Verdicts that mean "this member will never answer until someone changes something".
+ *
+ * `auth` is a CONFIG fact (no enabled credential slot has a present key, so no request was
+ * sent); `denied` is a SERVER response (401/403) whose cause we deliberately do not infer —
+ * it may be the credential, but it may also be an entitlement wall on a model this key
+ * legitimately cannot touch. Both are surfaced to the operator, but only `auth` carries a
+ * credential-rotation recommendation in the CLI advice.
+ */
+export const DEAD_VERDICTS: ReadonlySet<MemberVerdict> = new Set<MemberVerdict>(["missing", "auth", "denied"]);
 
 /**
  * Probe headers. The credential half comes from the shared builder — it obeys the DECLARED
@@ -100,13 +108,24 @@ export async function probeMember(
     const r = await fetchFn(url, { method: "POST", headers: authHeaders(p, apiKey), body });
     const latencyMs = now() - started;
     if (r.status === 401 || r.status === 403) {
-      return { pool, spec, credentialId, verdict: "auth", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status}` };
+      // The server said no; we cannot tell why from one signed request. Free-tier rosters
+      // list premium SKUs, so a 401/403 here may be the model (entitlement wall) or the
+      // key. Surface the rejection without assigning blame; the operator decides.
+      return { pool, spec, credentialId, verdict: "denied", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status} (request rejected — cause not inferred; could be credential or entitlement)` };
     }
     if (r.status === 429) {
       return { pool, spec, credentialId, verdict: "rate_limited", httpStatus: 429, latencyMs, detail: "HTTP 429" };
     }
-    if (r.status === 404 || r.status === 400) {
-      return { pool, spec, credentialId, verdict: "missing", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status} — model not servable` };
+    if (r.status === 404) {
+      // A 404 on the chat/completions or /v1/messages endpoint is the strongest absence
+      // signal a single probe can produce: the server has no route for this model.
+      return { pool, spec, credentialId, verdict: "missing", httpStatus: r.status, latencyMs, detail: `HTTP 404 — model not servable` };
+    }
+    if (r.status === 400) {
+      // A 400 is a request-validation error (e.g. mistral's 9-char tool-call-id refusal,
+      // a max_tokens complaint), not evidence of model absence. Treat as a transient error
+      // so the operator looks at the detail instead of removing the member from the pool.
+      return { pool, spec, credentialId, verdict: "error", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status} — request rejected by server (not absence evidence)` };
     }
     if (!r.ok) {
       return { pool, spec, credentialId, verdict: "error", httpStatus: r.status, latencyMs, detail: `HTTP ${r.status}` };

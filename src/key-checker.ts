@@ -158,34 +158,49 @@ async function probeAuthenticated(
     if (r.status === 429) {
       return { status: "rate_limited", httpStatus: 429, message: "Rate limited or quota exhausted (HTTP 429)" };
     }
-    if (r.status !== 401 && r.status !== 403) {
-      // 2xx, or a 400/404 rejecting the request on its contents — either way it got past auth.
+    if (r.status >= 200 && r.status < 300) {
       return { status: "valid", httpStatus: r.status, message: "Key verified (authenticated probe)" };
     }
-
+    if (r.status === 400 || r.status === 404) {
+      // A 400/404 here means the throwaway request authenticated and was then rejected
+      // on its contents (unknown model id, parameter violation, etc.) — proof that the
+      // request reached the model-aware layer behind auth, not proof of the credential.
+      // Either way the key is not the wall; declare it valid.
+      return { status: "valid", httpStatus: r.status, message: "Key verified (authenticated probe — request rejected on contents, not credentials)" };
+    }
     // A 401/403 is ambiguous: the key may be bad, OR the key may be fine and simply not
     // entitled to this particular model (premium tiers are common in a free-tier roster, and
     // the catalogue lists them alongside the free ones). Send the SAME request anonymously:
     // if the answer changes, the credential demonstrably did something and the wall is about
     // the model, not the key. If it does not change, we have learned nothing and must say so
     // rather than accuse a working key.
-    const anon = await fetchFn(url, {
-      method: "POST",
-      headers: probeHeaders(p, undefined),
-      body,
-      ...withTimeout(),
-    });
-    if (anon.status !== r.status) {
+    if (r.status === 401 || r.status === 403) {
+      const anon = await fetchFn(url, {
+        method: "POST",
+        headers: probeHeaders(p, undefined),
+        body,
+        ...withTimeout(),
+      });
+      if (anon.status !== r.status) {
+        return {
+          status: "valid",
+          httpStatus: r.status,
+          message: `Key authenticated (HTTP ${r.status} is the probe model not being available on this plan)`,
+        };
+      }
       return {
-        status: "valid",
+        status: "unverified",
         httpStatus: r.status,
-        message: `Key authenticated (HTTP ${r.status} is the probe model not being available on this plan)`,
+        message: `Could not confirm — /models is public and the probe model answers HTTP ${r.status} with or without the key`,
       };
     }
+    // Anything else (5xx, 408, 425, 4xx other than 401/403/400/404, ...) proves nothing
+    // about the credential: a gateway error is not an authentication signal. Decline to
+    // conclude rather than guess, which is exactly what `unverified` is for.
     return {
       status: "unverified",
       httpStatus: r.status,
-      message: `Could not confirm — /models is public and the probe model answers HTTP ${r.status} with or without the key`,
+      message: `Could not confirm — authenticated probe returned HTTP ${r.status} (no evidence about the credential)`,
     };
   } catch (e) {
     return { status: "unreachable", httpStatus: undefined, message: describeFailure(e) };
@@ -292,11 +307,11 @@ export async function validateProviderKeys(
           message: "Rate limited or quota exhausted (HTTP 429)",
           quotaPercent: quota.quotaPercent,
         };
-      } else if (resp.ok || resp.status === 400 || resp.status === 404 || resp.status === 405) {
-        // 200 OK or endpoint-level expected response (e.g. GET on /messages returning 405 Method Not Allowed)
+      } else if (resp.ok) {
+        // 200 OK — may prove the key works if /models is auth-gated; otherwise escalate.
         let modelsCount: number | undefined;
         let firstModelId: string | undefined;
-        if (resp.ok && url.endsWith("/models")) {
+        if (url.endsWith("/models")) {
           try {
             const body = (await resp.json()) as { data?: { id?: unknown }[] };
             if (Array.isArray(body.data)) {
@@ -325,7 +340,7 @@ export async function validateProviderKeys(
         const probeModel = configuredModel && slotAllowsModel(slot, configuredModel)
           ? configuredModel
           : (slot.models?.[0] ?? firstModelId);
-        if (resp.ok && apiKey && url.endsWith("/models") && probeModel) {
+        if (apiKey && url.endsWith("/models") && probeModel) {
           const gated = await isAuthGated(p, url, fetchFn);
           if (!gated) {
             const verdict = await probeAuthenticated(p, apiKey, fetchFn, probeModel);
@@ -353,6 +368,34 @@ export async function validateProviderKeys(
           message: "Key verified & healthy",
           quotaPercent: quota.quotaPercent,
           modelsFound: modelsCount,
+        };
+      } else if (resp.status === 405) {
+        // GET on /v1/messages (Anthropic) returns 405 Method Not Allowed — the server is
+        // reachable but the method is wrong. This proves reachability, not credential
+        // validity. Decline to conclude.
+        return {
+          provider: name,
+          ...identity,
+          authEnv: envVarName,
+          hasEnvKey,
+          status: "unverified",
+          httpStatus: resp.status,
+          message: "Server reachable (HTTP 405) — no evidence about the credential",
+          quotaPercent: quota.quotaPercent,
+        };
+      } else if (resp.status === 400 || resp.status === 404) {
+        // 400/404 from GET /models or GET /v1/messages means the endpoint exists but the
+        // request was malformed or not found — this does NOT prove the credential
+        // authenticated. Decline to conclude rather than label a guess as "valid".
+        return {
+          provider: name,
+          ...identity,
+          authEnv: envVarName,
+          hasEnvKey,
+          status: "unverified",
+          httpStatus: resp.status,
+          message: `Server responded HTTP ${resp.status} — no evidence about the credential`,
+          quotaPercent: quota.quotaPercent,
         };
       } else {
  return {

@@ -55,6 +55,26 @@ describe("probeMember", () => {
     expect(DEAD_VERDICTS.has(r.verdict)).toBe(true);
   });
 
+  // A 400 is a request-validation error (mistral's 9-char tool-call-id refusal, a
+  // max_tokens complaint), not evidence of model absence. It must not be reported as "dead /
+  // missing" — that would tell the operator to remove a working deployment.
+  it("does not report a 400 as model-not-servable", async () => {
+    const r = await probeMember("coding", "p1/m", cfg({ coding: ["p1/m"] }), respond(400));
+    expect(r.verdict).toBe("error");
+    expect(r.verdict).not.toBe("missing");
+    expect(DEAD_VERDICTS.has(r.verdict)).toBe(false);
+  });
+
+  // A 401/403 from a single-model completion probe is ambiguous: it may be the credential,
+  // or it may be an entitlement wall on a model the key legitimately cannot touch. The probe
+  // must not ASSERT a credential fault, so it reports `denied` (a server rejection) rather
+  // than `auth` (which carries a rotate-the-key recommendation in the CLI).
+  it("reports an ambiguous 401 as denied, not as a proven credential fault", async () => {
+    const r = await probeMember("coding", "p1/m", cfg({ coding: ["p1/m"] }), respond(401));
+    expect(r.verdict).toBe("denied");
+    expect(DEAD_VERDICTS.has(r.verdict)).toBe(true);
+  });
+
   // A 200 with no content is what a reasoning model does when max_tokens is too small —
   // distinct from dead, and must not be reported as such.
   it("distinguishes an empty 200 from a dead model", async () => {
