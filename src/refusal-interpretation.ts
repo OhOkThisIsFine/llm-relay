@@ -1,6 +1,6 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { WriteBehindTimer } from "./write-behind.js";
@@ -182,6 +182,9 @@ const MAX_RESET_MS = 7 * 24 * 60 * 60 * 1000;
 
 let _store: InterpretationStore | null = null;
 let _path: string | null = null;
+// The stat token the currently-memoized `_store` was loaded from (or null when `_store` is null).
+// Keyed by normalized path so two syntactic aliases of one file coalesce, exactly like `keystore.ts`.
+let _token: string | null = null;
 const writer = new WriteBehindTimer();
 
 // Vitest workers can reuse a PID across separate runs. Keep the test store in a fresh,
@@ -722,54 +725,188 @@ function migrateV1(parsed: Record<string, unknown>): InterpretationStore {
   return { version: 2, confirmed, unknown, ignored };
 }
 
-function load(path: string): InterpretationStore {
-  if (_store && _path === path) return _store;
-  _path = path;
+interface InterpretationFileStat {
+  mtimeMs: number;
+  size: number;
+  ino: number;
+}
+
+type StoreObservation =
+  | { kind: "present"; token: string }
+  | { kind: "absent" }
+  | { kind: "error"; errno?: string };
+
+function observeInterpretationStore(path: string): StoreObservation {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (parsed && typeof parsed === "object") {
-      const raw = parsed as Record<string, unknown>;
-      if (raw.version === 1) {
-        _store = migrateV1(raw);
-        return _store;
-      }
-      if (raw.version === 2) {
-        const confirmed: Record<string, Interpretation> = {};
-        const unknown: Record<string, UnknownRefusal> = {};
-        const ignored: Record<string, { at: number }> = {};
-        if (raw.confirmed && typeof raw.confirmed === "object") {
-          for (const [signature, entry] of Object.entries(raw.confirmed)) {
-            if (signatureParts(signature) && validInterpretation(entry)) confirmed[signature] = entry;
-          }
-        }
-        if (raw.unknown && typeof raw.unknown === "object") {
-          for (const [signature, entry] of Object.entries(raw.unknown)) {
-            if (validUnknown(entry) && unknownMatchesSignature(signature, entry)) unknown[signature] = entry;
-          }
-        }
-        if (raw.ignored && typeof raw.ignored === "object") {
-          for (const [signature, entry] of Object.entries(raw.ignored)) {
-            if (signatureParts(signature) && validIgnored(entry)) ignored[signature] = entry;
-          }
-        }
-        _store = { version: 2, confirmed, unknown, ignored };
-        return _store;
+    let stat: InterpretationFileStat;
+    const pathStat = lstatSync(path);
+    if (pathStat.isSymbolicLink()) {
+      const targetStat = statSync(path);
+      stat = { mtimeMs: targetStat.mtimeMs, size: targetStat.size, ino: targetStat.ino };
+    } else {
+      stat = { mtimeMs: pathStat.mtimeMs, size: pathStat.size, ino: pathStat.ino };
+    }
+    if (!Number.isFinite(stat.mtimeMs) || !Number.isFinite(stat.size) || !Number.isFinite(stat.ino)) {
+      return { kind: "error", errno: "EINVAL" };
+    }
+    return { kind: "present", token: `stat:${stat.mtimeMs}:${stat.size}:${stat.ino}` };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return { kind: "absent" };
+    return code === undefined ? { kind: "error" } : { kind: "error", errno: code };
+  }
+}
+
+/** The one empty store. Absent, unreadable and corrupt all resolve to it. */
+const emptyStore = (): InterpretationStore => ({ version: 2, confirmed: {}, unknown: {}, ignored: {} });
+
+/**
+ * Parse a store file. The ONE parser: `load` reads through it, and so does the lost-update
+ * re-read inside `persist` — two copies of the acceptance rules is how one process comes to
+ * admit a row the other silently drops.
+ */
+function readStoreFile(normalizedPath: string): InterpretationStore {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(normalizedPath, "utf8"));
+    if (!parsed || typeof parsed !== "object") return emptyStore();
+    const raw = parsed as Record<string, unknown>;
+    if (raw.version === 1) return migrateV1(raw);
+    if (raw.version !== 2) return emptyStore();
+    const confirmed: Record<string, Interpretation> = {};
+    const unknown: Record<string, UnknownRefusal> = {};
+    const ignored: Record<string, { at: number }> = {};
+    if (raw.confirmed && typeof raw.confirmed === "object") {
+      for (const [signature, entry] of Object.entries(raw.confirmed)) {
+        if (signatureParts(signature) && validInterpretation(entry)) confirmed[signature] = entry;
       }
     }
+    if (raw.unknown && typeof raw.unknown === "object") {
+      for (const [signature, entry] of Object.entries(raw.unknown)) {
+        if (validUnknown(entry) && unknownMatchesSignature(signature, entry)) unknown[signature] = entry;
+      }
+    }
+    if (raw.ignored && typeof raw.ignored === "object") {
+      for (const [signature, entry] of Object.entries(raw.ignored)) {
+        if (signatureParts(signature) && validIgnored(entry)) ignored[signature] = entry;
+      }
+    }
+    return { version: 2, confirmed, unknown, ignored };
   } catch {
-    // Corrupt or absent: start clean. Seeds live in source, so nothing binding is lost.
+    return emptyStore();
   }
-  _store = { version: 2, confirmed: {}, unknown: {}, ignored: {} };
+}
+
+function load(path: string): InterpretationStore {
+  const normalizedPath = resolve(path);
+  const observation = observeInterpretationStore(normalizedPath);
+
+  // If we have a memoized store for this path:
+  // - If _token is null (file didn't exist when we loaded), we can only return the memoized
+  //   store if the file is STILL absent. If the file now exists externally, we must re-read.
+  // - If _token matches the current file's token, return the memoized store.
+  if (
+    _store !== null &&
+    _path === normalizedPath &&
+    ((_token === null && observation.kind === "absent") ||
+     (observation.kind === "present" && observation.token === _token))
+  ) {
+    return _store;
+  }
+
+  // Need to (re)load. Absent, unreadable and corrupt all degrade to an empty store: unlike a
+  // keystore row, every interpretation here is re-learnable and the SEEDS live in source, so
+  // nothing binding is lost. `persist` re-reads through the same parser, so the two paths cannot
+  // come to disagree about what a stored file means.
+  const result: InterpretationStore =
+    observation.kind === "present" ? readStoreFile(normalizedPath) : emptyStore();
+
+  // Memoize the loaded store and its stat token.
+  _store = result;
+  _path = normalizedPath;
+  _token = observation.kind === "present" ? observation.token : null;
   return _store;
+}
+
+/**
+ * Merge an externally-modified file into the in-memory store before overwriting.
+ *
+ * Merge rules (justified by provenance):
+ * - A `confirmed` row is an OPERATOR-DECLARED acceptance and must never be dropped by
+ *   another process's stale snapshot. We always take the union of confirmed signatures,
+ *   and for a signature present in both, the disk version wins (the operator explicitly
+ *   accepted it in another process).
+ * - `unknown` rows are queue entries and may be unioned. We keep the entry with the
+ *   higher `lastSeen` (fresher sample wins), and merge counts if the signature appears
+ *   in both.
+ * - A signature that moved from `unknown` to `confirmed` on disk must not be resurrected
+ *   into `unknown` by an in-memory writer that still had it pending. We handle this by
+ *   always preferring `confirmed` over `unknown` for the same signature.
+ * - `ignored` entries are unioned by signature, keeping the latest `at` timestamp.
+ */
+function mergeStores(disk: InterpretationStore, memory: InterpretationStore): InterpretationStore {
+  // Start with disk's confirmed (operator-declared wins)
+  const confirmed = { ...disk.confirmed };
+  // Then layer memory's confirmed — but disk's wins on conflicts
+  for (const [sig, entry] of Object.entries(memory.confirmed)) {
+    if (!(sig in confirmed)) confirmed[sig] = entry;
+  }
+
+  // Unknown: union, preferring confirmed over unknown for same signature
+  const unknown: Record<string, UnknownRefusal> = { ...disk.unknown };
+  for (const [sig, memEntry] of Object.entries(memory.unknown)) {
+    if (sig in confirmed) continue; // confirmed wins — don't resurrect into unknown
+    const diskEntry = unknown[sig];
+    if (!diskEntry) {
+      unknown[sig] = memEntry;
+    } else {
+      // Fresher sample wins the body; the window and the count span both observers.
+      // ⚠ COPY, never mutate in place: the chosen entry belongs to `_store` (or to the disk
+      // store we just parsed), and writing the summed count back into it would inflate the
+      // count again on the next persist that follows another external write.
+      const fresher = memEntry.lastSeen >= diskEntry.lastSeen ? memEntry : diskEntry;
+      unknown[sig] = {
+        ...fresher,
+        count: memEntry.count + diskEntry.count,
+        firstSeen: Math.min(memEntry.firstSeen, diskEntry.firstSeen),
+        lastSeen: Math.max(memEntry.lastSeen, diskEntry.lastSeen),
+      };
+    }
+  }
+
+  // Ignored: union, keep latest `at`
+  const ignored: Record<string, { at: number }> = { ...disk.ignored };
+  for (const [sig, memEntry] of Object.entries(memory.ignored ?? {})) {
+    const diskEntry = ignored[sig];
+    if (!diskEntry || memEntry.at > diskEntry.at) ignored[sig] = memEntry;
+  }
+
+  return { version: 2, confirmed, unknown, ignored };
 }
 
 function persist(path: string): void {
   if (!_store) return;
+  const normalizedPath = resolve(path);
   try {
-    mkdirSync(join(path, ".."), { recursive: true });
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(_store, null, 2) + "\n", "utf8");
-    renameSync(tmp, path);
+    // Before writing, check if the file has changed since we loaded it.
+    // If so, re-read and merge to avoid lost updates.
+    const observation = observeInterpretationStore(normalizedPath);
+    let storeToWrite = _store;
+    if (observation.kind === "present" && observation.token !== _token) {
+      // The file moved under us — another process (usually `llm-relay eligibility accept`, which
+      // runs as its own CLI process) wrote it after we loaded. Re-read through the SAME parser and
+      // merge, so this write cannot serialize a stale snapshot over an operator's acceptance.
+      const diskStore = readStoreFile(normalizedPath);
+      storeToWrite = mergeStores(diskStore, _store);
+    }
+
+    mkdirSync(join(normalizedPath, ".."), { recursive: true });
+    const tmp = `${normalizedPath}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(storeToWrite, null, 2) + "\n", "utf8");
+    renameSync(tmp, normalizedPath);
+
+    // Update memoized token to the newly-written file's stat.
+    const newObservation = observeInterpretationStore(normalizedPath);
+    _token = newObservation.kind === "present" ? newObservation.token : null;
   } catch {
     /* storage problem, never a request failure — same contract as every other store here */
   }
@@ -970,5 +1107,6 @@ export function flushInterpretations(opts: { path?: string } = {}): void {
 export function resetInterpretations(): void {
   _store = null;
   _path = null;
+  _token = null;
   writer.clear();
 }
