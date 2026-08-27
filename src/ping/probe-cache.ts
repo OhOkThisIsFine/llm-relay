@@ -1,3 +1,4 @@
+import { relayStatePath } from "../state-paths.js";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -61,8 +62,7 @@ export function getProbeCachePath(): string {
   // `mock-model-a` entries written by the suite — test fixtures polluting live health data that
   // the router then ranks on. Tests needing persistence pass an explicit `path`.
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "probe-cache.json");
-  const xdg = process.env.XDG_CACHE_HOME;
-  const baseDir = xdg && xdg.trim() ? join(xdg, "llm-relay") : join(homedir(), ".llm-relay");
+  const baseDir = relayStatePath("cache");
   return join(baseDir, "probe-cache.json");
 }
 

@@ -10,6 +10,7 @@
  * (it is what the user's shell, launcher or CI actually exported), and a stale file
  * silently overriding it would be a nastier version of the bug this fixes.
  */
+import { relayStatePath } from "./state-paths.js";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,7 +53,7 @@ export function defaultEnvPath(): string {
   // live credentials into process.env and tests must not pollute or depend on that state.
   // Tests needing persistence pass an explicit `path` to `loadEnvFile`.
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", ".env");
-  return join(homedir(), ".llm-relay", ".env");
+  return relayStatePath("config", [".env"]);
 }
 
 /** Display-only provenance for credential resolution; never a precedence input. */

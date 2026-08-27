@@ -86,8 +86,16 @@ three different policies: `usage/`, `probe-cache.json` and `runtime-telemetry.js
 the other eight honour neither. With either variable set the state directory **splits** —
 `XDG_CACHE_HOME` moves the health caches while `models-cache.json` stays, `XDG_CONFIG_HOME` moves
 the learned facts while `config.json` and the keystore stay. Nothing is broken, every resolver is
-internally consistent, and XDG appeared in no document at all. **Recorded, not fixed:** unifying it
-MOVES a live operator's state, which is the owner's call and not a tidy. See the decision below.
+internally consistent, and XDG appeared in no document at all.
+
+**Raised as an owner decision and answered the same day: honour XDG everywhere** (v0.51.0). The
+thirteen resolvers collapse into `src/state-paths.ts`. The option's stated cost — that it moves
+`config.json`, `.env` and the keystore for anyone with the variable set — is bought off by a
+legacy fallback rather than a migration: the legacy path still wins whenever it holds the file and
+the XDG one does not, so an existing install keeps reading and writing where it already does, and a
+fresh install with XDG set is fully XDG. Nothing is copied, nothing is deleted, and there is no
+migration step to forget. `test/state-paths.test.ts` pins the policy through injected seams and
+greps `src/` so a fourteenth resolver cannot reintroduce a raw XDG read.
 
 ## Code changes
 
@@ -109,7 +117,9 @@ MOVES a live operator's state, which is the owner's call and not a tidy. See the
 
 ## Deliberately not done
 
-- **Unifying the XDG resolvers.** It moves a live operator's state. Owner decision, stated above.
+- ~~Unifying the XDG resolvers.~~ **DONE** — owner chose "honour XDG everywhere" the same day; see
+  above. Kept in this list so the sequence is legible: it was raised as a decision, not silently
+  taken.
 - **The four large `server.ts` clones** between the Anthropic and OpenAI candidate loops
   (~19–40 lines each). This is the refactor `36de89d` already measured as net +160 lines against a
   −150 forecast, and that `docs/suggestion-review-2026-08-04.md` rejected in its enterprise-shaped

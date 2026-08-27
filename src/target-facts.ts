@@ -1,3 +1,4 @@
+import { relayStatePath } from "./state-paths.js";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join } from "node:path";
@@ -143,8 +144,7 @@ const writer = new WriteBehindTimer();
 
 function defaultPath(): string {
   if (process.env.VITEST !== undefined) return join(tmpdir(), `llm-relay-test-target-facts-${process.pid}.json`);
-  const xdg = process.env.XDG_CONFIG_HOME;
-  return join(xdg && xdg.trim() ? join(xdg, "llm-relay") : join(homedir(), ".llm-relay"), "target-facts.json");
+  return relayStatePath("config", ["target-facts.json"]);
 }
 
 function validText(value: unknown): value is string {

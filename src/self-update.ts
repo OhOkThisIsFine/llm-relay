@@ -16,6 +16,7 @@
  * behind on the PATH. The working install is never removed before its
  * replacement is on local disk (see `installGlobalUpdate`).
  */
+import { relayStatePath } from "./state-paths.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -183,7 +184,7 @@ export function currentVersion(): string {
  */
 export function defaultUpdateCachePath(): string {
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "update-check.json");
-  return join(homedir(), ".llm-relay", "update-check.json");
+  return relayStatePath("cache", ["update-check.json"]);
 }
 
 const cacheFile = () => defaultUpdateCachePath();

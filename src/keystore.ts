@@ -4,6 +4,7 @@
  * semantics. An envName is globally unique within a store; malformed or duplicate rows are
  * skipped in file order, so the first valid row deterministically wins read-side deduplication.
  */
+import { relayStatePath } from "./state-paths.js";
 import {
   chmodSync,
   closeSync,
@@ -291,7 +292,11 @@ export function resolveKeystorePath(opts: { path?: string } = {}): string {
     const worker = process.env.VITEST_WORKER_ID ?? "worker";
     return resolve(join(tmpdir(), `llm-relay-test-keystore-${process.pid}-${pool}-${worker}`, "keystore.json"));
   }
-  return resolve(join(homedir(), ".llm-relay", "keystore.json"));
+  // ⚠ `relayStatePath` keeps returning the legacy `~/.llm-relay/keystore.json` whenever that file
+  // exists and the XDG one does not. That fallback is load-bearing HERE above everywhere else: an
+  // operator's encrypted credentials are the one artifact this relay cannot re-fetch, so honouring
+  // XDG must never turn a working store into an empty one.
+  return resolve(relayStatePath("config", ["keystore.json"]));
 }
 
 function decodeBase64(value: unknown, expectedLength?: number): Buffer | null {

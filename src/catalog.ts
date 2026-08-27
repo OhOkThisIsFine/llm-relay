@@ -1,3 +1,4 @@
+import { relayStatePath } from "./state-paths.js";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -22,7 +23,7 @@ const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
  */
 export function defaultCatalogCachePath(): string {
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "models-cache.json");
-  return join(homedir(), ".llm-relay", "models-cache.json");
+  return relayStatePath("cache", ["models-cache.json"]);
 }
 
 const DEFAULT_CACHE = defaultCatalogCachePath();

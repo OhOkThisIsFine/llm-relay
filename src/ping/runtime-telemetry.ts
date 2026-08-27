@@ -1,3 +1,4 @@
+import { relayStatePath } from "../state-paths.js";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -32,8 +33,7 @@ export interface TelemetryData {
 
 export function getRuntimeTelemetryPath(): string {
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "runtime-telemetry.json");
-  const xdg = process.env.XDG_CACHE_HOME;
-  const baseDir = xdg && xdg.trim() ? join(xdg, "llm-relay") : join(homedir(), ".llm-relay");
+  const baseDir = relayStatePath("cache");
   return join(baseDir, "runtime-telemetry.json");
 }
 

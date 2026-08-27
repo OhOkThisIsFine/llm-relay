@@ -122,23 +122,31 @@ the `hooks/` script, and the `usage/` accounting subtree.
 
 ### Where state actually lives
 
-⚠ **`~/.llm-relay/` is the answer only when no XDG base variable is set.** Five artifacts honour
-one, and each of the two variables moves a different subset:
+`~/.llm-relay/` is the default. If you set an XDG base directory, **every** artifact honours it,
+split by what the artifact is:
 
 | Honours | Artifacts |
 |---|---|
-| `XDG_CACHE_HOME` | `usage/`, `probe-cache.json`, `runtime-telemetry.json` |
-| `XDG_CONFIG_HOME` | `target-facts.json`, `refusal-interpretations.json` |
-| Neither — always `~/.llm-relay/` | `config.json`, `.env`, `keystore.json`, `control-token`, `models-cache.json`, `lane-manifest.json`, `update-check.json`, the `hooks/` script |
+| `XDG_CONFIG_HOME/llm-relay/` | `config.json`, `.env`, `keystore.json`, `control-token`, `target-facts.json`, `refusal-interpretations.json`, the `hooks/` script |
+| `XDG_CACHE_HOME/llm-relay/` | `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `lane-manifest.json`, `update-check.json`, the `usage/` ledger |
 
-So on a machine with either variable set, the relay's state directory **splits in two**: setting
-`XDG_CACHE_HOME` moves the health caches while `models-cache.json` stays behind, and setting
-`XDG_CONFIG_HOME` moves the learned facts while `config.json` and the keystore stay behind.
-Nothing breaks — every resolver is internally consistent — but "back up `~/.llm-relay/`" stops
-being a complete backup, which is the reason to state it rather than leave it discovered.
+The rule is the XDG spec's own: anything you authored or that holds a credential is config;
+anything the relay can rebuild by asking a provider again is cache. A variable that is unset,
+empty, or whitespace-only counts as absent.
 
-If you want one directory, leave both variables unset, or pass `--config` and keep the rest of the
-default layout beside it.
+⚠ **Upgrading never moves anything.** If a file already exists under `~/.llm-relay/` and not under
+the XDG path, the relay keeps reading *and writing* the old one. So setting `XDG_CONFIG_HOME` on an
+install that already has a keystore does not hide it, and there is no migration step to run or
+forget. A fresh install with the variable set is fully XDG from the start.
+
+To move an existing install deliberately, stop the relay, copy the files to the locations in the
+table, and delete the originals — the XDG path wins as soon as it exists. Back up first
+(`llm-relay keys export` for the credentials), because `keystore.json` is the one artifact that
+cannot be re-fetched.
+
+Before 2026-08-27 only five of these honoured a variable and the rest did not, so the directory
+split in two. That is fixed; if you are on an older version, treat `~/.llm-relay/` plus both XDG
+locations as the full backup set.
 
 ```jsonc
 {
