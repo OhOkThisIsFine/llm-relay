@@ -3030,17 +3030,20 @@ export async function runPools(
     live: "LIVE",
     empty: "EMPTY",
     auth: "AUTH",
+    denied: "DENIED",
     rate_limited: "429",
     missing: "DEAD",
     error: "ERR",
   };
   let missing = 0;
   let auth = 0;
+  let denied = 0;
   for (const name of names) {
     process.stdout.write(`pool/${name}\n`);
     for (const r of results.filter((x) => x.pool === name)) {
       if (r.verdict === "missing") missing++;
       if (r.verdict === "auth") auth++;
+      if (r.verdict === "denied") denied++;
       const lat = r.latencyMs !== undefined ? `${r.latencyMs}ms` : "";
       const diagnostic = [
         r.credentialId !== undefined ? `credential=${r.credentialId}` : undefined,
@@ -3071,6 +3074,19 @@ export async function runPools(
     process.stdout.write(
       `⚠ ${auth} AUTH result(s). ${credentialGuidance};\n` +
         `  sibling slots and the deployment were not proven dead by this one-slot probe.\n`,
+    );
+  }
+  if (denied > 0) {
+    const deniedCredentialIds = [...new Set(results.flatMap((r) =>
+      r.verdict === "denied" && r.credentialId !== undefined ? [r.credentialId] : [],
+    ))];
+    const credentialContext = deniedCredentialIds.length === 0
+      ? ""
+      : ` (credential${deniedCredentialIds.length === 1 ? "" : "s"} ${deniedCredentialIds.join(", ")} were the ones that got a 401/403)`;
+    process.stdout.write(
+      `⚠ ${denied} DENIED result(s). The server rejected the request (401/403), but this probe cannot\n` +
+        `  distinguish a bad credential from an entitlement wall on a model the key cannot access.${credentialContext}\n` +
+        `  Do NOT rotate credentials based on this result alone — check the model's plan tier first.\n`,
     );
   }
 }

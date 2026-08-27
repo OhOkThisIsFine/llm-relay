@@ -129,6 +129,22 @@ describe("key-checker", () => {
       expect(results[0]?.message).toMatch(/not being available on this plan/);
     });
 
+    // A gateway error (5xx) proves nothing about a credential — the request may not even
+    // have reached the auth layer. It must be reported as `unverified`, never `valid`.
+    it("does not call a 503 from the authenticated probe a verified key", async () => {
+      process.env.MOCK_PROV_KEY = "good";
+      const mockFetch = (async (url: string) => {
+        if (url.endsWith("/models")) {
+          return new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 });
+        }
+        return new Response("gateway error", { status: 503 });
+      }) as unknown as typeof fetch;
+
+      const results = await validateProviderKeys(baseConfig, mockFetch);
+      expect(results[0]?.status).not.toBe("valid");
+      expect(results[0]?.status).toBe("unverified");
+    });
+
     // Identical answers with and without the key teach us nothing — say so rather than
     // accuse a key that may well be fine.
     it("reports unverified when the key changes nothing, instead of calling it invalid", async () => {
