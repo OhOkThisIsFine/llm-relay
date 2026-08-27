@@ -2,9 +2,52 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-26
+## 0. State as of 2026-08-27
 
-**Latest — the 2026-08-26 §5 implementation sprint, released as v0.48.0.** The nine §5 items the
+**Latest — the uncovered-areas sprint.** [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md)
+§6 recorded two gaps in its OWN coverage: the cross-cutting reviewer (JSON-store persistence,
+auth-header construction, vitest temp-dir guards, spec parsing, fetch retry wrappers) failed before
+returning, and no reviewer had proposed type-level simplifications — which it called the richest
+unexplored seam. Both briefs were re-run, every claim acted on was checked first-hand against
+source, and **nine defects were confirmed and fixed** across seven packets (`2920365`..`8192b43`).
+Full record, including everything left advisory:
+[docs/uncovered-areas-review-2026-08-26.md](docs/uncovered-areas-review-2026-08-26.md).
+
+The headline is a real routing bug: `quota-demotion.ts` memoized the ledger window under a
+PERIOD-only key while storing an already axis-projected value, and `bucketRank` puts requests
+first — so any period carrying both buckets resolved the TOKENS axis from the REQUESTS count and
+failed to demote a spent token allowance. `hard-cap.ts` had always keyed `scope:period:axis`
+correctly; one of the two modules asking the ledger the same question got it wrong.
+
+The rest, in one line each:
+
+- `330f475` the OpenRouter quota probe matched a SUBSTRING of a provider's name or base and then
+  posted that slot's credential to a hardcoded `openrouter.ai`. Now an exact-host test on the
+  configured base, with the URL rebuilt from it. Also: the catalog cap warning stopped printing
+  the configured base URL.
+- `b7d2311` `pool-health` reported `auth` on a model-specific 401/403 (the entitlement-wall case
+  the invariant names) and `missing` on a 400; `key-checker` called every 5xx "Key verified". Each
+  verdict now claims only what its evidence supports.
+- `5bbe788` the served-response announcement set had two owners that had drifted twice: the
+  Anthropic front omitted `x-llm-relay-served-by` on a terminal error, and the OpenAI front dropped
+  `x-llm-relay-unknown-refusal` when a later candidate succeeded. One owner now.
+- `6f8608b` four drift seams around the availability vocabulary — two mappers whose
+  `default: return null` swallowed every future member, a table that reported a missing row at the
+  index site, and a third hand-copy of the quota bucket key.
+- `b34e731` "Under vitest every default path redirects to a temp dir" was FALSE for six artifacts,
+  `.env` included — and `loadEnvFile` READS it into `process.env`. True now, and pinned by one
+  mechanical table.
+- `8192b43` `llm-relay eligibility accept` never reached a running relay: the store memoized on
+  path alone, so the documented "only `accept` makes an interpretation affect routing" needed a
+  restart. Stat-keyed now, with a merge that cannot overwrite an operator's acceptance.
+
+Process: every packet gate-verified twice, every new test confirmed to fail pre-fix, and **every
+packet needed correction in review** — the recurring shapes are named in the review doc's
+"What landed". Five of seven were implemented on relay free-pool lanes, which this sprint proves
+are a working WRITE lane for in-repo packets; both Codex lanes hit model-scoped quota limits
+mid-sprint.
+
+**Earlier — the 2026-08-26 §5 implementation sprint, released as v0.48.0.** The nine §5 items the
 second verification pass ranked worth the churn (10, 14, 8, 21, 25, 26, 16+18, 15, 20) are
 implemented as eight commits (`3561bb4`..`b9409e3`):
 
@@ -321,6 +364,17 @@ else.**
   mistaken for bugs.
 
 ## 6. Outstanding, unclaimed
+
+**From the 2026-08-27 uncovered-areas sprint** — every item, with its home, is in
+[docs/uncovered-areas-review-2026-08-26.md](docs/uncovered-areas-review-2026-08-26.md)
+"Not fixed, and why". In short: §5 item 24 is REJECTED on a measured line delta (about +5, not
+−20); §5 items 9, 11, 12, 13, 19-remainder and 23 keep their 2026-08-25 verdicts; two behaviours
+are recorded rather than changed (`key-checker`'s initial-probe 401/403, and an anthropic-kind
+provider now only ever reporting `unverified`); the pre-existing mis-indentation in
+`src/key-checker.ts` stands so a reformat cannot obscure a real diff; and the **13 cross-cutting
+plus 19 type-level lane findings that were not acted on remain ADVISORY and unverified** — the
+same treatment §5 itself asks for, not a work queue.
+
 
 After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7:
 
