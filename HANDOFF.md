@@ -4,7 +4,34 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-27
 
-**Latest — the uncovered-areas sprint.** [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md)
+**Latest — the documentation pass (v0.50.0, `f077a4d`..`63248ec`).** A pass over the whole doc set
+against source, plus the tidy it turned up. Ten parallel auditors, every finding adversarially
+verified and then re-checked first-hand before anything changed. Full ledger, the two findings
+worth reading on their own, everything deliberately NOT done, and the friction:
+[docs/documentation-pass-2026-08-27.md](docs/documentation-pass-2026-08-27.md).
+
+Three things from it that outlive the sprint:
+
+- **`llm-relay eligibility` told the operator that six of the ten fact kinds meant "gone from the
+  provider — excluded from pools".** A ternary with an unconditional else-branch, so `rate-limited`
+  and all five measurements inherited `not-servable`'s meaning — against the store's own
+  `COST_BLOCKING` set. Now a `Record<FactKind, string>`.
+- **Subagent detection has THREE signals and `docs/subagent-routing.md` documented two**, including
+  in the re-verification recipe CLAUDE.md sends you to. It could not observe a Codex subagent even
+  in principle. ⚠ For Codex, `x-codex-turn-metadata` is not one signal of three — it is the whole
+  set, because a `/v1/responses` turn has no Anthropic `system` field to carry the marker.
+- **`~/.llm-relay/` is the answer only when no XDG variable is set.** Twelve resolvers, three
+  policies; with `XDG_CACHE_HOME` or `XDG_CONFIG_HOME` set the state directory SPLITS. Nothing is
+  broken and every resolver is internally consistent, but "back up `~/.llm-relay/`" stops being a
+  complete backup. **RECORDED, not fixed** — unifying it moves a live operator's state. See the
+  open question in §6.
+
+⚠ The pass's own verification was incomplete and did not say so: a spend limit killed 43 of 81
+agents, and a finding whose verifier DIED was folded into the refuted pile by the run's
+`real === true` filter. Eight real findings were recovered by hand from `journal.jsonl`. A fan-out
+verify stage must be able to say "the verifier never answered" — a `boolean` verdict cannot.
+
+**Earlier — the uncovered-areas sprint (v0.49.0).** [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md)
 §6 recorded two gaps in its OWN coverage: the cross-cutting reviewer (JSON-store persistence,
 auth-header construction, vitest temp-dir guards, spec parsing, fetch retry wrappers) failed before
 returning, and no reviewer had proposed type-level simplifications — which it called the richest
@@ -110,115 +137,24 @@ verification belongs on relay free-pool lanes; and reviewer subagent shells leak
 files into the repo root twice (`git add -A` staged them once — amended out; stage with explicit
 pathspecs).
 
-## 0.1 Earlier: state as of 2026-08-24 (evening)
+## 0.1 Earlier releases
 
-**Latest, released as v0.46.0 (`091cf7c`): the dialect-rescue destructive filter.** This closes the last item
-in §6 that was a code gap rather than a recorded trade — the one known safety-shaped one. A
-WELL-FORMED destructive call the relay reconstructed out of assistant prose used to be served
-unfiltered, because `destructive` reached none of `tool-dialects.ts`, `openai-dialect.ts`,
-`dialect-stream.ts`. It is now refused whole and terminally at all four rescue commit points, and
-announced identically on all three fronts. Full entry: §6 below.
+Deliberately NOT restated here. This file holds current state plus the immediate next; a
+release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
+tags are the trail.
 
+What survived those sprints lives in its own home rather than in a history section:
 
-**The custody sprint is delivered — Stage 3 of
-[docs/credential-fleet-design-2026-08-16.md](docs/credential-fleet-design-2026-08-16.md), queued
-for v0.45.0.** Six commits in three packets, each implemented by Codex (GPT-5.6 Sol) and
-adversarially reviewed by fresh-context native Opus (every verdict MERGE-WITH-FIXES; every gate
-finding fixed and pinned in a same-day fix commit). The plan, the recon corrections to the design
-doc, and the seven build decisions live in
-[docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md):
-
-- `a83eef8` + `b1e704b` — custody core: `src/os-keyring.ts` (KEK wrap/unwrap for
-  dpapi/keychain/libsecret/passphrase; KEK crosses process boundaries over stdin/stdout ONLY;
-  sanitized spawn failures) and `src/keystore.ts` (v1 AES-256-GCM store, AAD
-  `version|provider|entryId|envName`, KEK-keyed HMAC fingerprint, **mutation-refusal on
-  dropped/unparseable stores** — degrade-to-fresh is for re-learnable data, and keystore rows are
-  the only copy of the operator's keys — plus a persisted KEK verifier so a wrong passphrase can
-  never fork the store); SID-based ACL hardening retaining SYSTEM/Administrators.
-- `5604fea` + `d8447eb` — the resolver keystore rung at BOTH leaf resolvers (source-major
-  precedence: env > `.env` > keystore), admission coverage for the two dispatcher-bypassing seams,
-  §2.10 degrade-never-outage, `source` provenance on `/registry`+`/candidates`, and a
-  staleness-keyed store memo (steady state: one stat, zero reads per request) with TTL-bound
-  unreadable/unlock verdicts that self-heal without a restart.
-- `bf909b7` + `b7129fa` — the `keys` lifecycle CLI (add/list/rotate/revoke/remove/disable/enable/
-  export/import/unlock; masked prompt; shadow refusals; encrypted-only ACL-hardened export;
-  narrowed rotation clearing via the token-gated `/cooldowns/clear` `kinds: ["credential-fault"]`
-  extension) and its review fixes.
-
-P1's platform question resolved in-build: Windows DPAPI live-verified twice independently
-(including a fresh-process unwrap), the Linux passphrase mode is real in CI, macOS/`secret-tool`
-ship as injected-double coverage only — stated, not papered over. Design §2.6/§2.7 carry dated
-amendments (shipped `add` stores-and-warns on a shadow; `rotate`'s narrowed live clear is the one
-deliberate HTTP touch, carrying no secret). **The key migration was executed 2026-08-24 evening
-(owner-approved):** all 12 provider keys imported into the keystore (`keys list`: 12 active, 0
-undecryptable), the 12 User-scope env vars removed (`FREELLMAPI_API_KEY`/`VERCEL_API_KEY` left —
-not llm-relay's), no `.env` file exists, and the relay restarted on a scrubbed environment —
-verified end-to-end by a groq completion (HTTP 200) through a relay that provably holds no env
-keys. ⚠ **One casualty: the NVIDIA key in the keystore is 403-dead** ("Authorization failed" on
-completions while `/models` authenticates — the exact 2026-08-23 outage signature). Most likely
-cause: the migrating session's inherited environment PREDATED that morning's key rotation, so the
-stale pre-rotation key was imported and the fresh one was then removed from HKCU with the sweep.
-**RESOLVED the same evening:** the owner supplied the fresh key; `llm-relay keys rotate nim`
-(piped stdin, from a shadow-free process) stored it, the rotation's narrowed live clear dropped
-nim's credential faults through the token-gated endpoint leaving other cooldowns untouched, and
-kimi-k3 answered HTTP 200 through the relay — the full Packet 3 lifecycle exercised in production.
-Lesson recorded: verify each
-migrated credential LIVE (a real completion) before deleting its env source — a User-scope
-rotation invisible to an old session is exactly the `winenv` class of bug, on the operator side
-this time.
-
-Earlier the same day, **v0.44.0** shipped M4/Gap 10 (`32f31c3`, attempt-scoped estimated output)
-and M3 (`1ee1ad2`, the cooldown-clear mutation) — see the reconciliation ledger §7.
-
-Branch `main`. The metering closeout is **complete**: every sprint lane merged (nine commits).
-Since then: **v0.39.0** (`883a804`, released `cb273b0`) fixed the request-side tool-call IR leak with a
-relay-owned Anthropic→OpenAI request mapper (`src/openai-request.ts`), and the **G2 hard cap** landed
-(`5e06a56`, v0.40.0): `limits.hard` refuses before egress on both fronts.
-
-This afternoon's sprint landed three more fixes, released as **v0.41.0**: `50e8233`
-fixed dashboard/`cost` coverage-partial semantics (partial now means lost/omitted data, never a
-merely-unmeasured token kind); `8473cb1` added `src/tool-use-ids.ts` to mint unique `tool_use` ids
-when an openai-kind host repeats its own tool-call ids (NIM kimi-k3); `3253a53` added
-`src/responses-request.ts`, the OpenAI Responses→Anthropic request mapper that closes the s6
-dropped-`function_call` gap.
-
-Two more commits landed after that, released as **v0.42.0**: `d75b143` fixed gemini's
-OpenAI-compatible tool messages — outbound `role:"tool"` messages now carry the caller's function
-`name`, looked up from the assistant `tool_use` the result answers (gemini requires
-`functionResponse.name` and never resolves it from `tool_calls`); `a407ee0` feeds the reviewed-rule
-rung of `resolveResetsAt` — facts persist `untilBasis` beside an explicit expiry, and both the
-dashboard availability producer and `llm-relay candidates` resolve through the new
-`factResetInputs` gate.
-
-Queued for **v0.43.0**: `providers.<name>.compat`, which closes the last two open findings in §6.
-`a509cab` rewrites outbound tool-call ids to mistral's stated `^[a-zA-Z0-9]{9}$`
-(`toolCallIds: "strict9"`, deterministic SHA-256→base62, announced as `x-llm-relay-tool-call-ids`);
-`405602f` stamps gemini's documented `skip_thought_signature_validator` sentinel on replayed tool
-calls (`thoughtSignature: "sentinel"`, live-verified). Both are base-host-defaulted labelled
-provider facts that config overrides in either direction, and both shape only bodies the relay
-AUTHORS — the direct Chat passthrough stays byte-exact by design (`docs/reference.md`
-§"Provider wire-shape quirks"). `0de0584` closed the review of the pair: the streamed Responses
-rebuild, the Responses front's outbound wire bytes, the sentinel's fetchBackend wiring, the `#k`
-collision policy (injected-digest seam) and two `as never` fixture casts.
-
-- The metering program is delivered through Stage 5. Merged lanes, by commit:
-  - `7abdaf2` — C3 / Gap 4: `AssistantMessage.usage` widened; cache tokens survive repair and translation.
-  - `ca9e75e` — Gap 5: operator-declared rate limits (`limits`) on providers and credential slots.
-  - `3611647` — Gap 8: learned rate-limit measurement facts on both fronts (display-only).
-  - `82cf8e9` — Gap 13: catalog harvesting of published rpm/rpd/tpm/tpd.
-  - `a386058` — Gap 11 / Stage 4: every attempt priced from published prices into four provenance cells.
-  - `a2cd375` (+ baseline regen `dd19780`) — Stage 3: availability ladders, in-memory usage window, dashboard availability producer.
-  - `f29e18e` — Stage 5 / Gap 12: quota joins both fronts' walk order as a demotion term.
-  - `9fd9f36` — Stage 4 / C1: the `llm-relay cost` spend roll-up with `--include-repair`.
-- [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) is THE
-  ledger of implemented-vs-open against `docs/quota-metering-spec-2026-08-16.md`; its §7 records
-  the closeout: M4/Gap 10 and M3 are delivered for v0.44.0, Gaps 15/16/P4 were dropped, and P1
-  rolls into the approved custody program. The reviewed-rule rung of `resolveResetsAt` (`a407ee0`)
-  and streaming cross-protocol usage parity in llm-bridge are both closed as of 2026-08-23,
-  delivered and accepted-as-is respectively (§6 below).
-- Earlier state, for orientation: env-backed multi-key credential pooling landed as `7217ce0` ..
-  `3795e60`; the accounting foundation + Analytics SPA (P0-P4) as `b4ec7ee`, followed by
-  review-driven hardening (`3c3edd2`) and the Gap 7 spec amendment (`90e5e55`).
+- **v0.46.0, the dialect-rescue destructive filter** — the last safety-shaped code gap. Its rule
+  is a CLAUDE.md gotcha ("The destructive refusal binds at the DIALECT-RESCUE commit point too"),
+  and its design is [docs/dialect-rescue-destructive-refusal-2026-08-24.md](docs/dialect-rescue-destructive-refusal-2026-08-24.md).
+- **v0.45.0, the custody program** — `src/os-keyring.ts`, `src/keystore.ts`, the resolver keystore
+  rung and the `keys` lifecycle CLI. Plan, recon corrections and the seven build decisions:
+  [docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md). Residuals: §6.
+- **v0.40.0–v0.44.0, the metering program** — closeout ledger and every gap/stage/decision table:
+  [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7.
+- **Every standing trade and open question** those sprints produced: §6 below, which is the one
+  place they are tracked.
 
 ## 1. What still binds
 
@@ -254,6 +190,7 @@ history - do not reintroduce them.
 | `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind |
 | `docs/evidence-2026-08-16/` | Machine-readable audit trail |
 | `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
+| `docs/documentation-pass-2026-08-27.md` | The 2026-08-27 doc-vs-source pass: what was wrong and in what classes, the two findings worth reading alone, what was deliberately left, and the friction. |
 
 ## 3. Verification — the one gate
 
@@ -368,6 +305,32 @@ else.**
   mistaken for bugs.
 
 ## 6. Outstanding, unclaimed
+
+⚠ Most of what follows is **recorded trades and closed items kept for their reasons**, not a work
+queue. The genuinely open question is first.
+
+### OPEN — one owner decision: should the XDG resolvers be unified?
+
+Found by the 2026-08-27 documentation pass and deliberately not acted on, because either answer
+moves a live operator's state. Twelve resolvers implement three policies: `usage/`,
+`probe-cache.json` and `runtime-telemetry.json` honour `XDG_CACHE_HOME`; `target-facts.json` and
+`refusal-interpretations.json` honour `XDG_CONFIG_HOME`; the other eight — including `config.json`,
+`.env`, `keystore.json` and `control-token` — honour neither. With either variable set the state
+directory splits, and `~/.llm-relay/` stops being a complete backup. Nothing is broken today.
+Three options, all owner's call:
+
+1. **Leave it, keep documenting it** (status quo). Zero risk, but the split stays surprising and
+   every future artifact has to pick a policy with no rule to follow.
+2. **Make every resolver honour XDG.** Consistent and the platform-correct answer, but it MOVES
+   `config.json`, `.env` and the keystore for anyone with the variable set — a silent "my keys are
+   gone" unless a migration ships with it.
+3. **Make every resolver ignore XDG** — always `~/.llm-relay/`. Also consistent, moves less on
+   Windows where neither variable is usually set, and matches what every document already claims.
+   Still moves the health caches and learned facts for XDG users.
+
+Full context: [docs/documentation-pass-2026-08-27.md](docs/documentation-pass-2026-08-27.md).
+
+### Recorded trades and closed items
 
 **From the 2026-08-27 uncovered-areas sprint** — every item, with its home, is in
 [docs/uncovered-areas-review-2026-08-26.md](docs/uncovered-areas-review-2026-08-26.md)
