@@ -76,7 +76,7 @@ describe("destructive-tool coverage (ARC-4e8f64b6)", () => {
  * a hand-written list goes stale the moment the harness ships another tool.
  *
  * These assert the POLICY instead, derived from `DEFAULT_DESTRUCTIVE` itself, so a
- * name added to the list is automatically held to the same rules. `HARNESS_MUTATING`
+ * name added to the list is automatically held to the same rules. `CLIENT_MUTATING`
  * is the one list that must still be maintained by hand — it is the REQUIREMENT
  * (what the harness can destroy), not the implementation, and it is where a new
  * Claude Code write/execute tool gets recorded.
