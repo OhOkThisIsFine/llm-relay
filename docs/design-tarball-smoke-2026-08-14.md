@@ -8,7 +8,7 @@ caveat: "This is an ADVISORY lane deliverable. File:line claims must be re-verif
 
 # Tarball Smoke Test — §6.4 Design
 
-**Reference:** [docs/freellmapi-adoption-review-2026-08-13.md](freellmapi-adoption-review-2026-08-13.md#L397-L401) §6 Item 4
+**Reference:** [docs/freellmapi-adoption-review-2026-08-13.md](freellmapi-adoption-review-2026-08-13.md) §6 Item 4
 
 ---
 

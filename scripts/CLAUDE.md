@@ -1,8 +1,39 @@
 # Scripts inventory (`scripts/`)
 
-⚠ Every `.mjs` here imports from `dist/` — **rebuild (`npm run build`) before running one** or
-you'll test stale code. (The root CLAUDE.md repeats this warning because it applies even when this
-file isn't loaded.)
+⚠ Nearly every `.mjs` here reads the compiled `dist/` — **rebuild (`npm run build`) before running
+one** or you'll test stale code. (The root CLAUDE.md repeats this warning because it applies even
+when this file isn't loaded.) The four that do NOT touch `dist/` are `analysis-run.mjs`,
+`install-skill.mjs`, `sync-tiers.mjs` and `tier-scoring.mjs`; they read the source tree, the
+package tree, or the network. Rebuilding first is still never wrong.
+
+⚠ This file is the inventory of `scripts/`, and `test/scripts-inventory.test.ts` pins it: every
+`.mjs` here must be named, and a name here must resolve to a real file. The build- and gate-path
+scripts were the ones the inventory omitted for months, so the omission was invisible exactly
+where it cost most.
+
+On the build and gate path — these run for you, from `package.json`, and a change here can turn CI
+red without anyone invoking a script by hand:
+- `clean-dist.mjs` (`npm run build:server`, before `tsc`) — the build's **only** recursive removal.
+  It refuses any target that is not this checkout's exact `dist/`, and refuses a symlinked one, so
+  a mis-resolved root cannot delete a tree. Don't loosen either guard.
+- `dashboard-package-check.mjs` (`npm run check:package`, first half) — compares the built dashboard
+  against `docs/dashboard-bundle-inventory.json` (the production Vite/Rollup module graph),
+  `docs/dashboard-package-baseline.json` (the size ratchet) and `THIRD_PARTY_NOTICES.md` (every
+  bundled package must have an attribution). ⚠ Regenerate the baseline in the SAME change that adds
+  or removes bundle weight, or the gate goes red.
+- `packed-dashboard-smoke.mjs` (`npm run check:package`, second half) — `npm pack`s the tarball,
+  installs it, and serves the dashboard out of the INSTALLED tree: the shell fetches, every asset is
+  content-hashed and manifest-owned, no inline script survives, and each `Content-Length` describes
+  its own body. It is the only check that sees what a consumer actually receives.
+- `tier-scoring.mjs` (+ `tier-scoring.d.mts`) — the pure capability-scoring policy `sync-tiers.mjs`
+  imports: capability, evidence and behaviour kept as three separate questions. No I/O, so the
+  policy stays deterministic and directly testable. **Ships in the package**, so treat its exports
+  as a published surface.
+- `analysis-run.mjs` (`npm run analysis:run`) — the ADVISORY static-analysis sweep (eslint+sonarjs,
+  knip, madge, dependency-cruiser, ts-prune, jscpd) into the gitignored `analysis-reports/`.
+  ⚠ Deliberately NOT in `npm run check`, and CI does not run it. Tools are invoked through `npx`, so
+  knip cannot see them — keep the `ignoreDependencies` list in `knip.config.json` in step when
+  adding a step here.
 
 Offline / unit-test-safe (no external creds):
 - `live-demo.mjs` — runs the compiled CLI against a local flaky backend + stub reshaper. Good smoke test.
