@@ -153,3 +153,10 @@ Rewalked from the transcript, not recalled.
   `run_in_background`.
 - **Mixing `sed -i` and the Edit tool on one file** forces a re-read between them. Workable, but
   pick one per file.
+- **The publish workflow's negative test emits a red `::error::` annotation on a SUCCESSFUL run.**
+  `Smoke-test the packed artifact` deliberately deletes `docs/tier-data.json` and asserts the
+  loader fails; that intentional failure surfaces as `X tier-data.json missing or empty` in the
+  run's annotation list, directly under the ✓ that says the job passed. The test is correct and the
+  release was fine — but the annotation is indistinguishable at a glance from a real packaging
+  failure, and `gh run watch` prints it as the last thing you see. Check the job's `conclusion`,
+  not the annotations.
