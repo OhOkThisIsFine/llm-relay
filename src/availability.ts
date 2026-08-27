@@ -20,7 +20,7 @@
  * `resolveRemaining` from the routing path under `routingEligible`; nothing here reorders or
  * refuses anything today.
  */
-import type { QuotaAxis, QuotaObservation, QuotaPeriod } from "./quota-observation.js";
+import { bucketKey, type QuotaAxis, type QuotaObservation, type QuotaPeriod } from "./quota-observation.js";
 import type { UsedInWindowReading } from "./accounting-store.js";
 import {
   CONFIGURED_LIMIT_AXES,
@@ -97,7 +97,7 @@ export interface CollectQuotaBucketsInput {
 export function collectQuotaBuckets(input: CollectQuotaBucketsInput): Map<string, QuotaBucket> {
   const buckets = new Map<string, QuotaBucket>();
   const bucketFor = (axis: QuotaAxis, period: Exclude<QuotaPeriod, "unknown">): QuotaBucket => {
-    const key = `${axis}:${period}`;
+    const key = bucketKey(axis, period);
     let bucket = buckets.get(key);
     if (bucket === undefined) {
       bucket = { axis, period, observations: [], limits: {} };
@@ -164,7 +164,7 @@ const DERIVED_BASIS = {
   configured: "derived:configured",
   learned: "derived:learned",
   published: "derived:published",
-} as const;
+} as const satisfies Record<LimitProvenance, RemainingResolution["basis"]>;
 
 /**
  * UTC period boundaries (spec §5.2 ⚠ C4): providers overwhelmingly reset on UTC or a fixed vendor
@@ -464,6 +464,7 @@ import type { LimitBasis, LocalUsedBasis, RemainingBasis, ResetsAtBasis } from "
  * `derived_published`, added to the contract additively (see the design-doc note dated 2026-08-22).
  */
 export function mapRemainingBasis(basis: RemainingResolution["basis"]): RemainingBasis | null {
+  if (basis === null) return null;
   switch (basis) {
     case "provider-stated":
       return "provider_stated";
@@ -476,6 +477,7 @@ export function mapRemainingBasis(basis: RemainingResolution["basis"]): Remainin
     case "derived:learned":
       return "derived_learned";
     default:
+      const _never: never = basis;
       return null;
   }
 }
@@ -497,6 +499,7 @@ export function mapLimitBasis(basis: RemainingResolution["limitBasis"]): LimitBa
 
 /** The request-count spelling is additive on the dashboard wire; token spellings are unchanged. */
 export function mapLocalUsedBasis(basis: LocalUsedReading["basis"]): LocalUsedBasis | null {
+  if (basis === null) return null;
   switch (basis) {
     case "reported":
     case "estimated":
@@ -505,6 +508,7 @@ export function mapLocalUsedBasis(basis: LocalUsedReading["basis"]): LocalUsedBa
     case "relay-counted":
       return "relay_counted";
     default:
+      const _never: never = basis;
       return null;
   }
 }

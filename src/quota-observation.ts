@@ -173,7 +173,7 @@ function parseRetryAfter(value: string | undefined, observedAt: number): number 
   return parseHttpDate(value);
 }
 
-function bucketKey(axis: QuotaAxis, period: QuotaPeriod): string {
+export function bucketKey(axis: QuotaAxis, period: QuotaPeriod): string {
   return `${axis}:${period}`;
 }
 
