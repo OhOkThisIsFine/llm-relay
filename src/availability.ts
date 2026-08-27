@@ -21,6 +21,7 @@
  * refuses anything today.
  */
 import type { QuotaAxis, QuotaObservation, QuotaPeriod } from "./quota-observation.js";
+import type { UsedInWindowReading } from "./accounting-store.js";
 import {
   CONFIGURED_LIMIT_AXES,
   configuredLimitQuotaShape,
@@ -30,11 +31,30 @@ import {
 /** Where a rung-2 limit may come from, in precedence order (see resolveRemaining). */
 export type LimitProvenance = "provider-stated" | "configured" | "learned" | "published";
 
+/** How the relay obtained one axis-projected local-usage figure. */
+export type LocalUsedProvenance = "reported" | "estimated" | "mixed" | "relay-counted";
+
 export interface LocalUsedReading {
   /** Tokens or requests consumed in the current period by THIS credential/deployment. */
   readonly value: number | null;
   /** How the ledger obtained it; null when there is no reading at all. */
-  readonly basis: "reported" | "estimated" | "mixed" | null;
+  readonly basis: LocalUsedProvenance | null;
+}
+
+/**
+ * Project one raw accounting window onto the requested quota axis. The store's `basis` describes
+ * its TOKEN figure only; completed requests are counted by the relay and must never borrow that
+ * token provenance. Keeping this projection in one place makes the three ledger consumers agree.
+ */
+export function projectLocalUsed(reading: UsedInWindowReading | null, axis: QuotaAxis): LocalUsedReading {
+  if (reading === null) return { value: null, basis: null };
+  if (axis === "requests") {
+    return {
+      value: reading.requests,
+      basis: reading.requests === null ? null : "relay-counted",
+    };
+  }
+  return { value: reading.tokens, basis: reading.basis };
 }
 
 /** The limits a caller has already resolved, each optional — absent until its gap lands. */
@@ -126,7 +146,7 @@ export interface RemainingResolution {
   limit: number | null;
   limitBasis: "provider-stated" | "configured" | "learned" | "published" | null;
   localUsed: number | null;
-  localUsedBasis: "reported" | "estimated" | "mixed" | null;
+  localUsedBasis: LocalUsedReading["basis"];
   /** The observation rung 1 used, when it did. Staleness and eligibility live here, not in data. */
   eligibleObservation: QuotaObservation | null;
   staleObservations: number;
@@ -470,6 +490,20 @@ export function mapLimitBasis(basis: RemainingResolution["limitBasis"]): LimitBa
       return "learned";
     case "published":
       return "published";
+    default:
+      return null;
+  }
+}
+
+/** The request-count spelling is additive on the dashboard wire; token spellings are unchanged. */
+export function mapLocalUsedBasis(basis: LocalUsedReading["basis"]): LocalUsedBasis | null {
+  switch (basis) {
+    case "reported":
+    case "estimated":
+    case "mixed":
+      return basis;
+    case "relay-counted":
+      return "relay_counted";
     default:
       return null;
   }

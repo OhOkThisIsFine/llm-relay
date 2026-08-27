@@ -29,11 +29,12 @@ import {
   collectQuotaBuckets,
   factResetInputs,
   mapLimitBasis,
+  mapLocalUsedBasis,
   mapRemainingBasis,
   mapResetsAtBasis,
+  projectLocalUsed,
   resolveRemaining,
   resolveResetsAt,
-  type LocalUsedReading,
 } from "./availability.js";
 import type { AccountingStore } from "./accounting-store.js";
 import { createHardCapLedgerReader, evaluateHardCap } from "./hard-cap.js";
@@ -116,9 +117,7 @@ function buildQuotas(
         accounting === undefined || accounting === null
           ? null
           : accounting.usedInWindow({ credentialId, ...(model !== null ? { model } : {}), period: periodPart, now });
-      const localUsed: LocalUsedReading = windowReading === null
-        ? { value: null, basis: null }
-        : { value: axisPart === "tokens" ? windowReading.tokens : windowReading.requests, basis: windowReading.basis };
+      const localUsed = projectLocalUsed(windowReading, axisPart);
       const resolution = resolveRemaining({
         observations: bucket.observations,
         axis: axisPart,
@@ -160,7 +159,7 @@ function buildQuotas(
             : new Date(resolution.eligibleObservation.observedAt).toISOString(),
         limitBasis: mapLimitBasis(resolution.limitBasis),
         remainingBasis: mapRemainingBasis(resolution.basis),
-        localUsedBasis: resolution.localUsedBasis,
+        localUsedBasis: mapLocalUsedBasis(resolution.localUsedBasis),
         resetsAtBasis: mapResetsAtBasis(resets.basis),
       });
     }

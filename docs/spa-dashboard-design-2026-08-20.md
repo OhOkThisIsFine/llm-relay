@@ -389,3 +389,32 @@ the one that never rendered. Renderers still clamp for display: `quotaHeadroom()
 [0, 1] and shows 0%, while the raw Remaining cell prints the true negative number via
 `number()`. No shape or version change; a producer that clamps instead is wrong, not compatible.
 Pinned by the overshoot tests in `test/dashboard/snapshot.test.ts`.
+
+## 2026-08-26 note — `LocalUsedBasis` gains `relay_counted` (additive)
+
+The quota-demotion term memoized its local-ledger window read under a PERIOD-only key while
+storing an already axis-projected value, so a period carrying both a requests bucket and a tokens
+bucket resolved the tokens axis from the REQUESTS count. Fixing that also fixed a provenance half
+of the same read: the store's `basis` describes its TOKEN figure, and a request count was wearing
+it. Details and the worked example:
+[uncovered-areas-review-2026-08-26.md](uncovered-areas-review-2026-08-26.md).
+
+A relay-counted request total needed a label of its own. Reusing `reported` would have called
+relay counting provider reporting, which the provenance invariant forbids, so the contract grew
+one spelling ADDITIVELY (no shape change, no version bump), exactly as the 2026-08-22 note above
+describes:
+
+- `LocalUsedBasis` gains `"relay_counted"` — a completed-request total observed by the relay's own
+  ledger. The three token spellings (`reported`, `estimated`, `mixed`) keep their meanings
+  unchanged and still describe token figures only.
+
+`LOCAL_USED_BASES` and `isDashboardLocalUsedBasis` were extended in the same change; the
+`dashboard.snapshot.v1` media type and schema name are unchanged, and consumers switching on the
+closed list must treat the new member as additive. `src/availability.ts` `projectLocalUsed` is now
+the ONE projection from a raw ledger window onto an axis, and `mapLocalUsedBasis` the one wire
+mapping; `test/dashboard/contract.test.ts` pins the extended list.
+
+⚠ The inline TypeScript block earlier in this document is the ORIGINAL 2026-08-20 snapshot and is
+not rewritten in place — these dated notes are the record of every extension since. `QuotaRowV1`'s
+`limitBasis`, `remainingBasis` and `localUsedBasis` in that block are all narrower than the shipped
+contract; read `src/dashboard-contract.ts` for the current lists.

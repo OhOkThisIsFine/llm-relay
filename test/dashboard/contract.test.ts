@@ -278,7 +278,7 @@ const quota = (): QuotaRowV1 => ({
   observedAt: now,
   limitBasis: "provider_stated",
   remainingBasis: "derived_configured",
-  localUsedBasis: "reported",
+  localUsedBasis: "relay_counted",
   resetsAtBasis: null,
 });
 
@@ -393,7 +393,7 @@ describe("dashboard v1 contract", () => {
     expect(SPEND_SOURCES).toEqual(["provider_reported", "relay_estimated", "unknown"]);
     expect(LIMIT_BASES).toEqual(["provider_stated", "configured", "learned", "published"]);
     expect(REMAINING_BASES).toEqual(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"]);
-    expect(LOCAL_USED_BASES).toEqual(["reported", "estimated", "mixed"]);
+    expect(LOCAL_USED_BASES).toEqual(["reported", "estimated", "mixed", "relay_counted"]);
     expect(RESETS_AT_BASES).toEqual(["provider_stated", "reviewed_rule", "derived_boundary"]);
     expect(RESPONSE_ATTRIBUTIONS).toEqual(["relay_held", "caller_operated", "unknown", "all"]);
     expect(isDashboardAttribution("relay_held")).toBe(true);

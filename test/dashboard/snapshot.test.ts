@@ -540,7 +540,7 @@ describe("dashboard snapshot projection", () => {
       observedAt: "2026-08-20T12:30:00.000Z",
       limitBasis: "provider_stated",
       remainingBasis: "provider_stated",
-      localUsedBasis: "reported",
+      localUsedBasis: "relay_counted",
       resetsAtBasis: null,
     };
     const cooldown: CooldownRowV1 = {
@@ -802,7 +802,7 @@ describe("availability port - server-shaped construction", () => {
       observedAt: null,
       limitBasis: "provider_stated",
       remainingBasis: "derived_provider_stated",
-      localUsedBasis: "reported",
+      localUsedBasis: "relay_counted",
       resetsAtBasis: null,
     };
     const snapshot = await createDashboardSnapshotReadPort({

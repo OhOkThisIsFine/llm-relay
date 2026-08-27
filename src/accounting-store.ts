@@ -143,14 +143,19 @@ export interface AccountingReader {
 /**
  * What one credential (optionally narrowed to one deployment) consumed in the CURRENT period,
  * read straight from in-memory state. Basis vocabulary shared with the dashboard contract's
- * `localUsedBasis`.
+ * `localUsedBasis`. This raw `basis` describes tokens only; consumers projecting `requests`
+ * label that independently as relay-counted.
  */
 export interface UsedInWindowReading {
   /** Completed requests attributed to this credential in the window; null when not visible. */
   readonly requests: number | null;
   /** Reported-or-estimated input+output tokens; null when nothing (or something uncertain) is visible. */
   readonly tokens: number | null;
-  /** How the token figure was obtained; null alongside a null token figure. */
+  /**
+   * How the token figure was obtained. Null when nothing was seen at all — but NOT implied by a
+   * null `tokens`: a window mixing reported and estimated bases reports `basis: "mixed"` with
+   * `tokens: null`, because the split is the honest answer and one blended number would not be.
+   */
   readonly basis: "reported" | "estimated" | "mixed" | null;
 }
 

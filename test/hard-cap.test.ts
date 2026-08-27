@@ -976,8 +976,8 @@ describe("ordering and /candidates surface", () => {
     // 9 requests on this credential today, every one of them on a different deployment.
     const usedInWindow = (options: UsedInWindowOptions) =>
       options.model === "m"
-        ? { requests: 0, tokens: null, basis: "reported" as const }
-        : { requests: 9, tokens: null, basis: "reported" as const };
+        ? { requests: 0, tokens: null, basis: "mixed" as const }
+        : { requests: 9, tokens: null, basis: "mixed" as const };
 
     const view = await buildCandidates(cfg, {
       breaker: new CircuitBreaker(),
@@ -1000,7 +1000,8 @@ describe("ordering and /candidates surface", () => {
       now,
     });
     expect(enforced).toBeNull();
-    expect(ledgerReader("requests", "day", "credential").value).toBe(9);
+    expect(ledgerReader("requests", "day", "credential")).toEqual({ value: 9, basis: "relay-counted" });
+    expect(ledgerReader("tokens", "day", "credential")).toEqual({ value: null, basis: "mixed" });
   });
 
   it("/candidates shows the reached cap for its cell, resolved like enforcement resolves it", async () => {
