@@ -1,3 +1,4 @@
+import { relayStatePath } from "./state-paths.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -56,7 +57,13 @@ export function claudeHookPaths(home = homedir()): ClaudeHookPaths {
   }
   return {
     settings: join(home, ".claude", "settings.json"),
-    script: join(home, ".llm-relay", "hooks", AGENT_HOOK_FILENAME),
+    // ⚠ Only the DEFAULT home resolves through the shared state policy. An explicitly passed
+    // `home` keeps its literal `<home>/.llm-relay/hooks/` meaning, because that parameter is the
+    // redirect seam callers and tests use — routing it through XDG would make an explicit home
+    // silently not the home.
+    script: home === homedir()
+      ? join(relayStatePath("config", ["hooks"]), AGENT_HOOK_FILENAME)
+      : join(home, ".llm-relay", "hooks", AGENT_HOOK_FILENAME),
   };
 }
 

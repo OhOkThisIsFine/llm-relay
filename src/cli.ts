@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { relayStatePath } from "./state-paths.js";
 import { isRecord } from "./json-shape.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -431,7 +432,11 @@ export function resolveConfigPath(): string {
     return join(vitestConfigDir, "config.json");
   }
 
-  const userConfigDir = join(homedir(), ".llm-relay");
+  // ⚠ `relayStatePath` keeps returning the legacy `~/.llm-relay/` whenever a config already lives
+  // there and the XDG location does not, so honouring XDG can never orphan an existing install's
+  // config — this resolver CREATES the file when absent, and creating a second one beside a
+  // working one is the failure mode to avoid.
+  const userConfigDir = relayStatePath("config");
   const userConfig = join(userConfigDir, "config.json");
 
   if (existsSync(userConfig)) return userConfig;

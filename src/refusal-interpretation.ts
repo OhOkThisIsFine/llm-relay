@@ -1,3 +1,4 @@
+import { relayStatePath } from "./state-paths.js";
 import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join, resolve } from "node:path";
@@ -202,9 +203,7 @@ function defaultPath(): string {
   if (process.env.VITEST !== undefined) {
     return testPath!;
   }
-  const xdg = process.env.XDG_CONFIG_HOME;
-  const baseDir = xdg && xdg.trim() ? join(xdg, "llm-relay") : join(homedir(), ".llm-relay");
-  return join(baseDir, "refusal-interpretations.json");
+  return relayStatePath("config", ["refusal-interpretations.json"]);
 }
 
 /**

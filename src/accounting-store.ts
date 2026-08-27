@@ -1,3 +1,4 @@
+import { relayStatePath } from "./state-paths.js";
 import { randomBytes } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -403,8 +404,7 @@ function dayTarget(value: string): boolean { const match = DAY_TARGET.exec(value
 function targetForDay(date: string): string { return `${date}.json`; }
 function defaultDirectory(): string {
   if (process.env.VITEST !== undefined) return join(tmpdir(), "llm-relay-vitest", `accounting-${process.pid}-${randomBytes(8).toString("hex")}`);
-  const xdg = process.env.XDG_CACHE_HOME;
-  return xdg !== undefined && xdg.trim() !== "" ? join(xdg, "llm-relay", "usage") : join(homedir(), ".llm-relay", "usage");
+  return relayStatePath("cache", ["usage"]);
 }
 function safeAttribution(value: unknown): AccountingAttribution { return value === "relay_held" || value === "caller_operated" || value === "unknown" ? value : "unknown"; }
 function safeOutcome(value: unknown): AccountingOutcome { return isDashboardOutcome(value) ? value : "unknown"; }

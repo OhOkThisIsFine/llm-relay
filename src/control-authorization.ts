@@ -1,3 +1,4 @@
+import { relayStatePath } from "./state-paths.js";
 import {
   chmodSync,
   closeSync,
@@ -33,7 +34,7 @@ export function defaultRelayConfigDir(): string {
   // ⚠ Under vitest, never touch the developer's real config directory.
   // Tests needing persistence pass an explicit `fallbackDir` to `resolveControlAuthorizationConfigDir`.
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest");
-  return join(homedir(), ".llm-relay");
+  return relayStatePath("config");
 }
 
 /**

@@ -20,11 +20,12 @@ Three things from it that outlive the sprint:
   in the re-verification recipe CLAUDE.md sends you to. It could not observe a Codex subagent even
   in principle. ⚠ For Codex, `x-codex-turn-metadata` is not one signal of three — it is the whole
   set, because a `/v1/responses` turn has no Anthropic `system` field to carry the marker.
-- **`~/.llm-relay/` is the answer only when no XDG variable is set.** Twelve resolvers, three
-  policies; with `XDG_CACHE_HOME` or `XDG_CONFIG_HOME` set the state directory SPLITS. Nothing is
-  broken and every resolver is internally consistent, but "back up `~/.llm-relay/`" stops being a
-  complete backup. **RECORDED, not fixed** — unifying it moves a live operator's state. See the
-  open question in §6.
+- **Every artifact honours XDG now, through one policy** (`src/state-paths.ts`). Thirteen
+  hand-rolled resolvers ran THREE policies, so with `XDG_CACHE_HOME` or `XDG_CONFIG_HOME` set the
+  state directory SPLIT and `~/.llm-relay/` was not a complete backup. Raised as an owner decision
+  and answered the same day. ⚠ **Upgrading moves nothing:** the legacy path still wins whenever it
+  holds the file and the XDG one does not, so an existing keystore can never read as empty and
+  there is no migration to run. Detail in the `state-paths.ts` row of CLAUDE.md.
 
 ⚠ The pass's own verification was incomplete and did not say so: a spend limit killed 43 of 81
 agents, and a finding whose verifier DIED was folded into the refuted pile by the run's
@@ -306,29 +307,19 @@ else.**
 
 ## 6. Outstanding, unclaimed
 
-⚠ Most of what follows is **recorded trades and closed items kept for their reasons**, not a work
-queue. The genuinely open question is first.
+⚠ What follows is **recorded trades and closed items kept for their reasons**, not a work queue.
+There is no open code gap.
 
-### OPEN — one owner decision: should the XDG resolvers be unified?
-
-Found by the 2026-08-27 documentation pass and deliberately not acted on, because either answer
-moves a live operator's state. Twelve resolvers implement three policies: `usage/`,
-`probe-cache.json` and `runtime-telemetry.json` honour `XDG_CACHE_HOME`; `target-facts.json` and
-`refusal-interpretations.json` honour `XDG_CONFIG_HOME`; the other eight — including `config.json`,
-`.env`, `keystore.json` and `control-token` — honour neither. With either variable set the state
-directory splits, and `~/.llm-relay/` stops being a complete backup. Nothing is broken today.
-Three options, all owner's call:
-
-1. **Leave it, keep documenting it** (status quo). Zero risk, but the split stays surprising and
-   every future artifact has to pick a policy with no rule to follow.
-2. **Make every resolver honour XDG.** Consistent and the platform-correct answer, but it MOVES
-   `config.json`, `.env` and the keystore for anyone with the variable set — a silent "my keys are
-   gone" unless a migration ships with it.
-3. **Make every resolver ignore XDG** — always `~/.llm-relay/`. Also consistent, moves less on
-   Windows where neither variable is usually set, and matches what every document already claims.
-   Still moves the health caches and learned facts for XDG users.
-
-Full context: [docs/documentation-pass-2026-08-27.md](docs/documentation-pass-2026-08-27.md).
+**CLOSED 2026-08-27 — the XDG state split.** Raised by the documentation pass as an owner decision
+and answered the same day: **honour XDG everywhere**. Thirteen hand-rolled resolvers running three
+policies collapse into `src/state-paths.ts` (config-kind → `XDG_CONFIG_HOME`, cache-kind →
+`XDG_CACHE_HOME`). ⚠ The option's stated cost — that it MOVES `config.json`, `.env` and the
+keystore for anyone with the variable set — is bought off by the legacy fallback rather than by a
+migration: `relayStatePath` returns the legacy path whenever the XDG one is ABSENT and the legacy
+one EXISTS, so an existing install keeps reading and writing exactly where it does today and a
+fresh install with XDG set is fully XDG. Nothing is copied, nothing is deleted, and there is no
+migration step to forget. `test/state-paths.test.ts` pins the policy AND greps `src/` so a
+fourteenth resolver cannot reintroduce a raw XDG read.
 
 ### Recorded trades and closed items
 

@@ -1,3 +1,4 @@
+import { relayStatePath } from "./state-paths.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -53,7 +54,7 @@ export interface LaneManifest {
  */
 export function getLaneManifestPath(): string {
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "lane-manifest.json");
-  return join(homedir(), ".llm-relay", "lane-manifest.json");
+  return relayStatePath("cache", ["lane-manifest.json"]);
 }
 
 export const DEFAULT_MANIFEST_PATH = getLaneManifestPath();
