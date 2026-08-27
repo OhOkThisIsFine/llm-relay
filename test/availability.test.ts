@@ -228,6 +228,7 @@ describe("resolveResetsAt — §5.2 ladder", () => {
 describe("contract vocabulary mapping", () => {
   it("maps every basis onto the dashboard spellings in one place", () => {
     expect(mapRemainingBasis("provider-stated")).toBe("provider_stated");
+    expect(mapRemainingBasis("derived:provider-stated")).toBe("derived_provider_stated");
     expect(mapRemainingBasis("derived:configured")).toBe("derived_configured");
     expect(mapRemainingBasis("derived:learned")).toBe("derived_learned");
     expect(mapRemainingBasis("derived:published")).toBe("derived_published");

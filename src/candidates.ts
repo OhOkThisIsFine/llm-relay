@@ -23,7 +23,7 @@ import { describeScope, factsFor } from "./target-facts.js";
 import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./ping/runtime-telemetry.js";
 import { loadTierData } from "./registry.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
-import { type QuotaObservation } from "./quota-observation.js";
+import { type QuotaObservation, bucketKey } from "./quota-observation.js";
 import { observedRateLimits } from "./rate-limits.js";
 import { resolveConfiguredLimits } from "./configured-limits.js";
 import { createHardCapLedgerReader, evaluateHardCap } from "./hard-cap.js";
@@ -353,7 +353,7 @@ function mergeCandidateQuota(
 ): QuotaObservation[] {
   const merged = new Map<string, QuotaObservation>();
   for (const observation of [...probe, ...breaker]) {
-    const key = `${observation.axis}:${observation.period}`;
+    const key = bucketKey(observation.axis, observation.period);
     const existing = merged.get(key);
     if (!existing || observation.observedAt >= existing.observedAt) merged.set(key, observation);
   }

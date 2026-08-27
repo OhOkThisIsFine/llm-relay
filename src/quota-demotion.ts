@@ -41,6 +41,7 @@ import {
   resolveRemaining,
   resolveResetsAt,
   type RemainingResolution,
+  type ResetsAtResolution,
 } from "./availability.js";
 
 /** One spent, gateable bucket — the smallest honest statement of "why this cell steps aside". */
@@ -54,7 +55,13 @@ export interface QuotaDemotion {
   readonly basis: RemainingResolution["basis"];
   /** When the band lifts; non-null by construction (see resolveQuotaDemotion). */
   readonly resetsAt: number;
-  readonly resetsAtBasis: "provider-stated" | "reviewed-rule" | "derived-boundary";
+  /**
+   * Which §5.2 rung produced `resetsAt`. Imported from `ResetsAtResolution` so the spelling has
+   * ONE home, but `Exclude`d of null: `resolveQuotaDemotion` skips a bucket whose reset or basis
+   * is null (no invented duration), so a demotion that exists always knows its rung. Importing
+   * the bare union would hand every consumer a null case that cannot occur.
+   */
+  readonly resetsAtBasis: Exclude<ResetsAtResolution["basis"], null>;
 }
 
 /** The per-request evaluator threaded through the walk-order helpers. Null ⇒ no demotion. */
