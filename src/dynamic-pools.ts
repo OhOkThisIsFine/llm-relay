@@ -1,3 +1,4 @@
+import { EFFORT_LEVELS } from "./config.js";
 import type { Config, EffortLevel, ResolvedTarget } from "./config.js";
 import type { ModelCatalog } from "./catalog.js";
 import { rankTargetsWithProvenance, specOfTarget, strengthAllowedForEffort } from "./benchmarks.js";
@@ -61,7 +62,8 @@ export function deploymentRankingSignals(
 }
 
 /** Effort bands weakest-first — the one ordering, so "lower band" means the same thing everywhere. */
-const EFFORT_ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh"];
+/** Weakest first — the ONE ordering, imported so a new band cannot miss the degrade tail. */
+const EFFORT_ORDER: readonly EffortLevel[] = EFFORT_LEVELS;
 
 /** Bands strictly below `effort`, strongest first: `xhigh` → high, medium, low. Empty for `low`. */
 function lowerBands(effort: EffortLevel): EffortLevel[] {

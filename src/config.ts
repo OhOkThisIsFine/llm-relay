@@ -29,10 +29,27 @@ export type Kind = "anthropic" | "openai";
 
 export type ProviderTierType = "free" | "mixed" | "subscription";
 
-/** Requested reasoning/capability band for an automatically discovered pool. */
-export type EffortLevel = "low" | "medium" | "high" | "xhigh";
+/**
+ * The effort bands, WEAKEST FIRST — one declaration, and the type is derived from it rather than
+ * the other way round.
+ *
+ * ⚠ Order is load-bearing: `dynamic-pools.ts` derives the degrade tail from this array's index, so
+ * a band inserted out of order silently reorders which weaker members an exhausted pool falls back
+ * to.
+ *
+ * ⚠ Why an ordered tuple and not four hand-lists: the member list stood restated in four places
+ * across three modules, and only ONE of them was exhaustiveness-checked. `new Set<EffortLevel>([…])`
+ * and `EffortLevel[]` both accept a SUBSET, and `cli.ts` validated against a bare `string[]` with
+ * no link to the type at all — so a fifth band would have compiled everywhere and silently failed
+ * in three of the four. `Record<EffortLevel, …>` (`EFFORT_FLOORS` in `benchmarks.ts`) is the shape
+ * that already caught it, and is why that one is left as it is.
+ */
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 
-const EFFORT_LEVELS = new Set<EffortLevel>(["low", "medium", "high", "xhigh"]);
+/** Requested reasoning/capability band for an automatically discovered pool. */
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+const EFFORT_LEVEL_SET: ReadonlySet<string> = new Set(EFFORT_LEVELS);
 
 /** Which requests a client-specific offload rule may reroute. */
 export type OffloadScope = "subagents" | "all";
@@ -1637,7 +1654,7 @@ function parseRouting(
         ) {
           throw new Error(`config.routing.pools.${k}.exclude must be an array of "provider/model" specs`);
         }
-        if (policy.effort !== undefined && !EFFORT_LEVELS.has(policy.effort as EffortLevel)) {
+        if (policy.effort !== undefined && !EFFORT_LEVEL_SET.has(policy.effort as string)) {
           throw new Error(`config.routing.pools.${k}.effort must be low, medium, high, or xhigh`);
         }
         const exclude = [...((policy.exclude as string[] | undefined) ?? [])];

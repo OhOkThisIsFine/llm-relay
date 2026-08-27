@@ -12,6 +12,7 @@ import {
   type Config,
   type ConfigOverrides,
   DEFAULT_DESTRUCTIVE,
+  EFFORT_LEVELS,
   FRONT_DOOR_CLIENTS,
   CLAUDE_CLIENT,
   type OffloadRule,
@@ -2933,8 +2934,11 @@ export async function runPools(
     const include = argValue("--include") ?? (hasFlag("--free") ? "free" : undefined);
     const effort = argValue("--effort");
     if (include !== undefined && include !== "free") configCommandError('pools: --include expects "free"');
-    if (effort !== undefined && !["low", "medium", "high", "xhigh"].includes(effort)) {
-      configCommandError("pools: --effort expects low, medium, high, or xhigh");
+    if (effort !== undefined && !(EFFORT_LEVELS as readonly string[]).includes(effort)) {
+      // Wording kept verbatim; only the SET it validates against is now shared.
+      configCommandError(
+        `pools: --effort expects ${EFFORT_LEVELS.slice(0, -1).join(", ")}, or ${EFFORT_LEVELS.at(-1)}`,
+      );
     }
     if (effort !== undefined && include !== "free") {
       configCommandError("pools: --effort requires --free or --include free");
