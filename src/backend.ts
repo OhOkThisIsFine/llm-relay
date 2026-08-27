@@ -80,7 +80,7 @@ export function errorOrigin(res: Response): ErrorOrigin | null {
 export const SERVED_BY_HEADER = "x-llm-relay-served-by";
 
 /**
- * WHY each of those candidates dropped out — `"13 tried, 0 served: 4×402, 5×429, 3×403, 1×400"`.
+ * WHY each of those candidates dropped out — `"13 tried, 0 served: 4x402, 5x429, 3x403, 1x400"`.
  *
  * `SERVED_BY_HEADER` answers "who was tried"; this answers "what happened to them", which is the
  * half that turns a pool exhaustion into a diagnosis. Without it a client holds one member's

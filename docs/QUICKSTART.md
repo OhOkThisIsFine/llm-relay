@@ -136,10 +136,19 @@ llm-relay pools --probe
 `keys` checks every configured credential slot. `pools --probe` spends one real completion per
 unique deployment in your routing pools, through one serviceable slot — not once per credential.
 It is the only way to catch a model that is configured, listed by the provider, and nonetheless
-dead. Remove a deployment from `routing.pools` only for deployment-level `DEAD` evidence. An
-`AUTH` result belongs to one credential slot: fix, rotate, or disable that slot. It does not by
-itself invalidate sibling slots or prove that the deployment is dead. `keys` names each slot as
-`provider#label`.
+dead. Remove a deployment from `routing.pools` only for deployment-level `DEAD` evidence.
+
+Two of the verdicts are about credentials, and they mean different things:
+
+- **`AUTH`** — no enabled credential slot that this model is allowed to use held a key, so **no
+  request was sent**. It is a configuration fact, not a provider answer. Add a key, enable the
+  slot, or widen its `models` list. Rotating a key fixes nothing here.
+- **`DENIED`** — the server itself answered 401/403. That may be a bad credential, **or** an
+  entitlement wall on a model your key legitimately cannot touch. The probe cannot tell the two
+  apart, so it does not guess. Check the model's plan tier before you rotate anything.
+
+Neither verdict proves the deployment is dead, and neither invalidates a sibling slot — the probe
+spends one slot only. `keys` names each slot as `provider#label`.
 
 > **Assistant note:** never add a model to a pool without probing that exact spec first. A
 > plausible-looking model id that 404s will sit at the top of a pool and burn a failover hop
@@ -259,9 +268,13 @@ or disable that slot. `llm-relay candidates` shows the slot's affected deploymen
 Do not remove the whole deployment or its sibling slots unless you also have deployment-level
 evidence that the model is unavailable.
 
-**`keys` reports UNVERIFIED.** That means the provider serves its model list publicly *and*
-answers the probe identically with and without your key, so nothing could be concluded. It is
-not an accusation. `pools --probe` is the ground truth.
+**`keys` reports UNVERIFIED.** It is a refusal to conclude, never an accusation — the probe
+produced no evidence about the credential either way. Four situations reach it: the provider
+serves its model list publicly *and* answers the probe identically with and without your key; the
+first probe returns 405 (an anthropic-kind provider probes with a GET on `/v1/messages`, which
+normally answers 405, so it usually lands here); the first probe returns 400 or 404; or the
+authenticated probe returns any other status, such as a 5xx gateway error. The row's message names
+which one. `pools --probe` is the ground truth.
 
 **A 403 that appears out of nowhere.** Check whether a VPN is running — some providers block
 VPN egress, which looks exactly like a rejected key.

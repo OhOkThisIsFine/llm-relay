@@ -65,4 +65,4 @@ at login.
 - [docs/capability-sources.md](docs/capability-sources.md) — where capability scores come from.
 - [docs/project-goals.md](docs/project-goals.md) — what this project is and is not.
 
-`llm-relay help` lists every command. [CLAUDE.md](CLAUDE.md) maps the source for contributors.
+`llm-relay help` lists the main commands. [CLAUDE.md](CLAUDE.md) maps the source for contributors.

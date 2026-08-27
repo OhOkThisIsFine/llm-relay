@@ -1,11 +1,13 @@
 ## Start here
 
-**Read [HANDOFF.md](HANDOFF.md) before `CLAUDE.md` or `docs/project-goals.md`.**
+**Read [HANDOFF.md](HANDOFF.md) first.** It is the entry point for any agent picking up llm-relay,
+on any provider: current state, what still binds, and where to read next.
 
-Those two files currently state four rules as binding that the owner removed on 2026-08-16 — the
-rewrite is outstanding. Following them as written leads back to conclusions that have been
-explicitly overturned. `HANDOFF.md` lists exactly which lines are stale, what replaced them, what
-still binds, and what the next task is.
+The 2026-08-16 invariant recalibration is **applied**. `CLAUDE.md` §Invariants and
+`docs/project-goals.md` are authoritative — read them as written. The retired rules and their
+replacements are recorded in
+[docs/rubric-recalibration-2026-08-16.md](docs/rubric-recalibration-2026-08-16.md) §2 and in git
+history; do not reintroduce them.
 
 <!-- audit-code:begin -->
 ## /audit-code

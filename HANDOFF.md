@@ -76,9 +76,8 @@ verdicts (status marks in the review doc §5): 9, 11, 12, 13 (not worth the chur
 (only in their corrected shapes, deferred), 19's remainder (polish), 22 and 24 (unranked; 22
 belongs beside finding 2 and needs a ctx adapter).
 
-**Earlier — the 2026-08-25/26 complexity sprint, released across v0.47.0 and v0.47.1.** (An
-earlier revision of this line claimed v0.48.0; no such release existed — the sprint shipped as
-v0.47.1, with the CLI arity guard preceding it as v0.47.0.) All seven verified findings
+**Earlier — the 2026-08-25/26 complexity sprint, released across v0.47.0 and v0.47.1.**
+All seven verified findings
 of [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md) are closed, and its
 nineteen unverified §5 findings now carry source-checked verdicts (owner-decision material, none
 implemented — the verdict table with corrected counts and conditions is in that doc's §5):
@@ -183,7 +182,7 @@ when an openai-kind host repeats its own tool-call ids (NIM kimi-k3); `3253a53` 
 `src/responses-request.ts`, the OpenAI Responses→Anthropic request mapper that closes the s6
 dropped-`function_call` gap.
 
-Two more commits landed after that, queued for **v0.42.0**: `d75b143` fixed gemini's
+Two more commits landed after that, released as **v0.42.0**: `d75b143` fixed gemini's
 OpenAI-compatible tool messages — outbound `role:"tool"` messages now carry the caller's function
 `name`, looked up from the assistant `tool_use` the result answers (gemini requires
 `functionResponse.name` and never resolves it from `tool_calls`); `a407ee0` feeds the reviewed-rule
@@ -295,8 +294,13 @@ else.**
 ## 4. Things that will bite you
 
 - **Do not trust this repo's documentation without checking source.** Drift here has been
-  recurrent; `test/architecture-map.test.ts` now pins every non-index `src/` file to a
-  `CLAUDE.md` table row, but only that one axis is guarded. Verify claims before inheriting them.
+  recurrent. THREE mechanical axes are guarded now — `test/architecture-map.test.ts` (every
+  non-index `src/` file has a `CLAUDE.md` table row), `test/scripts-inventory.test.ts` (every
+  `scripts/*.mjs` is named in `scripts/CLAUDE.md`, and no name there is dead), and
+  `test/doc-links.test.ts` (every relative link in the shipped doc set resolves, and no `.md`
+  target wears a line-number fragment). ⚠ Everything a doc SAYS is still unguarded: what a module
+  does, what a default is, which release shipped what. The 2026-08-27 documentation pass found
+  stale claims in all of those classes. Verify before inheriting them.
 - **A CLI process's environment is not the running relay's environment.** On Windows a User-scope var
   enters a process only at start, and the relay launches at logon. `llm-relay keys` reports *its own*
   env; `GET /registry` is authoritative. A whole "half the pool is dead" finding was once this.
@@ -393,7 +397,7 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   llm-bridge: the ledger observes the BACKEND stream, so accounting is correct; only the
   client-facing translated SSE loses cache fields. (The G2 hard cap is delivered: `5e06a56`,
   `limits.hard`.)
-- **Resolved 2026-08-23 (queued for v0.43.0, `405602f` + review fix-up `0de0584`)** — gemini 3.6
+- **Resolved 2026-08-23 (v0.43.0, `405602f` + review fix-up `0de0584`)** — gemini 3.6
   requiring a `thought_signature` on tool-calling turns. `compat.thoughtSignature: "sentinel"`
   stamps Google's own documented opt-out token at
   `tool_calls[N].extra_content.google.thought_signature`, defaulted for the base host
@@ -402,7 +406,7 @@ After the metering sprint, from [docs/metering-reconciliation-2026-08-22.md](doc
   No real signature is stored or echoed. Residual (stated in `CLAUDE.md`): the default is
   host-scoped while verification covered `models/gemini-3.6-flash` only; the override is
   `compat: { "thoughtSignature": "none" }`.
-- **Resolved 2026-08-23 (queued for v0.43.0, `a509cab` + review fix-up `0de0584`)** — mistral
+- **Resolved 2026-08-23 (v0.43.0, `a509cab` + review fix-up `0de0584`)** — mistral
   (medium-2505) enforcing a 9-char alphanumeric `tool_call_id`. `compat.toolCallIds: "strict9"`
   rewrites both halves of every pair to `^[a-zA-Z0-9]{9}$` — deterministic SHA-256→base62, no
   randomness, so a replayed turn and a failover retry map identically — defaulted for a
@@ -478,9 +482,10 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   silently become `internal`). The producer now tags the rejection with the shared
   `BODY_TOO_LARGE_CODE` and the regex is gone.
 - Dashboard session token rides `sessionStorage`; the mitigation is the strict CSP. Trade
-  recorded, not changed (C2 R2). Also standing: misleading error codes for body problems (C2 N8)
-  and `llm-relay dashboard <anything>` ignoring extra positionals (C2 N10). Both re-verified
-  2026-08-25 and kept, with the reasons worth knowing:
+  recorded, not changed (C2 R2). Also standing: misleading error codes for body problems (C2 N8),
+  re-verified 2026-08-25 and kept. Its neighbour `llm-relay dashboard <anything>` ignoring extra
+  positionals (C2 N10) was FIXED the same day, across the whole command family. Both reasons are
+  worth knowing:
   - **N8** would be a versioned WIRE change (`malformed_body` added to a frozen enum) for a code
     no consumer reads — the SPA never looks at it and the route tests assert status only. ✅ The
     real hazard in that area was not the code but the duplicate union in `src/dashboard-routes.ts`
@@ -527,7 +532,7 @@ Review findings deliberately NOT fixed on 2026-08-22 (report named beside each):
   both fronts: `test/accounting-lifecycle.test.ts` "records failed and committed winning serve
   attempts" walks a 429 candidate then a winner for each front.)
 
-**DELIVERED 2026-08-24 (queued for v0.45.0) — the custody program** (§0). P1's platform-coverage
+**DELIVERED 2026-08-24 (v0.45.0) — the custody program** (§0). P1's platform-coverage
 question resolved in-build. Custody review findings deliberately NOT fixed, standing (each judged
 in the packet reviews, recorded here so nobody re-litigates them as discoveries):
 

@@ -73,8 +73,13 @@ If your npm blocks unknown install scripts (`npm warn install-scripts … blocke
 
 ### Staying current
 
-Every start (except `help`/`version`) compares against the npm registry — cached 6h, 2.5s
-timeout, silent on failure. A **global install updates itself** (installs the new version,
+Only a **mutating** invocation compares against the npm registry — a bare proxy start, `onboard`,
+`setup claude-desktop`, `offload <client> on|off`, `cooldowns clear`, and the writing subcommands of
+`keys`, `config`, `routing`/`route`, `pools` and `eligibility`. Cached 6h, 2.5s timeout, silent on
+failure. Every read-only command skips the check entirely, and `help`/`version` (or a
+`--help`/`--version` flag) suppress it even on a mutating line — reinstalling the package
+underneath a question about your credentials is a side effect nobody asked for.
+A **global install updates itself** (installs the new version,
 re-execs, continues your command; a failed install says so and continues on the old version).
 Any other copy just prints the upgrade command. Stale bin shims from the old version are removed
 in all of npm's spellings. Set `LLM_RELAY_NO_SELF_UPDATE=1` to skip the check entirely.
@@ -486,8 +491,10 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
 ### Failover (both fronts, one policy)
 
 - **429 / 5xx / 400 / 402 / 404 / 410** → recorded as a breaker failure, next candidate tried. A
-  `Retry-After` sets that candidate's cooldown for exactly as long as the provider asked;
-  402 (depleted credits) cools for 1 hour. A 410 whose body states end-of-life additionally
+  `Retry-After` sets that candidate's cooldown to what the provider asked, **bounded to 1 s–15 min**
+  — so an hour-scale reset is re-probed after 15 minutes rather than parking the member for the
+  whole hour. 402 (depleted credits) cools for 1 hour when it carries no `Retry-After`; a 402 that
+  does carry one uses the same bounded value, i.e. at most 15 minutes. A 410 whose body states end-of-life additionally
   records a `not-servable` fact, so a retired model stops burning a walk slot per request.
 - **401 / 403** → the exact credential slot is marked `AUTH` and the walk may try a sibling slot or
   the next deployment. `llm-relay candidates` exposes the fault instead of hiding it. It expires
@@ -527,7 +534,7 @@ Any walk of **two or more** candidates also carries `x-llm-relay-pool-attempts` 
 each of them, in one line:
 
 ```
-x-llm-relay-pool-attempts: 13 tried, 0 served: 4×402, 5×429, 3×403, 1×400
+x-llm-relay-pool-attempts: 13 tried, 0 served: 4x402, 5x429, 3x403, 1x400
 ```
 
 Without it a pool's error is one member's error: a 402 pointing at a billing page, while the other
@@ -813,9 +820,10 @@ emit one that names a destructive tool — it never guesses arguments for it.
 - **Matching is exact on the tool name, case-insensitively** — not substring. A trailing `*` is
   an opt-in prefix form (`"git_*"` covers `git_push`, not `gitlab_read`); a bare `"*"` matches
   nothing.
-- **The default list leads with the harness's own write/execute tools** (`Bash`, `BashOutput`,
-  `Write`, `Edit`, `MultiEdit`, `NotebookEdit`) then the conventional names (`rm`, `delete`,
-  `delete_file`, `remove`, `overwrite`, `drop`, `reset`, `force_push`).
+- **The default list leads with the harness's own write/execute tools** — Claude Code's (`Bash`,
+  `BashOutput`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`) and Codex's (`shell_command`,
+  `apply_patch`) — then the conventional names (`rm`, `delete`, `delete_file`, `remove`,
+  `overwrite`, `drop`, `reset`, `force_push`).
 - An **empty** list refuses nothing — there is no hidden built-in set, so coverage is always
   traceable to your config. Refused repairs are logged `repair: "refused_destructive"`.
 
@@ -862,7 +870,8 @@ conversations — to other providers. **Off by default.**
 ```
 
 Rules are keyed by originating client (Claude uses the `/v1/messages` front door, Codex
-`/v1/responses`; an explicit `default` rule is the opt-in catch-all). `scope: "subagents"`
+`/v1/responses`, and `openai` the OpenAI-compatible chat front door `/v1/chat/completions`; an
+explicit `default` rule is the opt-in catch-all). `scope: "subagents"`
 reroutes only marked child requests; `scope: "all"` also moves the main conversation — useful
 when a quota is exhausted. The CLI toggles one client **without a restart**:
 
@@ -954,9 +963,11 @@ Each is stored at the **scope its evidence supports**, and lookups resolve most-
 
 | Scope | Covers | Typical evidence |
 |---|---|---|
-| `deployment` | one (provider, model) | "this model requires a subscription" |
+| `attempt` | one credential slot × one (provider, model) | a refusal naming this key on this model |
 | `group` | an explicit list of models on one provider | a family-wide gate, members named |
-| `provider` | every deployment behind that credential | a credit balance, a revoked key |
+| `deployment` | one (provider, model), whichever credential | "this model requires a subscription" |
+| `credential` | every deployment reached through one configured slot | a credit balance, a revoked key |
+| `provider` | every deployment behind **every** credential for that provider | a provider-wide outage or de-listing |
 | `model` | the same id wherever served | reference-grade only; never cost or availability |
 
 ⚠ Scope comes from what the evidence **states**, never from counting failures — several models
@@ -1332,7 +1343,10 @@ argument that would have been silently discarded exits 1 before anything happens
 longer lists every provider while ignoring `nim` (it is `-p nim`).
 
 Three details worth knowing. `--help` and `--version` still short-circuit, so `llm-relay <command>
---help` works even when the rest of the line is wrong. `pools`, `routing` and `route` take an
+--help` works even when the rest of the line is wrong — **except `keys` and `cooldowns`**, whose own
+strict, fail-closed parsers run ABOVE that short-circuit and refuse the flag outright
+(`llm-relay keys: unsupported option`; `llm-relay cooldowns: unknown option "--help"`). Use
+`llm-relay help` for those two. `pools`, `routing` and `route` take an
 unbounded list of specs and are deliberately unbounded here too. And the refusal names the command
 and the count but never echoes the offending token — a stray argument can be anything you pasted,
 and `keys` diagnostics have always refused to echo argv for that reason.

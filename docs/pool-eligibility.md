@@ -80,7 +80,7 @@ in play and the correct action was "use another pool".
 Now every walk of ≥2 candidates carries `x-llm-relay-pool-attempts`:
 
 ```
-x-llm-relay-pool-attempts: 13 tried, 0 served: 4×402, 5×429, 3×403, 1×400
+x-llm-relay-pool-attempts: 13 tried, 0 served: 4x402, 5x429, 3x403, 1x400
 ```
 
 A **header**, not a rewritten body: the served body stays the last candidate's real upstream error,
