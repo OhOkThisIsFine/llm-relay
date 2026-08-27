@@ -34,14 +34,6 @@ interface AttemptRecord {
 // Weak keys preserve request lifetime and expose no enumeration surface.
 const knownHandles = new WeakMap<object, AttemptRecord>();
 
-export interface AttemptLifecycleView {
-  readonly generation: number;
-  readonly issued: number;
-  readonly completed: number;
-  readonly open: number;
-  readonly closed: boolean;
-}
-
 function sameTarget(a: ProviderTargetIdentity, b: ProviderTargetIdentity): boolean {
   return (
     a.provider === b.provider &&
@@ -125,15 +117,5 @@ export class AttemptLifecycle implements AttemptLifecyclePort {
 
   close(): void {
     this.#closed = true;
-  }
-
-  view(): AttemptLifecycleView {
-    return Object.freeze({
-      generation: this.#generation,
-      issued: this.#issued,
-      completed: this.#completed,
-      open: this.#issued - this.#completed,
-      closed: this.#closed,
-    });
   }
 }

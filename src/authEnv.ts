@@ -140,17 +140,6 @@ export type CredentialSource = "env" | "env-file" | "keystore";
  */
 export type CredentialState = "not-declared" | "declared-present" | "declared-missing";
 
-export function resolveTargetAuthEnv(
-  declaredAuthEnv: string | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-  providerName?: string,
-): string | undefined {
-  if (!declaredAuthEnv) return undefined;
-  const candidates = credentialCandidateEnvNames(declaredAuthEnv, providerName);
-  const found = candidates.find((name) => keyIsPresent(env[name]));
-  return found ?? declaredAuthEnv;
-}
-
 function envCredentialSource(envName: string, env: NodeJS.ProcessEnv): CredentialSource {
   return env === process.env && wasEnvNameLoadedFromFile(envName) ? "env-file" : "env";
 }
