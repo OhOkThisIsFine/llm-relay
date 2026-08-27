@@ -134,6 +134,21 @@ function failure(reason: DashboardAuthFailureReason | "consumed"): DashboardAuth
 }
 
 /**
+ * Why an unmatched candidate failed, told apart WITHOUT revealing whether any record exists:
+ * a well-formed token that matched nothing is `wrong`, a string of the wrong shape is
+ * `malformed`, and anything that is not a string at all is `missing`.
+ *
+ * ⚠ One definition on purpose. This exact ternary stood hand-copied at all three unmatched-candidate
+ * sites (`exchangeBootstrap`, `validateSession`, `logout`); three copies of one security-relevant
+ * classification is how the three answers come to disagree about the same input.
+ */
+function unmatchedCandidateFailure(candidate: unknown): DashboardAuthFailure {
+  return failure(
+    validTokenShape(candidate) ? "wrong" : typeof candidate === "string" ? "malformed" : "missing",
+  );
+}
+
+/**
  * Synchronous, in-memory bootstrap/session authority for the analytics dashboard.
  *
  * Only SHA-256 token digests are retained. A new instance starts with no records, so process
@@ -201,7 +216,7 @@ export class DashboardAuthManager {
       return failure("expired");
     }
     this.cleanup(now);
-    return failure(validTokenShape(candidate) ? "wrong" : typeof candidate === "string" ? "malformed" : "missing");
+    return unmatchedCandidateFailure(candidate);
   }
 
   /** Validate and touch a session's idle expiry, never extending its absolute expiry. */
@@ -211,7 +226,7 @@ export class DashboardAuthManager {
     const record = this.#findSession(candidateDigest);
     if (!record) {
       this.cleanup(now);
-      return failure(validTokenShape(candidate) ? "wrong" : typeof candidate === "string" ? "malformed" : "missing");
+      return unmatchedCandidateFailure(candidate);
     }
     if (now >= record.absoluteExpiresAt || now >= record.idleExpiresAt) {
       this.#sessions.delete(record);
@@ -236,7 +251,7 @@ export class DashboardAuthManager {
     const record = this.#findSession(candidateDigest);
     if (!record) {
       this.cleanup(now);
-      return failure(validTokenShape(candidate) ? "wrong" : typeof candidate === "string" ? "malformed" : "missing");
+      return unmatchedCandidateFailure(candidate);
     }
     if (now >= record.absoluteExpiresAt || now >= record.idleExpiresAt) {
       this.#sessions.delete(record);
