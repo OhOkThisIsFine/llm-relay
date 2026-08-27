@@ -233,19 +233,35 @@ Messages** regardless of backend kind — translation is isolated in `backend.ts
   template spreads it, and `config.example.json` is asserted equal to it by
   `test/destructive-coverage.test.ts`. Don't hand-copy the names anywhere.
 - **Persistent storage directory:** Local configurations, keys, and caches are persisted under
-  `~/.llm-relay/`: `config.json`, `.env`, `models-cache.json`, `probe-cache.json`,
+  `~/.llm-relay/`: `config.json`, `.env`, `keystore.json` (the encrypted credential store),
+  `models-cache.json`, `probe-cache.json`,
   `runtime-telemetry.json`, `control-token` (control-plane capability), `target-facts.json`,
   `refusal-interpretations.json`, `lane-manifest.json`, `update-check.json`, the `hooks/` script
   (the Agent hook), and the accounting subtree `usage/` (`lifetime.json`, `recent.json`,
-  `YYYY-MM-DD.json` day shards, `snapshot-journal.json`). Under vitest every default path
+  `YYYY-MM-DD.json` day shards, `snapshot-journal.json`).
+  ⚠ **`~/.llm-relay/` is the answer only when no XDG base variable is set, and the three policies
+  in `src/` do not agree.** `usage/`, `probe-cache.json` and `runtime-telemetry.json` honour
+  `XDG_CACHE_HOME`; `target-facts.json` and `refusal-interpretations.json` honour
+  `XDG_CONFIG_HOME`; the other eight honour neither. So on a machine with either variable set the
+  state directory SPLITS, and "back up `~/.llm-relay/`" stops being a complete backup. Each
+  resolver is internally consistent, so nothing breaks — this is recorded, not fixed, because
+  unifying it MOVES a live operator's state and that is the owner's call, not a tidy. Documented
+  for users in `docs/reference.md` "Where state actually lives".
+  Under vitest every default path
   redirects to a temp dir. ⚠ That sentence was FALSE until 2026-08-27 — seven artifacts honoured
   it and six did not (`.env`, `models-cache.json`, `update-check.json`, the config dir holding
   `control-token`, the hook script, and `config.json`, whose resolver CREATES it). `.env` was the
   sharpest: `loadEnvFile` READS it into `process.env`, so a test run imported live credentials.
   Each resolver now guards itself AT THE RESOLVER — a call-site guard is how the control-token one
-  came to be half-covered — and `test/persistent-paths-vitest.test.ts` pins the whole set as one
-  table, so the next artifact cannot be added without a guard. There is deliberately no shared
-  "test mode" helper: each guard names the real state it protects. An EXPLICIT path always wins.
+  came to be half-covered. `test/persistent-paths-vitest.test.ts` pins the NINE that share the
+  `llm-relay-vitest` temp root as one table; the other four — `keystore.json`,
+  `target-facts.json`, `refusal-interpretations.json` and the `usage/` subtree — guard themselves
+  at their own resolvers into their own temp namespaces (per worker, per PID, per run), which is
+  deliberate: they hold cross-test state that a shared root would let one test leak into another.
+  ⚠ So the table is not the whole set. A new artifact using the shared root is caught; one that
+  invents its own namespace is not, and must carry its own guard and say so here. There is
+  deliberately no shared "test mode" helper: each guard names the real state it protects. An
+  EXPLICIT path always wins.
   ⚠ Not the same guard as `winenv.ts` / `secret-file-acl.ts` / `os-keyring.ts`, which refuse to
   SPAWN under vitest without an injected seam.
 - **Hand-built `Config` objects in tests must include** `repair: { maxAttempts,
@@ -615,9 +631,13 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   returns `x-llm-relay-unknown-refusal: <n>` and the skill makes checking it the reflex on a pool
   failure, because a queue nobody opens is a backlog. The dispatcher may `propose`; only the user
   may `accept`. ⚠ Error bodies are untrusted external content and an agent reading them is an
-  injection target — the containment is that a proposal is a 3-class/2-scope enum, signatures are
-  keyed per (provider, model) so one provider can never produce a verdict about another, and the
-  header carries a COUNT, never the message. Don't trade any of those for convenience.
+  injection target — the containment is that a proposal is a CLOSED enum on both axes (`--class`
+  validated against `FACT_KINDS` itself, `--scope` against the six of `SCOPE_PRECEDENCE`; the class
+  list is derived from the store rather than hand-listed, because a kind the store accepts and the
+  CLI rejects is invisible until somebody tries it — `rate-limited` shipped exactly that way), that
+  signatures are keyed per (provider, model) so one provider can never produce a verdict about
+  another, and that the header carries a COUNT, never the message. A `group` scope must also NAME
+  its members. Don't trade any of those for convenience.
 - **⚠ Never `res.clone()` a backend response on the failover path.** `clone()` tees the body and the
   failover branch cancels the original, so the un-read branch strands the walk and the client gets
   the FIRST candidate's error with the rest of the pool untouched. Read the body where it is already

@@ -41,9 +41,11 @@ mis-attributed `glm-5.2` → `glm-5.2-max`. Exact ids remove a whole class of si
 It also carries `context_length`, `pricing`, and `supported_parameters` (i.e. whether the model
 declares `tools` at all).
 
-⚠ **This exposed a second stale hardcoded table.** OpenRouter reports `context_length` 1048576 for
-`z-ai/glm-5.2`; `src/metadata.ts` hardcodes 128k, so the `ctx` column in `llm-relay candidates` is
-currently wrong by 8×. Same disease as `BENCHMARK_DB`: a hand-typed table that the roster outgrew.
+⚠ **This exposed a second stale hardcoded table — since REMOVED.** OpenRouter reported
+`context_length` 1048576 for `z-ai/glm-5.2` while `src/metadata.ts` handed out a blanket 128k, so
+the `ctx` column in `llm-relay candidates` was wrong by 8×. Same disease as `BENCHMARK_DB`: a
+hand-typed table the roster outgrew. That rung was deleted in 0.7.0 — see "There is no third,
+guessing rung" below. An unknown limit now renders blank rather than as a guess.
 
 ## Sources that disagree
 
