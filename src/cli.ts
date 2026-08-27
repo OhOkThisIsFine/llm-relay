@@ -933,7 +933,9 @@ interface CommandArity {
  *                 guard; it is also reachable through `rawCliCommand`'s special case, which keys
  *                 on raw argv this guard cannot see.
  *   `help` /    — both `process.exit(0)` above this guard, which is what makes `llm-relay <cmd>
- *   `version`     --help` work for every command. A bound here could never fire.
+ *   `version`     --help` work — for every command EXCEPT `keys` and `cooldowns`, whose parsers
+ *                 sit above the short-circuit too and reject `--help` as an unknown flag. A bound
+ *                 here could never fire.
  */
 const COMMAND_ARITY: Readonly<Record<string, CommandArity>> = {
   // Reads no positional; `--import` is a VALUE_FLAG and `--force` is a boolean.
@@ -2329,6 +2331,32 @@ function eligibilityResetArgs(reset: ResetRule | undefined): string {
     : ` --reset-ms ${reset.ms}`;
 }
 
+/**
+ * What each learned fact MEANS, spelled out per kind because the classes are NOT interchangeable
+ * and a bare label invites the reading this whole design exists to prevent — that a spent
+ * allowance means "paid".
+ *
+ * ⚠ A `Record<FactKind, string>`, not a ternary chain, so a new kind is a COMPILE error rather
+ * than a wrong sentence (the `DERIVED_BASIS satisfies Record<LimitProvenance, …>` precedent in
+ * `availability.ts`). The ternary this replaced had an unconditional else-branch, so SIX of the
+ * ten kinds — `rate-limited` and all five measurements — printed "gone from the provider —
+ * excluded from pools", contradicting both `target-facts.ts` (only `not-servable` and
+ * `subscription-required` are cost-blocking) and the invariant that a measurement never demotes
+ * anything at all.
+ */
+const FACT_MEANING: Record<FactKind, string> = {
+  "not-servable": "gone from the provider — excluded from pools",
+  "subscription-required": "not covered by our plan — excluded from free pools",
+  "allowance-exhausted": "free, but spent until it refreshes — demoted, never evicted",
+  "credential-invalid": "the provider says this key is bad — every deployment behind it demoted",
+  "rate-limited": "throughput throttled by the provider — demoted, never evicted",
+  "context-limit": "a ceiling this deployment stated about itself — a measurement, never a demotion",
+  "rate-limit-rpm": "a ceiling this deployment stated about itself — a measurement, never a demotion",
+  "rate-limit-rpd": "a ceiling this deployment stated about itself — a measurement, never a demotion",
+  "rate-limit-tpm": "a ceiling this deployment stated about itself — a measurement, never a demotion",
+  "rate-limit-tpd": "a ceiling this deployment stated about itself — a measurement, never a demotion",
+};
+
 function eligibilityAcceptCommand(
   index: number,
   cls: FactKind,
@@ -2433,15 +2461,7 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
   }
   for (const o of observations) {
     const mins = Math.max(0, Math.round((o.until - Date.now()) / 60000));
-    // Spelled out because the classes are NOT interchangeable and a bare label invites the
-    // reading this whole design exists to prevent — that a spent allowance means "paid".
-    const meaning = o.kind === "allowance-exhausted"
-      ? "free, but spent until it refreshes — demoted, never evicted"
-      : o.kind === "subscription-required"
-        ? "not covered by our plan — excluded from free pools"
-        : o.kind === "credential-invalid"
-          ? "the provider says this key is bad — every deployment behind it demoted"
-          : "gone from the provider — excluded from pools";
+    const meaning = FACT_MEANING[o.kind];
     process.stdout.write(`  ${describeScope(o.scope).padEnd(46)} ${o.kind.padEnd(22)} ${meaning}; expires in ${mins}m\n`);
     if (o.scope.kind === "group") {
       // The membership is the whole reason a group verdict is reviewable — show it, always.
@@ -3232,7 +3252,8 @@ export function main(): void {
   // ABOVE it, nothing durable has happened — but two things MUST stay above: `keys` and
   // `cooldowns` own strict, fail-closed, secret-safe parsers (and cooldowns returns), and
   // `--help`/`--version` short-circuit, which is what makes `llm-relay <cmd> --help` work for
-  // every command. Moving this check above them would flip `llm-relay cost extra --help` from
+  // every command except those same two — `keys`/`cooldowns` parse FIRST and refuse `--help`
+  // themselves. Moving this check above them would flip `llm-relay cost extra --help` from
   // printing help to exit 1.
   //
   // Keyed on `positionals[0]`, never on `rawCliCommand`: that scans PAST a leading non-command
