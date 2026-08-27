@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import type { ProviderConfig } from "./config.js";
 import { buildAuthHeaders } from "./authEnv.js";
 import {
@@ -11,7 +11,21 @@ import {
 import { WriteBehindTimer } from "./write-behind.js";
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
-const DEFAULT_CACHE = join(homedir(), ".llm-relay", "models-cache.json");
+/**
+ * Where the catalog caches `/models` when no explicit `cachePath` is given.
+ *
+ * ⚠ Under vitest, never touch the developer's real catalog cache — a test run would otherwise
+ * overwrite the live roster the router ranks on, the same way the suite was once found writing
+ * `openai_mock` entries into the real probe cache. Tests needing persistence pass an explicit
+ * `cachePath`. Exported so `test/persistent-paths-vitest.test.ts` can assert the redirect
+ * DIRECTLY rather than inferring it from behaviour.
+ */
+export function defaultCatalogCachePath(): string {
+  if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "models-cache.json");
+  return join(homedir(), ".llm-relay", "models-cache.json");
+}
+
+const DEFAULT_CACHE = defaultCatalogCachePath();
 
 // Bounds on a /models response (adoption review §1.11). The byte cap is the load-bearing one:
 // `AbortSignal.timeout` bounds time, not size, so a fast hostile stream could balloon this

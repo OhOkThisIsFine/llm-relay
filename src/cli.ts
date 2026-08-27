@@ -2,7 +2,7 @@
 import { isRecord } from "./json-shape.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import {
   loadConfig,
@@ -422,6 +422,13 @@ export { splitSpec };
 export function resolveConfigPath(): string {
   const explicit = argValue("--config", "-c");
   if (explicit) return explicit;
+
+  // ⚠ Under vitest, never touch the developer's real config.
+  // Tests pass an explicit `--config` path to control where the config lives.
+  if (process.env.VITEST) {
+    const vitestConfigDir = join(tmpdir(), "llm-relay-vitest");
+    return join(vitestConfigDir, "config.json");
+  }
 
   const userConfigDir = join(homedir(), ".llm-relay");
   const userConfig = join(userConfigDir, "config.json");
