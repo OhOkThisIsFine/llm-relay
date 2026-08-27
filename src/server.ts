@@ -1660,6 +1660,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         retryAfterOverrideMs: pool429.overrideMs(backendRes.status, retryAfterMs),
         poolSummary: null,
         poolUnknownRefusals: pool429.unknownCount(),
+        tried,
         degraded: degradedLabel(addressedPool, degradedSpecs, target),
         quotaDemoted: quotaDemotedFirst,
         paid: paidLabel(cfg, h, target),
@@ -2712,6 +2713,11 @@ interface Ctx {
   poolSummary?: string | null;
   /** Unrecognized refusals among the candidates stepped over. See the caveat at the emit site. */
   poolUnknownRefusals?: number | null;
+  /**
+   * Every deployment this walk addressed, in order. `SERVED_BY_HEADER` names the winner below
+   * 400 and this list at or above it, which is what makes an exhausted pool self-describing.
+   */
+  tried?: readonly string[];
   /** Credential diagnostics are slot identities only; values never leave the process. */
   credentialHeaders?: Record<string, string>;
   /** Set when the answering deployment came from the pool's degrade tail. See `degradedLabel`. */
@@ -3805,35 +3811,25 @@ async function openAiFrontPath(
 
       let responseBytesWritten = false;
       try {
-        const servedBy = upstream.status >= 400 ? tried.join(", ") : specOfTarget(target);
-        const headers: Record<string, string | string[]> = {
-          ...filterResponseHeaders(upstream.headers),
-          [SERVED_BY_HEADER]: servedBy,
-          ...credentialTrace.headers(),
-        };
-        const degradedBy = degradedLabel(
-          ctx.addressedPool ?? null,
-          ctx.degradedSpecs ?? null,
+        // One announcement set for both fronts — see `ServedAnnouncementContext`. The credential
+        // headers are read here, after `recordCredentialOutcome` above settled the winning slot,
+        // which is the per-attempt attribution a bare shared call would otherwise lose.
+        const headers: Record<string, string | string[]> = responseHeadersForTarget(upstream, {
           target,
-        );
-        if (degradedBy) headers[DEGRADED_HEADER] = degradedBy;
-        // The announcement computed at walk-order time, beside the same demotion that produced it.
-        if (ctx.quotaDemotedFirst) headers[QUOTA_DEMOTED_HEADER] = ctx.quotaDemotedFirst;
-        const paidBy = ctx.cfg ? paidLabel(ctx.cfg, h, target) : null;
-        if (paidBy) headers[PAID_HEADER] = paidBy;
-        const stickyBy = stickyHeaderValue(ctx.sticky, target, upstream.status);
-        if (stickyBy) headers[STICKY_PROVENANCE_HEADER] = stickyBy;
-        const poolAttempts = pool429.summary();
-        if (poolAttempts) headers[POOL_ATTEMPTS_HEADER] = poolAttempts;
-        const poolRetryAfterMs = pool429.overrideMs(upstream.status, retryAfterMs);
-        if (poolRetryAfterMs !== undefined) {
-          headers["retry-after"] = String(Math.max(1, Math.ceil(poolRetryAfterMs / 1000)));
-        }
+          tried,
+          retryAfterOverrideMs: pool429.overrideMs(upstream.status, retryAfterMs),
+          poolSummary: pool429.summary(),
+          poolUnknownRefusals: pool429.unknownCount(),
+          credentialHeaders: credentialTrace.headers(),
+          degraded: degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target),
+          // The announcement computed at walk-order time, beside the same demotion that produced it.
+          quotaDemoted: ctx.quotaDemotedFirst,
+          paid: ctx.cfg ? paidLabel(ctx.cfg, h, target) : null,
+          sticky: ctx.sticky,
+        });
 
         if (upstream.status >= 400) {
           const raw = await upstream.text();
-          const unknown = pool429.unknownCount();
-          if (unknown !== null) headers[UNKNOWN_REFUSAL_HEADER] = String(unknown);
           const normalized = normalizeOpenAiErrorBody(raw, upstream.status);
           const out = Buffer.from(normalized ?? raw, "utf8");
           res.writeHead(upstream.status, { ...headers, "content-type": "application/json" });
@@ -3972,15 +3968,65 @@ function toolUseIdRewriteField(source: Response): {
   };
 }
 
+/**
+ * The served-response announcement set: the ONE definition BOTH fronts emit.
+ *
+ * Deliberately a narrow structural context rather than the Anthropic `Ctx` — the OpenAI front has
+ * no `Ctx`, and widening this to accept one would either drag that front's shape toward the
+ * Anthropic path's or let a caller omit `credentialHeaders` silently. `Ctx` satisfies it
+ * structurally, so the Anthropic callers pass their existing object unchanged.
+ *
+ * ⚠ This covers only an ordinary SERVED upstream response. `walkExitHeaders` owns terminal
+ * transport and post-header exits, and `respondAllCapped` owns the local all-capped 429 where no
+ * provider was contacted; both are different response classes and stay separate. `HARD_CAP_HEADER`
+ * therefore never appears here.
+ *
+ * ⚠ Adopting this on the OpenAI front changed the ORDER its announcement headers are written in —
+ * that front used to spread the credential pair before the degraded/quota/paid/pool-attempts
+ * assignments, and now writes it after them, because this is the Anthropic front's long-standing
+ * order and one owner means one order. No VALUE moves: every name here is a distinct `x-llm-relay-*`
+ * constant, so nothing in this set can collide with anything else in it. Do not "restore" the old
+ * order on one front — two orders is the state this function exists to end.
+ */
+interface ServedAnnouncementContext {
+  readonly target: ResolvedTarget;
+  readonly tried?: readonly string[] | undefined;
+  readonly retryAfterOverrideMs?: number | undefined;
+  readonly poolSummary?: string | null | undefined;
+  readonly poolUnknownRefusals?: number | null | undefined;
+  readonly credentialHeaders?: Record<string, string> | undefined;
+  readonly degraded?: string | null | undefined;
+  readonly quotaDemoted?: string | null | undefined;
+  readonly paid?: string | null | undefined;
+  readonly sticky?: StickyRequestContext | null | undefined;
+}
+
 /** Winning-candidate response metadata, shared by transparent and repair streaming paths. */
-function responseHeadersForTarget(backendRes: Response, ctx: Ctx): Record<string, string | string[]> {
+function responseHeadersForTarget(
+  backendRes: Response,
+  ctx: ServedAnnouncementContext,
+): Record<string, string | string[]> {
   const responseHeaders = filterResponseHeaders(backendRes.headers);
-  if (backendRes.status < 400) responseHeaders[SERVED_BY_HEADER] = specOfTarget(ctx.target);
+  // The winner below 400, every deployment tried at or above it. The header's own declaration is
+  // the contract — "when every candidate fails it carries the list that was tried instead, so an
+  // exhausted pool is self-describing" — and `docs/reference.md` states it to users. This front
+  // used to omit it entirely on a terminal error while the OpenAI front supplied it, so the same
+  // documented behaviour was delivered by one path and not the other.
+  // ⚠ Not the transport-exit omission at the `handle` catch, which is a RECORDED deliberate
+  // residue: a transport exhaustion has no HTTP response to describe.
+  responseHeaders[SERVED_BY_HEADER] = backendRes.status < 400 || !ctx.tried?.length
+    ? specOfTarget(ctx.target)
+    : ctx.tried.join(", ");
   if (ctx.retryAfterOverrideMs !== undefined && Number.isFinite(ctx.retryAfterOverrideMs)) {
     responseHeaders["retry-after"] = String(Math.max(1, Math.ceil(ctx.retryAfterOverrideMs / 1000)));
   }
   if (ctx.poolSummary) responseHeaders[POOL_ATTEMPTS_HEADER] = ctx.poolSummary;
   // Counts only candidates stepped over: terminal refusal bodies are not buffered on this path.
+  // ⚠ Emitted on SUCCESS too, and that is the point: the count is the push half of the eligibility
+  // queue — "a NEW kind of refusal just appeared, run `llm-relay eligibility` while the context is
+  // still in hand". A later candidate answering does not un-see the refusal. The OpenAI front used
+  // to compute it only inside its own `status >= 400` branch and so swallowed exactly that case.
+  // The count is positive-or-null and never 0, so this truthy test is exact.
   if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   if (ctx.quotaDemoted) responseHeaders[QUOTA_DEMOTED_HEADER] = ctx.quotaDemoted;
