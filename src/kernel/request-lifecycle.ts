@@ -1,3 +1,4 @@
+import { sameProviderTarget } from "./contracts.js";
 import type {
   AttemptBeginFailure,
   AttemptCompletionFailure,
@@ -33,15 +34,6 @@ interface AttemptRecord {
 // Shared only to classify a genuine handle from another request as foreign.
 // Weak keys preserve request lifetime and expose no enumeration surface.
 const knownHandles = new WeakMap<object, AttemptRecord>();
-
-function sameTarget(a: ProviderTargetIdentity, b: ProviderTargetIdentity): boolean {
-  return (
-    a.provider === b.provider &&
-    a.model === b.model &&
-    a.kind === b.kind &&
-    a.credentialId === b.credentialId
-  );
-}
 
 /** Request-scoped owner of opaque, target-bound attempt handles. */
 export class AttemptLifecycle implements AttemptLifecyclePort {
@@ -99,7 +91,7 @@ export class AttemptLifecycle implements AttemptLifecyclePort {
     if (record.completed) {
       return { ok: false, error: { kind: "duplicate-completion", id: record.id } };
     }
-    if (!sameTarget(record.target, outcome.target)) {
+    if (!sameProviderTarget(record.target, outcome.target)) {
       return {
         ok: false,
         error: { kind: "cross-target", expected: record.target, received: outcome.target },

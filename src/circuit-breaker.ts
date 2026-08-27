@@ -1,3 +1,4 @@
+import { sameProviderTarget } from "./kernel/contracts.js";
 import type {
   AttemptBeginFailure,
   AttemptCompletionFailure,
@@ -119,18 +120,6 @@ function outcomeCode(outcome: {
     : String(outcome.status);
 }
 
-function sameTarget(
-  a: ProviderTargetIdentity,
-  b: ProviderTargetIdentity,
-): boolean {
-  return (
-    a.provider === b.provider &&
-    a.model === b.model &&
-    a.kind === b.kind &&
-    a.credentialId === b.credentialId
-  );
-}
-
 function isLoopbackTarget(target: ProviderTargetIdentity): boolean {
   if (target.base === undefined) return false;
   try {
@@ -240,7 +229,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
         ok: false,
         error: { kind: "duplicate-completion", id: record.value.completedId },
       };
-    if (!sameTarget(record.value.target, observation.target)) {
+    if (!sameProviderTarget(record.value.target, observation.target)) {
       return {
         ok: false,
         error: {
@@ -279,7 +268,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
         ok: false,
         error: { kind: "duplicate-completion", id: record.value.completedId },
       };
-    if (!sameTarget(record.value.target, outcome.target)) {
+    if (!sameProviderTarget(record.value.target, outcome.target)) {
       return {
         ok: false,
         error: {

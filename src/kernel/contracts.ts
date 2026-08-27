@@ -33,6 +33,24 @@ export interface ProviderTargetIdentity {
   readonly base?: string;
 }
 
+/**
+ * Target equality — the rule the type's own `base` comment states, in one place.
+ *
+ * ⚠ It lives beside the type rather than in either consumer because `circuit-breaker.ts` and
+ * `kernel/request-lifecycle.ts` each held an identical private copy, and nothing in the type
+ * system would have caught the two drifting: adding a field to `ProviderTargetIdentity` that ONE
+ * copy compares makes the breaker and the lifecycle disagree about whether a handle belongs to the
+ * attempt that issued it. Pure, so `test/kernel-architecture.test.ts` purity still holds.
+ */
+export function sameProviderTarget(a: ProviderTargetIdentity, b: ProviderTargetIdentity): boolean {
+  return (
+    a.provider === b.provider &&
+    a.model === b.model &&
+    a.kind === b.kind &&
+    a.credentialId === b.credentialId
+  );
+}
+
 declare const attemptHandleBrand: unique symbol;
 declare const attemptIdBrand: unique symbol;
 
