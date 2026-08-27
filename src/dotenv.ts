@@ -11,7 +11,7 @@
  * silently overriding it would be a nastier version of the bug this fixes.
  */
 import { readFileSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { keyIsPresent } from "./authEnv.js";
 
@@ -48,6 +48,10 @@ export function parseDotEnv(text: string): Record<string, string> {
 }
 
 export function defaultEnvPath(): string {
+  // ⚠ Under vitest, never touch the developer's real .env file. The real file loads
+  // live credentials into process.env and tests must not pollute or depend on that state.
+  // Tests needing persistence pass an explicit `path` to `loadEnvFile`.
+  if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", ".env");
   return join(homedir(), ".llm-relay", ".env");
 }
 

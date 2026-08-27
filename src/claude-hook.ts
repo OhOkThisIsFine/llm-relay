@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 /**
  * The `PreToolUse(Agent)` hook that makes `offload on` mean something on a host whose traffic
@@ -44,6 +44,16 @@ export interface ClaudeHookPaths {
 }
 
 export function claudeHookPaths(home = homedir()): ClaudeHookPaths {
+  // ⚠ Under vitest, never touch the developer's real hook paths.
+  // The settings path is the harness config; the script path is under the relay directory.
+  // Tests pass an explicit `home` to redirect both.
+  if (process.env.VITEST && home === homedir()) {
+    const vitestHome = join(tmpdir(), "llm-relay-vitest");
+    return {
+      settings: join(vitestHome, ".claude", "settings.json"),
+      script: join(vitestHome, "hooks", AGENT_HOOK_FILENAME),
+    };
+  }
   return {
     settings: join(home, ".claude", "settings.json"),
     script: join(home, ".llm-relay", "hooks", AGENT_HOOK_FILENAME),

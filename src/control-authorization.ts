@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { restrictSecretFileOnWindows } from "./secret-file-acl.js";
 
@@ -30,6 +30,9 @@ const DIRECTORY_MODE = 0o700;
 
 /** Default config directory used when a Config was assembled in memory and has no sourcePath. */
 export function defaultRelayConfigDir(): string {
+  // ⚠ Under vitest, never touch the developer's real config directory.
+  // Tests needing persistence pass an explicit `fallbackDir` to `resolveControlAuthorizationConfigDir`.
+  if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest");
   return join(homedir(), ".llm-relay");
 }
 

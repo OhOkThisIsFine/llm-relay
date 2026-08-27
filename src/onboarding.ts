@@ -1,10 +1,10 @@
 import { existsSync, appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import type { Config, ProviderTierType } from "./config.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
 import { aggregateHasKey, providerCredentialSlots } from "./credential-fleet.js";
+import { defaultEnvPath } from "./dotenv.js";
 import { restrictSecretFileOnWindows } from "./secret-file-acl.js";
 
 export interface OnboardingStatus {
@@ -140,7 +140,7 @@ export async function runInteractiveOnboarding(cfg?: Config, opts?: { envPath?: 
   }
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const envPath = opts?.envPath ?? join(homedir(), ".llm-relay", ".env");
+  const envPath = opts?.envPath ?? defaultEnvPath();
   const addedKeys: Record<string, string> = {};
 
   const ask = (query: string): Promise<string> =>

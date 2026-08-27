@@ -173,7 +173,20 @@ export function currentVersion(): string {
   return readPackageJson(packageRoot()).version ?? "0.0.0";
 }
 
-const cacheFile = () => join(homedir(), ".llm-relay", "update-check.json");
+/**
+ * Where the 6h npm-version check caches its answer.
+ *
+ * ⚠ Under vitest, never touch the developer's real update-check cache — a test run would
+ * otherwise suppress or force a real upgrade prompt. Exported so
+ * `test/persistent-paths-vitest.test.ts` can assert the redirect DIRECTLY rather than inferring
+ * it from a read that returns null either way.
+ */
+export function defaultUpdateCachePath(): string {
+  if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "update-check.json");
+  return join(homedir(), ".llm-relay", "update-check.json");
+}
+
+const cacheFile = () => defaultUpdateCachePath();
 
 export function readCache(now: number): string | null {
   try {
