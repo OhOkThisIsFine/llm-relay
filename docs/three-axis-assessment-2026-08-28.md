@@ -438,6 +438,27 @@ None of the four decisions is outstanding. What the assessment found and did NOT
 
 ---
 
+## Friction hit while implementing the four decisions
+
+Rewalked from the transcript, separate from the assessment's own friction below.
+
+1. **A Git Bash heredoc plus Python string escaping failed twice on source patches**, once with
+   `unexpected EOF while looking for matching '` on a 130-line markdown document, and once with a
+   bare `AssertionError` on a block whose text I had verified byte for byte with `cat -A`. Both
+   succeeded immediately through the `Edit` tool. Do not push source patches containing backticks,
+   `${...}` or escaped newlines through a heredoc.
+2. **The architecture-map guard is the only thing that demands a `CLAUDE.md` row for a new module**,
+   and it fails at the end of a full `npm run check` rather than at `typecheck`. Add the row when
+   the file is created, not when the gate tells you.
+3. **`npm run check` is the only place three separate guards fire** — the architecture map, the
+   arity coverage table, and the persistent-paths table. A packet touching `src/` in a new way
+   should run the whole gate early, not just the focused suite.
+4. **The publish workflow's `tier-data.json missing or empty` annotation reads as a failure and is
+   a negative control** (`.github/workflows/publish.yml:219` requires the error to appear against a
+   stripped fixture). Check the run's `conclusion` before reacting to an annotation.
+5. **Node cannot import a Windows absolute path as an ESM specifier.** `import(".../dist/config.js")`
+   fails with `ERR_UNSUPPORTED_ESM_URL_SCHEME`; use `pathToFileURL(...).href`.
+
 ## Friction hit during this assessment
 
 Rewalked from the transcript, not from recall.
