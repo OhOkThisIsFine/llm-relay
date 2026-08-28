@@ -252,3 +252,108 @@ describe("the suite never writes the developer's real probe cache", () => {
     }
   });
 });
+
+describe("probe cache degrades corrupt entries to empty/unknown", () => {
+  it("loadPersistedSamples returns [] for corrupt samples (string, number, null)", () => {
+    // Write a corrupt cache with non-array samples
+    const corruptPath = join(dir, "corrupt-samples.json");
+    writeFileSync(corruptPath, JSON.stringify({
+      version: CURRENT_PROBE_VERSION,
+      providers: {
+        p: {
+          models: {
+            m1: { modelId: "m1", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], samples: "not an array" },
+            m2: { modelId: "m2", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], samples: 123 },
+            m3: { modelId: "m3", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], samples: null },
+            m4: { modelId: "m4", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], samples: [{ ms: 50, code: "200", timestamp: Date.now() }] }, // valid
+          },
+        },
+      },
+    }));
+    loadProbeCache({ path: corruptPath, reload: true });
+
+    expect(loadPersistedSamples("p", "m1", { path: corruptPath })).toEqual([]);
+    expect(loadPersistedSamples("p", "m2", { path: corruptPath })).toEqual([]);
+    expect(loadPersistedSamples("p", "m3", { path: corruptPath })).toEqual([]);
+    expect(loadPersistedSamples("p", "m4", { path: corruptPath })).toHaveLength(1); // valid entry still works
+  });
+
+  it("loadTotals returns null for corrupt totals (string, number, array)", () => {
+    const corruptPath = join(dir, "corrupt-totals.json");
+    writeFileSync(corruptPath, JSON.stringify({
+      version: CURRENT_PROBE_VERSION,
+      providers: {
+        p: {
+          models: {
+            m1: { modelId: "m1", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], totals: "not an object" },
+            m2: { modelId: "m2", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], totals: 42 },
+            m3: { modelId: "m3", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], totals: [] },
+            m4: { modelId: "m4", status: "ok", lastProbedAt: Date.now(), probeVersion: CURRENT_PROBE_VERSION, ms: 10, code: "200", quotaObservations: [], totals: { probes: 5, ok: 5, sumMs: 250, firstProbedAt: 1000 } }, // valid
+          },
+        },
+      },
+    }));
+    loadProbeCache({ path: corruptPath, reload: true });
+
+    expect(loadTotals("p", "m1", { path: corruptPath })).toBeNull();
+    expect(loadTotals("p", "m2", { path: corruptPath })).toBeNull();
+    expect(loadTotals("p", "m3", { path: corruptPath })).toBeNull();
+    expect(loadTotals("p", "m4", { path: corruptPath })).toEqual({ probes: 5, ok: 5, sumMs: 250, firstProbedAt: 1000 });
+  });
+});
+
+describe("a corrupt probe cache is not LAUNDERED into a measurement on write", () => {
+  it("recordProbeResult refuses to spread a non-array samples field", () => {
+    // The read guards in loadPersistedSamples/loadTotals cannot save this case. If the WRITE path
+    // spreads a corrupt `samples: "abc"`, it becomes `["a","b","c"]` — a real array — and is
+    // written back to disk. From then on the read guard passes it through happily, and
+    // dynamic-pools feeds those characters to getStabilityScore and samples.length/5, which decide
+    // pool ORDER. Corruption would have been converted into evidence.
+    const p = join(dir, "launder.json");
+    writeFileSync(p, JSON.stringify({
+      version: CURRENT_PROBE_VERSION,
+      providers: {
+        prov: {
+          models: {
+            m: {
+              modelId: "m", status: "ok", lastProbedAt: 1000, probeVersion: CURRENT_PROBE_VERSION,
+              ms: 10, code: "200", quotaObservations: [], samples: "abc",
+            },
+          },
+        },
+      },
+    }));
+    loadProbeCache({ path: p, reload: true });
+
+    const entry = recordProbeResult("prov", "m", { code: "200", ms: 42, quotaObservations: [] }, { path: p, now: 2000 });
+
+    // Exactly one sample — this probe. The three characters must NOT have become three samples.
+    expect(entry.samples).toHaveLength(1);
+    expect(entry.samples?.[0]).toMatchObject({ ms: 42, code: "200" });
+    // And nothing character-shaped survived into the persisted window.
+    expect(loadPersistedSamples("prov", "m", { path: p })).toHaveLength(1);
+  });
+
+  it("still appends normally to a valid samples window", () => {
+    // The control: the guard must not empty a healthy window.
+    const p = join(dir, "healthy.json");
+    writeFileSync(p, JSON.stringify({
+      version: CURRENT_PROBE_VERSION,
+      providers: {
+        prov: {
+          models: {
+            m: {
+              modelId: "m", status: "ok", lastProbedAt: 1000, probeVersion: CURRENT_PROBE_VERSION,
+              ms: 10, code: "200", quotaObservations: [],
+              samples: [{ ms: 11, code: "200", timestamp: 900 }],
+            },
+          },
+        },
+      },
+    }));
+    loadProbeCache({ path: p, reload: true });
+
+    const entry = recordProbeResult("prov", "m", { code: "200", ms: 42, quotaObservations: [] }, { path: p, now: 2000 });
+    expect(entry.samples).toHaveLength(2);
+  });
+});

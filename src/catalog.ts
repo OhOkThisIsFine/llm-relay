@@ -315,10 +315,14 @@ export class ModelCatalog {
     try {
       const j = JSON.parse(readFileSync(this.cachePath, "utf8")) as Record<string, Entry>;
       for (const [k, v] of Object.entries(j)) {
-        if (!v || typeof v.fetchedAt !== "number" || !Array.isArray(v.models)) continue;
+        // Number.isFinite rejects Infinity/NaN; live fetch also caps model count and id length
+        if (!v || !Number.isFinite(v.fetchedAt) || !Array.isArray(v.models)) continue;
+        const models = v.models
+          .filter((m): m is string => typeof m === "string" && m.length <= MAX_MODEL_ID_CHARS)
+          .slice(0, MAX_CATALOG_MODELS);
         this.mem.set(k, {
           fetchedAt: v.fetchedAt,
-          models: v.models.filter((m): m is string => typeof m === "string"),
+          models,
           limits: sanitizeLimits(v.limits),
         });
         this.revision++;

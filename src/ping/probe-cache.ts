@@ -200,7 +200,12 @@ export function recordProbeResult(
   // Append to the rolling window rather than replacing the single sample a v1 entry held.
   // One probe cannot describe latency: p95, jitter and spike rate are distribution statistics,
   // and a scalar `ms` made every one of them a restatement of the most recent request.
-  const samples = [...(prev?.samples ?? []), { ms: result.ms, code: result.code, timestamp: now }];
+  // ⚠ Guard the WRITE side, not only the read helpers. `loadProbeCache` validates shallowly, so a
+  // corrupt `samples` survives the load; spreading a string here would turn it into an array of
+  // single characters and write that back as measurements. The read guard cannot recover from that
+  // — by then the corruption IS an array. Degrade to empty: this cache is re-learnable.
+  const prevSamples = Array.isArray(prev?.samples) ? prev.samples : [];
+  const samples = [...prevSamples, { ms: result.ms, code: result.code, timestamp: now }];
   if (samples.length > MAX_SAMPLES) samples.splice(0, samples.length - MAX_SAMPLES);
 
   const prevTotals = prev?.totals;
@@ -246,7 +251,8 @@ export function loadPersistedSamples(
   opts: { path?: string } = {},
 ): PingRecord[] {
   const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
-  return cache.providers[providerKey]?.models[modelId]?.samples ?? [];
+  const samples = cache.providers[providerKey]?.models[modelId]?.samples;
+  return Array.isArray(samples) ? samples : [];
 }
 
 /** Long-run counters for a model, or null when it has never been probed. */
@@ -256,7 +262,9 @@ export function loadTotals(
   opts: { path?: string } = {},
 ): ProbeTotals | null {
   const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
-  return cache.providers[providerKey]?.models[modelId]?.totals ?? null;
+  const totals = cache.providers[providerKey]?.models[modelId]?.totals;
+  // Corrupt totals (non-object or array) degrade to null — re-learnable cache degrades to empty/unknown
+  return totals && typeof totals === "object" && !Array.isArray(totals) ? totals as ProbeTotals : null;
 }
 
 /**
