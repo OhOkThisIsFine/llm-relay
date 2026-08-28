@@ -36,7 +36,6 @@ import { WriteBehindTimer } from "./write-behind.js";
 import type { BreakerCooldownRow, CooldownSource } from "./circuit-breaker.js";
 
 export type { BreakerCooldownRow } from "./circuit-breaker.js";
-import type { ProviderTargetIdentity } from "./kernel/contracts.js";
 
 /** Bumped when the row shape changes; a mismatch restores nothing rather than guessing. */
 export const CURRENT_BREAKER_STATE_VERSION = 1;
@@ -134,17 +133,6 @@ export function saveBreakerCooldowns(rows: readonly BreakerCooldownRow[], opts: 
       }
     }
   }
-}
-
-/** The identity half of a row, for handing back to the breaker. */
-export function rowIdentity(row: BreakerCooldownRow): ProviderTargetIdentity {
-  return {
-    provider: row.provider,
-    model: row.model,
-    kind: row.kind,
-    credentialId: row.credentialId,
-    ...(row.base === undefined ? {} : { base: row.base }),
-  } as ProviderTargetIdentity;
 }
 
 /**
