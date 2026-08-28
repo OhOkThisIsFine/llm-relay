@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,12 +13,14 @@ import {
   getProbeCachePath,
   MAX_SAMPLES,
   CURRENT_PROBE_VERSION,
+  flushProbeCache,
 } from "../src/ping/probe-cache.js";
 import { getVerdict, isPersistentlyDown, trailingFailures, getP95, type PingRecord } from "../src/ping/metrics.js";
 import { PingLoop } from "../src/ping/cadence.js";
 import { ModelCatalog } from "../src/catalog.js";
 import type { Config } from "../src/config.js";
 import { makeCredentialId } from "../src/credential-id.js";
+import { flushRuntimeTelemetry } from "../src/ping/runtime-telemetry.js";
 
 const noQuota = { quotaObservations: [] };
 const emptyConfig = { providers: {}, routing: { default: "x", tiers: {} } } as unknown as Config;
@@ -355,5 +357,63 @@ describe("a corrupt probe cache is not LAUNDERED into a measurement on write", (
 
     const entry = recordProbeResult("prov", "m", { code: "200", ms: 42, quotaObservations: [] }, { path: p, now: 2000 });
     expect(entry.samples).toHaveLength(2);
+  });
+});
+
+/**
+ * ⚠ Making the rename fail is the whole test, and it is easy to get wrong.
+ *
+ * A "non-existent parent directory" does NOT work: every one of these writers calls
+ * `mkdirSync(join(path, ".."), { recursive: true })` first, so the parent is created and the write
+ * succeeds. A fixture built that way passes on the UN-FIXED tree — and if a temp file did remain it
+ * would sit in the created subdirectory, not the one the assertion lists. Two independent reasons
+ * it could not observe the defect.
+ *
+ * Instead: make the TARGET an existing, non-empty directory. The temp file writes normally, and
+ * `renameSync(tmp, target)` cannot replace a non-empty directory on any platform.
+ */
+function blockedTarget(name: string): string {
+  const target = join(dir, name);
+  mkdirSync(target, { recursive: true });
+  writeFileSync(join(target, "occupant"), "x", "utf8");
+  return target;
+}
+
+const tempsIn = (d: string) => readdirSync(d).filter((f) => f.endsWith(".tmp"));
+
+describe("flushProbeCache cleans up its temp file when the rename fails", () => {
+  it("leaves no temp file behind", () => {
+    recordProbeResult("p", "m", { code: "200", ms: 10, quotaObservations: [] }, { path: join(dir, "probe-cache.json") });
+    const blocked = blockedTarget("blocked-probe-cache.json");
+
+    flushProbeCache({ path: blocked });
+
+    expect(tempsIn(dir)).toHaveLength(0);
+  });
+
+  it("still swallows the error rather than failing its caller", () => {
+    recordProbeResult("p", "m", { code: "200", ms: 10, quotaObservations: [] }, { path: join(dir, "probe-cache.json") });
+    const blocked = blockedTarget("blocked-probe-swallow.json");
+
+    // These are best-effort writers: a storage problem must never become a request failure.
+    expect(() => flushProbeCache({ path: blocked })).not.toThrow();
+  });
+});
+
+describe("flushRuntimeTelemetry cleans up its temp file when the rename fails", () => {
+  it("leaves no temp file behind", () => {
+    // ⚠ This writer and the probe cache name their temp `${target}.${Date.now()}.${random}.tmp`, so
+    // every failed write would leave a NEW file — unbounded accumulation, unlike the PID-named
+    // writers. Both run on a cadence inside the long-lived relay.
+    const blocked = blockedTarget("blocked-runtime-telemetry.json");
+
+    flushRuntimeTelemetry({ path: blocked });
+
+    expect(tempsIn(dir)).toHaveLength(0);
+  });
+
+  it("still swallows the error rather than failing its caller", () => {
+    const blocked = blockedTarget("blocked-telemetry-swallow.json");
+    expect(() => flushRuntimeTelemetry({ path: blocked })).not.toThrow();
   });
 });

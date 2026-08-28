@@ -1,5 +1,5 @@
 import { relayStatePath } from "../state-paths.js";
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import type { PingRecord } from "./metrics.js";
@@ -99,13 +99,20 @@ export function flushProbeCache(opts: { path?: string; cache?: ProbeCacheData } 
   const cacheData = opts.cache ?? _cache ?? emptyCache();
   if (!opts.path) _writeBehind.clear();
 
+  let tmpPath: string | null = null;
   try {
     mkdirSync(dirname(target), { recursive: true });
-    const tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+    tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
     writeFileSync(tmpPath, JSON.stringify(cacheData, null, 2) + "\n", "utf8");
     renameSync(tmpPath, target);
+    tmpPath = null;
   } catch {
     /* best-effort persistence */
+  }
+  finally {
+    if (tmpPath !== null) {
+      try { unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
+    }
   }
 }
 

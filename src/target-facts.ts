@@ -1,5 +1,5 @@
 import { relayStatePath } from "./state-paths.js";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -286,14 +286,28 @@ function load(path: string): FactStore {
   return _store;
 }
 
-function persist(path: string): void {
+function persist(path: string, now: number = Date.now()): void {
   if (!_store) return;
+  let tmp: string | null = null;
   try {
+    // Prune expired rows before serializing: an expired row is already invisible to every reader,
+    // so dropping it changes no answer. Keep the in-memory store and the written file consistent.
+    for (const [key, fact] of Object.entries(_store.facts)) {
+      if (now >= expiryOf(fact)) {
+        delete _store.facts[key];
+      }
+    }
     mkdirSync(join(path, ".."), { recursive: true });
-    const tmp = `${path}.${process.pid}.tmp`;
+    tmp = `${path}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(_store, null, 2) + "\n", "utf8");
     renameSync(tmp, path);
+    tmp = null;
   } catch { /* best effort */ }
+  finally {
+    if (tmp !== null) {
+      try { unlinkSync(tmp); } catch { /* best effort cleanup */ }
+    }
+  }
 }
 
 function expiryOf(fact: StoredFact): number { return fact.until ?? fact.at + FACT_TTL_MS[fact.kind]; }
@@ -370,7 +384,7 @@ export function recordFact(
     ...(basis === null ? {} : { untilBasis: basis }),
     ...(typeof opts.value === "number" && Number.isFinite(opts.value) ? { value: opts.value } : {}),
   };
-  writer.touch(() => persist(path));
+  writer.touch(() => persist(path, now));
 }
 
 export function factsFor(
@@ -408,8 +422,9 @@ export function cooldownUntil(provider: string, credentialId: CredentialId | nul
 }
 
 /** A success retracts conditions covering this credential/model cell, never measurements. */
-export function clearFacts(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string } = {}): FactKind[] {
+export function clearFacts(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number } = {}): FactKind[] {
   const path = opts.path ?? defaultPath();
+  const now = opts.now ?? Date.now();
   const m = typeof model === "string" ? model : null;
   const store = load(path);
   const cleared: FactKind[] = [];
@@ -422,7 +437,7 @@ export function clearFacts(provider: string, credentialId: CredentialId | null, 
     if (fact.scope.kind === "credential") cleared.push(fact.kind);
     changed = true;
   }
-  if (changed) writer.touch(() => persist(path));
+  if (changed) writer.touch(() => persist(path, now));
   return cleared;
 }
 
@@ -449,7 +464,7 @@ function clearMatchingActiveFacts(
         : { ...fact.scope },
     });
   }
-  if (cleared.length > 0) writer.touch(() => persist(path));
+  if (cleared.length > 0) writer.touch(() => persist(path, now));
   return cleared.sort((a, b) =>
     a.kind.localeCompare(b.kind) || keyOfScope(a.scope).localeCompare(keyOfScope(b.scope))
   );
@@ -493,10 +508,15 @@ export function describeScope(scope: FactScope): string {
   }
 }
 
-export function flushFacts(opts: { path?: string } = {}): void {
+export function flushFacts(opts: { path?: string; now?: number } = {}): void {
   if (!writer.dirty) return;
+  // A non-finite `now` (only reachable from a caller passing one explicitly) must fall back, never
+  // skip: `flushFacts` runs at shutdown, and refusing to flush would lose the pending write
+  // outright. The prune is the part that needs a clock; the write is not optional.
+  const supplied = opts.now ?? Date.now();
+  const now = Number.isFinite(supplied) ? supplied : Date.now();
   writer.clear();
-  persist(opts.path ?? defaultPath());
+  persist(opts.path ?? defaultPath(), now);
 }
 
 export function resetFacts(): void {
