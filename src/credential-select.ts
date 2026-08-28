@@ -2,6 +2,7 @@ import type { ResolvedAttempt } from "./resolved-attempt.js";
 import type { CredentialId } from "./credential-id.js";
 import type { FactScope } from "./target-facts.js";
 import type { QuotaObservation } from "./quota-observation.js";
+import { periodStart } from "./availability.js";
 
 /** A non-secret learned fact, already materialized for the candidate being routed. */
 export interface CredentialFact {
@@ -105,7 +106,14 @@ function headroomBand(
     now - observation.observedAt <= freshnessMs &&
     (observation.resetsAt === null || observation.resetsAt > now) &&
     Number.isFinite(observation.limit) && observation.limit > 0 &&
-    Number.isFinite(observation.remaining) && observation.remaining >= 0,
+    Number.isFinite(observation.remaining) && observation.remaining >= 0 &&
+    // The observation must describe the CURRENT period (UTC). An observation from a previous
+    // minute/day period is stale even if its observedAt is within the freshness window —
+    // the availability ladder (availability.ts) applies the same read-time eligibility test.
+    (() => {
+      const start = periodStart(now, observation.period);
+      return start === null || observation.observedAt >= start;
+    })(),
   );
   if (fresh.length === 0) return 1; // unknown
   const minimum = Math.min(...fresh.map((observation) => (observation.remaining / observation.limit) * 100));
