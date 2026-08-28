@@ -203,7 +203,15 @@ describe("mid-stream backend failure (REL-47acf940)", () => {
 });
 
 describe("inbound credential removal (INV-HS-8)", () => {
-  const base = { provider: "p", base: "http://127.0.0.1:1", kind: "anthropic", timeoutMs: 1000 } as unknown as ResolvedTarget;
+  // `authHeader` is REQUIRED on ResolvedTarget and production always supplies it
+  // (`parseAuthHeader` defaults it at config load), but the `as unknown as` cast let this fixture
+  // omit it. The old `buildAuthHeaders` ended in an unconditional `return { "x-api-key": value }`,
+  // so an absent header silently became `x-api-key` and nothing complained. Making that classifier
+  // total is what surfaced the gap — state it explicitly rather than leaning on a fall-through.
+  const base = {
+    provider: "p", base: "http://127.0.0.1:1", kind: "anthropic", timeoutMs: 1000,
+    authHeader: "x-api-key",
+  } as unknown as ResolvedTarget;
 
   it("declared-missing REMOVES the caller's Authorization and x-api-key, then throws", () => {
     const varName = "LLM_RELAY_TEST_MISSING_KEY";

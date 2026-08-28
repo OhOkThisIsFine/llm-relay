@@ -28,7 +28,7 @@ import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
-import { contextWindowResolver } from "./metadata.js";
+import { contextWindowResolver, type ContextWindowSource } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
 import { observedContextLimit, flushObservedContextLimits } from "./context-limits.js";
 import { allFacts, describeScope, flushFacts, FACT_KINDS, type FactKind } from "./target-facts.js";
@@ -76,6 +76,15 @@ import {
   runKeysUnlockLocal,
   type KeysCliDependencies,
 } from "./keys-cli.js";
+
+// Provenance stays attached to the rendered number: a first-party figure and a same-model figure
+// taken from another host are different claims, and a future source must be a compile error at the
+// table, not an unknown rendered as the strongest claim.
+const CONTEXT_WINDOW_SOURCE_LABEL: Record<ContextWindowSource, string> = {
+  observed: "learned from what this deployment stated when it refused an over-length request",
+  snapshot: "synced snapshot, same model id on another host",
+  provider: "published by the serving provider",
+} satisfies Record<ContextWindowSource, string>;
 
 const VALUE_FLAGS = new Set<string>([
   "--config", "-config", "-c",
@@ -2039,24 +2048,21 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     // and the consequence differs a lot: the child falls back to its own assumed window, which on
     // a large-context model throws most of it away.
     if (l.transposed && wantsContextWindow) {
-      // Provenance travels with the number, same rule as `strengthBasis` on a candidate row: a
-      // first-party figure and a same-model figure taken from another host are different claims.
-      const basis =
-        l.contextWindowSource === "observed"
-          ? "learned from what this deployment stated when it refused an over-length request"
-          : l.contextWindowSource === "snapshot"
-            ? "synced snapshot, same model id on another host"
-            : "published by the serving provider";
       // Say how much of a pool the reported minimum actually covers. Without it, a floor drawn
       // from 28 of 29 members reads identically to one drawn from all of them.
       const coverage =
         l.contextWindowUnknownMembers !== undefined
           ? `; ${l.contextWindowUnknownMembers} pool member${l.contextWindowUnknownMembers === 1 ? "" : "s"} unmeasured`
           : "";
+      // `contextWindow` and `contextWindowSource` are written together (`dispatch.ts`, inside
+      // `if (window !== null)`), so a window with no source cannot occur. Test BOTH anyway rather
+      // than assert one from the other: that is what lets the label be a total table lookup with
+      // no fallback, and a fallback here would mean inventing a provenance for a number whose
+      // provenance we did not have.
       process.stdout.write(
-        l.contextWindow === undefined
+        l.contextWindow === undefined || l.contextWindowSource === undefined
           ? `   context: nothing known for this spec — the variable is omitted and the CLI uses its own default\n`
-          : `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (${basis}${coverage})\n`,
+          : `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (${CONTEXT_WINDOW_SOURCE_LABEL[l.contextWindowSource]}${coverage})\n`,
       );
     }
     if (l.unreachable) process.stdout.write(`   ⚠ ${l.unreachable}\n`);
