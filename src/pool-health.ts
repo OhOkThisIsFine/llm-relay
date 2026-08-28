@@ -104,8 +104,9 @@ export async function probeMember(
   });
 
   const started = now();
+  const signal = p.timeoutMs && p.timeoutMs > 0 ? AbortSignal.timeout(p.timeoutMs) : null;
   try {
-    const r = await fetchFn(url, { method: "POST", headers: authHeaders(p, apiKey), body });
+    const r = await fetchFn(url, { method: "POST", headers: authHeaders(p, apiKey), body, signal });
     const latencyMs = now() - started;
     if (r.status === 401 || r.status === 403) {
       // The server said no; we cannot tell why from one signed request. Free-tier rosters
@@ -137,7 +138,19 @@ export async function probeMember(
     }
     return { pool, spec, credentialId, verdict: "live", httpStatus: r.status, latencyMs };
   } catch (e) {
-    return { pool, spec, credentialId, verdict: "error", latencyMs: now() - started, detail: (e as Error).message };
+    // ⚠ BOTH names, and the second is the one that actually fires here. `AbortSignal.timeout()`
+    // aborts with a `TimeoutError`, not an `AbortError` — only `AbortController.abort()` produces
+    // the latter (`ping.ts` uses a controller, which is why its own check reads `AbortError`).
+    // Matching only `AbortError` would leave the deadline working but reporting a raw DOMException
+    // message, and a test that hand-throws an `AbortError` would not notice.
+    const latencyMs = now() - started;
+    const name = e instanceof Error ? e.name : "";
+    if (name === "TimeoutError" || name === "AbortError") {
+      // A deadline is not evidence about the credential or the model — `error` is the verdict whose
+      // evidence actually fits, per the v0.49.0 rule that a verdict may only claim what it can show.
+      return { pool, spec, credentialId, verdict: "error", latencyMs, detail: "probe timed out" };
+    }
+    return { pool, spec, credentialId, verdict: "error", latencyMs, detail: (e as Error).message };
   }
 }
 

@@ -70,7 +70,7 @@ import {
 } from "./dashboard-static.js";
 import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
-import { estimateRequestTokens, assessCost, resolveMetadata } from "./metadata.js";
+import { estimateRequestTokens, assessCost, resolveMetadata, type CostClass } from "./metadata.js";
 import { findTierModel, loadTierData, type TierModel } from "./tier-data.js";
 import { specOfTarget } from "./benchmarks.js";
 import { extractQuotaObservations, type QuotaObservation } from "./quota-observation.js";
@@ -80,6 +80,14 @@ import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedCon
 import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact, type FactResetBasis } from "./target-facts.js";
 import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
+/**
+ * Resolves a deployment's cost class LIVE from the catalog, for facts that apply to one class
+ * only. Threaded exactly like `QuotaDemotionFn`: built once per proxy with its dependencies bound,
+ * and read fresh per call so it follows the catalog's own refresh rather than a snapshot.
+ * `undefined` means "could not classify" — a cost-filtered fact then does not apply, which is the
+ * fail-safe direction.
+ */
+type CostClassFn = (attempt: ResolvedAttempt) => CostClass | undefined;
 import { createHardCapLedgerReader, evaluateHardCap, hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
@@ -349,6 +357,29 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
         ? (deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow">)
         : null,
   });
+  // The cost class of a deployment, resolved LIVE from the catalog, for facts that apply to only
+  // one class. Built once per proxy like `quotaDemotion` above, and read fresh on every call so it
+  // tracks the catalog's own 10-minute refresh.
+  //
+  // ⚠ Why this exists: OpenRouter's `403 Key limit exceeded (weekly limit)` names the KEY, but it
+  // is a SPEND limit — its surface is the PAID subset. A credential-scoped demotion took out 18
+  // free models that were answering 200 (measured 2026-08-28). A `group` scope with a member list
+  // cannot fix it either, because a provider moves models between free, discounted and paid on its
+  // own schedule. Referencing the CLASSIFIER rather than a list is what cannot go stale.
+  //
+  // ⚠ Anthropic passthrough is definitionally not free — it spends primary quota — so it reports
+  // `paid` rather than a guess, exactly as the `targetCandidates` assessment above does.
+  const costClassOf = (attempt: ResolvedAttempt): CostClass | undefined => {
+    const t = attempt.target;
+    if (t.kind !== "openai" || !t.model) return "paid";
+    try {
+      return assessCost(t.model, catalog.cachedLimits(t.provider, t.model), cfg.providers[t.provider]?.tierType).costClass;
+    } catch {
+      // Unknown class ⇒ a cost-filtered fact simply does not apply. Never demote on a
+      // classification we could not make.
+      return undefined;
+    }
+  };
   // G2: the operator-set refusal ceilings. Narrowed to the SAME in-memory `usedInWindow` seam the
   // demotion term reads — a bare programmatic proxy has no ledger and its caps simply never fire
   // (unknown usage ⇒ no refusal). Built once per proxy; each call re-reads the live window.
@@ -477,6 +508,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
       quotaDemotion,
+      costClassOf,
       hardCap: hardCapEvaluator,
     }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
@@ -545,6 +577,7 @@ interface Handlers {
    * out pays one property read per candidate and nothing else.
    */
   quotaDemotion: QuotaDemotionFn;
+  costClassOf: CostClassFn;
   /**
    * G2's operator-set refusal ceilings (see `hard-cap.ts`). Null ⇒ no opinion; unlike the demotion
    * term this may REFUSE, and only ever on a figure the operator declared plus this relay's own
@@ -1154,6 +1187,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           t.provider,
           null,
           t.model,
+          { costClass: assessment.costClass },
         )) kept.push(t);
         else if (!blocked) {
           blocked = {
@@ -1222,6 +1256,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     h.breaker,
     routingNow,
     h.quotaDemotion,
+    h.costClassOf,
   );
   let walkAttempts = orderedAttempts;
   let sticky: StickyRequestContext | null = null;
@@ -1242,6 +1277,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           degradedSpecs,
           routingNow,
           h.quotaDemotion,
+          h.costClassOf,
         );
         walkAttempts = applied.targets;
         sticky.provenance = `${pinnedSpec} (${applied.status})`;
@@ -1846,10 +1882,15 @@ function degradedLabel(pool: string | null, degraded: Set<string> | null, target
 }
 
 /** Is a learned allowance exhaustion still cooling this target? Never throws — no store, no cooling. */
-function cooledByAllowance(attempt: ResolvedAttempt, now: number): boolean {
+function cooledByAllowance(attempt: ResolvedAttempt, now: number, costClass: CostClass | undefined): boolean {
   try {
     const { target } = attempt;
-    const until = cooldownUntil(target.provider, attempt.credentialId, target.model ?? null, { now });
+    // `exactOptionalPropertyTypes` is on: an explicit `undefined` is not the same as absent, and
+    // absent is what "the caller could not classify this" must look like to `factsFor`.
+    const until = cooldownUntil(target.provider, attempt.credentialId, target.model ?? null, {
+      now,
+      ...(costClass === undefined ? {} : { costClass }),
+    });
     return until !== null && now < until;
   } catch {
     return false;
@@ -1894,10 +1935,11 @@ function targetUsability(
   breaker: CircuitBreaker,
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
 ): TargetUsability {
   const identity = targetIdentity(attempt);
   if (!breaker.isHealthy(identity, now)) return "cooling";
-  if (cooledByAllowance(attempt, now)) return "cooling";
+  if (cooledByAllowance(attempt, now, costClassOf?.(attempt))) return "cooling";
   // A stated/declared quota at zero belongs in the SAME band as allowance-exhaustion above: both
   // are temporary conditions on a deployment that is otherwise healthy, and ordering them ahead
   // of live members is the whole point — the walk should spend its round-trips where capacity is.
@@ -1941,7 +1983,11 @@ function credentialEvidence(
     facts,
     health: breaker.isHealthy(identity, now) ? "unknown" as const : "unhealthy" as const,
     credentialFault: breaker.hasCredentialFault(identity, now),
-    cooling: cooledByAllowance(attempt, now),
+    // `cost` here is deliberately assessed with NO catalog limits (see above), so it can say
+    // `free` from a provider tier but never `paid` from a price. Passing it would under-report a
+    // paid deployment as unclassified, so this evidence view reports cooling for cost-filtered
+    // facts the same fail-safe way any unclassified caller does: they simply do not apply.
+    cooling: cooledByAllowance(attempt, now, undefined),
     saturated: provider?.maxConcurrent != null && breaker.inFlightCredential(attempt.credentialId) >= provider.maxConcurrent,
     quota: state?.quotaObservations ?? [],
     cost,
@@ -1958,6 +2004,7 @@ function orderDeploymentGroupsByUsability(
   breaker: CircuitBreaker,
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
 ): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null } {
   type Group = ReturnType<typeof groupCredentialAttempts>[number];
   const preferred = groupCredentialAttempts(attempts)[0]?.attempts[0];
@@ -1965,7 +2012,7 @@ function orderDeploymentGroupsByUsability(
   const faulted: Group[] = [];
   const cooling: Group[] = [];
   for (const group of groupCredentialAttempts(attempts)) {
-    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion);
+    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf);
     if (usability === "cooling") cooling.push(group);
     else if (usability === "credential-fault") faulted.push(group);
     else live.push(group);
@@ -2283,6 +2330,7 @@ function applyStickyOrdering(
   degraded: Set<string> | null,
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
 ): { targets: ResolvedAttempt[]; status: string } {
   const groups = groupCredentialAttempts(ordered);
   const pinnedIndex = groups.findIndex((group) => specOfTarget(group.attempts[0]!.target) === pinnedSpec);
@@ -2291,7 +2339,7 @@ function applyStickyOrdering(
   if (!pinned || !pinnedGroup) return { targets: ordered, status: "bypassed: not-in-pool" };
 
   // The first row is the credential selector's best-ranked usable slot for this deployment.
-  const usability = targetUsability(pinned, breaker, now, quotaDemotion);
+  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf);
   if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
 
   if (degraded?.has(pinnedSpec)) {
@@ -2299,7 +2347,7 @@ function applyStickyOrdering(
       (group) => {
         const candidate = group.attempts[0]!;
         return !degraded.has(specOfTarget(candidate.target)) &&
-          targetUsability(candidate, breaker, now, quotaDemotion) === "live";
+          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf) === "live";
       },
     );
     if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
@@ -2360,6 +2408,7 @@ function orderByUsabilityTracked(
   breaker: CircuitBreaker,
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
 ): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null } {
   const live: ResolvedAttempt[] = [];
   const faulted: ResolvedAttempt[] = [];
@@ -2375,7 +2424,7 @@ function orderByUsabilityTracked(
     // Demotion, never exclusion — same contract as the rest of this function, and doubly so here:
     // an exhausted allowance is a temporary condition on a deployment that is still free, and a
     // pool with nothing else left must still be able to try it.
-    const usability = targetUsability(attempt, breaker, now, quotaDemotion);
+    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf);
     if (usability === "cooling") cooling.push(attempt);
     else if (usability === "credential-fault") faulted.push(attempt);
     else live.push(attempt);
@@ -3021,6 +3070,11 @@ function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfter
     recordFact(verdict.class, scope, {
       retryAfterMs: reset?.ms ?? null,
       ...(reset === null ? {} : { untilBasis: reset.basis }),
+      // The verdict's cost filter travels with it. Without this the reviewer's "paid deployments
+      // only" would be accepted, displayed, and then silently dropped on the way to the store —
+      // the verdict would demote everything the scope covers, which is the defect it was written
+      // to prevent.
+      ...(verdict.costClasses === undefined ? {} : { costClasses: verdict.costClasses }),
     });
     return { unknown: false, scope };
   } catch {

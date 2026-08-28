@@ -282,11 +282,16 @@ export function buildAuthHeaders(
 ): Record<string, string> {
   if (!keyIsPresent(key)) return {};
   const value = key!.trim();
-  if (authHeader === "authorization") {
-    return { authorization: value.startsWith("Bearer ") ? value : `Bearer ${value}` };
-  }
-  return { "x-api-key": value };
+  return AUTH_HEADER_WRITER[authHeader](value);
 }
+
+// A writer table, not an if/else: a future `AuthHeaderName` must be a compile error here, never a
+// credential silently sent under the wrong header name. Gated on the declared `authHeader` only.
+const AUTH_HEADER_WRITER: Record<AuthHeaderName, (value: string) => Record<string, string>> = {
+  "x-api-key": (value) => ({ "x-api-key": value }),
+  authorization: (value) =>
+    ({ authorization: value.startsWith("Bearer ") ? value : `Bearer ${value}` }),
+} satisfies Record<AuthHeaderName, (value: string) => Record<string, string>>;
 
 /**
  * Pick the env-var name this provider's key actually lives under. Falls back to the

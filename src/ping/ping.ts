@@ -102,6 +102,8 @@ async function sendPingFetch(
 async function isDisabledThinkingRejected(resp: Response, req: { body: Record<string, unknown> }): Promise<boolean> {
   if (!req.body["thinking"] || !DISABLED_THINKING_RETRY_STATUSES.has(resp.status)) return false;
   try {
+    // Use clone() to read without consuming the original body — the original
+    // will be cancelled by the caller if this returns true, or served if false.
     const text = await resp.clone().text();
     return /thinking/i.test(text);
   } catch {
@@ -128,6 +130,9 @@ export async function pingProviderModel(
 
     if (await isDisabledThinkingRejected(resp, req)) {
       markDisabledThinkingUnsupported(providerName);
+      // Cancel the response we decided not to serve (its body was read by the check
+      // above), so the socket isn't stranded on the retry path.
+      await resp.body?.cancel().catch(() => {});
       req = buildPingRequest(providerName, modelId, cfg, apiKey, { disableThinking: false });
       resp = await sendPingFetch(req, ctrl.signal, opts.fetchFn);
     }
@@ -135,6 +140,9 @@ export async function pingProviderModel(
     const code = resp.status >= 200 && resp.status < 300 ? "200" : String(resp.status);
     const ms = Math.round(performance.now() - t0);
     const quotaObservations = extractQuotaObservations(resp.headers);
+    // The body was never read and never served — release the socket rather than holding it
+    // until GC (the abort timer is disarmed below, so nothing else would).
+    await resp.body?.cancel().catch(() => {});
 
     return { code, ms, quotaObservations };
   } catch (err: unknown) {

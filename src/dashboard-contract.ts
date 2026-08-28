@@ -168,37 +168,39 @@ export const DASHBOARD_ERROR_MESSAGES = Object.freeze([
 ] as const);
 export type DashboardErrorMessage = (typeof DASHBOARD_ERROR_MESSAGES)[number];
 
-export type TokenSource = "provider_reported" | "relay_estimated";
-export type SpendPriceSource = "provider_published" | "reference";
-export type TokenBasis = "reported" | "estimated";
-export type SpendSource = "provider_reported" | "relay_estimated" | "unknown";
+export const TOKEN_SOURCES = Object.freeze(["provider_reported", "relay_estimated"] as const);
+export type TokenSource = (typeof TOKEN_SOURCES)[number];
+
+export const SPEND_PRICE_SOURCES = Object.freeze(["provider_published", "reference"] as const);
+export type SpendPriceSource = (typeof SPEND_PRICE_SOURCES)[number];
+
+export const TOKEN_BASES = Object.freeze(["reported", "estimated"] as const);
+export type TokenBasis = (typeof TOKEN_BASES)[number];
+
+export const SPEND_SOURCES = Object.freeze(["provider_reported", "relay_estimated", "unknown"] as const);
+export type SpendSource = (typeof SPEND_SOURCES)[number];
+
 // `published` / `derived_published` were added 2026-08-22 when the availability producer landed:
 // a catalog-harvested rate limit (spec Gap 13) is a fourth limit provenance, and collapsing it
 // onto `configured` or `learned` would mislabel where the number came from.
-export type LimitBasis = "provider_stated" | "configured" | "learned" | "published";
-export type RemainingBasis =
-  | "provider_stated"
-  | "derived_provider_stated"
-  | "derived_configured"
-  | "derived_learned"
-  | "derived_published";
+export const LIMIT_BASES = Object.freeze(["provider_stated", "configured", "learned", "published"] as const);
+export type LimitBasis = (typeof LIMIT_BASES)[number];
+
+export const REMAINING_BASES = Object.freeze(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"] as const);
+export type RemainingBasis = (typeof REMAINING_BASES)[number];
+
 /** `relay_counted` is a completed-request total observed by the relay, not provider reporting. */
-export type LocalUsedBasis = "reported" | "estimated" | "mixed" | "relay_counted";
+export const LOCAL_USED_BASES = Object.freeze(["reported", "estimated", "mixed", "relay_counted"] as const);
+export type LocalUsedBasis = (typeof LOCAL_USED_BASES)[number];
+
 /**
  * Where a quota row's `resetsAt` came from (spec §5.2 ladder). `provider_stated` is the response's
  * own header/observation; `reviewed_rule` is a persisted reviewed refusal-interpretation rule
  * (added 2026-08-23, additive — the rung existed unfed until the fact store started persisting
  * reset provenance); `derived_boundary` is the UTC period boundary this relay computed.
  */
-export type ResetsAtBasis = "provider_stated" | "reviewed_rule" | "derived_boundary";
-export const TOKEN_SOURCES = Object.freeze(["provider_reported", "relay_estimated"] as const);
-export const SPEND_PRICE_SOURCES = Object.freeze(["provider_published", "reference"] as const);
-export const TOKEN_BASES = Object.freeze(["reported", "estimated"] as const);
-export const SPEND_SOURCES = Object.freeze(["provider_reported", "relay_estimated", "unknown"] as const);
-export const LIMIT_BASES = Object.freeze(["provider_stated", "configured", "learned", "published"] as const);
-export const REMAINING_BASES = Object.freeze(["provider_stated", "derived_provider_stated", "derived_configured", "derived_learned", "derived_published"] as const);
-export const LOCAL_USED_BASES = Object.freeze(["reported", "estimated", "mixed", "relay_counted"] as const);
 export const RESETS_AT_BASES = Object.freeze(["provider_stated", "reviewed_rule", "derived_boundary"] as const);
+export type ResetsAtBasis = (typeof RESETS_AT_BASES)[number];
 
 export type ResponseAttribution = Attribution | "all";
 export const RESPONSE_ATTRIBUTIONS = Object.freeze(["relay_held", "caller_operated", "unknown", "all"] as const);

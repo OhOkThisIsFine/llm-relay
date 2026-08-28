@@ -1,5 +1,6 @@
 import { relayStatePath } from "./state-paths.js";
-import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import type { CostClass } from "./metadata.js";
+import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -121,6 +122,15 @@ export type ResetRule =
 export interface Interpretation {
   class: FactKind;
   scope: ScopeTemplate;
+  /**
+   * Which cost classes the verdict covers. ABSENT = every class.
+   *
+   * Resolved through `assessCost()` at READ time, so unlike a group member list it follows the
+   * catalog rather than a snapshot — a model moving free → discounted moves with it. Exists
+   * because a provider spend limit (OpenRouter's weekly KEY limit) names the credential but only
+   * covers its PAID deployments.
+   */
+  costClasses?: readonly CostClass[];
   /** How long until it clears, when the reviewer could determine that. Optional. */
   reset?: ResetRule;
   /**
@@ -885,6 +895,7 @@ function mergeStores(disk: InterpretationStore, memory: InterpretationStore): In
 function persist(path: string): void {
   if (!_store) return;
   const normalizedPath = resolve(path);
+  let tmp: string | null = null;
   try {
     // Before writing, check if the file has changed since we loaded it.
     // If so, re-read and merge to avoid lost updates.
@@ -899,15 +910,21 @@ function persist(path: string): void {
     }
 
     mkdirSync(join(normalizedPath, ".."), { recursive: true });
-    const tmp = `${normalizedPath}.${process.pid}.tmp`;
+    tmp = `${normalizedPath}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(storeToWrite, null, 2) + "\n", "utf8");
     renameSync(tmp, normalizedPath);
+    tmp = null;
 
     // Update memoized token to the newly-written file's stat.
     const newObservation = observeInterpretationStore(normalizedPath);
     _token = newObservation.kind === "present" ? newObservation.token : null;
   } catch {
     /* storage problem, never a request failure — same contract as every other store here */
+  }
+  finally {
+    if (tmp !== null) {
+      try { unlinkSync(tmp); } catch { /* best effort cleanup */ }
+    }
   }
 }
 

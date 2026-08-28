@@ -62,6 +62,43 @@ describe("lane manifest", () => {
     expect(verifyModel(emptyRoster, "agy.exe", "anything").status).toBe("unknown");
   });
 
+  it("⚠ corrupt manifests degrade to UNKNOWN (loader validates deeply, returns null)", async () => {
+    const { loadLaneManifest } = await import("../src/lane-manifest.js");
+    const { tmpdir } = await import("node:os");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+
+    const dir = mkdtempSync(join(tmpdir(), "lane-corrupt-"));
+
+    // models: ["string"] — string.id is undefined, would silently evict as not-servable
+    const corruptStrings = join(dir, "corrupt-strings.json");
+    writeFileSync(corruptStrings, JSON.stringify({
+      version: 1,
+      lanes: { agy: { via: "agy models", probedAt: "2026-08-08T00:00:00Z", models: ["x"] } }
+    }));
+    expect(loadLaneManifest(corruptStrings)).toBeNull();
+
+    // models: [null] — would throw in verifyModel
+    const corruptNull = join(dir, "corrupt-null.json");
+    writeFileSync(corruptNull, JSON.stringify({
+      version: 1,
+      lanes: { agy: { via: "agy models", probedAt: "2026-08-08T00:00:00Z", models: [null] } }
+    }));
+    expect(loadLaneManifest(corruptNull)).toBeNull();
+
+    // models: 5 — not an array, would throw
+    const corruptNumber = join(dir, "corrupt-number.json");
+    writeFileSync(corruptNumber, JSON.stringify({
+      version: 1,
+      lanes: { agy: { via: "agy models", probedAt: "2026-08-08T00:00:00Z", models: 5 } }
+    }));
+    expect(loadLaneManifest(corruptNumber)).toBeNull();
+
+    // Also: verifyModel returns unknown when manifest is null (loader returns null)
+    const { verifyModel } = await import("../src/lane-manifest.js");
+    expect(verifyModel(null, "agy.exe", "anything").status).toBe("unknown");
+  });
+
   it("uses a STATED support list to reject an argument value", () => {
     // Codex publishes supported_reasoning_levels per model, so this needs no failed call.
     expect(unsupportedArgValues(manifest(), "codex", "gpt-5.6-sol", "model_reasoning_effort", "ultra").unsupported)

@@ -28,7 +28,7 @@ import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
-import { contextWindowResolver } from "./metadata.js";
+import { contextWindowResolver, COST_CLASSES, type ContextWindowSource, type CostClass } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
 import { observedContextLimit, flushObservedContextLimits } from "./context-limits.js";
 import { allFacts, describeScope, flushFacts, FACT_KINDS, type FactKind } from "./target-facts.js";
@@ -77,6 +77,15 @@ import {
   type KeysCliDependencies,
 } from "./keys-cli.js";
 
+// Provenance stays attached to the rendered number: a first-party figure and a same-model figure
+// taken from another host are different claims, and a future source must be a compile error at the
+// table, not an unknown rendered as the strongest claim.
+const CONTEXT_WINDOW_SOURCE_LABEL: Record<ContextWindowSource, string> = {
+  observed: "learned from what this deployment stated when it refused an over-length request",
+  snapshot: "synced snapshot, same model id on another host",
+  provider: "published by the serving provider",
+} satisfies Record<ContextWindowSource, string>;
+
 const VALUE_FLAGS = new Set<string>([
   "--config", "-config", "-c",
   "--provider", "-provider", "-p",
@@ -103,6 +112,7 @@ const VALUE_FLAGS = new Set<string>([
   "--shell", "-shell",
   "--class", "-class",
   "--members", "-members",
+  "--cost-class", "-cost-class",
   "--rationale", "-rationale",
   "--reset-field", "-reset-field",
   "--reset-ms", "-reset-ms",
@@ -247,6 +257,7 @@ ${formatTextTable([
   ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
   ["llm-relay eligibility <propose|accept> <n> --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model."],
   ["llm-relay eligibility ... --scope group --members <id,id,...> [--all-credentials]", "Groups default to the current credential slot; the flag explicitly widens them."],
+  ["llm-relay eligibility ... --cost-class free|paid|unknown", "Cover only deployments of that cost class, resolved live from catalog prices."],
   ["eligibility scope breadth", "credential = current credential slot; provider = all credentials for that provider."],
   ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane; adapts to the calling host."],
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
@@ -2039,24 +2050,21 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     // and the consequence differs a lot: the child falls back to its own assumed window, which on
     // a large-context model throws most of it away.
     if (l.transposed && wantsContextWindow) {
-      // Provenance travels with the number, same rule as `strengthBasis` on a candidate row: a
-      // first-party figure and a same-model figure taken from another host are different claims.
-      const basis =
-        l.contextWindowSource === "observed"
-          ? "learned from what this deployment stated when it refused an over-length request"
-          : l.contextWindowSource === "snapshot"
-            ? "synced snapshot, same model id on another host"
-            : "published by the serving provider";
       // Say how much of a pool the reported minimum actually covers. Without it, a floor drawn
       // from 28 of 29 members reads identically to one drawn from all of them.
       const coverage =
         l.contextWindowUnknownMembers !== undefined
           ? `; ${l.contextWindowUnknownMembers} pool member${l.contextWindowUnknownMembers === 1 ? "" : "s"} unmeasured`
           : "";
+      // `contextWindow` and `contextWindowSource` are written together (`dispatch.ts`, inside
+      // `if (window !== null)`), so a window with no source cannot occur. Test BOTH anyway rather
+      // than assert one from the other: that is what lets the label be a total table lookup with
+      // no fallback, and a fallback here would mean inventing a provenance for a number whose
+      // provenance we did not have.
       process.stdout.write(
-        l.contextWindow === undefined
+        l.contextWindow === undefined || l.contextWindowSource === undefined
           ? `   context: nothing known for this spec — the variable is omitted and the CLI uses its own default\n`
-          : `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (${basis}${coverage})\n`,
+          : `   context: ${l.contextWindow.toLocaleString("en-US")} tokens (${CONTEXT_WINDOW_SOURCE_LABEL[l.contextWindowSource]}${coverage})\n`,
       );
     }
     if (l.unreachable) process.stdout.write(`   ⚠ ${l.unreachable}\n`);
@@ -2363,13 +2371,25 @@ const FACT_MEANING: Record<FactKind, string> = {
   "rate-limit-tpd": "a ceiling this deployment stated about itself — a measurement, never a demotion",
 };
 
+/**
+ * The command that commits a proposal — and it must reproduce the proposal EXACTLY.
+ *
+ * ⚠ Every narrowing option belongs here. This line is meant to be copy-pasted, so an option the
+ * proposer supplied and this omits is silently WIDENED at accept time: a `--cost-class paid`
+ * proposal whose accept command drops the flag commits the credential-wide verdict that the flag
+ * exists to prevent. Add the flag here in the same change that adds it above.
+ */
 function eligibilityAcceptCommand(
   index: number,
   cls: FactKind,
   scope: ScopeTemplate,
   reset: ResetRule | undefined,
+  costClasses?: readonly CostClass[],
 ): string {
-  return `llm-relay eligibility accept ${index} --class ${cls} --scope ${eligibilityScopeArgs(scope)}${eligibilityResetArgs(reset)}`;
+  const cost = costClasses === undefined || costClasses.length === 0
+    ? ""
+    : ` --cost-class ${costClasses.join(",")}`;
+  return `llm-relay eligibility accept ${index} --class ${cls} --scope ${eligibilityScopeArgs(scope)}${eligibilityResetArgs(reset)}${cost}`;
 }
 
 export function runEligibility(sub: string | undefined, arg: string | undefined): void {
@@ -2443,18 +2463,47 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       }
       reset = { kind: "fixed", ms };
     }
-    const shown = scopeName === "group"
+    // ⚠ WHICH COST CLASSES it covers, and the reviewer must see it for the same reason a group
+    // must name its members: an accepted verdict has to state exactly what it will demote.
+    //
+    // The case this exists for: OpenRouter's `403 Key limit exceeded (weekly limit)` names the KEY,
+    // so it reads as credential-wide. It is a SPEND limit, so its surface is the PAID subset —
+    // measured 2026-08-28, two free models answered 200 on the same credential while a paid one
+    // 403'd, and a credential-scoped verdict would have demoted 398 deployments, 18 of them free
+    // and working. Unlike `--members`, this cannot go stale: it is resolved through `assessCost()`
+    // against catalog prices that refresh on their own, so a model moving free → discounted moves
+    // with it.
+    const costClassRaw = argValue("--cost-class");
+    const costClasses = (costClassRaw ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (costClassRaw !== undefined && costClasses.length === 0) {
+      process.stderr.write(`llm-relay eligibility: --cost-class expects one or more of ${COST_CLASSES.join(" | ")}\n`);
+      process.exit(1);
+      return;
+    }
+    // Closed enum on every axis, exactly as `--class` and `--scope` are — that containment is what
+    // lets an agent propose at all. Derived from the vocabulary, never hand-listed here.
+    const badClass = costClasses.find((c) => !(COST_CLASSES as readonly string[]).includes(c));
+    if (badClass !== undefined) {
+      process.stderr.write(`llm-relay eligibility: --cost-class "${badClass}" is not one of ${COST_CLASSES.join(" | ")}\n`);
+      process.exit(1);
+      return;
+    }
+    const costFilter = costClasses.length > 0 ? (costClasses as CostClass[]) : undefined;
+    const scopeShown = scopeName === "group"
       ? `group of ${members.length} (${allCredentials ? "all credentials" : "current credential slot"})`
       : scopeName;
+    const shown = costFilter === undefined
+      ? scopeShown
+      : `${scopeShown}, ${costFilter.join("+")} deployments only`;
     if (action === "propose") {
-      proposeInterpretation(entry.signature, { class: cls, scope, rationale, ...(reset ? { reset } : {}) });
+      proposeInterpretation(entry.signature, { class: cls, scope, rationale, ...(reset ? { reset } : {}), ...(costFilter ? { costClasses: costFilter } : {}) });
       flushInterpretations();
       process.stdout.write(
-        `proposed ${cls} (${shown}) — not yet binding. Commit with: ${eligibilityAcceptCommand(idx, cls, scope, reset)}\n`,
+        `proposed ${cls} (${shown}) — not yet binding. Commit with: ${eligibilityAcceptCommand(idx, cls, scope, reset, costFilter)}\n`,
       );
       return;
     }
-    acceptInterpretation(entry.signature, { override: { class: cls, scope, ...(reset ? { reset } : {}) } });
+    acceptInterpretation(entry.signature, { override: { class: cls, scope, ...(reset ? { reset } : {}), ...(costFilter ? { costClasses: costFilter } : {}) } });
     flushInterpretations();
     process.stdout.write(`accepted ${cls} (${shown}) — now applied to ${entry.provider}/${entry.model ?? "-"} refusals matching this message.\n`);
     return;
