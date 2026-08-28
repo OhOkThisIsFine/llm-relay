@@ -400,3 +400,37 @@ A fourth needs a decision of a different kind:
 
 4. **The fresh-install contradiction.** Change the template to declare the Anthropic passthrough, or
    change `README.md:43` and `QUICKSTART.md:68` to describe what the template actually does.
+
+---
+
+## Friction hit during this assessment
+
+Rewalked from the transcript, not from recall.
+
+1. **The fan-out lost 21 of 24 agents to a monthly spend limit mid-run.** The failure text was a
+   billing message, not a workflow error, so it did not look like a tool fault. `resumeFromRunId`
+   recovered it correctly: 3 agents replayed from cache, 63 ran, 0 errored. Resume works. Use it
+   instead of re-running a fan-out from the start.
+2. **Workflow journal result records carry no agent label.** `journal.jsonl` gave 69 result lines
+   whose `label` was `undefined`, so every one printed as `?`. I had to classify results by SHAPE
+   (`r.area`, `r.refuted`, `r.overall`) instead. A verdict therefore cannot be attributed to the
+   lane that produced it.
+3. **A Git Bash heredoc failed on a 130-line markdown document** with ``unexpected EOF while
+   looking for matching `'` `` despite `<<'EOF'` quoting. The `Write` tool succeeded on the same
+   content. Do not push large markdown with backticks and apostrophes through a heredoc.
+4. **The control-token header name is not discoverable from the error.** `GET /health` without it
+   answers `control authorization required`. The name is `x-llm-relay-control-token`
+   (`control-authorization.ts:21`), and the token is at `~/.llm-relay/control-token`. The error
+   names neither. One extra clause would save the next reader a source read.
+5. **Node cannot resolve a Git Bash `/tmp` path.** `curl -o /tmp/x.json` succeeded and
+   `require('/tmp/x.json')` then failed with `MODULE_NOT_FOUND`. Write to the scratchpad instead.
+6. **A verifier agent left `cfg2.json` in the repository root** — a throwaway fixture with a fake
+   key and an ephemeral port. Removed in the assessment commit. This is the recorded
+   "reviewer shells leak junk files" pattern, seen again. Check `git status` before every commit.
+7. **A free-text grading field invited the critic to renumber the axes.** It graded capability and
+   capacity under `axis2_single_verb`, and the tracking-to-routing seam under `axis3_cross_client`,
+   so neither the single-verb axis nor the cross-client axis received an overall verdict. Name each
+   axis inside its own schema field description.
+8. **`llm-relay routing show` reporting four empty pools cost real time.** I doubted the live config
+   until `llm-relay pools` reported 216 members each. That is finding 3 in the ledger above, and it
+   is also friction: the first read verb an operator reaches for is the misleading one.
