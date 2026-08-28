@@ -658,13 +658,23 @@ Rewalked from the transcript, not from memory. Each item cost real time.
    `<transcriptDir>/journal.jsonl` holds each agent's full return value, and
    `Workflow({scriptPath, resumeFromRunId})` replays the unchanged prefix from cache. Patching only
    the script's tail kept all 10 completed agents cached. Worth knowing before panicking.
-8. **The free relay pool lane failed this task twice.** Both runs read the inputs, printed
-   "Now I have all the source materials. Let me conduct the adversarial review systematically", and
-   exited 0 having written nothing. The second attempt explicitly instructed it to create the output
-   file first and append as it went; it created the placeholder and still produced no findings. This
-   is the "two words and exit 0 is a failure" mode already in memory — it is not fixed by a stricter
-   prompt. The independent review that DID land came from `codex exec --model gpt-5.6-sol`
-   (~27 minutes, 22 findings).
+8. **The free relay pool lane failed this task twice, for TWO DIFFERENT reasons** — and the second
+   one was my own fault, which is why both are recorded.
+   - Attempt 1 (`pool/medium`) read the inputs, printed "Now I have all the source materials. Let me
+     conduct the adversarial review systematically", and exited 0 having written nothing. That is
+     the "two words and exit 0 is a failure" mode already in memory.
+   - Attempt 2 (`pool/high`) was told to create its output file first and append as it went. It
+     created the placeholder, then died on
+     `API Error: 402 ... this model requires a subscription or extra usage` from an ollama member.
+     **That is a COLD POOL, not a broken lane.** I had restarted the relay three times while
+     applying config changes, and `llm-relay.vbs` says in as many words: in-memory breaker state is
+     lost on restart, so the first heavy walk burns the paid-gated members rediscovering their 402s
+     and can fail outright.
+   **Lesson: warm the pool after every relay restart, before spending a real job on it.** Confirmed
+   afterwards — one trivial request each and both pools answered: `pool/medium` in 11 s,
+   `pool/high` in 40 s, the extra time being the walk past the 402 members.
+   The independent review that DID land came from `codex exec --model gpt-5.6-sol` (~27 minutes,
+   22 findings, four genuine cross-file contradictions).
 9. **`codex exec` buffers all output until exit** under a background PowerShell pipeline, so a long
    run looks identical to a hung one. Check liveness by PID and CPU, not by output size.
 10. **agy truncates `cli.log` per run.** An early probe sliced "new" log lines and read stale ones
