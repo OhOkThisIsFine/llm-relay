@@ -192,6 +192,7 @@ history - do not reintroduce them.
 | `docs/evidence-2026-08-16/` | Machine-readable audit trail |
 | `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
 | `docs/documentation-pass-2026-08-27.md` | The 2026-08-27 doc-vs-source pass: what was wrong and in what classes, the two findings worth reading alone, what was deliberately left, and the friction. |
+| `docs/dispatch-integration-review-2026-08-27.md` | Cross-CLI dispatch: how the ladder is actually executed, the verified agy console-window cause and its host-side fix, agy's five-category permission vocabulary (three of its four entries had been inert), ACP as the verified cross-CLI transport, ranked options, open tests, and the friction. |
 
 ## 3. Verification — the one gate
 
