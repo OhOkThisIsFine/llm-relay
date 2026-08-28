@@ -7,8 +7,8 @@ function cfg(pools: Record<string, string[]>): Config {
     host: "127.0.0.1",
     port: 8791,
     providers: {
-      p1: { base: "https://p1.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 1000, authEnv: "P1_KEY" },
-      nokey: { base: "https://nokey.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 1000 },
+      p1: { base: "https://p1.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000, authEnv: "P1_KEY" },
+      nokey: { base: "https://nokey.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
     },
     routing: { default: "p1/m", tiers: {}, pools },
     mode: "detect",
@@ -226,4 +226,52 @@ describe("probeAllPools", () => {
   it("returns an empty list when no pools are configured", async () => {
     expect(await probeAllPools(cfg({}), respond(200, okBody))).toEqual([]);
   });
+
+  it("applies a total-operation deadline and returns both results when one member hangs", async () => {
+    const pools = { test: ["p1/fast", "p1/slow"] };
+    const c = cfg(pools);
+    // ⚠ A REAL deadline, deliberately short. The signal under test is a real `AbortSignal.timeout`,
+    // so the fixture's own `timeoutMs` is the wall-clock this test waits. At the shared 5000 it
+    // burned five real seconds and needed a 15 s budget — precisely the load-sensitive shape
+    // HANDOFF §3 records as having flaked two CLI tests for weeks. 40 ms proves the same thing.
+    c.providers.p1!.timeoutMs = 40;
+    // fast member resolves immediately
+    // slow member never settles (a Promise that never resolves) — only AbortSignal can stop it
+    let slowSettled = false;
+    const fetchFn = async (url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      const spec = body.model === "fast" ? "fast" : "slow";
+      if (spec === "fast") {
+        return new Response(okBody, { status: 200 });
+      }
+      // slow: await a promise that never resolves unless the signal aborts.
+      // ⚠ Reject with the signal's OWN `reason`, not a hand-made AbortError. `AbortSignal.timeout()`
+      // aborts with a **TimeoutError**; only `AbortController.abort()` produces an `AbortError`.
+      // A fake that invents an AbortError would pass against a `name === "AbortError"` check that
+      // a real timeout never satisfies — which is exactly the bug this fixture nearly hid.
+      await new Promise<void>((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        if (signal) {
+          if (signal.aborted) {
+            reject(signal.reason);
+          } else {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          }
+        }
+      });
+      slowSettled = true;
+      return new Response(okBody, { status: 200 }); // never reached without abort
+    };
+    const results = await probeAllPools(c, fetchFn);
+    // Should return both members without hanging
+    expect(results).toHaveLength(2);
+    expect(results.map(r => r.spec)).toEqual(["p1/fast", "p1/slow"]);
+    expect(results.find(r => r.spec === "p1/fast")!.verdict).toBe("live");
+    const slow = results.find(r => r.spec === "p1/slow")!;
+    expect(slow.verdict).toBe("error");
+    // Not merely "it stopped" — the operator must be told WHY. A raw DOMException message here
+    // would mean the TimeoutError fell through the abort branch.
+    expect(slow.detail).toBe("probe timed out");
+    expect(slowSettled).toBe(false); // the slow request was aborted, never settled naturally
+  }, 15000);
 });

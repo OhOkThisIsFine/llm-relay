@@ -494,4 +494,47 @@ describe("key-checker", () => {
       expect(leaks(results[0]?.message ?? "")).toBe(false);
     });
   });
+
+  describe("fetchProviderQuota timeout", () => {
+    it("passes a signal to the quota fetch and aborts at the provider's configured deadline", async () => {
+      process.env.MOCK_PROV_KEY = "good";
+      let seenSignal: AbortSignal | undefined;
+      const openRouterConfig: Config = {
+        ...baseConfig,
+        providers: {
+          openrouter: {
+            base: "https://openrouter.ai/api/v1",
+            kind: "openai",
+            authEnv: "MOCK_PROV_KEY",
+            authHeader: "authorization",
+            timeoutMs: 40,
+          },
+        },
+        routing: { default: "openrouter/model-x", tiers: {} },
+      };
+      const mockFetch = (async (url: string, init?: RequestInit) => {
+        seenSignal = init?.signal as AbortSignal | undefined;
+        if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 });
+        if (url.endsWith("/auth/key")) {
+          // Wait for the signal to abort
+          await new Promise<void>((resolve, reject) => {
+            if (seenSignal?.aborted) {
+              reject(seenSignal?.reason ?? new Error("aborted"));
+            } else {
+              seenSignal?.addEventListener("abort", () => reject(seenSignal?.reason ?? new Error("aborted")), { once: true });
+            }
+          });
+          return new Response(JSON.stringify({ data: { limit: 100, usage: 10 } }), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      }) as unknown as typeof fetch;
+
+      const results = await validateProviderKeys(openRouterConfig, mockFetch);
+      // Should complete (via withBudget) and not hang
+      expect(results).toHaveLength(1);
+      // The quota fetch was attempted with a signal
+      expect(seenSignal).toBeDefined();
+      expect(seenSignal).toBeInstanceOf(AbortSignal);
+    }, 15000);
+  });
 });
