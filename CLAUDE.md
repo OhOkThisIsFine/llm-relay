@@ -630,6 +630,22 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   credential axis. ⚠ **A group carries its own member list** — no registry, no prefix inference
   (that is the heuristic `authEnv.ts` refuses), and the reviewer sees exactly which models a group
   verdict will cover before accepting it.
+  ⚠ **A scope must match the SURFACE the evidence covers, not the noun the message names** (owner
+  correction, 2026-08-28). OpenRouter's `403 Key limit exceeded (weekly limit)` names the KEY, which
+  reads as a credential-scoped `allowance-exhausted`. It is not: that limit is a **SPEND** limit, so
+  its surface is the PAID subset. Measured on one credential inside one minute —
+  `cohere/north-mini-code:free` **200**, `dots-studio/dots-3-note-preview:free` **200**,
+  `deepseek/deepseek-v4-flash-0731` **403**. A credential-scoped fact would have demoted all 398
+  OpenRouter deployments, 18 of them free and answering. This is the mirror of the
+  "out of free credits is NOT paid" rule below: collapsing a paid-tier exhaustion onto the free tier
+  is the same defect facing the other way.
+  ⚠ **No scope can express a dynamic cost subset**, and that is the point — attempt → group →
+  deployment → credential → provider → model carry no cost dimension, and a `group` member list goes
+  stale because a provider moves models between free, discounted and paid on its own schedule.
+  `assessCost()` classifies cost LIVE (it is what `freeOnly` resolves through), but a fact cannot say
+  "the paid subset of this credential". **When the surface is a moving subset, record NO fact** and
+  let the per-deployment breaker discover it: per-deployment rediscovery looks like waste, and it is
+  what keeps the demotion from crossing the boundary.
 - **The breaker and the fact store COMPOSE; neither replaces the other.** Per-deployment behaviour
   (back-pressure, timeouts, an entitlement wall on one model) stays on the breaker. Only what a
   backend *states* about a wider scope becomes a fact: `rate-limited` fires on a 429 naming the

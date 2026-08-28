@@ -275,10 +275,36 @@ Rewalked from the transcript, not recalled.
    returned `OK` — the walk only exhausts on a LARGE request, which narrows the pool by context
    window to exactly the OpenRouter members. **A pool that answers a one-word probe is not a pool
    that can carry a long packet.**
-5. **This produced a live demonstration of the problem `target-facts.ts` exists for:** the same
-   account-level refusal was queued once PER MODEL (entries 17, 19-24, all identical). The message
-   names the KEY, so a credential-scoped `allowance-exhausted` fact is justified by the wording
-   rather than by counting siblings. Proposed, not accepted — only the operator may accept.
+5. **This produced a live demonstration of the problem `target-facts.ts` exists for** — and then a
+   sharper demonstration of the trap next to it. The same refusal was queued once PER MODEL
+   (entries 17, 19-24, all identical), which looks exactly like the "rediscovered per model" waste
+   the fact store was built to end. I proposed a **credential**-scoped `allowance-exhausted`,
+   reasoning that the message names the KEY.
+
+   ⚠ **That was wrong, and the owner caught it.** OpenRouter's weekly key limit is a **SPEND**
+   limit, and its models are a mix of free, temporarily discounted and paid — categories that
+   change on OpenRouter's schedule, not ours. Measured 2026-08-28 on one credential within one
+   minute: `cohere/north-mini-code:free` → **200**, `dots-studio/dots-3-note-preview:free` →
+   **200**, `deepseek/deepseek-v4-flash-0731` (paid) → **403 Key limit exceeded**. The relay's
+   OpenRouter catalog holds 398 models, 18 of them free.
+
+   So the condition is real but its SURFACE is the paid subset, not the credential. A
+   credential-scoped fact would have demoted all 398 deployments, including 18 that demonstrably
+   answer. **A scope must match the surface the evidence covers, not the noun the message
+   happens to name.** `CLAUDE.md` already warns against collapsing "out of free credits" into
+   "paid"; this is the mirror image — collapsing a paid-tier exhaustion onto the free tier — and
+   it is just as wrong.
+
+   ⚠ **No static scope can express it.** The vocabulary is attempt → group → deployment →
+   credential → provider → model; none carries a cost dimension. A `group` with an explicit member
+   list is the closest, and it would go stale precisely because the categories move. The relay
+   *does* classify cost live — `assessCost()` reads catalog pricing and `freeOnly` rules resolve
+   through it — but a fact cannot say "the paid subset of this credential".
+
+   **Conclusion: record no fact.** The per-deployment breaker credential-fault path is correct
+   here *because* it is per-deployment: each model discovers its own 403 and demotes on its own,
+   which cannot cross the cost boundary. The per-model rediscovery I called waste **is the safety
+   property**. Nothing binding was written; `propose` leaves the signature queued.
 
 ### Lane output quality — the tells
 
@@ -361,10 +387,16 @@ the shutdown flush on a non-finite clock rather than falling back, losing the pe
 
 ### Still open, with its home
 
-- **The owner decision on the OpenRouter weekly limit.** `llm-relay eligibility accept 17
-  --class allowance-exhausted --scope credential` — proposed, not accepted. It would demote all
-  nineteen OpenRouter deployments on one credential-scoped fact instead of rediscovering the same
-  limit per model. Only the operator may accept an interpretation.
+- ~~The OpenRouter weekly limit, as a credential-scoped fact.~~ **WITHDRAWN, and it should not be
+  accepted** — see friction item 5. The limit is a SPEND limit whose surface is the paid subset;
+  free models on the same key answer 200. No scope in the vocabulary expresses a dynamic cost
+  subset, so the right answer is to record nothing and let the per-deployment breaker handle it.
+  Nothing binding was written.
+- **Observation, not a proposed change:** the fact-scope vocabulary has no cost-class dimension,
+  and the one mechanism that could express a spend ceiling directly — the G2 `limits.hard` cap — is
+  denominated in requests/tokens per minute or day, not currency per week. So an operator-declared
+  "stop at $N/week on this key" has no home today. Recorded because it is the shape a real answer
+  would take, not because it is asked for.
 - **Type-level 7** (hard-cap usage basis) and **type-level 12** (persisted accounting vocabularies):
   confirmed, deferred with reasons above. Owner decisions.
 - **Four Class B findings** (type-level 2, 8, 14, 15): hardening, deferred.
