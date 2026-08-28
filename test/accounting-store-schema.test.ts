@@ -482,6 +482,91 @@ describe("accounting persisted schema", () => {
     })).toBe(false);
   });
 
+  describe("authoritative-attempt coherence guard compares spend", () => {
+    function validSpend(): { amountMicrousd: number; priceSource: "provider_published" | "reference"; tokenBasis: "reported" | "estimated"; source: "provider_reported" | "relay_estimated"; coverage: "full" | "input_only" | "partial"; unpricedTokens: { cacheRead: number | null; cacheCreation: number | null; cachedInput: number | null }; pricesUsed: { perMillionIn: number | null; perMillionOut: number | null }; observedAt: string } {
+      return {
+        amountMicrousd: 1_234,
+        priceSource: "provider_published",
+        tokenBasis: "reported",
+        source: "provider_reported",
+        coverage: "full",
+        unpricedTokens: { cacheRead: 0, cacheCreation: 0, cachedInput: 0 },
+        pricesUsed: { perMillionIn: 1.0, perMillionOut: 2.0 },
+        observedAt: "2026-08-20T01:02:03.000Z",
+      };
+    }
+
+    it("legacy shard with attempt spend: null and no requestSpend loads", () => {
+      const legacyPacket = {
+        ...packet(),
+        // Legacy pre-spend shape: attempt spend is null, no request-side spend at all
+        attempts: [{ ...attempt(), spend: null }],
+        spend: null, // absent entirely on legacy shards per schema comment
+      };
+      expect(isAccountingRequestPacketV1(legacyPacket)).toBe(true);
+    });
+
+    it("legacy shard with attempt spend: null and request spend: null loads", () => {
+      const legacyPacket = {
+        ...packet(),
+        attempts: [{ ...attempt(), spend: null }],
+        spend: null,
+      };
+      expect(isAccountingRequestPacketV1(legacyPacket)).toBe(true);
+    });
+
+    it("shard whose request spend disagrees with winner spend FAILS the guard", () => {
+      const winnerSpend = validSpend();
+      const differentSpend = { ...winnerSpend, amountMicrousd: 5_678 }; // Different amount
+
+      const badPacket = {
+        ...packet(),
+        winningAttemptId: ATTEMPT_ID,
+        attempts: [{ ...attempt(), spend: winnerSpend }],
+        spend: differentSpend, // Mismatched!
+      };
+      expect(isAccountingRequestPacketV1(badPacket)).toBe(false);
+    });
+
+    it("shard with matching spend on winner and request passes", () => {
+      const matchingSpend = validSpend();
+
+      const goodPacket = {
+        ...packet(),
+        winningAttemptId: ATTEMPT_ID,
+        attempts: [{ ...attempt(), spend: matchingSpend }],
+        spend: matchingSpend,
+      };
+      expect(isAccountingRequestPacketV1(goodPacket)).toBe(true);
+    });
+
+    it("shard with null winner spend and non-null request spend LOADS (null = no claim, never conflicts)", () => {
+      const someSpend = validSpend();
+
+      const packetWithNullWinner = {
+        ...packet(),
+        winningAttemptId: ATTEMPT_ID,
+        attempts: [{ ...attempt(), spend: null }],
+        spend: someSpend,
+      };
+      // null means "no claim" — it never conflicts with anything per the schema design
+      expect(isAccountingRequestPacketV1(packetWithNullWinner)).toBe(true);
+    });
+
+    it("shard with non-null winner spend and null request spend LOADS (null = no claim, never conflicts)", () => {
+      const winnerSpend = validSpend();
+
+      const packetWithNullRequest = {
+        ...packet(),
+        winningAttemptId: ATTEMPT_ID,
+        attempts: [{ ...attempt(), spend: winnerSpend }],
+        spend: null,
+      };
+      // null means "no claim" — it never conflicts with anything per the schema design
+      expect(isAccountingRequestPacketV1(packetWithNullRequest)).toBe(true);
+    });
+  });
+
   it("keeps the global day-row and serialized-file budgets explicit", () => {
     expect(ACCOUNTING_MAX_DAY_ROWS).toBeGreaterThan(ACCOUNTING_MAX_ROWS_PER_CELL);
     expect(ACCOUNTING_MAX_FILE_BYTES).toBe(16 * 1024 * 1024);

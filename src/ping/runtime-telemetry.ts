@@ -1,5 +1,5 @@
 import { relayStatePath } from "../state-paths.js";
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { WriteBehindTimer } from "../write-behind.js";
@@ -138,13 +138,21 @@ export function flushRuntimeTelemetry(opts: { path?: string; telemetry?: Telemet
   const target = opts.path ?? _telemetryPath ?? getRuntimeTelemetryPath();
   const data = opts.telemetry ?? _telemetry ?? { version: 2, models: {} };
   if (!opts.path) _writeBehind.clear();
+
+  let tmpPath: string | null = null;
   try {
     mkdirSync(dirname(target), { recursive: true });
-    const tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+    tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
     writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf8");
     renameSync(tmpPath, target);
+    tmpPath = null;
   } catch {
     return;
+  }
+  finally {
+    if (tmpPath !== null) {
+      try { unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
+    }
   }
 }
 

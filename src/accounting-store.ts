@@ -936,10 +936,16 @@ class AccountingStoreImpl implements AccountingStore {
   record(event: AccountingEvent): void {
     if (this._closed || event === null || typeof event !== "object") return;
     try {
-      if (event.type === "request-started") this.onRequestStarted(event);
-      else if (event.type === "attempt-started") this.onAttemptStarted(event);
-      else if (event.type === "attempt-completed") this.onAttemptCompleted(event);
-      else if (event.type === "request-completed") this.onRequestCompleted(event);
+      switch (event.type) {
+        case "request-started": this.onRequestStarted(event); break;
+        case "attempt-started": this.onAttemptStarted(event); break;
+        case "attempt-completed": this.onAttemptCompleted(event); break;
+        case "request-completed": this.onRequestCompleted(event); break;
+        default: {
+          const _never: never = event;
+          this.markGlobalLoss("unknown", "truncated", "event");
+        }
+      }
     } catch {
       this.markGlobalLoss("unknown", "truncated", "event");
     }

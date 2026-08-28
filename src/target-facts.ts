@@ -1,10 +1,11 @@
 import { relayStatePath } from "./state-paths.js";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import { WriteBehindTimer } from "./write-behind.js";
+import { COST_CLASSES, type CostClass } from "./metadata.js";
 
 /**
  * A learned condition or measurement about a routing target.
@@ -73,9 +74,56 @@ export const SCOPE_PRECEDENCE: Array<FactScope["kind"]> = [
  */
 export type FactResetBasis = "retry-after" | "reviewed-field" | "stated-body" | "reviewed-fixed";
 
-const UNTIL_BASES: ReadonlySet<string> = new Set([
-  "retry-after", "reviewed-field", "stated-body", "reviewed-fixed",
-]);
+/**
+ * Maps each reset basis to which rung of the availability ladder it belongs on.
+ * This is the ONE definition — `UNTIL_BASES` derives from it, and `availability.ts`
+ * `factResetInputs` reads it instead of comparing two literals.
+ *
+ * rung "stated"   = rung 1 (provider_stated): retry-after, stated-body — came from the
+ *                   provider's own response.
+ * rung "reviewed" = rung 2 (reviewed_rule): reviewed-field, reviewed-fixed — a reviewer's
+ *                   assertion, not a provider measurement.
+ */
+const FACT_RESET_BASIS_RUNG: Record<FactResetBasis, "stated" | "reviewed"> = {
+  "retry-after": "stated",
+  "reviewed-field": "reviewed",
+  "stated-body": "stated",
+  "reviewed-fixed": "reviewed",
+} as const satisfies Record<FactResetBasis, "stated" | "reviewed">;
+
+const UNTIL_BASES: ReadonlySet<FactResetBasis> = new Set(Object.keys(FACT_RESET_BASIS_RUNG) as FactResetBasis[]);
+export { FACT_RESET_BASIS_RUNG };
+
+/**
+ * Derived from `COST_CLASSES`, never re-listed — a hand-written copy is the drift seam this file's
+ * `UNTIL_BASES` used to be.
+ *
+ * ⚠ This module takes a TYPE-and-CONST import from `metadata.ts` and must never take more.
+ * `metadata.ts` has no imports of its own, so there is no cycle; but `target-facts.ts` must not
+ * reach for the catalog or call `assessCost` itself. A fact store records what was learned — the
+ * cost class is a fact ABOUT the deployment that the CALLER resolves and passes in, exactly as
+ * `availability.ts` is handed the facts it reasons over.
+ */
+const COST_CLASS_SET: ReadonlySet<string> = new Set(COST_CLASSES);
+
+/**
+ * Normalize a persisted cost filter, or return undefined to mean "applies to every class".
+ *
+ * Two rejections, both deliberate:
+ * - an entry outside the closed set drops the WHOLE filter rather than the bad entry, because a
+ *   partially-understood filter would silently cover a different subset than the reviewer accepted;
+ * - an EMPTY array is dropped, because a filter matching nothing is a fact that bounds nothing
+ *   while looking like it does — the `configured-limits` precedent, where an ignored typo reads as
+ *   a ceiling that bounds nothing.
+ *
+ * Neither ever fails the load: an unknown spelling must behave exactly like a legacy row that never
+ * carried a filter, which is the same contract `untilBasis` has.
+ */
+function normalizeCostClasses(raw: unknown): readonly CostClass[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  if (!raw.every((c) => typeof c === "string" && COST_CLASS_SET.has(c))) return undefined;
+  return raw as readonly CostClass[];
+}
 
 interface StoredFact {
   kind: FactKind;
@@ -84,6 +132,8 @@ interface StoredFact {
   until?: number;
   value?: number;
   untilBasis?: FactResetBasis;
+  /** Which cost classes this fact applies to. ABSENT = every class (what every legacy row means). */
+  costClasses?: readonly CostClass[];
 }
 
 interface FactStore {
@@ -246,12 +296,16 @@ function load(path: string): FactStore {
           // explicit `until` goes the same way — `expiryOf` would then fall back to the kind's
           // default TTL, and handing a consumer that fallback with a basis attached is the exact
           // "a guess labelled a measurement" the field exists to prevent.
-          const { untilBasis, ...rest } = fact;
-          const attributable = Number.isFinite(fact.until) && UNTIL_BASES.has(untilBasis as string);
+          const { untilBasis, costClasses, ...rest } = fact;
+          const attributable = Number.isFinite(fact.until) && UNTIL_BASES.has(untilBasis as FactResetBasis);
+          // Strip the raw filter out of `rest` and re-add only a normalized one: an unrecognised or
+          // empty filter must leave the row behaving exactly like a legacy row that never had one.
+          const classes = normalizeCostClasses(costClasses);
           const stored: StoredFact = {
             ...rest,
             scope: normalizeScope(fact.scope),
             ...(attributable ? { untilBasis: untilBasis as FactResetBasis } : {}),
+            ...(classes === undefined ? {} : { costClasses: classes }),
           };
           // Rows predating the kind-in-key format carry a bare scope key; rekey them to the
           // canonical `<kind>:<scope>` so an upgrade keeps every learned fact. Where both forms
@@ -270,14 +324,28 @@ function load(path: string): FactStore {
   return _store;
 }
 
-function persist(path: string): void {
+function persist(path: string, now: number = Date.now()): void {
   if (!_store) return;
+  let tmp: string | null = null;
   try {
+    // Prune expired rows before serializing: an expired row is already invisible to every reader,
+    // so dropping it changes no answer. Keep the in-memory store and the written file consistent.
+    for (const [key, fact] of Object.entries(_store.facts)) {
+      if (now >= expiryOf(fact)) {
+        delete _store.facts[key];
+      }
+    }
     mkdirSync(join(path, ".."), { recursive: true });
-    const tmp = `${path}.${process.pid}.tmp`;
+    tmp = `${path}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(_store, null, 2) + "\n", "utf8");
     renameSync(tmp, path);
+    tmp = null;
   } catch { /* best effort */ }
+  finally {
+    if (tmp !== null) {
+      try { unlinkSync(tmp); } catch { /* best effort cleanup */ }
+    }
+  }
 }
 
 function expiryOf(fact: StoredFact): number { return fact.until ?? fact.at + FACT_TTL_MS[fact.kind]; }
@@ -334,7 +402,7 @@ function matchesClearSelector(scope: FactScope, selector: CooldownFactClearSelec
 export function recordFact(
   kind: FactKind,
   scope: FactScope,
-  opts: { path?: string; now?: number; retryAfterMs?: number | null; untilBasis?: FactResetBasis; value?: number } = {},
+  opts: { path?: string; now?: number; retryAfterMs?: number | null; untilBasis?: FactResetBasis; value?: number; costClasses?: readonly CostClass[] } = {},
 ): void {
   if (!isValidScope(scope)) return;
   const path = opts.path ?? defaultPath();
@@ -348,27 +416,50 @@ export function recordFact(
     ? opts.untilBasis
     : null;
   const normalized = normalizeScope(scope);
+  // Same gate the loader applies, so a filter cannot enter the store by a route that skips
+  // validation — an unrecognised or empty one is simply absent, i.e. "applies to every class".
+  const classes = normalizeCostClasses(opts.costClasses);
   load(path).facts[keyOf(kind, normalized)] = {
     kind, scope: normalized, at: now,
     ...(stated === null ? {} : { until: now + stated }),
     ...(basis === null ? {} : { untilBasis: basis }),
     ...(typeof opts.value === "number" && Number.isFinite(opts.value) ? { value: opts.value } : {}),
+    ...(classes === undefined ? {} : { costClasses: classes }),
   };
-  writer.touch(() => persist(path));
+  writer.touch(() => persist(path, now));
+}
+
+/**
+ * Does this fact's cost filter admit the class the caller reported?
+ *
+ * A fact with NO filter applies to every class — that is what every row written before this
+ * existed means, and it keeps every existing caller's behaviour identical.
+ *
+ * ⚠ A filtered fact matches NOTHING when the caller supplies no class, and that direction is the
+ * whole point. A filter is a claim about a SUBSET; a caller that cannot say which subset this
+ * deployment is in has not shown the fact applies to it. Applying it anyway is exactly the defect
+ * this exists to prevent — OpenRouter's weekly KEY limit is a SPEND limit whose surface is the paid
+ * subset, and a credential-wide demotion took out 18 free models that were answering 200. Declining
+ * costs one walked request, which the breaker then learns from; that is recoverable, and demoting a
+ * healthy free deployment on an unproven classification is not.
+ */
+function costFilterAdmits(fact: StoredFact, costClass: CostClass | undefined): boolean {
+  if (fact.costClasses === undefined) return true;
+  return costClass !== undefined && fact.costClasses.includes(costClass);
 }
 
 export function factsFor(
   provider: string,
   credentialId: CredentialId | null,
   model: string | null | undefined,
-  opts: { path?: string; now?: number } = {},
+  opts: { path?: string; now?: number; costClass?: CostClass } = {},
 ): Array<{ kind: FactKind; scope: FactScope; until: number; untilBasis?: FactResetBasis; value?: number }> {
   const now = opts.now ?? Date.now();
   const m = typeof model === "string" ? model : null;
   const hits: Array<{ kind: FactKind; scope: FactScope; until: number; untilBasis?: FactResetBasis; value?: number }> = [];
   for (const fact of Object.values(load(opts.path ?? defaultPath()).facts)) {
     const until = expiryOf(fact);
-    if (now < until && covers(fact, provider, credentialId, m)) {
+    if (now < until && covers(fact, provider, credentialId, m) && costFilterAdmits(fact, opts.costClass)) {
       hits.push({
         kind: fact.kind, scope: fact.scope, until,
         ...(fact.untilBasis === undefined ? {} : { untilBasis: fact.untilBasis }),
@@ -379,11 +470,11 @@ export function factsFor(
   return hits.sort((a, b) => SCOPE_PRECEDENCE.indexOf(a.scope.kind) - SCOPE_PRECEDENCE.indexOf(b.scope.kind));
 }
 
-export function isCostBlocked(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number } = {}): boolean {
+export function isCostBlocked(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass } = {}): boolean {
   return factsFor(provider, credentialId, model, opts).some((fact) => COST_BLOCKING.has(fact.kind));
 }
 
-export function cooldownUntil(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number } = {}): number | null {
+export function cooldownUntil(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass } = {}): number | null {
   let latest: number | null = null;
   for (const fact of factsFor(provider, credentialId, model, opts)) {
     if (COOLING.has(fact.kind)) latest = latest === null ? fact.until : Math.max(latest, fact.until);
@@ -392,8 +483,9 @@ export function cooldownUntil(provider: string, credentialId: CredentialId | nul
 }
 
 /** A success retracts conditions covering this credential/model cell, never measurements. */
-export function clearFacts(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string } = {}): FactKind[] {
+export function clearFacts(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number } = {}): FactKind[] {
   const path = opts.path ?? defaultPath();
+  const now = opts.now ?? Date.now();
   const m = typeof model === "string" ? model : null;
   const store = load(path);
   const cleared: FactKind[] = [];
@@ -406,7 +498,7 @@ export function clearFacts(provider: string, credentialId: CredentialId | null, 
     if (fact.scope.kind === "credential") cleared.push(fact.kind);
     changed = true;
   }
-  if (changed) writer.touch(() => persist(path));
+  if (changed) writer.touch(() => persist(path, now));
   return cleared;
 }
 
@@ -433,7 +525,7 @@ function clearMatchingActiveFacts(
         : { ...fact.scope },
     });
   }
-  if (cleared.length > 0) writer.touch(() => persist(path));
+  if (cleared.length > 0) writer.touch(() => persist(path, now));
   return cleared.sort((a, b) =>
     a.kind.localeCompare(b.kind) || keyOfScope(a.scope).localeCompare(keyOfScope(b.scope))
   );
@@ -477,10 +569,15 @@ export function describeScope(scope: FactScope): string {
   }
 }
 
-export function flushFacts(opts: { path?: string } = {}): void {
+export function flushFacts(opts: { path?: string; now?: number } = {}): void {
   if (!writer.dirty) return;
+  // A non-finite `now` (only reachable from a caller passing one explicitly) must fall back, never
+  // skip: `flushFacts` runs at shutdown, and refusing to flush would lose the pending write
+  // outright. The prune is the part that needs a clock; the write is not optional.
+  const supplied = opts.now ?? Date.now();
+  const now = Number.isFinite(supplied) ? supplied : Date.now();
   writer.clear();
-  persist(opts.path ?? defaultPath());
+  persist(opts.path ?? defaultPath(), now);
 }
 
 export function resetFacts(): void {

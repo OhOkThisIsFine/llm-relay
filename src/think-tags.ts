@@ -16,6 +16,17 @@ const MARKER_HOLDBACK = CLOSE_TAG.length - 1; // 7 chars: a strict split-marker 
 
 type FilterState = "pass-through" | "lead-hold" | "inside-think" | "done";
 
+/**
+ * Does `flush()` still owe the caller bytes from this state? Declared once, over the whole union,
+ * so adding a state forces an answer here instead of inheriting "no" by falling through an else.
+ */
+const FLUSH_RELEASES_HELD = {
+  "lead-hold": true,
+  "inside-think": true,
+  "pass-through": false,
+  done: false,
+} as const satisfies Record<FilterState, boolean>;
+
 function bytes(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
@@ -41,10 +52,16 @@ export class ThinkTagStripFilter {
     return this.inspectThink();
   }
 
-  /** Release every undecided byte when the message/text block ends. */
+  /**
+   * Release every undecided byte when the message/text block ends.
+   *
+   * A table, not an `if`/`else`: this filter's whole purpose is losslessness, so a future state
+   * that HOLDS bytes must be a compile error here rather than falling into the empty return and
+   * silently deleting them. `done` and `pass-through` return empty because both have already
+   * released and cleared their held text.
+   */
   flush(): string {
-    if (this.state === "lead-hold" || this.state === "inside-think") return this.releaseLosslessly();
-    return "";
+    return FLUSH_RELEASES_HELD[this.state] ? this.releaseLosslessly() : "";
   }
 
   private decideLead(): string {

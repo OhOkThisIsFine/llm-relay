@@ -187,6 +187,145 @@ describe("Ping Requests", () => {
       await Promise.all([close(redirectingBackend), close(redirectTarget)]);
     }
   });
+
+  describe("response body cancellation", () => {
+    it("cancels the body on the success path", async () => {
+      const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+      let cancelCalls = 0;
+      let lastCancelPath: string | null = null;
+
+      // Helper to create a stream that stays open until cancelled
+      function makeStream(onCancel: () => void) {
+        return new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("{}"));
+            // Don't close - leave stream open so cancel() gets called
+          },
+          cancel() {
+            onCancel();
+          },
+        });
+      }
+
+      const mockFetch = async (url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        if (body.model === "success-model") {
+          return new Response(makeStream(() => { cancelCalls++; lastCancelPath = "success"; }), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      };
+
+      // Success path
+      cancelCalls = 0;
+      lastCancelPath = null;
+      const res1 = await pingProviderModel("test", "success-model", pCfg, "sk-test", { fetchFn: mockFetch as any, timeoutMs: 1000 });
+      expect(res1.code).toBe("200");
+      expect(cancelCalls).toBe(1);
+      expect(lastCancelPath).toBe("success");
+    });
+
+    it("cancels the body on the non-2xx path", async () => {
+      const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+      let cancelCalls = 0;
+      let lastCancelPath: string | null = null;
+
+      function makeStream(onCancel: () => void) {
+        return new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("{}"));
+          },
+          cancel() {
+            onCancel();
+          },
+        });
+      }
+
+      const mockFetch = async (url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        if (body.model === "error-model") {
+          return new Response(makeStream(() => { cancelCalls++; lastCancelPath = "error"; }), { status: 500 });
+        }
+        return new Response("{}", { status: 200 });
+      };
+
+      // Non-2xx path
+      cancelCalls = 0;
+      lastCancelPath = null;
+      const res2 = await pingProviderModel("test", "error-model", pCfg, "sk-test", { fetchFn: mockFetch as any, timeoutMs: 1000 });
+      expect(res2.code).toBe("500");
+      expect(cancelCalls).toBe(1);
+      expect(lastCancelPath).toBe("error");
+    });
+
+    it("cancels the body on the disabled-thinking retry path (second response body)", async () => {
+      const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+      let cancelCalls = 0;
+      let lastCancelPath: string | null = null;
+
+      function makeStream(bodyText: string, onCancel: () => void) {
+        return new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(bodyText));
+            controller.close();
+          },
+          cancel() {
+            onCancel();
+          },
+        });
+      }
+
+      const mockFetch = async (url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        if (body.model === "retry-model" && body.thinking) {
+          // First request with thinking enabled - returns 400 with "thinking" in body
+          // This body is fully consumed by isDisabledThinkingRejected via clone().text(),
+          // so cancelling it afterwards is a no-op (stream already closed).
+          return new Response(
+            makeStream('{"error":"thinking not supported"}', () => { cancelCalls++; lastCancelPath = "retry-first"; }),
+            { status: 400 }
+          );
+        }
+        // Second request after retry (no thinking) - body is never read, only headers.
+        // This body SHOULD be cancelled.
+        return new Response(makeStream("{}", () => { cancelCalls++; lastCancelPath = "retry-second"; }), { status: 200 });
+      };
+
+      // Disabled-thinking retry path: first response body consumed by clone().text(),
+      // second response body cancelled because never read.
+      cancelCalls = 0;
+      lastCancelPath = null;
+      const res3 = await pingProviderModel("test", "retry-model", pCfg, "sk-test", { fetchFn: mockFetch as any, timeoutMs: 1000 });
+      expect(res3.code).toBe("200");
+      expect(cancelCalls).toBe(1); // only the second (served) response body is cancellable
+      expect(lastCancelPath).toBe("retry-second");
+    });
+
+    it("a throwing cancel() still yields the normal result", async () => {
+      const pCfg: ProviderConfig = { base: "https://api.test/v1", kind: "openai", authHeader: "authorization", timeoutMs: 5000 };
+      let cancelCalled = false;
+
+      function makeThrowingStream() {
+        return new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("{}"));
+            // Don't close - leave stream open
+          },
+          cancel() {
+            cancelCalled = true;
+            throw new Error("cancel failed");
+          },
+        });
+      }
+
+      const mockFetch = async () => {
+        return new Response(makeThrowingStream(), { status: 200 });
+      };
+
+      const res = await pingProviderModel("test", "model-a", pCfg, "sk-test", { fetchFn: mockFetch as any });
+      expect(res.code).toBe("200");
+      expect(cancelCalled).toBe(true); // cancel was attempted
+    });
+  });
 });
 
 describe("Probe Cache Persistence", () => {

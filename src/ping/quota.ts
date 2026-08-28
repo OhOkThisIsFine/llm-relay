@@ -52,8 +52,10 @@ export async function fetchProviderQuota(
       quotaUrl.hash = "";
       quotaUrl.username = "";
       quotaUrl.password = "";
+      const signal = cfg.timeoutMs && cfg.timeoutMs > 0 ? AbortSignal.timeout(cfg.timeoutMs) : null;
       const resp = await fetchFn(quotaUrl.toString(), {
         headers: { Authorization: apiKey.startsWith("Bearer ") ? apiKey : `Bearer ${apiKey}` },
+        signal,
       });
       if (!resp.ok) {
         return { provider: providerName, ok: false, statusText: `HTTP ${resp.status}` };

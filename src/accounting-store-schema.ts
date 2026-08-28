@@ -1061,6 +1061,20 @@ function tokenTotalsEqual(a: AccountingAggregateTokenTotalsV1, b: AccountingAggr
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/**
+ * Compares two spend values for equality, treating null/absent as "no claim".
+ * A "no claim" (null) never conflicts with anything — this is essential because
+ * legacy shards have `spend: null` on attempts and no `requestSpend` at all.
+ */
+function spendEqual(a: AccountingSpendV1 | null, b: AccountingSpendV1 | null): boolean {
+  // Both null/absent = no claim on either side = compatible
+  if (a === null && b === null) return true;
+  // One has a claim, the other doesn't = no conflict (null means "no claim", not zero)
+  if (a === null || b === null) return true;
+  // Both have claims — compare them
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 function isAttemptMetadata(value: unknown): value is AccountingDetailAttemptMetadataV1 {
   return hasExactKeys(value, ["total", "stored", "dropped"]) && isCounter(value.total) && isCounter(value.stored) && isCounter(value.dropped) && value.total <= ACCOUNTING_MAX_PACKET_ATTEMPTS && value.stored <= ACCOUNTING_MAX_DETAIL_ATTEMPTS && value.dropped === value.total - value.stored;
 }
@@ -1159,7 +1173,8 @@ function isRequestPacket(value: unknown): value is AccountingRequestPacketV1 {
       authoritative.model !== value.model ||
       authoritative.credentialId !== value.credentialId ||
       authoritative.attribution !== value.attribution ||
-      !tokenTotalsEqual(authoritative.tokens, value.tokens)
+      !tokenTotalsEqual(authoritative.tokens, value.tokens) ||
+      !spendEqual(authoritative.spend, value.spend)
     ) return false;
   }
 

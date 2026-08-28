@@ -353,3 +353,66 @@ describe("bounded catalog fetch (adoption review §1.11)", () => {
     expect(models.length).toBe(5000);
   });
 });
+
+describe("disk loader validation (Change 3)", () => {
+  it("rejects a non-finite fetchedAt and does NOT serve it as permanently fresh", async () => {
+    const cachePath = join(dir, "infinity-fetchedAt.json");
+    // ⚠ The fixture MUST be raw JSON text. `JSON.stringify({ fetchedAt: 1e309 })` emits
+    // `{"fetchedAt":null}` — the spec has no Infinity literal — so a stringify-built fixture
+    // never contains the value under test, and the test passes before AND after the fix while
+    // appearing to pin it. `JSON.parse` does read `1e309` back as Infinity, which is exactly how
+    // a corrupt cache acquires one.
+    writeFileSync(cachePath, '{"p":{"fetchedAt":1e309,"models":["should-not-appear"]}}\n');
+
+    const c = new ModelCatalog({ cachePath, ttlMs: 10_000 });
+    // Pre-fix: `typeof Infinity === "number"` admits the entry, and `now - Infinity` is -Infinity,
+    // which is < ttlMs — so the stale entry reads as fresh forever and the cached list is served.
+    const models = await c.list("p", provider, { now: 2000, fetchFn: okFetch(["fresh-model"]) });
+    expect(models).toEqual(["fresh-model"]);
+    expect(models).not.toContain("should-not-appear");
+  });
+
+  it("still serves a finite in-TTL cache from disk without refetching", async () => {
+    // The control for the guard above: `Number.isFinite` must not reject a good timestamp.
+    const cachePath = join(dir, "finite-fetchedAt.json");
+    writeFileSync(cachePath, '{"p":{"fetchedAt":1000,"models":["cached-model"]}}\n');
+
+    const c = new ModelCatalog({ cachePath, ttlMs: 10_000 });
+    const models = await c.list("p", provider, {
+      now: 2000,
+      fetchFn: () => { throw new Error("must not refetch an in-TTL cache"); },
+    });
+    expect(models).toEqual(["cached-model"]);
+  });
+
+  it("bounds model id length on disk path (MAX_MODEL_ID_CHARS)", async () => {
+    const cachePath = join(dir, "long-ids.json");
+    const longId = "m".repeat(300);
+    writeFileSync(cachePath, JSON.stringify({
+      p: {
+        fetchedAt: 1000,
+        models: ["good-model", longId],
+      },
+    }) + "\n");
+
+    const c = new ModelCatalog({ cachePath, ttlMs: 10_000 });
+    const models = await c.list("p", provider, { now: 2000, fetchFn: throwFetch() });
+    // Only good-model should load; longId is filtered out
+    expect(models).toEqual(["good-model"]);
+  });
+
+  it("bounds model count on disk path (MAX_CATALOG_MODELS)", async () => {
+    const cachePath = join(dir, "too-many-models.json");
+    const tooMany = Array.from({ length: 6000 }, (_, i) => `model-${i}`);
+    writeFileSync(cachePath, JSON.stringify({
+      p: {
+        fetchedAt: 1000,
+        models: tooMany,
+      },
+    }) + "\n");
+
+    const c = new ModelCatalog({ cachePath, ttlMs: 10_000 });
+    const models = await c.list("p", provider, { now: 2000, fetchFn: throwFetch() });
+    expect(models.length).toBe(5000); // capped at MAX_CATALOG_MODELS
+  });
+});

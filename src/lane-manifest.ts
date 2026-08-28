@@ -59,11 +59,28 @@ export function getLaneManifestPath(): string {
 
 export const DEFAULT_MANIFEST_PATH = getLaneManifestPath();
 
+function isLaneModel(obj: unknown): obj is LaneModel {
+  return typeof obj === "object" && obj !== null && typeof (obj as Record<string, unknown>).id === "string";
+}
+
+function isLaneEntry(obj: unknown): obj is LaneEntry {
+  if (typeof obj !== "object" || obj === null) return false;
+  const e = obj as Record<string, unknown>;
+  if (typeof e.via !== "string") return false;
+  if (typeof e.probedAt !== "string") return false;
+  if (!Array.isArray(e.models)) return false;
+  return e.models.every(isLaneModel);
+}
+
 export function loadLaneManifest(path: string = DEFAULT_MANIFEST_PATH): LaneManifest | null {
   try {
     if (!existsSync(path)) return null;
     const j = JSON.parse(readFileSync(path, "utf8")) as LaneManifest;
     if (j?.version !== 1 || typeof j.lanes !== "object" || j.lanes === null) return null;
+    // Deep-validate each lane entry: corrupt ⇒ null ⇒ unknown (the loader's documented contract)
+    for (const entry of Object.values(j.lanes)) {
+      if (!isLaneEntry(entry)) return null;
+    }
     return j;
   } catch {
     // Unreadable is UNKNOWN, never "nothing is servable". A corrupt manifest that evicted every

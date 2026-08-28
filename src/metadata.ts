@@ -102,7 +102,14 @@ export function resolveMetadata(
  * paid (a guess must not spend money), and the basis field says which evidence produced the
  * verdict, same contract as every other number here.
  */
-export type CostClass = "free" | "paid" | "unknown";
+/**
+ * The vocabulary, as an array first so the TYPE derives from it rather than being a second
+ * hand-written list beside it. `target-facts.ts` needs the runtime set to validate a persisted
+ * cost filter, and a hand-listed set is the drift seam this codebase closed eight times on
+ * 2026-08-28 (see the closed-vocabulary gotcha in CLAUDE.md).
+ */
+export const COST_CLASSES = Object.freeze(["free", "paid", "unknown"] as const);
+export type CostClass = (typeof COST_CLASSES)[number];
 
 export interface CostAssessment {
   costClass: CostClass;

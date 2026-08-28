@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeCredentialId } from "../src/credential-id.js";
@@ -8,6 +8,7 @@ import {
   clearFacts as clearFactsV2,
   cooldownUntil as cooldownUntilV2,
   factsFor as factsForV2,
+  flushFacts,
   isCostBlocked as isCostBlockedV2,
   keyOf,
   recordFact,
@@ -796,6 +797,127 @@ describe("nothing is known until something is recorded", () => {
     expect(factsFor("nim", "z-ai/glm-5.2", { path })).toEqual([]);
     expect(isCostBlocked("nim", "z-ai/glm-5.2", { path })).toBe(false);
     expect(cooldownUntil("nim", "z-ai/glm-5.2", { path })).toBeNull();
+  });
+});
+
+describe("persist prunes expired rows without changing any answer", () => {
+  const personal = makeCredentialId("p", "personal");
+
+  it("drops expired rows on persist while keeping live rows, and factsFor is unchanged", () => {
+    const now = 1_000_000;
+    const longAgo = now - FACT_TTL_MS["not-servable"] - 1_000;
+
+    // Record an expired row and a live row (deployment scope uses the helper's default credential)
+    recordFact("not-servable", { kind: "deployment", provider: "p", model: "expired" }, { path, now: longAgo });
+    recordFact("not-servable", { kind: "deployment", provider: "p", model: "alive" }, { path, now });
+
+    // But factsFor filters by expiry - expired excluded, live included
+    expect(factsFor("p", "expired", { path, now })).toHaveLength(0);
+    expect(factsFor("p", "alive", { path, now })).toHaveLength(1);
+
+    // Trigger persist with the test's `now`
+    flushFacts({ path, now });
+
+    // Verify the expired row is gone from the file
+    const persisted = JSON.parse(readFileSync(path, "utf8"));
+    const keys = Object.keys(persisted.facts);
+    expect(keys.some((k) => k.includes("expired"))).toBe(false);
+    expect(keys.some((k) => k.includes("alive"))).toBe(true);
+
+    // Verify factsFor answers identically - live row still there, expired still excluded
+    const afterPersist = factsFor("p", "alive", { path, now });
+    expect(afterPersist).toHaveLength(1);
+    expect(afterPersist[0]?.kind).toBe("not-servable");
+
+    // Expired model still reports nothing (as it did before)
+    expect(factsFor("p", "expired", { path, now })).toHaveLength(0);
+  });
+
+  it("prunes all expired kinds, not just conditions", () => {
+    const now = 1_000_000;
+    const longAgo = now - FACT_TTL_MS["context-limit"] - 1_000;
+
+    // Record expired measurement and expired condition
+    recordFact("context-limit", { kind: "attempt", provider: "p", credentialId: personal, model: "m1" }, { path, now: longAgo, value: 4096 });
+    recordFact("credential-invalid", { kind: "credential", provider: "p", credentialId: personal }, { path, now: longAgo });
+
+    // Live ones
+    recordFact("context-limit", { kind: "attempt", provider: "p", credentialId: personal, model: "m2" }, { path, now, value: 8192 });
+    recordFact("credential-invalid", { kind: "attempt", provider: "p", credentialId: personal, model: "m3" }, { path, now });
+
+    // Trigger persist with the test's `now`
+    flushFacts({ path, now });
+
+    // Verify expired ones are pruned from file
+    const persisted = JSON.parse(readFileSync(path, "utf8"));
+    const keys = Object.keys(persisted.facts);
+    expect(keys.filter((k) => k.includes("m1")).length).toBe(0);
+    expect(keys.filter((k) => k.startsWith("credential-invalid:c:")).length).toBe(0); // expired credential
+
+    // Live ones survive - use the V2 function directly with explicit credentialId
+    expect(factsForV2("p", personal, "m2", { path, now })).toHaveLength(1);
+    expect(factsForV2("p", personal, "m3", { path, now })).toHaveLength(1);
+  });
+});
+
+/**
+ * ⚠ Making the rename fail is the whole test, and the obvious way does not work.
+ *
+ * A "non-existent parent directory" is useless here: both writers call
+ * `mkdirSync(join(path, ".."), { recursive: true })` before writing, so the parent is created and
+ * the write succeeds. A fixture built that way passes on the UN-FIXED tree, and any temp left
+ * behind would sit in the created subdirectory rather than the one the assertion lists — two
+ * independent reasons it cannot observe the defect.
+ *
+ * Instead: make the TARGET an existing, non-empty directory. The temp writes normally and
+ * `renameSync(tmp, target)` cannot replace a non-empty directory on any platform.
+ */
+function blockedTarget(name: string): string {
+  const target = join(dir, name);
+  mkdirSync(target, { recursive: true });
+  writeFileSync(join(target, "occupant"), "x", "utf8");
+  return target;
+}
+
+const tempsIn = (d: string) => readdirSync(d).filter((f) => f.endsWith(".tmp"));
+
+describe("target-facts persist cleans up its temp file when the rename fails", () => {
+  it("leaves no temp file behind", () => {
+    const now = 1_000_000;
+    recordFact("not-servable", { kind: "deployment", provider: "p", model: "m" }, { path, now });
+    const blocked = blockedTarget("blocked-facts.json");
+
+    flushFacts({ path: blocked, now });
+
+    expect(tempsIn(dir)).toHaveLength(0);
+  });
+
+  it("still swallows the error rather than failing its caller", () => {
+    const now = 1_000_000;
+    recordFact("not-servable", { kind: "deployment", provider: "p", model: "m" }, { path, now });
+    const blocked = blockedTarget("blocked-facts-swallow.json");
+
+    // Best-effort by contract: a storage problem must never become a request failure.
+    expect(() => flushFacts({ path: blocked, now })).not.toThrow();
+  });
+});
+
+describe("refusal-interpretation persist cleans up its temp file when the rename fails", () => {
+  it("leaves no temp file behind", () => {
+    const now = 1_000_000;
+    recordUnknownRefusal("p", "m", 403, `{"error":{"message":"test message"}}`, { path: interpPath, now });
+    const blocked = blockedTarget("blocked-interpretations.json");
+
+    flushInterpretations({ path: blocked });
+
+    expect(tempsIn(dir)).toHaveLength(0);
+  });
+
+  it("still swallows the error rather than failing its caller", () => {
+    recordUnknownRefusal("p", "m", 403, `{"error":{"message":"test message"}}`, { path: interpPath });
+    const blocked = blockedTarget("blocked-interpretations-swallow.json");
+
+    expect(() => flushInterpretations({ path: blocked })).not.toThrow();
   });
 });
 
