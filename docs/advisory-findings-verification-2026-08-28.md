@@ -406,3 +406,38 @@ the shutdown flush on a non-finite clock rather than falling back, losing the pe
   reaching for.
 - **Response-SIZE bounds** on the pool-health and quota paths, and the `withBudget` non-cancelling
   race in `key-checker.ts` — both named in the packet-D commit as deliberately out of scope.
+
+## A finding produced by using the tool, not by reviewing it
+
+⚠ **`llm-relay eligibility propose|accept <n>` addresses the queue by LIST POSITION, and positions
+are not stable between invocations.**
+
+The CLI is explicit that this is deliberate — *"Addressed by list POSITION, not by signature: a
+signature is a whole normalized error message and nobody is retyping one at a shell"* — and that
+reasoning is sound. But the pending list is ordered by occurrence count, and those counts move as
+traffic flows. Across three `propose 17` calls minutes apart in this session, item 17 was a
+different refusal each time: two proposals landed on `404 model-not-served` signatures for models I
+had never intended, carrying `allowance-exhausted`, which is the wrong class for a 404 as well as
+the wrong target.
+
+Nothing bound — `propose` is non-binding by design, `confirmed` stayed at 0, and both stale
+proposals were removed (backup:
+`~/.llm-relay/refusal-interpretations.json.bak-2026-08-28-pre-proposal-cleanup`). But a
+non-binding annotation sitting on the wrong signature is exactly the kind of thing a later reviewer
+accepts in good faith.
+
+**Two things follow, and neither is fixed here:**
+
+1. **Operationally:** re-read the queue immediately before every `propose`/`accept`, and check the
+   printed provider/model in the confirmation line against what you meant. The confirmation does
+   name the target — `accepted … now applied to <provider>/<model> refusals matching this message` —
+   so the information is there to catch it.
+2. **As a candidate change:** the accept path could take a short signature digest alongside the
+   index and refuse when they disagree — the index stays the ergonomic handle, the digest makes a
+   shifted queue a loud failure instead of a silent mis-target. Recorded as a candidate, not built:
+   it is a CLI contract change and belongs in its own packet with the owner's say-so.
+
+⚠ Worth stating plainly because it cuts against this whole sprint's method: **I found this by
+running the command, not by reading the code.** Every verdict above came from reading source, and
+none of them could have surfaced a defect that only appears across two invocations separated by
+live traffic.
