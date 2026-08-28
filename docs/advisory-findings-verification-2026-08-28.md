@@ -250,3 +250,127 @@ beside it.
   with a different risk profile.
 - **No orphan-temp sweeper.** A readdir-and-age sweep would have to prove a file is not another
   process's in-flight temp; `HANDOFF.md` §6 already weighed and declined that.
+
+## Friction
+
+Rewalked from the transcript, not recalled.
+
+### Lane behaviour
+
+1. ⚠ **`codex exec` exits 0 when it hits its usage limit.** Three lanes died mid-work with
+   `ERROR: You've hit your usage limit … try again at Sep 3rd` and **exit code 0**; the harness
+   reported "completed (exit code 0)" for all three. Nothing in the exit status distinguishes a
+   finished lane from a dead one — only the missing report file does. **Never judge a Codex lane by
+   its exit code; check for the artifact.** Memory already recorded this for relay lanes ("a lane
+   returning two words and exit 0 is a failure, retry"); it is true of Codex too.
+2. ⚠ **Codex went from healthy to exhausted inside one sprint**, with a reset SIX DAYS out. A probe
+   returned `CODEXOK` at 09:33; the limit hit at ~09:55 after roughly 930k tokens across four lanes.
+   Put the CHEAPEST packets on Codex first — the opposite of what I did, having given it the biggest
+   ones because it is the strongest.
+3. ⚠ **`codex exec --sandbox workspace-write` DECLINES a write outside the workspace** (`patch:
+   declined`), losing that lane's entire answer. A Codex lane's report path must be inside the repo.
+4. ⚠ **The OpenRouter key hit a WEEKLY limit and dominated every pool.** Four lane dispatches died on
+   it across `pool/high`, `pool/xhigh` and `pool/medium`, because gemini and huggingface were
+   simultaneously `allowance-exhausted` and three kimi-k3 breakers were OPEN. A trivial probe still
+   returned `OK` — the walk only exhausts on a LARGE request, which narrows the pool by context
+   window to exactly the OpenRouter members. **A pool that answers a one-word probe is not a pool
+   that can carry a long packet.**
+5. **This produced a live demonstration of the problem `target-facts.ts` exists for:** the same
+   account-level refusal was queued once PER MODEL (entries 17, 19-24, all identical). The message
+   names the KEY, so a credential-scoped `allowance-exhausted` fact is justified by the wording
+   rather than by counting siblings. Proposed, not accepted — only the operator may accept.
+
+### Lane output quality — the tells
+
+6. ⚠ **Uniformity is the rubber-stamp tell.** A report confirming all four of its findings with an
+   empty evidence column is not a pass. Both honest reports (CC-B, CC-C) produced real evidence and
+   each got one thing wrong. The rejected one (TL-A) confirmed everything, quoted nothing, and was
+   wrong on two of four — including recommending the DELETION of a working, deliberately-guarded API.
+7. ⚠ **A brief's own example can come back as a finding.** CC-C reported a cap of "1000" that is
+   actually 200; 1000 was `session-pin.ts`'s LRU, which I had named in that brief as an example of a
+   collection that already has a cap.
+8. ⚠ **Three of five implementing lanes shipped a fixture that hid the bug it was meant to pin.**
+   `JSON.stringify({fetchedAt: 1e309})` emits `null`, so the Infinity test never contained Infinity.
+   A hand-thrown `new DOMException("Aborted","AbortError")` never matches a real
+   `AbortSignal.timeout`, which aborts with `TimeoutError`. **Always run a new test against the
+   un-fixed tree and read the failure**, and prefer rejecting with the real signal's own `reason`
+   over inventing an error.
+9. ⚠ **A lane reported "gate green" having written NO tests at all** (FIX-B, five changes). Green is
+   not done.
+10. ⚠ **A lane introduced a routing regression that the full gate passed.** `deadline: false` in the
+    breaker's provenance table would have left a timing-out deployment permanently healthy. Nothing
+    covered the path. **When a lane converts a branch into a table, check every entry against what
+    the branch actually did** — a table is a transcription, not an invitation to re-decide policy.
+11. **A lane also destroyed half of a brief's premise, correctly.** CC-A was asked to confirm
+    `ping/ping.ts` bounds its fetches "for contrast"; it does, it said so, and then found the
+    unrelated body-cancellation gap that became this sprint's one new finding. Briefs should invite
+    that.
+
+### Environment
+
+12. ⚠ **I hit the documented `python -` trap anyway.** `docs/documentation-pass-2026-08-27.md`
+    records that it opens an interactive REPL and hangs to the 2-minute timeout. I used it as the
+    first half of a `python - … || node -e …` fallback and lost the full two minutes. **A documented
+    trap is not a solved trap.** Use the Edit tool, or write a `.mjs` and run it with node.
+13. ⚠ **`pwsh -File <relative-path>` prints the PowerShell help and exits 0** when the path does not
+    resolve. Two re-dispatches silently did nothing because the Bash tool's cwd had moved into a
+    subdirectory from an earlier `cd`. Use absolute paths for `-File`; the Bash tool's cwd persists
+    across calls.
+14. ⚠ **Heredoc quoting in the Bash tool broke twice** on content containing backticks and nested
+    quotes, both times costing a retry. For anything with code in it, use the Write tool.
+15. **Fix lanes must be SEQUENTIAL; verification lanes may be parallel.** Two write lanes would both
+    run `npm run build` into the same `dist/` and both run vitest over a shared `src/`, so each
+    would see the other's half-finished edits. Nine read-only verification lanes ran at once with no
+    trouble.
+16. **A lane that dies mid-response can leave good work.** FIX-A died after two of three changes; the
+    tables were correct, the comments explained why, and the strings were intact, so finishing it was
+    cheaper than discarding it. Judge the partial tree on quality — the precedent for discarding
+    (2026-08-26) was a tree that was mis-indented and untested, not merely incomplete.
+
+## What landed, completed
+
+Five fix packets, gate green on each, every new test confirmed to FAIL on the un-fixed tree.
+
+| commit | what |
+|---|---|
+| `aabac49` | three closed unions that produce LABELS get one total owner each |
+| `1546b19` | three persisted evidence stores degrade to UNKNOWN, never to a verdict |
+| `ab75f65` | four closed unions that decide ROUTING and HEALTH, plus nine derived wire unions |
+| `cd6e5f8` | the diagnostic probes get a deadline; the relay's ping loop stops stranding sockets |
+| `82c084f` | expired facts pruned, four temp files cleaned up, `spend` mirrored in the guard |
+
+**Every one of the five implementing lanes needed correction in review, and the corrections
+cluster.** Three of five shipped a fixture that could not observe the bug it was meant to pin:
+
+- `JSON.stringify({ fetchedAt: 1e309 })` emits `{"fetchedAt":null}` — JSON has no Infinity literal.
+- A hand-thrown `new DOMException("Aborted", "AbortError")` never matches a real
+  `AbortSignal.timeout`, which aborts with **TimeoutError**.
+- All four temp-cleanup tests aimed at a "non-existent parent directory", which every one of those
+  writers creates with `mkdirSync(…, { recursive: true })` before writing — and then asserted
+  against the wrong directory.
+
+In each case the test passed identically before and after the fix. **The only reliable check is to
+run a new test against the un-fixed tree and read the failure.** "Gate green" caught none of them —
+nor did it catch a lane reporting green with no tests at all, nor a lane's `deadline: false` routing
+regression.
+
+Two further corrections were design rather than test quality: a lane inlined a duplicate of
+`errorOrigin()` at the call site — creating a second definition inside the commit whose entire point
+is one owner — and left the real drift seam untouched; and a `flushFacts` guard would have SKIPPED
+the shutdown flush on a non-finite clock rather than falling back, losing the pending write.
+
+### Still open, with its home
+
+- **The owner decision on the OpenRouter weekly limit.** `llm-relay eligibility accept 17
+  --class allowance-exhausted --scope credential` — proposed, not accepted. It would demote all
+  nineteen OpenRouter deployments on one credential-scoped fact instead of rediscovering the same
+  limit per model. Only the operator may accept an interpretation.
+- **Type-level 7** (hard-cap usage basis) and **type-level 12** (persisted accounting vocabularies):
+  confirmed, deferred with reasons above. Owner decisions.
+- **Four Class B findings** (type-level 2, 8, 14, 15): hardening, deferred.
+- **Type-level 2's real residue:** `AccountingSpend` carries both `tokenBasis` and `source`, two
+  fields holding the same fact with near-identical doc-comments and nothing enforcing agreement.
+  A correlated-pair smell, not worth churn alone, and the honest version of what that finding was
+  reaching for.
+- **Response-SIZE bounds** on the pool-health and quota paths, and the `withBudget` non-cancelling
+  race in `key-checker.ts` — both named in the packet-D commit as deliberately out of scope.

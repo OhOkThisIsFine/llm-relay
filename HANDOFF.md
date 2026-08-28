@@ -2,9 +2,57 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-27
+## 0. State as of 2026-08-28
 
-**Latest — the documentation pass (v0.50.0, `f077a4d`..`63248ec`).** A pass over the whole doc set
+**Latest — the advisory-findings verification sprint.** The 2026-08-26 uncovered-areas review ended
+by saying its remaining 13 cross-cutting and 19 type-level lane findings "remain advisory and
+unverified — do not treat them as a work queue". That was right, and it left 32 unchecked claims.
+This sprint checked all 32 against source. Full ledger, the Class A / Class B distinction, the three
+lane reports that were wrong and how, and everything deliberately left:
+[docs/advisory-findings-verification-2026-08-28.md](docs/advisory-findings-verification-2026-08-28.md).
+
+**The result was ONE bug class, not a list.** An open classifier over a CLOSED union — an
+unconditional `else`, a bare `default:`, or a runtime list hand-copied from the type — where the
+fall-through resolves to the **stronger** claim. v0.50.0 had fixed one instance without naming it
+(`FactKind`); **seven more survived, in seven different modules**, and all seven are now closed.
+The class is written up in `CLAUDE.md`'s gotchas, because the next instance will be somewhere none
+of these touch.
+
+Three things from it that outlive the sprint:
+
+- **A `deadline` outcome must reach the breaker.** While converting the breaker's provenance branch
+  into a table, an implementing lane wrote `deadline: false` — which would have left a timing-out
+  deployment permanently healthy, in the component whose paradigm case is a hanging provider. **The
+  full gate passed with that regression**, because nothing covered the path. There is a live guard
+  for it now in `test/closed-vocabulary-routing.test.ts`.
+- **A corrupt lane manifest was EVICTING a healthy lane.** Not throwing — `"x".id` is `undefined`,
+  so the roster check simply returned false and reported `not-servable`. That contradicts the
+  module's own comment and this repo's "corrupt ⇒ UNKNOWN, nothing evicted". ⚠ A test asserting
+  only "does not throw" still passes on the old code; assert `status === "unknown"`.
+- **`JSON.stringify` cannot express `Infinity`.** A lane's fixture for the catalog's
+  permanently-fresh bug was built with `JSON.stringify({ fetchedAt: 1e309 })`, which emits
+  `{"fetchedAt":null}` — so the test never contained the value under test and passed identically
+  before and after the fix. Build such a fixture from raw JSON text.
+
+⚠ **Making a classifier total surfaces live bugs the analysis missed.** It did twice here: an
+optional `contextWindowSource` was already rendering as "published by the serving provider", and a
+test fixture had hidden a missing required `authHeader` behind `as unknown as`. Expect that, and fix
+what surfaces rather than restoring the fall-through.
+
+⚠ **The single most useful process lesson: "gate green" proved nothing three times.** Every one of
+the five implementing lanes needed correction, and **three of five shipped a fixture that could not
+observe the bug it was meant to pin** — `JSON.stringify` cannot express `Infinity`; a hand-thrown
+`AbortError` never matches a real `AbortSignal.timeout` (which aborts with `TimeoutError`); and four
+temp-cleanup tests aimed at a "non-existent parent directory" that the writer itself creates. In
+each case the test passed identically before and after the fix. One lane also reported green with
+**no tests at all**, and another reported green while carrying a routing regression. **Run every new
+test against the un-fixed tree and read the failure.** The full friction list is in the sprint doc.
+
+Five commits: `aabac49` (label unions), `1546b19` (persisted evidence stores), `ab75f65` (routing and
+health unions), `cd6e5f8` (bounded probes, ping sockets), `82c084f` (fact prune, temp cleanup, spend
+in the coherence guard).
+
+**Earlier — the documentation pass (v0.50.0, `f077a4d`..`63248ec`).** A pass over the whole doc set
 against source, plus the tidy it turned up. Ten parallel auditors, every finding adversarially
 verified and then re-checked first-hand before anything changed. Full ledger, the two findings
 worth reading on their own, everything deliberately NOT done, and the friction:
@@ -192,6 +240,7 @@ history - do not reintroduce them.
 | `docs/evidence-2026-08-16/` | Machine-readable audit trail |
 | `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
 | `docs/documentation-pass-2026-08-27.md` | The 2026-08-27 doc-vs-source pass: what was wrong and in what classes, the two findings worth reading alone, what was deliberately left, and the friction. |
+| `docs/advisory-findings-verification-2026-08-28.md` | The 2026-08-28 pass over the 32 advisory findings the 2026-08-26 review left unverified: the closed-vocabulary bug class and all eight of its instances, the Class A (fix) versus Class B (defer) distinction, the verdict ledger, the three lane reports that were wrong and how, and what was deliberately left. |
 | `docs/dispatch-integration-review-2026-08-27.md` | Cross-CLI dispatch: how the ladder is actually executed, the verified agy console-window cause and its host-side fix, agy's five-category permission vocabulary (three of its four entries had been inert), ACP as the verified cross-CLI transport, ranked options, open tests, and the friction. |
 
 ## 3. Verification — the one gate
