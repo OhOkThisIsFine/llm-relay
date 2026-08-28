@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { relayStatePath } from "./state-paths.js";
 import { isRecord } from "./json-shape.js";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawn } from "node:child_process";
@@ -243,7 +243,9 @@ ${formatTextTable([
   ["llm-relay keys <action> ...", "action: add|list|rotate|revoke|remove|disable|enable|export|import|unlock."],
   ["llm-relay pools [--probe]", "List members; --probe tests each deployment once."],
   ["llm-relay pools <action> <name> [<spec>...]", "action: set|add|remove|delete."],
-  ["llm-relay routing <action> ...", "action: show|get|default|tier|subagent|sort|benchmark|set|unset."],
+  ["llm-relay routing <action> ...", "action: show|get|default|tier|subagent|sort|benchmark|set|unset|answered."],
+  ["llm-relay route <action> ...", "Alias for routing."],
+  ["llm-relay lanes [--probe]", "What each cli dispatch lane's own tool says it serves."],
   ["llm-relay config <action> [<path>] [<value>]", "action: show|get|set|unset."],
   ["llm-relay models [-p <name>] [-r]", "List provider models."],
   ["llm-relay ping [-p <name>]", "Probe providers."],
@@ -358,10 +360,36 @@ capability token; the CLI attaches it automatically. /telemetry stays provider-a
 `;
 
 
+/**
+ * The config written on a FIRST RUN, when no config exists anywhere.
+ *
+ * ⚠ It declares the Anthropic passthrough and points every tier at it, and that is load-bearing
+ * rather than a preference. It used to declare no `anthropic` provider at all and set
+ * `routing.default: "pool/medium"`, so a `claude-opus-5` request resolved to a FREE POOL — and
+ * with no free keys yet configured, to nothing at all (`resolveTargets` returned `[]` on a clean
+ * HOME). Meanwhile `README.md` promised "Claude traffic keeps your own credentials and reaches
+ * real Anthropic untouched", `docs/QUICKSTART.md` said "At this point everything still goes to
+ * Anthropic. Nothing is saved yet — but nothing is broken either", and `skills/llm-relay/SKILL.md`
+ * said a Claude model id reaches the Anthropic passthrough. All three were false for a stranger
+ * following README plus `llm-relay onboard`, which `docs/project-goals.md` makes an explicit goal.
+ *
+ * The safe default is the one where nothing changes until the operator asks for it: install the
+ * relay, keep working exactly as before, then move traffic deliberately. `pools`, `subagents` and
+ * the offload switches are all still here and still off, so turning offload on is one command.
+ *
+ * ⚠ `credentialMode: "passthrough"` is stated rather than left to omission. Omitting it forwards
+ * too, but "needs no key of its own" and "may be sent the user's subscription credential" are
+ * different intentions and only the first should follow from silence.
+ */
 const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
   {
     listen: "127.0.0.1:8791",
     providers: {
+      anthropic: {
+        base: "https://api.anthropic.com",
+        kind: "anthropic",
+        credentialMode: "passthrough",
+      },
       nim: {
         base: "https://integrate.api.nvidia.com/v1",
         kind: "openai",
@@ -389,12 +417,14 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
       },
     },
     routing: {
-      default: "pool/medium",
+      // Nothing moves until the operator asks. Claude ids reach real Anthropic, exactly as the
+      // README, QUICKSTART and skill all describe; `pool/*` is addressable from day one.
+      default: "anthropic",
       tiers: {
-        opus: "pool/xhigh",
-        fable: "pool/xhigh",
-        sonnet: "pool/high",
-        haiku: "pool/medium",
+        opus: "anthropic",
+        fable: "anthropic",
+        sonnet: "anthropic",
+        haiku: "anthropic",
       },
       // Addressable as `model: pool/<name>` — including from subagent frontmatter, which only
       // accepts a single string and so cannot express a candidate list on its own.
@@ -420,6 +450,13 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
       },
     },
     mode: "repair",
+    // ⚠ Required once an `anthropic`-kind provider is declared: `mode: "repair"` needs somewhere
+    // to reshape a malformed tool call, and an anthropic passthrough has no fixed model of its
+    // own to do it on, so `loadConfig` refuses to start without this. A POOL rather than a fixed
+    // {base, model, authEnv} for the reason the error message itself gives — ranked candidates
+    // that survive a de-listed model. Adding the passthrough without this line made every fresh
+    // install fail to load; `test/first-run.test.ts` caught it.
+    reshaper: { pool: "medium" },
     repair: {
       maxAttempts: 2,
       destructiveTools: [...DEFAULT_DESTRUCTIVE],
@@ -429,6 +466,15 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
   null,
   2,
 );
+
+/**
+ * The shipped template, exposed for `test/first-run.test.ts`.
+ *
+ * A test that rebuilt this object would be testing itself: the defect being pinned was that the
+ * SHIPPED bytes routed `claude-*` to a free pool while three user-facing documents said Anthropic.
+ * Only the real constant can observe that.
+ */
+export const DEFAULT_CONFIG_TEMPLATE_FOR_TEST = DEFAULT_CONFIG_TEMPLATE;
 
 export { splitSpec };
 
@@ -457,9 +503,86 @@ export function resolveConfigPath(): string {
     mkdirSync(userConfigDir, { recursive: true });
     writeFileSync(userConfig, DEFAULT_CONFIG_TEMPLATE, "utf8");
     process.stderr.write(`llm-relay: initialized global config at ${userConfig}\n`);
+    markFirstRun(userConfigDir);
     return userConfig;
   } catch {
     return "config.json";
+  }
+}
+
+/** The first-run marker file, beside `config.json` in whichever config dir won. */
+export const FIRST_RUN_MARKER = "first-run";
+
+function firstRunDir(configDir?: string): string {
+  if (configDir !== undefined) return configDir;
+  // ⚠ Under vitest, share the same temp root the config resolver uses, so a test never reads or
+  // writes the developer's real marker. Guarded here, at the resolver, per CLAUDE.md.
+  return process.env.VITEST ? join(tmpdir(), "llm-relay-vitest") : relayStatePath("config");
+}
+
+/**
+ * Record that this install has never been steered.
+ *
+ * The shipped default deliberately changes nothing — every Claude id still reaches real Anthropic
+ * — which is the right SAFE default and the wrong FINAL state for somebody who installed a traffic
+ * router. Nobody reads a config file they did not write, so the relay leaves one flag, and
+ * `skills/llm-relay/SKILL.md` tells the agent to ASK the operator what they want the first time it
+ * is used, apply the answer with the ordinary verbs, and clear the flag.
+ *
+ * ⚠ A flag, not a prompt. `resolveConfigPath` runs inside every CLI command and inside the proxy
+ * itself, usually with no terminal attached, so asking here would block a headless start. The
+ * agent holds the conversation; the relay only records that the question is unanswered.
+ *
+ * ⚠ Best-effort: failing to write it must never stop a first run, and its absence simply means
+ * "no question pending" — the same fail-open direction as every other optional file here.
+ */
+function markFirstRun(configDir: string): void {
+  try {
+    writeFileSync(join(configDir, FIRST_RUN_MARKER), `${new Date().toISOString()}\n`, "utf8");
+  } catch {
+    /* best-effort: a missing marker only means no question is pending */
+  }
+}
+
+/** Is the first-run routing question still unanswered? Absent file ⇒ no. Never throws. */
+export function firstRunPending(configDir?: string): boolean {
+  try {
+    return existsSync(join(firstRunDir(configDir), FIRST_RUN_MARKER));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Tell whoever is reading that the first-run routing question is still open.
+ *
+ * ⚠ STDERR, never stdout. `routing show` and `offload status` are JSON surfaces that scripts and
+ * agents parse; a synthetic key inside `cfg.routing` would also be a lie about the config, since
+ * nothing in the file says this. A notice beside the JSON reaches a human and an agent both,
+ * and breaks no parser.
+ */
+export function printFirstRunNotice(configDir?: string): void {
+  if (!firstRunPending(configDir)) return;
+  process.stderr.write(
+    "\nllm-relay: first run — this install has never been steered.\n" +
+      "  Every Claude model id currently reaches real Anthropic, which is the safe default and\n" +
+      "  probably not why you installed a traffic router. Ask the operator what they want, then:\n" +
+      "    llm-relay offload claude on            # marked subagents to the free pools\n" +
+      "    llm-relay routing subagent <tier> <spec>   # choose where each tier lands\n" +
+      "    llm-relay routing default <spec>       # move the MAIN conversation (deliberate)\n" +
+      "  Then run `llm-relay routing answered` to stop showing this.\n",
+  );
+}
+
+/** Record that the operator has been asked and has answered. Idempotent; never throws. */
+export function clearFirstRun(configDir?: string): boolean {
+  try {
+    const marker = join(firstRunDir(configDir), FIRST_RUN_MARKER);
+    if (!existsSync(marker)) return false;
+    rmSync(marker, { force: true });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -2208,6 +2331,9 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   // and the relay-routed CLI children this ladder spawns. What it cannot do is affect the session
   // running this command, when that session's traffic never arrives. Saying so here is the point:
   // the switch reporting ON while nothing changes is precisely how the no-op went unnoticed.
+  // The other surface an agent reaches for when it is about to steer traffic. Stderr, so the
+  // stdout report stays exactly what it was for anything parsing it.
+  if (want === null) printFirstRunNotice();
   const hostRouting = detectHostRouting();
   if (hostRouting.state === "bypassed" && state.enabled) {
     process.stdout.write(`  ⚠ ${hostRouting.reason}\n`);
@@ -2900,6 +3026,7 @@ export function runRoutingCommand(): void {
 
   if (action === "show" || action === "get") {
     outputJson(cfg.routing);
+    printFirstRunNotice();
     return;
   }
 
@@ -2959,6 +3086,18 @@ export function runRoutingCommand(): void {
       });
     }
     changedConfig(path);
+    return;
+  }
+
+  if (action === "answered") {
+    // Retires the first-run notice without touching routing. Separate from the steering verbs on
+    // purpose: "I have decided to change nothing" is a real answer, and forcing an edit to silence
+    // a prompt is how a default gets changed for the wrong reason.
+    process.stdout.write(
+      clearFirstRun()
+        ? "llm-relay: first-run question marked answered.\n"
+        : "llm-relay: no first-run question was pending.\n",
+    );
     return;
   }
 
@@ -3350,8 +3489,14 @@ export function main(): void {
     if (arg3 === "claude-desktop" || arg3 === "desktop") {
       const res = setupClaudeDesktop();
       process.stdout.write(`${res.message}\n`);
-    } else {
+    } else if (arg3 === undefined || arg3 === "claude-cli" || arg3 === "cli" || arg3 === "claude") {
       setupClaudeCli();
+    } else {
+      // ⚠ This used to be a bare `else`, so `setup clade-desktop` (a typo) silently ran the CLI
+      // setup and exited 0 — the user believed they had configured Desktop. HELP has always
+      // documented `claude-cli`, which matched no branch and only worked by that fall-through;
+      // it is a real target now, and anything else is named and refused.
+      configCommandError(`setup: unknown target "${arg3}" (targets: claude-cli, claude-desktop)`);
     }
     return;
   }
@@ -3573,8 +3718,10 @@ export function classifyCommand(argv: string[]): CommandEffect {
       return arg3 === "set" || arg3 === "unset" ? "mutating" : "read-only";
     case "routing":
     case "route":
+      // `answered` writes too — it removes the first-run marker. It touches no routing, but a
+      // command that deletes a file the relay wrote is not a read.
       return arg3 === "set" || arg3 === "unset" || arg3 === "default" || arg3 === "tier" ||
-        arg3 === "subagent" || arg3 === "sort" || arg3 === "benchmark"
+        arg3 === "subagent" || arg3 === "sort" || arg3 === "benchmark" || arg3 === "answered"
         ? "mutating"
         : "read-only";
     case "pools":
