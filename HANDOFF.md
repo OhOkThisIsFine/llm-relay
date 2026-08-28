@@ -360,6 +360,22 @@ else.**
 ⚠ What follows is **recorded trades and closed items kept for their reasons**, not a work queue.
 There is no open code gap.
 
+**From the 2026-08-28 verification sprint** — every item with its reason is in
+[docs/advisory-findings-verification-2026-08-28.md](docs/advisory-findings-verification-2026-08-28.md)
+"Still open, with its home". In short: four **Class B** findings (a type wider than its producers,
+which no producer can reach) are hardening and deferred — type-level 2, 8, 14, 15; type-level 12 is
+deferred until someone can show acceptance-equivalence by differential fuzzing, because it governs
+what LOADS and a quarantined shard is a lost day of ledger; type-level 7 is narrowed to a real
+transparency gap (a hard cap's `used` carries no provenance) and is an owner decision, not a wrong
+refusal. Response-SIZE bounds on the probe paths and the `withBudget` non-cancelling race are named
+as out of scope in `cd6e5f8`.
+
+⚠ **Two CANDIDATES recorded, neither built, both needing the owner's say-so:** an `eligibility`
+accept that takes a signature digest beside the index, because queue positions shift between
+invocations and a `propose` can silently land on the wrong refusal (it did, twice, in that
+session); and a spend ceiling denominated in currency per week, which has no home today because
+`limits.hard` speaks requests/tokens per minute or day.
+
 **CLOSED 2026-08-27 — the XDG state split.** Raised by the documentation pass as an owner decision
 and answered the same day: **honour XDG everywhere**. Thirteen hand-rolled resolvers running three
 policies collapse into `src/state-paths.ts` (config-kind → `XDG_CONFIG_HOME`, cache-kind →
