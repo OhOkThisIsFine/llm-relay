@@ -178,6 +178,18 @@ async function fetchOpenRouter() {
       supports_tools: Array.isArray(m.supported_parameters) ? m.supported_parameters.includes("tools") : null,
     });
   }
+
+  // This block carries one of the two signals in every capability dimension; if OpenRouter
+  // renames or drops it wholesale, every model silently loses half its signals and drops below
+  // the effort-band floor with no error. Per-model absence is fine — only the all-records case
+  // is drift. Same shape as the context_length guard above.
+  if (!out.some((r) => r.aa_intelligence != null || r.aa_coding != null || r.aa_agentic != null)) {
+    const bm = j.data[0]?.benchmarks ?? {};
+    throw new Error(
+      `OpenRouter schema drift — ${j.data.length} models but no artificial_analysis score field. ` +
+      `benchmarks keys: ${Object.keys(bm).join(" | ")}`,
+    );
+  }
   return out;
 }
 
