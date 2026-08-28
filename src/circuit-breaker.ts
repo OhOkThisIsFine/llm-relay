@@ -7,6 +7,7 @@ import type {
   AttemptLifecyclePort,
   AttemptOutcome,
   CompletedAttempt,
+  OutcomeProvenance,
   ProviderTargetIdentity,
   TransitionResult,
 } from "./kernel/contracts.js";
@@ -97,6 +98,38 @@ export interface CircuitCooldownClearResult {
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
+
+/**
+ * Does this outcome provenance reach the provider-health path?
+ *
+ * ⚠ This table is a faithful TRANSCRIPTION of the single `provenance === "relay-mapper-defect"`
+ * early return it replaced — not a fresh policy judgement. Its job is to force a maintainer adding
+ * an `OutcomeProvenance` member to make a decision, because the old `if` silently defaulted every
+ * unnamed member to `true` — charging the PROVIDER's breaker for what may be a relay-local fault.
+ * That is why the values below are what they are, and why changing one is a routing change that
+ * belongs in its own commit with its own evidence:
+ *
+ * - `upstream`, `invalid-upstream-envelope` — the provider answered badly. Real evidence.
+ * - `deadline` — the provider did not answer in time. **Real evidence, and the paradigm case a
+ *   circuit breaker exists for**: a hanging deployment must be demoted. Setting this `false` would
+ *   make a timing-out provider permanently healthy.
+ * - `client-cancellation` — kept `true` ONLY to preserve the prior behaviour exactly. It is
+ *   unreachable in practice: `outcome.terminal === "cancelled"` returns before this table is
+ *   consulted. Semantically a client hanging up says nothing about the provider, so if that early
+ *   return ever moves, this is the entry to revisit.
+ * - `relay-mapper-defect` — the relay's own bug. The one `false`, and the reason the guard exists.
+ *
+ * Consulted AFTER `recordQuotaObservations`, which runs even for a mapper defect: a header the
+ * provider sent is still the provider's statement. Order: cancelled → quota → this table → health.
+ */
+const PROVENANCE_REACHES_HEALTH_PATH: Record<OutcomeProvenance, boolean> = {
+  "upstream": true,
+  "invalid-upstream-envelope": true,
+  "deadline": true,
+  "client-cancellation": true,
+  "relay-mapper-defect": false,
+} as const satisfies Record<OutcomeProvenance, boolean>;
+
 const RATE_LIMIT_ESCALATION_MS = [
   120_000, 600_000, 3_600_000, 86_400_000,
 ] as const;
@@ -324,9 +357,11 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   ): void {
     if (outcome.terminal === "cancelled") return;
     this.recordQuotaObservations(target, observation?.quotaObservations);
-    // Mapper defects must not affect provider health, but valid upstream headers
-    // observed before translation are still useful quota facts.
-    if (outcome.provenance === "relay-mapper-defect") return;
+    // Consult the single provenance table. Quota observations were recorded above even for a
+    // mapper defect (a header the provider sent is still the provider's statement). A `false`
+    // entry means "return without touching provider health" — the fault is relay-local and must
+    // not demote the provider.
+    if (!PROVENANCE_REACHES_HEALTH_PATH[outcome.provenance]) return;
     if (outcome.terminal === "succeeded") {
       this.applyHealthOutcome(target, {
         ok: true,

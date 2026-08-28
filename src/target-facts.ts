@@ -73,9 +73,25 @@ export const SCOPE_PRECEDENCE: Array<FactScope["kind"]> = [
  */
 export type FactResetBasis = "retry-after" | "reviewed-field" | "stated-body" | "reviewed-fixed";
 
-const UNTIL_BASES: ReadonlySet<string> = new Set([
-  "retry-after", "reviewed-field", "stated-body", "reviewed-fixed",
-]);
+/**
+ * Maps each reset basis to which rung of the availability ladder it belongs on.
+ * This is the ONE definition — `UNTIL_BASES` derives from it, and `availability.ts`
+ * `factResetInputs` reads it instead of comparing two literals.
+ *
+ * rung "stated"   = rung 1 (provider_stated): retry-after, stated-body — came from the
+ *                   provider's own response.
+ * rung "reviewed" = rung 2 (reviewed_rule): reviewed-field, reviewed-fixed — a reviewer's
+ *                   assertion, not a provider measurement.
+ */
+const FACT_RESET_BASIS_RUNG: Record<FactResetBasis, "stated" | "reviewed"> = {
+  "retry-after": "stated",
+  "reviewed-field": "reviewed",
+  "stated-body": "stated",
+  "reviewed-fixed": "reviewed",
+} as const satisfies Record<FactResetBasis, "stated" | "reviewed">;
+
+const UNTIL_BASES: ReadonlySet<FactResetBasis> = new Set(Object.keys(FACT_RESET_BASIS_RUNG) as FactResetBasis[]);
+export { FACT_RESET_BASIS_RUNG };
 
 interface StoredFact {
   kind: FactKind;
@@ -247,7 +263,7 @@ function load(path: string): FactStore {
           // default TTL, and handing a consumer that fallback with a basis attached is the exact
           // "a guess labelled a measurement" the field exists to prevent.
           const { untilBasis, ...rest } = fact;
-          const attributable = Number.isFinite(fact.until) && UNTIL_BASES.has(untilBasis as string);
+          const attributable = Number.isFinite(fact.until) && UNTIL_BASES.has(untilBasis as FactResetBasis);
           const stored: StoredFact = {
             ...rest,
             scope: normalizeScope(fact.scope),

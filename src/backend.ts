@@ -64,9 +64,20 @@ export const ERROR_ORIGIN_HEADER = "x-llm-relay-error-origin";
 export type ErrorOrigin = "upstream" | "local";
 
 /** Read the origin marker off a Response, when it carries one. */
+/**
+ * The declared origins, as a runtime set derived from the type rather than hand-listed beside it.
+ *
+ * `errorOrigin` is the ONE validator for this header, and its two-literal test was the drift seam:
+ * a third `ErrorOrigin` member would have been silently rejected here and defaulted to `"upstream"`
+ * by every caller — an unknown origin reported as the provider's fault, and `upstream` also means
+ * RETRIABLE, so the walk would reroll other pool members for a fault that may be the relay's own.
+ * Deriving the set makes a new member a compile error at the table instead.
+ */
+const ERROR_ORIGINS = { upstream: true, local: true } as const satisfies Record<ErrorOrigin, true>;
+
 export function errorOrigin(res: Response): ErrorOrigin | null {
   const v = res.headers.get(ERROR_ORIGIN_HEADER);
-  return v === "upstream" || v === "local" ? v : null;
+  return v !== null && Object.hasOwn(ERROR_ORIGINS, v) ? (v as ErrorOrigin) : null;
 }
 
 /**
@@ -1563,6 +1574,9 @@ export async function fetchOpenAiFront(
     } catch (cause) {
       return attachPostHeaderBodyFailure(backendRes, cause);
     }
+    // Absent or unreadable ⇒ `"upstream"`, deliberately: the provider DID answer, and the relay
+    // marks its own errors. `errorOrigin` is the one place the declared members are enumerated,
+    // and it is now derived from the type — so a third member cannot be silently rejected here.
     const origin = errorOrigin(backendRes) ?? "upstream";
     // Same rule as the two id-rewrite counters below: rebuilding the response must not swallow the
     // announcement of a decision the relay made one Response ago. A dialect-rescue destructive

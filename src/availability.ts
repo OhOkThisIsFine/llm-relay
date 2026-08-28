@@ -378,7 +378,7 @@ export function resolveResetsAt(input: {
 
 // ── §5.2 rung inputs from persisted target-facts ────────────────────────────────────────────────
 
-import { QUOTA_RESET_FACT_KINDS, type FactKind, type FactResetBasis } from "./target-facts.js";
+import { QUOTA_RESET_FACT_KINDS, type FactKind, type FactResetBasis, FACT_RESET_BASIS_RUNG } from "./target-facts.js";
 
 /**
  * One covering fact, in exactly the shape `factsFor()` returns (wider objects satisfy it).
@@ -446,9 +446,10 @@ export function factResetInputs(input: {
     if (fact.untilBasis === undefined) continue;
     if (!QUOTA_RESET_FACT_KINDS.has(fact.kind)) continue;
     if (!Number.isFinite(fact.until) || fact.until <= input.now) continue;
-    // `retry-after` / `stated-body` came out of the provider's own response, so they belong on
-    // rung 1; the reviewed rungs are a reviewer's assertion and belong on rung 2.
-    if (fact.untilBasis === "reviewed-field" || fact.untilBasis === "reviewed-fixed") reviewed ??= fact.until;
+    // Read the rung from the single table in target-facts.ts. A missing key is a compile
+    // error there, so no unrecognised basis can reach here.
+    const rung = FACT_RESET_BASIS_RUNG[fact.untilBasis];
+    if (rung === "reviewed") reviewed ??= fact.until;
     else stated ??= fact.until;
   }
   return { providerStated: stated, reviewedRule: reviewed };
