@@ -213,15 +213,14 @@ pool the operator runs `routing subagent <tier> <spec>` (file only, restart requ
 prints a warning for the half-configured case (`cli.ts:2242`), which is good, and which also shows
 the trap is real.
 
-**Two read verbs over the same pools disagree.** Verified first-hand:
-
-```
-llm-relay routing show  ->  pools: {"low":[],"medium":[],"high":[],"xhigh":[]}
-llm-relay pools         ->  pool/low — 216 members  (and the same for the other three)
-```
-
-`routing show` prints the raw config; `pools` materializes the dynamic pool. An operator reading
-`routing show` would reasonably conclude the pools are broken.
+**Two read verbs over the same pools read differently** — though less badly than this assessment
+first said. `routing show` prints `"pools": {"low": [], …}` because `loadConfig` splits a dynamic
+pool into an empty `pools` array plus a `poolPolicies` declaration, and members are materialized at
+runtime; `llm-relay pools` prints 216 members each. **Correction:** an earlier draft called this a
+flat contradiction. It is not — `routing show` prints `poolPolicies` immediately below, showing
+`{preferred: [], include: "free", effort: "low"}`, so a reader who sees the whole output has the
+explanation. The first draft's evidence came from a probe script of mine that filtered the output
+down to `.pools`, which manufactured the contradiction it then reported. Left unchanged.
 
 **HELP drift is real and verified today.** `CLI_COMMAND_NAMES` holds 21 names.
 HELP omits `lanes` and the `route` alias entirely (0 matches each). HELP documents a `setup`
@@ -367,7 +366,7 @@ Findings verified first-hand during this assessment, additional to the nine:
 |---|---|
 | The request-path context guardrail never reads the learned ceiling. | `server.ts:1307` reads `catalog.cachedLimits` only. `contextWindowResolver`, whose top rung is the learned `context-limit` fact, is called only by `cli.ts:1923` and `routes/admin.ts:337`. |
 | `CircuitBreaker.orderByUsability` has zero `src/` callers. | Only tests call it. `server.ts:2391` `orderByUsability` is also a test-only seam. Live ordering is `targetUsability` + `orderDeploymentGroupsByUsability`. `CLAUDE.md` calls the breaker method "the ordering API". |
-| `routing show` and `pools` disagree about the same four pools. | Empty arrays versus 216 members each. |
+| ~~`routing show` and `pools` disagree about the same four pools.~~ **RETRACTED.** | `routing show` prints `poolPolicies` beside the empty `pools`, so the dynamic declaration is visible. The original evidence came from a probe script that filtered the output to `.pools`. |
 | The cooling band is ordered by fitness, not by soonest lift. | `server.ts:2002`. |
 | `candidates.ts:395` omits `published` from its `hasLimits` test; `availability-snapshot.ts:124` includes it. | Currently inert — 0 of 1223 catalogued models publish a rate limit. |
 
@@ -385,21 +384,57 @@ Findings verified first-hand during this assessment, additional to the nine:
 - **The `/v1/messages`-only scope of tool-call validation is an explicit design commitment.**
 - **Codex wiring through `postinstall` is the primary documented install path, not a leftover.**
 
-## Open owner decisions
+## Owner decisions — ANSWERED AND SHIPPED, 2026-08-28
 
-The three levers below are one-file changes. Each needs a decision, not analysis.
+All four were put to the owner and all four were approved. They are implemented in this repository;
+the decision text is kept because the reasoning outlives the commits.
 
-1. **Unknown-period observations that state their own reset.** Admit them as a distinct bucket, or
-   keep the spec rule as written and accept that the fleet's most common header shape stays inert.
-2. **The stability composite.** Rescale it by uptime, or leave it and accept that 403-walled members
-   lead the pool order.
-3. **Breaker persistence.** Persist cooldowns and the escalation ladder across restart, or accept
-   that a restart discards up to 24 hours of learned exhaustion.
+| Decision | Answer | Commit |
+|---|---|---|
+| Unknown-period observations that state their own reset | **Admit them** | `feat(quota): admit an unknown-period observation that states its own reset` |
+| The stability composite | **Rescale by uptime** | `fix(health): scale the stability score by availability…` |
+| Breaker persistence | **Persist cooldowns and the ladder** | `feat(health): persist breaker cooldowns and the 429 escalation ladder` |
+| The fresh-install contradiction | **Fix the template**, and have the agent ASK on first use | `feat(onboarding): ship a template that matches the docs, and ask on first run` |
 
-A fourth needs a decision of a different kind:
+Measured effects, recomputed against this operator's own live data after the change:
 
-4. **The fresh-install contradiction.** Change the template to declare the Anthropic passthrough, or
-   change `README.md:43` and `QUICKSTART.md:68` to describe what the template actually does.
+- Zero-success deployments scoring above 50 fell from **27 to 0**; `openrouter/x-ai/grok-build-0.1`
+  fell from **81 to 8**.
+- The groq shape (`period: "unknown"` with a stated `resetsAt`) now reaches the demotion ladder
+  instead of being discarded.
+- A restart no longer discards a 19.9-hour cooldown learned from 7 failed requests.
+- A fresh install resolves `claude-opus-5` to the Anthropic passthrough with no keys configured.
+
+Three things worth keeping from the implementation:
+
+1. **My own negative-control test caught a hole in my own fix.** `resolveRemaining` rung 2 still
+   subtracted a ledger figure for an unknown period, returning `-39`. The rule now lives in the
+   exported pure function rather than in each caller.
+2. **The first-run test caught a defect worse than the bug.** Declaring the Anthropic passthrough
+   makes `mode: "repair"` a hard load error without a `reshaper`, so the template as first written
+   would have made *every* fresh install fail to start.
+3. **The breaker fix was mutation-checked.** Neutering `restoreCooldowns` to `return 0` fails
+   exactly the two tests that claim state survives a restart.
+
+## Remaining open items
+
+None of the four decisions is outstanding. What the assessment found and did NOT act on:
+
+- **Findings 3, 4, 5, 8 and 9 in the ledger are untouched** — the OpenRouter `sync-tiers` drift
+  guard, the hardcoded 272,000 `context_window` on `GET /v1/models`, the Cerebras/Cohere rows in
+  QUICKSTART that no template declares, the double `observeEligibility` count on the Anthropic
+  front, and the stale `server.ts:2723` JSDoc. Each is real and none was part of a decision.
+- **The learned context ceiling still never reaches the request-path guardrail.**
+  `server.ts` reads `catalog.cachedLimits` only. Not raised as a decision because the store holds
+  zero `context-limit` facts today, so the fix would be unobservable either way.
+- **`CircuitBreaker.orderByUsability` still has zero `src/` callers.** `CLAUDE.md` no longer calls
+  it "the ordering API"; the dead code itself is left, and its tests pin a function the router does
+  not call.
+- **The cooling band is still ordered by fitness, not soonest lift.** `state.cooldownUntil` is now
+  persisted as well as live, so the sort key is in hand whenever this is taken up.
+- **`credential-select.ts` `headroomBand` still ignores `period`** while the availability ladder
+  gates on it. Inert today because no provider declares a `credentials` fleet; the first fleet the
+  operator configures activates it.
 
 ---
 
