@@ -4,7 +4,55 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-28
 
-**Latest — the advisory-findings verification sprint.** The 2026-08-26 uncovered-areas review ended
+**Latest — the three-axis assessment and the four decisions it produced (v0.53.0).** The owner asked
+how well the relay handles (a) tracking quota/rate/capability/capacity from different sources,
+(b) steering traffic through a single verb, and (c) working from Claude, Codex, OpenCode and other
+IDEs. Six auditors read source, every gap claim went to an adversarial verifier (60 claims, **51
+refuted**), and the report adds first-hand measurement against the running relay:
+[docs/three-axis-assessment-2026-08-28.md](docs/three-axis-assessment-2026-08-28.md).
+
+**The finding that mattered was not in the code — it was in the code's OUTPUT.** The quota
+architecture is genuinely excellent and the live signal was nearly empty: 3 of 216 candidates
+carried a provider-stated observation and **none** was routing-eligible; 0 configured limits; 0
+learned rate-limit measurements in 7 days; 0 of 1223 catalogued models publish one. What actually
+gated traffic was the breaker's blind 429/402 escalation — which was **memory-only**. Capability was
+the opposite: 216/216 exact matches on synced-snapshot basis.
+⚠ **Read a pipeline's output files, not only its source.** Six auditors graded the code correctly
+and the grade only moved on `target-facts.json`, `refusal-interpretations.json`, `probe-cache.json`
+and `usage/`.
+
+All four owner decisions were approved and shipped:
+
+- **Unknown-period observations that state their own reset are now admitted.** The recorded
+  rationale ("a bucket without a known period cannot reach a boundary to expire at") was falsified
+  by the wire — groq states limit, remaining AND reset on a header whose NAME carries no period.
+  `QuotaBucket.period` widened to `QuotaPeriod`, which made the compiler enumerate all three ledger
+  consumers; they now share one `localUsedForPeriod` helper.
+- **The stability composite is scaled by availability, not plus 20% of it.** Live: 27 zero-success
+  deployments scored above 50 and one at 1-success-in-12 scored 81; recomputed after, that is 0 and
+  8. `-1` now means "never probed", not "no measurable sample".
+- **Breaker cooldowns and the 429 escalation ladder persist** (`breaker-persistence.ts`). A restart
+  was discarding a 19.9-hour cooldown learned from 7 failed requests.
+- **`DEFAULT_CONFIG_TEMPLATE` declares the Anthropic passthrough**, so a fresh install matches what
+  README/QUICKSTART/SKILL all promise, plus a first-run marker and `llm-relay routing answered` — the
+  skill now tells the agent to ASK the operator what they want on first use.
+
+Three process lessons worth more than the commits:
+
+- **A negative-control test caught a hole in the fix it was controlling for.** `resolveRemaining`
+  rung 2 still subtracted a ledger figure for an unknown period (returned `-39`). Write the controls.
+- **The first-run test caught a defect worse than the bug.** Declaring the passthrough makes
+  `mode: "repair"` a hard load error without a `reshaper`, so the template as first written would
+  have made *every* fresh install fail to start.
+- **Mutation-check a new guard.** Neutering `restoreCooldowns` to `return 0` fails exactly the two
+  tests that claim state survives a restart — which is how you know they can observe the bug.
+
+⚠ **One assessment finding was RETRACTED and left visible in the ledger:** the claim that
+`routing show` and `pools` flatly contradict each other. They do not — `routing show` prints
+`poolPolicies` beside the empty `pools`. The original evidence came from a probe script that
+filtered the output to `.pools`, manufacturing the contradiction it reported.
+
+**Earlier — the advisory-findings verification sprint.** The 2026-08-26 uncovered-areas review ended
 by saying its remaining 13 cross-cutting and 19 type-level lane findings "remain advisory and
 unverified — do not treat them as a work queue". That was right, and it left 32 unchecked claims.
 This sprint checked all 32 against source. Full ledger, the Class A / Class B distinction, the three
