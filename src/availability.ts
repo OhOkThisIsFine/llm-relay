@@ -57,6 +57,25 @@ export function projectLocalUsed(reading: UsedInWindowReading | null, axis: Quot
   return { value: reading.tokens, basis: reading.basis };
 }
 
+/**
+ * The ONE definition of "which buckets may read the local ledger at all", wrapping
+ * `projectLocalUsed` so its three consumers cannot disagree.
+ *
+ * ⚠ An `"unknown"` period has no window to count, so rung 2 must not run for it and the ledger is
+ * never asked. `AccountingStore.usedInWindow` also declines the period by type; this is the
+ * runtime half of the same rule, in one place rather than hand-copied into
+ * `quota-demotion.ts`, `availability-snapshot.ts` and `candidates.ts` — three hand-copies of the
+ * quota bucket key is exactly how the last drift of this shape happened.
+ */
+export function localUsedForPeriod(
+  read: (period: Exclude<QuotaPeriod, "unknown">) => UsedInWindowReading | null,
+  period: QuotaPeriod,
+  axis: QuotaAxis,
+): LocalUsedReading {
+  if (period === "unknown") return { value: null, basis: null };
+  return projectLocalUsed(read(period), axis);
+}
+
 /** The limits a caller has already resolved, each optional — absent until its gap lands. */
 export interface LimitInputs {
   configured?: number | null;
@@ -72,9 +91,18 @@ export interface LimitInputs {
  * ⚠ `quota-observation.ts` keeps a PRIVATE interface of the same name for its own header
  * parsing; this exported shape is the one consumers see. Exporting the other would collide.
  */
+/**
+ * ⚠ `period` INCLUDES `"unknown"`, and that is load-bearing rather than lax. A provider whose
+ * header name carries no period word (groq's `x-ratelimit-limit-requests`, the whole
+ * `anthropic-ratelimit-*` family) still states limit, remaining AND reset on the row. Such a
+ * bucket is admitted only when the observation supplies its own reset — see `collectQuotaBuckets`
+ * — so nothing here is ever derived from a period that does not exist: `periodStart`/`periodEnd`
+ * both return null for `"unknown"`, and `usedInWindow` declines the period by type, so the
+ * rung-2 arithmetic and the rung-3 boundary fail closed on their own.
+ */
 export interface QuotaBucket {
   readonly axis: QuotaAxis;
-  readonly period: Exclude<QuotaPeriod, "unknown">;
+  readonly period: QuotaPeriod;
   readonly observations: QuotaObservation[];
   readonly limits: LimitInputs;
 }
@@ -96,7 +124,7 @@ export interface CollectQuotaBucketsInput {
  */
 export function collectQuotaBuckets(input: CollectQuotaBucketsInput): Map<string, QuotaBucket> {
   const buckets = new Map<string, QuotaBucket>();
-  const bucketFor = (axis: QuotaAxis, period: Exclude<QuotaPeriod, "unknown">): QuotaBucket => {
+  const bucketFor = (axis: QuotaAxis, period: QuotaPeriod): QuotaBucket => {
     const key = bucketKey(axis, period);
     let bucket = buckets.get(key);
     if (bucket === undefined) {
@@ -107,7 +135,12 @@ export function collectQuotaBuckets(input: CollectQuotaBucketsInput): Map<string
   };
 
   for (const observation of input.observations) {
-    if (observation.period === "unknown") continue;
+    // An unknown PERIOD is not an unknown QUOTA. The row still carries the provider's own
+    // limit/remaining, and it is admissible exactly when the provider also stated when the window
+    // resets — that reset is what the demotion expires against, so nothing has to be invented.
+    // Without one there is no boundary in reach and no period to derive one from, which is the
+    // case the old blanket `continue` was written for; keep declining it.
+    if (observation.period === "unknown" && !Number.isFinite(observation.resetsAt ?? Number.NaN)) continue;
     bucketFor(observation.axis, observation.period).observations.push(observation);
   }
   for (const entry of input.learned) {
@@ -207,8 +240,22 @@ export function periodEnd(now: number, period: QuotaPeriod): number | null {
   }
 }
 
-function withinCurrentPeriod(observedAt: number, now: number, period: QuotaPeriod): boolean {
+/**
+ * Is this observation still describing the CURRENT window?
+ *
+ * For a named period the test is the UTC boundary. For `"unknown"` there is no boundary to test
+ * against, so the observation's OWN stated reset is the window: before it, the figure describes
+ * the live window; at or after it, the window has rolled over and the figure is gone. That reset
+ * is the same fact `collectQuotaBuckets` required to admit the row at all, so an unknown-period
+ * observation reaching here always has one.
+ */
+function withinCurrentPeriod(observation: QuotaObservation, now: number, period: QuotaPeriod): boolean {
+  const { observedAt } = observation;
   if (!Number.isFinite(observedAt) || observedAt > now) return false;
+  if (period === "unknown") {
+    const resetsAt = observation.resetsAt;
+    return resetsAt !== null && Number.isFinite(resetsAt) && resetsAt > now;
+  }
   const start = periodStart(now, period);
   return start !== null && observedAt >= start;
 }
@@ -232,7 +279,7 @@ function eligibleObservation(
     // requests/minute question even when it is the freshest thing on the cell.
     if (candidate.axis === axis && candidate.period === period) {
       // Newest-wins per tuple; ties keep the first seen (callers merge newest-first).
-      if (withinCurrentPeriod(candidate.observedAt, now, period)) {
+      if (withinCurrentPeriod(candidate, now, period)) {
         eligible ??= candidate;
       } else {
         staleCount += 1;
@@ -286,8 +333,15 @@ export function resolveLimit(
 
 /** The spec §5.1 ladder, one call per (scope, axis, period). */
 export function resolveRemaining(input: ResolveRemainingInput): RemainingResolution {
+  // ⚠ Rung 2 subtracts THIS PERIOD's usage from a stated ceiling, so it needs a period to count.
+  // An `"unknown"` period has none, and a figure counted over some other window would be an
+  // invented remaining wearing a `derived:` label. Every caller already routes its ledger read
+  // through `localUsedForPeriod`, which returns null here — but this function is exported and
+  // pure, so it owns the rule rather than trusting each caller to remember it.
   const localUsedValue =
-    typeof input.localUsed.value === "number" && Number.isFinite(input.localUsed.value)
+    input.period !== "unknown" &&
+    typeof input.localUsed.value === "number" &&
+    Number.isFinite(input.localUsed.value)
       ? input.localUsed.value
       : null;
 
