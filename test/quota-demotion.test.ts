@@ -126,6 +126,81 @@ describe("quota demotion resolver — the §5.4 gates", () => {
     expect(fn(resolveAttempt(t("a")), now)).toBeNull();
   });
 
+  /**
+   * An UNKNOWN period is not an unknown QUOTA. Groq (and the whole
+   * `anthropic-ratelimit-*` family) states limit/remaining/reset on headers whose NAME carries no
+   * period word, so `quota-observation.ts` records `period: "unknown"`. Such a row used to be
+   * dropped whole by `collectQuotaBuckets`, on the recorded ground that "a bucket without a known
+   * period cannot reach a boundary to expire at" — which the live wire falsifies: the reset is
+   * stated on the row. Admitting it needs no invented number and no derived arithmetic; the
+   * provider supplied both halves.
+   *
+   * ⚠ The stated reset is what makes the row admissible, so it is also the staleness test: past
+   * the stated reset the window has rolled over and the figure describes a window that is gone.
+   */
+  it("demotes on an unknown-period observation that states its OWN reset (the groq shape)", () => {
+    const now = Math.floor(Date.now() / MINUTE) * MINUTE + 5_000;
+    const resetAt = now + 86_000;
+    const cb = new CircuitBreaker();
+    seedObservations(cb, breakerIdentity("a", "m"), [
+      obs({ period: "unknown", limit: 1000, remaining: 0, resetsAt: resetAt, observedAt: now }),
+    ]);
+    const fn = createQuotaDemotionFn({ cfg: baseCfg(), breaker: cb });
+    const d = fn(resolveAttempt(t("a")), now);
+    expect(d).not.toBeNull();
+    expect(d!.axis).toBe("requests");
+    expect(d!.period).toBe("unknown");
+    expect(d!.remaining).toBe(0);
+    expect(d!.basis).toBe("provider-stated");
+    expect(d!.resetsAt).toBe(resetAt);
+    expect(d!.resetsAtBasis).toBe("provider-stated");
+  });
+
+  it("an unknown-period observation with NO stated reset still has no effect", () => {
+    const now = Math.floor(Date.now() / MINUTE) * MINUTE + 5_000;
+    const cb = new CircuitBreaker();
+    seedObservations(cb, breakerIdentity("a", "m"), [
+      obs({ period: "unknown", limit: 1000, remaining: 0, resetsAt: null, observedAt: now }),
+    ]);
+    const fn = createQuotaDemotionFn({ cfg: baseCfg(), breaker: cb });
+    expect(fn(resolveAttempt(t("a")), now)).toBeNull();
+  });
+
+  it("an unknown-period observation whose stated reset has PASSED is stale and has no effect", () => {
+    const now = Math.floor(Date.now() / MINUTE) * MINUTE + 5_000;
+    const cb = new CircuitBreaker();
+    seedObservations(cb, breakerIdentity("a", "m"), [
+      obs({ period: "unknown", limit: 1000, remaining: 0, resetsAt: now - 1, observedAt: now - 90_000 }),
+    ]);
+    const fn = createQuotaDemotionFn({ cfg: baseCfg(), breaker: cb });
+    expect(fn(resolveAttempt(t("a")), now)).toBeNull();
+  });
+
+  /**
+   * ⚠ An unknown-period bucket may never do rung-2 arithmetic: there is no window to read, and
+   * `usedInWindow` declines the period by type. So a bucket carrying ONLY a stale unknown-period
+   * limit must resolve nothing, even with a ledger present — the opposite of the `derived:
+   * provider-stated` case below, which has a real period to count against.
+   */
+  it("an unknown-period bucket never derives a remaining from the ledger", () => {
+    const now = Math.floor(Date.now() / MINUTE) * MINUTE + 5_000;
+    const cb = new CircuitBreaker();
+    seedObservations(cb, breakerIdentity("a", "m"), [
+      // Admissible (states a reset) but STALE, so only its limit half survives to rung 2.
+      obs({ period: "unknown", limit: 5, remaining: 5, resetsAt: now - 1, observedAt: now - 90_000 }),
+    ]);
+    const fn = createQuotaDemotionFn({
+      cfg: baseCfg(),
+      breaker: cb,
+      accounting: {
+        usedInWindow: () => {
+          throw new Error("usedInWindow must never be called for an unknown period");
+        },
+      },
+    });
+    expect(fn(resolveAttempt(t("a")), now)).toBeNull();
+  });
+
   it("a STALE observation's stated LIMIT still gates through this period's ledger usage (derived:provider-stated)", () => {
     const minuteStart = Math.floor(Date.now() / MINUTE) * MINUTE;
     const now = minuteStart + 30_000;

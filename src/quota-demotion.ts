@@ -37,7 +37,7 @@ import { resolveConfiguredLimits } from "./configured-limits.js";
 import { observedRateLimits } from "./rate-limits.js";
 import {
   collectQuotaBuckets,
-  projectLocalUsed,
+  localUsedForPeriod,
   resolveRemaining,
   resolveResetsAt,
   type RemainingResolution,
@@ -47,8 +47,16 @@ import {
 /** One spent, gateable bucket — the smallest honest statement of "why this cell steps aside". */
 export interface QuotaDemotion {
   readonly axis: QuotaAxis;
-  /** Never "unknown": a bucket without a known period cannot reach a boundary to expire at. */
-  readonly period: Exclude<QuotaPeriod, "unknown">;
+  /**
+   * MAY be `"unknown"`, and the reason the old `Exclude` was wrong is worth keeping: it read
+   * "a bucket without a known period cannot reach a boundary to expire at", which the wire
+   * falsifies. Groq answers `x-ratelimit-limit-requests` with limit, remaining AND reset, and the
+   * reset is what a demotion expires against — rung 1 of `resolveResetsAt` reads it directly and
+   * never needs a period. An unknown-period bucket is admitted only when the provider stated that
+   * reset (`collectQuotaBuckets`), so this member can only ever carry a first-party expiry. What
+   * an unknown period still cannot do is rung-2 arithmetic; `localUsedForPeriod` enforces that.
+   */
+  readonly period: QuotaPeriod;
   /** ≤ 0 by construction; preserved rather than clamped — overshoot is information. */
   readonly remaining: number;
   /** `provider-stated` | `derived:provider-stated` | `derived:configured` | `derived:learned` — never a guess label. */
@@ -85,10 +93,22 @@ export interface QuotaDemotionDeps {
  * Exported for `hard-cap.ts`, which orders the same (axis, period) buckets for the same reason:
  * one definition of "requests before tokens, minute before day" rather than two to keep in step.
  */
+const PERIOD_RANK = {
+  minute: 0,
+  day: 1,
+  month: 2,
+  // Last on purpose: an unknown-period bucket carries no boundary of its own, so a named period
+  // covering the same axis is the more specific statement and should be preferred when both exist.
+  unknown: 3,
+} as const satisfies Record<QuotaPeriod, number>;
+
 export function bucketRank(axis: QuotaAxis, period: QuotaPeriod): number {
   const axisRank = axis === "requests" ? 0 : 1;
-  const periodRank = period === "minute" ? 0 : period === "day" ? 1 : 2;
-  return axisRank * 10 + periodRank;
+  // ⚠ A total table, not a ternary chain. The chain this replaced ended in a bare `: 2`, so
+  // "month" and "unknown" shared a rank and a fifth period would silently have joined them —
+  // the closed-vocabulary fall-through class CLAUDE.md records. A new member is now a compile
+  // error at the table, which is where a maintainer adding one is already looking.
+  return axisRank * 10 + PERIOD_RANK[period];
 }
 
 /** The §5.4 verdict for ONE credential×deployment cell, from whatever evidence exists. */
@@ -120,22 +140,29 @@ function resolveQuotaDemotion(deps: QuotaDemotionDeps, attempt: ResolvedAttempt,
   // Cache the RAW ledger window by period, so at most one read per period serves every axis
   // projection without storing an already-projected value under an axis-free key.
   const windowCache = new Map<Exclude<QuotaPeriod, "unknown">, UsedInWindowReading | null>();
-  const localUsedFor = (period: Exclude<QuotaPeriod, "unknown">, axis: QuotaAxis) => {
-    let window = windowCache.get(period);
-    if (window === undefined) {
-      window =
-        deps.accounting === undefined || deps.accounting === null
-          ? null
-          : deps.accounting.usedInWindow({
-              credentialId: attempt.credentialId,
-              ...(model !== null ? { model } : {}),
-              period,
-              now,
-            });
-      windowCache.set(period, window);
-    }
-    return projectLocalUsed(window, axis);
-  };
+  const localUsedFor = (period: QuotaPeriod, axis: QuotaAxis) =>
+    // `localUsedForPeriod` owns the "an unknown period reads no ledger" rule, so this caller
+    // never restates it and the three ledger consumers cannot drift apart.
+    localUsedForPeriod(
+      (namedPeriod) => {
+        let window = windowCache.get(namedPeriod);
+        if (window === undefined) {
+          window =
+            deps.accounting === undefined || deps.accounting === null
+              ? null
+              : deps.accounting.usedInWindow({
+                  credentialId: attempt.credentialId,
+                  ...(model !== null ? { model } : {}),
+                  period: namedPeriod,
+                  now,
+                });
+          windowCache.set(namedPeriod, window);
+        }
+        return window;
+      },
+      period,
+      axis,
+    );
 
   let best: QuotaDemotion | null = null;
   for (const bucket of [...buckets.values()].sort((a, b) => bucketRank(a.axis, a.period) - bucketRank(b.axis, b.period))) {

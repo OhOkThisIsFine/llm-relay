@@ -32,7 +32,7 @@ import {
   mapLocalUsedBasis,
   mapRemainingBasis,
   mapResetsAtBasis,
-  projectLocalUsed,
+  localUsedForPeriod,
   resolveRemaining,
   resolveResetsAt,
 } from "./availability.js";
@@ -113,11 +113,16 @@ function buildQuotas(
       const { axis: axisPart, period: periodPart } = bucket;
       // The ledger reports {requests, tokens}; the ladder consumes one figure — tokens for the
       // token axes (what a TPM/TPD ceiling bounds) and the request count otherwise.
-      const windowReading =
-        accounting === undefined || accounting === null
-          ? null
-          : accounting.usedInWindow({ credentialId, ...(model !== null ? { model } : {}), period: periodPart, now });
-      const localUsed = projectLocalUsed(windowReading, axisPart);
+      // `localUsedForPeriod` owns the "an unknown period reads no ledger" half, so this producer
+      // and `quota-demotion.ts` cannot answer that question differently for the same bucket.
+      const localUsed = localUsedForPeriod(
+        (namedPeriod) =>
+          accounting === undefined || accounting === null
+            ? null
+            : accounting.usedInWindow({ credentialId, ...(model !== null ? { model } : {}), period: namedPeriod, now }),
+        periodPart,
+        axisPart,
+      );
       const resolution = resolveRemaining({
         observations: bucket.observations,
         axis: axisPart,

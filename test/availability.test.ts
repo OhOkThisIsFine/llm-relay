@@ -47,7 +47,7 @@ function resolutionFor(overrides: Partial<Parameters<typeof resolveRemaining>[0]
 }
 
 describe("collectQuotaBuckets — the one bucket builder", () => {
-  it("keeps month observations, drops unknown periods, and keeps learned and configured apart", () => {
+  it("keeps month observations, drops a resetless unknown period, and keeps learned and configured apart", () => {
     // Month-period observations had no pin anywhere before the builder existed; the consumer
     // suites exercise minute/day only, so a builder that dropped "month" would have passed them.
     const monthObservation: QuotaObservation = {
@@ -59,7 +59,9 @@ describe("collectQuotaBuckets — the one bucket builder", () => {
       observedAt: NOW,
       basis: "provider-stated",
     };
-    const unknownPeriod = { ...observation(NOW), period: "unknown" } as unknown as QuotaObservation;
+    // An unknown period with NO stated reset stays dropped: there is no boundary in reach and no
+    // period to derive one from, so nothing downstream could ever expire against it.
+    const unknownPeriod: QuotaObservation = { ...observation(NOW), period: "unknown", resetsAt: null };
 
     const buckets = collectQuotaBuckets({
       observations: [monthObservation, unknownPeriod, observation(NOW)],
@@ -74,6 +76,65 @@ describe("collectQuotaBuckets — the one bucket builder", () => {
     expect(buckets.get("requests:day")!.limits).toEqual({ learned: 2_000 });
     expect(buckets.get("requests:minute")!.limits.configured).toBe(50);
     expect(buckets.get("requests:minute")!.limits.learned).toBeUndefined();
+  });
+
+  /**
+   * The groq shape: `x-ratelimit-limit-requests` names no period, so the parser records
+   * `period: "unknown"` — but the same response states the reset. The row is admissible on that
+   * reset alone, which is why the drop above is conditional rather than blanket.
+   */
+  it("admits an unknown period when the observation states its own reset", () => {
+    const stated: QuotaObservation = { ...observation(NOW), period: "unknown", resetsAt: NOW + 86_000 };
+    const buckets = collectQuotaBuckets({ observations: [stated], learned: [], configured: null });
+
+    expect([...buckets.keys()]).toEqual(["requests:unknown"]);
+    expect(buckets.get("requests:unknown")!.observations).toEqual([stated]);
+  });
+
+  it("an admitted unknown-period bucket resolves rung 1 and expires at the stated reset", () => {
+    const stated: QuotaObservation = { ...observation(NOW), period: "unknown", remaining: 0, resetsAt: NOW + 86_000 };
+    const resolution = resolveRemaining({
+      observations: [stated],
+      axis: "requests",
+      period: "unknown",
+      localUsed: NO_USED,
+      now: NOW,
+    });
+    expect(resolution.remaining).toBe(0);
+    expect(resolution.basis).toBe("provider-stated");
+    expect(resolution.routingEligible).toBe(true);
+    expect(resolution.staleObservations).toBe(0);
+
+    const resets = resolveResetsAt({
+      providerStated: resolution.eligibleObservation?.resetsAt ?? null,
+      reviewedRule: null,
+      period: "unknown",
+      now: NOW,
+    });
+    expect(resets.resetsAt).toBe(NOW + 86_000);
+    expect(resets.basis).toBe("provider-stated");
+  });
+
+  /**
+   * ⚠ The stated reset is the admission ticket, so it is also the staleness test. Past it the
+   * window has rolled over and the figure describes a window that no longer exists — the same
+   * fail-safe direction as a named period whose UTC boundary has passed.
+   */
+  it("an unknown-period observation past its stated reset is stale, and derives nothing", () => {
+    const expired: QuotaObservation = { ...observation(NOW), period: "unknown", remaining: 0, resetsAt: NOW - 1 };
+    const resolution = resolveRemaining({
+      observations: [expired],
+      axis: "requests",
+      period: "unknown",
+      // A ledger figure must not rescue it: an unknown period has no window to count, so rung 2
+      // is unreachable no matter what a caller passes.
+      localUsed: { value: 99, basis: "relay-counted" },
+      now: NOW,
+    });
+    expect(resolution.remaining).toBeNull();
+    expect(resolution.basis).toBeNull();
+    expect(resolution.staleObservations).toBe(1);
+    expect(resolution.routingEligible).toBe(false);
   });
 });
 

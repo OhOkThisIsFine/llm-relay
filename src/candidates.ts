@@ -48,7 +48,13 @@ import {
  */
 export interface CandidateAvailability {
   axis: "requests" | "tokens";
-  period: "minute" | "day" | "month";
+  /**
+   * ⚠ Includes `"unknown"` — the same spelling `dashboard-contract.ts` `QUOTA_PERIODS` has always
+   * carried. A provider stating limit/remaining/reset on a header whose NAME omits the period
+   * (groq, the `anthropic-ratelimit-*` family) produces exactly such a row, and hiding it here
+   * while the dashboard shows it is how the two operator surfaces come to disagree about a cell.
+   */
+  period: "minute" | "day" | "month" | "unknown";
   limit: number | null;
   limitBasis: RemainingResolution["limitBasis"];
   remaining: number | null;
