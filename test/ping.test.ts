@@ -62,8 +62,13 @@ describe("Ping Metrics", () => {
     expect(getSpikeRate(pings)).toBe(0);
     expect(getUptime(pings)).toBe(80); // 4 out of 5 are 200
 
+    // Excellent latency, but one probe in five was a 401 — so availability is 80% and the score
+    // cannot exceed 80. This used to assert `> 80` and passed at 91, because uptime was a 20%
+    // additive term rather than the scale factor. The latency half is still near-perfect: the
+    // score sits just under its 80% ceiling, not near the floor.
     const score = getStabilityScore(pings);
-    expect(score).toBeGreaterThan(80);
+    expect(score).toBeLessThanOrEqual(getUptime(pings));
+    expect(score).toBeGreaterThan(70);
     // Four fast successes and then a 401 is NOT "Perfect": the latest probe is the provider
     // stating a fact about the credential, and it will say the same thing next time. `getVerdict`
     // now derives down-ness from the history itself rather than from a flag the caller passes, so
@@ -73,6 +78,67 @@ describe("Ping Metrics", () => {
     // ...whereas a transient 503 in the same position is weather, and must not disqualify it.
     const blip: PingRecord[] = [...pings.slice(0, 4), { ms: 500, code: "503", timestamp: 5 }];
     expect(getVerdict(blip)).toBe("Perfect");
+  });
+
+  /**
+   * The composite must never rank a deployment that mostly FAILS above one that always succeeds.
+   *
+   * `MEASURABLE_CODES` is a LATENCY set — 403/404/429/5xx leave p95, jitter and spike entirely —
+   * so under the old additive shape (`0.3*p95 + 0.3*jitter + 0.2*spike + 0.2*uptime`) a failing
+   * deployment kept a clean latency profile and paid only the 20% availability term. Measured on
+   * this operator's live probe cache: `openrouter/x-ai/grok-build-0.1` at 1 success in 12 scored
+   * **81**, while `gemini/models/gemini-3.5-flash` at 3 of 3 scored **27**; 27 deployments with
+   * ZERO successes scored above 50. All four pools here are `{include: "free"}`, so this score
+   * IS the pool order (`dynamic-pools.ts` -> `benchmarks.ts`).
+   *
+   * Availability now SCALES the composite instead of contributing a fifth of it, so a score can
+   * never exceed what the deployment's success rate supports.
+   */
+  it("never ranks a mostly-failing deployment above an always-succeeding one", () => {
+    // The grok shape: one fast success, then eleven 403s that the latency terms cannot see.
+    const mostlyFailing: PingRecord[] = [
+      { ms: 120, code: "200", timestamp: 1 },
+      ...Array.from({ length: 11 }, (_, i) => ({ ms: 90, code: "403", timestamp: i + 2 })),
+    ];
+    // The gemini shape: every probe succeeded, but slowly.
+    const alwaysSucceedingButSlow: PingRecord[] = [
+      { ms: 4200, code: "200", timestamp: 1 },
+      { ms: 4600, code: "200", timestamp: 2 },
+      { ms: 4400, code: "200", timestamp: 3 },
+    ];
+
+    expect(getUptime(mostlyFailing)).toBe(8);
+    expect(getUptime(alwaysSucceedingButSlow)).toBe(100);
+    expect(getStabilityScore(alwaysSucceedingButSlow)).toBeGreaterThan(getStabilityScore(mostlyFailing));
+  });
+
+  it("caps a zero-success deployment below the midpoint, whatever its latency looked like", () => {
+    // The `opencode/*` block: twelve 401s, fast. A 401 is a real latency sample and stays in the
+    // latency terms deliberately — the network path WAS timed — but it is not availability, so
+    // the multiplier is what stops a revoked key from reading as a healthy fast target.
+    const allUnauthorized: PingRecord[] = Array.from({ length: 12 }, (_, i) => ({
+      ms: 80,
+      code: "401",
+      timestamp: i + 1,
+    }));
+    expect(getUptime(allUnauthorized)).toBe(0);
+    expect(getStabilityScore(allUnauthorized)).toBe(0);
+  });
+
+  /**
+   * ⚠ The other face of the same defect. An all-402 deployment has NO measurable latency sample,
+   * so the composite used to return -1, which every consumer maps to "unmeasured" and the ordering
+   * maps to a NEUTRAL 50 — above the all-success gemini rows. Twelve consecutive 402s is evidence,
+   * not absence of evidence. `-1` now means only "never probed".
+   */
+  it("distinguishes 'never probed' from 'probed and always failed'", () => {
+    expect(getStabilityScore([])).toBe(-1);
+    const allPaymentRequired: PingRecord[] = Array.from({ length: 12 }, (_, i) => ({
+      ms: 70,
+      code: "402",
+      timestamp: i + 1,
+    }));
+    expect(getStabilityScore(allPaymentRequired)).toBe(0);
   });
 
   it("returns Spiky verdict for fast avg but high p95", () => {

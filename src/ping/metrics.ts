@@ -20,9 +20,12 @@ export type Verdict =
  *
  * ⚠ Latency only — this is NOT an availability set. Availability is decided by `getUptime()`
  * below, which counts `"200"` and nothing else, so a target answering only 401s reports 0%
- * uptime and its composite score is capped accordingly. Two other sites used to treat 401 as
- * equivalent to 200 for availability (`probe-cache.ts`, `cadence.ts`) and a provider with a
- * revoked key read as healthy; both now follow the 200-only rule.
+ * uptime and `getStabilityScore` MULTIPLIES its composite to 0. That claim used to read "capped
+ * accordingly" while the arithmetic merely subtracted a 20% term, which capped an all-401 target
+ * at ~80 — above every all-success target with mediocre latency. The cap is real now because
+ * availability scales the score rather than contributing a share of it. Two other sites used to
+ * treat 401 as equivalent to 200 for availability (`probe-cache.ts`, `cadence.ts`) and a provider
+ * with a revoked key read as healthy; both now follow the 200-only rule.
  */
 const MEASURABLE_CODES = new Set(["200", "401"]);
 
@@ -68,23 +71,47 @@ export function getUptime(pings: PingRecord[]): number {
   return Math.round((successful / pings.length) * 100);
 }
 
-/** Calculate composite Stability Score (0–100). Returns -1 if no measurable pings exist. */
+/**
+ * Composite Stability Score (0–100). Returns -1 only when the deployment has NEVER been probed.
+ *
+ * Shape: **latency quality, SCALED by availability** — not latency quality plus a fifth of
+ * availability. The distinction is the whole point, because `MEASURABLE_CODES` is a latency set:
+ * 403/404/429/5xx leave p95, jitter and spike entirely, so under the old additive form
+ * (`0.3*p95 + 0.3*jitter + 0.2*spike + 0.2*uptime`) a failing deployment kept a clean latency
+ * profile and paid only 20%. Measured on live probe data: 1 success in 12 scored **81** while
+ * 3 of 3 scored **27**, and 27 zero-success deployments scored above 50 — on a machine whose
+ * pools are all `{include: "free"}`, so this score IS the pool order. The comment above
+ * `MEASURABLE_CODES` claimed such a target was "capped accordingly"; only a multiplier delivers
+ * that cap.
+ *
+ * The latency weights are renormalized to sum to 1 across the three latency terms, so a
+ * deployment at 100% uptime scores exactly its latency quality and nothing is silently rescaled.
+ *
+ * ⚠ 401 deliberately STAYS in the latency terms: the response came back from the provider, so it
+ * really did time the network path. It contributes nothing to uptime, so the multiplier is what
+ * stops a revoked key from reading as a fast healthy target — no need to discard real timing data.
+ *
+ * ⚠ `-1` means "no samples", not "no MEASURABLE samples". Twelve consecutive 402s is evidence that
+ * this deployment fails, not absence of evidence: returning -1 there made every consumer read
+ * "unmeasured" and the ordering substitute a neutral 50, which put a fully-exhausted deployment
+ * above one that answered every probe.
+ */
 export function getStabilityScore(pings: PingRecord[]): number {
-  const measurable = pings.filter((p) => MEASURABLE_CODES.has(p.code));
-  if (measurable.length === 0) return -1;
+  if (pings.length === 0) return -1;
 
   const p95 = getP95(pings);
   const jitter = getJitter(pings);
   const uptime = getUptime(pings);
   const spikeRate = getSpikeRate(pings);
 
+  // With no measurable sample `getP95` returns Infinity, so `p95Score` clamps to 0 rather than
+  // producing NaN. Such a deployment also has 0% uptime, so the product is 0 either way.
   const p95Score = Math.max(0, Math.min(100, 100 * (1 - p95 / 5000)));
   const jitterScore = Math.max(0, Math.min(100, 100 * (1 - jitter / 2000)));
   const spikeScore = Math.max(0, 100 * (1 - spikeRate));
-  const reliabilityScore = uptime;
 
-  const score = 0.3 * p95Score + 0.3 * jitterScore + 0.2 * spikeScore + 0.2 * reliabilityScore;
-  return Math.round(score);
+  const latencyQuality = 0.4 * p95Score + 0.4 * jitterScore + 0.2 * spikeScore;
+  return Math.round(latencyQuality * (uptime / 100));
 }
 
 /**
