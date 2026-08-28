@@ -112,6 +112,26 @@ unless `--force` is supplied. CSV, JSONC, generic JSON and value-shape guessing 
 
 ---
 
+### First run — the relay asks what you want
+
+A fresh install writes a config that **changes nothing**: every Claude model id reaches real
+Anthropic through the passthrough, and the four free pools exist but nothing routes to them. That
+is deliberate — installing a proxy should not silently move your traffic — and it is also not the
+final state anybody wants, so the relay drops a marker file (`~/.llm-relay/first-run`) recording
+that the question has never been put.
+
+While that marker exists, `llm-relay routing show` and `llm-relay offload status` print a notice on
+**stderr** (never stdout, so nothing parsing their JSON breaks). An agent following
+`skills/llm-relay/SKILL.md` is told to ask you what you want, apply your answer with the ordinary
+verbs, and then run:
+
+```
+llm-relay routing answered
+```
+
+which retires the notice and touches no routing. "Leave it as it is" is a real answer, so silencing
+the prompt deliberately does not require a config edit.
+
 ## Config
 
 `~/.llm-relay/config.json` (or `--config <path>`): a `providers{}` registry plus a `routing`
@@ -1397,7 +1417,8 @@ and `keys` diagnostics have always refused to echo argv for that reason.
 | `llm-relay keys [check\|add\|list\|rotate\|revoke\|remove\|disable\|enable\|export\|import\|unlock]` | Check or manage encrypted provider credentials; see [Key custody](#key-custody) |
 | `llm-relay pools [--probe]` | List pool members; `--probe` spends one completion per unique deployment through one serviceable slot |
 | `llm-relay pools <set\|add\|remove\|delete> <name> [spec...]` | Edit a pool |
-| `llm-relay routing <show\|get\|default\|tier\|subagent\|sort\|benchmark\|set\|unset>` | Edit routing |
+| `llm-relay routing <show\|get\|default\|tier\|subagent\|sort\|benchmark\|set\|unset\|answered>` | Edit routing. `answered` retires the first-run notice (below) without changing anything. `route` is an alias for the whole command. |
+| `llm-relay lanes [--probe]` | What each `cli` dispatch lane's own tool says it serves; `--probe` runs each lane's roster command. The only writer of `~/.llm-relay/lane-manifest.json` — without it, lane eviction never engages. |
 | `llm-relay config <show\|get\|set\|unset> [path] [value]` | Edit any config field |
 | `llm-relay models [-p <name>] [-r]` | List live provider catalogs |
 | `llm-relay ping [-p <name>]` | Probe provider latency/health |

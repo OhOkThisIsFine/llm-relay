@@ -23,6 +23,32 @@ One boundary governs everything it does: the proxy fixes **protocol form** (tool
 violate the schema), never **judgment**. It refuses to fabricate destructive tool calls, and an
 unrepairable response fails loudly (502 / mid-stream SSE error) rather than passing through broken.
 
+## First use on a machine — ASK, do not assume
+
+A fresh install writes a config that **changes nothing**: every Claude model id reaches real
+Anthropic, and the free pools exist but nothing is routed to them. That is the safe default and it
+is almost certainly not why the operator installed a traffic router — so the relay leaves a marker
+saying the question has never been put, and **you** are the one who asks.
+
+`llm-relay routing show` and `llm-relay offload status` print a first-run notice **on stderr** while
+that marker exists. When you see it:
+
+1. Ask the operator what they want. Offer concrete options, not a lecture:
+   - **Subagents only** (recommended start) — `llm-relay offload claude on`. Marked child requests
+     go to the free pools; the operator's own turns stay on Anthropic. Nothing else changes.
+   - **Subagents plus the whole conversation** — `llm-relay offload claude on --scope all`. Spends
+     no Anthropic quota, and every turn now runs on a weaker model. Say that plainly.
+   - **Free lanes only, never spend money** — add `"freeOnly": true` to the rule. It refuses with a
+     clean 503 rather than falling through to paid.
+   - **Nothing yet** — a real answer. Leave the routing alone.
+2. Apply the answer with the ordinary verbs. Do not hand-edit `config.json`.
+3. Run `llm-relay routing answered` to retire the notice — including when the answer was "nothing
+   yet". Forcing a config edit just to silence a prompt is how a default gets changed for the
+   wrong reason.
+
+⚠ Ask ONCE per machine. The marker is the memory; do not re-open the question because a later
+session did not see the notice.
+
 ## Addressing a model
 
 Three forms in a request's `model` field, resolved in this order:
