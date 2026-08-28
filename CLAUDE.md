@@ -639,13 +639,34 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   OpenRouter deployments, 18 of them free and answering. This is the mirror of the
   "out of free credits is NOT paid" rule below: collapsing a paid-tier exhaustion onto the free tier
   is the same defect facing the other way.
-  ⚠ **No scope can express a dynamic cost subset**, and that is the point — attempt → group →
-  deployment → credential → provider → model carry no cost dimension, and a `group` member list goes
-  stale because a provider moves models between free, discounted and paid on its own schedule.
-  `assessCost()` classifies cost LIVE (it is what `freeOnly` resolves through), but a fact cannot say
-  "the paid subset of this credential". **When the surface is a moving subset, record NO fact** and
-  let the per-deployment breaker discover it: per-deployment rediscovery looks like waste, and it is
-  what keeps the demotion from crossing the boundary.
+  ⚠ **No SCOPE can express a dynamic cost subset** — attempt → group → deployment → credential →
+  provider → model carry no cost dimension, and a `group` member list goes stale because a provider
+  moves models between free, discounted and paid on its own schedule.
+  ⚠ **So a fact carries a COST FILTER instead, and it references the CLASSIFIER, not a list**
+  (2026-08-28). `StoredFact.costClasses` narrows a fact to `free` / `paid` / `unknown`, and
+  `factsFor(..., { costClass })` intersects it with what the CALLER resolved through `assessCost()`
+  — which reads catalog prices that refresh on a 10-minute TTL, so a model moving free → discounted
+  moves with it and no fact needs editing. Set it with
+  `llm-relay eligibility accept <n> --class … --scope … --cost-class paid`.
+  - **ABSENT means every class.** Every pre-existing row and every unwired caller behaves exactly as
+    before; only the three consumers that DEMOTE pass a class (`dynamic-pools` admission, the
+    `freeOnly` guard, and `cooledByAllowance` via the `costClassOf` resolver threaded like
+    `quotaDemotion`).
+  - ⚠ **A filtered fact matches NOTHING when the caller supplies no class.** A filter is a claim
+    about a subset; a caller that cannot say which subset it is in has not shown the fact applies.
+    Declining costs one walked request the breaker learns from — demoting a healthy free deployment
+    on an unproven classification does not recover as cheaply.
+  - ⚠ An EMPTY filter is dropped at load (it would bound nothing while looking like it does — the
+    `configured-limits` precedent), and a filter containing an unrecognised class is dropped WHOLE,
+    never per-entry: a partially-understood filter would cover a different subset than the reviewer
+    accepted. Neither ever fails the load.
+  - ⚠ `target-facts.ts` takes a type-and-const import from `metadata.ts` (which has no imports, so
+    no cycle) and **must never call `assessCost` itself** — the class is passed in, exactly as
+    `availability.ts` is handed the facts it reasons over.
+  - ⚠ Every narrowing flag must appear in `eligibilityAcceptCommand` AND in `VALUE_FLAGS`. The
+    propose output is copy-pasted, so a flag it omits is silently WIDENED at accept time; and a
+    value-taking flag missing from `VALUE_FLAGS` puts its value in command position, which the
+    arity guard then rejects. Both were caught during development, by review and by the guard.
 - **The breaker and the fact store COMPOSE; neither replaces the other.** Per-deployment behaviour
   (back-pressure, timeouts, an entitlement wall on one model) stays on the breaker. Only what a
   backend *states* about a wider scope becomes a fact: `rate-limited` fires on a 429 naming the

@@ -191,7 +191,11 @@ export function materializeDynamicPools(
       // `allowance-exhausted`: a spent free allowance is the normal state of a working free lane,
       // not a discovery about price, and evicting on it would outlive the exhaustion that caused
       // it. That case cools in `orderByUsability` and returns on its own.
-      if (isCostBlocked(provider, null, model)) continue;
+      // `cost.costClass` is resolved just above from this refresh's catalog prices, so a fact that
+      // applies to only one class (OpenRouter's paid-subset spend limit) is matched against what
+      // this deployment IS right now — not against a member list that goes stale when a provider
+      // moves a model between free, discounted and paid.
+      if (isCostBlocked(provider, null, model, { costClass: cost.costClass })) continue;
 
       discovered.push({
         provider,

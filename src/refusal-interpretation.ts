@@ -1,4 +1,5 @@
 import { relayStatePath } from "./state-paths.js";
+import type { CostClass } from "./metadata.js";
 import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join, resolve } from "node:path";
@@ -121,6 +122,15 @@ export type ResetRule =
 export interface Interpretation {
   class: FactKind;
   scope: ScopeTemplate;
+  /**
+   * Which cost classes the verdict covers. ABSENT = every class.
+   *
+   * Resolved through `assessCost()` at READ time, so unlike a group member list it follows the
+   * catalog rather than a snapshot — a model moving free → discounted moves with it. Exists
+   * because a provider spend limit (OpenRouter's weekly KEY limit) names the credential but only
+   * covers its PAID deployments.
+   */
+  costClasses?: readonly CostClass[];
   /** How long until it clears, when the reviewer could determine that. Optional. */
   reset?: ResetRule;
   /**
