@@ -70,6 +70,7 @@ import {
 } from "./dashboard-static.js";
 import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
+import { installBreakerPersistence } from "./breaker-persistence.js";
 import { estimateRequestTokens, assessCost, resolveMetadata, type CostClass } from "./metadata.js";
 import { findTierModel, loadTierData, type TierModel } from "./tier-data.js";
 import { specOfTarget } from "./benchmarks.js";
@@ -310,6 +311,18 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const catalog = deps.catalog ?? new ModelCatalog();
   const pingLoop = deps.pingLoop ?? new PingLoop(cfg, catalog);
   const breaker = deps.breaker ?? new CircuitBreaker();
+  /**
+   * Cooling state survives a restart, like ping health already did.
+   *
+   * Without this the relay discarded every cooldown and the whole unexplained-429 escalation
+   * ladder on restart, then walked back into the same walls — measured here as a 19.9-hour
+   * cooldown learned from 7 consecutive 429s on one deployment and 26 on another.
+   *
+   * ⚠ Skipped under vitest for the reason the probe loop is: a test proxy must not read or write
+   * the developer's live cooling state. `getBreakerStatePath()` also redirects under vitest, so
+   * this is belt and braces — the suite exercises the mechanism directly with an explicit path.
+   */
+  if (!process.env.VITEST) installBreakerPersistence(breaker);
   // Process-local and deliberately credential-wide: a deployment switch must not reset fairness.
   const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);

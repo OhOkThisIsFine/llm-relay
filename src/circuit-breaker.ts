@@ -40,6 +40,27 @@ export interface CircuitState {
   credentialFaultUntil: number;
 }
 
+/**
+ * The COOLING half of one cell, in a shape that can be written to disk and read back.
+ *
+ * Declared here rather than in `breaker-persistence.ts` so the dependency runs one way only
+ * (persistence imports the breaker, never the reverse) and `exportCooldowns`/`restoreCooldowns`
+ * can stay IO-free. See that module for what is deliberately NOT carried.
+ */
+export interface BreakerCooldownRow {
+  readonly provider: string;
+  readonly model: string | null;
+  readonly kind: string;
+  readonly credentialId: string;
+  readonly base?: string | undefined;
+  /** Absolute epoch ms. A row whose value is not in the future is never restored. */
+  readonly cooldownUntil: number;
+  readonly cooldownSource: CooldownSource | null;
+  /** Consecutive unexplained 429s — the ladder index that makes the next 429 escalate correctly. */
+  readonly unexplained429s: number;
+  readonly lastStatus?: number | undefined;
+}
+
 /** Provisional upstream metadata, committed only with a terminal attempt outcome. */
 export interface HeaderObservation {
   readonly target: ProviderTargetIdentity;
@@ -433,6 +454,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     });
     if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
     if (outcome.ok) {
+      const wasCooling = state.cooldownUntil > now;
       state.consecutiveFailures = 0;
       state.cooldownUntil = 0;
       state.cooldownSource = null;
@@ -441,6 +463,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       state.credentialFailures = 0;
       state.credentialFaultUntil = 0;
       delete state.lastCredentialStatus;
+      // A success RETRACTS a persisted cooldown, so the file must be rewritten too. Skipping the
+      // notify when nothing was cooling keeps a healthy relay from writing on every request.
+      if (wasCooling) this.notifyCoolingChanged();
       return;
     }
     state.consecutiveFailures += 1;
@@ -479,6 +504,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
       state.cooldownSource = "default";
     }
+    // One notify for the whole ladder above, whichever branch set the cooldown. A failure that
+    // set none (below the trip threshold, no Retry-After) leaves nothing new to persist.
+    if (state.cooldownUntil > now) this.notifyCoolingChanged();
   }
 
   /** Retain a fresh axis/period tuple without discarding another axis from an earlier response. */
@@ -582,6 +610,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     }
     breakerCells.sort(compareClearedCells);
     credentialFaults.sort(compareClearedCells);
+    // `llm-relay cooldowns clear` must reach the FILE too. Without this a cleared cooldown would
+    // come back on the next restart, which is exactly the state the operator just retracted.
+    if (breakerCells.length > 0) this.notifyCoolingChanged();
     return { breakerCells, credentialFaults };
   }
 
@@ -616,6 +647,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     if (state.cooldownUntil >= until) return; // an existing longer cooldown keeps its own source
     state.cooldownUntil = until;
     state.cooldownSource = "quota";
+    this.notifyCoolingChanged();
   }
 
   /** Active backend attempts for one credential slot across all of its deployments. */
@@ -631,6 +663,83 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   /** Process-local cell states; their identity is stored rather than decoded from keys. */
   getAllStates(): ReadonlyMap<string, CircuitState> {
     return this.states;
+  }
+
+  /**
+   * The cooling half of every cell that is still cooling, for `breaker-persistence.ts`.
+   *
+   * Pure and IO-free on purpose: this module holds no file handles, so persistence stays a
+   * separate concern that a bare programmatic proxy can simply not install. Cells that are not
+   * cooling are omitted rather than written as empty rows.
+   */
+  exportCooldowns(now: number = Date.now()): BreakerCooldownRow[] {
+    const rows: BreakerCooldownRow[] = [];
+    for (const state of this.states.values()) {
+      if (state.cooldownUntil <= now) continue;
+      rows.push({
+        provider: state.target.provider,
+        model: state.target.model,
+        kind: state.target.kind,
+        credentialId: state.target.credentialId,
+        ...(state.target.base === undefined ? {} : { base: state.target.base }),
+        cooldownUntil: state.cooldownUntil,
+        cooldownSource: state.cooldownSource,
+        unexplained429s: state.unexplained429s,
+        ...(state.lastStatus === undefined ? {} : { lastStatus: state.lastStatus }),
+      });
+    }
+    return rows;
+  }
+
+  /**
+   * Re-apply persisted cooling rows, returning how many were applied.
+   *
+   * ⚠ NEVER overwrites a cooldown this process has already learned. A restore runs at startup, but
+   * making it defensive costs nothing and means a late or repeated call cannot shorten or extend
+   * live state — the same rule `recordQuotaCooldown` follows ("a quota demotion never SHORTENS
+   * someone else's cooldown"). Rows at or before `now` are already excluded by
+   * `loadBreakerCooldowns`; the check is repeated here so a direct caller cannot bypass it.
+   */
+  restoreCooldowns(rows: readonly BreakerCooldownRow[], now: number = Date.now()): number {
+    let applied = 0;
+    for (const row of rows) {
+      if (row.cooldownUntil <= now) continue;
+      const target: ProviderTargetIdentity = {
+        provider: row.provider,
+        model: row.model,
+        kind: row.kind as ProviderTargetIdentity["kind"],
+        credentialId: row.credentialId as ProviderTargetIdentity["credentialId"],
+        ...(row.base === undefined ? {} : { base: row.base }),
+      };
+      const state = this.getOrCreate(target);
+      if (state.cooldownUntil > now) continue;
+      state.cooldownUntil = row.cooldownUntil;
+      state.cooldownSource = row.cooldownSource;
+      state.unexplained429s = row.unexplained429s;
+      if (row.lastStatus !== undefined) state.lastStatus = row.lastStatus;
+      applied += 1;
+    }
+    return applied;
+  }
+
+  /**
+   * Register the persistence listener. At most one: a second install would double every write,
+   * and there is exactly one file.
+   */
+  onCoolingChanged(listener: () => void): void {
+    this.#coolingChanged = listener;
+  }
+
+  /** Fired wherever cooling state changes; a no-op until persistence is installed. */
+  #coolingChanged: (() => void) | null = null;
+
+  private notifyCoolingChanged(): void {
+    // Never let a persistence failure reach the request path — this runs inside outcome recording.
+    try {
+      this.#coolingChanged?.();
+    } catch {
+      /* best-effort persistence */
+    }
   }
 
   /** Deployment measurement merges timestamp-sorted pings without inflating confidence. */
