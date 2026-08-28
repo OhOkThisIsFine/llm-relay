@@ -92,6 +92,57 @@ describe("credential selection", () => {
     ]);
   });
 
+  it("declines a minute-period observation from the previous minute even within freshness window", () => {
+    const prevMinute = attempt("p", "m", "prev-minute");
+    const currentMinute = attempt("p", "m", "current-minute");
+    // now = 120_100 (2 minutes + 100ms). Current minute window: [120_000, 180_000)
+    // Previous minute window: [60_000, 120_000)
+    // observedAt = 119_000 (in previous minute, but only 1_100 ms ago = within 5 min freshness)
+    // observedAt = 120_050 (in current minute, just inside)
+    const now = 120_100;
+    const freshnessMs = 5 * 60_000;
+    const quota = (label: string, observedAt: number) => [{ axis: "requests" as const, period: "minute" as const, limit: 100, remaining: 50, resetsAt: null, observedAt, basis: "provider-stated" as const }];
+    const evidence = new Map([
+      [prevMinute.credentialId, { quota: quota("prev", 119_000) }], // previous minute
+      [currentMinute.credentialId, { quota: quota("current", 120_050) }], // current minute (just inside)
+    ]);
+    // prev-minute should be declined (band=1 neutral), current-minute should rank (band=0 ample)
+    expect(rankCredentialAttempts([prevMinute, currentMinute], new CredentialLru(), { evidence, now, quotaFreshnessMs: freshnessMs }).map((x) => x.credentialId)).toEqual([
+      "p#current-minute", "p#prev-minute",
+    ]);
+  });
+
+  it("ranks a minute-period observation inside the current minute", () => {
+    const early = attempt("p", "m", "early");
+    const late = attempt("p", "m", "late");
+    // now = 100_000. Current minute window: [60_000, 120_000)
+    const now = 100_000;
+    const quota = (observedAt: number) => [{ axis: "requests" as const, period: "minute" as const, limit: 100, remaining: 50, resetsAt: null, observedAt, basis: "provider-stated" as const }];
+    const evidence = new Map([
+      [early.credentialId, { quota: quota(60_500) }], // early in current minute
+      [late.credentialId, { quota: quota(119_900) }], // late in current minute
+    ]);
+    // Both should rank (band=0 ample), tie-broken by configIndex
+    expect(rankCredentialAttempts([early, late], new CredentialLru(), { evidence, now }).map((x) => x.credentialId)).toEqual([
+      "p#early", "p#late",
+    ]);
+  });
+
+  it("ranks an unknown-period observation with a future resetsAt (v0.53.0 regression pin)", () => {
+    const unknownPeriod = attempt("p", "m", "unknown-period");
+    const noQuota = attempt("p", "m", "no-quota");
+    const now = 100_000;
+    const futureReset = now + 60_000; // 1 minute in future
+    const evidence = new Map([
+      [unknownPeriod.credentialId, { quota: [{ axis: "requests" as const, period: "unknown" as const, limit: 100, remaining: 50, resetsAt: futureReset, observedAt: now, basis: "provider-stated" as const }] }],
+      [noQuota.credentialId, {}],
+    ]);
+    // unknown-period with future resetsAt should still rank (band=0 ample)
+    expect(rankCredentialAttempts([noQuota, unknownPeriod], new CredentialLru(), { evidence, now }).map((x) => x.credentialId)).toEqual([
+      "p#unknown-period", "p#no-quota",
+    ]);
+  });
+
   it("treats an expired reset as stale and ties unknown pricing with paid", () => {
     const expired = attempt("p", "m", "expired", { configIndex: 0 });
     const paid = attempt("p", "m", "paid", { configIndex: 2 });
