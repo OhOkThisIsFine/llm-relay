@@ -1,0 +1,37 @@
+diff --git a/test/widget.test.ts b/test/widget.test.ts
+new file mode 100644
+index 0000000..a1b2c3d
+--- /dev/null
++++ b/test/widget.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, it } from "vitest";
++
++describe("widget", () => {
++  // SYNTHESIZED: the sharp, always-correct patterns the task spec names explicitly.
++  it("is always true", () => {
++    expect(true).toBe(true);
++  });
++
++  it("compares itself to itself", () => {
++    const value = computeSomething();
++    expect(value).toBe(value);
++  });
++
++  it("a literal is defined", () => {
++    expect("ready").toBeDefined();
++  });
++
++  // ADAPTED FROM REAL HISTORY: audit-tools commit c791df49 ("refactor(tests): one step-walking
++  // driver, and fix the test that never called its subject") fixed a test that declared a
++  // hand-copied REPLICA of the production walker inside the test body and asserted against the
++  // replica -- the production helper could have been deleted and the test would still pass.
++  // `driveReplica` below is that shape: declared locally, never imported, so the assertion has
++  // no traceable connection to the code under test -- the best-effort no-data-flow heuristic.
++  it("throws on unknown pause kind", () => {
++    function driveReplica(kind: string): string {
++      if (kind === "known") return "handled";
++      throw new Error("unknown pause kind");
++    }
++    expect(() => driveReplica("bogus")).toThrow("unknown pause kind");
++  });
++});

@@ -1,0 +1,19 @@
+diff --git a/src/format.ts b/src/format.ts
+index 3333333..4444444 100644
+--- a/src/format.ts
++++ b/src/format.ts
+@@ -1,8 +1,8 @@
+ export function greet(name: string): string {
+-  const label = "Hello";
+-  const trimmed = name.trim();
+-  const upper = trimmed.toUpperCase();
+-  const suffix = "!";
+-  const result = label + " " + upper + suffix;
+-  return result;
++    const label = "Hi";
++    const trimmed = name.trim();
++    const upper = trimmed.toUpperCase();
++    const suffix = "!";
++    const result = label + " " + upper + suffix;
++    return result.trim();
+ }
