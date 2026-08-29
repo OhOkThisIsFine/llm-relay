@@ -2728,10 +2728,11 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       if (sc.kind === "group") {
         process.stdout.write(`      covers: ${sc.members.join(", ")}\n`);
       }
-      // ⚠ The full proposal travels — reset AND costClasses. This call once omitted `costClasses`,
-      // so the status listing printed an accept command WIDER than the proposal it echoed: the
-      // silent-widening hazard `eligibilityAcceptCommand`'s own comment warns about, surviving in
-      // the one call site the v0.55.2 fix did not reach.
+      // ⚠ The full proposal travels — reset AND costClasses. This call omitted `costClasses` from
+      // the day the flag was introduced (`7412435`, v0.52.0), so the status listing printed an
+      // accept command WIDER than the proposal it echoed — the silent-widening hazard
+      // `eligibilityAcceptCommand`'s own comment warns about. (v0.55.2 fixed the separate
+      // store-persistence half in `acceptInterpretation`; it never touched this file.)
       process.stdout.write(
         `      accept with: ${eligibilityAcceptCommand(i + 1, p.signature, p.proposed.class, sc, p.proposed.reset, p.proposed.costClasses)}\n`,
       );
