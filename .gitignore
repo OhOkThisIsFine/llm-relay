@@ -14,3 +14,4 @@ control-token
 .audit-tools/
 .audit-code/
 .remediate-code/
+.claude/verify-green/
