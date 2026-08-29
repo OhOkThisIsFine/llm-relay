@@ -14,10 +14,11 @@ import { COST_CLASSES, type CostClass } from "./metadata.js";
  * - CONDITIONS (`not-servable`, `subscription-required`, `allowance-exhausted`, `credential-invalid`,
  *   `rate-limited`) say "this target is currently unusable for a reason". A success disproves a
  *   condition, so `clearFacts()` deletes them; they cool or cost-block through the sets below.
- * - MEASUREMENTS (`context-limit`, `rate-limit-rpm|rpd|tpm|tpd`) say "here is a ceiling this
- *   deployment stated". A success does not disprove a measurement, so they are in none of the sets
- *   below and `clearFacts()` never touches them — they expire on their own TTL. They are
- *   display-only today (see `rate-limits.ts`); acting on them is a separate, announced decision.
+ * - MEASUREMENTS (`context-limit`, `max-output`, `rate-limit-rpm|rpd|tpm|tpd`) say "here is a
+ *   ceiling this deployment stated". A success does not disprove a measurement, so they are in
+ *   none of the sets below and `clearFacts()` never touches them — they expire on their own TTL.
+ *   They are display-only today (see `rate-limits.ts`); acting on them is a separate, announced
+ *   decision.
  */
 export type FactKind =
   | "not-servable"
@@ -26,6 +27,7 @@ export type FactKind =
   | "credential-invalid"
   | "rate-limited"
   | "context-limit"
+  | "max-output"
   | "rate-limit-rpm"
   | "rate-limit-rpd"
   | "rate-limit-tpm"
@@ -151,15 +153,17 @@ export const FACT_TTL_MS: Record<FactKind, number> = {
   // Same TTL as context-limit — provider rate structures change on the same timescale as
   // published context windows do. A success neither clears nor refreshes these; only age does.
   "context-limit": 30 * 24 * 60 * 60 * 1000,
+  "max-output": 30 * 24 * 60 * 60 * 1000,
   "rate-limit-rpm": 30 * 24 * 60 * 60 * 1000,
   "rate-limit-rpd": 30 * 24 * 60 * 60 * 1000,
   "rate-limit-tpm": 30 * 24 * 60 * 60 * 1000,
   "rate-limit-tpd": 30 * 24 * 60 * 60 * 1000,
 };
 
-// The condition half only (see FactKind). The rate-limit-* / context-limit measurements are
-// deliberately absent from every set below: not cleared by clearFacts, never cooling, never
-// cost-blocking. They describe what the deployment is entitled to, not whether it is broken.
+// The condition half only (see FactKind). The rate-limit-* / context-limit / max-output
+// measurements are deliberately absent from every set below: not cleared by clearFacts, never
+// cooling, never cost-blocking. They describe what the deployment is entitled to, not whether it
+// is broken.
 const CONDITIONS: ReadonlySet<FactKind> = new Set([
   "not-servable", "subscription-required", "allowance-exhausted", "credential-invalid", "rate-limited",
 ]);

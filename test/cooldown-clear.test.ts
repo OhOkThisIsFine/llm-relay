@@ -738,6 +738,7 @@ describe("operator cooldown clearing", () => {
       "not-servable",
       "subscription-required",
       "context-limit",
+      "max-output",
       "rate-limit-rpm",
       "rate-limit-rpd",
       "rate-limit-tpm",
@@ -747,7 +748,7 @@ describe("operator cooldown clearing", () => {
     retained.forEach((kind, index) => recordFact(kind, scope, {
       path: factsPath,
       now: NOW,
-      ...(kind.startsWith("rate-limit-") || kind === "context-limit"
+      ...(kind.startsWith("rate-limit-") || kind === "context-limit" || kind === "max-output"
         ? { value: 1_000 + index }
         : {}),
     }));

@@ -2509,6 +2509,7 @@ const FACT_MEANING: Record<FactKind, string> = {
   "credential-invalid": "the provider says this key is bad — every deployment behind it demoted",
   "rate-limited": "throughput throttled by the provider — demoted, never evicted",
   "context-limit": "a ceiling this deployment stated about itself — a measurement, never a demotion",
+  "max-output": "a ceiling this deployment stated about itself — a measurement, never a demotion",
   "rate-limit-rpm": "a ceiling this deployment stated about itself — a measurement, never a demotion",
   "rate-limit-rpd": "a ceiling this deployment stated about itself — a measurement, never a demotion",
   "rate-limit-tpm": "a ceiling this deployment stated about itself — a measurement, never a demotion",

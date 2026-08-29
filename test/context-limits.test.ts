@@ -5,11 +5,16 @@ import { tmpdir } from "node:os";
 import {
   parseStatedContextLimit,
   looksLikeContextLengthError,
+  parseStatedMaxOutput,
+  looksLikeMaxOutputError,
   recordObservedContextLimit,
   observedContextLimit,
+  recordObservedMaxOutput,
+  observedMaxOutput,
   flushObservedContextLimits,
   resetObservedContextLimits,
   OBSERVED_LIMIT_TTL_MS,
+  OBSERVED_MAX_OUTPUT_TTL_MS,
 } from "../src/context-limits.js";
 import { clearFacts } from "../src/target-facts.js";
 
@@ -252,5 +257,153 @@ describe("learning a ceiling from a real backend rejection", () => {
     });
     const body = (await r.json()) as { error?: { message?: string } };
     expect(body.error?.message).toBe(MSG);
+  });
+});
+
+// ── The max-output half (docs/max-output-caps-design-2026-08-29.md) ────────────────────────────
+
+describe("parsing a STATED max_tokens ceiling out of an error body", () => {
+  it.each([
+    ["Groq", "`max_tokens` must be less than or equal to `8192`, the maximum value for `max_tokens` is less than the `context_window` for this model", 8192],
+    ["TGI", "Input validation error: `max_new_tokens` must be <= 4096. Given: 20000", 4096],
+    ["OpenAI", "max_tokens is too large: 40000. This model supports at most 16384 completion tokens, whereas you provided 40000.", 16384],
+    ["Anthropic", "max_tokens: 40000 > 8192, which is the maximum allowed number of output tokens for this model", 8192],
+    ["bare-comparison", "max_tokens: 100000 > 65536 maximum", 65536],
+    ["restated-field", "the maximum value for `max_tokens` is 8192", 8192],
+    ["comma-grouped", "`max_tokens` must be less than or equal to `32,768`", 32768],
+  ])("reads the maximum from a %s-style message", (_label, body, expected) => {
+    expect(parseStatedMaxOutput(body as string)).toBe(expected);
+  });
+
+  it("captures the MAXIMUM, never the requested count", () => {
+    // The requested number is the larger one. Capturing it would overstate the real ceiling —
+    // the single most dangerous way this parser could be wrong, same as the context half.
+    const body = "max_tokens: 999999 > 8192, which is the maximum allowed number of output tokens";
+    expect(parseStatedMaxOutput(body)).toBe(8192);
+  });
+
+  it("returns null when the body proves the cap was exceeded but states no ceiling", () => {
+    expect(looksLikeMaxOutputError("max_tokens is too large for this model.")).toBe(true);
+    expect(parseStatedMaxOutput("max_tokens is too large for this model.")).toBeNull();
+  });
+
+  it("returns null for unrelated errors, junk, and CONTEXT-ceiling messages", () => {
+    // The last entry pins the separation: a context-window statement is not an output ceiling.
+    for (const body of ["", "rate limit exceeded", "{}", "This model's maximum context length is 8192 tokens."]) {
+      expect(parseStatedMaxOutput(body)).toBeNull();
+    }
+  });
+
+  it("yields no CONTEXT limit from a max_tokens body — the two parsers stay separate", () => {
+    const groq = "`max_tokens` must be less than or equal to `8192`, the maximum value for `max_tokens` is less than the `context_window` for this model";
+    expect(parseStatedContextLimit(groq)).toBeNull();
+  });
+
+  it("rejects an implausible ceiling rather than persisting a parse artifact", () => {
+    expect(parseStatedMaxOutput("`max_tokens` must be less than or equal to `999999999999`")).toBeNull();
+  });
+
+  it("does not scan an unbounded body", () => {
+    const buried = "x".repeat(20000) + " `max_tokens` must be less than or equal to `4096`";
+    expect(parseStatedMaxOutput(buried)).toBeNull();
+  });
+});
+
+describe("the learned max-output store", () => {
+  it("records and reads back an output ceiling per deployment", () => {
+    recordObservedMaxOutput("groq", "qwen/qwen3.6-27b", 8192, { path });
+    expect(observedMaxOutput("groq", "qwen/qwen3.6-27b", { path })).toBe(8192);
+  });
+
+  it("keeps the measurement through a condition clear — a success disproves no ceiling", () => {
+    recordObservedMaxOutput("groq", "m", 8192, { path });
+    clearFacts("groq", null, "m", { path });
+    expect(observedMaxOutput("groq", "m", { path })).toBe(8192);
+  });
+
+  it("keys by (provider, model), and sits BESIDE the context ceiling on the same cell", () => {
+    // The `<kind>:<scope>` store keying is what lets one deployment carry both measurements at
+    // once; a scope-only key would collapse them to whichever was written last.
+    recordObservedMaxOutput("groq", "m", 8192, { path });
+    recordObservedContextLimit("groq", "m", 131072, { path });
+    expect(observedMaxOutput("groq", "m", { path })).toBe(8192);
+    expect(observedContextLimit("groq", "m", { path })).toBe(131072);
+    expect(observedMaxOutput("openrouter", "m", { path })).toBeNull();
+  });
+
+  it("lets a fresh observation replace an older one, in both directions", () => {
+    recordObservedMaxOutput("groq", "m", 8192, { path, now: 1000 });
+    recordObservedMaxOutput("groq", "m", 16384, { path, now: 2000 });
+    expect(observedMaxOutput("groq", "m", { path, now: 3000 })).toBe(16384);
+    recordObservedMaxOutput("groq", "m", 4096, { path, now: 4000 });
+    expect(observedMaxOutput("groq", "m", { path, now: 5000 })).toBe(4096);
+  });
+
+  it("expires, so a raised ceiling is not disbelieved forever", () => {
+    recordObservedMaxOutput("groq", "m", 8192, { path, now: 0 });
+    expect(observedMaxOutput("groq", "m", { path, now: OBSERVED_MAX_OUTPUT_TTL_MS - 1 })).toBe(8192);
+    expect(observedMaxOutput("groq", "m", { path, now: OBSERVED_MAX_OUTPUT_TTL_MS + 1 })).toBeNull();
+  });
+
+  it("ignores a nonsensical value instead of storing it", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1e12]) {
+      recordObservedMaxOutput("groq", "bad", bad, { path });
+      expect(observedMaxOutput("groq", "bad", { path })).toBeNull();
+    }
+  });
+});
+
+describe("learning a stated max_tokens ceiling from a real backend rejection", () => {
+  const GROQ_MSG = "`max_tokens` must be less than or equal to `8192`, the maximum value for `max_tokens` is less than the `context_window` for this model";
+
+  beforeEach(() => {
+    globalCircuitBreaker.reset();
+    resetObservedContextLimits();
+  });
+
+  it("learns from the OpenAI front (/v1/chat/completions)", async () => {
+    const backend = await tooLongBackend(GROQ_MSG);
+    const p = portOf(await startProxy(singleCfg(`http://127.0.0.1:${portOf(backend)}`)));
+
+    const r = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "p1/out-a", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(r.status).toBe(400);
+
+    await new Promise((res) => setTimeout(res, 50));
+    expect(observedMaxOutput("p1", "out-a")).toBe(8192);
+  });
+
+  it("learns from the Anthropic front (/v1/messages) too — one policy, both paths", async () => {
+    const backend = await tooLongBackend(GROQ_MSG);
+    const p = portOf(await startProxy(singleCfg(`http://127.0.0.1:${portOf(backend)}`)));
+
+    const r = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "p1/out-b", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(r.status).toBe(400);
+
+    await new Promise((res) => setTimeout(res, 50));
+    expect(observedMaxOutput("p1", "out-b")).toBe(8192);
+  });
+
+  it("records an output ceiling and NO context ceiling from that body", async () => {
+    // The groq message mentions `context_window` in prose; a context-limit fact from it would be
+    // a number nobody stated. Entry-specific assertions on a model no other test touches.
+    const backend = await tooLongBackend(GROQ_MSG);
+    const p = portOf(await startProxy(singleCfg(`http://127.0.0.1:${portOf(backend)}`)));
+
+    await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "p1/out-c", messages: [{ role: "user", content: "hi" }] }),
+    });
+    await new Promise((res) => setTimeout(res, 50));
+    expect(observedMaxOutput("p1", "out-c")).toBe(8192);
+    expect(observedContextLimit("p1", "out-c")).toBeNull();
   });
 });
