@@ -2,50 +2,32 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-29
+## 0. State as of 2026-08-29 (second lap)
 
-**Current: v0.57.0 is released; the global bin and the restarted relay are on it** (publish run
-green, registry 0.57.0, live-probed: a `:batch` 404 refreshed its `not-servable` fact through the
-new normalizer with no queue growth). Nothing else is pending — §6 holds recorded trades,
-deferrals and settled decisions, not a work queue; the work queue is
-[docs/backlog.md](docs/backlog.md). The max-output-caps design was ACCEPTED at the lap's
-hand-back and sits in the backlog as the next tracked item (below).
+**Current: v0.58.0 is released; the global bin and the restarted relay are on it** (publish run
+green, registry 0.58.0). Nothing awaits the owner — §6 holds recorded trades, deferrals and
+settled decisions, not a work queue; the work queue is [docs/backlog.md](docs/backlog.md), which
+holds ONE item: the quota-source re-probe design (unstarted, no design chosen).
 
-**2026-08-29, one lap, three deliveries** — full record:
-[docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
+**2026-08-29, second lap — the max-output-caps implementation** (v0.58.0):
 
-- **The eligibility queue was triaged with the owner, 199 → 4 pending.** 192 signatures accepted
-  (every verdict owner-approved family by family), 4 plain-429s rejected, 4 left pending on
-  purpose. Verified end-to-end against the running relay: an accepted `:batch` signature's
-  recurrence recorded a live `not-servable` fact with no restart.
-- **The lane-split signature defect the triage exposed was fixed the same day** (owner decision:
-  fix and re-migrate). `normalizeRefusalMessage` unwraps to a fixpoint and `readStoreFile`
-  re-keys stored signatures at load; verified against a copy of the live store — 192 of 193
-  confirmed rows bind after migration, the one inert row is the empty-body case that now
-  deliberately teaches nothing. Mechanism and residuals: the `refusal-interpretation.ts` row in
-  `CLAUDE.md`.
-- **The size ratchet caught a Tailwind scan leak while verifying the fix**: relative content
-  globs resolved against the repo root, so SERVER source words became shipped CSS utilities.
-  Globs are anchored to `dashboard/` now; the baseline was regenerated in the same change.
-- **The max-output-caps design proposal was drafted** on the owner's direction:
-  [docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md) —
-  awaiting owner review, no implementation until accepted.
-
-v0.56.0 shipped the two approved v0.54.0 hand-back items:
-
-- **Digest-keyed `eligibility accept`.** Every printed propose/accept command carries
-  `--sig <digest>` (`signatureDigest` in `refusal-interpretation.ts`: ten hex chars of SHA-256
-  over the signature), the listing prints each pending item's digest, and a present `--sig`
-  resolves the entry authoritatively — a stale index is corrected with a stderr note, an unknown
-  digest exits 1 touching nothing. The bare index stays valid against a fresh listing. The
-  contract, and the `--cost-class` listing-omission history it closed, live in the eligibility
-  gotchas of `CLAUDE.md`.
-- **Provider-stated spend headroom** (`src/spend-headroom.ts` + `PingLoop.pollSpendHeadroom`).
-  The ping loop asks each OpenRouter credential's key endpoint every 15 minutes (zero egress for
-  every other provider) and feeds the stated `limit`/`usage` into the SAME paid-only
-  `allowance-exhausted` fact the accepted weekly-limit interpretation produces, retracting it when
-  headroom returns — so the paid/free boundary comes from the provider's own statement and updates
-  in both directions. Design reasoning: the `spend-headroom.ts` row in `CLAUDE.md`.
+- **The `max-output` measurement fact shipped exactly as scoped** in
+  [docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md): the
+  parser half in `src/context-limits.ts` (stated-maximum-only discipline — the groq comparator
+  form, TGI `<=`, OpenAI "supports at most N completion tokens", Anthropic "> N, which is the
+  maximum", and the restated-field form), the observer beside `observeContextLimit` in
+  `inspectCandidateResponse` (both fronts through the one shared call site), and rendering in
+  `llm-relay candidates` and `FACT_MEANING`. Display-only: nothing clamps, refuses, or routes on
+  the learned figure. The closed-vocabulary mutation check held — the new kind failed compilation
+  at exactly the two total tables (`FACT_TTL_MS`, `FACT_MEANING`).
+- **The carrier groq signature is resolved** — rejected from the eligibility queue on landing.
+  ⚠ Its digest was `6f8361b9e7` at rejection time, not the `075f1cb584` the backlog had recorded:
+  the v0.57.0 store migration re-keys signatures through the current normalizer, and the digest
+  is a hash OF the signature, so recorded digests can go stale across a normalizer change. List
+  before addressing; trust the listing's digest.
+- Incidental dedup: the two candidate loops' byte-identical client-gone closures became one
+  `abortOnClientClose` helper (the machine eslint gate surfaced the pre-existing pair when an
+  edit shifted its lines).
 
 Operational: Codex quota RESET 2026-08-29 (owner-reported, verified by live probe — `codex exec`
 answered on `gpt-5.6-sol`). The earlier "quota-dead until Sep 3" record is retired. The six codex
@@ -58,6 +40,11 @@ Deliberately NOT restated here. This file holds current state plus the immediate
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
 tags are the trail. What survived each sprint lives in its own home:
 
+- **v0.57.0, the eligibility triage lap** — queue 199 → 4 with owner-approved family verdicts,
+  the lane-split signature fix and its load-time store migration, the Tailwind scan leak:
+  [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
+- **v0.56.0, digest-keyed `eligibility accept` + provider-stated spend headroom** — the
+  eligibility gotchas and the `spend-headroom.ts` row in `CLAUDE.md`.
 - **v0.53.0–v0.54.0, the three-axis assessment and its follow-ups** — the report, every verified
   and refuted claim, the retracted finding, and the closed "Remaining open items" ledger:
   [docs/three-axis-assessment-2026-08-28.md](docs/three-axis-assessment-2026-08-28.md).
@@ -233,11 +220,10 @@ owner.
 - **EXECUTED: the lane-split refusal-signature fix** (owner decision 2026-08-29: fix and
   re-migrate). Shipped in v0.57.0 with the load-time store migration; residuals recorded in §4
   and in the `refusal-interpretation.ts` row of `CLAUDE.md`.
-- **ACCEPTED (owner decision 2026-08-29): the max-output-caps design**
-  ([docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md)) —
-  display-only learning of stated output ceilings, to be implemented as scoped. The work item is
-  in [docs/backlog.md](docs/backlog.md); the carrier signature stays pending in the queue until
-  the implementation lands.
+- **EXECUTED: the max-output-caps design (accepted 2026-08-29, implemented the same day in
+  v0.58.0).** Display-only learning of stated output ceilings, shipped exactly as scoped
+  ([docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md));
+  the carrier groq signature was rejected from the queue on landing.
 
 **Owner decisions on record:**
 
