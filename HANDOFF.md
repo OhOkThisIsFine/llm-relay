@@ -11,11 +11,14 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   over the signature), the listing prints each pending item's digest, and a present `--sig`
   resolves the entry authoritatively — a stale index is corrected with a stderr note, an unknown
   digest exits 1 touching nothing. The bare index stays valid against a fresh listing.
-  ⚠ Found and fixed while wiring it: the STATUS listing's "accept with:" line still dropped
-  `--cost-class` — the v0.55.2 fix covered the propose echo only, so a later `llm-relay
-  eligibility` printed a command WIDER than the proposal it echoed. Both call sites now pass the
-  full proposal, pinned behaviorally (rendered-output tests in `test/cli.test.ts`) and by an
-  argument-list grep widened to both sites (`test/fact-cost-class.test.ts`).
+  ⚠ Found and fixed while wiring it: the STATUS listing's "accept with:" line dropped
+  `--cost-class`, so a later `llm-relay eligibility` printed a command WIDER than the proposal it
+  echoed. Both call sites now pass the full proposal, pinned behaviorally (rendered-output tests
+  in `test/cli.test.ts`) and by an argument-list grep widened to both sites
+  (`test/fact-cost-class.test.ts`). ⚠ History correction from the independent closeout auditor:
+  the `3d2fcee` commit message blames v0.55.2 for "missing" this call site — wrong. The listing
+  omission dates from the flag's INTRODUCTION (`7412435`, v0.52.0); v0.55.2 fixed the separate
+  `acceptInterpretation` store-persistence half and never touched `cli.ts`.
 - **Provider-stated spend headroom** (`src/spend-headroom.ts` + `PingLoop.pollSpendHeadroom`).
   The ping loop asks each OpenRouter credential's key endpoint every 15 minutes (zero egress for
   every other provider) and feeds the stated `limit`/`usage` into the SAME fact the accepted
@@ -28,8 +31,14 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   could never gate it without an invented cooldown).
 - **The "OPEN: dashboard-package-check cannot run on Windows" item is CLOSED as
   not-reproducible** — see §6.
-- Process: both features implemented in the main session; every new test ran against the
-  stashed un-fixed tree first (4 CLI + 4 spend tests failed pre-fix, naming the right defects).
+- Process: both features implemented in the main session; the new tests ran against a
+  `git stash push -- src/` tree first — 4 CLI tests and the 4 spend BEHAVIOR tests failed
+  pre-fix, naming the right defects. ⚠ Stated precisely, because the auditor probed it: a plain
+  `src/`-pathspec stash does NOT stash the UNTRACKED new `spend-headroom.ts`, so its 5 pure
+  classifier/apply tests kept passing against the new module while the 4 that depend on the
+  reverted `cadence.ts`/`target-facts.ts` failed. For a brand-new module the pure-function tests
+  have no "un-fixed tree" to fail against; the control is meaningful only for the behavior the
+  old tree lacked, and that is the part that failed.
 
 **Earlier — the assessment's leftover findings closed on external lanes (v0.54.0).** The
 "Remaining open items" ledger of

@@ -1256,9 +1256,10 @@ describe("llm-relay eligibility scopes", () => {
     const rendered = out.join("");
     const digest = signatureDigest(signature);
     expect(rendered).toContain(`sig ${digest}`);
-    // ⚠ The cost filter must survive into the LISTED accept command: this call site once dropped
-    // `costClasses`, so the listing printed a command WIDER than the proposal it echoed — the
-    // silent-widening hazard the v0.55.2 fix closed on the propose echo but not here.
+    // ⚠ The cost filter must survive into the LISTED accept command: this call site dropped
+    // `costClasses` from the flag's introduction (v0.52.0) until 2026-08-28, so the listing
+    // printed a command WIDER than the proposal it echoed — the silent-widening hazard the
+    // propose echo never had and the store-persistence fix (v0.55.2) could not see.
     expect(rendered).toContain(
       `llm-relay eligibility accept 1 --sig ${digest} --class allowance-exhausted --scope credential --cost-class paid`,
     );

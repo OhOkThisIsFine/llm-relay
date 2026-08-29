@@ -673,10 +673,13 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
     propose output is copy-pasted, so a flag it omits is silently WIDENED at accept time; and a
     value-taking flag missing from `VALUE_FLAGS` puts its value in command position, which the
     arity guard then rejects. Both were caught during development, by review and by the guard.
-    ⚠ And it means EVERY call site: the v0.55.2 fix covered the propose echo while the STATUS
-    listing's "accept with:" line kept dropping `costClasses` — a later `llm-relay eligibility`
-    printed a command wider than the proposal it echoed. Closed 2026-08-28; pinned by the listing
-    test in `test/cli.test.ts`.
+    ⚠ And it means EVERY call site: the STATUS listing's "accept with:" line dropped `costClasses`
+    from the flag's introduction (v0.52.0, `7412435`) until 2026-08-28, so a later `llm-relay
+    eligibility` printed a command wider than the proposal it echoed. Two different halves, two
+    different releases: v0.55.2 fixed `acceptInterpretation`'s store persistence and never touched
+    `cli.ts`; the listing display half closed with the digest work. Pinned by the listing test in
+    `test/cli.test.ts`. (The `3d2fcee` commit message misattributes the miss to v0.55.2 — the
+    independent closeout auditor corrected the history; this paragraph is the corrected record.)
   - ⚠ **Accept is digest-keyed (2026-08-28).** The queue is addressed by list position for typing
     convenience, but positions SHIFT between invocations (the sort is count-then-recency), and an
     index-only accept landed a verdict on the wrong refusal twice. Every printed
