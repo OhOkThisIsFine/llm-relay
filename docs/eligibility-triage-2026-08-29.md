@@ -46,6 +46,9 @@ v0.56.0 stat-token store-memo fix live: a CLI accept reaches the running relay's
 
 ## Findings
 
+⚠ Finding 1 was FIXED the same day, on the owner's direction — see "Resolution of finding 1"
+below. The text is kept as the diagnosis of record.
+
 1. **One provider condition can carry TWO signatures, split by lane.** The historical pool-walk
    refusals normalize to a message that embeds the relay's own diagnostic wrapper
    (`openai backend http <n> — model "…" is not served by provider "…" (…): {provider body}`),
@@ -64,6 +67,48 @@ v0.56.0 stat-token store-memo fix live: a CLI accept reaches the running relay's
 3. **A `:batch` admission exclusion was considered and NOT built.** The fact layer already contains
    the waste to ~1 probe per model per 6h, and a hardcoded id-pattern exclusion would add provider
    knowledge to `src/` for negligible saving. Do not re-derive this.
+
+## Resolution of finding 1 (same day, owner decision: fix and re-migrate)
+
+The mechanism turned out narrower than the diagnosis assumed. The lookup side already unwrapped
+nested payloads; the split came from `normalizeRefusalMessage` stopping after ONE extraction round
+— the walk lane's body is the relay's anthropic error envelope, whose `error.message` is the
+`openai backend HTTP <n>: …` wrapper, whose tail is the provider body truncated at 300 chars by
+`backend.ts`. A truncated payload does not parse, so the whole wrapper became the signature.
+The store also held rows from an older normalizer generation (the same ollama-cloud condition sat
+in the queue in BOTH forms), so historical rows needed re-keying regardless.
+
+The fix, both halves in `refusal-interpretation.ts`:
+
+- `normalizeRefusalMessage` unwraps to a fixpoint: extract (JSON parse, then a deterministic
+  field-regex fallback for truncated/unparseable payloads — unterminated values accepted,
+  JSON escapes decoded), strip the relay's own wrapper prefix, repeat.
+- `readStoreFile` re-keys every stored signature through the current normalizer at load
+  (`migrateSignatures`), inside the ONE parser, so the persist-merge can never resurrect an old
+  key. Confirmed collisions: later acceptance wins. Unknown rows merge counts and update their
+  `normalized`/`sample`. Ignored rows keep the latest timestamp.
+
+**Verified against a copy of the live store before release: 192 of 193 confirmed rows still bind
+after migration; the 4 deliberate pending items survive un-merged.** The one inert row is the
+empty-body nim nemotron 404 (×2): its old signature was pure relay wrapper prose, and an empty
+provider body now normalizes to "" and deliberately learns/queues nothing — the condition stays
+covered by its JSON-body sibling signature. Remaining residual: a message CUT by the 300-char cap
+converges across lanes only when both extractions share the same 240-char signature prefix;
+otherwise each lane keeps its own signature and each binds for the lane it was learned on
+(today's `:batch` family is such a case — walk-lane accepts cover walk traffic, which is all the
+real traffic).
+
+## Fourth finding (from verifying the fix): the size ratchet caught a Tailwind scan leak
+
+`npm run check:package` went red on a 36-byte CSS growth — exactly `.uppercase{...}`, emitted
+because a source COMMENT in `src/refusal-interpretation.ts` contained the word "uppercase".
+Tailwind v3 resolves relative content globs against the process CWD, and the build runs from the
+repo root, so `./src/**/*.{ts,tsx}` in `dashboard/tailwind.config.cjs` scanned the SERVER source —
+the config's own comment claimed the opposite boundary. The globs are now anchored to the config's
+directory (`__dirname`, forward-slashed), which also dropped ~0.9 KB of dead utilities that
+server-source words had been emitting all along (the SPA uses only its own classes plus
+`sr-only`, whose candidate lives in dashboard TSX and survives). The size baseline was
+regenerated in the same change, and the ratchet is the only reason any of this was visible.
 
 ## Mechanics (for the next triage)
 
