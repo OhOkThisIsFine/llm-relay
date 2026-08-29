@@ -4,7 +4,7 @@ import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlin
 import { hasExactKeys } from "./json-shape.js";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { WriteBehindTimer } from "./write-behind.js";
 import type { CredentialId } from "./credential-id.js";
 import { FACT_KINDS, type FactKind, type FactScope } from "./target-facts.js";
@@ -432,6 +432,21 @@ function interpretStructured(
 /** The lookup key. Per (provider, model, normalized message) — see the header for why all three. */
 export function refusalSignature(provider: string, model: string | null | undefined, status: number, body: string): string {
   return `${provider}|${model ?? "-"}|${status}|${normalizeRefusalMessage(body)}`;
+}
+
+/**
+ * A short, stable digest of a signature — the address `llm-relay eligibility` prints beside each
+ * pending item and `--sig` resolves against.
+ *
+ * The queue is addressed by list POSITION for typing convenience, but positions SHIFT between
+ * invocations: the sort is count-then-recency, so any new refusal arriving between `propose` and
+ * `accept` can silently move item N onto a different signature — which landed a verdict on the
+ * wrong refusal twice (owner decision 2026-08-28: accept takes a digest beside the index). The
+ * digest names the signature itself, so it survives any reordering. Ten hex characters of SHA-256:
+ * far beyond collision range for a queue capped at MAX_UNKNOWN entries, and short enough to retype.
+ */
+export function signatureDigest(signature: string): string {
+  return createHash("sha256").update(signature, "utf8").digest("hex").slice(0, 10);
 }
 
 /**

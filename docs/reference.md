@@ -1044,13 +1044,41 @@ Resolve one by researching what that message means for that provider and model o
 ```
 llm-relay eligibility propose 1 --class subscription-required --scope deployment --rationale "..."
 llm-relay eligibility propose 2 --class subscription-required --scope group --members pro-1,pro-2 --rationale "..."
-llm-relay eligibility accept 1 --class subscription-required --scope deployment
+llm-relay eligibility accept 1 --sig 3f2a91c04d --class subscription-required --scope deployment
 llm-relay eligibility reject 1
 ```
+
+A proposal may also carry `--cost-class free|paid|unknown` so the verdict covers only deployments
+of that class, resolved live from catalog prices — the case it exists for is a provider spend
+limit that names the key but only gates its paid models.
+
+Each pending item is listed with a short **signature digest** (`sig 3f2a91c04d`), and every
+printed accept command carries it as `--sig`. The digest pins the command to the refusal itself:
+the queue is sorted by count-then-recency, so item numbers shift whenever a new refusal arrives,
+and an index-only accept can land a verdict on a different refusal than the one proposed. With
+`--sig` present the digest decides; a stale index is corrected with a note, and an unknown digest
+exits 1 without touching anything. The bare index still works when typed against a listing you are
+looking at.
 
 Only `accept` makes an interpretation affect routing. That gate is deliberate: research may be done
 by an agent, but the request path only ever reads confirmed data — it never asks a model what an
 error means mid-request. Design and evidence: [pool-eligibility.md](pool-eligibility.md).
+
+### Provider-stated spend headroom
+
+Where a provider **publishes** its credit state, the relay asks instead of inferring. OpenRouter's
+key endpoint (`GET /api/v1/auth/key`) states the key's credit `limit` and `usage`; the background
+ping loop asks each configured OpenRouter credential every 15 minutes (no other provider produces
+any request) and feeds the answer into the same learned-fact mechanism the eligibility store uses:
+
+- `usage >= limit` records `allowance-exhausted` at credential scope, covering **paid deployments
+  only** — free models on the same key stay fully routable.
+- `usage < limit` retracts that condition, including one learned earlier from a refusal — so
+  buying credits un-demotes on the next poll, with no operator action and no lucky paid success.
+- no stated limit (an unlimited key, or a failed request) changes **nothing**, in either direction.
+
+The resulting fact is visible in `llm-relay eligibility`, `llm-relay candidates` and the
+dashboard's Cooldowns panel like any other learned condition.
 
 ### Choosing a target: `llm-relay candidates`
 

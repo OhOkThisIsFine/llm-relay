@@ -194,13 +194,17 @@ describe("the CLI round-trip preserves the narrowing", () => {
     expect(text).toMatch(/"--cost-class", "-cost-class",/);
   });
 
-  it("the suggested accept command reproduces the filter", async () => {
+  it("the suggested accept command reproduces the filter, at BOTH call sites", async () => {
     // ⚠ The trap this pins: the propose output is meant to be copy-pasted. An option the proposer
     // supplied and the accept command omits is silently WIDENED at accept time — here that would
-    // commit the credential-wide verdict the flag exists to prevent.
+    // commit the credential-wide verdict the flag exists to prevent. Both call sites must pass the
+    // filter: the STATUS listing's call once dropped it while this grep watched only the propose
+    // echo. (The rendered-output pins live in test/cli.test.ts; these greps only keep the
+    // argument lists visible.)
     const { readFileSync } = await import("node:fs");
     const text = readFileSync(join(__dirname, "..", "src", "cli.ts"), "utf8");
-    expect(text).toMatch(/eligibilityAcceptCommand\(idx, cls, scope, reset, costFilter\)/);
+    expect(text).toMatch(/eligibilityAcceptCommand\(pending\.indexOf\(entry\) \+ 1, entry\.signature, cls, scope, reset, costFilter\)/);
+    expect(text).toMatch(/eligibilityAcceptCommand\(i \+ 1, p\.signature, p\.proposed\.class, sc, p\.proposed\.reset, p\.proposed\.costClasses\)/);
     expect(text).toMatch(/--cost-class \$\{costClasses\.join\(","\)\}/);
   });
 

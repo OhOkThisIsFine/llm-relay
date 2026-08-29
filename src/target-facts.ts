@@ -505,7 +505,7 @@ export function clearFacts(provider: string, credentialId: CredentialId | null, 
 function clearMatchingActiveFacts(
   selector: CooldownFactClearSelector,
   opts: { path?: string; now?: number },
-  matchesKind: (kind: FactKind) => boolean,
+  matches: (fact: StoredFact) => boolean,
 ): ClearedCooldownFact[] {
   const path = opts.path ?? defaultPath();
   const now = opts.now ?? Date.now();
@@ -513,7 +513,7 @@ function clearMatchingActiveFacts(
   const cleared: ClearedCooldownFact[] = [];
   for (const [key, fact] of Object.entries(store.facts)) {
     if (
-      !matchesKind(fact.kind) ||
+      !matches(fact) ||
       now >= expiryOf(fact) ||
       !matchesClearSelector(fact.scope, selector)
     ) continue;
@@ -536,7 +536,7 @@ export function clearCooldownFacts(
   selector: CooldownFactClearSelector,
   opts: { path?: string; now?: number } = {},
 ): ClearedCooldownFact[] {
-  return clearMatchingActiveFacts(selector, opts, (kind) => COOLING.has(kind));
+  return clearMatchingActiveFacts(selector, opts, (fact) => COOLING.has(fact.kind));
 }
 
 /** Rotation retraction of active credential-invalid facts only. */
@@ -544,7 +544,27 @@ export function clearCredentialInvalidFacts(
   selector: CooldownFactClearSelector,
   opts: { path?: string; now?: number } = {},
 ): ClearedCooldownFact[] {
-  return clearMatchingActiveFacts(selector, opts, (kind) => kind === "credential-invalid");
+  return clearMatchingActiveFacts(selector, opts, (fact) => fact.kind === "credential-invalid");
+}
+
+/**
+ * Retraction for a provider-stated paid-spend statement (`spend-headroom.ts`): only
+ * `allowance-exhausted` rows whose cost filter is PAID-ONLY.
+ *
+ * The narrowing is the whole point. A provider stating "this key still has paid credit" disproves
+ * exactly the paid-spend exhaustion — it says nothing about a free-tier allowance. So a row with
+ * NO filter (covers every class) and a row filtered to `free` both survive; retracting either
+ * would launder a paid-credit statement into evidence about the free tier, the same collapse the
+ * "out of free credits is NOT paid" rule forbids in the other direction.
+ */
+export function clearPaidAllowanceFacts(
+  selector: CooldownFactClearSelector,
+  opts: { path?: string; now?: number } = {},
+): ClearedCooldownFact[] {
+  return clearMatchingActiveFacts(selector, opts, (fact) =>
+    fact.kind === "allowance-exhausted"
+    && fact.costClasses !== undefined
+    && fact.costClasses.every((cls) => cls === "paid"));
 }
 
 export function allFacts(opts: { path?: string; now?: number } = {}): Array<{ kind: FactKind; scope: FactScope; at: number; until: number; untilBasis?: FactResetBasis }> {

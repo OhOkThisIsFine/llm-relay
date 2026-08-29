@@ -14,6 +14,8 @@ import { getLastSuccessfulCallAt, loadRuntimeTelemetry } from "./runtime-telemet
 import { materializeDynamicPools } from "../dynamic-pools.js";
 import { makeCredentialId, parseCredentialId, type CredentialId } from "../credential-id.js";
 import { mergeQuotaObservations, type QuotaObservation } from "../quota-observation.js";
+import { fetchProviderQuota } from "./quota.js";
+import { applySpendHeadroom, classifySpendHeadroom } from "../spend-headroom.js";
 
 export type PingMode = "speed" | "normal" | "slow" | "forced";
 
@@ -26,6 +28,13 @@ export const PING_MODE_INTERVALS: Record<PingMode, number> = {
 
 export const SPEED_MODE_DURATION_MS = 60000; // 60s
 export const IDLE_SLOW_AFTER_MS = 300000; // 5 min
+/**
+ * How often one credential's provider-stated spend headroom is re-asked (`spend-headroom.ts`).
+ * Slow on purpose: the figure moves with the account's own spend, and the `allowance-exhausted`
+ * fact it feeds carries a 1h TTL — a 15-minute cadence keeps the fact alive while a condition
+ * holds and notices bought credits within one interval, at four requests per credential per hour.
+ */
+export const SPEND_POLL_INTERVAL_MS = 15 * 60 * 1000;
 
 export interface ModelHealthSummary {
   providerKey: string;
@@ -103,6 +112,8 @@ export class PingLoop {
   private latestQuota = new Map<string, QuotaObservation[]>();
   /** Request-local fleet cursor persisted between ticks so one-due-model ticks still rotate. */
   private credentialCursors = new Map<string, number>();
+  /** When each credential's spend headroom was last asked for — the SPEND_POLL_INTERVAL_MS gate. */
+  private spendPolledAt = new Map<CredentialId, number>();
 
   constructor(
     private cfg: Config,
@@ -294,8 +305,48 @@ export class PingLoop {
     };
   }
 
+  /**
+   * Ask each provider for its stated spend headroom and feed the answer to `spend-headroom.ts`.
+   *
+   * Egress happens only where a provider actually publishes the figure — `fetchProviderQuota`
+   * fetches for an OpenRouter base and no-ops for everyone else — so this walk costs nothing for
+   * a config with no such provider. One ask per credential slot per SPEND_POLL_INTERVAL_MS; the
+   * gate is stamped before the fetch so a failing endpoint is not re-asked every tick. A failed
+   * or unparseable answer applies nothing in either direction (`unknown` has no effect), and any
+   * throw is contained: a health poll must never break the ping loop.
+   */
+  public async pollSpendHeadroom(now = Date.now()): Promise<void> {
+    for (const [providerName, pCfg] of Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>) {
+      for (const slot of providerCredentialSlots(providerName, pCfg)) {
+        if (!slot.enabled) continue;
+        const last = this.spendPolledAt.get(slot.credentialId) ?? 0;
+        if (now - last < SPEND_POLL_INTERVAL_MS) continue;
+        this.spendPolledAt.set(slot.credentialId, now);
+        await this.pollSlotSpendHeadroom(providerName, pCfg, slot, now);
+      }
+    }
+  }
+
+  private async pollSlotSpendHeadroom(
+    providerName: string,
+    pCfg: ProviderConfig,
+    slot: ReturnType<typeof providerCredentialSlots>[number],
+    now: number,
+  ): Promise<void> {
+    try {
+      const resolution = resolveCredentialSlot(slot);
+      if (resolution.state === "declared-missing") return;
+      const info = await fetchProviderQuota(providerName, pCfg, resolution.value, this.opts.fetchFn ?? fetch);
+      if (!info.ok) return;
+      applySpendHeadroom(providerName, slot.credentialId, classifySpendHeadroom(info), { now });
+    } catch {
+      // Best effort: the statement is re-asked on the next due tick.
+    }
+  }
+
   public async tickOnce(scope: "catalog" | "routable" = "catalog"): Promise<void> {
     this.refreshAutoPingMode();
+    await this.pollSpendHeadroom().catch(() => {});
     if (scope === "routable") materializeDynamicPools(this.cfg, this.catalog);
     const providers = Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>;
     const beforeRefresh = scope === "routable" ? collectRoutableModels(this.cfg) : null;

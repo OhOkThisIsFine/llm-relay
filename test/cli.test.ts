@@ -36,7 +36,7 @@ import {
 } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { ModelCatalog } from "../src/catalog.js";
-import { interpretRefusal, pendingRefusals, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations } from "../src/refusal-interpretation.js";
+import { interpretRefusal, pendingRefusals, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations, signatureDigest } from "../src/refusal-interpretation.js";
 
 describe("cli helper utilities", () => {
   const origArgv = process.argv;
@@ -1164,12 +1164,13 @@ describe("llm-relay eligibility scopes", () => {
     });
 
     runEligibility("propose", "1");
+    const digest = signatureDigest(refusalSignature("provider", "model", 418, "propose widened group"));
     expect(out.join("")).toContain(
-      "llm-relay eligibility accept 1 --class not-servable --scope group --members a,b --all-credentials --reset-ms 1000",
+      `llm-relay eligibility accept 1 --sig ${digest} --class not-servable --scope group --members a,b --all-credentials --reset-ms 1000`,
     );
 
     process.argv = [
-      "node", "cli.ts", "eligibility", "accept", "1",
+      "node", "cli.ts", "eligibility", "accept", "1", "--sig", digest,
       "--class", "not-servable", "--scope", "group", "--members", "a,b", "--all-credentials", "--reset-ms", "1000",
     ];
     runEligibility("accept", "1");
@@ -1177,6 +1178,90 @@ describe("llm-relay eligibility scopes", () => {
       scope: { kind: "group", members: ["a", "b"], credential: "all" },
       reset: { kind: "fixed", ms: 1000 },
     });
+  });
+
+  it("resolves accept by --sig when the queue reorders between propose and accept", () => {
+    // Two pending refusals; B is listed first (fresher), then A overtakes it on count — the
+    // count-then-recency sort is exactly what moved a printed index onto a different refusal.
+    recordUnknownRefusal("provider", "model", 418, "victim A", { now: 1000 });
+    recordUnknownRefusal("provider", "model", 418, "target B", { now: 2000 });
+    expect(pendingRefusals()[0]!.normalized).toBe("target b");
+    const digestB = signatureDigest(refusalSignature("provider", "model", 418, "target B"));
+
+    recordUnknownRefusal("provider", "model", 418, "victim A", { now: 3000 });
+    expect(pendingRefusals()[0]!.normalized).toBe("victim a"); // the queue reordered
+
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    process.argv = ["node", "cli.ts", "eligibility", "accept", "1", "--sig", digestB, "--class", "not-servable", "--scope", "deployment"];
+    runEligibility("accept", "1");
+    err.mockRestore();
+
+    // The digest, not the stale index, decided which refusal was accepted — and the verdict is
+    // read back from the store FILE, not the in-memory memo.
+    resetInterpretations();
+    expect(interpretRefusal("provider", "model", 418, "target B")).toMatchObject({
+      class: "not-servable", scope: { kind: "deployment" },
+    });
+    expect(interpretRefusal("provider", "model", 418, "victim A")).toBeNull();
+    expect(pendingRefusals().some((p) => p.normalized === "victim a")).toBe(true);
+  });
+
+  it("refuses an unknown --sig and touches nothing", () => {
+    queue("sole pending refusal");
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit:1"); }) as never);
+    process.argv = ["node", "cli.ts", "eligibility", "accept", "1", "--sig", "beefbeef00", "--class", "not-servable", "--scope", "deployment"];
+    expect(() => runEligibility("accept", "1")).toThrow("exit:1");
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("no pending refusal matches --sig beefbeef00"));
+    exit.mockRestore();
+    err.mockRestore();
+    expect(interpretRefusal("provider", "model", 418, "sole pending refusal")).toBeNull();
+    // The file outlives resetInterpretations, so assert THIS entry survives rather than a length.
+    expect(pendingRefusals().some((p) => p.normalized === "sole pending refusal")).toBe(true);
+  });
+
+  it("the propose echo's commit command reproduces --sig and the cost filter", () => {
+    const signature = queue("propose with cost filter");
+    const digest = signatureDigest(signature);
+    process.argv = [
+      "node", "cli.ts", "eligibility", "propose", "1",
+      "--class", "allowance-exhausted", "--scope", "credential", "--cost-class", "paid",
+      "--rationale", "stated spend limit",
+    ];
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    runEligibility("propose", "1");
+    expect(out.join("")).toContain(
+      `llm-relay eligibility accept 1 --sig ${digest} --class allowance-exhausted --scope credential --cost-class paid`,
+    );
+  });
+
+  it("lists each pending item's digest, and the listed accept command carries --sig AND the cost filter", () => {
+    const signature = queue("cost filtered proposal");
+    proposeInterpretation(signature, {
+      class: "allowance-exhausted",
+      scope: { kind: "credential" },
+      rationale: "stated spend limit",
+      costClasses: ["paid"],
+    });
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+    runEligibility(undefined, undefined);
+    const rendered = out.join("");
+    const digest = signatureDigest(signature);
+    expect(rendered).toContain(`sig ${digest}`);
+    // ⚠ The cost filter must survive into the LISTED accept command: this call site once dropped
+    // `costClasses`, so the listing printed a command WIDER than the proposal it echoed — the
+    // silent-widening hazard the v0.55.2 fix closed on the propose echo but not here.
+    expect(rendered).toContain(
+      `llm-relay eligibility accept 1 --sig ${digest} --class allowance-exhausted --scope credential --cost-class paid`,
+    );
   });
 
   it("documents group options and credential breadth in top-level help", () => {
