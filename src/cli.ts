@@ -76,6 +76,7 @@ import {
   runKeysUnlockLocal,
   type KeysCliDependencies,
 } from "./keys-cli.js";
+import { runDelegateGateCli } from "./delegate-gate/cli.js";
 
 // Provenance stays attached to the rendered number: a first-party figure and a same-model figure
 // taken from another host are different claims, and a future source must be a compile error at the
@@ -120,6 +121,7 @@ const VALUE_FLAGS = new Set<string>([
   "--label", "-label",
   "--env-name", "-env-name",
   "--out", "-out",
+  "--repo", "-repo",
 ]);
 
 interface ParsedCliArgs {
@@ -263,6 +265,7 @@ ${formatTextTable([
   ["eligibility scope breadth", "credential = current credential slot; provider = all credentials for that provider."],
   ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane; adapts to the calling host."],
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
+  ["llm-relay delegate-gate <diff-file> --repo <root> [--fix]", "Quality-gate a delegated lane's diff before judgment/merge."],
   ["llm-relay help | --help | -h", "Show help."],
   ["llm-relay version | --version | -v", "Print version."],
 ], "  ")}
@@ -1049,7 +1052,7 @@ const COOLDOWN_CLEAR_OPTIONS: ReadonlyMap<string, CooldownClearOption> = new Map
 export const CLI_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "onboard", "setup", "keys", "check-keys", "models", "ping", "dashboard", "telemetry",
   "offload", "lanes", "dispatch", "cooldowns", "eligibility", "candidates", "cost", "pools",
-  "routing", "route", "config", "help", "version",
+  "routing", "route", "config", "delegate-gate", "help", "version",
 ]);
 
 interface CommandArity {
@@ -1123,6 +1126,8 @@ const COMMAND_ARITY: Readonly<Record<string, CommandArity>> = {
   routing: { min: 1, max: -1 },
   // Same handler as `routing`; omitting the alias would leave it unguarded.
   route: { min: 1, max: -1 },
+  // `runDelegateGateCli(arg3)` — one required diff-file positional; `--repo` and `--fix` are flags.
+  "delegate-gate": { min: 2, max: 2, hint: "llm-relay delegate-gate <diff-file> --repo <root> [--fix]" },
 };
 
 /**
@@ -3653,6 +3658,16 @@ export function main(): void {
     });
     return;
   }
+  if (arg2 === "delegate-gate") {
+    const result = runDelegateGateCli({
+      diffPath: arg3,
+      repoRoot: argValue("--repo", "-repo"),
+      fix: hasFlag("--fix", "-fix"),
+    });
+    if (result.stdout.length > 0) process.stdout.write(result.stdout);
+    if (result.stderr.length > 0) process.stderr.write(result.stderr);
+    process.exit(result.exitCode);
+  }
   dispatchDashboardOrProxy(arg2, {
     loadConfig: loadOrExit,
     runDashboard: runDashboardCommand,
@@ -3743,6 +3758,11 @@ export function classifyCommand(argv: string[]): CommandEffect {
     case "eligibility":
       return arg3 === "accept" || arg3 === "reject" || arg3 === "propose" ? "mutating" : "read-only";
     case "dashboard":
+      return "read-only";
+    // Analyzes a diff file and optionally writes `<diff-file>.fixed.patch` NEXT TO THE INPUT —
+    // never touches this machine's own config/state, so it stays read-only for update-check
+    // purposes exactly like `dispatch -x` does for the same reason.
+    case "delegate-gate":
       return "read-only";
     // check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
     // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a
