@@ -4,17 +4,30 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-29
 
-**Current: v0.56.0 is released; the global bin and the running relay are on it.** Nothing is
-pending from the last sprint — §6 holds recorded trades, deferrals and settled decisions, not a
-work queue. The next work item, if any, comes from a §6 deferral or a new owner request. The one
-code-shaped observation on record is the lane-split refusal signature (§6, from the triage below).
+**Current: v0.57.0 is the release in flight from the 2026-08-29 lap.** Nothing else is pending —
+§6 holds recorded trades, deferrals and settled decisions, not a work queue. The next work item,
+if any, comes from a §6 deferral or a new owner request. The one open owner review is the
+max-output-caps design proposal (below).
 
-**2026-08-29: the eligibility queue was triaged with the owner, 199 → 4 pending.** 192 signatures
-accepted (every verdict owner-approved family by family), 4 plain-429s rejected, 4 left pending on
-purpose. Verified end-to-end against the running relay: an accepted `:batch` signature's
-recurrence recorded a live `not-servable` fact with no restart. Verdict table, the two findings
-(lane-split signatures; stated max-output ceilings have no home) and the batch mechanics:
+**2026-08-29, one lap, three deliveries** — full record:
 [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
+
+- **The eligibility queue was triaged with the owner, 199 → 4 pending.** 192 signatures accepted
+  (every verdict owner-approved family by family), 4 plain-429s rejected, 4 left pending on
+  purpose. Verified end-to-end against the running relay: an accepted `:batch` signature's
+  recurrence recorded a live `not-servable` fact with no restart.
+- **The lane-split signature defect the triage exposed was fixed the same day** (owner decision:
+  fix and re-migrate). `normalizeRefusalMessage` unwraps to a fixpoint and `readStoreFile`
+  re-keys stored signatures at load; verified against a copy of the live store — 192 of 193
+  confirmed rows bind after migration, the one inert row is the empty-body case that now
+  deliberately teaches nothing. Mechanism and residuals: the `refusal-interpretation.ts` row in
+  `CLAUDE.md`.
+- **The size ratchet caught a Tailwind scan leak while verifying the fix**: relative content
+  globs resolved against the repo root, so SERVER source words became shipped CSS utilities.
+  Globs are anchored to `dashboard/` now; the baseline was regenerated in the same change.
+- **The max-output-caps design proposal was drafted** on the owner's direction:
+  [docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md) —
+  awaiting owner review, no implementation until accepted.
 
 v0.56.0 shipped the two approved v0.54.0 hand-back items:
 
@@ -183,11 +196,12 @@ else.**
   annotation.** It comes from the smoke step's DELIBERATE negative test (publish.yml deletes the
   file and requires exactly that error — "PASS-AS-EXPECTED"), and GitHub renders the `::error::`
   as a failure annotation anyway. Judge a run by `conclusion`, never by its annotations.
-- **One refusal condition can carry TWO signatures, split by lane.** A pool-walk refusal
-  normalizes WITH the relay's diagnostic wrapper (`openai backend http <n> — model "…" is not
-  served by …`); a directly addressed request normalizes to the provider's bare body. An accepted
-  interpretation covers only its own form — verify with one probe per lane before calling a
-  condition covered, and expect a second accept. Details and the fix trade:
+- **Refusal signatures converge across lanes since the 2026-08-29 fix, with one stated residual.**
+  A provider message CUT by the wrapper's 300-char body cap converges only when both lanes'
+  extractions share the same 240-char signature prefix; otherwise each lane keeps its own
+  signature and each binds for the lane it was learned on. An accepted verdict therefore covers
+  the lane whose traffic produced it — which is the walk lane for everything pool-routed. An
+  EMPTY wrapped body teaches and queues nothing, by design. Diagnosis and resolution:
   [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
 - **The vitest interpretations/fact stores are per-PROCESS files, so entries leak between tests
   in one file.** `resetInterpretations()` drops the memo, not the file — a later test's
@@ -208,21 +222,19 @@ else.**
 ## 6. Outstanding, unclaimed
 
 ⚠ What follows is **recorded trades, deferrals and settled decisions kept for their reasons**, not
-a work queue. The queue is [docs/backlog.md](docs/backlog.md). The one open code-shaped
-observation is the first entry below; everything else is settled.
+a work queue. The queue is [docs/backlog.md](docs/backlog.md). The one item awaiting the owner
+here is the max-output-caps design review.
 
-**Open observations (2026-08-29 triage,
-[docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md)):**
+**From the 2026-08-29 triage
+([docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md)):**
 
-- **Lane-split refusal signatures.** The signature embeds the relay's own diagnostic wrapper on
-  the pool-walk lane and not on the direct lane, so one provider condition can need two accepts,
-  and confirmed signatures are coupled to relay-authored prose. Owner decision 2026-08-29: FIX —
-  compute the signature over the provider body only, with a store migration that re-keys existing
-  confirmed rows.
-- **Stated max-output ceilings have no home.** groq 400s name an explicit `max_tokens` maximum;
-  no store learns output caps and nothing could act on one without editing the caller's request.
-  Owner decision 2026-08-29: draft a design proposal (display-only learning, judged against
-  `docs/project-goals.md`); no implementation until the proposal is reviewed.
+- **EXECUTED: the lane-split refusal-signature fix** (owner decision 2026-08-29: fix and
+  re-migrate). Shipped in v0.57.0 with the load-time store migration; residuals recorded in §4
+  and in the `refusal-interpretation.ts` row of `CLAUDE.md`.
+- **AWAITING OWNER REVIEW: the max-output-caps design proposal**
+  ([docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md)) —
+  display-only learning of stated output ceilings, judged against `docs/project-goals.md`.
+  No implementation until accepted. The carrier signature stays pending in the queue on purpose.
 
 **Owner decisions on record:**
 
