@@ -15,3 +15,5 @@ control-token
 .audit-code/
 .remediate-code/
 .claude/verify-green/
+# /start-lap writes it, /closeout consumes and deletes it — machine-lap state, never shipped.
+.claude/lap-start.json
