@@ -240,8 +240,20 @@ function defaultPath(): string {
  */
 export function normalizeRefusalMessage(body: string): string {
   if (typeof body !== "string") return "";
-  const text = body.length > 4096 ? body.slice(0, 4096) : body;
-  return (extractMessage(text) ?? text)
+  let text = body.length > 4096 ? body.slice(0, 4096) : body;
+  // Unwrap to a FIXPOINT, because a refusal often arrives as an envelope around an envelope: the
+  // walk lane hands this the relay's own anthropic error JSON, whose `error.message` is the
+  // relay's `openai backend HTTP <n>: …` wrapper, whose tail is the provider's (possibly
+  // truncated) payload. One extraction round used to stop at the wrapper, so the SAME provider
+  // condition normalized differently per lane and needed two accepts — the lane-split defect
+  // (docs/eligibility-triage-2026-08-29.md finding 1). Three real layers exist; the bound is a
+  // formality against a pathological body.
+  for (let round = 0; round < 4; round++) {
+    const next = stripRelayWrapper(extractMessage(text) ?? text);
+    if (next === text) break;
+    text = next;
+  }
+  return text
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, "<url>")
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<id>")
@@ -250,6 +262,20 @@ export function normalizeRefusalMessage(body: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 240);
+}
+
+/**
+ * The relay's OWN error wrapper — `backend.ts` synthesizes `openai backend HTTP <status><hint>: `
+ * in front of a provider body it forwards. Stripping it is parsing our own fixed grammar, never
+ * provider prose. The pattern accepts both the raw form (digits, uppercase HTTP) and the
+ * historical STORED form (already lowercased and redacted to `<n>`), because the store migration
+ * re-normalizes old rows through this same function.
+ */
+const RELAY_WRAPPER_PREFIX =
+  /^openai backend http (?:\d{3}|<n>)(?: — model "[^"]{0,256}" is not served by provider "[^"]{0,128}" \([^)]{0,200}\))?:\s*/i;
+
+function stripRelayWrapper(text: string): string {
+  return text.replace(RELAY_WRAPPER_PREFIX, "");
 }
 
 /** The human-readable message inside a body, whether it is JSON, wrapped JSON, or neither. */
@@ -266,7 +292,33 @@ function extractMessage(text: string): string | null {
       // Not parseable — try the next candidate.
     }
   }
+  return fieldFromUnparseable(text);
+}
+
+/**
+ * Deterministic last resort for text whose JSON payload does NOT parse. The relay's wrapper caps
+ * the embedded provider body at 300 chars, so a long body arrives cut mid-string and the parse
+ * path above learns nothing — which left the whole wrapper as the signature on the walk lane
+ * while the direct lane extracted the bare message (the lane-split defect). Field priority
+ * mirrors `findMessage`. A value cut at end-of-text (no closing quote) is accepted, because that
+ * is exactly what truncation produces; the signature's own 240-char cap then makes both lanes
+ * converge on the same prefix.
+ */
+function fieldFromUnparseable(text: string): string | null {
+  for (const field of ["message", "detail", "error", "title"]) {
+    const re = new RegExp(`"${field}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)(?:"|$)`);
+    const value = re.exec(text)?.[1];
+    if (value) return unescapeJsonString(value);
+  }
   return null;
+}
+
+/** JSON string-escape decoding, so the truncated lane matches what `JSON.parse` yields. */
+function unescapeJsonString(value: string): string {
+  const simple: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+  return value
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\(.)/g, (_, ch: string) => simple[ch] ?? ch);
 }
 
 /** Depth-first hunt for the message field an OpenAI-shaped error envelope carries. */
@@ -785,6 +837,77 @@ function observeInterpretationStore(path: string): StoreObservation {
 const emptyStore = (): InterpretationStore => ({ version: 2, confirmed: {}, unknown: {}, ignored: {} });
 
 /**
+ * Re-key every stored signature through the CURRENT normalizer.
+ *
+ * The signature embeds the normalized message, so any improvement to `normalizeRefusalMessage`
+ * silently orphans every row keyed under the old form: fresh traffic produces the new form,
+ * nothing matches, and an operator's accepted verdicts stop binding — exactly what the lane-split
+ * fix would have done to the 192 verdicts accepted on 2026-08-29. This re-normalizes each key's
+ * message part (the stored form is the normalizer's own output, which the normalizer converges on
+ * idempotently) and re-keys the row.
+ *
+ * Merge rules on collision (two historical forms of one condition converging):
+ * - confirmed: the LATER acceptance wins — both are operator-declared, the newer is the operator's
+ *   most recent word. Seeds carry no acceptedAt and rank as 0.
+ * - unknown: counts sum, the window spans both, the fresher sample wins — `mergeStores`' rule.
+ *   A row converging onto a confirmed signature is RESOLVED (dropped), and one converging onto an
+ *   ignored signature stays suppressed — mirroring what `recordUnknownRefusal` would do.
+ * - ignored: latest `at` wins.
+ *
+ * Runs inside `readStoreFile`, so BOTH readers (`load`, and the lost-update re-read in `persist`)
+ * see migrated keys and a merge can never resurrect an old-keyed row. Idempotent: a migrated
+ * store re-keys to itself.
+ */
+function migrateSignatures(store: InterpretationStore): InterpretationStore {
+  const rekey = (sig: string): string => {
+    const parts = signatureParts(sig);
+    if (!parts) return sig;
+    const renorm = normalizeRefusalMessage(parts.sample);
+    if (!renorm || renorm === parts.sample) return sig;
+    return `${parts.provider}|${parts.model ?? "-"}|${parts.status}|${renorm}`;
+  };
+
+  const ignored: Record<string, { at: number }> = {};
+  for (const [sig, entry] of Object.entries(store.ignored ?? {})) {
+    const next = rekey(sig);
+    const existing = ignored[next];
+    if (!existing || entry.at > existing.at) ignored[next] = entry;
+  }
+
+  const confirmed: Record<string, Interpretation> = {};
+  for (const [sig, entry] of Object.entries(store.confirmed)) {
+    const next = rekey(sig);
+    const existing = confirmed[next];
+    if (!existing || (entry.acceptedAt ?? 0) > (existing.acceptedAt ?? 0)) confirmed[next] = entry;
+  }
+
+  const unknown: Record<string, UnknownRefusal> = {};
+  for (const [sig, entry] of Object.entries(store.unknown)) {
+    const next = rekey(sig);
+    if (confirmed[next] || ignored[next]) continue;
+    const parts = signatureParts(next);
+    if (!parts) continue;
+    // `unknownMatchesSignature` requires the row's normalized text to equal the key's message
+    // part, so a re-keyed row must carry the re-normalized form or the NEXT read drops it.
+    const renormed = next === sig ? entry : { ...entry, normalized: parts.sample, sample: parts.sample };
+    unknown[next] = mergeUnknownPair(renormed, unknown[next]);
+  }
+
+  return { version: 2, confirmed, unknown, ignored };
+}
+
+/** Two queue rows for one signature — counts sum, the window spans both, the fresher sample wins. */
+function mergeUnknownPair(incoming: UnknownRefusal, existing: UnknownRefusal | undefined): UnknownRefusal {
+  if (!existing) return incoming;
+  return {
+    ...(incoming.lastSeen >= existing.lastSeen ? incoming : existing),
+    count: incoming.count + existing.count,
+    firstSeen: Math.min(incoming.firstSeen, existing.firstSeen),
+    lastSeen: Math.max(incoming.lastSeen, existing.lastSeen),
+  };
+}
+
+/**
  * Parse a store file. The ONE parser: `load` reads through it, and so does the lost-update
  * re-read inside `persist` — two copies of the acceptance rules is how one process comes to
  * admit a row the other silently drops.
@@ -794,7 +917,7 @@ function readStoreFile(normalizedPath: string): InterpretationStore {
     const parsed: unknown = JSON.parse(readFileSync(normalizedPath, "utf8"));
     if (!parsed || typeof parsed !== "object") return emptyStore();
     const raw = parsed as Record<string, unknown>;
-    if (raw.version === 1) return migrateV1(raw);
+    if (raw.version === 1) return migrateSignatures(migrateV1(raw));
     if (raw.version !== 2) return emptyStore();
     const confirmed: Record<string, Interpretation> = {};
     const unknown: Record<string, UnknownRefusal> = {};
@@ -814,7 +937,7 @@ function readStoreFile(normalizedPath: string): InterpretationStore {
         if (signatureParts(signature) && validIgnored(entry)) ignored[signature] = entry;
       }
     }
-    return { version: 2, confirmed, unknown, ignored };
+    return migrateSignatures({ version: 2, confirmed, unknown, ignored });
   } catch {
     return emptyStore();
   }
