@@ -2,12 +2,19 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-28
+## 0. State as of 2026-08-29
 
-**Current: v0.56.0 is released; the global bin and the running relay are on it.** There is no open
-code gap, and nothing is pending from the last sprint — §6 holds recorded trades, deferrals and
-settled decisions, not a work queue. The next work item, if any, comes from a §6 deferral or a new
-owner request.
+**Current: v0.56.0 is released; the global bin and the running relay are on it.** Nothing is
+pending from the last sprint — §6 holds recorded trades, deferrals and settled decisions, not a
+work queue. The next work item, if any, comes from a §6 deferral or a new owner request. The one
+code-shaped observation on record is the lane-split refusal signature (§6, from the triage below).
+
+**2026-08-29: the eligibility queue was triaged with the owner, 199 → 4 pending.** 192 signatures
+accepted (every verdict owner-approved family by family), 4 plain-429s rejected, 4 left pending on
+purpose. Verified end-to-end against the running relay: an accepted `:batch` signature's
+recurrence recorded a live `not-servable` fact with no restart. Verdict table, the two findings
+(lane-split signatures; stated max-output ceilings have no home) and the batch mechanics:
+[docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
 
 v0.56.0 shipped the two approved v0.54.0 hand-back items:
 
@@ -174,6 +181,12 @@ else.**
   annotation.** It comes from the smoke step's DELIBERATE negative test (publish.yml deletes the
   file and requires exactly that error — "PASS-AS-EXPECTED"), and GitHub renders the `::error::`
   as a failure annotation anyway. Judge a run by `conclusion`, never by its annotations.
+- **One refusal condition can carry TWO signatures, split by lane.** A pool-walk refusal
+  normalizes WITH the relay's diagnostic wrapper (`openai backend http <n> — model "…" is not
+  served by …`); a directly addressed request normalizes to the provider's bare body. An accepted
+  interpretation covers only its own form — verify with one probe per lane before calling a
+  condition covered, and expect a second accept. Details and the fix trade:
+  [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
 - **The vitest interpretations/fact stores are per-PROCESS files, so entries leak between tests
   in one file.** `resetInterpretations()` drops the memo, not the file — a later test's
   `pendingRefusals()` sees every entry earlier tests flushed. Assert entry-specific facts
@@ -193,7 +206,21 @@ else.**
 ## 6. Outstanding, unclaimed
 
 ⚠ What follows is **recorded trades, deferrals and settled decisions kept for their reasons**, not
-a work queue. There is currently NO open code gap.
+a work queue. The one open code-shaped observation is the first entry below; everything else is
+settled.
+
+**Open observations (2026-08-29 triage,
+[docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md)):**
+
+- **Lane-split refusal signatures.** The signature embeds the relay's own diagnostic wrapper on
+  the pool-walk lane and not on the direct lane, so one provider condition can need two accepts,
+  and confirmed signatures are coupled to relay-authored prose. Owner decision 2026-08-29: FIX —
+  compute the signature over the provider body only, with a store migration that re-keys existing
+  confirmed rows.
+- **Stated max-output ceilings have no home.** groq 400s name an explicit `max_tokens` maximum;
+  no store learns output caps and nothing could act on one without editing the caller's request.
+  Owner decision 2026-08-29: draft a design proposal (display-only learning, judged against
+  `docs/project-goals.md`); no implementation until the proposal is reviewed.
 
 **Owner decisions on record:**
 
