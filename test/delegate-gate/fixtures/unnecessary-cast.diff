@@ -1,0 +1,14 @@
+diff --git a/src/cast-example.ts b/src/cast-example.ts
+new file mode 100644
+index 0000000..b2c3d4e
+--- /dev/null
++++ b/src/cast-example.ts
+@@ -0,0 +1,8 @@
++export function example(input: unknown): void {
++  const s = "hello" as string;
++  const n = input as any;
++  const m = input as unknown as string;
++  // Not flagged on purpose: an array-literal cast to a non-keyword type node is outside the
++  // syntactic (no full type-checker) scope this detector deliberately stays within.
++  const arr = [1, 2, 3] as number[];
++}
