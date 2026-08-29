@@ -416,6 +416,19 @@ else.**
   `openrouter/nvidia/nemotron-3-ultra-556b-v2` is also de-listed on OpenRouter (400 "not a valid
   model ID"); cached candidates can be stale about both failures.
 - **Two heredoc groups in one Bash call break quoting in this harness.** One heredoc per call.
+- **`gh run watch` on a PASSING publish run shows an `X tier-data.json missing or empty`
+  annotation.** It comes from the smoke step's DELIBERATE negative test (publish.yml deletes the
+  file and requires exactly that error — "PASS-AS-EXPECTED"), and GitHub renders the `::error::`
+  as a failure annotation anyway. Judge a run by `conclusion`, never by its annotations.
+- **The vitest interpretations/fact stores are per-PROCESS files, so entries leak between tests
+  in one file.** `resetInterpretations()` drops the memo, not the file — a later test's
+  `pendingRefusals()` sees every entry earlier tests flushed. Assert entry-specific facts
+  ("this signature is still pending"), never queue lengths.
+- **A recorded "open gap" is a claim like any other — verify its MECHANISM before working it.**
+  The §6 Windows package-check entry cited backslashes in the generated graph; `toPortablePath()`
+  had normalized that path since the plugin's first commit, and a fresh build + check passed
+  first try. The real v0.55.0 failure was the entries ceiling, already fixed. Ten minutes of
+  reproduction beat an afternoon of fixing a defect that did not exist.
 
 ## 5. Definition of done
 
