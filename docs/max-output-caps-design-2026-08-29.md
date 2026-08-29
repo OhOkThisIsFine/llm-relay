@@ -1,8 +1,9 @@
 # Design proposal: learned max-output ceilings (display-only)
 
-Status: PROPOSAL — owner-requested 2026-08-29 (triage follow-up,
-[eligibility-triage-2026-08-29.md](eligibility-triage-2026-08-29.md) finding 2). Not accepted, not
-implemented. Judged against [project-goals.md](project-goals.md) below.
+Status: **ACCEPTED** (owner decision 2026-08-29, at the triage lap's hand-back) — implement in a
+coming lap exactly as scoped below; the backlog carries the work item. Origin: triage follow-up,
+[eligibility-triage-2026-08-29.md](eligibility-triage-2026-08-29.md) finding 2. Judged against
+[project-goals.md](project-goals.md) below.
 
 ## Problem and evidence
 
