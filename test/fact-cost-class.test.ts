@@ -212,3 +212,69 @@ describe("the CLI round-trip preserves the narrowing", () => {
     expect(text).toMatch(/costClasses: verdict\.costClasses/);
   });
 });
+
+describe("acceptInterpretation persists the cost filter (the REAL round trip)", () => {
+  // ⚠ The source-text pins above passed while acceptInterpretation silently DROPPED
+  // `costClasses`: the parameter type did not declare the field, a spread into `override`
+  // defeats the excess-property check, and the persisted literal copied six named fields — so
+  // `--cost-class paid` accepted cleanly, persisted a verdict covering EVERY class, and the
+  // 2026-08-28 closeout auditor found the operator's live store entry field-less. Only an
+  // accept → flush → re-read round trip can observe that, so these read the FILE back.
+  const REFUSAL_BODY = JSON.stringify({ error: { message: "key limit exceeded (weekly limit). manage it using https://example.test/keys" } });
+
+  let storeDir: string;
+  let storePath: string;
+
+  beforeEach(async () => {
+    const { resetInterpretations } = await import("../src/refusal-interpretation.js");
+    resetInterpretations();
+    storeDir = mkdtempSync(join(tmpdir(), "llm-relay-interp-roundtrip-"));
+    storePath = join(storeDir, "refusal-interpretations.json");
+  });
+  afterEach(async () => {
+    const { resetInterpretations } = await import("../src/refusal-interpretation.js");
+    resetInterpretations();
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  it("override.costClasses survives accept -> flush -> re-read", async () => {
+    const { acceptInterpretation, flushInterpretations, recordUnknownRefusal, refusalSignature } =
+      await import("../src/refusal-interpretation.js");
+    recordUnknownRefusal("openrouter", "anthropic/claude-fable-5", 403, REFUSAL_BODY, { path: storePath });
+    const signature = refusalSignature("openrouter", "anthropic/claude-fable-5", 403, REFUSAL_BODY);
+    const accepted = acceptInterpretation(signature, {
+      path: storePath,
+      override: { class: "allowance-exhausted", scope: { kind: "credential" }, costClasses: ["paid"] },
+    });
+    expect(accepted).toBe(true);
+    flushInterpretations({ path: storePath });
+
+    const persisted = JSON.parse(readFileSync(storePath, "utf8")) as {
+      confirmed: Record<string, { class: string; costClasses?: string[] }>;
+    };
+    expect(persisted.confirmed[signature]?.class).toBe("allowance-exhausted");
+    expect(persisted.confirmed[signature]?.costClasses).toEqual(["paid"]);
+  });
+
+  it("a proposed costClasses survives propose -> accept-without-override -> re-read", async () => {
+    const { acceptInterpretation, flushInterpretations, proposeInterpretation, recordUnknownRefusal, refusalSignature } =
+      await import("../src/refusal-interpretation.js");
+    recordUnknownRefusal("openrouter", "anthropic/claude-fable-5", 403, REFUSAL_BODY, { path: storePath });
+    const signature = refusalSignature("openrouter", "anthropic/claude-fable-5", 403, REFUSAL_BODY);
+    const proposed = proposeInterpretation(signature, {
+      class: "allowance-exhausted",
+      scope: { kind: "credential" },
+      rationale: "spend limit — paid surface only",
+      costClasses: ["paid"],
+    }, { path: storePath });
+    expect(proposed).toBe(true);
+    const accepted = acceptInterpretation(signature, { path: storePath });
+    expect(accepted).toBe(true);
+    flushInterpretations({ path: storePath });
+
+    const persisted = JSON.parse(readFileSync(storePath, "utf8")) as {
+      confirmed: Record<string, { class: string; costClasses?: string[] }>;
+    };
+    expect(persisted.confirmed[signature]?.costClasses).toEqual(["paid"]);
+  });
+});

@@ -21,13 +21,25 @@ creep, not one change — and the baseline was regenerated in its own commit.
 
 Process facts that outlive the sprint:
 
-- **Three of five lanes again shipped regression tests that passed on the UN-FIXED tree.**
+- **Two of five lanes shipped regression tests that passed on the UN-FIXED tree.**
   Lane D asserted the dedup-keyed fact store, which is structurally blind to a doubled
   observation (the observable is `pendingRefusals().count`); lane B's every assertion was
   satisfiable by the 272,000 fallback, and one read the LIVE snapshot (the exact
-  never-pin-live-data gotcha). The orchestrator's pre-fix control caught all three; the
-  adversarial review lane caught none of them. **Run every new test against the un-fixed tree
-  yourself; do not delegate that control.**
+  never-pin-live-data gotcha). The orchestrator's pre-fix control caught both; the adversarial
+  review lane caught neither. (This bullet first said "three of five" — the independent
+  closeout auditor counted the commit evidence and corrected it.) **Run every new test against
+  the un-fixed tree yourself; do not delegate that control.**
+- **The independent closeout auditor also caught a LIVE bug the whole pipeline missed, fixed
+  in v0.55.2:** `acceptInterpretation` silently DROPPED `--cost-class` — its parameter type
+  lacked `costClasses`, a spread into `override` defeats the excess-property check, and the
+  persisted literal copied six named fields — so the OpenRouter weekly-limit accept persisted
+  a verdict covering EVERY class, the exact over-demotion the flag exists to prevent. The
+  shipped "round-trip" tests were source-text greps and pinned nothing; the replacement tests
+  read the store FILE back after accept (pre-fix: "expected undefined to deeply equal
+  ['paid']"). The operator's live entry was repaired in place the same evening (backup:
+  `refusal-interpretations.json.bak-2026-08-28-pre-costclass-repair`). ⚠ An evidence-only
+  auditor (repo path + start commit + closeout text, nothing else) is now a proven step: it
+  corrected the orchestrator twice in one closeout.
 - **A five-lane burst degrades the free pool it runs on.** OpenRouter's weekly spend-limit 403
   ended one headless lane (a `claude -p` session dies on 403), the pool's 402-prone members
   cooled under the burst, and two more lanes died with the client's generic model error.
