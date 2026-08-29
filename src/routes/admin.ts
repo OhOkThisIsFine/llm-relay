@@ -7,7 +7,7 @@ import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { loadLaneManifest } from "../lane-manifest.js";
-import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, type DispatchOutcome } from "../dispatch.js";
+import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, specContextWindow, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
 import { contextWindowResolver } from "../metadata.js";
 import { snapshotContextWindow } from "../tier-data.js";
@@ -33,59 +33,101 @@ function collectModelAliases(value: unknown, out: Set<string>): void {
   }
 }
 
+/**
+ * Codex-shaped default context window for an unresolvable id.
+ * Under-promising is safe; over-promising causes the defect this fixes.
+ * 272000 = 272k, the pre-existing hardcoded value.
+ */
+const CODEX_DEFAULT_CONTEXT_WINDOW = 272000;
+
 /** OpenAI-compatible model discovery for clients such as local Codex. */
-function relayModels(cfg: Config): Array<Record<string, unknown>> {
+function relayModels(
+  cfg: Config,
+  h: Pick<AdminHandlers, "catalog">,
+): Array<Record<string, unknown>> {
   const ids = new Set<string>();
   collectModelAliases(cfg.routing.default, ids);
   collectModelAliases(cfg.routing.tiers, ids);
   collectModelAliases(cfg.routing.subagents, ids);
   for (const name of Object.keys(cfg.routing.pools ?? {})) ids.add(`pool/${name}`);
-  return [...ids].sort().map((id) => ({
-    id,
-    slug: id,
-    display_name: id,
-    description: "Model routed through llm-relay.",
-    default_reasoning_level: "medium",
-    supported_reasoning_levels: [
-      { effort: "minimal", description: "Fast responses with minimal reasoning" },
-      { effort: "low", description: "Fast responses with lighter reasoning" },
-      { effort: "medium", description: "Balances speed and reasoning depth for everyday tasks" },
-      { effort: "high", description: "Greater reasoning depth for complex problems" },
-      { effort: "xhigh", description: "Extra high reasoning depth for complex problems" },
-    ],
-    shell_type: "shell_command",
-    visibility: "list",
-    supported_in_api: true,
-    priority: 0,
-    additional_speed_tiers: ["fast"],
-    service_tiers: [],
-    availability_nux: null,
-    upgrade: null,
-    base_instructions: "",
-    model_messages: { instructions_template: "", instructions_variables: null },
-    include_skills_usage_instructions: false,
-    default_reasoning_summary: "none",
-    support_verbosity: true,
-    default_verbosity: "medium",
-    apply_patch_tool_type: "freeform",
-    web_search_tool_type: "text_and_image",
-    truncation_policy: { mode: "tokens", limit: 10000 },
-    supports_parallel_tool_calls: true,
-    supports_image_detail_original: true,
-    context_window: 272000,
-    max_context_window: 272000,
-    comp_hash: "llm-relay",
-    effective_context_window_percent: 95,
-    experimental_supported_tools: [],
-    input_modalities: ["text", "image"],
-    supports_search_tool: true,
-    use_responses_lite: false,
-    tool_mode: "code_mode_only",
-    multi_agent_version: "v2",
-    object: "model",
-    created: 0,
-    owned_by: "llm-relay",
-  }));
+
+  // Build the context window resolver once, reusing the same machinery as dispatch.ts
+  // `catalog.cachedLimits` never fetches — a cold cache degrades to "no window stated" rather than
+  // turning this catalog read into a blocking upstream round-trip.
+  const publishedContextWindow = contextWindowResolver(
+    (provider, model) => h.catalog.cachedLimits(provider, model)?.contextLength ?? null,
+    snapshotContextWindow,
+    observedContextLimit,
+  );
+
+  return [...ids].sort().map((id) => {
+    // Resolve context window per id: pool/<name> -> pool minimum; provider spec -> deployment; nothing -> fallback
+    let contextWindow: number = CODEX_DEFAULT_CONTEXT_WINDOW;
+    let maxContextWindow: number = CODEX_DEFAULT_CONTEXT_WINDOW;
+
+    // For pool/<name>, resolve to the pool-minimum context window
+    if (id.startsWith("pool/")) {
+      const resolved = specContextWindow(id, cfg, publishedContextWindow);
+      if (resolved !== null && Number.isFinite(resolved.tokens) && resolved.tokens > 0) {
+        contextWindow = resolved.tokens;
+        maxContextWindow = resolved.tokens;
+      }
+    } else {
+      // For a concrete provider spec, try to resolve it directly
+      const resolved = publishedContextWindow(id);
+      if (resolved !== null && Number.isFinite(resolved.tokens) && resolved.tokens > 0) {
+        contextWindow = resolved.tokens;
+        maxContextWindow = resolved.tokens;
+      }
+    }
+
+    return {
+      id,
+      slug: id,
+      display_name: id,
+      description: "Model routed through llm-relay.",
+      default_reasoning_level: "medium",
+      supported_reasoning_levels: [
+        { effort: "minimal", description: "Fast responses with minimal reasoning" },
+        { effort: "low", description: "Fast responses with lighter reasoning" },
+        { effort: "medium", description: "Balances speed and reasoning depth for everyday tasks" },
+        { effort: "high", description: "Greater reasoning depth for complex problems" },
+        { effort: "xhigh", description: "Extra high reasoning depth for complex problems" },
+      ],
+      shell_type: "shell_command",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 0,
+      additional_speed_tiers: ["fast"],
+      service_tiers: [],
+      availability_nux: null,
+      upgrade: null,
+      base_instructions: "",
+      model_messages: { instructions_template: "", instructions_variables: null },
+      include_skills_usage_instructions: false,
+      default_reasoning_summary: "none",
+      support_verbosity: true,
+      default_verbosity: "medium",
+      apply_patch_tool_type: "freeform",
+      web_search_tool_type: "text_and_image",
+      truncation_policy: { mode: "tokens", limit: 10000 },
+      supports_parallel_tool_calls: true,
+      supports_image_detail_original: true,
+      context_window: contextWindow,
+      max_context_window: maxContextWindow,
+      comp_hash: "llm-relay",
+      effective_context_window_percent: 95,
+      experimental_supported_tools: [],
+      input_modalities: ["text", "image"],
+      supports_search_tool: true,
+      use_responses_lite: false,
+      tool_mode: "code_mode_only",
+      multi_agent_version: "v2",
+      object: "model",
+      created: 0,
+      owned_by: "llm-relay",
+    };
+  });
 }
 
 export interface AdminHandlers {
@@ -140,7 +182,7 @@ export async function handleAdminRoutes(
   };
 
   if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
-    const models = relayModels(cfg);
+    const models = relayModels(cfg, { catalog: h.catalog });
     // `data` is the standard OpenAI shape; Codex's custom-provider catalog reader also accepts
     // the same entries under `models`. Returning both keeps the endpoint useful to both clients.
     return ok({ object: "list", data: models, models });
