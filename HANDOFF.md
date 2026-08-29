@@ -443,8 +443,17 @@ else.**
 
 ## 6. Outstanding, unclaimed
 
-⚠ What follows is **recorded trades and closed items kept for their reasons**, not a work queue.
-There is no open code gap.
+⚠ What follows is **recorded trades and closed items kept for their reasons**, not a work queue —
+plus, currently, ONE open code gap:
+
+- **OPEN (2026-08-28): `scripts/dashboard-package-check.mjs` cannot run on Windows.** Its
+  bundle-inventory validation rejects any resolved `packagePath` containing `\` ("not a portable
+  resolved package record"), and on Windows the generated graph carries backslashes — so
+  `npm run check:package` fails locally before the size ratchet is even reached, and the
+  v0.55.0 entries-ceiling failure was only visible on CI. Fix belongs at the graph GENERATION
+  site (normalize to forward slashes), not by loosening the portability check. Until then,
+  measure package metrics from a real tarball (`npm pack` + `tar -tzvf`) when regenerating
+  `docs/dashboard-package-baseline.json` on this machine.
 
 **From the 2026-08-28 verification sprint** — every item with its reason is in
 [docs/advisory-findings-verification-2026-08-28.md](docs/advisory-findings-verification-2026-08-28.md)
