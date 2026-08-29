@@ -32,8 +32,10 @@ v0.56.0 shipped the two approved v0.54.0 hand-back items:
   headroom returns — so the paid/free boundary comes from the provider's own statement and updates
   in both directions. Design reasoning: the `spend-headroom.ts` row in `CLAUDE.md`.
 
-Operational: Codex is quota-dead until Sep 3 (probed; exit 0 with a usage-limit body — the
-recorded trap).
+Operational: Codex quota RESET 2026-08-29 (owner-reported, verified by live probe — `codex exec`
+answered on `gpt-5.6-sol`). The earlier "quota-dead until Sep 3" record is retired. The six codex
+dispatch rungs stay `"enabled": false` (the 2026-08-27 move to the first-party plugin); a reset
+restores the hand lane, not a ladder rung.
 
 ## 0.1 Earlier releases
 
@@ -206,8 +208,8 @@ else.**
 ## 6. Outstanding, unclaimed
 
 ⚠ What follows is **recorded trades, deferrals and settled decisions kept for their reasons**, not
-a work queue. The one open code-shaped observation is the first entry below; everything else is
-settled.
+a work queue. The queue is [docs/backlog.md](docs/backlog.md). The one open code-shaped
+observation is the first entry below; everything else is settled.
 
 **Open observations (2026-08-29 triage,
 [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md)):**
