@@ -4,10 +4,12 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-29
 
-**Current: v0.57.0 is the release in flight from the 2026-08-29 lap.** Nothing else is pending —
-§6 holds recorded trades, deferrals and settled decisions, not a work queue. The next work item,
-if any, comes from a §6 deferral or a new owner request. The one open owner review is the
-max-output-caps design proposal (below).
+**Current: v0.57.0 is released; the global bin and the restarted relay are on it** (publish run
+green, registry 0.57.0, live-probed: a `:batch` 404 refreshed its `not-servable` fact through the
+new normalizer with no queue growth). Nothing else is pending — §6 holds recorded trades,
+deferrals and settled decisions, not a work queue; the work queue is
+[docs/backlog.md](docs/backlog.md). The one open owner review is the max-output-caps design
+proposal (below).
 
 **2026-08-29, one lap, three deliveries** — full record:
 [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
