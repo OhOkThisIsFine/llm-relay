@@ -3,7 +3,7 @@ import type { CostClass } from "./metadata.js";
 import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join, resolve } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { WriteBehindTimer } from "./write-behind.js";
 import type { CredentialId } from "./credential-id.js";
@@ -158,7 +158,7 @@ export interface UnknownRefusal {
   firstSeen: number;
   lastSeen: number;
   /** A researched verdict awaiting acceptance. Present once the research tier has run. */
-  proposed?: { class: FactKind; scope: ScopeTemplate; rationale: string; at: number; reset?: ResetRule };
+  proposed?: { class: FactKind; scope: ScopeTemplate; rationale: string; at: number; reset?: ResetRule; costClasses?: readonly CostClass[] };
 }
 
 interface InterpretationStore {
@@ -1049,7 +1049,7 @@ export function pendingRefusals(opts: { path?: string } = {}): Array<UnknownRefu
 /** Attach a researched verdict to a pending signature. It does NOT bind until accepted. */
 export function proposeInterpretation(
   signature: string,
-  proposal: { class: FactKind; scope: ScopeTemplate; rationale: string; reset?: ResetRule },
+  proposal: { class: FactKind; scope: ScopeTemplate; rationale: string; reset?: ResetRule; costClasses?: readonly CostClass[] },
   opts: { path?: string; now?: number } = {},
 ): boolean {
   const path = opts.path ?? defaultPath();
@@ -1070,22 +1070,28 @@ export function proposeInterpretation(
  */
 export function acceptInterpretation(
   signature: string,
-  opts: { path?: string; now?: number; override?: { class: FactKind; scope: ScopeTemplate; reset?: ResetRule } } = {},
+  opts: { path?: string; now?: number; override?: { class: FactKind; scope: ScopeTemplate; reset?: ResetRule; costClasses?: readonly CostClass[] } } = {},
 ): boolean {
   const path = opts.path ?? defaultPath();
   const store = load(path);
   const pending = store.unknown[signature];
   const verdict = opts.override ?? (pending?.proposed
-    ? { class: pending.proposed.class, scope: pending.proposed.scope, reset: pending.proposed.reset }
+    ? { class: pending.proposed.class, scope: pending.proposed.scope, reset: pending.proposed.reset, costClasses: pending.proposed.costClasses }
     : null);
   if (!verdict) return false;
   // The reset travels with the verdict: accepting an interpretation commits everything known about
   // that message shape — what it means, who it covers, and when it clears — not just a label.
   const reset = verdict.reset ?? pending?.proposed?.reset;
+  // So does the cost filter. This literal used to copy six named fields and silently DROP
+  // `costClasses` (the parameter type did not declare it, and a spread into `override` defeats
+  // the excess-property check), so `--cost-class paid` accepted cleanly and persisted nothing —
+  // the verdict then covered EVERY class, the exact over-demotion the flag exists to prevent.
+  const costClasses = verdict.costClasses ?? pending?.proposed?.costClasses;
   store.confirmed[signature] = {
     class: verdict.class,
     scope: verdict.scope,
     ...(reset ? { reset } : {}),
+    ...(costClasses && costClasses.length > 0 ? { costClasses } : {}),
     source: "researched",
     acceptedAt: opts.now ?? Date.now(),
     ...(pending?.proposed?.rationale ? { rationale: pending.proposed.rationale } : {}),
