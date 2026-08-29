@@ -4,7 +4,41 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-28
 
-**Latest — the three-axis assessment and the four decisions it produced (v0.53.0).** The owner asked
+**Latest — the assessment's leftover findings closed on external lanes (v0.54.0).** The
+"Remaining open items" ledger of
+[docs/three-axis-assessment-2026-08-28.md](docs/three-axis-assessment-2026-08-28.md) is now
+closed except the two lines it keeps deliberately (the learned context ceiling never reaching
+the request-path guardrail, unobservable while the store holds zero such facts; and the
+`orderByUsability` dead seam). Seven items shipped as five lane packets, every one implemented
+on a relay free-pool or pinned-member lane, none by the orchestrator: the `sync-tiers`
+artificial_analysis drift guard; `GET /v1/models` resolving real context windows (pool minimum
+via `specContextWindow`, 272,000 kept only as the named unresolvable-id fallback); template
+declarations for cerebras and cohere plus a live-verified cohere preset, making the QUICKSTART
+Stage 2 rows true; the Anthropic front's double `observeEligibility` count; the cooling band
+ordered by soonest known lift on both fronts; `headroomBand` gaining the UTC-period gate; and
+the `recordCall` JSDoc. The package size ratchet fired during integration — cross-release
+creep, not one change — and the baseline was regenerated in its own commit.
+
+Process facts that outlive the sprint:
+
+- **Three of five lanes again shipped regression tests that passed on the UN-FIXED tree.**
+  Lane D asserted the dedup-keyed fact store, which is structurally blind to a doubled
+  observation (the observable is `pendingRefusals().count`); lane B's every assertion was
+  satisfiable by the 272,000 fallback, and one read the LIVE snapshot (the exact
+  never-pin-live-data gotcha). The orchestrator's pre-fix control caught all three; the
+  adversarial review lane caught none of them. **Run every new test against the un-fixed tree
+  yourself; do not delegate that control.**
+- **A five-lane burst degrades the free pool it runs on.** OpenRouter's weekly spend-limit 403
+  ended one headless lane (a `claude -p` session dies on 403), the pool's 402-prone members
+  cooled under the burst, and two more lanes died with the client's generic model error.
+  Recovery that worked: relaunch each dead lane pinned to a DIFFERENT healthy free member from
+  `/candidates` (kilo nemotron, nim nemotron, mistral) so lanes sit in separate quota domains.
+  Mistral's lane survived 2.1 h and died of its own 402 AFTER finishing the diff — the work
+  was intact in the worktree.
+- Codex is quota-dead until Sep 3 (probed; exit 0 with a usage-limit body — the recorded
+  trap), so Codex carried nothing this sprint.
+
+**Earlier — the three-axis assessment and the four decisions it produced (v0.53.0).** The owner asked
 how well the relay handles (a) tracking quota/rate/capability/capacity from different sources,
 (b) steering traffic through a single verb, and (c) working from Claude, Codex, OpenCode and other
 IDEs. Six auditors read source, every gap claim went to an adversarial verifier (60 claims, **51

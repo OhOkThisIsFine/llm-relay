@@ -418,23 +418,27 @@ Three things worth keeping from the implementation:
 
 ## Remaining open items
 
-None of the four decisions is outstanding. What the assessment found and did NOT act on:
+None of the four decisions is outstanding.
 
-- **Findings 3, 4, 5, 8 and 9 in the ledger are untouched** — the OpenRouter `sync-tiers` drift
-  guard, the hardcoded 272,000 `context_window` on `GET /v1/models`, the Cerebras/Cohere rows in
-  QUICKSTART that no template declares, the double `observeEligibility` count on the Anthropic
-  front, and the stale `server.ts:2723` JSDoc. Each is real and none was part of a decision.
+**CLOSED 2026-08-28 evening (v0.54.0), the five-lane follow-up sprint:** findings 3, 4, 5, 8
+and 9 (the OpenRouter `sync-tiers` drift guard; the hardcoded 272,000 `context_window` on
+`GET /v1/models`, now resolved through the same machinery as dispatch with 272,000 kept only
+as the named fallback for an unresolvable id; the Cerebras/Cohere template declarations plus a
+live-verified Cohere preset; the double `observeEligibility` count; the `recordCall` JSDoc) —
+plus the two residues this section had named: the cooling band now orders ascending by soonest
+known lift on both fronts, and `headroomBand` declines an observation from a lapsed UTC
+period. All implemented on relay free-pool/pinned-member lanes and adversarially checked;
+three of the five lanes' regression tests had to be rewritten because they passed on the
+un-fixed tree.
+
+Still open, deliberately:
+
 - **The learned context ceiling still never reaches the request-path guardrail.**
   `server.ts` reads `catalog.cachedLimits` only. Not raised as a decision because the store holds
   zero `context-limit` facts today, so the fix would be unobservable either way.
 - **`CircuitBreaker.orderByUsability` still has zero `src/` callers.** `CLAUDE.md` no longer calls
   it "the ordering API"; the dead code itself is left, and its tests pin a function the router does
   not call.
-- **The cooling band is still ordered by fitness, not soonest lift.** `state.cooldownUntil` is now
-  persisted as well as live, so the sort key is in hand whenever this is taken up.
-- **`credential-select.ts` `headroomBand` still ignores `period`** while the availability ladder
-  gates on it. Inert today because no provider declares a `credentials` fleet; the first fleet the
-  operator configures activates it.
 
 ---
 
