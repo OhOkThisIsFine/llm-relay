@@ -37,6 +37,10 @@ Process facts that outlive the sprint:
   was intact in the worktree.
 - Codex is quota-dead until Sep 3 (probed; exit 0 with a usage-limit body — the recorded
   trap), so Codex carried nothing this sprint.
+- Two smaller frictions, so nobody re-hits them: piping a gate through `| tail -N` and then
+  reading `$?` reports the TAIL's exit and hides the failure — the ratchet failure surfaced
+  only on a full-output rerun; and a write lane cannot append to the log its own launcher
+  holds open (`Out-File` keeps the handle) — lane self-reports belong in the digest file.
 
 **Earlier — the three-axis assessment and the four decisions it produced (v0.53.0).** The owner asked
 how well the relay handles (a) tracking quota/rate/capability/capacity from different sources,
