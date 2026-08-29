@@ -490,10 +490,12 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   into `recordOutcome`: recording a failure opens the breaker on a *config* problem, recording a
   success launders a permanently broken member into a healthy one, and both were tried.
 - **Health DEMOTES candidates; it never drops them.** `orderByUsability()` returns every candidate,
-  ordered live → credential-faulted → cooling. The old `filter(isHealthy)` deleted cooling
-  candidates whenever any healthy one remained, so a pool could narrow to one member and then have
-  nothing left when that member failed too. Only an unset credential removes a candidate, and that
-  happens in `resolveTargets` for a different reason.
+  ordered live → credential-faulted → cooling. Within the cooling band, candidates are ordered by
+  soonest known lift time (ascending; `cooldownUntil` from the breaker or target-facts); unknown
+  lifts sort last. The old `filter(isHealthy)` deleted cooling candidates whenever any healthy one
+  remained, so a pool could narrow to one member and then have nothing left when that member failed
+  too. Only an unset credential removes a candidate, and that happens in `resolveTargets` for a
+  different reason.
 - **Quota is a demotion term, never a drop (Gap 12, spec §5.4).** A spent quota (`remaining <= 0`,
   basis `provider-stated`, `derived:provider-stated` (a STALE observation's stated limit minus
   locally measured usage — first-party enough to gate, same rule as `availability.ts`

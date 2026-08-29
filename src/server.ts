@@ -2008,9 +2008,41 @@ function credentialEvidence(
 }
 
 /**
+ * Get the soonest cooldown lift time for a cooling attempt.
+ * Checks breaker state first (covers breaker cooling + quota demotion), then target-facts for allowance facts.
+ * Returns null if no known lift time (unknown).
+ */
+function coolingLiftTime(
+  attempt: ResolvedAttempt,
+  breaker: CircuitBreaker,
+  now: number,
+  costClassOf?: CostClassFn | null,
+): number | null {
+  const identity = targetIdentity(attempt);
+  // 1. Breaker cooldown (covers failure/429/402 cooling AND quota demotion cooling)
+  const breakerState = breaker.getState(identity);
+  if (breakerState && breakerState.cooldownUntil > now) {
+    return breakerState.cooldownUntil;
+  }
+  // 2. Allowance exhaustion fact (target-facts) - only if not already covered by breaker
+  const costClass = costClassOf?.(attempt);
+  const factCooldown = cooldownUntil(attempt.target.provider, attempt.credentialId, attempt.target.model ?? null, {
+    now,
+    ...(costClass === undefined ? {} : { costClass }),
+  });
+  if (factCooldown !== null && factCooldown > now) {
+    return factCooldown;
+  }
+  return null;
+}
+
+/**
  * Keep every credential row of a deployment together while ordering deployments by their
  * best-ranked row. CredentialWalk performs the breadth-first interleaving when it offers rows.
  * Tracked like `orderByUsabilityTracked` so the request path can announce a displaced first choice.
+ *
+ * Within the COOLING band, order by soonest known lift time (ascending). Unknown lifts sort last.
+ * Stable within ties and unknowns.
  */
 function orderDeploymentGroupsByUsability(
   attempts: readonly ResolvedAttempt[],
@@ -2030,6 +2062,18 @@ function orderDeploymentGroupsByUsability(
     else if (usability === "credential-fault") faulted.push(group);
     else live.push(group);
   }
+
+  // Sort cooling band by soonest lift time (ascending). Unknown (null) sorts last.
+  // Stable sort preserves original order for ties and unknowns.
+  cooling.sort((a, b) => {
+    const liftA = coolingLiftTime(a.attempts[0]!, breaker, now, costClassOf);
+    const liftB = coolingLiftTime(b.attempts[0]!, breaker, now, costClassOf);
+    if (liftA === null && liftB === null) return 0; // both unknown - preserve order
+    if (liftA === null) return 1; // A unknown sorts after B
+    if (liftB === null) return -1; // B unknown sorts after A
+    return liftA - liftB; // both known - ascending by lift time
+  });
+
   const ordered = [...live, ...faulted, ...cooling].flatMap((group) => group.attempts);
   let quotaDemotedFirst: string | null = null;
   if (
@@ -2415,6 +2459,9 @@ export function orderByUsability(
  * quota-demotion ANNOUNCEMENT lives in exactly one place —
  * `orderDeploymentGroupsByUsability` above — because two copies of the displacement check
  * would drift silently (the first version of this block was unreachable here).
+ *
+ * Within the COOLING band, order by soonest known lift time (ascending). Unknown lifts sort last.
+ * Stable within ties and unknowns.
  */
 function orderByUsabilityTracked(
   attempts: ResolvedAttempt[],
@@ -2442,6 +2489,18 @@ function orderByUsabilityTracked(
     else if (usability === "credential-fault") faulted.push(attempt);
     else live.push(attempt);
   }
+
+  // Sort cooling band by soonest lift time (ascending). Unknown (null) sorts last.
+  // Stable sort preserves original order for ties and unknowns.
+  cooling.sort((a, b) => {
+    const liftA = coolingLiftTime(a, breaker, now, costClassOf);
+    const liftB = coolingLiftTime(b, breaker, now, costClassOf);
+    if (liftA === null && liftB === null) return 0;
+    if (liftA === null) return 1;
+    if (liftB === null) return -1;
+    return liftA - liftB;
+  });
+
   return { ordered: [...live, ...faulted, ...cooling], quotaDemotedFirst: null };
 }
 
@@ -2734,9 +2793,12 @@ class Pool429Tracker {
 
 /**
  * Feed the proxy's own request outcome into runtime telemetry — the "observed traffic"
- * evidence `getStrength()` ranks on (basis "telemetry") and `/candidates` reports under
- * `observed`. Only targets with a concrete model id are recorded; the Anthropic passthrough
- * has none. Skipped under vitest so tests never write the user's real telemetry file.
+ * evidence consumed by `deploymentFitness()` on the operational axis (after capability
+ * eligibility is decided by `getStrength()`) and reported under `observed` in `/candidates`.
+ * `getStrength()` ranks capability using ONLY the synced capability snapshot (basis
+ * "snapshot" → neutral 50); it does not consume runtime telemetry. Only targets with a
+ * concrete model id are recorded; the Anthropic passthrough has none. Skipped under vitest
+ * so tests never write the user's real telemetry file.
  */
 function recordCall(h: Handlers, attempt: HealthAttempt, ok: boolean, completedAt: number): void {
   const { target, usage } = attempt;
@@ -4146,14 +4208,8 @@ async function transparentPath(
       // Same as the OpenAI front's terminal branch: the served response is the last candidate's,
       // and for a single-member pool the only refusal we will ever see. Errors are never streamed,
       // so this branch is where they land.
-      if (backendRes.status >= 400 && carriesEligibilityFact(backendRes.status)) {
-        observeEligibility(
-          ctx.attempt.resolvedAttempt,
-          backendRes.status,
-          parseRetryAfterMs(backendRes.headers.get("retry-after")),
-          bytes.toString("utf8"),
-        );
-      }
+      // NOTE: observeEligibility was already called in inspectCandidateResponse for this response.
+      // Calling it again here would double-count the refusal signature in the eligibility queue.
       if (ctx.willValidate && bytes.length <= MAX_VALIDATE_BYTES) assistant = parseAssistant(bytes.toString("utf8"));
     }
   } catch (e) {

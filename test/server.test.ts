@@ -14,7 +14,14 @@ import { isToolUseBlock, type AssistantMessage } from "../src/anthropic.js";
 import { reconstructFromSse } from "../src/sse.js";
 import { reconstruct } from "../src/reshaper.js";
 import { allFacts, resetFacts } from "../src/target-facts.js";
-import { acceptInterpretation, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations } from "../src/refusal-interpretation.js";
+import { acceptInterpretation, pendingRefusals, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations } from "../src/refusal-interpretation.js";
+import {
+  CREDENTIAL_ATTEMPTS_HEADER,
+  CREDENTIAL_HEADER,
+  SERVED_BY_HEADER,
+  POOL_ATTEMPTS_HEADER,
+  UNKNOWN_REFUSAL_HEADER,
+} from "../src/backend.js";
 
 const breakerIdentity = (provider: string, model: string | null) => ({
   provider,
@@ -124,6 +131,13 @@ const REQUEST_BODY = JSON.stringify({
   tools: [
     { name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
   ],
+});
+
+const OK_BODY = JSON.stringify({
+  id: "cmpl_ok",
+  object: "chat.completion",
+  choices: [{ message: { role: "assistant", content: "served" }, finish_reason: "stop" }],
+  usage: { prompt_tokens: 2, completion_tokens: 6 },
 });
 
 describe("repair-proxy end-to-end (detect mode)", () => {
@@ -1808,5 +1822,130 @@ describe("eligibility → untilBasis wiring", () => {
     expect(fact.untilBasis).toBeUndefined();
     expect(fact.until).toBeGreaterThan(Date.now() + 100_000);
     expect(fact.until).toBeLessThan(Date.now() + 150_000);
+  });
+});
+
+/**
+ * Regression: observeEligibility called twice for terminal buffered 4xx on Anthropic front.
+ *
+ * The bug: a terminal buffered 4xx (single-candidate walk, or the last candidate's response)
+ * went through `inspectCandidateResponse` (which calls `observeEligibility`) AND then
+ * `transparentPath` (which ALSO called `observeEligibility`). This doubled the signature's
+ * occurrence count in the refusal-interpretation queue.
+ *
+ * The fix: `transparentPath` no longer calls `observeEligibility` — it was already observed
+ * in `inspectCandidateResponse`. The OpenAI front never had this bug; this test pins the
+ * Anthropic front's behaviour to match.
+ */
+describe("observeEligibility — no double-count on terminal buffered 4xx (Anthropic front)", () => {
+  beforeEach(() => {
+    resetFacts();
+    resetInterpretations();
+  });
+  afterEach(() => {
+    resetFacts();
+    resetInterpretations();
+  });
+
+  // The observable is the unknown-refusal QUEUE's occurrence count. The fact store cannot see
+  // this bug: recordFact keys by <kind>:<scope>, so a double observation lands on the same row
+  // and the store looks identical either way — the first version of this test asserted facts
+  // and passed on the UN-FIXED tree. pendingRefusals().count is what actually doubled.
+  const UNSEEN_REFUSAL = JSON.stringify({ error: { message: "the flux capacitor declined this request" } });
+
+  it("counts a terminal buffered 4xx exactly once in the unknown queue (single candidate, Anthropic front)", async () => {
+    const backend = await mockBackend(() => ({
+      status: 403,
+      headers: { "content-type": "application/json" },
+      body: UNSEEN_REFUSAL,
+    }));
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { up: { base: `http://127.0.0.1:${port(backend)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 } },
+      routing: { default: "up/m", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 1, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    const p = port(await startProxy(cfg));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: REQUEST_BODY,
+    });
+    expect(resp.status).toBe(403);
+
+    // Exactly one queue entry for this signature, seen exactly ONCE. The un-fixed tree
+    // observed the terminal response in inspectCandidateResponse AND again in
+    // transparentPath, so count was 2 here.
+    const queue = pendingRefusals().filter((r) => r.provider === "up");
+    expect(queue.length).toBe(1);
+    expect(queue[0]?.count).toBe(1);
+  });
+
+  it("counts a mid-walk 4xx exactly once when failover succeeds (2 candidates, Anthropic front)", async () => {
+    const ANTHROPIC_OK = JSON.stringify({
+      id: "msg_ok", type: "message", role: "assistant", model: "m2",
+      stop_reason: "end_turn", content: [{ type: "text", text: "served" }],
+      usage: { input_tokens: 2, output_tokens: 6 },
+    });
+    const first = await mockBackend(() => ({ status: 403, headers: { "content-type": "application/json" }, body: UNSEEN_REFUSAL }));
+    const second = await mockBackend(() => ({ headers: { "content-type": "application/json" }, body: ANTHROPIC_OK }));
+    const p = port(await startProxy({
+      host: "127.0.0.1", port: 0,
+      providers: {
+        p1: { base: `http://127.0.0.1:${port(first)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+        p2: { base: `http://127.0.0.1:${port(second)}`, kind: "anthropic", authHeader: "x-api-key", timeoutMs: 5000 },
+      },
+      routing: { default: "pool/coding", tiers: {}, benchmarkSort: false, pools: { coding: ["p1/m1", "p2/m2"] } },
+      mode: "detect",
+      repair: { maxAttempts: 1, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    }));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: REQUEST_BODY,
+    });
+    expect(resp.status).toBe(200);
+    // The walked refusal is queued exactly once, and announced on the SERVED response.
+    const queue = pendingRefusals().filter((r) => r.provider === "p1");
+    expect(queue.length).toBe(1);
+    expect(queue[0]?.count).toBe(1);
+    expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).toBe("1");
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+    const summary = resp.headers.get(POOL_ATTEMPTS_HEADER);
+    expect(summary).toContain("2 tried, 1 served");
+    expect(summary).toContain("1x403");
+    expect(summary).toContain("1x200");
+  });
+
+  it("the OpenAI front counts once too (parity pin, 2 candidates)", async () => {
+    const first = await mockBackend(() => ({ status: 403, headers: { "content-type": "application/json" }, body: UNSEEN_REFUSAL }));
+    const second = await mockBackend(() => ({ headers: { "content-type": "application/json" }, body: OK_BODY }));
+    const p = port(await startProxy({
+      host: "127.0.0.1", port: 0,
+      providers: {
+        p1: { base: `http://127.0.0.1:${port(first)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+        p2: { base: `http://127.0.0.1:${port(second)}`, kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      },
+      routing: { default: "pool/coding", tiers: {}, benchmarkSort: false, pools: { coding: ["p1/m1", "p2/m2"] } },
+      mode: "detect",
+      repair: { maxAttempts: 1, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    }));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(resp.status).toBe(200);
+    const queue = pendingRefusals().filter((r) => r.provider === "p1");
+    expect(queue.length).toBe(1);
+    expect(queue[0]?.count).toBe(1);
+    expect(resp.headers.get(UNKNOWN_REFUSAL_HEADER)).toBe("1");
   });
 });
