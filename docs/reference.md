@@ -1010,8 +1010,8 @@ Five condition verdicts, and they are **not interchangeable**:
 | `credential-invalid` | the provider says this key is bad | **demoted only**, cleared by any success |
 | `rate-limited` | the provider is throttling throughput | **demoted only**, expires by itself |
 
-`--class` also accepts the five MEASUREMENT kinds the relay learns for itself — `context-limit`
-and `rate-limit-rpm|rpd|tpm|tpd`. They record what a deployment stated about its own ceilings and
+`--class` also accepts the six MEASUREMENT kinds the relay learns for itself — `context-limit`,
+`max-output` and `rate-limit-rpm|rpd|tpm|tpd`. They record what a deployment stated about its own ceilings and
 are display-only: a measurement never demotes, never cools, and never blocks a free pool. You would
 rarely propose one by hand; the list is open because it is derived from the store rather than
 retyped here, which is how `rate-limited` came to be accepted by the store and rejected by the CLI
@@ -1256,9 +1256,9 @@ would read as zero or garbage), leaving the client on its own default.
 speculative 1M would overshoot the weakest member by six to eight times and overflow the real
 backend, which is strictly worse than the conservative default it replaced.
 
-#### Learned limits (a `context-limit` fact in `~/.llm-relay/target-facts.json`)
+#### Learned limits (`context-limit` and `max-output` facts in `~/.llm-relay/target-facts.json`)
 
-There is no separate `context-limits.json`: ceilings are stored as a deployment-scoped fact by
+There is no separate `context-limits.json`: ceilings are stored as deployment-scoped facts by
 the shared learned-facts store, so scope and keying are decided in one place.
 
 Providers publish little, but a deployment that *rejects* an over-length request usually states its
@@ -1270,11 +1270,17 @@ more accurate the more it is used:
 - Records **only an explicitly stated maximum**. "The request was too long" is *not* recorded — it
   bounds the ceiling by this proxy's own chars/4 estimate, and a store whose value is that it holds
   measurements must not accept a guess.
-- Reads a **clone** of the response, so the client's body and any failover are untouched. Every
-  failure path simply learns nothing.
+- Reads bytes the relay already buffered on the error path, so the client's body and any failover
+  are untouched. Every failure path simply learns nothing.
 - Keyed per `(provider, model)`, since the same model id on two hosts is two deployments. A fresh
   observation always replaces an older one in either direction — the deployment is the authority on
   its own ceiling — and entries expire after 30 days so a raised ceiling is not disbelieved forever.
+
+The same mechanism learns a stated **output** ceiling. A 400 whose body explicitly states the
+maximum `max_tokens` (Groq's `` `max_tokens` must be less than or equal to `8192` ``) records a
+`max-output` fact under the same rules — explicit statements only, deployment scope, 30-day TTL.
+Unlike `context-limit`, which feeds the `{contextWindow}` resolver, `max-output` is **display-only**:
+`llm-relay candidates` renders it, and nothing clamps, refuses, or routes on it.
 
 This is what makes the "unmeasured member" case self-correcting: the first over-length rejection
 from that member states its ceiling, and the next dispatch reports the corrected floor.
@@ -1507,7 +1513,7 @@ It retains every non-cooling axis:
 
 - breaker failure, status/ping, and measured-stability history (apart from the dedicated
   consecutive-429 escalation counter named above);
-- configured and learned quota observations plus the `context-limit` and
+- configured and learned quota observations plus the `context-limit`, `max-output` and
   `rate-limit-rpm|rpd|tpm|tpd` measurement facts;
 - the `not-servable` and `subscription-required` eviction facts; and
 - all accounting-store state, including its usage history, windows, and roll-ups.

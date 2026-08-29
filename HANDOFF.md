@@ -224,8 +224,8 @@ else.**
 ## 6. Outstanding, unclaimed
 
 ⚠ What follows is **recorded trades, deferrals and settled decisions kept for their reasons**, not
-a work queue. The queue is [docs/backlog.md](docs/backlog.md). The one item awaiting the owner
-here is the max-output-caps design review.
+a work queue. The queue is [docs/backlog.md](docs/backlog.md). Nothing here currently awaits the
+owner.
 
 **From the 2026-08-29 triage
 ([docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md)):**

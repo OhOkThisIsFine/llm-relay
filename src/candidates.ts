@@ -156,8 +156,8 @@ export interface Candidate {
   /**
    * What this deployment (or its provider, or its group) has STATED about itself — the learned
    * facts from `target-facts.ts`, each with the scope it applies at. The measurement kinds
-   * (`context-limit`, `rate-limit-rpm|rpd|tpm|tpd`) also carry `value`: the ceiling itself, as
-   * stated. Display-only — nothing here reorders or gates a candidate.
+   * (`context-limit`, `max-output`, `rate-limit-rpm|rpd|tpm|tpd`) also carry `value`: the ceiling
+   * itself, as stated. Display-only — nothing here reorders or gates a candidate.
    */
   facts: Array<{ kind: string; scope: string; expiresInMs: number; value?: number }>;
   /**

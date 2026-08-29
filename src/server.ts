@@ -77,7 +77,14 @@ import { specOfTarget } from "./benchmarks.js";
 import { extractQuotaObservations, type QuotaObservation } from "./quota-observation.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
-import { looksLikeContextLengthError, parseStatedContextLimit, recordObservedContextLimit } from "./context-limits.js";
+import {
+  looksLikeContextLengthError,
+  looksLikeMaxOutputError,
+  parseStatedContextLimit,
+  parseStatedMaxOutput,
+  recordObservedContextLimit,
+  recordObservedMaxOutput,
+} from "./context-limits.js";
 import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact, type FactResetBasis } from "./target-facts.js";
 import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
@@ -1412,12 +1419,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const controller = new AbortController();
     const callerController = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
-    const onResClose = () => {
-      if (!res.writableEnded) {
-        callerController.abort();
-        controller.abort();
-      }
-    };
+    const onResClose = abortOnClientClose(res, callerController, controller);
     res.on("close", onResClose);
     let attempt: HealthAttempt | undefined;
     const usage = createUsageAccumulator();
@@ -2947,6 +2949,24 @@ function beginHealthAttempt(
 }
 
 /**
+ * The candidate loops' client-gone reaction, shared by both fronts: when the client connection
+ * closes before the response is finished, abort the caller-facing work and the in-flight backend
+ * fetch together. One definition, so the two loops cannot drift.
+ */
+function abortOnClientClose(
+  res: ServerResponse,
+  callerController: AbortController,
+  controller: AbortController,
+): () => void {
+  return () => {
+    if (!res.writableEnded) {
+      callerController.abort();
+      controller.abort();
+    }
+  };
+}
+
+/**
  * Learn a deployment's real context ceiling from an error it just returned.
  *
  * ⚠ Called from BOTH request paths, right beside `observeAttemptHeaders`, and for the same reason
@@ -2968,6 +2988,33 @@ function observeContextLimit(status: number, target: ResolvedTarget, body: strin
     const stated = parseStatedContextLimit(body);
     if (stated === null) return;
     recordObservedContextLimit(target.provider, target.model, stated);
+  } catch {
+    // Learning is best-effort and never in the request's way.
+  }
+}
+
+/**
+ * Learn a deployment's stated OUTPUT-token ceiling (`max_tokens`) from an error it just returned.
+ *
+ * ⚠ Called from BOTH request paths beside `observeContextLimit`, for the same reason that helper
+ * documents: a learning loop wired into only one front would silently know nothing about half the
+ * traffic (docs/pool-failover.md). Called with bytes already buffered by
+ * `inspectCandidateResponse`, so it never tees or consumes the Response that may still become the
+ * client's terminal real error.
+ *
+ * Display-only by owner decision (docs/max-output-caps-design-2026-08-29.md): the fact renders in
+ * `llm-relay candidates`; nothing clamps, refuses, or routes on it.
+ */
+function observeMaxOutput(status: number, target: ResolvedTarget, body: string): void {
+  // A max_tokens rejection is a request-validation 400 (or a 413 variant); same gate as the
+  // context observer beside it.
+  if (status !== 400 && status !== 413) return;
+  if (target.model === undefined) return;
+  try {
+    if (!looksLikeMaxOutputError(body)) return;
+    const stated = parseStatedMaxOutput(body);
+    if (stated === null) return;
+    recordObservedMaxOutput(target.provider, target.model, stated);
   } catch {
     // Learning is best-effort and never in the request's way.
   }
@@ -3270,6 +3317,7 @@ async function inspectCandidateResponse(
   }
   const body = bytes.toString("utf8");
   observeContextLimit(status, attempt.target, body);
+  observeMaxOutput(status, attempt.target, body);
   observeRateLimit(attempt, status, body);
   const eligibility = carriesEligibilityFact(status) && body
     ? observeEligibility(attempt, status, retryAfterMs, body)
@@ -3543,12 +3591,7 @@ async function openAiFrontPath(
     const controller = new AbortController();
     const callerController = new AbortController();
     const timer = setTimeout(() => controller.abort(), target.timeoutMs);
-    const onResClose = () => {
-      if (!res.writableEnded) {
-        callerController.abort();
-        controller.abort();
-      }
-    };
+    const onResClose = abortOnClientClose(res, callerController, controller);
     res.on("close", onResClose);
     let attempt: HealthAttempt | undefined;
     const usage = createUsageAccumulator();
