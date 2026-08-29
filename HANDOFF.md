@@ -4,7 +4,34 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-28
 
-**Latest — the assessment's leftover findings closed on external lanes (v0.54.0).** The
+**Latest — the two approved v0.54.0 hand-back items shipped (v0.56.0).**
+
+- **Digest-keyed `eligibility accept`.** Every printed propose/accept command now carries
+  `--sig <digest>` (`signatureDigest` in `refusal-interpretation.ts`: ten hex chars of SHA-256
+  over the signature), the listing prints each pending item's digest, and a present `--sig`
+  resolves the entry authoritatively — a stale index is corrected with a stderr note, an unknown
+  digest exits 1 touching nothing. The bare index stays valid against a fresh listing.
+  ⚠ Found and fixed while wiring it: the STATUS listing's "accept with:" line still dropped
+  `--cost-class` — the v0.55.2 fix covered the propose echo only, so a later `llm-relay
+  eligibility` printed a command WIDER than the proposal it echoed. Both call sites now pass the
+  full proposal, pinned behaviorally (rendered-output tests in `test/cli.test.ts`) and by an
+  argument-list grep widened to both sites (`test/fact-cost-class.test.ts`).
+- **Provider-stated spend headroom** (`src/spend-headroom.ts` + `PingLoop.pollSpendHeadroom`).
+  The ping loop asks each OpenRouter credential's key endpoint every 15 minutes (zero egress for
+  every other provider) and feeds the stated `limit`/`usage` into the SAME fact the accepted
+  weekly-limit interpretation produces: `allowance-exhausted`, credential scope,
+  `costClasses: ["paid"]`. `usage >= limit` records it; `usage < limit` retracts ONLY
+  paid-only-filtered rows (`clearPaidAllowanceFacts` — a paid-credit statement cannot disprove a
+  free-tier exhaustion); no stated limit changes nothing. Design reasoning is in the
+  `spend-headroom.ts` CLAUDE.md row — notably why this feeds the fact store and not the quota
+  ladder (spend is not a `QuotaAxis`, and the credits answer states no reset, so quota demotion
+  could never gate it without an invented cooldown).
+- **The "OPEN: dashboard-package-check cannot run on Windows" item is CLOSED as
+  not-reproducible** — see §6.
+- Process: both features implemented in the main session; every new test ran against the
+  stashed un-fixed tree first (4 CLI + 4 spend tests failed pre-fix, naming the right defects).
+
+**Earlier — the assessment's leftover findings closed on external lanes (v0.54.0).** The
 "Remaining open items" ledger of
 [docs/three-axis-assessment-2026-08-28.md](docs/three-axis-assessment-2026-08-28.md) is now
 closed except the two lines it keeps deliberately (the learned context ceiling never reaching
@@ -221,68 +248,16 @@ packet needed correction in review** — the recurring shapes are named in the r
 are a working WRITE lane for in-repo packets; both Codex lanes hit model-scoped quota limits
 mid-sprint.
 
-**Earlier — the 2026-08-26 §5 implementation sprint, released as v0.48.0.** The nine §5 items the
-second verification pass ranked worth the churn (10, 14, 8, 21, 25, 26, 16+18, 15, 20) are
-implemented as eight commits (`3561bb4`..`b9409e3`):
+**Earlier — the 2026-08-26 §5 implementation sprint (v0.48.0)** — the nine §5 items ranked worth
+the churn, shipped as eight commits (`3561bb4`..`b9409e3`); items not picked keep their verdicts
+in [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md) §5, and git holds
+the per-commit detail.
 
-- `3561bb4` backend stream-event validation as a field table (item 14).
-- `23a87c5` dashboard route ladder as an ordered per-route policy table (item 10).
-- `0cdf45c` one SPEND_CELLS table for the snapshot projection's four spend cells (item 8);
-  a key-correlated union makes a wrong provenance pairing a compile error.
-- `c9430bb` one line-terminator scan in the usage observer's SSE drain; the discard and overflow
-  tails stay distinct (item 21).
-- `caa762c` the coverage state machine shared and the spend empty-factory folded onto
-  SPEND_CELL_KEYS; each validator keeps its own key set and loss formula (items 25+26).
-- `3598885` configured-limits: one axis grammar (parseLimitEntry) and one four-rung ladder walked
-  once per axis with soft and hard figures resolved independently (items 16+18); a test now pins
-  that the two winners on one axis stay independent.
-- `915c983` createHardCapLedgerReader in hard-cap.ts — enforcement, `/candidates` and the
-  availability producer now ask the ledger the literally same scope-narrowed question (item 15);
-  test/hard-cap.test.ts exercises the factory itself and drops an `as never`.
-- `b9409e3` the candidates table's 17 columns declared once; stdout byte-identical
-  (3,184-character before/after diff of the built CLI) (item 20).
-
-Process: every packet Codex-implemented (GPT-5.6 Sol), gate green twice per packet (implementer
-and orchestrator runs), independently reviewed by a relay free-pool `pool/high` read lane (every
-verdict MERGE; one retry on a HuggingFace 402, one on a bare-verdict report), with AGY second
-lenses on the route table and the ledger-reader guard. §5 items NOT picked, per the same pass's
-verdicts (status marks in the review doc §5): 9, 11, 12, 13 (not worth the churn), 17 and 23
-(only in their corrected shapes, deferred), 19's remainder (polish), 22 and 24 (unranked; 22
-belongs beside finding 2 and needs a ctx adapter).
-
-**Earlier — the 2026-08-25/26 complexity sprint, released across v0.47.0 and v0.47.1.**
-All seven verified findings
-of [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md) are closed, and its
-nineteen unverified §5 findings now carry source-checked verdicts (owner-decision material, none
-implemented — the verdict table with corrected counts and conditions is in that doc's §5):
-
-- `06d4581` fix(dialect): the streamed rescue's double `finish_reason` defect, plus two ADJACENT
-  hazards found in-session (recovered-text finish leak; non-capturing tail misorder with a doubled
-  finish). Five pinning tests; the adversarial review measured old-vs-new wire bytes.
-- `9964213` `src/json-shape.ts` + 35 dead schema exports deleted; every switched call site proven
-  acceptance-equivalent by differential fuzzing over a hostile-value corpus.
-- `f1f69c6` one `/cooldowns/clear` validator beside the owning type (665,980-combination fuzz, zero
-  acceptance differences; `COOLING_FACT_KINDS` exported so the set has one home).
-- `78b1913` `src/sse-frames.ts`: FIVE boundary detectors carried THREE semantics, not the four/two
-  the finding claimed — and `dialect-stream`'s pure-`\n\n` scan silently swallowed a CRLF upstream
-  WHOLE (latent; now pinned). ~31,000 old-vs-new comparisons, zero unintended diffs.
-- `36de89d` `endWalk` + `walkExitHeaders`: one owner for walk-exhaustion policy on both fronts (two
-  review rounds; net +160 against a -150 forecast — the win is one owner, recorded). Two
-  pre-existing cross-front residues RECORDED, not changed: `handle`'s transport exit emits no
-  `SERVED_BY_HEADER`, and the two dead-stream liveness spellings differ.
-- `99eb472` `collectQuotaBuckets` in `availability.ts`; caller policies stayed at callers; verified
-  first-hand plus a relay free-pool lane (PARITY-CONFIRMED) after the Opus lane hit the spend cap.
-- `adbd5c4` two load-sensitive tests fixed at the root — the winenv flake class on two NEW axes:
-  `keys` status probed LIVE hosts inside vi.waitFor's 1s budget (now mocked; the test pins router
-  equivalence), and the dedup-cap test insert-sorted 16,384 ids inside 5s (store gained a
-  `dedupLimit` test seam on the `recentLimit` pattern; production unchanged).
-
-Process notes that generalize: every packet was Codex-implemented and independently reviewed with
-the gate green before its commit; agy dropped TWO long-report answers end-to-end (reproducible
-print-mode failure — full narration, no final report, mitigations did not help), so long-report
-verification belongs on relay free-pool lanes; and reviewer subagent shells leaked zero-byte junk
-files into the repo root twice (`git add -A` staged them once — amended out; stage with explicit
-pathspecs).
+**Earlier — the 2026-08-25/26 complexity sprint (v0.47.0/v0.47.1)** — all seven verified findings
+of the same review closed (`06d4581`..`adbd5c4`); the §5 verdict table lives in that doc, and the
+process notes that generalize (agy drops long print-mode reports — long-report verification
+belongs on relay free-pool lanes; reviewer shells leak junk files — stage with explicit
+pathspecs) live in agent memory (`no-fable-subagents`). Per-commit detail: `git log`.
 
 ## 0.1 Earlier releases
 
@@ -455,17 +430,18 @@ else.**
 
 ## 6. Outstanding, unclaimed
 
-⚠ What follows is **recorded trades and closed items kept for their reasons**, not a work queue —
-plus, currently, ONE open code gap:
+⚠ What follows is **recorded trades and closed items kept for their reasons**, not a work queue.
+There is currently NO open code gap.
 
-- **OPEN (2026-08-28): `scripts/dashboard-package-check.mjs` cannot run on Windows.** Its
-  bundle-inventory validation rejects any resolved `packagePath` containing `\` ("not a portable
-  resolved package record"), and on Windows the generated graph carries backslashes — so
-  `npm run check:package` fails locally before the size ratchet is even reached, and the
-  v0.55.0 entries-ceiling failure was only visible on CI. Fix belongs at the graph GENERATION
-  site (normalize to forward slashes), not by loosening the portability check. Until then,
-  measure package metrics from a real tarball (`npm pack` + `tar -tzvf`) when regenerating
-  `docs/dashboard-package-baseline.json` on this machine.
+- **CLOSED 2026-08-28 evening, NOT REPRODUCIBLE: the "dashboard-package-check cannot run on
+  Windows" claim.** Verified on this Windows machine the same day the entry was recorded: a fresh
+  `npm run build` followed by `npm run check:package` passes both halves, and the generated
+  `dashboard-bundle-graph.json` holds zero backslash paths — `toPortablePath()` has normalized
+  `packagePath` at the generation site since the plugin's first commit (`b4ec7ee`), so the claimed
+  mechanism does not exist on this tree. The v0.55.0 failure that prompted the entry was the
+  entries-CEILING ratchet (real, fixed by `4f8c7c9`'s baseline regeneration), not a portability
+  refusal. The tarball-measurement workaround is therefore unnecessary; regenerate the baseline
+  with the normal local run.
 
 **From the 2026-08-28 verification sprint** — every item with its reason is in
 [docs/advisory-findings-verification-2026-08-28.md](docs/advisory-findings-verification-2026-08-28.md)
@@ -479,21 +455,22 @@ as out of scope in `cd6e5f8`.
 
 **Owner decisions, 2026-08-28 evening (v0.54.0 hand-back):**
 
-- **APPROVED, next sprint: digest-keyed `eligibility accept`** — accept takes a signature digest
-  beside the index, because queue positions shift between invocations and a `propose` can
-  silently land on the wrong refusal (it did, twice).
+- ~~**APPROVED, next sprint: digest-keyed `eligibility accept`**~~ — **DELIVERED in v0.56.0**
+  (§0): accept takes a signature digest beside the index, because queue positions shift between
+  invocations and a `propose` can silently land on the wrong refusal (it did, twice).
 - **WITHDRAWN: the currency-per-week spend ceiling.** The owner never asked for it; it was an
   agent-recorded candidate. Do not re-raise it as an open item.
 - **EXECUTED: the OpenRouter weekly-limit interpretation is accepted** —
   `allowance-exhausted, scope credential, --cost-class paid`, so paid OpenRouter deployments
   demote while the condition cools and free ones stay walkable. Self-healing on both sides: any
   paid success clears the condition, so buying credits un-demotes without an operator action.
-- **NEW owner-endorsed direction: stop inferring paid-credit state — ASK OpenRouter.** The owner:
-  "OpenRouter publishes metadata and we can explicitly request the missing information."
-  `ping/quota.ts` already fetches the key/credits endpoint (exact-host, URL rebuilt from the
-  configured base); the build is to feed that answer into the availability ladder as
-  provider-stated spend headroom, so the paid/free boundary comes from the provider's own
-  statement instead of a learned refusal. Candidate for the same sprint as the digest accept.
+- ~~**NEW owner-endorsed direction: stop inferring paid-credit state — ASK OpenRouter.**~~ —
+  **DELIVERED in v0.56.0** (§0, `src/spend-headroom.ts`): the ping loop polls the key/credits
+  endpoint and feeds the answer into the fact store, so the paid/free boundary comes from the
+  provider's own statement instead of a learned refusal, and updates in both directions. ⚠ It
+  deliberately feeds the FACT store, not the quota ladder — spend is not a `QuotaAxis` and the
+  credits answer states no reset, so the quota-demotion path could never gate it without an
+  invented cooldown duration.
 - **Type-level 7 stays as recorded** (hard-cap `used` without basis provenance) — owner chose
   keep-as-is.
 

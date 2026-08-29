@@ -541,12 +541,14 @@ When there is a pending item you can interpret, **propose it and ask the user to
 llm-relay eligibility propose 1 --class subscription-required --scope deployment --rationale "..."
 ```
 
-Then say what you read and why, and let them decide:
+Then say what you read and why, and let them decide. Hand them the accept command `propose`
+printed — it carries `--sig <digest>`, which pins the command to that refusal even if the queue
+reorders before they run it. Never strip the flag to shorten the line:
 
 > ollama-cloud/kimi-k3 answered 403 "requires both a Pro, Max, or Team plan and extra usage". I read
 > that as `subscription-required`, scoped to the deployment — the credential works for that
-> provider's other models. Accept? (`llm-relay eligibility accept 1 --class subscription-required
-> --scope deployment`)
+> provider's other models. Accept? (`llm-relay eligibility accept 1 --sig 3f2a91c04d
+> --class subscription-required --scope deployment`)
 
 ⚠ **Never run `accept` on your own initiative.** Acceptance is what makes a verdict change routing,
 and it is the user's call — that gate is the whole reason the relay does not ask a model what an

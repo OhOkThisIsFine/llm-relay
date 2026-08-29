@@ -38,8 +38,10 @@ import {
   pendingRefusals,
   proposeInterpretation,
   rejectInterpretation,
+  signatureDigest,
   type ResetRule,
   type ScopeTemplate,
+  type UnknownRefusal,
 } from "./refusal-interpretation.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { installProcessSafetyNet } from "./process-safety-net.js";
@@ -117,6 +119,7 @@ const VALUE_FLAGS = new Set<string>([
   "--rationale", "-rationale",
   "--reset-field", "-reset-field",
   "--reset-ms", "-reset-ms",
+  "--sig", "-sig",
   "--import", "-import",
   "--label", "-label",
   "--env-name", "-env-name",
@@ -259,7 +262,7 @@ ${formatTextTable([
   ["llm-relay candidates [-p <name>]", "Compare deployment x credential-slot targets."],
   ["llm-relay cost [--window <w>] [--by <d>] [--include-repair]", "Summarise spend from the local accounting ledger."],
   ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
-  ["llm-relay eligibility <propose|accept> <n> --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model."],
+  ["llm-relay eligibility <propose|accept> <n> [--sig <digest>] --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model. --sig pins the item across queue reorderings."],
   ["llm-relay eligibility ... --scope group --members <id,id,...> [--all-credentials]", "Groups default to the current credential slot; the flag explicitly widens them."],
   ["llm-relay eligibility ... --cost-class free|paid|unknown", "Cover only deployments of that cost class, resolved live from catalog prices."],
   ["eligibility scope breadth", "credential = current credential slot; provider = all credentials for that provider."],
@@ -2522,6 +2525,7 @@ const FACT_MEANING: Record<FactKind, string> = {
  */
 function eligibilityAcceptCommand(
   index: number,
+  signature: string,
   cls: FactKind,
   scope: ScopeTemplate,
   reset: ResetRule | undefined,
@@ -2530,7 +2534,52 @@ function eligibilityAcceptCommand(
   const cost = costClasses === undefined || costClasses.length === 0
     ? ""
     : ` --cost-class ${costClasses.join(",")}`;
-  return `llm-relay eligibility accept ${index} --class ${cls} --scope ${eligibilityScopeArgs(scope)}${eligibilityResetArgs(reset)}${cost}`;
+  // `--sig` keys the accept to the SIGNATURE, so a queue that reorders between propose and accept
+  // cannot land the verdict on a different refusal — the index alone did, twice.
+  return `llm-relay eligibility accept ${index} --sig ${signatureDigest(signature)} --class ${cls} --scope ${eligibilityScopeArgs(scope)}${eligibilityResetArgs(reset)}${cost}`;
+}
+
+/**
+ * Resolve which pending refusal a mutation addresses.
+ *
+ * Addressed by list POSITION for typing convenience — a signature is a whole normalized error
+ * message and nobody is retyping one at a shell — but positions SHIFT between invocations (the
+ * sort is count-then-recency), so the printed commands also carry `--sig <digest>`. When present,
+ * the digest is authoritative: it names the signature itself and survives any reordering. The bare
+ * index remains valid for hand-typed use against a fresh listing. Exits 1 on no resolution.
+ */
+function resolvePendingEntry(
+  pending: Array<UnknownRefusal & { signature: string }>,
+  action: string,
+  arg: string | undefined,
+): (UnknownRefusal & { signature: string }) | undefined {
+  const idx = Number(arg);
+  const byIndex = Number.isInteger(idx) && idx >= 1 && idx <= pending.length ? pending[idx - 1] : undefined;
+  const sigArg = argValue("--sig")?.toLowerCase();
+  if (sigArg === undefined) {
+    if (byIndex) return byIndex;
+    process.stderr.write(`llm-relay eligibility: ${action} expects a pending item number 1..${pending.length}\n`);
+    process.exit(1);
+    return undefined;
+  }
+  const matches = pending.filter((p) => signatureDigest(p.signature) === sigArg);
+  // >1 is a digest collision — not expected within a MAX_UNKNOWN-capped queue, but if it ever
+  // happens the index disambiguates, and refusing beats guessing between two refusals.
+  const entry = matches.length === 1 ? matches[0] : matches.find((p) => p === byIndex);
+  if (!entry) {
+    process.stderr.write(
+      matches.length === 0
+        ? `llm-relay eligibility: no pending refusal matches --sig ${sigArg}; run llm-relay eligibility to list current digests\n`
+        : `llm-relay eligibility: --sig ${sigArg} matches ${matches.length} pending refusals; pass the item number of the intended one alongside --sig\n`,
+    );
+    process.exit(1);
+    return undefined;
+  }
+  if (byIndex !== undefined && byIndex !== entry) {
+    // The queue moved since the command was printed — exactly the case `--sig` exists for.
+    process.stderr.write(`llm-relay eligibility: the queue reordered; --sig ${sigArg} now sits at position ${pending.indexOf(entry) + 1}, acting on it\n`);
+  }
+  return entry;
 }
 
 export function runEligibility(sub: string | undefined, arg: string | undefined): void {
@@ -2538,15 +2587,8 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
   const action = sub ?? "status";
 
   if (action === "accept" || action === "reject" || action === "propose") {
-    // Addressed by list POSITION, not by signature: a signature is a whole normalized error
-    // message and nobody is retyping one at a shell.
-    const idx = Number(arg);
-    const entry = Number.isInteger(idx) && idx >= 1 && idx <= pending.length ? pending[idx - 1] : undefined;
-    if (!entry) {
-      process.stderr.write(`llm-relay eligibility: ${action} expects a pending item number 1..${pending.length}\n`);
-      process.exit(1);
-      return;
-    }
+    const entry = resolvePendingEntry(pending, action, arg);
+    if (!entry) return;
     if (action === "reject") {
       rejectInterpretation(entry.signature);
       flushInterpretations();
@@ -2640,7 +2682,7 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       proposeInterpretation(entry.signature, { class: cls, scope, rationale, ...(reset ? { reset } : {}), ...(costFilter ? { costClasses: costFilter } : {}) });
       flushInterpretations();
       process.stdout.write(
-        `proposed ${cls} (${shown}) — not yet binding. Commit with: ${eligibilityAcceptCommand(idx, cls, scope, reset, costFilter)}\n`,
+        `proposed ${cls} (${shown}) — not yet binding. Commit with: ${eligibilityAcceptCommand(pending.indexOf(entry) + 1, entry.signature, cls, scope, reset, costFilter)}\n`,
       );
       return;
     }
@@ -2671,7 +2713,8 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     process.stdout.write("  (none; every refusal seen so far was understood)\n");
   }
   pending.forEach((p, i) => {
-    process.stdout.write(`\n  [${i + 1}] ${p.provider}/${p.model ?? "-"}  HTTP ${p.status}  ×${p.count}\n`);
+    // The digest addresses the item across reorderings; the index is only this listing's position.
+    process.stdout.write(`\n  [${i + 1}] sig ${signatureDigest(p.signature)}  ${p.provider}/${p.model ?? "-"}  HTTP ${p.status}  ×${p.count}\n`);
     process.stdout.write(`      ${p.normalized}\n`);
     if (p.proposed) {
       // ⚠ The scope is a STRUCTURE now, not a word — interpolating it printed "[object Object]"
@@ -2685,8 +2728,12 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       if (sc.kind === "group") {
         process.stdout.write(`      covers: ${sc.members.join(", ")}\n`);
       }
+      // ⚠ The full proposal travels — reset AND costClasses. This call once omitted `costClasses`,
+      // so the status listing printed an accept command WIDER than the proposal it echoed: the
+      // silent-widening hazard `eligibilityAcceptCommand`'s own comment warns about, surviving in
+      // the one call site the v0.55.2 fix did not reach.
       process.stdout.write(
-        `      accept with: ${eligibilityAcceptCommand(i + 1, p.proposed.class, sc, p.proposed.reset)}\n`,
+        `      accept with: ${eligibilityAcceptCommand(i + 1, p.signature, p.proposed.class, sc, p.proposed.reset, p.proposed.costClasses)}\n`,
       );
     }
   });
@@ -2696,8 +2743,10 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
       `  that provider and model on this account, then:\n` +
       `    llm-relay eligibility propose <n> --class <not-servable|subscription-required|allowance-exhausted|credential-invalid|rate-limited> \\\n` +
       `        --scope <attempt|group|deployment|credential|provider|model> [--members id1,id2] [--all-credentials] --rationale "..."\n` +
-      `    llm-relay eligibility accept <n> --class <...> --scope <...>\n` +
-      `    llm-relay eligibility reject <n>       # means nothing durable, and is remembered\n` +
+      `    llm-relay eligibility accept <n> --sig <digest> --class <...> --scope <...>\n` +
+      `    llm-relay eligibility reject <n> [--sig <digest>]   # means nothing durable, and is remembered\n` +
+      `  --sig pins the item to its digest, so a queue that reorders between listing and accept\n` +
+      `  cannot land the verdict on a different refusal.\n` +
       `\n  Scope by what the message STATES, not by a pattern of failures: "credential" means the\n` +
       `  current credential slot; "provider" means all credentials for that provider. Groups stay\n` +
       `  on the current credential slot unless --all-credentials is stated explicitly.\n`,
