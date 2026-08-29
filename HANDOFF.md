@@ -90,9 +90,7 @@ history - do not reintroduce them.
 | `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting - components, staged build order |
 | `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline - metrics, collection sites, storage, stages |
 | `docs/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA implementation design, protocol, contract, staged gates |
-| `docs/open-decisions-2026-08-16.md` | Owner decisions; all recommendations approved 2026-08-21 |
 | `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind |
-| `docs/evidence-2026-08-16/` | Machine-readable audit trail |
 | `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
 | `docs/three-axis-assessment-2026-08-28.md` | The owner's three-axis capability assessment: verdicts per axis, the live-signal finding, the closed follow-up ledger. |
 | `docs/advisory-findings-verification-2026-08-28.md` | The pass over the 32 advisory findings the 2026-08-26 review left unverified: the closed-vocabulary bug class and all eight instances, Class A vs Class B, the verdict ledger. |
@@ -113,8 +111,9 @@ else.**
 - Bundle sizes live in `docs/dashboard-package-baseline.json` and are ratcheted: regenerate the
   baseline in the SAME change that adds or removes bundle weight, or `check:package` goes red.
 - Tests read `src/` directly; `scripts/*.mjs` read `dist/` - rebuild before running any script.
-- Four POSIX-permission tests skip on Windows; CI's ubuntu leg is the only place they run, so a
-  green local Windows run is not full coverage of secret-file permissions. A store path nested
+- Some tests are POSIX-only (`skipIf(process.platform === "win32")`) and skip on Windows; CI's
+  ubuntu leg is the only place they run, so a green local Windows run is not full coverage of
+  secret-file permissions. A store path nested
   under a regular file reads as `ENOENT` on Windows but `ENOTDIR` on Linux, so fixtures that
   require an absent load must inject the stat/read seam rather than relying on that filesystem shape.
 - A failing test may be pinning a defect it should have caught. Read its stated reasoning before
@@ -171,11 +170,6 @@ else.**
   together (a weekly spend-limit 403 ends a headless `claude -p` lane outright). Relaunch each
   dead lane pinned to a DIFFERENT healthy member from `/candidates`, so lanes sit in separate
   quota domains.
-- **Never read a gate's exit status through a pipe.** `gate | tail -N` reports the TAIL's exit
-  and hides the failure — rerun with full output before believing a green.
-- **A write lane cannot append to a log its own launcher holds open** (`Out-File` keeps the
-  handle). Lane self-reports belong in the lane's own digest file.
-- **Two heredoc groups in one Bash call break quoting in this harness.** One heredoc per call.
 - **`gh run watch` on a PASSING publish run shows an `X tier-data.json missing or empty`
   annotation.** It comes from the smoke step's DELIBERATE negative test (publish.yml deletes the
   file and requires exactly that error — "PASS-AS-EXPECTED"), and GitHub renders the `::error::`
