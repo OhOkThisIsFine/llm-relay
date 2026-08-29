@@ -8,8 +8,8 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 green, registry 0.57.0, live-probed: a `:batch` 404 refreshed its `not-servable` fact through the
 new normalizer with no queue growth). Nothing else is pending — §6 holds recorded trades,
 deferrals and settled decisions, not a work queue; the work queue is
-[docs/backlog.md](docs/backlog.md). The one open owner review is the max-output-caps design
-proposal (below).
+[docs/backlog.md](docs/backlog.md). The max-output-caps design was ACCEPTED at the lap's
+hand-back and sits in the backlog as the next tracked item (below).
 
 **2026-08-29, one lap, three deliveries** — full record:
 [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
@@ -233,10 +233,11 @@ here is the max-output-caps design review.
 - **EXECUTED: the lane-split refusal-signature fix** (owner decision 2026-08-29: fix and
   re-migrate). Shipped in v0.57.0 with the load-time store migration; residuals recorded in §4
   and in the `refusal-interpretation.ts` row of `CLAUDE.md`.
-- **AWAITING OWNER REVIEW: the max-output-caps design proposal**
+- **ACCEPTED (owner decision 2026-08-29): the max-output-caps design**
   ([docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md)) —
-  display-only learning of stated output ceilings, judged against `docs/project-goals.md`.
-  No implementation until accepted. The carrier signature stays pending in the queue on purpose.
+  display-only learning of stated output ceilings, to be implemented as scoped. The work item is
+  in [docs/backlog.md](docs/backlog.md); the carrier signature stays pending in the queue until
+  the implementation lands.
 
 **Owner decisions on record:**
 

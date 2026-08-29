@@ -9,6 +9,14 @@
 
 ## Open
 
+- **Implement the accepted max-output-caps design (2026-08-29, owner-accepted).**
+  Learn a provider's EXPLICITLY stated `max_tokens` ceiling as a new `max-output` measurement
+  fact (deployment scope, 30-day TTL, the `rate-limits.ts` parser discipline), wired beside
+  `observeContextLimit` in `inspectCandidateResponse`, rendered in `llm-relay candidates`.
+  Display-only: no clamping, no refusal, no routing effect. Full scope, exclusions and the
+  rubric assessment: [max-output-caps-design-2026-08-29.md](max-output-caps-design-2026-08-29.md).
+  On landing: resolve the pending groq `max_tokens` signature (queue item, sig `075f1cb584`).
+
 - **Re-probe every quota source on a schedule, dead ones included (2026-08-29, owner request).**
   A source recorded as quota-dead is a SNAPSHOT, not a standing fact: a quota can reset at any
   moment, and today's Codex reset landed days before its recorded "dead until Sep 3" expiry. So a
