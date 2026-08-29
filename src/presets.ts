@@ -90,6 +90,21 @@ export const FREE_PROVIDER_PRESETS: Record<string, PresetProvider> = {
       "llama3.1-8b",
     ],
   },
+  cohere: {
+    name: "cohere",
+    displayName: "Cohere (Free Trial)",
+    base: "https://api.cohere.ai/compatibility/v1",
+    kind: "openai",
+    authEnv: "COHERE_API_KEY",
+    authHeader: "authorization",
+    timeoutMs: 60000,
+    tierType: "free",
+    signupUrl: "https://dashboard.cohere.com/api-keys",
+    recommendedModels: [
+      "command-a-03-2025",
+      "command-r-plus-08-2024",
+    ],
+  },
   sambanova: {
     name: "sambanova",
     displayName: "SambaNova Cloud (Free Tier)",

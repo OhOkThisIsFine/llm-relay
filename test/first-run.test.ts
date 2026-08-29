@@ -64,6 +64,28 @@ describe("the shipped default config matches the shipped docs", () => {
     expect(cfg.providers["anthropic"]!.credentialMode).toBe("passthrough");
   });
 
+  it("declares the QUICKSTART free providers that carry an env var", () => {
+    const cfg = loadTemplate();
+    // QUICKSTART Stage 2 tells a stranger to set these two env vars; the template must declare
+    // the provider that consumes each, or setting the variable is a silent no-op.
+    const cerebras = cfg.providers["cerebras"];
+    expect(cerebras).toBeDefined();
+    expect(cerebras!.base).toBe("https://api.cerebras.ai/v1");
+    expect(cerebras!.kind).toBe("openai");
+    expect(cerebras!.authEnv).toBe("CEREBRAS_API_KEY");
+
+    const cohere = cfg.providers["cohere"];
+    expect(cohere).toBeDefined();
+    expect(cohere!.base).toBe("https://api.cohere.ai/compatibility/v1");
+    expect(cohere!.kind).toBe("openai");
+    expect(cohere!.authEnv).toBe("COHERE_API_KEY");
+
+    // A fresh template must still LOAD with no env vars set — an unset authEnv only drops that
+    // provider's pool members, it never breaks startup.
+    expect(cfg.providers["cerebras"]).toBeDefined();
+    expect(cfg.providers["cohere"]).toBeDefined();
+  });
+
   it("still ships the free pools and the offload switches, all off", () => {
     const cfg = loadTemplate();
     expect(Object.keys(cfg.routing.poolPolicies ?? {}).sort()).toEqual(["high", "low", "medium", "xhigh"]);

@@ -39,6 +39,7 @@ const PROVIDER_ENV_ALIASES: Record<string, string[]> = {
   groq: ["GROQ_API_KEY"],
   mistral: ["MISTRAL_API_KEY", "MISTRALAI_API_KEY"],
   cerebras: ["CEREBRAS_API_KEY"],
+  cohere: ["COHERE_API_KEY"],
   sambanova: ["SAMBANOVA_API_KEY"],
   openai: ["OPENAI_API_KEY"],
   anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],

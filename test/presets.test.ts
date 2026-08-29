@@ -19,6 +19,16 @@ describe("presets", () => {
     expect(FREE_PROVIDER_PRESETS.ollama).toBeDefined();
     expect(FREE_PROVIDER_PRESETS.ollama!.tierType).toBe("free");
     expect(FREE_PROVIDER_PRESETS.ollama!.authEnv).toBeUndefined();
+
+    expect(FREE_PROVIDER_PRESETS.cohere).toBeDefined();
+    expect(FREE_PROVIDER_PRESETS.cohere!.tierType).toBe("free");
+    expect(FREE_PROVIDER_PRESETS.cohere!.authEnv).toBe("COHERE_API_KEY");
+    expect(FREE_PROVIDER_PRESETS.cohere!.signupUrl).toBe("https://dashboard.cohere.com/api-keys");
+    expect(FREE_PROVIDER_PRESETS.cohere!.authHeader).toBe("authorization");
+    expect(FREE_PROVIDER_PRESETS.cohere!.recommendedModels).toEqual([
+      "command-a-03-2025",
+      "command-r-plus-08-2024",
+    ]);
   });
 
   it("SUBSCRIPTION_PROVIDER_PRESETS contains subscription templates", () => {
