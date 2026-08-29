@@ -456,11 +456,25 @@ transparency gap (a hard cap's `used` carries no provenance) and is an owner dec
 refusal. Response-SIZE bounds on the probe paths and the `withBudget` non-cancelling race are named
 as out of scope in `cd6e5f8`.
 
-⚠ **Two CANDIDATES recorded, neither built, both needing the owner's say-so:** an `eligibility`
-accept that takes a signature digest beside the index, because queue positions shift between
-invocations and a `propose` can silently land on the wrong refusal (it did, twice, in that
-session); and a spend ceiling denominated in currency per week, which has no home today because
-`limits.hard` speaks requests/tokens per minute or day.
+**Owner decisions, 2026-08-28 evening (v0.54.0 hand-back):**
+
+- **APPROVED, next sprint: digest-keyed `eligibility accept`** — accept takes a signature digest
+  beside the index, because queue positions shift between invocations and a `propose` can
+  silently land on the wrong refusal (it did, twice).
+- **WITHDRAWN: the currency-per-week spend ceiling.** The owner never asked for it; it was an
+  agent-recorded candidate. Do not re-raise it as an open item.
+- **EXECUTED: the OpenRouter weekly-limit interpretation is accepted** —
+  `allowance-exhausted, scope credential, --cost-class paid`, so paid OpenRouter deployments
+  demote while the condition cools and free ones stay walkable. Self-healing on both sides: any
+  paid success clears the condition, so buying credits un-demotes without an operator action.
+- **NEW owner-endorsed direction: stop inferring paid-credit state — ASK OpenRouter.** The owner:
+  "OpenRouter publishes metadata and we can explicitly request the missing information."
+  `ping/quota.ts` already fetches the key/credits endpoint (exact-host, URL rebuilt from the
+  configured base); the build is to feed that answer into the availability ladder as
+  provider-stated spend headroom, so the paid/free boundary comes from the provider's own
+  statement instead of a learned refusal. Candidate for the same sprint as the digest accept.
+- **Type-level 7 stays as recorded** (hard-cap `used` without basis provenance) — owner chose
+  keep-as-is.
 
 **CLOSED 2026-08-27 — the XDG state split.** Raised by the documentation pass as an owner decision
 and answered the same day: **honour XDG everywhere**. Thirteen hand-rolled resolvers running three
