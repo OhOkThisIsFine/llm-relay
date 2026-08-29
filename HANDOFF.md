@@ -58,7 +58,7 @@ tags are the trail. What survived each sprint lives in its own home:
   place they are tracked.
 - **Process lessons that generalize** (run the pre-fix control yourself; lane discipline; the
   evidence-only closeout auditor) live in agent memory (`llm-relay-revival`,
-  `no-fable-subagents`).
+  `free-lane-playbook`).
 
 ## 1. What still binds
 
