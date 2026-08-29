@@ -415,6 +415,16 @@ const DEFAULT_CONFIG_TEMPLATE = JSON.stringify(
         kind: "openai",
         authEnv: "MISTRAL_API_KEY",
       },
+      cerebras: {
+        base: "https://api.cerebras.ai/v1",
+        kind: "openai",
+        authEnv: "CEREBRAS_API_KEY",
+      },
+      cohere: {
+        base: "https://api.cohere.ai/compatibility/v1",
+        kind: "openai",
+        authEnv: "COHERE_API_KEY",
+      },
     },
     routing: {
       // Nothing moves until the operator asks. Claude ids reach real Anthropic, exactly as the

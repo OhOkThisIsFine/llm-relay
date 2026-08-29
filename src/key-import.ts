@@ -47,6 +47,7 @@ const IMPORT_NAME_ALIASES: Record<string, string[]> = {
   groq: ["groq", "GROQ_KEY"],
   mistral: ["mistral", "MISTRAL_KEY"],
   cerebras: ["cerebras", "CEREBRAS_KEY"],
+  cohere: ["cohere", "COHERE_KEY"],
   sambanova: ["sambanova", "SAMBANOVA_KEY"],
   openai: ["openai", "OPENAI_KEY"],
   anthropic: ["anthropic", "ANTHROPIC_KEY"],
