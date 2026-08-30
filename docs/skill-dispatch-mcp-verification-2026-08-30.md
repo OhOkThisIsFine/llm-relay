@@ -513,6 +513,23 @@ harness-less host, which is what Fix 1 guarantees.
 **Gate after both fixes:** `npm run build` then `npm run check` green on tree `19106e4dc92f`.
 `packBytes` 1101934 against the 1106200 ceiling — the skill addition cost 1475 bytes and left 4266.
 
+### 4.6 Fix 1 was verified LIVE after release, with both negative controls
+
+Recorded here on 2026-08-30 because it lived only in `HANDOFF.md` §0 and was lost when that
+section was trimmed back to current state. A post-release live check is verification evidence, so
+it belongs in this doc rather than in the status doc.
+
+Against the relay restarted onto v0.61.0, the defect case was re-checked end to end: a
+harness-less caller now gets **exit 0 and a runnable command** where it previously got exit 2 with
+nothing to run. Both negative controls were confirmed live at the same time:
+
+- a **`bypassed`** session still transposes, exactly as before the fix; and
+- a **`routed`** host still receives the lighter in-process subagent target, so the fix did not
+  widen transposition to hosts that never needed it.
+
+⚠ The controls are the point. Fix 1 changes what one host class receives, and without them
+"unknown is fixed" and "everything is now transposed" are the same observation.
+
 ---
 
 ## 5. Machine-scoped observations (not repo defects)

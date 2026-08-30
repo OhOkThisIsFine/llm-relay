@@ -181,6 +181,20 @@ rather than as blessed. Verified by an independent auditor that rebuilt and pack
 pre-existing drift, not this lap's doing, and it is recorded rather than raised — the next lap that
 adds anything will hit it and should root-cause the growth rather than regenerate the baseline.
 
+### 4.1 The 7-day reset was confirmed END TO END, not just accepted
+
+Recorded here on 2026-08-30 because it lived only in `HANDOFF.md` §0 and was lost when that
+section was trimmed back to current state. It is a MEASUREMENT, so it belongs in this doc.
+
+After v0.60.0 shipped and the relay restarted onto it, the accepted interpretation bound on the
+next real refusal and produced a `mistral#default/*` `allowance-exhausted` fact **expiring in
+10080m** — exactly the 7 days the operator asserted. That is the whole chain working: an accepted
+interpretation reaching a running relay, producing a fact, with the operator's window intact.
+
+⚠ The reason this was safe to accept at all is §3 — a successful background probe now RETRACTS
+cooling conditions, so a 7-day window that turns out to be wrong is disproved by the next
+successful probe rather than surviving its whole term.
+
 ---
 
 ## 5. The nightly maintenance failure — root-caused
