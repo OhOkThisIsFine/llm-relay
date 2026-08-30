@@ -212,20 +212,25 @@ export const defaultLaneProbeSpawner: LaneProbeSpawner = (command, args, opts) =
     timedOut: err.killed === true,
   });
   return new Promise((resolve) => {
-    execFile(command, args, execOpts, (err, stdout, stderr) => {
+    const child = execFile(command, args, execOpts, (err, stdout, stderr) => {
       if (!err) {
         resolve({ code: 0, stdout, stderr, timedOut: false });
         return;
       }
       if (process.platform === "win32" && err.code === "ENOENT") {
-        exec(`"${command}" ${args.join(" ")}`, execOpts, (err2, stdout2, stderr2) => {
+        const fallback = exec(`"${command}" ${args.join(" ")}`, execOpts, (err2, stdout2, stderr2) => {
           if (!err2) resolve({ code: 0, stdout: stdout2, stderr: stderr2, timedOut: false });
           else resolve(failureResult(err2, stdout2 ?? "", stderr2 ?? ""));
         });
+        fallback.stdin?.end();
         return;
       }
       resolve(failureResult(err, stdout ?? "", stderr ?? ""));
     });
+    // ⚠ Same stdin-EOF rule as `lane-probe.ts` runLaneCommand, measured on agy: an open stdin
+    // pipe stalls the tool to the timeout — which the classifier correctly reads as
+    // inconclusive, so the bug's symptom was "the probe never learns", not a wrong verdict.
+    child.stdin?.end();
   });
 };
 

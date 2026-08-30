@@ -53,7 +53,7 @@ function runLaneCommand(command: string, args: string[]): Promise<string> {
     windowsHide: true,
   };
   return new Promise((resolve, reject) => {
-    execFile(command, args, opts, (err, stdout) => {
+    const child = execFile(command, args, opts, (err, stdout) => {
       if (!err) {
         resolve(stdout);
         return;
@@ -64,14 +64,19 @@ function runLaneCommand(command: string, args: string[]): Promise<string> {
       // the fallback, not the norm. Passed as ONE quoted command line; every token here is a
       // fixed literal from a prober below — no task content, no user input.
       if (process.platform === "win32" && (err as NodeJS.ErrnoException).code === "ENOENT") {
-        exec(`"${command}" ${args.join(" ")}`, opts, (err2, stdout2) => {
+        const fallback = exec(`"${command}" ${args.join(" ")}`, opts, (err2, stdout2) => {
           if (err2) reject(err2);
           else resolve(stdout2);
         });
+        fallback.stdin?.end();
         return;
       }
       reject(err);
     });
+    // ⚠ Load-bearing, measured 2026-08-30: the sync predecessor passed `stdio: ["ignore", …]`,
+    // which execFile cannot express — its stdin is an OPEN pipe. `agy models` waits on stdin and
+    // produced 0 bytes until the 60s timeout killed it; with EOF it answers in ~2s. Close it.
+    child.stdin?.end();
   });
 }
 
