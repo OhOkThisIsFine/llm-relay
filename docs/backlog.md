@@ -9,52 +9,80 @@
 
 ## Open
 
-- **Build an MCP server so agy can DELEGATE** (owner decision 2026-08-30, reversing the
-  2026-08-30 verdict). The reversal condition recorded in `CLAUDE.md` was stated in as many words:
-  *"That reverses this verdict if the owner states agy must be able to DELEGATE rather than only be
-  delegated to."* The owner has now stated it.
+- **Build an MCP server so agy can DELEGATE** (owner decision 2026-08-30, D4, reversing the
+  2026-08-30 "no MCP" verdict).
 
-  ⚠ **OWNED BY ANOTHER AGENT** (owner, 2026-08-30). A design pass is in progress in a different
-  session. Do not start the design here; coordinate through the owner.
+  **⚠ OWNED BY ANOTHER AGENT.** A design pass runs in a different session. Do not start the design
+  here; coordinate through the owner. This entry exists to hand that designer everything already
+  established, so nothing below has to be rediscovered or re-argued.
 
-  ⚠⚠ **THE STATED JUSTIFICATION EXPIRED ~70 MINUTES AFTER THE DECISION, AND THE DESIGNER MUST
-  KNOW.** D4 rested on one argument: *"agy has no shell but does have `mcp(*)`, so an agy session
-  has zero delegation mechanisms today."* **agy has a shell again.** Verified against the authority
-  — `~/.gemini/antigravity-cli/settings.json` now reads
-  `read_file(*) write_file(*) read_url(*) mcp(*) command(*)`. Timeline, from file timestamps:
+  **The goal, which has not changed:** agy must be able to hand work to another agent, rather than
+  only receive it. The reversal condition was written into the `CLAUDE.md` gotcha in as many words
+  — *"That reverses this verdict if the owner states agy must be able to DELEGATE rather than only
+  be delegated to"* — and the owner stated it.
+
+  ### ⚠⚠ Read this first: the argument that WON the reversal has since expired
+
+  D4 turned on exactly one claim: *"agy has no shell but does have `mcp(*)`, so an agy session has
+  zero delegation mechanisms today."* **That is no longer true. agy has a shell.**
+
+  Verified against the authority rather than from prose — `~/.gemini/antigravity-cli/settings.json`
+  reads `read_file(*)  write_file(*)  read_url(*)  mcp(*)  command(*)`.
 
   | Time (PDT, 2026-08-30) | Event |
   |---|---|
   | ~09:40 | Owner answers D4 — agy must delegate, reopen MCP |
   | 10:16:30 | The security-cost framing is retracted (commit `6b1753d`) |
   | 10:50:59 | `settings.json.bak-2026-08-30-pre-shell-restore` written |
-  | **10:51:13** | **`command(*)` restored** |
+  | **10:51:13** | **`command(*)` restored — about 70 minutes after the decision** |
 
-  So with a shell, agy can already delegate by running `codex exec`, `claude -p` or `npx acpx`
-  directly. MCP is no longer the ONLY mechanism, which is the entire argument D4 turned on. ⚠ This
-  does NOT by itself reverse D4 — the owner's GOAL (agy must be able to delegate) is unchanged, and
-  MCP may still be wanted as a cleaner interface than a shell-out. But the decision was taken under
-  a premise that no longer holds, so **confirm with the owner before building.**
-  ⚠ Attribution: the `command(*)` restore and its live `echo` check were done by another session
-  and are recorded in the global `CLAUDE.md`. What THIS entry verified first-hand is only the
-  contents of the live settings file and the timestamps above.
+  With a shell, agy can already delegate by running `codex exec`, `claude -p` or `npx acpx`
+  directly. So MCP is no longer the ONLY mechanism, which is the whole of what D4 rested on.
 
-  ⚠ **Do NOT gate this on agy's missing shell, and do NOT call that a security boundary.**
-  An earlier version of this entry did both, and it was wrong. Owner correction, 2026-08-30:
+  ⚠ **This does not by itself reverse D4.** The GOAL is unchanged, and MCP may still be the better
+  interface — a typed tool call beats a shell-out that must be composed, quoted and parsed. But the
+  decision was taken under a premise that no longer holds, so **confirm the item is still wanted
+  before building it.** Three questions worth putting to the owner:
+
+  1. Now that agy can shell out, is MCP still wanted — or is the goal already met?
+  2. If still wanted, is it wanted for agy specifically, or for every host?
+  3. Does it need to EXECUTE work, or only to RETURN a command the caller runs? That single answer
+     decides most of the design (see the constraints below).
+
+  ⚠ **Attribution, kept honest:** the `command(*)` restore and its live `echo` check were done by
+  another session and are recorded in the global `CLAUDE.md`. What THIS entry verified first-hand
+  is the contents of the live settings file and the timestamps in the table.
+
+  ### Two dead arguments — do not revive either
+
+  **1. Never gate this on agy's shell, and never call that shell state a security boundary.**
+  An earlier version of this very entry did both, and it was wrong. Owner correction, 2026-08-30:
   *"some agent ordained that AGY had certain limitations, that it did not have, that I didn't
-  want"* — the 2026-08-11 `command(*)` revocation was an AGENT's act, not an owner decision, and
-  the global `CLAUDE.md` phrase "the accepted cost" describes an acceptance no file history shows.
-  So "an MCP server reaches around a deliberate revocation through a side door" rests on a premise
-  that does not hold. Design the server on its own merits. Restoring agy's shell is a one-line
-  change, on explicit owner instruction only — it is not this work item's business either way.
+  want."* The 2026-08-11 `command(*)` revocation was an AGENT's act, not an owner decision, and the
+  global `CLAUDE.md` phrase "the accepted cost" described an acceptance no file history shows. The
+  revocation has since been undone. So "an MCP server reaches around a deliberate revocation
+  through a side door" is false twice over — the revocation was never the owner's, and it is no
+  longer in force. Design the server on its own merits.
 
-  Still true and still binding on the design, from
+  **2. Two objections were checked and found INVALID.** A minimal JSON-RPC-over-stdio server needs
+  **no** new dependency — this repo already hand-rolls `sse-frames.ts` and four SSE parsers. And
+  `packBytes` is a regenerable CEILING, not a size wall. Do not repeat either.
+
+  ### What still binds on the design
+
+  All four are unsolved rather than withdrawn, from
   [skill-dispatch-mcp-verification-2026-08-30.md](skill-dispatch-mcp-verification-2026-08-30.md) §4:
-  a fresh install ships no `routing.ladder` and no `cliLane`, so a `dispatch()` tool is inert for a
-  stranger; a tool that RETURNS a command duplicates `/dispatch`; a tool that EXECUTES needs a
-  caller-supplied `cwd`, escapes the harness permission gate, and has no representation for a
-  30-minute lane. Two objections were checked and found INVALID — no new dependency is needed, and
-  `packBytes` is a regenerable ceiling, not a size wall. Do not repeat those two.
+
+  - **A `dispatch()` tool is INERT for a stranger.** A fresh install ships no `routing.ladder` and
+    no `cliLane`, so it would do nothing for anyone but this machine. ⚠ And that gap will not be
+    closed from the config side: D2 was settled the other way on 2026-08-30 —
+    `DEFAULT_CONFIG_TEMPLATE` will NOT ship a ladder, because dispatch is deliberately a per-machine
+    feature.
+  - **A tool that RETURNS a command** duplicates `/dispatch`, which already exists.
+  - **A tool that EXECUTES** needs a caller-supplied `cwd`, escapes the harness permission gate, and
+    has no representation for a 30-minute lane.
+  - **The request path never spawns a lane.** That invariant stands; outside it there are exactly
+    two sanctioned spawn sites, the operator `lanes --probe` and the background lane cadence.
 
 - **Investigate why the llm-relay offload lane STALLS and returns nothing** (owner-directed,
   2026-08-30). Measured this lap: a `dispatch --next-command` lane on `pool/medium` ran for about
