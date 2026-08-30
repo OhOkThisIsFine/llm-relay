@@ -605,6 +605,9 @@ describe("G2 end to end — both fronts", () => {
       ], kind, true), ledgerStore));
 
       try {
+        // Read the clock BEFORE the request: the relay derives its retry-after from its own
+        // reading, which is necessarily >= this one. See the bound below.
+        const sentAt = Date.now();
         const refused = await post(p, kind);
         expect(refused.status).toBe(429);
         // Nothing anywhere was contacted.
@@ -629,8 +632,16 @@ describe("G2 end to end — both fronts", () => {
         expect(message).toContain("No provider was contacted");
 
         // Retry-after derived ONLY from the soonest UTC day boundary.
+        // ⚠ Derive the bound from `sentAt`, never from a fresh `Date.now()`. `server.ts`
+        // `respondAllCapped` computes `ceil((resetAt - Date.now()) / 1000)` at a moment that is
+        // necessarily EARLIER than any reading taken here, and `ceil` is monotonic, so a bound
+        // read after the response can legitimately be one second SMALLER than the relay's value.
+        // That made this assertion fail whenever a second boundary fell between the two reads —
+        // a one-sided race that only the loaded full suite was slow enough to hit (measured
+        // 2026-08-30: 26478 vs 26477). Taking the day boundary from `sentAt` too keeps the bound
+        // correct across a UTC-midnight crossing.
         const retryAfter = Number(refused.headers.get("retry-after"));
-        const midnight = Math.ceil((Date.parse(new Date().toISOString().slice(0, 10) + "T00:00:00.000Z") + 86_400_000 - Date.now()) / 1000);
+        const midnight = Math.ceil((Date.parse(new Date(sentAt).toISOString().slice(0, 10) + "T00:00:00.000Z") + 86_400_000 - sentAt) / 1000);
         expect(refused.headers.get("retry-after")).not.toBeNull();
         expect(retryAfter).toBeGreaterThan(0);
         expect(retryAfter).toBeLessThanOrEqual(Math.max(1, midnight));
