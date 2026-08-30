@@ -198,8 +198,12 @@ blocker:
     `headroom.vbs`, `llm-relay.vbs`, `Ollama.lnk`.
   - **C8 skipped on measurement.** Pollinations/LLM7 not added (nil measured contribution); no
     operator `limits` declared (declare when real pacing pain appears).
-  - **Open follow-ups, each named with its home:** audit-tools `docs/nightly-routine.md:29`
-    still dispatches via `claude.ps1`, which would RESURRECT the retired router (audit-tools
-    repo); `llm-relay setup claude-cli` prints wrapper paths relative to the CURRENT checkout,
-    so a worktree run names a temporary tree (this repo, minor). The third follow-up — the live
-    config's missing Codex `destructiveTools` entries — is CLOSED 2026-08-29; see §7.
+  - **Follow-ups, each named with its home:** the audit-tools item — its routine still
+    dispatched via `claude.ps1`, which would RESURRECT the retired router — is CLOSED
+    2026-08-29 (audit-tools commit `def41288`: the nightly routine's second lane and the
+    design-check skill now run `llm-relay dispatch -t`, and four durable-traps entries carry
+    dated corrections, including a RETIRED banner naming `claude.ps1`/`start.ps1` as
+    router-resurrecting). The live config's missing Codex `destructiveTools` entries are
+    CLOSED 2026-08-29; see §7. Still open: `llm-relay setup claude-cli` prints wrapper paths
+    relative to the CURRENT checkout, so a worktree run names a temporary tree (this repo,
+    minor).
