@@ -549,3 +549,32 @@ has no mechanism at all today, and MCP is the only one that could exist. Buildin
 host that cannot run `ls` the power to spawn a writing agent — reversing a deliberate 2026-08-11
 security decision through a side door. Worth doing only if agy orchestrating is a real requirement,
 and no record so far treats agy as anything but a lane.
+
+---
+
+## 7. Friction log (rewalked from the transcript, not recalled)
+
+1. **`npm run check` fails with a raw ENOENT stack when the build has not run.**
+   `scripts/dashboard-package-check.mjs:15` reads `dist/dashboard/.vite/dashboard-bundle-graph.json`
+   and throws an unhandled `ENOENT` with a Node stack trace. Nothing says "run `npm run build`
+   first". This cost a full verify-green cycle at lap start. `CLAUDE.md` does say to run
+   `npm run build && npm run check`, so the knowledge exists — it is the ERROR that does not carry
+   it. **Worth a one-line guard** that names the missing build. Candidate backlog item.
+2. **The empty-worktree trap recurred**, exactly as HANDOFF §0 predicted. The SessionStart hook
+   warned, and the warning was correct and load-bearing: `node_modules` held zero packages. The
+   hook did its job; this is recorded to confirm the guard works, not as a complaint.
+3. **A server-side fix is invisible to a local CLI test until the relay restarts.** The CLI asks the
+   running relay over HTTP, so the first live verification of Fix 1 showed the OLD behaviour with
+   the NEW binary. Diagnosing that took a config copy on a dead port to force the local path. The
+   `--config` escape works but is not documented for this purpose.
+4. **`posttooluse-typecheck.mjs` blocks on an unavoidable intermediate state.** Extracting three
+   helpers is naturally two edits — define, then wire — and the hook failed the first with
+   `no-unused-vars` on functions that were about to be used. It also correctly caught that my change
+   raised `toLane`'s cognitive complexity, which is what prompted the extraction. Net positive, but
+   a multi-edit refactor costs one blocked call per intermediate step.
+5. **Agent recon must be verified, and verifying it paid off every time.** The source-of-truth recon
+   missed `test/destructive-coverage.test.ts:138-152`, which reads `config.example.json` — the exact
+   assertion that decided a claim. Three of this document's own claims were wrong until adversarial
+   review broke them, and two of the three *reviews* also contained inaccuracies. Nothing here
+   survived on an agent's summary alone.
+6. **Stored mojibake makes `dispatch` output hard to read** on this machine — see §5b.

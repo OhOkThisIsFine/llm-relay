@@ -9,10 +9,22 @@
 
 ## Open
 
-- **`packBytes` is within 0.5% of its own ceiling** (1100459 against 1106200, measured 2026-08-30).
-  Pre-existing drift, deliberately NOT raised in the v0.60.0 lap. The next change that adds anything
-  will trip `check:package`. When it does, **root-cause the growth first** — regenerating the
-  baseline is what turns a size ratchet into decoration.
+- **`packBytes` is within 0.4% of its own ceiling** (**1101933** against 1106200, re-measured
+  2026-08-30 after v0.61.0 — was 1100459). Pre-existing drift, deliberately NOT raised in the
+  v0.60.0 lap. ⚠ **The v0.61.0 lap consumed 1474 bytes of the remaining headroom** by adding the
+  `--next-command` contract table to `skills/llm-relay/SKILL.md`, which the package ships. That was
+  a deliberate, disclosed cost — the section is what makes the single-verb contract legible to an
+  agent — but it leaves only **4267 bytes**. The next change that adds anything will trip
+  `check:package`. When it does, **root-cause the growth first** — regenerating the baseline is what
+  turns a size ratchet into decoration.
+
+- **`check:package` should say "run the build first" instead of throwing a raw ENOENT.**
+  `scripts/dashboard-package-check.mjs:15` reads `dist/dashboard/.vite/dashboard-bundle-graph.json`
+  and, when `dist/` is absent, dies with an unhandled Node stack trace that names the missing file
+  but not the cause. `CLAUDE.md` already says to run `npm run build && npm run check`; the gap is
+  that the ERROR does not carry that knowledge, so anyone who runs `npm run check` alone loses a
+  full cycle. Cost one at the v0.61.0 lap start. A one-line existence check naming `npm run build`
+  fixes it.
 
 - **Root-cause 9 unexplained package entries.** The baseline's `observed.packageEntries` read 329
   while a clean rebuild at the v0.60.0 lap-start commit packed **338**; the lap's update to 341
