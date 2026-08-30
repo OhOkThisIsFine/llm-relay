@@ -96,6 +96,52 @@ The term is weakest precisely where it is needed.
 Taken with §2, the feature is **inverted**: it cannot demote the slow member, and it does demote
 the fast one.
 
+### And the breaker does not stop it either — the cooldown is shorter than the failure
+
+Asked to investigate before choosing a fix, the answer turned out to be simpler and larger than the
+latency term. Every timeout attempt in `recent.json`:
+
+```
+timeout ATTEMPTS in recent.json: 43
+   43 nim/deepseek-ai/deepseek-v4-flash-0731
+```
+
+**Forty-three consecutive 120-second timeouts, all on one deployment, and its breaker still reads
+`closed`.** A representative walk:
+
+| attempt | outcome | latency |
+|---|---|---|
+| 1 | provider_error | 341 ms |
+| 2 | provider_error | 322 ms |
+| 3 | auth_error | 385 ms |
+| 4 | provider_error | 489 ms |
+| 5 | **timeout** | **120007 ms** |
+
+The walk is fast until it reaches this member, which then consumes the whole request.
+
+The arithmetic, all from `src/circuit-breaker.ts` and `src/config.ts`:
+
+- a provider with no declared `timeoutMs` gets **120000 ms** (`config.ts`), so one hanging attempt
+  costs 120 s;
+- a timeout is charged correctly — `PROVENANCE_REACHES_HEALTH_PATH["deadline"]` is `true`, and a
+  504 passes the 4xx filter — so `consecutiveFailures` does increment;
+- at `MAX_FAILURES_BEFORE_TRIP` (2) the breaker trips for `DEFAULT_COOLDOWN_MS` = **60000 ms**;
+- the owner's `walkBudgetMs` is **120000 ms**, and requests arrived 78–139 seconds apart.
+
+**So the cooldown (60 s) is half the failure it is punishing (120 s), and shorter than the gap
+between requests.** By the time the next request walks the pool the cooldown has always expired,
+the member reads healthy, and it burns another 120 seconds. The breaker is working exactly as
+written; the constant is simply smaller than the failure mode it meets here.
+
+This, not the latency term, is the best explanation of the original complaint that an offload lane
+took about 17 minutes: every agent turn pays 120 seconds to this one deployment.
+
+⚠ A second contributor, worth knowing before choosing a fix: when the CLIENT gives up first, the
+walk records the attempt as `cancelled`, and cancelled returns **before** the provenance table
+(`circuit-breaker.ts`: "Order: cancelled → quota → this table → health"). So a deployment that
+out-waits the caller teaches the breaker nothing at all. That is what happened to the 65-second
+probe in §5.
+
 ## 4. What else reads the polluted statistic
 
 `getP95` has four consumers: the latency term, `getModelSummary` (the `llm-relay candidates` p95
@@ -154,22 +200,38 @@ Every option keeps the owner's 2026-08-30 decision that sustained latency should
   deployment is unjudged during warm-up where today it is judged on probes.
 - **(c) Lower `minSamples`.** Reintroduces what that floor was chosen to prevent.
 
-**For defect B — a deployment that hangs or errors never qualifies:**
+**For defect B — the investigation changed the options.** "The latency term cannot demote it" is
+true but secondary. The measured cause is that a 120-second failure earns a 60-second cooldown, so
+these are now the candidates:
 
-- **(B1) Leave it.** The breaker already reacts to timeouts and 5xx. Latency then covers only the
-  narrow case of a deployment that answers successfully but slowly.
-- **(B2) Count a timeout as evidence of latency.** A request that hit the timeout is a measurement
-  of "at least this slow". It would need its own sample kind, because it is not a completed
-  generation and has no token count.
-- **(B3) Treat the walk budget as the lever instead.** Cap the time any single candidate may
-  consume so one hang cannot eat the whole budget.
+- **(B4) A cooldown must outlast the failure that caused it.** On a timeout, cool for at least the
+  elapsed time of the attempt — the deployment just proved it can waste that much. This is the
+  smallest change that fits the evidence, and it needs no new configuration: the number is already
+  in hand at the call site (`elapsedMs`). It is also consistent with this relay's rule against
+  inventing durations, because the duration is measured rather than guessed.
+- **(B5) A single candidate may not consume the whole walk budget.** Bound per-candidate time
+  below `walkBudgetMs` so one hang cannot end the request. It fixes the symptom for every cause,
+  not only for a hang, but it adds a knob and can cut off a slow-but-working member.
+- **(B6) Charge the breaker when the CLIENT gives up.** Today that path records `cancelled` and
+  teaches nothing, so a deployment that out-waits the caller is never charged. Narrow and correct,
+  but on its own it does not shorten any request.
+- **(B2) Count a timeout as latency evidence.** Still possible, but now clearly the weakest of the
+  four: it needs a new sample kind, and the breaker already has the signal.
+- **(B1) Leave it.** No longer defensible on this evidence — 43 consecutive 120-second timeouts on
+  one deployment is not a narrow case.
 
-Recommendation: **(a)** for defect A; for defect B, decide before building, because B2 and B3 are
-different mechanisms with different blast radii.
+Recommendation: **(B4)**, optionally with **(B6)**. Both are small, both use numbers already
+measured rather than invented, and B4 alone would have stopped all 43 repeats.
 
 ## 7. Status
 
-Found at lap start on 2026-08-30, on `e01d510` (v0.65.1). No code is changed yet.
-`routing.latency` is currently **false** in `~/.llm-relay/config.json` (backup:
-`config.json.bak-2026-08-30-pre-latency-disable`), and the relay was restarted onto that setting.
-Nothing depends on leaving it off; re-enable it once defect A is fixed.
+Found at lap start on 2026-08-30, on `e01d510` (v0.65.1).
+
+- **Defect A: FIXED and released.** The absolute ceiling reads probe samples only
+  (`ad4f503`, released as **v0.65.2**). Three new tests plus one corrected test that had been
+  pinning the defect; mutation-checked; full gate green on the committed tree.
+- **Defect B: root-caused, not fixed.** Options in §6; the owner decides before any code.
+- `routing.latency` is currently **false** in `~/.llm-relay/config.json` (backup:
+  `config.json.bak-2026-08-30-pre-latency-disable`). Re-enable it now that defect A is fixed and
+  the daemon runs a build that carries the fix.
+- The `nim` outage in §5 is external and needs nothing from this repository.
