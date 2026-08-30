@@ -65,12 +65,19 @@ including every claim three independent adversarial reviews broke:
 [docs/skill-dispatch-mcp-verification-2026-08-30.md](docs/skill-dispatch-mcp-verification-2026-08-30.md).
 
 - **Skill installation: PASS.** One source, `copyFileSync` to two hosts, verified live by MD5 —
-  source and both installed copies are `8aa883fe…`. Seven test cases pin the installer.
+  source and both installed copies agree — `8aa883fe…` at lap start, and `8e08061d…` after v0.61.0
+  shipped and the global bin was reinstalled, which shows the whole pipeline propagates. Seven test
+  cases pin the installer.
 - **One code fix, a real defect.** A stated `unknown` host — any shell with no `CLAUDECODE` — was
   treated like `routed`, so a headless caller got a `target:` spec to address as a subagent it does
   not have, and `--next-command` exited 2 leaving it nothing to run. Reproduced with zero flags.
-  `dispatch.ts` now carries three named predicates; an ABSENT verdict deliberately keeps the old
-  path. Mutation-checked. See the CLAUDE.md gotcha.
+  `dispatch.ts` now carries two named predicates plus a reason function; an ABSENT verdict
+  deliberately keeps the old path. Mutation-checked. See the CLAUDE.md gotcha.
+- ⚠ **The independent closeout auditor caught three inaccuracies in this lap's own write-up** — a
+  stale MD5 invalidated by a later edit in the same lap, "three negative controls" where only two
+  are controls, and "three predicates" for two predicates and a string function. All three are
+  corrected in the doc, which states what was wrong rather than quietly fixing it. The lesson worth
+  keeping: **re-measure a measured figure after anything in the same lap changes what it measured.**
 - **MCP: NO**, with recorded reversal conditions. Two obvious objections turned out INVALID (no
   dependency is needed; `packBytes` is a regenerable ceiling) and are recorded so nobody repeats
   them. The decisive fact is that a fresh install ships no ladder at all.

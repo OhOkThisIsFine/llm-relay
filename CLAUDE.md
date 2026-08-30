@@ -885,8 +885,9 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   spec to address as a subagent it does not have, and `--next-command` then refused with exit 2 and
   left it nothing to run at all. That is the closed-vocabulary defect class above — an unhandled
   member resolving to the STRONGER claim ("you can reach this") — and it reproduced with **zero
-  flags** in any shell without `CLAUDECODE`. The policy now lives in three named predicates
-  (`canAddressAsSubagent`, `mustTransposeEveryRung`, `unreachableReason`). ⚠ For `unknown` EVERY
+  flags** in any shell without `CLAUDECODE`. The policy now lives in two named predicates plus one
+  reason function (`canAddressAsSubagent`, `mustTransposeEveryRung`, and `unreachableReason`, which
+  returns a string). ⚠ For `unknown` EVERY
   relay rung is transposed, the plain Anthropic passthrough included — `reachableWithoutRelay` asks
   whether a bare `Agent(...)` reaches a spec, and there is no `Agent(...)` here at all. ⚠ An
   **absent** verdict is deliberately NOT `unknown`: `buildDispatch` collapses absent into

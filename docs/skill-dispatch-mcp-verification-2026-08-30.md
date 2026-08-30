@@ -29,11 +29,20 @@ the same file.
 
 | File | MD5 | Bytes |
 |---|---|---|
-| `skills/llm-relay/SKILL.md` (source) | `8aa883feee83a4561b43467c2909228d` | 41160 |
-| `~/.claude/skills/llm-relay/SKILL.md` | `8aa883feee83a4561b43467c2909228d` | 41160 |
-| `~/.codex/skills/llm-relay/SKILL.md` | `8aa883feee83a4561b43467c2909228d` | 41160 |
+| When | Source | `~/.claude` copy | `~/.codex` copy |
+|---|---|---|---|
+| At lap start (`48282fd`) | `8aa883fe…` | `8aa883fe…` | `8aa883fe…` |
+| After v0.61.0 shipped and the global bin was reinstalled | `8e08061d…` | `8e08061d…` | `8e08061d…` |
 
 The two installed copies are identical to the source. The installation is correct.
+
+⚠ **Both rows are stated because the first went stale inside this lap, and the independent closeout
+auditor caught it.** An earlier draft quoted only `8aa883fe…`. Commit `9d09691` then edited
+`SKILL.md` (Fix 2), so that hash described a file that no longer existed by the time the document
+was read. The conclusion survived and is in fact **stronger** at the second row: the three copies
+agree again at a NEW hash, which shows the whole pipeline works end to end — edit, publish,
+`npm i -g`, postinstall, both hosts refreshed. A measured figure must be re-measured after anything
+in the same lap changes what it measured.
 
 **Guards that hold.**
 
@@ -437,7 +446,8 @@ correct — rather than an exit code plus an inference.
 
 ### Fix 1 — `src/dispatch.ts`: a stated `unknown` host is no longer treated as `routed`
 
-The gate `host === "bypassed"` became three named policies, so the decision has one home and a
+The gate `host === "bypassed"` became two named predicates plus one reason function, so the
+decision has one home and a
 maintainer adding a host state is looking straight at it:
 
 - `canAddressAsSubagent(host)` — true for `routed` and for an **absent** verdict.
@@ -453,8 +463,12 @@ directly. A caller that stated nothing keeps the pre-existing path; the CLI alwa
 this costs real callers nothing and the pinned backward-compatibility test at
 `test/host-adaptive-dispatch.test.ts:218` still passes unchanged.
 
-**Verification.** Six new tests, including three negative controls (`bypassed` keeps the per-spec
-test, `routed` unchanged, `requiresDirective` never set for `unknown`). **Mutation-checked**: with
+**Verification.** Six new tests: **two** genuine negative controls (`bypassed` keeps the per-spec
+test; `routed` unchanged) plus four that verify the new behaviour. ⚠ An earlier draft called
+`requiresDirective` never set for `unknown` a third negative control. The auditor refuted that
+correctly: before the fix, `unknown` took the `routed` branch and DID set `requiresDirective`, so
+that test verifies changed behaviour and is not a control for anything untouched.
+**Mutation-checked**: with
 `mustTransposeEveryRung` forced to `false`, exactly the two dependent tests failed — the two that
 should. Live, on the local path with `CLAUDECODE` unset:
 
