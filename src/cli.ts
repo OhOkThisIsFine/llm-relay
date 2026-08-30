@@ -44,6 +44,7 @@ import {
   type ScopeTemplate,
   type UnknownRefusal,
 } from "./refusal-interpretation.js";
+import { classifyNetworkBlock } from "./network-block.js";
 import { installAgentHook, removeAgentHook, agentHookInstalled } from "./claude-hook.js";
 import { installProcessSafetyNet } from "./process-safety-net.js";
 import { createProxy } from "./server.js";
@@ -2728,6 +2729,14 @@ export function runEligibility(sub: string | undefined, arg: string | undefined)
     // The digest addresses the item across reorderings; the index is only this listing's position.
     process.stdout.write(`\n  [${i + 1}] sig ${signatureDigest(p.signature)}  ${p.provider}/${p.model ?? "-"}  HTTP ${p.status}  ×${p.count}\n`);
     process.stdout.write(`      ${p.normalized}\n`);
+    // Advisory only — see `network-block.ts`. It names a condition the closed fact vocabulary
+    // cannot express (the caller's own network), so it steers the reader rather than the router.
+    const networkBlock = classifyNetworkBlock(p.normalized);
+    if (networkBlock) {
+      process.stdout.write(`      ⚠ looks like a CLIENT-SIDE network block, not a provider fault\n`);
+      process.stdout.write(`        ${networkBlock.advice}\n`);
+      process.stdout.write(`        matched "${networkBlock.phrase}" — ${networkBlock.basis}: ${networkBlock.provenance}\n`);
+    }
     if (p.proposed) {
       // ⚠ The scope is a STRUCTURE now, not a word — interpolating it printed "[object Object]"
       // and produced an accept command that could not run. A review UI that emits an invalid

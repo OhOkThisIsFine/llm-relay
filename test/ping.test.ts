@@ -10,6 +10,7 @@ import {
 import { recordModelCall, getRealWorldScore, loadRuntimeTelemetry } from "../src/ping/runtime-telemetry.js";
 import { PingLoop, collectRoutableModels } from "../src/ping/cadence.js";
 import { makeCredentialId } from "../src/credential-id.js";
+import { recordFact, factsFor, resetFacts } from "../src/target-facts.js";
 import { createProxy } from "../src/server.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { Config, ProviderConfig } from "../src/config.js";
@@ -736,6 +737,61 @@ describe("PingLoop Cadence", () => {
     expect(loop.getQuotaObservations(work, "model-a")).toEqual(tokensMinute);
     expect(loop.getQuotaObservations(personal, "model-b")).toEqual(tokensMinute);
     expect(loop.getQuotaObservations(work, "model-b")).toEqual([]);
+  });
+
+  /**
+   * The background probe is a REAL completion, so its success is the same first-party evidence a
+   * served request is. Before 2026-08-30 `clearFacts` had exactly ONE caller (`server.ts`), so a
+   * long-window `allowance-exhausted` fact survived its whole window unless real traffic happened
+   * to reach the demoted candidate — which made an operator-asserted multi-day reset unsafe to
+   * record, because nothing could retract it early.
+   */
+  describe("probe success retracts cooling facts", () => {
+    beforeEach(() => resetFacts());
+    afterEach(() => resetFacts());
+
+    const slot = makeCredentialId("testProv");
+    const newLoop = () =>
+      new PingLoop(testConfig({}), {} as ModelCatalog, { probeCachePath: isolatedProbeCache() });
+
+    it("clears a credential-scoped allowance-exhausted on a 200", () => {
+      recordFact("allowance-exhausted", { kind: "credential", provider: "testProv", credentialId: slot });
+      expect(factsFor("testProv", slot, "model-a").map((f) => f.kind)).toContain("allowance-exhausted");
+
+      newLoop().recordPing("testProv", "model-a", { code: "200", ms: 1, quotaObservations: [] }, 1, slot);
+
+      expect(factsFor("testProv", slot, "model-a").map((f) => f.kind)).not.toContain("allowance-exhausted");
+    });
+
+    // Negative control. Without it, a test that only asserts the clearing would still pass on an
+    // implementation that cleared unconditionally — which would retract a live condition every
+    // time the probe FAILED, the exact inverse of the intent.
+    it("leaves the fact intact when the probe did not answer 200", () => {
+      recordFact("allowance-exhausted", { kind: "credential", provider: "testProv", credentialId: slot });
+
+      newLoop().recordPing("testProv", "model-a", { code: "429", ms: 1, quotaObservations: [] }, 1, slot);
+
+      expect(factsFor("testProv", slot, "model-a").map((f) => f.kind)).toContain("allowance-exhausted");
+    });
+
+    // Second negative control: a success disproves a CONDITION, never a MEASUREMENT.
+    it("never retracts a measurement", () => {
+      recordFact("max-output", { kind: "deployment", provider: "testProv", model: "model-a" }, { value: 4096 });
+
+      newLoop().recordPing("testProv", "model-a", { code: "200", ms: 1, quotaObservations: [] }, 1, slot);
+
+      expect(factsFor("testProv", slot, "model-a").map((f) => f.kind)).toContain("max-output");
+    });
+
+    // Scope containment: a probe of one credential must not speak for another's allowance.
+    it("does not clear another credential's fact", () => {
+      const other = makeCredentialId("testProv", "work");
+      recordFact("allowance-exhausted", { kind: "credential", provider: "testProv", credentialId: other });
+
+      newLoop().recordPing("testProv", "model-a", { code: "200", ms: 1, quotaObservations: [] }, 1, slot);
+
+      expect(factsFor("testProv", other, "model-a").map((f) => f.kind)).toContain("allowance-exhausted");
+    });
   });
 });
 
