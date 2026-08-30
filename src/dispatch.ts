@@ -252,19 +252,102 @@ export function markExhausted(
   if (typeof id !== "string" || id.length === 0) return false;
   const rung = selectLadder(cfg, tier).rungs.find((r) => r.id === id);
   if (!rung) return false;
-  cooldownsFor(cfg).set(cooldownKey(rung), Date.now() + normalizeTtl(ttlMs));
+  markExhaustedKey(cfg, cooldownKey(rung), Date.now() + normalizeTtl(ttlMs));
   return true;
 }
 
 /** Clear one rung's cooldown, or every cooldown for this config when no id is given. */
 export function clearExhausted(cfg: Config, id?: string, tier?: string): void {
   if (id === undefined) {
-    cooldownsFor(cfg).clear();
+    const map = cooldownsFor(cfg);
+    if (map.size > 0) {
+      map.clear();
+      notifyExhaustion(cfg);
+    }
     return;
   }
   if (typeof id !== "string") return;
   const rung = selectLadder(cfg, tier).rungs.find((r) => r.id === id);
-  if (rung) cooldownsFor(cfg).delete(cooldownKey(rung));
+  if (rung) clearExhaustedKey(cfg, cooldownKey(rung));
+}
+
+/**
+ * One exported/persisted cooldown row: the raw map key (`rung:<id>` / `quota:<name>`) and its
+ * absolute expiry in epoch ms. The KEY travels, not the rung, because a bucket outlives any one
+ * ladder rendering — the same `quota:<name>` may appear in several tiers.
+ */
+export interface ExhaustedRow {
+  key: string;
+  until: number;
+}
+
+/**
+ * Change listeners for this config's exhaustion state, so persistence can mirror it to disk the
+ * way `breaker-persistence.ts` mirrors the breaker. A listener throw is contained: mirroring is
+ * best-effort and must never fail a dispatch mutation.
+ */
+const exhaustionListeners = new WeakMap<Config, Set<() => void>>();
+
+export function onExhaustionChanged(cfg: Config, listener: () => void): void {
+  let set = exhaustionListeners.get(cfg);
+  if (!set) {
+    set = new Set();
+    exhaustionListeners.set(cfg, set);
+  }
+  set.add(listener);
+}
+
+function notifyExhaustion(cfg: Config): void {
+  for (const listener of exhaustionListeners.get(cfg) ?? []) {
+    try {
+      listener();
+    } catch {
+      /* best-effort mirror — never fail the mutation */
+    }
+  }
+}
+
+/** Still-future cooldown rows, for persistence and for probe-target selection. */
+export function exportExhaustedRows(cfg: Config, now: number = Date.now()): ExhaustedRow[] {
+  const out: ExhaustedRow[] = [];
+  for (const [key, until] of cooldownsFor(cfg)) {
+    if (until > now) out.push({ key, until });
+  }
+  return out;
+}
+
+/**
+ * Restore persisted rows into this config's live map. Field-validated per row, future-only, and
+ * it NEVER overwrites a cooldown this process already learned — the `restoreCooldowns` contract.
+ * An `until` beyond `MAX_EXHAUSTED_MS` from now is clamped, mirroring `normalizeTtl` at write.
+ */
+export function restoreExhaustedRows(cfg: Config, rows: readonly ExhaustedRow[], now: number = Date.now()): number {
+  const map = cooldownsFor(cfg);
+  let restored = 0;
+  for (const row of rows) {
+    // Shape validation lives in the persistence LOADER (the breaker split); these are the
+    // semantic guards a validated row still needs: a live expiry, and no overwrite.
+    if (row.key.length === 0) continue;
+    if (!Number.isFinite(row.until) || row.until <= now) continue;
+    if (map.has(row.key)) continue;
+    map.set(row.key, Math.min(row.until, now + MAX_EXHAUSTED_MS));
+    restored++;
+  }
+  if (restored > 0) notifyExhaustion(cfg);
+  return restored;
+}
+
+/** Mark one raw bucket key exhausted until an absolute time — the probe path's write. */
+export function markExhaustedKey(cfg: Config, key: string, untilMs: number, now: number = Date.now()): void {
+  if (typeof key !== "string" || key.length === 0) return;
+  if (typeof untilMs !== "number" || !Number.isFinite(untilMs)) return;
+  cooldownsFor(cfg).set(key, Math.min(Math.max(now, untilMs), now + MAX_EXHAUSTED_MS));
+  notifyExhaustion(cfg);
+}
+
+/** Clear one raw bucket key — the probe path's retraction. */
+export function clearExhaustedKey(cfg: Config, key: string): void {
+  if (cooldownsFor(cfg).delete(key)) notifyExhaustion(cfg);
 }
 
 /** The placeholder a cli rung's args must contain; substituted with the task text. */
@@ -649,7 +732,9 @@ function verifyRungModel(rung: LadderRung, manifest: LaneManifest | null) {
   if (!rung.command) return null;
   const model = rungModel(rung);
   if (!model) return null;
-  return verifyModel(manifest, rung.command, model);
+  // Args ride along so a lane behind a wrapper command (`pwsh … lane-launch.ps1 … agy.exe`)
+  // still resolves to its lane — see `laneOfRung`.
+  return verifyModel(manifest, rung.command, model, { args: rung.args });
 }
 
 /** Argument name/value pairs a cli rung passes, in both `--flag value` and `key=value` forms. */
@@ -677,7 +762,7 @@ function unsupportedRungArgs(rung: LadderRung, manifest: LaneManifest | null): A
   const dropped: Array<{ arg: string; reason: string }> = [];
   for (const { arg, value } of rungArgValues(rung)) {
     if (arg === "--model") continue;
-    const v = unsupportedArgValues(manifest, rung.command, model, arg, value);
+    const v = unsupportedArgValues(manifest, rung.command, model, arg, value, { args: rung.args });
     if (v.unsupported && v.reason) dropped.push({ arg, reason: v.reason });
   }
   return dropped;

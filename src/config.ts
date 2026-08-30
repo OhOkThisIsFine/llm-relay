@@ -347,6 +347,16 @@ export interface Routing {
    */
   quota?: QuotaEnforcementConfig;
   /**
+   * Background lane re-probing (owner decision 2026-08-29,
+   * docs/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
+   * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
+   * metadata commands that spend no quota, and quota probes fire only for buckets carrying an
+   * ACTIVE recorded death (an alive lane is re-tested by real use for free). Boolean shorthand
+   * toggles `enabled` with the default intervals. Absent on a hand-built `Config` means the
+   * defaults too — the cadence resolves absence itself.
+   */
+  laneProbe?: LaneProbeSettings;
+  /**
    * Ordered dispatch ladder consulted by `/dispatch` — which LANE a host agent should hand a
    * whole delegated task to, and in what order to fall back. Distinct from `subagents`, which
    * routes one HTTP turn: a ladder rung may be an agent CLI that never traverses this proxy,
@@ -1593,6 +1603,7 @@ function parseRouting(
     benchmarkSort?: unknown;
     sticky?: unknown;
     quota?: unknown;
+    laneProbe?: unknown;
     ladder?: unknown;
     ladders?: unknown;
     cliLane?: unknown;
@@ -1708,6 +1719,7 @@ function parseRouting(
   if (sticky) routing.sticky = sticky;
   const quota = parseQuotaEnforcement(r.quota);
   if (quota) routing.quota = quota;
+  routing.laneProbe = parseLaneProbe(r.laneProbe);
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
@@ -1792,6 +1804,56 @@ function parseRouting(
     }
   }
   return routing;
+}
+
+/** Background lane re-probing settings — see the `laneProbe` field doc on `Routing`. */
+export interface LaneProbeSettings {
+  enabled: boolean;
+  /** Gate between quota probes of ONE dead bucket. A probe spends that lane's quota. */
+  quotaIntervalMs: number;
+  /** Gate between catalog re-probes of ONE lane. Metadata commands, no quota spent. */
+  catalogIntervalMs: number;
+}
+
+export const DEFAULT_LANE_PROBE: LaneProbeSettings = {
+  enabled: true,
+  quotaIntervalMs: 6 * 60 * 60 * 1000,
+  catalogIntervalMs: 24 * 60 * 60 * 1000,
+};
+
+/**
+ * Absent ⇒ the defaults (ON — the owner's 2026-08-29 decision that background metadata polling
+ * is the relay's job). Boolean toggles `enabled`. An unknown key is a hard error naming it (the
+ * `compat` precedent: an ignored typo would read as a setting that took effect while changing
+ * nothing).
+ */
+function parseLaneProbe(raw: unknown): LaneProbeSettings {
+  if (raw === undefined || raw === null) return { ...DEFAULT_LANE_PROBE };
+  if (typeof raw === "boolean") return { ...DEFAULT_LANE_PROBE, enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`config.routing.laneProbe must be a boolean or an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  for (const key of Object.keys(o)) {
+    if (key !== "enabled" && key !== "quotaIntervalMs" && key !== "catalogIntervalMs") {
+      throw new Error(`config.routing.laneProbe.${key} is not a recognized key (enabled, quotaIntervalMs, catalogIntervalMs)`);
+    }
+  }
+  if (typeof o.enabled !== "boolean") {
+    throw new Error(`config.routing.laneProbe.enabled must be a boolean`);
+  }
+  const interval = (name: string, value: unknown, fallback: number): number => {
+    if (value === undefined) return fallback;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 60_000 || value > 2_592_000_000) {
+      throw new Error(`config.routing.laneProbe.${name} must be between 60000 (1m) and 2592000000 ms (30d)`);
+    }
+    return Math.floor(value);
+  };
+  return {
+    enabled: o.enabled,
+    quotaIntervalMs: interval("quotaIntervalMs", o.quotaIntervalMs, DEFAULT_LANE_PROBE.quotaIntervalMs),
+    catalogIntervalMs: interval("catalogIntervalMs", o.catalogIntervalMs, DEFAULT_LANE_PROBE.catalogIntervalMs),
+  };
 }
 
 function parseSticky(raw: unknown): StickyRoutingConfig | undefined {

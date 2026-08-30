@@ -28,12 +28,15 @@ function cfgWithLadder() {
   return cfg;
 }
 
+// FRESH on purpose: eviction demands a roster inside LANE_ROSTER_TTL_MS, and `buildDispatch`
+// reads the real clock. A dated literal here rotted into staleness and turned these tests into
+// pins of the pre-staleness behaviour.
 const manifest: LaneManifest = {
   version: 1,
   lanes: {
     agy: {
       via: "agy models",
-      probedAt: "2026-08-08T00:00:00Z",
+      probedAt: new Date().toISOString(),
       models: [{ id: "claude-opus-4-6-thinking" }],
       rejectedArgs: { "claude-opus-4-6-thinking": ["--effort"] },
     },
@@ -68,6 +71,22 @@ describe("cli lane eviction from the dispatch ladder", () => {
     expect(real.invoke!.args).not.toContain("medium");
     expect(real.invoke!.args).toEqual(["-p", "probe", "--model", "claude-opus-4-6-thinking"]);
     expect(real.droppedArgs!.join(" ")).toContain("observed");
+  });
+
+  it("⚠ a STALE roster evicts nothing — the rung stays ready with its command", () => {
+    // The 2026-08-29 finding: both live rosters were 21 days old, and an eviction on that
+    // evidence would have parked a healthy lane. Stale ⇒ unknown ⇒ untouched ladder.
+    const stale: LaneManifest = {
+      version: 1,
+      lanes: {
+        agy: { via: "agy models", probedAt: "2026-08-08T00:00:00Z", models: [{ id: "claude-opus-4-6-thinking" }] },
+      },
+    };
+    const view = buildDispatch(cfgWithLadder(), { task: "probe", manifest: stale });
+    const ghost = view.ladder.find((l) => l.id === "agy-ghost")!;
+    expect(ghost.state).toBe("ready");
+    expect(ghost.notServable).toBeUndefined();
+    expect(ghost.invoke).toBeDefined();
   });
 
   it("⚠ changes NOTHING without a manifest — absence of evidence is not evidence of absence", () => {

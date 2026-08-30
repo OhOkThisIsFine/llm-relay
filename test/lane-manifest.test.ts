@@ -1,11 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
+  LANE_ROSTER_TTL_MS,
   laneOfCommand,
+  laneOfRung,
   recordRejectedArg,
+  rosterIsStale,
   unsupportedArgValues,
   verifyModel,
   type LaneManifest,
 } from "../src/lane-manifest.js";
+
+/** A clock inside the roster's freshness window — roster age is its own test dimension below. */
+const FRESH_NOW = Date.parse("2026-08-09T00:00:00Z");
+/** A clock one day past the roster TTL. */
+const STALE_NOW = Date.parse("2026-08-08T00:00:00Z") + LANE_ROSTER_TTL_MS + 86_400_000;
 
 const manifest = (): LaneManifest => ({
   version: 1,
@@ -34,9 +42,9 @@ describe("lane manifest", () => {
     expect(laneOfCommand("some-other-cli")).toBeNull();
   });
 
-  it("evicts a model the lane's roster omits", () => {
+  it("evicts a model a FRESH roster omits", () => {
     // The measured failure: the ladder named a model AGY does not serve.
-    const v = verifyModel(manifest(), "agy.exe", "claude-opus-5");
+    const v = verifyModel(manifest(), "agy.exe", "claude-opus-5", { now: FRESH_NOW });
     expect(v.status).toBe("not-servable");
     expect(v.status === "not-servable" && v.reason).toContain("agy's roster");
   });
@@ -99,11 +107,15 @@ describe("lane manifest", () => {
     expect(verifyModel(null, "agy.exe", "anything").status).toBe("unknown");
   });
 
-  it("uses a STATED support list to reject an argument value", () => {
+  it("uses a STATED support list from a FRESH roster to reject an argument value", () => {
     // Codex publishes supported_reasoning_levels per model, so this needs no failed call.
-    expect(unsupportedArgValues(manifest(), "codex", "gpt-5.6-sol", "model_reasoning_effort", "ultra").unsupported)
-      .toBe(false);
-    const spark = unsupportedArgValues(manifest(), "codex", "gpt-5.3-codex-spark", "model_reasoning_effort", "ultra");
+    expect(
+      unsupportedArgValues(manifest(), "codex", "gpt-5.6-sol", "model_reasoning_effort", "ultra", { now: FRESH_NOW })
+        .unsupported,
+    ).toBe(false);
+    const spark = unsupportedArgValues(manifest(), "codex", "gpt-5.3-codex-spark", "model_reasoning_effort", "ultra", {
+      now: FRESH_NOW,
+    });
     expect(spark.unsupported).toBe(true);
     expect(spark.reason).toContain("supports model_reasoning_effort");
   });
@@ -123,5 +135,79 @@ describe("lane manifest", () => {
     expect(out.reason).toContain("observed");
     // Scoped to the model that rejected it — a sibling is unaffected.
     expect(unsupportedArgValues(m, "agy.exe", "gemini-3.6-flash-medium", "--effort", "medium").unsupported).toBe(false);
+  });
+});
+
+describe("roster staleness (LANE_ROSTER_TTL_MS)", () => {
+  it("⚠ a STALE roster may no longer evict — omission degrades to unknown", () => {
+    // The parked-lane failure mode this lap exists for: both live rosters were 21 days old, and
+    // a vendor rename plus a config update would have evicted a healthy lane on that evidence.
+    const v = verifyModel(manifest(), "agy.exe", "claude-opus-5", { now: STALE_NOW });
+    expect(v.status).toBe("unknown");
+    expect(v.status === "unknown" && v.reason).toContain("stale");
+  });
+
+  it("a stale roster still answers servable for a model it LISTS", () => {
+    // Age weakens eviction evidence; it does not disprove presence. Safe direction only.
+    expect(verifyModel(manifest(), "agy.exe", "claude-opus-4-6-thinking", { now: STALE_NOW }).status).toBe("servable");
+  });
+
+  it("an unparseable probedAt counts as stale, not as fresh", () => {
+    const m: LaneManifest = {
+      version: 1,
+      lanes: { agy: { via: "agy models", probedAt: "not-a-date", models: [{ id: "listed" }] } },
+    };
+    expect(verifyModel(m, "agy.exe", "missing", { now: FRESH_NOW }).status).toBe("unknown");
+  });
+
+  it("age exactly at the TTL boundary is still fresh (strict >)", () => {
+    const at = Date.parse("2026-08-08T00:00:00Z");
+    const entry = { via: "agy models", probedAt: "2026-08-08T00:00:00Z", models: [{ id: "x" }] };
+    expect(rosterIsStale(entry, at + LANE_ROSTER_TTL_MS)).toBe(false);
+    expect(rosterIsStale(entry, at + LANE_ROSTER_TTL_MS + 1)).toBe(true);
+  });
+
+  it("a stale STATED support list stops rejecting argument values; observed rejections never age", () => {
+    // Dropping an argument on a stated list is the same eviction move as not-servable — it
+    // demands the same freshness. An OBSERVED rejection is an existence fact and stands.
+    const stale = unsupportedArgValues(manifest(), "codex", "gpt-5.3-codex-spark", "model_reasoning_effort", "ultra", {
+      now: STALE_NOW,
+    });
+    expect(stale.unsupported).toBe(false);
+    const m = recordRejectedArg(manifest(), "agy", "claude-opus-4-6-thinking", "--effort");
+    expect(
+      unsupportedArgValues(m, "agy.exe", "claude-opus-4-6-thinking", "--effort", "medium", { now: STALE_NOW })
+        .unsupported,
+    ).toBe(true);
+  });
+});
+
+describe("laneOfRung (wrapper-aware recognition)", () => {
+  it("resolves a direct lane command exactly like laneOfCommand", () => {
+    expect(laneOfRung("codex", ["exec", "{task}"])).toEqual({ lane: "codex", binary: "codex" });
+  });
+
+  it("sees through a wrapper command to the lane binary in args", () => {
+    // The live agy rungs: command "pwsh", the real binary several args in. Before this existed,
+    // recognition returned null and the agy roster could never refresh again.
+    const match = laneOfRung("pwsh", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      "C:\\Users\\x\\.llm-relay\\bin\\lane-launch.ps1",
+      "--timeout",
+      "2100",
+      "C:\\Users\\x\\AppData\\Local\\agy\\bin\\agy.exe",
+      "-p",
+      "{task}",
+    ]);
+    expect(match).toEqual({ lane: "agy", binary: "C:\\Users\\x\\AppData\\Local\\agy\\bin\\agy.exe" });
+  });
+
+  it("⚠ never matches a lane name embedded in a longer token", () => {
+    // "gpt-5.3-codex-spark" contains "codex" but IS a model id — a substring match would claim
+    // rungs for lanes they do not belong to. Exact basename only.
+    expect(laneOfRung("claude", ["-p", "{task}", "--model", "gpt-5.3-codex-spark"])).toBeNull();
   });
 });
