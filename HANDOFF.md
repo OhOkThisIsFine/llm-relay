@@ -97,16 +97,27 @@ two passes into one `removeComments: true` — that is variant B, which strips t
 was rejected for that reason. See the CLAUDE.md build note and
 [docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md) §3.1.
 
-**Immediate next:** two items in [docs/backlog.md](docs/backlog.md) — the MCP server build (D4),
-and an owner-directed investigation into why the llm-relay offload lane STALLS and returns nothing
-(measured: ~17 minutes, ~19 idle child processes, one diagnostic line reporting `pool/medium` as an
-unrecognized model on the session-title query path).
+**Immediate next:** one item for whoever picks this repo up — the owner-directed investigation into
+why the llm-relay offload lane STALLS and returns nothing (measured: ~17 minutes, ~19 idle child
+processes, one diagnostic line reporting `pool/medium` as an unrecognized model on the
+session-title query path). See [docs/backlog.md](docs/backlog.md).
+
+⚠ **The MCP server design is OWNED BY ANOTHER AGENT** (owner, 2026-08-30). Do not start it here.
+⚠⚠ **And its stated justification expired ~70 minutes after the decision.** D4 rested on *"agy has
+no shell, so MCP is its only delegation mechanism"*. **agy has a shell again** —
+`~/.gemini/antigravity-cli/settings.json` now reads
+`read_file(*) write_file(*) read_url(*) mcp(*) command(*)`, restored at 10:51:13 PDT against a D4
+answered at about 09:40. The owner's GOAL is unchanged, but the premise is gone, so the design
+should be confirmed rather than assumed. Timeline and attribution: [docs/backlog.md](docs/backlog.md).
+
 ⚠ `AGENTS.md` cannot be regenerated from a worktree; `sync.mjs` resolves project targets under
 `C:/Code` only, so this lap's `CLAUDE.md` edits need `node ~/.agent-config/sync.mjs` run from the
 MAIN checkout.
-⚠ **Nothing here is released.** The commits after the v0.62.0 tag are unreleased by owner decision:
-before variant C nothing shipped changed at all, and variant C now DOES change `dist/`, so the next
-release carries it.
+
+⚠ **UNRELEASED BY OWNER DECISION** (2026-08-30). Everything after the v0.62.0 tag stays unpublished
+for now, variant C included. So the REGISTRY still serves the pre-variant-C package: npm
+`dist-tags.latest` is 0.62.0 at `packBytes` 1113288, while this tree builds 861516. The 22.6%
+reduction reaches users only when someone cuts the next release.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
 decisions and the full verification record:

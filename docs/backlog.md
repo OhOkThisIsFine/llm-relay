@@ -14,6 +14,31 @@
   *"That reverses this verdict if the owner states agy must be able to DELEGATE rather than only be
   delegated to."* The owner has now stated it.
 
+  ⚠ **OWNED BY ANOTHER AGENT** (owner, 2026-08-30). A design pass is in progress in a different
+  session. Do not start the design here; coordinate through the owner.
+
+  ⚠⚠ **THE STATED JUSTIFICATION EXPIRED ~70 MINUTES AFTER THE DECISION, AND THE DESIGNER MUST
+  KNOW.** D4 rested on one argument: *"agy has no shell but does have `mcp(*)`, so an agy session
+  has zero delegation mechanisms today."* **agy has a shell again.** Verified against the authority
+  — `~/.gemini/antigravity-cli/settings.json` now reads
+  `read_file(*) write_file(*) read_url(*) mcp(*) command(*)`. Timeline, from file timestamps:
+
+  | Time (PDT, 2026-08-30) | Event |
+  |---|---|
+  | ~09:40 | Owner answers D4 — agy must delegate, reopen MCP |
+  | 10:16:30 | The security-cost framing is retracted (commit `6b1753d`) |
+  | 10:50:59 | `settings.json.bak-2026-08-30-pre-shell-restore` written |
+  | **10:51:13** | **`command(*)` restored** |
+
+  So with a shell, agy can already delegate by running `codex exec`, `claude -p` or `npx acpx`
+  directly. MCP is no longer the ONLY mechanism, which is the entire argument D4 turned on. ⚠ This
+  does NOT by itself reverse D4 — the owner's GOAL (agy must be able to delegate) is unchanged, and
+  MCP may still be wanted as a cleaner interface than a shell-out. But the decision was taken under
+  a premise that no longer holds, so **confirm with the owner before building.**
+  ⚠ Attribution: the `command(*)` restore and its live `echo` check were done by another session
+  and are recorded in the global `CLAUDE.md`. What THIS entry verified first-hand is only the
+  contents of the live settings file and the timestamps above.
+
   ⚠ **Do NOT gate this on agy's missing shell, and do NOT call that a security boundary.**
   An earlier version of this entry did both, and it was wrong. Owner correction, 2026-08-30:
   *"some agent ordained that AGY had certain limitations, that it did not have, that I didn't

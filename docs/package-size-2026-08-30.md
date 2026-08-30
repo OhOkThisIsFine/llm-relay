@@ -118,7 +118,13 @@ npx tsc -p tsconfig.json --removeComments --declaration false --declarationMap f
 
 ⚠ Restore the normal build afterwards with `npm run build`, or the next check measures the variant.
 
-## 3.1 DECIDED: variant C, and it shipped (2026-08-30)
+## 3.1 DECIDED: variant C, built and merged — but NOT PUBLISHED (2026-08-30)
+
+⚠ **Read this before quoting the numbers below as what users get.** Variant C is on `main` and
+green, but the owner decided to leave it **unreleased**. The npm registry therefore still serves
+the PRE-variant-C package: `dist-tags.latest` is 0.62.0 at `packBytes` 1113288, while this tree
+builds 861516. The 22.6% reduction reaches users only when someone cuts the next release.
+
 
 The owner chose **C** — strip the comments from `dist/*.js`, keep the `.d.ts` doc comments — so
 consumers keep their IntelliSense text. `build:server` now runs `tsc` twice:
