@@ -103,8 +103,11 @@ _Nothing open._
   `docs/reference.md`.
 
   Size cost, root-caused BEFORE the ceiling moved, measured against the PUBLISHED v0.63.1 tarball
-  rather than a local guess: `packBytes` 879010 → 886142, `unpackedBytes` 4654284 → 4670709
-  (+16425), `packageEntries` 356 → 359. The delta decomposes with **no residue** —
+  rather than a local guess: `unpackedBytes` 4654284 → 4670709 (**+16425**), `packageEntries`
+  356 → 359, `packBytes` 881636 → 886142 (+4506). ⚠ The decomposition is stated on
+  **unpackedBytes**, deliberately: `packBytes` is gzip output, so it is neither additive across
+  files nor byte-reproducible (an independent rebuild measured 886146 against the same tree). Treat
+  it as a ceiling only, never as an equality. The delta decomposes with **no residue** —
   9257 B of new `dist/latency-demotion.*` (3 files, matching the +3 entries exactly) + 4010 B
   `config` + 2081 B `server` + 1077 B `backend` = 16425. ⚠ `dist/backend.d.ts` grew 962 B while
   `dist/backend.js` grew 69 B, which is the two-pass build doing its job: the header constant's doc

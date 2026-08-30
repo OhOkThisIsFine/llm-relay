@@ -27,7 +27,7 @@ export type Verdict =
  * treat 401 as equivalent to 200 for availability (`probe-cache.ts`, `cadence.ts`) and a provider
  * with a revoked key read as healthy; both now follow the 200-only rule.
  */
-const MEASURABLE_CODES = new Set(["200", "401"]);
+export const MEASURABLE_CODES: ReadonlySet<string> = new Set(["200", "401"]);
 
 /** Calculate average latency from measurable pings (HTTP 200/401). Returns Infinity if none. */
 export function getAvg(pings: PingRecord[]): number {

@@ -41,7 +41,13 @@
 import type { CircuitBreaker } from "./circuit-breaker.js";
 import type { LatencyDemotionConfig } from "./config.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
-import { getP95 } from "./ping/metrics.js";
+// ⚠ MEASURABLE_CODES is IMPORTED, never re-declared. `getP95` counts only these codes, so
+// `pings.length` is an OVERCOUNT of the samples behind the figure — a deployment with fifty 429s
+// and one 200 would clear a `minSamples` test written against `pings.length` on the strength of a
+// single measurement, which is exactly the case the sample floor exists to exclude. The floor must
+// therefore count the SAME set `getP95` measured, and a hand-copied second set is this codebase's
+// most-repeated defect class: the copies drift, and here the drift would silently widen the floor.
+import { MEASURABLE_CODES, getP95 } from "./ping/metrics.js";
 
 /**
  * Tunable defaults. These are TUNABLES, not provider facts, which is the distinction the
@@ -98,14 +104,6 @@ function resolveSettings(settings: LatencyDemotionConfig | undefined): {
     minSamples: settings?.minSamples ?? DEFAULT_LATENCY_MIN_SAMPLES,
   };
 }
-
-/**
- * ⚠ `getP95` counts only `MEASURABLE_CODES` (200/401), so `pings.length` is an OVERCOUNT of the
- * samples behind the figure — a deployment with fifty 429s and one 200 would clear a `minSamples`
- * test written against `pings.length` on the strength of a single measurement, which is exactly
- * the case the sample floor exists to exclude. Count the same set `getP95` measured.
- */
-const MEASURABLE_CODES = new Set(["200", "401"]);
 
 export function resolveLatencyDemotion(
   deps: LatencyDemotionDeps,
