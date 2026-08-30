@@ -103,8 +103,42 @@ including every claim three independent adversarial reviews broke:
   MCP included, fails the "this installation first" rubric test until that changes. This is an
   owner decision, not a defect.
 
-**Immediate next:** owner decisions listed in the verification doc §6. Two recorded items remain in
-[docs/backlog.md](docs/backlog.md), both about package size and neither blocking.
+**This lap (2026-08-30, sixth) — the package-hygiene lap.** Full evidence:
+[docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md).
+
+- **A green baseline was intermittently RED, and the cause is now known.**
+  `test/hard-cap.test.ts` derived its retry-after bound from a clock read AFTER the response, while
+  `server.ts` `respondAllCapped` reads its own clock earlier. `ceil` is monotonic, so the relay's
+  value can legitimately be one second LARGER than the test's bound. Measured 26478 vs 26477.
+  A 200000-case arithmetic model reproduces the old form failing 2.4% of the time and the new form
+  never failing. ⚠ **This is very likely the unexplained flake recorded in the v0.61.0 friction
+  log**, whose diagnostics were lost to a `tail` pipe. The fix is in the TEST, per this repo's
+  own protocol; `hard-cap.test.ts:636` was the suite's only derived-boundary retry-after bound.
+- **`check:package` now names the build** instead of dying on a raw ENOENT (`readBuiltJson`).
+- **The 9 unexplained package entries are closed with no residue** — three modules from `ba3bd2a`
+  (v0.59.0) × three `tsc` outputs. 329 + 9 + 3 = 341 exactly.
+- **A stale `observed.unpackedBytes` was corrected** to the measured 5205915. The recorded 5194760
+  described no tree that ever existed, and survived because a CEILING metric's `observed` value is
+  never compared for equality. A provenance correction, not a ratchet raise; no ceiling moved.
+- **The comment-prose size question is now measured, not asked.** 29.5% of `dist/*.js` is comment
+  prose; four tarball variants are measured in the doc §3. Owner decision, in the backlog.
+
+**Owner decisions taken this lap.** D1, D3 and D5 were already closed and were verified as such.
+
+- **D2 — CLOSED PERMANENTLY, the other way.** `DEFAULT_CONFIG_TEMPLATE` will NOT ship a
+  `routing.ladder` or `cliLane`. Dispatch is deliberately a per-machine feature, so dispatch work
+  is no longer measured against `docs/project-goals.md` rubric test 1. Recorded in the CLAUDE.md
+  MCP gotcha.
+- **D4 — REVERSED: agy must be able to DELEGATE**, so an MCP server is now wanted. The reversal
+  condition was written into the CLAUDE.md gotcha and the owner met it. ⚠ The recorded security
+  cost travels with it: agy has had no shell since 2026-08-11, so this reaches around that
+  revocation through a side door. The owner accepted that knowingly; the design must bound it
+  rather than rediscover it. Work item in [docs/backlog.md](docs/backlog.md).
+
+**Immediate next:** the two owner decisions now in [docs/backlog.md](docs/backlog.md) — the MCP
+server build (D4) and the package-size variant. ⚠ `AGENTS.md` cannot be regenerated from a
+worktree; `sync.mjs` resolves project targets under `C:/Code` only, so the CLAUDE.md edit in this
+lap needs `node ~/.agent-config/sync.mjs` run from the MAIN checkout.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
 decisions and the full verification record:
