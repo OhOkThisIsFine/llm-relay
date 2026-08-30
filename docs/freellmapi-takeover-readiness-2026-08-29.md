@@ -78,18 +78,23 @@ blocker:
 ## 4. Losses — named, with mitigation
 
 - **L1 — compression.** freellmapi compresses free-pool sessions; the relay never will (three
-  runtime deps, no second implementation). Cost: more tokens per free request. Evidence the pools
-  sustain the load anyway: 8,704 requests/7d served without compression. Mitigation if TPM pain
-  appears later: chain a second headroom instance in front of :8791 — possible, not part of this
-  cutover.
-- **L2 — Pollinations and LLM7 (keyless).** Not in the relay config. Close by adding two keyless
-  `openai`-kind provider entries, or accept the loss; their contribution this week was minor
-  relative to gemini/kilo-free/nim.
+  runtime deps, no second implementation). **Measured 2026-08-29 (`compression_stats`): 9
+  compressed requests, 1,572,929 → 1,571,692 chars, 309 estimated tokens saved — 0.08%.** The
+  response cache reports **0 entries and 0 hits ever** (agentic histories never repeat, as
+  status-vs-freellmapi §3.7 predicted). On this machine's traffic shape the loss is nominal, not
+  substantive. If a token-heavy free lane ever appears, the mitigation stays available: chain a
+  second headroom instance (already installed for Codex) in front of :8791.
+- **L2 — Pollinations and LLM7 (keyless).** Not in the relay config — and **absent from
+  freellmapi's own top-10 fallback chain (`routing_info`) and its 7-day top models**. Measured
+  contribution ≈ nil. Two keyless `openai`-kind provider entries recreate them in llm-relay at
+  any time (the ollama entry is the working precedent for keyless providers).
 - **L3 — pre-dispatch RPM/TPM enforcement with in-flight leases.** The relay is reactive
   (breaker, Retry-After, escalation ladder, quota demotion) plus operator-declared (`limits`,
-  hard caps). In-flight leases were DROPPED by owner decision 2026-08-23 (Gap 16). Mitigation
-  where pacing pain appears: declare `providers.<name>.limits` for the chatty providers — the
-  configured-limits rung exists precisely for this.
+  hard caps). In-flight leases were already adjudicated INSIDE llm-relay: Gap 16 was DROPPED by
+  owner decision 2026-08-23, with spec §5.4 arguing no measured overshoot. Retirement therefore
+  removes a second implementation of a mechanism the project of record already declined on
+  evidence. Mitigation where pacing pain appears: declare `providers.<name>.limits` for the
+  chatty providers — the configured-limits rung exists precisely for this.
 
 ## 5. Cutover checklist (owner-gated; runs only after the decision)
 
@@ -156,3 +161,7 @@ blocker:
 - **2026-08-29 — evaluation delivered; decision PENDING.** Options put to the owner: (a) retire
   via §5, (b) keep both per the 2026-08-16 division, (c) partial — move lanes/MCP off freellmapi
   now, keep the :3001 router temporarily. This file is amended when the owner decides.
+- **2026-08-29 — owner queried the three losses before deciding.** Measured answers appended to
+  §4: compression saved 0.08% (309 tokens, cache 0 hits); Pollinations/LLM7 rank nowhere in
+  freellmapi's own chain; in-flight leases were already dropped inside llm-relay on 2026-08-23.
+  Recommendation unchanged and strengthened: retire.
