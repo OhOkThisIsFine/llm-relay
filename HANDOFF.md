@@ -8,15 +8,23 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 both verified 2026-08-30. ⚠ The RUNNING relay's version is not asserted here: `GET /telemetry`
 carries no version field, so a claim about the live process needs a restart or another check.
 §6 holds recorded trades, deferrals and settled decisions, not a work queue. The work queue is
-[docs/backlog.md](docs/backlog.md), which holds **two owner decisions** — build the MCP server so
-agy can delegate (D4), and choose a package-size variant.
+[docs/backlog.md](docs/backlog.md). **Both owner decisions that stood there are now settled:**
+package-size variant C is adopted, and the MCP server (D4) is BUILT AND SHIPPED to `main`.
+
+✅ **`llm-relay mcp` is live** (`e8ac127`, `67d12a0`, `e059bbe`). One MCP tool call hands a whole
+task to another agent lane and returns its ANSWER, so no caller composes a lane command. Registered
+on Claude Code (✔ Connected) and AGY, where **delegation is verified live** — agy dispatched a task
+and reported the answer plus the lane. That closes the goal D4 existed for. ⚠ Codex is registered
+and `codex mcp list` shows it enabled, but `codex exec` surfaces NO MCP tools at all, including two
+servers older than this one; use the CLI form from Codex. Design survey:
+[docs/mcp-dispatch-prior-art-2026-08-30.md](docs/mcp-dispatch-prior-art-2026-08-30.md).
 
 ⚠ **Unreleased commits sit on `main` after the v0.62.0 tag, and they are no longer neutral.** The
 package-hygiene lap itself (`fb38d7e`, `68ea8ce`, `76ae510`) changed nothing inside the published
 package — a test and a script `package.json` `files` does not list. The owner then chose
-package-size variant C in the hand-back, and THAT does change `dist/`: `packBytes` 1113288 →
-861516. So the next release ships a materially smaller tarball, and the "byte-identical" reasoning
-that made a release pointless no longer applies.
+package-size variant C, and THAT does change `dist/`: `packBytes` 1113288 → 861516. The MCP server
+then added 17494 B back, so `main` builds 879010 — still 21% below what the registry serves. Two
+material changes now await a release, not one.
 
 **freellmapi is RETIRED** (owner decision 2026-08-29), so llm-relay is now the ONLY free-provider
 offload runtime on this machine. It is dormant and reversible, nothing deleted; the measured basis
@@ -117,7 +125,9 @@ MAIN checkout.
 ⚠ **UNRELEASED BY OWNER DECISION** (2026-08-30). Everything after the v0.62.0 tag stays unpublished
 for now, variant C included. So the REGISTRY still serves the pre-variant-C package: npm
 `dist-tags.latest` is 0.62.0 at `packBytes` 1113288, while this tree builds 861516. The 22.6%
-reduction reaches users only when someone cuts the next release.
+reduction reaches users only when someone cuts the next release. The MCP server (`llm-relay mcp`)
+is unpublished for the same reason; it works LOCALLY because the global bin was reinstalled from
+this tree. A stranger installing from npm does not have it yet.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
 decisions and the full verification record:
