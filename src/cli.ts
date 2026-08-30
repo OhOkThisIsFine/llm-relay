@@ -579,7 +579,7 @@ export function firstRunPending(configDir?: string): boolean {
  * nothing in the file says this. A notice beside the JSON reaches a human and an agent both,
  * and breaks no parser.
  */
-export function printFirstRunNotice(configDir?: string): void {
+export function printFirstRunNotice(configDir?: string, cfg?: Config): void {
   if (!firstRunPending(configDir)) return;
   process.stderr.write(
     "\nllm-relay: first run — this install has never been steered.\n" +
@@ -588,8 +588,118 @@ export function printFirstRunNotice(configDir?: string): void {
       "    llm-relay offload claude on            # marked subagents to the free pools\n" +
       "    llm-relay routing subagent <tier> <spec>   # choose where each tier lands\n" +
       "    llm-relay routing default <spec>       # move the MAIN conversation (deliberate)\n" +
-      "  Then run `llm-relay routing answered` to stop showing this.\n",
+      "  Then run `llm-relay routing answered` to stop showing this.\n" +
+      firstRunEnvironmentReport(cfg),
   );
+}
+
+/** How many missing providers the first-run notice names before it summarises the rest. */
+const FIRST_RUN_MISSING_SHOWN = 3;
+
+/**
+ * The environment half of the first-run notice: what is installed, and what already has a key.
+ *
+ * ⚠ **Why this is here and not in `onboard`.** Everything it reports already existed —
+ * `presets.ts` has carried a `signupUrl` for every free provider since the beginning, and
+ * `printOnboardingGuide()` has printed them. What did not exist was any moment at which a user
+ * SAW it: onboarding is pull-only, so it fires when somebody types `llm-relay onboard`, and a
+ * first-time user has no reason to guess that command exists. The first-run notice is the one
+ * place the relay already speaks unprompted, so the report belongs beside the routing question.
+ *
+ * ⚠ It reports, and never acts. No key is read aloud, nothing is written, and no provider is
+ * added — a notice that changed configuration would be exactly the silent behaviour the first-run
+ * marker exists to avoid. `llm-relay onboard` remains the only thing that writes credentials.
+ *
+ * ⚠ Absence is reported as "not detected", never as "not installed". `installed-hosts.ts` requires
+ * positive evidence, so a false there means no evidence was found — the `key-checker.ts`
+ * `unverified` rule, applied to tools instead of credentials.
+ *
+ * Never throws: the notice is advisory, and a detection fault must not break the command it rides
+ * on. A caller with no `Config` still gets the host half.
+ */
+/** The inputs the report renders. Injected so the rendering is testable without a real machine. */
+export interface FirstRunEnvironmentInputs {
+  /** Hosts for which POSITIVE evidence was found. Never a claim about what is absent. */
+  detected: readonly { readonly label: string }[];
+  /** Provider credential status, as `getOnboardingStatusList` reports it. */
+  statuses: readonly {
+    readonly displayName: string;
+    readonly hasKey: boolean;
+    // `| undefined` explicitly: this repo runs `exactOptionalPropertyTypes`, so an optional
+    // property is not the same type as one that may hold undefined, and `OnboardingStatus`
+    // declares the latter.
+    readonly signupUrl?: string | undefined;
+  }[];
+}
+
+/**
+ * PURE renderer for the environment half of the first-run notice.
+ *
+ * ⚠ Separated from the IO so it can be tested at all. Adversarial review found the first version
+ * had no seam and zero coverage, unlike every sibling in this file — and it was the only part of
+ * the notice that makes factual claims about the operator's machine, so it was exactly the part
+ * that needed pinning.
+ *
+ * ⚠ **It makes no claim about ladder membership**, and that is a deliberate correction. The first
+ * version printed "none is configured as a lane yet" unconditionally whenever any host was
+ * detected — false the moment an operator adds a rung, which is a supported edit that does not
+ * clear the first-run marker. Checking properly is not available either: `laneOfCommand`'s closed
+ * vocabulary recognises only `agy` and `codex`, so Claude Code and OpenCode would always look
+ * unconfigured. Rather than duplicate ladder logic in a notice, or assert what it cannot verify,
+ * this points at the surface that DOES know. That is the same "ask the relay, don't guess" rule
+ * the skill states for dispatch order.
+ */
+export function renderFirstRunEnvironment(inputs: FirstRunEnvironmentInputs): string {
+  const lines: string[] = [];
+
+  if (inputs.detected.length > 0) {
+    lines.push(`  Detected on this machine: ${inputs.detected.map((h) => h.label).join(", ")}.`);
+    lines.push("    `llm-relay dispatch` shows which of these are configured as lanes, and in what order.");
+  }
+
+  const statuses = inputs.statuses;
+  if (statuses.length > 0) {
+    const ready = statuses.filter((s) => s.hasKey);
+    const missing = statuses.filter((s) => !s.hasKey && s.signupUrl !== undefined);
+    lines.push(`  Credentials: ${ready.length} of ${statuses.length} configured providers have a key.`);
+    for (const s of missing.slice(0, FIRST_RUN_MISSING_SHOWN)) {
+      lines.push(`    ${s.displayName} — sign up free: ${s.signupUrl}`);
+    }
+    if (missing.length > FIRST_RUN_MISSING_SHOWN) {
+      lines.push(`    …and ${missing.length - FIRST_RUN_MISSING_SHOWN} more.`);
+    }
+    if (missing.length > 0) {
+      lines.push("    `llm-relay onboard` walks through them and saves the keys.");
+    }
+  }
+
+  return lines.length > 0 ? `\n${lines.join("\n")}\n` : "";
+}
+
+/**
+ * Gather the real inputs and render them.
+ *
+ * ⚠ **Why this exists at all.** Everything it reports already existed — `presets.ts` has carried a
+ * `signupUrl` for every free provider since the beginning, and `printOnboardingGuide()` has printed
+ * them. What did not exist was any moment at which a user SAW it: onboarding is pull-only, so it
+ * fires when somebody types `llm-relay onboard`, and a first-time user has no reason to guess that
+ * command exists. The first-run notice is the one place the relay already speaks unprompted.
+ *
+ * ⚠ It reports, and never acts. No key is read aloud, nothing is written, and no provider is added.
+ * `llm-relay onboard` remains the only thing that writes credentials.
+ *
+ * Never throws: the notice is advisory, and a detection fault must not break the command it rides on.
+ */
+function firstRunEnvironmentReport(cfg?: Config): string {
+  try {
+    return renderFirstRunEnvironment({
+      detected: detectHosts().filter((h) => h.installed),
+      statuses: getOnboardingStatusList(cfg),
+    });
+  } catch {
+    // Advisory only. A broken detection must never cost the caller its command.
+    return "";
+  }
 }
 
 /** Record that the operator has been asked and has answered. Idempotent; never throws. */
@@ -2363,7 +2473,7 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   // the switch reporting ON while nothing changes is precisely how the no-op went unnoticed.
   // The other surface an agent reaches for when it is about to steer traffic. Stderr, so the
   // stdout report stays exactly what it was for anything parsing it.
-  if (want === null) printFirstRunNotice();
+  if (want === null) printFirstRunNotice(undefined, cfg);
   const hostRouting = detectHostRouting();
   if (hostRouting.state === "bypassed" && state.enabled) {
     process.stdout.write(`  ⚠ ${hostRouting.reason}\n`);
@@ -3112,7 +3222,7 @@ export function runRoutingCommand(): void {
 
   if (action === "show" || action === "get") {
     outputJson(cfg.routing);
-    printFirstRunNotice();
+    printFirstRunNotice(undefined, cfg);
     return;
   }
 
@@ -3402,7 +3512,8 @@ export async function runPools(
 }
 
 import { probeAllPools, type MemberVerdict } from "./pool-health.js";
-import { runInteractiveOnboarding } from "./onboarding.js";
+import { runInteractiveOnboarding, getOnboardingStatusList } from "./onboarding.js";
+import { detectHosts } from "./installed-hosts.js";
 import { importKeysFromFile } from "./key-import.js";
 import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
 import { getTelemetryReport } from "./telemetry.js";

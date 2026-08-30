@@ -1,8 +1,8 @@
 import { randomBytes as nodeRandomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { spawnSync as nodeSpawnSync } from "node:child_process";
-import { accessSync, constants as fsConstants } from "node:fs";
-import { delimiter, join, win32 } from "node:path";
+import { win32 } from "node:path";
 import { windowsSystem32Executable } from "./secret-file-acl.js";
+import { commandExistsOnPath } from "./executable-lookup.js";
 
 const KEK_BYTES = 32;
 const SCRYPT_SALT_BYTES = 32;
@@ -173,24 +173,16 @@ export function libsecretLoadArgv(keyId?: string): string[] {
   return ["lookup", "application", "llm-relay", "purpose", keyringPurpose(keyId)];
 }
 
-/** PATH lookup used only to select Linux libsecret versus passphrase mode; it never spawns. */
-export function commandExistsOnPath(
-  command: string,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  const path = env.PATH;
-  if (!path) return false;
-  for (const directory of path.split(delimiter)) {
-    if (!directory) continue;
-    try {
-      accessSync(join(directory, command), fsConstants.X_OK);
-      return true;
-    } catch {
-      // Keep searching. Absence is the branch signal, not an exceptional condition.
-    }
-  }
-  return false;
-}
+/**
+ * PATH lookup used only to select Linux libsecret versus passphrase mode; it never spawns.
+ *
+ * ⚠ The implementation moved to `executable-lookup.ts` when `installed-hosts.ts` needed the same
+ * question answered — two PATH walks would be the second implementation this project forbids, and
+ * the copy here had no PATHEXT handling. Behaviour on Linux, the only platform this caller runs
+ * on, is unchanged. Re-exported rather than relocated at the call sites so this module's public
+ * surface stays what it was.
+ */
+export { commandExistsOnPath };
 
 const spawnCaptured: KeyringSpawnSync = (command, args, options) => {
   // Unit tests must inject a captured-stdio seam. Never let an omitted double reach a real

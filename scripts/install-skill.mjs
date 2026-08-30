@@ -148,13 +148,59 @@ try {
     }
   }
 
+  // ⚠ Only provision Codex when Codex is actually here (owner decision 2026-08-30). This used to
+  // run unconditionally, so every global install created `~/.codex/config.toml` and two agent
+  // TOMLs on machines with no Codex at all — configuration for a tool the operator does not have,
+  // written silently.
+  //
+  // ⚠ The detector is IMPORTED from `dist/`, never re-implemented here: a second copy of the
+  // PATH-and-config test would be the duplicate the project forbids, and it is the copy that
+  // would drift. `dist/` ships in `files`, so it is present in an installed package — but this is
+  // a postinstall hook, so an unreadable `dist/` must not break anything. It fails to the OLD
+  // behaviour (provision anyway), because the cost of an unused config directory is far smaller
+  // than the cost of a Codex user silently getting no provider block.
+  let codexDetected = true;
   try {
-    installCodexSetup(home);
+    const { detectHost } = await import("../dist/installed-hosts.js");
+    // `home` explicitly: `homedir()` reads the real user, and the postinstall tests redirect
+    // HOME/USERPROFILE at a temp dir precisely so nothing consults the developer's machine.
+    //
+    // ⚠ `onPath`, NOT `installed`. Adversarial review caught this reading `installed`, which is a
+    // no-op gate for every existing user: llm-relay before v0.62.0 wrote `~/.codex/config.toml`
+    // unconditionally, so a config-path signal would be llm-relay detecting its own footprint and
+    // the gate would be permanently open. `installed-hosts.ts` now returns no config path for
+    // Codex at all, so the two agree — reading `onPath` states the intent at the call site so a
+    // later widening of that module cannot silently reopen the gate.
+    const codex = detectHost("codex", { home });
+    codexDetected = codex.onPath;
+    if (!codexDetected) {
+      process.stderr.write(
+        "llm-relay: Codex not detected (no codex binary on PATH) — skipping Codex provider setup.\n" +
+          `llm-relay: install Codex, then run: node "${here}/install-skill.mjs" --force\n`,
+      );
+    }
   } catch (e) {
-    process.stderr.write(`llm-relay: Codex global setup not installed — ${e?.message ?? e}\n`);
+    // ⚠ Say so. This branch used to leave `codexDetected` true and fall through to the `if
+    // (!codexDetected)` message, which therefore NEVER printed — the reason string was dead code
+    // and a failed detector was completely silent. That breaks this file's own stated contract:
+    // best-effort, but never SILENT. It still fails OPEN (provision anyway), because an unused
+    // config directory costs far less than a real Codex user silently losing their provider block.
+    process.stderr.write(
+      `llm-relay: Codex detection unavailable (${e?.message ?? e}) — provisioning Codex anyway.\n`,
+    );
+  }
+
+  // The "not detected" message is printed above, beside the evidence that produced it, so this
+  // reads as a plain positive condition rather than an empty branch.
+  if (codexDetected) {
+    try {
+      installCodexSetup(home);
+    } catch (e) {
+      process.stderr.write(`llm-relay: Codex global setup not installed — ${e?.message ?? e}\n`);
+    }
   }
 } catch (e) {
-  // Never fail the install over the skills — but always say why neither could be attempted.
+  // Never fail the install over the skills — but always say why none could be attempted.
   process.stderr.write(`llm-relay: host skills not installed — ${e?.message ?? e}\n`);
   process.exit(0);
 }

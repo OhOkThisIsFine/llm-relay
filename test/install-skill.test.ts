@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,12 +29,41 @@ function run(args: string[], home: string, extraEnv: Record<string, string> = {}
   // have the suite write outside the temp HOME — the same non-hermeticity these tests redirect
   // HOME/USERPROFILE to avoid. Clear it here; the one test that exercises XDG sets it explicitly.
   delete env.XDG_CONFIG_HOME;
+  // ⚠ PATH is blanked because Codex provisioning is now DETECTED, not unconditional, and the
+  // detector walks PATH. Inheriting the real one makes the suite pass on a developer machine that
+  // has Codex and fail in CI that does not — the same non-hermeticity as HOME. A test that WANTS
+  // Codex detected calls `codexOnPath()`, which puts a real fixture binary on a controlled PATH;
+  // creating `~/.codex/config.toml` does NOT work and must not be used, because that file is
+  // llm-relay's own footprint rather than evidence of Codex.
+  // The child is spawned via process.execPath, so it needs no PATH to start.
+  env.PATH = "";
   const res = spawnSync(process.execPath, [script, ...args], {
     cwd: repoRoot,
     encoding: "utf8",
     env: { ...env, HOME: home, USERPROFILE: home, ...extraEnv },
   });
   return { status: res.status, stderr: res.stderr ?? "", stdout: res.stdout ?? "" };
+}
+
+/**
+ * Make Codex genuinely DETECTABLE, by putting a real `codex` executable on a controlled PATH.
+ *
+ * ⚠ This is how a Codex-provisioning test must set itself up since v0.62.0. The gate reads
+ * `onPath` — a binary — because llm-relay wrote `~/.codex/config.toml` unconditionally before that
+ * version, so a config file proves only that llm-relay ran, never that Codex is present. Creating
+ * the config file would therefore NOT satisfy the gate, and a test that did so would be asserting
+ * the footprint bug rather than the fix.
+ *
+ * On Windows a bare name resolves only through PATHEXT, so the fixture carries `.cmd` — which is
+ * exactly the npm global-install shim shape the lookup was written to find.
+ */
+function codexOnPath(): { dir: string; env: Record<string, string> } {
+  const dir = mkdtempSync(join(tmpdir(), "llm-relay-codexbin-"));
+  const isWindows = process.platform === "win32";
+  const file = join(dir, isWindows ? "codex.cmd" : "codex");
+  writeFileSync(file, isWindows ? "@echo off\r\n" : "#!/bin/sh\nexit 0\n");
+  if (!isWindows) chmodSync(file, 0o755);
+  return { dir, env: { PATH: dir, PATHEXT: ".COM;.EXE;.BAT;.CMD" } };
 }
 
 const installedPaths = (home: string) => ({
@@ -79,26 +108,104 @@ describe("install-skill postinstall hook", () => {
     expect(r.stderr).toContain("installed Claude Code skill");
     expect(r.stderr).toContain("installed Codex skill");
     expect(r.stderr).toContain("installed OpenCode skill");
-    expect(readFileSync(paths.codexConfig, "utf8")).toContain("[model_providers.llm-relay]");
-    expect(readFileSync(paths.codexConfig, "utf8")).toContain('base_url = "http://127.0.0.1:8791/v1"');
-    expect(readFileSync(paths.defaultAgent, "utf8")).toContain('model = "pool/medium"');
-    expect(readFileSync(paths.codingAgent, "utf8")).toContain('model_provider = "llm-relay"');
-    expect(r.stderr).toContain("Codex provider configured");
-    expect(r.stderr).toContain("Codex agent installed");
   });
 
-  it("--force installs regardless of install context", () => {
+  /**
+   * ⚠ Codex PROVISIONING (the provider block and the two agent TOMLs) is gated on Codex actually
+   * being present, since 2026-08-30. It used to run on every global install, so a machine with no
+   * Codex got `~/.codex/config.toml` and two agent files written for a tool it did not have.
+   *
+   * ⚠ The SKILL COPY is deliberately NOT gated — see the last test in this block. Copying a
+   * markdown file into a directory is cheap and self-correcting; writing a provider block that
+   * changes how another tool routes its traffic is not.
+   */
+  describe("Codex provisioning is gated on Codex being detected", () => {
+    /**
+     * ⚠ PRECONDITION, stated as its own assertion on purpose. The gate imports the detector from
+     * `dist/`, so these tests need a BUILT tree — a dependency the rest of the suite does not have
+     * (`CLAUDE.md`: "vitest reads `src/` directly; scripts read `dist/`"). Without this check a
+     * missing `dist/` surfaces as three unrelated-looking failures about Codex provisioning, and
+     * the reader has to work backwards to the real cause. Here it fails once, saying what to run.
+     */
+    it("PRECONDITION: dist/ is built, because the gate imports the detector from it", () => {
+      const detector = join(repoRoot, "dist", "installed-hosts.js");
+      expect(
+        existsSync(detector),
+        `${detector} is missing — run \`npm run build\` first. These gate tests exercise ` +
+          "scripts/install-skill.mjs, which imports the detector from dist/, not from src/.",
+      ).toBe(true);
+    });
+
+    it("skips the provider block, and says why, when no Codex is present", () => {
+      const r = run([], home, { npm_config_global: "true" });
+      const paths = installedPaths(home);
+      expect(r.status).toBe(0);
+      expect(existsSync(paths.codexConfig)).toBe(false);
+      expect(existsSync(paths.defaultAgent)).toBe(false);
+      expect(r.stderr).toContain("Codex not detected");
+      // Never silent, and it must say how to get it later — a detection miss is recoverable.
+      expect(r.stderr).toContain("--force");
+    });
+
+    /**
+     * ⚠ Detection is by BINARY, not by config file. An earlier draft of this test created
+     * `~/.codex/config.toml` to make Codex "detected" — but llm-relay wrote that file
+     * unconditionally before v0.62.0, so it proves llm-relay ran, not that Codex exists. A test
+     * built on it would have pinned the footprint bug instead of the fix.
+     */
+    it("provisions when the codex binary is on PATH", () => {
+      const codex = codexOnPath();
+      mkdirSync(join(home, ".codex"), { recursive: true });
+      writeFileSync(installedPaths(home).codexConfig, "# pre-existing codex config\n");
+      const r = run([], home, { npm_config_global: "true", ...codex.env });
+      const paths = installedPaths(home);
+      rmSync(codex.dir, { recursive: true, force: true });
+      expect(r.status).toBe(0);
+      expect(readFileSync(paths.codexConfig, "utf8")).toContain("[model_providers.llm-relay]");
+      expect(readFileSync(paths.codexConfig, "utf8")).toContain('base_url = "http://127.0.0.1:8791/v1"');
+      expect(readFileSync(paths.defaultAgent, "utf8")).toContain('model = "pool/medium"');
+      expect(readFileSync(paths.codingAgent, "utf8")).toContain('model_provider = "llm-relay"');
+      expect(r.stderr).toContain("Codex provider configured");
+      expect(r.stderr).toContain("Codex agent installed");
+      // The operator's own bytes survive — the gate must not turn provisioning into a rewrite.
+      expect(readFileSync(paths.codexConfig, "utf8")).toContain("# pre-existing codex config");
+    });
+
+    it("still copies the SKILL to every host even when Codex is not detected", () => {
+      const r = run([], home, { npm_config_global: "true" });
+      const paths = installedPaths(home);
+      const source = readFileSync(skillSrc, "utf8");
+      expect(readFileSync(paths.codex, "utf8")).toBe(source);
+      expect(readFileSync(paths.claude, "utf8")).toBe(source);
+      expect(readFileSync(paths.opencode, "utf8")).toBe(source);
+      expect(r.stderr).toContain("Codex not detected");
+    });
+  });
+
+  /**
+   * ⚠ `--force` overrides the INSTALL CONTEXT (global vs local), and nothing else. It is not a
+   * blanket "do everything" switch: Codex provisioning is gated on Codex being detected, and that
+   * gate is about whether the operator HAS Codex, which forcing an install context cannot answer.
+   * This test asserted unconditional Codex provisioning until 2026-08-30 — it was pinning the
+   * behaviour the detection gate exists to remove, so it changed with the source.
+   *
+   * The escape the stderr message advertises still works: install Codex, re-run with `--force`,
+   * and the detector now finds it. That path is covered by the detection describe-block below.
+   */
+  it("--force installs the skills regardless of install context", () => {
     const r = run(["--force"], home);
     const paths = installedPaths(home);
     expect(r.status).toBe(0);
     expect(existsSync(paths.claude)).toBe(true);
     expect(existsSync(paths.codex)).toBe(true);
-    expect(existsSync(paths.codexConfig)).toBe(true);
-    expect(existsSync(paths.defaultAgent)).toBe(true);
-    expect(existsSync(paths.codingAgent)).toBe(true);
+    expect(existsSync(paths.opencode)).toBe(true);
+    // ...but forcing the context does not conjure a Codex install.
+    expect(existsSync(paths.codexConfig)).toBe(false);
+    expect(r.stderr).toContain("Codex not detected");
   });
 
   it("preserves existing Codex config and agent files and stays idempotent", () => {
+    const codex = codexOnPath();
     const paths = installedPaths(home);
     mkdirSync(join(home, ".codex", "agents"), { recursive: true });
     const existingConfig = "model = \"gpt-5\"\n\n[model_providers.openai]\nname = \"openai\"\n";
@@ -106,10 +213,10 @@ describe("install-skill postinstall hook", () => {
     writeFileSync(paths.codexConfig, existingConfig);
     writeFileSync(paths.defaultAgent, existingDefault);
 
-    const first = run([], home, { npm_config_global: "true" });
+    const first = run([], home, { npm_config_global: "true", ...codex.env });
     const afterFirstConfig = readFileSync(paths.codexConfig, "utf8");
     const afterFirstDefault = readFileSync(paths.defaultAgent, "utf8");
-    const second = run([], home, { npm_config_global: "true" });
+    const second = run([], home, { npm_config_global: "true", ...codex.env });
     const afterSecondConfig = readFileSync(paths.codexConfig, "utf8");
 
     expect(first.status).toBe(0);
@@ -132,11 +239,12 @@ describe("install-skill postinstall hook", () => {
     // TOML treats all of these as the SAME table. Matching only the exact literal spelling makes
     // postinstall append a SECOND provider block to the user's config.toml on every install —
     // a duplicate table in a file this tool edits in the user's home directory.
+    const codex = codexOnPath();
     const paths = installedPaths(home);
     mkdirSync(join(home, ".codex", "agents"), { recursive: true });
     writeFileSync(paths.codexConfig, existing);
 
-    const r = run([], home, { npm_config_global: "true" });
+    const r = run([], home, { npm_config_global: "true", ...codex.env });
     const after = readFileSync(paths.codexConfig, "utf8");
 
     expect(r.status).toBe(0);

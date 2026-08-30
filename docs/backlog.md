@@ -9,15 +9,32 @@
 
 ## Open
 
-- **`packBytes` is within 0.4% of its own ceiling** (**1102172** against 1106200, re-measured
-  2026-08-30 after v0.62.0 — was 1100459 before this pair of laps). Pre-existing drift, deliberately
-  NOT raised in the v0.60.0 lap. ⚠ **Two laps have now consumed 1713 bytes of the remaining
-  headroom, both disclosed rather than absorbed:** v0.61.0 spent 1474 on the `--next-command`
-  contract table in `skills/llm-relay/SKILL.md`, which the package ships, and v0.62.0 spent 239 on
-  the third install target. **4028 bytes remain.** The next change that adds anything will trip
-  `check:package`. When it does, **root-cause the growth first** — regenerating the baseline is what
-  turns a size ratchet into decoration. ⚠ Re-measure this figure in the same change that alters it;
-  a stale measured number is what the v0.61.0 closeout auditor caught elsewhere.
+- **The `packBytes` ceiling TRIPPED and was raised, with the growth root-caused first**
+  (2026-08-30). It had been predicted here and it happened exactly as written: adding two modules
+  pushed `packBytes` to **1109072** against the old 1106200 ceiling.
+
+  **Root cause, established BEFORE regenerating** (`npm pack --dry-run --json --ignore-scripts`,
+  file list diffed): `packageEntries` went **341 → 347, exactly +6**, and all six are the new
+  modules' build outputs — `dist/executable-lookup.{js,d.ts,js.map}` and
+  `dist/installed-hosts.{js,d.ts,js.map}`, 16531 unpacked bytes — plus `dist/cli.js` growth from
+  the first-run environment report. Nothing unaccounted for. Baseline raised to observed 1109072
+  with the ceiling at 1115000, the same ~0.5% headroom it carried before. `packageEntries`
+  (347/352) and `unpackedBytes` were both already inside their ceilings and needed no change.
+
+  ⚠ **This regeneration did NOT resolve the 9-entry mystery below, and did not absorb it either.**
+  341 + 6 = 347 exactly, so the pre-existing gap is carried forward unchanged, still unexplained.
+  Keep them separate: the rule is that a ratchet may be raised for growth you can name, and this
+  growth is named.
+
+  ⚠ **Re-measured again after the adversarial-review fixes: 1113288, leaving only 1712 bytes.**
+  The +4216 is explained — expanded doc comments in `executable-lookup.ts`, `installed-hosts.ts`
+  and `install-skill.mjs`, all recording why each fix exists. `packageEntries` did NOT move (still
+  347), so nothing new was added to the package; this is text growth inside files that already
+  ship. **The ceiling was deliberately NOT raised a second time in the same lap** — raising it
+  twice to accommodate one lap's own work is how a ratchet becomes decoration. So the next change
+  that adds anything WILL trip `check:package`, on purpose, and whoever hits it must root-cause
+  before regenerating. The honest question waiting there is whether shipping this much comment
+  prose to npm is worth its size.
 
 - **`check:package` should say "run the build first" instead of throwing a raw ENOENT.**
   `scripts/dashboard-package-check.mjs:15` reads `dist/dashboard/.vite/dashboard-bundle-graph.json`
