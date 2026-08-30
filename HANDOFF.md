@@ -2,12 +2,19 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-30 (fourth lap)
+## 0. State as of 2026-08-30 (sixth lap)
 
-**Current: v0.59.3 is released; the global bin and the relay are on it** (npm registry 0.59.3,
-`llm-relay version` 0.59.3). Nothing awaits the owner — §6 holds recorded trades, deferrals and
-settled decisions, not a work queue; the work queue is [docs/backlog.md](docs/backlog.md), which
-is EMPTY.
+**Current: v0.62.0 is released** — npm `dist-tags.latest` 0.62.0 and `llm-relay version` 0.62.0,
+both verified 2026-08-30. ⚠ The RUNNING relay's version is not asserted here: `GET /telemetry`
+carries no version field, so a claim about the live process needs a restart or another check.
+§6 holds recorded trades, deferrals and settled decisions, not a work queue. The work queue is
+[docs/backlog.md](docs/backlog.md), which holds **two owner decisions** — build the MCP server so
+agy can delegate (D4), and choose a package-size variant.
+
+⚠ Three commits sit on `main` after the v0.62.0 release tag (`fb38d7e`, `68ea8ce`, `76ae510` —
+the package-hygiene lap). They change nothing inside the published package: `packBytes` is
+byte-identical at 1113288 and `packageEntries` at 347, because the only code touched was a test
+and a script that `package.json` `files` does not list.
 
 **freellmapi is RETIRED** (owner decision 2026-08-29), so llm-relay is now the ONLY free-provider
 offload runtime on this machine. It is dormant and reversible, nothing deleted; the measured basis
@@ -17,91 +24,30 @@ The measurements that settled it: llm-relay carried 5.5× freellmapi's weekly tr
 accounts, freellmapi's compression had saved 0.08% lifetime, and its in-flight quota leases were
 already handled inside llm-relay.
 
-**This lap (2026-08-30) — the eligibility-and-probe lap.** Full record, every owner decision and
-the reversal of my own first mistral verdict:
-[docs/eligibility-and-probe-lap-2026-08-30.md](docs/eligibility-and-probe-lap-2026-08-30.md).
-Two code changes, both driven by live evidence the queue surfaced:
+**Recent laps, compressed — each has its own doc, and git holds the narrative.**
 
-- **A successful background probe now retracts cooling facts** (`src/ping/cadence.ts`
-  `recordPing` → `clearFacts`). `clearFacts` had exactly ONE caller, `server.ts`, so only a
-  SERVED request could disprove a condition early — while the relay probes every deployment on a
-  cadence with a REAL completion and threw that evidence away. A long-window
-  `allowance-exhausted` fact therefore survived its whole window unless real traffic happened to
-  reach the demoted candidate. This is what makes an operator-asserted multi-day reset safe to
-  record. Negative controls pinned: a non-200 clears nothing, measurements are never retracted,
-  and one credential's probe never speaks for another's.
-- **A network-block advisory** (`src/network-block.ts`, rendered in `llm-relay eligibility`).
-  Display-only: no fact, no demotion, no request-path reach — because no member of the closed
-  `FactKind` vocabulary describes the CALLER's own network, and recording one would assert what
-  the evidence does not support.
+- **v0.60.0, the eligibility-and-probe lap** — a successful background probe now RETRACTS cooling
+  facts (`src/ping/cadence.ts` `recordPing` → `clearFacts`), plus a display-only network-block
+  advisory. [docs/eligibility-and-probe-lap-2026-08-30.md](docs/eligibility-and-probe-lap-2026-08-30.md).
+- **v0.61.0** — a stated `unknown` host was treated like `routed`, so a headless caller got a
+  `target:` spec it could not address and `--next-command` exited 2 with nothing to run.
+  [docs/skill-dispatch-mcp-verification-2026-08-30.md](docs/skill-dispatch-mcp-verification-2026-08-30.md).
+- **v0.62.0** — OpenCode is a third `install-skill.mjs` target, and it is the only one honouring
+  `XDG_CONFIG_HOME` rather than a fixed dotfolder in HOME.
+- **v0.62.0+, the package-hygiene lap** — below.
 
-Eligibility queue resolved to its irreducible floor. Two mistral signatures accepted as
-`allowance-exhausted`, scope `credential`, with an operator-asserted **7-day** reset; one groq
-signature deliberately LEFT PENDING, because `reject` suppresses a signature for good and would
-silence the next episode.
+Three durable facts from those laps, kept because prose elsewhere had them wrong:
 
-**Released as v0.60.0** and verified live: npm `dist-tags.latest` 0.60.0, `llm-relay version` 0.60.0,
-relay restarted onto it, publish run 33293673199 green through both tag-refusal gates and a full
-`npm run check` in CI. The 7-day mistral window was confirmed end to end — the accepted
-interpretation bound on the next refusal and produced `mistral#default/*` `allowance-exhausted`
-expiring in 10080m.
-
-`AGENTS.md` was regenerated and committed (`3b157bb`): the shared region had gone stale at 174.1 KB
-against a `CLAUDE.md` now 182.0 KB. ⚠ **That step can only run in the MAIN checkout** — `sync.mjs`
-resolves project targets under `C:/Code` and never reads a worktree — so a worktree lap must hand it
-back or step out to finish it.
-
-**v0.62.0 — OpenCode is a third skill install target** (owner decision, 2026-08-30).
-`scripts/install-skill.mjs` now writes `<XDG_CONFIG_HOME or ~/.config>/opencode/skills/llm-relay/`
-alongside `~/.claude` and `~/.codex`. It is the only target that is not a fixed dotfolder in HOME,
-so it honours `XDG_CONFIG_HOME` — matching OpenCode's own convention and `state-paths.ts`'s
-config-kind policy. Four tests: the three-host copy, an independent-failure control, XDG honoured,
-and a blank `XDG_CONFIG_HOME` falling back rather than resolving a bare relative path. Before this,
-an OpenCode copy placed by any other means went stale with nothing to refresh it — measured 1875
-bytes behind on this machine.
-
-⚠ **Owner correction, recorded because I had it wrong: agy is far more capable than the v0.61.0
-write-up said.** Its live allow list is `read_file`, `write_file`, `read_url`, `mcp` — verified
-end to end on 2026-08-27. The "zero mechanisms" claim was true only before that date. agy still
-cannot DELEGATE (no MCP server mode, no ACP mode), so the MCP verdict is unchanged, but reason
-about agy from `~/.gemini/antigravity-cli/settings.json`, never from prose. ⚠ **`~/.agent-config/
-host-agy.md` is stale and actively wrong** — it forbids MCP and names three tool actions that were
-never valid. Machine layer; surfaced to the owner, not changed here.
-
-**Released as v0.61.0 and verified live**: publish run 33296485234 green, registry
-`dist-tags.latest` 0.61.0, global bin 0.61.0, relay restarted onto it. The defect case was
-re-checked end to end through the restarted relay — a harness-less caller now gets exit 0 and a
-runnable command where it got exit 2 — with both negative controls confirmed live (a `bypassed`
-session still transposes; a `routed` host still gets the lighter in-process subagent target).
-⚠ Minor, not patch: the fix changes what a whole class of callers receives from `dispatch`.
-
-**This lap (2026-08-30, fifth) — the skill/dispatch/MCP verification lap.** Owner asked three
-questions: is the skill installed correctly and generated from a single source of truth; can an
-agent dispatch with ONE syntax in every case; and does MCP make sense, assessed fresh. Full record,
-including every claim three independent adversarial reviews broke:
-[docs/skill-dispatch-mcp-verification-2026-08-30.md](docs/skill-dispatch-mcp-verification-2026-08-30.md).
-
-- **Skill installation: PASS.** One source, `copyFileSync` to two hosts, verified live by MD5 —
-  source and both installed copies agree — `8aa883fe…` at lap start, and `8e08061d…` after v0.61.0
-  shipped and the global bin was reinstalled, which shows the whole pipeline propagates. Seven test
-  cases pin the installer.
-- **One code fix, a real defect.** A stated `unknown` host — any shell with no `CLAUDECODE` — was
-  treated like `routed`, so a headless caller got a `target:` spec to address as a subagent it does
-  not have, and `--next-command` exited 2 leaving it nothing to run. Reproduced with zero flags.
-  `dispatch.ts` now carries two named predicates plus a reason function; an ABSENT verdict
-  deliberately keeps the old path. Mutation-checked. See the CLAUDE.md gotcha.
-- ⚠ **The independent closeout auditor caught three inaccuracies in this lap's own write-up** — a
-  stale MD5 invalidated by a later edit in the same lap, "three negative controls" where only two
-  are controls, and "three predicates" for two predicates and a string function. All three are
-  corrected in the doc, which states what was wrong rather than quietly fixing it. The lesson worth
-  keeping: **re-measure a measured figure after anything in the same lap changes what it measured.**
-- **MCP: NO**, with recorded reversal conditions. Two obvious objections turned out INVALID (no
-  dependency is needed; `packBytes` is a regenerable ceiling) and are recorded so nobody repeats
-  them. The decisive fact is that a fresh install ships no ladder at all.
-- ⚠ **Surfaced, not decided:** a fresh install has **no** `routing.ladder` and no `cliLane`, so
-  `llm-relay dispatch` returns `next: null` for a stranger. Every dispatch-uniformity improvement,
-  MCP included, fails the "this installation first" rubric test until that changes. This is an
-  owner decision, not a defect.
+- ⚠ **`AGENTS.md` can only be regenerated from the MAIN checkout.** `sync.mjs` resolves project
+  targets under `C:/Code` and never reads a worktree, so a worktree lap must hand that step back.
+- ⚠ **Reason about agy from `~/.gemini/antigravity-cli/settings.json`, never from prose.** Its live
+  allow list is `read_file`, `write_file`, `read_url`, `mcp` — verified end to end 2026-08-27. An
+  earlier write-up here claimed far less. (`~/.agent-config/host-agy.md` was stale for three days
+  and was rewritten 2026-08-30; it is correct now.)
+- ⚠ **The MCP verdict is REVERSED** (owner, 2026-08-30): agy must be able to DELEGATE, so an MCP
+  server is now wanted. The work item and its recorded security cost are in
+  [docs/backlog.md](docs/backlog.md); the superseded reasoning stays in `CLAUDE.md` because its two
+  INVALID objections must not be repeated.
 
 **This lap (2026-08-30, sixth) — the package-hygiene lap.** Full evidence:
 [docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md).
