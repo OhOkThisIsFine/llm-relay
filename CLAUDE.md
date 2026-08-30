@@ -898,7 +898,22 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   the old answer until the relay restarts onto it — the CLI asks the running relay over HTTP.
   Evidence, the three adversarial reviews and the MCP verdict:
   [docs/skill-dispatch-mcp-verification-2026-08-30.md](docs/skill-dispatch-mcp-verification-2026-08-30.md).
-- **Do NOT build an MCP server (assessed fresh 2026-08-30, owner-directed).** The 2026-08-16
+- **⚠ THE MCP VERDICT IS REVERSED (owner decision, 2026-08-30 — later the same day).** The
+  paragraph below stated its own reversal condition in as many words, and the owner then stated
+  it: **agy must be able to DELEGATE, not only be delegated to.** So an MCP server is now WANTED,
+  and the backlog carries the work item. Everything below stays on the record and stays binding on
+  the DESIGN — the two invalid objections must not be repeated, and the four real design
+  constraints (an inert `dispatch()` on a stranger's install, a read tool duplicating `/dispatch`,
+  a caller-supplied `cwd`, no representation for a 30-minute lane) are unsolved, not withdrawn.
+  ⚠ **Carry the security cost forward explicitly, because the owner accepted it knowingly:** agy
+  has had no shell since 2026-08-11, so giving it a delegation mechanism reaches around that
+  revocation through a side door. Bound it in the design; never treat it as unnoticed.
+  ⚠ **A related question was closed the OTHER way in the same decision:** `DEFAULT_CONFIG_TEMPLATE`
+  will NOT ship a `routing.ladder` or a `cliLane` (owner decision 2026-08-30, D2). Dispatch is
+  deliberately a per-machine feature, so **stop measuring dispatch work against rubric test 1** —
+  a stranger's install having no ladder is now a stated design choice, not a gap to close.
+- **Do NOT build an MCP server (assessed fresh 2026-08-30, owner-directed — SUPERSEDED above,
+  kept for its reasoning).** The 2026-08-16
   ledger rejection was re-opened and re-argued from scratch; two of the obvious objections are
   INVALID and should not be repeated — a minimal JSON-RPC-over-stdio server needs **no** new
   dependency (this repo hand-rolls `sse-frames.ts` and four SSE parsers already), and `packBytes`
