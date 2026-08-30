@@ -138,18 +138,26 @@ describe("latency demotion — per-token, the primary signal", () => {
     expect(resolveLatencyDemotion({ readPings: reader(justUnder) }, attempt())).toBeNull();
   });
 
-  it("ignores request samples with no reported token count", () => {
-    // Unknown is never zero. Such a sample still measures absolute latency, but it cannot say
-    // anything about throughput, so it must not be counted toward the per-token floor.
+  it("ignores request samples with no reported token count, in BOTH statistics", () => {
+    // Unknown is never zero, so such a sample cannot reach the per-token floor.
+    //
+    // ⚠ This test previously asserted the opposite second half — that the sample "still measures
+    // absolute latency" and falls through to that ceiling. It was pinning the defect. `p95Ms` is
+    // calibrated on a one-token probe, and this sample is a GENERATION of unknown length, so it is
+    // the least comparable measurement of all: not normalisable, and not the kind the ceiling
+    // describes. Changed in the same commit as the source fix, per this repo's protocol.
     const noTokens: PingRecord[] = Array.from({ length: 8 }, (_, i) => ({
       ms: 90_000,
       code: "200",
       timestamp: 3000 + i,
       source: "request" as const,
     }));
-    const d = resolveLatencyDemotion({ readPings: reader(noTokens) }, attempt());
-    // It falls through to the ABSOLUTE ceiling, which 90 s does exceed.
-    expect(d?.basis).toBe("absolute");
+    expect(resolveLatencyDemotion({ readPings: reader(noTokens) }, attempt())).toBeNull();
+
+    // And they cannot inflate a probe-based verdict either: five healthy probes still read healthy
+    // beside eight 90-second tokenless requests.
+    const withProbes = [...probes(5, 23_478), ...noTokens];
+    expect(resolveLatencyDemotion({ readPings: reader(withProbes) }, attempt())).toBeNull();
   });
 
   it("honours an operator ms/token ceiling", () => {
@@ -187,6 +195,44 @@ describe("latency demotion — absolute fallback", () => {
     // a single measurement, which is exactly what the floor exists to exclude.
     const noisy = [...probes(50, 1, "429"), ...probes(1, 600_000)];
     expect(resolveLatencyDemotion({ readPings: reader(noisy) }, attempt())).toBeNull();
+  });
+
+  /**
+   * The absolute ceiling reads PROBE samples ONLY.
+   *
+   * These three reproduce a measured live regression (2026-08-30): `p95Ms` is calibrated on a
+   * `max_tokens: 1` probe, so letting a real generation into the absolute statistic compares two
+   * different things. The per-token guard cannot cover it, because per-token engages only at
+   * `minSamples` REQUEST samples — so every deployment passes through a window where a probe-
+   * calibrated ceiling judges generation latency. Evidence:
+   * `docs/latency-demotion-regression-2026-08-30.md`.
+   */
+  it("does NOTHING when a healthy deployment's own long ANSWER exceeds the probe ceiling", () => {
+    // The live case, with its real figures. `nemotron-3-ultra` had served 59 of 62 successful
+    // requests. Its probes sit at 23478 ms (under the ceiling), and it answered one request with
+    // 632 tokens in 34863 ms — 55.2 ms/token, healthy by the primary signal. Mixing the two put
+    // the absolute p95 at 34863 and demoted the deployment that was carrying the machine.
+    const live = [...probes(5, 23_478), ...requests(3, 34_863, 632)];
+    expect(resolveLatencyDemotion({ readPings: reader(live) }, attempt())).toBeNull();
+  });
+
+  it("reports the PROBE sample count, not the mixed count", () => {
+    // Slow probes still demote — the fallback keeps its purpose. But `samples` must describe the
+    // set the figure was taken over, or the verdict claims evidence it does not have.
+    const d = resolveLatencyDemotion(
+      { readPings: reader([...probes(12, 70_364), ...requests(3, 1_000, 500)]) },
+      attempt(),
+    );
+    expect(d?.basis).toBe("absolute");
+    expect(d?.measured).toBe(70_364);
+    expect(d?.samples).toBe(12);
+  });
+
+  it("counts PROBE samples toward the floor, so request samples cannot unlock the ceiling", () => {
+    // Four probes is below the floor. Adding request samples must not clear it: they are measured
+    // by the per-token statistic, which has its own floor and has not reached it here either.
+    const thin = [...probes(4, 70_364), ...requests(4, 100, 10)];
+    expect(resolveLatencyDemotion({ readPings: reader(thin) }, attempt())).toBeNull();
   });
 });
 

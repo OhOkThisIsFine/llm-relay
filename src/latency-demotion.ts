@@ -39,11 +39,25 @@
  * overhead. So:
  *   - **per-token** (`getP95MsPerToken`) is the primary signal, over REQUEST samples only. It is
  *     what the owner asked for, and the only figure that is fair across sample kinds.
- *   - **absolute** (`getP95`) is the fallback, over every measurable sample. It still catches a
- *     deployment that is slow before it emits anything, and it works before any request sample
- *     exists.
+ *   - **absolute** (`getP95`) is the fallback, over measurable **PROBE** samples only. It still
+ *     catches a deployment that is slow before it emits anything, and it works before any request
+ *     sample exists.
  * Per-token is tested FIRST, so a deployment with real traffic is judged on the better evidence
  * rather than on whichever ceiling happens to trip first.
+ *
+ * ⚠ **The absolute fallback reads PROBE samples ONLY, and that split is load-bearing
+ * (2026-08-30).** It briefly read every measurable sample, request samples included, which put a
+ * probe-calibrated ceiling in front of generation data — the exact comparison the paragraph above
+ * says cannot be made. Measured live: `nim/nvidia/nemotron-3-ultra-550b-a55b`, which had served 59
+ * of this machine's 62 successful requests, answered one request with 632 tokens in 34863 ms. That
+ * is **55.2 ms/token** against a 250 ceiling — healthy by the primary signal — yet it pushed the
+ * mixed absolute p95 to 34863 and DEMOTED the deployment. Probe-only, the same deployment reads
+ * 23478 ms and is not demoted. The per-token guard could not save it, because per-token engages
+ * only at `minSamples` REQUEST samples and it had three. So a deployment demoted itself by
+ * succeeding, inside a window every deployment passes through on its way to being measured.
+ * ⚠ A request sample with NO token count therefore reaches NEITHER statistic. That is deliberate:
+ * it is a generation of unknown length, so it is not normalisable and not what `p95Ms` describes.
+ * Evidence: `docs/latency-demotion-regression-2026-08-30.md`.
  *
  * ⚠ **NO breaker cooldown is registered, and that is the design, not an omission.** Quota demotion
  * can register one because its evidence STATES a `resetsAt`. Latency states no reset, and this
@@ -176,9 +190,15 @@ export function resolveLatencyDemotion(
 
   // ABSOLUTE FALLBACK: catches a deployment that is slow before it emits anything, and it works
   // before any request sample exists at all.
-  const absoluteSamples = pings.filter((p) => MEASURABLE_CODES.has(p.code)).length;
+  //
+  // ⚠ PROBE samples only. `p95Ms` is calibrated on a `max_tokens: 1` probe, so measuring a real
+  // generation against it compares two different things — see the units note in the module header
+  // and the measured regression it caused. ABSENT `source` means "probe", so this is the
+  // documented test and it keeps every pre-2026-08-30 sample in scope.
+  const probeSamples = pings.filter((p) => p.source !== "request");
+  const absoluteSamples = probeSamples.filter((p) => MEASURABLE_CODES.has(p.code)).length;
   if (absoluteSamples < minSamples) return null;
-  const p95 = getP95(pings);
+  const p95 = getP95(probeSamples);
   if (!Number.isFinite(p95)) return null;
   if (p95 <= p95Ms) return null;
   return { basis: "absolute", measured: p95, threshold: p95Ms, samples: absoluteSamples };

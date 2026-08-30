@@ -715,6 +715,12 @@ because total latency scales with how much was generated: a member that answers 
   catches a deployment that is slow before it emits anything.
 - **Probes never enter the per-token rate.** A probe asks for a single token, so almost all of its
   time is fixed overhead. Counting it would make every healthy deployment look catastrophic.
+- **Real requests never enter the absolute p95.** The separation runs both ways. The absolute
+  ceiling is calibrated on one-token probes, so judging a full generation against it compares two
+  different measurements — and it demotes exactly the deployment that is working, because the
+  deployment serving the most traffic produces the longest answers. A request sample carrying no
+  reported token count therefore reaches **neither** statistic: it is a generation of unknown
+  length, so it cannot be normalised and it is not what the absolute ceiling describes.
 
 Samples live in the same `probe-cache.json` that `llm-relay candidates` reads, so the two surfaces
 agree and the evidence survives a restart. Real served requests are added to that dataset with
