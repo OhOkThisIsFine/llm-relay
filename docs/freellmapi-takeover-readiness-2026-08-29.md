@@ -158,6 +158,8 @@ blocker:
 - Execution pass: the `shell-conventions-guard` hook blocked a `&&`-chained generator run
   (worked as designed — generators run as separate calls); `llm-relay setup claude-cli` printed
   wrapper paths under the temporary worktree instead of the install (recorded in §9 follow-ups).
+- `gh run list --commit <sha>` intermittently returns an EMPTY list for a run that exists — a
+  watch keyed on it silently no-ops. Key CI watches on `--branch` + a headSha match instead.
 
 ## 9. Decision record
 
