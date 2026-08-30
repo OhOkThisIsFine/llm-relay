@@ -1328,6 +1328,61 @@ they never gate traffic unless you turn on the Stage 5 opt-in `routing.quota.enf
 `llm-relay dispatch --next-command -t "<task>"` prints just the runnable line for `next`, for
 callers that want something executable rather than the human ladder.
 
+### `llm-relay mcp` — dispatch as an MCP tool
+
+`llm-relay mcp` serves the dispatch verb over the Model Context Protocol on stdio. Any MCP host
+then delegates a whole task with **one call that returns an answer**, instead of a command it has
+to execute itself.
+
+Why that difference matters: executing a lane command correctly is the hard part. The lane needs
+three client idle timeouts lifted or a long think is aborted at about 300 seconds; it needs its
+stdin closed or `agy` waits on it until the timeout; an npm `.cmd` shim needs a shell whose every
+token is quoted; and a console-subsystem child needs `windowsHide` or it steals the desktop focus.
+`llm-relay mcp` does all of that once, so a caller never builds a command line.
+
+Add it to a host:
+
+```bash
+claude mcp add --scope user llm-relay -- llm-relay mcp
+```
+
+Codex, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.llm-relay]
+command = "llm-relay"
+args = ["mcp"]
+```
+
+Five tools:
+
+| Tool | Purpose |
+|---|---|
+| `dispatch(task, tier?, lane?, cwd?, waitMs?, timeoutMs?)` | Hand a task to the best ready lane and return its answer. |
+| `dispatch_status(jobId)` | Is a long lane still running? |
+| `dispatch_result(jobId)` | Collect a finished lane's answer. |
+| `dispatch_cancel(jobId)` | Stop a running lane. |
+| `dispatch_lanes(tier?)` | Show the ladder, to choose a lane deliberately. |
+
+`dispatch` blocks for `waitMs` (default 60 s) and then hands back a `jobId`. A fast lane therefore
+costs one call, and a long one degrades to polling rather than hitting the host's tool timeout.
+Every answer names the lane that produced it — the relay never presents another agent's text as
+its own.
+
+**Bounds.** Delegation depth is capped at 3 through `LLM_RELAY_DISPATCH_DEPTH`, because a
+dispatched lane can reach this server again. A lane runs in the server's own working directory
+unless the caller names another; declare `routing.mcp.allowedRoots` to bound which directories a
+caller may name:
+
+```json
+{ "routing": { "mcp": { "allowedRoots": ["C:/Code"] } } }
+```
+
+**Scope.** This is a separate process that the host launches. It is not part of the relay daemon,
+it serves no HTTP, and it does not change the rule that no HTTP request causes a lane to be
+spawned. It needs a configured `routing.ladder`, which is a per-machine choice — a fresh install
+ships none, and `dispatch_lanes` says so plainly.
+
 ---
 
 ## The OpenAI front and `/registry`

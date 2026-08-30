@@ -27,6 +27,7 @@ import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js"
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { McpDispatchServer } from "./mcp/server.js";
 import { loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { contextWindowResolver, COST_CLASSES, type ContextWindowSource, type CostClass } from "./metadata.js";
@@ -271,6 +272,7 @@ ${formatTextTable([
   ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane; adapts to the calling host."],
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
   ["llm-relay delegate-gate <diff-file> --repo <root> [--fix]", "Quality-gate a delegated lane's diff before judgment/merge."],
+  ["llm-relay mcp", "Serve the dispatch verb over MCP on stdio, so any MCP host can delegate."],
   ["llm-relay help | --help | -h", "Show help."],
   ["llm-relay version | --version | -v", "Print version."],
 ], "  ")}
@@ -1167,7 +1169,7 @@ const COOLDOWN_CLEAR_OPTIONS: ReadonlyMap<string, CooldownClearOption> = new Map
 export const CLI_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "onboard", "setup", "keys", "check-keys", "models", "ping", "dashboard", "telemetry",
   "offload", "lanes", "dispatch", "cooldowns", "eligibility", "candidates", "cost", "pools",
-  "routing", "route", "config", "delegate-gate", "help", "version",
+  "routing", "route", "config", "delegate-gate", "mcp", "help", "version",
 ]);
 
 interface CommandArity {
@@ -1243,6 +1245,9 @@ const COMMAND_ARITY: Readonly<Record<string, CommandArity>> = {
   route: { min: 1, max: -1 },
   // `runDelegateGateCli(arg3)` — one required diff-file positional; `--repo` and `--fix` are flags.
   "delegate-gate": { min: 2, max: 2, hint: "llm-relay delegate-gate <diff-file> --repo <root> [--fix]" },
+  // Reads no positional at all: every knob is a config setting, because a stdio server is launched
+  // by a host config line that nobody re-types.
+  mcp: { min: 1, max: 1, hint: "llm-relay mcp" },
 };
 
 /**
@@ -1820,6 +1825,13 @@ export interface DashboardCommandRouteDependencies {
    * reporter would let a future caller silently reinstate the fall-through this exists to close.
    */
   readonly reportUnknownCommand: (name: string) => void;
+  /**
+   * Serve MCP on stdio. REQUIRED for the same reason as `reportUnknownCommand`: `mcp` is in
+   * `CLI_COMMAND_NAMES`, so without a branch here it is a KNOWN name that falls through to
+   * `runProxy()` — a host adding the MCP server to its config would silently start a second relay
+   * instead. An optional dependency would let that regression back in.
+   */
+  readonly runMcpServer: () => void;
 }
 
 /**
@@ -1847,6 +1859,15 @@ export function dispatchDashboardOrProxy(
   if (positional === "dashboard") {
     const cfg = dependencies.loadConfig();
     void dependencies.runDashboard(cfg).catch(dependencies.reportError);
+    return undefined;
+  }
+  // ⚠ `mcp` is handled HERE, not in `main`, and both halves of that matter. It is a KNOWN name, so
+  // without this branch it reaches `runProxy()` below and a host wiring up the MCP server would
+  // start a SECOND relay on the configured port instead — a silent, confusing failure. Placing it
+  // in this small router rather than in `main` also keeps it out of a function this repository has
+  // already declined to restructure for complexity.
+  if (positional === "mcp") {
+    dependencies.runMcpServer();
     return undefined;
   }
   if (positional !== undefined && !CLI_COMMAND_NAMES.has(positional)) {
@@ -2092,6 +2113,101 @@ ${lane} — ${entry.models.length} models, probed ${entry.probedAt} via \`${entr
 `);
     process.stdout.write("These are removed from the ladder and their command is withheld.\n");
   }
+}
+
+/**
+ * Resolve one dispatch view for a caller that is NOT the interactive CLI.
+ *
+ * Factored out of `runDispatch` so the MCP server shares its exact resolution — live proxy state
+ * when a relay is listening, a cold local read otherwise, dynamic pools materialized either way.
+ * Two resolvers would be two answers to one question, which is how `/candidates` and the dashboard
+ * once disagreed about the same cell.
+ *
+ * ⚠ `host` is fixed at `"bypassed"` and that is deliberate, not a shortcut. The host verdict
+ * governs one thing: whether a relay rung can be addressed as a subagent, or must be transposed
+ * into a runnable command. An MCP server has no subagent tool and never will — spawning a process
+ * is the only mechanism it has — so `bypassed` is the literally accurate answer for this caller,
+ * and it is what makes every rung come back with an `invoke`.
+ */
+export async function resolveDispatchView(opts: {
+  task?: string | undefined;
+  tier?: string | undefined;
+  lane?: string | undefined;
+  client?: string | undefined;
+  cfg?: Config;
+}): Promise<DispatchView> {
+  const cfg = opts.cfg ?? loadOrExit();
+  const qs = new URLSearchParams();
+  if (opts.task) qs.set("task", opts.task);
+  if (opts.lane) qs.set("lane", opts.lane);
+  if (opts.tier) qs.set("tier", opts.tier);
+  if (opts.client) qs.set("client", opts.client);
+  qs.set("host", "bypassed");
+
+  const catalog = new ModelCatalog();
+  try {
+    materializeDynamicPools(cfg, catalog);
+  } catch {
+    // A pool we cannot materialize stays empty — the same degradation as a cold cache.
+  }
+  const cachedContextWindow = contextWindowResolver(
+    (provider, model) => catalog.cachedLimits(provider, model)?.contextLength ?? null,
+    snapshotContextWindow,
+    observedContextLimit,
+  );
+
+  const liveRaw = (await tryServer(cfg, `/dispatch?${qs}`)) as WireDispatchView | null;
+  // Same staleness discriminator `runDispatch` applies: a proxy that ignores `?host=` would answer
+  // as though relay rungs were addressable, which for this caller is never true.
+  const live = liveRaw !== null && liveRaw.host === "bypassed" ? liveRaw : null;
+  restoreExhaustedRows(cfg, loadExhaustedRows());
+  return normalizeDispatchCommands(
+    live ??
+      buildDispatch(cfg, {
+        ...(opts.task ? { task: opts.task } : {}),
+        ...(opts.lane ? { lane: opts.lane } : {}),
+        ...(opts.tier ? { tier: opts.tier } : {}),
+        ...(opts.client ? { client: opts.client } : {}),
+        host: "bypassed",
+        publishedContextWindow: cachedContextWindow,
+        manifest: loadLaneManifest(),
+      }),
+  );
+}
+
+/**
+ * `llm-relay mcp` — serve the dispatch verb over MCP on stdio.
+ *
+ * Launched by a HOST (`claude mcp add`, `~/.codex/config.toml`, agy's MCP config), never by the
+ * relay daemon. Gives every host one call that returns an ANSWER rather than a command to execute
+ * — see `src/mcp/server.ts` for the full reasoning.
+ */
+export async function runMcp(): Promise<void> {
+  const cfg = loadOrExit();
+  const allowedRoots = cfg.routing.mcp?.allowedRoots;
+  const server = new McpDispatchServer({
+    config: cfg,
+    buildView: (o) => resolveDispatchView({ ...o, cfg }),
+    ...(allowedRoots ? { allowedRoots } : {}),
+    version: currentVersion(),
+    write: (chunk) => process.stdout.write(chunk),
+  });
+
+  const stop = (): void => {
+    server.shutdown();
+    process.exit(0);
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  // A host closing the pipe is the ordinary end of a stdio server's life.
+  process.stdin.on("end", stop);
+  process.stdin.on("close", stop);
+
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) {
+    await server.ingest(chunk as string);
+  }
+  server.shutdown();
 }
 
 /**
@@ -3850,6 +3966,14 @@ export function main(): void {
   dispatchDashboardOrProxy(arg2, {
     loadConfig: loadOrExit,
     runDashboard: runDashboardCommand,
+    runMcpServer: () => {
+      void runMcp().catch((e: unknown) => {
+        // stderr only: stdout carries the MCP protocol, and a stray byte there corrupts the
+        // stream so the host drops the connection with no diagnosable error.
+        process.stderr.write(`llm-relay mcp: ${(e as Error).message}\n`);
+        process.exit(1);
+      });
+    },
     // Bounded, because an unlisted value flag can push its VALUE into command position. The token
     // is the user's own and belongs in their own terminal, but it is not worth echoing unbounded.
     reportUnknownCommand: (name) => {
@@ -3942,6 +4066,11 @@ export function classifyCommand(argv: string[]): CommandEffect {
     // never touches this machine's own config/state, so it stays read-only for update-check
     // purposes exactly like `dispatch -x` does for the same reason.
     case "delegate-gate":
+      return "read-only";
+    // WARNING: explicit, not left to the default. A "mutating" verdict would run the update check,
+    // and a stale GLOBAL install then downloads a replacement and RE-EXECS - which for a stdio
+    // server means the host's pipe dies mid-session with no diagnosable error.
+    case "mcp":
       return "read-only";
     // check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
     // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a

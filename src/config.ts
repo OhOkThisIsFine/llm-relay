@@ -357,6 +357,15 @@ export interface Routing {
    */
   laneProbe?: LaneProbeSettings;
   /**
+   * Settings for `llm-relay mcp`, the stdio MCP server that exposes the dispatch verb to any MCP
+   * host. Read ONLY by that server — the daemon never consults this block, because the daemon
+   * never serves MCP and never spawns a lane for an HTTP turn.
+   *
+   * Absent means every default: the lane runs in the MCP server's own working directory unless the
+   * caller names another, and any existing directory is accepted.
+   */
+  mcp?: McpSettings;
+  /**
    * Ordered dispatch ladder consulted by `/dispatch` — which LANE a host agent should hand a
    * whole delegated task to, and in what order to fall back. Distinct from `subagents`, which
    * routes one HTTP turn: a ladder rung may be an agent CLI that never traverses this proxy,
@@ -1604,6 +1613,7 @@ function parseRouting(
     sticky?: unknown;
     quota?: unknown;
     laneProbe?: unknown;
+    mcp?: unknown;
     ladder?: unknown;
     ladders?: unknown;
     cliLane?: unknown;
@@ -1720,6 +1730,8 @@ function parseRouting(
   const quota = parseQuotaEnforcement(r.quota);
   if (quota) routing.quota = quota;
   routing.laneProbe = parseLaneProbe(r.laneProbe);
+  const mcpSettings = parseMcpSettings(r.mcp);
+  if (mcpSettings) routing.mcp = mcpSettings;
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
@@ -1804,6 +1816,41 @@ function parseRouting(
     }
   }
   return routing;
+}
+
+/** `llm-relay mcp` settings — see the `mcp` field doc on `Routing`. */
+export interface McpSettings {
+  /**
+   * Directories a caller-supplied `cwd` must sit under. Absent or empty ⇒ no bound beyond the
+   * directory existing.
+   *
+   * ⚠ Offered, never imposed. The MCP caller is already a trusted agent on the operator's own
+   * machine, and defaulting to a bound would make the tool useless for its stated purpose. Whether
+   * to narrow it is the operator's decision to record here, not this file's to assume.
+   */
+  allowedRoots?: string[];
+}
+
+/**
+ * Absent ⇒ every default. An unknown key is a hard error naming it (the `laneProbe` and `compat`
+ * precedent: an ignored typo reads as a setting that took effect while bounding nothing).
+ */
+function parseMcpSettings(raw: unknown): McpSettings | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`config.routing.mcp must be an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  for (const key of Object.keys(o)) {
+    if (key !== "allowedRoots") {
+      throw new Error(`config.routing.mcp.${key} is not a recognized key (allowedRoots)`);
+    }
+  }
+  if (o.allowedRoots === undefined) return {};
+  if (!Array.isArray(o.allowedRoots) || o.allowedRoots.some((r) => typeof r !== "string" || r.length === 0)) {
+    throw new Error(`config.routing.mcp.allowedRoots must be an array of non-empty strings`);
+  }
+  return { allowedRoots: [...(o.allowedRoots as string[])] };
 }
 
 /** Background lane re-probing settings — see the `laneProbe` field doc on `Routing`. */

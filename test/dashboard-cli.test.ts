@@ -106,6 +106,7 @@ describe("dashboard CLI launcher", () => {
       reportError: () => undefined,
       reportUnknownCommand: () => undefined,
       runProxy: () => { fallback += 1; },
+      runMcpServer: () => undefined,
     });
     await new Promise<void>((resolve) => queueMicrotask(() => resolve()));
     expect({ loaded, launched, fallback }).toEqual({ loaded: 1, launched: 1, fallback: 0 });
@@ -125,27 +126,34 @@ describe("dashboard CLI launcher", () => {
     const run = (positional: string | undefined) => {
       const seen: string[] = [];
       let fallback = 0;
+      let served = 0;
       dispatchDashboardOrProxy(positional, {
         loadConfig: () => config(),
         runDashboard: async () => undefined,
         reportError: () => undefined,
         reportUnknownCommand: (name) => { seen.push(name); },
         runProxy: () => { fallback += 1; },
+        runMcpServer: () => { served += 1; },
       });
-      return { seen, fallback };
+      return { seen, fallback, served };
     };
 
     // A typo is refused, and NAMED — the whole diagnostic value.
-    expect(run("dashbaord")).toEqual({ seen: ["dashbaord"], fallback: 0 });
-    expect(run("stats")).toEqual({ seen: ["stats"], fallback: 0 });
+    expect(run("dashbaord")).toEqual({ seen: ["dashbaord"], fallback: 0, served: 0 });
+    expect(run("stats")).toEqual({ seen: ["stats"], fallback: 0, served: 0 });
 
     // No positional at all still starts the proxy: `llm-relay [options]` is the primary usage.
-    expect(run(undefined)).toEqual({ seen: [], fallback: 1 });
+    expect(run(undefined)).toEqual({ seen: [], fallback: 1, served: 0 });
 
     // A KNOWN command that reaches the tail keeps falling through, so nothing that worked changes.
     // `onboard` is in CLI_COMMAND_NAMES and is claimed by an earlier branch in the real ladder;
     // reaching here directly proves the guard is gated on the name set, not on the ladder.
-    expect(run("onboard")).toEqual({ seen: [], fallback: 1 });
+    expect(run("onboard")).toEqual({ seen: [], fallback: 1, served: 0 });
+
+    // WARNING: `mcp` is in CLI_COMMAND_NAMES, so without its own branch it would be a KNOWN name
+    // that falls through to `runProxy()` — a host wiring up the MCP server would silently start a
+    // SECOND relay on the configured port. It must serve MCP and start no proxy.
+    expect(run("mcp")).toEqual({ seen: [], fallback: 0, served: 1 });
   });
 
   it("waits for native opener success and rejects spawn/nonzero failures", async () => {
