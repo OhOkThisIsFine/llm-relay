@@ -19,7 +19,7 @@ import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { PingLoop } from "../src/ping/cadence.js";
 import type { Config, ProviderConfig } from "../src/config.js";
-import type { PingRecord } from "../src/ping/metrics.js";
+import { countMsPerTokenSamples, getP95MsPerToken, type PingRecord } from "../src/ping/metrics.js";
 import type { ResolvedAttempt } from "../src/resolved-attempt.js";
 import {
   DEFAULT_LATENCY_MIN_SAMPLES,
@@ -54,6 +54,54 @@ function requests(n: number, ms: number, tokens: number, code = "200"): PingReco
     source: "request" as const,
   }));
 }
+
+/**
+ * The two per-token statistics, tested DIRECTLY.
+ *
+ * WARNING: these exist because an independent auditor mutation-checked the module and found the
+ * `source !== "request"` guard was NOT pinned by anything. Every probe fixture in this file lacks a
+ * token count, so the separate `tokens > 0` check already excluded them and the source guard could
+ * be deleted with the whole suite still green. Worse, the two guards live in two functions that
+ * shield each other through `resolveLatencyDemotion`: mutating either one alone is absorbed, so no
+ * end-to-end test can pin them. Only a direct test of each function can.
+ *
+ * Production probes never carry a token count today, so nothing was broken - but the module's
+ * sharpest claim was resting on an accident of the fixtures rather than on the code.
+ */
+describe("per-token statistics — the guards, pinned one at a time", () => {
+  /** A probe that DOES carry a token count. Nothing writes this today; the guard is why. */
+  const probeWithTokens: PingRecord[] = Array.from({ length: 20 }, (_, i) => ({
+    ms: 5_000,
+    code: "200",
+    timestamp: 1_000 + i,
+    tokens: 1,
+  }));
+
+  it("getP95MsPerToken excludes a probe sample even when it carries a token count", () => {
+    // 5000 ms for 1 token would read as 5000 ms/token - catastrophic, and pure fixed overhead.
+    // Admitting it would demote every healthy deployment that has probe history.
+    expect(getP95MsPerToken(probeWithTokens)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("countMsPerTokenSamples excludes it too, so the sample floor cannot be widened by probes", () => {
+    // The count and the statistic MUST agree. A count over a wider set is exactly how a floor
+    // comes to admit a figure resting on too few real measurements.
+    expect(countMsPerTokenSamples(probeWithTokens)).toBe(0);
+  });
+
+  it("both accept a request sample, so the guards are not simply rejecting everything", () => {
+    // The negative control for the two assertions above.
+    const real: PingRecord[] = Array.from({ length: 6 }, (_, i) => ({
+      ms: 5_000,
+      code: "200",
+      timestamp: 2_000 + i,
+      tokens: 1,
+      source: "request" as const,
+    }));
+    expect(countMsPerTokenSamples(real)).toBe(6);
+    expect(getP95MsPerToken(real)).toBe(5_000);
+  });
+});
 
 describe("latency demotion — per-token, the primary signal", () => {
   it("demotes a deployment whose measured ms/token exceeds the ceiling", () => {

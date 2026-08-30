@@ -240,16 +240,6 @@ export class PingLoop {
   }
 
   /**
-   * Recent probes for a model — from memory, falling back to what previous runs persisted.
-   *
-   * ⚠ The fallback is the whole point. This used to read `pingHistory` alone, a Map built only
-   * during the current process's life, while `recordProbeResult` wrote every probe to
-   * `probe-cache.json` and nothing ever read it back. Every restart therefore reset every model
-   * to `Pending` with `p95: -1`, so a proxy that restarts at all — a laptop that slept, an
-   * upgrade, a crash — never accumulated latency history for anything. The disk is the long-term
-   * record this is supposed to be keeping; memory is just the hot copy.
-   */
-  /**
    * Record a REAL SERVED REQUEST's latency against a deployment, with the output-token count when
    * the provider reported one.
    *
@@ -294,6 +284,20 @@ export class PingLoop {
     }
   }
 
+  /**
+   * Recent samples for a model — from memory, falling back to what previous runs persisted.
+   *
+   * ⚠ The fallback is the whole point. This used to read `pingHistory` alone, a Map built only
+   * during the current process's life, while `recordProbeResult` wrote every probe to
+   * `probe-cache.json` and nothing ever read it back. Every restart therefore reset every model
+   * to `Pending` with `p95: -1`, so a proxy that restarts at all — a laptop that slept, an
+   * upgrade, a crash — never accumulated latency history for anything. The disk is the long-term
+   * record this is supposed to be keeping; memory is just the hot copy.
+   *
+   * ⚠ Since 2026-08-30 the window carries REQUEST samples beside probes (`source: "request"`, with
+   * a token count). This is the seam `latency-demotion.ts` reads, which is exactly why the
+   * fallback matters there too: without it the latency term would go inert after every restart.
+   */
   public getModelPings(providerKey: string, modelId: string): PingRecord[] {
     const key = `${providerKey}/${modelId}`;
     const live = this.pingHistory.get(key);

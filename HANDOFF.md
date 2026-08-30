@@ -4,11 +4,16 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-30 (sixth lap)
 
-**Current: v0.63.0 is released** — npm `dist-tags.latest` 0.63.0 and `llm-relay version` 0.63.0,
-both verified 2026-08-30 against the registry itself rather than a cached packument. ⚠ The RUNNING
-relay's version is not asserted here: `GET /telemetry` carries no version field, so a claim about
-the live process needs a restart or another check — and the daemon on this machine was started
-before v0.63.0, so it is NOT serving this build.
+**Current: v0.65.0 is released** — npm `dist-tags.latest` 0.65.0, verified against the registry
+itself rather than a cached packument, and the global bin reinstalled to match. Four releases
+landed on 2026-08-30 (v0.63.1 → v0.65.0); the seventh lap's entry below says what each carried.
+✅ **The running daemon IS serving this build** — restarted onto it on the owner's instruction and
+confirmed by a real request that persisted a request-latency sample.
+⚠ **`GET /telemetry` still carries no version field**, so a claim about the live process always
+needs a restart or another check; that has caught this file out before. ⚠ A packument read right
+after a publish can serve a STALE `dist-tags.latest` — the version document
+(`registry.npmjs.org/llm-relay/<version>`, HTTP 200) plus the publish job's own conclusion are the
+tie-breakers, and they disagreed once during this lap.
 §6 holds recorded trades, deferrals and settled decisions, not a work queue. The work queue is
 [docs/backlog.md](docs/backlog.md). **Both owner decisions that stood there are now settled:**
 package-size variant C is adopted, and the MCP server (D4) is BUILT AND SHIPPED to `main`.

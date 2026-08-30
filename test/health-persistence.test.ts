@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   recordProbeResult,
+  recordRequestSample,
   loadPersistedSamples,
   loadTotals,
   loadPersistedQuotaObservations,
@@ -415,5 +416,109 @@ describe("flushRuntimeTelemetry cleans up its temp file when the rename fails", 
   it("still swallows the error rather than failing its caller", () => {
     const blocked = blockedTarget("blocked-telemetry-swallow.json");
     expect(() => flushRuntimeTelemetry({ path: blocked })).not.toThrow();
+  });
+});
+
+/**
+ * REQUEST samples in the probe dataset (owner decision 2026-08-30).
+ *
+ * The latency term reads this dataset, and the writer carries explicit promises about what it does
+ * NOT touch. Those promises were prose only until an independent auditor pointed out that nothing
+ * pinned them — so each one is asserted here, against a real temp cache file.
+ */
+describe("probe cache — request-latency samples", () => {
+  function seedProbe(): void {
+    recordProbeResult("nim", "m1", { code: "200", ms: 900, ...noQuota }, { path: cachePath, now: 1_000 });
+  }
+
+  function entry() {
+    return loadProbeCache({ path: cachePath, reload: true }).providers["nim"]!.models["m1"]!;
+  }
+
+  it("appends a request sample carrying its source and token count", () => {
+    seedProbe();
+    recordRequestSample("nim", "m1", { ms: 2120, tokens: 64 }, { path: cachePath, now: 2_000 });
+    const samples = loadPersistedSamples("nim", "m1", { path: cachePath });
+    expect(samples).toHaveLength(2);
+    expect(samples[1]).toEqual({ ms: 2120, code: "200", timestamp: 2_000, tokens: 64, source: "request" });
+    // The measured live value on 2026-08-30 was exactly this: 2120 ms / 64 tokens = 33.1 ms/token.
+    expect(samples[1]!.ms / samples[1]!.tokens!).toBeCloseTo(33.1, 1);
+  });
+
+  it("records a sample with NO token count rather than inventing one", () => {
+    // Unknown is never zero. Such a sample still measures absolute latency; it simply cannot
+    // contribute to the per-token rate.
+    seedProbe();
+    recordRequestSample("nim", "m1", { ms: 500 }, { path: cachePath, now: 2_000 });
+    const samples = loadPersistedSamples("nim", "m1", { path: cachePath });
+    expect(samples[1]).toEqual({ ms: 500, code: "200", timestamp: 2_000, source: "request" });
+    expect(samples[1]).not.toHaveProperty("tokens");
+  });
+
+  it("touches NOTHING that schedules probing", () => {
+    // ⚠ The load-bearing guarantee. `getModelsDueForProbe` reads `lastProbedAt`, so if a request
+    // sample refreshed it, a deployment carrying real traffic would silently stop being probed —
+    // its independent health signal going stale precisely for the models that matter most.
+    seedProbe();
+    const before = entry();
+    const snapshot = {
+      status: before.status,
+      lastProbedAt: before.lastProbedAt,
+      probeVersion: before.probeVersion,
+      ms: before.ms,
+      code: before.code,
+      quotaObservations: before.quotaObservations,
+      totals: { ...before.totals! },
+    };
+    recordRequestSample("nim", "m1", { ms: 99_999, tokens: 1 }, { path: cachePath, now: 5_000 });
+    const after = entry();
+    expect(after.status).toBe(snapshot.status);
+    expect(after.lastProbedAt).toBe(snapshot.lastProbedAt);
+    expect(after.probeVersion).toBe(snapshot.probeVersion);
+    expect(after.ms).toBe(snapshot.ms);
+    expect(after.code).toBe(snapshot.code);
+    expect(after.quotaObservations).toEqual(snapshot.quotaObservations);
+    // `totals` count PROBES and feed uptime; folding request samples in would change what uptime
+    // has always meant.
+    expect(after.totals).toEqual(snapshot.totals);
+  });
+
+  it("SKIPS an unknown deployment rather than minting a fake probe record", () => {
+    seedProbe();
+    recordRequestSample("nim", "never-probed", { ms: 100, tokens: 10 }, { path: cachePath, now: 2_000 });
+    const cache = loadProbeCache({ path: cachePath, reload: true });
+    expect(cache.providers["nim"]!.models["never-probed"]).toBeUndefined();
+    // …and it did not disturb the deployment that does exist.
+    expect(loadPersistedSamples("nim", "m1", { path: cachePath })).toHaveLength(1);
+  });
+
+  it("refuses a nonsensical duration instead of persisting it", () => {
+    seedProbe();
+    for (const ms of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      recordRequestSample("nim", "m1", { ms, tokens: 5 }, { path: cachePath, now: 2_000 });
+    }
+    expect(loadPersistedSamples("nim", "m1", { path: cachePath })).toHaveLength(1);
+  });
+
+  it("bounds the window at MAX_SAMPLES like every other writer", () => {
+    seedProbe();
+    for (let i = 0; i < MAX_SAMPLES + 10; i += 1) {
+      recordRequestSample("nim", "m1", { ms: 10 + i, tokens: 2 }, { path: cachePath, now: 3_000 + i });
+    }
+    const samples = loadPersistedSamples("nim", "m1", { path: cachePath });
+    expect(samples).toHaveLength(MAX_SAMPLES);
+    // Oldest-first, so the seeded probe has aged out and the newest write is last.
+    expect(samples[samples.length - 1]!.ms).toBe(10 + MAX_SAMPLES + 9);
+  });
+
+  it("PingLoop.recordRequestLatency writes through to the same persisted window", () => {
+    // The thin wrapper the request path actually calls: in-memory window plus the durable one.
+    seedProbe();
+    const loop = new PingLoop(emptyConfig, new ModelCatalog({ cachePath: null }), { probeCachePath: cachePath });
+    loop.recordRequestLatency("nim", "m1", { ms: 3_000, tokens: 100 });
+    const live = loop.getModelPings("nim", "m1");
+    expect(live[live.length - 1]).toMatchObject({ ms: 3_000, tokens: 100, source: "request" });
+    const persisted = loadPersistedSamples("nim", "m1", { path: cachePath });
+    expect(persisted[persisted.length - 1]).toMatchObject({ ms: 3_000, tokens: 100, source: "request" });
   });
 });
