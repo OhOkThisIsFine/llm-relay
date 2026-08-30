@@ -32,6 +32,24 @@
   retry". This is the stronger form — no output and no exit — so establish first whether it is a
   lane stall, a relay stall, or a client-side hang, and do not assume which.
 
+  ✅ **Reproduced through a SECOND, independent path (2026-08-30, v0.63.0 release verification),
+  which narrows it usefully.** The same `pool/medium` lane stalled when spawned by the new
+  `llm-relay mcp` server rather than by a shell running `dispatch --next-command`. That rules out
+  one whole class of cause: the MCP server closes stdin, lifts all three idle timeouts from the
+  rung's own `env`, sets `windowsHide`, and quotes the `.cmd` fallback per token — so the stall is
+  NOT caused by any of the four known command-execution mistakes. It survives a correct invocation.
+
+  ⚠ It is intermittent, not constant, and that matters for whoever investigates: the SAME code and
+  the SAME lane answered in 33 s and (via agy) in 7 s earlier the same day, then stalled past 100 s
+  and past 420 s within the hour. Treat it as a load- or time-dependent condition, not a broken
+  path. `GET /telemetry` answered 200 throughout, and `usage/recent.json` held no rows for the
+  stalled attempts — so the request may not be reaching the accounting store at all, which is the
+  next thread worth pulling.
+
+  ⚠ The MCP server does not fix this and does not claim to. What it changes is the SYMPTOM: the
+  caller receives a `jobId` after `waitMs` and can poll or `dispatch_cancel` it, instead of a shell
+  that blocks with no output and no exit.
+
 ## Closed
 
 - ✅ **Package-size variant C adopted and shipped** (owner decision, 2026-08-30).
