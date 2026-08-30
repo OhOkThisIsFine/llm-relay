@@ -681,6 +681,30 @@ describe("PingLoop Cadence", () => {
     expect(probed).not.toContain("catalog-only");
   });
 
+  it("⚠ a direct tickOnce call NEVER fires the lane-cadence hook — only the self-scheduled loop does", async () => {
+    // The 2026-08-30 closeout audit caught the leak this pins: the admitted GET /ping route
+    // calls tickOnce directly, so a hook inside tickOnce let an HTTP request initiate lane
+    // work — crossing the "request path never spawns a lane" boundary. The hook now fires only
+    // from start()'s own loop iteration.
+    const mockCatalog: ModelCatalog = { list: async () => [] } as any;
+    let fired = 0;
+    const loop = new PingLoop(testConfig({}), mockCatalog, {
+      probeCachePath: isolatedProbeCache(),
+      onTick: () => {
+        fired++;
+      },
+    });
+    await loop.tickOnce();
+    await loop.tickOnce("routable");
+    expect(fired).toBe(0);
+
+    // start()'s first iteration runs synchronously up to its first await, and the hook fires
+    // before the tick — one firing, then stop() before the timer re-arms.
+    loop.start();
+    expect(fired).toBe(1);
+    loop.stop();
+  });
+
   it("keeps quota isolated by exact credential and model", () => {
     const loop = new PingLoop(testConfig({}), {} as ModelCatalog, { probeCachePath: isolatedProbeCache() });
     const personal = makeCredentialId("testProv");
