@@ -108,10 +108,31 @@ two passes into one `removeComments: true` — that is variant B, which strips t
 was rejected for that reason. See the CLAUDE.md build note and
 [docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md) §3.1.
 
-**Immediate next:** one item for whoever picks this repo up — the owner-directed investigation into
-why the llm-relay offload lane STALLS and returns nothing (measured: ~17 minutes, ~19 idle child
-processes, one diagnostic line reporting `pool/medium` as an unrecognized model on the
-session-title query path). See [docs/backlog.md](docs/backlog.md).
+**This lap (2026-08-30, seventh) — the self-announcing-offload lap.**
+
+✅ **Offload now announces itself.** The owner reported having to say *"use llm-relay for offload"*
+out loud, and asked that the tool make itself known without being named. Three measured causes, all
+fixed in the repo so every host and every stranger gets it: the MCP `initialize` instructions stated
+only WHAT the tool is (they are the one channel a host loads unconditionally); the `dispatch` tool
+is DEFERRED on a real host, so its description never loads until a tool search; and the skill
+description triggered on the DECISION to offload rather than on the situation. Four tests in
+`test/mcp-server.test.ts` pin the claims, mutation-checked both ways. Details in
+[docs/backlog.md](docs/backlog.md).
+⚠ The durable lesson is in `CLAUDE.md`: **prose the model must go and find is not a trigger.** The
+global instructions already said "PREFER THE MCP TOOL" in bold and it changed nothing.
+
+✅ **The offload "stall" is root-caused, and it is not a stall.** A `pool/medium` lane completed
+with **exit 0 after 333 s** and returned a complete answer. The cost is the relay's own candidate
+walk: individual requests took 120–123 s across 2–6 attempts, because latency is deliberately not
+part of health banding, so a breaker-CLOSED member with a **p95 of 70364 ms**
+(`nim/deepseek-ai/deepseek-v4-flash`) is walked ahead of a cooling one. Two previously recorded
+threads are disproved — the accounting store DOES receive the rows (`recent.json` `rows` is simply
+not sorted by time), and the `unrecognized_model` line remains the no-information warning
+`CLAUDE.md` already describes. Full evidence table in [docs/backlog.md](docs/backlog.md).
+
+**Immediate next:** the stall item is now an owner DECISION, not an investigation. The behaviour
+follows from a design choice recorded with its reasoning (`src/server.ts:1257-1265`), so changing it
+is the owner's call. The three options are stated in [docs/backlog.md](docs/backlog.md).
 
 ⚠ **The MCP server design is OWNED BY ANOTHER AGENT** (owner, 2026-08-30). Do not start it here.
 ⚠⚠ **And its stated justification expired ~70 minutes after the decision.** D4 rested on *"agy has

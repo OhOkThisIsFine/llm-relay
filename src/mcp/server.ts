@@ -89,6 +89,29 @@ interface ToolDefinition {
 }
 
 /**
+ * The `initialize` instructions. An MCP host puts this in the model's system prompt
+ * unconditionally, so it is the ONE channel here that cannot be deferred, collapsed to a bare
+ * tool name, or missed because the model never went looking. The tool descriptions below say
+ * WHAT each tool does; a host only reads them once the model has already decided to delegate.
+ *
+ * ⚠ So this text must state WHEN to delegate, not just what the tool is. It carried only the
+ * "what" until 2026-08-30, and the measured consequence was that the operator had to say
+ * "use llm-relay for offload" out loud — on a machine whose own CLAUDE.md already said
+ * "PREFER THE MCP TOOL" in bold. Prose the model must go and find is not a trigger.
+ *
+ * Keep it short: every host pays for it in every session. Pinned by `test/mcp-server.test.ts`.
+ */
+export const MCP_INSTRUCTIONS =
+  "Use dispatch to hand a whole task to another agent lane and get its answer back. You never " +
+  "need to know whether the lane is a model pool or a peer CLI — that is resolved here.\n\n" +
+  "Reach for it on your own, without being asked. Offload a task when it is self-contained and " +
+  "its result is a conclusion you can check: a broad code search, a file-by-file sweep, a " +
+  "survey, a draft, a long summary, a second opinion. Keep in this session whatever needs your " +
+  "own conversation context or edits you must supervise. The default lane is free capacity, so " +
+  "offloading spends no subscription quota and saves this session's context.\n\n" +
+  "Lane output is advisory. Verify it against the source before you act on it.";
+
+/**
  * The tool set, kept deliberately small.
  *
  * `agent-dispatch`, the closest prior art, exposes about twenty tools. That is the opposite of the
@@ -101,10 +124,13 @@ const TOOLS: ToolDefinition[] = [
     title: "Dispatch a task to another agent",
     description:
       "Hand a whole task to the best available agent lane (a free model pool, or a peer agent CLI " +
-      "such as Codex or Antigravity) and return its answer. Picks the lane from the configured " +
-      "ladder unless you name one. Runs the lane correctly — working directory, environment and " +
-      "idle timeouts are handled here, so you never build a command line. If the lane is still " +
-      "running after waitMs, returns a jobId to poll with dispatch_status.",
+      "such as Codex or Antigravity) and return its answer. Reach for this without being asked " +
+      "whenever a task is self-contained and its result is a conclusion you can check — a broad " +
+      "code search, a file-by-file sweep, a survey, a draft, a second opinion — because the " +
+      "default lane is free capacity and it saves this session's context. Picks the lane from " +
+      "the configured ladder unless you name one. Runs the lane correctly — working directory, " +
+      "environment and idle timeouts are handled here, so you never build a command line. If the " +
+      "lane is still running after waitMs, returns a jobId to poll with dispatch_status.",
     inputSchema: {
       type: "object",
       properties: {
@@ -343,9 +369,7 @@ export class McpDispatchServer {
       protocolVersion: negotiateProtocolVersion(p["protocolVersion"]),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: MCP_SERVER_NAME, version: this.deps.version ?? "unknown" },
-      instructions:
-        "Use dispatch to hand a whole task to another agent and get its answer back. You never " +
-        "need to know whether the lane is a model pool or a peer CLI — that is resolved here.",
+      instructions: MCP_INSTRUCTIONS,
     };
   }
 

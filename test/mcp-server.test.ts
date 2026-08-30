@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  MCP_INSTRUCTIONS,
   McpDispatchServer,
   type DispatchViewBuilder,
   type McpServerDeps,
@@ -180,6 +181,39 @@ describe("mcp server handshake", () => {
     expect(result["protocolVersion"]).toBe("2025-06-18");
     expect(result["capabilities"]).toEqual({ tools: { listChanged: false } });
     expect(result["serverInfo"]).toEqual({ name: "llm-relay", version: "9.9.9" });
+  });
+
+  it("serves the instructions constant on the wire, never a second hand-written copy", async () => {
+    const h = new Harness();
+    const res = await h.request("initialize", {});
+    const result = res["result"] as Record<string, unknown>;
+    expect(result["instructions"]).toBe(MCP_INSTRUCTIONS);
+  });
+
+  it("states WHEN to delegate, not only what the tool is", () => {
+    // ⚠ This pins CLAIMS, not prose. An MCP host puts `instructions` in the model's system prompt
+    // unconditionally, so it is the one channel that cannot be deferred or missed — and until
+    // 2026-08-30 it carried only the "what". The measured consequence: the operator had to say
+    // "use llm-relay for offload" out loud, on a machine whose own global instructions already
+    // said "PREFER THE MCP TOOL" in bold. Reword freely; if you drop one of these three claims,
+    // update this test deliberately rather than deleting the assertion.
+    const text = MCP_INSTRUCTIONS.toLowerCase();
+    // 1. The trigger is unprompted. Without this the model waits to be told.
+    expect(text).toContain("without being asked");
+    // 2. Offloading is cheap, which is the reason to prefer it.
+    expect(text).toContain("free capacity");
+    // 3. And the answer is not authoritative, which bounds what the model may do with it.
+    expect(text).toContain("advisory");
+  });
+
+  it("carries the unprompted trigger on the dispatch tool description too", async () => {
+    // Belt and braces: a host that ignores `initialize` instructions still reads tool
+    // descriptions, and that host would otherwise get the "what" with no "when".
+    const h = new Harness();
+    const res = await h.request("tools/list");
+    const tools = (res["result"] as { tools: { name: string; description: string }[] }).tools;
+    const dispatch = tools.find((t) => t.name === "dispatch");
+    expect(dispatch?.description.toLowerCase()).toContain("without being asked");
   });
 
   it("reports the version as unknown rather than a fake 0.0.0 when none is injected", async () => {

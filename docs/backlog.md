@@ -42,15 +42,86 @@
   ⚠ It is intermittent, not constant, and that matters for whoever investigates: the SAME code and
   the SAME lane answered in 33 s and (via agy) in 7 s earlier the same day, then stalled past 100 s
   and past 420 s within the hour. Treat it as a load- or time-dependent condition, not a broken
-  path. `GET /telemetry` answered 200 throughout, and `usage/recent.json` held no rows for the
-  stalled attempts — so the request may not be reaching the accounting store at all, which is the
-  next thread worth pulling.
+  path.
+
+  ✅ **ROOT-CAUSED 2026-08-30. It is not a stall at all — it is cumulative pool-walk latency.**
+  A `pool/medium` lane dispatched through the MCP tool completed normally with **exit 0 after
+  333 s** and returned a complete, correct answer. So the lane does not hang, the child is not
+  wedged, and none of the four known command-execution mistakes is involved. What takes the time
+  is the relay's own candidate walk. Measured in that lane's window, from `usage/recent.json`:
+
+  | started | latency | outcome | attempts | served |
+  |---|---|---|---|---|
+  | 19:34:08 | 120222 ms | `provider_error` | 2 | — |
+  | 19:34:08 | 120280 ms | `provider_error` | 2 | — |
+  | 19:36:08 | 5321 ms | success | 1 | `nim/nvidia/nemotron-3-ultra-550b-a55b` |
+  | 19:36:08 | 15457 ms | success | 1 | `nim/nvidia/nemotron-3-ultra-550b-a55b` |
+  | 19:36:24 | 123343 ms | **`timeout`** | **6** | — |
+  | 19:38:28 | 70750 ms | success | 2 | `nim/nvidia/nemotron-3-ultra-550b-a55b` |
+
+  A single agent turn costing 120 s, times the several turns a `claude -p` run makes, is the
+  whole reported duration. The `~19 idle node children` are those turns waiting on the relay, and
+  the absent output is just `claude -p` buffering its answer until exit — a fact `CLAUDE.md`
+  already records as meaning nothing.
+
+  ⚠ **Why the walk is that expensive: latency is not part of health banding, deliberately.**
+  `llm-relay candidates --tier medium`, same window — five of the top-ranked members carry an
+  OPEN breaker (`nim/moonshotai/kimi-k3` for 72838 s, `huggingface/moonshotai/Kimi-K3` 927 s,
+  `ollama-cloud/minimax-m3` 928 s, `nim/minimaxai/minimax-m3` 649 s), and
+  `nim/deepseek-ai/deepseek-v4-flash` is **breaker-CLOSED with a p95 of 70364 ms**. `server.ts`
+  ordering demotes on breaker state and nothing else (`src/server.ts:1257-1265`, with the reason
+  stated: a second ranking pass on stability "means neither decides the order"). So a healthy-but-
+  glacial member is walked AHEAD of a cooling one, and each such candidate can cost 60–70 s before
+  the walk moves on. Even the member that finally served has p95 23478 ms and answered one
+  request in 70750 ms.
+
+  ⚠ **Two recorded threads are now disproved; do not re-pull them.**
+  - *"`usage/recent.json` held no rows for the stalled attempts, so the request may not be reaching
+    the accounting store."* **False.** The rows are there. `recent.json` `rows` is **not sorted by
+    time**, so reading its tail shows an hour-old row while `max(startedAt)` is current. I made
+    exactly that mistake twice before sorting. Sort before concluding anything from this file.
+  - *"the `[claude-code:unrecognized_model]` line on the session-title path is the only thread."*
+    It remains a harmless side query. `CLAUDE.md` already records that warning as carrying no
+    information.
+
+  **What is left is a DECISION, not an investigation.** The behaviour follows from a design choice
+  that is recorded with its reasoning, so changing it is the owner's call. Options: bound the
+  per-candidate attempt so a 70 s member cannot hold a walk; let sustained latency demote into the
+  cooling band; or accept it and leave the MCP job handle as the mitigation.
 
   ⚠ The MCP server does not fix this and does not claim to. What it changes is the SYMPTOM: the
   caller receives a `jobId` after `waitMs` and can poll or `dispatch_cancel` it, instead of a shell
   that blocks with no output and no exit.
 
 ## Closed
+
+- ✅ **Offload announces itself — the operator no longer has to ask for it** (2026-08-30).
+  The owner's report was blunt: *"the llm-relay skill or MCP or whatever should obviate me
+  explicitly saying 'use llm-relay for offload' … it should make itself known to the agent without
+  me having to say so."* Three measured causes, all closed in the repo so every host and every
+  stranger gets the fix:
+  1. **The MCP `initialize` instructions stated only WHAT the tool is.** A host puts that text in
+     the model's system prompt unconditionally, so it is the one channel that cannot be deferred
+     or missed — and it never said WHEN to delegate. It does now (`MCP_INSTRUCTIONS`, exported
+     from `src/mcp/server.ts`).
+  2. **The `dispatch` tool is a DEFERRED tool on a real host**, so only its bare name loads and its
+     description is invisible until a tool search. The trigger sentence now rides the description
+     as well, for a host that ignores `instructions`.
+  3. **The skill description triggered on the DECISION, not the situation** — "use when offloading
+     bulk work" only fires once the model has already chosen to offload. It now names the
+     situations (a broad search, a file-by-file sweep, a survey, a draft, a second opinion) and
+     says outright that nobody has to ask first. A new skill section carries the policy.
+
+  ⚠ **The lesson worth keeping: prose the model must go and find is not a trigger.** This machine's
+  global `CLAUDE.md` already said *"PREFER THE MCP TOOL"* in bold, and the owner still had to say
+  it out loud. That is the machine's own "rules become tooling, not prose" policy failing in the
+  one place nobody had applied it.
+
+  Pinned by four tests in `test/mcp-server.test.ts` — the served instructions must equal the
+  exported constant, and both the constant and the `dispatch` description must carry the trigger.
+  Mutation-checked both ways: removing the trigger from the constant fails exactly one test, and
+  removing it from the tool description fails exactly the other, so neither assertion is carrying
+  the other.
 
 - ✅ **Package-size variant C adopted and shipped** (owner decision, 2026-08-30).
   `build:server` runs `tsc` twice: pass 1 emits `.d.ts` WITH docs, pass 2 re-emits only the

@@ -2,12 +2,14 @@
 name: llm-relay
 description: >-
   Operate llm-relay, the loopback multi-provider LLM proxy (default 127.0.0.1:8791) that
-  validates/repairs tool calls and can independently offload Claude, Codex, and future client
-  requests to non-Anthropic providers. Use when offloading bulk work to a subagent on another
-  provider, choosing an offload target, addressing a pool or model through the relay, toggling
-  client-specific offload,
-  dispatching to peer agent CLIs (Antigravity/Codex) as fallback lanes, reordering dispatch,
-  or diagnosing a request that failed at or behind the relay.
+  validates/repairs tool calls and offloads Claude, Codex and other client requests to
+  non-Anthropic providers on free capacity. Use it BEFORE spending this session's context or
+  subscription quota on delegatable work — a broad code search, a file-by-file sweep, a survey,
+  a bulk edit, a long summary, a second opinion, or any self-contained task whose result is a
+  conclusion you can check. Nobody has to ask for offload first. Also use when choosing an
+  offload target, addressing a pool or model through the relay, toggling client-specific
+  offload, dispatching to peer agent CLIs (Antigravity/Codex) as fallback lanes, reordering
+  dispatch, or diagnosing a request that failed at or behind the relay.
 ---
 
 # llm-relay — operating guide
@@ -22,6 +24,45 @@ so agent harnesses can run on models that are weaker at tool use. Config, keys a
 One boundary governs everything it does: the proxy fixes **protocol form** (tool-call args that
 violate the schema), never **judgment**. It refuses to fabricate destructive tool calls, and an
 unrepairable response fails loudly (502 / mid-stream SSE error) rather than passing through broken.
+
+## Reach for a lane without being asked
+
+**The operator should never have to say "use llm-relay for offload".** If they did, this section
+failed. Offload is a reflex you apply yourself, not an instruction you wait for. ⚠ Prose alone has
+already failed at this once: a machine whose global instructions said *"PREFER THE MCP TOOL"* in
+bold still needed the words spoken out loud (2026-08-30). That is why the trigger now lives in the
+skill description and in the MCP `initialize` instructions, which a host loads whether or not the
+model goes looking.
+
+**Offload a task when both of these hold:**
+
+1. It is self-contained. A prompt plus a path is enough, and it needs nothing from this
+   conversation that you cannot write into the prompt.
+2. Its result is a conclusion you can check afterwards against the source.
+
+Typical: a broad code search, a file-by-file sweep, an inventory, a survey of prior art, a long
+summary, a draft, a second opinion on a diagnosis, a bulk mechanical edit.
+
+**Keep the work here instead when** it needs your own conversation context, when you must
+supervise each edit, when it is one file and two minutes, or when the answer decides something
+you cannot reverse.
+
+**How to offload, in order of preference:**
+
+1. `dispatch(task: "...")` — the MCP tool. One call returns an ANSWER. Prefer it whenever the
+   tools are present, because building and running a lane command correctly is the part that keeps
+   going wrong; the server handles the working directory, the environment and the idle timeouts.
+2. `llm-relay dispatch --next-command -t "<task>"` — when the MCP tools are absent. Exit 0 prints
+   one runnable command line. Exit 2 means the rung is a relay target, so address the named spec
+   as an ordinary subagent.
+
+⚠ Free capacity is spent before any metered or subscription lane, so an offloaded task normally
+costs no subscription quota.
+
+⚠ **Lane output is advisory.** Verify every claim against the source before you act on it. For a
+lane that WRITES, inspect the tree yourself (`git status --porcelain`, `git diff`,
+`git show --stat HEAD`) rather than trusting the lane's own report, and give every writing lane its
+own worktree.
 
 ## First use on a machine — ASK, do not assume
 
