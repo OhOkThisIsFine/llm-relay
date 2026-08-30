@@ -291,9 +291,36 @@ ids written down anywhere, since a de-listed id fails a whole rung.
 
 ### One verb, host-adapted
 
-`llm-relay dispatch -t "<task>"` is the **only** thing you need to ask, from any harness. Do not
-branch on which one you are in, and do not reason about whether a subagent can reach a pool from
-here — the relay works that out and answers with something you can actually run.
+`llm-relay dispatch` is the **only** thing you need to ask, from any harness. Do not branch on which
+one you are in, and do not reason about whether a subagent can reach a pool from here — the relay
+works that out and answers with something you can actually run.
+
+Two flags, and pick by what you are doing:
+
+```bash
+llm-relay dispatch --next-command -t "<task>"   # TO ACT: just the command, ~220 tokens
+llm-relay dispatch -t "<task>"                  # TO SURVEY: the whole ladder, ~1800 tokens
+```
+
+⚠ **Use `--next-command` when you intend to delegate.** Bare `-t` prints every rung with its notes
+and ends with a `use:` line naming the winner — useful when you are choosing or diagnosing, and
+roughly eight times the tokens when you only wanted the command.
+
+`--next-command` has exactly two outcomes, and that is the whole contract:
+
+| Exit | Output | What you do |
+|---|---|---|
+| `0` | one runnable command line | Run it in your shell, verbatim. |
+| `2` | `lane "<id>" is a relay target (<spec>), not a command` on **stderr** | Address `<spec>` as an ordinary subagent. |
+
+Exit 2 means the relay judged a subagent to be the *better* mechanism here, not that something
+failed — your traffic reaches the relay, so `routing.subagents` reroutes an ordinary `Agent(...)`
+call in place, with no second process. The spec is already in that message; you never need a second
+call to find it.
+
+⚠ You will only ever see exit 2 from a session whose traffic reaches the relay. A host with no
+Claude harness at all — a script, a cron job, CI — has no subagent to fall back on, so every relay
+rung comes back transposed into a command and `--next-command` always exits 0 there.
 
 It classifies the calling session as **routed** (its traffic reaches the relay, so relay rungs work
 as written) or **bypassed** (it does not — Claude Desktop, or any session with no loopback

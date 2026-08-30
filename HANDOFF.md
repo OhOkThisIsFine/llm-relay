@@ -51,7 +51,28 @@ against a `CLAUDE.md` now 182.0 KB. ⚠ **That step can only run in the MAIN che
 resolves project targets under `C:/Code` and never reads a worktree — so a worktree lap must hand it
 back or step out to finish it.
 
-**Immediate next:** nothing pending. Two recorded items remain in
+**This lap (2026-08-30, fifth) — the skill/dispatch/MCP verification lap.** Owner asked three
+questions: is the skill installed correctly and generated from a single source of truth; can an
+agent dispatch with ONE syntax in every case; and does MCP make sense, assessed fresh. Full record,
+including every claim three independent adversarial reviews broke:
+[docs/skill-dispatch-mcp-verification-2026-08-30.md](docs/skill-dispatch-mcp-verification-2026-08-30.md).
+
+- **Skill installation: PASS.** One source, `copyFileSync` to two hosts, verified live by MD5 —
+  source and both installed copies are `8aa883fe…`. Seven test cases pin the installer.
+- **One code fix, a real defect.** A stated `unknown` host — any shell with no `CLAUDECODE` — was
+  treated like `routed`, so a headless caller got a `target:` spec to address as a subagent it does
+  not have, and `--next-command` exited 2 leaving it nothing to run. Reproduced with zero flags.
+  `dispatch.ts` now carries three named predicates; an ABSENT verdict deliberately keeps the old
+  path. Mutation-checked. See the CLAUDE.md gotcha.
+- **MCP: NO**, with recorded reversal conditions. Two obvious objections turned out INVALID (no
+  dependency is needed; `packBytes` is a regenerable ceiling) and are recorded so nobody repeats
+  them. The decisive fact is that a fresh install ships no ladder at all.
+- ⚠ **Surfaced, not decided:** a fresh install has **no** `routing.ladder` and no `cliLane`, so
+  `llm-relay dispatch` returns `next: null` for a stranger. Every dispatch-uniformity improvement,
+  MCP included, fails the "this installation first" rubric test until that changes. This is an
+  owner decision, not a defect.
+
+**Immediate next:** owner decisions listed in the verification doc §6. Two recorded items remain in
 [docs/backlog.md](docs/backlog.md), both about package size and neither blocking.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner

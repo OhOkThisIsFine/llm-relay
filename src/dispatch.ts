@@ -642,6 +642,39 @@ function describeId(id: string): string {
   return clean.length > MAX_ECHOED_ID ? `${clean.slice(0, MAX_ECHOED_ID)}\u2026` : clean;
 }
 
+/**
+ * Can THIS host address a relay spec as a subagent at all?
+ *
+ * `routed` can — its traffic reaches the relay, so `routing.subagents` reroutes an `Agent(...)`
+ * call in place. An ABSENT verdict keeps that same pre-existing path: the caller stated nothing,
+ * and second-guessing silence would change behaviour for a caller that never asked.
+ *
+ * `bypassed` and `unknown` cannot, for different reasons — see `mustTransposeEveryRung`.
+ */
+function canAddressAsSubagent(host: HostRoutingState | undefined): boolean {
+  return host === "routed" || host === undefined;
+}
+
+/**
+ * Must EVERY relay rung be transposed for this host, whatever the spec says?
+ *
+ * Only for a STATED `unknown`. `host-routing.ts` defines that state as "not running inside a
+ * Claude Code session — no subagent routing to adapt to", so such a caller has no subagent
+ * mechanism of any kind and `reachableWithoutRelay` has nothing to decide: even the plain
+ * Anthropic passthrough, which any Claude harness reaches with a bare `Agent(...)`, is
+ * unreachable here. A `bypassed` host still HAS the tool, so it keeps the per-spec test.
+ */
+function mustTransposeEveryRung(host: HostRoutingState | undefined): boolean {
+  return host === "unknown";
+}
+
+/** Why a relay rung cannot be reached, in terms true for THIS host's actual condition. */
+function unreachableReason(host: HostRoutingState | undefined, who: string): string {
+  return mustTransposeEveryRung(host)
+    ? `${who} is not running inside a Claude Code session, so it has no subagent mechanism to reach`
+    : `${who} does not route its traffic through this relay, so a subagent cannot reach`;
+}
+
 function toLane(
   rung: LadderRung,
   position: number,
@@ -650,7 +683,7 @@ function toLane(
   now: number,
   client: string,
   platform: NodeJS.Platform,
-  host: HostRoutingState,
+  host: HostRoutingState | undefined,
   entrypoint: string | undefined,
 ): DispatchLane {
   const until = cooldownUntil(cfg, rung, now);
@@ -689,10 +722,14 @@ function toLane(
   }
   if (rung.kind === "relay" && rung.spec) {
     lane.spec = rung.spec;
-    const bypassed = host === "bypassed";
-    if (!bypassed) {
+    // ⚠ This used to ask only `host === "bypassed"`, so a STATED `unknown` fell through with
+    // `routed` and a headless caller — a cron job, a CI step, `run-headless.ps1` — was handed a
+    // `target:` spec to address as a subagent it does not have; `--next-command` then refused
+    // with exit 2 and left it nothing to run. That is the closed-vocabulary defect class
+    // CLAUDE.md documents: an unhandled member falling through to the STRONGER claim.
+    if (canAddressAsSubagent(host)) {
       lane.requiresDirective = !offloadRule(cfg, client).enabled;
-    } else if (!reachableWithoutRelay(rung.spec, cfg)) {
+    } else if (mustTransposeEveryRung(host) || !reachableWithoutRelay(rung.spec, cfg)) {
       // The host cannot address this spec as a subagent at all, so the rung is offered as the
       // shell-out that CAN reach it — a change of mechanism, not of target. `requiresDirective`
       // is deliberately left unset: see its doc comment.
@@ -709,9 +746,12 @@ function toLane(
           if (window.unknownMembers > 0) lane.contextWindowUnknownMembers = window.unknownMembers;
         }
       } else {
+        // Name the REAL reason, which differs by state. Telling a cron job that it "does not
+        // route its traffic through this relay" describes a Claude-harness condition it does
+        // not have, and points at a fix that would not help it.
         lane.unreachable =
-          `${who} does not route its traffic through this relay, so a subagent cannot reach ` +
-          `"${rung.spec}" — configure routing.cliLane to reach it by shelling out`;
+          `${unreachableReason(host, who)} "${rung.spec}" — ` +
+          `configure routing.cliLane to reach it by shelling out`;
       }
     }
   }
@@ -797,7 +837,10 @@ export function buildDispatch(
   const now = Date.now();
   const selected = selectLadder(cfg, opts.tier);
   const rungs = selected.rungs;
-  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client, platform, host, opts.entrypoint));
+  // ⚠ `opts.host`, NOT the `host` above. `host` collapses an ABSENT verdict into "unknown" for
+  // the rendered view, and the lane builder must tell those two apart: an absent verdict keeps
+  // the pre-existing subagent path, a STATED "unknown" has no subagent mechanism to keep.
+  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client, platform, opts.host, opts.entrypoint));
   const offload = offloadRule(cfg, client).enabled;
   const base = { tier: selected.tier, offload, client, host, ladder };
 
