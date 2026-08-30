@@ -147,16 +147,20 @@ deleted, and it still bounds the design: what was rejected is a second ranking P
 and can PROMOTE on one request's latency, and that stays rejected. Do not "restore" the old
 behaviour as a regression fix.
 
-⚠ **One follow-up, found immediately after shipping it and recorded rather than left to be
-rediscovered: `routing.latency` measures REAL REQUEST latency** (breaker pings, in memory), not the
-probe latency `llm-relay candidates` displays (`probe-cache.json`). So it is **inert after every
-relay restart** until `minSamples` real requests per deployment, and the 30000 ms default was
-calibrated on `candidates` figures — i.e. on probes sending `max_tokens: 1` — while it is applied
-to full generations, which run higher. Nothing is unsafe (it still only reorders, still needs 5
-samples, still does nothing when unmeasured), but the dataset choice is an open decision with three
-costed options in [docs/backlog.md](docs/backlog.md).
+✅ **And the dataset question that opened right after it is closed too** (owner decision, same day):
+`routing.latency` reads the **PROBE dataset** — it persists across restarts and is what
+`llm-relay candidates` shows — and that dataset now carries **request latency** as well, so the
+primary signal is **milliseconds per output token**. Absolute latency cannot compare a
+`max_tokens: 1` probe with a 500-token generation; per-token can, and it is FINAL when it has
+evidence rather than falling through to the absolute ceiling. The 250 ms/token default is measured
+from 68 real requests (healthy deployments 36–70, the bad one 688), not invented.
 
-**Immediate next:** that one decision. Everything else this lap is shipped and released.
+⚠ The first version of this read the BREAKER's pings — request-path only, in memory only — so it
+went inert after every restart and disagreed with `candidates`. **A live check found that one
+request after restarting the daemon; the tests and an independent auditor did not, because every
+test seeded the breaker directly and so agreed with the code about which dataset it meant.**
+
+**Immediate next: nothing.** [docs/backlog.md](docs/backlog.md) has an empty Open section.
 
 ⚠ **The MCP server design is OWNED BY ANOTHER AGENT** (owner, 2026-08-30). Do not start it here.
 ⚠⚠ **And its stated justification expired ~70 minutes after the decision.** D4 rested on *"agy has

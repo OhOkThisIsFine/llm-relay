@@ -4,6 +4,7 @@ import { pingProviderModel, type PingResult } from "./ping.js";
 import { type PingRecord, getAvg, getP95, getJitter, getStabilityScore, getVerdict, getUptime } from "./metrics.js";
 import {
   recordProbeResult,
+  recordRequestSample,
   getModelsDueForProbe,
   loadPersistedSamples,
   loadPersistedQuotaObservations,
@@ -248,6 +249,51 @@ export class PingLoop {
    * upgrade, a crash — never accumulated latency history for anything. The disk is the long-term
    * record this is supposed to be keeping; memory is just the hot copy.
    */
+  /**
+   * Record a REAL SERVED REQUEST's latency against a deployment, with the output-token count when
+   * the provider reported one.
+   *
+   * Owner decision 2026-08-30: the latency signal reads the PROBE dataset, and the probe dataset
+   * carries request samples too, so a per-token rate can come from actual traffic rather than from
+   * a one-token probe.
+   *
+   * WARNING: this must never look like a probe. `recordRequestSample` leaves every
+   * probe-scheduling field alone, and this method deliberately does NOT touch `latestQuota` or
+   * the entry status either. A served request already reported its quota headers through the
+   * request path's own observer; re-recording them here would double-count one observation.
+   *
+   * WARNING: tokens ABSENT means unknown, never zero. A sample with no token count still measures
+   * absolute latency; it simply cannot contribute to the per-token statistic.
+   */
+  public recordRequestLatency(
+    providerKey: string,
+    modelId: string,
+    sample: { ms: number; tokens?: number },
+  ): void {
+    if (typeof sample.ms !== "number" || !Number.isFinite(sample.ms) || sample.ms < 0) return;
+    const key = providerKey + "/" + modelId;
+    // Through the hydrating getter, so this process appends to the history previous runs built
+    // instead of starting a second, shorter one beside it.
+    if (!this.pingHistory.has(key)) this.getModelPings(providerKey, modelId);
+    let history = this.pingHistory.get(key);
+    if (!history) {
+      history = [];
+      this.pingHistory.set(key, history);
+    }
+    const record: PingRecord = { ms: sample.ms, code: "200", timestamp: Date.now(), source: "request" };
+    if (typeof sample.tokens === "number" && Number.isFinite(sample.tokens) && sample.tokens > 0) {
+      record.tokens = sample.tokens;
+    }
+    history.push(record);
+    if (history.length > 50) history.shift();
+    try {
+      recordRequestSample(providerKey, modelId, sample, this.probeCacheOpts());
+    } catch {
+      // Persistence is best effort. A corrupt or unwritable cache must never affect a served
+      // request, and the in-memory window above already carries the sample for this process.
+    }
+  }
+
   public getModelPings(providerKey: string, modelId: string): PingRecord[] {
     const key = `${providerKey}/${modelId}`;
     const live = this.pingHistory.get(key);

@@ -2,6 +2,20 @@ export interface PingRecord {
   ms: number;
   code: string;
   timestamp: number;
+  /**
+   * Output tokens this sample generated, when the provider reported them.
+   *
+   * ⚠ ABSENT means UNKNOWN, never zero — the standing provenance rule. Present only on
+   * `source: "request"` samples: a probe asks for one token, so its rate would be pure fixed
+   * overhead and is deliberately not comparable with a real generation.
+   */
+  tokens?: number;
+  /**
+   * Where the sample came from. ⚠ ABSENT means `"probe"` — that is every sample written before
+   * 2026-08-30 and every sample the ping loop writes, so absence must never be read as "unknown
+   * provenance". Only the request path writes `"request"`.
+   */
+  source?: "probe" | "request";
 }
 
 export type Verdict =
@@ -44,6 +58,60 @@ export function getP95(pings: PingRecord[]): number {
   const sorted = measurable.map((p) => p.ms).sort((a, b) => a - b);
   const idx = Math.ceil(sorted.length * 0.95) - 1;
   return sorted[Math.max(0, idx)]!;
+}
+
+/**
+ * 95th-percentile latency PER OUTPUT TOKEN, in ms — the only figure that compares a real
+ * generation with anything else, because absolute latency scales with how much was generated.
+ *
+ * ⚠ REQUEST samples only, and only those carrying a reported token count. A probe sends
+ * `max_tokens: 1`, so its ms/token is almost entirely fixed overhead (connect, queue, prompt
+ * processing) and would read as catastrophically slow beside a 500-token answer that amortises
+ * the same overhead. Mixing the two would not be a noisy measurement; it would be a wrong one.
+ *
+ * ⚠ Returns `Infinity` when nothing qualifies — "unmeasured", never "infinitely slow", exactly as
+ * `getP95` does. Callers must test `Number.isFinite` rather than compare against a ceiling.
+ *
+ * Measured on this machine 2026-08-30 over 68 real requests, and this is what calibrates the
+ * default ceiling: p50 40.4, p75 70.5, p90 292.0, p95 967.1 ms/token. Per deployment the
+ * separation is clean — a healthy `nemotron-3-ultra` ran a median 36.3 while `gemini-3.6-flash`
+ * ran 687.8.
+ */
+export function getP95MsPerToken(pings: PingRecord[]): number {
+  const rates: number[] = [];
+  for (const p of pings) {
+    if (p.source !== "request") continue;
+    if (!MEASURABLE_CODES.has(p.code)) continue;
+    const tokens = p.tokens;
+    if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) continue;
+    if (typeof p.ms !== "number" || !Number.isFinite(p.ms) || p.ms < 0) continue;
+    rates.push(p.ms / tokens);
+  }
+  if (rates.length === 0) return Infinity;
+  rates.sort((a, b) => a - b);
+  const idx = Math.ceil(rates.length * 0.95) - 1;
+  return rates[Math.max(0, idx)]!;
+}
+
+/**
+ * How many samples actually back `getP95MsPerToken`.
+ *
+ * ⚠ It repeats that function's filter deliberately, and the two must stay identical: a count taken
+ * over a WIDER set than the statistic it describes is how a sample floor comes to admit a figure
+ * resting on one measurement.
+ */
+export function countMsPerTokenSamples(pings: PingRecord[]): number {
+  return pings.filter(
+    (p) =>
+      p.source === "request" &&
+      MEASURABLE_CODES.has(p.code) &&
+      typeof p.tokens === "number" &&
+      Number.isFinite(p.tokens) &&
+      p.tokens > 0 &&
+      typeof p.ms === "number" &&
+      Number.isFinite(p.ms) &&
+      p.ms >= 0,
+  ).length;
 }
 
 /** Calculate latency standard deviation (jitter) in ms from measurable pings. */

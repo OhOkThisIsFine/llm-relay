@@ -181,6 +181,51 @@ export function getModelsDueForProbe(
   return due;
 }
 
+/**
+ * Append a REAL SERVED-REQUEST latency sample to a deployment's rolling window.
+ *
+ * Owner decision 2026-08-30: `routing.latency` reads the PROBE dataset — it persists across
+ * restarts and it is what `llm-relay candidates` displays — and that dataset is EXPANDED to carry
+ * request latency too, so a per-token rate can be derived from actual traffic.
+ *
+ * ⚠ **It deliberately touches NOTHING that schedules probing.** `status`, `lastProbedAt`,
+ * `probeVersion`, the scalar `ms`/`code` and `quotaObservations` are all left exactly as they were,
+ * because `getModelsDueForProbe` reads `lastProbedAt`: refreshing it here would mean a deployment
+ * carrying real traffic silently STOPPED being probed, so its independent health signal would go
+ * stale precisely for the models that matter most.
+ *
+ * ⚠ **`totals` are untouched too.** They count PROBES (`probes`/`ok`/`sumMs`) and feed uptime;
+ * folding request samples in would change what uptime has always meant.
+ *
+ * ⚠ **An unknown deployment is SKIPPED, not created.** Minting an entry here would mean inventing
+ * probe-scheduling fields for a model nobody has probed. The ping loop creates the entry on its
+ * first real probe and request samples land from then on — a short warm-up, in exchange for never
+ * writing a fabricated probe record.
+ */
+export function recordRequestSample(
+  providerKey: string,
+  modelId: string,
+  sample: { ms: number; tokens?: number },
+  opts: { now?: number; path?: string } = {},
+): void {
+  if (typeof sample.ms !== "number" || !Number.isFinite(sample.ms) || sample.ms < 0) return;
+  const now = opts.now ?? Date.now();
+  const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
+  const entry = cache.providers[providerKey]?.models[modelId];
+  if (!entry) return;
+  // Same write-side guard as `recordProbeResult`: a corrupt `samples` survives the shallow load,
+  // and spreading a string here would persist an array of single characters as measurements.
+  const prevSamples = Array.isArray(entry.samples) ? entry.samples : [];
+  const record: PingRecord = { ms: sample.ms, code: "200", timestamp: now, source: "request" };
+  if (typeof sample.tokens === "number" && Number.isFinite(sample.tokens) && sample.tokens > 0) {
+    record.tokens = sample.tokens;
+  }
+  const samples = [...prevSamples, record];
+  entry.samples = samples.length > MAX_SAMPLES ? samples.slice(samples.length - MAX_SAMPLES) : samples;
+  if (opts.path) flushProbeCache({ path: opts.path, cache });
+  else scheduleProbeCacheFlush();
+}
+
 export function recordProbeResult(
   providerKey: string,
   modelId: string,

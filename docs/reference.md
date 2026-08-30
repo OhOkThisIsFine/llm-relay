@@ -686,7 +686,7 @@ as an offload lane "stalling".
 
 ```json
 "routing": {
-  "latency": { "enabled": true, "p95Ms": 30000, "minSamples": 5 }
+  "latency": { "enabled": true, "msPerToken": 250, "p95Ms": 30000, "minSamples": 5 }
 }
 ```
 
@@ -696,22 +696,37 @@ exactly. An unknown key is a hard config error rather than a silently ignored on
 When the walk's ranked first choice was displaced this way, the response says so:
 
 ```
-x-llm-relay-latency-demoted: nim/deepseek-ai/deepseek-v4-flash (p95 70364ms > 30000ms over 10 samples)
+x-llm-relay-latency-demoted: gemini/models/gemini-3.6-flash (p95 687.8ms/token > 250ms/token over 8 request samples)
 ```
 
 ⚠ That header is this demotion's **only** surface. Unlike quota it registers no breaker cooldown, so
 `llm-relay candidates` and the dashboard Cooldowns panel — which read breaker state — will not show
 it.
 
-⚠ **It measures REAL REQUEST latency, and that has two consequences worth knowing.** The samples
-come from requests the relay actually served, held in memory:
+### What it measures: latency per token
 
-- **It is inert after a relay restart** until at least `minSamples` real requests have been served
-  for a deployment. Background probes do not feed it.
-- **It can disagree with the `p95` column in `llm-relay candidates`**, which is probe latency from
-  `probe-cache.json`. A probe asks for one token; a real request generates an answer, so request
-  latency is systematically higher. Treat the default ceiling of 30000 ms as a starting point and
-  tune it against your own traffic rather than against the `candidates` column.
+The primary signal is **milliseconds per output token**, not total round-trip time. That matters,
+because total latency scales with how much was generated: a member that answers a long question in
+40 seconds is not slow, and a member that takes 40 seconds to produce 60 tokens is.
+
+- **Per-token wins when it has evidence.** With at least `minSamples` real request samples, its
+  verdict is final — a healthy per-token rate is *not* then overridden by the absolute ceiling.
+- **Absolute p95 is the fallback**, used only when there is not enough per-token evidence. It still
+  catches a deployment that is slow before it emits anything.
+- **Probes never enter the per-token rate.** A probe asks for a single token, so almost all of its
+  time is fixed overhead. Counting it would make every healthy deployment look catastrophic.
+
+Samples live in the same `probe-cache.json` that `llm-relay candidates` reads, so the two surfaces
+agree and the evidence survives a restart. Real served requests are added to that dataset with
+their output-token counts; recording one never changes probe scheduling.
+
+The defaults are measured, not guessed. Over 68 real requests on the author's machine the
+population ran 40 ms/token at the median and 70 at p75, while one bad deployment ran 688. Re-run
+that check against your own traffic before tuning:
+
+```bash
+node -e "const r=require(require('os').homedir()+'/.llm-relay/usage/recent.json');const v=r.rows.filter(x=>x.outcome==='success'&&x.tokens?.reported?.reportedOutput?.value>0).map(x=>x.latencyMs/x.tokens.reported.reportedOutput.value).sort((a,b)=>a-b);console.log('n',v.length,'p50',v[v.length>>1]?.toFixed(1),'p90',v[Math.floor(v.length*0.9)]?.toFixed(1))"
+```
 
 #### Hard caps refuse, loudly
 

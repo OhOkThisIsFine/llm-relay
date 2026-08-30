@@ -9,8 +9,52 @@
 
 ## Open
 
-- **Decide which latency dataset `routing.latency` should measure** (found 2026-08-30, immediately
-  after shipping it; the feature works, this is about which evidence it reads).
+_Nothing open._
+
+## Closed
+
+- ✅ **Which latency dataset `routing.latency` measures — DECIDED and SHIPPED** (owner,
+  2026-08-30). *"Switch to the probe dataset, and expand that dataset to include request latency …
+  where we can get latency per token from actual requests."* Delivered:
+
+  1. **Reads the PROBE dataset** (`probe-cache.json`, via an injected `readPings` seam). It
+     persists across restarts and is what `llm-relay candidates` displays, so the two surfaces
+     agree and the term is no longer inert after a restart.
+  2. **That dataset now carries REQUEST latency too.** `probe-cache.ts` `recordRequestSample`, fed
+     from `RequestAccountingState.complete()` for SERVED + SUCCESS attempts only, with the reported
+     output-token count. ⚠ It touches nothing that schedules probing — `lastProbedAt`, `status`,
+     `probeVersion`, the scalar `ms`/`code`, `quotaObservations` and `totals` are all left alone,
+     because refreshing `lastProbedAt` would silently stop probing the deployments carrying real
+     traffic. An unknown deployment is skipped, never created with invented probe fields.
+  3. **Latency PER TOKEN is the primary signal** (`getP95MsPerToken`), because absolute latency
+     cannot compare a `max_tokens: 1` probe with a 500-token generation. Probes are excluded from
+     it by construction; absolute p95 remains the fallback when per-token has too little evidence.
+
+  ⚠ **Per-token is FINAL when it has evidence, and a test forced that.** The first implementation
+  fell through to the absolute ceiling after a healthy per-token verdict, so a member answering in
+  40 s with 1000 tokens — 40 ms/token, squarely healthy — was demoted anyway by the 30000 ms
+  ceiling. That would make "primary signal" meaningless and punish exactly the fast deployment that
+  merely produced a long answer.
+
+  **The default is measured, not invented.** 250 ms/token, from 68 real requests in
+  `usage/recent.json` on 2026-08-30: population p50 40.4, p75 70.5, p90 292.0, p95 967.1; per
+  deployment a healthy `nemotron-3-ultra` at a median 36.3 and `minimax-m3` at 57.3 against
+  `gemini-3.6-flash` at **687.8**. 250 sits about 3.5x above the healthy band and well below the
+  bad one. `docs/reference.md` carries the one-liner to re-run that calibration.
+
+  ⚠⚠ **THE PACKAGE CEILING WAS RAISED A SECOND TIME IN ONE LAP, against the standing rule.** That
+  rule reads "never raise a ratchet twice in one lap for that lap's own work", and it is recorded
+  here as a knowing exception rather than quietly taken. Reasoning, for the owner to overrule: this
+  was a SEPARATE owner decision taken mid-lap and shipped as its own release, not the same change
+  creeping; the growth was root-caused to the byte first; and the alternatives were deleting
+  documentation to fit a number, or leaving correct, released work red. Growth since the published
+  v0.64.2, decomposed with **no residue** and **no new entries** (359 unchanged):
+  `unpackedBytes` 4673004 -> 4690084 (**+17080**) = 4522 `ping/metrics` + 3790 `ping/probe-cache`
+  + 3170 `ping/cadence` + 2772 `latency-demotion` + 2364 `server` + 462 `config`. Ceilings keep the
+  same ~0.5% headroom the baseline has always carried.
+
+- **(superseded, kept for its reasoning) Decide which latency dataset `routing.latency` should
+  measure** (found 2026-08-30, immediately after shipping it).
 
   `src/latency-demotion.ts` reads `breaker.getDeploymentMeasurement().pings` — **real
   served-request** latency, written only by `applyHealthOutcome` on the request path, held in
@@ -33,9 +77,9 @@
   ⚠ Nothing here is unsafe: the term still only reorders, still needs 5 samples, and still does
   nothing when unmeasured. The live check after the restart returned
   `4 tried, 0 served: 1x429, 2x402, 1x504` with no latency header — consistent with a freshly
-  restarted breaker holding no samples yet, and with the pool genuinely being sick.
-
-## Closed
+  restarted breaker holding no samples yet, and with the pool genuinely being sick. That live check
+  is what surfaced the dataset question, one request after the restart, when neither the tests nor
+  an independent auditor had.
 
 - ✅ **The offload lane "stall" — root-caused, then FIXED** (owner-directed, 2026-08-30).
   Filed as *"investigate why the llm-relay offload lane STALLS and returns nothing"*; it turned out

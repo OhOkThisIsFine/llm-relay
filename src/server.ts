@@ -396,7 +396,11 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   // `latency-demotion.ts`). Built once per proxy like `quotaDemotion` above; each call re-reads
   // live breaker samples, so the demotion lifts by itself when the measurement recovers.
   const latencyDemotion = createLatencyDemotionFn({
-    breaker,
+    // The PROBE dataset, which persists across restarts and is what `llm-relay candidates` shows.
+    // It briefly read the breaker's pings instead: request-path only, in memory only, never
+    // written by `PingLoop` - so the term went inert after every restart and could disagree with
+    // the surface the operator reads. Owner decision 2026-08-30.
+    readPings: (provider, model) => pingLoop.getModelPings(provider, model),
     // No conditional spread: `parseLatencyDemotion` is TOTAL, so `routing.latency` is always
     // present on a loaded config and `undefined` here only for a hand-built one — which the
     // module already reads as "every default".
@@ -768,6 +772,17 @@ class RequestAccountingState {
   private readonly request: AccountingRequest | null;
   private readonly active = new Set<AccountingAttempt>();
   private readonly committed = new Set<AccountingAttempt>();
+  /**
+   * Per-attempt deployment + start time, so `complete()` can attribute a served request's latency.
+   *
+   * `AccountingAttempt` carries `role` and `startedAt` but NOT provider/model - those are given to
+   * `start()`. Rather than widen that contract, the pair is remembered here and dropped the moment
+   * the attempt completes, so this map can never outlive the request.
+   */
+  private readonly attemptDeployments = new Map<
+    AccountingAttempt,
+    { provider: string | null; model: string | null; startedAt: number }
+  >();
   private responseTerminal: "finished" | "cancelled" | null = null;
   private finalized = false;
   private successfulServe = false;
@@ -782,6 +797,13 @@ class RequestAccountingState {
     private readonly estimatedInputTokens: number,
     client: string,
     private readonly pricePort?: AccountingPricePort,
+    /** Sink for a served request's measured latency. Absent on a bare programmatic proxy. */
+    private readonly onServedLatency?: (
+      provider: string,
+      model: string,
+      ms: number,
+      tokens: number | undefined,
+    ) => void,
   ) {
     try {
       this.request = createAccountingRequest({ recorder, startedAt, client, pricePort });
@@ -879,6 +901,33 @@ class RequestAccountingState {
     } catch {
       // The recorder and its packets are strictly observational.
     }
+    // A SERVED, SUCCESSFUL attempt is a real latency measurement for this deployment, and the
+    // output-token count makes it comparable with any other. Feed it to the health dataset the
+    // latency demotion reads (owner decision 2026-08-30).
+    //
+    // Serve-only and success-only, deliberately: a repair is internal traffic the caller never
+    // waited for, and a failed attempt's elapsed time measures the failure, not the throughput.
+    // Tokens ABSENT stays absent - unknown is never zero, so such a sample still measures absolute
+    // latency and simply cannot contribute to the per-token rate.
+    const deployment = this.attemptDeployments.get(attempt);
+    this.attemptDeployments.delete(attempt);
+    if (
+      this.onServedLatency &&
+      deployment &&
+      attempt.role === "serve" &&
+      outcome === "success" &&
+      typeof deployment.provider === "string" &&
+      typeof deployment.model === "string"
+    ) {
+      const elapsed = endedAt - deployment.startedAt;
+      if (Number.isFinite(elapsed) && elapsed >= 0) {
+        try {
+          this.onServedLatency(deployment.provider, deployment.model, elapsed, usage.outputTokens);
+        } catch {
+          // Health sampling is strictly observational and must never fail a served request.
+        }
+      }
+    }
     this.active.delete(attempt);
     this.committed.delete(attempt);
     this.lastAttribution = attempt.attribution;
@@ -901,6 +950,11 @@ class RequestAccountingState {
     try {
       const attempt = this.request.startAttempt({ role, ...options });
       this.active.add(attempt);
+      this.attemptDeployments.set(attempt, {
+        provider: options.provider,
+        model: options.model,
+        startedAt: options.startedAt,
+      });
       this.lastAttribution = options.attribution;
       return attempt;
     } catch {
@@ -1161,6 +1215,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       estimatedRequestTokens,
       requestClient,
       h.accountingPricePort,
+      (provider, model, ms, tokens) => {
+        h.pingLoop?.recordRequestLatency(
+          provider,
+          model,
+          tokens === undefined ? { ms } : { ms, tokens },
+        );
+      },
     )
     : null;
 

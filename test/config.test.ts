@@ -1693,9 +1693,11 @@ describe("loadConfig — routing.latency", () => {
     expect(loadConfig(write("lat-true.json", latencyCfg(true))).routing.latency).toEqual({ enabled: true });
   });
 
-  it("round-trips an explicit ceiling and sample floor", () => {
-    expect(loadConfig(write("lat-obj.json", latencyCfg({ p95Ms: 5000, minSamples: 20 }))).routing.latency)
-      .toEqual({ p95Ms: 5000, minSamples: 20 });
+  it("round-trips both ceilings and the sample floor", () => {
+    expect(
+      loadConfig(write("lat-obj.json", latencyCfg({ p95Ms: 5000, msPerToken: 120, minSamples: 20 })))
+        .routing.latency,
+    ).toEqual({ p95Ms: 5000, msPerToken: 120, minSamples: 20 });
   });
 
   it("REFUSES an unknown key rather than ignoring it", () => {
@@ -1716,6 +1718,9 @@ describe("loadConfig — routing.latency", () => {
     }
     expect(() => loadConfig(write("lat-bad-samples.json", latencyCfg({ minSamples: 0 })))).toThrow(
       /routing\.latency\.minSamples must be a positive finite number/,
+    );
+    expect(() => loadConfig(write("lat-bad-rate.json", latencyCfg({ msPerToken: -5 })))).toThrow(
+      /routing\.latency\.msPerToken must be a positive finite number/,
     );
   });
 

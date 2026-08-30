@@ -12,11 +12,11 @@
  * - **Demote only.** Never promote, never drop, never re-sort. The objection is about a competing
  *   ranking PASS; a one-way term folded into `targetUsability` is not one. Fitness still decides
  *   the order, exactly as it does for quota.
- * - **Never act on one request's latency.** `p95` over at least `minSamples` MEASURABLE samples,
- *   which is the objection's own worst case ruled out by construction.
- * - **Unmeasured has NO effect whatsoever.** `getP95` answers `Infinity` when nothing measurable
- *   was sampled, and `Infinity` is not a slow deployment — it is an unmeasured one. Treating it as
- *   slow would demote every never-probed member, which is the "unknown stays null, never 0"
+ * - **Never act on one request's latency.** Every figure is a p95 over at least `minSamples`
+ *   qualifying samples — the objection's own worst case, ruled out by construction.
+ * - **Unmeasured has NO effect whatsoever.** Both statistics answer `Infinity` when nothing
+ *   qualifies, and `Infinity` is an UNMEASURED deployment, never an infinitely slow one. Treating
+ *   it as slow would demote every never-probed member, which is the "unknown stays null, never 0"
  *   invariant broken in the most damaging possible direction.
  *
  * WHY IT EXISTS. Measured 2026-08-30: an offload lane read as "stalled" was in fact paying the
@@ -26,97 +26,119 @@
  * else, that healthy-but-glacial member was walked AHEAD of every cooling one. Evidence:
  * `docs/backlog.md`.
  *
- * ⚠ **NO breaker cooldown is registered, and that is the design, not an omission.** Quota
- * demotion can register one because its evidence STATES a `resetsAt`. Latency states no reset, and
- * this relay never invents a cooldown duration — so instead the term is re-resolved from the
- * rolling sample window on every request, which means it lifts BY ITSELF as soon as the
- * measurement recovers, with no expiry anybody had to guess. The cost, stated: a latency demotion
- * is invisible to `/candidates`' cooldown column and to the dashboard Cooldowns panel, because
- * those read breaker state. The response header is its surface.
+ * ⚠ **WHICH DATASET — the answer changed once already, so it is stated plainly.** This reads the
+ * PROBE dataset (`probe-cache.json`, through the injected `readPings` seam), which is what
+ * `llm-relay candidates` displays and which SURVIVES A RESTART. It briefly read the BREAKER's
+ * pings instead; those are request-path only, in memory only, and never written by `PingLoop`, so
+ * the term went inert after every restart and could disagree with the surface an operator reads.
+ * Owner decision, same day: use the probe dataset, and EXPAND it to carry request latency too
+ * (`probe-cache.ts` `recordRequestSample`).
  *
- * ⚠ **WHICH DATASET, and what follows from it.** `getDeploymentMeasurement` returns the
- * BREAKER's pings, which are written only by `applyHealthOutcome` on the REQUEST path — they are
- * real served-request latencies, they live in memory only, and `PingLoop` never writes them
- * (`cadence.ts`: "PingLoop holds no breaker reference"). `breaker-persistence.ts` deliberately
- * does not persist them either ("`probe-cache.json` is their one home"). So: **this term is inert
- * after every relay restart** until `minSamples` real requests have been served per deployment,
- * and it measures what callers actually waited for rather than what a 1-token probe waited for.
- * That is defensible — request latency is the thing being complained about — but it is NOT the
- * dataset `llm-relay candidates` displays, so the two surfaces can disagree about one deployment.
- * Switching to the probe dataset would survive restarts and match `candidates`, at the cost of
- * measuring a 1-token round-trip instead of a real answer.
+ * ⚠ **TWO STATISTICS, because absolute latency alone cannot compare a probe with a generation.**
+ * A probe asks for one token; a real request may generate hundreds, amortising the same fixed
+ * overhead. So:
+ *   - **per-token** (`getP95MsPerToken`) is the primary signal, over REQUEST samples only. It is
+ *     what the owner asked for, and the only figure that is fair across sample kinds.
+ *   - **absolute** (`getP95`) is the fallback, over every measurable sample. It still catches a
+ *     deployment that is slow before it emits anything, and it works before any request sample
+ *     exists.
+ * Per-token is tested FIRST, so a deployment with real traffic is judged on the better evidence
+ * rather than on whichever ceiling happens to trip first.
  *
- * Pure and bounded: no IO and no clock of its own beyond what the caller passes. The factory wraps
- * everything in try/catch — this runs on the request path, and a routing hint must never be able
- * to fail a request. It logs nothing: routing is not an error stream.
+ * ⚠ **NO breaker cooldown is registered, and that is the design, not an omission.** Quota demotion
+ * can register one because its evidence STATES a `resetsAt`. Latency states no reset, and this
+ * relay never invents a cooldown duration — so instead the term is re-resolved from the rolling
+ * sample window on every request, which means it lifts BY ITSELF as soon as the measurement
+ * recovers, with no expiry anybody had to guess. The cost, stated: a latency demotion is invisible
+ * to `/candidates`' cooldown column and to the dashboard Cooldowns panel, because those read
+ * breaker state. The response header is its surface.
+ *
+ * Pure and bounded: no IO and no clock of its own. The factory wraps everything in try/catch —
+ * this runs on the request path, and a routing hint must never be able to fail a request. It logs
+ * nothing: routing is not an error stream.
  */
-import type { CircuitBreaker } from "./circuit-breaker.js";
 import type { LatencyDemotionConfig } from "./config.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
-// ⚠ MEASURABLE_CODES is IMPORTED, never re-declared. `getP95` counts only these codes, so
-// `pings.length` is an OVERCOUNT of the samples behind the figure — a deployment with fifty 429s
-// and one 200 would clear a `minSamples` test written against `pings.length` on the strength of a
-// single measurement, which is exactly the case the sample floor exists to exclude. The floor must
-// therefore count the SAME set `getP95` measured, and a hand-copied second set is this codebase's
-// most-repeated defect class: the copies drift, and here the drift would silently widen the floor.
-import { MEASURABLE_CODES, getP95 } from "./ping/metrics.js";
+import {
+  MEASURABLE_CODES,
+  countMsPerTokenSamples,
+  getP95,
+  getP95MsPerToken,
+  type PingRecord,
+} from "./ping/metrics.js";
 
 /**
  * Tunable defaults. These are TUNABLES, not provider facts, which is the distinction the
  * "a guess must never be labelled a measurement" invariant draws — it forbids inventing an
  * unpublished provider limit, price or context ceiling, and explicitly permits a tunable default.
  *
- * ⚠ **KNOWN CALIBRATION CAVEAT, stated rather than glossed.** The figures that motivated this
- * module — a serving member at p95 23478 ms, a walk-burning member at 70364 ms — were read from
- * `llm-relay candidates`, whose p95 column comes from `PingLoop.getModelSummary()`: the PROBE
- * dataset in `probe-cache.json`. This module reads a DIFFERENT dataset (below), so 30000 ms is
- * calibrated on probe latency and applied to request latency. A probe sends `max_tokens: 1`; a
- * real request generates, so request latency runs systematically HIGHER. Expect this default to
- * demote more readily than those two numbers suggest, and re-calibrate against request-path
- * figures before treating 30000 as measured rather than chosen.
+ * ⚠ Both are nonetheless CALIBRATED against this machine's own traffic rather than picked, and the
+ * measurement is recorded here so it can be re-run:
+ *
+ * - **`msPerToken` = 250.** Over 68 real requests (2026-08-30) the population ran p50 40.4,
+ *   p75 70.5, p90 292.0, p95 967.1 ms/token. Per deployment the separation was clean: a healthy
+ *   `nemotron-3-ultra` at a median 36.3 and `minimax-m3` at 57.3, against `gemini-3.6-flash` at
+ *   687.8. 250 sits about 3.5x above the healthy band and well under the bad one, so it demotes
+ *   the deployment that was costing whole requests and leaves the ones that were working.
+ * - **`p95Ms` = 30000.** The fallback ceiling, from the same window: the member that actually
+ *   SERVED had an absolute p95 of 23478 ms, the one that burned the walk 70364 ms.
  */
+export const DEFAULT_LATENCY_MS_PER_TOKEN = 250;
 export const DEFAULT_LATENCY_P95_MS = 30_000;
 
 /**
- * Minimum MEASURABLE samples before latency may demote anything. Five is the smallest count for
- * which a p95 is not simply "the worst of a handful", and it is the direct answer to the recorded
- * objection about acting on a single request's latency.
+ * Minimum qualifying samples before latency may demote anything, applied to EACH statistic against
+ * its own sample set. Five is the smallest count for which a p95 is not simply "the worst of a
+ * handful", and it is the direct answer to the recorded objection about acting on a single
+ * request's latency.
  */
 export const DEFAULT_LATENCY_MIN_SAMPLES = 5;
 
 /** One sustained-latency verdict — the smallest honest statement of "why this cell stepped aside". */
 export interface LatencyDemotion {
-  /** Measured 95th-percentile round-trip in ms. Finite by construction. */
-  readonly p95Ms: number;
-  /** The ceiling it exceeded. Operator-configured, or the tunable default above. */
-  readonly thresholdMs: number;
-  /** How many measurable samples backed the figure. Never below `minSamples`. */
+  /** Which statistic crossed its ceiling. Per-token wins when it has enough evidence. */
+  readonly basis: "per-token" | "absolute";
+  /** The measured figure: ms/token for `per-token`, ms for `absolute`. Finite by construction. */
+  readonly measured: number;
+  /** The ceiling it exceeded, in the same unit. */
+  readonly threshold: number;
+  /** Qualifying samples behind `measured`. Never below `minSamples`. */
   readonly samples: number;
 }
 
 export type LatencyDemotionFn = (attempt: ResolvedAttempt, now: number) => LatencyDemotion | null;
 
+/**
+ * How this module reads latency samples.
+ *
+ * ⚠ A plain function, NOT a `PingLoop`. Keeping the seam narrow is what lets this module stay pure
+ * and testable, and it means nothing here can reach into probe scheduling or quota state. The
+ * server passes `PingLoop.getModelPings`; the suite passes an array.
+ */
+export type PingReader = (provider: string, model: string) => readonly PingRecord[];
+
 export interface LatencyDemotionDeps {
-  readonly breaker: CircuitBreaker;
+  readonly readPings: PingReader;
   /**
    * ⚠ The SHAPE is owned by `config.ts` (`LatencyDemotionConfig`) and imported, never re-declared
    * here. Two hand-written copies of one settings object is a defect class this codebase has hit
-   * repeatedly — `dashboard-routes.ts` restated a closed union, `availability.ts` carried three
-   * copies of one key format — and the copies always drift. `config.ts` also normalizes the
-   * boolean shorthand away, so this module never has to decide what `false` means.
+   * repeatedly, and the copies always drift. `config.ts` also normalizes the boolean shorthand
+   * away, so this module never has to decide what `false` means.
    */
   readonly settings?: LatencyDemotionConfig | undefined;
 }
 
-/** Resolve the three knobs once. Absent, or an empty object, means every default. */
+/** Resolve the knobs once. Absent, or an empty object, means every default. */
 function resolveSettings(settings: LatencyDemotionConfig | undefined): {
   enabled: boolean;
   p95Ms: number;
+  msPerToken: number;
   minSamples: number;
 } {
   return {
     enabled: settings?.enabled ?? true,
     p95Ms: settings?.p95Ms ?? DEFAULT_LATENCY_P95_MS,
+    msPerToken: settings?.msPerToken ?? DEFAULT_LATENCY_MS_PER_TOKEN,
     minSamples: settings?.minSamples ?? DEFAULT_LATENCY_MIN_SAMPLES,
   };
 }
@@ -125,36 +147,41 @@ export function resolveLatencyDemotion(
   deps: LatencyDemotionDeps,
   attempt: ResolvedAttempt,
 ): LatencyDemotion | null {
-  const { enabled, p95Ms, minSamples } = resolveSettings(deps.settings);
+  const { enabled, p95Ms, msPerToken, minSamples } = resolveSettings(deps.settings);
   if (!enabled) return null;
 
-  const measurement = deps.breaker.getDeploymentMeasurement({
-    provider: attempt.target.provider,
-    // ⚠ `ProviderDeploymentIdentity.model` is `string | null`, and an ABSENT model is `null` here
-    // rather than `undefined` — coercing it the other way would build an identity that matches no
-    // stored cell, so the lookup would silently return an empty measurement and this term would
-    // quietly never fire.
-    model: attempt.target.model ?? null,
-  });
-  const samples = measurement.pings.filter((p) => MEASURABLE_CODES.has(p.code)).length;
-  // Too little evidence is NOT slowness. Same direction as every other unknown here.
-  if (samples < minSamples) return null;
+  // No model means no deployment key, so there are no samples to read and no opinion to give.
+  const model = attempt.target.model;
+  if (typeof model !== "string" || model.length === 0) return null;
+  const pings = [...deps.readPings(attempt.target.provider, model)];
 
-  const p95 = getP95([...measurement.pings]);
-  // Infinity means "nothing measurable was sampled", never "infinitely slow" — and treating it as
-  // slow would demote every never-probed deployment at once.
-  //
-  // ⚠ Mutation-checked 2026-08-30, and the honest result is worth recording rather than dressing
-  // up: this guard is UNREACHABLE as the code stands. The sample floor above already counts the
-  // same MEASURABLE set `getP95` measures, so reaching this line guarantees at least `minSamples`
-  // finite samples, and deleting the guard leaves the suite fully green. It is kept as defense in
-  // depth because the two checks are only equivalent while the floor precedes it — reorder them,
-  // or widen the floor to raw `pings.length`, and this becomes load-bearing in the one direction
-  // that is unrecoverable. Do NOT read its green mutation as a weak test; read it as redundancy.
+  // PER-TOKEN FIRST: it is the fair comparison across probe and request samples, so a deployment
+  // carrying real traffic is judged on the better evidence.
+  const perTokenSamples = countMsPerTokenSamples(pings);
+  if (perTokenSamples >= minSamples) {
+    const rate = getP95MsPerToken(pings);
+    // `Infinity` means "nothing qualified", never "infinitely slow". Unreachable while the count
+    // above uses the SAME filter — kept because the two are only equivalent while that holds.
+    if (Number.isFinite(rate)) {
+      // ⚠ **Per-token is FINAL when it has evidence — it does not fall through to the absolute
+      // ceiling.** Caught by a test: a member answering in 40 s with 1000 tokens is 40 ms/token,
+      // squarely healthy, yet the absolute ceiling of 30000 ms would still have demoted it. Then
+      // "primary signal" would mean nothing, and the very case per-token exists to protect — a
+      // fast deployment that simply produced a long answer — would be demoted anyway.
+      return rate > msPerToken
+        ? { basis: "per-token", measured: rate, threshold: msPerToken, samples: perTokenSamples }
+        : null;
+    }
+  }
+
+  // ABSOLUTE FALLBACK: catches a deployment that is slow before it emits anything, and it works
+  // before any request sample exists at all.
+  const absoluteSamples = pings.filter((p) => MEASURABLE_CODES.has(p.code)).length;
+  if (absoluteSamples < minSamples) return null;
+  const p95 = getP95(pings);
   if (!Number.isFinite(p95)) return null;
   if (p95 <= p95Ms) return null;
-
-  return { p95Ms: p95, thresholdMs: p95Ms, samples };
+  return { basis: "absolute", measured: p95, threshold: p95Ms, samples: absoluteSamples };
 }
 
 /**
@@ -172,7 +199,14 @@ export function createLatencyDemotionFn(deps: LatencyDemotionDeps): LatencyDemot
   };
 }
 
-/** `"<spec> (p95 70364ms > 30000ms over 12 samples)"` — bounded, metadata only. */
+/**
+ * `"<spec> (p95 687.8ms/token > 250ms/token over 8 request samples)"`, or the absolute form.
+ * Bounded, metadata only — a rate and a count, never a prompt, a credential or an id.
+ */
 export function latencyDemotionLabel(spec: string, demotion: LatencyDemotion): string {
-  return `${spec} (p95 ${demotion.p95Ms}ms > ${demotion.thresholdMs}ms over ${demotion.samples} samples)`;
+  const perToken = demotion.basis === "per-token";
+  const unit = perToken ? "ms/token" : "ms";
+  const kind = perToken ? "request samples" : "samples";
+  const measured = perToken ? demotion.measured.toFixed(1) : String(demotion.measured);
+  return `${spec} (p95 ${measured}${unit} > ${demotion.threshold}${unit} over ${demotion.samples} ${kind})`;
 }

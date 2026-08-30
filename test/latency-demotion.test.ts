@@ -3,6 +3,10 @@
  * reverses a rationale recorded in `server.ts` by owner decision, and every bound that made the
  * reversal safe is a case where it must do NOTHING. A test file that only proved it demotes would
  * be testing the easy half.
+ *
+ * The sharpest claim is that PROBE samples never reach the per-token statistic. A probe asks for
+ * one token, so its ms/token is nearly all fixed overhead; letting one into the rate would demote
+ * healthy deployments on arithmetic, not on evidence.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
@@ -13,140 +17,184 @@ import { globalCircuitBreaker } from "../src/circuit-breaker.js";
 import { LATENCY_DEMOTED_HEADER, SERVED_BY_HEADER } from "../src/backend.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
+import type { PingLoop } from "../src/ping/cadence.js";
 import type { Config, ProviderConfig } from "../src/config.js";
-import type { CircuitBreaker } from "../src/circuit-breaker.js";
 import type { PingRecord } from "../src/ping/metrics.js";
 import type { ResolvedAttempt } from "../src/resolved-attempt.js";
 import {
   DEFAULT_LATENCY_MIN_SAMPLES,
+  DEFAULT_LATENCY_MS_PER_TOKEN,
   DEFAULT_LATENCY_P95_MS,
   createLatencyDemotionFn,
   latencyDemotionLabel,
   resolveLatencyDemotion,
 } from "../src/latency-demotion.js";
 
-/** Only `getDeploymentMeasurement` is reached, so only it is stubbed. */
-function breakerWith(pings: PingRecord[]): CircuitBreaker {
-  return {
-    getDeploymentMeasurement: () => ({ pings, stabilityScore: null, minSamples: pings.length }),
-  } as unknown as CircuitBreaker;
+/** The whole seam: a function from (provider, model) to samples. */
+function reader(pings: PingRecord[]): (p: string, m: string) => readonly PingRecord[] {
+  return () => pings;
 }
 
 function attempt(provider = "nim", model = "deepseek-ai/deepseek-v4-flash"): ResolvedAttempt {
   return { target: { provider, model } } as unknown as ResolvedAttempt;
 }
 
-/** n samples at `ms`, all HTTP 200 — i.e. all MEASURABLE. */
-function samples(n: number, ms: number, code = "200"): PingRecord[] {
+/** n PROBE samples at `ms` — no token count, so they can never reach the per-token statistic. */
+function probes(n: number, ms: number, code = "200"): PingRecord[] {
   return Array.from({ length: n }, (_, i) => ({ ms, code, timestamp: 1000 + i }));
 }
 
-describe("latency demotion", () => {
-  it("demotes a deployment whose measured p95 exceeds the ceiling", () => {
-    // The case that motivated the module: measured 2026-08-30, breaker-CLOSED and 70364 ms.
-    const d = resolveLatencyDemotion({ breaker: breakerWith(samples(12, 70364)) }, attempt());
-    expect(d).not.toBeNull();
-    expect(d?.p95Ms).toBe(70364);
-    expect(d?.thresholdMs).toBe(DEFAULT_LATENCY_P95_MS);
+/** n REQUEST samples, each generating `tokens` output tokens in `ms`. */
+function requests(n: number, ms: number, tokens: number, code = "200"): PingRecord[] {
+  return Array.from({ length: n }, (_, i) => ({
+    ms,
+    code,
+    timestamp: 2000 + i,
+    tokens,
+    source: "request" as const,
+  }));
+}
+
+describe("latency demotion — per-token, the primary signal", () => {
+  it("demotes a deployment whose measured ms/token exceeds the ceiling", () => {
+    // The measured case: gemini-3.6-flash ran a median 687.8 ms/token on 2026-08-30.
+    const d = resolveLatencyDemotion({ readPings: reader(requests(8, 68_780, 100)) }, attempt());
+    expect(d?.basis).toBe("per-token");
+    expect(d?.measured).toBeCloseTo(687.8, 1);
+    expect(d?.threshold).toBe(DEFAULT_LATENCY_MS_PER_TOKEN);
+    expect(d?.samples).toBe(8);
+  });
+
+  it("does NOTHING for a deployment that is slow in total but fast per token", () => {
+    // 40 s of wall time, but 1000 tokens — 40 ms/token, the healthy band. This is the whole point
+    // of measuring per token: absolute latency alone would demote a member that is working well
+    // and merely answered a long question.
+    const d = resolveLatencyDemotion({ readPings: reader(requests(8, 40_000, 1000)) }, attempt());
+    expect(d).toBeNull();
+  });
+
+  it("NEVER lets a probe sample into the per-token rate", () => {
+    // ⚠ The sharpest claim in this module. A probe asks for one token, so if a probe were admitted
+    // with an assumed token count of 1 its rate would be its whole round-trip — 5000 ms/token here
+    // — and every healthy deployment with probe history would be demoted instantly.
+    const mixed = [...probes(20, 5_000), ...requests(8, 4_000, 100)];
+    const d = resolveLatencyDemotion({ readPings: reader(mixed) }, attempt());
+    // 4000/100 = 40 ms/token: healthy. The 20 probes at 5000 ms must not change that.
+    expect(d).toBeNull();
+  });
+
+  it("does NOTHING on too few request samples, however slow they are", () => {
+    // The direct answer to the recorded objection about acting on one request's latency.
+    expect(resolveLatencyDemotion({ readPings: reader(requests(1, 600_000, 1)) }, attempt())).toBeNull();
+    const justUnder = requests(DEFAULT_LATENCY_MIN_SAMPLES - 1, 600_000, 1);
+    expect(resolveLatencyDemotion({ readPings: reader(justUnder) }, attempt())).toBeNull();
+  });
+
+  it("ignores request samples with no reported token count", () => {
+    // Unknown is never zero. Such a sample still measures absolute latency, but it cannot say
+    // anything about throughput, so it must not be counted toward the per-token floor.
+    const noTokens: PingRecord[] = Array.from({ length: 8 }, (_, i) => ({
+      ms: 90_000,
+      code: "200",
+      timestamp: 3000 + i,
+      source: "request" as const,
+    }));
+    const d = resolveLatencyDemotion({ readPings: reader(noTokens) }, attempt());
+    // It falls through to the ABSOLUTE ceiling, which 90 s does exceed.
+    expect(d?.basis).toBe("absolute");
+  });
+
+  it("honours an operator ms/token ceiling", () => {
+    const fast = { readPings: reader(requests(8, 4_000, 100)) }; // 40 ms/token
+    expect(resolveLatencyDemotion(fast, attempt())).toBeNull();
+    const d = resolveLatencyDemotion({ ...fast, settings: { msPerToken: 20 } }, attempt());
+    expect(d?.basis).toBe("per-token");
+    expect(d?.threshold).toBe(20);
+  });
+});
+
+describe("latency demotion — absolute fallback", () => {
+  it("fires when there are no request samples at all", () => {
+    const d = resolveLatencyDemotion({ readPings: reader(probes(12, 70_364)) }, attempt());
+    expect(d?.basis).toBe("absolute");
+    expect(d?.measured).toBe(70_364);
+    expect(d?.threshold).toBe(DEFAULT_LATENCY_P95_MS);
     expect(d?.samples).toBe(12);
   });
 
   it("does NOTHING when the deployment is merely slow but under the ceiling", () => {
-    // 23478 ms is the member that actually SERVED in that same window. The default ceiling is
+    // 23478 ms is the member that actually SERVED in the measured window. The default ceiling is
     // calibrated to leave it alone, so this pins the calibration and not just the comparison.
-    expect(resolveLatencyDemotion({ breaker: breakerWith(samples(12, 23478)) }, attempt())).toBeNull();
+    expect(resolveLatencyDemotion({ readPings: reader(probes(12, 23_478)) }, attempt())).toBeNull();
   });
 
   it("does NOTHING when there is no measurement at all", () => {
     // `getP95` answers Infinity here. Infinity is an UNMEASURED deployment, never an infinitely
     // slow one — treating it as slow would demote every never-probed member at once.
-    expect(resolveLatencyDemotion({ breaker: breakerWith([]) }, attempt())).toBeNull();
-  });
-
-  it("does NOTHING on too few samples, however slow they are", () => {
-    // The direct answer to the recorded objection: "live health then PROMOTES on evidence that is
-    // often a single request's latency".
-    const one = resolveLatencyDemotion({ breaker: breakerWith(samples(1, 600_000)) }, attempt());
-    expect(one).toBeNull();
-    const justUnder = resolveLatencyDemotion(
-      { breaker: breakerWith(samples(DEFAULT_LATENCY_MIN_SAMPLES - 1, 600_000)) },
-      attempt(),
-    );
-    expect(justUnder).toBeNull();
+    expect(resolveLatencyDemotion({ readPings: reader([]) }, attempt())).toBeNull();
   });
 
   it("counts only MEASURABLE samples toward the floor, never the raw ping count", () => {
-    // ⚠ The trap this pins: `getP95` measures 200/401 only, so a deployment with fifty 429s and
-    // ONE slow 200 has a p95 of that single sample. Counting `pings.length` would clear the floor
-    // at 51 and demote on one measurement — exactly the case the floor exists to exclude.
-    const noisy = [...samples(50, 1, "429"), ...samples(1, 600_000)];
-    expect(resolveLatencyDemotion({ breaker: breakerWith(noisy) }, attempt())).toBeNull();
+    // Fifty 429s and one slow 200: counting raw length would clear a floor of 5 on the strength of
+    // a single measurement, which is exactly what the floor exists to exclude.
+    const noisy = [...probes(50, 1, "429"), ...probes(1, 600_000)];
+    expect(resolveLatencyDemotion({ readPings: reader(noisy) }, attempt())).toBeNull();
   });
+});
 
-  it("ignores non-measurable codes when computing the figure", () => {
-    // Same set, but now with enough real measurements. The 429s must not drag the p95 down.
-    const mixed = [...samples(50, 1, "429"), ...samples(10, 70_000)];
-    const d = resolveLatencyDemotion({ breaker: breakerWith(mixed) }, attempt());
-    expect(d?.samples).toBe(10);
-    expect(d?.p95Ms).toBe(70_000);
-  });
-
+describe("latency demotion — bounds and safety", () => {
   it("does NOTHING when the operator switched it off", () => {
-    const slow = { breaker: breakerWith(samples(12, 70_364)) };
+    const slow = { readPings: reader(probes(12, 70_364)) };
     expect(resolveLatencyDemotion({ ...slow, settings: { enabled: false } }, attempt())).toBeNull();
     // …and absent settings, or an empty object, mean every default — i.e. ON.
     expect(resolveLatencyDemotion(slow, attempt())).not.toBeNull();
     expect(resolveLatencyDemotion({ ...slow, settings: {} }, attempt())).not.toBeNull();
   });
 
-  it("honours an operator ceiling and sample floor", () => {
-    const slow = { breaker: breakerWith(samples(6, 9_000)) };
-    expect(resolveLatencyDemotion(slow, attempt())).toBeNull();
-    const d = resolveLatencyDemotion({ ...slow, settings: { p95Ms: 5_000 } }, attempt());
-    expect(d?.thresholdMs).toBe(5_000);
-    expect(resolveLatencyDemotion({ ...slow, settings: { p95Ms: 5_000, minSamples: 20 } }, attempt())).toBeNull();
+  it("gives no opinion when the target has no model", () => {
+    // No model means no deployment key, so there are no samples to read. It must not fall back to
+    // some provider-wide figure — that would attribute one model's slowness to its siblings.
+    const d = resolveLatencyDemotion(
+      { readPings: reader(probes(12, 600_000)) },
+      { target: { provider: "nim" } } as unknown as ResolvedAttempt,
+    );
+    expect(d).toBeNull();
   });
 
   it("never throws into the request path", () => {
-    const exploding = {
-      getDeploymentMeasurement: () => {
-        throw new Error("breaker exploded");
+    const fn = createLatencyDemotionFn({
+      readPings: () => {
+        throw new Error("probe cache exploded");
       },
-    } as unknown as CircuitBreaker;
-    const fn = createLatencyDemotionFn({ breaker: exploding });
+    });
     expect(fn(attempt(), 1)).toBeNull();
   });
 
-  it("asks about the DEPLOYMENT, passing null rather than undefined for an absent model", () => {
-    // `ProviderDeploymentIdentity.model` is `string | null`. Handing it `undefined` would build an
-    // identity matching no stored cell, so the lookup would return an empty measurement and the
-    // whole term would silently never fire.
-    let seen: unknown;
-    const breaker = {
-      getDeploymentMeasurement: (id: unknown) => {
-        seen = id;
-        return { pings: [], stabilityScore: null, minSamples: 0 };
-      },
-    } as unknown as CircuitBreaker;
-    resolveLatencyDemotion({ breaker }, { target: { provider: "nim" } } as unknown as ResolvedAttempt);
-    expect(seen).toEqual({ provider: "nim", model: null });
-  });
-
-  it("labels the demotion with the figure, the ceiling and the sample count", () => {
-    const label = latencyDemotionLabel("nim/deepseek-ai/deepseek-v4-flash", {
-      p95Ms: 70364,
-      thresholdMs: 30000,
-      samples: 12,
-    });
-    expect(label).toBe("nim/deepseek-ai/deepseek-v4-flash (p95 70364ms > 30000ms over 12 samples)");
+  it("labels each basis in its own unit", () => {
+    expect(
+      latencyDemotionLabel("gemini/models/gemini-3.6-flash", {
+        basis: "per-token",
+        measured: 687.8,
+        threshold: 250,
+        samples: 8,
+      }),
+    ).toBe("gemini/models/gemini-3.6-flash (p95 687.8ms/token > 250ms/token over 8 request samples)");
+    expect(
+      latencyDemotionLabel("nim/deepseek-ai/deepseek-v4-flash", {
+        basis: "absolute",
+        measured: 70364,
+        threshold: 30000,
+        samples: 12,
+      }),
+    ).toBe("nim/deepseek-ai/deepseek-v4-flash (p95 70364ms > 30000ms over 12 samples)");
   });
 });
 
 /**
- * End to end, on BOTH fronts. The unit tests above prove the resolver; this proves the term is
- * actually WIRED — that a slow member loses the lead in a real walk and that the displacement is
- * announced. Two candidates throughout: with one, "was demoted" and "had nowhere to go" are the
- * same observation, which is the trap `test/pool-failover.test.ts` exists to avoid.
+ * End to end, on BOTH fronts. The unit tests prove the resolver; this proves the term is actually
+ * WIRED — that a slow member loses the lead in a real walk and that the displacement is announced.
+ * Two candidates throughout: with one, "was demoted" and "had nowhere to go" are the same
+ * observation, which is the trap `test/pool-failover.test.ts` exists to avoid.
  */
 describe("latency demotion — end to end", () => {
   const servers: Server[] = [];
@@ -164,6 +212,25 @@ describe("latency demotion — end to end", () => {
     resetFacts();
     resetInterpretations();
   });
+
+  /**
+   * A stand-in for `PingLoop` holding seeded samples.
+   *
+   * ⚠ Injected rather than driving a real loop on purpose: a real one would probe live providers
+   * and write the operator's own `probe-cache.json`. Only the members `createProxy` actually calls
+   * are implemented, so an unimplemented one fails loudly instead of silently returning undefined.
+   */
+  function stubPingLoop(samples: Record<string, PingRecord[]>): PingLoop {
+    return {
+      start: () => {},
+      stop: () => {},
+      noteUserActivity: () => {},
+      recordRequestLatency: () => {},
+      getModelPings: (provider: string, model: string) => samples[`${provider}/${model}`] ?? [],
+      getModelSummary: () => null,
+      getQuotaObservations: () => [],
+    } as unknown as PingLoop;
+  }
 
   function backend(body: string): Promise<{ server: Server; calls: () => number }> {
     let n = 0;
@@ -226,63 +293,43 @@ describe("latency demotion — end to end", () => {
     });
   }
 
-  /**
-   * Teach the breaker that p1/m1 answers, but glacially. Successes, so nothing else demotes it.
-   *
-   * ⚠ The breaker keeps at most `MAX_PING_HISTORY` (10, `src/circuit-breaker.ts`) samples PER CELL
-   * and shifts the oldest out, so seeding 12 leaves 10 — which is why the announcement below says
-   * 10. Found by this test rather than by reading, and it bounds the feature: `minSamples` must
-   * stay at or under 10 per cell or latency could never demote a single-credential deployment at
-   * all. The default is 5. (`getDeploymentMeasurement` aggregates across a deployment's credential
-   * cells, so a multi-credential deployment can exceed 10 in total.)
-   */
-  function seedSlow(provider: string, model: string, kind: "anthropic" | "openai", ms: number, n = 12): void {
-    // ⚠ A full `ProviderTargetIdentity`, not just provider+model — `tsconfig.test.json` catches
-    // the short literal, which is exactly the class of drift CLAUDE.md says the test typecheck
-    // exists for. `kind` and `credentialId` play no part in the DEPLOYMENT lookup
-    // (`getDeploymentMeasurement` matches provider+model across every credential cell), but a
-    // fixture that states a shape the source does not have is a test asserting against fiction.
-    for (let i = 0; i < n; i += 1) {
-      globalCircuitBreaker.recordOutcome(
-        { provider, model, kind, credentialId: `${provider}#default` },
-        { ok: true, elapsedMs: ms, status: 200, at: 1000 + i },
-      );
-    }
-  }
-
   it.each(["anthropic", "openai"] as const)(
-    "a sustained slow p95 demotes candidate 1 behind candidate 2, and says so (%s front)",
+    "a slow ms/token demotes candidate 1 behind candidate 2, and says so (%s front)",
     async (kind) => {
       const a = await backend(okBody(kind, "m1"));
       const b = await backend(okBody(kind, "m2"));
-      seedSlow("p1", "m1", kind, 70_364);
-      const p = portOf(await startProxy(poolCfg([
-        `http://127.0.0.1:${portOf(a.server)}`,
-        `http://127.0.0.1:${portOf(b.server)}`,
-      ], kind)));
+      const p = portOf(
+        await startProxy(
+          poolCfg([`http://127.0.0.1:${portOf(a.server)}`, `http://127.0.0.1:${portOf(b.server)}`], kind),
+          { pingLoop: stubPingLoop({ "p1/m1": requests(8, 68_780, 100) }) },
+        ),
+      );
 
       const res = await post(p, kind);
       expect(res.status).toBe(200);
       await res.text();
       expect(res.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
-      // 10, not the 12 seeded — see `seedSlow` on the breaker's per-cell history cap.
-      expect(res.headers.get(LATENCY_DEMOTED_HEADER)).toBe("p1/m1 (p95 70364ms > 30000ms over 10 samples)");
+      expect(res.headers.get(LATENCY_DEMOTED_HEADER)).toBe(
+        "p1/m1 (p95 687.8ms/token > 250ms/token over 8 request samples)",
+      );
       // Demoted, never DROPPED: it simply was not tried ahead of the live one.
       expect(a.calls()).toBe(0);
     },
   );
 
   it.each(["anthropic", "openai"] as const)(
-    "leaves the order alone when the measurement is under the ceiling (%s front)",
+    "leaves the order alone when the measurement is healthy (%s front)",
     async (kind) => {
       const a = await backend(okBody(kind, "m1"));
       const b = await backend(okBody(kind, "m2"));
-      // 23478 ms is the member that actually SERVED in the measured window — it must keep the lead.
-      seedSlow("p1", "m1", kind, 23_478);
-      const p = portOf(await startProxy(poolCfg([
-        `http://127.0.0.1:${portOf(a.server)}`,
-        `http://127.0.0.1:${portOf(b.server)}`,
-      ], kind)));
+      const p = portOf(
+        await startProxy(
+          poolCfg([`http://127.0.0.1:${portOf(a.server)}`, `http://127.0.0.1:${portOf(b.server)}`], kind),
+          // 40 ms/token, and 40 s of absolute latency: slow in total, healthy per token. The whole
+          // reason the primary signal is per-token.
+          { pingLoop: stubPingLoop({ "p1/m1": requests(8, 40_000, 1000) }) },
+        ),
+      );
 
       const res = await post(p, kind);
       await res.text();
@@ -297,11 +344,16 @@ describe("latency demotion — end to end", () => {
     async (kind) => {
       const a = await backend(okBody(kind, "m1"));
       const b = await backend(okBody(kind, "m2"));
-      seedSlow("p1", "m1", kind, 70_364);
-      const p = portOf(await startProxy(poolCfg([
-        `http://127.0.0.1:${portOf(a.server)}`,
-        `http://127.0.0.1:${portOf(b.server)}`,
-      ], kind, { enabled: false })));
+      const p = portOf(
+        await startProxy(
+          poolCfg(
+            [`http://127.0.0.1:${portOf(a.server)}`, `http://127.0.0.1:${portOf(b.server)}`],
+            kind,
+            { enabled: false },
+          ),
+          { pingLoop: stubPingLoop({ "p1/m1": requests(8, 68_780, 100) }) },
+        ),
+      );
 
       const res = await post(p, kind);
       await res.text();

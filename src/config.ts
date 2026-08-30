@@ -474,8 +474,16 @@ function parseQuotaEnforcement(raw: unknown): QuotaEnforcementConfig | undefined
 export interface LatencyDemotionConfig {
   /** Default true. false disables latency demotion entirely. */
   enabled?: boolean;
-  /** Measured p95 ceiling in ms. Above it, the candidate is demoted. */
+  /** Fallback ceiling: measured absolute p95 in ms. Above it, the candidate is demoted. */
   p95Ms?: number;
+  /**
+   * PRIMARY ceiling: measured p95 latency per OUTPUT TOKEN, in ms.
+   *
+   * Absolute latency cannot compare a probe with a generation - a probe asks for one token, a real
+   * request may produce hundreds and amortise the same fixed overhead. The per-token rate is the
+   * fair figure, so it is tested first, over real request samples only.
+   */
+  msPerToken?: number;
   /** Minimum measurable samples before latency may demote anything at all. */
   minSamples?: number;
 }
@@ -503,7 +511,7 @@ function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
     throw new Error("config.routing.latency must be an object or a boolean");
   }
   const value = raw as Record<string, unknown>;
-  const known = new Set(["enabled", "p95Ms", "minSamples"]);
+  const known = new Set(["enabled", "p95Ms", "msPerToken", "minSamples"]);
   for (const key of Object.keys(value)) {
     if (!known.has(key)) {
       throw new Error(`config.routing.latency has an unknown key "${key}"`);
@@ -514,7 +522,7 @@ function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
     if (typeof value.enabled !== "boolean") throw new Error("config.routing.latency.enabled must be a boolean");
     out.enabled = value.enabled;
   }
-  for (const key of ["p95Ms", "minSamples"] as const) {
+  for (const key of ["p95Ms", "msPerToken", "minSamples"] as const) {
     const n = value[key];
     if (n === undefined) continue;
     if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
