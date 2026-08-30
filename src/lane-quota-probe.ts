@@ -23,6 +23,7 @@
 import { execFile, exec } from "node:child_process";
 import { TASK_TOKEN, MAX_EXHAUSTED_MS, type DispatchOutcome } from "./dispatch.js";
 import { laneOfRung } from "./lane-manifest.js";
+import { quoteCmdArg } from "./lane-probe.js";
 import type { Config, LadderRung } from "./config.js";
 
 /** Minimal spend; the no-shell instruction is agy policy on this machine and harmless elsewhere. */
@@ -218,7 +219,9 @@ export const defaultLaneProbeSpawner: LaneProbeSpawner = (command, args, opts) =
         return;
       }
       if (process.platform === "win32" && err.code === "ENOENT") {
-        const fallback = exec(`"${command}" ${args.join(" ")}`, execOpts, (err2, stdout2, stderr2) => {
+        // ⚠ Quoted per token — the probe prompt CONTAINS SPACES, and the unquoted join handed
+        // codex seven arguments (`unexpected argument 'with'`), measured live on v0.59.1.
+        const fallback = exec(`${quoteCmdArg(command)} ${args.map(quoteCmdArg).join(" ")}`, execOpts, (err2, stdout2, stderr2) => {
           if (!err2) resolve({ code: 0, stdout: stdout2, stderr: stderr2, timedOut: false });
           else resolve(failureResult(err2, stdout2 ?? "", stderr2 ?? ""));
         });
