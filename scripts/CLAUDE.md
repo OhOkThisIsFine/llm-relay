@@ -2,9 +2,17 @@
 
 ⚠ Nearly every `.mjs` here reads the compiled `dist/` — **rebuild (`npm run build`) before running
 one** or you'll test stale code. (The root CLAUDE.md repeats this warning because it applies even
-when this file isn't loaded.) The four that do NOT touch `dist/` are `analysis-run.mjs`,
-`install-skill.mjs`, `sync-tiers.mjs` and `tier-scoring.mjs`; they read the source tree, the
-package tree, or the network. Rebuilding first is still never wrong.
+when this file isn't loaded.) The three that do NOT touch `dist/` are `analysis-run.mjs`,
+`sync-tiers.mjs` and `tier-scoring.mjs`; they read the source tree, the package tree, or the
+network. Rebuilding first is still never wrong.
+
+⚠ **`install-skill.mjs` JOINED the dist-reading set on 2026-08-30 (v0.62.0), and that is a change
+of kind worth knowing.** It now `await import`s `../dist/installed-hosts.js` to decide whether Codex
+is present. Two consequences: a stale `dist/` gives a stale detector, and — the surprising one —
+**`test/install-skill.test.ts` now needs a BUILT tree**, which no other test in the suite does. That
+cuts against the usual split ("vitest reads `src/`; scripts read `dist/`"), so the gate tests carry
+an explicit PRECONDITION assertion naming `npm run build`; without it a missing `dist/` reads as
+three unrelated Codex failures. The import fails OPEN (provision anyway) and now says so on stderr.
 
 ⚠ This file is the inventory of `scripts/`, and `test/scripts-inventory.test.ts` pins it: every
 `.mjs` here must be named, and a name here must resolve to a real file. The build- and gate-path
