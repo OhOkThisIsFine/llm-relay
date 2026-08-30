@@ -2,12 +2,45 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-30 (third lap of 2026-08-29)
+## 0. State as of 2026-08-30 (fourth lap)
 
-**Current: v0.59.2 is released; the global bin and the restarted relay are on it** (publish runs
-green for v0.59.0/.1/.2, registry 0.59.2, end-to-end drill passed live). Nothing awaits the
-owner — §6 holds recorded trades, deferrals and settled decisions, not a work queue; the work
-queue is [docs/backlog.md](docs/backlog.md), which is EMPTY.
+**Current: v0.59.3 is released; the global bin and the relay are on it** (npm registry 0.59.3,
+`llm-relay version` 0.59.3). Nothing awaits the owner — §6 holds recorded trades, deferrals and
+settled decisions, not a work queue; the work queue is [docs/backlog.md](docs/backlog.md), which
+is EMPTY.
+
+**freellmapi is RETIRED** (owner decision 2026-08-29), so llm-relay is now the ONLY free-provider
+offload runtime on this machine. It is dormant and reversible, nothing deleted; the measured basis
+and the cutover record are
+[docs/freellmapi-takeover-readiness-2026-08-29.md](docs/freellmapi-takeover-readiness-2026-08-29.md).
+The measurements that settled it: llm-relay carried 5.5× freellmapi's weekly traffic on the same
+accounts, freellmapi's compression had saved 0.08% lifetime, and its in-flight quota leases were
+already handled inside llm-relay.
+
+**This lap (2026-08-30) — the eligibility-and-probe lap.** Full record, every owner decision and
+the reversal of my own first mistral verdict:
+[docs/eligibility-and-probe-lap-2026-08-30.md](docs/eligibility-and-probe-lap-2026-08-30.md).
+Two code changes, both driven by live evidence the queue surfaced:
+
+- **A successful background probe now retracts cooling facts** (`src/ping/cadence.ts`
+  `recordPing` → `clearFacts`). `clearFacts` had exactly ONE caller, `server.ts`, so only a
+  SERVED request could disprove a condition early — while the relay probes every deployment on a
+  cadence with a REAL completion and threw that evidence away. A long-window
+  `allowance-exhausted` fact therefore survived its whole window unless real traffic happened to
+  reach the demoted candidate. This is what makes an operator-asserted multi-day reset safe to
+  record. Negative controls pinned: a non-200 clears nothing, measurements are never retracted,
+  and one credential's probe never speaks for another's.
+- **A network-block advisory** (`src/network-block.ts`, rendered in `llm-relay eligibility`).
+  Display-only: no fact, no demotion, no request-path reach — because no member of the closed
+  `FactKind` vocabulary describes the CALLER's own network, and recording one would assert what
+  the evidence does not support.
+
+Eligibility queue resolved to its irreducible floor. Two mistral signatures accepted as
+`allowance-exhausted`, scope `credential`, with an operator-asserted **7-day** reset; one groq
+signature deliberately LEFT PENDING, because `reject` suppresses a signature for good and would
+silence the next episode.
+
+**Immediate next:** release this lap's work, then verify the global bin and the relay are on it.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
 decisions and the full verification record:
@@ -33,12 +66,21 @@ decisions and the full verification record:
   restarts, was probed through a real `codex exec` completion, retracted, and the retraction
   flushed to disk.
 
-Operational: the lap ran from the worktree branch `claude/start-lap-codex-delegation-e5b82d`,
-pushed to `origin/main` (fast-forward). ⚠ The MAIN CHECKOUT's local `main` at `C:\Code\llm-relay`
-is behind origin until someone runs `git pull` there — a worktree cannot fast-forward a branch
-another worktree has checked out. The six codex dispatch rungs stay `"enabled": false` (the
-2026-08-27 move to the first-party plugin); machine-side prose no longer carries its own
-quota-dead claims — the relay's dispatch state is authoritative (design §5).
+Operational: this lap ran from the worktree branch `claude/start-lap-a218d7`. ⚠ **Standing, and it
+recurs every lap:** after a worktree pushes to `origin/main`, the MAIN CHECKOUT's local `main` at
+`C:\Code\llm-relay` is behind origin until someone runs `git pull` there — a worktree cannot
+fast-forward a branch another worktree has checked out. The six codex dispatch rungs stay
+`"enabled": false` (the 2026-08-27 move to the first-party plugin); machine-side prose no longer
+carries its own quota-dead claims — the relay's dispatch state is authoritative (design §5).
+
+⚠ **A worktree with an empty `node_modules` silently certifies the WRONG tree.** Found this lap:
+this worktree held zero installed packages, so Node resolution walked up three levels and
+satisfied every import from the parent checkout. `npm run build`, `tsc` and the entire vitest
+suite all passed against a dependency tree that was not this worktree's; the only check that
+noticed was `check:package`, and it reported the symptom (`../../../node_modules/react`) rather
+than the cause. Run `npm ci` in a fresh worktree BEFORE recording any verify-green entry. A global
+SessionStart hook (`~/.claude/hooks/worktree-deps-guard.mjs`, owner decision 2026-08-30: warn,
+never auto-install) now says so at session start, for every repo on this machine.
 
 ## 0.1 Earlier releases
 

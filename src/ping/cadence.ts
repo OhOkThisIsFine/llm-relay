@@ -16,6 +16,7 @@ import { makeCredentialId, parseCredentialId, type CredentialId } from "../crede
 import { mergeQuotaObservations, type QuotaObservation } from "../quota-observation.js";
 import { fetchProviderQuota } from "./quota.js";
 import { applySpendHeadroom, classifySpendHeadroom } from "../spend-headroom.js";
+import { clearFacts } from "../target-facts.js";
 
 export type PingMode = "speed" | "normal" | "slow" | "forced";
 
@@ -213,6 +214,28 @@ export class PingLoop {
       ...res,
       quotaObservations: isDefaultProbe ? res.quotaObservations : [],
     }, this.probeCacheOpts());
+
+    // A successful probe is a REAL completion — `ping.ts` posts one user message at
+    // `max_tokens: 1` — sent with THIS credential slot, so it is the same first-party proof a
+    // served request is: the deployment exists and the credential has allowance RIGHT NOW.
+    // `server.ts` has always cleared cooling conditions on that evidence; until 2026-08-30 this
+    // path did not, so `clearFacts` had exactly ONE caller and a long-window
+    // `allowance-exhausted` fact survived its whole window unless real traffic happened to reach
+    // the demoted candidate. Since the relay probes every deployment on a cadence anyway, that
+    // made background recovery undetectable — the owner's stated expectation, and the reason a
+    // week-long operator-asserted reset is safe to record at all.
+    // ⚠ Measurements are never touched: `clearFacts` excludes them, because a success disproves
+    // a condition and never a measurement.
+    // ⚠ Unlike the served path this does NOT also clear the breaker's credential faults —
+    // `PingLoop` holds no breaker reference, and those carry their own 5-minute TTL.
+    // ⚠ Contained: the fact store must never be able to break the probe loop.
+    if (res.code === "200") {
+      try {
+        clearFacts(providerKey, credentialId, modelId);
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 
   /**
