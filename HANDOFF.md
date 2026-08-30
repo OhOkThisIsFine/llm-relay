@@ -46,9 +46,13 @@ relay restarted onto it, publish run 33293673199 green through both tag-refusal 
 interpretation bound on the next refusal and produced `mistral#default/*` `allowance-exhausted`
 expiring in 10080m.
 
-**Immediate next:** regenerate the committed `AGENTS.md` — see [docs/backlog.md](docs/backlog.md).
-It is the one part of this lap that a worktree cannot finish, because `sync.mjs` only ever reads
-`C:/Code/llm-relay/CLAUDE.md`.
+`AGENTS.md` was regenerated and committed (`3b157bb`): the shared region had gone stale at 174.1 KB
+against a `CLAUDE.md` now 182.0 KB. ⚠ **That step can only run in the MAIN checkout** — `sync.mjs`
+resolves project targets under `C:/Code` and never reads a worktree — so a worktree lap must hand it
+back or step out to finish it.
+
+**Immediate next:** nothing pending. Two recorded items remain in
+[docs/backlog.md](docs/backlog.md), both about package size and neither blocking.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
 decisions and the full verification record:
