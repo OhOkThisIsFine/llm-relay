@@ -1,18 +1,34 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, relative, resolve } from "node:path";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const dashboard = join(root, "dist", "dashboard");
-const graph = readJson(join(dashboard, ".vite", "dashboard-bundle-graph.json"));
+const graph = readBuiltJson(join(dashboard, ".vite", "dashboard-bundle-graph.json"));
 const inventory = readJson(join(root, "docs", "dashboard-bundle-inventory.json"));
 const baseline = readJson(join(root, "docs", "dashboard-package-baseline.json"));
-const manifest = readJson(join(dashboard, ".vite", "manifest.json"));
+const manifest = readBuiltJson(join(dashboard, ".vite", "manifest.json"));
 const notices = readFileSync(join(root, "THIRD_PARTY_NOTICES.md"), "utf8");
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
+}
+
+/**
+ * Read a BUILD OUTPUT, and say so when it is absent.
+ *
+ * Every other input here is tracked in git, so a missing one is genuine corruption. These two
+ * come from `npm run build:dashboard`, and `npm run check` does not build. Without this guard the
+ * script died on a raw ENOENT stack that named the file but not the cause, which cost a full
+ * verify-green cycle at the v0.61.0 lap start. `CLAUDE.md` already says to run
+ * `npm run build && npm run check`; the point of this guard is that the ERROR carries that too.
+ */
+function readBuiltJson(path) {
+  if (!existsSync(path)) {
+    fail(`${relative(root, path).replace(/\\/g, "/")} is missing. It is a BUILD OUTPUT, and \`npm run check\` does not build. Run \`npm run build\` first, then re-run \`npm run check\`.`);
+  }
+  return readJson(path);
 }
 
 function fail(message) {
