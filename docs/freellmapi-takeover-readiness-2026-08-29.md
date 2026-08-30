@@ -155,6 +155,9 @@ blocker:
 - Liveness endpoints on both services mislead: llm-relay `/health` is 403 by design (use
   `/telemetry`); freellmapi `/health` is an unconditional 200 (use `/api/health`). Both already
   documented; both still cost a first attempt.
+- Execution pass: the `shell-conventions-guard` hook blocked a `&&`-chained generator run
+  (worked as designed — generators run as separate calls); `llm-relay setup claude-cli` printed
+  wrapper paths under the temporary worktree instead of the install (recorded in §9 follow-ups).
 
 ## 9. Decision record
 
@@ -165,3 +168,34 @@ blocker:
   §4: compression saved 0.08% (309 tokens, cache 0 hits); Pollinations/LLM7 rank nowhere in
   freellmapi's own chain; in-flight leases were already dropped inside llm-relay on 2026-08-23.
   Recommendation unchanged and strengthened: retire.
+- **2026-08-29 — DECIDED: RETIRE (owner). Cutover EXECUTED the same session.** Per step:
+  - **C1 done.** Backup `freellmapi\backups\2026-08-29_202413` (db ok; 12 api_keys, 1 user,
+    2/2 docs verified). The plaintext dashboard key export was deliberately SKIPPED: the
+    encrypted DB + `.env` snapshot restores custody whole, every key also lives in the env vars
+    llm-relay already reads, and a plaintext key file on disk would weaken custody for no need.
+  - **C2 closed as a no-op.** `opencode/nemotron-3-ultra-free` answered HTTP 200 through the
+    relay on the env key — the probe's opencode 401s were entitlement walls on premium SKUs,
+    not a stale credential. No import needed.
+  - **C3 done.** `~/.agent-config/offload-lane-data.mjs` rewritten: the freellmapi router, five
+    MCP job lanes and the `claude.ps1` launcher rows removed; `llm-relay-router` (probe
+    `GET /telemetry`, 200 + JSON required) and `relay-pool-lane` (keeps the P43 workspace-trust
+    check, now on `~/.llm-relay-claude`) added; agy/codex peer rows kept; import-verified.
+  - **C4 done.** `claude mcp remove freellmapi -s user`; the 4 `mcp__freellmapi__offload_*`
+    permission entries removed from `~/.claude/settings.json`.
+  - **C5 done.** Interactive recipe is now `scripts/claude-proxied.ps1` (main checkout) with
+    `RP_CONFIG_DIR=C:\Users\ethan\.llm-relay-claude` and a pinned 131k context; headless stays
+    `llm-relay dispatch`. The wrapper's own defaults were left untouched (other users'
+    trust records live under `~/.repair-proxy-claude`).
+  - **C6 done.** Global `~/.claude/CLAUDE.md`: the FreeLLMAPI section replaced by the
+    retirement record; topology/autostart/escape-hatch references updated; `sync.mjs` wrote 5
+    targets; `--check` clean.
+  - **C7 done.** `Startup\freellmapi.vbs` → `freellmapi\freellmapi.vbs.retired-2026-08-29`;
+    `stop.ps1` stopped 1 process; port 3001 now refuses connections. Startup holds
+    `headroom.vbs`, `llm-relay.vbs`, `Ollama.lnk`.
+  - **C8 skipped on measurement.** Pollinations/LLM7 not added (nil measured contribution); no
+    operator `limits` declared (declare when real pacing pain appears).
+  - **Open follow-ups, each named with its home:** audit-tools `docs/nightly-routine.md:29`
+    still dispatches via `claude.ps1`, which would RESURRECT the retired router (audit-tools
+    repo); `llm-relay setup claude-cli` prints wrapper paths relative to the CURRENT checkout,
+    so a worktree run names a temporary tree (this repo, minor); the live config's missing
+    Codex `destructiveTools` entries (filed as a session task chip).
