@@ -51,6 +51,23 @@ against a `CLAUDE.md` now 182.0 KB. ⚠ **That step can only run in the MAIN che
 resolves project targets under `C:/Code` and never reads a worktree — so a worktree lap must hand it
 back or step out to finish it.
 
+**v0.62.0 — OpenCode is a third skill install target** (owner decision, 2026-08-30).
+`scripts/install-skill.mjs` now writes `<XDG_CONFIG_HOME or ~/.config>/opencode/skills/llm-relay/`
+alongside `~/.claude` and `~/.codex`. It is the only target that is not a fixed dotfolder in HOME,
+so it honours `XDG_CONFIG_HOME` — matching OpenCode's own convention and `state-paths.ts`'s
+config-kind policy. Four tests: the three-host copy, an independent-failure control, XDG honoured,
+and a blank `XDG_CONFIG_HOME` falling back rather than resolving a bare relative path. Before this,
+an OpenCode copy placed by any other means went stale with nothing to refresh it — measured 1875
+bytes behind on this machine.
+
+⚠ **Owner correction, recorded because I had it wrong: agy is far more capable than the v0.61.0
+write-up said.** Its live allow list is `read_file`, `write_file`, `read_url`, `mcp` — verified
+end to end on 2026-08-27. The "zero mechanisms" claim was true only before that date. agy still
+cannot DELEGATE (no MCP server mode, no ACP mode), so the MCP verdict is unchanged, but reason
+about agy from `~/.gemini/antigravity-cli/settings.json`, never from prose. ⚠ **`~/.agent-config/
+host-agy.md` is stale and actively wrong** — it forbids MCP and names three tool actions that were
+never valid. Machine layer; surfaced to the owner, not changed here.
+
 **Released as v0.61.0 and verified live**: publish run 33296485234 green, registry
 `dist-tags.latest` 0.61.0, global bin 0.61.0, relay restarted onto it. The defect case was
 re-checked end to end through the restarted relay — a harness-less caller now gets exit 0 and a

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * Install/refresh the llm-relay skill for Claude Code and Codex from the same
+ * Install/refresh the llm-relay skill for Claude Code, Codex and OpenCode from the same
  * shipped source (skills/llm-relay/SKILL.md), and provision Codex's global
  * provider/child-agent setup.
  *
  * Runs from npm `postinstall`, but only acts on GLOBAL installs (`npm i -g llm-relay`)
  * so that a repo-local `npm install` (dev checkout, CI) never touches the developer's
- * ~/.claude or ~/.codex. Because the self-updater reinstalls the global package on a new
- * version, both skill descriptions and the missing Codex setup refresh on every upgrade with
- * no extra step.
+ * ~/.claude, ~/.codex or the XDG config dir. Because the self-updater reinstalls the global
+ * package on a new version, every host's skill description and the missing Codex setup refresh
+ * on every upgrade with no extra step.
  *
  * `--force` installs regardless of install context (for manual runs and tests).
  *
@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 
 /** Report why neither skill can be installed, and leave the package install itself alone. */
 function skipAll(reason) {
-  process.stderr.write(`llm-relay: Claude Code and Codex skills not installed — ${reason}\n`);
+  process.stderr.write(`llm-relay: host skills not installed — ${reason}\n`);
   process.exit(0);
 }
 
@@ -124,9 +124,16 @@ try {
   if (!existsSync(src)) skipAll(`this package does not contain ${src}`);
 
   const home = homedir();
+  // OpenCode keeps its configuration under the XDG config dir, unlike Claude Code and Codex which
+  // use fixed dotfolders in HOME. Honour XDG_CONFIG_HOME when it is set to a real value and fall
+  // back to ~/.config — the same policy `src/state-paths.ts` applies to this relay's own
+  // config-kind state, and the path observed live on this machine.
+  const xdgConfig = process.env.XDG_CONFIG_HOME;
+  const configHome = xdgConfig && xdgConfig.trim() !== "" ? xdgConfig : join(home, ".config");
   const targets = [
     { host: "Claude Code", dest: join(home, ".claude", "skills", "llm-relay", "SKILL.md") },
     { host: "Codex", dest: join(home, ".codex", "skills", "llm-relay", "SKILL.md") },
+    { host: "OpenCode", dest: join(configHome, "opencode", "skills", "llm-relay", "SKILL.md") },
   ];
 
   // Keep host failures independent: a broken ~/.claude must not prevent Codex from receiving
@@ -148,6 +155,6 @@ try {
   }
 } catch (e) {
   // Never fail the install over the skills — but always say why neither could be attempted.
-  process.stderr.write(`llm-relay: Claude Code and Codex skills not installed — ${e?.message ?? e}\n`);
+  process.stderr.write(`llm-relay: host skills not installed — ${e?.message ?? e}\n`);
   process.exit(0);
 }

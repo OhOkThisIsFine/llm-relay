@@ -61,11 +61,13 @@ NVIDIA_API_KEY=nvapi-... npx llm-relay    # instant, no install
 npm install -g llm-relay && llm-relay      # global
 ```
 
-A global install also drops the generated **llm-relay skill** into `~/.claude/skills/llm-relay/`
-and `~/.codex/skills/llm-relay/` (both copied from one source, refreshed on every upgrade), and
-provisions local Codex: the `llm-relay` Responses provider in `~/.codex/config.toml` plus
-relay-backed `default` and `relay_coding` child agents under `~/.codex/agents/` when absent.
-Existing Codex files are preserved.
+A global install also drops the generated **llm-relay skill** into three host directories — 
+`~/.claude/skills/llm-relay/`, `~/.codex/skills/llm-relay/` and
+`$XDG_CONFIG_HOME/opencode/skills/llm-relay/` (falling back to `~/.config` when that variable is
+unset or blank). All three are copied byte-for-byte from one source and refreshed on every upgrade;
+a failure at one host never stops the others. It also provisions local Codex: the `llm-relay`
+Responses provider in `~/.codex/config.toml` plus relay-backed `default` and `relay_coding` child
+agents under `~/.codex/agents/` when absent. Existing Codex files are preserved.
 
 If your npm blocks unknown install scripts (`npm warn install-scripts … blocked`), allow this one
 — `npm config set allow-scripts=llm-relay --location=user` — or run the installer by hand:

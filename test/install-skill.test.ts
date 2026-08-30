@@ -25,6 +25,10 @@ const skillSrc = join(repoRoot, "skills", "llm-relay", "SKILL.md");
 function run(args: string[], home: string, extraEnv: Record<string, string> = {}) {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
   delete env.npm_config_global;
+  // ⚠ The OpenCode target honours XDG_CONFIG_HOME, so a developer who has it set would otherwise
+  // have the suite write outside the temp HOME — the same non-hermeticity these tests redirect
+  // HOME/USERPROFILE to avoid. Clear it here; the one test that exercises XDG sets it explicitly.
+  delete env.XDG_CONFIG_HOME;
   const res = spawnSync(process.execPath, [script, ...args], {
     cwd: repoRoot,
     encoding: "utf8",
@@ -36,6 +40,7 @@ function run(args: string[], home: string, extraEnv: Record<string, string> = {}
 const installedPaths = (home: string) => ({
   claude: join(home, ".claude", "skills", "llm-relay", "SKILL.md"),
   codex: join(home, ".codex", "skills", "llm-relay", "SKILL.md"),
+  opencode: join(home, ".config", "opencode", "skills", "llm-relay", "SKILL.md"),
   codexConfig: join(home, ".codex", "config.toml"),
   defaultAgent: join(home, ".codex", "agents", "default.toml"),
   codingAgent: join(home, ".codex", "agents", "relay_coding.toml"),
@@ -56,20 +61,24 @@ describe("install-skill postinstall hook", () => {
     expect(r.status).toBe(0);
     expect(existsSync(join(home, ".claude"))).toBe(false);
     expect(existsSync(join(home, ".codex"))).toBe(false);
+    expect(existsSync(join(home, ".config"))).toBe(false);
     // The designed no-op stays quiet; only failures are allowed to print.
     expect(r.stderr).toBe("");
   });
 
-  it("installs the same shipped skill for Claude Code and Codex on a global install", () => {
+  it("installs the same shipped skill for Claude Code, Codex and OpenCode on a global install", () => {
     const r = run([], home, { npm_config_global: "true" });
     const paths = installedPaths(home);
     const source = readFileSync(skillSrc, "utf8");
     expect(r.status).toBe(0);
     expect(readFileSync(paths.claude, "utf8")).toBe(source);
     expect(readFileSync(paths.codex, "utf8")).toBe(source);
+    expect(readFileSync(paths.opencode, "utf8")).toBe(source);
     expect(readFileSync(paths.claude, "utf8")).toBe(readFileSync(paths.codex, "utf8"));
+    expect(readFileSync(paths.claude, "utf8")).toBe(readFileSync(paths.opencode, "utf8"));
     expect(r.stderr).toContain("installed Claude Code skill");
     expect(r.stderr).toContain("installed Codex skill");
+    expect(r.stderr).toContain("installed OpenCode skill");
     expect(readFileSync(paths.codexConfig, "utf8")).toContain("[model_providers.llm-relay]");
     expect(readFileSync(paths.codexConfig, "utf8")).toContain('base_url = "http://127.0.0.1:8791/v1"');
     expect(readFileSync(paths.defaultAgent, "utf8")).toContain('model = "pool/medium"');
@@ -156,5 +165,39 @@ describe("install-skill postinstall hook", () => {
     expect(r.stderr).toContain("Claude Code skill not installed");
     expect(readFileSync(paths.codex, "utf8")).toBe(readFileSync(skillSrc, "utf8"));
     expect(r.stderr).toContain("installed Codex skill");
+    // The third host is independent too — a broken ~/.claude must not cost OpenCode its copy.
+    expect(readFileSync(paths.opencode, "utf8")).toBe(readFileSync(skillSrc, "utf8"));
+    expect(r.stderr).toContain("installed OpenCode skill");
+  });
+
+  /**
+   * OpenCode is the only target that is not a fixed dotfolder in HOME: it lives under the XDG
+   * config dir. Added 2026-08-30 — before that the installer wrote two hosts, so an OpenCode copy
+   * put there by any other means went stale with nothing on the machine to refresh it (measured
+   * 1875 bytes behind). These pin the path policy, since getting it wrong writes a real file to
+   * the wrong place rather than failing loudly.
+   */
+  describe("the OpenCode target's XDG path policy", () => {
+    it("honours XDG_CONFIG_HOME when it is set", () => {
+      const xdg = mkdtempSync(join(tmpdir(), "llm-relay-xdg-"));
+      try {
+        const r = run(["--force"], home, { XDG_CONFIG_HOME: xdg });
+        const dest = join(xdg, "opencode", "skills", "llm-relay", "SKILL.md");
+        expect(r.status).toBe(0);
+        expect(readFileSync(dest, "utf8")).toBe(readFileSync(skillSrc, "utf8"));
+        // ...and does NOT also write the ~/.config fallback, which would leave two copies to drift.
+        expect(existsSync(installedPaths(home).opencode)).toBe(false);
+      } finally {
+        rmSync(xdg, { recursive: true, force: true });
+      }
+    });
+
+    it("falls back to ~/.config when XDG_CONFIG_HOME is blank rather than writing to a bare path", () => {
+      // A blank value is set-but-meaningless. Treating it as a directory would resolve the skill
+      // to a relative path outside HOME — the same rule `state-paths.ts` applies to its own dirs.
+      const r = run(["--force"], home, { XDG_CONFIG_HOME: "   " });
+      expect(r.status).toBe(0);
+      expect(readFileSync(installedPaths(home).opencode, "utf8")).toBe(readFileSync(skillSrc, "utf8"));
+    });
   });
 });

@@ -38,11 +38,16 @@ red without anyone invoking a script by hand:
 Offline / unit-test-safe (no external creds):
 - `live-demo.mjs` — runs the compiled CLI against a local flaky backend + stub reshaper. Good smoke test.
 - `install-skill.mjs` — npm `postinstall` hook: copies the single
-  `skills/llm-relay/SKILL.md` source to both `~/.claude/skills/llm-relay/` and
-  `~/.codex/skills/llm-relay/` on GLOBAL installs only (env var or global-tree path detection);
-  a repo-local `npm install` touches neither host directory. `--force` overrides for manual runs.
-  Host failures are independent. Ships in the package, so the self-updater refreshes both skill
-  descriptions on every upgrade.
+  `skills/llm-relay/SKILL.md` source to THREE host directories — `~/.claude/skills/llm-relay/`,
+  `~/.codex/skills/llm-relay/` and `<XDG_CONFIG_HOME or ~/.config>/opencode/skills/llm-relay/` —
+  on GLOBAL installs only (env var or global-tree path detection); a repo-local `npm install`
+  touches no host directory. `--force` overrides for manual runs. Host failures are independent.
+  Ships in the package, so the self-updater refreshes every host's skill on every upgrade.
+  ⚠ **OpenCode was added 2026-08-30 (v0.62.0) and it is the only target that is not a fixed
+  dotfolder in HOME** — it honours `XDG_CONFIG_HOME`, matching OpenCode's own `~/.config`
+  convention and `src/state-paths.ts`'s config-kind policy. Before that the installer wrote two
+  hosts, so an OpenCode copy placed there by any other means went stale with nothing to refresh
+  it — measured 1875 bytes behind on this machine.
 
 Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compatible provider):
 - `nim-front.mjs` — run the compiled proxy fronting a live backend end-to-end.
