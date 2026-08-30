@@ -156,6 +156,26 @@ because it bounds module growth and the count did not move.
 `tsconfig.json` is variant B: it strips the `.d.ts` docs as well, and buys only a further ~122k.
 It was rejected for exactly that reason.
 
+### 3.2 Two things that look like failures and are not
+
+Both were raised by an independent audit of the change. Recorded so nobody re-derives them.
+
+- ⚠ **`dist/claude-hook.js` still contains comment TEXT, and that is correct.** Lines 23-61 hold
+  the body of the `.mjs` hook script that `src/claude-hook.ts` WRITES TO DISK, carried in a
+  template literal. `--removeComments` strips syntactic comments, not string data, so the
+  generated hook keeps its own comments — which is what you want, since an operator reads that
+  file. Every other `//` match across `dist/*.js` is inside a quoted string too (URLs in `cli.js`,
+  `presets.js`, `server.js`, `dashboard-static.js`, `responses-request.js`). A full sweep of all
+  335 files found no genuine stray comment in any file's own code.
+- ⚠ **`dist/sse.d.ts` has no doc blocks, and that is not stripping.** `src/sse.ts` has none to
+  begin with. It is the only one of 91 top-level `.d.ts` files without them; the other 90 carry
+  theirs intact.
+
+Two structural facts confirmed at the same time: nothing in `src/` or `test/` reads a comment out
+of `dist/*.js` at run time, and the second pass leaves no stale output — every top-level
+`dist/*.js` has a matching `.d.ts` and `.js.map`, with no orphan in either direction. The 111 `.js`
+against 110 `.d.ts` is the Vite dashboard bundle, which correctly has neither pair.
+
 ## 4. Friction
 
 - `npm pack --dry-run --json` returns an OBJECT keyed by package name on the npm major installed
