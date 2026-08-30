@@ -289,7 +289,32 @@ back to the next on failure or quota exhaustion, exactly like candidates inside 
 The CLIs' own model lists are the authority on what exists — re-check them rather than trusting
 ids written down anywhere, since a de-listed id fails a whole rung.
 
-### One verb, host-adapted
+### The best way to delegate: the `dispatch` MCP tool
+
+**If your host has llm-relay's MCP tools, use `dispatch`. It is one call and it returns an
+ANSWER**, not a command you then have to run correctly:
+
+```
+dispatch(task: "<the whole task>")            -> the lane's answer, plus which lane produced it
+dispatch(task: "...", tier: "high")           -> pick a capability tier
+dispatch(task: "...", lane: "agy-gemini")     -> force one rung
+```
+
+If the lane outlives `waitMs` (default 60 s) you get a `jobId` instead. Then:
+`dispatch_status(jobId)` -> `dispatch_result(jobId)`, and `dispatch_cancel(jobId)` to stop it.
+`dispatch_lanes()` shows the ladder if you want to choose deliberately.
+
+⚠ **Prefer this over the CLI whenever it is available.** The CLI hands you a command, and running a
+lane command correctly is the hard part — three client idle timeouts must be lifted or a long think
+dies at ~300 s, stdin must be closed or `agy` stalls to its timeout, an npm `.cmd` shim needs a
+shell with every token quoted, and a console child steals the desktop focus without window
+suppression. The MCP server does all of that for you.
+
+Not present? Add it once: `claude mcp add --scope user llm-relay -- llm-relay mcp`.
+
+### One verb, host-adapted (the CLI form)
+
+Use this when the MCP tools are not available to you.
 
 `llm-relay dispatch` is the **only** thing you need to ask, from any harness. Do not branch on which
 one you are in, and do not reason about whether a subagent can reach a pool from here — the relay
