@@ -115,9 +115,12 @@ out loud, and asked that the tool make itself known without being named. Three m
 fixed in the repo so every host and every stranger gets it: the MCP `initialize` instructions stated
 only WHAT the tool is (they are the one channel a host loads unconditionally); the `dispatch` tool
 is DEFERRED on a real host, so its description never loads until a tool search; and the skill
-description triggered on the DECISION to offload rather than on the situation. Four tests in
+description triggered on the DECISION to offload rather than on the situation. Three tests in
 `test/mcp-server.test.ts` pin the claims, mutation-checked both ways. Details in
-[docs/backlog.md](docs/backlog.md).
+[docs/backlog.md](docs/backlog.md). ⚠ Commit `61b4ec6`'s message says "four tests"; it is **three**
+(`serves the instructions constant`, `states WHEN to delegate`, `carries the unprompted trigger`).
+The independent closeout auditor caught the miscount after the push, so this line is the corrected
+record — the same treatment `CLAUDE.md` already gives `3d2fcee`.
 ⚠ The durable lesson is in `CLAUDE.md`: **prose the model must go and find is not a trigger.** The
 global instructions already said "PREFER THE MCP TOOL" in bold and it changed nothing.
 

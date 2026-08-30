@@ -117,8 +117,10 @@
   it out loud. That is the machine's own "rules become tooling, not prose" policy failing in the
   one place nobody had applied it.
 
-  Pinned by four tests in `test/mcp-server.test.ts` — the served instructions must equal the
+  Pinned by three tests in `test/mcp-server.test.ts` — the served instructions must equal the
   exported constant, and both the constant and the `dispatch` description must carry the trigger.
+  ⚠ Commit `61b4ec6`'s message claims "four tests". It is three; the independent closeout auditor
+  caught the miscount after the push, and this is the corrected record.
   Mutation-checked both ways: removing the trigger from the constant fails exactly one test, and
   removing it from the tool description fails exactly the other, so neither assertion is carrying
   the other.
