@@ -132,9 +132,11 @@ blocker:
 
 ## 7. Findings in passing (not blockers)
 
-- The live `~/.llm-relay/config.json` `repair.destructiveTools` list lacks Codex's
+- The live `~/.llm-relay/config.json` `repair.destructiveTools` list lacked Codex's
   `shell_command` and `apply_patch` (the source default gained them 2026-08-14; the operator
-  config predates). One-line config addition.
+  config predated). **CLOSED 2026-08-29:** both names added via `llm-relay config set` — the
+  list now matches the 16-name source default — relay restarted, `routing show` loads cleanly.
+  Backup: `~/.llm-relay/config.json.bak-2026-08-29-pre-codex-destructive`.
 - The probe reports **64 DEAD pool members** (mostly OpenRouter `:batch` variants, HTTP 404) —
   pool hygiene, handled by catalog refresh/eviction, worth a later look.
 - The recon subagent printed the freellmapi **unified key** value into its transcript despite
@@ -199,5 +201,5 @@ blocker:
   - **Open follow-ups, each named with its home:** audit-tools `docs/nightly-routine.md:29`
     still dispatches via `claude.ps1`, which would RESURRECT the retired router (audit-tools
     repo); `llm-relay setup claude-cli` prints wrapper paths relative to the CURRENT checkout,
-    so a worktree run names a temporary tree (this repo, minor); the live config's missing
-    Codex `destructiveTools` entries (filed as a session task chip).
+    so a worktree run names a temporary tree (this repo, minor). The third follow-up — the live
+    config's missing Codex `destructiveTools` entries — is CLOSED 2026-08-29; see §7.
