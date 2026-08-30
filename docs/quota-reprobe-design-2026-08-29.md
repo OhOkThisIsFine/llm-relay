@@ -91,6 +91,10 @@ retracts.
   spawns exist in exactly two places — the operator CLI probe and the relay's background
   lane cadence. The reasons the old rule existed (client-bound quota, a lane cannot answer
   an HTTP turn) all bind the request path and survive intact.
+  ⚠ The independent closeout audit (2026-08-30) caught the first implementation violating this
+  as written: the cadence hook sat inside `tickOnce`, which the admitted `GET /ping` route also
+  calls, so an HTTP request could initiate lane work. Fixed the same night — the hook fires only
+  from the ping loop's own scheduled iteration, pinned by `test/ping.test.ts`.
 
 ## 6. Recon findings (Codex read-only recon; load-bearing claims re-verified against source)
 
@@ -208,9 +212,17 @@ Facts that shape the design:
 
 ## 9. Residuals, stated
 
-- The quota probe's failure patterns are a closed, conservative set; a vendor wording outside it
-  is `inconclusive` and the recorded death simply stands until its own expiry. Extending the set
-  follows evidence, never guesswork.
+- The quota probe's failure patterns are a closed set of word-level matches, and word-level
+  matching CAN over-record: a failed probe whose output mentions "quota" for an unrelated reason
+  records `quota_exhausted`. The blast radius is bounded by construction — only a bucket ALREADY
+  recorded dead is ever probed, the wrong verdict refreshes a demotion (never an eviction, never
+  a new death on a healthy lane), and the next gate or any real success corrects it. A vendor
+  wording outside the set is `inconclusive` and the recorded death stands until its own expiry.
+  Extending the set follows evidence, never guesswork.
+- Quota-probe gate stamps live in process memory: a restart forgets them, and a restored dead
+  bucket is re-stamped on first sight — deferring its next probe by one interval rather than
+  probing immediately. Bounded in both directions (no storm, at most one extra interval of
+  delay), so persisting the stamps was deliberately skipped.
 - `llm-relay lanes` has no manual `--probe-quota` verb; the cadence (with a shortened interval)
   is the verification path. Add the verb only if a real operator need appears.
 - S3 hand-lane deaths still need SOMEONE to record them (`llm-relay dispatch -x … --retry-after-ms …`);

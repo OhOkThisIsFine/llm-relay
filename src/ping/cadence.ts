@@ -123,9 +123,12 @@ export class PingLoop {
       autoStart?: boolean;
       probeCachePath?: string;
       /**
-       * Called once per tick, contained — the lane cadence's entry point (`lane-cadence.ts`).
-       * A hook, not an await: lane work runs detached, so a minutes-long lane command can never
-       * delay an HTTP probe tick.
+       * Called once per SELF-SCHEDULED loop iteration, contained — the lane cadence's entry
+       * point (`lane-cadence.ts`). A hook, not an await: lane work runs detached, so a
+       * minutes-long lane command can never delay an HTTP probe tick. ⚠ Deliberately NOT fired
+       * from `tickOnce` itself: the admitted `GET /ping` route calls `tickOnce` directly, and
+       * the request path must not be able to initiate lane work (the closeout audit of
+       * 2026-08-30 caught exactly that leak) — only the timer loop advances the lane cadence.
        */
       onTick?: ((now: number) => void) | undefined;
     } = {},
@@ -356,11 +359,6 @@ export class PingLoop {
 
   public async tickOnce(scope: "catalog" | "routable" = "catalog"): Promise<void> {
     this.refreshAutoPingMode();
-    try {
-      this.opts.onTick?.(Date.now());
-    } catch {
-      // Contained: a tick hook must never break the ping loop.
-    }
     await this.pollSpendHeadroom().catch(() => {});
     if (scope === "routable") materializeDynamicPools(this.cfg, this.catalog);
     const providers = Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>;
@@ -444,6 +442,13 @@ export class PingLoop {
 
     const loop = async () => {
       if (!this.running) return;
+      // The lane-cadence hook fires HERE and only here — see the `onTick` option doc: a direct
+      // `tickOnce` caller (the admitted GET /ping) must never be able to initiate lane work.
+      try {
+        this.opts.onTick?.(Date.now());
+      } catch {
+        // Contained: a tick hook must never break the ping loop.
+      }
       await this.tickOnce("routable").catch(() => {});
       if (this.running) {
         this.timerObj = setTimeout(loop, this.intervalMs);

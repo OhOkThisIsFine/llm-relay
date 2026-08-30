@@ -885,7 +885,10 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   outside the request path there are exactly TWO lane-spawn sites — the operator CLI probe
   (`lanes --probe`) and the background lane cadence (`lane-cadence.ts`), because keeping lane
   metadata fresh and re-testing recorded quota deaths is the relay's own job, exactly as the
-  ping loop already does for HTTP. The old flat sentence "the relay never spawns one" narrowed
+  ping loop already does for HTTP. ⚠ The cadence hook fires only from `PingLoop.start()`'s OWN
+  loop iteration, never from `tickOnce` — the admitted `GET /ping` route calls `tickOnce`
+  directly, and a hook there let an HTTP request initiate lane work (caught by the 2026-08-30
+  closeout audit; pinned in `test/ping.test.ts`). The old flat sentence "the relay never spawns one" narrowed
   to the request path; every reason behind it binds there and survives intact. Exhaustion state
   is durable now (`dispatch-exhaustion-persistence.ts`), and a recorded death is re-probed on
   the `routing.laneProbe` cadence until a real answer retracts it or it expires — no lane stays
