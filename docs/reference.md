@@ -666,6 +666,43 @@ x-llm-relay-quota-demoted: nim/z-ai/glm-5.2 (requests/minute remaining 0, provid
 `llm-relay candidates` shows the same fact per row as `QUOTA <seconds>s (<axis>/<period>, <basis>)`
 in the breaker column; the dashboard Cooldowns panel lists it with reason `rate_limit`.
 
+#### Sustained latency as a demotion term (`routing.latency`)
+
+**On by default.** A candidate whose MEASURED 95th-percentile latency exceeds a ceiling joins the
+same cooling band, so the walk stops leading with a member that answers but takes a minute.
+
+Why it exists: measured 2026-08-30, a member with a healthy (closed) breaker and a p95 of
+**70364 ms** was walked ahead of every cooling one, because health banding read breaker state and
+nothing else. Single requests were costing 120–123 s across 2–6 attempts, which read from outside
+as an offload lane "stalling".
+
+- It only ever REORDERS. It never drops a candidate and never refuses a request.
+- It needs a **sustained** measurement — a p95 over at least `minSamples` measurable probes — so a
+  single slow request can never demote anything.
+- **Unmeasured latency has no effect whatsoever**, the same rule as unknown quota. A deployment
+  nobody has probed keeps its place.
+- No cooldown is registered, because latency states no reset and the relay does not invent
+  durations. The demotion simply lifts by itself once the measurement recovers.
+
+```json
+"routing": {
+  "latency": { "enabled": true, "p95Ms": 30000, "minSamples": 5 }
+}
+```
+
+`"latency": false` is shorthand for `{ "enabled": false }` and restores the previous behaviour
+exactly. An unknown key is a hard config error rather than a silently ignored one.
+
+When the walk's ranked first choice was displaced this way, the response says so:
+
+```
+x-llm-relay-latency-demoted: nim/deepseek-ai/deepseek-v4-flash (p95 70364ms > 30000ms over 10 samples)
+```
+
+⚠ That header is this demotion's **only** surface. Unlike quota it registers no breaker cooldown, so
+`llm-relay candidates` and the dashboard Cooldowns panel — which read breaker state — will not show
+it.
+
 #### Hard caps refuse, loudly
 
 Everything above demotes — and then there is the one thing that may refuse: an operator-declared

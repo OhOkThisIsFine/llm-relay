@@ -40,7 +40,7 @@ import {
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE } from "./tool-dialects.js";
-import { dialectRefusalSignalOf, ERROR_ORIGIN_HEADER, TOOL_DIALECT_HEADER, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type ErrorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { dialectRefusalSignalOf, ERROR_ORIGIN_HEADER, TOOL_DIALECT_HEADER, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, LATENCY_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type ErrorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -90,6 +90,7 @@ import {
 import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact, type FactResetBasis } from "./target-facts.js";
 import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
+import { createLatencyDemotionFn, latencyDemotionLabel, type LatencyDemotionFn } from "./latency-demotion.js";
 /**
  * Resolves a deployment's cost class LIVE from the catalog, for facts that apply to one class
  * only. Threaded exactly like `QuotaDemotionFn`: built once per proxy with its dependencies bound,
@@ -391,6 +392,16 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
         ? (deps.accountingReader as unknown as Pick<AccountingStore, "usedInWindow">)
         : null,
   });
+  // Sustained measured latency as a demotion term (owner decision 2026-08-30, see
+  // `latency-demotion.ts`). Built once per proxy like `quotaDemotion` above; each call re-reads
+  // live breaker samples, so the demotion lifts by itself when the measurement recovers.
+  const latencyDemotion = createLatencyDemotionFn({
+    breaker,
+    // No conditional spread: `parseLatencyDemotion` is TOTAL, so `routing.latency` is always
+    // present on a loaded config and `undefined` here only for a hand-built one — which the
+    // module already reads as "every default".
+    settings: cfg.routing?.latency,
+  });
   // The cost class of a deployment, resolved LIVE from the catalog, for facts that apply to only
   // one class. Built once per proxy like `quotaDemotion` above, and read fresh on every call so it
   // tracks the catalog's own 10-minute refresh.
@@ -542,6 +553,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
       quotaDemotion,
+      latencyDemotion,
       costClassOf,
       hardCap: hardCapEvaluator,
     }).catch((e) => {
@@ -611,6 +623,12 @@ interface Handlers {
    * out pays one property read per candidate and nothing else.
    */
   quotaDemotion: QuotaDemotionFn;
+  /**
+   * Sustained measured latency (see `latency-demotion.ts`). Inert — returns null without reading
+   * anything — while `routing.latency.enabled` is false, and inert on any deployment with fewer
+   * than `minSamples` measurable probes, which is every deployment on a cold start.
+   */
+  latencyDemotion: LatencyDemotionFn;
   costClassOf: CostClassFn;
   /**
    * G2's operator-set refusal ceilings (see `hard-cap.ts`). Null ⇒ no opinion; unlike the demotion
@@ -1264,6 +1282,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   // to promote: a target the breaker is cooling steps aside, everything else keeps
   // its fitness order. (The re-sort was invisible for as long as an untracked target
   // scored a flat 100 and `Array.prototype.sort` is stable — INV-TS-7.)
+  //
+  // ⚠⚠ **AMENDED BY OWNER DECISION 2026-08-30, and this is NOT drift — do not "restore" it.**
+  // Latency now DOES demote, via `latency-demotion.ts` folded into `targetUsability` beside the
+  // quota term. The paragraph above stays because every word of it is still the constraint: what
+  // was rejected is a second ranking PASS that re-sorts and can PROMOTE on one request's latency,
+  // and that remains rejected. A one-way demotion term is a different thing — it never re-sorts,
+  // never promotes, and cannot fire on a single sample (p95 over a minimum count of MEASURABLE
+  // samples, unmeasured having no effect at all).
+  //
+  // What forced the amendment: measured 2026-08-30, banding on breaker state ALONE walked a
+  // breaker-CLOSED member with a p95 of 70364 ms ahead of every cooling one, and single requests
+  // cost 120-123 s across 2-6 attempts. `docs/backlog.md` holds the evidence table and the
+  // owner's choice between the three options.
   // The OpenAI front (Chat Completions / Responses) is detected BEFORE the context guardrail so
   // the guardrail covers it: both fronts resolve concrete target deployments, and the estimator
   // walks all three wire shapes. The front went without this pruning until 0.17.0 — the same
@@ -1285,12 +1316,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const rankedAttempts = rankCredentialAttempts(attempts, h.credentialLru, {
     evidenceFor: (attempt) => credentialEvidence(attempt, cfg, h.breaker, routingNow),
   });
-  const { ordered: orderedAttempts, quotaDemotedFirst } = orderDeploymentGroupsByUsability(
+  const { ordered: orderedAttempts, quotaDemotedFirst, latencyDemotedFirst } = orderDeploymentGroupsByUsability(
     rankedAttempts,
     h.breaker,
     routingNow,
     h.quotaDemotion,
     h.costClassOf,
+    h.latencyDemotion,
   );
   let walkAttempts = orderedAttempts;
   let sticky: StickyRequestContext | null = null;
@@ -1394,6 +1426,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       cfg,
       accounting,
       quotaDemotedFirst,
+      latencyDemotedFirst,
     }, h);
     return;
   }
@@ -1728,6 +1761,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         tried,
         degraded: degradedLabel(addressedPool, degradedSpecs, target),
         quotaDemoted: quotaDemotedFirst,
+        latencyDemoted: latencyDemotedFirst,
         paid: paidLabel(cfg, h, target),
         credentialHeaders: backendRes.status < 400
           ? credentialTrace.headers(resolvedAttempt)
@@ -1965,6 +1999,7 @@ function targetUsability(
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
+  latencyDemotion?: LatencyDemotionFn | null,
 ): TargetUsability {
   const identity = targetIdentity(attempt);
   if (!breaker.isHealthy(identity, now)) return "cooling";
@@ -1973,6 +2008,13 @@ function targetUsability(
   // are temporary conditions on a deployment that is otherwise healthy, and ordering them ahead
   // of live members is the whole point — the walk should spend its round-trips where capacity is.
   if (cooledByQuota(attempt, breaker, quotaDemotion, now)) return "cooling";
+  // Sustained MEASURED latency joins the same band, for the same reason: the walk should spend its
+  // round-trips where capacity is. Measured 2026-08-30, this is the case that motivated it — a
+  // breaker-CLOSED member with a p95 of 70364 ms was walked ahead of every cooling one, and single
+  // requests cost 120-123 s. ⚠ No breaker cooldown is registered (unlike quota): latency states no
+  // reset and this relay never invents a duration, so the term is simply re-resolved next request
+  // and lifts by itself. Unmeasured latency has NO effect whatsoever.
+  if (latencyDemotion?.(attempt, now)) return "cooling";
   if (breaker.hasCredentialFault(identity, now)) return "credential-fault";
   return "live";
 }
@@ -2066,14 +2108,15 @@ function orderDeploymentGroupsByUsability(
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
-): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null } {
+  latencyDemotion?: LatencyDemotionFn | null,
+): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null; latencyDemotedFirst: string | null } {
   type Group = ReturnType<typeof groupCredentialAttempts>[number];
   const preferred = groupCredentialAttempts(attempts)[0]?.attempts[0];
   const live: Group[] = [];
   const faulted: Group[] = [];
   const cooling: Group[] = [];
   for (const group of groupCredentialAttempts(attempts)) {
-    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf);
+    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
     if (usability === "cooling") cooling.push(group);
     else if (usability === "credential-fault") faulted.push(group);
     else live.push(group);
@@ -2091,6 +2134,17 @@ function orderDeploymentGroupsByUsability(
   });
 
   const ordered = [...live, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  let latencyDemotedFirst: string | null = null;
+  if (
+    preferred !== undefined &&
+    latencyDemotion !== undefined &&
+    latencyDemotion !== null &&
+    ordered[0] !== undefined &&
+    ordered[0] !== preferred
+  ) {
+    const slow = latencyDemotion(preferred, now);
+    if (slow) latencyDemotedFirst = latencyDemotionLabel(specOfTarget(preferred.target), slow);
+  }
   let quotaDemotedFirst: string | null = null;
   if (
     preferred !== undefined &&
@@ -2102,7 +2156,7 @@ function orderDeploymentGroupsByUsability(
   ) {
     quotaDemotedFirst = quotaDemotionLabel(specOfTarget(preferred.target), quotaDemotion(preferred, now)!);
   }
-  return { ordered, quotaDemotedFirst };
+  return { ordered, quotaDemotedFirst, latencyDemotedFirst };
 }
 
 type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
@@ -2404,6 +2458,7 @@ function applyStickyOrdering(
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
+  latencyDemotion?: LatencyDemotionFn | null,
 ): { targets: ResolvedAttempt[]; status: string } {
   const groups = groupCredentialAttempts(ordered);
   const pinnedIndex = groups.findIndex((group) => specOfTarget(group.attempts[0]!.target) === pinnedSpec);
@@ -2412,7 +2467,7 @@ function applyStickyOrdering(
   if (!pinned || !pinnedGroup) return { targets: ordered, status: "bypassed: not-in-pool" };
 
   // The first row is the credential selector's best-ranked usable slot for this deployment.
-  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf);
+  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
   if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
 
   if (degraded?.has(pinnedSpec)) {
@@ -2420,7 +2475,7 @@ function applyStickyOrdering(
       (group) => {
         const candidate = group.attempts[0]!;
         return !degraded.has(specOfTarget(candidate.target)) &&
-          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf) === "live";
+          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf, latencyDemotion) === "live";
       },
     );
     if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
@@ -2485,7 +2540,8 @@ function orderByUsabilityTracked(
   now: number,
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
-): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null } {
+  latencyDemotion?: LatencyDemotionFn | null,
+): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null; latencyDemotedFirst: string | null } {
   const live: ResolvedAttempt[] = [];
   const faulted: ResolvedAttempt[] = [];
   const cooling: ResolvedAttempt[] = [];
@@ -2500,7 +2556,7 @@ function orderByUsabilityTracked(
     // Demotion, never exclusion — same contract as the rest of this function, and doubly so here:
     // an exhausted allowance is a temporary condition on a deployment that is still free, and a
     // pool with nothing else left must still be able to try it.
-    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf);
+    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
     if (usability === "cooling") cooling.push(attempt);
     else if (usability === "credential-fault") faulted.push(attempt);
     else live.push(attempt);
@@ -2517,7 +2573,7 @@ function orderByUsabilityTracked(
     return liftA - liftB;
   });
 
-  return { ordered: [...live, ...faulted, ...cooling], quotaDemotedFirst: null };
+  return { ordered: [...live, ...faulted, ...cooling], quotaDemotedFirst: null, latencyDemotedFirst: null };
 }
 
 /**
@@ -2867,6 +2923,7 @@ interface Ctx {
    * Computed once by `orderDeploymentGroupsByUsability`, beside the order it explains.
    */
   quotaDemoted?: string | null;
+  latencyDemoted?: string | null;
   /** Set when the answering deployment is not free. See `PAID_HEADER`. */
   paid?: string | null;
   /** Request-local sticky key and the previously stored pin's evaluation. */
@@ -3588,6 +3645,8 @@ async function openAiFrontPath(
     accounting: RequestAccountingState | null;
     /** The walk's ranked first choice was quota-demoted; see `QUOTA_DEMOTED_HEADER`. */
     quotaDemotedFirst?: string | null;
+    /** The walk's ranked first choice was latency-demoted; see `LATENCY_DEMOTED_HEADER`. */
+    latencyDemotedFirst?: string | null;
   },
   h: Handlers,
 ): Promise<void> {
@@ -4010,6 +4069,7 @@ async function openAiFrontPath(
           degraded: degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target),
           // The announcement computed at walk-order time, beside the same demotion that produced it.
           quotaDemoted: ctx.quotaDemotedFirst,
+          latencyDemoted: ctx.latencyDemotedFirst,
           paid: ctx.cfg ? paidLabel(ctx.cfg, h, target) : null,
           sticky: ctx.sticky,
         });
@@ -4183,6 +4243,7 @@ interface ServedAnnouncementContext {
   readonly credentialHeaders?: Record<string, string> | undefined;
   readonly degraded?: string | null | undefined;
   readonly quotaDemoted?: string | null | undefined;
+  readonly latencyDemoted?: string | null | undefined;
   readonly paid?: string | null | undefined;
   readonly sticky?: StickyRequestContext | null | undefined;
 }
@@ -4216,6 +4277,7 @@ function responseHeadersForTarget(
   if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   if (ctx.quotaDemoted) responseHeaders[QUOTA_DEMOTED_HEADER] = ctx.quotaDemoted;
+  if (ctx.latencyDemoted) responseHeaders[LATENCY_DEMOTED_HEADER] = ctx.latencyDemoted;
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
   if (ctx.credentialHeaders) Object.assign(responseHeaders, ctx.credentialHeaders);
   const sticky = stickyHeaderValue(ctx.sticky, ctx.target, backendRes.status);

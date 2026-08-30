@@ -1671,3 +1671,60 @@ describe("routing.laneProbe", () => {
     ).toThrow(/laneProbe\.enabled must be a boolean/);
   });
 });
+
+/**
+ * `routing.latency` — the parse contract for the sustained-latency demotion term (owner decision
+ * 2026-08-30). What the term DOES to a walk is pinned in test/latency-demotion.test.ts; this is
+ * only about what the file is allowed to say.
+ */
+describe("loadConfig — routing.latency", () => {
+  function latencyCfg(latency: unknown) {
+    return base({ routing: { default: "nim/z-ai/glm-5.2", latency } });
+  }
+
+  it("defaults to an empty object, which means every default (i.e. ON)", () => {
+    // Deliberately NOT undefined: the parser is total so `parseRouting` needs no extra branch,
+    // and `{}` and absence are the same statement because every key is optional.
+    expect(loadConfig(write("lat-absent.json", base())).routing.latency).toEqual({});
+  });
+
+  it("normalizes the boolean shorthand away, so nothing downstream decides what false means", () => {
+    expect(loadConfig(write("lat-false.json", latencyCfg(false))).routing.latency).toEqual({ enabled: false });
+    expect(loadConfig(write("lat-true.json", latencyCfg(true))).routing.latency).toEqual({ enabled: true });
+  });
+
+  it("round-trips an explicit ceiling and sample floor", () => {
+    expect(loadConfig(write("lat-obj.json", latencyCfg({ p95Ms: 5000, minSamples: 20 }))).routing.latency)
+      .toEqual({ p95Ms: 5000, minSamples: 20 });
+  });
+
+  it("REFUSES an unknown key rather than ignoring it", () => {
+    // The compat/configured-limits precedent. An operator who wrote `p95ms` (wrong case) believes
+    // they lowered the ceiling; ignoring the key leaves the default in force while looking changed.
+    expect(() => loadConfig(write("lat-typo.json", latencyCfg({ p95ms: 5000 })))).toThrow(
+      /routing\.latency has an unknown key "p95ms"/,
+    );
+  });
+
+  it("refuses a ceiling that would bound nothing or everything", () => {
+    // 0 demotes every measured deployment at once; a negative or non-finite ceiling bounds nothing
+    // while looking like it does — the same reason an empty cost filter is dropped at load.
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "5000"]) {
+      expect(() => loadConfig(write(`lat-bad-${String(bad)}.json`, latencyCfg({ p95Ms: bad })))).toThrow(
+        /routing\.latency\.p95Ms must be a positive finite number/,
+      );
+    }
+    expect(() => loadConfig(write("lat-bad-samples.json", latencyCfg({ minSamples: 0 })))).toThrow(
+      /routing\.latency\.minSamples must be a positive finite number/,
+    );
+  });
+
+  it("rejects a malformed block outright", () => {
+    expect(() => loadConfig(write("lat-array.json", latencyCfg([])))).toThrow(
+      /routing\.latency must be an object or a boolean/,
+    );
+    expect(() => loadConfig(write("lat-enabled.json", latencyCfg({ enabled: "yes" })))).toThrow(
+      /routing\.latency\.enabled must be a boolean/,
+    );
+  });
+});

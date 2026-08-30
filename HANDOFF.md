@@ -133,9 +133,21 @@ threads are disproved — the accounting store DOES receive the rows (`recent.js
 not sorted by time), and the `unrecognized_model` line remains the no-information warning
 `CLAUDE.md` already describes. Full evidence table in [docs/backlog.md](docs/backlog.md).
 
-**Immediate next:** the stall item is now an owner DECISION, not an investigation. The behaviour
-follows from a design choice recorded with its reasoning (`src/server.ts:1257-1265`), so changing it
-is the owner's call. The three options are stated in [docs/backlog.md](docs/backlog.md).
+✅ **And the owner chose the fix, which shipped the same day: sustained latency now DEMOTES.**
+`src/latency-demotion.ts`, folded into `targetUsability` beside the quota term — `routing.latency`
+(default ON, p95 ceiling 30000 ms over at least 5 measurable samples), announced by
+`x-llm-relay-latency-demoted`. It only reorders: never drops, never refuses, and unmeasured latency
+has no effect at all. No breaker cooldown is registered, because latency states no reset and this
+relay never invents a duration — so the demotion lifts by itself when the measurement recovers.
+17 tests, 6 of them driving a real two-candidate walk on BOTH fronts.
+
+⚠ **This reverses a rationale recorded in place at `src/server.ts`, and that is an owner decision,
+not drift.** The comment there argued against re-ranking on stability. It is amended rather than
+deleted, and it still bounds the design: what was rejected is a second ranking PASS that re-sorts
+and can PROMOTE on one request's latency, and that stays rejected. Do not "restore" the old
+behaviour as a regression fix.
+
+**Immediate next: nothing.** [docs/backlog.md](docs/backlog.md) has an empty Open section.
 
 ⚠ **The MCP server design is OWNED BY ANOTHER AGENT** (owner, 2026-08-30). Do not start it here.
 ⚠⚠ **And its stated justification expired ~70 minutes after the decision.** D4 rested on *"agy has

@@ -164,6 +164,23 @@ export const DEGRADED_HEADER = "x-llm-relay-degraded";
 export const QUOTA_DEMOTED_HEADER = "x-llm-relay-quota-demoted";
 
 /**
+ * The walk's FIRST choice was demoted for SUSTAINED MEASURED LATENCY and the answer came from
+ * further down. Third member of the same family as `DEGRADED_HEADER` and `QUOTA_DEMOTED_HEADER`,
+ * and it exists for the same reason: an automatic reorder is acceptable only because it is
+ * announced.
+ *
+ * ⚠ It is also the ONLY surface this demotion has. Quota demotion registers a breaker cooldown, so
+ * `/candidates` and the dashboard Cooldowns panel can see it; latency states no reset, and this
+ * relay never invents a cooldown duration, so no cooldown is registered and those panels show
+ * nothing. See `src/latency-demotion.ts`.
+ *
+ * Value is one bounded line, e.g. `nim/deepseek-ai/deepseek-v4-flash (p95 70364ms > 30000ms over
+ * 12 samples)` — the measured figure, the ceiling it crossed and the sample count behind it.
+ * Nothing secret, no credential values.
+ */
+export const LATENCY_DEMOTED_HEADER = "x-llm-relay-latency-demoted";
+
+/**
  * This request was refused by an OPERATOR-SET HARD CAP (G2) — not by a provider.
  *
  * Value is one line per capped credential cell, e.g.

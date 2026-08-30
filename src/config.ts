@@ -347,6 +347,15 @@ export interface Routing {
    */
   quota?: QuotaEnforcementConfig;
   /**
+   * Sustained MEASURED latency as a demotion term (owner decision 2026-08-30). **Default ON** —
+   * absent means enabled with the tunable defaults in `src/latency-demotion.ts`. `false` is the
+   * shorthand for `{ enabled: false }` and restores the pre-2026-08-30 behaviour exactly.
+   *
+   * Like quota, it only ever REORDERS: never drops, never refuses, and unmeasured latency has no
+   * effect whatsoever.
+   */
+  latency?: LatencyDemotionConfig;
+  /**
    * Background lane re-probing (owner decision 2026-08-29,
    * docs/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
    * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
@@ -445,6 +454,73 @@ function parseQuotaEnforcement(raw: unknown): QuotaEnforcementConfig | undefined
       throw new Error("config.routing.quota.hardCaps must be a boolean");
     }
     out.hardCaps = value.hardCaps;
+  }
+  return out;
+}
+
+/**
+ * `routing.latency` — sustained MEASURED latency as a demotion term (owner decision 2026-08-30).
+ *
+ * **Default ON.** A candidate whose measured p95 exceeds `p95Ms`, over at least `minSamples`
+ * measurable samples, joins the cooling band instead of leading the walk. It is a demotion, so the
+ * worst case is a reorder: nothing is dropped and nothing is refused.
+ *
+ * `false` is the documented shorthand for `{ enabled: false }` and restores the pre-2026-08-30
+ * behaviour exactly. An object with no keys is legal and means the defaults — writing it down is
+ * documentation, not a behaviour change.
+ *
+ * The thresholds live in `src/latency-demotion.ts` beside the measurement that calibrated them.
+ */
+export interface LatencyDemotionConfig {
+  /** Default true. false disables latency demotion entirely. */
+  enabled?: boolean;
+  /** Measured p95 ceiling in ms. Above it, the candidate is demoted. */
+  p95Ms?: number;
+  /** Minimum measurable samples before latency may demote anything at all. */
+  minSamples?: number;
+}
+
+/**
+ * Validate `routing.latency`. Malformed is a hard error, and an UNKNOWN KEY is a hard error too —
+ * the `compat`/`configured-limits` precedent rather than the looser `routing.quota` one. An
+ * operator who wrote `"p95ms": 5000` (wrong case) believes they lowered the ceiling; silently
+ * ignoring the key would leave the default in force while looking like it had been changed.
+ *
+ * ⚠ Both numbers must be finite and positive. `0` would demote every measured deployment at once
+ * and a negative or `NaN` ceiling bounds nothing while looking like it does.
+ */
+function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
+  // ABSENT returns `{}`, not `undefined`, and the two are the same thing here: every key is
+  // optional and the module resolves its own defaults, so "{}" IS "all defaults". Returning a
+  // total value lets the caller assign unconditionally — the `laneProbe` precedent — which keeps
+  // `parseRouting` free of another branch. That function is already at cognitive complexity 124
+  // against a limit of 15, and CLAUDE.md records the decision NOT to restructure it.
+  if (raw === undefined || raw === null) return {};
+  // The boolean shorthand is NORMALIZED here rather than carried through the type. One shape
+  // downstream means the demotion module never re-implements "what does `false` mean".
+  if (typeof raw === "boolean") return { enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.latency must be an object or a boolean");
+  }
+  const value = raw as Record<string, unknown>;
+  const known = new Set(["enabled", "p95Ms", "minSamples"]);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      throw new Error(`config.routing.latency has an unknown key "${key}"`);
+    }
+  }
+  const out: LatencyDemotionConfig = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== "boolean") throw new Error("config.routing.latency.enabled must be a boolean");
+    out.enabled = value.enabled;
+  }
+  for (const key of ["p95Ms", "minSamples"] as const) {
+    const n = value[key];
+    if (n === undefined) continue;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new Error(`config.routing.latency.${key} must be a positive finite number`);
+    }
+    out[key] = n;
   }
   return out;
 }
@@ -1612,6 +1688,7 @@ function parseRouting(
     benchmarkSort?: unknown;
     sticky?: unknown;
     quota?: unknown;
+    latency?: unknown;
     laneProbe?: unknown;
     mcp?: unknown;
     ladder?: unknown;
@@ -1729,6 +1806,7 @@ function parseRouting(
   if (sticky) routing.sticky = sticky;
   const quota = parseQuotaEnforcement(r.quota);
   if (quota) routing.quota = quota;
+  routing.latency = parseLatencyDemotion(r.latency);
   routing.laneProbe = parseLaneProbe(r.laneProbe);
   const mcpSettings = parseMcpSettings(r.mcp);
   if (mcpSettings) routing.mcp = mcpSettings;

@@ -9,9 +9,17 @@
 
 ## Open
 
+_Nothing open._
 
-- **Investigate why the llm-relay offload lane STALLS and returns nothing** (owner-directed,
-  2026-08-30). Measured this lap: a `dispatch --next-command` lane on `pool/medium` ran for about
+## Closed
+
+- ✅ **The offload lane "stall" — root-caused, then FIXED** (owner-directed, 2026-08-30).
+  Filed as *"investigate why the llm-relay offload lane STALLS and returns nothing"*; it turned out
+  not to be a stall at all, and the fix the owner chose ships as `src/latency-demotion.ts`
+  (`routing.latency`, default ON, announced by `x-llm-relay-latency-demoted`). The original entry
+  and its evidence follow, because the measurements are the reason the fix looks the way it does.
+
+  Measured at filing: a `dispatch --next-command` lane on `pool/medium` ran for about
   17 minutes, spawned roughly 19 `node` children that all sat at near-zero CPU, and produced no
   output at all beyond one line —
 
@@ -84,16 +92,45 @@
     It remains a harmless side query. `CLAUDE.md` already records that warning as carrying no
     information.
 
-  **What is left is a DECISION, not an investigation.** The behaviour follows from a design choice
-  that is recorded with its reasoning, so changing it is the owner's call. Options: bound the
-  per-candidate attempt so a 70 s member cannot hold a walk; let sustained latency demote into the
-  cooling band; or accept it and leave the MCP job handle as the mitigation.
+  **DECIDED by the owner, 2026-08-30, and SHIPPED the same day: let sustained latency DEMOTE into
+  the cooling band.** Two other options were offered and declined — bounding the per-candidate
+  attempt, and accepting the behaviour with the MCP job handle as the mitigation.
+
+  Delivered as `src/latency-demotion.ts`, folded into `targetUsability` beside the quota term:
+  `routing.latency` (default ON, `p95Ms` 30000, `minSamples` 5), announced by
+  `x-llm-relay-latency-demoted`. 17 tests, of which 6 drive a real two-candidate walk on BOTH
+  fronts; mutation-checked. Details in `CLAUDE.md`'s `latency-demotion.ts` row and
+  `docs/reference.md`.
+
+  Size cost, root-caused BEFORE the ceiling moved, measured against the PUBLISHED v0.63.1 tarball
+  rather than a local guess: `packBytes` 879010 → 886142, `unpackedBytes` 4654284 → 4670709
+  (+16425), `packageEntries` 356 → 359. The delta decomposes with **no residue** —
+  9257 B of new `dist/latency-demotion.*` (3 files, matching the +3 entries exactly) + 4010 B
+  `config` + 2081 B `server` + 1077 B `backend` = 16425. ⚠ `dist/backend.d.ts` grew 962 B while
+  `dist/backend.js` grew 69 B, which is the two-pass build doing its job: the header constant's doc
+  comment survives in the declaration and is stripped from the JavaScript. ⚠ `docs/reference.md` and
+  `CLAUDE.md` are NOT packed, so documentation growth costs the tarball nothing. Ceilings were
+  raised ONCE, keeping the ~0.5% headroom the previous baseline carried.
+
+  ⚠ **This deliberately reverses a rationale recorded in place.** `src/server.ts:1257-1265` argues
+  against exactly this, in these words: a second ranking pass on stability "means neither decides
+  the order", and "live health then PROMOTES on evidence that is often a single request's latency".
+  The owner was shown that cost in the question and chose this option anyway, so it is an
+  **owner override of a recorded agent decision, not drift** — say so wherever the comment is
+  edited, and do not let a later reader "restore" the old behaviour as a regression fix.
+
+  The recorded objection also bounds the design, and every bound below is a direct answer to it:
+  - **Demote only. Never promote, never drop, never re-sort.** The objection is about a competing
+    ranking PASS; a one-way demotion term is not one. Same shape as the existing quota demotion.
+  - **Never act on a single request's latency** — that is the objection's own worst case. Require a
+    sustained, measured statistic.
+  - **Unmeasured has NO effect whatsoever**, matching `getDeploymentMeasurement`'s null contract
+    and the relay's standing "unknown stays null, never 0" invariant.
+  - **Announce it**, like every other automatic reorder here.
 
   ⚠ The MCP server does not fix this and does not claim to. What it changes is the SYMPTOM: the
   caller receives a `jobId` after `waitMs` and can poll or `dispatch_cancel` it, instead of a shell
   that blocks with no output and no exit.
-
-## Closed
 
 - ✅ **Offload announces itself — the operator no longer has to ask for it** (2026-08-30).
   The owner's report was blunt: *"the llm-relay skill or MCP or whatever should obviate me
