@@ -417,6 +417,70 @@ evidence, never the evidence.
 
 ---
 
+## 7. Friction log — the build lap, 2026-08-30
+
+Rewalked from the transcript, not recalled. Each entry says what it cost.
+
+**Environment and tooling**
+
+1. **The global `shell-conventions-guard` hook blocks heredocs for file content.** Correct on
+   Windows, and it applied to every multi-line source edit in this lap. The workaround is to Write
+   a `.py` script to the scratchpad and then run it — about eight times here. Cost: two tool calls
+   per edit instead of one. Worth keeping; worth knowing before you start.
+2. **`cd <dir> && node <generator>` is refused as an `&&`-chained generator.** The guard reads the
+   whole command line, so the innocent `cd` prefix trips it. Fix: give `node` an absolute path and
+   drop the `cd`. Not obvious from the message, which talks about generators rather than about the
+   `cd`.
+3. **Python's Windows console encoding (cp1252) cannot print `⚠`.** A script that WROTE the file
+   correctly still exited 1 on its confirmation `print`, which reads as a failed edit. Verify the
+   file, not the exit code, when a script's only failure is in its output.
+4. **A stray placeholder command dropped into the Python REPL and burned a 2-minute timeout.**
+   Self-inflicted. `python - <<X` with no body opens an interactive interpreter that cannot read
+   stdin and loops on `WinError 6`.
+
+**The measured trap this repository already documents, hit anyway**
+
+5. **The eslint hook's baseline is line-number sensitive**, exactly as `CLAUDE.md` warns. Adding one
+   `if` to `main()` reported *"Cognitive Complexity from 49"* as a NEW finding. `main()` is already
+   **48 at HEAD**, and the repo has explicitly declined to restructure `cli.ts` for it. Disproving
+   this cost a stash, a full eslint run and a restore. ⚠ The right response was not to suppress it:
+   moving the branch into `dispatchDashboardOrProxy` kept `main()` at its baseline AND landed the
+   code in its correct semantic home, where it also closes a real fall-through to `runProxy()`.
+
+**Measurement cost**
+
+6. **Three separate stash-and-rebuild cycles** were needed to decompose the package-size growth —
+   once before the rebase, once after variant C landed, and once to restore. Each is a ~30 s build.
+   The decomposition was worth it (both times the arithmetic closed to the byte), but there is no
+   cheap way to ask "what would `dist/` be without my change?".
+
+**Concurrency**
+
+7. **A parallel session moved `main` seven commits mid-lap**, including adopting package-size
+   variant C. That invalidated a baseline this lap had already measured and required a rebase plus a
+   full re-measurement. ⚠ It also produced two independent, agreeing corrections of the same agy
+   record, which is reassuring rather than wasteful. Check `origin/main` before measuring anything
+   that a sibling lap could move.
+
+**Host gaps, pre-existing**
+
+8. **`codex exec` surfaces NO MCP tools at all** — not this server, and not `codebase-memory-mcp` or
+   `headroom`, both registered long before it. `codex mcp list` shows all three ENABLED, so the
+   registration is correct and the gap is inside `codex exec`. Unresolved; Codex must use the CLI
+   form. Worth its own investigation.
+9. **`npm i -g .` blocks the postinstall hook** (`install-scripts ... not covered by allowScripts`),
+   so the bundled skills are NOT refreshed by a global install alone. Run
+   `node scripts/install-skill.mjs --force` after it, or the installed skill silently stays stale.
+
+**Protocol**
+
+10. **A client's protocol revision cannot be guessed.** Claude Code 2.1.237 asks for `2025-11-25`
+    and probes `server/discover` first — neither is documented where the server author would look.
+    A ten-line logging shim between host and server answered it in one attempt. Do that first, not
+    third.
+
+---
+
 ## Sources
 
 - <https://getlulu.dev/mcps>
