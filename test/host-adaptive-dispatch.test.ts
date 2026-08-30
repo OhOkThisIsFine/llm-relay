@@ -224,6 +224,55 @@ describe("transposing relay rungs for a bypassed host", () => {
   });
 });
 
+/**
+ * A STATED `unknown` is not a Claude harness, so it has NO subagent mechanism — `host-routing.ts`
+ * says exactly that. It used to share the `routed` branch, so a headless caller (cron, CI,
+ * run-headless.ps1) was handed a `target:` spec it could never address and `--next-command`
+ * refused with exit 2, leaving it nothing to run at all.
+ */
+describe("a host that stated `unknown` — no Claude harness, so no subagent mechanism", () => {
+  it("transposes a relay rung instead of offering a subagent path that does not exist", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE });
+    const l = lane(c, "pools", { host: "unknown" });
+    expect(l.transposed).toBe(true);
+    expect(l.invoke?.command).toBe("claude");
+    expect(l.invoke?.args).toContain("pool/coding");
+    expect(l.spec).toBe("pool/coding");
+  });
+
+  it("never sets requiresDirective — a directive is a Claude-subagent mechanism", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE, offload: { claude: { enabled: false } } });
+    expect(lane(c, "pools", { host: "unknown", client: "claude" }).requiresDirective).toBeUndefined();
+  });
+
+  it("transposes EVEN the plain passthrough — there is no Agent() here to reach it with", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE });
+    const l = lane(c, "anthropic", { host: "unknown" });
+    expect(l.transposed).toBe(true);
+    expect(l.invoke).toBeDefined();
+  });
+
+  it("names the real reason when no cliLane can transpose it", () => {
+    const l = lane(cfgWith({ ladder: LADDER }), "pools", { host: "unknown" });
+    expect(l.unreachable).toContain("not running inside a Claude Code session");
+    expect(l.unreachable).not.toContain("does not route its traffic");
+  });
+
+  // Negative controls: the fix must move `unknown` ALONE.
+  it("leaves a bypassed host on the per-spec test — it still HAS a subagent tool", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE });
+    expect(lane(c, "anthropic", { host: "bypassed" }).transposed).toBeUndefined();
+    expect(lane(c, "pools", { host: "bypassed" }).transposed).toBe(true);
+  });
+
+  it("leaves a routed host completely unchanged", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE, offload: { claude: { enabled: false } } });
+    const l = lane(c, "pools", { host: "routed", client: "claude" });
+    expect(l.transposed).toBeUndefined();
+    expect(l.requiresDirective).toBe(true);
+  });
+});
+
 describe("a bypassed host with no cliLane configured", () => {
   const cfg = () => cfgWith({ ladder: LADDER });
 

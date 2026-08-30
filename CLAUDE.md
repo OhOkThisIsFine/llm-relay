@@ -877,6 +877,38 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   match), and it fails **open** everywhere: a hook that denied subagents because the proxy was down
   would turn one unavailable optional lane into a total outage — same reasoning as an unset
   `${ENV}` disabling one provider instead of aborting startup.
+- **A host with no subagent mechanism must be handed a COMMAND, and `unknown` is such a host
+  (fixed 2026-08-30).** `host-routing.ts` defines three states and says what `unknown` means in as
+  many words — *"not running inside a Claude Code session — no subagent routing to adapt to"*. But
+  `dispatch.ts` gated transposition on `host === "bypassed"` alone, so `unknown` fell through with
+  `routed`: a headless caller (a cron job, a CI step, `run-headless.ps1`) was handed a `target:`
+  spec to address as a subagent it does not have, and `--next-command` then refused with exit 2 and
+  left it nothing to run at all. That is the closed-vocabulary defect class above — an unhandled
+  member resolving to the STRONGER claim ("you can reach this") — and it reproduced with **zero
+  flags** in any shell without `CLAUDECODE`. The policy now lives in three named predicates
+  (`canAddressAsSubagent`, `mustTransposeEveryRung`, `unreachableReason`). ⚠ For `unknown` EVERY
+  relay rung is transposed, the plain Anthropic passthrough included — `reachableWithoutRelay` asks
+  whether a bare `Agent(...)` reaches a spec, and there is no `Agent(...)` here at all. ⚠ An
+  **absent** verdict is deliberately NOT `unknown`: `buildDispatch` collapses absent into
+  `"unknown"` for the rendered view, so the lane builder takes `opts.host` directly and a caller
+  that stated nothing keeps the pre-existing path. ⚠ The fix is SERVER-side, so a live host keeps
+  the old answer until the relay restarts onto it — the CLI asks the running relay over HTTP.
+  Evidence, the three adversarial reviews and the MCP verdict:
+  [docs/skill-dispatch-mcp-verification-2026-08-30.md](docs/skill-dispatch-mcp-verification-2026-08-30.md).
+- **Do NOT build an MCP server (assessed fresh 2026-08-30, owner-directed).** The 2026-08-16
+  ledger rejection was re-opened and re-argued from scratch; two of the obvious objections are
+  INVALID and should not be repeated — a minimal JSON-RPC-over-stdio server needs **no** new
+  dependency (this repo hand-rolls `sse-frames.ts` and four SSE parsers already), and `packBytes`
+  is a regenerable CEILING, not a size wall. The real reasons: a fresh install ships **no**
+  `routing.ladder` and no `cliLane` (`DEFAULT_CONFIG_TEMPLATE`, `config.example.json` and
+  `onboarding.ts` all have zero), so a `dispatch()` tool would do nothing for anyone but this
+  machine and fails rubric test 1; a tool that RETURNS a command is a read tool duplicating
+  `/dispatch`; and a tool that EXECUTES needs a caller-supplied `cwd`, escapes the harness's
+  permission gate, has no representation for a 30-minute lane, and is precisely the "future async
+  spawn site" the quota-reprobe design warned about. ⚠ The strongest argument FOR it is real and
+  recorded: **agy has no shell but does have `mcp(*)`**, so an agy session has zero delegation
+  mechanisms today. That reverses this verdict if the owner states agy must be able to DELEGATE
+  rather than only be delegated to. Reversal conditions are listed in the doc §4.3.
 - **The dispatch ladder decides ORDER; the REQUEST PATH never executes a lane.** `routing.ladder`
   may name agent CLIs (`kind: "cli"`), and no lane command is ever spawned to answer an HTTP
   turn: a lane's quota is client-bound, it runs its own tool loop, and it returns only final
