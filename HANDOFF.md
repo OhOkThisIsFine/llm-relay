@@ -51,6 +51,13 @@ against a `CLAUDE.md` now 182.0 KB. ⚠ **That step can only run in the MAIN che
 resolves project targets under `C:/Code` and never reads a worktree — so a worktree lap must hand it
 back or step out to finish it.
 
+**Released as v0.61.0 and verified live**: publish run 33296485234 green, registry
+`dist-tags.latest` 0.61.0, global bin 0.61.0, relay restarted onto it. The defect case was
+re-checked end to end through the restarted relay — a harness-less caller now gets exit 0 and a
+runnable command where it got exit 2 — with both negative controls confirmed live (a `bypassed`
+session still transposes; a `routed` host still gets the lighter in-process subagent target).
+⚠ Minor, not patch: the fix changes what a whole class of callers receives from `dispatch`.
+
 **This lap (2026-08-30, fifth) — the skill/dispatch/MCP verification lap.** Owner asked three
 questions: is the skill installed correctly and generated from a single source of truth; can an
 agent dispatch with ONE syntax in every case; and does MCP make sense, assessed fresh. Full record,
