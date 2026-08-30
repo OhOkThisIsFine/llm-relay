@@ -118,9 +118,43 @@ npx tsc -p tsconfig.json --removeComments --declaration false --declarationMap f
 
 ⚠ Restore the normal build afterwards with `npm run build`, or the next check measures the variant.
 
-**Not decided here.** Which variant to adopt changes what every user receives, so it is an owner
-decision, not an agent's. Variant A is the status quo and needs no action beyond accepting that
-the next change trips the ceiling on purpose.
+## 3.1 DECIDED: variant C, and it shipped (2026-08-30)
+
+The owner chose **C** — strip the comments from `dist/*.js`, keep the `.d.ts` doc comments — so
+consumers keep their IntelliSense text. `build:server` now runs `tsc` twice:
+
+```
+node scripts/clean-dist.mjs && tsc -p tsconfig.json && tsc -p tsconfig.json --removeComments --declaration false --declarationMap false
+```
+
+Pass 1 emits the declarations with their docs. Pass 2 re-emits only the JavaScript, overwriting
+`dist/*.js` and `dist/*.js.map` and leaving pass 1's `.d.ts` files untouched.
+
+**Measured result**, before → after:
+
+| | before | after | change |
+|---|---|---|---|
+| `packBytes` | 1113288 | **861516** | **−251772 (22.6%)** |
+| `unpackedBytes` | 5205915 | 4578538 | −627377 |
+| `packageEntries` | 347 | 347 | unchanged |
+| `dist/*.js` bytes | 2203448 | 1624791 | −578657, exactly the measured comment prose |
+| `dist/*.d.ts` bytes | 511895 | 511895 | **unchanged — the point of C** |
+
+Verified directly rather than inferred: `dist/network-block.d.ts` still carries its full 43-line
+doc block, and `dist/network-block.js` contains exactly one `//` line — its
+`//# sourceMappingURL=` directive, which must stay.
+
+⚠ The 36-byte gap against the 861480 measured in §3 is fully explained: `package.json` ships, and
+the `build:server` script string grew when the second pass was added.
+
+**Ceilings ratcheted DOWN with it** — `packBytes` 1115000 → 866000 and `unpackedBytes` 5240300 →
+4602000, each keeping the ~0.5% headroom the baseline carried before. A ceiling left at the old
+figure after a 22.6% reduction would be decoration, not a ratchet. `packageEntries` stays at 352,
+because it bounds module growth and the count did not move.
+
+⚠ **Do not "simplify" the two passes into one.** A single `removeComments: true` in
+`tsconfig.json` is variant B: it strips the `.d.ts` docs as well, and buys only a further ~122k.
+It was rejected for exactly that reason.
 
 ## 4. Friction
 

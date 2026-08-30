@@ -44,7 +44,7 @@
     "analysis:run": "node scripts/analysis-run.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build && npm run check",
-    "build:server": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
+    "build:server": "node scripts/clean-dist.mjs && tsc -p tsconfig.json && tsc -p tsconfig.json --removeComments --declaration false --declarationMap false",
     "build:dashboard": "vite build --config dashboard/vite.config.ts",
     "check:dashboard": "tsc -p dashboard/tsconfig.json --noEmit && vitest run --config dashboard/vitest.config.ts",
     "check:package": "node scripts/dashboard-package-check.mjs && node scripts/packed-dashboard-smoke.mjs"

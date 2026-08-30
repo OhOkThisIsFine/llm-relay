@@ -11,10 +11,12 @@ carries no version field, so a claim about the live process needs a restart or a
 [docs/backlog.md](docs/backlog.md), which holds **two owner decisions** — build the MCP server so
 agy can delegate (D4), and choose a package-size variant.
 
-⚠ Three commits sit on `main` after the v0.62.0 release tag (`fb38d7e`, `68ea8ce`, `76ae510` —
-the package-hygiene lap). They change nothing inside the published package: `packBytes` is
-byte-identical at 1113288 and `packageEntries` at 347, because the only code touched was a test
-and a script that `package.json` `files` does not list.
+⚠ **Unreleased commits sit on `main` after the v0.62.0 tag, and they are no longer neutral.** The
+package-hygiene lap itself (`fb38d7e`, `68ea8ce`, `76ae510`) changed nothing inside the published
+package — a test and a script `package.json` `files` does not list. The owner then chose
+package-size variant C in the hand-back, and THAT does change `dist/`: `packBytes` 1113288 →
+861516. So the next release ships a materially smaller tarball, and the "byte-identical" reasoning
+that made a release pointless no longer applies.
 
 **freellmapi is RETIRED** (owner decision 2026-08-29), so llm-relay is now the ONLY free-provider
 offload runtime on this machine. It is dormant and reversible, nothing deleted; the measured basis
@@ -86,10 +88,25 @@ Three durable facts from those laps, kept because prose elsewhere had them wrong
   knowingly". Both halves were false: the revocation was an agent's act, and no file history shows
   an acceptance. The text is retracted in place in all three homes rather than quietly deleted.
 
-**Immediate next:** the two owner decisions now in [docs/backlog.md](docs/backlog.md) — the MCP
-server build (D4) and the package-size variant. ⚠ `AGENTS.md` cannot be regenerated from a
-worktree; `sync.mjs` resolves project targets under `C:/Code` only, so the CLAUDE.md edit in this
-lap needs `node ~/.agent-config/sync.mjs` run from the MAIN checkout.
+**Package-size variant C shipped** (owner decision, 2026-08-30, taken in the hand-back).
+`build:server` now runs `tsc` twice — pass 1 emits the `.d.ts` files WITH docs, pass 2 re-emits
+only the JavaScript with `--removeComments`. Consumers keep their IntelliSense text.
+**`packBytes` 1113288 → 861516, 22.6% smaller**, `packageEntries` unchanged at 347, `.d.ts` bytes
+unchanged. Ceilings ratcheted DOWN with it, keeping the same ~0.5% headroom. ⚠ Do not collapse the
+two passes into one `removeComments: true` — that is variant B, which strips the `.d.ts` docs and
+was rejected for that reason. See the CLAUDE.md build note and
+[docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md) §3.1.
+
+**Immediate next:** two items in [docs/backlog.md](docs/backlog.md) — the MCP server build (D4),
+and an owner-directed investigation into why the llm-relay offload lane STALLS and returns nothing
+(measured: ~17 minutes, ~19 idle child processes, one diagnostic line reporting `pool/medium` as an
+unrecognized model on the session-title query path).
+⚠ `AGENTS.md` cannot be regenerated from a worktree; `sync.mjs` resolves project targets under
+`C:/Code` only, so this lap's `CLAUDE.md` edits need `node ~/.agent-config/sync.mjs` run from the
+MAIN checkout.
+⚠ **Nothing here is released.** The commits after the v0.62.0 tag are unreleased by owner decision:
+before variant C nothing shipped changed at all, and variant C now DOES change `dist/`, so the next
+release carries it.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
 decisions and the full verification record:

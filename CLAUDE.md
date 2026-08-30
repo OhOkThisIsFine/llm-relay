@@ -34,7 +34,7 @@ never from an LLM's opinion inserted into the request path.
 
 ```bash
 npm install
-npm run build          # build:server (tsc -> dist/) + build:dashboard (vite, from dashboard/)
+npm run build          # build:server (TWO tsc passes -> dist/, see below) + build:dashboard (vite, from dashboard/)
 npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
 npm run typecheck      # tsc --noEmit — src/ (tsconfig.json)
 npm run typecheck:test # tsc — the SUITE (tsconfig.test.json). See the note below.
@@ -49,6 +49,20 @@ npx vitest run test/repair.test.ts             # one file
 npx vitest run -t "refuses to reshape a destructive"   # one test by name
 ```
 **Always verify green before AND after a change:** `npm run build && npm run check`.
+
+⚠ **`build:server` runs `tsc` TWICE, and the second pass is load-bearing** (owner decision
+2026-08-30, package-size variant C). Pass 1 is the ordinary `tsc -p tsconfig.json` and emits the
+`.d.ts` files WITH their doc comments. Pass 2 re-emits only the JavaScript
+(`--removeComments --declaration false --declarationMap false`), overwriting `dist/*.js` and
+`dist/*.js.map` with comment-free output while leaving pass 1's declarations untouched. Measured:
+**29.5% of `dist/*.js` was comment prose** (578657 bytes), and dropping it took the tarball from
+1113288 to **861516 packBytes — 22.6% smaller** with the entry count unchanged at 347.
+⚠ The split exists so consumers KEEP their IntelliSense text. Collapsing it to a single
+`removeComments: true` in `tsconfig.json` would strip the `.d.ts` docs too and save only a further
+~122k — that is variant B, and it was rejected for exactly this reason. Do not "simplify" the two
+passes into one. ⚠ The only comment surviving in a `dist/*.js` is its `//# sourceMappingURL=` line,
+which must stay. Evidence, the four costed variants and the commands to re-measure:
+[docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md).
 
 **`test/` is type-checked by `tsconfig.test.json`, not by `tsconfig.json` or by vitest.**
 `tsconfig.json` is `include: ["src/**/*.ts"]` with `exclude: [… "**/*.test.ts"]` because it drives

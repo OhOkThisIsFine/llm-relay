@@ -31,25 +31,41 @@
   30-minute lane. Two objections were checked and found INVALID — no new dependency is needed, and
   `packBytes` is a regenerable ceiling, not a size wall. Do not repeat those two.
 
-- **Decide which package-size variant to adopt** — the measured answer to the question this backlog
-  used to ask in prose. Full evidence, commands and the four measured variants:
-  [package-size-2026-08-30.md](package-size-2026-08-30.md) §3.
+- **Investigate why the llm-relay offload lane STALLS and returns nothing** (owner-directed,
+  2026-08-30). Measured this lap: a `dispatch --next-command` lane on `pool/medium` ran for about
+  17 minutes, spawned roughly 19 `node` children that all sat at near-zero CPU, and produced no
+  output at all beyond one line —
 
-  29.5% of `dist/*.js` is comment prose (578657 bytes). Measured against the real tarball:
+  ```
+  [claude-code:unrecognized_model] {"model":"pool/medium","query_source":"generate_session_title"}
+  ```
 
-  | Variant | `packBytes` | Saving | Cost |
-  |---|---|---|---|
-  | A. Ship as today | 1113288 | — | 1712 bytes of headroom; the next change trips the ceiling |
-  | B. `removeComments: true` | 739390 | −373898 (33.6%) | `.d.ts` loses doc comments |
-  | C. Strip `.js` comments, keep `.d.ts` docs | 861480 | −251808 (22.6%) | A second `tsc` pass |
-  | D. Drop source maps | 870204 | −243084 (21.8%) | No stack-trace mapping for users |
+  The relay itself was healthy throughout (`GET /telemetry` 200) and had served traffic in the
+  window, so the request reached the pool. The task was a small read-only git verification, which
+  should take a few turns rather than minutes.
 
-  C and D are orthogonal and combine. **Owner decision**, because every variant changes what users
-  receive. Variant A needs no action beyond accepting that the next change trips the ceiling on
-  purpose — which remains the standing instruction: root-cause before regenerating, and never raise
-  a ratchet twice in one lap for that lap's own work.
+  ⚠ **Start with that one diagnostic line**, because it is the only one the lane emitted: the
+  session-title query path reports `pool/medium` as an unrecognized model. That is a SIDE query,
+  not the main turn, so it may be harmless — but it is evidence that something on the client side
+  does not resolve a `pool/` spec, and it is the only thread available.
+
+  ⚠ The free-lane playbook already records "a lane returning two words and exit 0 is a failure,
+  retry". This is the stronger form — no output and no exit — so establish first whether it is a
+  lane stall, a relay stall, or a client-side hang, and do not assume which.
 
 ## Closed
+
+- ✅ **Package-size variant C adopted and shipped** (owner decision, 2026-08-30).
+  `build:server` runs `tsc` twice: pass 1 emits `.d.ts` WITH docs, pass 2 re-emits only the
+  JavaScript with `--removeComments`. Consumers keep their IntelliSense text.
+  **`packBytes` 1113288 → 861516, a 251772 (22.6%) reduction**, `packageEntries` unchanged at 347,
+  and `dist/*.d.ts` bytes unchanged. Ceilings ratcheted DOWN with it (`packBytes` → 866000,
+  `unpackedBytes` → 4602000), each keeping the ~0.5% headroom the baseline carried before — a
+  ceiling left at the old figure after a 22.6% drop would be decoration.
+  Evidence and the rejected variants: [package-size-2026-08-30.md](package-size-2026-08-30.md) §3.1.
+  ⚠ This also retires the "1712 bytes of headroom" warning: the next change no longer trips the
+  ceiling by design. The standing rule is unchanged — root-cause growth before regenerating, and
+  never raise a ratchet twice in one lap for that lap's own work.
 
 - ✅ **`check:package` now names the build instead of throwing a raw ENOENT** (2026-08-30).
   `scripts/dashboard-package-check.mjs` reads two BUILD OUTPUTS through `readBuiltJson`, which
