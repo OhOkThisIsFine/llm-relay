@@ -2,37 +2,43 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-29 (second lap)
+## 0. State as of 2026-08-30 (third lap of 2026-08-29)
 
-**Current: v0.58.0 is released; the global bin and the restarted relay are on it** (publish run
-green, registry 0.58.0). Nothing awaits the owner — §6 holds recorded trades, deferrals and
-settled decisions, not a work queue; the work queue is [docs/backlog.md](docs/backlog.md), which
-holds ONE item: the quota-source re-probe design (unstarted, no design chosen).
+**Current: v0.59.2 is released; the global bin and the restarted relay are on it** (publish runs
+green for v0.59.0/.1/.2, registry 0.59.2, end-to-end drill passed live). Nothing awaits the
+owner — §6 holds recorded trades, deferrals and settled decisions, not a work queue; the work
+queue is [docs/backlog.md](docs/backlog.md), which is EMPTY.
 
-**2026-08-29, second lap — the max-output-caps implementation** (v0.58.0):
+**The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
+decisions and the full verification record:
+[docs/quota-reprobe-design-2026-08-29.md](docs/quota-reprobe-design-2026-08-29.md)):
 
-- **The `max-output` measurement fact shipped exactly as scoped** in
-  [docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md): the
-  parser half in `src/context-limits.ts` (stated-maximum-only discipline — the groq comparator
-  form, TGI `<=`, OpenAI "supports at most N completion tokens", Anthropic "> N, which is the
-  maximum", and the restated-field form), the observer beside `observeContextLimit` in
-  `inspectCandidateResponse` (both fronts through the one shared call site), and rendering in
-  `llm-relay candidates` and `FACT_MEANING`. Display-only: nothing clamps, refuses, or routes on
-  the learned figure. The closed-vocabulary mutation check held — the new kind failed compilation
-  at exactly the two total tables (`FACT_TTL_MS`, `FACT_MEANING`).
-- **The carrier groq signature is resolved** — rejected from the eligibility queue on landing.
-  ⚠ Its digest was `6f8361b9e7` at rejection time, not the `075f1cb584` the backlog had recorded:
-  the v0.57.0 store migration re-keys signatures through the current normalizer, and the digest
-  is a hash OF the signature, so recorded digests can go stale across a normalizer change. List
-  before addressing; trust the listing's digest.
-- Incidental dedup: the two candidate loops' byte-identical client-gone closures became one
-  `abortOnClientClose` helper (the machine eslint gate surfaced the pre-existing pair when an
-  edit shifted its lines).
+- **The property the backlog demanded now holds**: a recorded lane quota death either carries an
+  expiry the relay enforces (`dispatch-exhaustion.json`, future-only restore), or the background
+  quota probe retracts it. Roster staleness (7d) stops evictions on old evidence; `laneOfRung`
+  sees through the `lane-launch.ps1` wrapper (agy had been unprobeable since 2026-08-27);
+  `routing.laneProbe` (default ON) rides the ping tick — catalog per 24h, quota probes per 6h
+  for DEAD buckets only.
+- **Invariant amended by owner decision**: the request path never spawns a lane; the operator
+  `--probe` and the background cadence are the only two spawn sites. Recorded in the CLAUDE.md
+  ladder gotcha and the design doc §5.
+- **Two defects were found ONLY by the live drill, both in the Windows spawn path**: v0.59.1 —
+  async `execFile` leaves stdin an open pipe and `agy models` stalls to the timeout (the sync
+  `stdio: ["ignore"]` was load-bearing); v0.59.2 — the `.cmd` shell fallback joined args
+  unquoted, so the probe prompt reached codex as seven tokens. Both fail-safes held: every
+  symptom was "never learns", never a wrong verdict.
+- Live-verified end to end: cadence refreshed both rosters (agy 11 → 14 models — today's roster
+  leads with gemini-3.7, which the stale roster lacked, so a fresh probe under the OLD code
+  would have evicted the healthy `agy-gemini` rung); a real recorded death survived two
+  restarts, was probed through a real `codex exec` completion, retracted, and the retraction
+  flushed to disk.
 
-Operational: Codex quota RESET 2026-08-29 (owner-reported, verified by live probe — `codex exec`
-answered on `gpt-5.6-sol`). The earlier "quota-dead until Sep 3" record is retired. The six codex
-dispatch rungs stay `"enabled": false` (the 2026-08-27 move to the first-party plugin); a reset
-restores the hand lane, not a ladder rung.
+Operational: the lap ran from the worktree branch `claude/start-lap-codex-delegation-e5b82d`,
+pushed to `origin/main` (fast-forward). ⚠ The MAIN CHECKOUT's local `main` at `C:\Code\llm-relay`
+is behind origin until someone runs `git pull` there — a worktree cannot fast-forward a branch
+another worktree has checked out. The six codex dispatch rungs stay `"enabled": false` (the
+2026-08-27 move to the first-party plugin); machine-side prose no longer carries its own
+quota-dead claims — the relay's dispatch state is authoritative (design §5).
 
 ## 0.1 Earlier releases
 
@@ -40,6 +46,10 @@ Deliberately NOT restated here. This file holds current state plus the immediate
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
 tags are the trail. What survived each sprint lives in its own home:
 
+- **v0.58.0, the max-output-caps lap** — the display-only `max-output` measurement fact (parser
+  beside the context parser, observer on both fronts, live-verified on groq), and the stale-digest
+  lesson (recorded signature digests go stale across a normalizer migration — list before
+  addressing): [docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md).
 - **v0.57.0, the eligibility triage lap** — queue 199 → 4 with owner-approved family verdicts,
   the lane-split signature fix and its load-time store migration, the Tailwind scan leak:
   [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
