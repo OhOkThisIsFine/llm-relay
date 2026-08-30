@@ -59,11 +59,25 @@ export const RPC_INTERNAL_ERROR = -32603;
  * Protocol revisions this server can speak, newest first.
  *
  * Negotiation rule, from the MCP specification: echo the client's requested revision when it is
- * one we support, otherwise answer with our newest and let the client decide. Never echo a
+ * one we support, otherwise answer with our newest and let the client decide. Never list a
  * revision we do not implement — that claims a capability we do not have, which is the
  * closed-vocabulary defect this repository documents eight times.
+ *
+ * ⚠ **`2026-07-28` is deliberately ABSENT, and the reason is measured.** That revision adds
+ * `server/discover`, which this server does not implement. Listing it was the first live-wiring
+ * failure: Claude Code 2.1.237 sends `initialize` with `protocolVersion: "2025-11-25"`, which was
+ * not on this list, so the fallback answered `2026-07-28` — a revision the client had already
+ * declined — and the client refused the connection with *"Server's protocol version is not
+ * supported: 2026-07-28"*. Captured from the real handshake, not inferred.
+ *
+ * ⚠ The lesson generalises past the one entry: a fallback to "our newest" is only safe when every
+ * listed revision is one we genuinely serve. Add a revision here when its CORE (`initialize`,
+ * `tools/list`, `tools/call`, `ping`) is what we implement — never because it is newer.
+ *
+ * ⚠ A `server/discover` probe still arrives from a 2026-07-28-aware client BEFORE `initialize`.
+ * Answering it `-32601` is correct and the client falls back on its own; that path is verified.
  */
-export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-06-18", "2025-03-26"] as const;
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
 export type ProtocolVersion = (typeof SUPPORTED_PROTOCOL_VERSIONS)[number];
 
 export function negotiateProtocolVersion(requested: unknown): ProtocolVersion {

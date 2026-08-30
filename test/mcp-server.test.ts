@@ -152,6 +152,24 @@ describe("mcp protocol framing", () => {
     expect(negotiateProtocolVersion(undefined)).toBe(SUPPORTED_PROTOCOL_VERSIONS[0]);
     expect(negotiateProtocolVersion(42)).toBe(SUPPORTED_PROTOCOL_VERSIONS[0]);
   });
+
+  it("speaks the revision Claude Code actually asks for, and does NOT claim 2026-07-28", () => {
+    // ⚠ Both halves are regressions, captured from a real handshake with Claude Code 2.1.237.
+    // It sends `2025-11-25`. That was missing, so the fallback answered `2026-07-28` and the
+    // client refused: "Server's protocol version is not supported: 2026-07-28".
+    expect(negotiateProtocolVersion("2025-11-25")).toBe("2025-11-25");
+    // `2026-07-28` adds `server/discover`, which this server does not implement. Listing a
+    // revision we do not serve is what made the fallback dangerous in the first place.
+    expect(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).not.toContain("2026-07-28");
+  });
+
+  it("declines server/discover with -32601 so a 2026-07-28-aware client falls back", async () => {
+    // Claude Code probes `server/discover` BEFORE `initialize`. Answering "method not found" is
+    // correct and the client then negotiates normally — verified live.
+    const h = new Harness();
+    const res = await h.request("server/discover", {});
+    expect((res["error"] as { code: number }).code).toBe(-32601);
+  });
 });
 
 describe("mcp server handshake", () => {
