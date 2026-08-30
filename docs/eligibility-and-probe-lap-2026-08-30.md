@@ -169,6 +169,14 @@ signature for a control.
 The package ceiling was raised **knowingly**: the new module emits exactly three artifacts
 (`.js`, `.d.ts`, `.js.map`), 338 → 341, and 352 keeps the same ~3.3% slack the other ceilings use.
 
+⚠ **Disclosed, because updating `observed` absorbed drift that was not this lap's.** The baseline's
+checked-in `observed.packageEntries` read **329**, while a clean rebuild at the lap-start commit
+packs **338** — so 9 entries of growth had accumulated without the snapshot being refreshed. Setting
+`observed` to the measured 341 silently corrects that as a side effect. Only **+3** of the move is
+this lap's. Nobody root-caused the other 9, and the standing rule is that a size baseline you did
+not knowingly grow deserves root-causing rather than regeneration — so treat that 9 as unexplained
+rather than as blessed. Verified by an independent auditor that rebuilt and packed both commits.
+
 ⚠ **`packBytes` is now within 0.5% of its own ceiling** (1100459 against 1106200). That is
 pre-existing drift, not this lap's doing, and it is recorded rather than raised — the next lap that
 adds anything will hit it and should root-cause the growth rather than regenerate the baseline.

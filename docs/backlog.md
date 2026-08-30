@@ -23,6 +23,12 @@
   will trip `check:package`. When it does, **root-cause the growth first** — regenerating the
   baseline is what turns a size ratchet into decoration.
 
+- **Root-cause 9 unexplained package entries.** The baseline's `observed.packageEntries` read 329
+  while a clean rebuild at the v0.60.0 lap-start commit packed **338**; the lap's update to 341
+  absorbed that gap as a side effect while only +3 was the lap's own new module. Nobody has
+  explained the other 9. Find what added them (`npm pack --dry-run --json` at successive commits and
+  diff the file lists) before the next baseline refresh, or the ratchet keeps laundering growth.
+
 (The quota-source re-probe shipped 2026-08-29; design and verification record:
 [quota-reprobe-design-2026-08-29.md](quota-reprobe-design-2026-08-29.md). The eligibility-and-probe
 lap shipped 2026-08-30 as v0.60.0:
