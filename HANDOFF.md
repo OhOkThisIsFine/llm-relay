@@ -40,7 +40,15 @@ Eligibility queue resolved to its irreducible floor. Two mistral signatures acce
 signature deliberately LEFT PENDING, because `reject` suppresses a signature for good and would
 silence the next episode.
 
-**Immediate next:** release this lap's work, then verify the global bin and the relay are on it.
+**Released as v0.60.0** and verified live: npm `dist-tags.latest` 0.60.0, `llm-relay version` 0.60.0,
+relay restarted onto it, publish run 33293673199 green through both tag-refusal gates and a full
+`npm run check` in CI. The 7-day mistral window was confirmed end to end — the accepted
+interpretation bound on the next refusal and produced `mistral#default/*` `allowance-exhausted`
+expiring in 10080m.
+
+**Immediate next:** regenerate the committed `AGENTS.md` — see [docs/backlog.md](docs/backlog.md).
+It is the one part of this lap that a worktree cannot finish, because `sync.mjs` only ever reads
+`C:/Code/llm-relay/CLAUDE.md`.
 
 **The quota-source re-probe shipped** (v0.59.0 feature + two live-found fixes; design, owner
 decisions and the full verification record:
