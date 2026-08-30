@@ -170,15 +170,41 @@ Facts that shape the design:
   (`routing.laneProbe` parse). Two pre-existing tests pinned the pre-staleness behaviour through
   a dated fixture literal and were corrected in the same change (the repo's standing
   tests-pin-the-defect lesson).
-- **Live, catalog half (no quota spent):** after the release restart, the first tick sees both
-  rosters older than `catalogIntervalMs` and refreshes them — `llm-relay lanes` shows a
-  same-day `probedAt` for codex AND agy (agy proves the wrapper-aware recognition; before this
-  lap it could never refresh). No console window appears (`windowsHide`).
-- **Live, quota half (spends one minimal codex request):** set
-  `routing.laneProbe.quotaIntervalMs` to `60000` temporarily, restart, record a death on a real
-  bucket (`llm-relay dispatch -x codex-sol --outcome quota_exhausted`), and watch: the first
-  sighting stamps, the next tick past 60s probes, the OK answer retracts the death
-  (`llm-relay dispatch` shows the rung ready again). Revert the interval afterwards.
+- **Live, catalog half — PASSED, and it found a real defect.** On v0.59.0's first tick the
+  cadence refreshed codex on its own (nobody ran `--probe`) while agy silently kept its stale
+  entry. Root cause, measured: the async `execFile` leaves stdin an OPEN pipe (the sync
+  predecessor's `stdio: ["ignore", …]` cannot be expressed), and `agy models` waits on stdin —
+  0 bytes until the 60s timeout, ~2s with EOF. Fixed in v0.59.1 (both spawn sites end stdin
+  after spawn). After the fix the agy roster refreshed 11 → 14 models — today's live roster
+  leads with the gemini-3.7 family the 21-day-old roster lacked, which also means the config's
+  `agy-gemini` rung (`gemini-3.7-flash-medium`) would have been EVICTED by a fresh probe under
+  the pre-staleness code. No console window appeared (`windowsHide`).
+- **Live, quota half — PASSED on the second attempt, and found a second defect.** Drill:
+  `quotaIntervalMs` 60000, `llm-relay dispatch -x codex-sol --outcome quota_exhausted`
+  (recorded until +1h). Attempt 1 (v0.59.1) never retracted: `codex` resolves only through the
+  Windows `.cmd` shell fallback, and the unquoted `args.join(" ")` handed codex the probe
+  prompt as SEVEN arguments (`error: unexpected argument 'with' found`) — the classifier
+  correctly read that as inconclusive, so the fail-safe held and the symptom was "never
+  learns". Fixed in v0.59.2 (`quoteCmdArg` on every token of both fallback lines). Attempt 2:
+  the persisted death survived TWO restarts (`dispatch-exhaustion.json` restore), the first
+  sighting stamped, the probe fired after the 60s gate, the real `codex exec` answer retracted
+  the death, and the retraction flushed to disk (`rows: []`). One codex request spent, as
+  designed. The drill interval was then reverted; the relay runs the defaults.
+
+## 8.1 Friction (rewalked from the lap transcript)
+
+- **Two Windows spawn traps cost one fix release each**, and neither was catchable by the suite
+  (both need a real child): stdin-open stalls a stdin-reading CLI to the timeout, and the
+  `.cmd` shell fallback splits unquoted spaced args. Both are now pinned in code comments and,
+  for the quoting, a pure test. A future async spawn site should copy `runLaneCommand` whole.
+- **The cadence swallows probe results by design** (contained errors), so its only live
+  diagnostics are effects (manifest timestamps, exhaustion rows). The operator `--probe`
+  printing per-lane errors is what made the stdin failure diagnosable in minutes.
+- **`gh run watch`'s stream can display an annotation from an ADJACENT run** ("tier-data.json
+  missing or empty" belonged to an older run). Judge a run by
+  `gh run list --json conclusion` for its own id, never by stream tail-reading.
+- **A fresh worktree carries a COPY of the main checkout's verify-green ledger**, which reads as
+  stale for the worktree's tree. Expected once understood; re-record and move on.
 
 ## 9. Residuals, stated
 
