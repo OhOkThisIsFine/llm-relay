@@ -1,7 +1,7 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFile, exec } from "node:child_process";
 import type { Config } from "./config.js";
 import {
-  laneOfCommand,
+  laneOfRung,
   loadLaneManifest,
   saveLaneManifest,
   DEFAULT_MANIFEST_PATH,
@@ -13,13 +13,14 @@ import {
 /**
  * `llm-relay lanes --probe` — ask each `cli` lane's own tool what it serves.
  *
- * ⚠ This is the ONE place the relay runs a `cli` lane's command, and the boundary is worth stating
- * because CLAUDE.md says flatly that the relay never spawns one. That invariant is about the
- * REQUEST PATH: a cli lane's quota is client-bound, it runs its own tool loop, and it returns only
- * final text, so a relay that shelled out mid-request could never return the `tool_use` blocks an
- * HTTP turn owes its caller. An operator running a diagnostic is not the request path — exactly as
- * `pools --probe` sends real completions the request path would never send. Nothing here is
- * reachable from `handle()`, and the request path reads only the CACHED manifest.
+ * ⚠ The spawn boundary (amended by owner decision 2026-08-29, docs/quota-reprobe-design-2026-08-29.md):
+ * the REQUEST PATH never runs a `cli` lane's command — a lane's quota is client-bound, it runs its
+ * own tool loop, and it returns only final text, so a relay that shelled out mid-request could
+ * never return the `tool_use` blocks an HTTP turn owes its caller. Outside the request path there
+ * are exactly TWO spawn sites: this operator-invoked probe, and the background lane cadence
+ * (`lane-cadence.ts`) that keeps rosters fresh and re-tests recorded quota deaths — background
+ * metadata polling is the relay's job, exactly as the ping loop already does for HTTP. Nothing
+ * here is reachable from `handle()`, and the request path reads only the CACHED manifest.
  *
  * Discovery is not symmetric (docs/lane-discovery.md):
  *   codex — `codex debug models` returns JSON including per-model `supported_reasoning_levels`,
@@ -36,33 +37,47 @@ export interface LaneProbeResult {
   error?: string;
 }
 
-function run(command: string, args: string[]): string {
+/**
+ * Async on purpose: the background cadence runs this beside the ping loop, and a synchronous
+ * spawn would block every HTTP probe for the lane command's whole runtime. `windowsHide` is
+ * load-bearing, not cosmetic — the relay daemon is launched console-less at logon, and a console
+ * CLI spawned from a console-less parent makes Windows ALLOCATE a console and STEAL FOCUS unless
+ * the caller sets CREATE_NO_WINDOW (verified on agy, 2026-08-27; `windowsHide: true` is Node's
+ * spelling of that flag).
+ */
+function runLaneCommand(command: string, args: string[]): Promise<string> {
   const opts = {
     encoding: "utf8" as const,
     maxBuffer: 64 * 1024 * 1024,
     timeout: 60_000,
-    stdio: ["ignore", "pipe", "pipe"] as ("ignore" | "pipe")[],
+    windowsHide: true,
   };
-  try {
-    return execFileSync(command, args, opts);
-  } catch (e) {
-    // ⚠ On Windows an npm-installed CLI is a `.cmd` shim, which execFileSync will not resolve
-    // without a shell — `codex` fails ENOENT while running fine in any terminal. Retry through the
-    // shell rather than defaulting to it: shell:true re-parses the command line, so it is the
-    // fallback, not the norm. Args here are fixed literals from the probers, never task content.
-    if (process.platform === "win32" && (e as NodeJS.ErrnoException).code === "ENOENT") {
-      // Passed as ONE command line rather than command+args: node deprecates the args form under
-      // `shell: true` because it concatenates without escaping. Every token here is a fixed literal
-      // from a prober above — no task content, no user input — and the path is quoted.
-      return execSync(`"${command}" ${args.join(" ")}`, opts);
-    }
-    throw e;
-  }
+  return new Promise((resolve, reject) => {
+    execFile(command, args, opts, (err, stdout) => {
+      if (!err) {
+        resolve(stdout);
+        return;
+      }
+      // ⚠ On Windows an npm-installed CLI is a `.cmd` shim, which execFile will not resolve
+      // without a shell — `codex` fails ENOENT while running fine in any terminal. Retry through
+      // the shell rather than defaulting to it: the shell re-parses the command line, so it is
+      // the fallback, not the norm. Passed as ONE quoted command line; every token here is a
+      // fixed literal from a prober below — no task content, no user input.
+      if (process.platform === "win32" && (err as NodeJS.ErrnoException).code === "ENOENT") {
+        exec(`"${command}" ${args.join(" ")}`, opts, (err2, stdout2) => {
+          if (err2) reject(err2);
+          else resolve(stdout2);
+        });
+        return;
+      }
+      reject(err);
+    });
+  });
 }
 
-function probeCodex(command: string): LaneEntry {
+async function probeCodex(command: string): Promise<LaneEntry> {
   const via = `${command} debug models`;
-  const raw = run(command, ["debug", "models"]);
+  const raw = await runLaneCommand(command, ["debug", "models"]);
   const parsed = JSON.parse(raw) as { models?: Array<Record<string, unknown>> };
   if (!Array.isArray(parsed.models)) {
     throw new Error(`codex catalog had no "models" array — keys: ${Object.keys(parsed).join(" | ")}`);
@@ -82,9 +97,9 @@ function probeCodex(command: string): LaneEntry {
   return { via, probedAt: new Date().toISOString(), models };
 }
 
-function probeAgy(command: string): LaneEntry {
+async function probeAgy(command: string): Promise<LaneEntry> {
   const via = `${command} models`;
-  const raw = run(command, ["models"]);
+  const raw = await runLaneCommand(command, ["models"]);
   const models: LaneModel[] = [];
   for (const line of raw.split("\n")) {
     // `id<TAB>Display Name`. A header/status line ("Fetching available models...") has no tab.
@@ -99,25 +114,30 @@ function probeAgy(command: string): LaneEntry {
   return { via, probedAt: new Date().toISOString(), models };
 }
 
-const PROBERS: Record<string, (command: string) => LaneEntry> = {
+const PROBERS: Record<string, (command: string) => Promise<LaneEntry>> = {
   codex: probeCodex,
   agy: probeAgy,
 };
 
-/** Distinct `cli` commands the configured ladders actually reference. */
+/**
+ * Distinct `cli` lanes the configured ladders actually reference, mapped to the lane's OWN
+ * binary. Recognition sees through wrapper commands (`laneOfRung`), and the value is the matched
+ * lane binary rather than `rung.command` — probing `pwsh models` would probe the wrapper, not
+ * the lane. `windowsHide` above is what makes the direct binary safe to spawn console-less.
+ */
 export function laneCommands(cfg: Config): Map<string, string> {
   const found = new Map<string, string>();
   const ladders = cfg.routing.ladders ?? {};
   const all = [...Object.values(ladders).flat(), ...(cfg.routing.ladder ?? [])];
   for (const rung of all) {
     if (rung?.kind !== "cli" || typeof rung.command !== "string") continue;
-    const lane = laneOfCommand(rung.command);
-    if (lane && !found.has(lane)) found.set(lane, rung.command);
+    const match = laneOfRung(rung.command, rung.args);
+    if (match && !found.has(match.lane)) found.set(match.lane, match.binary);
   }
   return found;
 }
 
-export function probeLanes(cfg: Config, path: string = DEFAULT_MANIFEST_PATH): LaneProbeResult[] {
+export async function probeLanes(cfg: Config, path: string = DEFAULT_MANIFEST_PATH): Promise<LaneProbeResult[]> {
   const existing = loadLaneManifest(path);
   const manifest: LaneManifest = existing ?? { version: 1, lanes: {} };
   const results: LaneProbeResult[] = [];
@@ -129,7 +149,7 @@ export function probeLanes(cfg: Config, path: string = DEFAULT_MANIFEST_PATH): L
       continue;
     }
     try {
-      const entry = prober(command);
+      const entry = await prober(command);
       // Learned argument rejections survive a re-probe: they are existence facts about a flag,
       // and the roster reading that replaces the model list says nothing about them.
       const previous = manifest.lanes[lane]?.rejectedArgs;

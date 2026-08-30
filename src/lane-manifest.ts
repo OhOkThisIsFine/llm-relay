@@ -102,6 +102,53 @@ export function laneOfCommand(command: string): string | null {
   return null;
 }
 
+/**
+ * The lane a RUNG belongs to, seeing through wrapper commands — and which token is the lane's own
+ * binary.
+ *
+ * `laneOfCommand` reads only `rung.command`, and that stopped matching reality on 2026-08-27 when
+ * the agy rungs moved behind `lane-launch.ps1`: their `command` became `pwsh` and the agy binary
+ * moved into `args`. From that day the agy roster could never refresh (`laneCommands` no longer
+ * found an agy lane to probe) and `verifyModel` answered `unknown` for every agy rung — fail-safe,
+ * but blind. Recognition therefore also scans the rung's ARGS for a token whose basename is a
+ * known lane binary. The scan matches exact basenames from the same closed set only; an arg VALUE
+ * like `gpt-5.3-codex-spark` has basename `gpt-5.3-codex-spark`, not `codex`, so it cannot match.
+ *
+ * Returns the matched token as `binary` because a prober must run the LANE's tool, not the
+ * wrapper: probing `pwsh models` is not probing agy.
+ */
+export function laneOfRung(
+  command: string,
+  args?: readonly string[],
+): { lane: string; binary: string } | null {
+  const direct = laneOfCommand(command);
+  if (direct) return { lane: direct, binary: command };
+  for (const token of args ?? []) {
+    const lane = laneOfCommand(token);
+    if (lane) return { lane, binary: token };
+  }
+  return null;
+}
+
+/**
+ * How old a roster may grow while still counting as POSITIVE evidence for eviction.
+ *
+ * A roster is a snapshot of what a vendor served at probe time, and vendors rename and retire
+ * models on their own schedule — measured here: both live rosters were 21 days old while the
+ * loader's own comment promised "a stale manifest must never be able to empty the ladder". Age
+ * does not make the roster WRONG, so a listed model stays `servable`; age makes it too weak to
+ * EVICT on, so a missing model degrades to `unknown` instead of `not-servable`. Same fail-safe
+ * direction as every other verdict here: only fresh positive evidence removes a rung.
+ */
+export const LANE_ROSTER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** True when `probedAt` is unparseable or older than `LANE_ROSTER_TTL_MS`. */
+export function rosterIsStale(entry: LaneEntry, now: number = Date.now()): boolean {
+  const probed = Date.parse(entry.probedAt);
+  if (!Number.isFinite(probed)) return true;
+  return now - probed > LANE_ROSTER_TTL_MS;
+}
+
 export type ModelVerdict =
   | { status: "unknown"; reason: string }
   | { status: "servable" }
@@ -110,20 +157,30 @@ export type ModelVerdict =
 /**
  * Is this model one the lane's tool says it serves?
  *
- * ⚠ Every negative path that is not positive evidence returns `unknown`. Only a KNOWN roster that
- * omits the model produces `not-servable`.
+ * ⚠ Every negative path that is not positive evidence returns `unknown`. Only a KNOWN, FRESH
+ * roster that omits the model produces `not-servable` — a stale roster keeps answering `servable`
+ * for models it lists (age does not disprove presence) but may no longer evict (see
+ * `LANE_ROSTER_TTL_MS`).
  */
 export function verifyModel(
   manifest: LaneManifest | null,
   command: string,
   model: string,
+  opts: { args?: readonly string[] | undefined; now?: number | undefined } = {},
 ): ModelVerdict {
-  const lane = laneOfCommand(command);
-  if (!lane) return { status: "unknown", reason: "command is not a lane this relay can probe" };
+  const rung = laneOfRung(command, opts.args);
+  if (!rung) return { status: "unknown", reason: "command is not a lane this relay can probe" };
+  const lane = rung.lane;
   const entry = manifest?.lanes[lane];
   if (!entry) return { status: "unknown", reason: `lane "${lane}" has never been probed` };
   if (entry.models.length === 0) return { status: "unknown", reason: `lane "${lane}" probed but returned no roster` };
   if (entry.models.some((m) => m.id === model)) return { status: "servable" };
+  if (rosterIsStale(entry, opts.now)) {
+    return {
+      status: "unknown",
+      reason: `lane "${lane}"'s roster is stale (probed ${entry.probedAt}) — treated as unprobed; run \`llm-relay lanes --probe\``,
+    };
+  }
   return {
     status: "not-servable",
     reason: `"${model}" is not in ${lane}'s roster (probed ${entry.probedAt} via \`${entry.via}\`)`,
@@ -140,16 +197,22 @@ export function unsupportedArgValues(
   model: string,
   arg: string,
   value: string,
+  opts: { args?: readonly string[] | undefined; now?: number | undefined } = {},
 ): { unsupported: boolean; reason?: string } {
-  const lane = laneOfCommand(command);
-  if (!lane) return { unsupported: false };
+  const rung = laneOfRung(command, opts.args);
+  if (!rung) return { unsupported: false };
+  const lane = rung.lane;
   const entry = manifest?.lanes[lane];
   if (!entry) return { unsupported: false };
 
+  // Observed rejections are existence facts about a flag, not roster snapshots — they never age.
   const rejected = entry.rejectedArgs?.[model];
   if (rejected?.includes(arg)) {
     return { unsupported: true, reason: `${lane} rejects "${arg}" for "${model}" (observed)` };
   }
+  // A stated support list is roster evidence, and dropping an argument on it is the same eviction
+  // move as `not-servable` — so it demands the same freshness (`LANE_ROSTER_TTL_MS`).
+  if (rosterIsStale(entry, opts.now)) return { unsupported: false };
   const stated = entry.models.find((m) => m.id === model)?.supports?.[arg];
   // Absence of a support list is UNKNOWN — only a stated list that omits the value is evidence.
   if (stated && !stated.includes(value)) {

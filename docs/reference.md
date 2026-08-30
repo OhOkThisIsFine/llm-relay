@@ -137,8 +137,9 @@ the prompt deliberately does not require a config edit.
 `~/.llm-relay/config.json` (or `--config <path>`): a `providers{}` registry plus a `routing`
 block. State lives under `~/.llm-relay/`: `config.json`, `.env`, `keystore.json`,
 `control-token`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`,
-`target-facts.json`, `refusal-interpretations.json`, `lane-manifest.json`, `update-check.json`,
-the `hooks/` script, and the `usage/` accounting subtree.
+`target-facts.json`, `refusal-interpretations.json`, `lane-manifest.json`,
+`dispatch-exhaustion.json`, `breaker-state.json`, `update-check.json`, the `hooks/` script, and
+the `usage/` accounting subtree.
 
 ### Where state actually lives
 
@@ -148,7 +149,7 @@ split by what the artifact is:
 | Honours | Artifacts |
 |---|---|
 | `XDG_CONFIG_HOME/llm-relay/` | `config.json`, `.env`, `keystore.json`, `control-token`, `target-facts.json`, `refusal-interpretations.json`, the `hooks/` script |
-| `XDG_CACHE_HOME/llm-relay/` | `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `lane-manifest.json`, `update-check.json`, the `usage/` ledger |
+| `XDG_CACHE_HOME/llm-relay/` | `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `lane-manifest.json`, `dispatch-exhaustion.json`, `breaker-state.json`, `update-check.json`, the `usage/` ledger |
 
 The rule is the XDG spec's own: anything you authored or that holds a credential is config;
 anything the relay can rebuild by asking a provider again is cache. A variable that is unset,
@@ -1125,9 +1126,40 @@ loopback relay — those remain separate dispatch lanes.
 `llm-relay dispatch` answers a different question than offload: which **lane** (peer CLI, relay
 pool, passthrough) should a host hand a whole task to, in what order. The order is config
 (`routing.ladder`, or per-tier `routing.ladders.{low,medium,high,xhigh}`); the relay hands the
-host a command and **never spawns a CLI itself**. Mark a spent lane with
+host a command and **never spawns a CLI to answer a request**. Mark a spent lane with
 `llm-relay dispatch -x <lane> --outcome rate_limited|quota_exhausted` (or
 `--retry-after-ms <n>` for a vendor-stated reset).
+
+Exhaustion reports survive a relay restart: still-future cooldowns are mirrored to
+`dispatch-exhaustion.json` (cache directory) and restored at startup, so a vendor-stated
+"spent until <date>" is not forgotten on a bounce. Lapsed rows are never restored.
+
+#### Background lane re-probing (`routing.laneProbe`)
+
+A recorded lane death is a snapshot, not a standing fact — a quota can reset early. The relay
+therefore re-probes on its own background cadence (the same loop that pings HTTP providers):
+
+- **Catalog probes** re-run each lane's roster command (`codex debug models`, `agy models`) once
+  per `catalogIntervalMs` (default 24h). Metadata only; no quota is spent. A roster older than
+  7 days stops counting as eviction evidence — a model missing from a stale roster reads as
+  UNKNOWN, never `not-servable`, until a fresh probe answers.
+- **Quota probes** send one minimal real completion through a lane's own configured command —
+  but ONLY for a quota bucket currently recorded as exhausted, once per `quotaIntervalMs`
+  (default 6h). An alive lane is never probed (real use re-tests it for free). A real answer
+  retracts the recorded death immediately; an explicit rate/quota statement in the failure
+  refreshes it (a vendor-stated "try again in N hours" wins over the defaults); anything else —
+  timeout, empty output, unrecognized error — changes nothing.
+
+```jsonc
+"routing": {
+  "laneProbe": { "enabled": true, "quotaIntervalMs": 21600000, "catalogIntervalMs": 86400000 }
+  // or the boolean shorthand: "laneProbe": false
+}
+```
+
+Default ON. A quota probe spends the lane's own quota, so it is bounded: only dead buckets, one
+prompt ("Reply with the single word OK."), and a freshly reported death waits one full interval
+before its first re-probe. Disable with `"laneProbe": false`; an unknown key is a config error.
 
 A `cli` rung may declare `env`: string values are set on the spawned command, `null` values are
 unset (`llm-relay dispatch` renders both into the printed line — `env -u X NAME=value cmd …` for
@@ -1452,7 +1484,7 @@ and `keys` diagnostics have always refused to echo argv for that reason.
 | `llm-relay pools [--probe]` | List pool members; `--probe` spends one completion per unique deployment through one serviceable slot |
 | `llm-relay pools <set\|add\|remove\|delete> <name> [spec...]` | Edit a pool |
 | `llm-relay routing <show\|get\|default\|tier\|subagent\|sort\|benchmark\|set\|unset\|answered>` | Edit routing. `answered` retires the first-run notice (below) without changing anything. `route` is an alias for the whole command. |
-| `llm-relay lanes [--probe]` | What each `cli` dispatch lane's own tool says it serves; `--probe` runs each lane's roster command. The only writer of `~/.llm-relay/lane-manifest.json` — without it, lane eviction never engages. |
+| `llm-relay lanes [--probe]` | What each `cli` dispatch lane's own tool says it serves; `--probe` runs each lane's roster command. A roster older than 7 days is flagged `STALE` and stops counting as eviction evidence. Rosters are also refreshed by the background cadence (`routing.laneProbe`), so `--probe` is the on-demand form, no longer the only writer. |
 | `llm-relay config <show\|get\|set\|unset> [path] [value]` | Edit any config field |
 | `llm-relay models [-p <name>] [-r]` | List live provider catalogs |
 | `llm-relay ping [-p <name>]` | Probe provider latency/health |

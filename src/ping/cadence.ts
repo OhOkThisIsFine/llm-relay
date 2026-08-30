@@ -118,7 +118,17 @@ export class PingLoop {
   constructor(
     private cfg: Config,
     private catalog: ModelCatalog,
-    private opts: { fetchFn?: typeof fetch; autoStart?: boolean; probeCachePath?: string } = {},
+    private opts: {
+      fetchFn?: typeof fetch;
+      autoStart?: boolean;
+      probeCachePath?: string;
+      /**
+       * Called once per tick, contained — the lane cadence's entry point (`lane-cadence.ts`).
+       * A hook, not an await: lane work runs detached, so a minutes-long lane command can never
+       * delay an HTTP probe tick.
+       */
+      onTick?: ((now: number) => void) | undefined;
+    } = {},
   ) {}
 
   public getMode(): PingMode {
@@ -346,6 +356,11 @@ export class PingLoop {
 
   public async tickOnce(scope: "catalog" | "routable" = "catalog"): Promise<void> {
     this.refreshAutoPingMode();
+    try {
+      this.opts.onTick?.(Date.now());
+    } catch {
+      // Contained: a tick hook must never break the ping loop.
+    }
     await this.pollSpendHeadroom().catch(() => {});
     if (scope === "routable") materializeDynamicPools(this.cfg, this.catalog);
     const providers = Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>;

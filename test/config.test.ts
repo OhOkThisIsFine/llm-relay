@@ -1621,3 +1621,53 @@ describe("loadConfig — provider compat (thought signature)", () => {
     );
   });
 });
+
+describe("routing.laneProbe", () => {
+  it("defaults ON with the standard intervals when absent — the 2026-08-29 owner decision", () => {
+    const cfg = loadConfig(write("lp-absent.json", base()));
+    expect(cfg.routing.laneProbe).toEqual({
+      enabled: true,
+      quotaIntervalMs: 6 * 60 * 60 * 1000,
+      catalogIntervalMs: 24 * 60 * 60 * 1000,
+    });
+  });
+
+  it("boolean shorthand toggles enabled and keeps the default intervals", () => {
+    const off = loadConfig(write("lp-false.json", base({ routing: { default: "nim/z-ai/glm-5.2", laneProbe: false } })));
+    expect(off.routing.laneProbe?.enabled).toBe(false);
+    expect(off.routing.laneProbe?.quotaIntervalMs).toBe(6 * 60 * 60 * 1000);
+  });
+
+  it("accepts bounded interval overrides and floors them to integers", () => {
+    const cfg = loadConfig(
+      write("lp-obj.json", base({
+        routing: {
+          default: "nim/z-ai/glm-5.2",
+          laneProbe: { enabled: true, quotaIntervalMs: 90_000.9, catalogIntervalMs: 120_000 },
+        },
+      })),
+    );
+    expect(cfg.routing.laneProbe).toEqual({ enabled: true, quotaIntervalMs: 90_000, catalogIntervalMs: 120_000 });
+  });
+
+  it("⚠ rejects an unknown key by name — an ignored typo would read as a setting that took effect", () => {
+    expect(() =>
+      loadConfig(write("lp-unknown.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", laneProbe: { enabled: true, quotaInterval: 90_000 } },
+      }))),
+    ).toThrow(/laneProbe\.quotaInterval is not a recognized key/);
+  });
+
+  it("rejects an out-of-bounds interval and a missing enabled", () => {
+    expect(() =>
+      loadConfig(write("lp-bounds.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", laneProbe: { enabled: true, quotaIntervalMs: 1000 } },
+      }))),
+    ).toThrow(/quotaIntervalMs must be between/);
+    expect(() =>
+      loadConfig(write("lp-noenabled.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", laneProbe: { quotaIntervalMs: 90_000 } },
+      }))),
+    ).toThrow(/laneProbe\.enabled must be a boolean/);
+  });
+});

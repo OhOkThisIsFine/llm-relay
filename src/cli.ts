@@ -24,9 +24,10 @@ import { offloadState, setOffload, type OffloadState } from "./offload.js";
 import { buildCandidates, type CandidatesView, type Candidate, type CandidateAvailability } from "./candidates.js";
 import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
-import { loadLaneManifest, verifyModel } from "./lane-manifest.js";
+import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
-import { buildDispatch, normalizeCliCommand, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { contextWindowResolver, COST_CLASSES, type ContextWindowSource, type CostClass } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
@@ -1913,14 +1914,16 @@ export function renderCommand(
 /**
  * `llm-relay lanes [--probe]` — what each cli lane's own tool says it serves.
  *
- * ⚠ `--probe` is the ONE place the relay runs a lane's command, and only as an explicit operator
- * action — same precedent as `pools --probe` sending real completions. The request path reads the
- * cached manifest and never spawns anything. Without `--probe` this just prints the cache.
+ * ⚠ `--probe` spawns lane commands as an explicit operator action — same precedent as
+ * `pools --probe` sending real completions. The request path reads the cached manifest and never
+ * spawns anything; outside it the only OTHER spawn site is the relay's background lane cadence
+ * (owner decision 2026-08-29, docs/quota-reprobe-design-2026-08-29.md). Without `--probe` this
+ * just prints the cache.
  */
-export function runLanes(): void {
+export async function runLanes(): Promise<void> {
   const cfg = loadOrExit();
   if (hasFlag("--probe")) {
-    for (const r of probeLanes(cfg)) {
+    for (const r of await probeLanes(cfg)) {
       process.stdout.write(
         r.ok
           ? `  ✓ ${r.lane.padEnd(8)} ${String(r.modelCount).padStart(3)} models via \`${r.via}\`
@@ -1940,8 +1943,11 @@ export function runLanes(): void {
   }
 
   for (const [lane, entry] of Object.entries(manifest.lanes)) {
+    const stale = rosterIsStale(entry)
+      ? "  ⚠ STALE — no longer evidence for eviction; run `llm-relay lanes --probe`"
+      : "";
     process.stdout.write(`
-${lane} — ${entry.models.length} models, probed ${entry.probedAt} via \`${entry.via}\`
+${lane} — ${entry.models.length} models, probed ${entry.probedAt} via \`${entry.via}\`${stale}
 `);
     for (const m of entry.models) {
       const supports = m.supports
@@ -1964,7 +1970,7 @@ ${lane} — ${entry.models.length} models, probed ${entry.probedAt} via \`${entr
     const i = rung.args.indexOf("--model");
     const model = i >= 0 ? rung.args[i + 1] : undefined;
     if (!model) continue;
-    const v = verifyModel(manifest, rung.command, model);
+    const v = verifyModel(manifest, rung.command, model, { args: rung.args });
     if (v.status === "not-servable" && !bad.includes(v.reason)) bad.push(v.reason);
   }
   if (bad.length > 0) {
@@ -2094,6 +2100,11 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     );
   const staleProxy = hostStale || windowStale;
   const live = staleProxy ? null : liveRaw;
+  // The durable half of exhaustion state is readable cold since dispatch-exhaustion persistence
+  // landed: restore still-future rows so the fallback ladder shows what the relay recorded.
+  // In-memory-only rows on a running relay still need the live answer — this narrows the gap, it
+  // does not close it. Read-only here: no listener is installed, so nothing writes back.
+  restoreExhaustedRows(cfg, loadExhaustedRows());
   const view = normalizeDispatchCommands(
     live ??
       buildDispatch(cfg, {
@@ -3638,13 +3649,10 @@ export function main(): void {
     return;
   }
   if (arg2 === "lanes") {
-    try {
-      runLanes();
-    } catch (e) {
-      process.stderr.write(`llm-relay lanes: ${(e as Error).message}
-`);
+    runLanes().catch((e) => {
+      process.stderr.write(`llm-relay lanes: ${(e as Error).message}\n`);
       process.exit(1);
-    }
+    });
     return;
   }
   if (arg2 === "dispatch") {

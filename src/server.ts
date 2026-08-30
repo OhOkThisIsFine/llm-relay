@@ -71,6 +71,8 @@ import {
 import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { installBreakerPersistence } from "./breaker-persistence.js";
+import { installDispatchExhaustionPersistence } from "./dispatch-exhaustion-persistence.js";
+import { LaneCadence } from "./lane-cadence.js";
 import { estimateRequestTokens, assessCost, resolveMetadata, type CostClass } from "./metadata.js";
 import { findTierModel, loadTierData, type TierModel } from "./tier-data.js";
 import { specOfTarget } from "./benchmarks.js";
@@ -316,7 +318,16 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const logger = new MetadataLogger(cfg.log);
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
   const catalog = deps.catalog ?? new ModelCatalog();
-  const pingLoop = deps.pingLoop ?? new PingLoop(cfg, catalog);
+  /**
+   * The lane cadence rides the ping tick (owner decision 2026-08-29): catalog re-probes keep
+   * rosters fresh, and quota probes re-test recorded lane deaths so no lane stays parked on a
+   * stale record. Skipped under vitest — the suite exercises `LaneCadence` directly with
+   * injected seams, and a test proxy must never spawn a real lane.
+   */
+  const laneCadence = process.env.VITEST ? null : new LaneCadence(cfg);
+  const pingLoop =
+    deps.pingLoop ??
+    new PingLoop(cfg, catalog, laneCadence ? { onTick: (now) => laneCadence.poke(now) } : {});
   const breaker = deps.breaker ?? new CircuitBreaker();
   /**
    * Cooling state survives a restart, like ping health already did.
@@ -330,6 +341,9 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
    * this is belt and braces — the suite exercises the mechanism directly with an explicit path.
    */
   if (!process.env.VITEST) installBreakerPersistence(breaker);
+  // The ladder's exhaustion state survives a restart for the same reason — the report route
+  // accepts vendor-stated cooldowns up to 30 days, exactly the rows worth keeping.
+  if (!process.env.VITEST) installDispatchExhaustionPersistence(cfg);
   // Process-local and deliberately credential-wide: a deployment switch must not reset fairness.
   const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
