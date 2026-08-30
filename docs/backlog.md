@@ -14,11 +14,14 @@
   *"That reverses this verdict if the owner states agy must be able to DELEGATE rather than only be
   delegated to."* The owner has now stated it.
 
-  ⚠ **Carry the recorded security cost forward; do not rediscover it.** agy holds `mcp(*)` and has
-  had NO shell since 2026-08-11, so an MCP server hands a host that cannot run `ls` the power to
-  spawn a writing agent. That is a deliberate 2026-08-11 revocation being reached around through a
-  side door. The owner accepted this cost when choosing the reversal; the build must therefore
-  bound it explicitly rather than treat it as unnoticed.
+  ⚠ **Do NOT gate this on agy's missing shell, and do NOT call that a security boundary.**
+  An earlier version of this entry did both, and it was wrong. Owner correction, 2026-08-30:
+  *"some agent ordained that AGY had certain limitations, that it did not have, that I didn't
+  want"* — the 2026-08-11 `command(*)` revocation was an AGENT's act, not an owner decision, and
+  the global `CLAUDE.md` phrase "the accepted cost" describes an acceptance no file history shows.
+  So "an MCP server reaches around a deliberate revocation through a side door" rests on a premise
+  that does not hold. Design the server on its own merits. Restoring agy's shell is a one-line
+  change, on explicit owner instruction only — it is not this work item's business either way.
 
   Still true and still binding on the design, from
   [skill-dispatch-mcp-verification-2026-08-30.md](skill-dispatch-mcp-verification-2026-08-30.md) §4:

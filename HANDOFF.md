@@ -45,9 +45,12 @@ Three durable facts from those laps, kept because prose elsewhere had them wrong
   earlier write-up here claimed far less. (`~/.agent-config/host-agy.md` was stale for three days
   and was rewritten 2026-08-30; it is correct now.)
 - ⚠ **The MCP verdict is REVERSED** (owner, 2026-08-30): agy must be able to DELEGATE, so an MCP
-  server is now wanted. The work item and its recorded security cost are in
-  [docs/backlog.md](docs/backlog.md); the superseded reasoning stays in `CLAUDE.md` because its two
-  INVALID objections must not be repeated.
+  server is now wanted. The work item is in [docs/backlog.md](docs/backlog.md); the superseded
+  reasoning stays in `CLAUDE.md` because its two INVALID objections must not be repeated.
+- ⚠ **agy's missing shell is NOT a security boundary** (owner correction, 2026-08-30). The
+  2026-08-11 `command(*)` revocation was an AGENT's act, not an owner decision, and the global
+  `CLAUDE.md` phrase "the accepted cost" describes an acceptance no file history shows. Never cite
+  it to gate a design. The MCP work item first did, and that text is retracted in place.
 
 **This lap (2026-08-30, sixth) — the package-hygiene lap.** Full evidence:
 [docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md).
@@ -76,10 +79,12 @@ Three durable facts from those laps, kept because prose elsewhere had them wrong
   is no longer measured against `docs/project-goals.md` rubric test 1. Recorded in the CLAUDE.md
   MCP gotcha.
 - **D4 — REVERSED: agy must be able to DELEGATE**, so an MCP server is now wanted. The reversal
-  condition was written into the CLAUDE.md gotcha and the owner met it. ⚠ The recorded security
-  cost travels with it: agy has had no shell since 2026-08-11, so this reaches around that
-  revocation through a side door. The owner accepted that knowingly; the design must bound it
-  rather than rediscover it. Work item in [docs/backlog.md](docs/backlog.md).
+  condition was written into the CLAUDE.md gotcha and the owner met it. Work item in
+  [docs/backlog.md](docs/backlog.md).
+  ⚠ **I first attached a security cost to it, and the owner retracted that the same day.** I wrote
+  that an MCP server "reaches around a deliberate 2026-08-11 revocation" which "the owner accepted
+  knowingly". Both halves were false: the revocation was an agent's act, and no file history shows
+  an acceptance. The text is retracted in place in all three homes rather than quietly deleted.
 
 **Immediate next:** the two owner decisions now in [docs/backlog.md](docs/backlog.md) — the MCP
 server build (D4) and the package-size variant. ⚠ `AGENTS.md` cannot be regenerated from a

@@ -905,9 +905,17 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   the DESIGN — the two invalid objections must not be repeated, and the four real design
   constraints (an inert `dispatch()` on a stranger's install, a read tool duplicating `/dispatch`,
   a caller-supplied `cwd`, no representation for a 30-minute lane) are unsolved, not withdrawn.
-  ⚠ **Carry the security cost forward explicitly, because the owner accepted it knowingly:** agy
-  has had no shell since 2026-08-11, so giving it a delegation mechanism reaches around that
-  revocation through a side door. Bound it in the design; never treat it as unnoticed.
+  ⚠ **RETRACTED, same day, by the owner: agy's missing shell is NOT a security boundary and must
+  never be cited as one.** This paragraph first said to carry a security cost forward "because the
+  owner accepted it knowingly" — that was false. Owner correction 2026-08-30: *"some agent ordained
+  that AGY had certain limitations, that it did not have, that I didn't want"*. The 2026-08-11
+  `command(*)` revocation was an AGENT's act, and the global `CLAUDE.md` phrase "the accepted cost"
+  describes an acceptance no file history shows. So do not argue that an MCP server "reaches around
+  a deliberate revocation through a side door" — the premise does not hold. Design the server on
+  its own merits, and treat restoring agy's shell as a separate one-line change that needs explicit
+  owner instruction. ⚠ The general lesson is the one this file already teaches about provenance:
+  an agent-imposed limitation recorded in prose reads, three days later, exactly like an
+  owner-chosen policy. Say who decided, or do not call it a decision.
   ⚠ **A related question was closed the OTHER way in the same decision:** `DEFAULT_CONFIG_TEMPLATE`
   will NOT ship a `routing.ladder` or a `cliLane` (owner decision 2026-08-30, D2). Dispatch is
   deliberately a per-machine feature, so **stop measuring dispatch work against rubric test 1** —
