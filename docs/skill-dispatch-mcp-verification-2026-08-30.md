@@ -592,3 +592,13 @@ and no record so far treats agy as anything but a lane.
    review broke them, and two of the three *reviews* also contained inaccuracies. Nothing here
    survived on an agent's summary alone.
 6. **Stored mojibake makes `dispatch` output hard to read** on this machine — see §5b.
+7. **A closeout run failed once on a tree that passed twice, and the diagnostics were lost.**
+   `verify-green record` reported `recorded FAILING run on tree cfe344fdb9ce` at 06:38:39. The same
+   command on the **same tree** then exited 0 twice — `npm run check` directly (135 files, 2623
+   tests, exit 0) and `verify-green record` again (`recorded PASSING run on tree cfe344fdb9ce`).
+   By this repo's own test-failure protocol that is a flake, not a regression. ⚠ **The cause is
+   unknown and stays unknown, because the invocation was piped through `tail -3`** — so the failing
+   test name and its output were discarded before anything could read them. Two lessons, both
+   process: never pipe `verify-green record` through `tail`; redirect the whole run to a file and
+   tail the FILE. And a lost-diagnostic failure must be reported as unexplained rather than quietly
+   overwritten by a later green run, which is why it is written down here.
