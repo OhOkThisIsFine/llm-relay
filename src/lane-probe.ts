@@ -38,6 +38,17 @@ export interface LaneProbeResult {
 }
 
 /**
+ * Quote ONE argument for the Windows shell-fallback line. `args.join(" ")` is the exact defect
+ * the dispatch renderer's comment warns about ("a task containing a space ... broke out"), and it
+ * bit again here on 2026-08-30: the quota probe's prompt reached codex as seven separate tokens
+ * (`error: unexpected argument 'with' found`). The fallback is unavoidable — Node refuses to
+ * execFile a `.cmd` shim without a shell — so every token is quoted, embedded quotes escaped.
+ */
+export function quoteCmdArg(arg: string): string {
+  return `"${arg.replace(/"/g, '\\"')}"`;
+}
+
+/**
  * Async on purpose: the background cadence runs this beside the ping loop, and a synchronous
  * spawn would block every HTTP probe for the lane command's whole runtime. `windowsHide` is
  * load-bearing, not cosmetic — the relay daemon is launched console-less at logon, and a console
@@ -64,7 +75,7 @@ function runLaneCommand(command: string, args: string[]): Promise<string> {
       // the fallback, not the norm. Passed as ONE quoted command line; every token here is a
       // fixed literal from a prober below — no task content, no user input.
       if (process.platform === "win32" && (err as NodeJS.ErrnoException).code === "ENOENT") {
-        const fallback = exec(`"${command}" ${args.join(" ")}`, opts, (err2, stdout2) => {
+        const fallback = exec(`${quoteCmdArg(command)} ${args.map(quoteCmdArg).join(" ")}`, opts, (err2, stdout2) => {
           if (err2) reject(err2);
           else resolve(stdout2);
         });

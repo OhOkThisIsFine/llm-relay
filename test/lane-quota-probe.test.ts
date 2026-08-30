@@ -16,6 +16,7 @@ import {
   type LaneProbeSpawnResult,
 } from "../src/lane-quota-probe.js";
 import { loadConfig, type Config } from "../src/config.js";
+import { quoteCmdArg } from "../src/lane-probe.js";
 
 function result(partial: Partial<LaneProbeSpawnResult>): LaneProbeSpawnResult {
   return { code: 0, stdout: "", stderr: "", timedOut: false, ...partial };
@@ -125,6 +126,17 @@ describe("buildLaneProbeInvocation", () => {
     expect(inv.env["CLAUDE_CONFIG_DIR"]).toBe("C:\\probe-home");
     // `null` unsets an inherited variable — the nested-session trap.
     expect("CLAUDECODE" in inv.env).toBe(false);
+  });
+});
+
+describe("quoteCmdArg (the shell-fallback line)", () => {
+  it("⚠ keeps a spaced prompt ONE token and escapes embedded quotes", () => {
+    // Measured live on v0.59.1: the unquoted join handed codex the probe prompt as seven
+    // arguments (`error: unexpected argument 'with' found`) and the quota probe never learned.
+    expect(quoteCmdArg(LANE_PROBE_PROMPT)).toBe(`"${LANE_PROBE_PROMPT}"`);
+    expect(quoteCmdArg('say "hi"')).toBe('"say \\"hi\\""');
+    const line = ["exec", LANE_PROBE_PROMPT].map(quoteCmdArg).join(" ");
+    expect(line).toBe(`"exec" "${LANE_PROBE_PROMPT}"`);
   });
 });
 
