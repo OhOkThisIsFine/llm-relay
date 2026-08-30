@@ -34,6 +34,18 @@
  * is invisible to `/candidates`' cooldown column and to the dashboard Cooldowns panel, because
  * those read breaker state. The response header is its surface.
  *
+ * ⚠ **WHICH DATASET, and what follows from it.** `getDeploymentMeasurement` returns the
+ * BREAKER's pings, which are written only by `applyHealthOutcome` on the REQUEST path — they are
+ * real served-request latencies, they live in memory only, and `PingLoop` never writes them
+ * (`cadence.ts`: "PingLoop holds no breaker reference"). `breaker-persistence.ts` deliberately
+ * does not persist them either ("`probe-cache.json` is their one home"). So: **this term is inert
+ * after every relay restart** until `minSamples` real requests have been served per deployment,
+ * and it measures what callers actually waited for rather than what a 1-token probe waited for.
+ * That is defensible — request latency is the thing being complained about — but it is NOT the
+ * dataset `llm-relay candidates` displays, so the two surfaces can disagree about one deployment.
+ * Switching to the probe dataset would survive restarts and match `candidates`, at the cost of
+ * measuring a 1-token round-trip instead of a real answer.
+ *
  * Pure and bounded: no IO and no clock of its own beyond what the caller passes. The factory wraps
  * everything in try/catch — this runs on the request path, and a routing hint must never be able
  * to fail a request. It logs nothing: routing is not an error stream.
@@ -54,10 +66,14 @@ import { MEASURABLE_CODES, getP95 } from "./ping/metrics.js";
  * "a guess must never be labelled a measurement" invariant draws — it forbids inventing an
  * unpublished provider limit, price or context ceiling, and explicitly permits a tunable default.
  *
- * The figures are nonetheless calibrated against real measurement rather than picked: in the
- * window that motivated this module the member that actually SERVED had a p95 of 23478 ms and
- * answered, while the member that burned the walk had 70364 ms. 30000 ms sits between them, so
- * the default demotes the one that was costing whole requests and leaves the one that was working.
+ * ⚠ **KNOWN CALIBRATION CAVEAT, stated rather than glossed.** The figures that motivated this
+ * module — a serving member at p95 23478 ms, a walk-burning member at 70364 ms — were read from
+ * `llm-relay candidates`, whose p95 column comes from `PingLoop.getModelSummary()`: the PROBE
+ * dataset in `probe-cache.json`. This module reads a DIFFERENT dataset (below), so 30000 ms is
+ * calibrated on probe latency and applied to request latency. A probe sends `max_tokens: 1`; a
+ * real request generates, so request latency runs systematically HIGHER. Expect this default to
+ * demote more readily than those two numbers suggest, and re-calibrate against request-path
+ * figures before treating 30000 as measured rather than chosen.
  */
 export const DEFAULT_LATENCY_P95_MS = 30_000;
 

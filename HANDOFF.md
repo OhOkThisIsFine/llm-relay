@@ -147,7 +147,16 @@ deleted, and it still bounds the design: what was rejected is a second ranking P
 and can PROMOTE on one request's latency, and that stays rejected. Do not "restore" the old
 behaviour as a regression fix.
 
-**Immediate next: nothing.** [docs/backlog.md](docs/backlog.md) has an empty Open section.
+⚠ **One follow-up, found immediately after shipping it and recorded rather than left to be
+rediscovered: `routing.latency` measures REAL REQUEST latency** (breaker pings, in memory), not the
+probe latency `llm-relay candidates` displays (`probe-cache.json`). So it is **inert after every
+relay restart** until `minSamples` real requests per deployment, and the 30000 ms default was
+calibrated on `candidates` figures — i.e. on probes sending `max_tokens: 1` — while it is applied
+to full generations, which run higher. Nothing is unsafe (it still only reorders, still needs 5
+samples, still does nothing when unmeasured), but the dataset choice is an open decision with three
+costed options in [docs/backlog.md](docs/backlog.md).
+
+**Immediate next:** that one decision. Everything else this lap is shipped and released.
 
 ⚠ **The MCP server design is OWNED BY ANOTHER AGENT** (owner, 2026-08-30). Do not start it here.
 ⚠⚠ **And its stated justification expired ~70 minutes after the decision.** D4 rested on *"agy has

@@ -9,7 +9,31 @@
 
 ## Open
 
-_Nothing open._
+- **Decide which latency dataset `routing.latency` should measure** (found 2026-08-30, immediately
+  after shipping it; the feature works, this is about which evidence it reads).
+
+  `src/latency-demotion.ts` reads `breaker.getDeploymentMeasurement().pings` — **real
+  served-request** latency, written only by `applyHealthOutcome` on the request path, held in
+  memory. `PingLoop` never writes it and `breaker-persistence.ts` deliberately does not persist it.
+  Two consequences, both now documented in place rather than discovered later:
+
+  1. **The term is inert after every relay restart** until `minSamples` real requests per
+     deployment.
+  2. **The default ceiling was calibrated on the WRONG dataset.** The 23478 / 70364 ms figures came
+     from `llm-relay candidates`, whose p95 is `PingLoop.getModelSummary()` — the PROBE dataset in
+     `probe-cache.json`. A probe sends `max_tokens: 1`; a real request generates. So request
+     latency runs systematically higher and 30000 ms will demote more readily than those two
+     numbers imply.
+
+  Options: (a) keep request latency and re-calibrate the default against real request-path figures
+  — measures what callers actually waited for, but stays restart-inert; (b) switch to the probe
+  dataset — survives restarts, matches what `candidates` displays, but measures a one-token
+  round-trip rather than an answer; (c) read both, and require both to agree before demoting.
+
+  ⚠ Nothing here is unsafe: the term still only reorders, still needs 5 samples, and still does
+  nothing when unmeasured. The live check after the restart returned
+  `4 tried, 0 served: 1x429, 2x402, 1x504` with no latency header — consistent with a freshly
+  restarted breaker holding no samples yet, and with the pool genuinely being sick.
 
 ## Closed
 

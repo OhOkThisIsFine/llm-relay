@@ -703,6 +703,16 @@ x-llm-relay-latency-demoted: nim/deepseek-ai/deepseek-v4-flash (p95 70364ms > 30
 `llm-relay candidates` and the dashboard Cooldowns panel — which read breaker state — will not show
 it.
 
+⚠ **It measures REAL REQUEST latency, and that has two consequences worth knowing.** The samples
+come from requests the relay actually served, held in memory:
+
+- **It is inert after a relay restart** until at least `minSamples` real requests have been served
+  for a deployment. Background probes do not feed it.
+- **It can disagree with the `p95` column in `llm-relay candidates`**, which is probe latency from
+  `probe-cache.json`. A probe asks for one token; a real request generates an answer, so request
+  latency is systematically higher. Treat the default ceiling of 30000 ms as a starting point and
+  tune it against your own traffic rather than against the `candidates` column.
+
 #### Hard caps refuse, loudly
 
 Everything above demotes — and then there is the one thing that may refuse: an operator-declared
