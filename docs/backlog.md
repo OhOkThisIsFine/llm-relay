@@ -9,14 +9,15 @@
 
 ## Open
 
-- **`packBytes` is within 0.4% of its own ceiling** (**1101933** against 1106200, re-measured
-  2026-08-30 after v0.61.0 — was 1100459). Pre-existing drift, deliberately NOT raised in the
-  v0.60.0 lap. ⚠ **The v0.61.0 lap consumed 1474 bytes of the remaining headroom** by adding the
-  `--next-command` contract table to `skills/llm-relay/SKILL.md`, which the package ships. That was
-  a deliberate, disclosed cost — the section is what makes the single-verb contract legible to an
-  agent — but it leaves only **4267 bytes**. The next change that adds anything will trip
+- **`packBytes` is within 0.4% of its own ceiling** (**1102172** against 1106200, re-measured
+  2026-08-30 after v0.62.0 — was 1100459 before this pair of laps). Pre-existing drift, deliberately
+  NOT raised in the v0.60.0 lap. ⚠ **Two laps have now consumed 1713 bytes of the remaining
+  headroom, both disclosed rather than absorbed:** v0.61.0 spent 1474 on the `--next-command`
+  contract table in `skills/llm-relay/SKILL.md`, which the package ships, and v0.62.0 spent 239 on
+  the third install target. **4028 bytes remain.** The next change that adds anything will trip
   `check:package`. When it does, **root-cause the growth first** — regenerating the baseline is what
-  turns a size ratchet into decoration.
+  turns a size ratchet into decoration. ⚠ Re-measure this figure in the same change that alters it;
+  a stale measured number is what the v0.61.0 closeout auditor caught elsewhere.
 
 - **`check:package` should say "run the build first" instead of throwing a raw ENOENT.**
   `scripts/dashboard-package-check.mjs:15` reads `dist/dashboard/.vite/dashboard-bundle-graph.json`

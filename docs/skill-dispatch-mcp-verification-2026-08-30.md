@@ -394,9 +394,29 @@ verdict.
 **Antigravity has no shell, and Antigravity can call MCP tools.** `command(*)` was revoked from
 agy's settings on 2026-08-11 and that revocation stands; `mcp(*)` is in its live allow list and was
 proven working on 2026-08-27. For an agy session, a printed command is **structurally unusable** —
-agy cannot execute it — and agy has no subagent tool either. An agy session that wants to delegate
-has **zero** mechanisms today. MCP is the only one that could exist. That argument passes rubric
-test 1 on measured evidence.
+agy cannot execute it — and agy has no subagent tool either. So MCP is the only mechanism through
+which an agy session could hand a task to another agent. That argument passes rubric test 1 on
+measured evidence.
+
+⚠ **Correction — an earlier draft said an agy session "has zero mechanisms today". That was wrong,
+and the owner caught it.** A follow-up investigation against primary sources confirmed the owner's
+recollection that someone had made agy do more. agy's **live** allow list at
+`~/.gemini/antigravity-cli/settings.json` is:
+
+```json
+{ "permissions": { "allow": ["read_file(*)", "write_file(*)", "read_url(*)", "mcp(*)"] } }
+```
+
+So agy can read files, **write files**, read URLs and call MCP tools — the last verified end to end
+(it called `codebase-memory-mcp` and returned 21 indexed projects in 6s). Three changes on
+2026-08-27 produced that: the permission-vocabulary fix that added write/URL/MCP, the
+`lane-launch.ps1` window/focus fix, and raising `--print-timeout` to 30m.
+
+The narrow claim survives and is what the argument actually rests on: agy still cannot **delegate**,
+because writing a file and calling a tool are ways of doing work itself, not of handing work to
+another agent. But "helpless" was the wrong picture, and the corrected one matters — the counter
+below (agy already holds `read_url(*)`, so it can already *ask* `GET /dispatch`) depends on
+capabilities the earlier draft had written off.
 
 **Why it does not carry the verdict, stated so it can be overruled:**
 
@@ -558,11 +578,26 @@ on this exact point. The stale copy at `~/.config/opencode/skills/llm-relay/SKIL
 either way; it can equally be deleted or refreshed by hand at the machine layer.
 
 **D4. Must agy be able to DELEGATE, or only be delegated to?** This is the one that reverses the
-MCP verdict. agy has no shell and does have `mcp(*)`, so an agy session that wants to hand off work
-has no mechanism at all today, and MCP is the only one that could exist. Building it would hand a
-host that cannot run `ls` the power to spawn a writing agent — reversing a deliberate 2026-08-11
-security decision through a side door. Worth doing only if agy orchestrating is a real requirement,
-and no record so far treats agy as anything but a lane.
+MCP verdict. agy has no shell and does have `mcp(*)`, so MCP is the only mechanism by which an agy
+session could hand work to another agent. Building it would hand a host that cannot run `ls` the
+power to spawn a writing agent — reversing a deliberate 2026-08-11 security decision through a side
+door. Worth doing only if agy orchestrating is a real requirement; every first-hand record still
+treats agy as a lane that RECEIVES work, and agy has no MCP *server* mode and no ACP mode, so it
+cannot be driven as a tool by another agent either.
+
+⚠ **Owner-raised and now settled: agy is considerably more capable than this document first said.**
+Its live allow list is `read_file`, `write_file`, `read_url`, `mcp` — see the correction in §4.2.
+That does not change D4's answer, because none of those is a delegation mechanism, but it does mean
+any reasoning about agy should start from the live settings file rather than from prose.
+
+**D5 (new, machine-scoped, found while checking D4). `~/.agent-config/host-agy.md` is stale and
+actively wrong.** It still tells agy *"You have no shell … You hold `read_file`,
+`list_directory`, `glob`, and `search_file_content` … **Never call an MCP tool.**"* Three of those
+four tool names were never valid agy actions, and the MCP prohibition contradicts the live allow
+list and the 2026-08-27 verification. An agy session reads that file as its documented first action,
+so it is being told to avoid two capabilities it actually has. A project memory note dated
+2026-08-23 saying *"agy has no write tool"* is unretracted for the same reason. Both are machine
+layer, not repo.
 
 ---
 
