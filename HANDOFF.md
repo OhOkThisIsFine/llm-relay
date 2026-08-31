@@ -21,8 +21,19 @@ boundary was rejected because the cost report and the dashboard chart resolve th
 `windowPlan`, and one figure with two definitions is the split this repo keeps closing. **The
 backlog is empty again.**
 
-⚠ **Not yet released.** The change is on `main` and green, and `package.json` is still at 0.67.0.
-It is user-visible output on a shipped command, so it wants a release before anyone sees it.
+✅ **Released as v0.68.0**, confirmed against the REGISTRY (`dist-tags.latest` 0.68.0) and verified
+from the reinstalled global bin: `--window 30d` printed its bounds and "the most recent 153 minutes
+are not counted" (clock 08:33Z, window ending 06:00Z), while `--window 1h` printed its bounds and
+NO gap sentence, because its gap was 4 seconds. Both branches of the sub-minute rule are therefore
+live-verified, not just unit-tested. MINOR rather than patch: it adds new output lines, the same
+reason v0.66.0 was minor for a new header.
+
+⚠ **The daemon was deliberately NOT restarted onto v0.68.0, and that is not an oversight.** The
+release contains no proxy code — `writeCoveredPeriod` is CLI rendering, and `cost` runs as its own
+process against the committed ledger. A restart would drop in-memory state the proxy has learned
+(credential faults, quota observations, the latency and hedge samples that live only in memory) to
+buy a version number. So the running proxy is 0.67.0 code and the CLI is 0.68.0; the skew is real,
+bounded to rendering, and is stated here so a later session does not read it as a missed step.
 
 **The tenth lap closed both backlog entries that stood before it.**
 
