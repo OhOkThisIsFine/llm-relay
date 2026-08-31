@@ -9,26 +9,47 @@
 
 ## Open
 
-- **⚠ D3 — should a LOSING hedge's spend enter `requestSpend`?** Owner decision 2026-08-30 said yes;
-  attempting it found an obstacle the decision did not have, so it is handed back rather than
-  overturned or silently skipped. Full reasoning:
-  [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md) §9.
+- **⚠ D3 — WHICH SURFACE shows a losing hedge's spend? (owner decision, open)** The recording half
+  shipped 2026-08-30: `RequestCompletedEvent.abandonedSpend`, the store fold into its own cells, and
+  the persisted `abandonedSpend` key. The figure is recorded and persisted, so it accrues history
+  from now on. It is **not yet projected** to any surface — a deliberate, named intermediate state,
+  not a bug.
 
-  - **`AccountingSpend` cannot honestly hold two deployments.** One record, one `pricesUsed`, one
-    `priceSource`, one `tokenBasis` — summing a winner's and a loser's amounts into it attaches one
-    deployment's prices to another's tokens, which is the provenance defect this project's own
-    invariant forbids. The faithful route is the four-cell aggregate in `accounting-store.ts`, which
-    already sums: carry the loser's spend as a separate entry on `RequestCompletedEvent` and fold it
-    in the STORE. That is additive across the event vocabulary, the shard schema and the dashboard
-    projection — a versioned contract change, which is what D3 itself calls it.
-  - **A decision taken AFTER D3 makes it usually zero.** `hedge-race.ts` decides at RESPONSE
-    RESOLUTION and the relay reads no body before then, so an ABORTED loser has no observed tokens
-    and no spend. D3 has real content only in the narrow case where both sides settle and one loses
-    by a microtask, carrying a full completion `abort()` can no longer undo.
+  Options, all additive over the shipped storage:
+  - **(a) `llm-relay cost` only.** `CostReportV1` gains an `abandoned` cell group mirroring
+    `RepairShareV1` (`Omit<SpendTotalsV1, "unpricedRequests" | "partiallyPricedRequests">`), and the
+    CLI prints one line. The SPA reads `dashboard.snapshot.v1`, not `dashboard.cost.v1`, so it is
+    untouched. The smallest honest surface that makes D3 observable.
+  - **(b) Also the dashboard.** A new panel figure beside spend. ⚠ The SPA types its spend table as
+    `Omit<SpendTotalsV1, "unpricedRequests" | "partiallyPricedRequests">`, so a new key becomes an
+    unlabelled row — it must be excluded and rendered deliberately. `dashboard/tsconfig.json` is in
+    `npm run check`, so this cannot slip silently.
+  - **(c) Leave it recorded and unprojected.** Zero further work; the data is there when a surface
+    is wanted.
+
+  ⚠ **What will NOT happen, and why — one part of D3's literal wording cannot hold.** D3 said
+  `requestSpend` "becomes what this request actually cost". It does not, and three measurements say
+  it must not:
+  - an abandoned attempt is estimated-basis with coverage `input_only`, so folding it into
+    `requestSpend` flips `partiallyPricedRequests` — the wire contract's LOWER-BOUND marker — on for
+    essentially every hedged request, without one amount changing;
+  - winner and loser are priced from the SAME request-level estimated input count, so a merged
+    figure double-counts one measurement;
+  - the property below is JOINT over spend and tokens, and folding tokens to match would reach
+    `usedInWindow`, which hard caps and quota demotion read — turning an accounting change into a
+    routing one.
+
+  So `requestSpend` keeps meaning "what the answer you received cost", and "what this request cost"
+  is `requestSpend + abandonedSpend`. Say so on whichever surface ships.
+
+  ⚠ One premise in the original handback is DISPROVED and should not be repeated: "an aborted loser
+  has no observed tokens and therefore no spend at all". An aborted serve attempt always carries the
+  request-level ESTIMATED INPUT count, so it reaches the estimated pricing branch and produces a
+  non-null figure whenever the price port resolves a price. D3 has real, non-zero content.
 
   **Property:** either `requestSpend` means "what this request cost" for every request, or it means
   "what the answer you received cost" — and whichever it means, the token totals beside it mean the
-  same thing. Today both follow the winner-only rule, and they agree.
+  same thing. Both still follow the winner-only rule, and they still agree.
 
 ## Closed
 
