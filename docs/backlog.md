@@ -78,6 +78,14 @@
   **Property:** a request's latency is bounded by the FASTEST candidate that answers, not by the
   first one that was tried.
 
+  **State 2026-08-30: every prerequisite is landed and tested; only the wiring remains.**
+  `hedge-trigger.ts` (the decision, 17 tests), `hedge-race.ts` (the concurrency, 12 tests,
+  mutation-checked twice) and `CredentialWalk`'s `maxInFlight` + `recordAbandoned` (8 tests, written
+  red first, mutation-checked twice) are all on `main`. What is left is the ANTHROPIC front's loop,
+  then the OpenAI front with the same extracted policy — the step list is in `HANDOFF.md` §0.
+  Owner decision: do it in a fresh session with full attention on `src/server.ts`, because it is the
+  riskiest edit of the feature and it lands on the path every request takes.
+
   ⚠ **An invariant is engaged and must be settled first, not assumed.** `CLAUDE.md` says of acting
   on counts: *"Acting on counts is optional, always announced, and may only reorder."* Hedging does
   not reorder — it DUPLICATES, onto free quota this relay does not own. The design answers that
