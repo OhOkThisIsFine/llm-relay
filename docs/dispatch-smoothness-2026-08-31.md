@@ -22,12 +22,12 @@ Both `claude mcp list` and `codex mcp list` reported `llm-relay: llm-relay mcp` 
 
 | Target | Preferred route | Fallback | Verified state |
 |---|---|---|---|
-| Relay pools / cheapest capable lane | MCP `dispatch`, normally without forcing a lane | `llm-relay dispatch --next-command -t <task>` when MCP is unavailable | Live MCP dispatches completed. The ladder is currently free-pool-first because AGY is quarantined. |
-| Claude CLI / Anthropic subscription | From another host, MCP dispatch or `claude -p` with an explicit route | [`scripts/claude-proxied.ps1`](../scripts/claude-proxied.ps1) for an explicitly relay-routed Claude CLI | Claude Code 2.1.237 is installed and authenticated. Transposed Claude lanes configure the three long-think idle-timeout overrides. Claude ACP uses the Agent SDK, not the installed CLI subscription path. |
+| Relay pools / cheapest capable lane | MCP `dispatch`, normally without forcing a lane | `llm-relay dispatch --next-command -t <task>` when MCP is unavailable | Live MCP dispatches completed. The ladder remains free-pool-first, with restored AGY lanes behind the free pool. |
+| Claude CLI / Anthropic subscription | From another host, MCP dispatch or `claude -p` with an explicit route | [`scripts/claude-proxied.ps1`](../scripts/claude-proxied.ps1) for an explicitly relay-routed Claude CLI | Claude Code 2.1.237 is installed, but the owner's subscription transition currently blocks a full Claude→MCP→AGY proof. A hidden auth-failure launch created no terminal event. Transposed Claude lanes configure the three long-think idle-timeout overrides. |
 | Codex | The current Codex task or the first-party Codex plugin; MCP dispatch for cheap offload | `acpx codex exec` from another host | Codex 0.151.0 is installed. Native Codex Desktop collaboration rejects a `pool/medium` child before it reaches the custom provider, so MCP dispatch is the working split-provider route. |
-| AGY | Disabled pending instrumented window revalidation | Once reverified: MCP dispatch through `lane-launch.ps1` and the absolute headless CLI path | AGY has no ACP agent. All 12 AGY ladder entries and autonomous lane probes are disabled after a terminal was observed while an MCP run and direct AGY probes were concurrent; the source was not isolated. |
+| AGY | MCP `dispatch` through `lane-launch.ps1`; force `lane: agy-gemini` only when AGY is wanted deliberately | A human may use the absolute headless CLI from an already-open terminal | Codex→MCP→AGY returned `AGY_CODEX_DISPATCH_OK` in 9 seconds with no AGY-associated top-level or foreground window. All 12 rows and autonomous probes are enabled. Direct `agy.exe` from console-less automation remains prohibited. |
 | OpenCode | `acpx --no-terminal --no-fs ... opencode exec <task>` | `opencode run <task>` from an existing console | Repaired global install; OpenCode 1.18.25. A real ACP turn returned `OPENCODE_ACP_OK` in 13.15 seconds. |
-| Gemini CLI | ACP or direct CLI after authentication is configured | None currently | Gemini 0.57.0 is installed, but ACP and direct CLI both report that no Gemini authentication method/API key is configured. AGY Gemini is not a fallback while AGY remains quarantined. |
+| Gemini CLI | ACP or direct CLI after authentication is configured | AGY Gemini through MCP `dispatch` | Gemini 0.57.0 is installed, but ACP and direct CLI both report that no Gemini authentication method/API key is configured. The `agy-gemini` lane is ready. |
 
 The installed agent-CLI inventory is Claude, Codex, AGY, Gemini, and OpenCode. Common Qoder,
 Qwen, Trae, Goose, Aider, Copilot, Cursor Agent, Amazon Q, Pi, Amp, Crush, Kiro, OpenClaw,
@@ -68,18 +68,21 @@ installed the 179,651,624-byte binary; `opencode --version` now returns `1.18.25
 the child command. Its option loop now uses an explicit PowerShell loop label. A focused launcher
 check completed with exit 0 and emitted its diagnostic line.
 
-### 4. AGY was quarantined after a contradictory live observation
+### 4. AGY quarantine, attribution correction, and revalidation
 
 A forced MCP AGY dispatch returned a valid answer and did not relaunch the Antigravity GUI, but the
 user observed a transient terminal window while several delegated investigations were concurrent.
-A forensic audit of every delegate then found one had directly run both `agy --version` and
-`agy --help`; no other delegate launched AGY or another peer-agent CLI. The AGY CLI log was last
-written at `2026-08-31 11:40:30`. Because `agy.exe` is a console-subsystem executable, either direct
-probe is itself sufficient to explain a transient console from a windowless parent. The observation
-therefore cannot be attributed specifically to the MCP AGY lane. A process scan after completion
-could not identify the already-exited window owner, so focus safety remains unproven.
+The first forensic pass found one delegate had directly run `agy --version` and `agy --help`, so the
+machine was quarantined while the observation remained unisolated.
 
-The live mitigation is deliberately broader than `enabled: false` on ladder rows:
+The later report has now been corrected from timestamps. The user report was recorded at
+`13:09:51.579`; the `audit-code.mjs` → `conhost.exe` process originally blamed for it was not created
+until `13:10:40.529`, so it cannot be the cause. AGY's instrumented interval had ended at `13:08:20`.
+The closest process match was a concurrent Codex task startup at `13:09:20–22`. Process-creation
+auditing was unavailable, so that is the strongest temporal match rather than definitive window-
+handle proof.
+
+The temporary mitigation was deliberately broader than `enabled: false` on ladder rows:
 
 - all 12 AGY entries across `low`, `medium`, `high`, and `xhigh` are disabled;
 - `routing.laneProbe.enabled` is false because the background cadence probes disabled rows too;
@@ -88,9 +91,17 @@ The live mitigation is deliberately broader than `enabled: false` on ladder rows
 - a ten-minute watcher after quarantine observed no new visible windows; a restart-specific watcher
   later also observed none.
 
-This preserves the AGY installation and credentials while ensuring automatic dispatch cannot start
-it. Re-enable only after one instrumented run shows no `PseudoConsoleWindow`,
-`CASCADIA_HOSTING_WINDOW_CLASS`, `ConsoleWindowClass`, or other visible descendant.
+The owner then authorized the exact exit test. Codex Desktop called the `llm-relay` MCP `dispatch`
+tool with `lane: agy-gemini`; job `job-0006` returned exactly `AGY_CODEX_DISPATCH_OK` in 9 seconds.
+The watcher recorded `agy.exe`, `lane-launch.ps1`, their console-host descendants, and the parent MCP
+server, but no `PseudoConsoleWindow`, `CASCADIA_HOSTING_WINDOW_CLASS`, `ConsoleWindowClass`, other
+AGY-associated visible window, or foreground transition.
+
+That passed the quarantine's stated condition. All 12 AGY rows and `routing.laneProbe.enabled` are
+enabled again. The daemon restarted from the hidden Startup VBS and a 60-second watcher recorded no
+new visible window or foreground transition. `agy-gemini` reports ready; the Claude-backed AGY
+buckets keep their measured cooldowns. Automated Codex and Claude callers must still use MCP
+`dispatch`; direct `agy.exe`, including help/version probes, bypasses the hidden launcher.
 
 ## Focus-safety evidence and limits
 
@@ -102,8 +113,9 @@ it. Re-enable only after one instrumented run shows no `PseudoConsoleWindow`,
 - `acpx@0.13.1` sets `windowsHide: true` on its agent spawn. `--no-terminal` controls capabilities
   advertised to the agent; it is not the window-suppression mechanism.
 - `agy.exe` is a console-subsystem executable with no window-suppression flag. The existing
-  `lane-launch.ps1` applies `CreateNoWindow=true` to the immediate AGY process. The current open
-  question is whether AGY or one of its helpers creates a separate visible descendant.
+  `lane-launch.ps1` applies `CreateNoWindow=true` to the immediate AGY process. The instrumented
+  Codex→MCP→AGY run found no visible helper descendant; direct console-less invocation remains an
+  unsupported bypass of that evidence.
 - `MainWindowHandle` is insufficient evidence: prior measurements found AGY's
   `PseudoConsoleWindow` and the focus-stealing Windows Terminal window belonged to different
   processes. Verification must enumerate top-level windows by PID and class while the lane runs.
@@ -114,8 +126,11 @@ it. Re-enable only after one instrumented run shows no `PseudoConsoleWindow`,
 the no-MCP fallback, but a console-less caller must still use a hidden process host. Copying the
 command into arbitrary shell automation loses the MCP server's process guarantees.
 
-The AGY quarantine remains pending one explicitly authorized, instrumented revalidation. Until
-then the cleanest behavior is to skip AGY and use the relay pool, Codex, Claude, or OpenCode route.
+Claude's full host-level MCP→AGY proof remains pending because the owner's subscription transition
+temporarily blocks Claude Code. The hidden Claude launch reached the authentication error without a
+terminal event, but no AGY child was started, so it is not an end-to-end proof and not an AGY
+failure. New MCP server processes load the restored ladder; already-running processes may keep the
+startup snapshot until their host session restarts.
 
 ## Release and live verification
 
@@ -124,9 +139,13 @@ then the cleanest behavior is to skip AGY and use the relay pool, Codex, Claude,
 - Feature CI run `33428200248`, final cleanup CI run `33431526327`, and `v0.68.4` publish run
   `33431851853` succeeded.
 - The npm registry and reinstalled global binary report `0.68.4`.
-- Reinstall preserved the config hash and the 12-row AGY quarantine.
-- The hidden Startup restart produced zero new visible windows during a 12-second watch.
+- The post-revalidation live config enables all 12 AGY rows and autonomous probes; its SHA-256 is
+  `DB6A53A5E447E6DF7781D66557AD957F5C312770A519623C88BA5355C244FC64`.
+- The final hidden Startup restart produced zero new visible windows and zero foreground
+  transitions during a 60-second watch.
 - Non-AGY MCP job `job-0005` completed through `claude-free-pool` (`pool/medium`) with exit 0.
+- Codex→MCP→AGY job `job-0006` completed through `agy-gemini` in 9 seconds with the exact expected
+  answer and no AGY-associated top-level or foreground window.
 
 One delegated release monitor used an unauthenticated public GitHub REST request and received a 404
 for the private repository. The authenticated `gh run view` path returned the authoritative workflow

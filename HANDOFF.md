@@ -13,22 +13,27 @@ registry and reinstalled global executable both report `0.68.4`.
 Current live state:
 
 - The daemon was restarted through the hidden Startup launcher from the global install and listens
-  on `127.0.0.1:8791`. A 12-second top-level-window watch around the restart observed zero new
-  visible windows.
-- The installed config retained SHA-256
-  `9C42B7684FF4239CCC1B907F29E5C4E84DBDC37939D806A128032EC4B61DB90E` across reinstall.
-- All 12 AGY ladder rows remain disabled and `routing.laneProbe.enabled` remains false. Do not run
-  AGY directly, including version/help probes, or re-enable it without an owner-authorized isolated
-  run that records every top-level window by PID, class, and ancestry.
-- A forced non-AGY MCP warm-up completed through `claude-free-pool` (`pool/medium`) with exit 0.
-  Telemetry answers successfully after the final restart; provider health is unmeasured until new
+  on `127.0.0.1:8791` as PID `472`. A 60-second top-level-window watch around the final restart
+  observed zero new visible windows and zero foreground transitions.
+- The live installed config has SHA-256
+  `DB6A53A5E447E6DF7781D66557AD957F5C312770A519623C88BA5355C244FC64`.
+- The owner-authorized focus-safety revalidation passed: Codex Desktop called MCP `dispatch` with
+  `lane: agy-gemini`; job `job-0006` returned exactly `AGY_CODEX_DISPATCH_OK` in 9 seconds. The
+  watcher recorded the AGY/launcher/process tree but no AGY-associated top-level or foreground
+  window. All 12 AGY ladder rows and `routing.laneProbe.enabled` are enabled again. `agy-gemini`
+  reports ready; the two Claude-backed AGY buckets retain their measured cooldowns.
+- The user's `13:09:51` terminal report preceded the audit process originally blamed for it
+  (`13:10:40`). The closest process match was a concurrent Codex task startup at `13:09:20–22`, so
+  the earlier audit-tools attribution is retracted. Automated hosts must still use MCP dispatch;
+  direct `agy.exe` calls, including help/version probes, bypass the hidden launcher.
+- Claude's full MCP→AGY validation is deferred while the owner's subscription transition blocks
+  Claude Code for roughly a day. A hidden Claude launch that reached the authentication failure
+  created no terminal event; that is not an AGY dispatch failure.
+- Telemetry answers successfully after the final restart; provider health is unmeasured until new
   traffic arrives, and `null` means unknown rather than unhealthy.
 
-The dispatch result and machine repairs are in
-[dispatch-smoothness-2026-08-31.md](docs/dispatch-smoothness-2026-08-31.md). A forensic audit after
-the user's terminal report found one concurrent delegate had directly invoked `agy --version` and
-`agy --help`. Either console-subsystem probe can explain the transient terminal, so that observation
-does not isolate the MCP lane; the quarantine remains the safe state.
+The dispatch result, revalidation evidence, and machine repairs are in
+[dispatch-smoothness-2026-08-31.md](docs/dispatch-smoothness-2026-08-31.md).
 
 Verification evidence:
 
@@ -39,9 +44,9 @@ Verification evidence:
   [33431526327](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33431526327) and the `v0.68.4`
   publish run above succeeded. Original feature CI run
   [33428200248](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428200248) also succeeded.
-- The only immediate next step is the owner-authorized AGY focus-safety revalidation tracked in the
-  machine-wide backlog at `C:\Code\docs\backlog.md`. Until then, use relay pools, Codex, Claude, or
-  OpenCode instead.
+- The only immediate next step is the deferred Claude→MCP→AGY end-to-end validation after Claude
+  subscription access returns. New Codex/Claude MCP server processes load the restored ladder;
+  already-running MCP processes may retain their startup snapshot until their host session restarts.
 
 Codebase-memory generation `2026-08-31T17:52:53Z` was ready but stale for the changed source and
 excluded the changed docs and tests. Exact source and whole-diff reads were used instead, so no
