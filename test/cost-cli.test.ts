@@ -171,6 +171,48 @@ describe("llm-relay cost CLI", () => {
     expect(output).toContain("may lag until then");
   });
 
+  /**
+   * The window NAME is not the period. `rollingPlan` floors `to` by the window's bucket, so the
+   * newest partial bucket is outside every rolling window — 15 minutes for `24h`, an hour for
+   * `7d`, SIX HOURS for `30d` — and until 2026-08-31 the table printed only the name, so the
+   * shortfall was invisible on a spend surface. Measured against a live store that day: one
+   * request at 06:23Z was reported under `1h` and reported as ZERO under `24h`, `7d` and `30d`.
+   *
+   * ⚠ This fixture already sits in the gap by construction: the clock is 12:34:56 and the 24h
+   * window ends at 12:30:00, so the assertion below is exercising the real boundary rather than a
+   * contrived one.
+   */
+  it("states the period it actually covers, and how far behind the clock the window ends", async () => {
+    const usageDir = tempUsageDir();
+    seed(usageDir, {
+      pricePort: PUBLISHED_PRICE,
+      attempts: [{ role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    const { output } = await runCost([], usageDir);
+    // Both bounds, so a reader can tell what was counted without reaching for --json.
+    expect(output).toContain("Covering 2026-08-19T12:30:00.000Z → 2026-08-20T12:30:00.000Z (UTC).");
+    // NOW is 12:34:56 and the window ends 12:30:00, a gap of 4m56s. The figure FLOORS, so it says
+    // 4 and never 5: the sentence claims how much is missing, so it must not claim more than the
+    // evidence supports. Naming the figure at all is the point — "24h" alone reads as "up to now".
+    expect(output).toContain("the most recent 4 minutes are not counted");
+  });
+
+  it("says nothing about a trailing gap when the window reaches the clock", async () => {
+    const usageDir = tempUsageDir();
+    seed(usageDir, {
+      pricePort: PUBLISHED_PRICE,
+      attempts: [{ role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    // The 1h window buckets by the MINUTE, so it ends at 12:34:00 — 56 seconds behind the clock.
+    // A sub-minute gap must print NO sentence rather than "0 minutes", which would read as a
+    // defect where there is none. ⚠ This case is why the figure floors: rounding turns 56 seconds
+    // into "1 minute" and prints a warning about a window that is, for any practical purpose,
+    // current. The first version of this change did exactly that and this test caught it.
+    const { output } = await runCost(["--window", "1h"], usageDir);
+    expect(output).toContain("Covering 2026-08-20T11:34:00.000Z → 2026-08-20T12:34:00.000Z (UTC).");
+    expect(output).not.toContain("are not counted");
+  });
+
   it("groups by model when --by model is given", async () => {
     const usageDir = tempUsageDir();
     // Two separate REQUESTS — a second serve attempt on the same request would be a

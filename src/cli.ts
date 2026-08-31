@@ -1801,6 +1801,47 @@ function writeAbandonedShare(report: CostReportV1, write: (message: string) => v
 }
 
 /** Human rendering of one cost report: cells side by side, never blended into one total. */
+/**
+ * State the period the report actually covers — the window NAME is not it.
+ *
+ * ⚠ Every rolling window ends at a BUCKET BOUNDARY (`rollingPlan` floors `to` by `bucketMs`), so
+ * the newest partial bucket is outside it: up to 15 minutes behind `now` for `24h`, an hour for
+ * `7d`, and SIX HOURS for `30d`. That alignment is right for the dashboard's bucketed chart, which
+ * is what `windowPlan` was written for. It is wrong to leave unstated on a SPEND surface, where
+ * this repo's own rule is that a lower bound is announced rather than implied. Measured 2026-08-31:
+ * a store holding one request at 06:23Z reported it under `1h` and reported ZERO under `24h`,
+ * `7d` and `30d`, with nothing on screen to say why.
+ *
+ * ⚠ This RENDERS the bounds; it does not move them (owner decision 2026-08-31, option A). Moving
+ * the boundary for the cost report alone would give one figure two definitions — the report and the
+ * dashboard chart would compute different windows out of the same `windowPlan` — which is the split
+ * this repo keeps closing.
+ *
+ * ⚠ The trailing-gap sentence is printed only from two timestamps the report already STATES, and
+ * only when both parse and the gap rounds to at least a minute. An unparseable timestamp prints
+ * nothing rather than a guessed figure.
+ */
+function writeCoveredPeriod(
+  from: string | null,
+  to: string,
+  generatedAt: string,
+  write: (message: string) => void,
+): void {
+  write(from === null ? `Covering everything up to ${to} (UTC).\n` : `Covering ${from} → ${to} (UTC).\n`);
+  const end = Date.parse(to);
+  const now = Date.parse(generatedAt);
+  if (!Number.isFinite(end) || !Number.isFinite(now)) return;
+  // FLOOR, not round: the sentence claims how much is missing, so it must never claim MORE than
+  // the evidence supports. A gap under a whole minute prints nothing at all — "0 minutes" would
+  // read as a defect where the window genuinely reaches the clock.
+  const minutes = Math.floor((now - end) / 60_000);
+  if (minutes < 1) return;
+  write(
+    `The window ends on a bucket boundary, so the most recent ${minutes} ` +
+    `${minutes === 1 ? "minute is" : "minutes are"} not counted.\n`,
+  );
+}
+
 function renderCostReport(
   report: Awaited<ReturnType<ReturnType<typeof createDashboardSnapshotReadPort>["readCostReport"]>>,
   write: (message: string) => void,
@@ -1820,6 +1861,7 @@ function renderCostReport(
   // included" while printing no share table would claim an answer the report does not have.
   const repairDeclinedByWindow = report.includeRepair && report.repair === null && report.window === "lifetime";
   write(`llm-relay cost — ${report.window}${report.includeRepair && !repairDeclinedByWindow ? ", repair included" : ""}\n`);
+  writeCoveredPeriod(report.from, report.to, report.generatedAt, write);
   if (repairDeclinedByWindow) {
     write("The lifetime window cannot prove the serve/repair split; use a day-bounded window (--window 1h|24h|7d|30d) for the repair share.\n");
   }

@@ -9,11 +9,20 @@ global bin reinstalled to match, and the daemon restarted onto it (PID checked, 
 200, one real `pool/low` request served 200 by `gemini/models/gemini-3.6-flash`). A MINOR rather
 than a patch: it changes routing behaviour and adds a `dashboard.cost.v1` field.
 
-**The eleventh lap changed no `src/` file.** It verified the one capability the tenth lap had left
-unverified — see the hedge-loser entry below — and it filed one finding met while doing so:
-`llm-relay cost` ends every rolling window at a bucket boundary, so it silently drops the newest
-partial bucket (up to 6 h on `--window 30d`). That entry is the backlog's only open item; it is
-measured, it awaits an owner decision, and no release was cut because nothing shipped.
+**The eleventh lap verified the one capability the tenth lap had left unverified** — see the
+hedge-loser entry below — and it filed one finding met while doing so: `llm-relay cost` ends every
+rolling window at a bucket boundary, so it silently dropped the newest partial bucket (up to 6 h on
+`--window 30d`). It changed no `src/` file.
+
+**The twelfth lap shipped that fix, the same day, on the owner's decision** (option A: RENDER the
+bounds, do not move them). `llm-relay cost` now prints `Covering <from> → <to> (UTC)` plus the count
+of whole excluded minutes; the count FLOORS, and a sub-minute gap prints nothing. Moving the
+boundary was rejected because the cost report and the dashboard chart resolve the same
+`windowPlan`, and one figure with two definitions is the split this repo keeps closing. **The
+backlog is empty again.**
+
+⚠ **Not yet released.** The change is on `main` and green, and `package.json` is still at 0.67.0.
+It is user-visible output on a shipped command, so it wants a release before anyone sees it.
 
 **The tenth lap closed both backlog entries that stood before it.**
 

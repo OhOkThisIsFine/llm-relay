@@ -1632,6 +1632,22 @@ The same accounting read model is available **without a running relay** as a ter
 per provider/model/client/credential, with the same provenance rules as the dashboard. See the
 CLI reference below.
 
+**The window name is not the period, so the report prints the period.** Every rolling window ends
+on a bucket boundary, which puts the newest partial bucket outside it — up to 15 minutes behind the
+clock for `24h`, an hour for `7d`, and six hours for `30d`. The report therefore states its own
+bounds and, when the window ends behind the clock, how many whole minutes are excluded:
+
+```
+llm-relay cost — 24h
+Covering 2026-08-30T06:15:00.000Z → 2026-08-31T06:15:00.000Z (UTC).
+The window ends on a bucket boundary, so the most recent 12 minutes are not counted.
+```
+
+The figure floors, so it never claims more is missing than the two timestamps prove, and a gap
+under a whole minute prints nothing. ⚠ This is a separate effect from the flush note in the
+footer: that one is about a running relay's unwritten deltas, while this applies to a stopped relay
+whose ledger is fully committed.
+
 ---
 
 ## CLI reference

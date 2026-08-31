@@ -9,35 +9,33 @@
 
 ## Open
 
-- **`llm-relay cost` ends its window early and never says so (2026-08-30, measured).**
-  `windowPlan`'s `rollingPlan` sets `to = floorUtc(now, bucketMs)`, so the newest PARTIAL bucket is
-  outside every rolling window. That alignment is right for a bucketed chart, which is what
-  `windowPlan` was written for; it is not right for a spend TOTAL, and the table renderer prints
-  only the window NAME, so the shortfall is invisible.
-
-  **Measured, one isolated store, clock `2026-08-31T06:27:17Z`:**
-
-  | window | `from` | `to` | requests |
-  |---|---|---|---|
-  | `1h`  | `2026-08-31T05:27:00Z` | `2026-08-31T06:27:00Z` | 1 |
-  | `24h` | `2026-08-30T06:15:00Z` | `2026-08-31T06:15:00Z` | 0 |
-  | `7d`  | `2026-08-24T06:00:00Z` | `2026-08-31T06:00:00Z` | 0 |
-  | `30d` | `2026-08-01T06:00:00Z` | `2026-08-31T06:00:00Z` | 0 |
-
-  The store held exactly one request, at `06:23`. It is inside `1h` and outside the other three.
-  The blind spot is one bucket wide: up to 15 min for `24h`, 60 min for `7d`, and **6 h for `30d`**.
-
-  ⚠ **The data is already in the contract.** `CostReportV1` carries `from` and `to`, and
-  `--json` prints both; only the human table drops them. So the cheapest honest fix is to RENDER the
-  bounds, not to move the boundary — moving it would give the cost report a different window from
-  the dashboard's chart, and two windows for one figure is the split this repo keeps closing.
-
-  ⚠ Distinct from the footer's existing caveat. That one warns about the relay's ledger FLUSH lag;
-  this is the reader's own window, and it applies to a stopped relay with everything committed.
-
-  **Property:** a cost report states the period it actually covers, or covers the period it names.
+Nothing pending. The cost-window entry that stood here shipped the same lap it was filed; its
+record is below, kept for the measurement and the decision, not as work.
 
 ## Closed
+
+- ✅ **`llm-relay cost` states the period it covers** (owner decision 2026-08-31, option A —
+  RENDER the bounds, do not move them). `rollingPlan` floors `to` by the window's bucket, so the
+  newest partial bucket sits outside every rolling window: 15 min for `24h`, an hour for `7d`,
+  **6 h for `30d`**. The table printed only the window NAME, so the shortfall was invisible on a
+  spend surface — measured against a live store, one request at `06:23Z` reported under `1h` and
+  reported as ZERO under `24h`, `7d` and `30d`.
+
+  `writeCoveredPeriod` in `src/cli.ts` now prints `from`/`to` — both already in
+  `CostReportV1` and already in `--json` — plus the count of whole excluded minutes.
+
+  ⚠ **The count FLOORS, and that is the decision the tests pin.** The sentence claims how much is
+  missing, so it must not claim more than the two timestamps prove; and a gap under a whole minute
+  prints NOTHING, because "0 minutes" reads as a defect where the window genuinely reaches the
+  clock. The first version rounded, which turned a 56-second gap on the `1h` window into a
+  warning — the `1h` test caught it before commit.
+
+  ⚠ **Moving the boundary was REJECTED, and why matters more than the choice.** Ending the cost
+  window at `now` would make the report and the dashboard chart compute different windows out of
+  one `windowPlan` — one figure with two definitions, which is the split this repo keeps closing —
+  and it would leave the final bucket partial, which is what the flooring exists to prevent.
+
+  Mutation-checked both ways: dropping the call kills 2 tests, `round` in place of `floor` kills 1.
 
 - ✅ **D3 — a losing hedge's spend is counted, and `llm-relay cost` shows it** (owner decision
   2026-08-30, surface chosen the same day). Shipped in three parts:
