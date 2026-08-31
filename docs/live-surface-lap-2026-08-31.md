@@ -83,5 +83,11 @@ The complete recorded repository gate is green on the implementation tree:
 - separate focused evidence: 4 CLI/server/hedge/MCP files with 227 tests, plus the 13-file /
   162-test `delegate-gate` set described above.
 
-The final documentation-tree gate is also green. Commit/push, release/publish, registry/live
-checks, and global-bin reinstall remain pending at this point in the lap.
+The final documentation-tree gate is also green. Final release/live verification is complete:
+commit `e5fcdd8` released v0.68.1 via
+[publish run](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33412435087); npm registry
+`latest` is 0.68.1, and the global executable is 0.68.1. The running daemon is PID 46012. A warm
+`pool/low` request returned 200 via `nim/moonshotai/kimi-k3`; the hedge fired and the primary won
+after the 20-second floor. The prefix-lookalike route returned 404, and `telemetry --bogus` exited
+1. CLI telemetry agrees with HTTP telemetry aside from the volatile timestamp and cooldown
+countdown.
