@@ -12,9 +12,15 @@ weaker (often free) models.
 npm install -g llm-relay
 llm-relay onboard          # collect free provider keys (NIM, Groq, Gemini, OpenRouter, ...)
 llm-relay onboard --import keys.env  # import dotenv or a FreeLLMAPI export JSON
-llm-relay setup claude-desktop   # or: llm-relay setup claude-cli
+llm-relay setup claude-desktop   # register MCP dispatch; or set up a routed claude-cli
 llm-relay                  # start the proxy — leave it running
 ```
+
+For agent-to-agent work, use the `llm-relay` MCP `dispatch` tool from any host. It returns the
+chosen lane's answer and owns the process details. If MCP is unavailable, use
+`llm-relay dispatch --next-command -t "<task>"` and follow its result. Do not create a `pool/*`
+collaboration child in Codex Desktop: its ChatGPT launcher rejects that model before the relay is
+contacted. A global install registers the MCP server for local Codex automatically.
 
 Then verify:
 
@@ -42,9 +48,9 @@ at login.
   and outages cascade to the next member. Free-model pools update themselves from live catalogs.
 - **Passthrough** — Claude traffic keeps your own credentials and reaches real Anthropic
   untouched, while `pool/*` requests go elsewhere. One proxy, both behaviours.
-- **Opt-in offload** — route Claude/Codex subagents (or whole conversations) to free
-  providers. `llm-relay candidates` compares targets; a `freeOnly` guard ensures rerouted
-  traffic never spends money.
+- **Host-independent offload** — MCP `dispatch` chooses and runs a lane from Claude, Codex,
+  desktop, CLI, or another MCP host; the CLI dispatch contract is the universal fallback. Direct
+  HTTP-routed clients can also opt in to rerouting marked subagents or whole conversations.
 - **Tool-call repair** — malformed tool calls are corrected and re-validated; destructive
   tool calls are refused, never fabricated; unrepairable calls fail clean.
 - **Both API fronts** — Anthropic `/v1/messages` plus OpenAI `/v1/chat/completions` and

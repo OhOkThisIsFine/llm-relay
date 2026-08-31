@@ -3,6 +3,12 @@
 How llm-relay independently sends Claude and Codex **subagents** to non-Anthropic providers, and
 optionally routes either client's main conversation through the same destination map.
 
+> **This document describes direct HTTP routing, not the portable dispatch entry point.** The
+> client's request must already reach llm-relay. For every MCP host, prefer the `dispatch` tool;
+> without MCP, use `llm-relay dispatch --next-command`. Codex Desktop collaboration rejects a
+> `pool/*` child against the ChatGPT account before contacting a custom provider, so it must use
+> MCP `dispatch` rather than the mechanism documented below.
+
 Shipped in **0.3.0**; **off by default since 0.4.0**. Config: `routing.subagents` gated by the
 client rules in `routing.offload`. Code: `isSubagentRequest()`, `readRelayDirective()`,
 `subagentSpec()` in

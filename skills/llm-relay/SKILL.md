@@ -9,7 +9,9 @@ description: >-
   conclusion you can check. Nobody has to ask for offload first. Also use when choosing an
   offload target, addressing a pool or model through the relay, toggling client-specific
   offload, dispatching to peer agent CLIs (Antigravity/Codex) as fallback lanes, reordering
-  dispatch, or diagnosing a request that failed at or behind the relay.
+  dispatch, or diagnosing a request that failed at or behind the relay. When MCP tools are
+  present, use `dispatch` on every host. In Codex Desktop, never try to reach a relay pool by
+  spawning a `pool/*` collaboration child; Desktop rejects it before the relay is contacted.
 ---
 
 # llm-relay — operating guide
@@ -52,9 +54,15 @@ you cannot reverse.
 1. `dispatch(task: "...")` — the MCP tool. One call returns an ANSWER. Prefer it whenever the
    tools are present, because building and running a lane command correctly is the part that keeps
    going wrong; the server handles the working directory, the environment and the idle timeouts.
+   This rule is the same in Claude, Codex, desktop apps, CLIs and other MCP hosts.
 2. `llm-relay dispatch --next-command -t "<task>"` — when the MCP tools are absent. Exit 0 prints
    one runnable command line. Exit 2 means the rung is a relay target, so address the named spec
    as an ordinary subagent.
+
+**Do not choose a mechanism by recognizing the host yourself.** Ask the MCP server when it exists;
+otherwise ask the CLI. In particular, Codex Desktop collaboration is not a relay path: with a
+ChatGPT account it validates a `pool/*` child against the parent account, ignores the child's
+`model_provider`, and fails before contacting llm-relay. Use MCP `dispatch` there.
 
 ⚠ Free capacity is spent before any metered or subscription lane, so an offloaded task normally
 costs no subscription quota.
@@ -203,47 +211,29 @@ down proxy never becomes "no subagent works".
 
 Offloaded output is **advisory** — verify claims against source files before acting on them.
 
-### Native Codex parent with relay children
+### Codex: use MCP dispatch, not Desktop collaboration children
 
-Keep the parent on its normal Codex provider and define a named child agent under
-`~/.codex/agents/` whose `model_provider` is `llm-relay` and whose `model` is a relay pool such as
-`pool/medium`. Ask the parent to spawn that agent by name. This is the reliable split setup for
-local Codex clients: the parent retains native Codex orchestration, while the child spends the
-configured provider pool. The `llm-relay` profile is an all-relay mode and routes the parent too.
+A global npm install provisions both the `llm-relay` Responses provider and the `llm-relay` MCP
+server in `~/.codex/config.toml`. In Codex Desktop, call the MCP `dispatch` tool for relay-backed
+work. Keep the parent on its normal Codex provider; the MCP server chooses and runs the offload lane.
 
-⚠ Codex desktop collaboration has a host-side limitation measured on Codex 0.151.0: with a
+⚠ Codex Desktop collaboration has a host-side limitation measured on Codex 0.151.0: with a
 ChatGPT account, the collaboration launcher validates a child model against the parent account
-before contacting llm-relay and ignores the child's `model_provider`. A `pool/medium` child can
-therefore fail with HTTP 400 (`model is not supported when using Codex with a ChatGPT account`).
-In the app, use the `llm-relay` MCP `dispatch` tool for relay-backed work instead. The generated
-agent files remain useful for Codex clients that honor custom providers (and are still provisioned
-by the installer).
+before contacting llm-relay and ignores the child's `model_provider`. A `pool/medium` child fails
+with HTTP 400 (`model is not supported when using Codex with a ChatGPT account`). No prompt or
+agent-file setting can repair a request that never reaches the relay.
 
-A global npm install provisions the `llm-relay` Responses provider in `~/.codex/config.toml` and
-creates the relay-backed `default` and `relay_coding` agents under `~/.codex/agents/` when they are
-absent. It preserves existing Codex config and agent files; use the manual snippets below if the
-install script was blocked.
+Releases through v0.68.4 installed `default.toml` and `relay_coding.toml` with that broken path.
+Current postinstall retires those files only when their bytes still exactly match llm-relay's old
+generated templates; user-edited agents are preserved. A non-Desktop Codex client may still use a
+custom-provider child after that exact client has been verified to honor `model_provider`, but that
+is an advanced direct-routing setup, not the portable dispatch path.
 
-Codex clients may additionally mark child Responses turns with
+Directly routed Codex clients may additionally mark child Responses turns with
 `x-codex-turn-metadata: {"request_kind":"subagent"}`; the relay recognizes that marker and can
-retarget a nominal child model through `routing.subagents`. A named child whose model is already a
-`pool/*` reference does not depend on that private header being present.
-
-For generic, unqualified child dispatches, override Codex's built-in `default` agent with
-`~/.codex/agents/default.toml`:
-
-```toml
-name = "default"
-description = "General-purpose read-only child routed through llm-relay."
-developer_instructions = "Work read-only. Return a concise result to the parent and do not modify files."
-
-model_provider = "llm-relay"
-model = "pool/medium"
-model_reasoning_effort = "medium"
-```
-
-This keeps the parent native while generic children use `pool/medium`; named agents can still select a
-different relay pool explicitly.
+retarget a nominal child model through `routing.subagents`. A verified custom-provider child whose
+model is already a `pool/*` reference does not depend on that private header being present. This
+does not make it usable in Codex Desktop.
 
 ## Choosing a target
 

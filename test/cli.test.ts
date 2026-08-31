@@ -270,7 +270,7 @@ describe("cli helper utilities", () => {
 
     const aligned = [
       { label: "llm-relay [options]", description: "Start proxy" },
-      { label: "llm-relay setup [target]", description: "target: claude-cli" },
+        { label: "llm-relay setup [target]", description: "claude-desktop: MCP dispatch" },
       { label: "llm-relay dispatch [lane] [options]", description: "Choose next dispatch lane" },
     ].map(({ label, description }) => {
       const line = help.split("\n").find((candidate) => candidate.includes(label) && candidate.includes(description));

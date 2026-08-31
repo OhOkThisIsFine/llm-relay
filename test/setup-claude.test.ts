@@ -41,7 +41,7 @@ describe("setup-claude", () => {
     expect(res.lines.join("\n")).toContain("claude-proxied.ps1");
   });
 
-  it("setupClaudeDesktop writes to the injected targetPath, not the real config", () => {
+  it("setupClaudeDesktop registers MCP dispatch at the injected targetPath, not the real config", () => {
     const target = join(dir, "claude_desktop_config.json");
     const res = setupClaudeDesktop({ targetPath: target, proxyUrl: "http://127.0.0.1:9999" });
 
@@ -49,9 +49,12 @@ describe("setup-claude", () => {
     expect(res.path).toBe(target);
     expect(res.path).not.toBe(realPath);
 
-    const written = JSON.parse(readFileSync(target, "utf8")) as { env: Record<string, string> };
-    expect(written.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:9999");
-    expect(written.env.CLAUDE_CONFIG_DIR).toBeDefined();
+    const written = JSON.parse(readFileSync(target, "utf8")) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+      env?: Record<string, string>;
+    };
+    expect(written.mcpServers["llm-relay"]).toEqual({ command: "llm-relay", args: ["mcp"] });
+    expect(written.env).toBeUndefined();
   });
 
   it("patches an existing config in place instead of replacing it", () => {
@@ -68,8 +71,41 @@ describe("setup-claude", () => {
     // Unrelated settings survive, and so does an unrelated env var — this function edits a
     // file that belongs to another application, so anything it does not own must be left alone.
     expect(written.mcpServers.keepme).toBeDefined();
+    expect(written.mcpServers["llm-relay"]).toEqual({ command: "llm-relay", args: ["mcp"] });
     expect(written.env.KEEP).toBe("yes");
-    expect(written.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8791");
+  });
+
+  it("removes only the exact stale environment written by the legacy Desktop setup", () => {
+    const target = join(dir, "legacy.json");
+    const legacyConfigDir = join(dir, "legacy-claude-config");
+    writeFileSync(
+      target,
+      JSON.stringify({
+        env: {
+          KEEP: "yes",
+          ANTHROPIC_BASE_URL: "http://127.0.0.1:9999",
+          ANTHROPIC_AUTH_TOKEN: "dummy",
+          CLAUDE_CONFIG_DIR: legacyConfigDir,
+          CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "1",
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
+          CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
+        },
+      }),
+    );
+
+    const res = setupClaudeDesktop({
+      targetPath: target,
+      proxyUrl: "http://127.0.0.1:9999",
+      configDir: legacyConfigDir,
+    });
+    expect(res.success).toBe(true);
+
+    const written = JSON.parse(readFileSync(target, "utf8")) as {
+      mcpServers: Record<string, unknown>;
+      env: Record<string, string>;
+    };
+    expect(written.mcpServers["llm-relay"]).toBeDefined();
+    expect(written.env).toEqual({ KEEP: "yes" });
   });
 
   it("reports failure instead of throwing when the target cannot be written", () => {

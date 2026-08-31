@@ -106,8 +106,9 @@ interface ToolDefinition {
  * Keep it short: every host pays for it in every session. Pinned by `test/mcp-server.test.ts`.
  */
 export const MCP_INSTRUCTIONS =
-  "Use dispatch to hand a whole task to another agent lane and get its answer back. You never " +
-  "need to know whether the lane is a model pool or a peer CLI — that is resolved here.\n\n" +
+  "Use dispatch from every MCP host — Claude, Codex, desktop, CLI, or otherwise — to hand a " +
+  "whole task to another agent lane and get its answer back. Never choose a host-specific child " +
+  "mechanism yourself; whether the lane is a model pool or a peer CLI is resolved here.\n\n" +
   "Reach for it on your own, without being asked. Offload a task when it is self-contained and " +
   "its result is a conclusion you can check: a broad code search, a file-by-file sweep, a " +
   "survey, a draft, a long summary, a second opinion. Keep in this session whatever needs your " +
@@ -115,7 +116,11 @@ export const MCP_INSTRUCTIONS =
   "offloading spends no subscription quota and saves this session's context. On Windows it " +
   "centralizes hidden child creation, closes stdin so headless agents do not stall, and applies " +
   "each lane's configured timeouts. Prefer it over launching an agent alias from a shell. A " +
-  "third-party CLI observed creating visible descendants must be disabled until reverified.\n\n" +
+  "third-party CLI observed creating visible descendants must be disabled until reverified. " +
+  "Do not use a pool/* native collaboration child from Codex Desktop: with a ChatGPT account, " +
+  "Desktop rejects that child model before reaching the relay and ignores its custom provider. " +
+  "Call dispatch instead. If this MCP server is unavailable, run `llm-relay dispatch " +
+  "--next-command -t <task>` and follow its returned command or target; do not guess from the host.\n\n" +
   "Lane output is advisory. Verify it against the source before you act on it.";
 
 /**
@@ -137,7 +142,9 @@ const TOOLS: ToolDefinition[] = [
       "default lane is free capacity and it saves this session's context. Picks the lane from " +
       "the configured ladder unless you name one. Runs the lane correctly — working directory, " +
       "environment and idle timeouts are handled here, so you never build a command line. If the " +
-      "lane is still running after waitMs, returns a jobId to poll with dispatch_status.",
+      "lane is still running after waitMs, returns a jobId to poll with dispatch_status. In Codex " +
+      "Desktop, use this instead of a pool/* collaboration child, which the ChatGPT launcher " +
+      "rejects before the custom provider or relay is reached.",
     inputSchema: {
       type: "object",
       properties: {

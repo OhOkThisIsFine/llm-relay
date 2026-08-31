@@ -13,7 +13,8 @@ import { fileURLToPath } from "node:url";
  *   - it must never be silent about a failure, and must never touch ~/.claude or ~/.codex on a
  *     local install;
  *   - Claude and Codex must receive byte-for-byte identical descriptions from the shipped source;
- *     global installs also provision the Codex provider and relay child agents.
+ *     global installs also provision Codex's provider and MCP dispatch server, while retiring
+ *     only the exact legacy child-agent files llm-relay itself generated.
  *
  * HOME and USERPROFILE are both redirected at a temp dir so the real developer machine is never
  * written to — `os.homedir()` reads USERPROFILE on Windows and HOME elsewhere.
@@ -75,6 +76,9 @@ const installedPaths = (home: string) => ({
   codingAgent: join(home, ".codex", "agents", "relay_coding.toml"),
 });
 
+const legacyDefaultAgent = `name = "default"\ndescription = "General-purpose read-only child routed through llm-relay."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/medium"\nmodel_reasoning_effort = "medium"\n`;
+const legacyCodingAgent = `name = "relay_coding"\ndescription = "Read-only medium-effort child routed through llm-relay to the configured non-OpenAI pool."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/medium"\nmodel_reasoning_effort = "medium"\n`;
+
 describe("install-skill postinstall hook", () => {
   let home: string;
 
@@ -111,7 +115,7 @@ describe("install-skill postinstall hook", () => {
   });
 
   /**
-   * ⚠ Codex PROVISIONING (the provider block and the two agent TOMLs) is gated on Codex actually
+   * ⚠ Codex PROVISIONING (the provider and MCP blocks) is gated on Codex actually
    * being present, since 2026-08-30. It used to run on every global install, so a machine with no
    * Codex got `~/.codex/config.toml` and two agent files written for a tool it did not have.
    *
@@ -142,6 +146,7 @@ describe("install-skill postinstall hook", () => {
       expect(r.status).toBe(0);
       expect(existsSync(paths.codexConfig)).toBe(false);
       expect(existsSync(paths.defaultAgent)).toBe(false);
+      expect(existsSync(paths.codingAgent)).toBe(false);
       expect(r.stderr).toContain("Codex not detected");
       // Never silent, and it must say how to get it later — a detection miss is recoverable.
       expect(r.stderr).toContain("--force");
@@ -163,10 +168,12 @@ describe("install-skill postinstall hook", () => {
       expect(r.status).toBe(0);
       expect(readFileSync(paths.codexConfig, "utf8")).toContain("[model_providers.llm-relay]");
       expect(readFileSync(paths.codexConfig, "utf8")).toContain('base_url = "http://127.0.0.1:8791/v1"');
-      expect(readFileSync(paths.defaultAgent, "utf8")).toContain('model = "pool/medium"');
-      expect(readFileSync(paths.codingAgent, "utf8")).toContain('model_provider = "llm-relay"');
+      expect(readFileSync(paths.codexConfig, "utf8")).toContain("[mcp_servers.llm-relay]");
+      expect(readFileSync(paths.codexConfig, "utf8")).toContain('args = ["mcp"]');
+      expect(existsSync(paths.defaultAgent)).toBe(false);
+      expect(existsSync(paths.codingAgent)).toBe(false);
       expect(r.stderr).toContain("Codex provider configured");
-      expect(r.stderr).toContain("Codex agent installed");
+      expect(r.stderr).toContain("Codex MCP server configured");
       // The operator's own bytes survive — the gate must not turn provisioning into a rewrite.
       expect(readFileSync(paths.codexConfig, "utf8")).toContain("# pre-existing codex config");
     });
@@ -204,14 +211,16 @@ describe("install-skill postinstall hook", () => {
     expect(r.stderr).toContain("Codex not detected");
   });
 
-  it("preserves existing Codex config and agent files and stays idempotent", () => {
+  it("preserves user-authored Codex agent files and stays idempotent", () => {
     const codex = codexOnPath();
     const paths = installedPaths(home);
     mkdirSync(join(home, ".codex", "agents"), { recursive: true });
     const existingConfig = "model = \"gpt-5\"\n\n[model_providers.openai]\nname = \"openai\"\n";
     const existingDefault = "name = \"default\"\ndescription = \"user choice\"\n";
+    const existingCoding = "name = \"relay_coding\"\ndescription = \"user choice too\"\n";
     writeFileSync(paths.codexConfig, existingConfig);
     writeFileSync(paths.defaultAgent, existingDefault);
+    writeFileSync(paths.codingAgent, existingCoding);
 
     const first = run([], home, { npm_config_global: "true", ...codex.env });
     const afterFirstConfig = readFileSync(paths.codexConfig, "utf8");
@@ -225,9 +234,27 @@ describe("install-skill postinstall hook", () => {
     expect(afterFirstConfig.match(/\[model_providers\.llm-relay\]/g)).toHaveLength(1);
     expect(afterSecondConfig).toBe(afterFirstConfig);
     expect(afterFirstDefault).toBe(existingDefault);
-    expect(readFileSync(paths.codingAgent, "utf8")).toContain('model = "pool/medium"');
+    expect(readFileSync(paths.codingAgent, "utf8")).toBe(existingCoding);
+    expect(afterFirstConfig).toContain("[mcp_servers.llm-relay]");
     expect(second.stderr).toContain("Codex provider already configured");
-    expect(second.stderr).toContain("Codex agent already exists");
+    expect(second.stderr).toContain("Codex MCP server already configured");
+    expect(second.stderr).toContain("Codex agent preserved");
+  });
+
+  it("retires only the exact legacy Codex child agents generated by llm-relay", () => {
+    const codex = codexOnPath();
+    const paths = installedPaths(home);
+    mkdirSync(join(home, ".codex", "agents"), { recursive: true });
+    writeFileSync(paths.defaultAgent, legacyDefaultAgent);
+    writeFileSync(paths.codingAgent, legacyCodingAgent);
+
+    const r = run([], home, { npm_config_global: "true", ...codex.env });
+    rmSync(codex.dir, { recursive: true, force: true });
+
+    expect(r.status).toBe(0);
+    expect(existsSync(paths.defaultAgent)).toBe(false);
+    expect(existsSync(paths.codingAgent)).toBe(false);
+    expect(r.stderr.match(/Codex agent retired/g)).toHaveLength(2);
   });
 
   it.each([
@@ -248,8 +275,29 @@ describe("install-skill postinstall hook", () => {
     const after = readFileSync(paths.codexConfig, "utf8");
 
     expect(r.status).toBe(0);
-    expect(after).toBe(existing);
+    // The existing provider bytes survive, while the independent MCP entry is appended.
+    expect(after.startsWith(existing)).toBe(true);
+    expect(after.match(/model_providers/g)).toHaveLength(1);
+    expect(after).toContain("[mcp_servers.llm-relay]");
     expect(r.stderr).toContain("Codex provider already configured");
+  });
+
+  it.each([
+    ["inner whitespace", '[ mcp_servers.llm-relay ]\ncommand = "llm-relay"\n'],
+    ["quoted key", '[mcp_servers."llm-relay"]\ncommand = "llm-relay"\n'],
+  ])("recognizes an already-configured Codex MCP server written with %s", (_label, existing) => {
+    const codex = codexOnPath();
+    const paths = installedPaths(home);
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(paths.codexConfig, existing);
+
+    const r = run([], home, { npm_config_global: "true", ...codex.env });
+    const after = readFileSync(paths.codexConfig, "utf8");
+    rmSync(codex.dir, { recursive: true, force: true });
+
+    expect(r.status).toBe(0);
+    expect(after.match(/mcp_servers/g)).toHaveLength(1);
+    expect(r.stderr).toContain("Codex MCP server already configured");
   });
 
   it("exits 0 AND explains itself when the copy cannot happen", () => {

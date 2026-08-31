@@ -65,9 +65,12 @@ A global install also drops the generated **llm-relay skill** into three host di
 `~/.claude/skills/llm-relay/`, `~/.codex/skills/llm-relay/` and
 `$XDG_CONFIG_HOME/opencode/skills/llm-relay/` (falling back to `~/.config` when that variable is
 unset or blank). All three are copied byte-for-byte from one source and refreshed on every upgrade;
-a failure at one host never stops the others. It also provisions local Codex: the `llm-relay`
-Responses provider in `~/.codex/config.toml` plus relay-backed `default` and `relay_coding` child
-agents under `~/.codex/agents/` when absent. Existing Codex files are preserved.
+a failure at one host never stops the others. It also provisions local Codex with two independent
+entries in `~/.codex/config.toml`: the `llm-relay` Responses provider for direct routing and the
+`llm-relay` MCP server for portable `dispatch`. Releases through v0.68.4 also generated
+`default`/`relay_coding` child agents; current postinstall retires only byte-identical generated
+copies because Codex Desktop rejects their `pool/*` model before reaching the relay. User-edited
+agent files are preserved.
 
 If your npm blocks unknown install scripts (`npm warn install-scripts … blocked`), allow this one
 — `npm config set allow-scripts=llm-relay --location=user` — or run the installer by hand:
@@ -1068,6 +1071,11 @@ arrive. A **Claude Desktop** session's does not: the launcher pins `ANTHROPIC_BA
 `~/.claude/settings.json` (the block's other keys still land — only that one is managed). The
 switch then reports ON and nothing changes.
 
+`llm-relay setup claude-desktop` configures the working path: it registers `llm-relay mcp` in
+`claude_desktop_config.json`. When migrating a setup written through v0.68.4, it removes only the
+exact stale relay proxy environment values that old command authored and preserves every unrelated
+Desktop setting. Direct API routing remains available to a terminal-launched Claude CLI.
+
 `llm-relay offload status` detects this and says so. And on such a host, `llm-relay offload claude
 on` installs a **`PreToolUse(Agent)` hook** into `~/.claude/settings.json` — the delivery mechanism
 for the setting where HTTP rerouting cannot work, not a separate feature. `offload claude off`
@@ -1227,7 +1235,21 @@ marked `~`; where nobody publishes one, the cell is blank — the relay does not
 
 ### Local Codex setup
 
-A global install creates these automatically; to do it by hand, add to `~/.codex/config.toml`:
+A global install creates these automatically. The portable split-provider setup is the MCP server:
+
+```toml
+[mcp_servers.llm-relay]
+command = "llm-relay"
+args = ["mcp"]
+```
+
+Use its `dispatch` tool for relay-backed work while the parent stays on its normal Codex provider.
+
+⚠ **Do not create a `pool/*` collaboration child for Codex Desktop.** With a ChatGPT account,
+Desktop validates the child model against the account and ignores `model_provider` before the
+request reaches llm-relay, producing HTTP 400. MCP `dispatch` is the working Desktop route.
+
+Clients verified to honor custom providers can additionally use the direct Responses provider:
 
 ```toml
 [model_providers.llm-relay]
@@ -1237,10 +1259,8 @@ wire_api = "responses"
 requires_openai_auth = true
 ```
 
-Then create `~/.codex/agents/relay_coding.toml` (and optionally override `default.toml` the same
-way) with `model_provider = "llm-relay"` and `model = "pool/medium"`. The parent session stays
-on its normal provider; child dispatches go through the relay. Enable with
-`llm-relay offload codex on --scope subagents`. Hosted ChatGPT/Cloud tasks cannot reach a
+That provider supports a client whose own traffic is deliberately pointed at the relay. It is not
+a workaround for Desktop collaboration validation. Hosted ChatGPT/Cloud tasks cannot reach a
 loopback relay — those remain separate dispatch lanes.
 
 ### Dispatch ladder
@@ -1453,6 +1473,13 @@ callers that want something executable rather than the human ladder.
 `llm-relay mcp` serves the dispatch verb over the Model Context Protocol on stdio. Any MCP host
 then delegates a whole task with **one call that returns an answer**, instead of a command it has
 to execute itself.
+
+This is the preferred entry point for every MCP host—Claude, Codex, desktop, CLI, or otherwise.
+The model should not classify its host or choose a native child mechanism. In particular, Codex
+Desktop must use MCP `dispatch`, because its ChatGPT collaboration launcher rejects a `pool/*`
+child before the custom provider or relay is contacted. If MCP is unavailable, use the one generic
+fallback: `llm-relay dispatch --next-command -t "<task>"`, then follow exactly the returned command
+or target rather than guessing what this host can reach.
 
 Why that difference matters: executing a lane command correctly is the hard part. The lane needs
 three client idle timeouts lifted or a long think is aborted at about 300 seconds; it needs its

@@ -11,10 +11,40 @@ capability. **Stop wherever it stops being worth it.**
 
 ---
 
+## One dispatch rule for every host
+
+When an assistant has the `llm-relay` MCP tools, it should call `dispatch` for a self-contained
+task. This is the same rule in Claude, Codex, desktop apps, CLIs, and any other MCP host. The MCP
+server chooses the lane and returns its answer; the assistant does not need to identify its host or
+construct a lane command.
+
+If MCP is unavailable, the one fallback is:
+
+```bash
+llm-relay dispatch --next-command -t "<the whole task>"
+```
+
+Follow the command or target it returns. Do not guess whether a native child can reach a relay pool.
+
+⚠ **Codex Desktop must use MCP `dispatch`, not a `pool/*` collaboration child.** With a ChatGPT
+account, Desktop validates that child model before contacting the custom provider or llm-relay and
+returns HTTP 400. A global llm-relay install registers its MCP server for local Codex automatically.
+
+For Claude, register it once with:
+
+```bash
+claude mcp add --scope user llm-relay -- llm-relay mcp
+```
+
+Other MCP hosts should register the stdio command `llm-relay mcp` using their normal MCP settings.
+
+---
+
 ## What this actually does
 
-llm-relay is a loopback proxy for the Anthropic `/v1/messages` API. Your client points at it
-instead of `api.anthropic.com`. It then:
+llm-relay has two complementary entry points: an MCP dispatch server (`llm-relay mcp`) that hands a
+whole task to the configured lane, and a loopback API proxy for clients whose HTTP traffic can be
+pointed at it. The proxy then:
 
 - forwards your **own** conversation to real Anthropic, untouched (your subscription, your model);
 - optionally routes **subagents** to free providers instead (this is the quota saving);
@@ -51,7 +81,8 @@ It listens on `127.0.0.1:8791` and refuses to bind anything non-loopback — it 
 keys. Its data plane relies on the configured client/provider credentials; stateful and costly
 control routes independently require the per-install capability that the CLI manages automatically.
 
-**Point Claude Code at it** by adding to the `env` block of `~/.claude/settings.json`:
+**Point a terminal-launched Claude CLI at it** by adding an `env` block to
+`~/.claude/settings.json`:
 
 ```json
 { "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791" } }
@@ -60,6 +91,9 @@ control routes independently require the per-install capability that the CLI man
 > ⚠️ Use the settings file, not a shell environment variable. Some launchers set
 > `ANTHROPIC_BASE_URL` into the process environment themselves, which silently overrides a
 > user-level variable — and then nothing looks wrong while the proxy is not in the path.
+
+> ⚠️ Claude Desktop is a bypassed host: it pins its own sessions to `api.anthropic.com`. Use
+> MCP `dispatch` there. The setting above applies only to a client that honors the custom base URL.
 
 **Known cost of a custom base URL:** Claude Code's `/remote-control` is hard-gated to
 `api.anthropic.com` and will not work behind any proxy. There is no workaround; if you rely
@@ -158,7 +192,9 @@ spends one slot only. `keys` names each slot as `provider#label`.
 
 ## Stage 3 — choose client-specific offload
 
-Offload is **off by default**, deliberately. Enable only the harnesses and request scope you want:
+This stage is only for a client's own HTTP traffic that already reaches the relay. It is not
+needed for MCP `dispatch`, and it cannot reroute a native child from a bypassed host. Offload is
+**off by default**, deliberately. Enable only the harnesses and request scope you want:
 
 ```bash
 llm-relay offload <harness> <on|off> [--scope <scope>]
@@ -167,10 +203,10 @@ llm-relay offload <harness> <on|off> [--scope <scope>]
 `<harness>`: `claude` | `codex` | another configured client. `<scope>`: `subagents` | `all`
 (default: `subagents`).
 
-Claude Code subagents (Explore, general-purpose, custom agents) now route to your free pools while
-the Claude conversation stays on its normal route. Codex is independently configured; `--scope all`
-also routes the Codex parent conversation through the pool. Changes take effect on the next request;
-no restart.
+On a routed client, marked Claude/Codex subagent requests now use the free pools while the parent
+conversation stays on its normal route. `--scope all` also routes the parent conversation through
+the pool. Changes take effect on the next request; no restart. Codex Desktop collaboration does not
+reach this routing layer—use MCP `dispatch` there.
 
 ```bash
 llm-relay offload status
@@ -179,8 +215,8 @@ llm-relay offload status
 Use `llm-relay offload <harness> off` to disable one harness. The legacy boolean form remains
 supported in config files as a global subagents-only rule, but CLI changes require a harness name.
 
-To offload a **single** dispatch without turning the switch on globally, put this as the first
-line of that subagent's prompt:
+To offload a **single request on an already-routed client** without turning the switch on globally,
+put this as the first line of that subagent's prompt:
 
 ```
 @relay: pool/high

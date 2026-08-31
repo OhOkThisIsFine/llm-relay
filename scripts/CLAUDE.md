@@ -56,6 +56,12 @@ Offline / unit-test-safe (no external creds):
   convention and `src/state-paths.ts`'s config-kind policy. Before that the installer wrote two
   hosts, so an OpenCode copy placed there by any other means went stale with nothing to refresh
   it — measured 1875 bytes behind on this machine.
+  ⚠ **Codex provisioning is MCP-first since the post-v0.68.4 routing correction.** The installer
+  appends both the direct Responses provider and `[mcp_servers.llm-relay]`, then retires the exact
+  legacy generated `default.toml` / `relay_coding.toml` bytes. Codex Desktop rejects those
+  `pool/*` children against the ChatGPT account before consulting `model_provider`; leaving them
+  installed makes the model choose a path the relay never sees. Only byte-identical templates are
+  removed—any user edit proves ownership and must be preserved.
 
 Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compatible provider):
 - `nim-front.mjs` — run the compiled proxy fronting a live backend end-to-end.

@@ -211,6 +211,13 @@ describe("mcp server handshake", () => {
     expect(text).toContain("closes stdin");
     expect(text).toContain("agent alias");
     expect(text).toContain("visible descendants");
+    // 5. Every host gets the same decision rule. In particular, Codex Desktop must not try the
+    // generated pool/* collaboration child that its ChatGPT launcher rejects before the custom
+    // provider is contacted; the always-loaded instructions must name both the trap and the
+    // working route so a model never has to rediscover it.
+    expect(text).toContain("codex desktop");
+    expect(text).toContain("before reaching the relay");
+    expect(text).toContain("--next-command");
   });
 
   it("carries the unprompted trigger on the dispatch tool description too", async () => {
@@ -220,7 +227,10 @@ describe("mcp server handshake", () => {
     const res = await h.request("tools/list");
     const tools = (res["result"] as { tools: { name: string; description: string }[] }).tools;
     const dispatch = tools.find((t) => t.name === "dispatch");
-    expect(dispatch?.description.toLowerCase()).toContain("without being asked");
+    const description = dispatch?.description.toLowerCase() ?? "";
+    expect(description).toContain("without being asked");
+    expect(description).toContain("codex desktop");
+    expect(description).toContain("collaboration child");
   });
 
   it("reports the version as unknown rather than a fake 0.0.0 when none is injected", async () => {

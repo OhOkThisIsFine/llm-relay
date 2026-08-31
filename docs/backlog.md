@@ -9,8 +9,13 @@
 
 ## Open
 
-Nothing pending. The cost-window entry that stood here shipped the same lap it was filed; its
-record is below, kept for the measurement and the decision, not as work.
+- **Re-check long `pool/medium` MCP dispatch after v0.68.4.** During the universal-entrypoint lap,
+  read-only survey job `job-0001` stayed `running` with no answer for 1,594 seconds and was
+  cancelled. The caller-side MCP mechanics were correct; no claim is made yet about whether the
+  delay was pool walking, a provider think, or a stuck agent loop. Compare its usage window and
+  process exit evidence against the latency-demotion/cumulative-walk correction before deciding
+  whether this is a regression. Home for the eventual mechanism and verdict:
+  [`dispatch-smoothness-2026-08-31.md`](dispatch-smoothness-2026-08-31.md).
 
 ## Closed
 

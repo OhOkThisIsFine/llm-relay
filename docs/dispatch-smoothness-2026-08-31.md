@@ -18,6 +18,26 @@ cannot independently create a visible descendant.
 
 Both `claude mcp list` and `codex mcp list` reported `llm-relay: llm-relay mcp` connected.
 
+## Owner decision: one entry point, not a host quiz
+
+The portable rule is now explicit on every model-facing surface: if the MCP tools are present,
+call `dispatch`; if they are absent, run `llm-relay dispatch --next-command -t "<task>"` and obey
+the returned command or target. The caller never decides from “Claude vs Codex,” “CLI vs desktop,”
+or its own guess about provider reachability.
+
+This closes the Codex Desktop contradiction. Releases through v0.68.4 installed `default` and
+`relay_coding` agents whose `model_provider = "llm-relay"` / `model = "pool/medium"` looked like the
+preferred split-provider route. Desktop's ChatGPT collaboration launcher rejects that model before
+the custom provider is contacted, so the relay can do nothing with the request. Global install now
+registers the MCP server in Codex config and retires only byte-identical legacy generated agents;
+user-edited files remain untouched. The always-loaded MCP instructions, shipped skill, CLI help,
+README, quick start, and reference all name the same rule and the Desktop boundary.
+
+Friction recorded during this correction: MCP survey job `job-0001` on `claude-free-pool`
+(`pool/medium`) returned no answer after 1,594 seconds and was cancelled. Its output was never used
+as evidence. The bounded follow-up is in [`backlog.md`](backlog.md); the symptom alone does not say
+whether the delay was pool walking, provider thinking, or an agent loop.
+
 ## Verified routing matrix
 
 | Target | Preferred route | Fallback | Verified state |

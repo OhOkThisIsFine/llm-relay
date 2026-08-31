@@ -4,7 +4,7 @@ import { homedir, platform } from "node:os";
 
 export interface SetupOptions {
   proxyUrl?: string;
-  /** The CLAUDE_CONFIG_DIR *value* written into the config. Not where the config itself goes. */
+  /** Legacy CLAUDE_CONFIG_DIR value removed when migrating an older llm-relay Desktop setup. */
   configDir?: string;
   /**
    * Where `claude_desktop_config.json` is written. Defaults to the real per-platform path.
@@ -34,11 +34,11 @@ export function getClaudeDesktopConfigPath(): string {
   }
 }
 
-/** Configures Claude Desktop to route through llm-relay loopback proxy. */
+/** Configures Claude Desktop with the host-independent llm-relay MCP dispatch server. */
 export function setupClaudeDesktop(opts: SetupOptions = {}): { success: boolean; path: string; message: string } {
   const targetPath = opts.targetPath ?? getClaudeDesktopConfigPath();
-  const proxyUrl = opts.proxyUrl ?? "http://127.0.0.1:8791";
-  const proxyConfigDir = opts.configDir ?? join(homedir(), ".llm-relay-claude");
+  const legacyProxyUrl = opts.proxyUrl ?? "http://127.0.0.1:8791";
+  const legacyConfigDir = opts.configDir ?? join(homedir(), ".llm-relay-claude");
 
   try {
     mkdirSync(dirname(targetPath), { recursive: true });
@@ -52,21 +52,41 @@ export function setupClaudeDesktop(opts: SetupOptions = {}): { success: boolean;
       }
     }
 
-    const envObj = (existingConfig.env as Record<string, string>) ?? {};
-    envObj.ANTHROPIC_BASE_URL = proxyUrl;
-    envObj.ANTHROPIC_AUTH_TOKEN = "dummy";
-    envObj.CLAUDE_CONFIG_DIR = proxyConfigDir;
-    envObj.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING = "1";
-    envObj.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS = "1";
-    envObj.CLAUDE_CODE_ATTRIBUTION_HEADER = "0";
+    const currentServers =
+      existingConfig.mcpServers && typeof existingConfig.mcpServers === "object"
+        ? (existingConfig.mcpServers as Record<string, unknown>)
+        : {};
+    existingConfig.mcpServers = {
+      ...currentServers,
+      "llm-relay": { command: "llm-relay", args: ["mcp"] },
+    };
 
-    existingConfig.env = envObj;
+    // Releases through v0.68.4 wrote these exact values even though Desktop overrides the base
+    // URL before a session starts. Remove only values this setup command can prove it authored;
+    // unrelated environment settings and user-chosen alternatives survive.
+    const currentEnv =
+      existingConfig.env && typeof existingConfig.env === "object"
+        ? { ...(existingConfig.env as Record<string, string>) }
+        : {};
+    const legacyEnv: Record<string, string> = {
+      ANTHROPIC_BASE_URL: legacyProxyUrl,
+      ANTHROPIC_AUTH_TOKEN: "dummy",
+      CLAUDE_CONFIG_DIR: legacyConfigDir,
+      CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "1",
+      CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
+      CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
+    };
+    for (const [name, value] of Object.entries(legacyEnv)) {
+      if (currentEnv[name] === value) delete currentEnv[name];
+    }
+    if (Object.keys(currentEnv).length === 0) delete existingConfig.env;
+    else existingConfig.env = currentEnv;
 
     writeFileSync(targetPath, JSON.stringify(existingConfig, null, 2) + "\n");
     return {
       success: true,
       path: targetPath,
-      message: `Successfully configured Claude Desktop at ${targetPath} (pointing to ${proxyUrl})`,
+      message: `Successfully configured Claude Desktop MCP dispatch at ${targetPath}`,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -247,7 +247,7 @@ Usage:
 ${formatTextTable([
   ["llm-relay [options]", "Start proxy."],
   ["llm-relay onboard [--import <file>] [--force]", "Set up or import provider keys."],
-  ["llm-relay setup [target]", "target: claude-cli | claude-desktop."],
+  ["llm-relay setup [target]", "claude-desktop: MCP dispatch; claude-cli: routed CLI wrapper."],
   ["llm-relay keys | keys check | check-keys", "Check every configured credential slot."],
   ["llm-relay keys <action> ...", "action: add|list|rotate|revoke|remove|disable|enable|export|import|unlock."],
   ["llm-relay pools [--probe]", "List members; --probe tests each deployment once."],
@@ -274,7 +274,7 @@ ${formatTextTable([
   ["llm-relay dispatch [lane] [options]", "Choose next dispatch lane; adapts to the calling host."],
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
   ["llm-relay delegate-gate <diff-file> --repo <root> [--fix]", "Quality-gate a delegated lane's diff before judgment/merge."],
-  ["llm-relay mcp", "Serve the dispatch verb over MCP on stdio, so any MCP host can delegate."],
+  ["llm-relay mcp", "Preferred dispatch entry point for every MCP host; one call returns an answer."],
   ["llm-relay help | --help | -h", "Show help."],
   ["llm-relay version | --version | -v", "Print version."],
 ], "  ")}
@@ -298,6 +298,11 @@ If this host's traffic does not reach the relay (Claude Desktop pins its own bas
 subagent can be rerouted and "@relay:" is inert. "llm-relay dispatch" detects that and hands
 back runnable commands instead; "offload claude on" there also installs a PreToolUse(Agent)
 hook that redirects Agent() calls to the same lane. "offload claude off" removes it.
+
+Codex Desktop is also not a native relay-child path: its ChatGPT collaboration launcher rejects a
+pool/* child model before contacting the custom provider or llm-relay. Use the llm-relay MCP
+dispatch tool there. On any host without MCP, use "dispatch --next-command" and follow its result
+instead of guessing which child mechanism the host supports.
 
 Setup checks: "llm-relay keys" checks every credential slot; "llm-relay pools --probe" spends one
 real completion per unique pool deployment through one serviceable slot, not every credential.
