@@ -2,11 +2,16 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-31 (v0.68.1)
+## 0. State as of 2026-08-31 (v0.68.2)
 
-Implementation `fcf7b26` shipped in release `e5fcdd8` / tag `v0.68.1`. The publish run
-[33412435087](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33412435087) succeeded.
-Registry latest/version lookup and the reinstalled global bin report `0.68.1`.
+Feature implementation `fcf7b26` shipped in release `e5fcdd8` / tag `v0.68.1`. Docs clarification
+`3fd3a51` shipped in release `80015fc` / tag `v0.68.2`; publish run
+[33415315153](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33415315153) succeeded.
+Registry latest and the reinstalled global executable report `0.68.2`.
+
+The daemon remains PID 46012, the v0.68.1-started process, deliberately: v0.68.2 changes only
+bundled skill wording and package version metadata, not proxy code, and restarting would discard
+in-memory routing observations.
 
 Current live state:
 
