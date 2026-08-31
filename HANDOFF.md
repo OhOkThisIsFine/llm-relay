@@ -2,55 +2,46 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-31 (v0.68.4)
+## 0. State as of 2026-08-31 (v0.68.5)
 
-Windows dispatch hardening commit `5554bfa` shipped in release commit `9d62a6d` / tag `v0.68.3`.
-The final attribution correction and reviewer cleanup shipped in release commit `7721e10` / tag
-`v0.68.4`; publish run
-[33431851853](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33431851853) succeeded. The npm
-registry and reinstalled global executable both report `0.68.4`.
+Universal relay dispatch correction shipped in feature commit `de34c78`, release commit `c72b113`,
+and tag `v0.68.5`. Publish run
+[33443516055](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33443516055)
+succeeded; npm registry and the reinstalled global executable both report `0.68.5`.
 
-Current live state:
+Current installed state:
 
-- The daemon was restarted through the hidden Startup launcher from the global install and listens
-  on `127.0.0.1:8791` as PID `472`. A 60-second top-level-window watch around the final restart
-  observed zero new visible windows and zero foreground transitions.
-- The live installed config has SHA-256
-  `DB6A53A5E447E6DF7781D66557AD957F5C312770A519623C88BA5355C244FC64`.
-- The owner-authorized focus-safety revalidation passed: Codex Desktop called MCP `dispatch` with
-  `lane: agy-gemini`; job `job-0006` returned exactly `AGY_CODEX_DISPATCH_OK` in 9 seconds. The
-  watcher recorded the AGY/launcher/process tree but no AGY-associated top-level or foreground
-  window. All 12 AGY ladder rows and `routing.laneProbe.enabled` are enabled again. `agy-gemini`
-  reports ready; the two Claude-backed AGY buckets retain their measured cooldowns.
-- The user's `13:09:51` terminal report preceded the audit process originally blamed for it
-  (`13:10:40`). The closest process match was a concurrent Codex task startup at `13:09:20–22`, so
-  the earlier audit-tools attribution is retracted. Automated hosts must still use MCP dispatch;
-  direct `agy.exe` calls, including help/version probes, bypass the hidden launcher.
-- Claude's full MCP→AGY validation is deferred while the owner's subscription transition blocks
-  Claude Code for roughly a day. A hidden Claude launch that reached the authentication failure
-  created no terminal event; that is not an AGY dispatch failure.
-- Telemetry answers successfully after the final restart; provider health is unmeasured until new
-  traffic arrives, and `null` means unknown rather than unhealthy.
-
-The dispatch result, revalidation evidence, and machine repairs are in
-[dispatch-smoothness-2026-08-31.md](docs/dispatch-smoothness-2026-08-31.md).
+- One portable rule now appears in MCP `initialize` instructions, the `dispatch` tool description,
+  the shipped skill, CLI help, README, quick start, reference, and direct-routing design: use MCP
+  `dispatch` whenever available; otherwise use `llm-relay dispatch --next-command -t "<task>"`
+  and follow its returned command or target. The model does not classify its host itself.
+- Codex global setup now appends `[mcp_servers.llm-relay]` beside the direct Responses provider.
+  Postinstall retired the byte-identical legacy `default.toml` and `relay_coding.toml` on this
+  machine; user-edited agents are preserved. Codex Desktop's ChatGPT launcher rejects `pool/*`
+  collaboration children before contacting `model_provider`, so MCP dispatch is the working route.
+- `llm-relay setup claude-desktop` now registers `llm-relay mcp` instead of writing an ineffective
+  proxy base URL. It removes only the exact legacy environment values llm-relay used through
+  v0.68.4. The live Claude Desktop config now contains command `llm-relay`, args `["mcp"]`, and
+  none of those legacy env keys.
+- Installed skill bytes match the repository. A new Codex/Claude Desktop process is required to
+  load the new MCP instructions/config; already-running MCP processes keep their startup snapshot.
 
 Verification evidence:
 
-- Focused dispatch tests: 51 passed.
-- Full server suite: 145 files, 2,841 passed, 5 skipped.
-- Dashboard suite: 5 files, 32 passed; package smoke passed.
-- Final cleanup CI run
-  [33431526327](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33431526327) and the `v0.68.4`
-  publish run above succeeded. Original feature CI run
-  [33428200248](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428200248) also succeeded.
-- The only immediate next step is the deferred Claude→MCP→AGY end-to-end validation after Claude
-  subscription access returns. New Codex/Claude MCP server processes load the restored ladder;
-  already-running MCP processes may retain their startup snapshot until their host session restarts.
+- Focused routing/setup/documentation tests: 7 files, 181 passed.
+- Full recorded local gate: server 145 files, 2,845 passed, 5 skipped; dashboard 5 files, 32 passed;
+  package smoke passed.
+- Feature CI run
+  [33443181622](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33443181622)
+  and the publish run above succeeded on their exact SHAs.
 
-Codebase-memory generation `2026-08-31T17:52:53Z` was ready but stale for the changed source and
-excluded the changed docs and tests. Exact source and whole-diff reads were used instead, so no
-exhaustive graph claim is made.
+Immediate next:
+
+- Investigate the 1,594-second `pool/medium` MCP survey job recorded in
+  [`docs/backlog.md`](docs/backlog.md); it was cancelled without an answer and was not used as
+  evidence. The symptom is not yet attributed to pool walking, provider thinking, or an agent loop.
+- Claude→MCP→AGY end-to-end validation remains deferred until Claude subscription access returns.
+  Codex→MCP→AGY already passed with no visible or foreground AGY window.
 
 ## 0.1 Earlier releases
 
