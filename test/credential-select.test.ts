@@ -319,3 +319,119 @@ describe("CredentialWalk", () => {
     expect(walk.stats.skipped).toBe(1);
   });
 });
+
+/**
+ * More than one attempt in flight — the prerequisite for hedging.
+ *
+ * ⚠ **`maxInFlight` defaults to 1, and at 1 every behaviour above must be byte-for-byte what it
+ * was.** That is the load-bearing property of this whole change: the walk is "the sole budget/LRU
+ * mutation boundary", so a regression here is a regression in every request the relay serves. The
+ * existing suite above IS the guard for it, and it is deliberately left untouched.
+ *
+ * Two things blocked hedging before this, both found by attempting the wiring:
+ *   1. `next()` re-offered the SAME pending attempt while one was in flight, so asking for a hedge
+ *      candidate handed back the primary and would have fetched one deployment twice.
+ *   2. `record(..., { kind: "cancelled" })` STOPS the walk — so retiring an aborted hedge loser
+ *      through the ordinary path would have ended the request's walk entirely.
+ */
+describe("CredentialWalk — more than one attempt in flight", () => {
+  it("still offers only one at a time by default", () => {
+    // The regression guard, stated explicitly rather than left implicit in the suite above.
+    const a = attempt("a", "m");
+    const b = attempt("b", "m");
+    const walk = new CredentialWalk([a, b]);
+    const first = walk.next();
+    expect(first).toBe(a);
+    walk.recordStarted(a);
+    expect(walk.next()).toBe(a); // re-offers the SAME pending attempt, exactly as before
+  });
+
+  it("offers a SECOND candidate while the first is still in flight when allowed", () => {
+    const a = attempt("a", "m");
+    const b = attempt("b", "m");
+    const walk = new CredentialWalk([a, b], { maxInFlight: 2 });
+    expect(walk.next()).toBe(a);
+    walk.recordStarted(a);
+    expect(walk.next()).toBe(b); // the hedge candidate, and it is NOT the primary
+    walk.recordStarted(b);
+    expect(walk.isPending(a)).toBe(true);
+    expect(walk.isPending(b)).toBe(true);
+    expect(walk.stats.started).toBe(2);
+  });
+
+  it("re-offers the oldest in-flight attempt once the cap is reached", () => {
+    const a = attempt("a", "m");
+    const b = attempt("b", "m");
+    const c = attempt("c", "m");
+    const walk = new CredentialWalk([a, b, c], { maxInFlight: 2 });
+    walk.recordStarted(walk.next()!);
+    walk.recordStarted(walk.next()!);
+    expect(walk.next()).toBe(a); // saturated: same shape as the single-slot case at its cap
+  });
+
+  it("keys every lifecycle call by attempt, so the two cannot be confused", () => {
+    const a = attempt("a", "m");
+    const b = attempt("b", "m");
+    const walk = new CredentialWalk([a, b], { maxInFlight: 2 });
+    walk.recordStarted(walk.next()!);
+    walk.recordStarted(walk.next()!);
+    // Recording the SECOND one must not disturb the first.
+    walk.record(b, { status: 503 });
+    expect(walk.isPending(a)).toBe(true);
+    expect(walk.isPending(b)).toBe(false);
+    expect(() => walk.recordStarted(a)).toThrow(/already marked started/);
+    expect(() => walk.record(b, { status: 503 })).toThrow(/does not match/);
+  });
+
+  it("ABANDONS a hedge loser without stopping the walk", () => {
+    // The second blocker. A loser is aborted by the relay, not proven bad by the provider, so it
+    // must not carry the terminal semantics `record` gives a cancellation — that would end the
+    // walk for a request the hedge just rescued.
+    const a = attempt("a", "m");
+    const b = attempt("b", "m");
+    const walk = new CredentialWalk([a, b], { maxInFlight: 2 });
+    walk.recordStarted(walk.next()!);
+    walk.recordStarted(walk.next()!);
+    walk.recordAbandoned(a);
+    expect(walk.isPending(a)).toBe(false);
+    expect(walk.stats.stopped).toBe(false);
+  });
+
+  it("abandoning returns the deployment to the queue and suppresses nothing", () => {
+    // An aborted attempt proved NOTHING about its deployment, so unlike `record` with a 401/429 it
+    // must not suppress the credential or close the group. With a second slot on the same
+    // deployment, that slot must still be reachable.
+    //
+    // ⚠ It releases the group by the walk's EXISTING rule, the same one `recordRejected` uses: the
+    // cursor has already advanced past the offered slot, so a group with only one slot is closed.
+    // Rewinding the cursor would be a different and riskier behaviour — an attempt could be
+    // offered and abandoned indefinitely — and hedging does not need it, because the winner's
+    // own `record` stops the walk anyway.
+    const first = attempt("a", "m", "default");
+    const second = attempt("a", "m", "second");
+    const walk = new CredentialWalk([first, second], { maxInFlight: 2 });
+    const offered = walk.next()!;
+    walk.recordStarted(offered);
+    walk.recordAbandoned(offered);
+    expect(walk.stats.stopped).toBe(false);
+    const after = walk.next();
+    expect(after).toBeDefined();
+    expect(after).not.toBe(offered); // the sibling slot, not a re-offer of the abandoned one
+  });
+
+  it("does not let abandoning launder a real outcome", () => {
+    const a = attempt("a", "m");
+    const walk = new CredentialWalk([a], { maxInFlight: 2 });
+    expect(() => walk.recordAbandoned(a)).toThrow(/does not match/); // never started
+  });
+
+  it("counts each concurrent start against the budget", () => {
+    // Concurrency must not become a way to spend more of the walk budget than a serial walk could.
+    const a = attempt("a", "m");
+    const b = attempt("b", "m");
+    const walk = new CredentialWalk([a, b], { maxInFlight: 2 });
+    walk.recordStarted(walk.next()!);
+    walk.recordStarted(walk.next()!);
+    expect(walk.stats.started).toBe(2);
+  });
+});

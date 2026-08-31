@@ -230,6 +230,15 @@ export interface CredentialWalkOptions extends Omit<CredentialSelectionOptions, 
   readonly now?: () => number;
   readonly selectionNow?: number;
   readonly suppressedFacts?: readonly CredentialFact[];
+  /**
+   * How many attempts may be in flight at once. **Defaults to 1**, which is the walk's historical
+   * behaviour exactly — one offered candidate, re-offered until it is recorded.
+   *
+   * ⚠ Above 1 is what makes a HEDGE possible: the walk can offer the next candidate while the
+   * previous one is still running. It changes nothing on its own — the caller still decides whether
+   * to ask — so a caller that never asks for a second candidate sees no difference at all.
+   */
+  readonly maxInFlight?: number;
 }
 
 export interface CredentialWalkStats {
@@ -257,7 +266,21 @@ export class CredentialWalk {
   #skipped = 0;
   #stopped = false;
   #startedAt: number | undefined;
-  #pending: { group: DeploymentCredentialGroup; attempt: ResolvedAttempt; started: boolean } | undefined;
+  /**
+   * Every attempt currently in flight, in the order they were offered.
+   *
+   * ⚠ This was a SINGLE optional record until 2026-08-30, and the change is the prerequisite for
+   * hedging: `next()` used to open with `if (this.#pending) return this.#pending.attempt;`, so
+   * while an attempt was live it re-offered THAT SAME ATTEMPT, and asking for a hedge candidate
+   * handed back the primary. A `Map` keyed by the attempt keeps insertion order, so "the oldest
+   * in flight" is well defined and the saturated case behaves exactly as the single slot did.
+   *
+   * ⚠ At `maxInFlight` 1 — the default — every observable behaviour is unchanged. That is the
+   * load-bearing property: this class is the sole budget/LRU mutation boundary, so a regression
+   * here is a regression in every request the relay serves.
+   */
+  readonly #pending = new Map<ResolvedAttempt, { group: DeploymentCredentialGroup; started: boolean }>();
+  readonly #maxInFlight: number;
 
   constructor(attempts: readonly ResolvedAttempt[], options: CredentialWalkOptions = {}) {
     const lru = options.lru ?? new CredentialLru();
@@ -274,6 +297,10 @@ export class CredentialWalk {
     this.#lru = lru;
     this.#clock = options.now ?? (() => Date.now());
     this.#budgetMs = options.walkBudgetMs ?? 45_000;
+    // A non-finite or sub-1 value degrades to the historical single slot rather than to zero, which
+    // would offer nothing at all and fail every request.
+    const cap = options.maxInFlight;
+    this.#maxInFlight = typeof cap === "number" && Number.isFinite(cap) && cap >= 1 ? Math.floor(cap) : 1;
     for (const group of this.#groups) this.#cursor.set(group.key, 0);
   }
 
@@ -281,7 +308,23 @@ export class CredentialWalk {
     return { started: this.#started, skipped: this.#skipped, stopped: this.#stopped };
   }
 
-  get pending(): ResolvedAttempt | undefined { return this.#pending?.attempt; }
+  /**
+   * The OLDEST attempt still in flight, or undefined.
+   *
+   * ⚠ Kept as a single-value getter because that is what callers already test against
+   * (`walk.pending === resolvedAttempt`). At `maxInFlight` 1 it is exactly what it always was. Use
+   * `isPending` when more than one may be live, or the check silently only ever asks about the
+   * first.
+   */
+  get pending(): ResolvedAttempt | undefined {
+    for (const attempt of this.#pending.keys()) return attempt;
+    return undefined;
+  }
+
+  /** Is this exact attempt still in flight? The multi-attempt form of the `pending` check. */
+  isPending(attempt: ResolvedAttempt): boolean {
+    return this.#pending.has(attempt);
+  }
 
   #budgetAllowsStart(): boolean {
     if (this.#started < 2 || this.#budgetMs === 0 || this.#startedAt === undefined) return true;
@@ -294,7 +337,9 @@ export class CredentialWalk {
 
   next(): ResolvedAttempt | undefined {
     if (this.#stopped) return undefined;
-    if (this.#pending) return this.#pending.attempt;
+    // Saturated: re-offer the oldest in flight, which at `maxInFlight` 1 is the single pending
+    // attempt and is byte-for-byte the historical behaviour.
+    if (this.#pending.size >= this.#maxInFlight) return this.pending;
     if (!this.#budgetAllowsStart()) return undefined;
     while (this.#queue.length > 0) {
       const key = this.#queue.shift()!;
@@ -307,36 +352,68 @@ export class CredentialWalk {
       // A suppressed slot consumes neither a round nor budget. Continue within this deployment
       // so a still-eligible sibling credential can be selected before moving to the next group.
       if (this.#isSuppressed(attempt)) { this.#skipped++; this.#queue.unshift(key); continue; }
-      this.#pending = { group, attempt, started: false };
+      this.#pending.set(attempt, { group, started: false });
       return attempt;
     }
     return undefined;
   }
 
-  /** Mark the offered candidate as crossing the real backend-start boundary. */
-  recordStarted(attempt: ResolvedAttempt): void {
-    if (this.#pending?.attempt !== attempt) throw new Error("credential start does not match pending attempt");
-    if (this.#pending.started) throw new Error("credential attempt already marked started");
-    if (this.#startedAt === undefined) this.#startedAt = this.#clock();
-    this.#started++;
-    this.#lru.touch(attempt.credentialId);
-    this.#pending = { ...this.#pending, started: true };
+  /** The in-flight record for this exact attempt, or a thrown error naming what went wrong. */
+  #inFlight(attempt: ResolvedAttempt, verb: string): { group: DeploymentCredentialGroup; started: boolean } {
+    const held = this.#pending.get(attempt);
+    if (!held) throw new Error(`credential ${verb} does not match pending attempt`);
+    return held;
   }
 
-  /** Discard an offered candidate after local/pre-egress validation; no LRU or budget mutation. */
-  recordRejected(attempt: ResolvedAttempt): void {
-    if (this.#pending?.attempt !== attempt) throw new Error("credential rejection does not match pending attempt");
-    const group = this.#pending.group;
-    this.#pending = undefined;
+  /** Return this deployment to the queue, or close it when its credentials are exhausted. */
+  #releaseGroup(group: DeploymentCredentialGroup): void {
     if ((this.#cursor.get(group.key) ?? 0) < group.attempts.length) this.#queue.push(group.key);
     else this.#deploymentClosed.add(group.key);
   }
 
+  /** Mark the offered candidate as crossing the real backend-start boundary. */
+  recordStarted(attempt: ResolvedAttempt): void {
+    const held = this.#inFlight(attempt, "start");
+    if (held.started) throw new Error("credential attempt already marked started");
+    if (this.#startedAt === undefined) this.#startedAt = this.#clock();
+    this.#started++;
+    this.#lru.touch(attempt.credentialId);
+    this.#pending.set(attempt, { ...held, started: true });
+  }
+
+  /** Discard an offered candidate after local/pre-egress validation; no LRU or budget mutation. */
+  recordRejected(attempt: ResolvedAttempt): void {
+    const held = this.#inFlight(attempt, "rejection");
+    this.#pending.delete(attempt);
+    this.#releaseGroup(held.group);
+  }
+
+  /**
+   * Retire a HEDGE LOSER: an attempt this relay aborted because another one won.
+   *
+   * ⚠ **It deliberately does NOT go through `record`, and that is the second blocker hedging hit.**
+   * `record` treats a `cancelled` outcome as terminal and sets `#stopped`, which is right for a
+   * client hanging up and catastrophically wrong here — it would end the walk for a request the
+   * hedge just rescued. An abandoned attempt proved NOTHING about its deployment, so it also must
+   * not suppress a credential, close a deployment, or record an outcome of any kind.
+   *
+   * ⚠ The deployment goes BACK ON THE QUEUE. Burning it would silently shrink the candidate pool
+   * on every hedged request, which is the opposite of what hedging is for. The start budget is
+   * NOT refunded: the attempt really was started, and pretending otherwise would let concurrency
+   * buy more of the walk budget than a serial walk could spend.
+   */
+  recordAbandoned(attempt: ResolvedAttempt): void {
+    const held = this.#inFlight(attempt, "abandonment");
+    if (!held.started) throw new Error("credential abandonment does not match pending attempt");
+    this.#pending.delete(attempt);
+    this.#releaseGroup(held.group);
+  }
+
   record(attempt: ResolvedAttempt, outcome: CredentialWalkOutcome): void {
-    if (this.#pending?.attempt !== attempt) throw new Error("credential walk outcome does not match pending attempt");
-    if (!this.#pending.started) throw new Error("credential outcome recorded before backend start");
-    const group = this.#pending.group;
-    this.#pending = undefined;
+    const held = this.#inFlight(attempt, "walk outcome");
+    if (!held.started) throw new Error("credential outcome recorded before backend start");
+    const group = held.group;
+    this.#pending.delete(attempt);
     const status = outcome.status;
     if (outcome.kind === "success" || (status !== undefined && status >= 200 && status < 400)) { this.#stopped = true; return; }
     if (outcome.kind === "local" || outcome.kind === "client" || outcome.kind === "cancelled") { this.#stopped = true; return; }
@@ -357,8 +434,7 @@ export class CredentialWalk {
         model: attempt.target.model ?? "",
       };
       this.#suppressedFacts = [...this.#suppressedFacts, { kind: "accepted", scope: exactScope }];
-      if ((this.#cursor.get(group.key) ?? 0) < group.attempts.length) this.#queue.push(group.key);
-      else this.#deploymentClosed.add(group.key);
+      this.#releaseGroup(group);
       return;
     }
     if (scope) this.#suppressedFacts = [...this.#suppressedFacts, { kind: "accepted", scope }];
