@@ -257,6 +257,11 @@ describe("hedged attempts — end to end on both fronts", () => {
       expect(res.status).toBe(200);
       await res.text();
       expect(res.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+      // Both were really contacted — the same proof every positive case here carries. Without it
+      // this passes on a relay that never hedged and simply failed over from the 429, which is a
+      // DIFFERENT mechanism reaching the same header.
+      expect(a.calls()).toBe(1);
+      expect(b.calls()).toBe(1);
       expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 120ms, floor)");
     },
   );
