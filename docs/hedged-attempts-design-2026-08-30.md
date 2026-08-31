@@ -191,6 +191,53 @@ second time on the reversed `server.ts` ranking rationale.
 
 ## 9. Status
 
-Proposed by the owner 2026-08-30, in response to the defect B options. Nothing built. B4 shipped
-separately and is complementary: B4 makes the relay *meet* a slow member less often, hedging makes
-*meeting* one cheap.
+Proposed by the owner 2026-08-30, in response to the defect B options. B4 shipped separately and is
+complementary: B4 makes the relay *meet* a slow member less often, hedging makes *meeting* one cheap.
+
+✅ **BUILT AND WIRED on both fronts, 2026-08-30.** `hedge-trigger.ts` (the decision),
+`hedge-race.ts` (the concurrency), `CredentialWalk.maxInFlight` + `recordAbandoned`, and
+`server.ts` `runAttemptWithHedge` — ONE shared policy for `handle` and `openAiFrontPath`.
+`routing.hedge` parses with `routing.latency`'s strictness; `x-llm-relay-hedged` announces every
+hedge, won or lost.
+
+Two structural findings from §8's open questions, both surfaced by ATTEMPTING the wiring rather than
+by reading, and both recorded in `CLAUDE.md`:
+
+- `CredentialAttemptTrace.record` matched the LAST open entry, so a primary that won against an
+  egressed hedge threw on a good 200. It now matches the most recent open entry for that attempt.
+- `CredentialWalk.next()` had to start re-offering a pending-but-UNSTARTED attempt. Both fronts'
+  failover look-ahead depended on the single-slot saturation branch by accident, and raising the cap
+  to 2 made the walk skip a candidate. 40 multi-candidate failover tests HUNG.
+
+§8's three open questions, as answered by the implementation:
+
+- **The constants stay placeholders.** They are unchanged and still say so in the source. The
+  population needed to calibrate them is still not recorded; `HEDGED_HEADER` now states which rung
+  set each delay, so the calibration can be gathered from real traffic.
+- **One hedge in flight is enough for now.** `maxInFlight` is 2 with hedging on and 1 with it off, so
+  `routing.hedge: false` is a byte-for-byte revert. Making the cap configurable is not done and is
+  not needed by any measured case.
+- **The header names BOTH deployments and which one answered**, plus the delay and its basis. Naming
+  only the winner would hide a hedge that lost, which is the case an operator most needs to see.
+
+⚠⚠ **D3 is NOT implemented, and attempting it found a structural obstacle the decision did not
+have.** A losing hedge's spend does not enter `requestSpend`; the winner-only projection still
+stands. Two findings, both from reading the code the change would have to touch:
+
+1. **`AccountingSpend` cannot honestly represent two deployments.** It is one record carrying one
+   `pricesUsed`, one `priceSource` and one `tokenBasis`, so summing a winner's and a loser's amounts
+   into it would attach one deployment's prices to another's tokens — the provenance defect this
+   project's own invariant forbids. The four-cell aggregate in `accounting-store.ts` CAN sum
+   (`addSpendIntoCells`), so the faithful route is to carry the loser's spend as a separate entry on
+   `RequestCompletedEvent` and fold it in the STORE. That is an additive change to the accounting
+   event vocabulary, the persisted shard schema and the dashboard projection — a versioned contract
+   change, exactly as D3 itself says, and a different piece of work from wiring a race.
+2. **How much it would add is usually zero, because of a decision taken AFTER D3.** `hedge-race.ts`
+   decides the race at RESPONSE RESOLUTION, and the relay reads no body before then, so an ABORTED
+   loser has no observed tokens and therefore no spend at all. The case where D3 has real content is
+   narrow but real: both sides settle and one loses by a microtask, so the loser carries a full
+   completion that `abort()` can no longer undo.
+
+⚠ This is the "an owner decision whose premise moved" pattern this repo already records twice. D3
+was taken before the race's resolution point was chosen. The decision is not overturned here — it is
+handed back with the measurement it did not have. Tracked in [backlog.md](backlog.md).

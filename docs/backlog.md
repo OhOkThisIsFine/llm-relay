@@ -9,92 +9,26 @@
 
 ## Open
 
-- **⚠⚠ THE PACKAGE CEILING WAS RAISED TWICE IN THIS LAP, against the standing rule** (2026-08-30).
-  Recorded as a knowing exception rather than quietly taken, for the owner to overrule — the same
-  treatment the previous double-raise got.
+- **⚠ D3 — should a LOSING hedge's spend enter `requestSpend`?** Owner decision 2026-08-30 said yes;
+  attempting it found an obstacle the decision did not have, so it is handed back rather than
+  overturned or silently skipped. Full reasoning:
+  [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md) §9.
 
-  - **Raise 1** was for `hedge-trigger.ts` (+10656 B unpacked, 3 entries). It also RESTORED the
-    documented ~0.5% headroom, which had drifted to 0.15% — so part of that raise was correcting a
-    baseline that had been left tight, not making room for new work. `hedge-race.ts` then fitted
-    inside it with **no raise at all**.
-  - **Raise 2** was for the `CredentialWalk` extension: +3284 B unpacked, **no new entries**, all of
-    it `credential-select` .js/.d.ts/.js.map from the new methods and their doc comments. It
-    exceeded by **266 bytes**. `packBytes` 901100 → 905800.
+  - **`AccountingSpend` cannot honestly hold two deployments.** One record, one `pricesUsed`, one
+    `priceSource`, one `tokenBasis` — summing a winner's and a loser's amounts into it attaches one
+    deployment's prices to another's tokens, which is the provenance defect this project's own
+    invariant forbids. The faithful route is the four-cell aggregate in `accounting-store.ts`, which
+    already sums: carry the loser's spend as a separate entry on `RequestCompletedEvent` and fold it
+    in the STORE. That is additive across the event vocabulary, the shard schema and the dashboard
+    projection — a versioned contract change, which is what D3 itself calls it.
+  - **A decision taken AFTER D3 makes it usually zero.** `hedge-race.ts` decides at RESPONSE
+    RESOLUTION and the relay reads no body before then, so an ABORTED loser has no observed tokens
+    and no spend. D3 has real content only in the narrow case where both sides settle and one loses
+    by a microtask, carrying a full completion `abort()` can no longer undo.
 
-  Reasoning, stated so it can be judged: the growth is root-caused to the byte with no residue; the
-  alternative was deleting documentation to fit a number, which this file already named as the
-  wrong trade; and `.d.ts` doc comments are load-bearing here by owner decision (package-size
-  variant C ships them deliberately). ⚠ Two of the three modules behind these raises are **inert**,
-  which weakens the justification and is exactly why it is written down.
-
-  **Property:** a lap's own work moves a ratchet at most once, or the exception is recorded with
-  its decomposition and its reasoning.
-
-- **⚠ BLOCKER for hedging: `CredentialWalk` holds exactly ONE in-flight attempt** — **RESOLVED
-  2026-08-30**, and kept here for its reasoning until hedging actually ships.
-
-  `maxInFlight` (default **1**, byte-for-byte the historical behaviour) now lets the walk carry N
-  in-flight attempts, and `recordAbandoned` retires a hedge loser without the terminal semantics
-  `record` gives a cancellation. 8 new tests, written RED first; mutation-checked twice — ignoring
-  the cap fails 2, making abandonment stop the walk fails 2. The original finding follows, because
-  it is what the design has to keep satisfying.
-
-  (found 2026-08-30 while attempting the stage-2 wiring, before any of `server.ts` was touched).
-
-  The walk's contract is that it is *"the sole budget/LRU mutation boundary"*, and it enforces that
-  with a single `#pending` slot. In `src/credential-select.ts`:
-
-  - `next()` opens with `if (this.#pending) return this.#pending.attempt;` — while an attempt is in
-    flight it **re-offers that same attempt**, so asking for a hedge candidate hands back the
-    primary and the relay would fetch one deployment twice;
-  - `recordStarted()` throws `"credential attempt already marked started"` on the second call;
-  - `recordOutcome()` throws when the outcome does not match the single pending attempt.
-
-  **So hedging is not a restructuring of the request loop.** It first needs `CredentialWalk` to
-  carry N in-flight attempts, with its start budget, LRU touch and breadth-first ordering all still
-  correct. Patching around it would produce requests that THROW.
-
-  **Property:** the walk can have more than one attempt in flight, and its budget, LRU and ordering
-  invariants still hold — stated and tested — for every one of them.
-
-  ⚠ Both hedge modules are built, tested and INERT pending this. That is more unadopted surface
-  than the `kernel/` precedent tolerated (`CLAUDE.md`: an aspirational contract surface "lived here
-  unadopted and was **deleted** 2026-08-04"), so this should be resolved or the modules reverted —
-  it should not sit.
-
-- **Hedged attempts — overlap the walk instead of serialising it** (owner proposal, 2026-08-30).
-  In the owner's words: *"maybe if an attempt is taking longer than p90 for that endpoint
-  (normalized by number of tokens), we pass the task off to the next source, but still allow for
-  the possibility of the first source returning a useful result."*
-
-  Design, costs and the four decisions it needs before any code:
-  [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md).
-
-  **Why it is worth building:** every fix shipped this lap leaves the walk SERIAL, so a request
-  still pays the full cost of each slow candidate it meets — v0.65.3 makes the relay meet one less
-  often, it does not make meeting one cheap. Hedging does, and unlike a timeout or a per-candidate
-  cap it still lets a slow member win.
-
-  **Property:** a request's latency is bounded by the FASTEST candidate that answers, not by the
-  first one that was tried.
-
-  **State 2026-08-30: every prerequisite is landed and tested; only the wiring remains.**
-  `hedge-trigger.ts` (the decision, 17 tests), `hedge-race.ts` (the concurrency, 12 tests,
-  mutation-checked twice) and `CredentialWalk`'s `maxInFlight` + `recordAbandoned` (8 tests, written
-  red first, mutation-checked twice) are all on `main`. What is left is the ANTHROPIC front's loop,
-  then the OpenAI front with the same extracted policy — the step list is in `HANDOFF.md` §0.
-  Owner decision: do it in a fresh session with full attention on `src/server.ts`, because it is the
-  riskiest edit of the feature and it lands on the path every request takes.
-
-  ⚠ **An invariant is engaged and must be settled first, not assumed.** `CLAUDE.md` says of acting
-  on counts: *"Acting on counts is optional, always announced, and may only reorder."* Hedging does
-  not reorder — it DUPLICATES, onto free quota this relay does not own. The design answers that
-  with off-by-default (`routing.hedge`) plus an announcement header, but the owner should confirm
-  it rather than inherit it from a design doc.
-
-  **The cheap thing to try first, so it is not skipped:** `providers.nim` declares no `timeoutMs`
-  and takes the 120000 ms default — the same value as the owner's `walkBudgetMs` — so one hang
-  consumes the entire budget alone. A shorter per-provider timeout is configuration, not code.
+  **Property:** either `requestSpend` means "what this request cost" for every request, or it means
+  "what the answer you received cost" — and whichever it means, the token totals beside it mean the
+  same thing. Today both follow the winner-only rule, and they agree.
 
 - **The breaker learns nothing when the CLIENT gives up first** (found 2026-08-30, low, recorded
   not fixed). A client disconnect records the attempt as `cancelled`, and cancelled returns BEFORE
@@ -108,6 +42,56 @@
   the return deleted.
 
 ## Closed
+
+- ✅ **Hedged attempts — SHIPPED and wired on both fronts** (owner proposal 2026-08-30; the four
+  decisions are in [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md) §7).
+  In the owner's words: *"maybe if an attempt is taking longer than p90 for that endpoint
+  (normalized by number of tokens), we pass the task off to the next source, but still allow for the
+  possibility of the first source returning a useful result."*
+
+  **Property met:** a request's latency is bounded by the FASTEST candidate that answers, not by the
+  first one that was tried. Every fix before this left the walk SERIAL, so a request still paid the
+  full cost of each slow candidate it met; v0.65.3 made the relay *meet* one less often, hedging
+  makes *meeting* one cheap.
+
+  Delivered as `routing.hedge` (ON by default, free deployments only), `server.ts`
+  `runAttemptWithHedge` shared by both fronts, and `x-llm-relay-hedged` on every hedge — won or
+  lost, because the duplication happened either way. `routing.hedge: false` is a byte-for-byte
+  revert, including the walk's in-flight cap.
+
+  ⚠ **The engaged invariant was settled, not assumed.** `CLAUDE.md` said acting on counts *"may only
+  reorder"*; the owner amended it for hedging on 2026-08-30, and the amendment is written into
+  `CLAUDE.md` and `docs/project-goals.md` as an amendment rather than a repeal — nothing else here
+  may duplicate, and a later term that wants to must be argued on its own.
+
+  ⚠ **Two structural findings, both from ATTEMPTING the wiring rather than reading it, and both
+  would have shipped broken requests.** They are recorded in `CLAUDE.md` because they are the
+  durable half:
+  - `CredentialAttemptTrace.record` matched the LAST open entry and only then checked identity, so a
+    PRIMARY that won against an egressed hedge threw on a perfectly good 200.
+  - `CredentialWalk.next()` had to start re-offering a pending-but-UNSTARTED attempt. Both fronts'
+    failover look-ahead depended on the single-slot saturation branch BY ACCIDENT, so raising the cap
+    to 2 made the walk hand out a third candidate while the second stayed pending forever. Measured:
+    40 multi-candidate failover tests, and they HUNG rather than failed.
+
+  ⚠ **The cheap thing was already tried and is unchanged:** `providers.nim` carries
+  `timeoutMs: 100000`, measured rather than chosen.
+
+  ⚠ D3 is the one part not delivered — see the Open half.
+
+- ✅ **The package ceiling raised twice in one lap — the exception was ACCEPTED** (owner decision,
+  2026-08-30). The growth had been root-caused to the byte with no residue, and the alternative was
+  deleting documentation to fit a number, which package-size variant C ships deliberately.
+
+  **The standing rule is unchanged:** a lap's own work moves a ratchet at most once, or the
+  exception is recorded with its decomposition and its reasoning. The hedge-wiring lap moved it
+  ONCE — `unpackedBytes` 4722843 -> 4745634 (+22791), decomposed with no residue and **no new
+  entries** (365 unchanged), measured against a build of the baseline commit rather than a guess:
+  `server` 14779 + `config` 5086 + `backend` 1638 + `hedge-trigger` 1059 + `credential-select` 229.
+  ⚠ Stated on `unpackedBytes` deliberately — `packBytes` is gzip output, so it is neither additive
+  across files nor byte-reproducible. ⚠ The `.d.ts` outgrowing the `.js` on `config` and `backend` is
+  the two-pass build working as designed: doc comments survive in the declarations and are stripped
+  from the JavaScript.
 
 - ✅ **Which latency dataset `routing.latency` measures — DECIDED and SHIPPED** (owner,
   2026-08-30). *"Switch to the probe dataset, and expand that dataset to include request latency …

@@ -205,49 +205,75 @@ Two things worth carrying forward from it:
   row carrying it would have been dropped at load. `CooldownSource` is now DERIVED from
   `COOLDOWN_SOURCES`.
 
-**Hedged attempts: every prerequisite is landed and tested; the wiring is not started.** The
-owner's proposal — *"if an attempt is taking longer than p90 for that endpoint (normalized by
+**This lap (2026-08-30, ninth) — the hedge-wiring lap. HEDGING IS WIRED ON BOTH FRONTS.**
+The owner's proposal — *"if an attempt is taking longer than p90 for that endpoint (normalized by
 number of tokens), we pass the task off to the next source, but still allow for the possibility of
-the first source returning a useful result"* — with all four design decisions taken
-([docs/hedged-attempts-design-2026-08-30.md](docs/hedged-attempts-design-2026-08-30.md) §7).
+the first source returning a useful result"* — is delivered
+([docs/hedged-attempts-design-2026-08-30.md](docs/hedged-attempts-design-2026-08-30.md)).
 
-✅ Built, tested, **and deliberately inert**:
-- `src/hedge-trigger.ts` — the decision. Ladder per-token → absolute → floor, first rung with
-  evidence is FINAL, exactly one comparison in the module. 17 tests.
-- `src/hedge-race.ts` — the concurrency, isolated from HTTP. 12 tests, injected timers,
-  mutation-checked twice.
-- `CredentialWalk` now carries **N attempts in flight** (`maxInFlight`, default **1** =
-  byte-for-byte the old behaviour) plus `recordAbandoned`. 8 tests written RED first,
-  mutation-checked twice.
+✅ Shipped this lap:
+- **`routing.hedge`** — parsed with `routing.latency`'s strictness (unknown key is a hard load
+  error). **ON by default, free deployments only** (owner decision D1). `false` is a byte-for-byte
+  revert, including the walk's in-flight cap.
+- **`server.ts` `runAttemptWithHedge`** — ONE policy shared by `handle` and `openAiFrontPath`.
+  `isWin` is the loop's own failover expression, extracted so there is one definition.
+- **`x-llm-relay-hedged`** on every hedge, won or lost, naming both deployments, the delay and the
+  rung of evidence that set it — which is how the three placeholder constants become calibratable
+  from real traffic.
+- **`test/hedge-wiring.test.ts`** — 14 tests, both fronts, real two-backend races. Every positive
+  case asserts the SECOND backend was actually contacted, never just a header.
 
-⚠ **Two blockers were found by ATTEMPTING the wiring, not by reading, and both would have produced
-throwing requests.** `next()` re-offered the same pending attempt, so a hedge candidate came back as
-the primary; and `record(..., {kind:"cancelled"})` sets `#stopped`, so retiring an aborted loser
-would have ended the walk for the request the hedge just rescued. Both are fixed.
+⚠⚠ **The invariant was AMENDED, not assumed.** `CLAUDE.md` said acting on counts *"may only
+reorder"*; hedging DUPLICATES. The owner amended it on 2026-08-30, and the amendment is written into
+`CLAUDE.md` and `docs/project-goals.md` as an amendment rather than a repeal — nothing else here may
+duplicate, and a later term that wants to must be argued on its own merits.
 
-**Immediate next: wire the ANTHROPIC front, in a fresh session with full attention on
-`src/server.ts`** (owner decision 2026-08-30 — the loop restructure is the riskiest edit of the
-feature and the last thing in a long session is the wrong time for it). What is left, concretely:
+⚠⚠ **Two structural findings, both from ATTEMPTING the wiring rather than reading it, and both
+would have shipped broken requests.** They are in `CLAUDE.md` because they are the durable half:
+- `CredentialAttemptTrace.record` matched the LAST open entry and only then checked identity, so a
+  PRIMARY that won against an egressed hedge threw on a perfectly good 200.
+- `CredentialWalk.next()` had to start re-offering a pending-but-UNSTARTED attempt. Both fronts'
+  failover look-ahead depended on the single-slot saturation branch BY ACCIDENT, so raising the cap
+  to 2 made the walk hand out a THIRD candidate while the second stayed pending forever.
+  **Measured: 40 multi-candidate failover tests, and they HUNG rather than failed.** A hedging change
+  nobody expected to touch failover must still run the whole suite.
 
-1. Parse `routing.hedge` in `config.ts` (unknown key = hard load error, the `configured-limits`
-   precedent), and pass `maxInFlight: 2` when it is enabled.
-2. In the `/v1/messages` walk (`server.ts`, the `while (!res.destroyed)` loop opening near the
-   `nextUncappedAttempt` call): extract the per-attempt setup — `resolvedAttempt`, `controller`,
-   `callerController`, `timer`, `onResClose`, `usage`, `attempt`, `egressCallbackCalled` — into a
-   record, because `onEgress` must write into ITS OWN record rather than the loop's locals.
-3. Replace the single `await fetchBackend(...)` with `raceWithHedge`, using
-   `hedgeDelayMs(pings, isFree, settings)` as the delay and "resolved with a status the walk would
-   not fail over from" as `isWin`.
-4. On a hedge win: rebind the loop's locals to the winner's record, `recordAbandoned` + abort the
-   loser, and announce `x-llm-relay-hedged`.
-5. Only then repeat on the OpenAI front, with the SAME extracted policy — two fronts with two
-   policies is the shape of the pool-failover incident this repo already paid for.
+⚠ **D3 is the one part of the approved scope NOT delivered, and it is a QUESTION, not an
+omission.** The owner decided that a losing hedge's spend should enter `requestSpend`; attempting it
+found that `AccountingSpend` is one record with one `pricesUsed`, so it cannot honestly hold two
+deployments — the faithful route is the store's four-cell aggregate, i.e. a versioned change to the
+event vocabulary, the shard schema and the dashboard projection. And a decision taken AFTER D3
+(the race resolves at RESPONSE RESOLUTION) makes an aborted loser carry no tokens at all, so D3 is
+usually worth zero. Handed back with the measurement it did not have; tracked in
+[docs/backlog.md](docs/backlog.md).
 
-⚠ **Nothing is released**, and two inert modules now sit in the tree. `CLAUDE.md` records that the
-`kernel/` aspirational surface "lived here unadopted and was **deleted**", so this should be wired
-or reverted rather than left to sit. ⚠ **The package ceiling was raised TWICE in this lap**, against
-the standing rule, both decomposed and recorded in [docs/backlog.md](docs/backlog.md) for the owner
-to overrule.
+⚠ **Nothing is released.** The two formerly inert modules are now both wired, so the `kernel/`
+precedent no longer applies. ⚠ The package ceiling moved ONCE this lap, decomposed to the byte with
+no residue and no new entries — the decomposition is in [docs/backlog.md](docs/backlog.md).
+✅ **The live-signal check WAS run, because the unit tests share v0.65.1's blind spot.** Those tests
+inject a stub `pingLoop` and hand-built tier types, so they agree with the code about the very data
+the feature reads — which is exactly how `routing.latency` shipped inert. Measured against the
+OPERATOR'S OWN config and `models-cache.json`:
+
+| deployment | `assessCost` | hedgeable |
+|---|---|---|
+| `nim/moonshotai/kimi-k3` | free (provider-tier) | yes |
+| `nim/nvidia/nemotron-3-ultra-550b-a55b` | free (provider-tier) | yes |
+| `gemini/models/gemini-3.6-flash` | free (provider-tier) | yes |
+| `mistral/mistral-medium-2505` | free (provider-tier) | yes |
+| `openrouter/nvidia/nemotron-3-ultra-550b-a55b` | paid (published-price) | no |
+| `anthropic/*` | paid (anthropic-kind short-circuit) | no |
+
+So the feature fires on the deployments that actually serve this machine — including the `nim`
+member whose 43 consecutive 120 s hangs it was built for — and is correctly excluded from the paid
+and passthrough ones. ⚠ The `$15~` figures in `llm-relay candidates` are REFERENCE prices and never
+reach `assessCost`, which reads the serving provider's own published figures; that is why an
+apparently priced `nim` member is still classified free. The operator's real config also loads
+through the new parser with `routing.hedge` resolving to `{}` — all defaults, i.e. ON.
+
+⚠ **What was NOT done: a request through the live daemon.** It is still running the old build, and a
+hedge only fires on a deployment that is slow right now, so "no header appeared" would have proved
+nothing either way. The measurement above is the part that could be made to answer.
 
 ✅ **Already applied and NOT pending:** `providers.nim` was given `timeoutMs: 100000`. The figure is
 measured, not chosen — over 40 successful `nim` attempts the working band runs 559 ms to 96959 ms,

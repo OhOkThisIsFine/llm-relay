@@ -99,6 +99,13 @@ llm-relay must answer, per credential and per deployment: **how much was used, h
 and the rate.** Counting is unconditional and needs no published limit. Acting on counts is
 optional, always announced, and may only reorder.
 
+⚠ **One narrow exception, added by owner amendment 2026-08-30: a HEDGE may also DUPLICATE** — start
+the next candidate beside a slow in-flight attempt rather than after it
+([hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md) §7). It is bounded
+three ways, all owner decisions: free deployments only (`assessCost()`), the loser aborted the
+moment a winner commits, and the response announcing it. The amendment covers hedging and nothing
+else; a later term that wants to duplicate must be argued on its own merits.
+
 The ledger is **accounting, not custody**: it meters keys the operator already holds. It does not
 authorise the relay to obtain, store, mint, or centrally proxy credentials.
 

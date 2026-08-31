@@ -734,6 +734,58 @@ that check against your own traffic before tuning:
 node -e "const r=require(require('os').homedir()+'/.llm-relay/usage/recent.json');const v=r.rows.filter(x=>x.outcome==='success'&&x.tokens?.reported?.reportedOutput?.value>0).map(x=>x.latencyMs/x.tokens.reported.reportedOutput.value).sort((a,b)=>a-b);console.log('n',v.length,'p50',v[v.length>>1]?.toFixed(1),'p90',v[Math.floor(v.length*0.9)]?.toFixed(1))"
 ```
 
+#### Hedged attempts (`routing.hedge`)
+
+**On by default, and confined to FREE deployments.** When an attempt has been running longer than
+this deployment's own expected time, the relay starts the next candidate **beside** it instead of
+after it, and serves whichever answers first. The loser is aborted the moment a winner commits.
+
+⚠ **This is the one thing here that DUPLICATES a request rather than reordering the walk.** That is
+why it is confined to deployments the relay can establish are free: an unpriced deployment counts as
+paid, so a hedge can never spend money you did not expect to spend. The cost of that safety is that
+hedging silently will not fire on members whose prices nobody publishes.
+
+Why it exists: a timeout has to choose between abandoning a slow success and waiting out a hang, and
+on a real free pool the two are indistinguishable by duration — measured, successful requests on one
+provider ran from 559 ms to 96959 ms while a hang sat at the 120000 ms timeout, so a 25000 ms cap
+would have cut 22.5% of real successes. A hedge does not choose.
+
+- A primary that answers **inside** the delay starts no hedge at all, so a healthy pool never
+  duplicates.
+- A primary that answers with a status the walk would fail over from (a 429, say) does **not** win —
+  it would have been failed over anyway, so the hedge is left running.
+- The hedge is the candidate the walk was going to try next. Nothing competes with your pool order.
+- A hedge with no next candidate degrades to the ordinary serial wait.
+
+```json
+"routing": {
+  "hedge": { "enabled": true, "floorMs": 20000, "margin": 2, "minSamples": 5 }
+}
+```
+
+`"hedge": false` is shorthand for `{ "enabled": false }` and restores the previous behaviour
+exactly. An unknown key is a hard config error rather than a silently ignored one.
+
+Every hedge is announced — whether it won or lost, because the duplication happened either way:
+
+```
+x-llm-relay-hedged: nim/deepseek-ai/deepseek-v4-flash -> nim/nvidia/nemotron-3-ultra-550b-a55b (hedge won after 20000ms, floor)
+```
+
+The last field is the rung of evidence that set the delay: `per-token` from real request samples,
+`absolute` from probe samples, or `floor` when this deployment is unmeasured. ⚠ Unlike
+`routing.latency`, an **unmeasured deployment IS hedged**. The two rules point opposite ways on
+purpose: a demotion punishes, so with no evidence it must do nothing, while a hedge only starts an
+attempt the walk was already going to make.
+
+⚠ The three tunables are **placeholders awaiting calibration**, unlike `routing.latency`'s
+measured 250 ms/token. The population they need — how long an attempt runs before its first token —
+is not recorded yet. Watch the header's basis field on your own traffic before tuning them.
+
+⚠ An aborted loser teaches the circuit breaker nothing, so a hedged request does not record the
+slowness it routed around. Requests that do **not** hedge still cool a slow deployment for as long
+as it wasted, which is what keeps that slowness visible.
+
 #### Hard caps refuse, loudly
 
 Everything above demotes — and then there is the one thing that may refuse: an operator-declared
