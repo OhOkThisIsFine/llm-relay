@@ -73,9 +73,10 @@ threaded through, not just that an attempt was aborted: `accounting.ts` filters 
 
 ⚠ **Do NOT run that experiment against the live daemon's state.** The second relay needs
 `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` pointed at a scratch tree, AND every cache-kind artifact
-pre-created there — `relayStatePath` falls back to the legacy path whenever the XDG one is ABSENT,
-so a missing file puts a second writer on `~/.llm-relay/usage/`. Leave `.env` and `keystore.json`
-absent on purpose: they fall back to the live copies, which the proxy only ever reads.
+pre-created there — `relayStatePath` returns the LEGACY path when the XDG one is ABSENT and the
+legacy one EXISTS, which is every established install, so a file you forget to pre-create puts a
+second writer on `~/.llm-relay/usage/`. Leave `.env` and `keystore.json` absent on purpose: that
+same rule then resolves them to the live copies, which the proxy only ever reads.
 
 Earlier the same day, v0.63.1 → v0.66.0 (eight releases); the lap entries below say what each
 carried.
