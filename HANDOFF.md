@@ -2,45 +2,43 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-31 (v0.68.2)
+## 0. State as of 2026-08-31 (v0.68.3)
 
-Feature implementation `fcf7b26` shipped in release `e5fcdd8` / tag `v0.68.1`. Docs clarification
-`3fd3a51` shipped in release `80015fc` / tag `v0.68.2`; publish run
-[33415315153](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33415315153) succeeded.
-Registry latest and the reinstalled global executable report `0.68.2`.
-
-The daemon remains PID 46012, the v0.68.1-started process, deliberately: v0.68.2 changes only
-bundled skill wording and package version metadata, not proxy code, and restarting would discard
-in-memory routing observations.
+Windows dispatch hardening commit `5554bfa` shipped in release commit `9d62a6d` / tag `v0.68.3`.
+Publish run [33428810696](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428810696)
+succeeded. The npm registry and reinstalled global executable both report `0.68.3`.
 
 Current live state:
 
-- The daemon was restarted from the global install (PID 46012).
-- A warm `pool/low` request returned HTTP 200 from `nim/moonshotai/kimi-k3` and carried a hedge
-  primary-won header.
-- CLI telemetry and HTTP `/telemetry` match apart from volatile timestamps and cooldown countdowns;
-  `telemetry --bogus` exits 1.
-- Package smoke passed, including the packaged artifact check and global-bin reinstall.
+- The daemon was restarted through the hidden Startup launcher from the global install and listens
+  on `127.0.0.1:8791` as PID 13408. A 12-second top-level-window watch around the restart observed
+  zero new visible windows.
+- The installed config retained SHA-256
+  `9C42B7684FF4239CCC1B907F29E5C4E84DBDC37939D806A128032EC4B61DB90E` across reinstall.
+- All 12 AGY ladder rows remain disabled and `routing.laneProbe.enabled` remains false. Do not run
+  AGY directly, including version/help probes, or re-enable it without an owner-authorized isolated
+  run that records every top-level window by PID, class, and ancestry.
+- A forced non-AGY MCP warm-up completed through `claude-free-pool` (`pool/medium`) with exit 0.
+  Telemetry reports three measured healthy providers and twelve unmeasured providers; `null` health
+  remains unknown, not unhealthy.
 
-Live-surface fixes and documentation:
-
-- Hedge decisions now count measurable samples only; the exact `/v1/messages` route rejects
-  lookalike paths.
-- CLI options are strict; telemetry prefers the live relay and falls back locally; mutating command
-  classification covers dispatch exhaustion and `delegate-gate --fix`.
-- MCP reports explicit lane quota/rate evidence once before exposing completion, including AGY's
-  exit-zero `Individual quota reached` envelope, while successful answer prose remains success.
-- CLI/reference/skill documentation covers corrected commands, aliases, routes, and the Codex
-  desktop custom-provider limitation. Details:
-  [live-surface lap report](docs/live-surface-lap-2026-08-31.md).
+The dispatch result and machine repairs are in
+[dispatch-smoothness-2026-08-31.md](docs/dispatch-smoothness-2026-08-31.md). A forensic audit after
+the user's terminal report found one concurrent delegate had directly invoked `agy --version` and
+`agy --help`. Either console-subsystem probe can explain the transient terminal, so that observation
+does not isolate the MCP lane; the quarantine remains the safe state.
 
 Verification evidence:
 
-- Server suite: 144 files, 2,839 passed, 5 skipped.
-- Dashboard suite: 5 files, 32 passed.
-- Package smoke and registry/global/daemon/live checks passed as listed above.
-- The backlog is empty: [docs/backlog.md](docs/backlog.md). No owner decision is pending; the
-  immediate next step is normal maintenance.
+- Focused dispatch tests: 51 passed.
+- Full server suite: 145 files, 2,841 passed, 5 skipped.
+- Dashboard suite: 5 files, 32 passed; package smoke passed.
+- Feature CI run
+  [33428200248](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428200248) and the publish
+  run above both succeeded.
+- The only immediate next step is the owner-authorized AGY focus-safety revalidation tracked in the
+  machine-wide backlog at `C:\Code\docs\backlog.md`. Until then, use relay pools, Codex, Claude, or
+  OpenCode instead.
 
 Codebase-memory graph transport was unavailable for this handoff; exact source and test reads were
 used instead, so no exhaustive graph claim is made.

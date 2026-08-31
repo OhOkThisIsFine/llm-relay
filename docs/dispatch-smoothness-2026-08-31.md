@@ -71,14 +71,19 @@ check completed with exit 0 and emitted its diagnostic line.
 ### 4. AGY was quarantined after a contradictory live observation
 
 A forced MCP AGY dispatch returned a valid answer and did not relaunch the Antigravity GUI, but the
-user observed a transient terminal window during the run. A process scan after completion could
-not identify a process that had already exited. The earlier conclusion "no GUI process afterward"
-therefore did not prove focus safety.
+user observed a transient terminal window while several delegated investigations were concurrent.
+A forensic audit of every delegate then found one had directly run both `agy --version` and
+`agy --help`; no other delegate launched AGY or another peer-agent CLI. The AGY CLI log was last
+written at `2026-08-31 11:40:30`. Because `agy.exe` is a console-subsystem executable, either direct
+probe is itself sufficient to explain a transient console from a windowless parent. The observation
+therefore cannot be attributed specifically to the MCP AGY lane. A process scan after completion
+could not identify the already-exited window owner, so focus safety remains unproven.
 
 The live mitigation is deliberately broader than `enabled: false` on ladder rows:
 
 - all 12 AGY entries across `low`, `medium`, `high`, and `xhigh` are disabled;
 - `routing.laneProbe.enabled` is false because the background cadence probes disabled rows too;
+- direct AGY invocation is prohibited during quarantine, including `agy --version` and `agy --help`;
 - the hidden relay service was restarted and resumed listening on `127.0.0.1:8791`;
 - a top-level-window watcher records any new window's class, PID, and process ancestry.
 
@@ -110,3 +115,12 @@ command into arbitrary shell automation loses the MCP server's process guarantee
 
 The AGY quarantine remains pending one explicitly authorized, instrumented revalidation. Until
 then the cleanest behavior is to skip AGY and use the relay pool, Codex, Claude, or OpenCode route.
+
+## Release and live verification
+
+- Implementation commit `5554bfa` and release commit `9d62a6d` shipped as `v0.68.3`.
+- Feature CI run `33428200248` and publish run `33428810696` succeeded.
+- The npm registry and reinstalled global binary report `0.68.3`.
+- Reinstall preserved the config hash and the 12-row AGY quarantine.
+- The hidden Startup restart produced PID 13408 and zero new visible windows during a 12-second watch.
+- Non-AGY MCP job `job-0005` completed through `claude-free-pool` (`pool/medium`) with exit 0.
