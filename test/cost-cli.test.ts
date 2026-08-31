@@ -210,7 +210,11 @@ describe("llm-relay cost CLI", () => {
     // current. The first version of this change did exactly that and this test caught it.
     const { output } = await runCost(["--window", "1h"], usageDir);
     expect(output).toContain("Covering 2026-08-20T11:34:00.000Z → 2026-08-20T12:34:00.000Z (UTC).");
-    expect(output).not.toContain("are not counted");
+    // ⚠ Match the phrase both GRAMMATICAL forms share. Asserting the plural "are not counted" let
+    // the rounding defect through: `round` turns this 56-second gap into 1, which prints the
+    // SINGULAR "1 minute is not counted" — the very output this test exists to forbid, wearing a
+    // spelling the assertion did not look for. An independent auditor caught that on 2026-08-31.
+    expect(output).not.toContain("not counted");
   });
 
   it("groups by model when --by model is given", async () => {
