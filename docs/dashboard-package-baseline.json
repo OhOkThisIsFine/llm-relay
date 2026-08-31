@@ -15,14 +15,14 @@
     "cssBytes": 11841,
     "htmlBytes": 383,
     "manifestBytes": 185,
-    "packBytes": 891027,
-    "unpackedBytes": 4690084,
-    "packageEntries": 359
+    "packBytes": 896640,
+    "unpackedBytes": 4706942,
+    "packageEntries": 362
   },
   "ceilings": {
     "dashboardRawBytes": 291600,
-    "packBytes": 895600,
-    "unpackedBytes": 4713800,
-    "packageEntries": 364
+    "packBytes": 901100,
+    "unpackedBytes": 4730500,
+    "packageEntries": 367
   }
 }

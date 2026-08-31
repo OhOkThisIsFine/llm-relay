@@ -51,13 +51,41 @@ export function getAvg(pings: PingRecord[]): number {
   return Math.round(sum / measurable.length);
 }
 
+/**
+ * The ONE quantile convention in this file: `ceil(n * q) - 1`, clamped, over an ascending array.
+ *
+ * ⚠ It was written out four times before this existed, and every copy was identical — which is the
+ * "hand-copied" shape this repo keeps paying for. Sharing it also fixes the copies in lockstep if
+ * the convention ever changes.
+ *
+ * ⚠ Worth knowing when reading any figure it produces: for `n <= 20` the index is `n - 1`, so a
+ * "p95" over a small window IS the maximum sample. That is why one slow outlier moves these
+ * statistics so far, and it is measured behaviour, not a rounding bug.
+ */
+function quantileOf(ascending: number[], q: number): number {
+  if (ascending.length === 0) return Infinity;
+  return ascending[Math.max(0, Math.ceil(ascending.length * q) - 1)]!;
+}
+
+/** Ascending measurable latencies. `MEASURABLE_CODES` is a LATENCY set, not a success set. */
+function measurableMs(pings: PingRecord[]): number[] {
+  return pings.filter((p) => MEASURABLE_CODES.has(p.code)).map((p) => p.ms).sort((a, b) => a - b);
+}
+
 /** Calculate 95th percentile latency from measurable pings. Returns Infinity if none. */
 export function getP95(pings: PingRecord[]): number {
-  const measurable = pings.filter((p) => MEASURABLE_CODES.has(p.code));
-  if (measurable.length === 0) return Infinity;
-  const sorted = measurable.map((p) => p.ms).sort((a, b) => a - b);
-  const idx = Math.ceil(sorted.length * 0.95) - 1;
-  return sorted[Math.max(0, idx)]!;
+  return quantileOf(measurableMs(pings), 0.95);
+}
+
+/**
+ * 90th percentile latency from measurable pings. Returns Infinity if none.
+ *
+ * Added for the hedge trigger, which asks "is this attempt slower than this deployment normally
+ * is?" — a question p90 answers better than p95, because p95 over a short window is the worst
+ * sample and would almost never be exceeded.
+ */
+export function getP90(pings: PingRecord[]): number {
+  return quantileOf(measurableMs(pings), 0.9);
 }
 
 /**
@@ -78,6 +106,34 @@ export function getP95(pings: PingRecord[]): number {
  * ran 687.8.
  */
 export function getP95MsPerToken(pings: PingRecord[]): number {
+  return quantileOf(msPerTokenRates(pings), 0.95);
+}
+
+/**
+ * 90th-percentile ms per output token — the hedge trigger's signal.
+ *
+ * Same filter and same convention as the p95 above, so the two can never describe different
+ * populations. p90 rather than p95 because the question is "is THIS attempt slower than this
+ * deployment normally is?", and a p95 taken over a short window is the worst sample ever seen,
+ * which almost nothing exceeds.
+ */
+export function getP90MsPerToken(pings: PingRecord[]): number {
+  return quantileOf(msPerTokenRates(pings), 0.9);
+}
+
+/**
+ * The ONE definition of "which samples carry a per-token rate, and what is that rate" — ascending.
+ *
+ * ⚠ REQUEST samples only, and only those carrying a reported token count. A probe asks for one
+ * token, so its ms/token is nearly all fixed overhead and is not comparable with a generation.
+ *
+ * ⚠ **`getP95MsPerToken`, `getP90MsPerToken` and `countMsPerTokenSamples` all read THIS**, rather
+ * than repeating the filter. They used to repeat it, with a comment saying the copies "must stay
+ * identical" — a requirement nothing enforced. Sharing one filter is what actually enforces it, and
+ * it matters because a count taken over a WIDER set than the statistic it describes is how a sample
+ * floor comes to admit a figure resting on one measurement.
+ */
+function msPerTokenRates(pings: PingRecord[]): number[] {
   const rates: number[] = [];
   for (const p of pings) {
     if (p.source !== "request") continue;
@@ -87,31 +143,19 @@ export function getP95MsPerToken(pings: PingRecord[]): number {
     if (typeof p.ms !== "number" || !Number.isFinite(p.ms) || p.ms < 0) continue;
     rates.push(p.ms / tokens);
   }
-  if (rates.length === 0) return Infinity;
-  rates.sort((a, b) => a - b);
-  const idx = Math.ceil(rates.length * 0.95) - 1;
-  return rates[Math.max(0, idx)]!;
+  return rates.sort((a, b) => a - b);
 }
 
 /**
- * How many samples actually back `getP95MsPerToken`.
+ * How many samples actually back `getP95MsPerToken` and `getP90MsPerToken`.
  *
- * ⚠ It repeats that function's filter deliberately, and the two must stay identical: a count taken
- * over a WIDER set than the statistic it describes is how a sample floor comes to admit a figure
- * resting on one measurement.
+ * ⚠ It used to REPEAT their filter, under a comment saying the copies "must stay identical" — a
+ * requirement nothing enforced. All three now read `msPerTokenRates`, which is what enforces it.
+ * The reason is unchanged: a count taken over a WIDER set than the statistic it describes is how a
+ * sample floor comes to admit a figure resting on one measurement.
  */
 export function countMsPerTokenSamples(pings: PingRecord[]): number {
-  return pings.filter(
-    (p) =>
-      p.source === "request" &&
-      MEASURABLE_CODES.has(p.code) &&
-      typeof p.tokens === "number" &&
-      Number.isFinite(p.tokens) &&
-      p.tokens > 0 &&
-      typeof p.ms === "number" &&
-      Number.isFinite(p.ms) &&
-      p.ms >= 0,
-  ).length;
+  return msPerTokenRates(pings).length;
 }
 
 /** Calculate latency standard deviation (jitter) in ms from measurable pings. */
