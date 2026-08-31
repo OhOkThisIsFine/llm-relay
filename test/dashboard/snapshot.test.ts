@@ -35,6 +35,8 @@ interface AttemptPlan {
   readonly tokens?: TokenFactsInput;
   readonly latencyMs?: number | null;
   readonly commitMs?: number;
+  /** The relay abandoned this attempt — a hedge loser (D3). Stated, never inferred. */
+  readonly abandonedByRelay?: boolean;
 }
 
 function record(
@@ -79,6 +81,7 @@ function record(
       endedAt: options.endedAt,
       latencyMs: plan.latencyMs ?? 20,
       ...(plan.tokens === undefined ? {} : { tokens: plan.tokens }),
+      ...(plan.abandonedByRelay === undefined ? {} : { abandonedByRelay: plan.abandonedByRelay }),
     });
   }
   const outcome = options.outcome ?? "success";
@@ -695,6 +698,61 @@ describe("dashboard snapshot projection", () => {
     const filtered = await createDashboardSnapshotReadPort({ accounting: reader, relayVersion: "test", now: () => "2026-08-20T12:00:00.000Z" }).readSnapshot({ window: "lifetime", includeRepair: true, provider: "openai" });
     expect(filtered.summary.requests).toBe(0);
     expect(filtered.panelCoverage.find((coverage) => coverage.panel === "summary")?.state).toBe("unavailable");
+    store.close();
+  });
+
+  it("cost roll-up reports the abandoned hedge beside the total, never inside it", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    record(store, {
+      endedAt: "2026-08-20T11:00:00.000Z",
+      pricePort: () => ({ pricePerMillionIn: 2, pricePerMillionOut: 8, priceSource: "provider" }),
+      outcome: "success",
+      attempts: [
+        {
+          provider: "slow", model: "m-slow", outcome: "cancelled", failureKind: "aborted",
+          abandonedByRelay: true,
+          tokens: { reported: { inputTokens: 1_000, outputTokens: 0 } },
+        },
+        { provider: "fast", model: "m-fast", outcome: "success", tokens: { reported: { inputTokens: 1_000, outputTokens: 0 } } },
+      ],
+    });
+    store.flush();
+
+    const port = createDashboardSnapshotReadPort({
+      accounting: store.reader(), relayVersion: "test", now: () => "2026-08-20T12:00:00.000Z",
+    });
+    const report = await port.readCostReport({ window: "lifetime", includeRepair: false });
+
+    // The abandoned attempt is reported...
+    expect(report.abandoned.providerPublishedReported.amountMicrousd).toBe(2_000);
+    // ...and the TOTAL is exactly the winner's, unchanged by it. `total` answers "what the answers
+    // you received cost"; adding the two answers "what those requests cost".
+    expect(report.total.spend.providerPublishedReported.amountMicrousd).toBe(2_000);
+    // The lower-bound marker stays OFF: folding an estimated-basis loser into the total would have
+    // set it for every hedged request without one amount changing.
+    expect(report.total.spend.partiallyPricedRequests).toBe(0);
+    expect(report.total.requests).toBe(1);
+    store.close();
+  });
+
+  it("cost roll-up reports empty abandoned cells when nothing was hedged", async () => {
+    const store = createAccountingStore({ rootDir: root() });
+    record(store, {
+      endedAt: "2026-08-20T11:00:00.000Z",
+      pricePort: () => ({ pricePerMillionIn: 2, pricePerMillionOut: 8, priceSource: "provider" }),
+      outcome: "success",
+      attempts: [{ provider: "fast", model: "m-fast", outcome: "success", tokens: { reported: { inputTokens: 1_000, outputTokens: 0 } } }],
+    });
+    store.flush();
+
+    const report = await createDashboardSnapshotReadPort({
+      accounting: store.reader(), relayVersion: "test", now: () => "2026-08-20T12:00:00.000Z",
+    }).readCostReport({ window: "lifetime", includeRepair: false });
+
+    // Null, never $0: the renderer uses exactly this to decide the table is not worth printing.
+    expect(report.abandoned.providerPublishedReported.amountMicrousd).toBeNull();
+    expect(report.abandoned.providerPublishedReported.observedAt).toBeNull();
+    expect(report.total.spend.providerPublishedReported.amountMicrousd).toBe(2_000);
     store.close();
   });
 

@@ -201,6 +201,14 @@ interface MutableStats {
   partiallyPricedRequests: number;
   readonly tokens: MutableTokens;
   readonly spend: MutableSpend;
+  /**
+   * Spend on serve attempts the relay abandoned — a hedge loser (D3).
+   *
+   * ⚠ Accumulated beside `spend`, never into it. `spend` answers "what the answer you received
+   * cost"; the two added answer "what this request cost". Only `readCostReport` projects this
+   * today — the dashboard snapshot deliberately does not (owner decision 2026-08-30).
+   */
+  readonly abandonedSpend: MutableSpend;
   readonly latency: MutableMetric;
   readonly commit: MutableMetric;
   readonly health: ProjectionHealth;
@@ -335,6 +343,7 @@ function newStats(): MutableStats {
     partiallyPricedRequests: 0,
     tokens: newTokens(),
     spend: newSpend(),
+    abandonedSpend: newSpend(),
     latency: newMetric(),
     commit: newMetric(),
     health: newHealth(),
@@ -543,6 +552,9 @@ function addRequestAggregate(target: MutableStats, aggregate: AccountingAggregat
   // Request-scoped spend cells ride beside request tokens; a legacy shard without
   // them contributes nothing rather than implying zero.
   mergeSpend(target.spend, aggregate.requestSpend, target.health);
+  // Beside it, never into it (D3). A legacy shard carries no `abandonedSpend` at all, and
+  // `mergeSpend` returns on an absent source rather than implying zero.
+  mergeSpend(target.abandonedSpend, aggregate.abandonedSpend, target.health);
   mergeMetric(target.latency, aggregate.latency, target.health);
   mergeMetric(target.commit, aggregate.commit, target.health);
 }
@@ -1725,6 +1737,9 @@ export function createDashboardSnapshotReadPort(options: DashboardSnapshotReadOp
           unpricedAttempts: repair.unpricedAttempts,
           spend: repairShareCells(repair.spend),
         },
+        // The same four cells as the repair share, and unlike `repair` it is never null: an
+        // all-zero reading honestly means "nothing was hedged in this window".
+        abandoned: repairShareCells(total.abandonedSpend),
         coverage: coverageFor("spend", health).state,
         coverageReason: coverageFor("spend", health).reason,
         recentMinutesMayLag: true,

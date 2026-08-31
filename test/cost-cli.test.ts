@@ -43,6 +43,8 @@ describe("llm-relay cost CLI", () => {
     readonly model: string;
     readonly credentialId: string;
     readonly tokens?: TokenFactsInput;
+    /** The relay abandoned this serve attempt — a hedge loser (D3). */
+    readonly abandonedByRelay?: boolean;
   }
 
   /**
@@ -87,9 +89,11 @@ describe("llm-relay cost CLI", () => {
       });
       // The relay marks the winning serve attempt as committed before responding;
       // without this the commit metric reads unknown and coverage degrades to partial.
-      if (plan.role === "serve") attempt.markCommitted({ commitMs: 5 });
+      // An abandoned loser never commits — nothing of it reached the caller.
+      if (plan.role === "serve" && plan.abandonedByRelay !== true) attempt.markCommitted({ commitMs: 5 });
       attempt.complete({
-        outcome: "success",
+        outcome: plan.abandonedByRelay === true ? "cancelled" : "success",
+        ...(plan.abandonedByRelay === true ? { failureKind: "aborted" as const, abandonedByRelay: true } : {}),
         endedAt: AT,
         latencyMs: 20,
         ...(plan.tokens === undefined ? {} : { tokens: plan.tokens }),
@@ -204,6 +208,30 @@ describe("llm-relay cost CLI", () => {
     expect(withRepair.output).toMatch(/Tool-call repair share[\s\S]*?\n1\b/);
     // The serve-side row keeps only the winning serve attempt's priced figure.
     expect(withRepair.output).toContain("$0.0020");
+  });
+
+  it("shows the abandoned hedge as its own table, and only when one happened", async () => {
+    const quiet = tempUsageDir();
+    seed(quiet, {
+      pricePort: PUBLISHED_PRICE,
+      attempts: [{ role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    const withoutHedge = await runCost([], quiet);
+    // An always-printed table of four "-" cells would be noise on every ordinary run.
+    expect(withoutHedge.output).not.toContain("Hedged attempts the relay abandoned");
+
+    const hedged = tempUsageDir();
+    seed(hedged, {
+      pricePort: PUBLISHED_PRICE,
+      attempts: [
+        { role: "serve", provider: "kilo", model: "z-ai/glm-5.2", credentialId: "kilo#primary", abandonedByRelay: true, tokens: { reported: { inputTokens: 1000, outputTokens: 0 } } },
+        { role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } },
+      ],
+    });
+    const withHedge = await runCost([], hedged);
+    expect(withHedge.output).toContain("Hedged attempts the relay abandoned");
+    // It states plainly that the totals above exclude it, so the two are never read as one number.
+    expect(withHedge.output).toContain("NOT included in the totals above");
   });
 
   it("--json emits a contract-valid dashboard.cost.v1 object", async () => {

@@ -64,7 +64,7 @@ import {
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
 import { isCooldownClearResult, type CooldownClearTargetKey } from "./cooldown-clear.js";
 import { createDashboardSnapshotReadPort, type CostReportQuery } from "./dashboard-snapshot.js";
-import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp } from "./dashboard-contract.js";
+import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp, SHARE_CELL_KEYS, type CostReportV1, type CostRowV1 } from "./dashboard-contract.js";
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
 import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { flushProbeCache } from "./ping/probe-cache.js";
@@ -1719,6 +1719,87 @@ export async function runCostCommand(dependencies: CostCommandDependencies = {})
   }
 }
 
+const COST_BY_HEADING = {
+  credential: "Credential",
+  model: "Provider/model",
+  client: "Client",
+  provider: "Provider",
+} as const satisfies Record<CostReportV1["by"], string>;
+
+/** One dimension row (or the TOTAL row) as printable cells. */
+function costRowCells(label: string, row: CostRowV1): TableRow {
+  return [
+    label,
+    String(row.requests),
+    String(row.pricedRequests),
+    ...SHARE_CELL_KEYS.map((key) => `${costCell(row.spend[key])} (${costCellBasis(row.spend[key])})`),
+    String(row.spend.unpricedRequests),
+    String(row.spend.partiallyPricedRequests),
+  ];
+}
+
+function costTableRows(report: CostReportV1): TableRow[] {
+  return [
+    [
+      COST_BY_HEADING[report.by],
+      "Requests",
+      "Priced",
+      "Published/reported",
+      "Published/estimated",
+      "Reference/reported",
+      "Reference/estimated",
+      "Unpriced",
+      "Partial",
+    ],
+    ...report.rows.map((row) => costRowCells(row.key, row)),
+    costRowCells("TOTAL", report.total),
+  ];
+}
+
+/** The repair-share table, or null when the window could not prove the serve/repair split. */
+function writeRepairShare(report: CostReportV1, write: (message: string) => void): void {
+  const share = report.repair;
+  if (share === null) return;
+  const rows: TableRow[] = [
+    ["Repair attempts", "Priced", "Published/reported", "Published/estimated", "Reference/reported", "Reference/estimated", "Unpriced"],
+    [
+      String(share.attempts),
+      String(Math.max(0, share.attempts - share.unpricedAttempts)),
+      ...SHARE_CELL_KEYS.map((key) => `${costCell(share.spend[key])} (${costCellBasis(share.spend[key])})`),
+      String(share.unpricedAttempts),
+    ],
+  ];
+  write(`\nTool-call repair share (role:"repair" attempts only):\n${formatTextTable(rows)}\n`);
+}
+
+/**
+ * The abandoned-hedge table, or null when nothing was abandoned in this window.
+ *
+ * ⚠ Printed only when something actually was. Four "-" cells on every ordinary run would be noise,
+ * and the reader learns nothing from a table that is always empty.
+ *
+ * ⚠ The presence test is EVIDENCE in a cell, not a count: the wire cells carry no contribution
+ * count, and the figure deliberately carries no counter of its own. `observedAt` is tested beside
+ * the amount because a cell whose running sum overflowed reports a null amount while still having
+ * had contributions — treating that as "nothing happened" would hide exactly the busiest case.
+ */
+function writeAbandonedShare(report: CostReportV1, write: (message: string) => void): void {
+  const seen = SHARE_CELL_KEYS.some((key) => {
+    const cell = report.abandoned[key];
+    return cell.amountMicrousd !== null || cell.observedAt !== null;
+  });
+  if (!seen) return;
+  const rows: TableRow[] = [
+    ["Published/reported", "Published/estimated", "Reference/reported", "Reference/estimated"],
+    SHARE_CELL_KEYS.map((key) => `${costCell(report.abandoned[key])} (${costCellBasis(report.abandoned[key])})`),
+  ];
+  write(
+    `\nHedged attempts the relay abandoned (a hedge loser; NOT included in the totals above):\n` +
+      `${formatTextTable(rows)}\n` +
+      `The totals above are what the answers you received cost. Add this table for what the requests cost.\n`,
+  );
+}
+
 /** Human rendering of one cost report: cells side by side, never blended into one total. */
 function renderCostReport(
   report: Awaited<ReturnType<ReturnType<typeof createDashboardSnapshotReadPort>["readCostReport"]>>,
@@ -1733,41 +1814,7 @@ function renderCostReport(
     return;
   }
 
-  const rows: TableRow[] = [
-    [
-      report.by === "credential" ? "Credential" : report.by === "model" ? "Provider/model" : report.by === "client" ? "Client" : "Provider",
-      "Requests",
-      "Priced",
-      "Published/reported",
-      "Published/estimated",
-      "Reference/reported",
-      "Reference/estimated",
-      "Unpriced",
-      "Partial",
-    ],
-    ...report.rows.map((row): TableRow => [
-      row.key,
-      String(row.requests),
-      String(row.pricedRequests),
-      `${costCell(row.spend.providerPublishedReported)} (${costCellBasis(row.spend.providerPublishedReported)})`,
-      `${costCell(row.spend.providerPublishedEstimated)} (${costCellBasis(row.spend.providerPublishedEstimated)})`,
-      `${costCell(row.spend.referenceReported)} (${costCellBasis(row.spend.referenceReported)})`,
-      `${costCell(row.spend.referenceEstimated)} (${costCellBasis(row.spend.referenceEstimated)})`,
-      String(row.spend.unpricedRequests),
-      String(row.spend.partiallyPricedRequests),
-    ]),
-    [
-      "TOTAL",
-      String(report.total.requests),
-      String(report.total.pricedRequests),
-      `${costCell(report.total.spend.providerPublishedReported)} (${costCellBasis(report.total.spend.providerPublishedReported)})`,
-      `${costCell(report.total.spend.providerPublishedEstimated)} (${costCellBasis(report.total.spend.providerPublishedEstimated)})`,
-      `${costCell(report.total.spend.referenceReported)} (${costCellBasis(report.total.spend.referenceReported)})`,
-      `${costCell(report.total.spend.referenceEstimated)} (${costCellBasis(report.total.spend.referenceEstimated)})`,
-      String(report.total.spend.unpricedRequests),
-      String(report.total.spend.partiallyPricedRequests),
-    ],
-  ];
+  const rows = costTableRows(report);
   // The lifetime window declines the serve/repair split (month rollups mix both roles in
   // one figure), so "--include-repair" cannot be honoured there: announcing "repair
   // included" while printing no share table would claim an answer the report does not have.
@@ -1778,22 +1825,8 @@ function renderCostReport(
   }
   write(`${formatTextTable(rows)}\n`);
 
-  if (report.repair !== null) {
-    const share = report.repair;
-    const repairRows: TableRow[] = [
-      ["Repair attempts", "Priced", "Published/reported", "Published/estimated", "Reference/reported", "Reference/estimated", "Unpriced"],
-      [
-        String(share.attempts),
-        String(Math.max(0, share.attempts - share.unpricedAttempts)),
-        `${costCell(share.spend.providerPublishedReported)} (${costCellBasis(share.spend.providerPublishedReported)})`,
-        `${costCell(share.spend.providerPublishedEstimated)} (${costCellBasis(share.spend.providerPublishedEstimated)})`,
-        `${costCell(share.spend.referenceReported)} (${costCellBasis(share.spend.referenceReported)})`,
-        `${costCell(share.spend.referenceEstimated)} (${costCellBasis(share.spend.referenceEstimated)})`,
-        String(share.unpricedAttempts),
-      ],
-    ];
-    write(`\nTool-call repair share (role:"repair" attempts only):\n${formatTextTable(repairRows)}\n`);
-  }
+  writeRepairShare(report, write);
+  writeAbandonedShare(report, write);
 
   if (report.coverage === "partial") {
     // "partial" means the store held (or should have held) data this report could not

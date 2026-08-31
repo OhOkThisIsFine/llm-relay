@@ -1865,7 +1865,15 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
   repair attempts are excluded from every row. Under `--window all` the lifetime rollups mix serve
   and repair spend in one figure, so the split cannot be proven: the command says so instead of
   claiming "repair included", and a day-bounded window gives the share.
-- `--json` emits the same numbers as a stable `dashboard.cost.v1` object.
+- **Hedged attempts the relay abandoned get their own table**, printed only when one happened. When
+  `routing.hedge` starts a second candidate beside a slow one, the loser is aborted — but the prompt
+  really was sent, so it really was spent. That figure is **not** inside the totals above it: the
+  totals are what the answers you received cost, and the two added are what those requests cost. The
+  table says so in prose, so the two are never read as one number. The split is deliberate — an
+  abandoned attempt is priced from an estimated input count, so folding it into the totals would
+  mark every hedged request's amounts as a lower bound without any amount changing.
+- `--json` emits the same numbers as a stable `dashboard.cost.v1` object, with the abandoned figure
+  under `abandoned` beside `total`.
 - A store with no data yet prints "No accounting data" and exits 0; only a corrupt or unreadable
   store reports failure; a malformed flag prints a usage line and exits 1.
 - "Coverage: partial" means the store held (or should have held) data this report omits — never a

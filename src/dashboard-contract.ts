@@ -362,6 +362,27 @@ export interface CostReportV1 {
    * attempt spend in one figure, so the split cannot be proven there.
    */
   readonly repair: RepairShareV1 | null;
+  /**
+   * What this window spent on serve attempts the relay ABANDONED — a hedge loser (owner decision
+   * D3, 2026-08-30). Same four provenance-labelled cells as {@link RepairShareV1.spend}.
+   *
+   * ⚠ **This is NOT included in {@link CostReportV1.total}, and that is the contract.** `total`
+   * answers "what the answers you received cost"; `total.spend + abandoned` answers "what those
+   * requests cost". Folding it into `total` was rejected on three measurements: an abandoned
+   * attempt is estimated-basis with coverage `input_only`, so it would flip
+   * {@link SpendTotalsV1.partiallyPricedRequests} — the LOWER-BOUND marker — on for essentially
+   * every hedged request without one amount changing; winner and loser are priced from the SAME
+   * request-level estimated input count, so a merged figure double-counts one measurement; and the
+   * token totals beside spend would then have to follow, which reaches the quota ledger and turns
+   * an accounting figure into a routing one.
+   *
+   * ⚠ It carries no counter of its own. Each cell's `known` is the number of abandoned attempts
+   * that contributed, which is the only count the aggregates can prove.
+   *
+   * All-zero cells are the honest reading for a window in which nothing was hedged, and for every
+   * shard written before this field existed.
+   */
+  readonly abandoned: RepairShareV1["spend"];
   /** Same coverage vocabulary as the dashboard panels; `empty` = no accounting data yet. */
   readonly coverage: Coverage;
   readonly coverageReason: CoverageReason | null;
@@ -781,16 +802,35 @@ const isSpendCellOnly = (
   isNullableNonNegativeInteger(value.amountMicrousd) &&
   value.priceSource === priceSource &&
   value.tokenBasis === tokenBasis;
+/**
+ * The four provenance-labelled cell keys, as ONE list.
+ *
+ * ⚠ Exported so a renderer walks these rather than hand-listing them a fifth time. The names were
+ * already written out in the type, the projection and two validators; a runtime list hand-copied
+ * from a closed set is this repo's most-repeated defect, so this is the list and
+ * `Omit<SpendTotalsV1, "unpricedRequests" | "partiallyPricedRequests">` is checked against it by
+ * `isShareSpendCells`.
+ */
+export const SHARE_CELL_KEYS = [
+  "providerPublishedReported",
+  "providerPublishedEstimated",
+  "referenceReported",
+  "referenceEstimated",
+] as const satisfies readonly (keyof RepairShareV1["spend"])[];
+
+/** The four provenance-labelled cells, shared by the repair share and the abandoned-hedge figure. */
+const isShareSpendCells = (value: unknown): value is RepairShareV1["spend"] =>
+  isExactRecord(value, SHARE_CELL_KEYS) &&
+  isSpendCellOnly(value.providerPublishedReported, "provider_published", "reported") &&
+  isSpendCellOnly(value.providerPublishedEstimated, "provider_published", "estimated") &&
+  isSpendCellOnly(value.referenceReported, "reference", "reported") &&
+  isSpendCellOnly(value.referenceEstimated, "reference", "estimated");
 const isRepairShareV1 = (value: unknown): value is RepairShareV1 =>
   isExactRecord(value, ["attempts", "unpricedAttempts", "spend"]) &&
   isNonNegativeInteger(value.attempts) &&
   isNonNegativeInteger(value.unpricedAttempts) &&
   value.unpricedAttempts <= value.attempts &&
-  isExactRecord(value.spend, ["providerPublishedReported", "providerPublishedEstimated", "referenceReported", "referenceEstimated"]) &&
-  isSpendCellOnly(value.spend.providerPublishedReported, "provider_published", "reported") &&
-  isSpendCellOnly(value.spend.providerPublishedEstimated, "provider_published", "estimated") &&
-  isSpendCellOnly(value.spend.referenceReported, "reference", "reported") &&
-  isSpendCellOnly(value.spend.referenceEstimated, "reference", "estimated");
+  isShareSpendCells(value.spend);
 export const isCostReportV1 = (value: unknown): value is CostReportV1 =>
   isExactRecord(value, [
     "schema",
@@ -803,6 +843,7 @@ export const isCostReportV1 = (value: unknown): value is CostReportV1 =>
     "rows",
     "total",
     "repair",
+    "abandoned",
     "coverage",
     "coverageReason",
     "recentMinutesMayLag",
@@ -817,6 +858,7 @@ export const isCostReportV1 = (value: unknown): value is CostReportV1 =>
   isBoundedArray(value.rows, DASHBOARD_MAX_DIMENSION_ROWS, isCostRowV1) &&
   isCostRowV1(value.total) &&
   isNullable(value.repair, isRepairShareV1) &&
+  isShareSpendCells(value.abandoned) &&
   isDashboardCoverage(value.coverage) &&
   isNullable(value.coverageReason, isDashboardCoverageReason) &&
   isBoolean(value.recentMinutesMayLag);

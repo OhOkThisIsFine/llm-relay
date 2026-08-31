@@ -9,25 +9,27 @@
 
 ## Open
 
-- **⚠ D3 — WHICH SURFACE shows a losing hedge's spend? (owner decision, open)** The recording half
-  shipped 2026-08-30: `RequestCompletedEvent.abandonedSpend`, the store fold into its own cells, and
-  the persisted `abandonedSpend` key. The figure is recorded and persisted, so it accrues history
-  from now on. It is **not yet projected** to any surface — a deliberate, named intermediate state,
-  not a bug.
+Nothing pending. Both entries that stood here on 2026-08-30 shipped the same day; their records are
+below, kept for the measurements and the constraints, not as work.
 
-  Options, all additive over the shipped storage:
-  - **(a) `llm-relay cost` only.** `CostReportV1` gains an `abandoned` cell group mirroring
-    `RepairShareV1` (`Omit<SpendTotalsV1, "unpricedRequests" | "partiallyPricedRequests">`), and the
-    CLI prints one line. The SPA reads `dashboard.snapshot.v1`, not `dashboard.cost.v1`, so it is
-    untouched. The smallest honest surface that makes D3 observable.
-  - **(b) Also the dashboard.** A new panel figure beside spend. ⚠ The SPA types its spend table as
-    `Omit<SpendTotalsV1, "unpricedRequests" | "partiallyPricedRequests">`, so a new key becomes an
-    unlabelled row — it must be excluded and rendered deliberately. `dashboard/tsconfig.json` is in
-    `npm run check`, so this cannot slip silently.
-  - **(c) Leave it recorded and unprojected.** Zero further work; the data is there when a surface
-    is wanted.
+## Closed
 
-  ⚠ **What will NOT happen, and why — one part of D3's literal wording cannot hold.** D3 said
+- ✅ **D3 — a losing hedge's spend is counted, and `llm-relay cost` shows it** (owner decision
+  2026-08-30, surface chosen the same day). Shipped in three parts:
+  `RequestCompletedEvent.abandonedSpend` (a LIST, never merged into one `AccountingSpend`), the
+  store fold into its own cells touching no counter, the persisted `abandonedSpend` optional key,
+  and `CostReportV1.abandoned` rendered by `llm-relay cost` as its own table.
+
+  **Surface chosen: `llm-relay cost` only.** The SPA reads `dashboard.snapshot.v1`, not
+  `dashboard.cost.v1`, so it is untouched. A dashboard panel remains available later and is not
+  needed by any measured case.
+
+  ⚠ **The table prints only when something was abandoned**, and the presence test is EVIDENCE in a
+  cell rather than a count: the wire cells carry no contribution count, and `observedAt` is tested
+  beside the amount because an overflowed running sum reports a null amount while still having had
+  contributions — reading that as "nothing happened" would hide exactly the busiest case.
+
+  ⚠ **One part of D3's literal wording did NOT hold, and this is the record of why.** D3 said
   `requestSpend` "becomes what this request actually cost". It does not, and three measurements say
   it must not:
   - an abandoned attempt is estimated-basis with coverage `input_only`, so folding it into
@@ -40,7 +42,8 @@
     routing one.
 
   So `requestSpend` keeps meaning "what the answer you received cost", and "what this request cost"
-  is `requestSpend + abandonedSpend`. Say so on whichever surface ships.
+  is `requestSpend + abandonedSpend`. The shipped table says exactly that in prose, so the two
+  figures cannot be read as one number.
 
   ⚠ One premise in the original handback is DISPROVED and should not be repeated: "an aborted loser
   has no observed tokens and therefore no spend at all". An aborted serve attempt always carries the
@@ -50,8 +53,6 @@
   **Property:** either `requestSpend` means "what this request cost" for every request, or it means
   "what the answer you received cost" — and whichever it means, the token totals beside it mean the
   same thing. Both still follow the winner-only rule, and they still agree.
-
-## Closed
 
 - ✅ **The breaker learns nothing when the CLIENT gives up first — SHIPPED** (found and closed
   2026-08-30). A client disconnect recorded the attempt as `cancelled`, and cancelled returned
