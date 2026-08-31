@@ -540,7 +540,7 @@ llm-relay models -p nim      # live roster per provider (listed ≠ servable —
 llm-relay keys               # check EVERY configured credential slot
 llm-relay pools --probe      # one completion per unique deployment, via one serviceable slot
 llm-relay ping               # latency/stability probe across providers
-llm-relay telemetry          # JSON health/quota report
+llm-relay telemetry          # provider-health/runtime-observation JSON (not dispatch quota JSON)
 ```
 
 Runtime endpoints on the running proxy: `/registry`, `/candidates`, `/offload?client=<name>` (GET/POST),
