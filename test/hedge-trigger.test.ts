@@ -137,6 +137,19 @@ describe("hedge trigger — the absolute rung reads PROBE samples only", () => {
     const d = ask({ elapsedMs: 25_000, tokensSeen: 0, pings });
     expect(d?.basis).toBe("floor");
   });
+
+  it("counts only MEASURABLE probes toward its floor, so one 200 among failures cannot unlock it", () => {
+    // ⚠ The floor must count the same set `getP90` measures. `MEASURABLE_CODES` is a LATENCY set
+    // (200/401), so four 503s carry no latency at all: they leave p90 resting on ONE sample.
+    // Four failures plus one slow 200 is five records but one measurement.
+    const pings = [...probes(4, 1_000, "503"), ...probes(1, 30_000)];
+    const d = ask({ elapsedMs: 30_000, tokensSeen: 0, pings });
+    // Counting all five reaches the absolute rung, and p90 over the single 200 sets the bar at
+    // 60 s — so a 30 s hang is NOT hedged, on the strength of one probe. The floor is the honest
+    // answer: one measurement is below `minSamples`, so no per-deployment statistic applies.
+    expect(d?.basis).toBe("floor");
+    expect(d?.thresholdMs).toBe(DEFAULT_HEDGE_FLOOR_MS);
+  });
 });
 
 describe("hedge trigger — an UNMEASURED deployment is hedged, unlike demotion", () => {

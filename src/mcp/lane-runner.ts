@@ -24,6 +24,8 @@
 import { exec, execFile, type ChildProcess } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { quoteCmdArg } from "../lane-probe.js";
+import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
+import { laneOfRung } from "../lane-manifest.js";
 
 /** Depth marker written into every child's environment, read back to bound recursion. */
 export const DEPTH_ENV = "LLM_RELAY_DISPATCH_DEPTH";
@@ -77,6 +79,91 @@ export interface LaneRunResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+}
+
+export interface DispatchedQuotaReport {
+  laneId: string;
+  tier: string | undefined;
+  outcome: "rate_limited" | "quota_exhausted";
+  retryAfterMs?: number;
+}
+
+/**
+ * Classify only positive quota evidence from a dispatched lane. Nonzero results use the same
+ * fail-safe classifier as probes. Exit-zero AGY JSON is special-cased because AGY can encode an
+ * error in its envelope; answer prose is never searched.
+ */
+export function classifyDispatchedResult(input: {
+  result: LaneRunResult;
+  laneId: string;
+  tier: string | undefined;
+  command: string;
+  args: readonly string[];
+}): DispatchedQuotaReport | undefined {
+  const { result } = input;
+  if (result.timedOut) return undefined;
+  // A signal-terminated child has no process verdict. Its buffered output may be partial or stale,
+  // so it cannot establish quota evidence even when the fragment resembles a structured envelope.
+  if (result.code === null) return undefined;
+  if (result.code !== null && result.code !== 0) {
+    const verdict = classifyLaneProbeOutput(result as LaneProbeSpawnResult);
+    if (verdict.kind !== "exhausted") return undefined;
+    return {
+      laneId: input.laneId,
+      tier: input.tier,
+      outcome: verdict.outcome,
+      ...(verdict.retryAfterMs === null ? {} : { retryAfterMs: verdict.retryAfterMs }),
+    };
+  }
+  if (laneOfRung(input.command, input.args)?.lane !== "agy") return undefined;
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(result.stdout);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(envelope)) return undefined;
+  const status = envelope["status"];
+  const errorText = errorPayloadText(envelope);
+  const exactSentinel = errorText.includes("Individual quota reached");
+  if (status !== "SUCCESS" && !errorText) return undefined;
+  // A successful envelope is trusted only for the one vendor sentinel. In particular, do not
+  // treat a successful answer (or incidental metadata) mentioning quota as evidence.
+  if (status === "SUCCESS" && !exactSentinel) return undefined;
+  if (!exactSentinel && !errorText) return undefined;
+  const verdict = classifyLaneProbeOutput({
+    code: 1,
+    stdout: errorText,
+    stderr: "",
+    timedOut: false,
+  });
+  if (verdict.kind !== "exhausted") return undefined;
+  return {
+    laneId: input.laneId,
+    tier: input.tier,
+    outcome: verdict.outcome,
+    ...(verdict.retryAfterMs === null ? {} : { retryAfterMs: verdict.retryAfterMs }),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Read structured error fields only; deliberately excludes answer/result/content prose. */
+function errorPayloadText(value: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const key of ["error", "errors", "message", "statusMessage", "errorMessage"]) {
+    const field = value[key];
+    if (typeof field === "string") parts.push(field);
+    else if (Array.isArray(field)) parts.push(...field.filter((x): x is string => typeof x === "string"));
+    else if (isRecord(field)) {
+      for (const nested of ["message", "error", "code", "detail"]) {
+        if (typeof field[nested] === "string") parts.push(field[nested] as string);
+      }
+    }
+  }
+  return parts.join("\n");
 }
 
 export interface LaneSpawnOptions {
@@ -236,7 +323,7 @@ export class LaneJobStore {
     return [...this.jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
   }
 
-  complete(id: string, run: LaneRunResult): void {
+  complete(id: string, run: LaneRunResult, semanticFailure?: string): void {
     const job = this.jobs.get(id);
     if (!job) return;
     // A cancelled job stays cancelled. The child's own exit arrives afterwards, and letting it
@@ -247,7 +334,8 @@ export class LaneJobStore {
     job.stderr = run.stderr;
     job.timedOut = run.timedOut;
     job.endedAt = Date.now();
-    job.status = run.code === 0 ? "completed" : "failed";
+    job.status = run.code === 0 && semanticFailure === undefined ? "completed" : "failed";
+    if (semanticFailure !== undefined) job.error = semanticFailure;
     this.kills.delete(id);
   }
 

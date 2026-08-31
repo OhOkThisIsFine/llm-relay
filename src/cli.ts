@@ -28,6 +28,7 @@ import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { McpDispatchServer } from "./mcp/server.js";
+import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import { loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { contextWindowResolver, COST_CLASSES, type ContextWindowSource, type CostClass } from "./metadata.js";
@@ -250,6 +251,7 @@ ${formatTextTable([
   ["llm-relay keys | keys check | check-keys", "Check every configured credential slot."],
   ["llm-relay keys <action> ...", "action: add|list|rotate|revoke|remove|disable|enable|export|import|unlock."],
   ["llm-relay pools [--probe]", "List members; --probe tests each deployment once."],
+  ["llm-relay pools list | pools <name> | pools show <name> [--json]", "List pool names or one pool's effective members."],
   ["llm-relay pools <action> <name> [<spec>...]", "action: set|add|remove|delete."],
   ["llm-relay routing <action> ...", "action: show|get|default|tier|subagent|sort|benchmark|set|unset|answered."],
   ["llm-relay route <action> ...", "Alias for routing."],
@@ -265,7 +267,7 @@ ${formatTextTable([
   ["llm-relay candidates [-p <name>]", "Compare deployment x credential-slot targets."],
   ["llm-relay cost [--window <w>] [--by <d>] [--include-repair]", "Summarise spend from the local accounting ledger."],
   ["llm-relay eligibility", "What backends said about themselves; refusals awaiting interpretation."],
-  ["llm-relay eligibility <propose|accept> <n> [--sig <digest>] --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model. --sig pins the item across queue reorderings."],
+  ["llm-relay eligibility <propose|accept|reject> <n> [--sig <digest>] --class <kind> --scope <scope>", "Scopes: attempt | group | deployment | credential | provider | model. --sig pins the item across queue reorderings."],
   ["llm-relay eligibility ... --scope group --members <id,id,...> [--all-credentials]", "Groups default to the current credential slot; the flag explicitly widens them."],
   ["llm-relay eligibility ... --cost-class free|paid|unknown", "Cover only deployments of that cost class, resolved live from catalog prices."],
   ["eligibility scope breadth", "credential = current credential slot; provider = all credentials for that provider."],
@@ -1140,6 +1142,42 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
   }
 }
 
+export interface TelemetryDeps {
+  readonly loadConfig?: () => Config;
+  readonly request?: (cfg: Config) => Promise<unknown | null>;
+  readonly localReport?: (cfg: Config) => unknown;
+  readonly write?: (text: string) => void;
+}
+
+/** Print telemetry from the live relay when available, falling back to the local snapshot. */
+export async function runTelemetry(deps: TelemetryDeps = {}): Promise<void> {
+  const cfg = (deps.loadConfig ?? loadOrExit)();
+  const live = await (deps.request ?? ((config) => tryServer(config, "/telemetry")))(cfg);
+  const report = live ?? (deps.localReport ? deps.localReport(cfg) : getTelemetryReport(cfg, globalCircuitBreaker));
+  (deps.write ?? ((text) => process.stdout.write(text)))(`${JSON.stringify(report, null, 2)}\n`);
+}
+
+export type DispatchReportRequest = (cfg: Config, path: string, init: RequestInit) => Promise<unknown | null>;
+
+/** Forward positive MCP lane quota evidence to the live relay's authenticated control route. */
+export async function reportMcpExhaustion(
+  cfg: Config,
+  report: DispatchedQuotaReport,
+  request: DispatchReportRequest = tryServer,
+): Promise<void> {
+  const live = await request(cfg, "/dispatch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      exhausted: report.laneId,
+      ...(report.tier ? { tier: report.tier } : {}),
+      outcome: report.outcome,
+      ...(report.retryAfterMs !== undefined ? { retryAfterMs: report.retryAfterMs } : {}),
+    }),
+  });
+  if (live === null) throw new Error("no proxy running — quota report not recorded");
+}
+
 /** Render a normalized listener address as an HTTP URL, including required IPv6 brackets. */
 export function proxyUrl(cfg: Pick<Config, "host" | "port">, path: string): string {
   const host = cfg.host.includes(":") ? `[${cfg.host}]` : cfg.host;
@@ -1190,9 +1228,8 @@ interface CommandArity {
  * command token: `llm-relay cost` is 1, `llm-relay config set a b` is 4.
  *
  * ⚠ Every bound is derived from what the DISPATCHER READS — `arg3`/`arg4`/`positionals[n]`/
- * `.slice()` — never from HELP, which drifts: `lanes` and the `route` alias appear nowhere in it,
- * and `setup`'s documented `claude-cli` target matches no branch at all (it works by fall-through).
- * A table built from the help text would have left two commands unguarded and mis-bounded a third.
+ * `.slice()` — never from HELP. The table is pinned against `CLI_COMMAND_NAMES`, so a new command
+ * cannot silently miss the guard; HELP remains a user-facing rendering, not parser authority.
  *
  * ⚠ DELIBERATELY ABSENT — do not "complete" this table with them:
  *   `keys`      — `validateKeysCommandArgs` is EXACT per subcommand and runs above this guard. It
@@ -1277,6 +1314,72 @@ export const ARITY_EXEMPT: ReadonlySet<string> = new Set(["keys", "cooldowns", "
 
 /** The commands this guard bounds — exported for the drift test, not for dispatch. */
 export const ARITY_GUARDED_COMMANDS: readonly string[] = Object.keys(COMMAND_ARITY);
+
+type CliOptionSpec = Readonly<Record<string, readonly string[]>>;
+const CLI_OPTIONS: CliOptionSpec = {
+  proxy: ["--config", "--default", "--mode", "--listen", "--ping"],
+  onboard: ["--config", "--import", "--force"],
+  setup: [],
+  "check-keys": ["--config"],
+  models: ["--config", "--provider", "--refresh"],
+  ping: ["--config", "--provider", "--ping"],
+  dashboard: ["--config"],
+  telemetry: ["--config"],
+  offload: ["--config", "--scope"],
+  lanes: ["--config", "--probe"],
+  dispatch: ["--config", "--task", "--exhausted", "--outcome", "--retry-after-ms", "--after", "--lane", "--tier", "--client", "--host", "--shell", "--next-command", "--json"],
+  eligibility: ["--config", "--sig", "--class", "--rationale", "--scope", "--members", "--all-credentials", "--reset-field", "--reset-ms", "--cost-class"],
+  candidates: ["--config", "--provider"],
+  cost: ["--window", "--by", "--include-repair", "--json"],
+  pools: ["--config", "--probe", "--json"],
+  routing: ["--config", "--clear"],
+  route: ["--config", "--clear"],
+  config: ["--config"],
+  "delegate-gate": ["--repo", "--fix"],
+  mcp: ["--config"],
+};
+
+const ACTION_OPTIONS: Readonly<Record<string, CliOptionSpec>> = {
+  offload: { on: ["--config", "--scope"], off: ["--config", "--scope"], enable: ["--config", "--scope"], disable: ["--config", "--scope"], status: ["--config"] },
+  pools: {
+    list: ["--config", "--json", "--probe"], show: ["--config", "--json"],
+    set: ["--config", "--include", "--free", "--effort"], add: ["--config", "--include", "--free", "--effort"],
+    remove: ["--config", "--include", "--free", "--effort"], delete: ["--config"], rm: ["--config"],
+  },
+  eligibility: {
+    status: ["--config"], reject: ["--config", "--sig"],
+    propose: ["--config", "--sig", "--class", "--rationale", "--scope", "--members", "--all-credentials", "--reset-field", "--reset-ms", "--cost-class"],
+    accept: ["--config", "--sig", "--class", "--scope", "--members", "--all-credentials", "--reset-field", "--reset-ms", "--cost-class"],
+  },
+  routing: {
+    tier: ["--config", "--clear"], subagent: ["--config", "--clear"],
+    show: ["--config"], get: ["--config"], default: ["--config"], sort: ["--config"],
+    benchmark: ["--config"], set: ["--config"], unset: ["--config"], answered: ["--config"],
+  },
+};
+
+/** Return a bounded, value-free diagnostic for an option not accepted by this command/action. */
+export function commandOptionError(argv: readonly string[]): string | null {
+  const hasHelp = argv.slice(2).some((a) => a === "--help" || a === "-h" || a === "--version" || a === "-v");
+  if (hasHelp) return null;
+  const positionals = getPositionalArgs([...argv]);
+  const command = positionals[0] ?? "proxy";
+  if (command === "keys" || command === "cooldowns" || command === "help" || command === "version") return null;
+  const base = CLI_OPTIONS[command];
+  if (!base) return null;
+  const action = positionals[1];
+  const actionOptions = ACTION_OPTIONS[command];
+  // Unknown actions get only the command-wide selectors. This prevents a flag that belongs to
+  // one mutating action from making a typoed action look valid (notably pools --probe).
+  const allowed = actionOptions
+    ? actionOptions[action ?? ""] ?? (action === undefined ? base : ["--config", "--json"])
+    : base;
+  const aliases = expandFlagAliases([...allowed]);
+  for (const flag of parseCliArgs([...argv]).flags) {
+    if (!aliases.has(flag)) return `llm-relay ${command}: unsupported option`;
+  }
+  return null;
+}
 
 export function commandArityError(positionals: readonly string[]): string | null {
   const name = positionals[0];
@@ -2265,6 +2368,7 @@ export async function runMcp(): Promise<void> {
     buildView: (o) => resolveDispatchView({ ...o, cfg }),
     ...(allowedRoots ? { allowedRoots } : {}),
     version: currentVersion(),
+    reportExhaustion: (report) => reportMcpExhaustion(cfg, report),
     write: (chunk) => process.stdout.write(chunk),
   });
 
@@ -3826,6 +3930,13 @@ export function main(): void {
     process.exit(0);
   }
 
+  const optionError = commandOptionError(process.argv);
+  if (optionError !== null) {
+    process.stderr.write(`${optionError}\n`);
+    process.exit(1);
+    return;
+  }
+
   // ⚠ THIS LINE, not one earlier and not one later.
   //
   // BELOW it is the first side effect in the whole ladder: the very next branch calls
@@ -3889,9 +4000,10 @@ export function main(): void {
     return;
   }
   if (arg2 === "telemetry") {
-    const cfg = loadOrExit();
-    const report = getTelemetryReport(cfg, globalCircuitBreaker);
-    process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    void runTelemetry().catch((e) => {
+      process.stderr.write(`llm-relay telemetry: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
     return;
   }
   if (arg2 === "check-keys") {
@@ -4137,19 +4249,19 @@ export function classifyCommand(argv: string[]): CommandEffect {
       return arg3 === "accept" || arg3 === "reject" || arg3 === "propose" ? "mutating" : "read-only";
     case "dashboard":
       return "read-only";
-    // Analyzes a diff file and optionally writes `<diff-file>.fixed.patch` NEXT TO THE INPUT —
-    // never touches this machine's own config/state, so it stays read-only for update-check
-    // purposes exactly like `dispatch -x` does for the same reason.
+    // `--fix` writes `<diff-file>.fixed.patch` next to the input; read-only gating must not
+    // replace the install before that requested mutation is performed.
     case "delegate-gate":
-      return "read-only";
+      return argv.some((a) => a === "--fix" || a === "-fix") ? "mutating" : "read-only";
     // WARNING: explicit, not left to the default. A "mutating" verdict would run the update check,
     // and a stale GLOBAL install then downloads a replacement and RE-EXECS - which for a stdio
     // server means the host's pipe dies mid-session with no diagnosable error.
     case "mcp":
       return "read-only";
-    // check-keys, models, telemetry, dispatch, candidates, pools, ping, help, version —
-    // and anything not yet listed. `dispatch -x` is included on purpose: it reports spend to a
-    // running proxy's in-memory cooldowns and changes nothing on this machine.
+    // check-keys, models, telemetry, candidates, pools, ping, help, version — and anything not
+    // yet listed. Dispatch exhaustion is persisted locally, so `-x` is a mutation.
+    case "dispatch":
+      return argv.some((a) => a === "--exhausted" || a === "-x") ? "mutating" : "read-only";
     default:
       return "read-only";
   }
@@ -4162,6 +4274,12 @@ export function classifyCommand(argv: string[]): CommandEffect {
 export async function run(): Promise<void> {
   // Reject malformed mutation argv before the self-update gate can perform any network request
   // or replace the installed CLI. Keys diagnostics stay generic so rejected argv is never echoed.
+  const optionError = commandOptionError(process.argv);
+  if (optionError !== null) {
+    process.stderr.write(`${optionError}\n`);
+    process.exit(1);
+    return;
+  }
   const command = rawCliCommand(process.argv);
   if (command === "cooldowns") parseCooldownClearArgs(process.argv);
   if (command === "keys") {

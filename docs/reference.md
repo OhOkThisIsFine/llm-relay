@@ -1672,9 +1672,10 @@ and `keys` diagnostics have always refused to echo argv for that reason.
 | :--- | :--- |
 | `llm-relay` | Start the proxy |
 | `llm-relay onboard [--import <file>] [--force]` | Set up or import provider keys |
-| `llm-relay setup <claude-cli\|claude-desktop>` | Point a client at the relay |
+| `llm-relay setup [<claude-cli\|claude-desktop>]` | Point a client at the relay (omitted target defaults to `claude-cli`) |
 | `llm-relay keys [check\|add\|list\|rotate\|revoke\|remove\|disable\|enable\|export\|import\|unlock]` | Check or manage encrypted provider credentials; see [Key custody](#key-custody) |
-| `llm-relay pools [--probe]` | List pool members; `--probe` spends one completion per unique deployment through one serviceable slot |
+| `llm-relay pools [list] [--json] [--probe]` | List pool names and members; `--probe` spends one completion per unique deployment through one serviceable slot |
+| `llm-relay pools <name> [--json]` / `llm-relay pools show <name> [--json]` | Show one pool's effective members |
 | `llm-relay pools <set\|add\|remove\|delete> <name> [spec...]` | Edit a pool |
 | `llm-relay routing <show\|get\|default\|tier\|subagent\|sort\|benchmark\|set\|unset\|answered>` | Edit routing. `answered` retires the first-run notice (below) without changing anything. `route` is an alias for the whole command. |
 | `llm-relay lanes [--probe]` | What each `cli` dispatch lane's own tool says it serves; `--probe` runs each lane's roster command. A roster older than 7 days is flagged `STALE` and stops counting as eviction evidence. Rosters are also refreshed by the background cadence (`routing.laneProbe`), so `--probe` is the on-demand form, no longer the only writer. |
@@ -1683,10 +1684,11 @@ and `keys` diagnostics have always refused to echo argv for that reason.
 | `llm-relay ping [-p <name>]` | Probe provider latency/health |
 | `llm-relay dashboard` | Open the read-only dashboard of an already-running relay |
 | `llm-relay cost [--window <w>] [--by <d>] [--include-repair] [--json]` | Summarise spend from the local accounting ledger; windows: 1h/24h/7d/30d/all (default 24h); group by provider/model/client/credential (default provider) |
-| `llm-relay telemetry` | Print telemetry/quota JSON |
+| `llm-relay telemetry` | Print provider-health and runtime-observation telemetry JSON (not quota JSON) |
 | `llm-relay offload [status \| <client> <on\|off> [--scope <scope>]]` | Show/toggle offload |
 | `llm-relay cooldowns clear <provider>[/<model>] [--credential <label>] [--json]` | Clear scoped cooling state in the running relay; print grouped results or raw JSON |
 | `llm-relay candidates [-p <name>]` | Compare deployment × credential-slot targets |
+| `llm-relay eligibility [<propose\|accept\|reject> ...]` | Review or record backend eligibility refusals; `reject` records that no durable fact should be learned |
 | `llm-relay dispatch [lane] [options]` | Choose the next dispatch lane |
 | `llm-relay help` / `llm-relay version` | Help / version |
 
@@ -1901,20 +1903,21 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 | :--- | :--- |
 | `POST /v1/messages` | Anthropic front; validates/repairs tool calls |
 | `POST /v1/messages/count_tokens` | Local token count |
-| `POST /v1/chat/completions`, `POST /v1/responses` | OpenAI front |
+| `POST /v1/chat/completions`, `POST /chat/completions`, `POST /v1/responses`, `POST /responses` | OpenAI front (versioned and unversioned aliases) |
+| `GET /v1/models`, `GET /models` | OpenAI-compatible model discovery |
 | `GET /registry` | Provider/routing/capability and nested credential metadata |
 | `GET /candidates` | Deployment × credential policy/state/quota/breaker data |
 | `GET\|POST /offload` | Read/set offload rules |
 | `GET\|POST /dispatch` | Read/advance the dispatch ladder |
 | `POST /cooldowns/clear` | Clear scoped live cooling state; identifiers-only grouped response |
-| `GET /telemetry`, `GET /ping`, `GET /health` | Telemetry, probe, health |
-| `GET /dashboard/`, `GET /dashboard/assets/*` | Read-only SPA shell and manifest-owned assets |
+| `GET /telemetry`, `GET /ping`, `GET /health`, `GET /health/stats` | Provider telemetry, probe, health (`/health/stats` is the protected `/health` alias) |
+| `GET|HEAD /dashboard/`, `GET|HEAD /dashboard/assets/*` | Read-only dashboard SPA shell and static assets |
+| `GET|HEAD /dashboard/api/v1/snapshot`, `GET|HEAD /dashboard/api/v1/requests/:requestId` | Session-authenticated dashboard reads |
 | `POST /dashboard/api/v1/bootstrap`, `POST /dashboard/api/v1/session` | Mint and exchange a one-use dashboard bootstrap |
-| `GET /dashboard/api/v1/snapshot`, `GET /dashboard/api/v1/requests/:requestId` | Session-authenticated bounded accounting views |
 | `POST /dashboard/api/v1/logout` | Revoke the current dashboard session |
 
 ⚠ **Loopback is not authorization.** Mutating control endpoints and control reads that expose or
-materialize provider state (`/registry`, `/candidates`, `/ping`, `/health`) require the per-install
+materialize provider state (`/registry`, `/candidates`, `/ping`, `/health/stats`, `/health`) require the per-install
 256-bit capability token (`~/.llm-relay/control-token` — the CLI carries it automatically). Every
 request's `Host` must exactly equal the bound listener authority; any present `Origin` must match
 the exact scheme, host, and effective port, and `Origin: null` is rejected. An absent `Origin` is

@@ -38,7 +38,13 @@
  * have cut 22.5% of real successes. **A timeout must choose between abandoning a slow success and
  * waiting out a hang; here the two are indistinguishable by duration.** A hedge does not choose.
  */
-import { getP90, getP90MsPerToken, countMsPerTokenSamples, type PingRecord } from "./ping/metrics.js";
+import {
+  MEASURABLE_CODES,
+  getP90,
+  getP90MsPerToken,
+  countMsPerTokenSamples,
+  type PingRecord,
+} from "./ping/metrics.js";
 
 /**
  * Tunables. ⚠ **These are PLACEHOLDERS awaiting calibration, and that is stated rather than
@@ -161,7 +167,14 @@ function hedgeThreshold(
 
   // PROBE samples only — see the note on rung 3 above.
   const probes = pings.filter((p) => p.source !== "request");
-  if (probes.length >= settings.minSamples) {
+  // ⚠ The floor counts the MEASURABLE probes — the same set `getP90` measures — never
+  // `probes.length`. `MEASURABLE_CODES` is a LATENCY set (200/401), so a 503 contributes a record
+  // and no measurement; counting records admits a p90 resting on one sample. Rung 2 above already
+  // gets this right through `countMsPerTokenSamples`, and `latency-demotion.ts` states the rule for
+  // its own identical rung. Measured harm: four 503s plus one slow 200 set the bar at that single
+  // probe's p90, so a real hang ran past the floor unhedged — the defect SUPPRESSES a hedge.
+  const measurableProbes = probes.filter((p) => MEASURABLE_CODES.has(p.code)).length;
+  if (measurableProbes >= settings.minSamples) {
     const p90 = getP90(probes);
     if (Number.isFinite(p90)) {
       return { basis: "absolute", thresholdMs: Math.max(settings.floorMs, p90 * settings.margin) };

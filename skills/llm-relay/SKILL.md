@@ -211,6 +211,14 @@ Keep the parent on its normal Codex provider and define a named child agent unde
 local Codex clients: the parent retains native Codex orchestration, while the child spends the
 configured provider pool. The `llm-relay` profile is an all-relay mode and routes the parent too.
 
+⚠ Codex desktop collaboration has a host-side limitation measured on Codex 0.151.0: with a
+ChatGPT account, the collaboration launcher validates a child model against the parent account
+before contacting llm-relay and ignores the child's `model_provider`. A `pool/medium` child can
+therefore fail with HTTP 400 (`model is not supported when using Codex with a ChatGPT account`).
+In the app, use the `llm-relay` MCP `dispatch` tool for relay-backed work instead. The generated
+agent files remain useful for Codex clients that honor custom providers (and are still provisioned
+by the installer).
+
 A global npm install provisions the `llm-relay` Responses provider in `~/.codex/config.toml` and
 creates the relay-backed `default` and `relay_coding` agents under `~/.codex/agents/` when they are
 absent. It preserves existing Codex config and agent files; use the manual snippets below if the

@@ -788,16 +788,19 @@ describe("OpenAI backend: count_tokens + non-messages paths", () => {
     expect(seenPaths).not.toContain("/chat/completions"); // …and specifically never mistranslated
   });
 
-  it("returns a clean 404 for a non-messages path instead of mistranslating it", async () => {
-    const p = await boot();
-    const resp = await fetch(`http://127.0.0.1:${p}/`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
-    });
-    expect(resp.status).toBe(404);
-    const j = (await resp.json()) as { error?: { message?: string } };
-    expect(j.error?.message).toMatch(/not supported/);
-    expect(seenPaths).toEqual([]); // a 404 the proxy answers itself, not one the backend produced
-  });
+  it.each(["/", "/v1/messages-prefix-lookalike"])(
+    "returns a clean 404 for the non-messages path %s instead of mistranslating it",
+    async (pathname) => {
+      const p = await boot();
+      const resp = await fetch(`http://127.0.0.1:${p}${pathname}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+      });
+      expect(resp.status).toBe(404);
+      const j = (await resp.json()) as { error?: { message?: string } };
+      expect(j.error?.message).toMatch(/not supported/);
+      expect(seenPaths).toEqual([]); // a 404 the proxy answers itself, not one the backend produced
+    },
+  );
 
   it("does NOT hijack count_tokens for an ANTHROPIC backend — that one speaks the route", async () => {
     // The local answer exists because an openai backend has no such endpoint. An anthropic

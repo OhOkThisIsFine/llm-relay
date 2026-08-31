@@ -1282,7 +1282,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 
 
   const isCountTokens = req.method === "POST" && pathname === "/v1/messages/count_tokens";
-  const isMessages = req.method === "POST" && pathname.startsWith("/v1/messages") && !isCountTokens;
+  const isMessages = req.method === "POST" && pathname === "/v1/messages";
 
   // Real traffic is the signal the adaptive cadence was built around: probe briskly while the
   // proxy is in use, drop to `slow` once it has been idle. `noteUserActivity()` had no callers

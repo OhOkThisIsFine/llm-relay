@@ -33,8 +33,11 @@ import {
   formatCandidateQuota,
   formatCandidateHardCap,
   formatKeyQuota,
+  commandOptionError,
+  runTelemetry,
+  reportMcpExhaustion,
 } from "../src/cli.js";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, type Config } from "../src/config.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { interpretRefusal, pendingRefusals, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations, signatureDigest } from "../src/refusal-interpretation.js";
 
@@ -53,6 +56,85 @@ describe("cli helper utilities", () => {
     expect(proxyUrl({ host: "127.0.0.1", port: 8791 }, "/health")).toBe("http://127.0.0.1:8791/health");
     expect(proxyUrl({ host: "localhost", port: 8791 }, "/health")).toBe("http://localhost:8791/health");
     expect(proxyUrl({ host: "::1", port: 8791 }, "/health")).toBe("http://[::1]:8791/health");
+  });
+
+  it("rejects unknown and wrong-command options without exposing values", () => {
+    expect(commandOptionError(["node", "cli.js", "telemetry", "--bogus", "secret"])).toContain("unsupported option");
+    expect(commandOptionError(["node", "cli.js", "pools", "--proeb"])).toContain("unsupported option");
+    expect(commandOptionError(["node", "cli.js", "dispatch", "--next-command"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "cost", "--config", "secret.json"])).toContain("unsupported option");
+    expect(commandOptionError(["node", "cli.js", "offload", "status", "--scope", "all"])).toContain("unsupported option");
+    expect(commandOptionError(["node", "cli.js", "pools", "show", "--probe"])).toContain("unsupported option");
+    expect(commandOptionError(["node", "cli.js", "pools", "list", "--probe", "--json"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "pools", "remove", "x", "--include", "free", "--effort", "low"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "telemetry", "--bogus", "secret"])).not.toContain("secret");
+  });
+
+  it("short-circuits help/version and leaves strict parsers to keys/cooldowns", () => {
+    expect(commandOptionError(["node", "cli.js", "telemetry", "--bogus", "--help"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "pools", "--bogus", "--version"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "keys", "--bogus"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "cooldowns", "clear", "x", "--bogus"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "models", "-provider", "nim", "-refresh"])).toBeNull();
+  });
+
+  it("has an explicit option-policy result for every CLI command", () => {
+    const exempt = new Set(["keys", "cooldowns", "help", "version"]);
+    for (const command of CLI_COMMAND_NAMES) {
+      if (exempt.has(command)) {
+        expect(commandOptionError(["node", "cli.js", command, "--future"])).toBeNull();
+      } else {
+        expect(commandOptionError(["node", "cli.js", command, "--future"])).toContain("unsupported option");
+      }
+    }
+    expect([...exempt].every((name) => CLI_COMMAND_NAMES.has(name))).toBe(true);
+  });
+
+  it("prints live telemetry first and falls back on connection, status, and JSON failures", async () => {
+    const cfg = { host: "127.0.0.1", port: 8791 } as Config;
+    const output: string[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock.mockResolvedValueOnce(new Response('{"live":true}', {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    await runTelemetry({ loadConfig: () => cfg, write: (s) => output.push(s) });
+    expect(JSON.parse(output.join("")).live).toBe(true);
+
+    const failures = [
+      ["connection", () => fetchMock.mockRejectedValueOnce(new Error("refused"))],
+      ["non-2xx", () => fetchMock.mockResolvedValueOnce(new Response("unavailable", { status: 503 }))],
+      ["malformed-json", () => fetchMock.mockResolvedValueOnce(new Response("{", { status: 200 }))],
+    ] as const;
+    for (const [failure, arrange] of failures) {
+      let localCalls = 0;
+      let writes = 0;
+      output.length = 0;
+      arrange();
+      await runTelemetry({
+        loadConfig: () => cfg,
+        localReport: () => { localCalls++; return { fallback: failure }; },
+        write: (s) => { writes++; output.push(s); },
+      });
+      expect(JSON.parse(output.join("")).fallback).toBe(failure);
+      expect(localCalls).toBe(1);
+      expect(writes).toBe(1);
+    }
+    fetchMock.mockRestore();
+  });
+
+  it("reports MCP exhaustion with exact dispatch payload", async () => {
+    const cfg = { host: "127.0.0.1", port: 8791 } as Config;
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const request = async (_cfg: Config, path: string, init: RequestInit): Promise<unknown | null> => { calls.push({ path, init }); return { ok: true }; };
+    await reportMcpExhaustion(cfg, { laneId: "codex", tier: "high", outcome: "quota_exhausted", retryAfterMs: 1234 }, request);
+    expect(calls[0]!.path).toBe("/dispatch");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.init.headers).toEqual({ "content-type": "application/json" });
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ exhausted: "codex", tier: "high", outcome: "quota_exhausted", retryAfterMs: 1234 });
+    await reportMcpExhaustion(cfg, { laneId: "agy", tier: undefined, outcome: "rate_limited" }, request);
+    expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ exhausted: "agy", outcome: "rate_limited" });
+    await expect(reportMcpExhaustion(cfg, { laneId: "x", tier: undefined, outcome: "rate_limited" }, async () => null)).rejects.toThrow("no proxy running");
   });
 
   it("normalizes AGY in structured output returned by an older live proxy", () => {
@@ -986,8 +1068,8 @@ describe("classifyCommand — the update-check gate", () => {
     for (const sub of ["keys", "check-keys", "models", "telemetry", "candidates", "pools", "ping", "dispatch"]) {
       expect(classifyCommand(argv(sub))).toBe("read-only");
     }
-    // Reporting spend changes a running proxy's in-memory cooldowns, nothing on this machine.
-    expect(classifyCommand(argv("dispatch", "-x", "codex"))).toBe("read-only");
+    // Exhaustion is persisted locally, so reporting it is a mutation for update-check purposes.
+    expect(classifyCommand(argv("dispatch", "-x", "codex"))).toBe("mutating");
     expect(classifyCommand(argv("cooldowns"))).toBe("read-only");
     expect(classifyCommand(argv("cooldowns", "clear", "anthropic"))).toBe("mutating");
   });

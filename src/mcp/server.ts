@@ -28,11 +28,13 @@ import {
   DEFAULT_WAIT_MS,
   DEPTH_ENV,
   LaneJobStore,
+  classifyDispatchedResult,
   checkCwd,
   currentDepth,
   defaultLaneSpawner,
   type LaneJob,
   type LaneSpawner,
+  type DispatchedQuotaReport,
 } from "./lane-runner.js";
 import {
   RPC_INTERNAL_ERROR,
@@ -78,6 +80,8 @@ export interface McpServerDeps {
    * reported "0.0.0" to every real client. Measured on the first live handshake.
    */
   version?: string;
+  /** Reports positive lane quota evidence to the relay's exhaustion state. */
+  reportExhaustion?: (report: DispatchedQuotaReport) => Promise<void> | void;
   write: (chunk: string) => void;
 }
 
@@ -495,8 +499,31 @@ export class McpDispatchServer {
     this.jobs.registerKill(job.id, run.kill);
 
     const settled = run.result.then(
-      (r) => {
-        this.jobs.complete(job.id, r);
+      async (r) => {
+        // A caller cancellation is not lane evidence, even if the child later exits with text
+        // that happens to contain quota vocabulary.
+        if (this.jobs.get(job.id)?.status === "cancelled") return "done" as const;
+        const report = classifyDispatchedResult({
+          result: r,
+          laneId: lane.id,
+          tier: view.tier ?? undefined,
+          command: lane.invoke!.command,
+          args: lane.invoke!.args,
+        });
+        let semanticFailure: string | undefined = report ? `lane reported ${report.outcome}` : undefined;
+        if (report) {
+          if (this.jobs.get(job.id)?.status === "cancelled") return "done" as const;
+          try {
+            await this.deps.reportExhaustion?.(report);
+          } catch (e) {
+            // Reporting is advisory, but the lane's semantic failure is not. Keep the diagnostic
+            // bounded because it may originate in an injected integration.
+            const detail = e instanceof Error ? e.message : String(e);
+            semanticFailure = `${semanticFailure}; quota report failed: ${detail.slice(0, 500)}`;
+            r = { ...r, stderr: `${r.stderr}${r.stderr ? "\n" : ""}${semanticFailure}` };
+          }
+        }
+        this.jobs.complete(job.id, r, semanticFailure);
         return "done" as const;
       },
       (e: Error) => {

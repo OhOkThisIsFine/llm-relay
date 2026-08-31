@@ -16,6 +16,7 @@ import {
 import {
   DEPTH_ENV,
   LaneJobStore,
+  classifyDispatchedResult,
   checkCwd,
   currentDepth,
   defaultLaneSpawner,
@@ -450,6 +451,38 @@ describe("async job path", () => {
       expect(isError, tool).toBe(true);
     }
   });
+
+  it("reports semantic AGY quota failure once before result and status exposure", async () => {
+    const reports: unknown[] = [];
+    const h = new Harness({
+      buildView: async () => view({ next: lane({ id: "agy", invoke: { command: "agy", args: ["-p", "x", "--output-format", "json"] } }) }),
+      spawn: fakeSpawner({ code: 0, stdout: '{"status":"ERROR","error":"Individual quota reached"}', stderr: "raw", timedOut: false }),
+      reportExhaustion: async (report) => { reports.push(report); },
+    });
+    const dispatched = await h.tool("dispatch", { task: "x" });
+    expect(dispatched.isError).toBe(true);
+    expect(dispatched.text).toContain("status: failed");
+    expect(dispatched.text).toContain("Individual quota reached");
+    const jobId = /job: (job-\d+)/.exec(dispatched.text)?.[1] as string;
+    const result = await h.tool("dispatch_result", { jobId });
+    const status = await h.tool("dispatch_status", { jobId });
+    expect(result.isError).toBe(true);
+    expect(status.text).toContain("status: failed");
+    expect(reports).toHaveLength(1);
+  });
+
+  it("keeps semantic failure visible when the quota reporter throws, with bounded diagnostics", async () => {
+    const h = new Harness({
+      buildView: async () => view({ next: lane({ id: "agy", invoke: { command: "agy", args: ["-p", "x", "--output-format", "json"] } }) }),
+      spawn: fakeSpawner({ code: 0, stdout: '{"status":"ERROR","error":"Individual quota reached"}', stderr: "raw", timedOut: false }),
+      reportExhaustion: () => { throw new Error("x".repeat(900)); },
+    });
+    const result = await h.tool("dispatch", { task: "x" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("lane reported quota_exhausted");
+    expect(result.text).toContain("quota report failed:");
+    expect(result.text.length).toBeLessThan(1800);
+  });
 });
 
 describe("dispatch_lanes", () => {
@@ -585,5 +618,41 @@ describe("spawn safety", () => {
     const r = await result;
     expect(r.code).toBeNull();
     expect(r.stderr).toContain("disabled under vitest");
+  });
+});
+
+describe("dispatched quota classification", () => {
+  const base = {
+    laneId: "agy",
+    tier: "medium" as string | undefined,
+    command: "agy",
+    args: ["-p", "x", "--output-format", "json"] as readonly string[],
+  };
+
+  it("recognizes AGY's exit-zero quota envelope and ignores successful answer prose", () => {
+    expect(classifyDispatchedResult({
+      ...base,
+      result: { code: 0, stdout: '{"status":"ERROR","error":"Individual quota reached"}', stderr: "", timedOut: false },
+    })?.outcome).toBe("quota_exhausted");
+    expect(classifyDispatchedResult({
+      ...base,
+      result: { code: 0, stdout: '{"status":"SUCCESS","response":"quota is discussed here"}', stderr: "", timedOut: false },
+    })).toBeUndefined();
+  });
+
+  it("uses explicit nonzero rate/quota evidence and stays inconclusive otherwise", () => {
+    expect(classifyDispatchedResult({
+      ...base,
+      command: "codex",
+      result: { code: 1, stdout: "", stderr: "429 too many requests", timedOut: false },
+    })?.outcome).toBe("rate_limited");
+    expect(classifyDispatchedResult({
+      ...base,
+      result: { code: 1, stdout: "failed", stderr: "timeout", timedOut: false },
+    })).toBeUndefined();
+    expect(classifyDispatchedResult({
+      ...base,
+      result: { code: null, stdout: '{"status":"ERROR","error":"Individual quota reached"}', stderr: "", timedOut: false },
+    })).toBeUndefined();
   });
 });
