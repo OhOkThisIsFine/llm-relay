@@ -4075,27 +4075,128 @@ async function openAiFrontPath(
   while (!res.destroyed) {
     // G2's attempt boundary, shared with the Anthropic front: a capped offer is refused here
     // before any egress and the loop comes straight back for the next candidate.
-    const resolvedAttempt = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
-    if (!resolvedAttempt) break;
-    const target = resolvedAttempt.target;
-    const controller = new AbortController();
-    const callerController = new AbortController();
-    const timer = setTimeout(() => controller.abort(), target.timeoutMs);
-    const onResClose = abortOnClientClose(res, callerController, controller);
-    res.on("close", onResClose);
-    let attempt: HealthAttempt | undefined;
-    const usage = createUsageAccumulator();
-    let egressCallbackCalled = false;
-    const onEgress = () => {
-      egressCallbackCalled = true;
-      pool429.noteEgress();
-      const egressAt = Date.now();
-      attempt = beginHealthAttempt(h, resolvedAttempt, egressAt, attemptTrace, usage, ctx.accounting) ?? undefined;
-      if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
-      attempt.accountingAttempt = ctx.accounting?.startServe(resolvedAttempt, egressAt) ?? null;
-      recordCredentialStarted(credentialWalk, credentialTrace, resolvedAttempt);
-      tried.push(specOfTarget(target));
+    const primaryOffer = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
+    if (!primaryOffer) break;
+
+    /**
+     * Per-run recovery audit. It lives with its run for the same reason `onEgress` does: a hedge
+     * that wins must report ITS OWN validation and repair outcome in the log, not the primary's.
+     */
+    type RecoveryAudit = { value: {
+      validated: RequestLog["validated"];
+      toolUseCount: number;
+      uncheckableCount: number;
+      errorKinds: string[];
+      repair: RepairOutcome | "none";
+    } | null };
+    const audits = new Map<AttemptRun, RecoveryAudit>();
+
+    /**
+     * Start ONE candidate's fetch. The primary uses it here, and a hedge uses the same function —
+     * the SAME extracted policy the Anthropic front uses, deliberately, because two fronts with two
+     * hedge policies is the shape this repo has already paid for once.
+     */
+    const startAttempt = (run: AttemptRun, forwardHeaders: Record<string, string>): Promise<Response> => {
+      const recoveryAudit: RecoveryAudit = { value: null };
+      audits.set(run, recoveryAudit);
+      const processRecoveredChat: RecoveredOpenAiChatProcessor = async (recovered) => {
+        const assistant: AssistantMessage = {
+          content: [
+            ...(recovered.text ? [{ type: "text", text: recovered.text } as const] : []),
+            ...recovered.calls.map((call) => ({
+              type: "tool_use" as const,
+              id: call.id,
+              name: call.name,
+              input: call.input,
+            })),
+          ],
+          stop_reason: "tool_use",
+        };
+        const validation = h.validator.validate(assistant, directTools);
+        recoveryAudit.value = {
+          validated: validation.errors.length > 0
+            ? "fail"
+            : validation.uncheckableCount > 0 ? "uncheckable" : "pass",
+          toolUseCount: validation.toolUseCount,
+          uncheckableCount: validation.uncheckableCount,
+          errorKinds: dedupe(validation.errors.map((error) => error.kind)),
+          repair: "none",
+        };
+        if (validation.valid || ctx.cfg?.mode !== "repair") return recovered;
+
+        const rawReshaper = h.resolveReshaper(run.resolvedAttempt);
+        const reshaper = rawReshaper ? withRepairAccounting(rawReshaper, ctx.accounting) : undefined;
+        if (!reshaper) return recovered;
+        const decision = await repair(assistant, directTools, {
+          validator: h.validator,
+          reshaper,
+          maxAttempts: ctx.cfg.repair.maxAttempts,
+          isDestructive: h.isDestructive,
+          backendModel: run.target.model ?? null,
+          signal: run.callerController.signal,
+        });
+        recoveryAudit.value.repair = decision.outcome;
+        if (decision.outcome !== "fixed" || !decision.message) {
+          throw new Error(`tool call could not be repaired (${decision.outcome})`);
+        }
+
+        const fixed: RecoveredOpenAiChat = { text: "", calls: [] };
+        for (const block of decision.message.content) {
+          if (block.type === "text" && typeof block.text === "string") fixed.text += block.text;
+          if (
+            block.type === "tool_use" &&
+            typeof block.id === "string" &&
+            typeof block.name === "string" &&
+            typeof block.input === "object" &&
+            block.input !== null &&
+            !Array.isArray(block.input)
+          ) {
+            fixed.calls.push({
+              id: block.id,
+              name: block.name,
+              input: block.input as Record<string, unknown>,
+            });
+          }
+        }
+        return fixed;
+      };
+
+      return fetchOpenAiFront(run.resolvedAttempt, {
+        reqJson: ctx.reqJson,
+        wantsStream: ctx.wantsStream,
+        protocol: ctx.protocol,
+        anthropicHeaders: forwardHeaders,
+        signal: run.controller.signal,
+        isDestructive: h.isDestructive,
+        processRecoveredChat,
+        usage: run.usage,
+        onEgress: () => {
+          run.egressCallbackCalled = true;
+          pool429.noteEgress();
+          const egressAt = Date.now();
+          run.attempt = beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, ctx.accounting) ?? undefined;
+          if (!run.attempt) throw new Error("llm-relay: could not begin provider attempt");
+          run.attempt.accountingAttempt = ctx.accounting?.startServe(run.resolvedAttempt, egressAt) ?? null;
+          recordCredentialStarted(credentialWalk, credentialTrace, run.resolvedAttempt);
+          tried.push(specOfTarget(run.target));
+        },
+      });
     };
+
+    const primaryRun = beginAttemptRun(res, primaryOffer);
+    // Rebound to the winner's record once the race settles — see the Anthropic front for why each
+    // one is a `let`. With hedging off, the winner is always the primary.
+    let resolvedAttempt = primaryRun.resolvedAttempt;
+    let target = primaryRun.target;
+    // Held from the PRIMARY because `finally` releases them, and `finally` runs even on the
+    // `buildForwardHeaders` early return that happens before any race exists.
+    let timer = primaryRun.timer;
+    let onResClose = primaryRun.onResClose;
+    let controller: AbortController;
+    let egressCallbackCalled: boolean;
+    let hedged: string | null;
+    let recoveryAudit: RecoveryAudit;
+    let attempt: HealthAttempt | undefined;
     let credentialRecorded = false;
 
     try {
@@ -4121,189 +4222,150 @@ async function openAiFrontPath(
         throw e;
       }
 
-      /* attempt begins at the real egress callback */
-    const recoveryAudit: { value: {
-      validated: RequestLog["validated"];
-      toolUseCount: number;
-      uncheckableCount: number;
-      errorKinds: string[];
-      repair: RepairOutcome | "none";
-    } | null } = { value: null };
-    const processRecoveredChat: RecoveredOpenAiChatProcessor = async (recovered) => {
-      const assistant: AssistantMessage = {
-        content: [
-          ...(recovered.text ? [{ type: "text", text: recovered.text } as const] : []),
-          ...recovered.calls.map((call) => ({
-            type: "tool_use" as const,
-            id: call.id,
-            name: call.name,
-            input: call.input,
-          })),
-        ],
-        stop_reason: "tool_use",
-      };
-      const validation = h.validator.validate(assistant, directTools);
-      recoveryAudit.value = {
-        validated: validation.errors.length > 0
-          ? "fail"
-          : validation.uncheckableCount > 0 ? "uncheckable" : "pass",
-        toolUseCount: validation.toolUseCount,
-        uncheckableCount: validation.uncheckableCount,
-        errorKinds: dedupe(validation.errors.map((error) => error.kind)),
-        repair: "none",
-      };
-      if (validation.valid || ctx.cfg?.mode !== "repair") return recovered;
+      let upstream: Response;
+      {
+        const raced = await runAttemptWithHedge(
+          { run: primaryRun, promise: startAttempt(primaryRun, forwardHeaders) },
+          {
+            h,
+            res,
+            walk: credentialWalk,
+            credentialTrace,
+            attemptTrace,
+            tracker: pool429,
+            startRun: (offer) => {
+              const hedgeRun = beginAttemptRun(res, offer);
+              try {
+                return { run: hedgeRun, promise: startAttempt(hedgeRun, buildForwardHeaders(ctx.inboundHeaders, offer)) };
+              } catch {
+                // DECLINE rather than fail: the primary is still in flight and is the caller's
+                // answer. See the Anthropic front for the full reasoning.
+                releaseAttemptRun(res, hedgeRun);
+                credentialWalk.recordRejected(offer);
+                return undefined;
+              }
+            },
+          },
+        );
+        resolvedAttempt = raced.run.resolvedAttempt;
+        target = raced.run.target;
+        controller = raced.run.controller;
+        timer = raced.run.timer;
+        onResClose = raced.run.onResClose;
+        attempt = raced.run.attempt;
+        egressCallbackCalled = raced.run.egressCallbackCalled;
+        hedged = raced.hedged;
+        // This front never reads the caller controller after the race — `processRecoveredChat`
+        // takes it from its OWN run, which is what a hedge needs. `beginAttemptRun` still wires it
+        // into `abortOnClientClose`, which is the part that matters.
+        // The WINNER's audit. A hedge that answered validated and repaired its own response.
+        recoveryAudit = audits.get(raced.run) ?? { value: null };
 
-      const rawReshaper = h.resolveReshaper(resolvedAttempt);
-      const reshaper = rawReshaper ? withRepairAccounting(rawReshaper, ctx.accounting) : undefined;
-      if (!reshaper) return recovered;
-      const decision = await repair(assistant, directTools, {
-        validator: h.validator,
-        reshaper,
-        maxAttempts: ctx.cfg.repair.maxAttempts,
-        isDestructive: h.isDestructive,
-        backendModel: target.model ?? null,
-        signal: callerController.signal,
-      });
-      recoveryAudit.value.repair = decision.outcome;
-      if (decision.outcome !== "fixed" || !decision.message) {
-        throw new Error(`tool call could not be repaired (${decision.outcome})`);
-      }
-
-      const fixed: RecoveredOpenAiChat = { text: "", calls: [] };
-      for (const block of decision.message.content) {
-        if (block.type === "text" && typeof block.text === "string") fixed.text += block.text;
-        if (
-          block.type === "tool_use" &&
-          typeof block.id === "string" &&
-          typeof block.name === "string" &&
-          typeof block.input === "object" &&
-          block.input !== null &&
-          !Array.isArray(block.input)
-        ) {
-          fixed.calls.push({
-            id: block.id,
-            name: block.name,
-            input: block.input as Record<string, unknown>,
-          });
-        }
-      }
-      return fixed;
-    };
-
-    let upstream: Response;
-      try {
-        upstream = await fetchOpenAiFront(resolvedAttempt, {
-          reqJson: ctx.reqJson,
-          wantsStream: ctx.wantsStream,
-          protocol: ctx.protocol,
-          anthropicHeaders: forwardHeaders,
-          signal: controller.signal,
-          isDestructive: h.isDestructive,
-          processRecoveredChat,
-          usage,
-          onEgress,
-        });
-        if (!attempt) {
-          credentialWalk.recordRejected(resolvedAttempt);
-          if (errorOrigin(upstream) === "local") {
-            await forwardLocalResponse(res, upstream);
+        const settled = raced.settled;
+        if (!settled.ok) {
+          const e = settled.error;
+          if (!attempt) {
+            if (credentialWalk.isPending(resolvedAttempt)) {
+              credentialWalk.recordRejected(resolvedAttempt);
+            }
+            if (res.destroyed) return;
+            const status = controller.signal.aborted ? 504 : 502;
+            failClosed(res, status, egressCallbackCalled
+              ? "llm-relay: could not begin provider attempt"
+              : "llm-relay: backend preparation failed");
             h.logger.write(baseLog(
               ctx.started,
               ctx.path,
               ctx.hadTools,
               false,
-              upstream.status,
+              status,
               "skipped",
               null,
               attemptTrace.snapshot(),
             ));
-          } else {
-            await upstream.body?.cancel().catch(() => {});
-            failClosed(res, 502, "llm-relay: backend returned before provider egress");
-            h.logger.write(baseLog(
-              ctx.started,
-              ctx.path,
-              ctx.hadTools,
-              false,
-              502,
-              "skipped",
-              null,
-              attemptTrace.snapshot(),
-            ));
+            return;
           }
+          const aborted = controller.signal.aborted;
+          const status = aborted ? 504 : 502;
+          if (res.destroyed) {
+            completeAttemptCancelled(h, attempt, "client disconnected");
+            recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+            credentialRecorded = true;
+            return;
+          }
+
+          completeAttemptFailure(h, attempt, {
+            failure: "transport",
+            provenance: aborted ? "deadline" : "upstream",
+            status,
+          });
+          recordCredentialOutcome(
+            credentialWalk,
+            credentialTrace,
+            resolvedAttempt,
+            aborted ? { kind: "timeout" } : { kind: "provider-transport" },
+          );
+          credentialRecorded = true;
+          const walkEnd = endWalk(
+            h,
+            res,
+            "openai",
+            credentialWalk,
+            attemptTrace,
+            pool429,
+            status,
+            ctx.sticky,
+            credentialTrace,
+            () => baseLog(
+              ctx.started,
+              ctx.path,
+              ctx.hadTools,
+              false,
+              status,
+              "skipped",
+              target,
+              attemptTrace.snapshot(),
+            ),
+            {
+              kind: "transport",
+              message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
+              servedBy: tried.join(", "),
+            },
+          );
+          if (walkEnd) continue;
           return;
         }
-    } catch (e) {
+        upstream = settled.value;
+      }
+
       if (!attempt) {
-        if (credentialWalk.pending === resolvedAttempt) {
-          credentialWalk.recordRejected(resolvedAttempt);
-        }
-          if (res.destroyed) return;
-          const status = controller.signal.aborted ? 504 : 502;
-          failClosed(res, status, egressCallbackCalled
-            ? "llm-relay: could not begin provider attempt"
-            : "llm-relay: backend preparation failed");
+        credentialWalk.recordRejected(resolvedAttempt);
+        if (errorOrigin(upstream) === "local") {
+          await forwardLocalResponse(res, upstream);
           h.logger.write(baseLog(
             ctx.started,
             ctx.path,
             ctx.hadTools,
             false,
-            status,
+            upstream.status,
             "skipped",
             null,
             attemptTrace.snapshot(),
           ));
-          return;
-        }
-        const aborted = controller.signal.aborted;
-        const status = aborted ? 504 : 502;
-        if (res.destroyed) {
-          completeAttemptCancelled(h, attempt, "client disconnected");
-          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
-          credentialRecorded = true;
-          return;
-        }
-
-        completeAttemptFailure(h, attempt, {
-          failure: "transport",
-          provenance: aborted ? "deadline" : "upstream",
-          status,
-        });
-        recordCredentialOutcome(
-          credentialWalk,
-          credentialTrace,
-          resolvedAttempt,
-          aborted ? { kind: "timeout" } : { kind: "provider-transport" },
-        );
-        credentialRecorded = true;
-        const walkEnd = endWalk(
-          h,
-          res,
-          "openai",
-          credentialWalk,
-          attemptTrace,
-          pool429,
-          status,
-          ctx.sticky,
-          credentialTrace,
-          () => baseLog(
+        } else {
+          await upstream.body?.cancel().catch(() => {});
+          failClosed(res, 502, "llm-relay: backend returned before provider egress");
+          h.logger.write(baseLog(
             ctx.started,
             ctx.path,
             ctx.hadTools,
             false,
-            status,
+            502,
             "skipped",
-            target,
+            null,
             attemptTrace.snapshot(),
-          ),
-          {
-            kind: "transport",
-            message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
-            servedBy: tried.join(", "),
-          },
-        );
-        if (walkEnd) continue;
+          ));
+        }
         return;
       }
 
@@ -4487,6 +4549,9 @@ async function openAiFrontPath(
           // The announcement computed at walk-order time, beside the same demotion that produced it.
           quotaDemoted: ctx.quotaDemotedFirst,
           latencyDemoted: ctx.latencyDemotedFirst,
+          // ⚠ Unlike the two above, this one is REQUEST-local rather than walk-order-local: a hedge
+          // is decided while an attempt is running, not while the order is being computed.
+          hedged,
           paid: ctx.cfg ? paidLabel(ctx.cfg, h, target) : null,
           sticky: ctx.sticky,
         });
