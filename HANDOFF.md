@@ -4,9 +4,10 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-08-30 (sixth lap)
 
-**Current: v0.65.0 is released** — npm `dist-tags.latest` 0.65.0, verified against the registry
-itself rather than a cached packument, and the global bin reinstalled to match. Four releases
-landed on 2026-08-30 (v0.63.1 → v0.65.0); the seventh lap's entry below says what each carried.
+**Current: v0.65.3 is released** — npm `dist-tags.latest` 0.65.3, verified against the registry
+itself rather than a cached packument, the global bin reinstalled to match, and the daemon
+restarted onto it. Seven releases landed on 2026-08-30 (v0.63.1 → v0.65.3); the seventh and eighth
+lap entries below say what each carried.
 ✅ **The running daemon IS serving this build** — restarted onto it on the owner's instruction and
 confirmed by a real request that persisted a request-latency sample.
 ⚠ **`GET /telemetry` still carries no version field**, so a claim about the live process always
@@ -165,7 +166,57 @@ went inert after every restart and disagreed with `candidates`. **A live check f
 request after restarting the daemon; the tests and an independent auditor did not, because every
 test seeded the breaker directly and so agreed with the code about which dataset it meant.**
 
-**Immediate next: nothing.** [docs/backlog.md](docs/backlog.md) has an empty Open section.
+**This lap (2026-08-30, eighth) — the latency-and-cooldown lap.** Opened to answer one question:
+did v0.65.0's `routing.latency` actually make offload faster? It had not. Full evidence, including
+a claim made and then disproved:
+[docs/latency-demotion-regression-2026-08-30.md](docs/latency-demotion-regression-2026-08-30.md).
+
+✅ **v0.65.2 — the absolute latency ceiling reads PROBE samples only.** `recordRequestSample` was
+appending generation latency into the same array the ABSOLUTE p95 reads, while `p95Ms` (30000) is
+calibrated on a `max_tokens: 1` probe. Per-token exists to stop a long-but-fast answer being
+demoted, but it engages only at `minSamples` REQUEST samples — so every deployment passes through a
+1-to-4-sample window judged by the wrong ceiling. Live: `nim/nvidia/nemotron-3-ultra-550b-a55b`,
+which had served **59 of this machine's 62** successful requests, answered one request with 632
+tokens in 34863 ms — **55.2 ms/token** against a 250 ceiling, healthy — and that success alone
+demoted it. **A deployment demoted itself by succeeding, and the term demotes the busiest server
+first, because the busiest server writes the longest answers.** Verified against the live cache: the
+fix flips exactly one verdict across 262 deployments, and it is the wrong one.
+
+✅ **v0.65.3 — a cooldown must outlast the failure that caused it.** Asked to investigate before
+choosing a fix, the answer turned out larger and simpler than the latency term. **All 43** timeout
+attempts in `usage/recent.json` were on ONE deployment,
+`nim/deepseek-ai/deepseek-v4-flash-0731`, each burning the full 120000 ms provider timeout, and its
+breaker read `closed` every time. ⚠ **Nothing was broken in the charging path** — `deadline`
+provenance reaches health, a 504 passes the 4xx filter, the trip fired as written. The CONSTANT was
+smaller than the failure it punished: a 120 s waste bought a 60 s cooldown against requests
+78-139 s apart. `DEFAULT_COOLDOWN_MS` is now a FLOOR; a slow failure cools for the time it wasted
+(`source: "elapsed"`, clamped to `MAX_RETRY_AFTER_MS`). Fast failures are unaffected by
+construction. This is the best explanation yet of the offload lane that took ~17 minutes: every
+agent turn paid 120 s to one deployment. Verified live — three consecutive walks ran 121 s, then
+**10 s**, then **1 s**, and the breaker shows that member cooling at `source=elapsed`.
+
+Two things worth carrying forward from it:
+
+- ⚠ **I claimed the latency term had "stopped offload" and it had not.** Disabling
+  `routing.latency` did not restore service, which disproved it; the outage was provider-side on
+  `nim`. The disproof is kept in the doc rather than deleted.
+- ⚠ **A fourth instance of the hand-copied closed list.** `isCooldownSource` re-stated all five
+  `CooldownSource` members literally, so adding `elapsed` type-checked clean while every persisted
+  row carrying it would have been dropped at load. `CooldownSource` is now DERIVED from
+  `COOLDOWN_SOURCES`.
+
+**Immediate next: the owner's hedging proposal.**
+[docs/backlog.md](docs/backlog.md) Open has it, with the design in
+[docs/hedged-attempts-design-2026-08-30.md](docs/hedged-attempts-design-2026-08-30.md) and **four
+open decisions** that need the owner before any code. In the owner's words: *"maybe if an attempt
+is taking longer than p90 for that endpoint (normalized by number of tokens), we pass the task off
+to the next source, but still allow for the possibility of the first source returning a useful
+result."* ⚠ It engages an invariant that must be settled rather than assumed: *"Acting on counts is
+optional, always announced, and may only reorder"* — hedging does not reorder, it DUPLICATES onto
+free quota this relay does not own. ⚠ The cheap thing to try first, so it is not skipped:
+`providers.nim` declares no `timeoutMs` and takes the 120000 ms default, the same value as the
+owner's `walkBudgetMs`, so one hang consumes the whole budget alone. That is configuration, not
+code.
 
 ⚠ **The MCP server design is OWNED BY ANOTHER AGENT** (owner, 2026-08-30). Do not start it here.
 ⚠⚠ **And its stated justification expired ~70 minutes after the decision.** D4 rested on *"agy has

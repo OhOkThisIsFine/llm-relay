@@ -9,7 +9,42 @@
 
 ## Open
 
-_Nothing open._
+- **Hedged attempts — overlap the walk instead of serialising it** (owner proposal, 2026-08-30).
+  In the owner's words: *"maybe if an attempt is taking longer than p90 for that endpoint
+  (normalized by number of tokens), we pass the task off to the next source, but still allow for
+  the possibility of the first source returning a useful result."*
+
+  Design, costs and the four decisions it needs before any code:
+  [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md).
+
+  **Why it is worth building:** every fix shipped this lap leaves the walk SERIAL, so a request
+  still pays the full cost of each slow candidate it meets — v0.65.3 makes the relay meet one less
+  often, it does not make meeting one cheap. Hedging does, and unlike a timeout or a per-candidate
+  cap it still lets a slow member win.
+
+  **Property:** a request's latency is bounded by the FASTEST candidate that answers, not by the
+  first one that was tried.
+
+  ⚠ **An invariant is engaged and must be settled first, not assumed.** `CLAUDE.md` says of acting
+  on counts: *"Acting on counts is optional, always announced, and may only reorder."* Hedging does
+  not reorder — it DUPLICATES, onto free quota this relay does not own. The design answers that
+  with off-by-default (`routing.hedge`) plus an announcement header, but the owner should confirm
+  it rather than inherit it from a design doc.
+
+  **The cheap thing to try first, so it is not skipped:** `providers.nim` declares no `timeoutMs`
+  and takes the 120000 ms default — the same value as the owner's `walkBudgetMs` — so one hang
+  consumes the entire budget alone. A shorter per-provider timeout is configuration, not code.
+
+- **The breaker learns nothing when the CLIENT gives up first** (found 2026-08-30, low, recorded
+  not fixed). A client disconnect records the attempt as `cancelled`, and cancelled returns BEFORE
+  `PROVENANCE_REACHES_HEALTH_PATH` (`circuit-breaker.ts`: "Order: cancelled → quota → this table →
+  health"). So a deployment that out-waits the caller is never charged. Measured: a 65-second probe
+  against the hanging member taught the breaker nothing at all.
+
+  **Property:** a deployment that outlasts the caller's patience is distinguishable from a caller
+  who simply changed their mind. ⚠ The early return is deliberate and its comment says why — a
+  client hanging up says nothing about the provider — so this needs the two cases separated, not
+  the return deleted.
 
 ## Closed
 

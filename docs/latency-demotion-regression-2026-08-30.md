@@ -230,7 +230,25 @@ Found at lap start on 2026-08-30, on `e01d510` (v0.65.1).
 - **Defect A: FIXED and released.** The absolute ceiling reads probe samples only
   (`ad4f503`, released as **v0.65.2**). Three new tests plus one corrected test that had been
   pinning the defect; mutation-checked; full gate green on the committed tree.
-- **Defect B: root-caused, not fixed.** Options in §6; the owner decides before any code.
+- **Defect B: FIXED and released** as **v0.65.3** (option B4 — `DEFAULT_COOLDOWN_MS` becomes a
+  floor, and a slow failure cools for the time it wasted, `source: "elapsed"`). Verified live on
+  the running daemon, three consecutive `pool/medium` walks:
+
+  | walk | result | elapsed | served by |
+  |---|---|---|---|
+  | 1 | 404 | **121 s** | — (`1x504, 1x404`; hit the hanging member) |
+  | 2 | 200 | **10 s** | `nim/nvidia/nemotron-3-ultra-550b-a55b` |
+  | 3 | 200 | **1 s** | `groq/qwen/qwen3.6-27b` |
+
+  ⚠ **Timing alone would be a confounded claim**, because `nim` partially recovered during the
+  lap — `nemotron-3-ultra` answered walk 2 after 503ing earlier. The unconfounded evidence is the
+  breaker itself: `nim/deepseek-ai/deepseek-v4-flash-0731` now reads
+  `source=elapsed, lastStatus=504` with ~120 s of cooldown. Under the old constant it would read
+  `source=default` with 60 s, which is shorter than the gap between walks — so walks 2 and 3 would
+  have hit it again, exactly as the previous 43 did.
+- **The hedging proposal** the owner raised in the same reply is designed but NOT built:
+  [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md), four open
+  decisions in its §7.
 - `routing.latency` is currently **false** in `~/.llm-relay/config.json` (backup:
   `config.json.bak-2026-08-30-pre-latency-disable`). Re-enable it now that defect A is fixed and
   the daemon runs a build that carries the fix.
