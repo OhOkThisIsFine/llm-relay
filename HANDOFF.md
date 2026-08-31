@@ -2,14 +2,29 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-30 (sixth lap)
+## 0. State as of 2026-08-30 (ninth lap)
 
-**Current: v0.65.3 is released** — npm `dist-tags.latest` 0.65.3, verified against the registry
-itself rather than a cached packument, the global bin reinstalled to match, and the daemon
-restarted onto it. Seven releases landed on 2026-08-30 (v0.63.1 → v0.65.3); the seventh and eighth
-lap entries below say what each carried.
-✅ **The running daemon IS serving this build** — restarted onto it on the owner's instruction and
-confirmed by a real request that persisted a request-latency sample.
+**Current: v0.66.0 is released** — npm `dist-tags.latest` 0.66.0, read from the REGISTRY rather than
+a cached packument, the global bin reinstalled to match, and the daemon restarted onto it. A MINOR
+rather than a patch, because hedging adds a config key (`routing.hedge`), a response header
+(`x-llm-relay-hedged`) and a default-ON behaviour change. Eight releases landed on 2026-08-30
+(v0.63.1 → v0.66.0); the lap entries below say what each carried.
+
+✅✅ **HEDGING IS PROVEN ON THE LIVE DAEMON.** One real `pool/low` request after the restart:
+
+```
+x-llm-relay-served-by:  openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+x-llm-relay-pool-attempts: 4 tried, 1 served: 1x502, 2x402, 1x200
+x-llm-relay-hedged: kilo/nvidia/nemotron-3-ultra-550b-a55b:free -> openrouter/nvidia/nemotron-3-ultra-550b-a55b:free (hedge won after 20000ms, floor)
+```
+
+The primary ran past the 20000 ms floor, the next candidate was started BESIDE it, and the hedge
+answered 200. That is the check the unit tests structurally cannot make — they inject the ping loop
+and the tier types, so they agree with the code about the data the feature reads, which is exactly
+how `routing.latency` shipped inert in v0.65.1. ⚠ The `floor` basis is expected and correct: these
+deployments carry no probe samples, and an UNMEASURED deployment is hedged by design.
+⚠ The daemon was verified by its command line plus the installed `package.json`, not by
+`/telemetry` — see the version-field warning below.
 ⚠ **`GET /telemetry` still carries no version field**, so a claim about the live process always
 needs a restart or another check; that has caught this file out before. ⚠ A packument read right
 after a publish can serve a STALE `dist-tags.latest` — the version document
@@ -271,9 +286,10 @@ reach `assessCost`, which reads the serving provider's own published figures; th
 apparently priced `nim` member is still classified free. The operator's real config also loads
 through the new parser with `routing.hedge` resolving to `{}` — all defaults, i.e. ON.
 
-⚠ **What was NOT done: a request through the live daemon.** It is still running the old build, and a
-hedge only fires on a deployment that is slow right now, so "no header appeared" would have proved
-nothing either way. The measurement above is the part that could be made to answer.
+✅ **And the live-daemon request WAS then made** (owner instruction, same lap): released as v0.66.0,
+global bin reinstalled, daemon restarted, and ONE real `pool/low` request fired a hedge that WON —
+`kilo/...:free -> openrouter/...:free (hedge won after 20000ms, floor)`. The full header block is at
+the top of this section.
 
 ✅ **Already applied and NOT pending:** `providers.nim` was given `timeoutMs: 100000`. The figure is
 measured, not chosen — over 40 successful `nim` attempts the working band runs 559 ms to 96959 ms,
