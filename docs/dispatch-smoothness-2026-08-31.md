@@ -40,9 +40,11 @@ whether the delay was pool walking, provider thinking, or an agent loop.
 
 The closeout exposed a second symptom on the same lane family: `pool/high` job `job-0002` exited 0
 after 75 seconds, but `dispatch_result` contained only `Based on the evidence`. That incomplete
-fragment was not used for the closeout audit; an independent collaboration auditor replaced it.
-The backlog investigation must distinguish a truncated provider completion from lane-output capture
-or MCP job-storage loss instead of treating exit 0 as proof that a usable answer returned.
+fragment was not used for the closeout audit.
+An independent collaboration audit was started, but its now-obsolete closeout was interrupted when
+the owner extended the lap; neither audit produced evidence used for a conclusion. The backlog
+investigation must distinguish a truncated provider completion from lane-output capture or MCP
+job-storage loss instead of treating exit 0 as proof that a usable answer returned.
 
 Tutor-sync then exposed a separate instruction-delivery failure: the installed primary relay skill
 was 46.9 KB / 724 lines, larger than one tool response. Its mandatory complete read was truncated,
