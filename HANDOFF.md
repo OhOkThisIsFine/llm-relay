@@ -2,44 +2,49 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-31 (v0.68.5)
+## 0. State as of 2026-08-31 (v0.68.6)
 
-Universal relay dispatch correction shipped in feature commit `de34c78`, release commit `c72b113`,
-and tag `v0.68.5`. Publish run
-[33443516055](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33443516055)
-succeeded; npm registry and the reinstalled global executable both report `0.68.5`.
+The universal MCP-first dispatch correction shipped in feature commit `de34c78` / v0.68.5.
+Tutor-sync then proved the primary skill itself was too large to deliver reliably: its mandatory
+46.9 KB / 724-line read was truncated. The progressive-disclosure correction shipped in feature
+commit `0cb5632`, release commit `8063bd3`, and tag `v0.68.6`. Publish run
+[33448024963](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33448024963)
+succeeded; npm registry and the reinstalled global executable both report `0.68.6`.
 
 Current installed state:
 
-- One portable rule now appears in MCP `initialize` instructions, the `dispatch` tool description,
-  the shipped skill, CLI help, README, quick start, reference, and direct-routing design: use MCP
-  `dispatch` whenever available; otherwise use `llm-relay dispatch --next-command -t "<task>"`
-  and follow its returned command or target. The model does not classify its host itself.
-- Codex global setup now appends `[mcp_servers.llm-relay]` beside the direct Responses provider.
-  Postinstall retired the byte-identical legacy `default.toml` and `relay_coding.toml` on this
-  machine; user-edited agents are preserved. Codex Desktop's ChatGPT launcher rejects `pool/*`
-  collaboration children before contacting `model_provider`, so MCP dispatch is the working route.
-- `llm-relay setup claude-desktop` now registers `llm-relay mcp` instead of writing an ineffective
-  proxy base URL. It removes only the exact legacy environment values llm-relay used through
-  v0.68.4. The live Claude Desktop config now contains command `llm-relay`, args `["mcp"]`, and
-  none of those legacy env keys.
-- Installed skill bytes match the repository. A new Codex/Claude Desktop process is required to
-  load the new MCP instructions/config; already-running MCP processes keep their startup snapshot.
+- One portable rule appears in MCP `initialize` instructions, the `dispatch` tool description,
+  and the compact shipped skill: use MCP `dispatch` whenever available; otherwise use
+  `llm-relay dispatch --next-command -t "<task>"` and follow its returned command or target. The
+  model does not classify its host itself.
+- The primary `SKILL.md` is now 7.7 KB / 128 lines and loads in one tool response. Direct-routing,
+  dispatch-lane, and operations/failure detail is preserved in three selectively loaded references
+  (8.0 KB, 19.4 KB, and 14.0 KB). All four files match byte-for-byte across the repository and the
+  installed Claude, Codex, and OpenCode skill directories.
+- Codex global setup keeps both `[mcp_servers.llm-relay]` and the direct Responses provider.
+  Byte-identical legacy `default.toml` / `relay_coding.toml` remain absent; user-edited agents
+  are preserved. Codex Desktop's ChatGPT launcher rejects `pool/*` collaboration children before
+  contacting `model_provider`, so MCP dispatch is the working route.
+- `llm-relay setup claude-desktop` registers `llm-relay mcp` instead of writing an ineffective
+  proxy base URL and removes only the exact legacy environment values authored through v0.68.4.
+- A new host turn is required to reload the shorter skill or a new MCP startup snapshot; an
+  already-running agent retains the instructions it loaded at its own turn start.
 
 Verification evidence:
 
-- Focused routing/setup/documentation tests: 7 files, 181 passed.
-- Full recorded local gate: server 145 files, 2,845 passed, 5 skipped; dashboard 5 files, 32 passed;
+- Skill structure validation passed; the tarball contains the compact entry point and all three
+  references. Installer/MCP focused tests passed (66), and the accounting-store file passed (42).
+- Full recorded local gate: server 145 files, 2,846 passed, 5 skipped; dashboard 5 files, 32 passed;
   package smoke passed.
 - Feature CI run
-  [33443181622](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33443181622)
-  and the publish run above succeeded on their exact SHAs.
+  [33447741354](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33447741354)
+  and the v0.68.6 publish run above succeeded on their exact SHAs.
 
 Immediate next:
 
 - Investigate the 1,594-second `pool/medium` MCP survey job recorded in
   [`docs/backlog.md`](docs/backlog.md); it was cancelled without an answer and was not used as
-  evidence. The same investigation now includes `pool/high` job `job-0002`, which exited 0 after
+  evidence. The same investigation includes `pool/high` job `job-0002`, which exited 0 after
   75 seconds but returned only the incomplete fragment `Based on the evidence`. Neither symptom is
   yet attributed to the serving model, pool walking, lane output capture, or MCP job storage.
 - Claude→MCP→AGY end-to-end validation remains deferred until Claude subscription access returns.
