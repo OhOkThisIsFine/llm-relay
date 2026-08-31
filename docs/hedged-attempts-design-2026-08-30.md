@@ -93,10 +93,15 @@ Three pieces exist, which is much of why this is feasible:
 ⚠ **An invariant is engaged, and it is being stated rather than assumed.** `CLAUDE.md` says of
 acting on counts: *"Acting on counts is optional, always announced, and may only reorder."*
 **Hedging does not reorder — it duplicates.** That is a new category of action for this relay. So
-it must be (a) announced on the response, the way every other automatic behaviour here is
-(`x-llm-relay-hedged`, naming the deployments raced and which won), and (b) **off by default**,
-under `routing.hedge`, because a default-on duplicator would spend a stranger's quota at up to twice
-the rate they asked for on the first request after install.
+it must be announced on the response, the way every other automatic behaviour here is
+(`x-llm-relay-hedged`, naming the deployments raced and which won).
+
+⚠ **On the second half — whether it ships on or off by default — I recommended OFF and the owner
+decided ON, confined to free deployments. See D1 in §7.** The paragraph above is left standing
+because its reasoning is what D1 answered, not because it describes the shipped behaviour. What D1
+substitutes for "off by default" is a narrower blast radius: a duplicate can only ever land on a
+deployment `assessCost()` calls `free`, and unknown counts as paid, so a stranger's install can
+duplicate quota but never money.
 
 ## 5. Bounds the design needs
 
@@ -116,22 +121,75 @@ the rate they asked for on the first request after install.
 the owner's `walkBudgetMs`. One hanging candidate therefore consumes the entire budget by itself,
 which is why the walk in §1 died with attempts still unmade.
 
-Setting a shorter per-provider `timeoutMs` (say 25000) is **configuration, not code**, and it caps
-the damage from a hang immediately. It is strictly worse than hedging — it abandons a slow member
-that was about to answer, which is the case hedging exists to preserve — but it costs nothing to
-try, and it makes the pool usable today.
+A shorter per-provider `timeoutMs` is **configuration, not code**, and it caps the damage from a
+hang immediately. It is strictly worse than hedging — it abandons a slow member that was about to
+answer, which is the case hedging exists to preserve.
 
-## 7. Decisions needed before any code
+⚠ **DONE, and the measurement moved the number a long way — it also makes the case for hedging.**
+I first suggested 25000. Measured against 40 successful `nim` attempts from the ledger, that would
+have cut **22.5%** of them:
 
-1. **Default off under `routing.hedge`?** (Recommended: yes, for the invariant reason in §4.)
-2. **Streaming only, or buffered too?** Streaming has the honest trigger. Buffered needs the weaker
-   absolute-p90 signal, and is where duplicate cost is least predictable.
-3. **What happens to `requestSpend` when a loser burned tokens** — change the projection, or
-   document the divergence?
-4. **Hedge target selection**: strictly the next candidate in walk order, or the fastest-measured
-   candidate not yet tried?
+| candidate | successful attempts cut | saved per hang |
+|---|---|---|
+| 25000 | 9 of 40 — **22.5%** | 95 s |
+| 45000 | 4 — 10.0% | 75 s |
+| 60000 | 2 — 5.0% | 60 s |
+| 75000 | 1 — 2.5% | 45 s |
+| **100000** | **0 — 0.0%** | **20 s** |
 
-## 8. Status
+Successful `nim` requests run from 559 ms to **96959 ms**, so there is **no clean gap between
+"working" and "hanging"** — the working band reaches almost to the timeout itself. `100000` is the
+only value the data supports, it was applied on 2026-08-30 (backup:
+`config.json.bak-2026-08-30-pre-nim-timeout`), and it buys only 20 s.
+
+**That is the strongest argument for this document.** A timeout must choose between abandoning a
+slow success and waiting out a hang, and here the two are indistinguishable by duration. A hedge
+does not have to choose.
+
+## 7. Decisions — ALL FOUR TAKEN BY THE OWNER, 2026-08-30
+
+Recorded with the recommendation each one answered, so a later reader can tell an owner decision
+from an agent's preference. **Two went against my recommendation; both stand, and the consequences
+I raised are restated here rather than quietly dropped.**
+
+**D1 — Gating: ON by default, for FREE deployments only.** (I recommended off by default.)
+Hedging is enabled without opt-in, and confined to deployments `assessCost()` calls `free`.
+⚠ **The consequence I raised, restated:** `assessCost()` treats **unknown as paid**, and a large
+share of this machine's pool members carry unknown prices. So the rule is SAFE — it can never
+duplicate onto a paid deployment — but it will **silently not fire** on many deployments where it
+would have helped. That is the safe direction for a duplicator, and it is the trade the owner
+accepted. It also means the feature's reach grows for free as catalog price coverage improves,
+with no code change.
+⚠ The `freeOnly` guard already resolves cost through `assessCost()`, so this reuses one classifier
+rather than adding a second opinion about what "free" means.
+
+**D2 — Scope: streaming AND buffered together.** (I recommended streaming first.)
+⚠ **The consequence I raised, restated:** buffered has no token count until the answer lands, so its
+trigger can only be absolute p90, and the duplicate rate is least predictable exactly where it
+cannot be watched accruing. Its absolute p90 must read **probe samples only**, for the reason
+v0.65.2 exists — a request-fed absolute statistic fires on the busiest healthy deployment first.
+
+**D3 — Spend: losing hedges are INCLUDED in `requestSpend`.** (I recommended keeping the
+winner-only projection and documenting the divergence.)
+`requestSpend` becomes "what this request actually cost", not "what the answer you received cost".
+⚠ **The consequence I raised, restated:** this changes the meaning of a shipped wire contract
+(`dashboard.cost.v1`), which consumers already read, and a request's spend will no longer match the
+deployment that served it. Treat it as a versioned contract change, not an internal edit.
+
+**D4 — Target: the next candidate in walk order.** (This matched my recommendation.)
+The hedge is simply the attempt the walk would have made anyway, started early. Deployment fitness
+still decides the order, so nothing competes with it — and this deliberately avoids leaning a
+second time on the reversed `server.ts` ranking rationale.
+
+## 8. What is still undecided, and belongs with the implementation
+
+- The trigger's constants: the floor under it, and the margin multiplier over expected time. Both
+  should be CALIBRATED against this machine's traffic and recorded beside the number, the way
+  `DEFAULT_LATENCY_MS_PER_TOKEN` is — not picked.
+- Whether one hedge in flight is enough, or the cap needs to be configurable.
+- Whether the response header names both deployments raced, or only the winner and a count.
+
+## 9. Status
 
 Proposed by the owner 2026-08-30, in response to the defect B options. Nothing built. B4 shipped
 separately and is complementary: B4 makes the relay *meet* a slow member less often, hedging makes
