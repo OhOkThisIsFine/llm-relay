@@ -5,8 +5,10 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 ## 0. State as of 2026-08-31 (v0.68.4)
 
 Windows dispatch hardening commit `5554bfa` shipped in release commit `9d62a6d` / tag `v0.68.3`.
-The final attribution correction and reviewer cleanup ship in tag `v0.68.4`. The npm registry and
-reinstalled global executable both report `0.68.4`.
+The final attribution correction and reviewer cleanup shipped in release commit `7721e10` / tag
+`v0.68.4`; publish run
+[33431851853](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33431851853) succeeded. The npm
+registry and reinstalled global executable both report `0.68.4`.
 
 Current live state:
 
@@ -19,8 +21,8 @@ Current live state:
   AGY directly, including version/help probes, or re-enable it without an owner-authorized isolated
   run that records every top-level window by PID, class, and ancestry.
 - A forced non-AGY MCP warm-up completed through `claude-free-pool` (`pool/medium`) with exit 0.
-  Telemetry reports three measured healthy providers and twelve unmeasured providers; `null` health
-  remains unknown, not unhealthy.
+  Telemetry answers successfully after the final restart; provider health is unmeasured until new
+  traffic arrives, and `null` means unknown rather than unhealthy.
 
 The dispatch result and machine repairs are in
 [dispatch-smoothness-2026-08-31.md](docs/dispatch-smoothness-2026-08-31.md). A forensic audit after
@@ -33,10 +35,10 @@ Verification evidence:
 - Focused dispatch tests: 51 passed.
 - Full server suite: 145 files, 2,841 passed, 5 skipped.
 - Dashboard suite: 5 files, 32 passed; package smoke passed.
-- Feature CI run
-  [33428200248](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428200248) and the `v0.68.3`
-  publish run
-  [33428810696](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428810696) succeeded.
+- Final cleanup CI run
+  [33431526327](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33431526327) and the `v0.68.4`
+  publish run above succeeded. Original feature CI run
+  [33428200248](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428200248) also succeeded.
 - The only immediate next step is the owner-authorized AGY focus-safety revalidation tracked in the
   machine-wide backlog at `C:\Code\docs\backlog.md`. Until then, use relay pools, Codex, Claude, or
   OpenCode instead.

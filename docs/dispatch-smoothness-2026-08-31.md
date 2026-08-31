@@ -121,7 +121,8 @@ then the cleanest behavior is to skip AGY and use the relay pool, Codex, Claude,
 
 - Implementation commit `5554bfa` and release commit `9d62a6d` shipped as `v0.68.3`; the final
   attribution correction and reviewer cleanup ship as `v0.68.4`.
-- Feature CI run `33428200248` and publish run `33428810696` succeeded.
+- Feature CI run `33428200248`, final cleanup CI run `33431526327`, and `v0.68.4` publish run
+  `33431851853` succeeded.
 - The npm registry and reinstalled global binary report `0.68.4`.
 - Reinstall preserved the config hash and the 12-row AGY quarantine.
 - The hidden Startup restart produced zero new visible windows during a 12-second watch.
