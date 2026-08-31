@@ -2,13 +2,43 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-30 (ninth lap)
+## 0. State as of 2026-08-30 (tenth lap)
 
-**Current: v0.66.0 is released** — npm `dist-tags.latest` 0.66.0, read from the REGISTRY rather than
-a cached packument, the global bin reinstalled to match, and the daemon restarted onto it. A MINOR
-rather than a patch, because hedging adds a config key (`routing.hedge`), a response header
-(`x-llm-relay-hedged`) and a default-ON behaviour change. Eight releases landed on 2026-08-30
-(v0.63.1 → v0.66.0); the lap entries below say what each carried.
+**Current: v0.67.0 is released** — npm `dist-tags.latest` 0.67.0 confirmed against the REGISTRY, the
+global bin reinstalled to match, and the daemon restarted onto it (PID checked, `GET /telemetry`
+200, one real `pool/low` request served 200 by `gemini/models/gemini-3.6-flash`). A MINOR rather
+than a patch: it changes routing behaviour and adds a `dashboard.cost.v1` field.
+
+**This lap closed both open backlog entries. The backlog is now empty.**
+
+- **The breaker learns from a client-cancelled hang** (`ae5c38c`). A deployment that out-waits the
+  caller is now distinguishable from a caller who changed their mind. ⚠ The backlog's constraint —
+  separate the two cases, do not delete the early return — was load-bearing: that one line carried
+  THREE events, so deleting it would have charged every ordinary client disconnect (the provenance
+  table already answers `true` for `client-cancellation`), charged every hedge loser, and started
+  merging cancelled attempts' quota headers into routing state. `AttemptCancelled` now carries a
+  REQUIRED closed `cause` routed by a second total table, DERIVED from `HealthAttempt.committed`
+  and never from the `reason` prose.
+- **D3 — a losing hedge's spend is counted and shown** (`0148553`, `779f5e6`). Recorded as its own
+  cells and rendered by `llm-relay cost` as its own table. ⚠ One part of D3's literal wording did
+  not hold: `requestSpend` does NOT become "what this request actually cost". Three measurements
+  forbid it, and the reasoning is in [docs/backlog.md](docs/backlog.md).
+
+⚠ **Two accepted consequences of the cancellation change, stated so they are not later read as
+bugs.** An admitted cancellation CREATES a `CircuitState` row where none existed, so that
+deployment appears in `availability-snapshot.ts`, `telemetry.ts`, `candidates.ts` and the breaker
+export. And `MAX_FAILURES_BEFORE_TRIP` is 2, so ONE long cancellation records a failure and a ping
+but sets no cooldown — deliberate, and this repo's standing rule against acting on a single
+request's latency.
+
+⚠ **Not verified live, and it cannot be on demand:** a hedge LOSER's new `relay-abandoned`
+classification and its spend entry. The live request after the restart was served by its first
+candidate, so no hedge fired — correct for a healthy pool. Both are covered by unit tests and by an
+end-to-end proxy test that spies on the real outcome; forcing a live loss needs a genuinely slow
+free deployment.
+
+Earlier the same day, v0.63.1 → v0.66.0 (eight releases); the lap entries below say what each
+carried.
 
 ✅✅ **HEDGING IS PROVEN ON THE LIVE DAEMON.** One real `pool/low` request after the restart:
 
@@ -31,8 +61,9 @@ after a publish can serve a STALE `dist-tags.latest` — the version document
 (`registry.npmjs.org/llm-relay/<version>`, HTTP 200) plus the publish job's own conclusion are the
 tie-breakers, and they disagreed once during this lap.
 §6 holds recorded trades, deferrals and settled decisions, not a work queue. The work queue is
-[docs/backlog.md](docs/backlog.md). **Both owner decisions that stood there are now settled:**
-package-size variant C is adopted, and the MCP server (D4) is BUILT AND SHIPPED to `main`.
+[docs/backlog.md](docs/backlog.md), and it is **EMPTY** — every entry that stood there closed this
+lap or the one before. Earlier settlements kept for their reasons: package-size variant C is
+adopted, and the MCP server (D4) is BUILT AND SHIPPED to `main`.
 
 ✅ **`llm-relay mcp` is live** (`e8ac127`, `67d12a0`, `e059bbe`). One MCP tool call hands a whole
 task to another agent lane and returns its ANSWER, so no caller composes a lane command. Registered
