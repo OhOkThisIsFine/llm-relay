@@ -1,6 +1,6 @@
 {
   "name": "llm-relay",
-  "version": "0.66.0",
+  "version": "0.67.0",
   "description": "Loopback bidirectional Anthropic/OpenAI API proxy with tool-call validation and multi-provider routing.",
   "type": "module",
   "engines": {
