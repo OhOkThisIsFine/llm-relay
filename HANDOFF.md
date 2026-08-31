@@ -31,6 +31,20 @@ export. And `MAX_FAILURES_BEFORE_TRIP` is 2, so ONE long cancellation records a 
 but sets no cooldown — deliberate, and this repo's standing rule against acting on a single
 request's latency.
 
+⚠ **Two commit messages from this lap overstate their test counts, and this is the corrected
+record** (the independent closeout auditor caught it after the push; history is not rewritten).
+`0148553` says "12 store/producer tests" — it is **7** (`test/abandoned-spend.test.ts` 5, plus 2 in
+`test/accounting-store.test.ts`). `779f5e6` says "Four new tests" — it is **3** (1 in
+`test/cost-cli.test.ts`, 2 in `test/dashboard/snapshot.test.ts`). `ae5c38c`'s "11 tests" is exact.
+This is the second time an auditor has caught a miscount in a commit message here; count from the
+diff, never from memory.
+
+⚠ **Mutation checks are real but leave NO repo-verifiable trace.** This repo has no mutation-testing
+tooling, so a claim like "five mutation checks, each killed by exactly one test" rests on the
+author's say-so and an auditor can only mark it unverifiable. Each check this lap was run by
+inverting the source and observing which tests failed; if that standing matters later, re-run the
+inversion rather than trusting the sentence.
+
 ⚠ **Not verified live, and it cannot be on demand:** a hedge LOSER's new `relay-abandoned`
 classification and its spend entry. The live request after the restart was served by its first
 candidate, so no hedge fired — correct for a healthy pool. Both are covered by unit tests and by an
