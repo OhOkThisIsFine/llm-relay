@@ -9,8 +9,33 @@
 
 ## Open
 
-Nothing pending. Both entries that stood here on 2026-08-30 shipped the same day; their records are
-below, kept for the measurements and the constraints, not as work.
+- **`llm-relay cost` ends its window early and never says so (2026-08-30, measured).**
+  `windowPlan`'s `rollingPlan` sets `to = floorUtc(now, bucketMs)`, so the newest PARTIAL bucket is
+  outside every rolling window. That alignment is right for a bucketed chart, which is what
+  `windowPlan` was written for; it is not right for a spend TOTAL, and the table renderer prints
+  only the window NAME, so the shortfall is invisible.
+
+  **Measured, one isolated store, clock `2026-08-31T06:27:17Z`:**
+
+  | window | `from` | `to` | requests |
+  |---|---|---|---|
+  | `1h`  | `06:27:00` (prev day) | `2026-08-31T06:27:00Z` | 1 |
+  | `24h` | `2026-08-30T06:15:00Z` | `2026-08-31T06:15:00Z` | 0 |
+  | `7d`  | `2026-08-24T06:00:00Z` | `2026-08-31T06:00:00Z` | 0 |
+  | `30d` | `2026-08-01T06:00:00Z` | `2026-08-31T06:00:00Z` | 0 |
+
+  The store held exactly one request, at `06:23`. It is inside `1h` and outside the other three.
+  The blind spot is one bucket wide: up to 15 min for `24h`, 60 min for `7d`, and **6 h for `30d`**.
+
+  ⚠ **The data is already in the contract.** `CostReportV1` carries `from` and `to`, and
+  `--json` prints both; only the human table drops them. So the cheapest honest fix is to RENDER the
+  bounds, not to move the boundary — moving it would give the cost report a different window from
+  the dashboard's chart, and two windows for one figure is the split this repo keeps closing.
+
+  ⚠ Distinct from the footer's existing caveat. That one warns about the relay's ledger FLUSH lag;
+  this is the reader's own window, and it applies to a stopped relay with everything committed.
+
+  **Property:** a cost report states the period it actually covers, or covers the period it names.
 
 ## Closed
 

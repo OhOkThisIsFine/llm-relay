@@ -45,11 +45,31 @@ author's say-so and an auditor can only mark it unverifiable. Each check this la
 inverting the source and observing which tests failed; if that standing matters later, re-run the
 inversion rather than trusting the sentence.
 
-⚠ **Not verified live, and it cannot be on demand:** a hedge LOSER's new `relay-abandoned`
-classification and its spend entry. The live request after the restart was served by its first
-candidate, so no hedge fired — correct for a healthy pool. Both are covered by unit tests and by an
-end-to-end proxy test that spies on the real outcome; forcing a live loss needs a genuinely slow
-free deployment.
+✅ **VERIFIED LIVE 2026-08-30 (eleventh lap):** a hedge LOSER's `relay-abandoned` classification
+and its spend entry. This paragraph used to say it "cannot be on demand", because the live request
+after the v0.67.0 restart was served by its first candidate. It CAN be forced, and the recipe is
+worth keeping: run a SECOND relay against the operator's own providers with `routing.hedge:
+{ enabled: true, floorMs: 1500, minSamples: 100000 }` — a high `minSamples` makes the per-token and
+absolute rungs decline, so the threshold is exactly `floorMs` and a hedge starts on nearly every
+request. One `pool/low` request then answered:
+
+```
+x-llm-relay-served-by: nim/moonshotai/kimi-k3
+x-llm-relay-hedged: nim/moonshotai/kimi-k3 -> huggingface/moonshotai/Kimi-K3 (primary won after 1500ms, floor)
+```
+
+The PRIMARY won, so the hedge was the loser. Its ledger attempt reads `cancelled` / `aborted` with
+`amountMicrousd: 57`, `tokenBasis: estimated`, `coverage: input_only` — exactly D3's stated shape —
+the day shard carries `abandonedSpend.referenceEstimated: 57`, and `llm-relay cost` printed the
+abandoned table beneath the totals. ⚠ The shard fold is the proof that the `relay-abandoned` CAUSE
+threaded through, not just that an attempt was aborted: `accounting.ts` filters that list on
+`attempt.abandonedByRelay`, which only `completeAttemptAbandoned` ever sets.
+
+⚠ **Do NOT run that experiment against the live daemon's state.** The second relay needs
+`XDG_CONFIG_HOME` and `XDG_CACHE_HOME` pointed at a scratch tree, AND every cache-kind artifact
+pre-created there — `relayStatePath` falls back to the legacy path whenever the XDG one is ABSENT,
+so a missing file puts a second writer on `~/.llm-relay/usage/`. Leave `.env` and `keystore.json`
+absent on purpose: they fall back to the live copies, which the proxy only ever reads.
 
 Earlier the same day, v0.63.1 → v0.66.0 (eight releases); the lap entries below say what each
 carried.
