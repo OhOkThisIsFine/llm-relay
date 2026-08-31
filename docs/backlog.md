@@ -9,6 +9,30 @@
 
 ## Open
 
+- **⚠ BLOCKER for hedging: `CredentialWalk` holds exactly ONE in-flight attempt** (found
+  2026-08-30 while attempting the stage-2 wiring, before any of `server.ts` was touched).
+
+  The walk's contract is that it is *"the sole budget/LRU mutation boundary"*, and it enforces that
+  with a single `#pending` slot. In `src/credential-select.ts`:
+
+  - `next()` opens with `if (this.#pending) return this.#pending.attempt;` — while an attempt is in
+    flight it **re-offers that same attempt**, so asking for a hedge candidate hands back the
+    primary and the relay would fetch one deployment twice;
+  - `recordStarted()` throws `"credential attempt already marked started"` on the second call;
+  - `recordOutcome()` throws when the outcome does not match the single pending attempt.
+
+  **So hedging is not a restructuring of the request loop.** It first needs `CredentialWalk` to
+  carry N in-flight attempts, with its start budget, LRU touch and breadth-first ordering all still
+  correct. Patching around it would produce requests that THROW.
+
+  **Property:** the walk can have more than one attempt in flight, and its budget, LRU and ordering
+  invariants still hold — stated and tested — for every one of them.
+
+  ⚠ Both hedge modules are built, tested and INERT pending this. That is more unadopted surface
+  than the `kernel/` precedent tolerated (`CLAUDE.md`: an aspirational contract surface "lived here
+  unadopted and was **deleted** 2026-08-04"), so this should be resolved or the modules reverted —
+  it should not sit.
+
 - **Hedged attempts — overlap the walk instead of serialising it** (owner proposal, 2026-08-30).
   In the owner's words: *"maybe if an attempt is taking longer than p90 for that endpoint
   (normalized by number of tokens), we pass the task off to the next source, but still allow for
