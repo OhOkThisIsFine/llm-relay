@@ -356,6 +356,20 @@ export interface Routing {
    */
   latency?: LatencyDemotionConfig;
   /**
+   * Hedged attempts (owner proposal + decisions 2026-08-30,
+   * docs/hedged-attempts-design-2026-08-30.md §7). **Default ON**, and confined to deployments
+   * `assessCost()` calls FREE.
+   *
+   * ⚠ This is the FIRST behaviour here that does not merely reorder — it DUPLICATES a request onto
+   * a second candidate. The `CLAUDE.md` invariant reads "Acting on counts is optional, always
+   * announced, and may only reorder"; the owner amended it for this feature on 2026-08-30 and
+   * bounded the duplication three ways: free deployments only (D1), the loser aborted the moment a
+   * winner commits, and the response announcing it (`x-llm-relay-hedged`).
+   *
+   * `false` is the shorthand for `{ enabled: false }` and restores the pre-hedge behaviour exactly.
+   */
+  hedge?: HedgeConfig;
+  /**
    * Background lane re-probing (owner decision 2026-08-29,
    * docs/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
    * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
@@ -527,6 +541,85 @@ function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
     if (n === undefined) continue;
     if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
       throw new Error(`config.routing.latency.${key} must be a positive finite number`);
+    }
+    out[key] = n;
+  }
+  return out;
+}
+
+/**
+ * `routing.hedge` — start the NEXT candidate beside a slow in-flight attempt, instead of after it
+ * (owner proposal 2026-08-30; the four decisions are in
+ * `docs/hedged-attempts-design-2026-08-30.md` §7).
+ *
+ * **Default ON, free deployments only.** That is owner decision D1, taken against the
+ * recommendation of off-by-default. `assessCost()` treats an UNKNOWN price as paid, so the rule is
+ * fail-safe in the only direction that matters: a duplicate can never land on a deployment whose
+ * price this relay cannot establish. The stated cost is that hedging silently does not fire on many
+ * members whose prices are simply unpublished.
+ *
+ * ⚠ **Hedging DUPLICATES; every other term here only reorders.** `false` is the documented
+ * shorthand for `{ enabled: false }` and restores the pre-hedge behaviour exactly, byte for byte.
+ * An object with no keys is legal and means the defaults.
+ *
+ * The thresholds live in `src/hedge-trigger.ts`. ⚠ Unlike `routing.latency`'s 250 ms/token, they
+ * are PLACEHOLDERS awaiting calibration and say so at their definition — do not quote them as
+ * measurements.
+ */
+export interface HedgeConfig {
+  /** Default true. false disables hedging entirely. */
+  enabled?: boolean;
+  /**
+   * The floor under every threshold, in ms.
+   *
+   * Without it a deployment with a tiny p90 is hedged on ordinary noise, and a fast pool duplicates
+   * almost every request. It is the one bound that keeps the duplicate rate tied to real slowness.
+   */
+  floorMs?: number;
+  /** How far past the expected time an attempt must run before a hedge starts. */
+  margin?: number;
+  /** Minimum samples before a measured statistic may set the bar instead of the floor. */
+  minSamples?: number;
+}
+
+/**
+ * Validate `routing.hedge`. Malformed is a hard error, and an UNKNOWN KEY is a hard error too —
+ * the `routing.latency` precedent, for the same reason: an operator who wrote `"floorms": 40000`
+ * believes they raised the floor, and a silently ignored key leaves the default in force while
+ * looking like it was changed.
+ *
+ * ⚠ Every number must be finite and positive. A `0` floor removes the one bound that stops a fast
+ * pool duplicating almost every request, and a negative or `NaN` value bounds nothing while looking
+ * like it does.
+ */
+function parseHedge(raw: unknown): HedgeConfig {
+  // ABSENT returns `{}`, not `undefined` — the `parseLatencyDemotion` precedent. Every key is
+  // optional and `resolveHedgeSettings` owns the defaults, so `{}` IS "all defaults", and a total
+  // return lets the caller assign unconditionally without another branch in `parseRouting`.
+  if (raw === undefined || raw === null) return {};
+  // The boolean shorthand is NORMALIZED here rather than carried through the type, so the trigger
+  // module never re-implements "what does `false` mean".
+  if (typeof raw === "boolean") return { enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.hedge must be an object or a boolean");
+  }
+  const value = raw as Record<string, unknown>;
+  const known = new Set(["enabled", "floorMs", "margin", "minSamples"]);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      throw new Error(`config.routing.hedge has an unknown key "${key}"`);
+    }
+  }
+  const out: HedgeConfig = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== "boolean") throw new Error("config.routing.hedge.enabled must be a boolean");
+    out.enabled = value.enabled;
+  }
+  for (const key of ["floorMs", "margin", "minSamples"] as const) {
+    const n = value[key];
+    if (n === undefined) continue;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new Error(`config.routing.hedge.${key} must be a positive finite number`);
     }
     out[key] = n;
   }
@@ -1697,6 +1790,7 @@ function parseRouting(
     sticky?: unknown;
     quota?: unknown;
     latency?: unknown;
+    hedge?: unknown;
     laneProbe?: unknown;
     mcp?: unknown;
     ladder?: unknown;
@@ -1815,6 +1909,7 @@ function parseRouting(
   const quota = parseQuotaEnforcement(r.quota);
   if (quota) routing.quota = quota;
   routing.latency = parseLatencyDemotion(r.latency);
+  routing.hedge = parseHedge(r.hedge);
   routing.laneProbe = parseLaneProbe(r.laneProbe);
   const mcpSettings = parseMcpSettings(r.mcp);
   if (mcpSettings) routing.mcp = mcpSettings;

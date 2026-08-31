@@ -191,8 +191,25 @@ export function hedgeDelayMs(
   isFree: boolean,
   settings: HedgeSettings,
 ): number | null {
+  return hedgeDelayDecision(pings, isFree, settings)?.delayMs ?? null;
+}
+
+/**
+ * The same decision as `hedgeDelayMs`, carrying the RUNG that produced it.
+ *
+ * ⚠ Split out rather than folded into `hedgeDelayMs` so the shipped scalar signature is untouched.
+ * The basis exists for one reason: the three constants above are declared placeholders, and an
+ * operator cannot calibrate them without knowing which rung actually fired. `HEDGED_HEADER` states
+ * it, so a hedged pool is calibratable from its own responses.
+ */
+export function hedgeDelayDecision(
+  pings: readonly PingRecord[],
+  isFree: boolean,
+  settings: HedgeSettings,
+): { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] } | null {
   if (!settings.enabled || !isFree) return null;
-  return hedgeThreshold([...pings], 0, settings).thresholdMs;
+  const { basis, thresholdMs } = hedgeThreshold([...pings], 0, settings);
+  return { delayMs: thresholdMs, basis };
 }
 
 /** `"<spec> (28.4s > 20.0s, floor, 0 tokens seen)"` — bounded, metadata only, never content. */

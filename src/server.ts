@@ -40,7 +40,7 @@ import {
   type ReshaperAccountingHooks,
 } from "./reshaper.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE } from "./tool-dialects.js";
-import { dialectRefusalSignalOf, ERROR_ORIGIN_HEADER, TOOL_DIALECT_HEADER, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, LATENCY_DEMOTED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type ErrorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
+import { dialectRefusalSignalOf, ERROR_ORIGIN_HEADER, TOOL_DIALECT_HEADER, fetchBackend, fetchOpenAiFront, normalizeOpenAiErrorBody, parseRetryAfterMs, postHeaderBodyFailure, upstreamReportedModel, toolUseIdRewrites, toolCallIdRewrites, thoughtSignatureSentinels, SERVED_BY_HEADER, POOL_ATTEMPTS_HEADER, UNKNOWN_REFUSAL_HEADER, DEGRADED_HEADER, PAID_HEADER, QUOTA_DEMOTED_HEADER, LATENCY_DEMOTED_HEADER, HEDGED_HEADER, CREDENTIAL_HEADER, CREDENTIAL_ATTEMPTS_HEADER, HARD_CAP_HEADER, errorOrigin, type ErrorOrigin, type OpenAiFrontProtocol, type PostHeaderBodyFailure } from "./backend.js";
 import { probeStreamForCommit, type StreamCommitProtocol } from "./stream-commit.js";
 import { ModelCatalog } from "./catalog.js";
 import { handleAdminRoutes } from "./routes/admin.js";
@@ -91,6 +91,8 @@ import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit 
 import { clearFacts, cooldownUntil, factsFor, isCostBlocked, recordFact, type FactResetBasis } from "./target-facts.js";
 import { createQuotaDemotionFn, quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
 import { createLatencyDemotionFn, latencyDemotionLabel, type LatencyDemotionFn } from "./latency-demotion.js";
+import { hedgeDelayDecision, resolveHedgeSettings, type HedgeVerdict } from "./hedge-trigger.js";
+import { raceWithHedge, type HedgeRaceResult, type RaceEntrant, type Settled } from "./hedge-race.js";
 /**
  * Resolves a deployment's cost class LIVE from the catalog, for facts that apply to one class
  * only. Threaded exactly like `QuotaDemotionFn`: built once per proxy with its dependencies bound,
@@ -429,6 +431,26 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       return undefined;
     }
   };
+  // Hedged attempts (owner proposal + decisions 2026-08-30). Built once per proxy like the two
+  // demotion terms above; each call re-reads live probe samples, so the delay tracks the
+  // measurement rather than a snapshot taken at startup.
+  //
+  // ⚠ It reads the SAME probe dataset `latencyDemotion` reads, through the same seam, and that is
+  // deliberate: two latency opinions built on two datasets is exactly the v0.65.1 defect, where a
+  // term went inert after a restart while the surface the operator reads said something else.
+  //
+  // ⚠ D1's containment lives INSIDE `hedgeDelayDecision` — it returns null for a deployment that is
+  // not free — so this closure resolves the class and passes it, and no caller repeats the test.
+  const hedgeSettings = resolveHedgeSettings(cfg.routing?.hedge);
+  const hedgeDelay = (
+    attempt: ResolvedAttempt,
+  ): { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] } | null => {
+    const t = attempt.target;
+    // No model means no ping series to read and no deployment to duplicate onto. `costClassOf`
+    // already answers "paid" for this shape, so this is belt and braces rather than policy.
+    if (!t.model) return null;
+    return hedgeDelayDecision(pingLoop.getModelPings(t.provider, t.model), costClassOf(attempt) === "free", hedgeSettings);
+  };
   // G2: the operator-set refusal ceilings. Narrowed to the SAME in-memory `usedInWindow` seam the
   // demotion term reads — a bare programmatic proxy has no ledger and its caps simply never fire
   // (unknown usage ⇒ no refusal). Built once per proxy; each call re-reads the live window.
@@ -558,6 +580,11 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       ...(controlAuthorization ? { controlAuthorization } : {}),
       quotaDemotion,
       latencyDemotion,
+      hedgeDelay,
+      // 1 when hedging is off, which makes `routing.hedge: false` a byte-for-byte revert: the walk
+      // is then the single-slot walk it has always been, and no second candidate can ever be
+      // offered while one is in flight.
+      hedgeMaxInFlight: hedgeSettings.enabled ? 2 : 1,
       costClassOf,
       hardCap: hardCapEvaluator,
     }).catch((e) => {
@@ -633,6 +660,29 @@ interface Handlers {
    * than `minSamples` measurable probes, which is every deployment on a cold start.
    */
   latencyDemotion: LatencyDemotionFn;
+  /**
+   * How long to wait before starting the NEXT candidate BESIDE this attempt, or null for "never
+   * hedge this one" (see `hedge-trigger.ts`).
+   *
+   * ⚠ Null is the answer for a deployment `assessCost()` does not call FREE, and that is owner
+   * decision D1's containment applied once — `hedgeDelayMs` refuses on it so no caller repeats the
+   * test. `costClassOf` returns `undefined` for a class it could not establish, and `undefined` is
+   * not `"free"`, so an unclassifiable deployment is never duplicated onto.
+   *
+   * ⚠ Inert — returns null without reading any pings — while `routing.hedge.enabled` is false.
+   */
+  hedgeDelay: (attempt: ResolvedAttempt) => { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] } | null;
+  /**
+   * How many attempts one `CredentialWalk` may hold in flight: 2 while hedging is enabled, 1
+   * otherwise.
+   *
+   * ⚠ **This is not a tuning knob; it is the walk's own precondition for hedging at all.** At 1 the
+   * walk is SATURATED while an attempt is live and `next()` re-offers that same attempt, so asking
+   * for a hedge candidate would hand back the primary and the relay would fetch one deployment
+   * twice. `runAttemptWithHedge` guards against that independently, but the walk must be built to
+   * allow the second slot or every hedge is silently declined.
+   */
+  hedgeMaxInFlight: number;
   costClassOf: CostClassFn;
   /**
    * G2's operator-set refusal ceilings (see `hard-cap.ts`). Null ⇒ no opinion; unlike the demotion
@@ -1465,6 +1515,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     walkBudgetMs: cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS,
     selectionNow: routingNow,
     evidenceFor: (attempt) => credentialEvidence(attempt, cfg, h.breaker, routingNow),
+    // Hedging's precondition: the walk must be able to hold a second attempt in flight. 1 while
+    // `routing.hedge` is off, and the walk then behaves exactly as it always has.
+    maxInFlight: h.hedgeMaxInFlight,
   });
   const credentialTrace = new CredentialAttemptTrace(cfg);
 
@@ -1521,27 +1574,59 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   while (!res.destroyed) {
     // G2's attempt boundary: an offer whose operator-set hard cap is reached is refused here,
     // before any egress, and the loop comes straight back for the next candidate.
-    const resolvedAttempt = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
-    if (!resolvedAttempt) break;
-    target = resolvedAttempt.target;
-    const controller = new AbortController();
-    const callerController = new AbortController();
-    const timer = setTimeout(() => controller.abort(), target.timeoutMs);
-    const onResClose = abortOnClientClose(res, callerController, controller);
-    res.on("close", onResClose);
+    const primaryOffer = nextUncappedAttempt(h, credentialWalk, attemptTrace, pool429);
+    if (!primaryOffer) break;
+
+    /**
+     * Start ONE candidate's fetch. The primary uses it here, and a hedge uses the same function —
+     * so the two sides of a race are built by one piece of code and cannot drift apart.
+     *
+     * ⚠ `onEgress` writes into `run`, never into this loop's locals. With a hedge in flight there
+     * are two callbacks, and one that wrote the locals would attribute the hedge's health attempt,
+     * accounting row and `tried` entry to the primary. See `AttemptRun`.
+     */
+    const startAttempt = (run: AttemptRun, forwardHeaders: Record<string, string>): Promise<Response> =>
+      fetchBackend(run.resolvedAttempt, {
+        path,
+        method: req.method ?? "POST",
+        reqBuf,
+        reqJson,
+        anthropicHeaders: forwardHeaders,
+        wantsStream,
+        // Reaches the dialect-rescue commit points: a tool call the relay reconstructs out of
+        // model TEXT is refused when it names a destructive tool.
+        isDestructive: h.isDestructive,
+        usage: run.usage,
+        signal: run.controller.signal,
+        onEgress: () => {
+          run.egressCallbackCalled = true;
+          pool429.noteEgress();
+          const egressAt = Date.now();
+          run.attempt = beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, accounting) ?? undefined;
+          if (!run.attempt) throw new Error("llm-relay: could not begin provider attempt");
+          run.attempt.accountingAttempt = accounting?.startServe(run.resolvedAttempt, egressAt) ?? null;
+          recordCredentialStarted(credentialWalk, credentialTrace, run.resolvedAttempt);
+          tried.push(specOfTarget(run.target));
+        },
+      });
+
+    const primaryRun = beginAttemptRun(res, primaryOffer);
+    // Every local below is REBOUND to the winner's record once the race settles. They are `let`
+    // for that reason alone: with hedging off, the winner is always the primary and each one is
+    // assigned exactly once, which is byte-for-byte the historical shape.
+    let resolvedAttempt = primaryRun.resolvedAttempt;
+    target = primaryRun.target;
+    // These two are held from the PRIMARY because `finally` releases them, and `finally` runs even
+    // on the `buildForwardHeaders` early return that happens before any race exists.
+    let timer = primaryRun.timer;
+    let onResClose = primaryRun.onResClose;
+    // Assigned from the WINNER when the race settles. Nothing reads them before that point, so
+    // there is deliberately no primary-shaped placeholder to go stale.
+    let controller: AbortController;
+    let callerController: AbortController;
+    let egressCallbackCalled: boolean;
+    let hedged: string | null;
     let attempt: HealthAttempt | undefined;
-    const usage = createUsageAccumulator();
-      let egressCallbackCalled = false;
-      const onEgress = () => {
-        egressCallbackCalled = true;
-        pool429.noteEgress();
-        const egressAt = Date.now();
-        attempt = beginHealthAttempt(h, resolvedAttempt, egressAt, attemptTrace, usage, accounting) ?? undefined;
-        if (!attempt) throw new Error("llm-relay: could not begin provider attempt");
-        attempt.accountingAttempt = accounting?.startServe(resolvedAttempt, egressAt) ?? null;
-        recordCredentialStarted(credentialWalk, credentialTrace, resolvedAttempt);
-      tried.push(specOfTarget(target));
-    };
     let credentialRecorded = false;
 
     try {
@@ -1559,86 +1644,114 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       }
 
       let backendRes: Response;
-      try {
-        backendRes = await fetchBackend(resolvedAttempt, {
-          path,
-          method: req.method ?? "POST",
-          reqBuf,
-          reqJson,
-          anthropicHeaders: forwardHeaders,
-          wantsStream,
-          // Reaches the dialect-rescue commit points: a tool call the relay reconstructs out of
-          // model TEXT is refused when it names a destructive tool.
-          isDestructive: h.isDestructive,
-          usage,
-          signal: controller.signal,
-          onEgress,
-        });
-        if (!attempt) {
-          credentialWalk.recordRejected(resolvedAttempt);
-          if (errorOrigin(backendRes) === "local") {
-            await forwardLocalResponse(res, backendRes);
-            h.logger.write(baseLog(started, path, hadTools, false, backendRes.status, "skipped", null, attemptTrace.snapshot()));
-          } else {
-            await backendRes.body?.cancel().catch(() => {});
-            failClosed(res, 502, "llm-relay: backend returned before provider egress");
-            h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
-          }
-          return;
-        }
-      } catch (e) {
-        if (!attempt) {
-          if (credentialWalk.pending === resolvedAttempt) {
-            credentialWalk.recordRejected(resolvedAttempt);
-          }
-          if (res.destroyed) return;
-          const status = controller.signal.aborted ? 504 : 502;
-          failClosed(res, status, egressCallbackCalled
-            ? "llm-relay: could not begin provider attempt"
-            : "llm-relay: backend preparation failed");
-          h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", null, attemptTrace.snapshot()));
-          return;
-        }
-        const aborted = controller.signal.aborted;
-        const status = aborted ? 504 : 502;
-        if (res.destroyed) {
-          completeAttemptCancelled(h, attempt, "client disconnected");
-          recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
-          credentialRecorded = true;
-          return;
-        }
-
-        completeAttemptFailure(h, attempt, {
-          failure: "transport",
-          provenance: aborted ? "deadline" : "upstream",
-          status,
-        });
-        recordCredentialOutcome(
-          credentialWalk,
-          credentialTrace,
-          resolvedAttempt,
-          aborted ? { kind: "timeout" } : { kind: "provider-transport" },
-        );
-        credentialRecorded = true;
-        const walkEnd = endWalk(
-          h,
-          res,
-          "anthropic",
-          credentialWalk,
-          attemptTrace,
-          pool429,
-          status,
-          sticky,
-          credentialTrace,
-          () => baseLog(started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot()),
+      {
+        const raced = await runAttemptWithHedge(
+          { run: primaryRun, promise: startAttempt(primaryRun, forwardHeaders) },
           {
-            kind: "transport",
-            message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
-            // Preserved cross-front residue: this handle exit omits served-by while its OpenAI
-            // twin includes it. Unifying it is now a one-line `servedBy` follow-up.
+            h,
+            res,
+            walk: credentialWalk,
+            credentialTrace,
+            attemptTrace,
+            tracker: pool429,
+            startRun: (offer) => {
+              const hedgeRun = beginAttemptRun(res, offer);
+              try {
+                return { run: hedgeRun, promise: startAttempt(hedgeRun, buildForwardHeaders(req.headers, offer)) };
+              } catch {
+                // The hedge could not build its own headers. DECLINE it rather than fail: the
+                // primary is still in flight and is the caller's answer. A `CredentialConfigError`
+                // that ends the request when it hits the PRIMARY must not end it when it hits a
+                // second candidate the caller never asked for.
+                releaseAttemptRun(res, hedgeRun);
+                credentialWalk.recordRejected(offer);
+                return undefined;
+              }
+            },
           },
         );
-        if (walkEnd) continue;
+        // Rebind to the winner. `raced.run` is the primary whenever no hedge started or the hedge
+        // lost, so with hedging off this is the primary's own record and nothing changes.
+        resolvedAttempt = raced.run.resolvedAttempt;
+        target = raced.run.target;
+        controller = raced.run.controller;
+        callerController = raced.run.callerController;
+        timer = raced.run.timer;
+        onResClose = raced.run.onResClose;
+        attempt = raced.run.attempt;
+        egressCallbackCalled = raced.run.egressCallbackCalled;
+        hedged = raced.hedged;
+
+        const settled = raced.settled;
+        if (!settled.ok) {
+          const e = settled.error;
+          if (!attempt) {
+            if (credentialWalk.isPending(resolvedAttempt)) {
+              credentialWalk.recordRejected(resolvedAttempt);
+            }
+            if (res.destroyed) return;
+            const status = controller.signal.aborted ? 504 : 502;
+            failClosed(res, status, egressCallbackCalled
+              ? "llm-relay: could not begin provider attempt"
+              : "llm-relay: backend preparation failed");
+            h.logger.write(baseLog(started, path, hadTools, false, status, "skipped", null, attemptTrace.snapshot()));
+            return;
+          }
+          const aborted = controller.signal.aborted;
+          const status = aborted ? 504 : 502;
+          if (res.destroyed) {
+            completeAttemptCancelled(h, attempt, "client disconnected");
+            recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+            credentialRecorded = true;
+            return;
+          }
+
+          completeAttemptFailure(h, attempt, {
+            failure: "transport",
+            provenance: aborted ? "deadline" : "upstream",
+            status,
+          });
+          recordCredentialOutcome(
+            credentialWalk,
+            credentialTrace,
+            resolvedAttempt,
+            aborted ? { kind: "timeout" } : { kind: "provider-transport" },
+          );
+          credentialRecorded = true;
+          const walkEnd = endWalk(
+            h,
+            res,
+            "anthropic",
+            credentialWalk,
+            attemptTrace,
+            pool429,
+            status,
+            sticky,
+            credentialTrace,
+            () => baseLog(started, path, hadTools, false, status, "skipped", target, attemptTrace.snapshot()),
+            {
+              kind: "transport",
+              message: aborted ? "backend timed out" : `backend unreachable: ${(e as Error).message}`,
+              // Preserved cross-front residue: this handle exit omits served-by while its OpenAI
+              // twin includes it. Unifying it is now a one-line `servedBy` follow-up.
+            },
+          );
+          if (walkEnd) continue;
+          return;
+        }
+        backendRes = settled.value;
+      }
+
+      if (!attempt) {
+        credentialWalk.recordRejected(resolvedAttempt);
+        if (errorOrigin(backendRes) === "local") {
+          await forwardLocalResponse(res, backendRes);
+          h.logger.write(baseLog(started, path, hadTools, false, backendRes.status, "skipped", null, attemptTrace.snapshot()));
+        } else {
+          await backendRes.body?.cancel().catch(() => {});
+          failClosed(res, 502, "llm-relay: backend returned before provider egress");
+          h.logger.write(baseLog(started, path, hadTools, false, 502, "skipped", null, attemptTrace.snapshot()));
+        }
         return;
       }
 
@@ -1823,6 +1936,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         degraded: degradedLabel(addressedPool, degradedSpecs, target),
         quotaDemoted: quotaDemotedFirst,
         latencyDemoted: latencyDemotedFirst,
+        hedged,
         paid: paidLabel(cfg, h, target),
         credentialHeaders: backendRes.status < 400
           ? credentialTrace.headers(resolvedAttempt)
@@ -1933,7 +2047,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           res.destroyed ? { kind: "cancelled" } : { kind: "local" },
         );
         credentialRecorded = true;
-      } else if (!credentialRecorded && credentialWalk.pending === resolvedAttempt) {
+      } else if (!credentialRecorded && credentialWalk.isPending(resolvedAttempt)) {
+        // `isPending`, not `pending ===`: the getter answers the OLDEST attempt in flight, which
+        // stops being the same question once a hedge can put two there. A hedge loser is retired
+        // before this point, so today the two agree — but a check that silently only ever asks
+        // about the first is exactly the trap `CredentialWalk` warns about.
         credentialWalk.recordRejected(resolvedAttempt);
       }
       if (attempt && !attempt.completed) {
@@ -2245,14 +2363,28 @@ class CredentialAttemptTrace {
     });
   }
 
+  /**
+   * Close the most recent OPEN entry belonging to this exact attempt.
+   *
+   * ⚠ **It used to take the last open entry unconditionally and then assert the identity matched.**
+   * That is the same check while exactly one attempt is ever in flight — the last open entry IS the
+   * only candidate — and it becomes wrong the moment hedging puts two in flight: entries are pushed
+   * in EGRESS order, so a PRIMARY that wins against an egressed hedge would be matched against the
+   * hedge's entry and throw "does not match a started attempt" on a perfectly good response.
+   *
+   * ⚠ The invariant it guards is UNCHANGED and still throws: an outcome recorded for an attempt with
+   * no open entry is a caller defect, not a shape to tolerate. What is now tolerated is only
+   * OUT-OF-ORDER closure, which is precisely what a race introduces.
+   */
   record(attempt: ResolvedAttempt, outcome: CredentialWalkOutcome): void {
-    const pending = [...this.entries].reverse().find((entry) => entry.outcome === undefined);
-    if (
-      !pending ||
-      pending.provider !== attempt.target.provider ||
-      pending.deployment !== specOfTarget(attempt.target) ||
-      pending.credentialId !== attempt.credentialId
-    ) {
+    const deployment = specOfTarget(attempt.target);
+    const pending = [...this.entries].reverse().find((entry) =>
+      entry.outcome === undefined &&
+      entry.provider === attempt.target.provider &&
+      entry.deployment === deployment &&
+      entry.credentialId === attempt.credentialId,
+    );
+    if (!pending) {
       throw new Error("credential attempt trace outcome does not match a started attempt");
     }
     pending.outcome = Object.freeze({ ...outcome });
@@ -2356,6 +2488,223 @@ function nextUncappedAttempt(
     attemptTrace.recordCapped(candidate.target, now);
     walk.recordRejected(candidate);
   }
+}
+
+/**
+ * Everything one in-flight attempt owns, as a record rather than a set of loop locals.
+ *
+ * ⚠ **This is the shape hedging needed, and the reason is `onEgress`.** That callback fires
+ * ASYNCHRONOUSLY, from inside `fetchBackend`, and it writes the health attempt, the accounting row
+ * and the `tried` entry. With two attempts in flight there are two callbacks, so a callback writing
+ * the LOOP's locals would attribute the hedge's egress to the primary — silently, and only under
+ * load. Each callback writes its OWN record; the loop rebinds to the winner's record once.
+ *
+ * ⚠ `attempt` and `egressCallbackCalled` are the only mutable fields, and they are mutable for
+ * exactly that reason. Everything else is fixed when the run is created.
+ */
+interface AttemptRun {
+  readonly resolvedAttempt: ResolvedAttempt;
+  readonly target: ResolvedTarget;
+  readonly controller: AbortController;
+  readonly callerController: AbortController;
+  readonly timer: ReturnType<typeof setTimeout>;
+  readonly onResClose: () => void;
+  readonly usage: UsageAccumulator;
+  attempt: HealthAttempt | undefined;
+  egressCallbackCalled: boolean;
+}
+
+/** Create one run's controllers, deadline and client-close listener. */
+function beginAttemptRun(res: ServerResponse, offer: ResolvedAttempt): AttemptRun {
+  const target = offer.target;
+  const controller = new AbortController();
+  const callerController = new AbortController();
+  const run: AttemptRun = {
+    resolvedAttempt: offer,
+    target,
+    controller,
+    callerController,
+    timer: setTimeout(() => controller.abort(), target.timeoutMs),
+    onResClose: abortOnClientClose(res, callerController, controller),
+    usage: createUsageAccumulator(),
+    attempt: undefined,
+    egressCallbackCalled: false,
+  };
+  res.on("close", run.onResClose);
+  return run;
+}
+
+/** Release a run's deadline and client-close listener. Idempotent; never throws. */
+function releaseAttemptRun(res: ServerResponse, run: AttemptRun): void {
+  clearTimeout(run.timer);
+  res.off("close", run.onResClose);
+}
+
+/** One started attempt: its record, plus the fetch already in flight for it. */
+interface StartedAttempt {
+  readonly run: AttemptRun;
+  readonly promise: Promise<Response>;
+}
+
+/**
+ * The hedge policy, in ONE place, for BOTH fronts.
+ *
+ * ⚠ Shared deliberately and not by preference. This repo has already paid for "two paths, two
+ * policies, one of them empty" once — the OpenAI front shipped with no failover and no breaker
+ * accounting at all — and a duplicating term is a far worse thing to get wrong on one front only.
+ */
+interface HedgedAttemptDeps {
+  readonly h: Handlers;
+  readonly res: ServerResponse;
+  readonly walk: CredentialWalk;
+  readonly credentialTrace: CredentialAttemptTrace;
+  readonly attemptTrace: RequestAttemptTrace;
+  readonly tracker: Pool429Tracker;
+  /**
+   * Begin the hedge candidate's own fetch, or decline it.
+   *
+   * ⚠ It must NEVER throw and must never fail the request. The primary is still in flight and is
+   * the caller's answer, so a hedge that cannot even build its own headers is simply not started —
+   * declining costs the request nothing, while a throw here would fail a healthy turn.
+   */
+  startRun(offer: ResolvedAttempt): StartedAttempt | undefined;
+}
+
+interface HedgedAttemptResult {
+  /** The run whose settlement the caller must now handle — primary, or the hedge that beat it. */
+  readonly run: AttemptRun;
+  readonly settled: Settled<Response>;
+  /** The `HEDGED_HEADER` line, or null when no hedge was started. */
+  readonly hedged: string | null;
+}
+
+/** Settle a promise into data without letting a rejection escape. */
+function settleResponse(promise: Promise<Response>): Promise<Settled<Response>> {
+  return promise.then(
+    (value) => ({ ok: true, value }) as Settled<Response>,
+    (error: unknown) => ({ ok: false, error }) as Settled<Response>,
+  );
+}
+
+/**
+ * Would the walk fail over past this response?
+ *
+ * ⚠ It is the loop's OWN expression, extracted so there is one definition. `isWin` must agree
+ * exactly with what the loop does next: a primary answering 429 has NOT won, because the walk was
+ * going to try another candidate anyway, and treating it as a win would abort a hedge that is
+ * about to answer 200.
+ */
+function walkWouldFailOver(response: Response): boolean {
+  return errorOrigin(response) !== "local" && shouldTryNext(classifyStatus(response.status));
+}
+
+/** `"a -> b (hedge won after 20000ms, floor)"` — bounded, metadata only, never content. */
+function hedgedLabel(
+  primary: AttemptRun,
+  hedge: AttemptRun,
+  winner: "primary" | "hedge",
+  decision: { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] },
+): string {
+  const side = winner === "hedge" ? "hedge won" : "primary won";
+  return `${specOfTarget(primary.target)} -> ${specOfTarget(hedge.target)} (${side} after ${decision.delayMs}ms, ${decision.basis})`;
+}
+
+/**
+ * Retire a hedge LOSER — the attempt this relay aborted because the other one answered.
+ *
+ * ⚠ Order matters and is load-bearing: the loser must be closed BEFORE the winner's own outcome is
+ * recorded, or the credential trace still holds two open entries when the winner closes one.
+ *
+ * ⚠ An aborted loser is charged NOTHING on the breaker. `completeAttemptCancelled` returns before
+ * the provenance table, exactly as a client disconnect does, so this deployment's slowness is not
+ * learned from this request. That is a stated cost of hedging and not an oversight — `hedge-race.ts`
+ * records it, and it is tolerable only because a NON-hedged request still cools a slow deployment
+ * for as long as it wasted (v0.65.3).
+ */
+function retireHedgeLoser(deps: HedgedAttemptDeps, loser: AttemptRun): void {
+  releaseAttemptRun(deps.res, loser);
+  try {
+    loser.controller.abort();
+  } catch {
+    // `raceWithHedge` already aborted it; this is belt and braces, and a failed abort must never
+    // take down a request the relay has already won.
+  }
+  if (loser.attempt) {
+    completeAttemptCancelled(deps.h, loser.attempt, "hedge loser aborted");
+    deps.credentialTrace.record(loser.resolvedAttempt, { kind: "cancelled" });
+    // NOT `walk.record`: a `cancelled` outcome there sets `#stopped` and would end the walk for the
+    // very request the hedge just rescued. An abandoned attempt proved nothing, so its deployment
+    // goes back on the queue and no credential is suppressed.
+    deps.walk.recordAbandoned(loser.resolvedAttempt);
+  } else if (deps.walk.isPending(loser.resolvedAttempt)) {
+    // It never reached egress, so there is nothing to abandon and no start budget was spent.
+    deps.walk.recordRejected(loser.resolvedAttempt);
+  }
+}
+
+/**
+ * Run one candidate, and start the NEXT one beside it if it turns out slow.
+ *
+ * Called by both fronts in place of a bare `await fetchBackend(...)`. When `hedgeDelay` declines —
+ * hedging off, or the deployment is not FREE — this is exactly the historical serial await, and no
+ * timer, no second candidate and no extra bookkeeping happen at all.
+ */
+async function runAttemptWithHedge(
+  primary: StartedAttempt,
+  deps: HedgedAttemptDeps,
+): Promise<HedgedAttemptResult> {
+  const decision = deps.h.hedgeDelay(primary.run.resolvedAttempt);
+  if (decision === null) {
+    return { run: primary.run, settled: await settleResponse(primary.promise), hedged: null };
+  }
+
+  let hedge: StartedAttempt | undefined;
+  let raced: HedgeRaceResult<Response>;
+  try {
+    raced = await raceWithHedge<Response>({
+      primary: { promise: primary.promise, abort: () => primary.run.controller.abort() },
+      delayMs: decision.delayMs,
+      // Resolved LATE, at the moment the hedge is actually needed: a hard cap, a quota demotion or
+      // a breaker trip may have landed while the primary ran, and `nextUncappedAttempt` re-reads
+      // all three. That is why `raceWithHedge` takes a factory rather than a candidate.
+      startHedge: (): RaceEntrant<Response> | undefined => {
+        if (deps.res.destroyed) return undefined;
+        const offer = nextUncappedAttempt(deps.h, deps.walk, deps.attemptTrace, deps.tracker);
+        if (!offer) return undefined;
+        // ⚠ THE structural guard, and it is independent of config on purpose. A SATURATED walk
+        // re-offers the attempt already in flight, so getting the primary back here means the walk
+        // had no second slot — and starting it would fetch one deployment twice, then record two
+        // outcomes against one pending slot. `hedgeMaxInFlight` should already prevent this; a walk
+        // built without it must still be safe.
+        //
+        // ⚠ Identity is the WHOLE test. `isPending` cannot be used here: `next()` inserts a
+        // genuinely NEW offer into the pending map BEFORE returning it, so an `isPending` check
+        // would decline every hedge and the feature would be silently inert.
+        if (offer === primary.run.resolvedAttempt) return undefined;
+        const started = deps.startRun(offer);
+        if (!started) return undefined;
+        hedge = started;
+        return { promise: started.promise, abort: () => started.run.controller.abort() };
+      },
+      isWin: (settled) => settled.ok && !walkWouldFailOver(settled.value),
+    });
+  } catch (e) {
+    // Defensive only — nothing inside the race is expected to throw. But a throw that escaped with
+    // a hedge already started would leak its deadline timer and its `close` listener for the life
+    // of the response, so retire it before the error continues on its way.
+    if (hedge) retireHedgeLoser(deps, hedge.run);
+    throw e;
+  }
+
+  if (!raced.hedgeStarted || !hedge) {
+    return { run: primary.run, settled: raced.settled, hedged: null };
+  }
+  const winner = raced.winner === "hedge" ? hedge.run : primary.run;
+  const loser = raced.winner === "hedge" ? primary.run : hedge.run;
+  retireHedgeLoser(deps, loser);
+  // Announced whether the hedge won or lost. A header that appeared only on a win would hide the
+  // case an operator most needs to see: a pool duplicating requests for no benefit.
+  return { run: winner, settled: raced.settled, hedged: hedgedLabel(primary.run, hedge.run, raced.winner, decision) };
 }
 
 type WalkExitKind = "transport" | "post-header-body-failure" | "dead-stream";
@@ -2985,6 +3334,13 @@ interface Ctx {
    */
   quotaDemoted?: string | null;
   latencyDemoted?: string | null;
+  /**
+   * Set when a HEDGE ran beside this walk's attempt — win or lose. See `HEDGED_HEADER`.
+   *
+   * ⚠ Unlike the three demotion fields above, this announces a DUPLICATED request rather than a
+   * reorder, which is why it is announced even when the hedge lost.
+   */
+  hedged?: string | null;
   /** Set when the answering deployment is not free. See `PAID_HEADER`. */
   paid?: string | null;
   /** Request-local sticky key and the previously stored pin's evaluation. */
@@ -4222,7 +4578,11 @@ async function openAiFrontPath(
           res.destroyed ? { kind: "cancelled" } : { kind: "local" },
         );
         credentialRecorded = true;
-      } else if (!credentialRecorded && credentialWalk.pending === resolvedAttempt) {
+      } else if (!credentialRecorded && credentialWalk.isPending(resolvedAttempt)) {
+        // `isPending`, not `pending ===`: the getter answers the OLDEST attempt in flight, which
+        // stops being the same question once a hedge can put two there. A hedge loser is retired
+        // before this point, so today the two agree — but a check that silently only ever asks
+        // about the first is exactly the trap `CredentialWalk` warns about.
         credentialWalk.recordRejected(resolvedAttempt);
       }
       if (attempt && !attempt.completed) {
@@ -4305,6 +4665,8 @@ interface ServedAnnouncementContext {
   readonly degraded?: string | null | undefined;
   readonly quotaDemoted?: string | null | undefined;
   readonly latencyDemoted?: string | null | undefined;
+  /** A hedge ran beside this walk's attempt. See `HEDGED_HEADER`. */
+  readonly hedged?: string | null | undefined;
   readonly paid?: string | null | undefined;
   readonly sticky?: StickyRequestContext | null | undefined;
 }
@@ -4339,6 +4701,7 @@ function responseHeadersForTarget(
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   if (ctx.quotaDemoted) responseHeaders[QUOTA_DEMOTED_HEADER] = ctx.quotaDemoted;
   if (ctx.latencyDemoted) responseHeaders[LATENCY_DEMOTED_HEADER] = ctx.latencyDemoted;
+  if (ctx.hedged) responseHeaders[HEDGED_HEADER] = ctx.hedged;
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
   if (ctx.credentialHeaders) Object.assign(responseHeaders, ctx.credentialHeaders);
   const sticky = stickyHeaderValue(ctx.sticky, ctx.target, backendRes.status);

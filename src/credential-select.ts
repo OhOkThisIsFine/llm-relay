@@ -337,8 +337,26 @@ export class CredentialWalk {
 
   next(): ResolvedAttempt | undefined {
     if (this.#stopped) return undefined;
-    // Saturated: re-offer the oldest in flight, which at `maxInFlight` 1 is the single pending
-    // attempt and is byte-for-byte the historical behaviour.
+    /**
+     * ⚠⚠ **An attempt already OFFERED but not yet STARTED is re-offered, never passed over.**
+     *
+     * This is what makes the request loop's LOOK-AHEAD idiom safe at any `maxInFlight`. Both fronts
+     * decide whether to fail over by asking for the next candidate, and then `continue`, and the
+     * top of the loop asks AGAIN — so one candidate is offered twice and must come back twice.
+     *
+     * At `maxInFlight` 1 the saturation branch below did that by accident: one pending attempt made
+     * the walk saturated, so the second ask re-offered it. Raising the cap to 2 for hedging broke
+     * exactly that, and the failure is instructive — the walk silently handed out a THIRD candidate
+     * while the second stayed pending and unstarted forever, so a two-candidate failover test hung
+     * instead of failing. **Measured: 40 tests across both fronts, every one of them a multi-
+     * candidate failover.**
+     *
+     * A HEDGE is unaffected because a hedge is asked for only while the primary is in flight, i.e.
+     * already STARTED — so this scan finds nothing and a genuinely new candidate is taken.
+     */
+    for (const [attempt, held] of this.#pending) if (!held.started) return attempt;
+    // Saturated with every slot STARTED: re-offer the oldest, which at `maxInFlight` 1 is the
+    // single pending attempt and is byte-for-byte the historical behaviour.
     if (this.#pending.size >= this.#maxInFlight) return this.pending;
     if (!this.#budgetAllowsStart()) return undefined;
     while (this.#queue.length > 0) {

@@ -1733,3 +1733,64 @@ describe("loadConfig — routing.latency", () => {
     );
   });
 });
+
+/**
+ * `routing.hedge` — the parse contract for hedged attempts (owner decisions 2026-08-30).
+ *
+ * Sibling of the `routing.latency` block above, and deliberately the same strictness. What hedging
+ * DOES to a walk is pinned in test/hedge-wiring.test.ts; this is only about what the file may say.
+ */
+describe("loadConfig — routing.hedge", () => {
+  function hedgeCfg(hedge: unknown) {
+    return base({ routing: { default: "nim/z-ai/glm-5.2", hedge } });
+  }
+
+  it("defaults to an empty object, which means every default (i.e. ON)", () => {
+    // ON by default is owner decision D1, taken against the recommendation of off-by-default. The
+    // duplication it permits is bounded elsewhere — free deployments only, and an announcement.
+    expect(loadConfig(write("hedge-absent.json", base())).routing.hedge).toEqual({});
+  });
+
+  it("normalizes the boolean shorthand away, so nothing downstream decides what false means", () => {
+    expect(loadConfig(write("hedge-false.json", hedgeCfg(false))).routing.hedge).toEqual({ enabled: false });
+    expect(loadConfig(write("hedge-true.json", hedgeCfg(true))).routing.hedge).toEqual({ enabled: true });
+  });
+
+  it("round-trips the floor, the margin and the sample floor", () => {
+    expect(
+      loadConfig(write("hedge-obj.json", hedgeCfg({ floorMs: 30_000, margin: 3, minSamples: 8 })))
+        .routing.hedge,
+    ).toEqual({ floorMs: 30_000, margin: 3, minSamples: 8 });
+  });
+
+  it("REFUSES an unknown key rather than ignoring it", () => {
+    expect(() => loadConfig(write("hedge-typo.json", hedgeCfg({ floorms: 30_000 })))).toThrow(
+      /routing\.hedge has an unknown key "floorms"/,
+    );
+  });
+
+  it("refuses a floor that would bound nothing", () => {
+    // A 0 floor removes the one bound that stops a fast pool duplicating almost every request, and
+    // a negative or non-finite value bounds nothing while looking like it does.
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "20000"]) {
+      expect(() => loadConfig(write(`hedge-bad-${String(bad)}.json`, hedgeCfg({ floorMs: bad })))).toThrow(
+        /routing\.hedge\.floorMs must be a positive finite number/,
+      );
+    }
+    expect(() => loadConfig(write("hedge-bad-margin.json", hedgeCfg({ margin: 0 })))).toThrow(
+      /routing\.hedge\.margin must be a positive finite number/,
+    );
+    expect(() => loadConfig(write("hedge-bad-samples.json", hedgeCfg({ minSamples: -2 })))).toThrow(
+      /routing\.hedge\.minSamples must be a positive finite number/,
+    );
+  });
+
+  it("rejects a malformed block outright", () => {
+    expect(() => loadConfig(write("hedge-array.json", hedgeCfg([])))).toThrow(
+      /routing\.hedge must be an object or a boolean/,
+    );
+    expect(() => loadConfig(write("hedge-enabled.json", hedgeCfg({ enabled: "yes" })))).toThrow(
+      /routing\.hedge\.enabled must be a boolean/,
+    );
+  });
+});

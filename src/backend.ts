@@ -181,6 +181,30 @@ export const QUOTA_DEMOTED_HEADER = "x-llm-relay-quota-demoted";
 export const LATENCY_DEMOTED_HEADER = "x-llm-relay-latency-demoted";
 
 /**
+ * A HEDGE ran: a slow in-flight attempt had the next candidate started beside it, rather than
+ * after it. Fourth member of the `DEGRADED_HEADER` family, and the announcement half of the
+ * duplication bound.
+ *
+ * ⚠⚠ **This one announces something stronger than its three siblings, and the difference matters.**
+ * They each state that the relay REORDERED the walk. This states that the relay sent the SAME
+ * request to a SECOND deployment — the first behaviour here that does not merely reorder. The
+ * `CLAUDE.md` invariant reads "Acting on counts is optional, always announced, and may only
+ * reorder"; the owner amended it for hedging on 2026-08-30, and this header is one of the three
+ * bounds that amendment rests on. The other two are `assessCost()`-free deployments only, and the
+ * loser aborted the moment a winner commits.
+ *
+ * Value is one bounded line naming BOTH deployments and which one answered, e.g.
+ * `nim/deepseek-ai/deepseek-v4-flash -> nim/nvidia/nemotron-3-ultra-550b-a55b (hedge won after
+ * 20000ms, floor)` — the two specs, the winner, the delay that started the hedge and the rung of
+ * evidence that set it. Metadata only: no credential values, no content, no token text.
+ *
+ * ⚠ A hedge that starts and LOSES is announced too. The duplication happened either way, and a
+ * header that appeared only when the hedge won would under-report exactly the case an operator
+ * needs to see — a pool duplicating requests for no benefit.
+ */
+export const HEDGED_HEADER = "x-llm-relay-hedged";
+
+/**
  * This request was refused by an OPERATOR-SET HARD CAP (G2) — not by a provider.
  *
  * Value is one line per capped credential cell, e.g.
