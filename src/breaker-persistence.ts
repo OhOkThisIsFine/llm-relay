@@ -33,6 +33,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { relayStatePath } from "./state-paths.js";
 import { WriteBehindTimer } from "./write-behind.js";
+import { COOLDOWN_SOURCES } from "./circuit-breaker.js";
 import type { BreakerCooldownRow, CooldownSource } from "./circuit-breaker.js";
 
 export type { BreakerCooldownRow } from "./circuit-breaker.js";
@@ -56,14 +57,20 @@ export function getBreakerStatePath(): string {
   return join(relayStatePath("cache"), "breaker-state.json");
 }
 
+/**
+ * ⚠ DERIVED from `COOLDOWN_SOURCES`, never hand-listed.
+ *
+ * This function used to re-state all five members literally, which is the "runtime list
+ * hand-copied from the type" defect `CLAUDE.md` records against `UNTIL_BASES` and nine
+ * `dashboard-contract.ts` unions: the compiler cannot connect a literal chain to the union, so
+ * adding a member type-checks clean while every persisted row carrying it fails validation and is
+ * dropped at load — silently, since one bad row is discarded alone by design. Adding `elapsed`
+ * (2026-08-30) would have done exactly that.
+ */
+const COOLDOWN_SOURCE_SET: ReadonlySet<string> = new Set(COOLDOWN_SOURCES);
+
 function isCooldownSource(value: unknown): value is CooldownSource {
-  return (
-    value === "retry-after" ||
-    value === "escalation" ||
-    value === "default" ||
-    value === "loopback" ||
-    value === "quota"
-  );
+  return typeof value === "string" && COOLDOWN_SOURCE_SET.has(value);
 }
 
 /**

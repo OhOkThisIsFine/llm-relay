@@ -98,8 +98,25 @@ export interface DeploymentMeasurement {
   readonly minSamples: number;
 }
 
-export type CooldownSource =
-  "default" | "escalation" | "retry-after" | "loopback" | "quota";
+/**
+ * Every reason a cell may be cooling — the ONE definition.
+ *
+ * ⚠ The list is the source of truth and the type is DERIVED from it, deliberately.
+ * `breaker-persistence.ts` used to re-state all five members by hand in `isCooldownSource`, which
+ * is the "runtime list hand-copied from the type" defect this repo records against nine
+ * `dashboard-contract.ts` unions and against `UNTIL_BASES`: the compiler cannot connect the two, so
+ * a new member silently fails to load from disk while type-checking clean. It now imports this.
+ */
+export const COOLDOWN_SOURCES = [
+  "default",
+  "escalation",
+  "retry-after",
+  "loopback",
+  "quota",
+  "elapsed",
+] as const;
+
+export type CooldownSource = (typeof COOLDOWN_SOURCES)[number];
 
 export interface CooldownClearSelector {
   readonly provider: string;
@@ -172,6 +189,39 @@ function outcomeCode(outcome: {
   return outcome.status >= 200 && outcome.status < 300
     ? "200"
     : String(outcome.status);
+}
+
+/**
+ * How long a generic (non-429, non-402, no `Retry-After`) failure cools a cell.
+ *
+ * ⚠ **A cooldown must outlast the failure that caused it.** Measured 2026-08-30:
+ * `nim/deepseek-ai/deepseek-v4-flash-0731` hung on **43 consecutive attempts**, each costing the
+ * full 120000 ms provider timeout, and its breaker read `closed` every time anyone looked — so the
+ * relay walked into the same 120-second hole on every request. Nothing was broken in the charging
+ * path: a `deadline` provenance reaches the health path and a 504 passes the 4xx filter, so the
+ * trip fired exactly as written. The CONSTANT was simply smaller than the failure it punished. A
+ * 120 s waste bought a 60 s cooldown, and requests arrived 78-139 s apart, so the cell was always
+ * closed again by the next walk.
+ *
+ * So `DEFAULT_COOLDOWN_MS` becomes a FLOOR, and a slow failure cools for the time it actually
+ * wasted. That figure is MEASURED (`elapsedMs`), never invented, which is what permits setting a
+ * duration at all under this relay's rule against inventing one — the same standing that lets a
+ * provider-stated `Retry-After` set one. It takes the same `MAX_RETRY_AFTER_MS` ceiling, so a
+ * 30-minute `timeoutMs` cannot buy a 30-minute cooldown off a single sample.
+ *
+ * ⚠ **Fast failures are unaffected by construction.** A 300 ms error keeps the 60 s default,
+ * because the floor wins. Only a failure slow enough to hurt moves the number — which is why this
+ * needs no failure-kind plumbing, no new configuration, and no change to any other branch of the
+ * ladder: a `Retry-After`, a 429 escalation and a 402 all still win where they applied before.
+ *
+ * Pure, so it is pinned directly rather than through the breaker's state machine.
+ * Evidence: `docs/latency-demotion-regression-2026-08-30.md` §3.
+ */
+export function failureCooldown(elapsedMs: number): { ms: number; source: CooldownSource } {
+  const wasted = Number.isFinite(elapsedMs) ? Math.min(MAX_RETRY_AFTER_MS, Math.max(0, elapsedMs)) : 0;
+  return wasted > DEFAULT_COOLDOWN_MS
+    ? { ms: wasted, source: "elapsed" }
+    : { ms: DEFAULT_COOLDOWN_MS, source: "default" };
 }
 
 function isLoopbackTarget(target: ProviderTargetIdentity): boolean {
@@ -501,8 +551,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       state.cooldownUntil = now + asked;
       state.cooldownSource = "retry-after";
     } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
-      state.cooldownUntil = now + DEFAULT_COOLDOWN_MS;
-      state.cooldownSource = "default";
+      const cooling = failureCooldown(outcome.elapsedMs);
+      state.cooldownUntil = now + cooling.ms;
+      state.cooldownSource = cooling.source;
     }
     // One notify for the whole ladder above, whichever branch set the cooldown. A failure that
     // set none (below the trip threshold, no Retry-After) leaves nothing new to persist.

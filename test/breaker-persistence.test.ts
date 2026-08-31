@@ -78,6 +78,34 @@ describe("breaker cooling survives a restart", () => {
   });
 
   /**
+   * ⚠ Every `CooldownSource` must survive the round trip, and this one is the reason the validator
+   * no longer hand-lists them.
+   *
+   * `isCooldownSource` used to re-state all five members literally, so adding `elapsed`
+   * (2026-08-30) type-checked clean while every persisted row carrying it failed validation and was
+   * dropped at load — silently, because one bad row is discarded alone by design. A restart would
+   * then have forgotten exactly the long cooldowns this source exists to record. The validator now
+   * derives its set from `COOLDOWN_SOURCES`, and this test fails if anyone re-hardcodes it.
+   */
+  it("carries every cooldown source across a restart, the newest one included", () => {
+    const now = 1_000_000_000_000;
+    const target = identity("nim", "deepseek-ai/deepseek-v4-flash-0731");
+
+    const before = new CircuitBreaker();
+    // Two 120-second timeouts: the live hang. The second trips, and it cools for what it wasted.
+    before.recordOutcome(target, { ok: false, status: 504, elapsedMs: 120_007, at: now });
+    before.recordOutcome(target, { ok: false, status: 504, elapsedMs: 120_007, at: now });
+    expect(before.getState(target)!.cooldownSource).toBe("elapsed");
+    saveBreakerCooldowns(before.exportCooldowns(now), { path: statePath });
+
+    const after = new CircuitBreaker();
+    expect(installBreakerPersistence(after, { path: statePath, now: () => now + 1_000 })).toBe(1);
+    const carried = after.getState(target)!;
+    expect(carried.cooldownSource).toBe("elapsed");
+    expect(carried.cooldownUntil).toBe(now + 120_007);
+  });
+
+  /**
    * ⚠ The point of carrying the COUNTER, not just the expiry: once the cooldown lifts, the next
    * unexplained 429 must resume at the top of the ladder rather than restart at two minutes.
    */

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { CircuitBreaker } from "../src/circuit-breaker.js";
+import { CircuitBreaker, failureCooldown } from "../src/circuit-breaker.js";
 import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
 
 describe("CircuitBreaker", () => {
@@ -328,5 +328,84 @@ describe("CircuitBreaker — credential-cell isolation", () => {
     expect(cb.hasCredentialFault(work, 3)).toBe(true);
     expect(cb.clearCredentialFaults("p#personal")).toBe(0);
     expect(cb.clearCredentialFaults("p#work")).toBe(1);
+  });
+});
+
+/**
+ * A cooldown must outlast the failure that caused it.
+ *
+ * Measured live 2026-08-30: `nim/deepseek-ai/deepseek-v4-flash-0731` hung on 43 consecutive
+ * attempts, each costing the full 120000 ms provider timeout, while its breaker read `closed` every
+ * time. The charging path was correct all along — the 60 s constant was simply smaller than the
+ * 120 s failure it punished, and requests arrived 78-139 s apart, so the cell was always closed
+ * again by the next walk. Evidence: `docs/latency-demotion-regression-2026-08-30.md` §3.
+ */
+describe("CircuitBreaker — a slow failure cools for at least as long as it wasted", () => {
+  const t: ProviderTargetIdentity = {
+    provider: "nim",
+    credentialId: "nim#default",
+    base: "http://nim",
+    kind: "openai",
+    model: "deepseek-ai/deepseek-v4-flash-0731",
+  };
+
+  it("cools for the wasted time after two 120-second timeouts, not the flat 60 seconds", () => {
+    const cb = new CircuitBreaker();
+    const at = 1_000_000;
+    // The live figure, twice: `MAX_FAILURES_BEFORE_TRIP` is 2, so the second one trips.
+    cb.recordOutcome(t, { ok: false, status: 504, elapsedMs: 120_007, at });
+    cb.recordOutcome(t, { ok: false, status: 504, elapsedMs: 120_007, at });
+    const state = cb.getState(t)!;
+    expect(state.cooldownUntil).toBe(at + 120_007);
+    expect(state.cooldownSource).toBe("elapsed");
+    // The whole point: still cooling when the next request arrives. Live spacing was 78-139 s.
+    expect(cb.isHealthy(t, at + 78_000)).toBe(false);
+  });
+
+  it("leaves a FAST failure on the flat default, so nothing else changes", () => {
+    const cb = new CircuitBreaker();
+    const at = 1_000_000;
+    cb.recordOutcome(t, { ok: false, status: 500, elapsedMs: 341, at });
+    cb.recordOutcome(t, { ok: false, status: 500, elapsedMs: 341, at });
+    const state = cb.getState(t)!;
+    expect(state.cooldownUntil).toBe(at + 60_000);
+    expect(state.cooldownSource).toBe("default");
+  });
+
+  it("never lets a provider-stated Retry-After lose to the elapsed time", () => {
+    // The ladder's order is unchanged: an explicit figure still wins where it applied before.
+    const cb = new CircuitBreaker();
+    const at = 1_000_000;
+    cb.recordOutcome(t, { ok: false, status: 503, elapsedMs: 120_000, at, retryAfterMs: 5_000 });
+    const state = cb.getState(t)!;
+    expect(state.cooldownUntil).toBe(at + 5_000);
+    expect(state.cooldownSource).toBe("retry-after");
+  });
+});
+
+describe("failureCooldown — the pure decision", () => {
+  it("keeps the 60-second floor for anything faster than it", () => {
+    expect(failureCooldown(0)).toEqual({ ms: 60_000, source: "default" });
+    expect(failureCooldown(341)).toEqual({ ms: 60_000, source: "default" });
+    expect(failureCooldown(60_000)).toEqual({ ms: 60_000, source: "default" });
+  });
+
+  it("rises to the measured waste above the floor", () => {
+    expect(failureCooldown(60_001)).toEqual({ ms: 60_001, source: "elapsed" });
+    expect(failureCooldown(120_007)).toEqual({ ms: 120_007, source: "elapsed" });
+  });
+
+  it("clamps at the same ceiling a provider-stated Retry-After gets", () => {
+    // A 30-minute `timeoutMs` (openrouter declares exactly that) must not buy a 30-minute
+    // cooldown off one sample.
+    expect(failureCooldown(1_800_000)).toEqual({ ms: 900_000, source: "elapsed" });
+  });
+
+  it("treats a nonsense elapsed time as no evidence, never as an enormous cooldown", () => {
+    // Unknown is never a measurement. Falling the other way would cool a cell for the ceiling on
+    // a number nobody measured — the provenance rule broken in the most damaging direction.
+    expect(failureCooldown(Number.NaN)).toEqual({ ms: 60_000, source: "default" });
+    expect(failureCooldown(Number.POSITIVE_INFINITY)).toEqual({ ms: 60_000, source: "default" });
+    expect(failureCooldown(-5)).toEqual({ ms: 60_000, source: "default" });
   });
 });
