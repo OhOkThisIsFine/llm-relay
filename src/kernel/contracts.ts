@@ -87,8 +87,30 @@ export interface AttemptFailed extends AttemptOutcomeBase {
   readonly retryAfterMs: number | null;
 }
 
+/**
+ * WHO abandoned a cancelled attempt, and on which side of the response commit.
+ *
+ * `reason` below is free text for a human reading a log. This is the closed vocabulary a POLICY may
+ * branch on, and the two are not interchangeable: when a client disconnects mid-race the relay
+ * retires the hedge with the reason string "hedge loser aborted" whatever the true cause, so a
+ * discriminator read off that prose would misclassify exactly the case it exists to catch.
+ *
+ * - `client-gone-before-response` — the caller left and this deployment had committed NOTHING to it.
+ *   The deployment produced no answer in the time it had.
+ * - `client-gone-mid-response` — the caller left while this deployment's answer was already
+ *   reaching it. The deployment was answering; the caller changed its mind.
+ * - `relay-abandoned` — the RELAY aborted it (a hedge loser). It proves only that the relay stopped
+ *   waiting, which is a statement about the relay's own policy, not about the deployment.
+ */
+export type AttemptCancellationCause =
+  | "client-gone-before-response"
+  | "client-gone-mid-response"
+  | "relay-abandoned";
+
 export interface AttemptCancelled extends AttemptOutcomeBase {
   readonly terminal: "cancelled";
+  /** Required, so a new cancellation site must decide rather than inherit a default. */
+  readonly cause: AttemptCancellationCause;
   readonly reason: string | null;
 }
 

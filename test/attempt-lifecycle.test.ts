@@ -499,6 +499,8 @@ describe("CircuitBreaker attempt lifecycle", () => {
   expect([...breaker.getAllStates().keys()]).toEqual(["passthrough#default"]);
 });
 
+  // Still true, and deliberately kept at `elapsedMs: 12`: a cancellation that short is BELOW the
+  // evidence floor, so it invents nothing even though its cause is the one cause that can charge.
   it("accepts cancellation once without inventing a health observation", () => {
     const breaker = new CircuitBreaker();
     const handle = begin(breaker);
@@ -506,6 +508,7 @@ describe("CircuitBreaker attempt lifecycle", () => {
       target: targetA,
       terminal: "cancelled",
       provenance: "client-cancellation",
+      cause: "client-gone-before-response",
       reason: "client disconnected",
       completedAt: 5_000,
       elapsedMs: 12,

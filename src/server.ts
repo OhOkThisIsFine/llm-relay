@@ -104,6 +104,7 @@ type CostClassFn = (attempt: ResolvedAttempt) => CostClass | undefined;
 import { createHardCapLedgerReader, evaluateHardCap, hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
 import { applyResetRule, interpretRefusal, materializeScope, parseStatedResetMs, recordUnknownRefusal, type Interpretation } from "./refusal-interpretation.js";
 import type {
+  AttemptCancellationCause,
   AttemptFailed,
   AttemptHandle,
   OutcomeProvenance,
@@ -2615,11 +2616,17 @@ function hedgedLabel(
  * ⚠ Order matters and is load-bearing: the loser must be closed BEFORE the winner's own outcome is
  * recorded, or the credential trace still holds two open entries when the winner closes one.
  *
- * ⚠ An aborted loser is charged NOTHING on the breaker. `completeAttemptCancelled` returns before
- * the provenance table, exactly as a client disconnect does, so this deployment's slowness is not
- * learned from this request. That is a stated cost of hedging and not an oversight — `hedge-race.ts`
- * records it, and it is tolerable only because a NON-hedged request still cools a slow deployment
- * for as long as it wasted (v0.65.3).
+ * ⚠ An aborted loser is charged NOTHING on the breaker, and that is now stated where a maintainer
+ * changing it will see it: `completeAttemptAbandoned` names the cause `relay-abandoned`, which
+ * `circuit-breaker.ts` `CANCELLATION_REACHES_HEALTH_PATH` answers `false`. So this deployment's
+ * slowness is still not learned from this request. It is a stated cost of hedging and not an
+ * oversight — the relay stopped waiting, which is a fact about `routing.hedge`'s delay rather than
+ * about the deployment, and the loser might have answered a millisecond later. It stays tolerable
+ * because a NON-hedged request still cools a slow deployment for as long as it wasted (v0.65.3).
+ *
+ * ⚠ It must NOT be `completeAttemptCancelled`. That one now classifies by whether the caller had
+ * been receiving an answer, and a loser that committed nothing would be read as a deployment that
+ * failed to answer a client — charging the very attempt hedging exists to abandon for free.
  */
 function retireHedgeLoser(deps: HedgedAttemptDeps, loser: AttemptRun): void {
   releaseAttemptRun(deps.res, loser);
@@ -2630,7 +2637,7 @@ function retireHedgeLoser(deps: HedgedAttemptDeps, loser: AttemptRun): void {
     // take down a request the relay has already won.
   }
   if (loser.attempt) {
-    completeAttemptCancelled(deps.h, loser.attempt, "hedge loser aborted");
+    completeAttemptAbandoned(deps.h, loser.attempt, "hedge loser aborted");
     deps.credentialTrace.record(loser.resolvedAttempt, { kind: "cancelled" });
     // NOT `walk.record`: a `cancelled` outcome there sets `#stopped` and would end the walk for the
     // very request the hedge just rescued. An abandoned attempt proved nothing, so its deployment
@@ -3397,6 +3404,15 @@ interface HealthAttempt {
   readonly accounting: RequestAccountingState | null;
   accountingAttempt: AccountingAttempt | null;
   completed: boolean;
+  /**
+   * Has any byte of THIS attempt's answer reached the caller?
+   *
+   * ⚠ Set by `markAttemptCommitted` and read only to classify a cancellation. It is the measured
+   * fact that separates "the deployment never answered" from "the caller changed its mind about an
+   * answer it was receiving" — the distinction the free-text `reason` cannot carry, because the
+   * hedge retires its loser with a fixed reason string whatever the true cause.
+   */
+  committed: boolean;
   terminal?: "succeeded" | "failed" | "cancelled";
 }
 
@@ -3423,6 +3439,7 @@ function beginHealthAttempt(
   const begun = h.breaker.beginAttempt(identity);
   if (!begun.ok) return null;
   return {
+    committed: false,
     handle: begun.value,
     identity,
     resolvedAttempt,
@@ -3877,6 +3894,9 @@ function accountingFailureForAttempt(options: {
 }
 
 function markAttemptCommitted(attempt: HealthAttempt): void {
+  // Recorded on the attempt itself, not only through the optional accounting recorder: the
+  // cancellation classifier must answer the same way on a relay running with no accounting.
+  attempt.committed = true;
   attempt.accounting?.markCommitted(attempt.accountingAttempt, Date.now());
 }
 
@@ -3961,7 +3981,41 @@ function completeAttemptFailure(
   );
 }
 
+/**
+ * The CALLER went away. Which side of the response commit it happened on is a MEASURED fact, read
+ * off the attempt rather than typed at the call site.
+ *
+ * ⚠ Never take the cause from a call site's prose. When the client disconnects during a live hedge
+ * race, `runAttemptWithHedge` still retires the hedge with the fixed reason "hedge loser aborted",
+ * so a discriminator read off `reason` would misclassify exactly the case this exists to catch.
+ */
 function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: string | null): void {
+  completeCancellation(
+    h,
+    attempt,
+    reason,
+    attempt.committed ? "client-gone-mid-response" : "client-gone-before-response",
+  );
+}
+
+/**
+ * The RELAY abandoned this attempt itself — today only a hedge loser.
+ *
+ * ⚠ Separate from `completeAttemptCancelled` on purpose. Both end an attempt the client never got
+ * an answer from, but only one of them is evidence about the deployment: an abandoned loser proves
+ * the relay stopped waiting, which is a statement about `routing.hedge`'s delay. The breaker's
+ * `CANCELLATION_REACHES_HEALTH_PATH` is where that stays a stated cost of hedging.
+ */
+function completeAttemptAbandoned(h: Handlers, attempt: HealthAttempt, reason: string | null): void {
+  completeCancellation(h, attempt, reason, "relay-abandoned");
+}
+
+function completeCancellation(
+  h: Handlers,
+  attempt: HealthAttempt,
+  reason: string | null,
+  cause: AttemptCancellationCause,
+): void {
   if (attempt.completed) return;
   const completedAt = Date.now();
   const result = h.breaker.completeAttempt(attempt.handle, {
@@ -3970,6 +4024,7 @@ function completeAttemptCancelled(h: Handlers, attempt: HealthAttempt, reason: s
     provenance: "client-cancellation",
     completedAt,
     elapsedMs: completedAt - attempt.started,
+    cause,
     reason,
   });
   if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);

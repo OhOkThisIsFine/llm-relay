@@ -30,18 +30,41 @@
   "what the answer you received cost" — and whichever it means, the token totals beside it mean the
   same thing. Today both follow the winner-only rule, and they agree.
 
-- **The breaker learns nothing when the CLIENT gives up first** (found 2026-08-30, low, recorded
-  not fixed). A client disconnect records the attempt as `cancelled`, and cancelled returns BEFORE
-  `PROVENANCE_REACHES_HEALTH_PATH` (`circuit-breaker.ts`: "Order: cancelled → quota → this table →
-  health"). So a deployment that out-waits the caller is never charged. Measured: a 65-second probe
-  against the hanging member taught the breaker nothing at all.
-
-  **Property:** a deployment that outlasts the caller's patience is distinguishable from a caller
-  who simply changed their mind. ⚠ The early return is deliberate and its comment says why — a
-  client hanging up says nothing about the provider — so this needs the two cases separated, not
-  the return deleted.
-
 ## Closed
+
+- ✅ **The breaker learns nothing when the CLIENT gives up first — SHIPPED** (found and closed
+  2026-08-30). A client disconnect recorded the attempt as `cancelled`, and cancelled returned
+  BEFORE `PROVENANCE_REACHES_HEALTH_PATH`, so a deployment that out-waited the caller was never
+  charged. Measured: a 65-second probe against the hanging member taught the breaker nothing at all.
+
+  **Property met:** a deployment that outlasts the caller's patience is now distinguishable from a
+  caller who simply changed their mind. The entry's own constraint was honoured — the two cases are
+  SEPARATED, and the early return was not deleted.
+
+  ⚠ **The constraint was load-bearing, and the measurement behind it is worth keeping.** That one
+  line carried THREE events, so deleting it would have made three routing changes at once:
+  `PROVENANCE_REACHES_HEALTH_PATH["client-cancellation"]` is already `true`, so every ordinary
+  client disconnect would have charged provider health; every hedge loser would have been charged,
+  repealing a documented hedging invariant that has its own tests; and cancelled attempts' quota
+  headers would have begun merging into routing state.
+
+  Delivered as a REQUIRED closed `cause` on `AttemptCancelled` routed by a second total table
+  (`CANCELLATION_REACHES_HEALTH_PATH`), with the cause DERIVED from `HealthAttempt.committed`
+  rather than from the `reason` prose — because when a client disconnects during a live hedge race
+  the relay still retires the hedge with the fixed string "hedge loser aborted" whatever the true
+  cause. 11 tests; five mutation checks, each killed by exactly one test.
+
+  ⚠ Two accepted consequences, stated so they are not later read as bugs: an admitted cancellation
+  CREATES a `CircuitState` row where none existed, surfacing that deployment on four operator-facing
+  surfaces; and `MAX_FAILURES_BEFORE_TRIP` is 2, so one long cancellation records a failure and a
+  ping but sets no cooldown — deliberate, and the repo's standing rule against acting on one
+  request's latency.
+
+  ⚠ NOT extended to the latency datasets. `onServedLatency` stays gated to serve+success, so a
+  cancelled attempt reaches neither `probe-cache.json` nor the `routing.latency`/`hedge-trigger`
+  terms. That is correct rather than unfinished: a cancellation carries no token count, and a
+  request sample with no token count already reaches NEITHER latency statistic by design.
+
 
 - ✅ **Hedged attempts — SHIPPED and wired on both fronts** (owner proposal 2026-08-30; the four
   decisions are in [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md) §7).

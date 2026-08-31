@@ -1,6 +1,8 @@
 import { sameProviderTarget } from "./kernel/contracts.js";
 import type {
   AttemptBeginFailure,
+  AttemptCancellationCause,
+  AttemptCancelled,
   AttemptCompletionFailure,
   AttemptHandle,
   AttemptId,
@@ -167,6 +169,52 @@ const PROVENANCE_REACHES_HEALTH_PATH: Record<OutcomeProvenance, boolean> = {
   "client-cancellation": true,
   "relay-mapper-defect": false,
 } as const satisfies Record<OutcomeProvenance, boolean>;
+
+/**
+ * Does this cancellation cause reach the provider-health path?
+ *
+ * ⚠ The sibling of `PROVENANCE_REACHES_HEALTH_PATH`, and it exists because that table cannot answer
+ * this question: every cancellation carries `provenance: "client-cancellation"`, so one entry there
+ * would have to speak for a caller who hung up AND for a hedge loser the relay itself aborted.
+ *
+ * - `client-gone-before-response` — the only `true`. The caller waited, this deployment committed
+ *   nothing, and the caller left. That is the same evidence a `deadline` carries — a deployment
+ *   that did not answer in the time it had — cut short by the client rather than by the relay's own
+ *   timer. ⚠ It is admitted only ABOVE `CANCELLATION_EVIDENCE_MS`; see that constant.
+ * - `client-gone-mid-response` — `false`. This deployment's answer was already reaching the caller,
+ *   so the caller changed its mind about an answer it was receiving. Charging it would demote a
+ *   deployment for being interrupted while working.
+ * - `relay-abandoned` — `false`. A hedge loser. It proves the RELAY stopped waiting, which is a
+ *   statement about `routing.hedge`'s own delay and not about the deployment; the loser might have
+ *   answered a millisecond later. `server.ts` `retireHedgeLoser` records this as a stated cost of
+ *   hedging, and this entry is where that cost is kept — do not flip it without owner instruction.
+ */
+const CANCELLATION_REACHES_HEALTH_PATH: Record<AttemptCancellationCause, boolean> = {
+  "client-gone-before-response": true,
+  "client-gone-mid-response": false,
+  "relay-abandoned": false,
+} as const satisfies Record<AttemptCancellationCause, boolean>;
+
+/**
+ * How long a client-abandoned attempt must have run before it is EVIDENCE about the deployment.
+ *
+ * ⚠ Without a floor this term would charge a deployment every time a caller changed its mind
+ * quickly, which is the half of the backlog property that says a caller who simply changed their
+ * mind must stay distinguishable. A cancellation at 200 ms says nothing: no deployment owes an
+ * answer that fast.
+ *
+ * ⚠ It is DERIVED from `DEFAULT_COOLDOWN_MS` rather than picked, so there is one tunable number
+ * here and not two, and so the rule carries a property worth stating: an admitted cancellation has
+ * by construction wasted more than the default cooldown, so when it does trip the cell,
+ * `failureCooldown` necessarily returns `source: "elapsed"` and the cooldown equals the measured
+ * waste. A cooldown shorter than the failure that earned it is the v0.65.3 defect.
+ *
+ * ⚠ It is a threshold on TIME WASTED, not a latency ceiling, and it is deliberately far above the
+ * `latency-demotion.ts` band: this term must fire on a hang, never on a slow answer. The measured
+ * incident it exists for is a 65-second probe against a hanging member that taught the breaker
+ * nothing at all, and 43 consecutive 120-second hangs on the same deployment.
+ */
+const CANCELLATION_EVIDENCE_MS = DEFAULT_COOLDOWN_MS;
 
 const RATE_LIMIT_ESCALATION_MS = [
   120_000, 600_000, 3_600_000, 86_400_000,
@@ -426,7 +474,10 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     outcome: AttemptOutcome,
     observation?: HeaderObservation,
   ): void {
-    if (outcome.terminal === "cancelled") return;
+    if (outcome.terminal === "cancelled") {
+      this.applyCancelledOutcome(target, outcome);
+      return;
+    }
     this.recordQuotaObservations(target, observation?.quotaObservations);
     // Consult the single provenance table. Quota observations were recorded above even for a
     // mapper defect (a header the provider sent is still the provider's statement). A `false`
@@ -486,6 +537,39 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     this.applyHealthOutcome(target, {
       ...outcome,
       at: outcome.at ?? Date.now(),
+    });
+  }
+
+  /**
+   * A cancelled attempt: teach the cell only what the cancellation actually proves.
+   *
+   * ⚠ This is the ONE place the old flat `if (outcome.terminal === "cancelled") return;` used to
+   * be, and its two guards are why that line could not simply be deleted. Deleting it would have
+   * charged provider health for every ordinary client disconnect — `PROVENANCE_REACHES_HEALTH_PATH`
+   * already answers `true` for `client-cancellation` — and for every hedge loser, silently
+   * repealing a documented hedging invariant. Two routing changes nobody asked for, from one line.
+   *
+   * ⚠ No quota observations are recorded here. The `HeaderObservation` a cancelled attempt carries
+   * is not passed on: a walk that was abandoned may hold a partially-read response, and the
+   * ordinary path records observations only alongside an outcome it also charges.
+   */
+  private applyCancelledOutcome(
+    target: ProviderTargetIdentity,
+    outcome: AttemptCancelled,
+  ): void {
+    if (!CANCELLATION_REACHES_HEALTH_PATH[outcome.cause]) return;
+    // The finite test is explicit rather than folded into the comparison: `NaN <= x` is FALSE, so
+    // a non-finite elapsed would fall through and CHARGE. An unusable measurement must fall to the
+    // weaker claim, which here is charging nothing.
+    if (!Number.isFinite(outcome.elapsedMs) || outcome.elapsedMs <= CANCELLATION_EVIDENCE_MS) return;
+    // `status` is deliberately absent: no provider status was ever received, so `outcomeCode`
+    // records this as a statusless failure exactly as a transport failure is. That keeps it OUT of
+    // `MEASURABLE_CODES`, so an attempt whose true duration is unknown never enters a latency
+    // statistic — it moves uptime, which is the thing it actually measured.
+    this.applyHealthOutcome(target, {
+      ok: false,
+      elapsedMs: outcome.elapsedMs,
+      at: outcome.completedAt,
     });
   }
 
