@@ -121,7 +121,8 @@ history - do not reintroduce them.
 | `docs/three-axis-assessment-2026-08-28.md` | The owner's three-axis capability assessment: verdicts per axis, the live-signal finding, the closed follow-up ledger. |
 | `docs/advisory-findings-verification-2026-08-28.md` | The pass over the 32 advisory findings the 2026-08-26 review left unverified: the closed-vocabulary bug class and all eight instances, Class A vs Class B, the verdict ledger. |
 | `docs/documentation-pass-2026-08-27.md` | The doc-vs-source pass: what was wrong and in what classes, what was deliberately left, and the friction. |
-| `docs/dispatch-integration-review-2026-08-27.md` | Cross-CLI dispatch: how the ladder is actually executed, the agy console-window cause and fix, agy's permission vocabulary, ACP as the verified transport, ranked options, open tests. |
+| `docs/dispatch-integration-review-2026-08-27.md` | Historical cross-CLI dispatch review: execution model, AGY permissions, ACP transport, and the original immediate-child window fix. Its AGY focus-safety conclusion is superseded by the 2026-08-31 report below. |
+| `docs/dispatch-smoothness-2026-08-31.md` | Current per-agent routing matrix, MCP spawn guarantees, PowerShell/OpenCode repairs, and the active AGY window quarantine plus revalidation boundary. |
 
 ## 3. Verification — the one gate
 

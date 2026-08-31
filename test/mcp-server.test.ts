@@ -205,6 +205,12 @@ describe("mcp server handshake", () => {
     expect(text).toContain("free capacity");
     // 3. And the answer is not authoritative, which bounds what the model may do with it.
     expect(text).toContain("advisory");
+    // 4. The always-loaded instructions state why shelling out is the wrong Windows fallback,
+    // while keeping the third-party descendant boundary explicit instead of promising too much.
+    expect(text).toContain("hidden child creation");
+    expect(text).toContain("closes stdin");
+    expect(text).toContain("agent alias");
+    expect(text).toContain("visible descendants");
   });
 
   it("carries the unprompted trigger on the dispatch tool description too", async () => {

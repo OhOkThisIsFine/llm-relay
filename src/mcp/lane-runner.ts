@@ -21,7 +21,7 @@
  * the relay daemon. The daemon's rule stands untouched: no HTTP turn causes a lane spawn. This
  * process answers no HTTP at all.
  */
-import { exec, execFile, type ChildProcess } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { quoteCmdArg } from "../lane-probe.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
@@ -183,6 +183,52 @@ export type LaneSpawner = (
   opts: LaneSpawnOptions,
 ) => { result: Promise<LaneRunResult>; kill: () => void };
 
+type LaneExecError = Error & { killed?: boolean | undefined; code?: unknown };
+
+/** The small child-process surface the lane spawner needs. */
+export interface LaneChildProcess {
+  stdin: { end: () => void } | null | undefined;
+  kill: () => boolean;
+}
+
+/** Spawn options common to the direct and Windows shell-fallback paths. */
+export interface LaneExecOptions {
+  encoding: "utf8";
+  maxBuffer: number;
+  timeout: number;
+  windowsHide: true;
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+}
+
+export type LaneExecCallback = (
+  err: LaneExecError | null,
+  stdout: string,
+  stderr: string,
+) => void;
+
+/** Injectable process boundary: tests prove the real spawn contract without launching a lane. */
+export interface LaneProcessApi {
+  platform: NodeJS.Platform;
+  execFile: (
+    command: string,
+    args: string[],
+    opts: LaneExecOptions,
+    callback: LaneExecCallback,
+  ) => LaneChildProcess;
+  exec: (
+    command: string,
+    opts: LaneExecOptions,
+    callback: LaneExecCallback,
+  ) => LaneChildProcess;
+}
+
+const nodeProcessApi: LaneProcessApi = {
+  platform: process.platform,
+  execFile: (command, args, opts, callback) => execFile(command, args, opts, callback),
+  exec: (command, opts, callback) => exec(command, opts, callback),
+};
+
 /**
  * The real spawner.
  *
@@ -194,85 +240,92 @@ export type LaneSpawner = (
  * `winenv.ts`, `os-keyring.ts` and `lane-quota-probe.ts`: a test run must never spend real quota
  * or touch the operator's live agent sessions.
  */
-export const defaultLaneSpawner: LaneSpawner = (command, args, opts) => {
-  if (process.env["VITEST"]) {
-    return {
-      result: Promise.resolve({
-        code: null,
-        stdout: "",
-        stderr: "lane spawns are disabled under vitest — inject a spawner",
-        timedOut: false,
-      }),
-      kill: () => {},
-    };
-  }
+export function createLaneSpawner(
+  processApi: LaneProcessApi,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+): LaneSpawner {
+  return (command, args, opts) => {
+    if (hostEnv["VITEST"]) {
+      return {
+        result: Promise.resolve({
+          code: null,
+          stdout: "",
+          stderr: "lane spawns are disabled under vitest — inject a spawner",
+          timedOut: false,
+        }),
+        kill: () => {},
+      };
+    }
 
-  const execOpts = {
-    encoding: "utf8" as const,
-    maxBuffer: MAX_OUTPUT_BYTES,
-    timeout: opts.timeoutMs,
-    // ⚠ A console-subsystem child (agy.exe, codex's shim) makes Windows allocate a console when the
-    // parent has none, and that console steals the desktop focus. The MCP server is launched by a
-    // host that usually has no console, so this flag is not optional here.
-    windowsHide: true,
-    env: opts.env,
-    cwd: opts.cwd,
-  };
-
-  let child: ChildProcess | undefined;
-  let killed = false;
-
-  const result = new Promise<LaneRunResult>((resolve) => {
-    const settle = (
-      err: (Error & { killed?: boolean | undefined; code?: unknown }) | null,
-      stdout: string,
-      stderr: string,
-    ): void => {
-      if (!err) {
-        resolve({ code: 0, stdout, stderr, timedOut: false });
-        return;
-      }
-      resolve({
-        code: typeof err.code === "number" ? err.code : null,
-        stdout,
-        stderr: stderr ? stderr : err.message,
-        timedOut: err.killed === true,
-      });
+    const execOpts: LaneExecOptions = {
+      encoding: "utf8",
+      maxBuffer: MAX_OUTPUT_BYTES,
+      timeout: opts.timeoutMs,
+      // ⚠ A console-subsystem child (agy.exe, codex's shim) makes Windows allocate a console when the
+      // parent has none, and that console steals the desktop focus. The MCP server is launched by a
+      // host that usually has no console, so this flag is not optional here.
+      windowsHide: true,
+      env: opts.env,
+      cwd: opts.cwd,
     };
 
-    child = execFile(command, args as string[], execOpts, (err, stdout, stderr) => {
-      if (!err) {
-        resolve({ code: 0, stdout, stderr, timedOut: false });
-        return;
-      }
-      // An npm `.cmd` shim is not directly executable; Windows answers ENOENT. Retry through the
-      // shell, quoting every token — see `quoteCmdArg`.
-      if (process.platform === "win32" && (err as { code?: unknown }).code === "ENOENT" && !killed) {
-        const line = `${quoteCmdArg(command)} ${args.map(quoteCmdArg).join(" ")}`;
-        const fallback = exec(line, execOpts, (err2, stdout2, stderr2) => {
-          settle(err2, stdout2 ?? "", stderr2 ?? "");
+    let child: LaneChildProcess | undefined;
+    let killed = false;
+
+    const result = new Promise<LaneRunResult>((resolve) => {
+      const settle = (
+        err: LaneExecError | null,
+        stdout: string,
+        stderr: string,
+      ): void => {
+        if (!err) {
+          resolve({ code: 0, stdout, stderr, timedOut: false });
+          return;
+        }
+        resolve({
+          code: typeof err.code === "number" ? err.code : null,
+          stdout,
+          stderr: stderr ? stderr : err.message,
+          timedOut: err.killed === true,
         });
-        child = fallback;
-        // ⚠ Same stdin rule as the direct spawn below.
-        fallback.stdin?.end();
-        return;
-      }
-      settle(err, stdout ?? "", stderr ?? "");
+      };
+
+      child = processApi.execFile(command, args as string[], execOpts, (err, stdout, stderr) => {
+        if (!err) {
+          resolve({ code: 0, stdout, stderr, timedOut: false });
+          return;
+        }
+        // An npm `.cmd` shim is not directly executable; Windows answers ENOENT. Retry through the
+        // shell, quoting every token — see `quoteCmdArg`.
+        if (processApi.platform === "win32" && err.code === "ENOENT" && !killed) {
+          const line = `${quoteCmdArg(command)} ${args.map(quoteCmdArg).join(" ")}`;
+          const fallback = processApi.exec(line, execOpts, (err2, stdout2, stderr2) => {
+            settle(err2, stdout2 ?? "", stderr2 ?? "");
+          });
+          child = fallback;
+          // ⚠ Same stdin rule as the direct spawn below.
+          fallback.stdin?.end();
+          return;
+        }
+        settle(err, stdout ?? "", stderr ?? "");
+      });
+
+      // ⚠ An async execFile leaves stdin an OPEN pipe. `agy` reads stdin, finds no EOF, and produces
+      // zero bytes until the timeout kills it. Measured live; the synchronous form hid it.
+      child.stdin?.end();
     });
 
-    // ⚠ An async execFile leaves stdin an OPEN pipe. `agy` reads stdin, finds no EOF, and produces
-    // zero bytes until the timeout kills it. Measured live; the synchronous form hid it.
-    child.stdin?.end();
-  });
-
-  return {
-    result,
-    kill: () => {
-      killed = true;
-      child?.kill();
-    },
+    return {
+      result,
+      kill: () => {
+        killed = true;
+        child?.kill();
+      },
+    };
   };
-};
+}
+
+export const defaultLaneSpawner: LaneSpawner = createLaneSpawner(nodeProcessApi);
 
 /** Monotonic per-process job ids. Readable, and stable to sort. */
 let jobCounter = 0;

@@ -112,7 +112,10 @@ export const MCP_INSTRUCTIONS =
   "its result is a conclusion you can check: a broad code search, a file-by-file sweep, a " +
   "survey, a draft, a long summary, a second opinion. Keep in this session whatever needs your " +
   "own conversation context or edits you must supervise. The default lane is free capacity, so " +
-  "offloading spends no subscription quota and saves this session's context.\n\n" +
+  "offloading spends no subscription quota and saves this session's context. On Windows it " +
+  "centralizes hidden child creation, closes stdin so headless agents do not stall, and applies " +
+  "each lane's configured timeouts. Prefer it over launching an agent alias from a shell. A " +
+  "third-party CLI observed creating visible descendants must be disabled until reverified.\n\n" +
   "Lane output is advisory. Verify it against the source before you act on it.";
 
 /**
