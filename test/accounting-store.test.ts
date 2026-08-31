@@ -125,6 +125,8 @@ interface AttemptPlan {
   readonly tokens?: TokenFactsInput | null;
   readonly latencyMs?: number | null;
   readonly commitMs?: number;
+  /** The relay abandoned this attempt — a hedge loser (D3). Stated, never inferred. */
+  readonly abandonedByRelay?: boolean;
 }
 
 interface RequestPlan {
@@ -189,6 +191,7 @@ function recordRequest(store: AccountingStore, plan: RequestPlan): RecordedReque
       endedAt: attemptPlan.endedAt ?? plan.endedAt,
       latencyMs: attemptPlan.latencyMs ?? 10,
       ...(attemptPlan.tokens === undefined ? {} : { tokens: attemptPlan.tokens }),
+      ...(attemptPlan.abandonedByRelay === undefined ? {} : { abandonedByRelay: attemptPlan.abandonedByRelay }),
     });
     if (completed === undefined) throw new Error("attempt completion was unexpectedly absent");
   }
@@ -221,6 +224,7 @@ function terminalOnly(id: string, endedAt: string): RequestCompletedEvent {
     credentialId: null,
     tokens: {} as RequestCompletedEvent["tokens"],
     spend: null,
+    abandonedSpend: [],
   };
 }
 
@@ -1392,6 +1396,72 @@ describe("spend aggregation into the four cells (Stage 4 / Gap 11)", () => {
     expect(life.partiallyPricedRequests).toBe(1);
     expect(life.unpricedRequests).toBe(0);
     store.close();
+  });
+
+  it("folds an abandoned hedge loser into its OWN cells, leaving requestSpend and every counter alone", () => {
+    const store = createAccountingStore({ rootDir: root() });
+    recordRequest(store, {
+      startedAt: "2026-08-20T05:00:00.000Z",
+      endedAt: "2026-08-20T05:00:01.000Z",
+      outcome: "success",
+      pricePort: PORT_PUBLISHED,
+      attempts: [
+        {
+          provider: "slow", model: "model-slow", outcome: "cancelled", failureKind: "aborted",
+          abandonedByRelay: true,
+          tokens: { reported: { inputTokens: 1_000, outputTokens: 0 } },
+        },
+        {
+          provider: "fast", model: "model-fast", outcome: "success",
+          tokens: { reported: { inputTokens: 1_000, outputTokens: 250 } },
+        },
+      ],
+    });
+    store.flush();
+
+    const life = lifetime(store).aggregate;
+    // The loser's spend is recorded, and it is its own figure.
+    expect(life.abandonedSpend?.providerPublishedReported.amountMicrousd).toBe(2_000);
+    expect(life.abandonedSpend?.providerPublishedReported.known).toBe(1);
+    // The winner's request-side figure is EXACTLY what it is without D3: 1000 input and 250 output
+    // priced by this file's PORT_PUBLISHED. Folding the loser in here would have changed a shipped
+    // number's meaning, so this assertion is the one that would catch it.
+    expect(life.requestSpend?.providerPublishedReported.amountMicrousd).toBe(3_000);
+    // ⚠ The counters are the silent-failure guard: the persisted schema enforces
+    // `unpriced + partiallyPriced <= requests`, and breaching it makes the store stop writing to
+    // disk without throwing. The loser touches neither.
+    expect(life.unpricedRequests).toBe(0);
+    expect(life.partiallyPricedRequests ?? 0).toBe(0);
+    expect(life.requests).toBe(1);
+    store.close();
+  });
+
+  it("keeps an abandoned loser off the request row's own aggregate counters after a reload", () => {
+    // The shard must round-trip: a rejected shape does not throw, it silently stops persistence.
+    const dir = root();
+    const first = createAccountingStore({ rootDir: dir });
+    recordRequest(first, {
+      startedAt: "2026-08-20T06:00:00.000Z",
+      endedAt: "2026-08-20T06:00:01.000Z",
+      outcome: "success",
+      pricePort: PORT_PUBLISHED,
+      attempts: [
+        {
+          provider: "slow", model: "model-slow", outcome: "cancelled", failureKind: "aborted",
+          abandonedByRelay: true,
+          tokens: { reported: { inputTokens: 500, outputTokens: 0 } },
+        },
+        { provider: "fast", model: "model-fast", outcome: "success", tokens: { reported: { inputTokens: 500, outputTokens: 100 } } },
+      ],
+    });
+    first.flush();
+    first.close();
+
+    const reopened = createAccountingStore({ rootDir: dir });
+    const life = lifetime(reopened).aggregate;
+    expect(life.abandonedSpend?.providerPublishedReported.amountMicrousd).toBe(1_000);
+    expect(life.requests).toBe(1);
+    reopened.close();
   });
 
   it("counts an unpriced request only in unpricedRequests, never as $0 spend", () => {

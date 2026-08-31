@@ -269,6 +269,8 @@ interface MutableAggregate {
   commit: MutableMetric;
   spend: MutableSpend | null;
   requestSpend?: MutableSpend;
+  /** Request-owned like `requestSpend`, and summed only from `RequestCompletedEvent.abandonedSpend`. */
+  abandonedSpend?: MutableSpend;
   partiallyPricedRequests?: number;
   unpricedRequests: number;
 }
@@ -717,6 +719,27 @@ function addRequest(target: MutableAggregate, event: RequestCompletedEvent, outc
     }
   } else {
     exact &&= increase(target as unknown as Record<string, number>, "unpricedRequests");
+  }
+  // D3: what the request ALSO spent on serve attempts the relay abandoned — a hedge loser.
+  //
+  // ⚠ Its OWN cells, never `requestSpend`. Three reasons, all measured: `AccountingSpend` carries
+  // one deployment's `pricesUsed`, so merging is a provenance lie; an abandoned attempt is
+  // estimated-basis with coverage "input_only", so folding it into `requestSpend` would flip the
+  // `partiallyPricedRequests` LOWER-BOUND marker on for essentially every hedged request without
+  // one amount changing; and winner and loser are priced from the SAME request-level estimated
+  // input count, so a merged figure would double-count one measurement.
+  //
+  // ⚠ It increments NO counter. `unpricedRequests` and `partiallyPricedRequests` are bounded by
+  // `<= requests` in the persisted schema, and breaching that does not throw — `snapshots()`
+  // returns null and the store SILENTLY STOPS PERSISTING while the relay keeps serving.
+  //
+  // `?? []` although the field is REQUIRED on the type: `AccountingRecorder` is a public interface,
+  // so this is an external boundary that must degrade rather than throw — the same reason the shard
+  // guards tolerate a legacy shape. The type stays required so the compiler still enumerates every
+  // in-tree producer.
+  for (const abandoned of event.abandonedSpend ?? []) {
+    target.abandonedSpend ??= emptySpend();
+    exact &&= addSpendIntoCells(target.abandonedSpend, abandoned);
   }
   return exact;
 }

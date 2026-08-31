@@ -211,6 +211,19 @@ export interface RequestCompletedEvent extends AccountingRecorderEventBase {
   /** Only the winning serve attempt is projected here; repair is separate. */
   readonly tokens: AccountingTokenTotals;
   readonly spend: AccountingSpend | null;
+  /**
+   * Spend on serve attempts the RELAY abandoned — a hedge loser (owner decision D3, 2026-08-30).
+   *
+   * ⚠ **A LIST, and never summed into `spend`.** `AccountingSpend` carries ONE `pricesUsed`, one
+   * `priceSource` and one `tokenBasis`, so merging a loser's amount into the winner's record would
+   * attach one deployment's prices to another's tokens — the provenance defect this project's own
+   * invariant forbids. Each entry stays honest about its own deployment, and the four-cell
+   * aggregate in `accounting-store.ts` is where they may legitimately be summed, because those
+   * cells are keyed BY provenance.
+   *
+   * ⚠ Empty for every request that ran no hedge, which is almost all of them.
+   */
+  readonly abandonedSpend: readonly AccountingSpend[];
 }
 
 export type AccountingEvent =
@@ -266,6 +279,15 @@ export interface AttemptCompletionOptions {
   latencyMs?: number | null;
   commitMs?: number | null;
   tokens?: TokenFactsInput | null;
+  /**
+   * The RELAY abandoned this attempt while another was in flight — today only a hedge loser.
+   *
+   * ⚠ It must be STATED, never inferred. At this layer a hedge loser and a client disconnect are
+   * both `outcome: "cancelled"` with `failureKind: "aborted"` from one call site, so the attempts
+   * map cannot tell them apart. Inferring one from "cancelled inside a successful request" would
+   * be the counting-based guess this project's own fact rules forbid.
+   */
+  abandonedByRelay?: boolean;
 }
 
 export interface RequestCompletionOptions {
@@ -312,6 +334,8 @@ interface AttemptState {
   readonly credentialId: string | null;
   completed: AttemptCompletedEvent | undefined;
   committed: boolean;
+  /** Stated by the caller at completion, never inferred. See `AttemptCompletionOptions`. */
+  abandonedByRelay: boolean;
   commitMs: number | null;
 }
 
@@ -748,6 +772,7 @@ class AccountingRequestLifecycle implements AccountingRequest {
       role,
       startedAt,
       attribution,
+      abandonedByRelay: false,
       provider: options.provider ?? null,
       model: options.model ?? null,
       credentialId: options.credentialId ?? null,
@@ -831,6 +856,7 @@ class AccountingRequestLifecycle implements AccountingRequest {
         this.requestCommitMs = completion.commitMs;
       }
     }
+    state.abandonedByRelay = completion.abandonedByRelay === true;
     const event = freezeDeep({
       type: "attempt-completed" as const,
       requestId: this.requestId,
@@ -955,6 +981,12 @@ class AccountingRequestLifecycle implements AccountingRequest {
       credentialId: winner?.credentialId ?? this.credentialId,
       tokens,
       spend,
+      // Each loser's OWN priced record, taken as it was computed against its OWN deployment's
+      // prices. Nothing is re-priced here and nothing is merged; see the field's docblock.
+      abandonedSpend: [...this.attempts.values()]
+        .filter((attempt) => attempt.role === "serve" && attempt.abandonedByRelay)
+        .map((attempt) => attempt.completed?.spend)
+        .filter((entry): entry is AccountingSpend => entry !== undefined && entry !== null),
     });
     this.requestCompleted = event;
     safeRecord(this.options.recorder, event);

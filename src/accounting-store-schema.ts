@@ -211,6 +211,24 @@ export interface AccountingAggregateV1 {
    */
   readonly requestSpend?: AccountingAggregateSpendV1 | null;
   /**
+   * Spend on serve attempts the RELAY abandoned — a hedge loser (owner decision D3, 2026-08-30).
+   *
+   * ⚠ Kept apart from `requestSpend` rather than folded into it, and the reason is a MEASUREMENT,
+   * not tidiness: an abandoned attempt is estimated-basis with coverage "input_only", so folding it
+   * would set `partiallyPricedRequests` — the LOWER-BOUND marker — on essentially every hedged
+   * request without one amount changing. Winner and loser are also priced from the SAME
+   * request-level estimated input count, so a merged figure would double-count one measurement.
+   *
+   * ⚠ It participates in NO counter. `unpricedRequests + partiallyPricedRequests <= requests` is
+   * enforced below, and breaching it does not throw — the snapshot build returns null and the store
+   * silently stops persisting.
+   *
+   * "What the answer you received cost" is `requestSpend`. "What this request cost" is
+   * `requestSpend + abandonedSpend`. Absent entirely on legacy shards, and on every request that
+   * ran no hedge.
+   */
+  readonly abandonedSpend?: AccountingAggregateSpendV1 | null;
+  /**
    * Requests whose spend figure exists but left present token kinds unpriced
    * (cache kinds, or one of in/out unpublished) — i.e. every amount above is a
    * lower bound while this is > 0. Absent (= 0) on legacy shards.
@@ -762,6 +780,7 @@ function isAggregateFields(value: Record<string, unknown>, owner: AggregateOwner
     !isMetric(value.commit) ||
     !isAggregateSpendOrNull(value.spend) ||
     !(value.requestSpend === undefined || isAggregateSpendOrNull(value.requestSpend)) ||
+    !(value.abandonedSpend === undefined || isAggregateSpendOrNull(value.abandonedSpend)) ||
     !(value.partiallyPricedRequests === undefined || isCounter(value.partiallyPricedRequests)) ||
     !isCounter(value.unpricedRequests)
   ) return false;
@@ -773,7 +792,11 @@ function isAggregateFields(value: Record<string, unknown>, owner: AggregateOwner
     if (value.requests !== 0 || !isEmptyAggregateTokens(value.requestTokens)) return false;
     if (value.served + value.errored + value.cancelled > value.attempts) return false;
     // Attempt-side rows carry no REQUEST-scoped facts.
-    if (value.requestSpend !== undefined || value.partiallyPricedRequests !== undefined) return false;
+    if (
+      value.requestSpend !== undefined ||
+      value.abandonedSpend !== undefined ||
+      value.partiallyPricedRequests !== undefined
+    ) return false;
   } else {
     if (value.served + value.errored + value.cancelled > value.requests) return false;
   }
@@ -803,7 +826,14 @@ function isEmptyAggregateSpend(spend: unknown): boolean {
   );
 }
 
-/** Aggregate keys; `requestSpend`/`partiallyPricedRequests` are the additive optional pair. */
+/**
+ * Aggregate keys; the optional set is the ADDITIVE half — `requestSpend`/`partiallyPricedRequests`
+ * from 2026-08-22, and `abandonedSpend` from 2026-08-30 (D3).
+ *
+ * ⚠ Growth here must join this list AND gain an `=== undefined ||` branch in `isAggregateFields`.
+ * Every other shape in this file is guarded by strict `hasExactKeys`, which has no optional concept
+ * and would reject an added field in BOTH directions.
+ */
 const AGGREGATE_KEYS = Object.freeze([
   "requests",
   "attempts",
@@ -817,7 +847,11 @@ const AGGREGATE_KEYS = Object.freeze([
   "spend",
   "unpricedRequests",
 ] as const);
-const AGGREGATE_OPTIONAL_KEYS = Object.freeze(["requestSpend", "partiallyPricedRequests"] as const);
+const AGGREGATE_OPTIONAL_KEYS = Object.freeze([
+  "requestSpend",
+  "abandonedSpend",
+  "partiallyPricedRequests",
+] as const);
 
 function isAggregate(value: unknown): value is AccountingAggregateV1 {
   return (

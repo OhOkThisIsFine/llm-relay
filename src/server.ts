@@ -933,6 +933,8 @@ class RequestAccountingState {
     failureKind: ProxyAccountingFailureKind | null,
     usage: UsageAccumulator,
     endedAt = Date.now(),
+    /** Only `completeAttemptAbandoned` states this. See `AttemptCompletionOptions`. */
+    abandonedByRelay = false,
   ): void {
     if (attempt === null) return;
     try {
@@ -948,6 +950,7 @@ class RequestAccountingState {
           attempt.role === "serve" ? this.estimatedInputTokens : 0,
           attempt.role === "repair" || this.committed.has(attempt),
         ),
+        abandonedByRelay,
       });
     } catch {
       // The recorder and its packets are strictly observational.
@@ -4031,7 +4034,17 @@ function completeCancellation(
   attempt.completed = true;
   attempt.terminal = "cancelled";
   attempt.trace.record(attempt.target, "cancelled", attempt.started, completedAt);
-  attempt.accounting?.complete(attempt.accountingAttempt, "cancelled", "aborted", attempt.usage, completedAt);
+  // The SAME closed cause drives both consumers, so the breaker and the ledger can never disagree
+  // about which attempt the relay abandoned. At the accounting layer a hedge loser and a client
+  // disconnect are otherwise identical — both `cancelled`/`aborted` from this one call.
+  attempt.accounting?.complete(
+    attempt.accountingAttempt,
+    "cancelled",
+    "aborted",
+    attempt.usage,
+    completedAt,
+    cause === "relay-abandoned",
+  );
 }
 
 type PostHeaderBodyDisposition = "cancelled" | "timeout" | "protocol";
