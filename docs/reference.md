@@ -61,11 +61,12 @@ NVIDIA_API_KEY=nvapi-... npx llm-relay    # instant, no install
 npm install -g llm-relay && llm-relay      # global
 ```
 
-A global install also drops the generated **llm-relay skill** into three host directories — 
+A global install also drops the generated **llm-relay skill bundle** into three host directories —
 `~/.claude/skills/llm-relay/`, `~/.codex/skills/llm-relay/` and
 `$XDG_CONFIG_HOME/opencode/skills/llm-relay/` (falling back to `~/.config` when that variable is
-unset or blank). All three are copied byte-for-byte from one source and refreshed on every upgrade;
-a failure at one host never stops the others. It also provisions local Codex with two independent
+unset or blank). Each gets the compact `SKILL.md` plus its three selectively loaded `references/`
+files byte-for-byte from one source bundle and is refreshed on every upgrade; a failure at one host
+never stops the others. It also provisions local Codex with two independent
 entries in `~/.codex/config.toml`: the `llm-relay` Responses provider for direct routing and the
 `llm-relay` MCP server for portable `dispatch`. Releases through v0.68.4 also generated
 `default`/`relay_coding` child agents; current postinstall retires only byte-identical generated

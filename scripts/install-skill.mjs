@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Install/refresh the llm-relay skill for Claude Code, Codex and OpenCode from the same
- * shipped source (skills/llm-relay/SKILL.md), and provision Codex's global provider plus the
- * host-independent MCP dispatch entry point.
+ * Install/refresh the llm-relay skill bundle for Claude Code, Codex and OpenCode from the same
+ * shipped source directory, and provision Codex's global provider plus the host-independent MCP
+ * dispatch entry point.
  *
  * Runs from npm `postinstall`, but only acts on GLOBAL installs (`npm i -g llm-relay`)
  * so that a repo-local `npm install` (dev checkout, CI) never touches the developer's
@@ -152,8 +152,17 @@ try {
     process.exit(0); // local/dev install — leave the user's host skill directories alone
   }
 
-  const src = join(here, "..", "skills", "llm-relay", "SKILL.md");
-  if (!existsSync(src)) skipAll(`this package does not contain ${src}`);
+  const skillSourceDir = join(here, "..", "skills", "llm-relay");
+  const skillFiles = [
+    "SKILL.md",
+    join("references", "direct-routing.md"),
+    join("references", "dispatch-lanes.md"),
+    join("references", "operations.md"),
+  ];
+  for (const relativePath of skillFiles) {
+    const sourcePath = join(skillSourceDir, relativePath);
+    if (!existsSync(sourcePath)) skipAll(`this package does not contain ${sourcePath}`);
+  }
 
   const home = homedir();
   // OpenCode keeps its configuration under the XDG config dir, unlike Claude Code and Codex which
@@ -163,18 +172,22 @@ try {
   const xdgConfig = process.env.XDG_CONFIG_HOME;
   const configHome = xdgConfig && xdgConfig.trim() !== "" ? xdgConfig : join(home, ".config");
   const targets = [
-    { host: "Claude Code", dest: join(home, ".claude", "skills", "llm-relay", "SKILL.md") },
-    { host: "Codex", dest: join(home, ".codex", "skills", "llm-relay", "SKILL.md") },
-    { host: "OpenCode", dest: join(configHome, "opencode", "skills", "llm-relay", "SKILL.md") },
+    { host: "Claude Code", destDir: join(home, ".claude", "skills", "llm-relay") },
+    { host: "Codex", destDir: join(home, ".codex", "skills", "llm-relay") },
+    { host: "OpenCode", destDir: join(configHome, "opencode", "skills", "llm-relay") },
   ];
 
-  // Keep host failures independent: a broken ~/.claude must not prevent Codex from receiving
-  // the same canonical description, or vice versa.
-  for (const { host, dest } of targets) {
+  // Keep host failures independent: broken ~/.claude must not prevent Codex from receiving the
+  // same canonical bundle, or vice versa. Copy every reference before reporting that host installed;
+  // a SKILL.md whose routed references are absent is not a usable installation.
+  for (const { host, destDir } of targets) {
     try {
-      mkdirSync(dirname(dest), { recursive: true });
-      copyFileSync(src, dest);
-      process.stderr.write(`llm-relay: installed ${host} skill at ${dest}\n`);
+      for (const relativePath of skillFiles) {
+        const dest = join(destDir, relativePath);
+        mkdirSync(dirname(dest), { recursive: true });
+        copyFileSync(join(skillSourceDir, relativePath), dest);
+      }
+      process.stderr.write(`llm-relay: installed ${host} skill bundle at ${destDir}\n`);
     } catch (e) {
       process.stderr.write(`llm-relay: ${host} skill not installed — ${e?.message ?? e}\n`);
     }

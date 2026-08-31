@@ -38,6 +38,19 @@ Friction recorded during this correction: MCP survey job `job-0001` on `claude-f
 as evidence. The bounded follow-up is in [`backlog.md`](backlog.md); the symptom alone does not say
 whether the delay was pool walking, provider thinking, or an agent loop.
 
+The closeout exposed a second symptom on the same lane family: `pool/high` job `job-0002` exited 0
+after 75 seconds, but `dispatch_result` contained only `Based on the evidence`. That incomplete
+fragment was not used for the closeout audit; an independent collaboration auditor replaced it.
+The backlog investigation must distinguish a truncated provider completion from lane-output capture
+or MCP job-storage loss instead of treating exit 0 as proof that a usable answer returned.
+
+Tutor-sync then exposed a separate instruction-delivery failure: the installed primary relay skill
+was 46.9 KB / 724 lines, larger than one tool response. Its mandatory complete read was truncated,
+so the agent correctly paused before mutating its lap record. The primary guide is now 7.7 KB / 128
+lines and retains the universal MCP-first decision; advanced direct routing, dispatch-lane, and
+operations guidance moved verbatim into three bounded references loaded only for the relevant task.
+Postinstall copies and tests the four-file bundle on Claude, Codex, and OpenCode.
+
 ## Verified routing matrix
 
 | Target | Preferred route | Fallback | Verified state |

@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
  *     package.json as `|| exit 0`, which also swallowed the reason);
  *   - it must never be silent about a failure, and must never touch ~/.claude or ~/.codex on a
  *     local install;
- *   - Claude and Codex must receive byte-for-byte identical descriptions from the shipped source;
+ *   - every host must receive a byte-for-byte identical progressive-disclosure bundle from the
+ *     shipped source, with a primary guide small enough to load in one tool response;
  *     global installs also provision Codex's provider and MCP dispatch server, while retiring
  *     only the exact legacy child-agent files llm-relay itself generated.
  *
@@ -21,7 +22,14 @@ import { fileURLToPath } from "node:url";
  */
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const script = join(repoRoot, "scripts", "install-skill.mjs");
-const skillSrc = join(repoRoot, "skills", "llm-relay", "SKILL.md");
+const skillDir = join(repoRoot, "skills", "llm-relay");
+const skillSrc = join(skillDir, "SKILL.md");
+const skillFiles = [
+  "SKILL.md",
+  join("references", "direct-routing.md"),
+  join("references", "dispatch-lanes.md"),
+  join("references", "operations.md"),
+];
 
 function run(args: string[], home: string, extraEnv: Record<string, string> = {}) {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
@@ -76,6 +84,12 @@ const installedPaths = (home: string) => ({
   codingAgent: join(home, ".codex", "agents", "relay_coding.toml"),
 });
 
+const installedSkillDirs = (home: string) => [
+  join(home, ".claude", "skills", "llm-relay"),
+  join(home, ".codex", "skills", "llm-relay"),
+  join(home, ".config", "opencode", "skills", "llm-relay"),
+];
+
 const legacyDefaultAgent = `name = "default"\ndescription = "General-purpose read-only child routed through llm-relay."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/medium"\nmodel_reasoning_effort = "medium"\n`;
 const legacyCodingAgent = `name = "relay_coding"\ndescription = "Read-only medium-effort child routed through llm-relay to the configured non-OpenAI pool."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/medium"\nmodel_reasoning_effort = "medium"\n`;
 
@@ -109,9 +123,26 @@ describe("install-skill postinstall hook", () => {
     expect(readFileSync(paths.opencode, "utf8")).toBe(source);
     expect(readFileSync(paths.claude, "utf8")).toBe(readFileSync(paths.codex, "utf8"));
     expect(readFileSync(paths.claude, "utf8")).toBe(readFileSync(paths.opencode, "utf8"));
+    for (const destDir of installedSkillDirs(home)) {
+      for (const relativePath of skillFiles) {
+        expect(readFileSync(join(destDir, relativePath), "utf8")).toBe(
+          readFileSync(join(skillDir, relativePath), "utf8"),
+        );
+      }
+    }
     expect(r.stderr).toContain("installed Claude Code skill");
     expect(r.stderr).toContain("installed Codex skill");
     expect(r.stderr).toContain("installed OpenCode skill");
+  });
+
+  it("keeps the primary guide single-response sized and routes advanced detail", () => {
+    const primary = readFileSync(skillSrc, "utf8");
+    expect(Buffer.byteLength(primary, "utf8")).toBeLessThanOrEqual(12_000);
+    for (const relativePath of skillFiles.slice(1)) {
+      const reference = readFileSync(join(skillDir, relativePath), "utf8");
+      expect(Buffer.byteLength(reference, "utf8")).toBeLessThanOrEqual(24_000);
+      expect(primary).toContain(relativePath.replace(/\\/g, "/"));
+    }
   });
 
   /**

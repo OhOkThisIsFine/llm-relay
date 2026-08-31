@@ -14,10 +14,26 @@
   cancelled. The caller-side MCP mechanics were correct; no claim is made yet about whether the
   delay was pool walking, a provider think, or a stuck agent loop. Compare its usage window and
   process exit evidence against the latency-demotion/cumulative-walk correction before deciding
-  whether this is a regression. Home for the eventual mechanism and verdict:
+  whether this is a regression. A later `pool/high` closeout-audit job (`job-0002`) exited 0 after
+  75 seconds, but `dispatch_result` returned only the incomplete fragment `Based on the evidence`;
+  its audit was discarded. Determine whether that truncation came from the serving model, lane
+  output capture, or MCP job storage while investigating the longer run. Home for the eventual
+  mechanism and verdict:
   [`dispatch-smoothness-2026-08-31.md`](dispatch-smoothness-2026-08-31.md).
 
 ## Closed
+
+- ✅ **Give the 4,096-mutation accounting cap test a contention-aware timeout.** The full suite
+  timed out `test/accounting-store.test.ts` at Vitest's 5-second default while 2,845 other server
+  tests passed; the required isolated rerun passed in 1.20 seconds. The case intentionally performs
+  all 4,096 serial mutations, so it now has a local 15-second ceiling instead of making concurrent
+  Windows worker I/O look like a product regression.
+
+- ✅ **Keep the primary relay skill within one tool response.** Tutor-sync paused because the
+  mandatory read of the 46.9 KB / 724-line `SKILL.md` was truncated. The entry point is now 7.7 KB /
+  128 lines, with advanced guidance preserved in three focused references (8.0 KB, 19.4 KB, and
+  14.0 KB). Postinstall ships the complete bundle to all three hosts, and a test pins the primary
+  guide at no more than 12 KB and every reference at no more than 24 KB.
 
 - ✅ **`llm-relay cost` states the period it covers** (owner decision 2026-08-31, option A —
   RENDER the bounds, do not move them). `rollingPlan` floors `to` by the window's bucket, so the

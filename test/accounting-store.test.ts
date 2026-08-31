@@ -587,6 +587,9 @@ describe("durable canonical accounting store", () => {
     store.close();
   });
 
+  // This exercises all 4,096 mutations deliberately. It normally finishes near one second, but
+  // the suite runs file workers concurrently and Windows I/O contention can exceed Vitest's 5s
+  // default without changing the behavior under test.
   it("enforces the whole-day row cap during mutation without poisoning the shard", () => {
     const directory = root();
     const store = createAccountingStore({ rootDir: directory });
@@ -621,7 +624,7 @@ describe("durable canonical accounting store", () => {
     expect(Object.values(persisted.cells).reduce((sum, cell) => sum + cell.rows.length, 0)).toBe(ACCOUNTING_MAX_DAY_ROWS);
     expect(persisted.coverage.droppedRows).toBe(1);
     restarted.close();
-  });
+  }, 15_000);
 
   it("propagates dimension row caps to day, lifetime, and month coverage", () => {
     const store = createAccountingStore({ rootDir: root() });

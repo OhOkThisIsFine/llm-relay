@@ -45,12 +45,14 @@ red without anyone invoking a script by hand:
 
 Offline / unit-test-safe (no external creds):
 - `live-demo.mjs` — runs the compiled CLI against a local flaky backend + stub reshaper. Good smoke test.
-- `install-skill.mjs` — npm `postinstall` hook: copies the single
-  `skills/llm-relay/SKILL.md` source to THREE host directories — `~/.claude/skills/llm-relay/`,
-  `~/.codex/skills/llm-relay/` and `<XDG_CONFIG_HOME or ~/.config>/opencode/skills/llm-relay/` —
-  on GLOBAL installs only (env var or global-tree path detection); a repo-local `npm install`
-  touches no host directory. `--force` overrides for manual runs. Host failures are independent.
-  Ships in the package, so the self-updater refreshes every host's skill on every upgrade.
+- `install-skill.mjs` — npm `postinstall` hook: copies the `skills/llm-relay/` bundle to THREE host
+  directories — `~/.claude/skills/llm-relay/`, `~/.codex/skills/llm-relay/` and
+  `<XDG_CONFIG_HOME or ~/.config>/opencode/skills/llm-relay/` — on GLOBAL installs only (env var or
+  global-tree path detection); a repo-local `npm install` touches no host directory. The primary
+  `SKILL.md` is deliberately single-response sized and routes advanced work to three focused
+  `references/` files, so all four files must be copied together. `--force` overrides for manual
+  runs. Host failures are independent. Ships in the package, so the self-updater refreshes every
+  host's complete skill bundle on every upgrade.
   ⚠ **OpenCode was added 2026-08-30 (v0.62.0) and it is the only target that is not a fixed
   dotfolder in HOME** — it honours `XDG_CONFIG_HOME`, matching OpenCode's own `~/.config`
   convention and `src/state-paths.ts`'s config-kind policy. Before that the installer wrote two

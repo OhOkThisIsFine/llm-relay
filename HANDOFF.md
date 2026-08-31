@@ -39,7 +39,9 @@ Immediate next:
 
 - Investigate the 1,594-second `pool/medium` MCP survey job recorded in
   [`docs/backlog.md`](docs/backlog.md); it was cancelled without an answer and was not used as
-  evidence. The symptom is not yet attributed to pool walking, provider thinking, or an agent loop.
+  evidence. The same investigation now includes `pool/high` job `job-0002`, which exited 0 after
+  75 seconds but returned only the incomplete fragment `Based on the evidence`. Neither symptom is
+  yet attributed to the serving model, pool walking, lane output capture, or MCP job storage.
 - Claude→MCP→AGY end-to-end validation remains deferred until Claude subscription access returns.
   Codex→MCP→AGY already passed with no visible or foreground AGY window.
 
