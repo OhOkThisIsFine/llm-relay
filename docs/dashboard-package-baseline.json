@@ -15,9 +15,9 @@
     "cssBytes": 11841,
     "htmlBytes": 383,
     "manifestBytes": 185,
-    "packBytes": 896640,
-    "unpackedBytes": 4706942,
-    "packageEntries": 362
+    "packBytes": 900312,
+    "unpackedBytes": 4719559,
+    "packageEntries": 365
   },
   "ceilings": {
     "dashboardRawBytes": 291600,

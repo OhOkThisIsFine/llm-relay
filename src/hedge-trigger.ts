@@ -8,6 +8,23 @@
  * larger change. Landing the decision first means its constants can be calibrated and its edge
  * cases pinned before any request behaviour moves.
  *
+ * ⚠⚠ **STAGE 2 IS BLOCKED ON `CredentialWalk`, and the blocker is structural — read this before
+ * attempting the wiring (found 2026-08-30, during that attempt).** The walk holds exactly ONE
+ * `#pending` slot, and that is its documented contract: *"`next()` only offers a candidate. The
+ * caller must call `recordStarted()` immediately before fetch/egress; that is the sole budget/LRU
+ * mutation boundary."* Concretely, in `credential-select.ts`:
+ *   - `next()` opens with `if (this.#pending) return this.#pending.attempt;` — while an attempt is
+ *     in flight it re-offers **that same attempt**, so asking for a hedge candidate hands back the
+ *     primary and the relay would fetch one deployment twice;
+ *   - `recordStarted()` throws `"credential attempt already marked started"` on the second call;
+ *   - `recordOutcome()` throws when the outcome does not match the single pending attempt.
+ *
+ * So hedging is not a restructuring of the loop — it first needs `CredentialWalk` to carry N
+ * in-flight attempts, with its start budget, LRU touch and breadth-first ordering all still
+ * correct. That is a change to a component whose whole job is being the one mutation boundary, and
+ * it must be designed rather than patched around. Attempting the loop first would produce requests
+ * that THROW, which is why this was worth finding before any of `server.ts` was touched.
+ *
  * ⚠ **Hedging DUPLICATES, it does not reorder** — the first behaviour in this relay that does. The
  * `CLAUDE.md` invariant reads *"Acting on counts is optional, always announced, and may only
  * reorder"*, so the duplication is bounded three ways, all of them owner decisions recorded in
@@ -152,6 +169,30 @@ function hedgeThreshold(
   }
 
   return { basis: "floor", thresholdMs: settings.floorMs };
+}
+
+/**
+ * How long to wait before starting the hedge, for an attempt that has produced NOTHING yet.
+ *
+ * ⚠ **The threshold IS the delay.** `shouldHedge` asks "has this attempt already run too long";
+ * a race asks "how long should I wait before starting the second one". They are the same number
+ * viewed from either side, so this returns it rather than letting a caller derive a second one.
+ *
+ * ⚠ `tokensSeen` is 0 by construction here, and that is the honest input for the case this serves:
+ * a race decided at RESPONSE RESOLUTION has, by definition, seen no tokens — the response has not
+ * arrived. The per-token rung therefore cannot apply, which is correct rather than a limitation:
+ * the measured hang produced no tokens for 120 s, so per-token could never have fired on it.
+ *
+ * Returns null when hedging is off or the deployment is not free — the D1 containment, applied
+ * once, here, so no caller repeats it.
+ */
+export function hedgeDelayMs(
+  pings: readonly PingRecord[],
+  isFree: boolean,
+  settings: HedgeSettings,
+): number | null {
+  if (!settings.enabled || !isFree) return null;
+  return hedgeThreshold([...pings], 0, settings).thresholdMs;
 }
 
 /** `"<spec> (28.4s > 20.0s, floor, 0 tokens seen)"` — bounded, metadata only, never content. */
