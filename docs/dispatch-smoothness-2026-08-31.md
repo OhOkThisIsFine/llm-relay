@@ -25,7 +25,7 @@ Both `claude mcp list` and `codex mcp list` reported `llm-relay: llm-relay mcp` 
 | Relay pools / cheapest capable lane | MCP `dispatch`, normally without forcing a lane | `llm-relay dispatch --next-command -t <task>` when MCP is unavailable | Live MCP dispatches completed. The ladder is currently free-pool-first because AGY is quarantined. |
 | Claude CLI / Anthropic subscription | From another host, MCP dispatch or `claude -p` with an explicit route | [`scripts/claude-proxied.ps1`](../scripts/claude-proxied.ps1) for an explicitly relay-routed Claude CLI | Claude Code 2.1.237 is installed and authenticated. Transposed Claude lanes configure the three long-think idle-timeout overrides. Claude ACP uses the Agent SDK, not the installed CLI subscription path. |
 | Codex | The current Codex task or the first-party Codex plugin; MCP dispatch for cheap offload | `acpx codex exec` from another host | Codex 0.151.0 is installed. Native Codex Desktop collaboration rejects a `pool/medium` child before it reaches the custom provider, so MCP dispatch is the working split-provider route. |
-| AGY | Disabled pending instrumented window revalidation | Once reverified: MCP dispatch through `lane-launch.ps1` and the absolute headless CLI path | AGY has no ACP agent. All 12 AGY ladder entries and autonomous lane probes are disabled after a user-observed terminal appeared during a live AGY dispatch. |
+| AGY | Disabled pending instrumented window revalidation | Once reverified: MCP dispatch through `lane-launch.ps1` and the absolute headless CLI path | AGY has no ACP agent. All 12 AGY ladder entries and autonomous lane probes are disabled after a terminal was observed while an MCP run and direct AGY probes were concurrent; the source was not isolated. |
 | OpenCode | `acpx --no-terminal --no-fs ... opencode exec <task>` | `opencode run <task>` from an existing console | Repaired global install; OpenCode 1.18.25. A real ACP turn returned `OPENCODE_ACP_OK` in 13.15 seconds. |
 | Gemini CLI | ACP or direct CLI after authentication is configured | None currently | Gemini 0.57.0 is installed, but ACP and direct CLI both report that no Gemini authentication method/API key is configured. AGY Gemini is not a fallback while AGY remains quarantined. |
 
@@ -85,7 +85,8 @@ The live mitigation is deliberately broader than `enabled: false` on ladder rows
 - `routing.laneProbe.enabled` is false because the background cadence probes disabled rows too;
 - direct AGY invocation is prohibited during quarantine, including `agy --version` and `agy --help`;
 - the hidden relay service was restarted and resumed listening on `127.0.0.1:8791`;
-- a top-level-window watcher records any new window's class, PID, and process ancestry.
+- a ten-minute watcher after quarantine observed no new visible windows; a restart-specific watcher
+  later also observed none.
 
 This preserves the AGY installation and credentials while ensuring automatic dispatch cannot start
 it. Re-enable only after one instrumented run shows no `PseudoConsoleWindow`,
@@ -118,9 +119,14 @@ then the cleanest behavior is to skip AGY and use the relay pool, Codex, Claude,
 
 ## Release and live verification
 
-- Implementation commit `5554bfa` and release commit `9d62a6d` shipped as `v0.68.3`.
+- Implementation commit `5554bfa` and release commit `9d62a6d` shipped as `v0.68.3`; the final
+  attribution correction and reviewer cleanup ship as `v0.68.4`.
 - Feature CI run `33428200248` and publish run `33428810696` succeeded.
-- The npm registry and reinstalled global binary report `0.68.3`.
+- The npm registry and reinstalled global binary report `0.68.4`.
 - Reinstall preserved the config hash and the 12-row AGY quarantine.
-- The hidden Startup restart produced PID 13408 and zero new visible windows during a 12-second watch.
+- The hidden Startup restart produced zero new visible windows during a 12-second watch.
 - Non-AGY MCP job `job-0005` completed through `claude-free-pool` (`pool/medium`) with exit 0.
+
+One delegated release monitor used an unauthenticated public GitHub REST request and received a 404
+for the private repository. The authenticated `gh run view` path returned the authoritative workflow
+state and should be used for future delegated release checks.

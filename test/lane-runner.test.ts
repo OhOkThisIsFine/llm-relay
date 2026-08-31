@@ -3,7 +3,6 @@ import {
   createLaneSpawner,
   MAX_OUTPUT_BYTES,
   type LaneChildProcess,
-  type LaneExecCallback,
   type LaneExecOptions,
   type LaneProcessApi,
 } from "../src/mcp/lane-runner.js";

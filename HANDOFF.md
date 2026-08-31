@@ -2,17 +2,17 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-31 (v0.68.3)
+## 0. State as of 2026-08-31 (v0.68.4)
 
 Windows dispatch hardening commit `5554bfa` shipped in release commit `9d62a6d` / tag `v0.68.3`.
-Publish run [33428810696](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428810696)
-succeeded. The npm registry and reinstalled global executable both report `0.68.3`.
+The final attribution correction and reviewer cleanup ship in tag `v0.68.4`. The npm registry and
+reinstalled global executable both report `0.68.4`.
 
 Current live state:
 
 - The daemon was restarted through the hidden Startup launcher from the global install and listens
-  on `127.0.0.1:8791` as PID 13408. A 12-second top-level-window watch around the restart observed
-  zero new visible windows.
+  on `127.0.0.1:8791`. A 12-second top-level-window watch around the restart observed zero new
+  visible windows.
 - The installed config retained SHA-256
   `9C42B7684FF4239CCC1B907F29E5C4E84DBDC37939D806A128032EC4B61DB90E` across reinstall.
 - All 12 AGY ladder rows remain disabled and `routing.laneProbe.enabled` remains false. Do not run
@@ -34,14 +34,16 @@ Verification evidence:
 - Full server suite: 145 files, 2,841 passed, 5 skipped.
 - Dashboard suite: 5 files, 32 passed; package smoke passed.
 - Feature CI run
-  [33428200248](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428200248) and the publish
-  run above both succeeded.
+  [33428200248](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428200248) and the `v0.68.3`
+  publish run
+  [33428810696](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33428810696) succeeded.
 - The only immediate next step is the owner-authorized AGY focus-safety revalidation tracked in the
   machine-wide backlog at `C:\Code\docs\backlog.md`. Until then, use relay pools, Codex, Claude, or
   OpenCode instead.
 
-Codebase-memory graph transport was unavailable for this handoff; exact source and test reads were
-used instead, so no exhaustive graph claim is made.
+Codebase-memory generation `2026-08-31T17:52:53Z` was ready but stale for the changed source and
+excluded the changed docs and tests. Exact source and whole-diff reads were used instead, so no
+exhaustive graph claim is made.
 
 ## 0.1 Earlier releases
 
