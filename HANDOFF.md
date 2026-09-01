@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-01 (v0.68.6 published; `main` ahead of the tag)
+## 0. State as of 2026-09-01 (v0.68.7 published)
 
 `src/server.ts` is decomposed (5,799 → 863 lines, a net −4,936). Its request path now lives in `routes/messages.ts`,
 `routes/openai-front.ts`, `candidate-runner.ts`, `stream-pipeline.ts` and `accounting-state.ts`;
@@ -25,8 +25,9 @@ was independently confirmed.
 
 - `build:server` had lost its second `tsc` pass — the 2026-08-30 package-size decision. It cost
   243,757 `packBytes`, and `docs/dashboard-package-baseline.json` had been regenerated with the
-  inflated figures rather than root-caused. Restored; the baseline now records 936,693 / 4,872,345 /
-  392, of which the honest refactor cost is +20,328 bytes and +24 entries.
+  inflated figures rather than root-caused. Restored; the baseline now records 937,955 / 4,875,246 /
+  389, of which the honest refactor cost is +20,328 bytes and +24 entries. ⚠ `check:package` measures
+  whatever `dist/` holds — rebuild before trusting any package figure.
 - `readBody` threw a plain `Error` embedding `BODY_TOO_LARGE_CODE` in its MESSAGE. `bodyReadErrorCode`
   classifies on a DECLARED `error.code`, so every oversized dashboard body answered 500 instead of
   413 — the exact defect `CLAUDE.md` records as fixed. The drain that lets the client receive that
@@ -59,8 +60,23 @@ Owner decisions taken 2026-09-01:
 - `vitest.config.ts` keeps `pool: "forks"`, for Windows flake resistance, with that reasoning now
   recorded beside the line. Measured: the suite passes with it and without it.
 
-Verification: `npm run check` green — server 148 files, 2,865 passed, 5 skipped; dashboard 5 files,
+Verification: `npm run check` green — server 147 files, 2,861 passed, 5 skipped; dashboard 5 files,
 32 passed; package checks passed. CI green on the exact SHA.
+
+**Released as v0.68.7** (owner decision 2026-09-01: patch — no public surface moved, and two live
+defect fixes reach users). Publish run
+[33537515414](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33537515414) succeeded;
+registry `dist-tags.latest` and the reinstalled global executable both report `0.68.7`. The packed
+artifact carries `tier-data.json` with 801 models.
+
+⚠ **A green publish run prints `::error::tier-data.json missing or empty`.** That is the workflow's
+own negative control deleting the asset from a throwaway copy to prove the probe catches it; the
+same step then prints `PASS-AS-EXPECTED`. Do not re-cut a release on that line. The trap, and the
+matching warning never to read a verdict off a piped `gh run watch`, are recorded in
+[`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md).
+
+⚠ The long-running relay daemon still serves the PREVIOUS build — it autostarts at logon and is not
+restarted by a publish. Restart it to run the decomposed request path.
 
 Immediate next:
 
@@ -69,8 +85,8 @@ Immediate next:
   evidence. The same investigation includes `pool/high` job `job-0002`, which exited 0 after
   75 seconds but returned only the incomplete fragment `Based on the evidence`. Neither symptom is
   yet attributed to the serving model, pool walking, lane output capture, or MCP job storage.
-- Decide whether the decomposition warrants a release. It changes no public surface and no wire
-  behaviour, but it is the largest structural change since the metering sprint.
+- Restart the relay daemon so it serves v0.68.7. It autostarts at logon and still runs the previous
+  build; a publish does not replace a running process.
 - Claude→MCP→AGY end-to-end validation remains deferred until Claude subscription access returns.
   Codex→MCP→AGY already passed with no visible or foreground AGY window.
 

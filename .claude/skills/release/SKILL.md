@@ -115,6 +115,28 @@ the remote (`git fetch && git status -sb` showing no ahead/behind).
 State the published version, the CI run URL, and the confirmed `npm view` output. If you stopped at
 a gate, say which gate and exactly what has to happen before the release can resume.
 
+## Known trap: a SUCCESSFUL publish run prints `::error::tier-data.json missing or empty`
+
+Observed on the v0.68.7 release (2026-09-01). `gh run watch` rendered a red `X tier-data.json
+missing or empty` line while every step succeeded and the package published normally.
+
+**That annotation is the workflow's own NEGATIVE CONTROL.** The "Smoke-test the packed artifact"
+step deletes `docs/tier-data.json` from a throwaway copy and asserts the probe DETECTS the absence.
+The probe emits `::error::` by design, GitHub renders it as an annotation, and the step then prints
+`PASS-AS-EXPECTED: tier-data.json absent correctly detected`. The positive assertion runs too and
+prints `tier-data.json: present, models=<n>`.
+
+So do not abandon or re-cut a release on that line. Confirm the run instead:
+
+```bash
+gh run view <id> --json status,conclusion --jq '"\(.status)/\(.conclusion)"'
+```
+
+⚠ **And never read the verdict off a piped `gh run watch`.** `gh run watch --exit-status ... | tail`
+reports `tail`'s exit code, not the watch's, so a genuinely failed run looks green — the same
+pipe-masks-the-exit-code trap this repo records for suite runs. Ask for `conclusion` explicitly, and
+treat the registry as the tie-breaker for whether the publish happened.
+
 ## Known trap: `--prefer-online` is not always enough
 
 Observed on the v0.21.0 release (2026-08-07), minutes after a **successful** publish:
