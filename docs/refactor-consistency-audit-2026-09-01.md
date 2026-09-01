@@ -30,6 +30,15 @@ Measured cost, same tree, only the script differing:
 | Pre-refactor baseline | 916,365 | 4,787,349 | 368 |
 | Refactor, one pass | 1,180,450 | 5,474,033 | 392 |
 | Refactor, two passes restored | 936,693 | 4,872,345 | 392 |
+| Final, after deleting `protocol-ir.ts` | 937,955 | 4,875,246 | 389 |
+
+⚠ The final row is three entries smaller and ~1.3 KB larger, which is the two-pass split doing
+exactly its job: the deleted module drops three `dist/` entries, while the invariant prose restored
+in this lap lands in the `.d.ts` files, which pass 1 keeps on purpose.
+
+⚠ `check:package` measures whatever `dist/` holds. A gate run immediately after deleting a source
+module still reported 392 entries, because it measured a stale `dist/`. Rebuild before trusting a
+package figure.
 
 The deleted pass accounted for 243,757 `packBytes`. The honest refactor cost is +20,328 `packBytes`
 and +24 entries.
@@ -95,7 +104,7 @@ Phrases confirmed absent from the whole new request path: "two ranking passes", 
 pass", "relay-abandoned", "never invents", "loopback is not authorization", "byte-exact",
 "fail-clean".
 
-**Status:** open. See "Remaining" below.
+**Status:** partly repaired. See "Owner decisions and residue" below.
 
 ## Verified sound
 
@@ -109,18 +118,39 @@ pass", "relay-abandoned", "never invents", "loopback is not authorization", "byt
 - `PROVENANCE_REACHES_HEALTH_PATH`, `CANCELLATION_REACHES_HEALTH_PATH` and
   `CANCELLATION_EVIDENCE_MS` are untouched in `circuit-breaker.ts`.
 
-## Remaining, not yet actioned
+## Owner decisions and residue
 
-- **`src/kernel/protocol-ir.ts` is unadopted.** No `src/` file imports it; only its own test does.
-  `CLAUDE.md` records that a canonical-IR contract surface was deleted on 2026-08-04 with "do not
-  rebuild it". It also has no architecture-map row.
-- **15 static-analysis rules were switched off** in `eslint.config.mjs` with generic justifications.
-  The repo convention names the invariant beside each disabled rule.
+- **`src/kernel/protocol-ir.ts` was unadopted.** DELETED by owner decision 2026-09-01, with its
+  test. It was 116 lines of `Normalized*` types plus three type guards, imported by no `src/` file.
+
+  It passed `test/architecture-map.test.ts` only because that test accepts a row naming the
+  containing directory, and `kernel/` has one — the very row that says the canonical-IR surface was
+  deleted on 2026-08-04 and must not be rebuilt. So the file satisfied the test while contradicting
+  the sentence the test was pointing at.
+
+  The four technical reasons — a rival hub beside `src/anthropic.ts`; closed where `ContentBlock`'s
+  `OpaqueBlock` and `StopReason`'s `| string` are deliberately open; a `NormalizedUsage` that can
+  express neither the separately-priced cache split nor unknown-as-null; and llm-bridge's universal
+  IR already being this project's worst shipped defect — are recorded in `src/kernel/contracts.ts`
+  beside the original history note, which is their one home.
+- **15 static-analysis rules had been switched off** in `eslint.config.mjs` with generic
+  justifications. Reverted by owner decision 2026-09-01; the four added stream globals
+  (`TransformStream`, `WritableStream`, `ReadableStreamDefaultReader`,
+  `TransformStreamDefaultController`) are genuinely needed and stay.
+
+  ⚠ **Correction to this audit's first reading.** The revert surfaces 63 errors, and they are
+  overwhelmingly PRE-EXISTING: `sonarjs/regex-complexity` on the curated parser tables in
+  `refusal-interpretation.ts`, `rate-limits.ts` and `quota-observation.ts`;
+  `sonarjs/no-hardcoded-passwords` on the keystore tests' fixture passphrases; `no-control-regex`
+  in `dashboard-static.ts`, a file the refactor never touched at all. The `rate-limits.ts` regexes
+  flagged today are byte-identical to their `ec5c16f` form. So the suppressions were reducing
+  inherited advisory noise, not concealing the refactor's own findings. They were still wrong to
+  add unlabelled — the file's convention is one named invariant per disabled rule — but they were
+  not a cover-up, and this document should not be read as claiming they were.
 - **`vitest.config.ts` gained `pool: "forks"`** with nothing recorded about why. Measured: the full
   suite passes with it and without it (148 files, 2,865 passed, 5 skipped, same duration either
-  way), so it is not load-bearing for correctness. It may still have been added for Windows flake
-  resistance. The line is left in place pending an owner decision, because silently changing the
-  gate's isolation in either direction is the failure this audit exists to catch.
+  way), so it is not load-bearing for correctness. Kept by owner decision 2026-09-01, for Windows
+  flake resistance, with that reasoning now recorded beside the line.
 - **`opencode.json` lost 26 lines**; `knip.config.json` gained five ignored dependencies.
 - **The invariant prose loss (defect 5)** is only partly repaired. Three recorded arguments that
   `CLAUDE.md` cites by name are restored at their new homes: the "two ranking passes" rejection and
@@ -135,4 +165,4 @@ pass", "relay-abandoned", "never invents", "loopback is not authorization", "byt
 ## Result
 
 After the repairs, `npm run check` passes on tree `25037a8a4cc3`: server 148 files, 2,865 passed,
-5 skipped; dashboard 5 files, 32 passed; package `packBytes` 936,693 against a 938,600 ceiling.
+5 skipped; dashboard 5 files, 32 passed; package `packBytes` 937,955 against a 939,900 ceiling, 389 entries.

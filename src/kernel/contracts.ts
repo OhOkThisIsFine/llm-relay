@@ -14,6 +14,27 @@
  * because it is load-bearing: CircuitBreaker implements `AttemptLifecyclePort`,
  * and the typed begin/complete handshake is what keeps both request paths from
  * drifting apart on breaker accounting again.
+ *
+ * ⚠ REAFFIRMED 2026-09-01 (owner decision) after a refactor re-added `protocol-ir.ts` — 116 lines
+ * of unadopted `Normalized*` types with no `src/` importer. Four concrete reasons, recorded so the
+ * next reader gets the ARGUMENT and not only the prohibition:
+ *
+ * (a) `src/anthropic.ts` is ALREADY the canonical internal shape — the validate/repair layer always
+ *     sees Anthropic Messages whatever the backend kind — so a second vocabulary is a rival hub,
+ *     not a missing one.
+ * (b) It was CLOSED exactly where this repo is deliberately OPEN: `ContentBlock` carries an
+ *     `OpaqueBlock` so an unmodelled block survives byte-exact, and `StopReason` ends `| string` so
+ *     a vendor spelling passes through. `NormalizedContentBlock` and `NormalizedStopReason` had
+ *     neither, so routing traffic through them would DROP what the byte-exactness rules protect.
+ * (c) Its `NormalizedUsage` held ONE `cachedInputTokens` and non-optional numbers, so it could
+ *     express neither Anthropic's separately-priced cache-creation/cache-read split nor "the
+ *     backend did not tell us" — breaching the unknown-stays-null invariant.
+ * (d) llm-bridge IS a universal-IR library, and its IR leaking into outbound prompts for three
+ *     releases is this project's worst shipped defect. The fix was to take the request direction
+ *     BACK into hand-written mappers.
+ *
+ * Rebuild it only when a fourth front-door protocol makes the mapper count the real cost; design it
+ * against those invariants first, and adopt it one direction at a time. Never land it unadopted.
  */
 
 export type TransitionResult<T, E> =

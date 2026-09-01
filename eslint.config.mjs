@@ -53,14 +53,6 @@ const sharedRules = {
   'sonarjs/no-os-command-from-path': 'off',
   // Used for temp-file suffixes and probe jitter, never for anything security-bearing.
   'sonarjs/pseudo-random': 'off',
-  // Parser and pattern matching regexes are curated domain tables.
-  'sonarjs/regex-complexity': 'off',
-  'sonarjs/no-nested-functions': 'off',
-  'sonarjs/different-types-comparison': 'off',
-  'sonarjs/redundant-type-aliases': 'off',
-  'sonarjs/function-return-type': 'off',
-  'sonarjs/no-inverted-boolean-check': 'off',
-  'no-control-regex': 'off',
 
   // ── Style opinions this codebase does not share ───────────────────────────────────────────
   // Nested ternaries and template literals are used deliberately and densely here (see the
@@ -169,14 +161,6 @@ export default [
       'sonarjs/publicly-writable-directories': 'off',
       '@typescript-eslint/no-explicit-any': 'off',
       'sonarjs/prefer-specific-assertions': 'off',
-      'sonarjs/no-hardcoded-passwords': 'off',
-      'sonarjs/no-nested-functions': 'off',
-      'sonarjs/no-floating-point-equality': 'off',
-      'sonarjs/deprecation': 'off',
-      'sonarjs/no-identical-functions': 'off',
-      'sonarjs/prefer-regexp-exec': 'off',
-      'sonarjs/no-all-duplicated-branches': 'off',
-      '@typescript-eslint/no-non-null-asserted-optional-chain': 'off',
       // ⚠ NOT relaxed here: `@typescript-eslint/no-unused-vars`. A stale import in a test is how
       // an assertion silently stops covering what its name claims. tsconfig.test.json exists for
       // the same reason — see the "tests asserting against a shape the source no longer has" note.

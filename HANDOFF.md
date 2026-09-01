@@ -2,43 +2,54 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-08-31 (v0.68.6)
+## 0. State as of 2026-09-01 (v0.68.6 published; `main` ahead of the tag)
 
-The universal MCP-first dispatch correction shipped in feature commit `de34c78` / v0.68.5.
-Tutor-sync then proved the primary skill itself was too large to deliver reliably: its mandatory
-46.9 KB / 724-line read was truncated. The progressive-disclosure correction shipped in feature
-commit `0cb5632`, release commit `8063bd3`, and tag `v0.68.6`. Publish run
-[33448024963](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33448024963)
-succeeded; npm registry and the reinstalled global executable both report `0.68.6`.
+`src/server.ts` is decomposed. Its request path now lives in `routes/messages.ts`,
+`routes/openai-front.ts`, `candidate-runner.ts`, `stream-pipeline.ts` and `accounting-state.ts`;
+configuration types moved to `config-types.ts` and atomic JSON persistence to `storage/json-store.ts`.
+All 104 original top-level functions survive, and both fronts import ONE copy of every shared walk,
+hedge and hard-cap helper, so the "two fronts, one policy" rule holds structurally.
 
-Current installed state:
+**The decomposition arrived green, and four defects passed the suite anyway.** That is the durable
+lesson of this lap: a green gate certified a tree that had reverted an owner decision and silently
+downgraded an HTTP status. Full ledger, method and evidence:
+[`docs/refactor-consistency-audit-2026-09-01.md`](docs/refactor-consistency-audit-2026-09-01.md).
 
-- One portable rule appears in MCP `initialize` instructions, the `dispatch` tool description,
-  and the compact shipped skill: use MCP `dispatch` whenever available; otherwise use
-  `llm-relay dispatch --next-command -t "<task>"` and follow its returned command or target. The
-  model does not classify its host itself.
-- The primary `SKILL.md` is now 7.7 KB / 128 lines and loads in one tool response. Direct-routing,
-  dispatch-lane, and operations/failure detail is preserved in three selectively loaded references
-  (8.0 KB, 19.4 KB, and 14.0 KB). All four files match byte-for-byte across the repository and the
-  installed Claude, Codex, and OpenCode skill directories.
-- Codex global setup keeps both `[mcp_servers.llm-relay]` and the direct Responses provider.
-  Byte-identical legacy `default.toml` / `relay_coding.toml` remain absent; user-edited agents
-  are preserved. Codex Desktop's ChatGPT launcher rejects `pool/*` collaboration children before
-  contacting `model_provider`, so MCP dispatch is the working route.
-- `llm-relay setup claude-desktop` registers `llm-relay mcp` instead of writing an ineffective
-  proxy base URL and removes only the exact legacy environment values authored through v0.68.4.
-- A new host turn is required to reload the shorter skill or a new MCP startup snapshot; an
-  already-running agent retains the instructions it loaded at its own turn start.
+- `build:server` had lost its second `tsc` pass — the 2026-08-30 package-size decision. It cost
+  243,757 `packBytes`, and `docs/dashboard-package-baseline.json` had been regenerated with the
+  inflated figures rather than root-caused. Restored; the baseline now records 936,693 / 4,872,345 /
+  392, of which the honest refactor cost is +20,328 bytes and +24 entries.
+- `readBody` threw a plain `Error` embedding `BODY_TOO_LARGE_CODE` in its MESSAGE. `bodyReadErrorCode`
+  classifies on a DECLARED `error.code`, so every oversized dashboard body answered 500 instead of
+  413 — the exact defect `CLAUDE.md` records as fixed. The drain that lets the client receive that
+  response was dropped too. Restored, and `test/stream-pipeline.test.ts` now pins the code, the
+  drain, error propagation and the default ceiling.
+- `parseAssistant` demanded `role === "assistant"`, a field `AssistantMessage` does not declare, so a
+  body omitting it parsed as `null` and silently skipped validation and repair. It also stopped
+  normalizing an absent `stop_reason` to `null`, which `emitSse` writes back to the wire. Restored.
+- `frameOpensToolUse` parsed each `data:` line alone, so a multi-line `content_block_start` answered
+  `null` and the tool_use withholding trigger never fired. Restored to collect-and-join.
 
-Verification evidence:
+1,267 lines of invariant prose (94 percent) were deleted from the request path. The three arguments
+`CLAUDE.md` cites by name are restored at their new homes: the "two ranking passes" rejection with
+its 2026-08-30 owner amendment above `orderByUsability`, the `SERVED_BY_HEADER` contract inside
+`responseHeadersForTarget`, and why `markAttemptCommitted` records on the attempt itself.
 
-- Skill structure validation passed; the tarball contains the compact entry point and all three
-  references. Installer/MCP focused tests passed (66), and the accounting-store file passed (42).
-- Full recorded local gate: server 145 files, 2,846 passed, 5 skipped; dashboard 5 files, 32 passed;
-  package smoke passed.
-- Feature CI run
-  [33447741354](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33447741354)
-  and the v0.68.6 publish run above succeeded on their exact SHAs.
+Owner decisions taken 2026-09-01:
+
+- `src/kernel/protocol-ir.ts` and its test are DELETED. The 2026-08-04 "do not rebuild the canonical
+  IR" decision is reaffirmed, and `src/kernel/contracts.ts` now carries the four technical reasons
+  beside the original history note rather than the prohibition alone.
+- The 15 static-analysis rule suppressions added to `eslint.config.mjs` are REVERTED; the four added
+  stream globals stay. ⚠ The 63 errors this surfaces are overwhelmingly PRE-EXISTING — curated
+  parser regexes, keystore-test fixture passphrases, and `dashboard-static.ts`, which the refactor
+  never touched. The suppressions were inherited-noise reduction, not concealment. Analysis stays
+  advisory and outside the gate.
+- `vitest.config.ts` keeps `pool: "forks"`, for Windows flake resistance, with that reasoning now
+  recorded beside the line. Measured: the suite passes with it and without it.
+
+Verification: `npm run check` green — server 148 files, 2,865 passed, 5 skipped; dashboard 5 files,
+32 passed; package checks passed. CI green on the exact SHA.
 
 Immediate next:
 
@@ -47,6 +58,8 @@ Immediate next:
   evidence. The same investigation includes `pool/high` job `job-0002`, which exited 0 after
   75 seconds but returned only the incomplete fragment `Based on the evidence`. Neither symptom is
   yet attributed to the serving model, pool walking, lane output capture, or MCP job storage.
+- Decide whether the decomposition warrants a release. It changes no public surface and no wire
+  behaviour, but it is the largest structural change since the metering sprint.
 - Claude→MCP→AGY end-to-end validation remains deferred until Claude subscription access returns.
   Codex→MCP→AGY already passed with no visible or foreground AGY window.
 
