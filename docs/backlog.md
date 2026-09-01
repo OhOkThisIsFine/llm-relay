@@ -9,6 +9,20 @@
 
 ## Open
 
+- **Decide what to do with the 63 advisory errors the eslint revert surfaced.** The
+  `server.ts` decomposition had switched off 15 rules; the owner reverted that on 2026-09-01
+  (`cde5d1c`). ⚠ The findings are **pre-existing**, not the refactor's: `sonarjs/regex-complexity`
+  on the curated parser tables in `refusal-interpretation.ts`, `rate-limits.ts` and
+  `quota-observation.ts`; `sonarjs/no-hardcoded-passwords` on the keystore tests' fixture
+  passphrases; `no-control-regex` in `dashboard-static.ts`, which the refactor never touched. The
+  `rate-limits.ts` regexes flagged today are byte-identical to their `ec5c16f` form.
+
+  Analysis is advisory and deliberately outside the gate, so nothing is broken. The unmet property
+  is that `eslint.config.mjs`'s convention — one **named invariant** beside each disabled rule — is
+  currently satisfied by neither state: the rules are on and noisy, or off and unlabelled. Resolve
+  by disabling each with its invariant named, or by fixing the findings. Evidence:
+  [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md).
+
 - **Re-check long `pool/medium` MCP dispatch after v0.68.4.** During the universal-entrypoint lap,
   read-only survey job `job-0001` stayed `running` with no answer for 1,594 seconds and was
   cancelled. The caller-side MCP mechanics were correct; no claim is made yet about whether the
