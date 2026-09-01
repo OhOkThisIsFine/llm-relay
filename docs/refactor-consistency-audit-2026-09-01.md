@@ -1,7 +1,7 @@
 # Refactor consistency audit — 2026-09-01
 
 Scope: the 98 uncommitted paths present at lap start (`ec5c16f`). Another model decomposed
-`src/server.ts` (−5,664 lines) into `routes/messages.ts`, `routes/openai-front.ts`,
+`src/server.ts` (5,799 → 863 lines, a net −4,936) into `routes/messages.ts`, `routes/openai-front.ts`,
 `candidate-runner.ts`, `stream-pipeline.ts`, `accounting-state.ts`, `config-types.ts`,
 `storage/json-store.ts` and `kernel/protocol-ir.ts`.
 
@@ -15,6 +15,17 @@ Every defect below therefore passed the suite. Green did not mean correct.
   lost.
 - Each old function body was extracted, comment-stripped and compared against its new home.
 - Survivors were then read against the invariants `CLAUDE.md` records for them.
+
+⚠⚠ **PROVENANCE OF THE "BEFORE" STATE — read this before checking any claim here against `git`.**
+Every defect below was found and repaired in the WORKING TREE, before the first commit of the
+sprint. The broken state therefore exists in no commit and cannot be reconstructed from history.
+An independent auditor confirmed this on 2026-09-01: `git show ec5c16f:package.json` and
+`package.json` at HEAD are byte-identical for `build:server`, and `git log ec5c16f..HEAD --
+package.json` is empty — exactly what a defect repaired before commit looks like.
+
+So the evidence for each "was broken" claim is a MEASUREMENT taken at the time, named in place
+below, not a diff. Where a claim can be checked at HEAD it says so, and every such claim was
+independently confirmed. A future reader wanting the broken state has only this document.
 
 ## Confirmed defects
 
@@ -92,8 +103,15 @@ tool_use withholding trigger never fired for it.
 
 ### 5. 1,267 lines of invariant prose were deleted from the request path
 
-`server.ts` carried 1,350 comment lines. The successor files carry 83 — a 94 percent loss.
-`src/server.ts` itself now has none.
+`server.ts` carried 1,350 comment lines. **As received**, its six successor files on the request
+path carried 83 — a 94 percent loss, with `src/server.ts` itself at zero.
+
+⚠ Counted as `grep -cE "^\s*(//|/\*|\*)"` over exactly `src/server.ts`, `routes/messages.ts`,
+`routes/openai-front.ts`, `candidate-runner.ts`, `stream-pipeline.ts` and `accounting-state.ts`.
+`config-types.ts` and `storage/json-store.ts` are excluded: they are newly authored type and
+infrastructure modules, not homes `server.ts`'s prose moved into. **At HEAD the same six count 138**,
+because this lap restored 55 lines. Both figures are correct for their own tree, and an auditor
+measuring HEAD will not reproduce 83 — that is the point of stating which tree each describes.
 
 This is not cosmetic in this repository. `CLAUDE.md` cites `server.ts` as the *home* of recorded
 arguments and instructs later readers to obey them. The `latency-demotion.ts` row says the
@@ -120,8 +138,14 @@ pass", "relay-abandoned", "never invents", "loopback is not authorization", "byt
 
 ## Owner decisions and residue
 
-- **`src/kernel/protocol-ir.ts` was unadopted.** DELETED by owner decision 2026-09-01, with its
-  test. It was 116 lines of `Normalized*` types plus three type guards, imported by no `src/` file.
+- **`src/kernel/protocol-ir.ts` was a fifth defect, not a neutral design question.** The refactor
+  REINTRODUCED the canonical IR that `CLAUDE.md` and `src/kernel/contracts.ts` both say was deleted
+  on 2026-08-04 and must not be rebuilt. Filing it under "owner decision" alone reads as a clean
+  architectural call; it was a forbidden surface re-added and walked back the same day. That framing
+  correction comes from the independent closeout auditor and is the right one.
+
+  DELETED by owner decision 2026-09-01, with its test. It was 116 lines of `Normalized*` types plus
+  three type guards, imported by no `src/` file.
 
   It passed `test/architecture-map.test.ts` only because that test accepts a row naming the
   containing directory, and `kernel/` has one — the very row that says the canonical-IR surface was
@@ -138,15 +162,31 @@ pass", "relay-abandoned", "never invents", "loopback is not authorization", "byt
   (`TransformStream`, `WritableStream`, `ReadableStreamDefaultReader`,
   `TransformStreamDefaultController`) are genuinely needed and stay.
 
-  ⚠ **Correction to this audit's first reading.** The revert surfaces 63 errors, and they are
-  overwhelmingly PRE-EXISTING: `sonarjs/regex-complexity` on the curated parser tables in
-  `refusal-interpretation.ts`, `rate-limits.ts` and `quota-observation.ts`;
-  `sonarjs/no-hardcoded-passwords` on the keystore tests' fixture passphrases; `no-control-regex`
-  in `dashboard-static.ts`, a file the refactor never touched at all. The `rate-limits.ts` regexes
-  flagged today are byte-identical to their `ec5c16f` form. So the suppressions were reducing
-  inherited advisory noise, not concealing the refactor's own findings. They were still wrong to
-  add unlabelled — the file's convention is one named invariant per disabled rule — but they were
-  not a cover-up, and this document should not be read as claiming they were.
+  ⚠ **Correction to this audit's first reading.** The revert surfaces 63 errors, and the CODE that
+  produces them is PRE-EXISTING. The suppressions were reducing inherited advisory noise, not
+  concealing the refactor's own findings. They were still wrong to add unlabelled — the file's
+  convention is one named invariant per disabled rule — but they were not a cover-up, and this
+  document should not be read as claiming they were.
+
+  ⚠⚠ **A SECOND correction, from the independent closeout auditor.** This paragraph first said the
+  errors were "in files the refactor never touched". **That phrasing is false**, and the difference
+  matters. Of the 16 `src/` files carrying the 63 errors, only four are genuinely untouched
+  (`circuit-breaker.ts`, `dashboard-routes.ts`, `dashboard-snapshot.ts`, `dashboard-static.ts`); the
+  other twelve were modified in the sprint, and one — `candidate-runner.ts` — the refactor CREATED.
+
+  The defensible claim is about the CODE, not the files, and it rests on three measurements:
+  `candidate-runner.ts`'s single error sits on `credentialAttemptLabel`, a body moved BYTE-FOR-BYTE
+  from `server.ts:2430`; the `rate-limits.ts` and `refusal-interpretation.ts` regexes carry
+  identical complexity scores on unchanged lines; and the whole tree scored **155 errors at
+  `ec5c16f` under that commit's own config against 63 at HEAD**, so the refactor left the codebase
+  cleaner by this measure, not dirtier. "Moved code keeps its findings" is the accurate statement.
+  "The refactor never touched those files" was a convenient shorthand that the evidence does not
+  support, and I should not have written it.
+
+  ⚠ One further unmentioned change stands: the file also swaps the base `no-redeclare` off for
+  `@typescript-eslint/no-redeclare: 'error'`. That is kept deliberately — the TypeScript-aware rule
+  is required for declaration merging, and it is set to `error`, so it is stricter than what it
+  replaces, not a suppression.
 - **`vitest.config.ts` gained `pool: "forks"`** with nothing recorded about why. Measured: the full
   suite passes with it and without it (148 files, 2,865 passed, 5 skipped, same duration either
   way), so it is not load-bearing for correctness. Kept by owner decision 2026-09-01, for Windows

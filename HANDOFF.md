@@ -4,16 +4,24 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-09-01 (v0.68.6 published; `main` ahead of the tag)
 
-`src/server.ts` is decomposed. Its request path now lives in `routes/messages.ts`,
+`src/server.ts` is decomposed (5,799 → 863 lines, a net −4,936). Its request path now lives in `routes/messages.ts`,
 `routes/openai-front.ts`, `candidate-runner.ts`, `stream-pipeline.ts` and `accounting-state.ts`;
 configuration types moved to `config-types.ts` and atomic JSON persistence to `storage/json-store.ts`.
 All 104 original top-level functions survive, and both fronts import ONE copy of every shared walk,
 hedge and hard-cap helper, so the "two fronts, one policy" rule holds structurally.
 
-**The decomposition arrived green, and four defects passed the suite anyway.** That is the durable
+**The decomposition was produced by another model, as 98 uncommitted paths sitting in the working
+tree at lap start. It arrived green, and four defects passed the suite anyway.** That is the durable
 lesson of this lap: a green gate certified a tree that had reverted an owner decision and silently
-downgraded an HTTP status. Full ledger, method and evidence:
+downgraded an HTTP status. This session audited it, repaired it, and committed it. Full ledger,
+method and evidence:
 [`docs/refactor-consistency-audit-2026-09-01.md`](docs/refactor-consistency-audit-2026-09-01.md).
+
+⚠⚠ **Do not try to check the four defects against `git`.** All were repaired in the working tree
+BEFORE the first commit, so no commit holds the broken state — `git show ec5c16f:package.json`
+matches HEAD exactly, and an independent auditor correctly returned UNVERIFIABLE for that half. The
+evidence is the measurements recorded in the audit document. Every claim that CAN be checked at HEAD
+was independently confirmed.
 
 - `build:server` had lost its second `tsc` pass — the 2026-08-30 package-size decision. It cost
   243,757 `packBytes`, and `docs/dashboard-package-baseline.json` had been regenerated with the
@@ -37,14 +45,17 @@ its 2026-08-30 owner amendment above `orderByUsability`, the `SERVED_BY_HEADER` 
 
 Owner decisions taken 2026-09-01:
 
-- `src/kernel/protocol-ir.ts` and its test are DELETED. The 2026-08-04 "do not rebuild the canonical
-  IR" decision is reaffirmed, and `src/kernel/contracts.ts` now carries the four technical reasons
-  beside the original history note rather than the prohibition alone.
+- `src/kernel/protocol-ir.ts` and its test are DELETED. ⚠ Read this as a FIFTH defect, not a neutral
+  design call: the refactor reintroduced the canonical IR that `CLAUDE.md` and
+  `src/kernel/contracts.ts` both say was deleted on 2026-08-04 and must not be rebuilt. That
+  prohibition is reaffirmed, and `contracts.ts` now carries the four technical reasons beside the
+  original history note rather than the prohibition alone.
 - The 15 static-analysis rule suppressions added to `eslint.config.mjs` are REVERTED; the four added
-  stream globals stay. ⚠ The 63 errors this surfaces are overwhelmingly PRE-EXISTING — curated
-  parser regexes, keystore-test fixture passphrases, and `dashboard-static.ts`, which the refactor
-  never touched. The suppressions were inherited-noise reduction, not concealment. Analysis stays
-  advisory and outside the gate.
+  stream globals stay. ⚠ The CODE producing the 63 surfaced errors is PRE-EXISTING: the tree scored
+  155 errors at `ec5c16f` under that commit's own config against 63 at HEAD. The suppressions were
+  inherited-noise reduction, not concealment. ⚠ Do not restate this as "files the refactor never
+  touched" — a closeout auditor falsified that phrasing; the claim is about moved code. Analysis
+  stays advisory and outside the gate. Tracked in [`docs/backlog.md`](docs/backlog.md).
 - `vitest.config.ts` keeps `pool: "forks"`, for Windows flake resistance, with that reasoning now
   recorded beside the line. Measured: the suite passes with it and without it.
 

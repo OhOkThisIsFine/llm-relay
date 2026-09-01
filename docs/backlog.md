@@ -11,11 +11,16 @@
 
 - **Decide what to do with the 63 advisory errors the eslint revert surfaced.** The
   `server.ts` decomposition had switched off 15 rules; the owner reverted that on 2026-09-01
-  (`cde5d1c`). ⚠ The findings are **pre-existing**, not the refactor's: `sonarjs/regex-complexity`
-  on the curated parser tables in `refusal-interpretation.ts`, `rate-limits.ts` and
-  `quota-observation.ts`; `sonarjs/no-hardcoded-passwords` on the keystore tests' fixture
-  passphrases; `no-control-regex` in `dashboard-static.ts`, which the refactor never touched. The
-  `rate-limits.ts` regexes flagged today are byte-identical to their `ec5c16f` form.
+  (`cde5d1c`). ⚠ The CODE producing the findings is **pre-existing**: curated parser regexes in
+  `refusal-interpretation.ts`, `rate-limits.ts` and `quota-observation.ts`; keystore-test fixture
+  passphrases; `no-control-regex` in `dashboard-static.ts`. The tree scored **155 errors at
+  `ec5c16f` under that commit's own config against 63 at HEAD**, so the refactor left it cleaner by
+  this measure.
+
+  ⚠ Do NOT restate this as "in files the refactor never touched" — an auditor falsified that
+  phrasing on 2026-09-01. Twelve of the sixteen error-bearing files WERE modified, and
+  `candidate-runner.ts` was created by the refactor; its one error sits on `credentialAttemptLabel`,
+  a body moved byte-for-byte from `server.ts`. The claim is about moved code, not untouched files.
 
   Analysis is advisory and deliberately outside the gate, so nothing is broken. The unmet property
   is that `eslint.config.mjs`'s convention — one **named invariant** beside each disabled rule — is
