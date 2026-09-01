@@ -236,8 +236,9 @@ export function extractQuotaObservations(
 
   const parsedRetryAfter = parseRetryAfter(retryAfter, observedAt);
   const allBuckets = [...buckets.values()];
+  allBuckets.sort(canonicalBucketOrder);
   const observations: QuotaObservation[] = [];
-  for (const bucket of allBuckets.sort(canonicalBucketOrder)) {
+  for (const bucket of allBuckets) {
     if (bucket.limit === undefined || bucket.remaining === undefined) continue;
     if (!Number.isFinite(bucket.limit) || bucket.limit <= 0) continue;
     if (!Number.isFinite(bucket.remaining) || bucket.remaining < 0) continue;

@@ -1,7 +1,7 @@
 import { relayStatePath } from "./state-paths.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 
 /**
  * What a `cli` lane's own tool says it can serve.
@@ -75,13 +75,16 @@ function isLaneEntry(obj: unknown): obj is LaneEntry {
 export function loadLaneManifest(path: string = DEFAULT_MANIFEST_PATH): LaneManifest | null {
   try {
     if (!existsSync(path)) return null;
-    const j = JSON.parse(readFileSync(path, "utf8")) as LaneManifest;
-    if (j?.version !== 1 || typeof j.lanes !== "object" || j.lanes === null) return null;
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const j = parsed as Record<string, unknown>;
+    if (j["version"] !== 1 || typeof j["lanes"] !== "object" || j["lanes"] === null) return null;
+    const manifest = j as unknown as LaneManifest;
     // Deep-validate each lane entry: corrupt ⇒ null ⇒ unknown (the loader's documented contract)
-    for (const entry of Object.values(j.lanes)) {
+    for (const entry of Object.values(manifest.lanes)) {
       if (!isLaneEntry(entry)) return null;
     }
-    return j;
+    return manifest;
   } catch {
     // Unreadable is UNKNOWN, never "nothing is servable". A corrupt manifest that evicted every
     // rung would turn a hygiene feature into a total outage.

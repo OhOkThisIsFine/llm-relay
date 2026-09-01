@@ -255,6 +255,13 @@ export function hasDocumentBlocks(body: unknown): boolean {
   });
 }
 
+const documentCache = new Map<string, string>();
+const MAX_DOCUMENT_CACHE_ENTRIES = 100;
+
+export function clearDocumentCache(): void {
+  documentCache.clear();
+}
+
 /**
  * Replace every `document` block with a markdown `text` block. Returns a NEW body —
  * the caller's object is not mutated. Throws `DocumentError` if any document cannot
@@ -273,7 +280,27 @@ export async function transcodeDocuments(body: unknown, opts: TranscodeOptions =
   const convert = async (block: unknown): Promise<unknown> => {
     const b = block as Record<string, unknown>;
     const decoded = decodeSource(b, maxBytes);
-    const text = "text" in decoded ? decoded.text : await run(decoded.buf, decoded.ext, { command, timeoutMs });
+    let text: string;
+    if ("text" in decoded) {
+      text = decoded.text;
+    } else if (opts.runner) {
+      text = await run(decoded.buf, decoded.ext, { command, timeoutMs });
+    } else {
+      const cacheKey = `${command}:${createHash("sha256").update(decoded.buf).digest("hex")}${decoded.ext}`;
+      const cached = documentCache.get(cacheKey);
+      if (cached !== undefined) {
+        text = cached;
+      } else {
+        text = await run(decoded.buf, decoded.ext, { command, timeoutMs });
+        if (text.trim()) {
+          if (documentCache.size >= MAX_DOCUMENT_CACHE_ENTRIES) {
+            const firstKey = documentCache.keys().next().value;
+            if (firstKey !== undefined) documentCache.delete(firstKey);
+          }
+          documentCache.set(cacheKey, text);
+        }
+      }
+    }
     const title = labelTitle(b.title);
     const converted = text.trim();
     if (!converted) throw new DocumentError(`markitdown produced no text for ${title}`);

@@ -3,15 +3,11 @@
  * learned limits, cooldown rows from breaker/credential-fault/target-fact sources, and the
  * never-throws guarantee that keeps a diagnostic panel from failing a read.
  */
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   isCooldownRowV1,
   isQuotaRowV1,
   type CooldownRowV1,
-  type QuotaRowV1,
 } from "../src/dashboard-contract.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
 import { extractQuotaObservations } from "../src/quota-observation.js";

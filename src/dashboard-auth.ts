@@ -219,20 +219,30 @@ export class DashboardAuthManager {
     return unmatchedCandidateFailure(candidate);
   }
 
-  /** Validate and touch a session's idle expiry, never extending its absolute expiry. */
-  validateSession(candidate: unknown): DashboardSessionResult {
-    const now = nowFrom(this.#clock);
+  #resolveSession(
+    candidate: unknown,
+    now: number,
+  ): { record: SessionRecord } | { failure: DashboardAuthFailure } {
     const candidateDigest = digestToken(candidate);
     const record = this.#findSession(candidateDigest);
     if (!record) {
       this.cleanup(now);
-      return unmatchedCandidateFailure(candidate);
+      return { failure: unmatchedCandidateFailure(candidate) };
     }
     if (now >= record.absoluteExpiresAt || now >= record.idleExpiresAt) {
       this.#sessions.delete(record);
       this.cleanup(now);
-      return failure("expired");
+      return { failure: failure("expired") };
     }
+    return { record };
+  }
+
+  /** Validate and touch a session's idle expiry, never extending its absolute expiry. */
+  validateSession(candidate: unknown): DashboardSessionResult {
+    const now = nowFrom(this.#clock);
+    const resolved = this.#resolveSession(candidate, now);
+    if ("failure" in resolved) return resolved.failure;
+    const { record } = resolved;
 
     this.cleanup(now);
     record.idleExpiresAt = Math.min(now + this.#idleTtlMs, record.absoluteExpiresAt);
@@ -247,19 +257,11 @@ export class DashboardAuthManager {
   /** Revoke the addressed session. Invalid candidates fail closed without revealing state. */
   logout(candidate: unknown): DashboardLogoutResult {
     const now = nowFrom(this.#clock);
-    const candidateDigest = digestToken(candidate);
-    const record = this.#findSession(candidateDigest);
-    if (!record) {
-      this.cleanup(now);
-      return unmatchedCandidateFailure(candidate);
-    }
-    if (now >= record.absoluteExpiresAt || now >= record.idleExpiresAt) {
-      this.#sessions.delete(record);
-      this.cleanup(now);
-      return failure("expired");
-    }
+    const resolved = this.#resolveSession(candidate, now);
+    if ("failure" in resolved) return resolved.failure;
+
     this.cleanup(now);
-    this.#sessions.delete(record);
+    this.#sessions.delete(resolved.record);
     return Object.freeze({ ok: true as const, revoked: true as const });
   }
 

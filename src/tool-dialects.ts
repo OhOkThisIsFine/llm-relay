@@ -17,6 +17,8 @@
  * path must never do. A dialect we do not recognize yields `detected` at most, never a guess.
  */
 
+import { isRecord } from "./json-shape.js";
+
 /** JSON Schema fragment, only the parts used to coerce a stringly-typed parameter. */
 interface SchemaLike {
   type?: unknown;
@@ -220,16 +222,20 @@ function coerce(raw: string, schema: SchemaLike | undefined): unknown {
 function fromJsonPayload(raw: string): DialectToolCall | null {
   let j: unknown;
   try { j = JSON.parse(raw.trim()); } catch { return null; }
-  if (typeof j !== "object" || j === null) return null;
-  const o = j as Record<string, unknown>;
-  const name = typeof o.name === "string" ? o.name : null;
+  if (!isRecord(j)) return null;
+  const name = typeof j.name === "string" ? j.name : null;
   if (!name) return null;
-  const args = o.arguments ?? o.parameters ?? o.input ?? {};
+  const args = j.arguments ?? j.parameters ?? j.input ?? {};
   if (typeof args === "string") {
-    try { return { name, input: JSON.parse(args) as Record<string, unknown> }; } catch { return null; }
+    try {
+      const parsed = JSON.parse(args);
+      return isRecord(parsed) ? { name, input: parsed } : null;
+    } catch {
+      return null;
+    }
   }
-  if (typeof args !== "object" || args === null) return null;
-  return { name, input: args as Record<string, unknown> };
+  if (!isRecord(args)) return null;
+  return { name, input: args };
 }
 
 /** `<invoke name="x"><parameter name="p">v</parameter></invoke>`, with or without DSML markers. */

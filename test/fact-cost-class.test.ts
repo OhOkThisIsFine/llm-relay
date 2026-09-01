@@ -212,7 +212,7 @@ describe("the CLI round-trip preserves the narrowing", () => {
     // Without this the reviewer's narrowing is accepted, displayed, and then dropped on the way to
     // the store — the verdict would demote everything its scope covers.
     const { readFileSync } = await import("node:fs");
-    const text = readFileSync(join(__dirname, "..", "src", "server.ts"), "utf8");
+    const text = readFileSync(join(__dirname, "..", "src", "candidate-runner.ts"), "utf8");
     expect(text).toMatch(/costClasses: verdict\.costClasses/);
   });
 });

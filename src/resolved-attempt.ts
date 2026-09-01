@@ -1,18 +1,9 @@
-import type { CredentialId } from "./credential-id.js";
-import type { CredentialResolution } from "./authEnv.js";
-import type { ResolvedTarget } from "./config.js";
-import type { CredentialSlot } from "./credential-fleet.js";
+import type { ResolvedTarget } from "./config-types.js";
+import type { ResolvedAttempt } from "./credential-fleet.js";
 import { emptyCredentialSlot, implicitCredentialSlot, resolveAttemptForSlot } from "./credential-fleet.js";
 import type { KeystoreOptions } from "./keystore.js";
 
-/** Application-layer attempt with credential resolution performed exactly once. */
-export interface ResolvedAttempt {
-  readonly target: ResolvedTarget;
-  readonly credentialId: CredentialId;
-  readonly credential: CredentialResolution;
-  /** Non-secret slot descriptor; the secret itself remains only in `credential.value`. */
-  readonly slot: CredentialSlot;
-}
+export type { ResolvedAttempt };
 
 /** Resolve the current single-slot target into the application attempt shape. */
 export function resolveAttempt(

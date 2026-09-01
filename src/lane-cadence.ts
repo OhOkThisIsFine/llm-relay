@@ -174,9 +174,9 @@ export class LaneCadence {
     const spawn = this.opts.spawn ?? defaultLaneProbeSpawner;
     const targets = new Map(laneQuotaTargets(this.cfg).map((t) => [t.key, t] as const));
     const records: LaneQuotaProbeRecord[] = [];
-    for (const key of quotaDueKeys) {
+    await Promise.allSettled(quotaDueKeys.map(async (key) => {
       const target = targets.get(key);
-      if (!target) continue; // the config no longer names this bucket — its row expires on its own
+      if (!target) return; // the config no longer names this bucket — its row expires on its own
       const now = this.clock();
       // Stamp BEFORE the spawn (`pollSpendHeadroom`'s rule) so a hanging tool is not re-asked
       // every tick.
@@ -196,7 +196,7 @@ export class LaneCadence {
       } catch {
         /* contained per probe; the next gate retries */
       }
-    }
+    }));
     if (records.length > 0) this.lastQuotaRecords = records;
   }
 }

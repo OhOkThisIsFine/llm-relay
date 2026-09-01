@@ -460,12 +460,12 @@ export class PingLoop {
     const routable = scope === "routable" ? collectRoutableModels(this.cfg) : null;
     const telemetry = loadRuntimeTelemetry();
 
-    for (const [providerName, pCfg] of providers) {
+    await Promise.allSettled(providers.map(async ([providerName, pCfg]) => {
       const modelIds = scope === "catalog"
         ? listedByProvider.get(providerName) ?? []
         : routable?.get(providerName) ?? [];
 
-      if (modelIds.length === 0) continue;
+      if (modelIds.length === 0) return;
 
       // Same cache the results are written to and hydrated from. `probe-cache.ts` keeps a
       // module-level cache keyed by the last path it was given, so a call that omits the path
@@ -500,13 +500,17 @@ export class PingLoop {
         }
         if (!selected || !selectedSlot) continue;
         this.credentialCursors.set(providerName, slotCursor);
-        const res = await pingProviderModel(providerName, mId, pCfg, selected.value, {
-          ...optsObj(this.opts.fetchFn),
-          timeoutMs: pCfg.timeoutMs,
-        });
-        this.recordPing(providerName, mId, res, Date.now(), selectedSlot.credentialId);
+        try {
+          const res = await pingProviderModel(providerName, mId, pCfg, selected.value, {
+            ...optsObj(this.opts.fetchFn),
+            timeoutMs: pCfg.timeoutMs,
+          });
+          this.recordPing(providerName, mId, res, Date.now(), selectedSlot.credentialId);
+        } catch {
+          // Probe failure contained per model
+        }
       }
-    }
+    }));
   }
 
   public start(): void {

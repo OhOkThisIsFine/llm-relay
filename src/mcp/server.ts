@@ -315,12 +315,12 @@ export class McpDispatchServer {
     this.maxDepth = deps.maxDepth ?? DEFAULT_MAX_DEPTH;
   }
 
-  /** Feed raw stdin bytes. Complete messages are handled; a partial tail is carried over. */
+  /** Feed raw stdin bytes. Complete messages are handled concurrently; a partial tail is carried over. */
   async ingest(chunk: string): Promise<void> {
     this.buffer += chunk;
     const { lines, rest } = splitMessages(this.buffer);
     this.buffer = rest;
-    for (const line of lines) await this.handleLine(line);
+    await Promise.all(lines.map((line) => this.handleLine(line)));
   }
 
   /** Kill every running child. Wired to process exit so nothing is orphaned. */

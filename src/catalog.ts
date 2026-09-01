@@ -1,7 +1,7 @@
 import { relayStatePath } from "./state-paths.js";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import type { ProviderConfig } from "./config.js";
 import { buildAuthHeaders } from "./authEnv.js";
 import {

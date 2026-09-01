@@ -4,7 +4,6 @@ import {
   credentialCandidateEnvNames,
   credentialState,
   keyIsPresent,
-  resolveAuthEnv,
 } from "./authEnv.js";
 import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { parseConfiguredLimits, type ProviderLimitsConfig } from "./configured-limits.js";
@@ -48,6 +47,9 @@ export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 
 /** Requested reasoning/capability band for an automatically discovered pool. */
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+export const CLAUDE_TIER_NAMES = ["opus", "sonnet", "haiku", "fable"] as const;
+export type ClaudeTierName = (typeof CLAUDE_TIER_NAMES)[number];
 
 const EFFORT_LEVEL_SET: ReadonlySet<string> = new Set(EFFORT_LEVELS);
 
@@ -1073,7 +1075,7 @@ const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export { DEFAULT_ANTHROPIC_VERSION };
 
 /** Claude tier names, longest-first so "haiku"/"sonnet" match before generic bits. */
-const TIER_NAMES = ["opus", "sonnet", "haiku", "fable"] as const;
+const TIER_NAMES = CLAUDE_TIER_NAMES;
 
 /** A routing failure — surfaced to the client as a clean 400, never a crash. */
 export class RoutingError extends Error {}
@@ -1178,6 +1180,36 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
 }
 
 /**
+ * Filter targets to those with active/usable credentials, falling back to full list if none are active.
+ */
+function filterUsableTargets(
+  targets: readonly ResolvedTarget[],
+  scopedKeystoreOptions: KeystoreOptions,
+): ResolvedTarget[] {
+  const activeTargets = targets.filter((t) =>
+    credentialState(t.authEnv, process.env, t.provider, scopedKeystoreOptions) !== "declared-missing"
+  );
+  return activeTargets.length > 0 ? activeTargets : [...targets];
+}
+
+/**
+ * Rank targets by benchmark unless the pool is a dynamic pool with predefined fitness order.
+ */
+function rankNonDynamicTargets(
+  picked: readonly string[],
+  targets: readonly ResolvedTarget[],
+  cfg: Config,
+): ResolvedTarget[] {
+  const pickedPool = picked.length === 1 && picked[0]?.startsWith(`${POOL_PREFIX}/`) ? picked[0] : undefined;
+  const dynamicPool =
+    pickedPool !== undefined && cfg.routing.poolPolicies?.[pickedPool.slice(POOL_PREFIX.length + 1)] !== undefined;
+  if (!dynamicPool && cfg.routing.benchmarkSort !== false && targets.length > 1) {
+    return rankTargetsByBenchmark([...targets]);
+  }
+  return [...targets];
+}
+
+/**
  * Resolve an inbound `model` to an array of concrete targets (primary + fallbacks).
  */
 export function resolveTargets(
@@ -1195,34 +1227,9 @@ export function resolveTargets(
   };
   const picked = pickSpecs(model, cfg);
   const specs = expandPoolSpecs(picked, cfg);
-  let targets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
-
-  // Prioritize targets whose credential is usable: no authEnv declared (a real passthrough or a
-  // keyless local provider) or a declared authEnv that is actually present.
-  //
-  // ⚠ Presence is decided by `credentialState`, the SAME predicate `server.ts`'s
-  // `buildForwardHeaders` uses — not an open-coded `Boolean(process.env[...])`. This site used to
-  // test truthiness without trimming while header construction trimmed, so a whitespace-only key
-  // read PRESENT here and ABSENT there: the blank-key target survived the filter, the
-  // keep-everything fallback below never ran, and the request went to a provider the proxy could
-  // not authenticate to. Any drift between the two answers reopens that gap, so both must keep
-  // calling the one predicate.
-  const activeTargets = targets.filter((t) =>
-    credentialState(t.authEnv, process.env, t.provider, scopedKeystoreOptions) !== "declared-missing"
-  );
-  if (activeTargets.length > 0) {
-    targets = activeTargets;
-  }
-
-  // Dynamic pools are already materialized as an invariant fixed prefix followed by a fitness-ranked
-  // discovery tail. Sorting the entire result again would destroy the user's preferred order.
-  const pickedPool = picked.length === 1 && picked[0]?.startsWith(`${POOL_PREFIX}/`) ? picked[0] : undefined;
-  const dynamicPool =
-    pickedPool !== undefined && cfg.routing.poolPolicies?.[pickedPool.slice(POOL_PREFIX.length + 1)] !== undefined;
-  if (!dynamicPool && cfg.routing.benchmarkSort !== false && targets.length > 1) {
-    targets = rankTargetsByBenchmark(targets);
-  }
-  return targets;
+  const rawTargets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
+  const activeTargets = filterUsableTargets(rawTargets, scopedKeystoreOptions);
+  return rankNonDynamicTargets(picked, activeTargets, cfg);
 }
 
 /**
@@ -1620,6 +1627,137 @@ function parseCredentialDeclarations(
   return out;
 }
 
+function validateProviderCredentialMode(
+  name: string,
+  declaresAuthEnv: boolean,
+  hasCredentialsDeclaration: boolean,
+  rawCredentialMode: unknown,
+): CredentialMode | undefined {
+  let credentialMode: CredentialMode | undefined =
+    rawCredentialMode === "passthrough" || rawCredentialMode === "contained" ? rawCredentialMode : undefined;
+  if (rawCredentialMode !== undefined && credentialMode === undefined) {
+    throw new Error(`config.providers.${name}.credentialMode must be "passthrough" or "contained"`);
+  }
+  if (credentialMode === "passthrough" && declaresAuthEnv) {
+    throw new Error(
+      `config.providers.${name}: credentialMode "passthrough" forwards the CALLER's own credential, ` +
+        `but authEnv declares one of its own — declare exactly one`,
+    );
+  }
+  if (hasCredentialsDeclaration && declaresAuthEnv) {
+    throw new Error(
+      `config.providers.${name}: authEnv and credentials cannot both be declared — declare exactly one`,
+    );
+  }
+  if (hasCredentialsDeclaration && credentialMode === "passthrough") {
+    throw new Error(
+      `config.providers.${name}: credentialMode "passthrough" cannot be combined with credentials`,
+    );
+  }
+  if (hasCredentialsDeclaration) credentialMode = "contained";
+  return credentialMode;
+}
+
+function validateProviderConcurrency(name: string, rawMaxConcurrent: unknown): number | null | undefined {
+  if (rawMaxConcurrent === undefined) return undefined;
+  if (rawMaxConcurrent === null) return null;
+  if (
+    typeof rawMaxConcurrent !== "number" ||
+    !Number.isSafeInteger(rawMaxConcurrent) ||
+    rawMaxConcurrent <= 0
+  ) {
+    throw new Error(`config.providers.${name}.maxConcurrent must be a positive safe integer or null`);
+  }
+  return rawMaxConcurrent;
+}
+
+function parseSingleProvider(
+  name: string,
+  v: unknown,
+  warnings: string[],
+  disabled: Set<string>,
+): ProviderConfig | null {
+  if (typeof v !== "object" || v === null) {
+    throw new Error(`config.providers.${name} must be an object`);
+  }
+  const p = v as {
+    base?: unknown;
+    kind?: unknown;
+    authEnv?: unknown;
+    credentials?: unknown;
+    credentialMode?: unknown;
+    maxConcurrent?: unknown;
+    authHeader?: unknown;
+    timeoutMs?: unknown;
+    stallTimeoutMs?: unknown;
+    tierType?: unknown;
+    signupUrl?: unknown;
+    limits?: unknown;
+    compat?: unknown;
+  };
+  try {
+    makeCredentialId(name);
+  } catch {
+    throw new Error(
+      `config.providers.${name} is not a valid provider name — provider names must be non-empty and must not contain '#'`,
+    );
+  }
+  if (typeof p.base !== "string") {
+    throw new Error(`config.providers.${name}.base (string URL) is required`);
+  }
+  const expanded = expandEnvSoft(p.base);
+  const kind: Kind = p.kind === "openai" ? "openai" : "anthropic";
+  const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
+  const declaredAuthEnv = typeof p.authEnv === "string" ? p.authEnv.trim() : undefined;
+  const declaresAuthEnv = typeof declaredAuthEnv === "string" && declaredAuthEnv.length > 0;
+  const hasCredentialsDeclaration = p.credentials !== undefined;
+  const credentialMode = validateProviderCredentialMode(name, declaresAuthEnv, hasCredentialsDeclaration, p.credentialMode);
+  let credentials: ProviderCredentialConfig[] | undefined;
+  if (hasCredentialsDeclaration) {
+    credentials = parseCredentialDeclarations(name, p.credentials, warnings);
+  }
+  const maxConcurrent = validateProviderConcurrency(name, p.maxConcurrent);
+  const limits = parseConfiguredLimits(p.limits, `config.providers.${name}.limits`);
+  const compat = parseProviderCompat(p.compat, `config.providers.${name}.compat`);
+
+  if (expanded.missing.length > 0) {
+    warnings.push(
+      `provider "${name}" DISABLED — base references unset env var ` +
+        `${expanded.missing.map((n) => `\${${n}}`).join(", ")}. ` +
+        `Set it and restart, or remove the provider. Everything else still works.`,
+    );
+    disabled.add(name);
+    return null;
+  }
+  if (kind === "anthropic" && !declaresAuthEnv && credentialMode === undefined) {
+    warnings.push(
+      `provider "${name}" forwards the CALLER's own credential to ${expanded.value} — inferred from ` +
+        `having no authEnv. Declare credentialMode "passthrough" to confirm that is intended, or ` +
+        `"contained" to strip it.`,
+    );
+  }
+
+  return {
+    base: expanded.value.trim().replace(/\/+$/, ""),
+    kind,
+    authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
+    timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
+    ...(typeof p.stallTimeoutMs === "number" && Number.isFinite(p.stallTimeoutMs) && p.stallTimeoutMs >= 0
+      ? { stallTimeoutMs: Math.floor(p.stallTimeoutMs) }
+      : {}),
+    ...(declaredAuthEnv ? { authEnv: declaredAuthEnv } : {}),
+    ...(credentials !== undefined ? { credentials } : {}),
+    ...(credentialMode !== undefined ? { credentialMode } : {}),
+    ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
+    ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
+      ? { tierType: p.tierType }
+      : {}),
+    ...(limits !== undefined ? { limits } : {}),
+    ...(compat !== undefined ? { compat } : {}),
+    ...(typeof p.signupUrl === "string" && p.signupUrl.length > 0 ? { signupUrl: p.signupUrl } : {}),
+  };
+}
+
 function parseProviders(
   raw: unknown,
   warnings: string[] = [],
@@ -1630,142 +1768,10 @@ function parseProviders(
   }
   const out: Record<string, ProviderConfig> = {};
   for (const [name, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof v !== "object" || v === null) {
-      throw new Error(`config.providers.${name} must be an object`);
+    const provider = parseSingleProvider(name, v, warnings, disabled);
+    if (provider !== null) {
+      out[name] = provider;
     }
-    const p = v as {
-      base?: unknown;
-      kind?: unknown;
-      authEnv?: unknown;
-      credentials?: unknown;
-      credentialMode?: unknown;
-      maxConcurrent?: unknown;
-      authHeader?: unknown;
-      timeoutMs?: unknown;
-      stallTimeoutMs?: unknown;
-      tierType?: unknown;
-      signupUrl?: unknown;
-      limits?: unknown;
-      compat?: unknown;
-    };
-    try {
-      makeCredentialId(name);
-    } catch {
-      throw new Error(
-        `config.providers.${name} is not a valid provider name — provider names must be non-empty and must not contain '#'`,
-      );
-    }
-    if (typeof p.base !== "string") {
-      throw new Error(`config.providers.${name}.base (string URL) is required`);
-    }
-    // An unset ${ENV} in `base` disables just this provider — see expandEnvSoft. Parse the
-    // provider's credential declaration before applying that soft disable so malformed fleet
-    // declarations cannot hide behind an unavailable endpoint.
-    const expanded = expandEnvSoft(p.base);
-    const kind: Kind = p.kind === "openai" ? "openai" : "anthropic";
-    const defaultAuthHeader: AuthHeader = kind === "openai" ? "authorization" : "x-api-key";
-    const declaredAuthEnv = typeof p.authEnv === "string" ? p.authEnv.trim() : undefined;
-    const declaresAuthEnv = typeof declaredAuthEnv === "string" && declaredAuthEnv.length > 0;
-    const hasCredentialsDeclaration = p.credentials !== undefined;
-    let credentialMode: CredentialMode | undefined =
-      p.credentialMode === "passthrough" || p.credentialMode === "contained" ? p.credentialMode : undefined;
-    if (p.credentialMode !== undefined && credentialMode === undefined) {
-      throw new Error(`config.providers.${name}.credentialMode must be "passthrough" or "contained"`);
-    }
-    // A typo with a credential consequence, so it fails loudly at load rather than resolving to
-    // whichever branch the header builder happens to test first.
-    if (credentialMode === "passthrough" && declaresAuthEnv) {
-      throw new Error(
-        `config.providers.${name}: credentialMode "passthrough" forwards the CALLER's own credential, ` +
-        `but authEnv ${String(declaredAuthEnv)} declares one of its own — declare exactly one`,
-      );
-    }
-    if (hasCredentialsDeclaration && p.authEnv !== undefined) {
-      throw new Error(
-        `config.providers.${name}: authEnv and credentials cannot both be declared — declare exactly one`,
-      );
-    }
-    if (hasCredentialsDeclaration && credentialMode === "passthrough") {
-      throw new Error(
-        `config.providers.${name}: credentialMode "passthrough" cannot be combined with credentials`,
-      );
-    }
-    // An explicit fleet, including `credentials: []`, is a provider-owned credential policy.
-    // Normalize it to contained so the absence of a usable slot can never fall through to the
-    // legacy Anthropic caller-credential passthrough.
-    if (hasCredentialsDeclaration) credentialMode = "contained";
-    let credentials: ProviderCredentialConfig[] | undefined;
-    if (hasCredentialsDeclaration) {
-      credentials = parseCredentialDeclarations(name, p.credentials, warnings);
-    }
-    let maxConcurrent: number | null | undefined;
-    if (p.maxConcurrent !== undefined) {
-      if (p.maxConcurrent === null) {
-        maxConcurrent = null;
-      } else if (
-        typeof p.maxConcurrent !== "number" ||
-        !Number.isSafeInteger(p.maxConcurrent) ||
-        p.maxConcurrent <= 0
-      ) {
-        throw new Error(
-          `config.providers.${name}.maxConcurrent must be a positive safe integer or null`,
-        );
-      } else {
-        maxConcurrent = p.maxConcurrent;
-      }
-    }
-    // Operator-asserted rate limits. Hard error on a malformed block — same reasoning as inside
-    // credentials[] above: an ignored typo reads as a ceiling nobody actually declared. Parsed
-    // BEFORE the unset-${ENV} soft disable below, mirroring the fleet precedent: the parse is
-    // purely syntactic (no provider-map lookups), so it cannot reintroduce the failure shape
-    // where a tier naming a degraded provider aborts startup.
-    const limits = parseConfiguredLimits(p.limits, `config.providers.${name}.limits`);
-    // Same reasoning, same placement: a compat typo that were merely ignored would read as a
-    // declaration that took effect while changing nothing on the wire.
-    const compat = parseProviderCompat(p.compat, `config.providers.${name}.compat`);
-    if (expanded.missing.length > 0) {
-      warnings.push(
-        `provider "${name}" DISABLED — base references unset env var ` +
-          `${expanded.missing.map((n) => `\${${n}}`).join(", ")}. ` +
-          `Set it and restart, or remove the provider. Everything else still works.`,
-      );
-      disabled.add(name);
-      continue;
-    }
-    // Warn, don't fail: this proxy fronts every client session, so refusing to start over a
-    // config that has worked for months would turn a hardening step into an outage. Scoped to
-    // `anthropic` kind because that is the only path whose upstream headers come from the inbound
-    // request at all — an `openai`-kind target gets a freshly built header map and can never
-    // receive the caller's credential, so warning about `ollama` would be a false alarm.
-    if (kind === "anthropic" && !declaresAuthEnv && credentialMode === undefined) {
-      warnings.push(
-        `provider "${name}" forwards the CALLER's own credential to ${expanded.value} — inferred from ` +
-          `having no authEnv. Declare credentialMode "passthrough" to confirm that is intended, or ` +
-          `"contained" to strip it.`,
-      );
-    }
-    out[name] = {
-      base: expanded.value.trim().replace(/\/+$/, ""),
-      kind,
-      authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
-      timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
-      ...(typeof p.stallTimeoutMs === "number" && Number.isFinite(p.stallTimeoutMs) && p.stallTimeoutMs >= 0
-        ? { stallTimeoutMs: Math.floor(p.stallTimeoutMs) }
-        : {}),
-      // The declared name is a default, not a requirement: if the key is present under
-      // a known alias instead, use that so an already-working env var doesn't have to
-      // be renamed. Resolved here so routing, key checks and the backend all agree.
-      ...(declaredAuthEnv ? { authEnv: declaredAuthEnv } : {}),
-      ...(credentials !== undefined ? { credentials } : {}),
-      ...(credentialMode !== undefined ? { credentialMode } : {}),
-      ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
-      ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
-        ? { tierType: p.tierType }
-        : {}),
-      ...(limits !== undefined ? { limits } : {}),
-      ...(compat !== undefined ? { compat } : {}),
-      ...(typeof p.signupUrl === "string" && p.signupUrl.length > 0 ? { signupUrl: p.signupUrl } : {}),
-    };
   }
   if (Object.keys(out).length === 0) {
     throw new Error(`config.providers must define at least one provider`);

@@ -28,11 +28,11 @@
  * learned this the hard way: shallow validation let `"x".id === undefined` evict a healthy lane.
  * Every row is validated field by field, and one bad row is dropped without taking the file down.
  */
-import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { relayStatePath } from "./state-paths.js";
 import { WriteBehindTimer } from "./write-behind.js";
+import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 import { COOLDOWN_SOURCES } from "./circuit-breaker.js";
 import type { BreakerCooldownRow, CooldownSource } from "./circuit-breaker.js";
 
@@ -102,16 +102,10 @@ function isBreakerCooldownRow(value: unknown): value is BreakerCooldownRow {
 export function loadBreakerCooldowns(opts: { path?: string; now?: number } = {}): BreakerCooldownRow[] {
   const target = opts.path ?? getBreakerStatePath();
   const now = opts.now ?? Date.now();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(target, "utf8"));
-  } catch {
-    return [];
-  }
+  const parsed = safeReadJsonSync<Record<string, unknown>>(target);
   if (parsed === null || typeof parsed !== "object") return [];
-  const file = parsed as Record<string, unknown>;
-  if (file["version"] !== CURRENT_BREAKER_STATE_VERSION) return [];
-  const rows = file["rows"];
+  if (parsed["version"] !== CURRENT_BREAKER_STATE_VERSION) return [];
+  const rows = parsed["rows"];
   if (!Array.isArray(rows)) return [];
   // Expired rows are dropped HERE rather than by the caller, so every consumer of this function
   // sees the same rule and a lapsed escalation counter can never be resurrected.
@@ -121,25 +115,7 @@ export function loadBreakerCooldowns(opts: { path?: string; now?: number } = {})
 export function saveBreakerCooldowns(rows: readonly BreakerCooldownRow[], opts: { path?: string } = {}): void {
   const target = opts.path ?? getBreakerStatePath();
   const file: BreakerStateFile = { version: CURRENT_BREAKER_STATE_VERSION, rows: [...rows] };
-  let tmpPath: string | null = null;
-  try {
-    mkdirSync(dirname(target), { recursive: true });
-    tmpPath = `${target}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify(file, null, 2) + "\n", "utf8");
-    renameSync(tmpPath, target);
-    tmpPath = null;
-  } catch {
-    // Best-effort persistence, like every other cache here: failing to save a routing hint must
-    // never fail a request or bring the relay down.
-  } finally {
-    if (tmpPath !== null) {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        /* best effort cleanup */
-      }
-    }
-  }
+  atomicWriteJsonSync(target, file, { space: 2 });
 }
 
 /**

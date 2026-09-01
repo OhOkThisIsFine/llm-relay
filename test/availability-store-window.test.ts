@@ -228,4 +228,20 @@ describe("usedInWindow", () => {
     expect(store.usedInWindow({ credentialId: "nim#a", period: "day", now: Date.UTC(2026, 7, 21) }).requests).toBeNull();
     store.close();
   });
+
+  it("hydrates existing day shard on cold start and reports usage via usedInWindow", () => {
+    const dir = root();
+    const store1 = createAccountingStore({ directory: dir });
+    record(store1, { startedAt: NOW_ISO, endedAt: NOW_ISO, provider: "nim", credentialId: "nim#a", model: "m-a", tokens: REPORTED });
+    store1.flush();
+    store1.close();
+
+    // Cold-start second store instance against the same directory
+    const store2 = createAccountingStore({ directory: dir, now: () => NOW });
+    const reading = store2.usedInWindow({ credentialId: "nim#a", period: "day", now: NOW });
+    expect(reading.requests).toBe(1);
+    expect(reading.tokens).toBe(140);
+    expect(reading.basis).toBe("reported");
+    store2.close();
+  });
 });

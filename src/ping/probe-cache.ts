@@ -1,10 +1,10 @@
 import { relayStatePath } from "../state-paths.js";
-import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { PingRecord } from "./metrics.js";
 import { WriteBehindTimer } from "../write-behind.js";
 import { mergeQuotaObservations, type QuotaObservation } from "../quota-observation.js";
+import { atomicWriteJsonSync, safeReadJsonSync } from "../storage/json-store.js";
 
 export const DEFAULT_PROBE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export const BROKEN_PROBE_BACKOFF_BASE_MS = 60_000;
@@ -79,15 +79,10 @@ export function loadProbeCache(opts: { path?: string; reload?: boolean } = {}): 
   if (!opts.reload && _cache && _cachePath === target) return _cache;
   _cachePath = target;
 
-  try {
-    const raw = readFileSync(target, "utf8");
-    const parsed = JSON.parse(raw) as ProbeCacheData;
-    if (parsed && typeof parsed === "object" && parsed.providers) {
-      _cache = parsed;
-      return parsed;
-    }
-  } catch {
-    /* No cache or parse error */
+  const parsed = safeReadJsonSync<ProbeCacheData>(target);
+  if (parsed && typeof parsed === "object" && parsed.providers) {
+    _cache = parsed;
+    return parsed;
   }
 
   _cache = emptyCache();
@@ -98,22 +93,7 @@ export function flushProbeCache(opts: { path?: string; cache?: ProbeCacheData } 
   const target = opts.path ?? _cachePath ?? getProbeCachePath();
   const cacheData = opts.cache ?? _cache ?? emptyCache();
   if (!opts.path) _writeBehind.clear();
-
-  let tmpPath: string | null = null;
-  try {
-    mkdirSync(dirname(target), { recursive: true });
-    tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify(cacheData, null, 2) + "\n", "utf8");
-    renameSync(tmpPath, target);
-    tmpPath = null;
-  } catch {
-    /* best-effort persistence */
-  }
-  finally {
-    if (tmpPath !== null) {
-      try { unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
-    }
-  }
+  atomicWriteJsonSync(target, cacheData, { space: 2 });
 }
 
 function scheduleProbeCacheFlush(): void {

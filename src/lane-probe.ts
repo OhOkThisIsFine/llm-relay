@@ -1,5 +1,5 @@
 import { execFile, exec } from "node:child_process";
-import type { Config } from "./config.js";
+import type { Config } from "./config-types.js";
 import {
   laneOfRung,
   loadLaneManifest,

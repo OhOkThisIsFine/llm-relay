@@ -12,9 +12,9 @@
  */
 import { relayStatePath } from "./state-paths.js";
 import { readFileSync, existsSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { keyIsPresent } from "./authEnv.js";
+import { keyIsPresent } from "./keystore.js";
 
 const loadedIntoProcessEnv = new Set<string>();
 

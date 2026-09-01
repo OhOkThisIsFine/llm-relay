@@ -14,7 +14,7 @@
  * that the question has never been put.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DEFAULT_CONFIG_TEMPLATE_FOR_TEST, FIRST_RUN_MARKER, firstRunPending, clearFirstRun } from "../src/cli.js";

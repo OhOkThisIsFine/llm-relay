@@ -83,7 +83,9 @@ export function parseOwnerSid(stdout: string): string | null {
 function icaclsPrincipal(owner: string): string {
   const trimmed = owner.trim();
   if (trimmed.startsWith("*") && SID_PATTERN.test(trimmed.slice(1))) return trimmed;
-  return SID_PATTERN.test(trimmed) ? `*${trimmed}` : trimmed;
+  if (SID_PATTERN.test(trimmed)) return `*${trimmed}`;
+  if (trimmed.includes(" ") && !trimmed.startsWith('"')) return `"${trimmed}"`;
+  return trimmed;
 }
 
 /**

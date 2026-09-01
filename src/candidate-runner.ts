@@ -1,0 +1,1674 @@
+/**
+ * MODULE CHARTER: Candidate Walk & Hedged Execution Engine (candidate-runner.ts)
+ *
+ * 1. Domain Boundary & Responsibilities:
+ *    - Executes failover candidate walks across prioritized models, provider deployments, and credential slots.
+ *    - Manages speculative hedging races to minimize tail latency across unreliable or slow free upstream tiers.
+ *    - Enforces protocol dialect translation, response streaming, and error classification across heterogeneous endpoints.
+ *
+ * 2. Candidate Walk Semantics & Ranking Order:
+ *    - Invariant ordering: Preserves dynamic pool benchmark rank and operator-configured primary/fallback lists.
+ *    - Runtime filters: Excludes circuit-broken deployments, cooling credentials, and cost-blocked candidates.
+ *    - Failover: Progresses sequentially across candidates upon 429 rate limits, 5xx server errors, or auth failures,
+ *      terminating early on non-retryable client errors (e.g., 400 Bad Request with invalid schema).
+ *
+ * 3. Hedging Race Semantics:
+ *    - Speculatively launches a secondary attempt if the primary attempt exceeds the configured hedge latency delay.
+ *    - The first attempt to return valid response headers wins the race and streams its body directly to the client.
+ *    - The losing or trailing attempt is promptly aborted via `AbortController` to conserve upstream bandwidth and quota.
+ *
+ * 4. Attribution & Transparency Invariants:
+ *    - Emits rich observability headers (`x-llm-relay-credential`, `x-llm-relay-pool-attempts`, `x-llm-relay-hedged`).
+ *    - Accurately classifies failure origins (`errorOrigin`) and distinguishes pre-header vs post-header body truncation.
+ */
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Config, ResolvedTarget } from "./config.js";
+import type { ModelLimits } from "./catalog.js";
+import { specOfTarget } from "./benchmarks.js";
+import {
+  CREDENTIAL_HEADER,
+  CREDENTIAL_ATTEMPTS_HEADER,
+  POOL_ATTEMPTS_HEADER,
+  HARD_CAP_HEADER,
+  ERROR_ORIGIN_HEADER,
+  SERVED_BY_HEADER,
+  TOOL_DIALECT_HEADER,
+  UNKNOWN_REFUSAL_HEADER,
+  DEGRADED_HEADER,
+  PAID_HEADER,
+  QUOTA_DEMOTED_HEADER,
+  LATENCY_DEMOTED_HEADER,
+  HEDGED_HEADER,
+  errorOrigin,
+  postHeaderBodyFailure,
+  toolUseIdRewrites,
+  toolCallIdRewrites,
+  thoughtSignatureSentinels,
+  upstreamReportedModel,
+  type ErrorOrigin,
+  type PostHeaderBodyFailure,
+} from "./backend.js";
+import { STICKY_PROVENANCE_HEADER, type StickySessionManager } from "./session-pin.js";
+import { DIALECT_REFUSED_DESTRUCTIVE_CODE } from "./tool-dialects.js";
+import { MAX_LOG_ATTEMPTS, type MetadataLogger, type RequestAttemptLog, type RequestAttemptStatus, type RequestLog } from "./log.js";
+import type { ModelCallRecorder, RequestAccountingState } from "./accounting-state.js";
+import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
+import { parseCredentialId } from "./credential-id.js";
+import { resolveAttempt, type ResolvedAttempt } from "./resolved-attempt.js";
+import { resolveAttemptForSlot } from "./credential-fleet.js";
+import {
+  CredentialWalk,
+  groupCredentialAttempts,
+  type CredentialWalkOutcome,
+} from "./credential-select.js";
+import { createUsageAccumulator, type UsageAccumulator } from "./usage-observer.js";
+import type { AccountingAttempt } from "./accounting.js";
+import { assessCost, type CostClass } from "./metadata.js";
+import { extractQuotaObservations, type QuotaObservation } from "./quota-observation.js";
+import { baseLog } from "./request-log.js";
+import {
+  looksLikeContextLengthError,
+  looksLikeMaxOutputError,
+  parseStatedContextLimit,
+  parseStatedMaxOutput,
+  recordObservedContextLimit,
+  recordObservedMaxOutput,
+} from "./context-limits.js";
+import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit } from "./rate-limits.js";
+import { clearFacts, cooldownUntil, factsFor, recordFact, type FactResetBasis } from "./target-facts.js";
+import { quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
+import { latencyDemotionLabel, type LatencyDemotionFn } from "./latency-demotion.js";
+import type { HedgeVerdict } from "./hedge-trigger.js";
+import { raceWithHedge, type HedgeRaceResult, type RaceEntrant, type Settled } from "./hedge-race.js";
+import { hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
+import {
+  applyResetRule,
+  interpretRefusal,
+  materializeScope,
+  parseStatedResetMs,
+  recordUnknownRefusal,
+  type Interpretation,
+} from "./refusal-interpretation.js";
+import type {
+  AttemptCancellationCause,
+  AttemptFailed,
+  AttemptHandle,
+  OutcomeProvenance,
+  ProviderTargetIdentity,
+} from "./kernel/contracts.js";
+import { DEFAULT_ANTHROPIC_VERSION } from "./config.js";
+import { buildAuthHeaders } from "./authEnv.js";
+import { CONTROL_AUTHORIZATION_HEADER } from "./control-authorization.js";
+import { STICKY_SESSION_HEADER } from "./session-pin.js";
+import { failClosed, HOP_BY_HOP } from "./stream-pipeline.js";
+
+const INTERNAL_REQUEST_HEADERS = new Set([
+  "x-codex-turn-metadata",
+  "x-llm-relay-dashboard-session",
+  STICKY_SESSION_HEADER,
+  CONTROL_AUTHORIZATION_HEADER,
+]);
+const INBOUND_AUTH = ["authorization", "x-api-key"];
+
+export const MID_STREAM_ERROR_KIND = "backend_stream_failed";
+
+export function toolUseIdRewriteField(source: Response): {
+  toolUseIdRewrites?: number;
+  toolCallIdRewrites?: number;
+  thoughtSignatureSentinels?: number;
+} {
+  const rewrites = toolUseIdRewrites(source);
+  const outbound = toolCallIdRewrites(source);
+  const sentinels = thoughtSignatureSentinels(source);
+  return {
+    ...(rewrites === undefined ? {} : { toolUseIdRewrites: rewrites }),
+    ...(outbound === undefined ? {} : { toolCallIdRewrites: outbound }),
+    ...(sentinels === undefined ? {} : { thoughtSignatureSentinels: sentinels }),
+  };
+}
+
+/** A provider declared an authEnv whose variable is unset — a configuration error, not a passthrough. */
+export class CredentialConfigError extends Error {
+  constructor(provider: string, authEnv: string) {
+    super(`provider "${provider}" declares authEnv ${authEnv} but it is unset or blank`);
+    this.name = "CredentialConfigError";
+  }
+}
+
+export function buildForwardHeaders(inbound: IncomingMessage["headers"], attempt: ResolvedAttempt): Record<string, string> {
+  const { target, credential } = attempt;
+  const stripAuth = credential.state !== "not-declared" || target.credentialMode === "contained";
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(inbound)) {
+    const key = k.toLowerCase();
+    if (HOP_BY_HOP.has(key)) continue;
+    if (INTERNAL_REQUEST_HEADERS.has(key)) continue;
+    if (stripAuth && INBOUND_AUTH.includes(key)) continue;
+    if (v === undefined) continue;
+    out[key] = Array.isArray(v) ? v.join(", ") : v;
+  }
+  if (!out["anthropic-version"]) out["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION;
+  if (credential.state === "declared-missing") {
+    throw new CredentialConfigError(target.provider, target.authEnv!);
+  }
+  Object.assign(out, buildAuthHeaders(credential.value, target.authHeader));
+  return out;
+}
+
+export type CostClassFn = (attempt: ResolvedAttempt) => CostClass | undefined;
+
+export interface StickyRequestContext {
+  key: string;
+  multiCandidateRoute: boolean;
+  /** The previously stored pin's routing evaluation; null means a new pin may be created. */
+  provenance: string | null;
+}
+
+export type TargetUsability = "live" | "credential-fault" | "cooling";
+export type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
+export type OutcomeClass = "ok" | "retriable" | "credential" | "client";
+
+export const DEFAULT_WALK_BUDGET_MS = 45_000;
+export const DEFAULT_STALL_TIMEOUT_MS = 90_000;
+const MAX_CAPPED_HEADER_CELLS = 5;
+
+export interface CandidateRunnerHandlers {
+  breaker: CircuitBreaker;
+  logger: MetadataLogger;
+  hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null;
+  hedgeDelay: (attempt: ResolvedAttempt) => { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] } | null;
+  modelCallRecorder?: ModelCallRecorder;
+  stickySessions?: StickySessionManager;
+}
+
+export interface ServedAnnouncementContext {
+  readonly target: ResolvedTarget;
+  readonly retryAfterOverrideMs?: number | null | undefined;
+  readonly poolSummary?: string | null | undefined;
+  readonly tried?: readonly string[] | undefined;
+  readonly poolUnknownRefusals?: number | null | undefined;
+  readonly credentialHeaders?: Record<string, string> | undefined;
+  readonly degraded?: string | null | undefined;
+  readonly quotaDemoted?: string | null | undefined;
+  readonly latencyDemoted?: string | null | undefined;
+  readonly hedged?: string | null | undefined;
+  readonly paid?: string | null | undefined;
+  readonly sticky?: StickyRequestContext | null | undefined;
+}
+
+export function filterResponseHeaders(hh: Headers): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of hh.entries()) {
+    const lower = k.toLowerCase();
+    if (HOP_BY_HOP.has(lower)) continue;
+    if (lower === "set-cookie") continue;
+    out[k] = v;
+  }
+  if (typeof hh.getSetCookie === "function") {
+    const cookies = hh.getSetCookie();
+    if (cookies.length > 0) {
+      out["set-cookie"] = cookies;
+    }
+  } else {
+    const cookie = hh.get("set-cookie");
+    if (cookie) out["set-cookie"] = cookie;
+  }
+  return out;
+}
+
+export function responseHeadersForTarget(
+  backendRes: Response,
+  ctx: ServedAnnouncementContext,
+): Record<string, string | string[]> {
+  const responseHeaders: Record<string, string | string[]> = filterResponseHeaders(backendRes.headers);
+  // The winner below 400, every deployment tried at or above it. The header's own declaration is
+  // the contract — "when every candidate fails it carries the list that was tried instead, so an
+  // exhausted pool is self-describing" — and `docs/reference.md` states it to users. The Anthropic
+  // front used to omit it entirely on a terminal error while the OpenAI front supplied it, so the
+  // same documented behaviour was delivered by one path and not the other.
+  // ⚠ Not the transport-exit omission at the `handle` catch, which is a RECORDED deliberate
+  // residue: a transport exhaustion has no HTTP response to describe.
+  responseHeaders[SERVED_BY_HEADER] = backendRes.status < 400 || !ctx.tried?.length
+    ? specOfTarget(ctx.target)
+    : ctx.tried.join(", ");
+  if (typeof ctx.retryAfterOverrideMs === "number" && Number.isFinite(ctx.retryAfterOverrideMs)) {
+    responseHeaders["retry-after"] = String(Math.max(1, Math.ceil(ctx.retryAfterOverrideMs / 1000)));
+  }
+  if (ctx.poolSummary) responseHeaders[POOL_ATTEMPTS_HEADER] = ctx.poolSummary;
+  if (ctx.poolUnknownRefusals) responseHeaders[UNKNOWN_REFUSAL_HEADER] = String(ctx.poolUnknownRefusals);
+  if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
+  if (ctx.quotaDemoted) responseHeaders[QUOTA_DEMOTED_HEADER] = ctx.quotaDemoted;
+  if (ctx.latencyDemoted) responseHeaders[LATENCY_DEMOTED_HEADER] = ctx.latencyDemoted;
+  if (ctx.hedged) responseHeaders[HEDGED_HEADER] = ctx.hedged;
+  if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
+  if (ctx.credentialHeaders) {
+    Object.assign(responseHeaders, ctx.credentialHeaders);
+  }
+  const stickyValue = stickyHeaderValue(ctx.sticky, ctx.target, backendRes.status);
+  if (stickyValue) {
+    responseHeaders[STICKY_PROVENANCE_HEADER] = stickyValue;
+  }
+  return responseHeaders;
+}
+
+export function endMidStreamFailure(
+  res: ServerResponse,
+  errorFrame: string | null,
+  message: string,
+): void {
+  if (res.writableEnded || res.destroyed) return;
+  if (res.headersSent) {
+    if (errorFrame) res.write(errorFrame);
+    res.end();
+  } else {
+    failClosed(res, 502, message);
+  }
+}
+
+export function midStreamMessage(e: unknown): string {
+  const errStr =
+    e && typeof e === "object" && "message" in e && typeof (e as { message: unknown }).message === "string"
+      ? (e as { message: string }).message
+      : String(e);
+  return `llm-relay: backend stream failed mid-response: ${errStr}`;
+}
+
+export function handleMidStreamError(
+  res: ServerResponse,
+  e: unknown,
+  started: number,
+  path: string,
+  hadTools: boolean,
+  streamed: boolean,
+  backendStatus: number,
+  target: ResolvedTarget,
+  attempt: HealthAttempt | undefined,
+  h: { logger: MetadataLogger; breaker: CircuitBreaker },
+  errorFrameBuilder: (msg: string) => string | null,
+  reportedModelSource?: Response,
+  deadlineAborted = false,
+  committed = false,
+): void {
+  const message = midStreamMessage(e);
+  const errorFrame = errorFrameBuilder(message);
+  endMidStreamFailure(res, errorFrame, message);
+  if (attempt) {
+    if (res.destroyed) {
+      completeAttemptCancelled(h, attempt, "client disconnected");
+    } else {
+      completeAttemptFailure(h, attempt, {
+        failure: deadlineAborted ? "transport" : "protocol",
+        provenance: deadlineAborted ? "deadline" : "upstream",
+        status: deadlineAborted ? 504 : 502,
+        ...(committed ? { logStatus: "committed" as const } : {}),
+      });
+    }
+  }
+  h.logger.write({
+    ...baseLog(
+      started,
+      path,
+      hadTools,
+      streamed,
+      backendStatus,
+      "skipped",
+      target,
+      attempt?.trace.snapshot(),
+      reportedModelSource ? upstreamReportedModel(reportedModelSource) : undefined,
+    ),
+    errorKinds: [MID_STREAM_ERROR_KIND],
+    ...(reportedModelSource ? toolUseIdRewriteField(reportedModelSource) : {}),
+  });
+}
+
+export function paidLabel(cfg: Config, h: { catalog: { cachedLimits: (p: string, m: string) => ModelLimits | null | undefined } }, target: ResolvedTarget): string | null {
+  if (target.kind !== "openai" || !target.model) return null;
+  const assessment = assessCost(target.model, h.catalog.cachedLimits(target.provider, target.model) ?? null, cfg.providers[target.provider]?.tierType);
+  if (assessment.costClass === "free") return null;
+  return `${specOfTarget(target)} (${assessment.costClass}, ${assessment.basis})`;
+}
+
+export function degradedLabel(pool: string | null, degraded: Set<string> | null, target: ResolvedTarget): string | null {
+  if (pool === null || degraded === null) return null;
+  const spec = specOfTarget(target);
+  return degraded.has(spec) ? `${spec} (below ${pool})` : null;
+}
+
+export function cooledByAllowance(attempt: ResolvedAttempt, now: number, costClass: CostClass | undefined): boolean {
+  try {
+    const { target } = attempt;
+    const until = cooldownUntil(target.provider, attempt.credentialId, target.model ?? null, {
+      now,
+      ...(costClass === undefined ? {} : { costClass }),
+    });
+    return until !== null && now < until;
+  } catch {
+    return false;
+  }
+}
+
+export function cooledByQuota(
+  attempt: ResolvedAttempt,
+  breaker: CircuitBreaker,
+  quotaDemotion: QuotaDemotionFn | null | undefined,
+  now: number,
+): boolean {
+  if (!quotaDemotion) return false;
+  const spent = quotaDemotion(attempt, now);
+  if (spent === null) return false;
+  breaker.recordQuotaCooldown(targetIdentity(attempt), spent.resetsAt, now);
+  return true;
+}
+
+export function targetUsability(
+  attempt: ResolvedAttempt,
+  breaker: CircuitBreaker,
+  now: number,
+  quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
+  latencyDemotion?: LatencyDemotionFn | null,
+): TargetUsability {
+  const identity = targetIdentity(attempt);
+  if (!breaker.isHealthy(identity, now)) return "cooling";
+  if (cooledByAllowance(attempt, now, costClassOf?.(attempt))) return "cooling";
+  if (cooledByQuota(attempt, breaker, quotaDemotion, now)) return "cooling";
+  if (latencyDemotion?.(attempt, now)) return "cooling";
+  if (breaker.hasCredentialFault(identity, now)) return "credential-fault";
+  return "live";
+}
+
+export function expandCredentialAttempts(targets: readonly ResolvedTarget[]): ResolvedAttempt[] {
+  const expanded: ResolvedAttempt[] = [];
+  for (const target of targets) {
+    const slots = target.credentialSlots;
+    if (slots === undefined) {
+      expanded.push(resolveAttempt(target));
+      continue;
+    }
+    for (const slot of slots) {
+      const attempt = resolveAttemptForSlot(target, slot);
+      if (attempt) expanded.push(attempt);
+    }
+  }
+  return expanded;
+}
+
+export function credentialEvidence(
+  attempt: ResolvedAttempt,
+  cfg: Config,
+  breaker: CircuitBreaker,
+  now: number,
+) {
+  const identity = targetIdentity(attempt);
+  const provider = cfg.providers[attempt.target.provider];
+  const state = breaker.getState(identity);
+  let facts: ReturnType<typeof factsFor> = [];
+  try { facts = factsFor(attempt.target.provider, attempt.credentialId, attempt.target.model ?? null, { now }); } catch { /* persistent evidence is best effort */ }
+  const cost = attempt.target.kind === "openai" && attempt.target.model
+    ? assessCost(attempt.target.model, null, provider?.tierType).costClass
+    : "paid";
+  return {
+    facts,
+    health: breaker.isHealthy(identity, now) ? "unknown" as const : "unhealthy" as const,
+    credentialFault: breaker.hasCredentialFault(identity, now),
+    cooling: cooledByAllowance(attempt, now, undefined),
+    saturated: provider?.maxConcurrent != null && breaker.inFlightCredential(attempt.credentialId) >= provider.maxConcurrent,
+    quota: state?.quotaObservations ?? [],
+    cost,
+  };
+}
+
+export function coolingLiftTime(
+  attempt: ResolvedAttempt,
+  breaker: CircuitBreaker,
+  now: number,
+  costClassOf?: CostClassFn | null,
+): number | null {
+  const identity = targetIdentity(attempt);
+  const breakerState = breaker.getState(identity);
+  if (breakerState && breakerState.cooldownUntil > now) {
+    return breakerState.cooldownUntil;
+  }
+  const costClass = costClassOf?.(attempt);
+  const factCooldown = cooldownUntil(attempt.target.provider, attempt.credentialId, attempt.target.model ?? null, {
+    now,
+    ...(costClass === undefined ? {} : { costClass }),
+  });
+  if (factCooldown !== null && factCooldown > now) {
+    return factCooldown;
+  }
+  return null;
+}
+
+export function orderDeploymentGroupsByUsability(
+  attempts: readonly ResolvedAttempt[],
+  breaker: CircuitBreaker,
+  now: number,
+  quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
+  latencyDemotion?: LatencyDemotionFn | null,
+): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null; latencyDemotedFirst: string | null } {
+  type Group = ReturnType<typeof groupCredentialAttempts>[number];
+  const preferred = groupCredentialAttempts(attempts)[0]?.attempts[0];
+  const live: Group[] = [];
+  const faulted: Group[] = [];
+  const cooling: Group[] = [];
+  for (const group of groupCredentialAttempts(attempts)) {
+    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
+    if (usability === "cooling") cooling.push(group);
+    else if (usability === "credential-fault") faulted.push(group);
+    else live.push(group);
+  }
+
+  cooling.sort((a, b) => {
+    const liftA = coolingLiftTime(a.attempts[0]!, breaker, now, costClassOf);
+    const liftB = coolingLiftTime(b.attempts[0]!, breaker, now, costClassOf);
+    if (liftA === null && liftB === null) return 0;
+    if (liftA === null) return 1;
+    if (liftB === null) return -1;
+    return liftA - liftB;
+  });
+
+  const ordered = [...live, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  let latencyDemotedFirst: string | null = null;
+  if (
+    preferred !== undefined &&
+    latencyDemotion !== undefined &&
+    latencyDemotion !== null &&
+    ordered[0] !== undefined &&
+    ordered[0] !== preferred
+  ) {
+    const slow = latencyDemotion(preferred, now);
+    if (slow) latencyDemotedFirst = latencyDemotionLabel(specOfTarget(preferred.target), slow);
+  }
+  let quotaDemotedFirst: string | null = null;
+  if (
+    preferred !== undefined &&
+    quotaDemotion !== undefined &&
+    quotaDemotion !== null &&
+    ordered[0] !== undefined &&
+    ordered[0] !== preferred &&
+    quotaDemotion(preferred, now) !== null
+  ) {
+    quotaDemotedFirst = quotaDemotionLabel(specOfTarget(preferred.target), quotaDemotion(preferred, now)!);
+  }
+  return { ordered, quotaDemotedFirst, latencyDemotedFirst };
+}
+
+export class CredentialAttemptTrace {
+  private readonly entries: Array<{
+    provider: string;
+    deployment: string;
+    credentialId: ResolvedAttempt["credentialId"];
+    multiSlot: boolean;
+    outcome?: CredentialWalkOutcome;
+  }> = [];
+
+  constructor(private readonly cfg: Config) {}
+
+  recordStarted(attempt: ResolvedAttempt): void {
+    const configured = this.cfg.providers[attempt.target.provider]?.credentials;
+    const multiSlot = configured !== undefined && configured.filter((slot) => slot.enabled !== false).length >= 2;
+    this.entries.push({
+      provider: attempt.target.provider,
+      deployment: specOfTarget(attempt.target),
+      credentialId: attempt.credentialId,
+      multiSlot,
+    });
+  }
+
+  record(attempt: ResolvedAttempt, outcome: CredentialWalkOutcome): void {
+    const deployment = specOfTarget(attempt.target);
+    const pending = [...this.entries].reverse().find((entry) =>
+      entry.outcome === undefined &&
+      entry.provider === attempt.target.provider &&
+      entry.deployment === deployment &&
+      entry.credentialId === attempt.credentialId,
+    );
+    if (!pending) {
+      throw new Error("credential attempt trace outcome does not match a started attempt");
+    }
+    pending.outcome = Object.freeze({ ...outcome });
+  }
+
+  headers(servedAttempt?: ResolvedAttempt): Record<string, string> {
+    if (!this.entries.some((entry) => entry.multiSlot)) return {};
+    const previewServed = servedAttempt
+      ? [...this.entries].reverse().find((entry) =>
+          entry.outcome === undefined &&
+          entry.provider === servedAttempt.target.provider &&
+          entry.deployment === specOfTarget(servedAttempt.target) &&
+          entry.credentialId === servedAttempt.credentialId,
+        )
+      : undefined;
+    const served = this.entries.find((entry) => entry.outcome?.kind === "success") ?? previewServed;
+    const headers: Record<string, string> = {};
+    if (served?.multiSlot) headers[CREDENTIAL_HEADER] = served.credentialId;
+
+    const failures = this.entries.filter(
+      (entry) => entry !== served && entry.outcome?.kind !== "success",
+    );
+    if (this.entries.length >= 2 || served === undefined) {
+      const tallies: Array<{ label: CredentialAttemptLabel; count: number }> = [];
+      for (const entry of failures) {
+        const label = credentialAttemptLabel(entry.outcome);
+        const existing = tallies.find((candidate) => candidate.label === label);
+        if (existing) existing.count += 1;
+        else tallies.push({ label, count: 1 });
+      }
+      const summary = tallies.map(({ label, count }) => `${count}x${label}`).join(", ");
+      headers[CREDENTIAL_ATTEMPTS_HEADER] =
+        `${this.entries.length} tried, ${served ? 1 : 0} served${summary ? `: ${summary}` : ""}`;
+    }
+    return headers;
+  }
+}
+
+export function credentialAttemptLabel(outcome: CredentialWalkOutcome | undefined): CredentialAttemptLabel {
+  if (outcome?.status !== undefined) return outcome.status;
+  if (outcome?.kind === "provider-transport") return "transport";
+  if (outcome?.kind === "timeout") return "timeout";
+  if (outcome?.kind === "protocol") return "protocol";
+  if (outcome?.kind === "client") return "client";
+  if (outcome?.kind === "cancelled") return "cancelled";
+  return "local";
+}
+
+export function recordCredentialStarted(
+  walk: CredentialWalk,
+  trace: CredentialAttemptTrace,
+  attempt: ResolvedAttempt,
+): void {
+  walk.recordStarted(attempt);
+  trace.recordStarted(attempt);
+}
+
+export function recordCredentialOutcome(
+  walk: CredentialWalk,
+  trace: CredentialAttemptTrace,
+  attempt: ResolvedAttempt,
+  outcome: CredentialWalkOutcome,
+): void {
+  walk.record(attempt, outcome);
+  trace.record(attempt, outcome);
+}
+
+export function nextUncappedAttempt(
+  h: { hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null },
+  walk: CredentialWalk,
+  attemptTrace: RequestAttemptTrace,
+  tracker: Pool429Tracker,
+): ResolvedAttempt | undefined {
+  const now = Date.now();
+  for (;;) {
+    const candidate = walk.next();
+    if (!candidate) return undefined;
+    const verdict = h.hardCap(candidate, now);
+    if (verdict === null) {
+      tracker.noteOffered();
+      return candidate;
+    }
+    tracker.recordCapped(
+      hardCapLabel(parseCredentialId(candidate.credentialId)?.label ?? null, specOfTarget(candidate.target), verdict),
+      verdict.resetsAt,
+    );
+    attemptTrace.recordCapped(candidate.target, now);
+    walk.recordRejected(candidate);
+  }
+}
+
+export interface AttemptRun {
+  readonly resolvedAttempt: ResolvedAttempt;
+  readonly target: ResolvedTarget;
+  readonly controller: AbortController;
+  readonly callerController: AbortController;
+  readonly timer: ReturnType<typeof setTimeout>;
+  readonly onResClose: () => void;
+  readonly usage: UsageAccumulator;
+  attempt: HealthAttempt | undefined;
+  egressCallbackCalled: boolean;
+}
+
+export function beginAttemptRun(res: ServerResponse, offer: ResolvedAttempt): AttemptRun {
+  const target = offer.target;
+  const controller = new AbortController();
+  const callerController = new AbortController();
+  const run: AttemptRun = {
+    resolvedAttempt: offer,
+    target,
+    controller,
+    callerController,
+    timer: setTimeout(() => controller.abort(), target.timeoutMs),
+    onResClose: abortOnClientClose(res, callerController, controller),
+    usage: createUsageAccumulator(),
+    attempt: undefined,
+    egressCallbackCalled: false,
+  };
+  res.on("close", run.onResClose);
+  return run;
+}
+
+export function releaseAttemptRun(res: ServerResponse, run: AttemptRun): void {
+  clearTimeout(run.timer);
+  res.off("close", run.onResClose);
+}
+
+export interface StartedAttempt {
+  readonly run: AttemptRun;
+  readonly promise: Promise<Response>;
+}
+
+export interface HedgedAttemptDeps {
+  readonly h: CandidateRunnerHandlers;
+  readonly res: ServerResponse;
+  readonly walk: CredentialWalk;
+  readonly credentialTrace: CredentialAttemptTrace;
+  readonly attemptTrace: RequestAttemptTrace;
+  readonly tracker: Pool429Tracker;
+  startRun(offer: ResolvedAttempt): StartedAttempt | undefined;
+}
+
+export interface HedgedAttemptResult {
+  readonly run: AttemptRun;
+  readonly settled: Settled<Response>;
+  readonly hedged: string | null;
+}
+
+export function settleResponse(promise: Promise<Response>): Promise<Settled<Response>> {
+  return promise.then(
+    (value) => ({ ok: true, value }) as Settled<Response>,
+    (error: unknown) => ({ ok: false, error }) as Settled<Response>,
+  );
+}
+
+export function walkWouldFailOver(response: Response): boolean {
+  return errorOrigin(response) !== "local" && shouldTryNext(classifyStatus(response.status));
+}
+
+export function hedgedLabel(
+  primary: AttemptRun,
+  hedge: AttemptRun,
+  winner: "primary" | "hedge",
+  decision: { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] },
+): string {
+  const side = winner === "hedge" ? "hedge won" : "primary won";
+  return `${specOfTarget(primary.target)} -> ${specOfTarget(hedge.target)} (${side} after ${decision.delayMs}ms, ${decision.basis})`;
+}
+
+export function retireHedgeLoser(deps: HedgedAttemptDeps, loser: AttemptRun): void {
+  releaseAttemptRun(deps.res, loser);
+  try {
+    loser.controller.abort();
+  } catch {
+    // best effort
+  }
+  if (loser.attempt) {
+    completeAttemptAbandoned(deps.h, loser.attempt, "hedge loser aborted");
+    deps.credentialTrace.record(loser.resolvedAttempt, { kind: "cancelled" });
+    deps.walk.recordAbandoned(loser.resolvedAttempt);
+  } else if (deps.walk.isPending(loser.resolvedAttempt)) {
+    deps.walk.recordRejected(loser.resolvedAttempt);
+  }
+}
+
+export async function runAttemptWithHedge(
+  primary: StartedAttempt,
+  deps: HedgedAttemptDeps,
+): Promise<HedgedAttemptResult> {
+  const decision = deps.h.hedgeDelay(primary.run.resolvedAttempt);
+  if (decision === null) {
+    return { run: primary.run, settled: await settleResponse(primary.promise), hedged: null };
+  }
+
+  let hedge: StartedAttempt | undefined;
+  let raced: HedgeRaceResult<Response>;
+  try {
+    raced = await raceWithHedge<Response>({
+      primary: { promise: primary.promise, abort: () => primary.run.controller.abort() },
+      delayMs: decision.delayMs,
+      startHedge: (): RaceEntrant<Response> | undefined => {
+        if (deps.res.destroyed) return undefined;
+        const offer = nextUncappedAttempt(deps.h, deps.walk, deps.attemptTrace, deps.tracker);
+        if (!offer) return undefined;
+        if (offer === primary.run.resolvedAttempt) return undefined;
+        const started = deps.startRun(offer);
+        if (!started) return undefined;
+        hedge = started;
+        return { promise: started.promise, abort: () => started.run.controller.abort() };
+      },
+      isWin: (settled) => settled.ok && !walkWouldFailOver(settled.value),
+    });
+  } catch (e) {
+    if (hedge) retireHedgeLoser(deps, hedge.run);
+    throw e;
+  }
+
+  if (!raced.hedgeStarted || !hedge) {
+    return { run: primary.run, settled: raced.settled, hedged: null };
+  }
+  const winner = raced.winner === "hedge" ? hedge.run : primary.run;
+  const loser = raced.winner === "hedge" ? primary.run : hedge.run;
+  retireHedgeLoser(deps, loser);
+  return { run: winner, settled: raced.settled, hedged: hedgedLabel(primary.run, hedge.run, raced.winner, decision) };
+}
+
+export type WalkExitKind = "transport" | "post-header-body-failure" | "dead-stream";
+
+export interface WalkExitData {
+  kind: WalkExitKind;
+  message: string;
+  errorType?: string | undefined;
+  errorOrigin?: ErrorOrigin;
+  servedBy?: string;
+  shouldTryNext?: boolean;
+}
+
+export function walkExitHeaders(
+  tracker: Pool429Tracker,
+  sticky: StickyRequestContext | null | undefined,
+  credentialTrace: CredentialAttemptTrace,
+  {
+    errorOrigin,
+    errorType,
+    servedBy,
+  }: Pick<WalkExitData, "errorOrigin" | "errorType" | "servedBy"> = {},
+): Record<string, string> {
+  const before: Record<string, string> = {};
+  if (servedBy !== undefined) before[SERVED_BY_HEADER] = servedBy;
+  if (errorOrigin !== undefined) before[ERROR_ORIGIN_HEADER] = errorOrigin;
+
+  const after = errorType === DIALECT_REFUSED_DESTRUCTIVE_CODE
+    ? { [TOOL_DIALECT_HEADER]: "refused-destructive" }
+    : {};
+  const headers: Record<string, string> = {
+    ...before,
+    ...(stickyProvenanceHeaders(sticky) ?? {}),
+    ...credentialTrace.headers(),
+    ...after,
+  };
+  const summary = tracker.summary();
+  if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+  return headers;
+}
+
+export function endWalk(
+  h: { hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null; logger: MetadataLogger },
+  res: ServerResponse,
+  front: "anthropic" | "openai",
+  walk: CredentialWalk,
+  attemptTrace: RequestAttemptTrace,
+  tracker: Pool429Tracker,
+  status: number,
+  sticky: StickyRequestContext | null | undefined,
+  credentialTrace: CredentialAttemptTrace,
+  log: () => RequestLog,
+  exit: WalkExitData,
+): boolean {
+  const shouldTryNext = exit.shouldTryNext ?? true;
+  let next: ResolvedAttempt | undefined;
+
+  if (exit.kind === "dead-stream") {
+    const canContinue = front === "anthropic"
+      ? !res.destroyed
+      : !res.writableEnded && !res.destroyed;
+    next = shouldTryNext && canContinue
+      ? nextUncappedAttempt(h, walk, attemptTrace, tracker)
+      : undefined;
+  } else {
+    next = shouldTryNext ? nextUncappedAttempt(h, walk, attemptTrace, tracker) : undefined;
+    if (res.writableEnded || res.destroyed) next = undefined;
+  }
+
+  if (next) {
+    tracker.recordFailover(status, null);
+    return true;
+  }
+
+  tracker.recordFinal(status);
+  const headers = walkExitHeaders(tracker, sticky, credentialTrace, exit);
+  if (front === "anthropic") {
+    failClosed(
+      res,
+      status,
+      exit.message,
+      Object.keys(headers).length > 0 ? headers : undefined,
+      exit.errorType,
+    );
+  } else if (!res.headersSent) {
+    res.writeHead(status, { "content-type": "application/json", ...headers });
+    res.end(JSON.stringify({
+      error: { message: exit.message, type: exit.errorType ?? "api_error" },
+    }));
+  }
+  h.logger.write(log());
+  return false;
+}
+
+export function respondAllCapped(
+  res: ServerResponse,
+  h: { logger: MetadataLogger },
+  ctx: { started: number; path: string; hadTools: boolean; streamed: boolean },
+  front: "anthropic" | "openai",
+  tracker: Pool429Tracker,
+  attempts: readonly RequestAttemptLog[],
+): void {
+  if (res.headersSent) return;
+  const summary = tracker.summary();
+  const capped = tracker.cappedSummary();
+  const labels = capped ?? "every candidate";
+  const resetAt = tracker.cappedResetAt();
+  const message =
+    `llm-relay: request refused by operator-declared hard cap(s): ${labels}. ` +
+    `No provider was contacted.` +
+    (resetAt !== null
+      ? ` The earliest cap lifts at ${new Date(resetAt).toISOString()} (its UTC period boundary).`
+      : ` No reset boundary could be derived, so no retry-after is offered.`);
+  const headers: Record<string, string> = {};
+  if (summary) headers[POOL_ATTEMPTS_HEADER] = summary;
+  if (capped !== null) headers[HARD_CAP_HEADER] = capped;
+  if (resetAt !== null && resetAt > Date.now()) {
+    headers["retry-after"] = String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000)));
+  }
+  const body = front === "openai"
+    ? { error: { message, type: "rate_limit_error", code: "llm_relay_capped" } }
+    : { type: "error" as const, error: { type: "rate_limit_error", message } };
+  res.writeHead(429, { ...headers, "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+  h.logger.write(baseLog(ctx.started, ctx.path, ctx.hadTools, ctx.streamed, 429, "skipped", null, attempts));
+}
+
+export function applyStickyOrdering(
+  ordered: ResolvedAttempt[],
+  pinnedSpec: string,
+  breaker: CircuitBreaker,
+  degraded: Set<string> | null,
+  now: number,
+  quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
+  latencyDemotion?: LatencyDemotionFn | null,
+): { targets: ResolvedAttempt[]; status: string } {
+  const groups = groupCredentialAttempts(ordered);
+  const pinnedIndex = groups.findIndex((group) => specOfTarget(group.attempts[0]!.target) === pinnedSpec);
+  const pinnedGroup = pinnedIndex < 0 ? undefined : groups[pinnedIndex];
+  const pinned = pinnedGroup?.attempts[0];
+  if (!pinned || !pinnedGroup) return { targets: ordered, status: "bypassed: not-in-pool" };
+
+  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
+  if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
+
+  if (degraded?.has(pinnedSpec)) {
+    const hasLiveInBand = groups.some(
+      (group) => {
+        const candidate = group.attempts[0]!;
+        return !degraded.has(specOfTarget(candidate.target)) &&
+          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf, latencyDemotion) === "live";
+      },
+    );
+    if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
+  }
+
+  if (pinnedIndex === 0) return { targets: ordered, status: "pinned, natural" };
+  const reordered = [pinnedGroup, ...groups.filter((_, index) => index !== pinnedIndex)]
+    .flatMap((group) => group.attempts);
+  return { targets: reordered, status: "pinned, reordered" };
+}
+
+export function stickyHeaderValue(
+  sticky: StickyRequestContext | null | undefined,
+  target: ResolvedTarget,
+  status: number,
+): string | null {
+  if (!sticky) return null;
+  if (sticky.provenance) return sticky.provenance;
+  if (status < 400 && sticky.multiCandidateRoute) return `${specOfTarget(target)} (new)`;
+  return null;
+}
+
+export function stickyProvenanceHeaders(
+  sticky: StickyRequestContext | null | undefined,
+): Record<string, string> | undefined {
+  return sticky?.provenance ? { [STICKY_PROVENANCE_HEADER]: sticky.provenance } : undefined;
+}
+
+export function recordStickySuccess(
+  h: { stickySessions?: StickySessionManager },
+  sticky: StickyRequestContext | null | undefined,
+  target: ResolvedTarget,
+  status: number,
+): void {
+  if (status >= 400 || !sticky?.multiCandidateRoute) return;
+  h.stickySessions?.setPin(sticky.key, specOfTarget(target));
+}
+
+/**
+ * Demote unusable candidates — and do NOTHING else to the order.
+ *
+ * ⚠ Deliberately NOT `getHealthyTargets()`: that filters AND re-sorts by measured stability, which
+ * is a second ranking pass competing with the deployment-fitness ranking `resolveTargets` already
+ * applied. Two ranking passes means neither decides the order, and live health then PROMOTES on
+ * evidence that is often a single request's latency. Health is used here only to demote, never to
+ * promote: a target the breaker is cooling steps aside, everything else keeps its fitness order.
+ * (The re-sort was invisible for as long as an untracked target scored a flat 100 and
+ * `Array.prototype.sort` is stable — INV-TS-7.)
+ *
+ * ⚠⚠ **AMENDED BY OWNER DECISION 2026-08-30, and this is NOT drift — do not "restore" it.**
+ * Latency now DOES demote, via `latency-demotion.ts` folded into `targetUsability` beside the quota
+ * term. The paragraph above stays because every word of it is still the constraint: what was
+ * rejected is a second ranking PASS that re-sorts and can PROMOTE on one request's latency, and
+ * that remains rejected. A one-way demotion term is a different thing — it never re-sorts, never
+ * promotes, and cannot fire on a single sample (p95 over a minimum count of MEASURABLE samples,
+ * unmeasured having no effect at all).
+ *
+ * What forced the amendment: measured 2026-08-30, banding on breaker state ALONE walked a
+ * breaker-CLOSED member with a p95 of 70364 ms ahead of every cooling one, and single requests cost
+ * 120-123 s across 2-6 attempts.
+ */
+export function orderByUsability(
+  attempts: ResolvedAttempt[],
+  breaker = globalCircuitBreaker,
+  now = Date.now(),
+): ResolvedAttempt[] {
+  const { ordered } = orderByUsabilityTracked(attempts, breaker, now);
+  return ordered;
+}
+
+export function orderByUsabilityTracked(
+  attempts: ResolvedAttempt[],
+  breaker: CircuitBreaker,
+  now: number,
+  quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
+  latencyDemotion?: LatencyDemotionFn | null,
+): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null; latencyDemotedFirst: string | null } {
+  const live: ResolvedAttempt[] = [];
+  const faulted: ResolvedAttempt[] = [];
+  const cooling: ResolvedAttempt[] = [];
+  for (const attempt of attempts) {
+    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
+    if (usability === "cooling") cooling.push(attempt);
+    else if (usability === "credential-fault") faulted.push(attempt);
+    else live.push(attempt);
+  }
+
+  cooling.sort((a, b) => {
+    const liftA = coolingLiftTime(a, breaker, now, costClassOf);
+    const liftB = coolingLiftTime(b, breaker, now, costClassOf);
+    if (liftA === null && liftB === null) return 0;
+    if (liftA === null) return 1;
+    if (liftB === null) return -1;
+    return liftA - liftB;
+  });
+
+  return { ordered: [...live, ...faulted, ...cooling], quotaDemotedFirst: null, latencyDemotedFirst: null };
+}
+
+export function classifyStatus(status: number): OutcomeClass {
+  if (status < 400) return "ok";
+  if (status === 401 || status === 403) return "credential";
+  if (status === 400 || status === 402 || status === 404 || status === 410 || status === 429 || status >= 500) return "retriable";
+  return "client";
+}
+
+export function shouldTryNext(cls: OutcomeClass): boolean {
+  return cls === "retriable" || cls === "credential";
+}
+
+export class Pool429Tracker {
+  private minRetryAfterMs: number | null = null;
+  private only429 = true;
+  private readonly counts = new Map<number | "dead-turn", number>();
+  private readonly firstSeenAt = new Map<number | "dead-turn" | "capped", number>();
+  private order = 0;
+  private inFlight = false;
+  private deferredCapped = false;
+  private readonly cappedLabels: string[] = [];
+  private soonestCapResetAt: number | null = null;
+  private egressed = false;
+
+  noteEgress(): void {
+    this.egressed = true;
+  }
+
+  noteOffered(): void {
+    this.inFlight = true;
+  }
+
+  private stamp(key: number | "dead-turn" | "capped"): void {
+    if (!this.firstSeenAt.has(key)) this.firstSeenAt.set(key, ++this.order);
+  }
+
+  private stampCapped(): void {
+    if (!this.deferredCapped) return;
+    this.deferredCapped = false;
+    this.stamp("capped");
+  }
+
+  recordFailover(status: number, retryAfterMs: number | null): void {
+    this.count(status);
+    if (status === 429) {
+      if (retryAfterMs !== null) {
+        this.minRetryAfterMs = this.minRetryAfterMs === null ? retryAfterMs : Math.min(this.minRetryAfterMs, retryAfterMs);
+      }
+    } else {
+      this.only429 = false;
+    }
+  }
+
+  recordFinal(status: number): void {
+    this.count(status);
+  }
+
+  recordCapped(label: string, resetsAt: number): void {
+    if (this.inFlight) this.deferredCapped = true;
+    else this.stamp("capped");
+    this.cappedLabels.push(label);
+    this.soonestCapResetAt =
+      this.soonestCapResetAt === null ? resetsAt : Math.min(this.soonestCapResetAt, resetsAt);
+  }
+
+  cappedResetAt(): number | null {
+    return this.soonestCapResetAt;
+  }
+
+  allCapped(): boolean {
+    return this.cappedLabels.length > 0 && this.counts.size === 0 && !this.egressed;
+  }
+
+  cappedSummary(): string | null {
+    if (this.cappedLabels.length === 0) return null;
+    if (this.cappedLabels.length <= MAX_CAPPED_HEADER_CELLS) return this.cappedLabels.join("; ");
+    const shown = this.cappedLabels.slice(0, MAX_CAPPED_HEADER_CELLS).join("; ");
+    return `${shown}; +${this.cappedLabels.length - MAX_CAPPED_HEADER_CELLS} more`;
+  }
+
+  recordDeadTurn(): void {
+    this.only429 = false;
+    this.count("dead-turn");
+  }
+
+  private unknownRefusals = 0;
+  noteUnknownRefusal(): void {
+    this.unknownRefusals += 1;
+  }
+
+  unknownCount(): number | null {
+    return this.unknownRefusals > 0 ? this.unknownRefusals : null;
+  }
+
+  private count(status: number | "dead-turn"): void {
+    this.counts.set(status, (this.counts.get(status) ?? 0) + 1);
+    this.stamp(status);
+    this.inFlight = false;
+    this.stampCapped();
+  }
+
+  summary(): string | null {
+    let tried = 0;
+    let served = 0;
+    for (const [status, n] of this.counts) {
+      tried += n;
+      if (typeof status === "number" && status < 400) served += n;
+    }
+    tried += this.cappedLabels.length;
+    if (tried < 2) return null;
+    this.stampCapped();
+    const parts = [...this.firstSeenAt.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map(([key]) => (key === "capped" ? `${this.cappedLabels.length}xcapped` : `${this.counts.get(key) ?? 0}x${key}`));
+    return `${tried} tried, ${served} served: ${parts.join(", ")}`;
+  }
+
+  overrideMs(finalStatus: number, finalRetryAfterMs: number | null): number | undefined {
+    if (finalStatus !== 429 || !this.only429 || this.minRetryAfterMs === null) return undefined;
+    return Math.min(this.minRetryAfterMs, finalRetryAfterMs ?? Infinity);
+  }
+}
+
+export function recordCall(
+  h: { modelCallRecorder?: ModelCallRecorder },
+  attempt: HealthAttempt,
+  ok: boolean,
+  completedAt: number,
+): void {
+  const { target, usage } = attempt;
+  if (!target.model || !h.modelCallRecorder) return;
+  try {
+    h.modelCallRecorder(target.provider, target.model, {
+      ok,
+      latencyMs: completedAt - attempt.started,
+      ...(usage.completionTokens !== undefined ? { completionTokens: usage.completionTokens } : {}),
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+export class RequestAttemptTrace {
+  private readonly entries: RequestAttemptLog[] = [];
+
+  record(target: ResolvedTarget, status: RequestAttemptStatus, started: number, completedAt: number): void {
+    if (this.entries.length >= MAX_LOG_ATTEMPTS) return;
+    this.entries.push({
+      provider: target.provider,
+      model: target.model ?? null,
+      status,
+      ms: Math.max(0, completedAt - started),
+    });
+  }
+
+  recordCapped(target: ResolvedTarget, at: number): void {
+    this.record(target, "capped", at, at);
+  }
+
+  snapshot(): RequestAttemptLog[] {
+    return this.entries.map((entry) => ({ ...entry }));
+  }
+}
+
+export interface HealthAttempt {
+  readonly handle: AttemptHandle;
+  readonly identity: ProviderTargetIdentity;
+  readonly resolvedAttempt: ResolvedAttempt;
+  readonly target: ResolvedTarget;
+  readonly started: number;
+  readonly trace: RequestAttemptTrace;
+  readonly usage: UsageAccumulator;
+  readonly accounting: RequestAccountingState | null;
+  accountingAttempt: AccountingAttempt | null;
+  completed: boolean;
+  committed: boolean;
+  terminal?: "succeeded" | "failed" | "cancelled";
+}
+
+export function targetIdentity(attempt: ResolvedAttempt): ProviderTargetIdentity {
+  const { target } = attempt;
+  return Object.freeze({
+    provider: target.provider,
+    model: target.model ?? null,
+    kind: target.kind,
+    credentialId: attempt.credentialId,
+    base: target.base,
+  });
+}
+
+export function beginHealthAttempt(
+  h: { breaker: CircuitBreaker },
+  resolvedAttempt: ResolvedAttempt,
+  started: number,
+  trace: RequestAttemptTrace,
+  usage: UsageAccumulator,
+  accounting: RequestAccountingState | null,
+): HealthAttempt | null {
+  const identity = targetIdentity(resolvedAttempt);
+  const begun = h.breaker.beginAttempt(identity);
+  if (!begun.ok) return null;
+  return {
+    committed: false,
+    handle: begun.value,
+    identity,
+    resolvedAttempt,
+    target: resolvedAttempt.target,
+    started,
+    trace,
+    usage,
+    accounting,
+    accountingAttempt: null,
+    completed: false,
+  };
+}
+
+export function abortOnClientClose(
+  res: ServerResponse,
+  callerController: AbortController,
+  controller: AbortController,
+): () => void {
+  return () => {
+    if (!res.writableEnded) {
+      callerController.abort();
+      controller.abort();
+    }
+  };
+}
+
+export function observeContextLimit(status: number, target: ResolvedTarget, body: string): void {
+  if (status !== 400 && status !== 413) return;
+  if (target.model === undefined) return;
+  try {
+    if (!looksLikeContextLengthError(body)) return;
+    const stated = parseStatedContextLimit(body);
+    if (stated === null) return;
+    recordObservedContextLimit(target.provider, target.model, stated);
+  } catch {
+    // best-effort
+  }
+}
+
+export function observeMaxOutput(status: number, target: ResolvedTarget, body: string): void {
+  if (status !== 400 && status !== 413) return;
+  if (target.model === undefined) return;
+  try {
+    if (!looksLikeMaxOutputError(body)) return;
+    const stated = parseStatedMaxOutput(body);
+    if (stated === null) return;
+    recordObservedMaxOutput(target.provider, target.model, stated);
+  } catch {
+    // best-effort
+  }
+}
+
+export function observeStatedRateLimits(attempt: HealthAttempt, observations: QuotaObservation[]): void {
+  if (observations.length === 0) return;
+  const { target } = attempt;
+  if (target.model === undefined) return;
+  try {
+    for (const o of observations) {
+      if (!Number.isFinite(o.limit) || o.limit <= 0) continue;
+      if (o.period !== "minute" && o.period !== "day") continue;
+      recordObservedRateLimit(target.provider, attempt.resolvedAttempt.credentialId, target.model, [
+        { axis: o.axis, period: o.period, limit: Math.floor(o.limit) },
+      ]);
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+export function observeRateLimit(attempt: ResolvedAttempt, status: number, body: string): void {
+  if (status !== 429) return;
+  if (attempt.target.model === undefined) return;
+  try {
+    if (!looksLikeRateLimitError(body)) return;
+    const stated = parseStatedRateLimit(body);
+    if (stated === null) return;
+    recordObservedRateLimit(attempt.target.provider, attempt.credentialId, attempt.target.model, stated);
+  } catch {
+    // best-effort
+  }
+}
+
+export type EligibilityObservation = { readonly unknown: boolean; readonly scope?: ReturnType<typeof materializeScope> };
+
+export function refusalBodyCandidates(body: string): string[] {
+  const candidates: string[] = [];
+  const queued: string[] = [body];
+  const seen = new Set<string>();
+  while (queued.length > 0 && candidates.length < 24) {
+    const text = queued.shift()!;
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    candidates.push(text);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      for (let index = 0; index < text.length; index++) {
+        if (text[index] !== "{" && text[index] !== "[") continue;
+        const nested = text.slice(index);
+        try {
+          JSON.parse(nested);
+          queued.push(nested);
+          break;
+        } catch {
+          // continue search
+        }
+      }
+      continue;
+    }
+
+    const visit = (value: unknown, depth: number): void => {
+      if (depth > 6 || candidates.length + queued.length >= 24) return;
+      if (typeof value === "string") {
+        if (!seen.has(value)) queued.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, depth + 1);
+        return;
+      }
+      if (typeof value === "object" && value !== null) {
+        for (const item of Object.values(value as Record<string, unknown>)) {
+          visit(item, depth + 1);
+        }
+      }
+    };
+    visit(parsed, 0);
+  }
+  return candidates;
+}
+
+export function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfterMs: number | null, body: string): EligibilityObservation {
+  const { target } = attempt;
+  if (target.model === undefined) return { unknown: false };
+  try {
+    let matchedBody = body;
+    let verdict: ReturnType<typeof interpretRefusal> = null;
+    for (const candidate of refusalBodyCandidates(body)) {
+      verdict = interpretRefusal(target.provider, target.model, status, candidate);
+      if (verdict !== null) {
+        matchedBody = candidate;
+        break;
+      }
+    }
+    if (verdict === null) {
+      recordUnknownRefusal(target.provider, target.model, status, body);
+      return { unknown: true };
+    }
+    const scope = materializeScope(
+      verdict.scope,
+      target.provider,
+      attempt.credentialId,
+      target.model,
+    );
+    const reset = resolveReset(verdict, retryAfterMs, matchedBody);
+    recordFact(verdict.class, scope, {
+      retryAfterMs: reset?.ms ?? null,
+      ...(reset === null ? {} : { untilBasis: reset.basis }),
+      ...(verdict.costClasses === undefined ? {} : { costClasses: verdict.costClasses }),
+    });
+    return { unknown: false, scope };
+  } catch {
+    // best-effort
+  }
+  return { unknown: false };
+}
+
+export function freeOnlyApplies(rule: { freeOnly?: boolean }, rerouted: boolean): boolean {
+  return rule.freeOnly ?? rerouted;
+}
+
+export function resolveReset(
+  interpretation: Interpretation,
+  headerMs: number | null,
+  body: string,
+): { ms: number; basis: FactResetBasis } | null {
+  if (headerMs !== null) return { ms: headerMs, basis: "retry-after" };
+  if (interpretation.reset?.kind === "field") {
+    const fromField = applyResetRule(interpretation.reset, body);
+    if (fromField !== null) return { ms: fromField, basis: "reviewed-field" };
+  }
+  const generic = parseStatedResetMs(body);
+  if (generic !== null) return { ms: generic, basis: "stated-body" };
+  if (interpretation.reset?.kind === "fixed") {
+    const fixed = applyResetRule(interpretation.reset, body);
+    if (fixed !== null) return { ms: fixed, basis: "reviewed-fixed" };
+  }
+  return null;
+}
+
+export function carriesEligibilityFact(status: number): boolean {
+  return (
+    status === 400 ||
+    status === 401 ||
+    status === 402 ||
+    status === 403 ||
+    status === 404 ||
+    status === 410 ||
+    status === 429
+  );
+}
+
+export type InspectedCandidateResponse =
+  | {
+      kind: "response";
+      response: Response;
+      eligibility: EligibilityObservation;
+    }
+  | PostHeaderBodyFailure;
+
+export async function inspectCandidateResponse(
+  res: Response,
+  attempt: ResolvedAttempt,
+  retryAfterMs: number | null,
+): Promise<InspectedCandidateResponse> {
+  const propagatedFailure = postHeaderBodyFailure(res);
+  if (propagatedFailure) return propagatedFailure;
+  const status = res.status;
+  if (status < 400) {
+    return { kind: "response", response: res, eligibility: { unknown: false } };
+  }
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(await res.arrayBuffer());
+  } catch (cause) {
+    return { kind: "post-header-body-failure", cause };
+  }
+  const body = bytes.toString("utf8");
+  observeContextLimit(status, attempt.target, body);
+  observeMaxOutput(status, attempt.target, body);
+  observeRateLimit(attempt, status, body);
+  const eligibility = carriesEligibilityFact(status) && body
+    ? observeEligibility(attempt, status, retryAfterMs, body)
+    : { unknown: false };
+  return {
+    kind: "response",
+    response: new Response(bytes, {
+      status,
+      statusText: res.statusText,
+      headers: res.headers,
+    }),
+    eligibility,
+  };
+}
+
+export function walkOutcomeForResponse(
+  status: number,
+  localFailure: boolean,
+  scope?: EligibilityObservation["scope"],
+): CredentialWalkOutcome {
+  if (localFailure) return { kind: "local", status, ...(scope ? { scope } : {}) };
+  const cls = classifyStatus(status);
+  if (cls === "client") return { kind: "client", status, ...(scope ? { scope } : {}) };
+  if (status === 401 || status === 403 || status === 402 || status === 429) {
+    return { kind: "credential", status, ...(scope ? { scope } : {}) };
+  }
+  return { kind: "deployment", status, ...(scope ? { scope } : {}) };
+}
+
+export function observeAttemptHeaders(
+  h: { breaker: CircuitBreaker },
+  attempt: HealthAttempt,
+  status: number,
+  retryAfterMs: number | null,
+  headers?: Headers,
+): void {
+  const observedAt = Date.now();
+  const quotaObservations = headers
+    ? extractQuotaObservations(headers, { observedAt })
+    : [];
+  observeStatedRateLimits(attempt, quotaObservations);
+  const result = h.breaker.observeHeaders(attempt.handle, {
+    target: attempt.identity,
+    status,
+    observedAt,
+    elapsedMs: observedAt - attempt.started,
+    ...(quotaObservations.length > 0 ? { quotaObservations } : {}),
+    ...(retryAfterMs !== null ? { retryAfterMs } : {}),
+  });
+  if (!result.ok) throw new Error(`attempt header observation rejected: ${result.error.kind}`);
+}
+
+export type ProxyAccountingFailureKind = "timeout" | "provider_error" | "auth_error" | "rate_limit" | "aborted" | "protocol" | "unknown";
+
+export function accountingFailureForAttempt(options: {
+  readonly failure: AttemptFailed["failure"];
+  readonly provenance: OutcomeProvenance;
+  readonly status: number | null;
+}): ProxyAccountingFailureKind {
+  if (options.status === 401 || options.status === 403) return "auth_error";
+  if (options.status === 429) return "rate_limit";
+  if (options.failure === "protocol" || options.failure === "mapping") return "protocol";
+  if (options.failure === "transport" && options.provenance === "deadline") return "timeout";
+  return "provider_error";
+}
+
+export function markAttemptCommitted(attempt: HealthAttempt | undefined): void {
+  if (!attempt) return;
+  // Recorded on the attempt itself, not only through the optional accounting recorder: the
+  // cancellation classifier must answer the same way on a relay running with no accounting.
+  attempt.committed = true;
+  attempt.accounting?.markCommitted(attempt.accountingAttempt, Date.now());
+}
+
+export function completeAttemptSuccess(
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  attempt: HealthAttempt,
+  status: number,
+): void {
+  if (attempt.completed) return;
+  const completedAt = Date.now();
+  const result = h.breaker.completeAttempt(attempt.handle, {
+    terminal: "succeeded",
+    target: attempt.identity,
+    provenance: "upstream",
+    completedAt,
+    elapsedMs: completedAt - attempt.started,
+    status,
+  });
+  if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
+  attempt.completed = true;
+  attempt.terminal = "succeeded";
+  attempt.trace.record(attempt.target, status, attempt.started, completedAt);
+  recordCall(h, attempt, true, completedAt);
+  attempt.accounting?.complete(attempt.accountingAttempt, "success", null, attempt.usage, completedAt);
+  try {
+    const cleared = clearFacts(
+      attempt.target.provider,
+      attempt.resolvedAttempt.credentialId,
+      attempt.target.model ?? null,
+    );
+    if (cleared.includes("credential-invalid")) {
+      h.breaker.clearCredentialFaults(attempt.resolvedAttempt.credentialId);
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+export function completeAttemptFailure(
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  attempt: HealthAttempt,
+  options: {
+    failure: AttemptFailed["failure"];
+    provenance: OutcomeProvenance;
+    status: number | null;
+    retryAfterMs?: number | null;
+    logStatus?: RequestAttemptStatus;
+  },
+): void {
+  if (attempt.completed) return;
+  const completedAt = Date.now();
+  const result = h.breaker.completeAttempt(attempt.handle, {
+    terminal: "failed",
+    target: attempt.identity,
+    provenance: options.provenance,
+    completedAt,
+    elapsedMs: completedAt - attempt.started,
+    failure: options.failure,
+    status: options.status,
+    retryAfterMs: options.retryAfterMs ?? null,
+  });
+  if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
+  attempt.completed = true;
+  attempt.terminal = "failed";
+  attempt.trace.record(
+    attempt.target,
+    options.logStatus ?? options.status ?? "failed",
+    attempt.started,
+    completedAt,
+  );
+  recordCall(h, attempt, false, completedAt);
+  attempt.accounting?.complete(
+    attempt.accountingAttempt,
+    "error",
+    accountingFailureForAttempt(options),
+    attempt.usage,
+    completedAt,
+  );
+}
+
+export function completeAttemptCancelled(
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  attempt: HealthAttempt,
+  reason: string | null,
+): void {
+  completeCancellation(
+    h,
+    attempt,
+    reason,
+    attempt.committed ? "client-gone-mid-response" : "client-gone-before-response",
+  );
+}
+
+export function completeAttemptAbandoned(
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  attempt: HealthAttempt,
+  reason: string | null,
+): void {
+  completeCancellation(h, attempt, reason, "relay-abandoned");
+}
+
+export function completeCancellation(
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  attempt: HealthAttempt,
+  reason: string | null,
+  cause: AttemptCancellationCause,
+): void {
+  if (attempt.completed) return;
+  const completedAt = Date.now();
+  const result = h.breaker.completeAttempt(attempt.handle, {
+    terminal: "cancelled",
+    target: attempt.identity,
+    provenance: "client-cancellation",
+    completedAt,
+    elapsedMs: completedAt - attempt.started,
+    cause,
+    reason,
+  });
+  if (!result.ok) throw new Error(`attempt completion rejected: ${result.error.kind}`);
+  attempt.completed = true;
+  attempt.terminal = "cancelled";
+  attempt.trace.record(attempt.target, "cancelled", attempt.started, completedAt);
+  attempt.accounting?.complete(
+    attempt.accountingAttempt,
+    "cancelled",
+    "aborted",
+    attempt.usage,
+    completedAt,
+    cause === "relay-abandoned",
+  );
+}
+
+export type PostHeaderBodyDisposition = "cancelled" | "timeout" | "protocol";
+
+export function completePostHeaderBodyFailure(
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  downstream: ServerResponse,
+  signal: AbortSignal,
+  attempt: HealthAttempt,
+  credentialWalk: CredentialWalk,
+  credentialTrace: CredentialAttemptTrace,
+  resolvedAttempt: ResolvedAttempt,
+): PostHeaderBodyDisposition {
+  if (downstream.destroyed) {
+    completeAttemptCancelled(h, attempt, "client disconnected while reading provider response body");
+    recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "cancelled" });
+    return "cancelled";
+  }
+  if (signal.aborted) {
+    completeAttemptFailure(h, attempt, {
+      failure: "transport",
+      provenance: "deadline",
+      status: 504,
+    });
+    recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "timeout" });
+    return "timeout";
+  }
+  completeAttemptFailure(h, attempt, {
+    failure: "protocol",
+    provenance: "invalid-upstream-envelope",
+    status: 502,
+  });
+  recordCredentialOutcome(credentialWalk, credentialTrace, resolvedAttempt, { kind: "protocol" });
+  return "protocol";
+}

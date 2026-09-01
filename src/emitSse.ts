@@ -133,35 +133,57 @@ export function emitSseTail(msg: AssistantMessage, startIndex: number): string {
   return out.join("");
 }
 
-function emitBlock(
+function emitToolUseBlock(
+  push: (type: string, data: object) => void,
+  block: Extract<ContentBlock, { type: "tool_use" }>,
+  index: number,
+): void {
+  push("content_block_start", {
+    index,
+    content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+  });
+  // Emit the full input as a single input_json_delta fragment.
+  const json = JSON.stringify(block.input ?? {});
+  push("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: json } });
+  push("content_block_stop", { index });
+}
+
+function emitTextBlock(
+  push: (type: string, data: object) => void,
+  block: { type: "text"; text: string },
+  index: number,
+): void {
+  push("content_block_start", { index, content_block: { type: "text", text: "" } });
+  push("content_block_delta", {
+    index,
+    delta: { type: "text_delta", text: block.text },
+  });
+  push("content_block_stop", { index });
+}
+
+function emitOpaqueBlock(
   push: (type: string, data: object) => void,
   block: ContentBlock,
   index: number,
 ): void {
-  if (isToolUseBlock(block)) {
-    push("content_block_start", {
-      index,
-      content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
-    });
-    // Emit the full input as a single input_json_delta fragment.
-    const json = JSON.stringify(block.input ?? {});
-    push("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: json } });
-    push("content_block_stop", { index });
-    return;
-  }
-  if (block.type === "text") {
-    push("content_block_start", { index, content_block: { type: "text", text: "" } });
-    push("content_block_delta", {
-      index,
-      delta: { type: "text_delta", text: (block as { text: string }).text },
-    });
-    push("content_block_stop", { index });
-    return;
-  }
   // Opaque block (thinking, redacted_thinking, …): echo the WHOLE block on the start
   // event rather than re-deriving deltas for it. reconstructFromSse keeps the entire
   // content_block payload, so this round-trips every field — including a thinking
   // block's `signature`, without which the block cannot be replayed on the next turn.
   push("content_block_start", { index, content_block: block });
   push("content_block_stop", { index });
+}
+
+function emitBlock(
+  push: (type: string, data: object) => void,
+  block: ContentBlock,
+  index: number,
+): void {
+  if (isToolUseBlock(block)) {
+    emitToolUseBlock(push, block, index);
+  } else if (block.type === "text") {
+    emitTextBlock(push, block as { type: "text"; text: string }, index);
+  } else {
+    emitOpaqueBlock(push, block, index);
+  }
 }

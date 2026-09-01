@@ -34,7 +34,6 @@ import {
   mergeAccountingMetricCells,
   mergeAccountingTokenCells,
   parseAccountingAggregateTokenCellV1,
-  parseAccountingRequestPacketV1,
 } from "../src/accounting-store-schema.js";
 
 const START = "2026-08-20T01:02:03.000Z";

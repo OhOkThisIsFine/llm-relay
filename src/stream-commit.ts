@@ -112,6 +112,27 @@ function errorVerdict(value: Record<string, unknown>, signal: DialectRefusalSign
   };
 }
 
+function anthropicBlockStartVerdict(block: Record<string, unknown>): EventVerdict {
+  const blockType = typeof block.type === "string" ? block.type : "";
+  if (blockType === "tool_use") {
+    return nonWhitespace(block.id) || nonWhitespace(block.name) ? READY : HOLD;
+  }
+  if (blockType === "text") return nonWhitespace(block.text) ? READY : HOLD;
+  if (blockType === "thinking") return nonWhitespace(block.thinking) ? READY : HOLD;
+  // Redacted thinking and future opaque content blocks are output only when they carry an
+  // actual payload; a type/index skeleton remains provisional.
+  return substantiveFields(block, new Set(["type", "index"])) ? READY : HOLD;
+}
+
+function anthropicBlockDeltaVerdict(delta: Record<string, unknown>): EventVerdict {
+  const deltaType = typeof delta.type === "string" ? delta.type : "";
+  if (deltaType === "text_delta") return nonWhitespace(delta.text) ? READY : HOLD;
+  if (deltaType === "thinking_delta") return nonWhitespace(delta.thinking) ? READY : HOLD;
+  // Tool arguments follow a meaningful tool_use start. Signatures are metadata, not content.
+  if (deltaType === "input_json_delta" || deltaType === "signature_delta") return HOLD;
+  return substantiveFields(delta, new Set(["type", "index"])) ? READY : HOLD;
+}
+
 function anthropicVerdict(value: Record<string, unknown>, signal: DialectRefusalSignal | undefined): EventVerdict {
   const type = typeof value.type === "string" ? value.type : "";
   if (type === "error" || isRecord(value.error)) {
@@ -123,28 +144,11 @@ function anthropicVerdict(value: Record<string, unknown>, signal: DialectRefusal
   }
 
   if (type === "content_block_start") {
-    if (!isRecord(value.content_block)) return HOLD;
-    const block = value.content_block;
-    const blockType = typeof block.type === "string" ? block.type : "";
-    if (blockType === "tool_use") {
-      return nonWhitespace(block.id) || nonWhitespace(block.name) ? READY : HOLD;
-    }
-    if (blockType === "text") return nonWhitespace(block.text) ? READY : HOLD;
-    if (blockType === "thinking") return nonWhitespace(block.thinking) ? READY : HOLD;
-    // Redacted thinking and future opaque content blocks are output only when they carry an
-    // actual payload; a type/index skeleton remains provisional.
-    return substantiveFields(block, new Set(["type", "index"])) ? READY : HOLD;
+    return isRecord(value.content_block) ? anthropicBlockStartVerdict(value.content_block) : HOLD;
   }
 
   if (type === "content_block_delta") {
-    if (!isRecord(value.delta)) return HOLD;
-    const delta = value.delta;
-    const deltaType = typeof delta.type === "string" ? delta.type : "";
-    if (deltaType === "text_delta") return nonWhitespace(delta.text) ? READY : HOLD;
-    if (deltaType === "thinking_delta") return nonWhitespace(delta.thinking) ? READY : HOLD;
-    // Tool arguments follow a meaningful tool_use start. Signatures are metadata, not content.
-    if (deltaType === "input_json_delta" || deltaType === "signature_delta") return HOLD;
-    return substantiveFields(delta, new Set(["type", "index"])) ? READY : HOLD;
+    return isRecord(value.delta) ? anthropicBlockDeltaVerdict(value.delta) : HOLD;
   }
 
   // Unknown future Anthropic content events are allowed to commit only when their content-shaped

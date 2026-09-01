@@ -2,21 +2,22 @@ import { recordFact, factsFor, flushFacts, resetFacts, FACT_TTL_MS, type FactKin
 import type { CredentialId } from "./credential-id.js";
 
 /**
- * Rate limits LEARNED from what a deployment STATED about itself — the sibling of
- * `context-limits.ts`, feeding the same `target-facts.ts` store.
+ * MODULE CHARTER: Learned Stated Rate Limits Subsystem (rate-limits.ts)
  *
- * Spec §4 Rung 1 (docs/quota-metering-spec-2026-08-16.md): a stated rate limit is a MEASUREMENT,
- * not a condition. It lands as one of four kinds — `rate-limit-rpm|rpd|tpm|tpd`, one kind per
- * axis×period so the compiler forces a TTL decision per bucket — and unlike the five conditions
- * it is never cleared by a success, never cools, never cost-blocks. It expires on its own TTL.
- * Today it is DISPLAY-ONLY (see `/candidates`); acting on it is a separately announced decision
- * (spec open decision M2).
+ * 1. Domain Boundary & Responsibilities:
+ *    - Parses and tracks rate limits explicitly STATED by upstream provider headers or response bodies.
+ *    - Records non-secret observed metrics into the shared `target-facts.ts` store.
+ *    - Serves as the rate limit measurement counterpart to `context-limits.ts`.
  *
- * ⚠ **Only an explicitly STATED limit is recorded, and only with a confidently identified axis
- * AND period.** "You sent 120 requests in the last minute" states a count, not a ceiling. "Rate
- * limit exceeded" proves throttling but states no number. Either would put a guess into the one
- * store whose whole value is that it holds measurements, so a miss learns NOTHING — the same
- * fail-safe as the context parser. Unknown stays null, never 0.
+ * 2. Measurement vs Condition Invariants:
+ *    - A stated rate limit is an immutable observation/measurement, not a transient health condition.
+ *    - Persisted across four discrete axes (`rpm`, `rpd`, `tpm`, `tpd`), each expiring independently on its TTL.
+ *    - Never cleared by successful calls, never cooled, and never triggers cost-blocking.
+ *
+ * 3. Confidence & Fallback Guarantees:
+ *    - Only records explicitly stated numerical ceilings with confidently identified axis AND period.
+ *    - Ambiguous error messages (e.g. "Rate limit exceeded" without numbers) learn NOTHING.
+ *    - Missing or unknown limits remain strictly `null`, never default to 0.
  */
 
 /** Retained for callers and docs that name the measurement's staleness window (30 days). */

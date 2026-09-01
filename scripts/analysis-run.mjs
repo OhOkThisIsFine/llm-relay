@@ -15,7 +15,7 @@
  */
 import { mkdirSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 const reportDir = join(process.cwd(), 'analysis-reports');
 if (!existsSync(reportDir)) {
@@ -66,35 +66,71 @@ const steps = [
   },
 ];
 
-const failures = [];
-const summary = [`Generated: ${new Date().toISOString()}`];
+async function runStep(step) {
+  return new Promise((resolve) => {
+    const child = spawn(step.command, {
+      cwd: process.cwd(),
+      shell: true,
+      env: process.env,
+    });
 
-for (const step of steps) {
-  const result = spawnSync(step.command, {
-    cwd: process.cwd(),
-    encoding: 'utf8',
-    shell: true,
-    env: process.env,
-    timeout: 120000,
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout?.on('data', (data) => {
+      stdout += data.toString('utf8');
+    });
+
+    child.stderr?.on('data', (data) => {
+      stderr += data.toString('utf8');
+    });
+
+    const timer = setTimeout(() => {
+      child.kill();
+    }, 120000);
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const output = `${stdout}${stderr}`.trim();
+      const status = code ?? 1;
+
+      const txtFile = join(reportDir, step.txt);
+      writeFileSync(txtFile, output.length ? output : '(no output)');
+
+      if (step.json) {
+        writeFileSync(join(reportDir, step.json), output.length ? output : '[]');
+      }
+
+      writeFileSync(join(reportDir, `${step.name}.exit.txt`), `${status}`);
+
+      resolve({
+        name: step.name,
+        status,
+        optional: Boolean(step.optional),
+      });
+    });
+
+    child.on('error', () => {
+      clearTimeout(timer);
+      writeFileSync(join(reportDir, `${step.name}.exit.txt`), '1');
+      resolve({
+        name: step.name,
+        status: 1,
+        optional: Boolean(step.optional),
+      });
+    });
   });
+}
 
-  const stdout = result.stdout ?? '';
-  const stderr = result.stderr ?? '';
-  const output = `${stdout}${stderr}`.trim();
-  const status = result.status ?? 1;
+const results = await Promise.all(steps.map(runStep));
 
-  const txtFile = join(reportDir, step.txt);
-  writeFileSync(txtFile, output.length ? output : '(no output)');
+const summary = [`Generated: ${new Date().toISOString()}`];
+const failures = [];
 
-  if (step.json) {
-    writeFileSync(join(reportDir, step.json), output.length ? output : '[]');
-  }
-
-  writeFileSync(join(reportDir, `${step.name}.exit.txt`), `${status}`);
-  summary.push(`${step.name}: ${status}`);
-
-  if (status !== 0 && !step.optional) {
-    failures.push(step.name);
+for (const res of results) {
+  summary.push(`${res.name}: ${res.status}`);
+  if (res.status !== 0 && !res.optional) {
+    failures.push(res.name);
   }
 }
 

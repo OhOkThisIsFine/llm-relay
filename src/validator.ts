@@ -85,6 +85,80 @@ export class ToolUseValidator {
     return fn;
   }
 
+  private validateSingleToolBlock(
+    block: Extract<ContentBlock, { type: "tool_use" }>,
+    blockIndex: number,
+    tools: Map<string, JsonSchema | null>,
+  ): { errors: ValidationError[]; uncheckable: boolean } {
+    const { name, input } = block;
+
+    if (!tools.has(name)) {
+      return {
+        errors: [{
+          kind: "unknown_tool",
+          blockIndex,
+          tool: name,
+          message: `tool_use references tool "${name}" not present in request tools[]`,
+        }],
+        uncheckable: false,
+      };
+    }
+
+    // input must be a JSON object for ANY tool, schema or not.
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return {
+        errors: [{
+          kind: "input_not_object",
+          blockIndex,
+          tool: name,
+          message: `tool_use.input is not a JSON object (got ${describe(input)})`,
+        }],
+        uncheckable: false,
+      };
+    }
+
+    const schema = tools.get(name) ?? null;
+    if (schema === null) {
+      return {
+        errors: [{
+          kind: "schema_uncheckable",
+          blockIndex,
+          tool: name,
+          message: `tool "${name}" has no executable input schema`,
+        }],
+        uncheckable: true,
+      };
+    }
+
+    const validate = this.compiledFor(name, schema);
+    if (validate === null) {
+      return {
+        errors: [{
+          kind: "schema_uncheckable",
+          blockIndex,
+          tool: name,
+          message: `tool "${name}" has an input schema that could not be compiled`,
+        }],
+        uncheckable: true,
+      };
+    }
+
+    const errors: ValidationError[] = [];
+    if (!validate(input)) {
+      for (const err of validate.errors ?? []) {
+        errors.push({
+          kind: "schema_violation",
+          blockIndex,
+          tool: name,
+          path: err.instancePath || "/",
+          message: `${err.instancePath || "(root)"} ${err.message ?? "failed schema"}`,
+        });
+      }
+    }
+
+    return { errors, uncheckable: false };
+  }
+
   validate(
     assistant: AssistantMessage,
     tools: Map<string, JsonSchema | null>,
@@ -99,64 +173,9 @@ export class ToolUseValidator {
     blocks.forEach((block, blockIndex) => {
       if (!isToolUseBlock(block)) return;
       toolUseCount++;
-      const { name, input } = block;
-
-      if (!tools.has(name)) {
-        errors.push({
-          kind: "unknown_tool",
-          blockIndex,
-          tool: name,
-          message: `tool_use references tool "${name}" not present in request tools[]`,
-        });
-        return;
-      }
-
-      // input must be a JSON object for ANY tool, schema or not.
-      if (typeof input !== "object" || input === null || Array.isArray(input)) {
-        errors.push({
-          kind: "input_not_object",
-          blockIndex,
-          tool: name,
-          message: `tool_use.input is not a JSON object (got ${describe(input)})`,
-        });
-        return;
-      }
-
-      const schema = tools.get(name) ?? null;
-      if (schema === null) {
-        uncheckableCount++;
-        errors.push({
-          kind: "schema_uncheckable",
-          blockIndex,
-          tool: name,
-          message: `tool "${name}" has no executable input schema`,
-        });
-        return;
-      }
-
-      const validate = this.compiledFor(name, schema);
-      if (validate === null) {
-        uncheckableCount++;
-        errors.push({
-          kind: "schema_uncheckable",
-          blockIndex,
-          tool: name,
-          message: `tool "${name}" has an input schema that could not be compiled`,
-        });
-        return;
-      }
-
-      if (!validate(input)) {
-        for (const err of validate.errors ?? []) {
-          errors.push({
-            kind: "schema_violation",
-            blockIndex,
-            tool: name,
-            path: err.instancePath || "/",
-            message: `${err.instancePath || "(root)"} ${err.message ?? "failed schema"}`,
-          });
-        }
-      }
+      const result = this.validateSingleToolBlock(block, blockIndex, tools);
+      if (result.uncheckable) uncheckableCount++;
+      errors.push(...result.errors);
     });
 
     // stop_reason consistency: a tool_use block requires stop_reason "tool_use",

@@ -1,42 +1,28 @@
 import type { CredentialResolution } from "./authEnv.js";
 import { resolveCredential, resolveCredentialExact } from "./authEnv.js";
 import { makeCredentialId, type CredentialId } from "./credential-id.js";
-import type { ProviderLimitsConfig } from "./configured-limits.js";
-import type { ProviderConfig, ResolvedTarget } from "./config.js";
-import type { ResolvedAttempt } from "./resolved-attempt.js";
+import type {
+  ProviderConfig,
+  ResolvedTarget,
+  CredentialSlot,
+  ProviderCredentialConfig,
+} from "./config-types.js";
 import type { KeystoreOptions } from "./keystore.js";
 
-/** A normalized provider credential declaration. Secrets are never held here. */
-export interface ProviderCredentialConfig {
-  label: string;
-  authEnv: string;
-  enabled?: boolean;
-  /** `null` means all models; an empty array deliberately matches no models. */
-  models?: readonly string[] | null;
-  /**
-   * This slot's own operator-asserted rate limits, overriding the provider-level `limits` for
-   * this key alone (each axis independently; see `resolveConfiguredLimits`). Keys of one account
-   * share that account's ceilings, so per-key figures can differ even under one provider.
-   */
-  limits?: ProviderLimitsConfig;
-}
-
-/** Non-secret identity and policy for one configured credential slot. */
-export interface CredentialSlot {
-  readonly credentialId: CredentialId;
-  readonly provider: string;
-  readonly label: string;
-  readonly authEnv: string | undefined;
-  readonly enabled: boolean;
-  readonly models: readonly string[] | null;
-  readonly origin: "implicit" | "legacy-authEnv" | "credentials";
-  readonly resolutionMode: "legacy-alias" | "declared-only";
-  readonly configIndex: number;
-}
+export type { CredentialSlot, ProviderCredentialConfig };
 
 export interface ResolvedCredentialSlot {
   readonly slot: CredentialSlot;
   readonly resolution: CredentialResolution;
+}
+
+/** Application-layer attempt with credential resolution performed exactly once. */
+export interface ResolvedAttempt {
+  readonly target: ResolvedTarget;
+  readonly credentialId: CredentialId;
+  readonly credential: CredentialResolution;
+  /** Non-secret slot descriptor; the secret itself remains only in `credential.value`. */
+  readonly slot: CredentialSlot;
 }
 
 /** The implicit one-slot view retained for old providers and hand-built targets. */
@@ -88,9 +74,17 @@ export function providerCredentialSlots(provider: string, config: ProviderConfig
   return Object.freeze([implicitCredentialSlot(provider, config.authEnv)]);
 }
 
+const slotModelSets = new WeakMap<CredentialSlot, ReadonlySet<string>>();
+
 export function slotAllowsModel(slot: CredentialSlot, model: string | undefined): boolean {
   if (slot.models === null) return true;
-  return model !== undefined && slot.models.includes(model);
+  if (model === undefined) return false;
+  let set = slotModelSets.get(slot);
+  if (!set) {
+    set = new Set(slot.models);
+    slotModelSets.set(slot, set);
+  }
+  return set.has(model);
 }
 
 export function resolveCredentialSlot(

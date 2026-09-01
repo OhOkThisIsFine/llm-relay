@@ -1,3 +1,13 @@
+/**
+ * Backend protocol execution and response transformation pipeline.
+ *
+ * Charter & Invariants:
+ *  - Translates requests and responses across Anthropic, OpenAI, and Responses protocols.
+ *  - Handles streaming SSE transformations, tool-call dialect recovery, think-tag stripping, and usage accumulation.
+ *  - Classifies downstream HTTP and dialect errors into retriable failovers vs terminal refusals.
+ *  - Logs remain strictly metadata-only (no payload bodies or headers).
+ */
+
 import { translateBetweenProviders, handleUniversalStreamRequest } from "llm-bridge";
 import { buildAuthHeaders } from "./authEnv.js";
 import { isRecord } from "./json-shape.js";
@@ -639,81 +649,86 @@ async function preflightResponseStream(
  * llm-bridge's SSE re-encoder, non-streaming via a direct mapper) — so the rest
  * of the proxy (validate/repair) always sees Anthropic Messages.
  */
-export async function fetchBackend(
-  attempt: ResolvedAttempt,
-  args: {
-    path: string;
-    method: string;
-    reqBuf: Buffer;
-    reqJson: unknown;
-    anthropicHeaders: Record<string, string>;
-    wantsStream: boolean;
-    /**
-     * The operator's configured destructive-tool set (`destructiveMatcher`). REQUIRED, not
-     * optional: it reaches the four dialect-rescue commit points, and an optional field here would
-     * let a caller silently disable the refusal — the failure mode that gap existed as.
-     */
-    isDestructive: (name: string) => boolean;
-    usage?: UsageAccumulator;
-    signal: AbortSignal;
-    onEgress?: OnEgress;
-  },
-  fetchFn: typeof fetch = fetch,
-): Promise<Response> {
-  const invokeFetch = oneShotFetch(fetchFn, args.signal, args.onEgress);
-  const target = attempt.target;
-  if (target.kind === "anthropic") {
-    const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
-    if (args.reqBuf.length) init.body = args.reqBuf;
-    const native = await invokeFetch(target.base + args.path, init);
-    const nativeStreamed = nativeResponseIsStreamed(native, args.wantsStream);
-    const res = args.usage
-      ? observeUsage(native, "anthropic-messages", args.usage, { streamed: nativeStreamed })
-      : native;
-    // Preserve passthrough bytes, but do not preserve a successful status for a malformed
-    // Messages envelope. Inspecting a clone leaves the original buffered body byte-exact.
-    const messagesPath = args.path.split("?", 1)[0] === "/v1/messages";
-    if (!res.ok || !messagesPath) return res;
-    const streamed = args.wantsStream || (res.headers.get("content-type") ?? "").includes("text/event-stream");
-    if (streamed) {
-      if (!res.body) {
-        return anthropicError(502, "llm-relay: invalid Anthropic upstream envelope: empty stream", "upstream", {
-          ...retryAfterHeader(res.headers),
-        }, "invalid_upstream_envelope");
-      }
-      const preflight = await preflightResponseStream(res.body, "anthropic-messages");
-      if (!preflight.ok) {
-        return anthropicError(502, `llm-relay: invalid Anthropic upstream envelope: ${preflight.reason}`, "upstream", {
-          ...retryAfterHeader(res.headers),
-        }, "invalid_upstream_envelope");
-      }
-      return attachUpstreamMetadata(
-        new Response(preflight.body, { status: res.status, headers: res.headers }),
-        preflight.metadata,
-      );
-    }
+export interface FetchBackendArgs {
+  path: string;
+  method: string;
+  reqBuf: Buffer;
+  reqJson: unknown;
+  anthropicHeaders: Record<string, string>;
+  wantsStream: boolean;
+  /**
+   * The operator's configured destructive-tool set (`destructiveMatcher`). REQUIRED, not
+   * optional: it reaches the four dialect-rescue commit points, and an optional field here would
+   * let a caller silently disable the refusal — the failure mode that gap existed as.
+   */
+  isDestructive: (name: string) => boolean;
+  usage?: UsageAccumulator;
+  signal: AbortSignal;
+  onEgress?: OnEgress;
+}
 
-    let body: unknown;
-    try {
-      body = await res.clone().json();
-    } catch (cause) {
-      if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
-      return anthropicError(502, "llm-relay: invalid Anthropic upstream envelope: body is not valid JSON", "upstream", {
+async function fetchAnthropicBackend(
+  attempt: ResolvedAttempt,
+  args: FetchBackendArgs,
+  invokeFetch: typeof fetch,
+): Promise<Response> {
+  const target = attempt.target;
+  const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
+  if (args.reqBuf.length) init.body = args.reqBuf;
+  const native = await invokeFetch(target.base + args.path, init);
+  const nativeStreamed = nativeResponseIsStreamed(native, args.wantsStream);
+  const res = args.usage
+    ? observeUsage(native, "anthropic-messages", args.usage, { streamed: nativeStreamed })
+    : native;
+  // Preserve passthrough bytes, but do not preserve a successful status for a malformed
+  // Messages envelope. Inspecting a clone leaves the original buffered body byte-exact.
+  const messagesPath = args.path.split("?", 1)[0] === "/v1/messages";
+  if (!res.ok || !messagesPath) return res;
+  const streamed = args.wantsStream || (res.headers.get("content-type") ?? "").includes("text/event-stream");
+  if (streamed) {
+    if (!res.body) {
+      return anthropicError(502, "llm-relay: invalid Anthropic upstream envelope: empty stream", "upstream", {
         ...retryAfterHeader(res.headers),
       }, "invalid_upstream_envelope");
     }
-    const invalidReason = invalidEnvelopeReason(body, "anthropic-messages", false);
-    if (invalidReason) {
-      return anthropicError(502, `llm-relay: invalid Anthropic upstream envelope: ${invalidReason}`, "upstream", {
+    const preflight = await preflightResponseStream(res.body, "anthropic-messages");
+    if (!preflight.ok) {
+      return anthropicError(502, `llm-relay: invalid Anthropic upstream envelope: ${preflight.reason}`, "upstream", {
         ...retryAfterHeader(res.headers),
       }, "invalid_upstream_envelope");
     }
-    const metadata: UpstreamResponseMetadata = {};
-    captureReportedModel(metadata, body, "anthropic-messages", false);
-    return attachUpstreamMetadata(res, metadata);
+    return attachUpstreamMetadata(
+      new Response(preflight.body, { status: res.status, headers: res.headers }),
+      preflight.metadata,
+    );
   }
 
-  // kind === "openai"
+  let body: unknown;
+  try {
+    body = await res.clone().json();
+  } catch (cause) {
+    if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
+    return anthropicError(502, "llm-relay: invalid Anthropic upstream envelope: body is not valid JSON", "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
+  }
+  const invalidReason = invalidEnvelopeReason(body, "anthropic-messages", false);
+  if (invalidReason) {
+    return anthropicError(502, `llm-relay: invalid Anthropic upstream envelope: ${invalidReason}`, "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
+  }
+  const metadata: UpstreamResponseMetadata = {};
+  captureReportedModel(metadata, body, "anthropic-messages", false);
+  return attachUpstreamMetadata(res, metadata);
+}
+
+async function fetchOpenAiBackend(
+  attempt: ResolvedAttempt,
+  args: FetchBackendArgs,
+  invokeFetch: typeof fetch,
+): Promise<Response> {
+  const target = attempt.target;
   // Documents are transcoded to markdown BEFORE the request mapper, or refused: a `document`
   // block has no OpenAI representation, and the pre-mapper behaviour put its whole base64
   // payload into the prompt. The pre-pass walks the top level of each turn AND the content of
@@ -945,6 +960,27 @@ export async function fetchBackend(
 }
 
 /**
+ * Perform one upstream inference call against the resolved attempt.
+ *
+ * For an `anthropic`-kind target this forwards native Messages request bytes and parses native
+ * Messages response bytes. For an `openai`-kind target it transcodes documents, maps the request to
+ * Chat Completions (`openai-request.ts`), parses the completion and translates it back to Anthropic
+ * Messages (`openAiResponseToAnthropic`). In both directions the rest of the proxy (validate/repair)
+ * always sees Anthropic Messages.
+ */
+export async function fetchBackend(
+  attempt: ResolvedAttempt,
+  args: FetchBackendArgs,
+  fetchFn: typeof fetch = fetch,
+): Promise<Response> {
+  const invokeFetch = oneShotFetch(fetchFn, args.signal, args.onEgress);
+  if (attempt.target.kind === "anthropic") {
+    return fetchAnthropicBackend(attempt, args, invokeFetch);
+  }
+  return fetchOpenAiBackend(attempt, args, invokeFetch);
+}
+
+/**
  * Give a translated message's `tool_use` blocks ids the conversation has not already used.
  *
  * Lazy on purpose: a response with no `tool_use` block never walks the request's messages, so the
@@ -972,6 +1008,69 @@ function recoveredDialectOf(message: object): string | null {
     : null;
 }
 
+interface OpenAiTextDialectResult {
+  recoveredCalls: DialectToolCall[];
+  textParts: object[];
+}
+
+function recoverOpenAiTextDialect(
+  messageText: string,
+  schemas: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }> | undefined,
+  isDestructive: (name: string) => boolean,
+): OpenAiTextDialectResult {
+  const out = recoverToolCalls(messageText, schemas ?? new Map(), isDestructive);
+  if (out.status === "parsed") {
+    const textParts: object[] = [];
+    if (out.text.length > 0) textParts.push({ type: "text", text: out.text });
+    return { recoveredCalls: out.calls, textParts };
+  }
+  if (out.status === "refused-destructive") {
+    throw new DialectDestructiveError(out.dialect, out.refused);
+  }
+  if (out.status === "detected") {
+    throw new DialectUnparseableError(out.dialect);
+  }
+  return { recoveredCalls: [], textParts: [{ type: "text", text: messageText }] };
+}
+
+function convertOpenAiToolCallsToAnthropic(
+  toolCalls: Array<Record<string, unknown>>,
+): Array<{ type: "tool_use"; id: string; name: string; input: unknown }> {
+  const result: Array<{ type: "tool_use"; id: string; name: string; input: unknown }> = [];
+  for (const tc of toolCalls) {
+    const fn = (tc.function as Record<string, unknown> | undefined) ?? {};
+    let input: unknown;
+    try {
+      input = JSON.parse((fn.arguments as string) ?? "{}");
+    } catch {
+      input = fn.arguments ?? {};
+    }
+    result.push({
+      type: "tool_use",
+      id: (tc.id as string) ?? "tu",
+      name: (fn.name as string) ?? "",
+      input,
+    });
+  }
+  return result;
+}
+
+function mapOpenAiFinishToAnthropicStopReason(finish: string | undefined, hasToolCalls: boolean): string {
+  if (hasToolCalls) return "tool_use";
+  if (finish === "length") return "max_tokens";
+  if (finish === "stop") return "end_turn";
+  return finish ?? "end_turn";
+}
+
+function extractAnthropicUsageFromOpenAi(rawUsage: unknown): Record<string, unknown> | null {
+  if (!isRecord(rawUsage)) return null;
+  if (typeof rawUsage.prompt_tokens !== "number" && typeof rawUsage.completion_tokens !== "number") return null;
+  return {
+    ...openAiPromptUsageToAnthropic(rawUsage),
+    ...(typeof rawUsage.completion_tokens === "number" ? { output_tokens: rawUsage.completion_tokens } : {}),
+  };
+}
+
 /**
  * Map a non-streaming OpenAI chat completion into an Anthropic message.
  *
@@ -996,51 +1095,23 @@ export function openAiResponseToAnthropic(
 
   // Recover ONLY when the host parsed nothing. A host that populated `tool_calls` has already
   // spoken; second-guessing it here would be inference, not translation.
-  let recovered: DialectToolCall[] = [];
   if (toolCalls.length === 0 && messageText !== null && messageText.length > 0) {
-    const out = recoverToolCalls(messageText, schemas ?? new Map(), isDestructive);
-    if (out.status === "parsed") {
-      recovered = out.calls;
-      if (out.text.length > 0) content.push({ type: "text", text: out.text });
-    } else if (out.status === "refused-destructive") {
-      // The relay reconstructed a destructive call out of prose. Refuse it whole rather than
-      // commit it — "refused, never fabricated". Terminal, not retriable: see the error class.
-      throw new DialectDestructiveError(out.dialect, out.refused);
-    } else if (out.status === "detected") {
-      // Framing present, nothing parseable — a truncated or unmodelled envelope. Fail clean so
-      // failover reaches a host that parses, exactly as repair fails clean on an unrepairable
-      // call. Returning the fragment would hand the client a "final answer" that is really the
-      // tail of a broken tool call, which is the misdiagnosis this whole path exists to prevent.
-      throw new DialectUnparseableError(out.dialect);
-    } else {
-      content.push({ type: "text", text: messageText });
+    const { recoveredCalls, textParts } = recoverOpenAiTextDialect(messageText, schemas, isDestructive);
+    content.push(...textParts);
+    if (recoveredCalls.length > 0) {
+      toolCalls = recoveredCalls.map((c, i) => ({
+        id: `tu_recovered_${i}`,
+        function: { name: c.name, arguments: JSON.stringify(c.input) },
+      }));
     }
   } else if (messageText !== null && messageText.length > 0) {
     content.push({ type: "text", text: messageText });
   }
-  if (recovered.length > 0) {
-    toolCalls = recovered.map((c, i) => ({
-      id: `tu_recovered_${i}`,
-      function: { name: c.name, arguments: JSON.stringify(c.input) },
-    }));
-  }
-  for (const tc of toolCalls) {
-    const fn = (tc.function as Record<string, unknown> | undefined) ?? {};
-    let input: unknown;
-    try { input = JSON.parse((fn.arguments as string) ?? "{}"); } catch { input = fn.arguments ?? {}; }
-    content.push({ type: "tool_use", id: (tc.id as string) ?? "tu", name: (fn.name as string) ?? "", input });
-  }
-  const finish = choice.finish_reason as string | undefined;
-  const stopReason =
-    toolCalls.length > 0 ? "tool_use" : finish === "length" ? "max_tokens" : finish === "stop" ? "end_turn" : finish ?? "end_turn";
-  const rawUsage = isRecord(j.usage) ? j.usage : null;
-  const usage = rawUsage &&
-    (typeof rawUsage.prompt_tokens === "number" || typeof rawUsage.completion_tokens === "number")
-    ? {
-        ...openAiPromptUsageToAnthropic(rawUsage),
-        ...(typeof rawUsage.completion_tokens === "number" ? { output_tokens: rawUsage.completion_tokens } : {}),
-      }
-    : null;
+
+  content.push(...convertOpenAiToolCallsToAnthropic(toolCalls));
+  const stopReason = mapOpenAiFinishToAnthropicStopReason(choice.finish_reason as string | undefined, toolCalls.length > 0);
+  const usage = extractAnthropicUsageFromOpenAi(j.usage);
+
   return {
     id: (j.id as string) ?? "msg_translated",
     type: "message",
@@ -1162,64 +1233,70 @@ function nativeResponseIsStreamed(response: Response, wantsStream: boolean): boo
   return wantsStream;
 }
 
-/**
- * Turn an Anthropic Message response into the response envelope expected by an OpenAI client.
- *
- * This is deliberately separate from llm-bridge's request translation. Provider request bodies
- * and provider response bodies are different contracts, and treating a response as a request
- * loses tool calls, stop reasons and usage on the way back to the caller.
- */
-export function anthropicMessageToOpenAi(
-  body: Record<string, unknown>,
-  protocol: OpenAiFrontProtocol,
-  fallbackModel = "",
-): Record<string, unknown> {
-  const content = Array.isArray(body.content) ? body.content : [];
+interface ExtractedAnthropicBlocks {
+  text: string;
+  toolCalls: Array<Record<string, unknown>>;
+}
+
+function extractAnthropicMessageBlocks(content: unknown): ExtractedAnthropicBlocks {
+  const contentArray = Array.isArray(content) ? content : [];
   const textParts: string[] = [];
   const toolCalls: Array<Record<string, unknown>> = [];
 
-  for (const raw of content) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const block = raw as Record<string, unknown>;
-    if (block.type === "text" && typeof block.text === "string") {
-      textParts.push(block.text);
-    } else if (block.type === "tool_use") {
-      const input = block.input ?? {};
+  for (const raw of contentArray) {
+    if (!isRecord(raw)) continue;
+    if (raw.type === "text" && typeof raw.text === "string") {
+      textParts.push(raw.text);
+    } else if (raw.type === "tool_use") {
+      const input = raw.input ?? {};
       toolCalls.push({
-        id: typeof block.id === "string" ? block.id : `tool_call_${toolCalls.length}`,
+        id: typeof raw.id === "string" ? raw.id : `tool_call_${toolCalls.length}`,
         type: "function",
         function: {
-          name: typeof block.name === "string" ? block.name : "",
+          name: typeof raw.name === "string" ? raw.name : "",
           arguments: typeof input === "string" ? input : JSON.stringify(input),
         },
       });
     }
   }
 
-  const text = textParts.join("");
-  const model = typeof body.model === "string" && body.model ? body.model : fallbackModel;
-  const usage = openAiUsage(body.usage);
-  if (protocol === "chat") {
-    const message: Record<string, unknown> = {
-      role: "assistant",
-      content: text || null,
-    };
-    if (toolCalls.length > 0) message.tool_calls = toolCalls;
-    const out: Record<string, unknown> = {
-      id: typeof body.id === "string" ? body.id : "chatcmpl_relay",
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        message,
-        finish_reason: openAiFinishReason(body.stop_reason, toolCalls.length > 0),
-      }],
-    };
-    if (usage) out.usage = withOpenAiTotal(usage);
-    return out;
-  }
+  return { text: textParts.join(""), toolCalls };
+}
 
+function formatOpenAiChatCompletion(
+  body: Record<string, unknown>,
+  text: string,
+  toolCalls: Array<Record<string, unknown>>,
+  model: string,
+  usage: ReturnType<typeof openAiUsage>,
+): Record<string, unknown> {
+  const message: Record<string, unknown> = {
+    role: "assistant",
+    content: text || null,
+  };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+  const out: Record<string, unknown> = {
+    id: typeof body.id === "string" ? body.id : "chatcmpl_relay",
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: openAiFinishReason(body.stop_reason, toolCalls.length > 0),
+    }],
+  };
+  if (usage) out.usage = withOpenAiTotal(usage);
+  return out;
+}
+
+function formatOpenAiResponses(
+  body: Record<string, unknown>,
+  text: string,
+  toolCalls: Array<Record<string, unknown>>,
+  model: string,
+  usage: ReturnType<typeof openAiUsage>,
+): Record<string, unknown> {
   const output: Array<Record<string, unknown>> = [];
   if (text) {
     output.push({
@@ -1252,6 +1329,29 @@ export function anthropicMessageToOpenAi(
   };
   if (usage) out.usage = withOpenAiTotal(usage);
   return out;
+}
+
+/**
+ * Translate an Anthropic non-streaming message into an OpenAI response.
+ *
+ * `protocol` selects the outer envelope: Chat Completions (`chat.completion`) vs Responses
+ * (`response`). Used by the OpenAI front (`fetchOpenAiFront`) when an `anthropic`-kind target
+ * answers a Codex or OpenAI-native request: llm-bridge models only Chat Completions, and its IR
+ * loses tool calls, stop reasons and usage on the way back to the caller.
+ */
+export function anthropicMessageToOpenAi(
+  body: Record<string, unknown>,
+  protocol: OpenAiFrontProtocol,
+  fallbackModel = "",
+): Record<string, unknown> {
+  const { text, toolCalls } = extractAnthropicMessageBlocks(body.content);
+  const model = typeof body.model === "string" && body.model ? body.model : fallbackModel;
+  const usage = openAiUsage(body.usage);
+
+  if (protocol === "chat") {
+    return formatOpenAiChatCompletion(body, text, toolCalls, model, usage);
+  }
+  return formatOpenAiResponses(body, text, toolCalls, model, usage);
 }
 
 /**
@@ -1432,145 +1532,151 @@ function buildTargetHeaders(attempt: ResolvedAttempt): Record<string, string> {
  * That makes an Anthropic passthrough usable from Codex and OpenAI-native IDEs without changing
  * the existing Claude client path.
  */
-export async function fetchOpenAiFront(
+export interface FetchOpenAiFrontArgs {
+  reqJson: unknown;
+  wantsStream: boolean;
+  signal: AbortSignal;
+  protocol?: OpenAiFrontProtocol;
+  anthropicHeaders?: Record<string, string>;
+  /** See `fetchBackend`'s field of the same name: required so no caller can silently opt out. */
+  isDestructive: (name: string) => boolean;
+  processRecoveredChat?: RecoveredOpenAiChatProcessor;
+  usage?: UsageAccumulator;
+  onEgress?: OnEgress;
+}
+
+async function fetchDirectOpenAiChat(
   attempt: ResolvedAttempt,
-  args: {
-    reqJson: unknown;
-    wantsStream: boolean;
-    signal: AbortSignal;
-    protocol?: OpenAiFrontProtocol;
-    anthropicHeaders?: Record<string, string>;
-    /** See `fetchBackend`'s field of the same name: required so no caller can silently opt out. */
-    isDestructive: (name: string) => boolean;
-    processRecoveredChat?: RecoveredOpenAiChatProcessor;
-    usage?: UsageAccumulator;
-    onEgress?: OnEgress;
-  },
-  fetchFn: typeof fetch = fetch,
+  args: FetchOpenAiFrontArgs,
+  invokeFetch: typeof fetch,
 ): Promise<Response> {
-  const invokeFetch = oneShotFetch(fetchFn, args.signal, args.onEgress);
+  const target = attempt.target;
+  const base = (args.reqJson ?? {}) as Record<string, unknown>;
+  const schemas = toolSchemaMap(base);
+  const callerRequestedUsage = isRecord(base.stream_options) && base.stream_options.include_usage === true;
+  const relayAddedUsage = args.wantsStream && !callerRequestedUsage;
+  const body: Record<string, unknown> = { ...base, model: target.model, stream: args.wantsStream };
+  const originalBody = { ...body };
+  if (relayAddedUsage) {
+    body.stream_options = {
+      ...(isRecord(base.stream_options) ? base.stream_options : {}),
+      include_usage: true,
+    };
+  }
+  const post = (requestBody: Record<string, unknown>) => invokeFetch(target.base + "/chat/completions", {
+    method: "POST",
+    headers: buildTargetHeaders(attempt),
+    body: JSON.stringify(requestBody),
+    signal: args.signal,
+  });
+  let res = await post(body);
+  // Only a relay-added compatibility hint is safe to remove. A caller-provided option is
+  // their request, not relay policy.
+  if (!res.ok && relayAddedUsage && (res.status === 400 || res.status === 422)) {
+    await res.body?.cancel().catch(() => {});
+    res = await post(originalBody);
+  }
+  if (args.usage) {
+    const nativeStreamed = nativeResponseIsStreamed(res, args.wantsStream);
+    res = observeUsage(res, "openai-chat", args.usage, { streamed: nativeStreamed });
+  }
+  if (!res.ok) return res;
+  const streamed = args.wantsStream || (res.headers.get("content-type") ?? "").includes("text/event-stream");
+  if (streamed) {
+    if (!res.body) {
+      return openaiError(502, "llm-relay: invalid OpenAI upstream envelope: empty stream", "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+    }
+    const preflight = await preflightResponseStream(res.body, "openai-chat");
+    if (!preflight.ok) {
+      return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${preflight.reason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+    }
+    let response: Response | null = null;
+    let recovered = false;
+    const chatRefusalSignal = dialectRefusalSignal();
+    const responseBody = schemas.size > 0
+      ? recoverDialectInOpenAiChatStream(preflight.body, schemas, args.isDestructive, () => {
+          recovered = true;
+          response?.headers.set(TOOL_DIALECT_HEADER, "recovered");
+        }, args.processRecoveredChat, chatRefusalSignal)
+      : preflight.body;
+    response = new Response(
+      relayAddedUsage ? suppressRelayAddedOpenAiUsageFrames(responseBody) : responseBody,
+      { status: res.status, headers: res.headers },
+    );
+    if (recovered) response.headers.set(TOOL_DIALECT_HEADER, "recovered");
+    dialectRefusalSignals.set(response, chatRefusalSignal);
+    return attachUpstreamMetadata(response, preflight.metadata);
+  }
+
+  let responseBody: unknown;
+  try {
+    responseBody = await res.clone().json();
+  } catch (cause) {
+    if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
+    return openaiError(502, "llm-relay: invalid OpenAI upstream envelope: body is not valid JSON", "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+  }
+  const invalidReason = invalidEnvelopeReason(responseBody, "openai-chat", false);
+  if (invalidReason) {
+    return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${invalidReason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
+  }
+  let recovery;
+  try {
+    recovery = await inspectDialectInOpenAiChat(
+      responseBody as Record<string, unknown>,
+      schemas,
+      args.isDestructive,
+      args.processRecoveredChat,
+    );
+  } catch (error) {
+    return openaiError(
+      502,
+      `llm-relay: ${error instanceof Error ? error.message : String(error)}`,
+      "upstream",
+      "tool_call_recovery_failed",
+    );
+  }
+  if (recovery.status === "refused-destructive") {
+    // "local" keeps this out of the failover walk and off the deployment's failure budget: the
+    // envelope parsed fine, the relay refused to commit what it reconstructed. Config, not
+    // health — the same line the hard cap draws.
+    return openaiError(
+      502,
+      `llm-relay: refused a ${recovery.dialect} tool call recovered from text because it names a destructive tool: ${describeRefused(recovery.refused)}`,
+      "local",
+      DIALECT_REFUSED_DESTRUCTIVE_CODE,
+      { [TOOL_DIALECT_HEADER]: "refused-destructive" },
+    );
+  }
+  if (recovery.status === "detected") {
+    return openaiError(
+      502,
+      `llm-relay: backend returned an unparseable ${recovery.dialect} tool-call envelope as text`,
+      "upstream",
+      "tool_dialect_unparseable",
+    );
+  }
+  const metadata: UpstreamResponseMetadata = {};
+  const finalBody = recovery.status === "parsed" ? recovery.body : responseBody;
+  captureReportedModel(metadata, finalBody, "openai-chat", false);
+  if (recovery.status === "parsed") {
+    const headers = new Headers(res.headers);
+    headers.set(TOOL_DIALECT_HEADER, "recovered");
+    return attachUpstreamMetadata(new Response(JSON.stringify(finalBody), {
+      status: res.status,
+      headers,
+    }), metadata);
+  }
+  return attachUpstreamMetadata(res, metadata);
+}
+
+async function fetchTranslatedOpenAiFront(
+  attempt: ResolvedAttempt,
+  args: FetchOpenAiFrontArgs,
+  fetchFn: typeof fetch,
+): Promise<Response> {
   const target = attempt.target;
   const protocol = args.protocol ?? "chat";
   const base = (args.reqJson ?? {}) as Record<string, unknown>;
-  // Preserve the existing direct path for the protocol/backend pair that already speaks the
-  // same wire format. It keeps provider-specific OpenAI fields byte-for-byte intact.
-  if (target.kind === "openai" && protocol === "chat") {
-    const schemas = toolSchemaMap(base);
-    const callerRequestedUsage = isRecord(base.stream_options) && base.stream_options.include_usage === true;
-    const relayAddedUsage = args.wantsStream && !callerRequestedUsage;
-    const body: Record<string, unknown> = { ...base, model: target.model, stream: args.wantsStream };
-    const originalBody = { ...body };
-    if (relayAddedUsage) {
-      body.stream_options = {
-        ...(isRecord(base.stream_options) ? base.stream_options : {}),
-        include_usage: true,
-      };
-    }
-    const post = (requestBody: Record<string, unknown>) => invokeFetch(target.base + "/chat/completions", {
-      method: "POST",
-      headers: buildTargetHeaders(attempt),
-      body: JSON.stringify(requestBody),
-      signal: args.signal,
-    });
-    let res = await post(body);
-    // Only a relay-added compatibility hint is safe to remove. A caller-provided option is
-    // their request, not relay policy.
-    if (!res.ok && relayAddedUsage && (res.status === 400 || res.status === 422)) {
-      await res.body?.cancel().catch(() => {});
-      res = await post(originalBody);
-    }
-    if (args.usage) {
-      const nativeStreamed = nativeResponseIsStreamed(res, args.wantsStream);
-      res = observeUsage(res, "openai-chat", args.usage, { streamed: nativeStreamed });
-    }
-    if (!res.ok) return res;
-    const streamed = args.wantsStream || (res.headers.get("content-type") ?? "").includes("text/event-stream");
-    if (streamed) {
-      if (!res.body) {
-        return openaiError(502, "llm-relay: invalid OpenAI upstream envelope: empty stream", "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
-      }
-      const preflight = await preflightResponseStream(res.body, "openai-chat");
-      if (!preflight.ok) {
-        return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${preflight.reason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
-      }
-      let response: Response | null = null;
-      let recovered = false;
-      const chatRefusalSignal = dialectRefusalSignal();
-      const responseBody = schemas.size > 0
-        ? recoverDialectInOpenAiChatStream(preflight.body, schemas, args.isDestructive, () => {
-            recovered = true;
-            response?.headers.set(TOOL_DIALECT_HEADER, "recovered");
-          }, args.processRecoveredChat, chatRefusalSignal)
-        : preflight.body;
-      response = new Response(
-        relayAddedUsage ? suppressRelayAddedOpenAiUsageFrames(responseBody) : responseBody,
-        { status: res.status, headers: res.headers },
-      );
-      if (recovered) response.headers.set(TOOL_DIALECT_HEADER, "recovered");
-      dialectRefusalSignals.set(response, chatRefusalSignal);
-      return attachUpstreamMetadata(response, preflight.metadata);
-    }
-
-    let responseBody: unknown;
-    try {
-      responseBody = await res.clone().json();
-    } catch (cause) {
-      if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
-      return openaiError(502, "llm-relay: invalid OpenAI upstream envelope: body is not valid JSON", "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
-    }
-    const invalidReason = invalidEnvelopeReason(responseBody, "openai-chat", false);
-    if (invalidReason) {
-      return openaiError(502, `llm-relay: invalid OpenAI upstream envelope: ${invalidReason}`, "upstream", "invalid_upstream_envelope", retryAfterHeader(res.headers));
-    }
-    let recovery;
-    try {
-      recovery = await inspectDialectInOpenAiChat(
-        responseBody as Record<string, unknown>,
-        schemas,
-        args.isDestructive,
-        args.processRecoveredChat,
-      );
-    } catch (error) {
-      return openaiError(
-        502,
-        `llm-relay: ${error instanceof Error ? error.message : String(error)}`,
-        "upstream",
-        "tool_call_recovery_failed",
-      );
-    }
-    if (recovery.status === "refused-destructive") {
-      // "local" keeps this out of the failover walk and off the deployment's failure budget: the
-      // envelope parsed fine, the relay refused to commit what it reconstructed. Config, not
-      // health — the same line the hard cap draws.
-      return openaiError(
-        502,
-        `llm-relay: refused a ${recovery.dialect} tool call recovered from text because it names a destructive tool: ${describeRefused(recovery.refused)}`,
-        "local",
-        DIALECT_REFUSED_DESTRUCTIVE_CODE,
-        { [TOOL_DIALECT_HEADER]: "refused-destructive" },
-      );
-    }
-    if (recovery.status === "detected") {
-      return openaiError(
-        502,
-        `llm-relay: backend returned an unparseable ${recovery.dialect} tool-call envelope as text`,
-        "upstream",
-        "tool_dialect_unparseable",
-      );
-    }
-    const metadata: UpstreamResponseMetadata = {};
-    const finalBody = recovery.status === "parsed" ? recovery.body : responseBody;
-    captureReportedModel(metadata, finalBody, "openai-chat", false);
-    if (recovery.status === "parsed") {
-      const headers = new Headers(res.headers);
-      headers.set(TOOL_DIALECT_HEADER, "recovered");
-      return attachUpstreamMetadata(new Response(JSON.stringify(finalBody), {
-        status: res.status,
-        headers,
-      }), metadata);
-    }
-    return attachUpstreamMetadata(res, metadata);
-  }
 
   let anthropicBody: Record<string, unknown>;
   try {
@@ -1731,4 +1837,27 @@ export async function fetchOpenAiFront(
   } catch (e) {
     return openaiError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", "relay_mapper_defect");
   }
+}
+
+/**
+ * OpenAI-compatible FRONT: an OpenAI Chat Completions or Responses request comes in, its
+ * `model` has already been resolved to a provider target by namespace/tier routing.
+ *
+ * The common case remains a byte-transparent OpenAI→OpenAI Chat Completions proxy. The other
+ * combinations use the same Anthropic-shaped internal seam as the Messages front:
+ * OpenAI request → Anthropic request → resolved backend → Anthropic response → OpenAI response.
+ * That makes an Anthropic passthrough usable from Codex and OpenAI-native IDEs without changing
+ * the existing Claude client path.
+ */
+export async function fetchOpenAiFront(
+  attempt: ResolvedAttempt,
+  args: FetchOpenAiFrontArgs,
+  fetchFn: typeof fetch = fetch,
+): Promise<Response> {
+  const protocol = args.protocol ?? "chat";
+  if (attempt.target.kind === "openai" && protocol === "chat") {
+    const invokeFetch = oneShotFetch(fetchFn, args.signal, args.onEgress);
+    return fetchDirectOpenAiChat(attempt, args, invokeFetch);
+  }
+  return fetchTranslatedOpenAiFront(attempt, args, fetchFn);
 }

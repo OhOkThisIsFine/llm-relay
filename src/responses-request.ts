@@ -332,6 +332,76 @@ function mapToolChoice(choice: unknown): Rec | undefined {
   return undefined;
 }
 
+interface InputCollector {
+  push: (next: "user" | "assistant", blocks: Rec[], first?: boolean) => void;
+  addSystemText: (text: string) => void;
+}
+
+function processResponsesInputItem(raw: unknown, collector: InputCollector): void {
+  if (!isRecord(raw)) throw new RequestMappingError("input item is not an object");
+  const type = typeof raw.type === "string" ? raw.type : undefined;
+  if (type === "function_call") {
+    collector.push("assistant", [toolUseBlock(raw)]);
+    return;
+  }
+  if (type === "function_call_output") {
+    collector.push("user", [toolResultBlock(raw)], true);
+    return;
+  }
+  // Dropped, and deliberately WITHOUT flushing: a Codex assistant turn is often
+  // message → reasoning → function_call, and flushing here would split it in two.
+  if (type === "reasoning") return;
+  if (type !== undefined && type !== "message") {
+    throw new RequestMappingError(`unsupported Responses input item ${describeType(raw.type)}`);
+  }
+  const itemRole = typeof raw.role === "string" ? raw.role : undefined;
+  if (itemRole === undefined) {
+    // Two different malformations, and the message must name the one the caller actually
+    // sent: a `message` item that forgot its role, or an item with no type at all.
+    throw new RequestMappingError(
+      type === "message" ? "message item without a role" : "input item has neither a type nor a role",
+    );
+  }
+  if (itemRole === "system" || itemRole === "developer") {
+    const text = systemTextOf(raw.content);
+    if (text.length > 0) collector.addSystemText(text);
+    return;
+  }
+  if (itemRole !== "user" && itemRole !== "assistant") {
+    throw new RequestMappingError(`unsupported Responses input role ${describeType(raw.role)}`);
+  }
+  collector.push(
+    itemRole,
+    contentBlocks(raw.content, {
+      documents: itemRole === "user",
+      context: itemRole === "user" ? "a user message" : "an assistant message",
+    }),
+  );
+}
+
+function mapResponsesOptions(body: Rec, out: Rec, systemParts: string[]): void {
+  // The caller's own id, untouched: `fetchOpenAiFront` replaces it with the resolved deployment.
+  if (typeof body.model === "string" && body.model.length > 0) out.model = body.model;
+  if (systemParts.length > 0) out.system = systemParts.join("\n");
+  const tools = mapTools(body.tools);
+  if (tools) {
+    out.tools = tools;
+    // `tool_choice` without `tools` is rejected by Anthropic and means nothing anyway.
+    const toolChoice = mapToolChoice(body.tool_choice);
+    if (toolChoice) {
+      // Anthropic spells the parallel-call switch on tool_choice, and only where it can apply —
+      // `{type:"none"}` calls no tool, so the flag there would be a field the API rejects.
+      if (body.parallel_tool_calls === false && toolChoice.type !== "none") {
+        toolChoice.disable_parallel_tool_use = true;
+      }
+      out.tool_choice = toolChoice;
+    }
+  }
+  if (typeof body.temperature === "number") out.temperature = body.temperature;
+  if (typeof body.top_p === "number") out.top_p = body.top_p;
+  if (typeof body.stream === "boolean") out.stream = body.stream;
+}
+
 /**
  * Translate one OpenAI Responses request body into an Anthropic Messages request body.
  *
@@ -389,46 +459,12 @@ export function openaiResponsesRequestToAnthropic(reqJson: unknown): Record<stri
   if (typeof input === "string") {
     push("user", contentBlocks(input, { documents: true, context: "a user message" }));
   } else if (Array.isArray(input)) {
+    const collector: InputCollector = {
+      push,
+      addSystemText: (text) => systemParts.push(text),
+    };
     for (const raw of input) {
-      if (!isRecord(raw)) throw new RequestMappingError("input item is not an object");
-      const type = typeof raw.type === "string" ? raw.type : undefined;
-      if (type === "function_call") {
-        push("assistant", [toolUseBlock(raw)]);
-        continue;
-      }
-      if (type === "function_call_output") {
-        push("user", [toolResultBlock(raw)], true);
-        continue;
-      }
-      // Dropped, and deliberately WITHOUT flushing: a Codex assistant turn is often
-      // message → reasoning → function_call, and flushing here would split it in two.
-      if (type === "reasoning") continue;
-      if (type !== undefined && type !== "message") {
-        throw new RequestMappingError(`unsupported Responses input item ${describeType(raw.type)}`);
-      }
-      const itemRole = typeof raw.role === "string" ? raw.role : undefined;
-      if (itemRole === undefined) {
-        // Two different malformations, and the message must name the one the caller actually
-        // sent: a `message` item that forgot its role, or an item with no type at all.
-        throw new RequestMappingError(
-          type === "message" ? "message item without a role" : "input item has neither a type nor a role",
-        );
-      }
-      if (itemRole === "system" || itemRole === "developer") {
-        const text = systemTextOf(raw.content);
-        if (text.length > 0) systemParts.push(text);
-        continue;
-      }
-      if (itemRole !== "user" && itemRole !== "assistant") {
-        throw new RequestMappingError(`unsupported Responses input role ${describeType(raw.role)}`);
-      }
-      push(
-        itemRole,
-        contentBlocks(raw.content, {
-          documents: itemRole === "user",
-          context: itemRole === "user" ? "a user message" : "an assistant message",
-        }),
-      );
+      processResponsesInputItem(raw, collector);
     }
   } else if (input !== undefined && input !== null) {
     throw new RequestMappingError("input must be a string or a list of items");
@@ -441,25 +477,6 @@ export function openaiResponsesRequestToAnthropic(reqJson: unknown): Record<stri
     max_tokens: typeof body.max_output_tokens === "number" ? body.max_output_tokens : 1024,
     messages,
   };
-  // The caller's own id, untouched: `fetchOpenAiFront` replaces it with the resolved deployment.
-  if (typeof body.model === "string" && body.model.length > 0) out.model = body.model;
-  if (systemParts.length > 0) out.system = systemParts.join("\n");
-  const tools = mapTools(body.tools);
-  if (tools) {
-    out.tools = tools;
-    // `tool_choice` without `tools` is rejected by Anthropic and means nothing anyway.
-    const toolChoice = mapToolChoice(body.tool_choice);
-    if (toolChoice) {
-      // Anthropic spells the parallel-call switch on tool_choice, and only where it can apply —
-      // `{type:"none"}` calls no tool, so the flag there would be a field the API rejects.
-      if (body.parallel_tool_calls === false && toolChoice.type !== "none") {
-        toolChoice.disable_parallel_tool_use = true;
-      }
-      out.tool_choice = toolChoice;
-    }
-  }
-  if (typeof body.temperature === "number") out.temperature = body.temperature;
-  if (typeof body.top_p === "number") out.top_p = body.top_p;
-  if (typeof body.stream === "boolean") out.stream = body.stream;
+  mapResponsesOptions(body, out, systemParts);
   return out;
 }

@@ -1,7 +1,7 @@
 import { relayStatePath } from "./state-paths.js";
 import type { CostClass } from "./metadata.js";
 import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { hasExactKeys } from "./json-shape.js";
+import { hasExactKeys, isRecord } from "./json-shape.js";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
@@ -332,12 +332,12 @@ function findMessage(v: unknown, depth = 0): string | null {
     }
     return null;
   }
-  if (v && typeof v === "object") {
-    const obj = v as Record<string, unknown>;
+  if (isRecord(v)) {
     for (const field of ["message", "detail", "error", "title"]) {
-      if (typeof obj[field] === "string") return obj[field] as string;
-      if (obj[field] && typeof obj[field] === "object") {
-        const found = findMessage(obj[field], depth + 1);
+      const val = v[field];
+      if (typeof val === "string") return val;
+      if (isRecord(val) || Array.isArray(val)) {
+        const found = findMessage(val, depth + 1);
         if (found) return found;
       }
     }
@@ -640,81 +640,75 @@ function signatureParts(signature: string): { provider: string; model: string | 
 }
 
 function validTemplate(value: unknown): value is ScopeTemplate {
-  if (!value || typeof value !== "object") return false;
-  const scope = value as Record<string, unknown>;
-  switch (scope.kind) {
+  if (!isRecord(value)) return false;
+  switch (value.kind) {
     case "attempt":
     case "deployment":
     case "credential":
     case "provider":
     case "model":
-      return hasExactKeys(scope, ["kind"]);
+      return hasExactKeys(value, ["kind"]);
     case "group":
-      return hasExactKeys(scope, ["kind", "members", "credential"])
-        && Array.isArray(scope.members) && scope.members.every((member) => typeof member === "string" && member.length > 0)
-        && (scope.credential === "attempt" || scope.credential === "all");
+      return hasExactKeys(value, ["kind", "members", "credential"])
+        && Array.isArray(value.members) && value.members.every((member) => typeof member === "string" && member.length > 0)
+        && (value.credential === "attempt" || value.credential === "all");
     default:
       return false;
   }
 }
 
 function validV1Template(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const scope = value as Record<string, unknown>;
-  switch (scope.kind) {
+  if (!isRecord(value)) return false;
+  switch (value.kind) {
     case "deployment":
     case "provider":
     case "model":
-      return hasExactKeys(scope, ["kind"]);
+      return hasExactKeys(value, ["kind"]);
     case "group":
-      return hasExactKeys(scope, ["kind", "members"])
-        && Array.isArray(scope.members) && scope.members.every((member) => typeof member === "string" && member.length > 0);
+      return hasExactKeys(value, ["kind", "members"])
+        && Array.isArray(value.members) && value.members.every((member) => typeof member === "string" && member.length > 0);
     default:
       return false;
   }
 }
 
 function validInterpretation(value: unknown): value is Interpretation {
-  if (!value || typeof value !== "object") return false;
-  const interpretation = value as Record<string, unknown>;
-  return FACT_KINDS.includes(interpretation.class as FactKind)
-    && validTemplate(interpretation.scope)
-    && (interpretation.source === "seed" || interpretation.source === "researched")
-    && (interpretation.acceptedAt === undefined || Number.isFinite(interpretation.acceptedAt));
+  if (!isRecord(value)) return false;
+  return FACT_KINDS.includes(value.class as FactKind)
+    && validTemplate(value.scope)
+    && (value.source === "seed" || value.source === "researched")
+    && (value.acceptedAt === undefined || Number.isFinite(value.acceptedAt));
 }
 
 function validV1Interpretation(value: unknown): value is Interpretation {
-  if (!value || typeof value !== "object") return false;
-  const interpretation = value as Record<string, unknown>;
-  return FACT_KINDS.includes(interpretation.class as FactKind)
-    && validV1Template(interpretation.scope)
-    && (interpretation.source === "seed" || interpretation.source === "researched")
-    && (interpretation.acceptedAt === undefined || Number.isFinite(interpretation.acceptedAt));
+  if (!isRecord(value)) return false;
+  return FACT_KINDS.includes(value.class as FactKind)
+    && validV1Template(value.scope)
+    && (value.source === "seed" || value.source === "researched")
+    && (value.acceptedAt === undefined || Number.isFinite(value.acceptedAt));
 }
 
 function validProposal(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const proposal = value as Record<string, unknown>;
-  return FACT_KINDS.includes(proposal.class as FactKind)
-    && validTemplate(proposal.scope)
-    && typeof proposal.rationale === "string"
-    && Number.isFinite(proposal.at);
+  if (!isRecord(value)) return false;
+  return FACT_KINDS.includes(value.class as FactKind)
+    && validTemplate(value.scope)
+    && typeof value.rationale === "string"
+    && Number.isFinite(value.at);
 }
 
 function validIgnored(value: unknown): value is { at: number } {
-  return !!value && typeof value === "object" && Number.isFinite((value as { at?: unknown }).at);
+  return isRecord(value) && Number.isFinite(value.at);
 }
 
 function validUnknown(value: unknown): value is UnknownRefusal {
-  if (!value || typeof value !== "object") return false;
-  const unknown = value as Record<string, unknown>;
-  const parts = typeof unknown.provider === "string" && (typeof unknown.model === "string" || unknown.model === null)
-    ? signatureParts(`${unknown.provider}|${unknown.model ?? "-"}|${unknown.status}|${unknown.normalized as string}`) : null;
-  return typeof unknown.provider === "string" && unknown.provider.length > 0
-    && (typeof unknown.model === "string" || unknown.model === null)
-    && Number.isInteger(unknown.status) && typeof unknown.normalized === "string" && typeof unknown.sample === "string"
-    && Number.isFinite(unknown.count) && Number.isFinite(unknown.firstSeen) && Number.isFinite(unknown.lastSeen)
-    && (unknown.proposed === undefined || validProposal(unknown.proposed))
+  if (!isRecord(value)) return false;
+  const parts = typeof value.provider === "string" && (typeof value.model === "string" || value.model === null)
+    ? signatureParts(`${value.provider}|${value.model ?? "-"}|${value.status}|${value.normalized as string}`) : null;
+  return typeof value.provider === "string" && value.provider.length > 0
+    && (typeof value.model === "string" || value.model === null)
+    && Number.isInteger(value.status) && typeof value.normalized === "string" && typeof value.sample === "string"
+    && Number.isFinite(value.count) && Number.isFinite(value.firstSeen) && Number.isFinite(value.lastSeen)
+    && (value.proposed === undefined || validProposal(value.proposed))
     && parts !== null;
 }
 
@@ -728,15 +722,14 @@ function unknownMatchesSignature(signature: string, value: UnknownRefusal): bool
 }
 
 function validV1Unknown(value: unknown): value is UnknownRefusal {
-  if (!validUnknown({ ...(value as object), proposed: undefined })) return false;
-  const proposed = (value as { proposed?: unknown }).proposed;
+  if (!isRecord(value) || !validUnknown({ ...value, proposed: undefined })) return false;
+  const proposed = value.proposed;
   if (proposed === undefined) return true;
-  if (!proposed || typeof proposed !== "object") return false;
-  const candidate = proposed as Record<string, unknown>;
-  return FACT_KINDS.includes(candidate.class as FactKind)
-    && validV1Template(candidate.scope)
-    && typeof candidate.rationale === "string"
-    && Number.isFinite(candidate.at);
+  if (!isRecord(proposed)) return false;
+  return FACT_KINDS.includes(proposed.class as FactKind)
+    && validV1Template(proposed.scope)
+    && typeof proposed.rationale === "string"
+    && Number.isFinite(proposed.at);
 }
 
 function asPending(signature: string, interpretation: Interpretation): UnknownRefusal | null {
@@ -760,7 +753,7 @@ function migrateV1(parsed: Record<string, unknown>): InterpretationStore {
   const unknown: Record<string, UnknownRefusal> = {};
   const ignored: Record<string, { at: number }> = {};
   const rawUnknown = parsed.unknown;
-  if (rawUnknown && typeof rawUnknown === "object") {
+  if (isRecord(rawUnknown)) {
     for (const [signature, entry] of Object.entries(rawUnknown)) {
       if (!validV1Unknown(entry) || !unknownMatchesSignature(signature, entry)) continue;
       const migrated = { ...entry };
@@ -777,7 +770,7 @@ function migrateV1(parsed: Record<string, unknown>): InterpretationStore {
     }
   }
   const rawConfirmed = parsed.confirmed;
-  if (rawConfirmed && typeof rawConfirmed === "object") {
+  if (isRecord(rawConfirmed)) {
     for (const [signature, entry] of Object.entries(rawConfirmed)) {
       if (!signatureParts(signature) || !validV1Interpretation(entry)) continue;
       if (entry.scope.kind === "provider") {
@@ -793,7 +786,7 @@ function migrateV1(parsed: Record<string, unknown>): InterpretationStore {
     }
   }
   const rawIgnored = parsed.ignored;
-  if (rawIgnored && typeof rawIgnored === "object") {
+  if (isRecord(rawIgnored)) {
     for (const [signature, entry] of Object.entries(rawIgnored)) {
       if (signatureParts(signature) && validIgnored(entry)) ignored[signature] = entry;
     }
@@ -915,24 +908,24 @@ function mergeUnknownPair(incoming: UnknownRefusal, existing: UnknownRefusal | u
 function readStoreFile(normalizedPath: string): InterpretationStore {
   try {
     const parsed: unknown = JSON.parse(readFileSync(normalizedPath, "utf8"));
-    if (!parsed || typeof parsed !== "object") return emptyStore();
-    const raw = parsed as Record<string, unknown>;
+    if (!isRecord(parsed)) return emptyStore();
+    const raw = parsed;
     if (raw.version === 1) return migrateSignatures(migrateV1(raw));
     if (raw.version !== 2) return emptyStore();
     const confirmed: Record<string, Interpretation> = {};
     const unknown: Record<string, UnknownRefusal> = {};
     const ignored: Record<string, { at: number }> = {};
-    if (raw.confirmed && typeof raw.confirmed === "object") {
+    if (isRecord(raw.confirmed)) {
       for (const [signature, entry] of Object.entries(raw.confirmed)) {
         if (signatureParts(signature) && validInterpretation(entry)) confirmed[signature] = entry;
       }
     }
-    if (raw.unknown && typeof raw.unknown === "object") {
+    if (isRecord(raw.unknown)) {
       for (const [signature, entry] of Object.entries(raw.unknown)) {
         if (validUnknown(entry) && unknownMatchesSignature(signature, entry)) unknown[signature] = entry;
       }
     }
-    if (raw.ignored && typeof raw.ignored === "object") {
+    if (isRecord(raw.ignored)) {
       for (const [signature, entry] of Object.entries(raw.ignored)) {
         if (signatureParts(signature) && validIgnored(entry)) ignored[signature] = entry;
       }

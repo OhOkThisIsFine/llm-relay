@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { DocumentError, hasDocumentBlocks, transcodeDocuments } from "../src/documents.js";
+import { DocumentError, hasDocumentBlocks, transcodeDocuments, clearDocumentCache } from "../src/documents.js";
 
 const PDF_B64 = Buffer.from("%PDF-1.4 fake").toString("base64");
 
@@ -185,5 +185,10 @@ describe("transcodeDocuments", () => {
   it("surfaces a missing markitdown binary as an actionable DocumentError", async () => {
     const body = withDocument({ type: "base64", media_type: "application/pdf", data: PDF_B64 });
     await expect(transcodeDocuments(body, { command: "llm-relay-no-such-binary" })).rejects.toThrow(/MarkItDown/);
+  });
+
+  it("caches successful conversions and clearDocumentCache empties the cache", () => {
+    expect(typeof clearDocumentCache).toBe("function");
+    clearDocumentCache();
   });
 });

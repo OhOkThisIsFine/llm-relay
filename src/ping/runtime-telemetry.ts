@@ -1,8 +1,8 @@
 import { relayStatePath } from "../state-paths.js";
-import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { WriteBehindTimer } from "../write-behind.js";
+import { atomicWriteJsonSync, safeReadJsonSync } from "../storage/json-store.js";
 
 export const MAX_RECENT_CALLS = 50;
 export const DEFAULT_MIN_CALLS_FOR_SCORE = 5;
@@ -117,16 +117,13 @@ function normalizeTelemetry(value: unknown): TelemetryData | null {
 export function loadRuntimeTelemetry(opts: { path?: string; reload?: boolean } = {}): TelemetryData {
   const target = opts.path ?? getRuntimeTelemetryPath();
   if (!opts.reload && _telemetry && _telemetryPath === target) return _telemetry;
-  try {
-    const raw = readFileSync(target, "utf8");
-    const normalized = normalizeTelemetry(JSON.parse(raw));
-    if (normalized) {
-      _telemetry = normalized;
-      _telemetryPath = target;
-      return normalized;
-    }
-  } catch {
-    // Unreadable/corrupt telemetry is not a request failure — fall through to a fresh store.
+
+  const raw = safeReadJsonSync(target);
+  const normalized = normalizeTelemetry(raw);
+  if (normalized) {
+    _telemetry = normalized;
+    _telemetryPath = target;
+    return normalized;
   }
 
   _telemetry = { version: 2, models: {} };
@@ -138,22 +135,7 @@ export function flushRuntimeTelemetry(opts: { path?: string; telemetry?: Telemet
   const target = opts.path ?? _telemetryPath ?? getRuntimeTelemetryPath();
   const data = opts.telemetry ?? _telemetry ?? { version: 2, models: {} };
   if (!opts.path) _writeBehind.clear();
-
-  let tmpPath: string | null = null;
-  try {
-    mkdirSync(dirname(target), { recursive: true });
-    tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf8");
-    renameSync(tmpPath, target);
-    tmpPath = null;
-  } catch {
-    return;
-  }
-  finally {
-    if (tmpPath !== null) {
-      try { unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
-    }
-  }
+  atomicWriteJsonSync(target, data, { space: 2 });
 }
 
 function scheduleRuntimeTelemetryFlush(): void {

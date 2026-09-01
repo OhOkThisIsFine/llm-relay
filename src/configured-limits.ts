@@ -14,40 +14,23 @@
  * lane, a CLI renderer) can import it WITHOUT dragging config internals: the `Config` edge below
  * is type-only and erased at runtime.
  */
-import type { Config } from "./config.js";
+import type { Config } from "./config-types.js";
 import type { QuotaAxis, QuotaPeriod } from "./quota-observation.js";
+import {
+  CONFIGURED_LIMIT_AXES,
+  type ConfiguredLimitAxis,
+  type HardRateLimits,
+  type ProviderRateLimits,
+  type ProviderLimitsConfig,
+} from "./config-types.js";
 
-/** The closed set of axes an operator may assert: requests/tokens per minute/day. Nothing else. */
-export const CONFIGURED_LIMIT_AXES = ["rpm", "rpd", "tpm", "tpd"] as const;
-
-export type ConfiguredLimitAxis = (typeof CONFIGURED_LIMIT_AXES)[number];
-
-/** Flat hard-cap axes, as declared inside a `hard` block. */
-export type HardRateLimits = Partial<Record<ConfiguredLimitAxis, number>>;
-
-/** One rate-limit figure per axis; an omitted axis is simply undeclared, never guessed. */
-export interface ProviderRateLimits {
-  rpm?: number;
-  rpd?: number;
-  tpm?: number;
-  tpd?: number;
-  /**
-   * Operator-set REFUSAL ceilings (G2). Same closed axes; see `src/hard-cap.ts` for what acts on
-   * them. Declared beside the soft figures so one block states both what the account allows and
-   * what this relay may spend.
-   */
-  hard?: HardRateLimits;
-}
-
-/**
- * A `limits` block: the flat axes plus optional per-deployment overrides keyed by BACKEND model
- * id (arbitrary ids on purpose — a catalog lookup here would make one provider's typo another
- * provider's problem, and free rosters churn). Per-axis resolution means a model entry naming
- * only `rpm` inherits `rpd`/`tpm`/`tpd` from above.
- */
-export interface ProviderLimitsConfig extends ProviderRateLimits {
-  models?: Record<string, ProviderRateLimits>;
-}
+export {
+  CONFIGURED_LIMIT_AXES,
+  type ConfiguredLimitAxis,
+  type HardRateLimits,
+  type ProviderRateLimits,
+  type ProviderLimitsConfig,
+};
 
 /**
  * Validate one flat axis set. Every figure is a POSITIVE SAFE INTEGER: a ceiling of 0 or a float
@@ -183,7 +166,7 @@ export type ConfiguredLimitSource =
   | "provider-model"
   | "credential-model";
 
-/** Where one hard-cap axis' figure was found; same ladder as `ConfiguredLimitSource`. */
+/** Where one hard-cap axis' figure was found; alias for ConfiguredLimitSource. */
 export type HardCapSource = ConfiguredLimitSource;
 
 /** What `resolveConfiguredLimits` returns: figures plus WHICH declaration supplied each. */
@@ -200,7 +183,7 @@ export interface ConfiguredLimits {
    */
   hard?: HardRateLimits;
   /** Which declaration level supplied each hard axis — provenance beside every ceiling. */
-  hardSource?: Partial<Record<ConfiguredLimitAxis, HardCapSource>>;
+  hardSource?: Partial<Record<ConfiguredLimitAxis, ConfiguredLimitSource>>;
   /** Uniform by construction — every figure here came out of config, never from a probe. */
   basis: "configured";
   source: Partial<Record<ConfiguredLimitAxis, ConfiguredLimitSource>>;

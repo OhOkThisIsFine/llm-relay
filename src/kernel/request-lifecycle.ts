@@ -40,7 +40,6 @@ export class AttemptLifecycle implements AttemptLifecyclePort {
   readonly #owner = Object.freeze({});
   readonly #generation: number;
   #issued = 0;
-  #completed = 0;
   #closed = false;
 
   constructor(generation = 1) {
@@ -100,7 +99,6 @@ export class AttemptLifecycle implements AttemptLifecyclePort {
 
     // This is the only mutation point after every rejection check has passed.
     record.completed = true;
-    this.#completed++;
     return {
       ok: true,
       value: Object.freeze({ id: record.id, target: record.target, outcome }),

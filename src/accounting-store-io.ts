@@ -17,19 +17,27 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 import { hasExactKeys as isExactRecord, isRecord } from "./json-shape.js";
 
 /**
- * A deliberately small durability primitive for accounting's multi-file read model.
+ * MODULE CHARTER: Durable Snapshot Journal & File IO Subsystem (accounting-store-io.ts)
  *
- * It writes a full snapshot journal before replacing any target.  A later process can
- * therefore replay the journal after any target-write prefix without applying a delta
- * twice.  This module knows nothing about accounting's schemas; callers supply already
- * materialised snapshots and an explicit target allow-list. Only flat, portable direct
- * children of the root are supported for targets and the journal.
+ * 1. Domain Boundary & Responsibilities:
+ *    - Durability and transaction primitive for multi-file snapshot partition writes (day shards, lifetime rollups).
+ *    - Decoupled from higher-level accounting domain schemas: accepts opaque materialised snapshots and target allow-lists.
+ *    - Enforces directory containment for all target files and journal storage under a flat root directory.
  *
- * Threat model: the root and its parent must be trusted and non-adversarial against
- * concurrent same-user replacement. Race-proof filesystem containment against an actor
- * able to rename or replace the root is out of scope; root and final reparse points are
- * still checked before filesystem operations. Writer ownership is enforced only among
- * instances in this process; cross-process concurrent writers are unsupported.
+ * 2. Atomic Rename & Durability Invariants:
+ *    - All mutations follow a write-journal-first protocol before modifying any target snapshot file.
+ *    - Files are written to adjacent temporary files (`.tmp.<pid>.<nonce>`), fsynced to disk, and atomically renamed.
+ *    - Complete journal replay guarantees idempotency: target shards are replaced in full rather than updated via deltas.
+ *
+ * 3. Quarantine & Recovery Semantics:
+ *    - Uncommitted or interrupted transactions are detected and replayed upon startup via `recoverPendingJournal()`.
+ *    - Corrupted journals or files exceeding hard size limits are safely quarantined rather than panicking or crashing.
+ *    - Bounded data loss is tracked and reported via `lowerBoundLoss` metadata when recovery cannot reconcile stale state.
+ *
+ * 4. File Descriptor & Concurrency Guarantees:
+ *    - Single-writer mutex enforced in-process across store instances; cross-process concurrent writes are unsupported.
+ *    - All open file handles are immediately closed in `finally` blocks, preventing file descriptor leaks on Windows/POSIX.
+ *    - Hard byte ceilings (`SNAPSHOT_IO_HARD_MAX_FILE_BYTES`, `SNAPSHOT_IO_HARD_MAX_JOURNAL_BYTES`) guard against OOMs.
  */
 export const SNAPSHOT_JOURNAL_SCHEMA = "llm-relay.snapshot-journal.v1";
 export const SNAPSHOT_JOURNAL_VERSION = 1;
@@ -533,36 +541,68 @@ class SnapshotJournalIoImpl implements SnapshotJournalIo {
     }
   }
 
+  private validateSnapshotsPreWrite(
+    snapshots: Readonly<Record<string, SnapshotText>>,
+  ): { ok: true; encoded: readonly EncodedSnapshot[]; lowerBoundLoss: boolean } | { ok: false; failure: SnapshotMutationResult } {
+    const config = this.config;
+    if (!config) return { ok: false, failure: mutationResult("invalid", { error: this.configError ?? "config", retryable: false }) };
+    const recovery = this.recoverUnlocked();
+    if (recovery.status === "failed" || recovery.status === "invalid") return { ok: false, failure: recovery };
+    const lowerBoundLoss = recovery.lowerBoundLoss;
+    const encoded = this.encodeSnapshots(snapshots);
+    if (encoded === null) {
+      return { ok: false, failure: mutationResult("invalid", { error: "snapshots", lowerBoundLoss, retryable: false }) };
+    }
+    return { ok: true, encoded, lowerBoundLoss };
+  }
+
+  private serializeAndCommitJournal(
+    config: Config,
+    encoded: readonly EncodedSnapshot[],
+    lowerBoundLoss: boolean,
+  ): { ok: true; journal: ParsedJournal; transactionId: string } | { ok: false; failure: SnapshotMutationResult } {
+    const transactionId = this.transactionId();
+    const payload = {
+      schema: SNAPSHOT_JOURNAL_SCHEMA,
+      version: SNAPSHOT_JOURNAL_VERSION,
+      transactionId,
+      createdAtMs: this.now(),
+      targets: encoded,
+    };
+    const text = JSON.stringify(payload);
+    if (utf8Bytes(text) > config.maxJournalBytes) {
+      return { ok: false, failure: mutationResult("invalid", { error: "journal-size", lowerBoundLoss, retryable: false }) };
+    }
+    const written = this.atomicReplace(config.journalPath, Buffer.from(text, "utf8"), "journal", null);
+    if (!written.ok) {
+      return {
+        ok: false,
+        failure: this.withPendingRecoveryLoss(mutationResult("failed", { transactionId, lowerBoundLoss, error: written.error, retryable: true })),
+      };
+    }
+    const journal = this.decodeJournal(Buffer.from(text, "utf8"));
+    if (journal === null) {
+      // This should be unreachable; preserve the journal so a future version can inspect it.
+      return {
+        ok: false,
+        failure: this.withPendingRecoveryLoss(mutationResult("failed", { transactionId, lowerBoundLoss, error: "journal-encode", retryable: true })),
+      };
+    }
+    return { ok: true, journal, transactionId };
+  }
+
   private commitUnlocked(snapshots: Readonly<Record<string, SnapshotText>>): SnapshotMutationResult {
     try {
       const config = this.config;
       if (!config) return mutationResult("invalid", { error: this.configError ?? "config", retryable: false });
-      const recovery = this.recoverUnlocked();
-      if (recovery.status === "failed" || recovery.status === "invalid") return recovery;
-      const lowerBoundLoss = recovery.lowerBoundLoss;
-      const encoded = this.encodeSnapshots(snapshots);
-      if (encoded === null) return mutationResult("invalid", { error: "snapshots", lowerBoundLoss, retryable: false });
-      const transactionId = this.transactionId();
-      const payload = {
-        schema: SNAPSHOT_JOURNAL_SCHEMA,
-        version: SNAPSHOT_JOURNAL_VERSION,
-        transactionId,
-        createdAtMs: this.now(),
-        targets: encoded,
-      };
-      const text = JSON.stringify(payload);
-      if (utf8Bytes(text) > config.maxJournalBytes) {
-        return mutationResult("invalid", { error: "journal-size", lowerBoundLoss, retryable: false });
-      }
-      const written = this.atomicReplace(config.journalPath, Buffer.from(text, "utf8"), "journal", null);
-      if (!written.ok) return this.withPendingRecoveryLoss(mutationResult("failed", { transactionId, lowerBoundLoss, error: written.error, retryable: true }));
-      const journal = this.decodeJournal(Buffer.from(text, "utf8"));
-      if (journal === null) {
-        // This should be unreachable; preserve the journal so a future version can inspect it.
-        return this.withPendingRecoveryLoss(mutationResult("failed", { transactionId, lowerBoundLoss, error: "journal-encode", retryable: true }));
-      }
-      const result = this.applyJournal(journal, "committed");
-      const merged = result.lowerBoundLoss === lowerBoundLoss ? result : { ...result, lowerBoundLoss };
+      const preWrite = this.validateSnapshotsPreWrite(snapshots);
+      if (!preWrite.ok) return preWrite.failure;
+
+      const journalCommit = this.serializeAndCommitJournal(config, preWrite.encoded, preWrite.lowerBoundLoss);
+      if (!journalCommit.ok) return journalCommit.failure;
+
+      const result = this.applyJournal(journalCommit.journal, "committed");
+      const merged = result.lowerBoundLoss === preWrite.lowerBoundLoss ? result : { ...result, lowerBoundLoss: preWrite.lowerBoundLoss };
       return this.withPendingRecoveryLoss(merged, merged.status === "committed");
     } catch (error) {
       return this.withPendingRecoveryLoss(mutationResult("failed", { error: safeError(error), retryable: true }));
@@ -766,7 +806,7 @@ class SnapshotJournalIoImpl implements SnapshotJournalIo {
       const unsupported = process.platform === "win32" && noFollow !== 0 && (hasCode(error, "EINVAL") || hasCode(error, "ENOTSUP"));
       if (!unsupported) throw error;
       const inspected = this.inspectExistingPath(path, false);
-      if (inspected.status !== "ok") throw new Error(inspected.error ?? "path");
+      if (inspected.status !== "ok") throw new Error(inspected.error ?? "path", { cause: error });
       return openSync(path, "r");
     }
   }

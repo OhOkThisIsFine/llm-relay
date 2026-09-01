@@ -13,7 +13,7 @@ import {
   resolveAuthEnv,
   resolveCredential,
 } from "../src/authEnv.js";
-import { loadConfig, resolveTargets, type Config, type ProviderConfig } from "../src/config.js";
+import { loadConfig, resolveTargets, type ProviderConfig } from "../src/config.js";
 import { createProxy } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { addEntry, lock, resolveKeystorePath } from "../src/keystore.js";

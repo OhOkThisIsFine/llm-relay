@@ -16,8 +16,6 @@ import { reconstruct } from "../src/reshaper.js";
 import { allFacts, resetFacts } from "../src/target-facts.js";
 import { acceptInterpretation, pendingRefusals, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations } from "../src/refusal-interpretation.js";
 import {
-  CREDENTIAL_ATTEMPTS_HEADER,
-  CREDENTIAL_HEADER,
   SERVED_BY_HEADER,
   POOL_ATTEMPTS_HEADER,
   UNKNOWN_REFUSAL_HEADER,

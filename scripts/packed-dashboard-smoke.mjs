@@ -19,7 +19,6 @@ try {
   const packed = Array.isArray(packedJson) ? packedJson[0] : packedJson?.["llm-relay"];
   if (!packed || typeof packed.filename !== "string") throw new Error("npm pack did not return one tarball");
   const tarball = join(temp, packed.filename);
-  const install = join(temp, "install");
   writeFileSync(join(temp, "package.json"), JSON.stringify({ private: true }), "utf8");
   // --prefer-offline, not --offline: a fresh CI runner's npm cache has nothing for this tarball's
   // runtime deps, and --offline is ENOTCACHED there. The smoke proves the TARBALL is complete, not that the registry is unreachable.

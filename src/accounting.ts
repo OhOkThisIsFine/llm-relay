@@ -4,7 +4,6 @@ import {
   DASHBOARD_REQUEST_ID_PATTERN,
   isDashboardFailureKind,
   isDashboardOutcome,
-  isDashboardSafeId,
   isDashboardUtcTimestamp,
   type AttemptRole,
   type Attribution,

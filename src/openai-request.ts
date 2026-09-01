@@ -195,7 +195,10 @@ export class ToolCallIds {
     if (STRICT9.test(id) && !this.taken.has(id)) out = id;
     else {
       out = strict9(id, 0, this.digest);
-      for (let k = 1; this.taken.has(out); k++) out = strict9(id, k, this.digest);
+      let k = 1;
+      while (this.taken.has(out)) {
+        out = strict9(id, k++, this.digest);
+      }
     }
     this.taken.add(out);
     this.bySource.set(id, out);
@@ -575,7 +578,8 @@ export function anthropicRequestToOpenAi(
       if (!isRecord(block) || block.type !== "tool_use") continue;
       if (typeof block.id === "string" && block.id.length > 0 &&
           typeof block.name === "string" && block.name.length > 0) {
-        (toolNames ??= new Map()).set(block.id, block.name);
+        if (!toolNames) toolNames = new Map();
+        toolNames.set(block.id, block.name);
       }
     }
   };

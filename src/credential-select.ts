@@ -1,3 +1,25 @@
+/**
+ * MODULE CHARTER: Pure Credential Selector & Attempt Planner (credential-select.ts)
+ *
+ * 1. Domain Boundary & Responsibilities:
+ *    - Implements deterministic, side-effect-free credential selection across provider fleets.
+ *    - Encapsulates LRU tracking, credential health assessment, and quota-driven slot prioritization.
+ *    - Isolates credential secrets from selection algorithms by operating exclusively on non-secret `CredentialId`s.
+ *
+ * 2. `AttemptPlan` Contract & Ranking Invariants:
+ *    - `groupCredentialAttempts()` partitions candidates into discrete attempts ordered by availability and cost.
+ *    - Prioritizes healthy, non-cooling slots with available quota before falling back to degraded or untested slots.
+ *    - Applies LRU tie-breaking via `CredentialLru` to evenly distribute requests across equal-priority credentials.
+ *
+ * 3. Look-Ahead Re-offering & Cooldown Rules:
+ *    - Credential slots marked saturated or cooling are suppressed until their backoff or reset periods expire.
+ *    - Re-offering logic evaluates timestamps against `now` without mutating global clock state.
+ *    - Permanent authentication failures (`credentialFault`) are excluded until explicitly cleared or rotated.
+ *
+ * 4. Learned Target Facts & Evidence:
+ *    - Integrates observed rate limits and quota headers from `target-facts.ts` into live routing decisions.
+ *    - Evidence lookup supports fine-grained attempt-level matching (provider × model × credential).
+ */
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import type { CredentialId } from "./credential-id.js";
 import type { FactScope } from "./target-facts.js";
@@ -75,7 +97,7 @@ function scopeMatches(scope: FactScope, attempt: ResolvedAttempt): boolean {
     case "model":
       return scope.model === model;
     case "group":
-      return scope.provider === provider && model !== undefined && scope.members.includes(model) &&
+      return scope.provider === provider && model.length > 0 && scope.members.includes(model) &&
         (scope.credentialId === undefined || scope.credentialId === attempt.credentialId);
   }
 }
@@ -248,6 +270,15 @@ export interface CredentialWalkStats {
 }
 
 /**
+ * An immutable attempt execution plan held in-flight by the candidate walk.
+ */
+export interface AttemptPlan {
+  readonly attempt: ResolvedAttempt;
+  readonly group: DeploymentCredentialGroup;
+  readonly started: boolean;
+}
+
+/**
  * Request-local breadth-first credential walk. `next()` only offers a candidate. The caller must
  * call `recordStarted()` immediately before fetch/egress; that is the sole budget/LRU mutation
  * boundary. Pre-egress validation can call `recordRejected()` and consumes no start budget.
@@ -279,7 +310,7 @@ export class CredentialWalk {
    * load-bearing property: this class is the sole budget/LRU mutation boundary, so a regression
    * here is a regression in every request the relay serves.
    */
-  readonly #pending = new Map<ResolvedAttempt, { group: DeploymentCredentialGroup; started: boolean }>();
+  readonly #pending = new Map<ResolvedAttempt, AttemptPlan>();
   readonly #maxInFlight: number;
 
   constructor(attempts: readonly ResolvedAttempt[], options: CredentialWalkOptions = {}) {
@@ -370,14 +401,14 @@ export class CredentialWalk {
       // A suppressed slot consumes neither a round nor budget. Continue within this deployment
       // so a still-eligible sibling credential can be selected before moving to the next group.
       if (this.#isSuppressed(attempt)) { this.#skipped++; this.#queue.unshift(key); continue; }
-      this.#pending.set(attempt, { group, started: false });
+      this.#pending.set(attempt, { attempt, group, started: false });
       return attempt;
     }
     return undefined;
   }
 
   /** The in-flight record for this exact attempt, or a thrown error naming what went wrong. */
-  #inFlight(attempt: ResolvedAttempt, verb: string): { group: DeploymentCredentialGroup; started: boolean } {
+  #inFlight(attempt: ResolvedAttempt, verb: string): AttemptPlan {
     const held = this.#pending.get(attempt);
     if (!held) throw new Error(`credential ${verb} does not match pending attempt`);
     return held;

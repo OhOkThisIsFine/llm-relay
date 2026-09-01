@@ -1,3 +1,19 @@
+/**
+ * Stated Context and Max-Output Limits Subsystem.
+ *
+ * Charter & Invariants:
+ *  - Observed vs Catalog Precedence: First-party ceilings explicitly stated in refusal error
+ *    bodies take precedence over catalog/snapshot figures because they represent actual
+ *    deployment-specific limits rather than generic model family estimates.
+ *  - Explicit Extraction Only: Never guess or record requested token counts as ceilings. If parsing
+ *    cannot extract an explicit maximum from the error body, nothing is learned.
+ *  - Deployment-Scoped Persistence: Ceilings are persisted in target-facts as deployment-scoped
+ *    facts (provider:model) with TTL expiration.
+ *  - Asymmetric Reset Invariance: Learned limits are measurements, not temporary conditions.
+ *    Subsequent successful requests do not clear or invalidate recorded context limits.
+ *  - Output-Limit Display-Only: Observed max-output limits are strictly display-only metadata
+ *    and never actively clamp, reject, or alter routing decisions.
+ */
 import { factsFor, flushFacts, recordFact, resetFacts, FACT_TTL_MS } from "./target-facts.js";
 
 /**

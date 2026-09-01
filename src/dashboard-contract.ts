@@ -1,5 +1,7 @@
 import { hasExactKeys as isExactRecord, isRecord } from "./json-shape.js";
 
+export { isRecord };
+
 /**
  * Server-safe wire contract shared by the analytics dashboard and relay.
  *

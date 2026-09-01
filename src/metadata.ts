@@ -1,3 +1,5 @@
+import { isRecord } from "./json-shape.js";
+
 /**
  * Where a metadata value came from, in descending trustworthiness.
  *  - `provider`   the provider serving this target published it about its OWN deployment;
@@ -161,7 +163,7 @@ export function estimateTokensFromCharacters(characters: number): number {
  * count_tokens is advisory bookkeeping.
  */
 export function estimateRequestTokens(reqJson: unknown): number {
-  if (typeof reqJson !== "object" || reqJson === null) return 0;
+  if (!isRecord(reqJson)) return 0;
   let chars = 0;
   const isBase64DataUrl = (s: string) => s.startsWith("data:") && s.includes(";base64,");
   const walk = (v: unknown, key?: string): void => {
@@ -169,16 +171,15 @@ export function estimateRequestTokens(reqJson: unknown): number {
       if (key !== "data" && !isBase64DataUrl(v)) chars += v.length;
     } else if (Array.isArray(v)) {
       for (const x of v) walk(x);
-    } else if (v && typeof v === "object") {
+    } else if (isRecord(v)) {
       for (const [k, x] of Object.entries(v)) walk(x, k);
     }
   };
-  const obj = reqJson as Record<string, unknown>;
-  walk(obj.system);
-  walk(obj.messages);
-  walk(obj.tools);
-  walk(obj.instructions);
-  walk(obj.input);
+  walk(reqJson.system);
+  walk(reqJson.messages);
+  walk(reqJson.tools);
+  walk(reqJson.instructions);
+  walk(reqJson.input);
   return estimateTokensFromCharacters(chars);
 }
 

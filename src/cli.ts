@@ -3,7 +3,7 @@ import { relayStatePath } from "./state-paths.js";
 import { isRecord } from "./json-shape.js";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import {
   loadConfig,
@@ -82,7 +82,6 @@ import {
   runKeysUnlockLocal,
   type KeysCliDependencies,
 } from "./keys-cli.js";
-import { runDelegateGateCli } from "./delegate-gate/cli.js";
 
 // Provenance stays attached to the rendered number: a first-party figure and a same-model figure
 // taken from another host are different claims, and a future source must be a compile error at the
@@ -2401,6 +2400,48 @@ export async function runMcp(): Promise<void> {
  * host last walked the ladder; falls back to a cold local read, which is still correct about
  * order and configuration but knows nothing about what is currently spent.
  */
+async function recordSpentDispatchLane(
+  cfg: Config,
+  spent: string,
+  options: { tier?: string | undefined; client?: string | undefined; outcome?: string | undefined; retryAfterMs?: number | undefined },
+): Promise<void> {
+  const live = await tryServer(cfg, "/dispatch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      exhausted: spent,
+      ...(options.tier ? { tier: options.tier } : {}),
+      ...(options.client ? { client: options.client } : {}),
+      ...(options.outcome ? { outcome: options.outcome } : {}),
+      ...(options.retryAfterMs !== undefined && Number.isFinite(options.retryAfterMs) ? { retryAfterMs: options.retryAfterMs } : {}),
+    }),
+  });
+  if (!live) {
+    process.stderr.write(`llm-relay dispatch: no proxy running — "${spent}" not recorded as spent\n`);
+    process.exit(1);
+  }
+}
+
+function renderNextCommandOrExit(view: DispatchView, shellArg?: string): void {
+  const shellOnly = parseRenderShell(shellArg) ?? shellFor();
+  if (!view.next) {
+    process.stderr.write(`llm-relay dispatch: ${view.reason}\n`);
+    process.exit(1);
+  }
+  if (!view.next.invoke) {
+    process.stderr.write(`llm-relay dispatch: lane "${view.next.id}" is a relay target (${view.next.spec ?? "?"}), not a command\n`);
+    process.exit(2);
+  }
+  process.stdout.write(renderCommand(view.next.invoke, shellOnly) + "\n");
+}
+
+/**
+ * `llm-relay dispatch [lane]` — which lane to hand a delegated task to next.
+ *
+ * Prefers a running proxy so the answer reflects live exhaustion state reported by whichever
+ * host last walked the ladder; falls back to a cold local read, which is still correct about
+ * order and configuration but knows nothing about what is currently spent.
+ */
 export async function runDispatch(arg: string | undefined): Promise<void> {
   const cfg = loadOrExit();
   const task = argValue("--task", "-t");
@@ -2412,10 +2453,6 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const outcome = argValue("--outcome");
   const retryAfterRaw = argValue("--retry-after-ms");
 
-  // Whether the CALLING session's traffic reaches this relay. Detected from this process's
-  // environment — the CLI is a child of that session and inherits it — and then FORWARDED to the
-  // proxy, which cannot work it out for itself. `--host` overrides for testing and for a host
-  // whose wiring this cannot see.
   const hostOverrideRaw = argValue("--host");
   const hostOverride = hostOverrideRaw === undefined ? null : parseHostRoutingState(hostOverrideRaw);
   if (hostOverrideRaw !== undefined && hostOverride === null) {
@@ -2434,23 +2471,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const retryAfterMs = retryAfterRaw !== undefined ? Number(retryAfterRaw) : undefined;
 
   if (spent) {
-    const live = await tryServer(cfg, "/dispatch", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        exhausted: spent,
-        ...(tier ? { tier } : {}),
-        ...(client ? { client } : {}),
-        ...(outcome ? { outcome } : {}),
-        ...(retryAfterMs !== undefined && Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}),
-      }),
-    });
-    // Cooldowns are runtime state held by the proxy; with nothing listening there is no
-    // process to remember it, and pretending otherwise would silently lose the report.
-    if (!live) {
-      process.stderr.write(`llm-relay dispatch: no proxy running — "${spent}" not recorded as spent\n`);
-      process.exit(1);
-    }
+    await recordSpentDispatchLane(cfg, spent, { tier, client, outcome, retryAfterMs });
   }
 
   const qs = new URLSearchParams();
@@ -2463,16 +2484,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (hostRouting.entrypoint) qs.set("entrypoint", hostRouting.entrypoint);
   const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
 
-  // One catalog for the whole render — it reads from disk, so building it per lane lookup would
-  // re-read the cache once per pool member. Same on-disk data the proxy uses, so a cold-read
-  // answer matches a live one; `cachedLimits` never fetches, so an unwarmed cache simply means no
-  // lane carries a window.
   const catalog = new ModelCatalog();
-  // ⚠ Dynamic pools (`{ include: "free" }`) are EMPTY until materialized, and the server does this
-  // at startup while this path never did — so a `pool/*` rung resolved to zero members here and
-  // therefore to no context window, while the same query against the running proxy resolved one.
-  // The local fallback is allowed to know less about live state (exhaustion); it must not disagree
-  // about configuration. Synchronous and catalog-cache-only, so it costs no round-trip.
   try {
     materializeDynamicPools(cfg, catalog);
   } catch {
@@ -2485,19 +2497,6 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   );
 
   const liveRaw = (await tryServer(cfg, path)) as WireDispatchView | null;
-  // A proxy predating host-adaptive dispatch ignores `?host=` and answers as though every relay
-  // rung were reachable. Its ladder would then quietly advise the subagent path this host cannot
-  // use — the exact failure being fixed — so the stale answer is discarded rather than rendered.
-  // The cost is live exhaustion state, which the existing "no proxy running" line already covers;
-  // trusting the reply would cost correctness, which it does not.
-  //
-  // A SECOND staleness shape, found the moment this was built: a proxy that understands `?host=`
-  // but predates context-window substitution answers the host check correctly and still returns
-  // lanes with the variable missing. From the rendered output that is indistinguishable from "the
-  // provider published nothing" — the failure would read as a correct result. The discriminator is
-  // cheap and exact: both sides resolve the window from the SAME on-disk cache, so if this process
-  // can resolve one for a transposed lane and the live answer carries none, the difference is the
-  // proxy's code, not the data.
   const hostStale = liveRaw !== null && hostRouting.state !== "unknown" && liveRaw.host !== hostRouting.state;
   const windowStale =
     liveRaw !== null &&
@@ -2511,10 +2510,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     );
   const staleProxy = hostStale || windowStale;
   const live = staleProxy ? null : liveRaw;
-  // The durable half of exhaustion state is readable cold since dispatch-exhaustion persistence
-  // landed: restore still-future rows so the fallback ladder shows what the relay recorded.
-  // In-memory-only rows on a running relay still need the live answer — this narrows the gap, it
-  // does not close it. Read-only here: no listener is installed, so nothing writes back.
+
   restoreExhaustedRows(cfg, loadExhaustedRows());
   const view = normalizeDispatchCommands(
     live ??
@@ -2536,23 +2532,8 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     return;
   }
 
-  // `--next-command`: the rendered command line for `next`, and nothing else. Exists so a caller
-  // that needs something RUNNABLE (the Agent hook, a script) gets exactly that without parsing the
-  // human ladder — and, more importantly, without a second copy of the shell-quoting rules, which
-  // is the one part of this that is unsafe to reimplement.
   if (hasFlag("--next-command")) {
-    const shellOnly = parseRenderShell(argValue("--shell")) ?? shellFor();
-    if (!view.next) {
-      process.stderr.write(`llm-relay dispatch: ${view.reason}\n`);
-      process.exit(1);
-    }
-    if (!view.next.invoke) {
-      // A relay lane is addressed through the proxy, not spawned; there is no command to print
-      // and inventing one would be a lie about the mechanism.
-      process.stderr.write(`llm-relay dispatch: lane "${view.next.id}" is a relay target (${view.next.spec ?? "?"}), not a command\n`);
-      process.exit(2);
-    }
-    process.stdout.write(renderCommand(view.next.invoke, shellOnly) + "\n");
+    renderNextCommandOrExit(view, argValue("--shell"));
     return;
   }
 
@@ -3855,25 +3836,16 @@ const KEYS_POSITIONAL_COUNT: Readonly<Record<KeysSubcommand, number>> = {
   check: 2,
 };
 
-/** Strict, secret-safe keys parser. Diagnostics deliberately never echo rejected argv tokens. */
-export function validateKeysCommandArgs(argv: string[]): string | null {
-  const positionals = getPositionalArgs(argv);
-  const candidate = positionals[1];
-  if (candidate !== undefined && !KEYS_SUBCOMMANDS.includes(candidate as KeysSubcommand)) {
-    return `unknown subcommand; valid subcommands: ${KEYS_SUBCOMMANDS.join(", ")}`;
-  }
-  const subcommand = candidate as KeysSubcommand | undefined;
-  const allowed = new Set<string>(KEYS_GLOBAL_FLAGS);
-  if (subcommand !== undefined) {
-    for (const flag of KEYS_FLAGS[subcommand]) allowed.add(flag);
-  }
-
+function validateFlagValues(
+  argv: readonly string[],
+  allowedFlags: Set<string>,
+): "unsupported option" | "invalid arguments" | null {
   for (let index = 2; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === undefined || !arg.startsWith("-")) continue;
     const equalsAt = arg.indexOf("=");
     const flag = equalsAt === -1 ? arg : arg.slice(0, equalsAt);
-    if (!allowed.has(flag)) return "unsupported option";
+    if (!allowedFlags.has(flag)) return "unsupported option";
     if (VALUE_FLAGS.has(flag)) {
       if (equalsAt !== -1) {
         if (arg.slice(equalsAt + 1).length === 0) return "invalid arguments";
@@ -3886,6 +3858,24 @@ export function validateKeysCommandArgs(argv: string[]): string | null {
       return "invalid arguments";
     }
   }
+  return null;
+}
+
+/** Strict, secret-safe keys parser. Diagnostics deliberately never echo rejected argv tokens. */
+export function validateKeysCommandArgs(argv: string[]): string | null {
+  const positionals = getPositionalArgs(argv);
+  const candidate = positionals[1];
+  if (candidate !== undefined && !KEYS_SUBCOMMANDS.includes(candidate as KeysSubcommand)) {
+    return `unknown subcommand; valid subcommands: ${KEYS_SUBCOMMANDS.join(", ")}`;
+  }
+  const subcommand = candidate as KeysSubcommand | undefined;
+  const allowed = expandFlagAliases([
+    ...KEYS_GLOBAL_FLAGS,
+    ...(subcommand !== undefined ? KEYS_FLAGS[subcommand] : []),
+  ]);
+
+  const flagError = validateFlagValues(argv, allowed);
+  if (flagError !== null) return flagError;
 
   const expected = subcommand === undefined ? 1 : KEYS_POSITIONAL_COUNT[subcommand];
   return positionals.length === expected ? null : "invalid arguments";
@@ -3966,42 +3956,90 @@ export function main(): void {
     return;
   }
 
-  if (arg2 === "onboard") {
-    const cfg = loadOrExit();
-    if (hasFlag("--import", "-import")) {
-      const importPath = argValue("--import", "-import");
-      if (!importPath) {
-        process.stderr.write("llm-relay onboard: --import requires a file path\n");
-        process.exit(1);
-        return;
-      }
-      try {
-        importKeysFromFile(importPath, cfg, { force: hasFlag("--force", "-force") });
-      } catch (e) {
-        process.stderr.write(`llm-relay onboard: ${(e as Error).message}\n`);
-        process.exit(1);
-      }
+function runOnboardSubcommand(cfg: Config): void {
+  if (hasFlag("--import", "-import")) {
+    const importPath = argValue("--import", "-import");
+    if (!importPath) {
+      process.stderr.write("llm-relay onboard: --import requires a file path\n");
+      process.exit(1);
       return;
     }
-    runInteractiveOnboarding(cfg).catch((e) => {
+    try {
+      importKeysFromFile(importPath, cfg, { force: hasFlag("--force", "-force") });
+    } catch (e) {
       process.stderr.write(`llm-relay onboard: ${(e as Error).message}\n`);
       process.exit(1);
-    });
+    }
+    return;
+  }
+  runInteractiveOnboarding(cfg).catch((e) => {
+    process.stderr.write(`llm-relay onboard: ${(e as Error).message}\n`);
+    process.exit(1);
+  });
+}
+
+function runSetupSubcommand(target: string | undefined): void {
+  if (target === "claude-desktop" || target === "desktop") {
+    const res = setupClaudeDesktop();
+    process.stdout.write(`${res.message}\n`);
+  } else if (target === undefined || target === "claude-cli" || target === "cli" || target === "claude") {
+    setupClaudeCli();
+  } else {
+    configCommandError(`setup: unknown target "${target}" (targets: claude-cli, claude-desktop)`);
+  }
+}
+
+function runKeysSubcommand(action: string | undefined, target: string | undefined): void {
+  switch (action) {
+    case undefined:
+    case "check":
+      runCheckKeys().catch((e) => {
+        process.stderr.write(`llm-relay check-keys: ${(e as Error).message}\n`);
+        process.exit(1);
+      });
+      return;
+    case "add":
+      runKeysPromise(runKeysAdd(target));
+      return;
+    case "list":
+      runKeysPromise(runKeysList());
+      return;
+    case "rotate":
+      runKeysPromise(runKeysRotate(target));
+      return;
+    case "revoke":
+      runKeysPromise(runKeysRevoke(target));
+      return;
+    case "remove":
+      runKeysPromise(runKeysRemove(target));
+      return;
+    case "disable":
+      runKeysPromise(runKeysDisable(target));
+      return;
+    case "enable":
+      runKeysPromise(runKeysEnable(target));
+      return;
+    case "export":
+      runKeysPromise(runKeysExport());
+      return;
+    case "import":
+      runKeysPromise(runKeysImport(target));
+      return;
+    case "unlock":
+      runKeysPromise(runKeysUnlock());
+      return;
+    default:
+      throw new Error("unreachable keys subcommand after validation");
+  }
+}
+
+  if (arg2 === "onboard") {
+    const cfg = loadOrExit();
+    runOnboardSubcommand(cfg);
     return;
   }
   if (arg2 === "setup") {
-    if (arg3 === "claude-desktop" || arg3 === "desktop") {
-      const res = setupClaudeDesktop();
-      process.stdout.write(`${res.message}\n`);
-    } else if (arg3 === undefined || arg3 === "claude-cli" || arg3 === "cli" || arg3 === "claude") {
-      setupClaudeCli();
-    } else {
-      // ⚠ This used to be a bare `else`, so `setup clade-desktop` (a typo) silently ran the CLI
-      // setup and exited 0 — the user believed they had configured Desktop. HELP has always
-      // documented `claude-cli`, which matched no branch and only worked by that fall-through;
-      // it is a real target now, and anything else is named and refused.
-      configCommandError(`setup: unknown target "${arg3}" (targets: claude-cli, claude-desktop)`);
-    }
+    runSetupSubcommand(arg3);
     return;
   }
   if (arg2 === "telemetry") {
@@ -4019,48 +4057,8 @@ export function main(): void {
     return;
   }
   if (arg2 === "keys") {
-    switch (arg3) {
-      case undefined:
-      case "check":
-        // Bare `keys` remains byte-for-byte the same status command as `check-keys`.
-        runCheckKeys().catch((e) => {
-          process.stderr.write(`llm-relay check-keys: ${(e as Error).message}\n`);
-          process.exit(1);
-        });
-        return;
-      case "add":
-        runKeysPromise(runKeysAdd(arg4));
-        return;
-      case "list":
-        runKeysPromise(runKeysList());
-        return;
-      case "rotate":
-        runKeysPromise(runKeysRotate(arg4));
-        return;
-      case "revoke":
-        runKeysPromise(runKeysRevoke(arg4));
-        return;
-      case "remove":
-        runKeysPromise(runKeysRemove(arg4));
-        return;
-      case "disable":
-        runKeysPromise(runKeysDisable(arg4));
-        return;
-      case "enable":
-        runKeysPromise(runKeysEnable(arg4));
-        return;
-      case "export":
-        runKeysPromise(runKeysExport());
-        return;
-      case "import":
-        runKeysPromise(runKeysImport(arg4));
-        return;
-      case "unlock":
-        runKeysPromise(runKeysUnlock());
-        return;
-      default:
-        throw new Error("unreachable keys subcommand after validation");
-    }
+    runKeysSubcommand(arg3, arg4);
+    return;
   }
   if (arg2 === "models") {
     runModels().catch((e) => {
@@ -4146,14 +4144,18 @@ export function main(): void {
     return;
   }
   if (arg2 === "delegate-gate") {
-    const result = runDelegateGateCli({
-      diffPath: arg3,
-      repoRoot: argValue("--repo", "-repo"),
-      fix: hasFlag("--fix", "-fix"),
-    });
-    if (result.stdout.length > 0) process.stdout.write(result.stdout);
-    if (result.stderr.length > 0) process.stderr.write(result.stderr);
-    process.exit(result.exitCode);
+    void (async () => {
+      const { runDelegateGateCli } = await import("./delegate-gate/cli.js");
+      const result = runDelegateGateCli({
+        diffPath: arg3,
+        repoRoot: argValue("--repo", "-repo"),
+        fix: hasFlag("--fix", "-fix"),
+      });
+      if (result.stdout.length > 0) process.stdout.write(result.stdout);
+      if (result.stderr.length > 0) process.stderr.write(result.stderr);
+      process.exit(result.exitCode);
+    })();
+    return;
   }
   dispatchDashboardOrProxy(arg2, {
     loadConfig: loadOrExit,

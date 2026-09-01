@@ -1,5 +1,5 @@
-import { anyOffloadEnabled, splitSpec, type Config, type OffloadRule, type ProviderConfig } from "./config.js";
-import { POOL_PREFIX } from "./config.js";
+import { anyOffloadEnabled, splitSpec, POOL_PREFIX } from "./config.js";
+import type { Config, OffloadRule, ProviderConfig } from "./config-types.js";
 import type { CredentialSource } from "./authEnv.js";
 import type { ModelCatalog } from "./catalog.js";
 import type { PingLoop } from "./ping/cadence.js";
@@ -385,13 +385,14 @@ function buildCandidateAvailability(
   model: string | undefined,
   quota: readonly QuotaObservation[],
   nowMs: number,
+  preloadedFacts?: ReturnType<typeof factsFor>,
 ): CandidateAvailability[] {
   const parsed = parseCredentialId(credentialId);
   if (parsed === null) return [];
   const configured = resolveConfiguredLimits(cfg, provider, parsed.label, model ?? null);
   const learned = model === undefined ? [] : observedRateLimits(provider, credentialId as CredentialId, model, { now: nowMs });
   // One read per cell; the order (most-specific scope first) is load-bearing input below.
-  const cellFacts = factsFor(provider, credentialId as CredentialId, model ?? null, { now: nowMs });
+  const cellFacts = preloadedFacts ?? factsFor(provider, credentialId as CredentialId, model ?? null, { now: nowMs });
 
   const buckets = collectQuotaBuckets({ observations: quota, learned, configured });
 
@@ -439,6 +440,286 @@ function buildCandidateAvailability(
   return rows;
 }
 
+async function hydrateProviderCatalogs(
+  cfg: Config,
+  memberships: Map<string, unknown>,
+  catalog: ModelCatalog | undefined,
+  providerFilter?: string,
+): Promise<Map<string, Set<string> | null>> {
+  const listedByProvider = new Map<string, Set<string> | null>();
+  if (!catalog) return listedByProvider;
+
+  const providers = new Set<string>();
+  for (const spec of memberships.keys()) {
+    const { provider } = splitSpec(spec);
+    if (!providerFilter || provider === providerFilter) providers.add(provider);
+  }
+  await Promise.all([...providers].map(async (provider) => {
+    const p = cfg.providers[provider];
+    if (!p || p.kind !== "openai") {
+      listedByProvider.set(provider, null);
+      return;
+    }
+    try {
+      const models = await catalog.list(provider, p);
+      listedByProvider.set(
+        provider,
+        models.length > 0 || catalog.hasCachedCatalog(provider) ? new Set(models) : null,
+      );
+    } catch {
+      listedByProvider.set(provider, null);
+    }
+  }));
+  return listedByProvider;
+}
+
+interface CandidateCellDefinition {
+  spec: string;
+  membership: { pools: string[]; subagentTiers: string[] };
+  provider: string;
+  model: string | undefined;
+  providerConfig: ProviderConfig | undefined;
+  slot: CredentialSlot;
+}
+
+function collectCandidateCells(
+  cfg: Config,
+  memberships: Map<string, { pools: string[]; subagentTiers: string[] }>,
+  providerFilter?: string,
+): CandidateCellDefinition[] {
+  const credentialCells: CandidateCellDefinition[] = [];
+  for (const [spec, membership] of memberships) {
+    const { provider, model } = splitSpec(spec);
+    if (providerFilter && provider !== providerFilter) continue;
+    const providerConfig: ProviderConfig | undefined = cfg.providers[provider];
+    const slots: readonly CredentialSlot[] = providerConfig
+      ? providerCredentialSlots(provider, providerConfig)
+      : [implicitCredentialSlot(provider)];
+    for (const slot of slots) {
+      credentialCells.push({ spec, membership, provider, model, providerConfig, slot });
+    }
+  }
+  return credentialCells;
+}
+
+interface SingleCandidateContext {
+  cfg: Config;
+  cell: CandidateCellDefinition;
+  listedByProvider: Map<string, Set<string> | null>;
+  catalog?: ModelCatalog | undefined;
+  pingLoop?: PingLoop | undefined;
+  breaker: CircuitBreaker;
+  telemetry: TelemetryData;
+  tierData?: TierData | null | undefined;
+  byNorm: NonNullable<TierData>["byNorm"];
+  nowMs: number;
+  accounting?: Pick<import("./accounting-store.js").AccountingStore, "usedInWindow"> | null | undefined;
+}
+
+function buildSingleCandidate(ctx: SingleCandidateContext): Candidate {
+  const { cfg, cell, listedByProvider, catalog, pingLoop, breaker, telemetry, tierData, byNorm, nowMs, accounting } = ctx;
+  const { spec, membership, provider, model, providerConfig: p, slot } = cell;
+  const credentialId = slot.credentialId;
+  const credentialResolution = p
+    ? resolveCredentialSlot(slot)
+    : { state: "not-declared" as const, value: undefined, envName: undefined, source: undefined };
+  const modelAllowed = slotAllowsModel(slot, model);
+
+  const cellTarget: ProviderTargetIdentity = {
+    provider,
+    model: model ?? null,
+    kind: p?.kind ?? "openai",
+    credentialId,
+    ...(p?.base ? { base: p.base } : {}),
+  };
+
+  const providerModels = listedByProvider.get(provider) ?? null;
+  const listed = p && p.kind === "openai" && model && catalog
+    ? providerModels?.has(model) ?? null
+    : null;
+
+  const summary = pingLoop && model ? pingLoop.getModelSummary(provider, model) : null;
+  const state = breaker.getState(cellTarget);
+  const obs = model ? telemetry.models[`${provider}/${model}`] : undefined;
+  const strength = getStrength(spec, tierData);
+  const matched = findTierModel(model ?? spec, byNorm, tierData?.exactByNorm);
+  const tier = matched?.rec;
+  const num = (k: string) => (typeof tier?.[k] === "number" ? (tier[k] as number) : null);
+
+  const providerLimits = p && p.kind === "openai" && model && catalog
+    ? catalog.cachedLimits(provider, model)
+    : null;
+
+  const referenceFrom =
+    matched && matched.match === "fuzzy" ? `openrouter:${matched.rec.norm}` : "openrouter";
+  const meta = resolveMetadata(model ?? provider, {
+    providerLimits,
+    reference: {
+      contextLength: num("context_length"),
+      pricePromptPerToken: num("price_prompt"),
+      priceCompletionPerToken: num("price_completion"),
+      from: referenceFrom,
+    },
+  });
+  const exactTier = matched?.match === "exact" ? tier : undefined;
+  const supportsTools = typeof exactTier?.supports_tools === "boolean" ? exactTier.supports_tools : null;
+  const deploymentStats = deploymentBreakerStats(breaker, cellTarget);
+  const breakerStability = deploymentStats.stability;
+
+  const stabilityScore = summary && summary.stabilityScore >= 0
+    ? summary.stabilityScore
+    : breakerStability;
+  const stabilitySamples = summary && pingLoop && model
+    ? pingLoop.getModelPings(provider, model).length
+    : deploymentStats.confidenceSamples;
+  const fitness = deploymentFitness(strength, {
+    stabilityScore,
+    stabilityConfidence: Math.min(1, stabilitySamples / 5),
+    runtimeScore: model ? getRealWorldScore(provider, model, { telemetry, now: nowMs }) : null,
+    supportsTools,
+    contextLength: meta.contextLength,
+    contextConfidence: metadataConfidence(meta.contextLengthSource, matched?.match === "exact"),
+    maxOutputTokens: meta.maxOutputTokens,
+    maxOutputConfidence: metadataConfidence(meta.maxOutputTokensSource, matched?.match === "exact"),
+    benchmarkTaskFitScore: typeof exactTier?.task_fit_score === "number" ? exactTier.task_fit_score * 100 : null,
+    benchmarkTaskFitConfidence: Math.min(1, (exactTier?.task_fit_signal_count ?? 0) / 3),
+  });
+
+  const cellQuota = mergeCandidateQuota(
+    pingLoop && model ? pingLoop.getQuotaObservations(credentialId, model) : [],
+    state?.quotaObservations ?? [],
+  );
+
+  const verdict = evaluateHardCap({
+    cfg,
+    provider,
+    credentialLabel: slot.label,
+    model: model ?? null,
+    usedInWindow: createHardCapLedgerReader(accounting, credentialId, model, nowMs),
+    now: nowMs,
+  });
+  const cellFacts = factsFor(provider, credentialId, model, { now: nowMs });
+
+  return {
+    spec,
+    provider,
+    ...(model ? { model } : {}),
+    credentialId,
+    pools: membership.pools,
+    subagentTiers: membership.subagentTiers,
+    hasKey: credentialResolution.state !== "declared-missing",
+    credential: {
+      label: slot.label,
+      authEnv: slot.authEnv ?? null,
+      enabled: slot.enabled,
+      models: slot.models,
+      state: credentialResolution.state,
+      source: credentialResolution.source ?? null,
+      modelAllowed,
+    },
+    listed,
+    capabilityMatch: matched ? { name: matched.rec.norm, match: matched.match } : null,
+    health: summary
+      ? {
+          verdict: summary.verdict,
+          avgMs: summary.avgMs >= 0 ? summary.avgMs : null,
+          p95Ms: summary.p95Ms >= 0 ? summary.p95Ms : null,
+          jitterMs: summary.jitterMs,
+          uptimePct: summary.uptimePct,
+          lastPingCode: summary.lastPingCode,
+          lastPingMs: summary.lastPingMs,
+        }
+      : null,
+    quota: cellQuota,
+    availability: buildCandidateAvailability(cfg, provider, credentialId, model, cellQuota, nowMs, cellFacts),
+    hardCap:
+      verdict === null
+        ? null
+        : {
+            axis: verdict.axis,
+            period: verdict.period,
+            cap: verdict.cap,
+            used: verdict.used,
+            basis: verdict.basis,
+            source: verdict.source,
+            scope: verdict.scope,
+            resetsAt: new Date(verdict.resetsAt).toISOString(),
+            resetsAtBasis: verdict.resetsAtBasis,
+          },
+    breaker: {
+      open: !breaker.isHealthy(cellTarget, nowMs),
+      consecutiveFailures: state?.consecutiveFailures ?? 0,
+      lastStatus: state?.lastStatus ?? null,
+      cooldownRemainingMs: Math.max(0, (state?.cooldownUntil ?? 0) - nowMs),
+      cooldownSource: state?.cooldownSource ?? null,
+      unexplained429s: state?.unexplained429s ?? 0,
+      credentialFailures: state?.credentialFailures ?? 0,
+      lastCredentialStatus: state?.lastCredentialStatus ?? null,
+      credentialFault: breaker.hasCredentialFault(cellTarget, nowMs),
+    },
+    facts: cellFacts.map((f) => ({
+      kind: f.kind,
+      scope: describeScope(f.scope),
+      expiresInMs: Math.max(0, f.until - nowMs),
+      ...(f.value === undefined ? {} : { value: f.value }),
+    })),
+    observed: obs
+      ? {
+          totalCalls: obs.totalCalls,
+          successCalls: obs.successCalls,
+          avgLatencyMs: obs.totalCalls > 0 ? Math.round(obs.totalLatencyMs / obs.totalCalls) : null,
+          lastCalledAt: obs.lastCalledAt ? new Date(obs.lastCalledAt).toISOString() : null,
+        }
+      : null,
+    completionTokens: {
+      reported: obs && obs.completionTokenCalls > 0 ? obs.totalCompletionTokens : null,
+      reportedCalls: obs?.completionTokenCalls ?? 0,
+      totalCalls: obs?.totalCalls ?? 0,
+    },
+    contextLength: meta.contextLength,
+    contextLengthSource: meta.contextLengthSource,
+    maxOutputTokens: meta.maxOutputTokens,
+    maxOutputTokensSource: meta.maxOutputTokensSource,
+    ...(meta.referenceFrom ? { metadataReferenceFrom: meta.referenceFrom } : {}),
+    pricePerMTokIn: meta.pricePerMTokIn,
+    pricePerMTokOut: meta.pricePerMTokOut,
+    priceSource: meta.priceSource,
+    supportsTools,
+    capabilitySources: Array.isArray(tier?.sources) ? (tier.sources as string[]) : [],
+    scores: {
+      bfclOverall: num("bfcl_overall"),
+      bfclMultiTurn: num("bfcl_multi_turn"),
+      bfclIrrelevance: num("bfcl_irrelevance"),
+      aaIntelligence: num("aa_intelligence"),
+      aaCoding: num("aa_coding"),
+      aaAgentic: num("aa_agentic"),
+      aiderPassRate: num("aider_pass_rate"),
+      aiderWellFormed: num("aider_well_formed"),
+      designArenaAgentsEloMean: num("design_arena_agents_elo_mean"),
+      designArenaModelsEloMean: num("design_arena_models_elo_mean"),
+      arenaRating: num("arena_rating"),
+      arenaRank: num("arena_rank"),
+    },
+    sortInputs: {
+      fitness: fitness.score,
+      capability: fitness.capability,
+      operational: fitness.operational,
+      metadata: fitness.metadata,
+      strength: strength.score,
+      rawStrength: strength.rawScore,
+      strengthConfidence: strength.confidence,
+      strengthBasis: strength.basis,
+      strengthSignals: strength.signals ?? [],
+      publishedSignalCount: strength.publishedSignalCount ?? strength.signalCount ?? 0,
+      capabilityDimensions: strength.dimensions ?? {},
+      directDimensions: strength.directDimensions ?? [],
+      imputedDimensions: strength.imputedDimensions ?? [],
+      benchmarkTaskFit: typeof exactTier?.task_fit_score === "number" ? exactTier.task_fit_score * 100 : null,
+      breakerStability,
+    },
+  };
+}
+
 /** Build the un-blended decision table for offload targets. */
 export async function buildCandidates(
   cfg: Config,
@@ -471,275 +752,24 @@ export async function buildCandidates(
   const telemetry = opts.telemetry ?? loadRuntimeTelemetry();
   const memberships = collectSpecs(cfg);
 
-  // Hydrate each provider once. `has()` + `limits()` per row both call `list()`, which turned a
-  // candidates view into 2N sequential catalog operations even though every row shares a small
-  // provider-level snapshot.
-  const listedByProvider = new Map<string, Set<string> | null>();
-  if (opts.catalog) {
-    const providers = new Set<string>();
-    for (const spec of memberships.keys()) {
-      const { provider } = splitSpec(spec);
-      if (!opts.provider || provider === opts.provider) providers.add(provider);
-    }
-    await Promise.all([...providers].map(async (provider) => {
-      const p = cfg.providers[provider];
-      if (!p || p.kind !== "openai") {
-        listedByProvider.set(provider, null);
-        return;
-      }
-      try {
-        const models = await opts.catalog!.list(provider, p);
-        listedByProvider.set(
-          provider,
-          models.length > 0 || opts.catalog!.hasCachedCatalog(provider) ? new Set(models) : null,
-        );
-      } catch {
-        listedByProvider.set(provider, null);
-      }
-    }));
-  }
+  const listedByProvider = await hydrateProviderCatalogs(cfg, memberships, opts.catalog, opts.provider);
+  const credentialCells = collectCandidateCells(cfg, memberships, opts.provider);
 
-  const credentialCells: Array<{
-    spec: string;
-    membership: { pools: string[]; subagentTiers: string[] };
-    provider: string;
-    model: string | undefined;
-    providerConfig: ProviderConfig | undefined;
-    slot: CredentialSlot;
-  }> = [];
-  for (const [spec, membership] of memberships) {
-    const { provider, model } = splitSpec(spec);
-    if (opts.provider && provider !== opts.provider) continue;
-    const providerConfig: ProviderConfig | undefined = cfg.providers[provider];
-    const slots: readonly CredentialSlot[] = providerConfig
-      ? providerCredentialSlots(provider, providerConfig)
-      : [implicitCredentialSlot(provider)];
-    for (const slot of slots) {
-      credentialCells.push({ spec, membership, provider, model, providerConfig, slot });
-    }
-  }
-
-  const candidates: Candidate[] = [];
-  for (const { spec, membership, provider, model, providerConfig: p, slot } of credentialCells) {
-    const credentialId = slot.credentialId;
-    const credentialResolution = p
-      ? resolveCredentialSlot(slot)
-      : { state: "not-declared" as const, value: undefined, envName: undefined, source: undefined };
-    const modelAllowed = slotAllowsModel(slot, model);
-    // This is the exact credential-cell identity. Cell-only breaker operations below
-    // must receive the identity, never the display spec or a serialized provider/model key.
-    const cellTarget: ProviderTargetIdentity = {
-      provider,
-      model: model ?? null,
-      kind: p?.kind ?? "openai",
-      credentialId,
-      ...(p?.base ? { base: p.base } : {}),
-    };
-
-    const providerModels = listedByProvider.get(provider) ?? null;
-    const listed = p && p.kind === "openai" && model && opts.catalog
-      ? providerModels?.has(model) ?? null
-      : null;
-
-    const summary = opts.pingLoop && model ? opts.pingLoop.getModelSummary(provider, model) : null;
-    const state = breaker.getState(cellTarget);
-    const obs = model ? telemetry.models[`${provider}/${model}`] : undefined;
-    const strength = getStrength(spec, tierData);
-    const matched = findTierModel(model ?? spec, byNorm, tierData?.exactByNorm);
-    const tier = matched?.rec;
-    const num = (k: string) => (typeof tier?.[k] === "number" ? (tier[k] as number) : null);
-
-    // Limits THIS provider publishes about its own deployment, if any. NIM publishes none;
-    // Groq and Mistral publish real ones. The snapshot's numbers come from OpenRouter, so for a
-    // NIM target they are a different deployment's figures and are labelled `reference`, never
-    // presented as this provider's own.
-    const providerLimits = p && p.kind === "openai" && model && opts.catalog
-      ? opts.catalog.cachedLimits(provider, model)
-      : null;
-    // ⚠ On a FUZZY snapshot match these figures describe a similarly-named but different
-    // SKU (`glm-5.2` → `glm-5.2-max`), and `from` named only the host — so a borrowed
-    // ceiling or price was indistinguishable from one published for this very model id
-    // unless the reader separately correlated `capabilityMatch`. The matched name travels
-    // with the attribution instead, so `metadataReferenceFrom` states both WHOSE figure it
-    // is and WHICH model's.
-    const referenceFrom =
-      matched && matched.match === "fuzzy" ? `openrouter:${matched.rec.norm}` : "openrouter";
-    const meta = resolveMetadata(model ?? provider, {
-      providerLimits,
-      reference: {
-        contextLength: num("context_length"),
-        pricePromptPerToken: num("price_prompt"),
-        priceCompletionPerToken: num("price_completion"),
-        from: referenceFrom,
-      },
-    });
-    const exactTier = matched?.match === "exact" ? tier : undefined;
-    const supportsTools = typeof exactTier?.supports_tools === "boolean" ? exactTier.supports_tools : null;
-    const deploymentStats = deploymentBreakerStats(breaker, cellTarget);
-    const breakerStability = deploymentStats.stability;
-    // Preserve the existing evidence order: the purpose-built probe summary wins when present;
-    // live breaker observations are the fallback. Packet 2 changes the breaker's fallback from
-    // one credential cell to the deployment aggregate, not which measurement source outranks it.
-    const stabilityScore = summary && summary.stabilityScore >= 0
-      ? summary.stabilityScore
-      : breakerStability;
-    const stabilitySamples = summary && opts.pingLoop && model
-      ? opts.pingLoop.getModelPings(provider, model).length
-      : deploymentStats.confidenceSamples;
-    const fitness = deploymentFitness(strength, {
-      stabilityScore,
-      stabilityConfidence: Math.min(1, stabilitySamples / 5),
-      runtimeScore: model ? getRealWorldScore(provider, model, { telemetry, now: nowMs }) : null,
-      supportsTools,
-      contextLength: meta.contextLength,
-      contextConfidence: metadataConfidence(meta.contextLengthSource, matched?.match === "exact"),
-      maxOutputTokens: meta.maxOutputTokens,
-      maxOutputConfidence: metadataConfidence(meta.maxOutputTokensSource, matched?.match === "exact"),
-      benchmarkTaskFitScore: typeof exactTier?.task_fit_score === "number" ? exactTier.task_fit_score * 100 : null,
-      benchmarkTaskFitConfidence: Math.min(1, (exactTier?.task_fit_signal_count ?? 0) / 3),
-    });
-
-    // One merge for BOTH the raw `quota` field and the resolved `availability` ladders, so the
-    // two views can never disagree about which observation is newest.
-    const cellQuota = mergeCandidateQuota(
-      opts.pingLoop && model ? opts.pingLoop.getQuotaObservations(credentialId, model) : [],
-      state?.quotaObservations ?? [],
-    );
-    // G2's refusal ceiling for this cell — resolved through the SAME evaluator the request path
-    // refuses on, AND narrowed by the same rule: a `models.<id>.hard` ceiling reads that
-    // deployment's usage, a flat one reads the credential's usage across every model. Sharing the
-    // evaluator is not enough on its own — display and enforcement drifted apart precisely by
-    // asking the ledger two different questions through it.
-    const verdict = evaluateHardCap({
+  const candidates: Candidate[] = credentialCells.map((cell) =>
+    buildSingleCandidate({
       cfg,
-      provider,
-      credentialLabel: slot.label,
-      model: model ?? null,
-      usedInWindow: createHardCapLedgerReader(opts.accounting, credentialId, model, nowMs),
-      now: nowMs,
-    });
-
-    candidates.push({
-      spec,
-      provider,
-      ...(model ? { model } : {}),
-      credentialId,
-      pools: membership.pools,
-      subagentTiers: membership.subagentTiers,
-      // The shared presence predicate, not an open-coded `?.trim()`. Three sites disagreed
-      // about whether a whitespace-only key counts as present; this is the single answer.
-      hasKey: credentialResolution.state !== "declared-missing",
-      credential: {
-        label: slot.label,
-        authEnv: slot.authEnv ?? null,
-        enabled: slot.enabled,
-        models: slot.models,
-        state: credentialResolution.state,
-        source: credentialResolution.source ?? null,
-        modelAllowed,
-      },
-      listed,
-      capabilityMatch: matched ? { name: matched.rec.norm, match: matched.match } : null,
-      health: summary
-        ? {
-            verdict: summary.verdict,
-            avgMs: summary.avgMs >= 0 ? summary.avgMs : null,
-            p95Ms: summary.p95Ms >= 0 ? summary.p95Ms : null,
-            jitterMs: summary.jitterMs,
-            uptimePct: summary.uptimePct,
-            lastPingCode: summary.lastPingCode,
-            lastPingMs: summary.lastPingMs,
-          }
-        : null,
-      quota: cellQuota,
-      availability: buildCandidateAvailability(cfg, provider, credentialId, model, cellQuota, nowMs),
-      hardCap:
-        verdict === null
-          ? null
-          : {
-              axis: verdict.axis,
-              period: verdict.period,
-              cap: verdict.cap,
-              used: verdict.used,
-              basis: verdict.basis,
-              source: verdict.source,
-              scope: verdict.scope,
-              resetsAt: new Date(verdict.resetsAt).toISOString(),
-              resetsAtBasis: verdict.resetsAtBasis,
-            },
-      breaker: {
-        open: !breaker.isHealthy(cellTarget, nowMs),
-        consecutiveFailures: state?.consecutiveFailures ?? 0,
-        lastStatus: state?.lastStatus ?? null,
-        cooldownRemainingMs: Math.max(0, (state?.cooldownUntil ?? 0) - nowMs),
-        cooldownSource: state?.cooldownSource ?? null,
-        unexplained429s: state?.unexplained429s ?? 0,
-        credentialFailures: state?.credentialFailures ?? 0,
-        lastCredentialStatus: state?.lastCredentialStatus ?? null,
-        credentialFault: breaker.hasCredentialFault(cellTarget, nowMs),
-      },
-      facts: factsFor(provider, credentialId, model, { now: nowMs }).map((f) => ({
-        kind: f.kind,
-        scope: describeScope(f.scope),
-        expiresInMs: Math.max(0, f.until - nowMs),
-        ...(f.value === undefined ? {} : { value: f.value }),
-      })),
-      observed: obs
-        ? {
-            totalCalls: obs.totalCalls,
-            successCalls: obs.successCalls,
-            avgLatencyMs: obs.totalCalls > 0 ? Math.round(obs.totalLatencyMs / obs.totalCalls) : null,
-            lastCalledAt: obs.lastCalledAt ? new Date(obs.lastCalledAt).toISOString() : null,
-          }
-        : null,
-      completionTokens: {
-        reported: obs && obs.completionTokenCalls > 0 ? obs.totalCompletionTokens : null,
-        reportedCalls: obs?.completionTokenCalls ?? 0,
-        totalCalls: obs?.totalCalls ?? 0,
-      },
-      contextLength: meta.contextLength,
-      contextLengthSource: meta.contextLengthSource,
-      maxOutputTokens: meta.maxOutputTokens,
-      maxOutputTokensSource: meta.maxOutputTokensSource,
-      ...(meta.referenceFrom ? { metadataReferenceFrom: meta.referenceFrom } : {}),
-      pricePerMTokIn: meta.pricePerMTokIn,
-      pricePerMTokOut: meta.pricePerMTokOut,
-      priceSource: meta.priceSource,
-      supportsTools,
-      capabilitySources: Array.isArray(tier?.sources) ? (tier.sources as string[]) : [],
-      scores: {
-        bfclOverall: num("bfcl_overall"),
-        bfclMultiTurn: num("bfcl_multi_turn"),
-        bfclIrrelevance: num("bfcl_irrelevance"),
-        aaIntelligence: num("aa_intelligence"),
-        aaCoding: num("aa_coding"),
-        aaAgentic: num("aa_agentic"),
-        aiderPassRate: num("aider_pass_rate"),
-        aiderWellFormed: num("aider_well_formed"),
-        designArenaAgentsEloMean: num("design_arena_agents_elo_mean"),
-        designArenaModelsEloMean: num("design_arena_models_elo_mean"),
-        arenaRating: num("arena_rating"),
-        arenaRank: num("arena_rank"),
-      },
-      sortInputs: {
-        fitness: fitness.score,
-        capability: fitness.capability,
-        operational: fitness.operational,
-        metadata: fitness.metadata,
-        strength: strength.score,
-        rawStrength: strength.rawScore,
-        strengthConfidence: strength.confidence,
-        strengthBasis: strength.basis,
-        strengthSignals: strength.signals ?? [],
-        publishedSignalCount: strength.publishedSignalCount ?? strength.signalCount ?? 0,
-        capabilityDimensions: strength.dimensions ?? {},
-        directDimensions: strength.directDimensions ?? [],
-        imputedDimensions: strength.imputedDimensions ?? [],
-        benchmarkTaskFit: typeof exactTier?.task_fit_score === "number" ? exactTier.task_fit_score * 100 : null,
-        breakerStability,
-      },
-    });
-  }
+      cell,
+      listedByProvider,
+      catalog: opts.catalog,
+      pingLoop: opts.pingLoop,
+      breaker,
+      telemetry,
+      tierData,
+      byNorm,
+      nowMs,
+      accounting: opts.accounting,
+    }),
+  );
 
   return {
     generated_at: opts.now ?? new Date(nowMs).toISOString(),

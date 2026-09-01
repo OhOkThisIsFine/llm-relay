@@ -531,9 +531,10 @@ export function mapRemainingBasis(basis: RemainingResolution["basis"]): Remainin
       return "derived_published";
     case "derived:learned":
       return "derived_learned";
-    default:
+    default: {
       const _never: never = basis;
       return null;
+    }
   }
 }
 
@@ -562,9 +563,10 @@ export function mapLocalUsedBasis(basis: LocalUsedReading["basis"]): LocalUsedBa
       return basis;
     case "relay-counted":
       return "relay_counted";
-    default:
+    default: {
       const _never: never = basis;
       return null;
+    }
   }
 }
 

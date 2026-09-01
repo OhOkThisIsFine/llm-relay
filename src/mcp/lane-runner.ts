@@ -21,7 +21,7 @@
  * the relay daemon. The daemon's rule stands untouched: no HTTP turn causes a lane spawn. This
  * process answers no HTTP at all.
  */
-import { exec, execFile } from "node:child_process";
+import { exec, execFile, execSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { quoteCmdArg } from "../lane-probe.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
@@ -185,8 +185,31 @@ export type LaneSpawner = (
 
 type LaneExecError = Error & { killed?: boolean | undefined; code?: unknown };
 
+/** Terminate a full process tree (on Windows via taskkill /T /F, on POSIX via process group / signal). */
+export function terminateProcessTree(pid: number, platform: NodeJS.Platform = process.platform): void {
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return;
+  if (platform === "win32") {
+    try {
+      execSync(`taskkill /pid ${pid} /T /F`, { windowsHide: true, stdio: "ignore" });
+    } catch {
+      // Process may already have terminated.
+    }
+  } else {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Process may already have terminated.
+      }
+    }
+  }
+}
+
 /** The small child-process surface the lane spawner needs. */
 export interface LaneChildProcess {
+  pid?: number | undefined;
   stdin: { end: () => void } | null | undefined;
   kill: () => boolean;
 }
@@ -319,6 +342,9 @@ export function createLaneSpawner(
       result,
       kill: () => {
         killed = true;
+        if (child?.pid) {
+          terminateProcessTree(child.pid, processApi.platform);
+        }
         child?.kill();
       },
     };

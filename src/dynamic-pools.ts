@@ -1,7 +1,28 @@
-import { EFFORT_LEVELS } from "./config.js";
-import type { Config, EffortLevel, ResolvedTarget } from "./config.js";
+/**
+ * MODULE CHARTER: Dynamic Pool Synthesis & Tier Discovery (dynamic-pools.ts)
+ *
+ * 1. Domain Boundary & Responsibilities:
+ *    - Synthesizes dynamic, benchmark-ranked model pools (`pool/low`, `pool/medium`, `pool/high`, `pool/xhigh`).
+ *    - Dynamically discovers candidates by evaluating active provider catalogs against known tier benchmarks.
+ *    - Materializes candidate lists combining invariant fixed targets with fitness-ranked discovery tails.
+ *
+ * 2. Tier Discovery & Ranking Invariants:
+ *    - Matches candidate models against curated benchmark data (`tier-data.js`) using strict normalized SKU matching.
+ *    - Weighs capability scores alongside runtime stability metrics (`runtime-telemetry.js`, `probe-cache.js`).
+ *    - Caches materialized pool signatures per configuration epoch (`DYNAMIC_POOL_RANKING_EPOCH_MS`) to bound CPU overhead.
+ *
+ * 3. Degradation Tail & Fallback Rules:
+ *    - Implements monotonic effort-level degradation: `xhigh` degrades to `high`, `medium`, and `low` successively.
+ *    - Higher tiers incorporate lower tier candidates in their fallback tail to survive total tier exhaustion.
+ *    - Fixed targets specified in configuration take strict precedence over dynamically discovered tail candidates.
+ *
+ * 4. Cost-Based Band Ordering & Guardrails:
+ *    - Prioritizes 100% free model providers and subscription pools over metered paid endpoints.
+ *    - Enforces operator cost blocks (`isCostBlocked()`) to guarantee zero unintended spend on offload lanes.
+ */
+import { EFFORT_LEVELS, type Config, type EffortLevel, type ResolvedTarget } from "./config-types.js";
 import type { ModelCatalog } from "./catalog.js";
-import { rankTargetsWithProvenance, specOfTarget, strengthAllowedForEffort } from "./benchmarks.js";
+import { rankTargetsWithProvenance, specOfTarget, strengthAllowedForEffort, type Strength } from "./benchmarks.js";
 import type { DeploymentRankingSignals } from "./benchmarks.js";
 import { loadTierData, findTierModel, type TierData } from "./tier-data.js";
 import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./ping/runtime-telemetry.js";
@@ -121,41 +142,15 @@ function interleaveByProvider<T extends { target: ResolvedTarget }>(entries: T[]
  * while the on-disk cache makes restarts immediately useful. Re-materializing after a refresh
  * replaces the tail rather than accumulating stale models.
  */
-export function materializeDynamicPools(
+function discoverDynamicTargets(
   cfg: Config,
   catalog: ModelCatalog,
-  opts: { now?: number; force?: boolean; tierData?: TierData | null } = {},
-): boolean {
-  if (!cfg.routing.poolPolicies || !cfg.routing.pools) return false;
-
-  const now = opts.now ?? Date.now();
-  // `tierData` is injectable so a test can pin band membership. Band floors are CALIBRATED against
-  // the whole synced population, so a test naming real models asserts on a threshold that moves
-  // every time `npm run sync:tiers` runs: `kimi-k2.6` drifted 0.794 -> 0.799 on a routine refresh
-  // (same two sources, same four signals) and crossed into `xhigh`, turning a correct test red for
-  // a reason that had nothing to do with the behaviour under test. Production passes nothing and
-  // reads the snapshot exactly as before.
-  const tierData = opts.tierData !== undefined ? opts.tierData : loadTierData({ now });
-  const catalogRevision = typeof catalog.getRevision === "function" ? catalog.getRevision() : 0;
-  const signature = JSON.stringify({
-    catalogRevision,
-    tierRevision: tierData?.revision ?? tierData?.synced_at ?? null,
-    epoch: Math.floor(now / DYNAMIC_POOL_RANKING_EPOCH_MS),
-    policies: cfg.routing.poolPolicies,
-  });
-  if (!opts.force && materializationCache.get(cfg)?.signature === signature) return false;
-
-  // One immutable view per epoch: every deployment reads the same tier, telemetry, and probe
-  // evidence, and every effort pool is a filter over the same ranked roster.
-  const snapshot: RankingDataSnapshot = {
-    tierData,
-    telemetry: loadRuntimeTelemetry(),
-    probes: loadProbeCache(),
-    now,
-  };
+): {
+  discovered: ResolvedTarget[];
+  costBySpec: Map<string, CostClass>;
+} {
   const discovered: ResolvedTarget[] = [];
   const discoveredSpecs = new Set<string>();
-  /** spec -> what serving one request costs. Decides ORDER within a band, never admission. */
   const costBySpec = new Map<string, CostClass>();
 
   for (const [provider, p] of Object.entries(cfg.providers)) {
@@ -164,37 +159,7 @@ export function materializeDynamicPools(
       const spec = `${provider}/${model}`;
       if (discoveredSpecs.has(spec)) continue;
 
-      // Admission is `assessCost` — the same definition the freeOnly offload guard enforces.
-      // Mixed catalogs (OpenRouter/OpenCode/Kilo) contribute only zero-priced or explicitly
-      // `free`-named models; genuinely free-tier providers (`tierType: "free"`) may contribute
-      // unknown-priced models because many publish no prices at all — assessCost folds that
-      // rule in via the provider-tier basis.
-      // Cost no longer gates ADMISSION — it decides ORDER (see `costRank` and the band assembly
-      // below). A pool that admits only free deployments is free by construction, which sounds
-      // safe until the free lane is spent and the pool has nothing left; the owner's call is that
-      // paid capacity should be reachable, always behind every free option, and never silently.
-      // The `freeOnly` guard (default ON) is what still makes a pool free-only for anyone who has
-      // not opted into spending.
       const cost = assessCost(model, catalog.cachedLimits(provider, model), p.tierType);
-
-      // What the deployment itself said, which outranks what the roster implies about it.
-      //
-      // `assessCost`'s `provider-tier` basis admits any unpriced model from a `tierType: "free"`
-      // provider — the right default, since most free providers publish no prices at all, but it
-      // is an assumption about a ROSTER and a roster contains subscription-gated SKUs and models
-      // that were de-listed behind the scenes. Both were measured here: five `ollama-cloud/*`
-      // members answering 403 "requires a subscription", and `nim/moonshotai/kimi-k2.6` answering
-      // 404 "not found for account", all of them still holding pool slots and burning one failover
-      // round-trip per request.
-      //
-      // ⚠ Only proven-unfit deployments are dropped. `isCostBlocked` deliberately excludes
-      // `allowance-exhausted`: a spent free allowance is the normal state of a working free lane,
-      // not a discovery about price, and evicting on it would outlive the exhaustion that caused
-      // it. That case cools in `orderByUsability` and returns on its own.
-      // `cost.costClass` is resolved just above from this refresh's catalog prices, so a fact that
-      // applies to only one class (OpenRouter's paid-subset spend limit) is matched against what
-      // this deployment IS right now — not against a member list that goes stale when a provider
-      // moves a model between free, discounted and paid.
       if (isCostBlocked(provider, null, model, { costClass: cost.costClass })) continue;
 
       discovered.push({
@@ -210,6 +175,74 @@ export function materializeDynamicPools(
       discoveredSpecs.add(spec);
     }
   }
+
+  return { discovered, costBySpec };
+}
+
+function computeDegradeTail<T extends { target: ResolvedTarget; strength: Strength }>(
+  usable: T[],
+  effort: EffortLevel | undefined,
+  inBandSpecs: Set<string>,
+): T[] {
+  const tail: T[] = [];
+  if (!effort) return tail;
+
+  const seen = new Set(inBandSpecs);
+  for (const band of lowerBands(effort)) {
+    for (const entry of usable) {
+      const spec = specOfTarget(entry.target);
+      if (seen.has(spec) || !strengthAllowedForEffort(entry.strength, band)) continue;
+      seen.add(spec);
+      tail.push(entry);
+    }
+  }
+  return tail;
+}
+
+function orderBandByCost<T extends { target: ResolvedTarget }>(
+  entries: T[],
+  costBySpec: Map<string, CostClass>,
+): T[] {
+  const free = entries.filter((e) => costBySpec.get(specOfTarget(e.target)) === "free");
+  const rest = entries.filter((e) => costBySpec.get(specOfTarget(e.target)) !== "free");
+  return [...interleaveByProvider(free), ...interleaveByProvider(rest)];
+}
+
+/**
+ * Materialize every dynamic pool as:
+ *
+ *   fixed configured prefix -> every eligible free target in deployment-fitness order
+ *
+ * Catalog discovery is deliberately synchronous here: startup warms catalogs in the background,
+ * while the on-disk cache makes restarts immediately useful. Re-materializing after a refresh
+ * replaces the tail rather than accumulating stale models.
+ */
+export function materializeDynamicPools(
+  cfg: Config,
+  catalog: ModelCatalog,
+  opts: { now?: number; force?: boolean; tierData?: TierData | null } = {},
+): boolean {
+  if (!cfg.routing.poolPolicies || !cfg.routing.pools) return false;
+
+  const now = opts.now ?? Date.now();
+  const tierData = opts.tierData !== undefined ? opts.tierData : loadTierData({ now });
+  const catalogRevision = typeof catalog.getRevision === "function" ? catalog.getRevision() : 0;
+  const signature = JSON.stringify({
+    catalogRevision,
+    tierRevision: tierData?.revision ?? tierData?.synced_at ?? null,
+    epoch: Math.floor(now / DYNAMIC_POOL_RANKING_EPOCH_MS),
+    policies: cfg.routing.poolPolicies,
+  });
+  if (!opts.force && materializationCache.get(cfg)?.signature === signature) return false;
+
+  const snapshot: RankingDataSnapshot = {
+    tierData,
+    telemetry: loadRuntimeTelemetry(),
+    probes: loadProbeCache(),
+    now,
+  };
+
+  const { discovered, costBySpec } = discoverDynamicTargets(cfg, catalog);
 
   const ranked = rankTargetsWithProvenance(discovered, {
     tierData,
@@ -229,49 +262,16 @@ export function materializeDynamicPools(
       ? usable.filter((entry) => strengthAllowedForEffort(entry.strength, policy.effort!))
       : usable;
 
-    // Everything live that did NOT clear the band, in rank order — the degrade tail. An effort
-    // band selects on CAPABILITY, and capability correlates with the providers that meter hardest,
-    // so the top band is both the narrowest and the first to run dry: measured 2026-08-08,
-    // `pool/xhigh` had 12 members across 4 quota domains and returned 0 served while `pool/low`
-    // answered from 46 at the same moment with the same credentials. A band with nothing behind it
-    // turns "the strongest models are busy" into "no answer at all".
-    //
-    // ⚠ Appended, never merged: the band still decides who is tried FIRST, so a healthy pool is
-    // completely unaffected and the tail is reached only after every in-band member has actually
-    // failed on this request. And it is never silent — `poolDegraded` is what lets the response
-    // say the answer came from below the band.
     const inBandSpecs = new Set(inBand.map((entry) => specOfTarget(entry.target)));
+    const tail = computeDegradeTail(usable, policy.effort, inBandSpecs);
 
-    // ⚠ The tail holds members that clear a LOWER band — never members that clear no band at all.
-    // A model with no snapshot evidence is not "weaker", it is UNASSESSED, and admitting it here
-    // would quietly reverse the evidence-aware admission rule that keeps unmeasured models out of
-    // every pool. Degrading to a measured weaker model is a considered trade; degrading to one
-    // nothing is known about is a guess wearing the same clothes. Walked strongest-first, so an
-    // exhausted `xhigh` reaches `high` before `medium` before `low`.
-    const tail: typeof usable = [];
-    if (policy.effort) {
-      const seen = new Set(inBandSpecs);
-      for (const band of lowerBands(policy.effort)) {
-        for (const entry of usable) {
-          const spec = specOfTarget(entry.target);
-          if (seen.has(spec) || !strengthAllowedForEffort(entry.strength, band)) continue;
-          seen.add(spec);
-          tail.push(entry);
-        }
-      }
-    }
+    const bandOrder = orderBandByCost(inBand, costBySpec)
+      .map((e) => specOfTarget(e.target))
+      .filter((s) => !preferred.has(s));
+    const tailOrder = orderBandByCost(tail, costBySpec)
+      .map((e) => specOfTarget(e.target))
+      .filter((s) => !preferred.has(s) && !inBandSpecs.has(s));
 
-    // FREE FIRST, within every band. Cost decides order, not admission: paid capacity is reachable
-    // so a spent free lane is not a dead end, but it is only ever reached after every free member
-    // of the same band has failed. `unknown` cost sits with paid — a guess must not spend money,
-    // the same rule `assessCost` applies for the `freeOnly` guard.
-    const byCost = (entries: typeof inBand) => {
-      const free = entries.filter((e) => costBySpec.get(specOfTarget(e.target)) === "free");
-      const rest = entries.filter((e) => costBySpec.get(specOfTarget(e.target)) !== "free");
-      return [...interleaveByProvider(free), ...interleaveByProvider(rest)];
-    };
-    const bandOrder = byCost(inBand).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s));
-    const tailOrder = byCost(tail).map((e) => specOfTarget(e.target)).filter((s) => !preferred.has(s) && !inBandSpecs.has(s));
     cfg.routing.pools[pool] = [...preferredPrefix, ...bandOrder, ...tailOrder];
     if (tailOrder.length > 0) degraded[pool] = tailOrder;
   }

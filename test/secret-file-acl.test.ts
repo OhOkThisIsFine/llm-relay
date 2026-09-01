@@ -37,6 +37,32 @@ describe("Windows secret-file ACL hardening", () => {
     ]);
   });
 
+  it("quotes non-SID username principals containing spaces for icacls", () => {
+    expect(secretFileIcaclsArgs(
+      "C:\\Users\\Pat Example\\.llm-relay\\keystore.json",
+      "Pat Example",
+    )).toEqual([
+      "C:\\Users\\Pat Example\\.llm-relay\\keystore.json",
+      "/inheritance:r",
+      "/grant:r",
+      "\"Pat Example\":F",
+      "*S-1-5-18:F",
+      "*S-1-5-32-544:F",
+    ]);
+
+    expect(secretDirectoryIcaclsArgs(
+      "C:\\Users\\Pat Example\\.llm-relay",
+      "Pat Example",
+    )).toEqual([
+      "C:\\Users\\Pat Example\\.llm-relay",
+      "/inheritance:r",
+      "/grant:r",
+      "\"Pat Example\":(OI)(CI)F",
+      "*S-1-5-18:(OI)(CI)F",
+      "*S-1-5-32-544:(OI)(CI)F",
+    ]);
+  });
+
   it("constructs exact inheritable directory argv", () => {
     expect(secretDirectoryIcaclsArgs(
       "C:\\Users\\Example User\\.llm-relay",
@@ -167,7 +193,7 @@ describe("Windows secret-file ACL hardening", () => {
         "C:\\secret",
         "/inheritance:r",
         "/grant:r",
-        "Domain\\Owner Name:F",
+        "\"Domain\\Owner Name\":F",
         "*S-1-5-18:F",
         "*S-1-5-32-544:F",
       ],

@@ -15,11 +15,11 @@
  * `lane-manifest.ts` shallow-validation regression is the standing warning. ⚠ Restore never
  * overwrites a cooldown the live process already learned.
  */
-import { readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { relayStatePath } from "./state-paths.js";
 import { WriteBehindTimer } from "./write-behind.js";
+import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 import {
   exportExhaustedRows,
   onExhaustionChanged,
@@ -62,16 +62,10 @@ function isExhaustedRow(value: unknown): value is ExhaustedRow {
 export function loadExhaustedRows(opts: { path?: string; now?: number } = {}): ExhaustedRow[] {
   const target = opts.path ?? getDispatchExhaustionPath();
   const now = opts.now ?? Date.now();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(target, "utf8"));
-  } catch {
-    return [];
-  }
+  const parsed = safeReadJsonSync<Record<string, unknown>>(target);
   if (parsed === null || typeof parsed !== "object") return [];
-  const file = parsed as Record<string, unknown>;
-  if (file["version"] !== CURRENT_DISPATCH_EXHAUSTION_VERSION) return [];
-  const rows = file["rows"];
+  if (parsed["version"] !== CURRENT_DISPATCH_EXHAUSTION_VERSION) return [];
+  const rows = parsed["rows"];
   if (!Array.isArray(rows)) return [];
   // Expired rows are dropped HERE so every consumer sees the same rule.
   return rows.filter((row): row is ExhaustedRow => isExhaustedRow(row) && row.until > now);
@@ -80,24 +74,7 @@ export function loadExhaustedRows(opts: { path?: string; now?: number } = {}): E
 export function saveExhaustedRows(rows: readonly ExhaustedRow[], opts: { path?: string } = {}): void {
   const target = opts.path ?? getDispatchExhaustionPath();
   const file: DispatchExhaustionFile = { version: CURRENT_DISPATCH_EXHAUSTION_VERSION, rows: [...rows] };
-  let tmpPath: string | null = null;
-  try {
-    mkdirSync(dirname(target), { recursive: true });
-    tmpPath = `${target}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify(file, null, 2) + "\n", "utf8");
-    renameSync(tmpPath, target);
-    tmpPath = null;
-  } catch {
-    // Best-effort persistence: failing to save a routing hint must never fail a request.
-  } finally {
-    if (tmpPath !== null) {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        /* best effort cleanup */
-      }
-    }
-  }
+  atomicWriteJsonSync(target, file, { space: 2 });
 }
 
 /**

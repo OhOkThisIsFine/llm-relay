@@ -1,4 +1,5 @@
-import { expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX, type Config, type LadderRung } from "./config.js";
+import { expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX } from "./config.js";
+import type { Config, LadderRung } from "./config-types.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";

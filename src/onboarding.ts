@@ -1,5 +1,5 @@
 import { existsSync, appendFileSync, chmodSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { dirname } from "node:path";
 import { createInterface } from "node:readline";
 import type { Config, ProviderTierType } from "./config.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";

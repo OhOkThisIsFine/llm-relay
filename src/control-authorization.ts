@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { restrictSecretFileOnWindows } from "./secret-file-acl.js";
 

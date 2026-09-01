@@ -1,4 +1,4 @@
-import type { EffortLevel, ResolvedTarget } from "./config.js";
+import type { EffortLevel, ResolvedTarget } from "./config-types.js";
 import { loadTierData, findTierModel, type TierData } from "./tier-data.js";
 import { getRealWorldScore } from "./ping/runtime-telemetry.js";
 

@@ -1,6 +1,17 @@
+/**
+ * Accounting storage engine and lifecycle store.
+ *
+ * Charter & Invariants:
+ *  - Append-only write-ahead journal (`.journal`) with atomic flush and recovery.
+ *  - Segmented day shards (`YYYY-MM-DD.json`) with bounded detail/aggregate rollups.
+ *  - In-memory recent minute sliding windows for near-real-time quota checks.
+ *  - Crash-consistent journal replay on store recovery with loss marker bounds.
+ *  - Read-only queries (`readOnly: true`) never mutate or create writer leases.
+ */
+
 import { relayStatePath } from "./state-paths.js";
 import { randomBytes } from "node:crypto";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ACCOUNTING_UNSPECIFIED_ESTIMATION_METHOD,
@@ -20,7 +31,6 @@ import {
   type SnapshotWriterResult,
 } from "./accounting-store-io.js";
 import {
-  emptyAccountingAggregateSpend,
   emptyAccountingSpendCell,
   mergeAccountingSpendCells,
   ACCOUNTING_DAY_SCHEMA,
@@ -47,13 +57,10 @@ import {
   parseAccountingRequestPacketV1,
   type AccountingAggregateTokenCellV1,
   type AccountingAggregateTokenTotalsV1,
-  type AccountingAggregateSpendCellV1,
-  type AccountingAggregateSpendV1,
   type AccountingAttribution,
   type AccountingAttemptPacketV1,
   type AccountingAttemptRole,
   type AccountingCoverageReason,
-  type AccountingCoverageV1,
   type AccountingDayShard,
   type AccountingFailureKind,
   type AccountingLifetime,
@@ -427,7 +434,12 @@ function emptyCoverage(): MutableCoverage {
 function emptyCellCoverage(): MutableCellCoverage { return { state: "complete", reason: null, droppedRows: 0, losses: [] }; }
 function addLoss(losses: MutableLoss[], kind: AccountingLossKind, field: string | null, count = 1): void {
   const current = losses.find((loss) => loss.kind === kind && loss.field === field);
-  if (current !== undefined) { if (!increase(current as unknown as Record<string, number>, "count", count)) current.count = Number.MAX_SAFE_INTEGER; return; }
+  if (current !== undefined) {
+    if (!increase(current as unknown as Record<string, number>, "count", count)) {
+      current.count = Number.MAX_SAFE_INTEGER;
+    }
+    return;
+  }
   if (losses.length < ACCOUNTING_MAX_LOSS_MARKERS) losses.push({ kind, count, field });
 }
 function markCoverage(coverage: MutableCoverage, reason: Exclude<AccountingCoverageReason, null>, kind: AccountingLossKind, field: string | null, count = 1): void {
@@ -1152,7 +1164,10 @@ class AccountingStoreImpl implements AccountingStore {
 
     if (options.period !== "month") {
       // Request rows carry kind "request"; their aggregate counts requests exactly once per row.
-      const day = this.days.get(date);
+      let day = this.days.get(date);
+      if (day === undefined && !this._closed) {
+        day = this.loadDayForWrite(date) ?? undefined;
+      }
       if (day !== undefined) {
         // Both sides are bare HH:MM strings, so lexicographic order is chronological. The day
         // shard only contains THIS date's cells; the bound just drops clock-skewed future ones.
@@ -1677,6 +1692,8 @@ class AccountingStoreImpl implements AccountingStore {
     if (journalLoss) this.consumeRecoveryLoss(recovered);
     if (fixedLoss) this.markGlobalLoss("corrupt_recovery", "corrupt", "snapshot");
     this.seedTrustedDateFromLifetime();
+    const today = new Date(this.now()).toISOString().slice(0, 10);
+    this.loadDayForWrite(today);
     this.queueRecoveredRetention();
     this.last = recovered;
   }

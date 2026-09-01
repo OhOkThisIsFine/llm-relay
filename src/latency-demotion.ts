@@ -1,5 +1,17 @@
 /**
- * Sustained LATENCY as a demotion term — the sibling of `quota-demotion.ts`.
+ * Sustained Latency Demotion Subsystem.
+ *
+ * Charter & Invariants:
+ *  - Demotion Only: Latency measurements are used exclusively to demote candidate usability;
+ *    they never promote, drop, or re-sort deployment order.
+ *  - Two-Tier Signal Precedence: Per-token latency (ms/token p95 over ≥ minSamples request samples)
+ *    is the primary signal. Absolute probe latency (p95 over probe samples only) acts as fallback.
+ *  - Unmeasured Invariance: Deployments without qualifying sample history evaluate to Infinity
+ *    (no opinion), ensuring unmeasured models are never penalized or demoted.
+ *  - Self-Healing Rolling Window: No persistent cooldowns are registered; demotion state is
+ *    dynamically derived from recent ping samples and clears automatically upon performance recovery.
+ *  - Fault Tolerance: Evaluator functions are fail-safe and catch internal errors to yield null,
+ *    preventing latency estimation faults from failing live proxy requests.
  *
  * ⚠ **This deliberately reverses a rationale recorded in place, by OWNER DECISION (2026-08-30).**
  * `server.ts` argues against re-ranking on stability, in these words: a second ranking pass

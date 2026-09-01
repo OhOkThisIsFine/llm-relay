@@ -12,5 +12,6 @@ export default defineConfig({
     // copy passes one. Don't widen it.
     include: ["test/**/*.test.ts"],
     exclude: ["node_modules/**", "dist/**"],
+    pool: "forks",
   },
 });

@@ -19,7 +19,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   createCipheriv,

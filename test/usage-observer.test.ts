@@ -543,13 +543,12 @@ describe("usage observer", () => {
       .rejects.toBe(failure);
     expect(partialAccumulator.estimatedOutputTokens).toBeUndefined();
 
-    let stored: number | undefined;
     let completionSetterCalls = 0;
     let estimateSetterCalls = 0;
     const accumulator = {} as ReturnType<typeof createUsageAccumulator>;
     Object.defineProperty(accumulator, "completionTokens", {
       configurable: true,
-      get: () => stored,
+      get: () => undefined,
       set: () => {
         completionSetterCalls += 1;
         throw new Error("observer setter failed");
@@ -557,7 +556,7 @@ describe("usage observer", () => {
     });
     Object.defineProperty(accumulator, "estimatedOutputTokens", {
       configurable: true,
-      get: () => stored,
+      get: () => undefined,
       set: () => {
         estimateSetterCalls += 1;
         throw new Error("observer setter failed");

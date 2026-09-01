@@ -1,8 +1,12 @@
 {
   "ignoreDependencies": [
+    "@testing-library/react",
+    "@testing-library/user-event",
+    "axe-core",
     "dependency-cruiser",
     "jscpd",
     "madge",
-    "ts-prune"
+    "ts-prune",
+    "vitest-axe"
   ]
 }

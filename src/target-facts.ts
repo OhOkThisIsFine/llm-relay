@@ -1,11 +1,11 @@
 import { relayStatePath } from "./state-paths.js";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { hasExactKeys } from "./json-shape.js";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import { WriteBehindTimer } from "./write-behind.js";
 import { COST_CLASSES, type CostClass } from "./metadata.js";
+import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 
 /**
  * A learned condition or measurement about a routing target.
@@ -286,43 +286,39 @@ function isValidFact(key: string, value: unknown): value is StoredFact {
 function load(path: string): FactStore {
   if (_store && _path === path) return _store;
   _path = path;
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    // v1 had no credential identity. It is intentionally empty, rather than guessed or widened.
-    if (parsed && typeof parsed === "object" && (parsed as { version?: unknown }).version === 2) {
-      const rawFacts = (parsed as { facts?: unknown }).facts;
-      const facts: Record<string, StoredFact> = {};
-      if (rawFacts && typeof rawFacts === "object") {
-        for (const [key, fact] of Object.entries(rawFacts)) {
-          if (!isValidFact(key, fact)) continue;
-          // Drop a basis outside the closed enum rather than failing the load: an unknown spelling
-          // must behave exactly like the legacy rows that never carried one. A basis with NO
-          // explicit `until` goes the same way — `expiryOf` would then fall back to the kind's
-          // default TTL, and handing a consumer that fallback with a basis attached is the exact
-          // "a guess labelled a measurement" the field exists to prevent.
-          const { untilBasis, costClasses, ...rest } = fact;
-          const attributable = Number.isFinite(fact.until) && UNTIL_BASES.has(untilBasis as FactResetBasis);
-          // Strip the raw filter out of `rest` and re-add only a normalized one: an unrecognised or
-          // empty filter must leave the row behaving exactly like a legacy row that never had one.
-          const classes = normalizeCostClasses(costClasses);
-          const stored: StoredFact = {
-            ...rest,
-            scope: normalizeScope(fact.scope),
-            ...(attributable ? { untilBasis: untilBasis as FactResetBasis } : {}),
-            ...(classes === undefined ? {} : { costClasses: classes }),
-          };
-          // Rows predating the kind-in-key format carry a bare scope key; rekey them to the
-          // canonical `<kind>:<scope>` so an upgrade keeps every learned fact. Where both forms
-          // exist the canonical one stays — it was written later by this version.
-          const canonical = keyOf(stored.kind, stored.scope);
-          facts[canonical] ??= stored;
-        }
+  const parsed = safeReadJsonSync<Record<string, unknown>>(path);
+  // v1 had no credential identity. It is intentionally empty, rather than guessed or widened.
+  if (parsed && typeof parsed === "object" && (parsed as { version?: unknown }).version === 2) {
+    const rawFacts = (parsed as { facts?: unknown }).facts;
+    const facts: Record<string, StoredFact> = {};
+    if (rawFacts && typeof rawFacts === "object") {
+      for (const [key, fact] of Object.entries(rawFacts)) {
+        if (!isValidFact(key, fact)) continue;
+        // Drop a basis outside the closed enum rather than failing the load: an unknown spelling
+        // must behave exactly like the legacy rows that never carried one. A basis with NO
+        // explicit `until` goes the same way — `expiryOf` would then fall back to the kind's
+        // default TTL, and handing a consumer that fallback with a basis attached is the exact
+        // "a guess labelled a measurement" the field exists to prevent.
+        const { untilBasis, costClasses, ...rest } = fact;
+        const attributable = Number.isFinite(fact.until) && UNTIL_BASES.has(untilBasis as FactResetBasis);
+        // Strip the raw filter out of `rest` and re-add only a normalized one: an unrecognised or
+        // empty filter must leave the row behaving exactly like a legacy row that never had one.
+        const classes = normalizeCostClasses(costClasses);
+        const stored: StoredFact = {
+          ...rest,
+          scope: normalizeScope(fact.scope),
+          ...(attributable ? { untilBasis: untilBasis as FactResetBasis } : {}),
+          ...(classes === undefined ? {} : { costClasses: classes }),
+        };
+        // Rows predating the kind-in-key format carry a bare scope key; rekey them to the
+        // canonical `<kind>:<scope>` so an upgrade keeps every learned fact. Where both forms
+        // exist the canonical one stays — it was written later by this version.
+        const canonical = keyOf(stored.kind, stored.scope);
+        facts[canonical] ??= stored;
       }
-      _store = { version: 2, facts };
-      return _store;
     }
-  } catch {
-    // Learned data is best effort. Corruption must never block startup or a request.
+    _store = { version: 2, facts };
+    return _store;
   }
   _store = { version: 2, facts: {} };
   return _store;
@@ -330,26 +326,14 @@ function load(path: string): FactStore {
 
 function persist(path: string, now: number = Date.now()): void {
   if (!_store) return;
-  let tmp: string | null = null;
-  try {
-    // Prune expired rows before serializing: an expired row is already invisible to every reader,
-    // so dropping it changes no answer. Keep the in-memory store and the written file consistent.
-    for (const [key, fact] of Object.entries(_store.facts)) {
-      if (now >= expiryOf(fact)) {
-        delete _store.facts[key];
-      }
-    }
-    mkdirSync(join(path, ".."), { recursive: true });
-    tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(_store, null, 2) + "\n", "utf8");
-    renameSync(tmp, path);
-    tmp = null;
-  } catch { /* best effort */ }
-  finally {
-    if (tmp !== null) {
-      try { unlinkSync(tmp); } catch { /* best effort cleanup */ }
+  // Prune expired rows before serializing: an expired row is already invisible to every reader,
+  // so dropping it changes no answer. Keep the in-memory store and the written file consistent.
+  for (const [key, fact] of Object.entries(_store.facts)) {
+    if (now >= expiryOf(fact)) {
+      delete _store.facts[key];
     }
   }
+  atomicWriteJsonSync(path, _store, { space: 2 });
 }
 
 function expiryOf(fact: StoredFact): number { return fact.until ?? fact.at + FACT_TTL_MS[fact.kind]; }

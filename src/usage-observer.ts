@@ -5,6 +5,7 @@
  * the stream.
  */
 
+import { TransformStream } from "node:stream/web";
 import { estimateTokensFromCharacters } from "./metadata.js";
 
 /**
@@ -190,6 +191,35 @@ function recordOutputText(
   recordOutputCharacters(accumulator, state, value.length);
 }
 
+function processCandidateCharacter(
+  character: string,
+  text: StreamedTextState,
+  state: OutputEstimateState,
+): "continue" | "done" {
+  if (text.prefix.length < 5) {
+    text.prefix += character;
+    if (text.prefix.toLowerCase() !== "data:".slice(0, text.prefix.length)) {
+      text.disposition = "count";
+      text.heldCharacters = 0;
+      return "done";
+    }
+    return "continue";
+  }
+  if (character === ",") {
+    if (text.headerTail.toLowerCase() === ";base64") {
+      text.disposition = "skip";
+      state.characters -= text.heldCharacters;
+      text.heldCharacters = 0;
+    } else {
+      text.disposition = "count";
+      text.heldCharacters = 0;
+    }
+    return "done";
+  }
+  text.headerTail = `${text.headerTail}${character}`.slice(-7);
+  return "continue";
+}
+
 /**
  * A streamed logical string may be split before `data:...;base64,` becomes
  * recognizable. Count partial text immediately, but retain only enough state
@@ -232,30 +262,10 @@ function appendStreamedOutputText(
   state.characters = totalCharacters;
 
   for (const character of value) {
-    if (text.prefix.length < 5) {
-      text.prefix += character;
-      if (text.prefix.toLowerCase() !== "data:".slice(0, text.prefix.length)) {
-        text.disposition = "count";
-        text.heldCharacters = 0;
-        publishOutputEstimate(accumulator, state);
-        return;
-      }
-      continue;
-    }
-    if (character === ",") {
-      if (text.headerTail.toLowerCase() === ";base64") {
-        text.disposition = "skip";
-        state.characters -= text.heldCharacters;
-        text.heldCharacters = 0;
-        publishOutputEstimate(accumulator, state);
-      } else {
-        text.disposition = "count";
-        text.heldCharacters = 0;
-        publishOutputEstimate(accumulator, state);
-      }
+    if (processCandidateCharacter(character, text, state) === "done") {
+      publishOutputEstimate(accumulator, state);
       return;
     }
-    text.headerTail = `${text.headerTail}${character}`.slice(-7);
   }
   publishOutputEstimate(accumulator, state);
 }
@@ -421,14 +431,12 @@ function inspectAnthropicOutput(
   }
 }
 
-function inspectOpenAiMessage(
-  value: unknown,
+function inspectOpenAiContent(
+  message: Record<string, unknown>,
   accumulator: UsageAccumulator,
   state: OutputEstimateState,
   streamKeyPrefix?: string,
 ): void {
-  const message = asRecord(value);
-  if (!message) return;
   if (typeof message.content === "string") {
     if (streamKeyPrefix) {
       appendStreamedOutputText(accumulator, state, `${streamKeyPrefix}:content`, message.content);
@@ -461,7 +469,14 @@ function inspectOpenAiMessage(
     recordOutputText(accumulator, state, reasoningContent);
     recordOutputText(accumulator, state, message.refusal);
   }
+}
 
+function inspectOpenAiTools(
+  message: Record<string, unknown>,
+  accumulator: UsageAccumulator,
+  state: OutputEstimateState,
+  streamKeyPrefix?: string,
+): void {
   const functionCall = asRecord(message.function_call);
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   if (toolCalls.length === 0 && functionCall) {
@@ -482,6 +497,18 @@ function inspectOpenAiMessage(
       recordToolArguments(accumulator, state, fn.arguments);
     }
   }
+}
+
+function inspectOpenAiMessage(
+  value: unknown,
+  accumulator: UsageAccumulator,
+  state: OutputEstimateState,
+  streamKeyPrefix?: string,
+): void {
+  const message = asRecord(value);
+  if (!message) return;
+  inspectOpenAiContent(message, accumulator, state, streamKeyPrefix);
+  inspectOpenAiTools(message, accumulator, state, streamKeyPrefix);
 }
 
 function inspectOpenAiOutput(

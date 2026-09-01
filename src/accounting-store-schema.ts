@@ -435,7 +435,7 @@ const UTC_CANONICAL = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{3}Z$
 const DATE_CANONICAL = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MINUTE_CANONICAL = /^(\d{2}):(\d{2})$/;
 const MONTH_CANONICAL = /^(\d{4})-(\d{2})$/;
-const METHOD_SPECIAL = new Set(["mixed", "unknown"]);
+const _METHOD_SPECIAL = new Set(["mixed", "unknown"]);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {

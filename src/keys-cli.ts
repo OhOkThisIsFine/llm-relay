@@ -5,7 +5,6 @@ import type { Config, ProviderConfig } from "./config.js";
 import {
   curatedEnvNames,
   resolveCredential,
-  resolveCredentialExact,
   type CredentialResolution,
 } from "./authEnv.js";
 import {
@@ -113,7 +112,7 @@ class MutedPromptOutput extends Writable {
 
   override _write(
     chunk: Buffer | string,
-    _encoding: BufferEncoding,
+    _encoding: string,
     callback: (error?: Error | null) => void,
   ): void {
     try {

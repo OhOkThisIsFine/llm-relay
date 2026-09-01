@@ -123,7 +123,7 @@ describe("dashboard static resolver", () => {
   });
 
   it("rejects a symlink that escapes the injected root when the platform permits symlinks", () => {
-    const { root, handler } = fixture();
+    const { root } = fixture();
     const outside = mkdtempSync(join(tmpdir(), "llm-relay-outside-"));
     roots.push(outside);
     writeFileSync(join(outside, "escape.js"), "escape");

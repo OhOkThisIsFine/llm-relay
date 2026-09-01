@@ -6,7 +6,6 @@ import { runCostCommand, type CostCommandDependencies } from "../src/cli.js";
 import {
   assertCostReportV1,
   DASHBOARD_COST_SCHEMA,
-  type CostBy,
   type CostReportV1,
 } from "../src/dashboard-contract.js";
 import { createAccountingStore } from "../src/accounting-store.js";
