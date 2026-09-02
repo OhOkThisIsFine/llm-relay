@@ -115,6 +115,28 @@ the remote (`git fetch && git status -sb` showing no ahead/behind).
 State the published version, the CI run URL, and the confirmed `npm view` output. If you stopped at
 a gate, say which gate and exactly what has to happen before the release can resume.
 
+## Known trap: `gh run list --limit 1` right after a push returns the PREVIOUS run
+
+Met twice in one session (2026-09-01). GitHub has not registered the new run yet, so the "latest"
+row is the run before it — and `gh run watch` on that id answers
+`has already completed with 'success'` for work that never ran. Both readings looked like a green
+release.
+
+**Select the run by what identifies it, never by list position.** For a publish, that is the tag; for
+a CI run, the SHA:
+
+```bash
+gh run list --workflow=publish.yml --limit 5 --json databaseId,headBranch --jq '.[] | select(.headBranch=="v0.0.0") | .databaseId'
+```
+
+```bash
+gh run list --workflow=ci.yml --branch main --limit 5 --json databaseId,headSha --jq ".[] | select(.headSha==\"$(git rev-parse HEAD)\") | .databaseId"
+```
+
+Then confirm the verdict with `gh run view <id> --json status,conclusion,headSha` and check the SHA
+in that same output. Poll for the row rather than assuming it is there — it can take a few seconds
+to appear.
+
 ## Known trap: a SUCCESSFUL publish run prints `::error::tier-data.json missing or empty`
 
 Observed on the v0.68.7 release (2026-09-01). `gh run watch` rendered a red `X tier-data.json

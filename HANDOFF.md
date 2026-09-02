@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-01 (v0.68.7 published)
+## 0. State as of 2026-09-01 (v0.68.8 published)
 
 `src/server.ts` is decomposed (5,799 → 863 lines, a net −4,936). Its request path now lives in `routes/messages.ts`,
 `routes/openai-front.ts`, `candidate-runner.ts`, `stream-pipeline.ts` and `accounting-state.ts`;
@@ -65,18 +65,52 @@ Verification: `npm run check` green — server 147 files, 2,861 passed, 5 skippe
 
 **Released as v0.68.7** (owner decision 2026-09-01: patch — no public surface moved, and two live
 defect fixes reach users). Publish run
-[33537515414](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33537515414) succeeded;
-registry `dist-tags.latest` and the reinstalled global executable both report `0.68.7`. The packed
-artifact carries `tier-data.json` with 801 models.
+[33537515414](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33537515414) succeeded. The
+packed artifact carries `tier-data.json` with 801 models.
+
+**Then v0.68.8**, carrying the three control-flow fixes below. Publish run
+[33578564713](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33578564713) succeeded;
+registry `dist-tags.latest` and the reinstalled global executable both report `0.68.8`.
 
 ⚠ **A green publish run prints `::error::tier-data.json missing or empty`.** That is the workflow's
 own negative control deleting the asset from a throwaway copy to prove the probe catches it; the
-same step then prints `PASS-AS-EXPECTED`. Do not re-cut a release on that line. The trap, and the
-matching warning never to read a verdict off a piped `gh run watch`, are recorded in
-[`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md).
+same step then prints `PASS-AS-EXPECTED`. Do not re-cut a release on that line.
+
+⚠⚠ **Three CI-verdict traps are now recorded in
+[`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md), all met live this lap.** Never
+read a verdict off a piped `gh run watch` (the pipe reports `tail`'s exit code, so a FAILED run
+reads as green); never take the run from `gh run list --limit 1` right after a push (it returns the
+PREVIOUS run — this bit twice, and `gh run watch` then cheerfully reports that run's old success);
+select by tag or SHA and confirm with `gh run view --json status,conclusion,headSha`.
 
 ⚠ The long-running relay daemon still serves the PREVIOUS build — it autostarts at logon and is not
 restarted by a publish. Restart it to run the decomposed request path.
+
+**Round two — v0.68.8, three CONTROL-FLOW changes the first pass could not see.** The first audit
+compared function BODIES; `handle` shrank 683 → 271 lines and `openAiFrontPath` grew 17 → 561, so
+those two handlers were RESTRUCTURED, not moved, and a body diff cannot see a reordered guard. All
+three below are confirmed against `git show ec5c16f:src/server.ts`, and all three shipped in
+v0.68.7.
+
+- **The Anthropic front re-read the clock per candidate.** The original built ONE `CredentialWalk`
+  before the front branch on the frozen `routingNow`, so the ordering and the walk could not
+  disagree. The split gave `routes/messages.ts` its own walk with `selectionNow: Date.now()` AND an
+  `evidenceFor` calling `Date.now()` again per invocation, while `server.ts` kept `routingNow` for
+  the OpenAI front — two fronts, two clocks, and a non-deterministic walk. `routingNow` is now
+  threaded through `MessagesContext`.
+- **The context guardrail gained a second rung and its 400 body named the wrong source.**
+  `observedContextLimit` has ZERO hits in the original. The learned rung is KEPT — it is first-party
+  evidence about the exact deployment — but the body claimed the provider "publishes" the limit
+  whatever rung produced it. `contextCeilingFor` now returns the basis with the number.
+- **`forwardLocalResponse` inverted its fail-clean ordering**, committing the head before reading
+  the body on the local-failure exit of both loops. Restored.
+
+⚠⚠ **THE CONTROL-FLOW REVIEW COVERED ONE REGION OF FOUR.** `anthropic-walk`, `openai-front` and
+`headers-accounting` have had NO control-flow review — only the body-level comparison, which is what
+missed these three. A multi-agent verification lost nine of ten agents to an account spend limit and
+reported the surviving region's findings as "refuted" with EMPTY reason lists, i.e. a zero-vote
+result read as a unanimous one; the findings were verified by hand instead. This is the largest open
+gap in the audit and is tracked in [`docs/backlog.md`](docs/backlog.md).
 
 Immediate next:
 

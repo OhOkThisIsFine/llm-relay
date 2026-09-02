@@ -9,6 +9,29 @@
 
 ## Open
 
+- **Review the three unexamined request-path regions for CONTROL-FLOW change.** The `server.ts`
+  decomposition was audited by comparing function BODIES, which cannot see a reordered guard — and a
+  later control-flow pass over ONE region (`repair-streaming`) immediately found three real changes
+  the body pass had missed, all of them already shipped in v0.68.7 (fixed in v0.68.8, `fb61c61`).
+
+  **Unmet property:** `anthropic-walk`, `openai-front` and `headers-accounting` have had no
+  control-flow review. Given a 3-for-1 hit rate on the one region that WAS reviewed, more changes
+  are likely.
+
+  What to compare, per region, against `git show ec5c16f:src/server.ts`:
+  - `anthropic-walk` — the ORDER of operations per candidate (the hard cap BEFORE egress AND before
+    `recordStarted()`), the loop-exit conditions, the walk budget, the last-candidate case.
+  - `openai-front` — `openAiFrontPath` grew from a 17-line wrapper to a ~561-line body. Hunt
+    specifically for a policy the Anthropic path applies that this one now does not, or the reverse;
+    that is the recorded "two paths, two policies, one of them empty" shape.
+  - `headers-accounting` — `responseHeadersForTarget` / `ServedAnnouncementContext` /
+    `walkExitHeaders` / `respondAllCapped`, and the accounting lifecycle. Both fronts must still
+    build the served-announcement set through ONE owner, in ONE order.
+
+  ⚠ Do NOT judge this by the suite. All three shipped defects passed 2,860 tests.
+  Evidence: [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md)
+  §"Round two".
+
 - **Decide what to do with the 63 advisory errors the eslint revert surfaced.** The
   `server.ts` decomposition had switched off 15 rules; the owner reverted that on 2026-09-01
   (`cde5d1c`). ⚠ The CODE producing the findings is **pre-existing**: curated parser regexes in
