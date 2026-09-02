@@ -109,6 +109,17 @@ export interface MessagesContext {
   latencyDemotedFirst: string | null;
   accounting: RequestAccountingState | null;
   cfg: Config;
+  /**
+   * The ONE routing instant, captured in `handle` after route-level pruning.
+   *
+   * ⚠ It is threaded in rather than re-read here, and that is load-bearing. The same instant drives
+   * `orderDeploymentGroupsByUsability`, `rankCredentialAttempts` and this walk, so the ordering and
+   * the walk cannot disagree about whether a cell is cooling. Calling `Date.now()` here instead
+   * re-reads the clock per candidate, so a cooldown lapsing mid-walk changes the answer part-way
+   * through and the walk stops being deterministic — and the OpenAI front, which still passes
+   * `routingNow`, would then run a different policy from this one.
+   */
+  routingNow: number;
 }
 
 export interface AnthropicCtx {
@@ -648,8 +659,8 @@ export async function anthropicMessagesPath(
   const credentialWalk = new CredentialWalk(ctx.walkAttempts, {
     lru: h.credentialLru,
     walkBudgetMs: ctx.cfg.walkBudgetMs ?? DEFAULT_WALK_BUDGET_MS,
-    selectionNow: Date.now(),
-    evidenceFor: (attempt: ResolvedAttempt) => credentialEvidence(attempt, ctx.cfg, h.breaker, Date.now()),
+    selectionNow: ctx.routingNow,
+    evidenceFor: (attempt: ResolvedAttempt) => credentialEvidence(attempt, ctx.cfg, h.breaker, ctx.routingNow),
     maxInFlight: h.hedgeMaxInFlight,
   });
   const credentialTrace = new CredentialAttemptTrace(ctx.cfg);

@@ -206,3 +206,78 @@ pass", "relay-abandoned", "never invents", "loopback is not authorization", "byt
 
 After the repairs, `npm run check` passes on tree `25037a8a4cc3`: server 148 files, 2,865 passed,
 5 skipped; dashboard 5 files, 32 passed; package `packBytes` 937,955 against a 939,900 ceiling, 389 entries.
+
+## Round two — control flow, after the release (2026-09-01)
+
+The first pass compared function BODIES. That cannot see a reordered guard, because `handle` shrank
+683 → 271 lines and `openAiFrontPath` grew 17 → 561: those two handlers were RESTRUCTURED, not
+moved. A second pass covered exactly that, and found three more behaviour changes. All three are
+confirmed against `git show ec5c16f:src/server.ts`, and all three shipped in v0.68.7.
+
+⚠ **The second pass was NOT completed, and its coverage is one region of four.** A multi-agent
+verification was launched over four regions — `anthropic-walk`, `openai-front`, `repair-streaming`
+and `headers-accounting`. Nine of its ten agents died on an account spend limit. Only
+`repair-streaming` was analyzed, and its findings' adversarial refuters died too, so the run
+reported them as "refuted" with EMPTY reason lists — a zero-vote result read as a unanimous one.
+The findings below were then verified by hand instead. **`anthropic-walk`, `openai-front` and
+`headers-accounting` have had no control-flow review at all.** That is the largest open gap in this
+audit; the body-level comparison covering them is not a substitute.
+
+### 6. The Anthropic front re-read the clock per candidate
+
+The original built ONE `CredentialWalk`, before the front branch, on the frozen `routingNow`:
+`selectionNow: routingNow` and `evidenceFor: (attempt) => credentialEvidence(…, routingNow)`. The
+same instant drove `orderDeploymentGroupsByUsability`, `rankCredentialAttempts` and the walk.
+
+The decomposition split it into two walks. `server.ts` kept `routingNow` for the OpenAI front;
+`routes/messages.ts` built its own with `selectionNow: Date.now()` **and an `evidenceFor` that calls
+`Date.now()` again on every invocation**. So the Anthropic front's walk disagreed with the ordering
+that produced its own candidate list, its two fronts ran different policies, and a cooldown lapsing
+mid-walk changed the answer part-way through — the walk was no longer deterministic.
+
+**Action taken:** `routingNow` is threaded through `MessagesContext` and used for both. One clock,
+one policy, both fronts.
+
+### 7. The context guardrail gained a second rung, and its refusal body lied about the source
+
+`observedContextLimit` has ZERO hits in `ec5c16f:src/server.ts`. The new guardrail reads it AHEAD of
+the published figure, so a relay-LEARNED ceiling now drops candidates from the walk and can refuse
+the request locally with a 400 — where the request previously went upstream.
+
+The behaviour is kept: a `context-limit` fact is recorded only when the deployment itself STATED its
+maximum while refusing, which is first-party evidence about the exact deployment, and
+`contextWindowResolver` already ranks it above a catalogue figure for the same reason.
+
+**The defect was the provenance label.** The 400 body said the limit was what the provider
+"publishes" whatever rung produced it — a measurement reported as a publication, which is the one
+thing the provenance invariant forbids.
+
+**Action taken:** the two rungs are extracted into `contextCeilingFor`, which returns the basis
+alongside the number; the refusal body now names the rung. `CLAUDE.md`'s guardrail gotcha is
+amended, including the two residual costs (a 30-day TTL keeps a raised ceiling stale, and the
+refusal is reachable where the request previously went upstream). `test/context-ceiling.test.ts`
+pins the rung order, the basis and the null-means-no-guardrail rule.
+
+⚠ Extracting the helper also cut `handle`'s cognitive complexity from 101 to 94. An intermediate
+version of the fix RAISED it to 105; the working note that claimed a reduction at that point was
+wrong and is corrected here.
+
+### 8. `forwardLocalResponse` inverted its fail-clean ordering
+
+Original: `const bytes = Buffer.from(await response.arrayBuffer()); if (!res.headersSent)
+res.writeHead(…); res.end(bytes);` — body first, head second.
+
+New: `writeHead` first, then the body streamed chunk-by-chunk.
+
+This is the local-failure exit of BOTH candidate loops — `RequestMappingError` 400s, `DocumentError`
+400s, dialect destructive refusals — where the contract is to fail CLEAN. While the head is unsent
+the caller can still answer with a proper status; once it is sent, a body read that rejects leaves
+the client a truncated body under a committed status.
+
+⚠ Practical risk was low: these are relay-authored, already-materialized in-memory `Response`
+objects, so a body-read rejection is close to impossible. The ordering is still the reviewed one and
+costs nothing to keep.
+
+**Action taken:** the buffered form is restored, with the reason recorded beside it.
+`test/stream-pipeline.test.ts` pins that a rejecting body leaves the head UNSENT — a test the
+streaming version fails twice over, because it commits the head and never throws at all.

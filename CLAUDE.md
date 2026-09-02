@@ -846,6 +846,20 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   other. Never present one provider's figure as another's: resolve through `resolveMetadata()` and
   keep the `provider` / `reference` label. Tests in `test/metadata.test.ts` pin this, including that
   an unknown limit or price stays **null** instead of being guessed.
+- ⚠⚠ **AMENDED 2026-09-01 — the guardrail now has TWO rungs, and this paragraph described one.**
+  `contextCeilingFor` in `server.ts` reads a relay-LEARNED ceiling FIRST (`observedContextLimit` — a
+  `context-limit` fact recorded when this exact deployment stated its own maximum while refusing an
+  over-length request), and falls back to the published figure. The change arrived unreviewed inside
+  the `server.ts` decomposition; it is kept because the learned rung is FIRST-PARTY evidence about
+  the exact deployment, which is the same standing `contextWindowResolver` already gives it, and the
+  paragraph's own stated reason — "a 400 invented from a number we made up" — does not describe a
+  number the provider itself stated. Everything else below still binds: no third rung, unknown still
+  means NO guardrail. ⚠ The refusal body now NAMES the rung; it claimed the provider "publishes" the
+  limit whatever its source until this date, which reports a measurement as a publication.
+  ⚠ Two residual costs, stated rather than hidden: a learned fact carries a 30-day TTL, so a
+  provider that RAISES its ceiling keeps losing that candidate from the walk until the fact expires;
+  and the refusal is now reachable where the request previously went upstream. Pinned by
+  `test/context-ceiling.test.ts`.
 - **The context guardrail fires only on a limit the SERVING provider published.** Unknown limit ⇒
   no guardrail; the request goes upstream and the backend returns its own authoritative error. It
   reads `catalog.cachedLimits()`, which never fetches — a cold cache degrades to "no guardrail",

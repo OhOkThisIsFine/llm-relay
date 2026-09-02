@@ -372,6 +372,37 @@ function pickBool(obj: unknown, key: string): boolean {
   return typeof obj === "object" && obj !== null && (obj as Record<string, unknown>)[key] === true;
 }
 
+/**
+ * The context ceiling this relay may hold a deployment to, and WHICH rung stated it.
+ *
+ * Two rungs, most-authoritative first — the `contextWindowResolver` order, minus its snapshot rung:
+ *
+ * 1. `observed` — a `context-limit` fact recorded when THIS deployment stated its own maximum while
+ *    refusing an over-length request (`context-limits.ts`, deployment scope, 30-day TTL). It is
+ *    first-party evidence about the exact deployment, which a catalogue figure can contradict by
+ *    being generic or stale.
+ * 2. `published` — the serving provider's own `contextLength` from the catalogue, read cache-only.
+ *
+ * Null when neither rung answers, and null must stay "no guardrail": the request goes upstream and
+ * the backend returns its own authoritative error. ⚠ There is deliberately no invented third rung —
+ * a 400 built from a number nobody stated is worse than a true upstream error.
+ *
+ * ⚠ The BASIS travels with the number because the refusal body names it. Reporting a learned
+ * measurement as something the provider "publishes" is the one thing the provenance invariant
+ * forbids, and the body said exactly that for every rung until 2026-09-01.
+ */
+export function contextCeilingFor(
+  target: ResolvedTarget,
+  catalog: Pick<Handlers["catalog"], "cachedLimits">,
+): { limit: number; basis: "observed" | "published" } | null {
+  if (!target.model) return null;
+  const observed = observedContextLimit(target.provider, target.model);
+  if (observed) return { limit: observed, basis: "observed" };
+  const published = catalog.cachedLimits(target.provider, target.model)?.contextLength;
+  if (published) return { limit: published, basis: "published" };
+  return null;
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
   const started = Date.now();
   const path = req.url ?? "/";
@@ -553,21 +584,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     const estimatedTokens = estimatedRequestTokens;
     if (estimatedTokens > 0) {
       const remainingAttempts: ResolvedAttempt[] = [];
-      let firstExceeded: { target: ResolvedTarget; limit: number } | null = null;
+      // ⚠ The BASIS travels with the number. This guardrail now reads a relay-LEARNED ceiling
+      // (`observedContextLimit`, a `context-limit` fact recorded when this deployment itself stated
+      // its maximum while refusing) ahead of the provider's published figure. The refusal body used
+      // to say the provider "publishes" the limit whatever its source, which reports a measurement
+      // as a publication — the provenance invariant's one prohibition. Say which rung answered.
+      let firstExceeded: { target: ResolvedTarget; limit: number; basis: "observed" | "published" } | null = null;
 
       for (const group of groupCredentialAttempts(walkAttempts)) {
-        const candidate = group.attempts[0]!;
-        const t = candidate.target;
-        if (t.model) {
-          const observed = observedContextLimit(t.provider, t.model);
-          const limits = h.catalog.cachedLimits(t.provider, t.model);
-          const limit = observed ?? limits?.contextLength ?? null;
-          if (limit && estimatedTokens > limit) {
-            if (!firstExceeded) {
-              firstExceeded = { target: t, limit };
-            }
-            continue;
-          }
+        const ceiling = contextCeilingFor(group.attempts[0]!.target, h.catalog);
+        if (ceiling && estimatedTokens > ceiling.limit) {
+          firstExceeded ??= { target: group.attempts[0]!.target, ...ceiling };
+          continue;
         }
         remainingAttempts.push(...group.attempts);
       }
@@ -577,7 +605,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           res,
           400,
           `llm-relay: request prompt estimated tokens (${estimatedTokens}) exceeds the context limit ` +
-            `"${firstExceeded.target.provider}" publishes for "${firstExceeded.target.model}" (${firstExceeded.limit})`,
+            (firstExceeded.basis === "observed"
+              ? `"${firstExceeded.target.provider}" stated for "${firstExceeded.target.model}" when it refused an earlier over-length request (${firstExceeded.limit})`
+              : `"${firstExceeded.target.provider}" publishes for "${firstExceeded.target.model}" (${firstExceeded.limit})`),
           stickyProvenanceHeaders(sticky),
         );
         h.logger.write(baseLog(started, path, hadTools, false, 400, "skipped", null));
@@ -657,6 +687,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     latencyDemotedFirst,
     accounting,
     cfg,
+    routingNow,
   }, {
     ...h,
     withRepairAccounting,

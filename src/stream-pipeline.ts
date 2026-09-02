@@ -165,18 +165,23 @@ export function failClosed(
 }
 
 /** Forward a local Response descriptor directly to ServerResponse. */
+/**
+ * Forward a response the RELAY authored — a `RequestMappingError` 400, a `DocumentError` 400, a
+ * dialect destructive refusal — to the client.
+ *
+ * ⚠ The body is buffered BEFORE the head is committed, and that order is the point. This is the
+ * local-failure exit of both candidate loops, where the contract is to fail CLEAN: while the head
+ * is unsent the caller can still answer with a proper status, so a body read that rejects must
+ * throw before `writeHead`, never after it. Committing the head first and then streaming leaves a
+ * truncated body under an already-sent status, which is the one outcome this path exists to avoid.
+ * The bodies are small and relay-authored, so buffering costs nothing.
+ */
 export async function forwardLocalResponse(res: ServerResponse, local: Response): Promise<void> {
   const headers: Record<string, string> = {};
   for (const [k, v] of local.headers) headers[k] = v;
+  const bytes = Buffer.from(await local.arrayBuffer());
   if (!res.headersSent) res.writeHead(local.status, headers);
-  if (!local.body) {
-    if (!res.writableEnded) res.end();
-    return;
-  }
-  for await (const chunk of local.body as unknown as AsyncIterable<Uint8Array>) {
-    if (!await writeChunk(res, Buffer.from(chunk))) break;
-  }
-  if (!res.writableEnded) res.end();
+  res.end(bytes);
 }
 
 /** Parse an AssistantMessage from raw JSON string if valid. */
