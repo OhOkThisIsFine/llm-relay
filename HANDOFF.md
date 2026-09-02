@@ -83,8 +83,30 @@ reads as green); never take the run from `gh run list --limit 1` right after a p
 PREVIOUS run — this bit twice, and `gh run watch` then cheerfully reports that run's old success);
 select by tag or SHA and confirm with `gh run view --json status,conclusion,headSha`.
 
-⚠ The long-running relay daemon still serves the PREVIOUS build — it autostarts at logon and is not
-restarted by a publish. Restart it to run the decomposed request path.
+✅ **The daemon was restarted onto v0.68.8 and the decomposed request path is PROVEN LIVE**
+(2026-09-01). It had been running since 13:15, i.e. pre-decomposition code, because it autostarts at
+logon and a publish does not replace a running process. Restarted with
+`wscript.exe "<Startup>\llm-relay.vbs"` — ⚠ never `cmd /c start` on a `.vbs`, which opens a shell
+instead.
+
+Four things the restart proved that no test could:
+
+- **Anthropic front, `/v1/messages`, `pool/low`** → HTTP 200 in 1.46 s with the exact expected text,
+  and `x-llm-relay-pool-attempts: 3 tried, 1 served: 2x402, 1x200` — the walk FAILED OVER TWICE
+  before serving, so `nextUncappedAttempt`, the failover classification, `beginHealthAttempt` and
+  the served-announcement set all ran for real.
+- **OpenAI front, `/v1/chat/completions`, streamed** → HTTP 200 in 1.01 s, one 402 failover, frames
+  assembling to the expected text. Both fronts, one policy, live.
+- **The breaker LEARNED from it**: `huggingface/moonshotai/Kimi-K3` reads `OPEN 3521s`, i.e. 58.7
+  minutes remaining of the 1-hour cooldown a 402 earns. Attempt accounting works through the new
+  path.
+- ⚠ **The new learned context rung is INERT on this machine today** — `target-facts.json` holds NO
+  `context-limit` fact, so the guardrail still resolves through the published figure alone. Its
+  blast radius is zero until a provider refuses an over-length request.
+
+⚠ A `/candidates` query without the control token answers **403**, and a parser that reads the error
+object for a row array reports "0 candidates" — a vacuous pass. Use `llm-relay candidates`, which
+carries the token.
 
 **Round two — v0.68.8, three CONTROL-FLOW changes the first pass could not see.** The first audit
 compared function BODIES; `handle` shrank 683 → 271 lines and `openAiFrontPath` grew 17 → 561, so
@@ -127,8 +149,9 @@ Immediate next:
   evidence. The same investigation includes `pool/high` job `job-0002`, which exited 0 after
   75 seconds but returned only the incomplete fragment `Based on the evidence`. Neither symptom is
   yet attributed to the serving model, pool walking, lane output capture, or MCP job storage.
-- Restart the relay daemon so it serves v0.68.7. It autostarts at logon and still runs the previous
-  build; a publish does not replace a running process.
+- Release the `targetIdentity` fix (`7e16acc`) when something else earns a version. It changes no
+  behaviour — the hand-built identity produced identical values — so there is nothing for users to
+  receive and it did not justify a release of its own.
 - Claude→MCP→AGY end-to-end validation remains deferred until Claude subscription access returns.
   Codex→MCP→AGY already passed with no visible or foreground AGY window.
 
