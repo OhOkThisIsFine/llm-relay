@@ -62,6 +62,7 @@ import {
   type CandidateRunnerHandlers,
   type HealthAttempt,
   type StickyRequestContext,
+  beginHealthAttempt,
 } from "../candidate-runner.js";
 import {
   failClosed,
@@ -687,28 +688,14 @@ export async function anthropicMessagesPath(
           run.egressCallbackCalled = true;
           pool429.noteEgress();
           const egressAt = Date.now();
-          const identity = {
-            provider: run.target.provider,
-            model: run.target.model ?? null,
-            kind: run.target.kind,
-            credentialId: run.resolvedAttempt.credentialId,
-            base: run.target.base,
-          };
-          const begun = h.breaker.beginAttempt(identity);
-          if (!begun.ok) throw new Error("llm-relay: could not begin provider attempt");
-          run.attempt = {
-            committed: false,
-            handle: begun.value,
-            identity,
-            resolvedAttempt: run.resolvedAttempt,
-            target: run.target,
-            started: egressAt,
-            trace: attemptTrace,
-            usage: run.usage,
-            accounting: ctx.accounting,
-            accountingAttempt: null,
-            completed: false,
-          };
+          // ⚠ `beginHealthAttempt`, never a hand-built identity — see the same note on the OpenAI
+          // front. Rebuilding `ProviderTargetIdentity` field by field makes a private copy of
+          // target-identity construction, the drift `kernel/contracts.ts` records having already
+          // closed once, and it drops `targetIdentity`'s `Object.freeze`.
+          run.attempt =
+            beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, ctx.accounting) ??
+            undefined;
+          if (!run.attempt) throw new Error("llm-relay: could not begin provider attempt");
           run.attempt.accountingAttempt = ctx.accounting?.startServe(run.resolvedAttempt, egressAt) ?? null;
           recordCredentialStarted(credentialWalk, credentialTrace, run.resolvedAttempt);
           tried.push(specOfTarget(run.target));

@@ -9,29 +9,6 @@
 
 ## Open
 
-- **Review the three unexamined request-path regions for CONTROL-FLOW change.** The `server.ts`
-  decomposition was audited by comparing function BODIES, which cannot see a reordered guard — and a
-  later control-flow pass over ONE region (`repair-streaming`) immediately found three real changes
-  the body pass had missed, all of them already shipped in v0.68.7 (fixed in v0.68.8, `fb61c61`).
-
-  **Unmet property:** `anthropic-walk`, `openai-front` and `headers-accounting` have had no
-  control-flow review. Given a 3-for-1 hit rate on the one region that WAS reviewed, more changes
-  are likely.
-
-  What to compare, per region, against `git show ec5c16f:src/server.ts`:
-  - `anthropic-walk` — the ORDER of operations per candidate (the hard cap BEFORE egress AND before
-    `recordStarted()`), the loop-exit conditions, the walk budget, the last-candidate case.
-  - `openai-front` — `openAiFrontPath` grew from a 17-line wrapper to a ~561-line body. Hunt
-    specifically for a policy the Anthropic path applies that this one now does not, or the reverse;
-    that is the recorded "two paths, two policies, one of them empty" shape.
-  - `headers-accounting` — `responseHeadersForTarget` / `ServedAnnouncementContext` /
-    `walkExitHeaders` / `respondAllCapped`, and the accounting lifecycle. Both fronts must still
-    build the served-announcement set through ONE owner, in ONE order.
-
-  ⚠ Do NOT judge this by the suite. All three shipped defects passed 2,860 tests.
-  Evidence: [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md)
-  §"Round two".
-
 - **Decide what to do with the 63 advisory errors the eslint revert surfaced.** The
   `server.ts` decomposition had switched off 15 rules; the owner reverted that on 2026-09-01
   (`cde5d1c`). ⚠ The CODE producing the findings is **pre-existing**: curated parser regexes in
@@ -64,6 +41,33 @@
   [`dispatch-smoothness-2026-08-31.md`](dispatch-smoothness-2026-08-31.md).
 
 ## Closed
+
+- ✅ **Control-flow review of the three unexamined request-path regions** (2026-09-01). The
+  `server.ts` decomposition was first audited by comparing function BODIES, which cannot see a
+  reordered guard; a control-flow pass over ONE region then found three real changes the body pass
+  had missed, all already shipped in v0.68.7 and fixed in v0.68.8 (`fb61c61`). The owner directed a
+  hand review of the rest rather than a re-run of the multi-agent workflow that had lost nine of ten
+  agents to a spend limit.
+
+  **Result:** `headers-accounting` clean. `openai-front` and `anthropic-walk` each carried ONE
+  defect, the same one — both fronts hand-built `ProviderTargetIdentity` field by field instead of
+  calling `targetIdentity` through `beginHealthAttempt`. That is a THIRD private copy of a
+  construction `kernel/contracts.ts` records having already closed once between
+  `circuit-breaker.ts` and `kernel/request-lifecycle.ts`, and both copies dropped its
+  `Object.freeze`. ⚠ The values were identical, so no behaviour changed and no user was affected —
+  the drift hazard was caught before it cost anything. Both fronts call `beginHealthAttempt` again
+  and now diff clean against the original.
+
+  ⚠ **Method note worth keeping.** A textual function-body extractor mis-identifies a body whenever
+  the signature spans lines, because it takes the first `{` — which is then a parameter's inline
+  type. It produced a false "openAiFrontPath grew 17 → 561 lines" (the real figures are 630 → 590,
+  i.e. the front largely MOVED) and three false "CHANGED" verdicts. Diff a LINE RANGE, or read the
+  body, before believing such a tool.
+
+  ⚠ Do NOT judge any of this by the suite. Every defect this audit found passed 2,860 tests.
+  Evidence: [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md)
+  §"Round three".
+
 
 - ✅ **Give the 4,096-mutation accounting cap test a contention-aware timeout.** The full suite
   timed out `test/accounting-store.test.ts` at Vitest's 5-second default while 2,845 other server

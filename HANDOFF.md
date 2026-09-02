@@ -105,12 +105,20 @@ v0.68.7.
 - **`forwardLocalResponse` inverted its fail-clean ordering**, committing the head before reading
   the body on the local-failure exit of both loops. Restored.
 
-⚠⚠ **THE CONTROL-FLOW REVIEW COVERED ONE REGION OF FOUR.** `anthropic-walk`, `openai-front` and
-`headers-accounting` have had NO control-flow review — only the body-level comparison, which is what
-missed these three. A multi-agent verification lost nine of ten agents to an account spend limit and
-reported the surviving region's findings as "refuted" with EMPTY reason lists, i.e. a zero-vote
-result read as a unanimous one; the findings were verified by hand instead. This is the largest open
-gap in the audit and is tracked in [`docs/backlog.md`](docs/backlog.md).
+✅ **All four regions are now reviewed** (owner decision 2026-09-01: review the remaining three by
+hand rather than re-run the multi-agent workflow, which had lost nine of ten agents to a spend limit
+and reported the surviving region's findings as "refuted" with EMPTY reason lists — a zero-vote
+result read as a unanimous one). `headers-accounting` is clean; `openai-front` and `anthropic-walk`
+each carried ONE defect, the same one: both fronts hand-built `ProviderTargetIdentity` field by
+field instead of calling `targetIdentity` through `beginHealthAttempt`, making a THIRD private copy
+of a construction `kernel/contracts.ts` records having already closed once, and both dropped its
+`Object.freeze`. ⚠ The values were identical, so nothing user-visible changed. Both fronts now diff
+clean against the original.
+
+⚠ Round three also CORRECTS a round-two measurement: `openAiFrontPath` went 630 → 590 lines, not
+"17 → 561". That figure came from a textual extractor matching a multi-line signature's parameter
+braces instead of the body — the same false-match class the audit already warns about. The OpenAI
+front largely MOVED; it was not rewritten.
 
 Immediate next:
 

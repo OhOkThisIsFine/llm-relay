@@ -58,6 +58,7 @@ import {
   type CandidateRunnerHandlers,
   type HealthAttempt,
   type StickyRequestContext,
+  beginHealthAttempt,
 } from "../candidate-runner.js";
 import {
   failClosed,
@@ -209,28 +210,17 @@ export async function openAiFrontPath(
           run.egressCallbackCalled = true;
           pool429.noteEgress();
           const egressAt = Date.now();
-          const identity = {
-            provider: run.target.provider,
-            model: run.target.model ?? null,
-            kind: run.target.kind,
-            credentialId: run.resolvedAttempt.credentialId,
-            base: run.target.base,
-          };
-          const begun = h.breaker.beginAttempt(identity);
-          if (!begun.ok) throw new Error("llm-relay: could not begin provider attempt");
-          run.attempt = {
-            committed: false,
-            handle: begun.value,
-            identity,
-            resolvedAttempt: run.resolvedAttempt,
-            target: run.target,
-            started: egressAt,
-            trace: attemptTrace,
-            usage: run.usage,
-            accounting: ctx.accounting,
-            accountingAttempt: null,
-            completed: false,
-          };
+          // ⚠ `beginHealthAttempt`, never a hand-built identity. The decomposition inlined this and
+          // rebuilt `ProviderTargetIdentity` field by field, which made a THIRD private copy of
+          // target-identity construction — the exact drift `kernel/contracts.ts` records having
+          // already closed once between `circuit-breaker.ts` and `kernel/request-lifecycle.ts`,
+          // where "nothing in the type system would have caught the two drifting". The copy also
+          // dropped `targetIdentity`'s `Object.freeze`, so the identity a completed attempt carries
+          // was mutable here and frozen on the other front.
+          run.attempt =
+            beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, ctx.accounting) ??
+            undefined;
+          if (!run.attempt) throw new Error("llm-relay: could not begin provider attempt");
           run.attempt.accountingAttempt = ctx.accounting?.startServe(run.resolvedAttempt, egressAt) ?? null;
           recordCredentialStarted(credentialWalk, credentialTrace, run.resolvedAttempt);
           tried.push(specOfTarget(run.target));

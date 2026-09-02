@@ -281,3 +281,75 @@ costs nothing to keep.
 **Action taken:** the buffered form is restored, with the reason recorded beside it.
 `test/stream-pipeline.test.ts` pins that a rejecting body leaves the head UNSENT — a test the
 streaming version fails twice over, because it commits the head and never throws at all.
+
+## Round three — the three remaining regions, reviewed by hand (2026-09-01)
+
+Owner decision 2026-09-01: review the gap by hand rather than re-running the workflow. Method: for
+each region, extract the ORIGINAL control flow from `ec5c16f:src/server.ts`, strip comments and
+blank lines, collapse whitespace, and diff it line-for-line against the new home.
+
+⚠ **This corrects a measurement in round two.** That section reported `openAiFrontPath` growing
+"17 → 561 lines". Wrong: the ORIGINAL is 630 lines (`ec5c16f:src/server.ts` 4112–4742) and the new
+one is 590. The earlier figure came from a textual extractor that matched the multi-line
+signature's parameter braces instead of the body — the same false-match this document already warns
+about. The front largely MOVED; it was not rewritten, and the risk was lower than round two implied.
+
+### Result
+
+| Region | Verdict |
+|---|---|
+| `openai-front` | ONE defect (below). Otherwise control-flow identical. |
+| `anthropic-walk` | The SAME defect. Otherwise control-flow identical. |
+| `headers-accounting` | Clean. |
+
+### 9. Both fronts hand-built `ProviderTargetIdentity` instead of calling `targetIdentity`
+
+The original called `beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage,
+accounting)`, which builds the identity through `targetIdentity` — ONE definition, shared.
+
+The decomposition inlined that on BOTH fronts, rebuilding the identity field by field:
+
+```
+const identity = { provider: run.target.provider, model: run.target.model ?? null,
+                   kind: run.target.kind, credentialId: run.resolvedAttempt.credentialId,
+                   base: run.target.base };
+```
+
+That makes a THIRD private copy of target-identity construction. `kernel/contracts.ts` records
+having already closed exactly this drift once, between `circuit-breaker.ts` and
+`kernel/request-lifecycle.ts`, with the reason stated in place: *"nothing in the type system would
+have caught the two drifting: adding a field to `ProviderTargetIdentity` that ONE copy compares
+makes the breaker and the lifecycle disagree about whether a handle belongs to the …"*.
+
+⚠ The copies also dropped `targetIdentity`'s `Object.freeze`, so the identity a completed attempt
+carried was mutable on both fronts where it had been frozen.
+
+⚠ The VALUES are identical today, so no behaviour changed and no user was affected. This is the
+drift hazard itself, caught before it cost anything.
+
+**Action taken:** both fronts call `beginHealthAttempt` again, with the reason recorded beside each.
+After the fix both regions diff clean against the original except for the mechanical rebinding of
+free variables onto a context object (`path` → `ctx.path`) and two type renames.
+
+### Checked and cleared — NOT defects
+
+- **The deleted `credentialRecorded = true;`** in the OpenAI front's `finally`. It looked like a
+  dropped flag write, but `credentialRecorded` is declared INSIDE the `while` loop and the `finally`
+  ends that iteration, so nothing reads the value afterwards and the next iteration re-declares it
+  `false`. The assignment was already dead in the original.
+- **`target` moved from an outer variable to a loop-local `let`.** The original reassigned it at the
+  top of every iteration and the post-loop code — the all-capped refusal site — never reads it.
+- **`paidLabel`** gained `?? null` on `cachedLimits(...)`, normalising `undefined` to `null` for the
+  widened parameter type. Same logic.
+- **`respondAllCapped`, `walkExitHeaders`, `degradedLabel`, `completeAttemptSuccess`,
+  `recordCredentialOutcome`, `withRepairAccounting`, `recordEarlyTerminalAccounting`** — bodies
+  equivalent. `completeAttemptSuccess` still completes the breaker attempt, records the trace and
+  the model call, completes accounting, calls `clearFacts`, and clears credential faults on a
+  disproved `credential-invalid`.
+- **`responseHeadersForTarget`** — `!== undefined` became `typeof === "number"`, which is stricter
+  in the safe direction. Same order, same names.
+
+⚠ **A method note worth keeping.** A textual function-body extractor mis-identifies a body whenever
+the signature spans lines, because it takes the first `{` — which is then a parameter's inline type.
+It produced a false "17 → 561" in round two and three false "CHANGED" rows here. Diff a LINE RANGE,
+or read the body, before believing such a tool.
