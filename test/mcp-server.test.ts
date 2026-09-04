@@ -366,10 +366,17 @@ describe("dispatch tool", () => {
   });
 
   it("stamps the recursion depth into the child environment", async () => {
-    const spawn = fakeSpawner({ code: 0, stdout: "ok", stderr: "", timedOut: false });
-    const h = new Harness({ spawn });
-    await h.tool("dispatch", { task: "x" });
-    expect((spawn.calls[0]?.[2].env as NodeJS.ProcessEnv)[DEPTH_ENV]).toBe("1");
+    const previous = process.env[DEPTH_ENV];
+    delete process.env[DEPTH_ENV];
+    try {
+      const spawn = fakeSpawner({ code: 0, stdout: "ok", stderr: "", timedOut: false });
+      const h = new Harness({ spawn });
+      await h.tool("dispatch", { task: "x" });
+      expect((spawn.calls[0]?.[2].env as NodeJS.ProcessEnv)[DEPTH_ENV]).toBe("1");
+    } finally {
+      if (previous === undefined) delete process.env[DEPTH_ENV];
+      else process.env[DEPTH_ENV] = previous;
+    }
   });
 
   it("refuses to delegate past the depth limit, and spawns NOTHING", async () => {

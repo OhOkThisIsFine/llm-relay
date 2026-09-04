@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { getAvg, getP95, getJitter, getSpikeRate, getUptime, getStabilityScore, getVerdict, type PingRecord } from "../src/ping/metrics.js";
 import { extractQuotaPercent, buildPingRequest, pingProviderModel } from "../src/ping/ping.js";
 import {
@@ -610,6 +610,7 @@ describe("PingLoop Cadence", () => {
   let priorXdg: string | undefined;
 
   beforeEach(() => {
+    vi.useRealTimers();
     priorXdg = process.env.XDG_CACHE_HOME;
     cacheRoot = mkdtempSync(join(tmpdir(), "rp-pingloop-"));
     process.env.XDG_CACHE_HOME = cacheRoot;
@@ -617,6 +618,7 @@ describe("PingLoop Cadence", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     if (priorXdg === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = priorXdg;
     rmSync(cacheRoot, { recursive: true, force: true });
@@ -666,9 +668,14 @@ describe("PingLoop Cadence", () => {
       list: async () => ["pool-leader", "routed-second", "catalog-only"],
     } as any;
     const probed: string[] = [];
+    let resolveProbed!: () => void;
+    const probeDone = new Promise<void>((resolve) => {
+      resolveProbed = resolve;
+    });
     const mockFetch = async (_url: string, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { model: string };
       probed.push(body.model);
+      if (probed.length >= 2) resolveProbed();
       return new Response(JSON.stringify({ choices: [] }), { status: 200 });
     };
 
@@ -678,6 +685,7 @@ describe("PingLoop Cadence", () => {
       probeCachePath: isolatedProbeCache(),
     });
     await loop.tickOnce("routable");
+    await probeDone;
     expect(probed).toEqual(["pool-leader", "routed-second"]);
     expect(probed).not.toContain("catalog-only");
   });
