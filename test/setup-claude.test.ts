@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getClaudeDesktopConfigPath, setupClaudeDesktop, setupClaudeCli, installRelayAgent, RELAY_AGENT_MARKER } from "../src/setup-claude.js";
+import { getClaudeDesktopConfigPath, setupClaudeDesktop, setupClaudeCli, installRelayAgent, RELAY_AGENT_MARKER, type SetupFs } from "../src/setup-claude.js";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 
@@ -197,4 +197,40 @@ describe("setup-claude", () => {
     expect(allOut).toContain(join(testHome, ".claude", "agents", "relay.md"));
     expect(allOut).toContain('agent(task, {agentType: "relay"})');
   });
+
+  it("(e) setupClaudeDesktop with an injected fs where relay.md exists WITHOUT the marker returns success: true, its message contains the refusal line, and the Desktop config file was still written", () => {
+    const testHome = join(dir, "desktop-e");
+    const target = join(testHome, "claude_desktop_config.json");
+    const agentPath = join(testHome, ".claude", "agents", "relay.md");
+    const injectedFs: SetupFs = {
+      existsSync: (p: string) => (p === agentPath ? true : existsSync(p)),
+      readFileSync: (p: string, enc: "utf8") => (p === agentPath ? "custom foreign agent without marker" : readFileSync(p, enc)),
+    };
+
+    const res = setupClaudeDesktop({ targetPath: target, homeDir: testHome, fs: injectedFs });
+    expect(res.success).toBe(true);
+    expect(res.message).toContain(`Refusing to overwrite foreign agent file at ${agentPath}`);
+    expect(existsSync(target)).toBe(true);
+    const written = JSON.parse(readFileSync(target, "utf8")) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+    };
+    expect(written.mcpServers["llm-relay"]).toEqual({ command: "llm-relay", args: ["mcp"] });
+  });
+
+  it("(f) setupClaudeCli with an injected fs where relay.md exists WITHOUT the marker returns success: true, refusal line among the output lines", () => {
+    const testHome = join(dir, "cli-f");
+    const agentPath = join(testHome, ".claude", "agents", "relay.md");
+    const seen: string[] = [];
+    const injectedFs: SetupFs = {
+      existsSync: (p: string) => (p === agentPath ? true : existsSync(p)),
+      readFileSync: (p: string, enc: "utf8") => (p === agentPath ? "custom foreign agent without marker" : readFileSync(p, enc)),
+    };
+
+    const res = setupClaudeCli({ homeDir: testHome, fs: injectedFs, out: (l) => seen.push(l) });
+    expect(res.success).toBe(true);
+    const refusalLine = `Refusing to overwrite foreign agent file at ${agentPath}`;
+    expect(res.lines).toContain(refusalLine);
+    expect(seen).toContain(refusalLine);
+  });
 });
+

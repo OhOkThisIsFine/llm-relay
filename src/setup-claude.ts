@@ -113,13 +113,18 @@ export function setupClaudeDesktop(opts: SetupOptions = {}): { success: boolean;
   const legacyProxyUrl = opts.proxyUrl ?? "http://127.0.0.1:8791";
   const legacyConfigDir = opts.configDir ?? join(homedir(), ".llm-relay-claude");
 
+  const exists = opts.fs?.existsSync ?? existsSync;
+  const mkdir = opts.fs?.mkdirSync ?? mkdirSync;
+  const read = opts.fs?.readFileSync ?? readFileSync;
+  const write = opts.fs?.writeFileSync ?? writeFileSync;
+
   try {
-    mkdirSync(dirname(targetPath), { recursive: true });
+    mkdir(dirname(targetPath), { recursive: true });
     let existingConfig: Record<string, unknown> = {};
 
-    if (existsSync(targetPath)) {
+    if (exists(targetPath)) {
       try {
-        existingConfig = JSON.parse(readFileSync(targetPath, "utf8")) as Record<string, unknown>;
+        existingConfig = JSON.parse(read(targetPath, "utf8")) as Record<string, unknown>;
       } catch {
         /* parse fallback */
       }
@@ -155,22 +160,18 @@ export function setupClaudeDesktop(opts: SetupOptions = {}): { success: boolean;
     if (Object.keys(currentEnv).length === 0) delete existingConfig.env;
     else existingConfig.env = currentEnv;
 
-    writeFileSync(targetPath, JSON.stringify(existingConfig, null, 2) + "\n");
+    write(targetPath, JSON.stringify(existingConfig, null, 2) + "\n");
 
     const agentRes = installRelayAgent(opts);
-    if (!agentRes.success) {
-      return {
-        success: false,
-        path: targetPath,
-        message: agentRes.message,
-      };
-    }
-
     const lines = [
       `Successfully configured Claude Desktop MCP dispatch at ${targetPath}`,
-      `Installed relay agent at ${agentRes.path}`,
-      'agent(task, {agentType: "relay"})',
     ];
+    if (agentRes.success) {
+      lines.push(`Installed relay agent at ${agentRes.path}`);
+      lines.push('agent(task, {agentType: "relay"})');
+    } else {
+      lines.push(agentRes.message);
+    }
 
     if (opts.out) {
       for (const line of lines) opts.out(line);
@@ -220,18 +221,12 @@ export function setupClaudeCli(opts: SetupOptions = {}): { success: boolean; mes
   const agentRes = installRelayAgent(opts);
   const out = opts.out ?? ((line: string) => console.log(line));
 
-  if (!agentRes.success) {
+  if (agentRes.success) {
+    lines.push(`Installed relay agent at ${agentRes.path}`);
+    lines.push('agent(task, {agentType: "relay"})');
+  } else {
     lines.push(agentRes.message);
-    for (const line of lines) out(line);
-    return {
-      success: false,
-      message: agentRes.message,
-      lines,
-    };
   }
-
-  lines.push(`Installed relay agent at ${agentRes.path}`);
-  lines.push('agent(task, {agentType: "relay"})');
   lines.push("");
   for (const line of lines) out(line);
 
