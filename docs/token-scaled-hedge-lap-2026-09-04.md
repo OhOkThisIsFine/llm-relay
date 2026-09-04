@@ -1,16 +1,17 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-04T12:39:08.014Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-04T12:42:47.562Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `95b5aa639c1c683f4bc4e18e1a86f27726fcadd2`
+- HEAD: `42d46e36f023a3da648bf0b5e24588f31f7e7fab`
 - Sprint start: `6c9943f4f8a98d353607404e44948218d396dd72`
 
 ## Commits in the sprint range
 
+- 42d46e3 docs: re-render the lap-2 closeout against the recorded ledger
 - 95b5aa6 docs: closeout for the token-scaled hedge and model-free relay agent lap (v0.70.0)
 - 8d1649c chore: release v0.70.0
 - fd6ed10 chore: re-baseline the package ceilings for the shipped calibration script
@@ -26,13 +27,13 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-04T12:39:00.679Z on tree `827d7ad0bc76`
-- `verify-green check`: verify-green: PASS — tree 827d7ad0bc76 matches the passing run recorded 2026-09-04T12:39:00.679Z (npm run check) — PASS
+- Ledger: `npm run check` recorded 2026-09-04T12:39:59.532Z on tree `09010442bc8e`
+- `verify-green check`: verify-green: PASS — tree 09010442bc8e matches the passing run recorded 2026-09-04T12:39:59.532Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: in_progress/ (run 33873787723) — FAIL
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33873787723
+- CI: completed/success (run 33873857691) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33873857691
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -103,4 +104,4 @@ before merge.
 
 ## Verdict
 
-- 1 section(s) FAIL: CI CI.
+- All machine-derived sections PASS.
