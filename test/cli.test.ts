@@ -36,6 +36,10 @@ import {
   commandOptionError,
   runTelemetry,
   reportMcpExhaustion,
+  FLAG_ALIASES,
+  CLI_OPTIONS,
+  ACTION_OPTIONS,
+  VALUE_FLAGS,
 } from "../src/cli.js";
 import { loadConfig, type Config } from "../src/config.js";
 import { ModelCatalog } from "../src/catalog.js";
@@ -88,6 +92,54 @@ describe("cli helper utilities", () => {
       }
     }
     expect([...exempt].every((name) => CLI_COMMAND_NAMES.has(name))).toBe(true);
+  });
+
+  it("accepts short aliases -t and -x on dispatch option guard", () => {
+    expect(commandOptionError(["node", "cli.js", "dispatch", "--next-command", "-t", "probe"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "dispatch", "-x", "claude-free-pool"])).toBeNull();
+  });
+
+  it("rejects unknown short flag -q on dispatch as unsupported option", () => {
+    expect(commandOptionError(["node", "cli.js", "dispatch", "-q"])).toBe("llm-relay dispatch: unsupported option");
+  });
+
+  it("accepts short flags advertised by help (-p on models and ping, -r on models)", () => {
+    expect(commandOptionError(["node", "cli.js", "models", "-p", "nim"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "ping", "-p", "nim"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "models", "-r"])).toBeNull();
+  });
+
+  it("walks the alias table and asserts each short alias passes the guard for every command allowing the long flag", () => {
+    let testedCount = 0;
+    for (const [longFlag, shortAliases] of Object.entries(FLAG_ALIASES)) {
+      for (const [command, allowed] of Object.entries(CLI_OPTIONS)) {
+        if (allowed.includes(longFlag)) {
+          for (const alias of shortAliases) {
+            const argv = VALUE_FLAGS.has(alias)
+              ? ["node", "cli.js", command, alias, "probe-val"]
+              : ["node", "cli.js", command, alias];
+            const err = commandOptionError(argv);
+            expect(err, `expected command "${command}" to accept alias "${alias}" for "${longFlag}"`).toBeNull();
+            testedCount += 1;
+          }
+        }
+      }
+      for (const [command, actions] of Object.entries(ACTION_OPTIONS)) {
+        for (const [action, allowed] of Object.entries(actions)) {
+          if (allowed.includes(longFlag)) {
+            for (const alias of shortAliases) {
+              const argv = VALUE_FLAGS.has(alias)
+                ? ["node", "cli.js", command, action, alias, "probe-val"]
+                : ["node", "cli.js", command, action, alias];
+              const err = commandOptionError(argv);
+              expect(err, `expected action "${command} ${action}" to accept alias "${alias}" for "${longFlag}"`).toBeNull();
+              testedCount += 1;
+            }
+          }
+        }
+      }
+    }
+    expect(testedCount).toBeGreaterThan(0);
   });
 
   it("prints live telemetry first and falls back on connection, status, and JSON failures", async () => {

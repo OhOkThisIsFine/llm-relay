@@ -92,7 +92,35 @@ const CONTEXT_WINDOW_SOURCE_LABEL: Record<ContextWindowSource, string> = {
   provider: "published by the serving provider",
 } satisfies Record<ContextWindowSource, string>;
 
-const VALUE_FLAGS = new Set<string>([
+/**
+ * Canonical flag to short aliases mapping.
+ *
+ * Single-dash long aliases (`-task` for `--task`) are expanded automatically by
+ * `expandFlagAliases`. This table declares the explicit short aliases advertised
+ * by help and accepted by the CLI parser.
+ */
+export const FLAG_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  "--config": ["-c"],
+  "--provider": ["-p"],
+  "--default": ["-d"],
+  "--mode": ["-m"],
+  "--listen": ["-l"],
+  "--task": ["-t"],
+  "--exhausted": ["-x"],
+  "--refresh": ["-r"],
+  "--help": ["-h"],
+  "--version": ["-v"],
+};
+
+export const CLI_FLAG_ALIASES = FLAG_ALIASES;
+
+const SHORT_TO_CANONICAL: Readonly<Record<string, string>> = Object.fromEntries(
+  Object.entries(FLAG_ALIASES).flatMap(([canonical, aliases]) =>
+    aliases.map((alias) => [alias, canonical]),
+  ),
+);
+
+export const VALUE_FLAGS = new Set<string>([
   "--config", "-config", "-c",
   "--provider", "-provider", "-p",
   "--default", "-default", "-d",
@@ -180,11 +208,23 @@ function parseCliArgs(argv: string[]): ParsedCliArgs {
   return cachedParsedArgs;
 }
 
-function expandFlagAliases(flags: string[]): Set<string> {
+export function expandFlagAliases(flags: readonly string[]): Set<string> {
   const aliases = new Set<string>();
   for (const flag of flags) {
     aliases.add(flag);
-    if (flag.startsWith("--")) aliases.add(flag.slice(1));
+    const canonical = SHORT_TO_CANONICAL[flag] ?? (flag.startsWith("--") ? flag : `-${flag}`);
+    if (canonical !== flag && (canonical.startsWith("--") || FLAG_ALIASES[canonical])) {
+      aliases.add(canonical);
+    }
+    if (canonical.startsWith("--")) {
+      aliases.add(canonical.slice(1));
+    }
+    const shortAliases = FLAG_ALIASES[canonical] ?? FLAG_ALIASES[flag];
+    if (shortAliases !== undefined) {
+      for (const alias of shortAliases) {
+        aliases.add(alias);
+      }
+    }
   }
   return aliases;
 }
@@ -1320,7 +1360,7 @@ export const ARITY_EXEMPT: ReadonlySet<string> = new Set(["keys", "cooldowns", "
 export const ARITY_GUARDED_COMMANDS: readonly string[] = Object.keys(COMMAND_ARITY);
 
 type CliOptionSpec = Readonly<Record<string, readonly string[]>>;
-const CLI_OPTIONS: CliOptionSpec = {
+export const CLI_OPTIONS: CliOptionSpec = {
   proxy: ["--config", "--default", "--mode", "--listen", "--ping"],
   onboard: ["--config", "--import", "--force"],
   setup: [],
@@ -1343,7 +1383,7 @@ const CLI_OPTIONS: CliOptionSpec = {
   mcp: ["--config"],
 };
 
-const ACTION_OPTIONS: Readonly<Record<string, CliOptionSpec>> = {
+export const ACTION_OPTIONS: Readonly<Record<string, CliOptionSpec>> = {
   offload: { on: ["--config", "--scope"], off: ["--config", "--scope"], enable: ["--config", "--scope"], disable: ["--config", "--scope"], status: ["--config"] },
   pools: {
     list: ["--config", "--json", "--probe"], show: ["--config", "--json"],
