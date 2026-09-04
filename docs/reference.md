@@ -1510,7 +1510,7 @@ Five tools:
 
 | Tool | Purpose |
 |---|---|
-| `dispatch(task, tier?, lane?, cwd?, waitMs?, timeoutMs?)` | Hand a task to the best ready lane and return its answer. |
+| `dispatch(task, mode?, system?, schema?, maxTokens?, tier?, lane?, cwd?, waitMs?, timeoutMs?)` | Hand a task to the best ready lane and return its answer. |
 | `dispatch_status(jobId)` | Is a long lane still running? |
 | `dispatch_result(jobId)` | Collect a finished lane's answer. |
 | `dispatch_cancel(jobId)` | Stop a running lane. |
@@ -1521,18 +1521,65 @@ costs one call, and a long one degrades to polling rather than hitting the host'
 Every answer names the lane that produced it — the relay never presents another agent's text as
 its own.
 
+### `mode: "agent"` vs `mode: "answer"`
+
+`mode` defaults to `"agent"` — a lane's own harness runs with full tool access, exactly as
+`dispatch` has always behaved. Pass `mode: "answer"` for a question, draft, summary, or second
+opinion that needs no file access: for a `relay`-kind rung (a pool spec) it skips the spawned
+harness entirely and POSTs straight to this relay's own `/v1/messages`, which is faster —
+measured 5.7–10.8 s direct against 22 s through a spawned `claude -p` harness for a one-line task.
+Use the default agent mode whenever the lane must read or edit files or run commands; a `cli`-kind
+rung (agy, codex) behaves exactly like agent mode in either `mode`, since it has no direct-HTTP
+form of its own.
+
+Three answer-mode-only parameters:
+
+- `system` — an optional system prompt for the direct call.
+- `schema` — a JSON Schema. When given, the call forces a single `answer` tool call and the
+  result is that tool's `input`, JSON-stringified, instead of free text — useful for a
+  structured second opinion (a verdict, a list, a score) rather than prose to re-parse.
+- `maxTokens` — `max_tokens` for the direct call (default 4096).
+
+Answer mode still returns a `jobId`/polls/cancels exactly like agent mode; `dispatch_cancel`
+aborts the in-flight fetch. Its provenance line also carries whichever of the relay's own
+`x-llm-relay-served-by` / `-pool-attempts` / `-hedged` / `-latency-demoted` / `-degraded`
+headers the response announced, when it answered 2xx — a non-2xx response is reported as a
+failure carrying the HTTP status and a bounded excerpt of the body, never headers. If the
+resolved spec happens to be the plain Anthropic passthrough, the dummy credential this mode
+sends fails there and the pool walk moves on to the next candidate, same as any other rejected
+attempt.
+
 **Bounds.** Delegation depth is capped at 3 through `LLM_RELAY_DISPATCH_DEPTH`, because a
 dispatched lane can reach this server again. A lane runs in the server's own working directory
 unless the caller names another; declare `routing.mcp.allowedRoots` to bound which directories a
-caller may name:
+caller may name (the containment check resolves `..` before comparing, so a traversal segment
+cannot escape a declared root):
 
 ```json
 { "routing": { "mcp": { "allowedRoots": ["C:/Code"] } } }
 ```
 
+Answer mode needs no working directory at all — the `cwd`/`allowedRoots` check applies only to
+agent mode and to a `cli`-kind rung in answer mode, both of which spawn a process.
+
+**A timed-out dispatch never returns nothing.** Whether the timeout kills a spawned child (agent
+mode) or aborts the fetch (answer mode), the job's status becomes the distinct `timed_out` —
+never a bare `failed` that hides *why* — and `dispatch`/`dispatch_result` render whatever partial
+output survived plus a one-line reason, so a caller polling a long lane is never left with an
+empty response to interpret.
+
+**A content-empty answer is reported as a failure, not a success.** A lane can exit 0 (or answer
+HTTP 200) with text that is syntactically nonempty but carries nothing usable — a lone `#`, a bare
+`---`. After stripping whitespace, punctuation, and Markdown scaffolding, if nothing alphanumeric
+remains, both dispatch modes report it as a distinct `empty-output` failure rather than a
+successful empty answer. This is a structural check only — a short real answer like `OK` or `42`
+still reads as content, and the check never tries to judge whether the content actually answers
+the task.
+
 **Scope.** This is a separate process that the host launches. It is not part of the relay daemon,
-it serves no HTTP, and it does not change the rule that no HTTP request causes a lane to be
-spawned. It needs a configured `routing.ladder`, which is a per-machine choice — a fresh install
+and it does not change the rule that no HTTP request causes a lane to be spawned — answer mode's
+own HTTP call is this server's OWN outbound request to the relay, not an inbound one triggering a
+spawn. It needs a configured `routing.ladder`, which is a per-machine choice — a fresh install
 ships none, and `dispatch_lanes` says so plainly.
 
 ---

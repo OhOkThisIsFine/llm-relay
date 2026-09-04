@@ -105,6 +105,7 @@ ANSWER**, not a command you then have to run correctly:
 dispatch(task: "<the whole task>")            -> the lane's answer, plus which lane produced it
 dispatch(task: "...", tier: "high")           -> pick a capability tier
 dispatch(task: "...", lane: "agy-gemini")     -> force one rung
+dispatch(task: "...", mode: "answer")         -> no harness — a direct call, for speed
 ```
 
 If the lane outlives `waitMs` (default 60 s) you get a `jobId` instead. Then:
@@ -116,6 +117,31 @@ lane command correctly is the hard part — three client idle timeouts must be l
 dies at ~300 s, stdin must be closed or `agy` stalls to its timeout, an npm `.cmd` shim needs a
 shell with every token quoted, and a console child steals the desktop focus without window
 suppression. The MCP server does all of that for you.
+
+#### `mode: "agent"` (default) vs `mode: "answer"`
+
+Agent mode spawns the lane's own harness — full tool access, and the only form a `cli`-kind rung
+(agy, codex) has. Answer mode is for a `relay`-kind rung (a pool spec) only: it skips the harness
+entirely and POSTs straight to the relay's own `/v1/messages`, which is measurably faster — a
+one-line task ran 5.7–10.8 s direct against 22 s through a spawned `claude -p` harness for the
+same pool. **Use answer mode for a question, draft, summary, or second opinion that needs no file
+access; keep agent mode whenever the lane must read or edit files or run commands.** A `cli`-kind
+rung behaves exactly like agent mode either way, since it has no direct-HTTP form.
+
+```
+dispatch(task: "is this diff safe to merge? answer yes or no with one reason", mode: "answer")
+dispatch(task: "draft a one-paragraph summary of this doc", mode: "answer", maxTokens: 300)
+dispatch(task: "rate this PR 1-5", mode: "answer",
+         schema: { type: "object", properties: { score: { type: "number" } }, required: ["score"] })
+```
+
+`system` sets an optional system prompt; `schema` (a JSON Schema) forces a single `answer` tool
+call and hands back that tool's input, JSON-stringified — pass it when the result should be
+structured data rather than prose to re-parse. `maxTokens` overrides the 4096 default.
+
+If the resolved spec happens to be the plain Anthropic passthrough, the dummy credential this
+mode sends fails there and the walk moves on to another candidate — the same failover a real
+credential failure would trigger.
 
 Not present? Add it once: `claude mcp add --scope user llm-relay -- llm-relay mcp`.
 

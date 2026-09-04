@@ -55,6 +55,10 @@ you cannot reverse.
    tools are present, because building and running a lane command correctly is the part that keeps
    going wrong; the server handles the working directory, the environment and the idle timeouts.
    This rule is the same in Claude, Codex, desktop apps, CLIs and other MCP hosts.
+   ⚠ Pass `mode: "answer"` for a question, draft, summary, or second opinion that needs no file
+   access — it skips spawning a harness and posts straight to the relay, so it answers in seconds
+   rather than tens of seconds. Keep the default agent mode when the lane must read or edit files
+   or run commands. See [references/dispatch-lanes.md](references/dispatch-lanes.md).
 2. `llm-relay dispatch --next-command -t "<task>"` — when the MCP tools are absent. Exit 0 prints
    one runnable command line. Exit 2 means the rung is a relay target, so address the named spec
    as an ordinary subagent.

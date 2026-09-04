@@ -23,6 +23,7 @@
  */
 import { exec, execFile, execSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { quoteCmdArg } from "../lane-probe.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
 import { laneOfRung } from "../lane-manifest.js";
@@ -53,7 +54,38 @@ export const DEFAULT_WAIT_MS = 60_000;
 /** Ceiling on one lane run. agy's own `--print-timeout` convention here is 30 minutes. */
 export const DEFAULT_LANE_TIMEOUT_MS = 30 * 60 * 1000;
 
-export type JobStatus = "running" | "completed" | "failed" | "cancelled";
+/**
+ * `"timed_out"` is its own terminal status, DISTINCT from `"failed"` (2026-09-03,
+ * C:\Code\docs\backlog.md "A bounded llm-relay design dispatch can consume its full 1,200-second
+ * wait and return no result"). A killed-by-timeout run used to fall into the same bucket as an
+ * ordinary nonzero exit, so a caller reading `status` could not tell "the lane ran and failed"
+ * from "the lane never finished" — the two call for different next actions (retry a different
+ * lane vs. maybe poll a little longer next time). `complete()` sets it whenever the run result
+ * says `timedOut`, ahead of the exit-code/semantic-failure check.
+ */
+export type JobStatus = "running" | "completed" | "failed" | "cancelled" | "timed_out";
+
+/**
+ * The four states `LaneJobStore.complete()`/`cancel()` can put a job into — `"running"` is the
+ * only non-terminal member of `JobStatus`. Exported so a rendering test can iterate every
+ * terminal status the store actually knows, rather than hand-copying the list a second time.
+ */
+export const TERMINAL_JOB_STATUSES = ["completed", "failed", "cancelled", "timed_out"] as const satisfies readonly JobStatus[];
+
+/**
+ * The relay's own response headers that announce what happened during an answer-mode HTTP call —
+ * the direct-fetch sibling of the provenance every spawned-lane answer already carries (lane id,
+ * spec, elapsed). Only these five, allow-list style: never the whole `Headers` object, and NEVER
+ * read at all on a non-2xx response (a failure carries status + a bounded body excerpt, not
+ * headers — see `runAnswerFetch`).
+ */
+export interface RelayAnnouncements {
+  servedBy?: string;
+  poolAttempts?: string;
+  hedged?: string;
+  latencyDemoted?: string;
+  degraded?: string;
+}
 
 export interface LaneJob {
   id: string;
@@ -71,6 +103,8 @@ export interface LaneJob {
   cwd: string;
   /** Set only when the run failed before or during the spawn. */
   error: string | undefined;
+  /** Set only for an answer-mode job whose relay response reached the 2xx branch. */
+  relay?: RelayAnnouncements;
 }
 
 /** What a completed run looks like to a caller. */
@@ -80,6 +114,31 @@ export interface LaneRunResult {
   stderr: string;
   timedOut: boolean;
 }
+
+/**
+ * A lane can exit 0 (agent mode) or answer HTTP 200 (answer mode) with text that is
+ * syntactically nonempty but carries nothing usable — a lone `#`, a bare `---`, a block of
+ * `***`. The pre-existing check caught only the LITERALLY empty string, which a scaffold-only
+ * fragment slips past (C:\Code\docs\backlog.md: a 652-second review returned only `#`).
+ *
+ * Deliberately STRUCTURAL, not semantic: it strips whitespace, punctuation and Markdown
+ * scaffolding characters and asks only whether anything ALPHANUMERIC remains — it does not judge
+ * whether the content actually answers the task, which would cross this repo's own repair
+ * boundary ("routing comes from config and deterministic classification, never from an LLM's
+ * opinion inserted into the request path"). `isContentEmpty("Here is")` is `false`: a generic
+ * lead-in with nothing after it is a real judgement call this predicate refuses to make. `"OK"`
+ * and `"42"` must both read as content, and do.
+ */
+export function isContentEmpty(text: string): boolean {
+  return text.replace(/[\s#*_\-|>`~=]/g, "").length === 0;
+}
+
+/**
+ * The distinct failure reason both dispatch modes report for a content-empty result — a single
+ * string constant so `describeJob`'s `error:` line and any caller-side matching agree on the
+ * literal token, rather than each spelling it out separately.
+ */
+export const EMPTY_OUTPUT_REASON = "empty-output: the lane's output has no usable content after stripping formatting";
 
 export interface DispatchedQuotaReport {
   laneId: string;
@@ -353,6 +412,67 @@ export function createLaneSpawner(
 
 export const defaultLaneSpawner: LaneSpawner = createLaneSpawner(nodeProcessApi);
 
+/**
+ * The answer-mode HTTP seam — a direct POST to the running relay's own `/v1/messages`,
+ * bypassing a spawned harness entirely for a `relay`-kind rung. Typed as `typeof fetch` (this
+ * repo's established convention — `backend.ts`, `catalog.ts`, `key-checker.ts`, `reshaper.ts` all
+ * inject the real global `fetch` this same way), so a test can hand it a fake built from the
+ * real `Response` constructor exactly as those modules' tests already do.
+ *
+ * Injected for the same reason `LaneSpawner` is, and guarded the same way: this process is
+ * launched by a host that may be running on a machine whose OWN `llm-relay` daemon is live on
+ * its default port, so an accidentally-unmocked call here would not spend a lane's OWN quota (the
+ * spawner's concern) but would reach a REAL locally-running relay and spend a REAL provider's.
+ * `createAnswerFetch` copies the `LaneSpawner` guard pattern exactly: under vitest, refuse unless
+ * the caller injects its own seam.
+ */
+export type AnswerFetch = typeof fetch;
+
+export function createAnswerFetch(hostEnv: NodeJS.ProcessEnv = process.env): AnswerFetch {
+  if (hostEnv["VITEST"]) {
+    return (async () => {
+      throw new Error("answer-mode HTTP calls are disabled under vitest — inject deps.fetch");
+    }) as AnswerFetch;
+  }
+  return fetch;
+}
+
+export const defaultAnswerFetch: AnswerFetch = createAnswerFetch();
+
+/**
+ * Where this relay itself is listening, for the answer-mode HTTP call. Deliberately a tiny local
+ * copy of `cli.ts`'s `proxyUrl` rather than an import of it: `cli.ts` already imports
+ * `McpDispatchServer` from this module's sibling, and importing back would create the first
+ * import cycle between `cli.ts` and `mcp/`, for two lines neither side is likely to drift on.
+ */
+export function relayLoopbackUrl(config: { host: string; port: number }, path: string): string {
+  const host = config.host.includes(":") ? `[${config.host}]` : config.host;
+  return `http://${host}:${config.port}${path}`;
+}
+
+/**
+ * The relay's own response headers that announce what happened, read allow-list style — never
+ * the whole `Headers` object — into an answer-mode job's provenance. Absent header ⇒ absent key,
+ * never an empty string, so `describeJob` renders a line only when the relay actually said
+ * something.
+ */
+const RELAY_ANNOUNCEMENT_HEADERS = {
+  servedBy: "x-llm-relay-served-by",
+  poolAttempts: "x-llm-relay-pool-attempts",
+  hedged: "x-llm-relay-hedged",
+  latencyDemoted: "x-llm-relay-latency-demoted",
+  degraded: "x-llm-relay-degraded",
+} as const satisfies Record<keyof RelayAnnouncements, string>;
+
+export function readRelayAnnouncements(headers: Headers): RelayAnnouncements {
+  const out: RelayAnnouncements = {};
+  for (const [key, header] of Object.entries(RELAY_ANNOUNCEMENT_HEADERS) as [keyof RelayAnnouncements, string][]) {
+    const value = headers.get(header);
+    if (value) out[key] = value;
+  }
+  return out;
+}
+
 /** Monotonic per-process job ids. Readable, and stable to sort. */
 let jobCounter = 0;
 function nextJobId(): string {
@@ -402,7 +522,17 @@ export class LaneJobStore {
     return [...this.jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
   }
 
-  complete(id: string, run: LaneRunResult, semanticFailure?: string): void {
+  /**
+   * `relay` carries an answer-mode job's captured provenance headers — absent for every
+   * agent-mode job, since those never touch HTTP directly.
+   *
+   * ⚠ `run.timedOut` is checked BEFORE the exit-code/semantic-failure branch and wins outright:
+   * a killed-by-timeout run gets `status: "timed_out"`, never `"failed"`, regardless of what
+   * `semanticFailure` a caller also passed (agent-mode quota classification already refuses to
+   * run on a timed-out result, so in practice this only ever arbitrates against the empty-output
+   * check — and a timeout is the more informative, more specific claim of the two).
+   */
+  complete(id: string, run: LaneRunResult, semanticFailure?: string, relay?: RelayAnnouncements): void {
     const job = this.jobs.get(id);
     if (!job) return;
     // A cancelled job stays cancelled. The child's own exit arrives afterwards, and letting it
@@ -413,8 +543,14 @@ export class LaneJobStore {
     job.stderr = run.stderr;
     job.timedOut = run.timedOut;
     job.endedAt = Date.now();
-    job.status = run.code === 0 && semanticFailure === undefined ? "completed" : "failed";
-    if (semanticFailure !== undefined) job.error = semanticFailure;
+    if (relay !== undefined) job.relay = relay;
+    if (run.timedOut) {
+      job.status = "timed_out";
+      job.error = semanticFailure ?? "the lane exceeded its configured timeout and was stopped before it finished";
+    } else {
+      job.status = run.code === 0 && semanticFailure === undefined ? "completed" : "failed";
+      if (semanticFailure !== undefined) job.error = semanticFailure;
+    }
     this.kills.delete(id);
   }
 
@@ -460,6 +596,16 @@ export interface CwdCheck {
  * the check is existence only — the caller is already a trusted agent on the operator's own
  * machine, and refusing by default would make the tool useless for its stated purpose. The bound
  * is offered, not imposed; that is the operator's call to make in config, not this file's.
+ *
+ * ⚠ **The containment test resolves BOTH sides with `path.resolve` before comparing** (closed
+ * 2026-09-03, docs/audit-findings-2026-09-03.md finding 1 / DR-002). Without it a literal `..`
+ * segment in `cwd` — a raw string a caller sends verbatim, never normalized — satisfied a bare
+ * `startsWith` prefix test while `existsSync`/`statSync` above had already resolved `..` at the
+ * OS level against the REAL, escaped directory: `allowedRoots: ["C:/allowed"]` admitted
+ * `C:/allowed/../other`. `path.resolve` collapses `..`/`.` the same way the OS already does for
+ * the existence check, so the two agree; it is a no-op on an already-clean absolute path, so the
+ * common case is unaffected. `normalizePath`'s trailing-separator LOOP is untouched — resolving
+ * first does not remove the need for it (`path.resolve` does not fold case on win32).
  */
 export function checkCwd(cwd: string, allowedRoots: readonly string[] | undefined): CwdCheck {
   if (!existsSync(cwd)) return { ok: false, reason: `working directory does not exist: ${cwd}` };
@@ -471,9 +617,9 @@ export function checkCwd(cwd: string, allowedRoots: readonly string[] | undefine
   }
   if (!isDir) return { ok: false, reason: `not a directory: ${cwd}` };
   if (!allowedRoots || allowedRoots.length === 0) return { ok: true };
-  const normalized = normalizePath(cwd);
+  const normalized = normalizePath(resolvePath(cwd));
   const permitted = allowedRoots.some((root) => {
-    const r = normalizePath(root);
+    const r = normalizePath(resolvePath(root));
     return normalized === r || normalized.startsWith(r.endsWith("/") ? r : `${r}/`);
   });
   if (permitted) return { ok: true };

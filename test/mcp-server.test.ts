@@ -16,10 +16,13 @@ import {
 import {
   DEPTH_ENV,
   LaneJobStore,
+  TERMINAL_JOB_STATUSES,
   classifyDispatchedResult,
   checkCwd,
   currentDepth,
+  defaultAnswerFetch,
   defaultLaneSpawner,
+  isContentEmpty,
   type LaneRunResult,
   type LaneSpawner,
 } from "../src/mcp/lane-runner.js";
@@ -95,7 +98,7 @@ class Harness {
   constructor(over: Partial<McpServerDeps> = {}) {
     const builder: DispatchViewBuilder = async () => view();
     this.server = new McpDispatchServer({
-      config: {} as Config,
+      config: { host: "127.0.0.1", port: 8791 } as Config,
       buildView: over.buildView ?? builder,
       spawn: over.spawn ?? fakeSpawner({ code: 0, stdout: "lane answer", stderr: "", timedOut: false }),
       cwd: over.cwd ?? (() => process.cwd()),
@@ -591,6 +594,51 @@ describe("checkCwd", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("resolves a `..` segment before the containment test, closing a path-traversal bypass", () => {
+    // docs/audit-findings-2026-09-03.md (DR-002 / finding 1): normalizePath unified separators,
+    // trimmed trailing slashes and lowercased, but never called path.resolve, so a literal `..`
+    // segment in the candidate satisfied a bare `startsWith` prefix test while existsSync/statSync
+    // above it had already resolved `..` at the OS level against the REAL, escaped directory.
+    // Demonstrated there: allowedRoots ["C:/Code/llm-relay"], candidate
+    // "C:/Code/llm-relay/../../Windows" was PERMITTED. This is the same shape with real temp dirs.
+    const base = mkdtempSync(join(tmpdir(), "llm-relay-mcp-traversal-"));
+    const allowed = join(base, "allowed");
+    const sub = join(allowed, "sub");
+    const outside = join(base, "outside");
+    try {
+      mkdirSync(sub, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+
+      // Control: a real child of the allowed root is still admitted.
+      expect(checkCwd(sub, [allowed]).ok).toBe(true);
+
+      // `path.join` would itself collapse `..`, which would defeat the point of this test — the
+      // real bypass is a RAW string a caller sends verbatim, so build it without normalizing.
+      const traversal = `${allowed}/../outside`;
+      expect(checkCwd(traversal, undefined).ok).toBe(true); // exists, real dir — sanity check
+      const denied = checkCwd(traversal, [allowed]);
+      expect(denied.ok).toBe(false);
+      expect(denied.reason).toContain("allowedRoots");
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a `..` segment in an allowed root too, not only in the candidate", () => {
+    const base = mkdtempSync(join(tmpdir(), "llm-relay-mcp-traversal-root-"));
+    const allowed = join(base, "allowed");
+    const decoy = join(base, "decoy");
+    try {
+      mkdirSync(allowed, { recursive: true });
+      mkdirSync(decoy, { recursive: true });
+      // A root declared with a trailing `..` segment must resolve to the same real directory.
+      const rootWithTraversal = `${decoy}/../allowed`;
+      expect(checkCwd(allowed, [rootWithTraversal]).ok).toBe(true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("job store", () => {
@@ -670,5 +718,373 @@ describe("dispatched quota classification", () => {
       ...base,
       result: { code: null, stdout: '{"status":"ERROR","error":"Individual quota reached"}', stderr: "", timedOut: false },
     })).toBeUndefined();
+  });
+});
+
+describe("isContentEmpty", () => {
+  // C:\Code\docs\backlog.md: "llm-relay accepts content-empty lane output as a successful
+  // answer" — a 652-second review returned only `#`. Structural, not semantic: it strips
+  // whitespace/punctuation/Markdown scaffolding and asks only whether anything ALPHANUMERIC
+  // remains. It must NOT try to judge whether the content actually answers the task — that is
+  // the repair-boundary line this repo draws elsewhere ("never an LLM's opinion in the request
+  // path"), so a short real answer like "OK" or "42" reads as content, and so does "Here is" even
+  // though it is a generic lead-in with nothing after it — the backlog's broader property is
+  // deliberately narrowed to this structural test, not a semantic one.
+  it("is true for an empty string", () => {
+    expect(isContentEmpty("")).toBe(true);
+  });
+
+  it("is true for whitespace only", () => {
+    expect(isContentEmpty("   \n\t  \n")).toBe(true);
+  });
+
+  it("is true for a lone markdown scaffold character", () => {
+    expect(isContentEmpty("#")).toBe(true);
+  });
+
+  it("is true for markdown scaffolding with no alphanumeric content", () => {
+    expect(isContentEmpty("# \n\n---\n")).toBe(true);
+    expect(isContentEmpty("***")).toBe(true);
+    expect(isContentEmpty("> ` ~ = | _ -")).toBe(true);
+  });
+
+  it("is false for a short real answer", () => {
+    expect(isContentEmpty("OK")).toBe(false);
+    expect(isContentEmpty("42")).toBe(false);
+  });
+
+  it("is false for markdown-formatted real content", () => {
+    expect(isContentEmpty("# Real content here")).toBe(false);
+  });
+
+  it("is false for a generic lead-in — this predicate is structural, not semantic", () => {
+    // Deliberately not caught: judging whether "Here is" is a substantive continuation would be
+    // exactly the task-specific semantic judgement this predicate refuses to make.
+    expect(isContentEmpty("Here is")).toBe(false);
+  });
+});
+
+describe("terminal job rendering never returns nothing", () => {
+  it("TERMINAL_JOB_STATUSES names every non-running status — extend the test below if this grows", () => {
+    expect([...TERMINAL_JOB_STATUSES].sort()).toEqual(["cancelled", "completed", "failed", "timed_out"]);
+  });
+
+  it("renders a non-empty structured result for every terminal status the store knows", async () => {
+    // completed
+    {
+      const h = new Harness({ spawn: fakeSpawner({ code: 0, stdout: "a real answer", stderr: "", timedOut: false }) });
+      const { text } = await h.tool("dispatch", { task: "x" });
+      expect(text.length).toBeGreaterThan(0);
+      expect(text).toContain("status: completed");
+    }
+    // failed
+    {
+      const h = new Harness({ spawn: fakeSpawner({ code: 1, stdout: "", stderr: "boom", timedOut: false }) });
+      const { text } = await h.tool("dispatch", { task: "x" });
+      expect(text.length).toBeGreaterThan(0);
+      expect(text).toContain("status: failed");
+    }
+    // timed_out — the spawner reports exactly what a killed-by-timeout child reports today.
+    {
+      const h = new Harness({ spawn: fakeSpawner({ code: null, stdout: "", stderr: "", timedOut: true }) });
+      const { text } = await h.tool("dispatch", { task: "x" });
+      expect(text.length).toBeGreaterThan(0);
+      expect(text).toContain("status: timed_out");
+    }
+    // cancelled
+    {
+      vi.useFakeTimers();
+      try {
+        const h = new Harness({ spawn: fakeSpawner({ code: 0, stdout: "too late", stderr: "", timedOut: false }, 5000) });
+        const call = h.tool("dispatch", { task: "x", waitMs: 100 });
+        await vi.advanceTimersByTimeAsync(150);
+        const started = await call;
+        const jobId = /job: (job-\d+)/.exec(started.text)?.[1] as string;
+        await h.tool("dispatch_cancel", { jobId });
+        const result = await h.tool("dispatch_result", { jobId });
+        expect(result.text.length).toBeGreaterThan(0);
+        expect(result.text).toContain("status: cancelled");
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
+  it("gives a timed-out job a clear one-line reason and reports it as an error result", async () => {
+    const h = new Harness({ spawn: fakeSpawner({ code: null, stdout: "partial thinking...", stderr: "", timedOut: true }) });
+    const { text, isError } = await h.tool("dispatch", { task: "x" });
+    expect(isError).toBe(true);
+    expect(text).toContain("status: timed_out");
+    // Partial output, when the killed child captured any, is still surfaced.
+    expect(text).toContain("partial thinking...");
+  });
+});
+
+describe("answer-mode fetch seam", () => {
+  it("the default answer-mode fetch REFUSES to run under vitest", async () => {
+    await expect(defaultAnswerFetch("http://127.0.0.1:8791/v1/messages", { method: "POST" })).rejects.toThrow(
+      /vitest/i,
+    );
+  });
+});
+
+describe("dispatch tool — answer mode", () => {
+  interface FetchCall {
+    url: string;
+    init: RequestInit;
+  }
+
+  function fakeAnswerFetch(handler: (call: FetchCall) => Response): { fetch: typeof fetch; calls: FetchCall[] } {
+    const calls: FetchCall[] = [];
+    const fn = (async (url: unknown, init: unknown) => {
+      const call = { url: String(url), init: init as RequestInit };
+      calls.push(call);
+      return handler(call);
+    }) as unknown as typeof fetch;
+    return { fetch: fn, calls };
+  }
+
+  function assistantTextResponse(text: string, headers: Record<string, string> = {}): Response {
+    return new Response(
+      JSON.stringify({
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 5, output_tokens: 5 },
+      }),
+      { status: 200, headers: { "content-type": "application/json", ...headers } },
+    );
+  }
+
+  it("POSTs straight to this relay's own /v1/messages for a relay lane, and spawns nothing", async () => {
+    const spawn = fakeSpawner({ code: 0, stdout: "should never run", stderr: "", timedOut: false });
+    const { fetch: fetchImpl, calls } = fakeAnswerFetch(() => assistantTextResponse("the direct answer"));
+    const h = new Harness({ spawn, fetch: fetchImpl });
+
+    const { text, isError } = await h.tool("dispatch", { task: "do the thing", mode: "answer" });
+
+    expect(isError).toBe(false);
+    expect(text).toContain("the direct answer");
+    expect(text).toContain("status: completed");
+    expect(spawn.calls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("http://127.0.0.1:8791/v1/messages");
+
+    const headers = calls[0]?.init.headers as Record<string, string>;
+    expect(headers["anthropic-version"]).toBe("2023-06-01");
+    expect(headers["content-type"]).toBe("application/json");
+    expect(headers["x-api-key"]).toBeTruthy();
+
+    const body = JSON.parse(calls[0]?.init.body as string) as Record<string, unknown>;
+    expect(body["model"]).toBe("pool/medium"); // the default lane() fixture's spec
+    expect(body["max_tokens"]).toBe(4096);
+    expect(body["messages"]).toEqual([{ role: "user", content: "do the thing" }]);
+    expect(body["system"]).toBeUndefined();
+    expect(body["tools"]).toBeUndefined();
+  });
+
+  it("passes an optional system prompt through", async () => {
+    const { fetch: fetchImpl, calls } = fakeAnswerFetch(() => assistantTextResponse("ok"));
+    const h = new Harness({ fetch: fetchImpl });
+    await h.tool("dispatch", { task: "x", mode: "answer", system: "You are terse." });
+    const body = JSON.parse(calls[0]?.init.body as string) as Record<string, unknown>;
+    expect(body["system"]).toBe("You are terse.");
+  });
+
+  it("with a schema, forces a single answer tool call and returns its input as JSON", async () => {
+    const schema = { type: "object", properties: { ok: { type: "boolean" } } };
+    const { fetch: fetchImpl, calls } = fakeAnswerFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            content: [{ type: "tool_use", id: "toolu_1", name: "answer", input: { ok: true } }],
+            stop_reason: "tool_use",
+          }),
+          { status: 200 },
+        ),
+    );
+    const h = new Harness({ fetch: fetchImpl });
+
+    const { text, isError } = await h.tool("dispatch", { task: "is this ok?", mode: "answer", schema });
+
+    expect(isError).toBe(false);
+    expect(text).toContain('{"ok":true}');
+    const body = JSON.parse(calls[0]?.init.body as string) as Record<string, unknown>;
+    expect(body["tools"]).toEqual([{ name: "answer", description: "Return the answer", input_schema: schema }]);
+    expect(body["tool_choice"]).toEqual({ type: "tool", name: "answer" });
+  });
+
+  it("respects an explicit maxTokens", async () => {
+    const { fetch: fetchImpl, calls } = fakeAnswerFetch(() => assistantTextResponse("ok"));
+    const h = new Harness({ fetch: fetchImpl });
+    await h.tool("dispatch", { task: "x", mode: "answer", maxTokens: 128 });
+    const body = JSON.parse(calls[0]?.init.body as string) as Record<string, unknown>;
+    expect(body["max_tokens"]).toBe(128);
+  });
+
+  it("reports a non-2xx answer as a failure carrying status and a bounded body excerpt, never headers", async () => {
+    const longBody = "x".repeat(500);
+    const { fetch: fetchImpl } = fakeAnswerFetch(
+      () =>
+        new Response(longBody, {
+          status: 429,
+          headers: { "retry-after": "30", "x-llm-relay-served-by": "should-not-appear" },
+        }),
+    );
+    const h = new Harness({ fetch: fetchImpl });
+
+    const { text, isError } = await h.tool("dispatch", { task: "x", mode: "answer" });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("429");
+    expect(text).toContain("x".repeat(300));
+    expect(text).not.toContain("x".repeat(301));
+    expect(text).not.toContain("retry-after");
+    expect(text).not.toContain("should-not-appear");
+  });
+
+  it("captures the relay's announcing headers into the answer's provenance", async () => {
+    const { fetch: fetchImpl } = fakeAnswerFetch(() =>
+      assistantTextResponse("hi", {
+        "x-llm-relay-served-by": "nim/z-ai/glm-5.2",
+        "x-llm-relay-pool-attempts": "2 tried, 1 served: 1x429",
+        "x-llm-relay-hedged": "won after 20000ms, floor",
+      }),
+    );
+    const h = new Harness({ fetch: fetchImpl });
+
+    const { text } = await h.tool("dispatch", { task: "x", mode: "answer" });
+
+    expect(text).toContain("served-by: nim/z-ai/glm-5.2");
+    expect(text).toContain("pool-attempts: 2 tried, 1 served: 1x429");
+    expect(text).toContain("hedged: won after 20000ms, floor");
+  });
+
+  it("treats a content-empty answer as a distinct empty-output failure, same as agent mode", async () => {
+    const { fetch: fetchImpl } = fakeAnswerFetch(() => assistantTextResponse("###   ---"));
+    const h = new Harness({ fetch: fetchImpl });
+
+    const { text, isError } = await h.tool("dispatch", { task: "x", mode: "answer" });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("empty-output");
+  });
+
+  it("times out an answer-mode call and renders a non-empty timed_out result", async () => {
+    // No timer fake needed: AbortSignal.timeout runs on the real clock, so a tiny real timeout
+    // keeps this test fast without needing to fake it.
+    const fetchImpl = (async (_url: unknown, init: unknown) => {
+      const signal = (init as RequestInit).signal;
+      return new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("The operation was aborted"), { name: "TimeoutError" }));
+        });
+      });
+    }) as unknown as typeof fetch;
+    const h = new Harness({ fetch: fetchImpl });
+
+    const { text, isError } = await h.tool("dispatch", { task: "x", mode: "answer", timeoutMs: 20 });
+
+    expect(isError).toBe(true);
+    expect(text.length).toBeGreaterThan(0);
+    expect(text).toContain("status: timed_out");
+  });
+
+  it("cancel = abort the fetch, and the answer-mode job stays cancelled", async () => {
+    vi.useFakeTimers();
+    try {
+      let aborted = false;
+      const fetchImpl = (async (_url: unknown, init: unknown) => {
+        const signal = (init as RequestInit).signal;
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            aborted = true;
+            reject(new Error("aborted"));
+          });
+        });
+      }) as unknown as typeof fetch;
+      const h = new Harness({ fetch: fetchImpl });
+
+      const call = h.tool("dispatch", { task: "x", mode: "answer", waitMs: 100 });
+      await vi.advanceTimersByTimeAsync(150);
+      const started = await call;
+      const jobId = /job: (job-\d+)/.exec(started.text)?.[1] as string;
+
+      const cancelled = await h.tool("dispatch_cancel", { jobId });
+      expect(cancelled.text).toContain("cancelled");
+      expect(aborted).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(10);
+      const after = await h.tool("dispatch_status", { jobId });
+      expect(after.text).toContain("status: cancelled");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a network error (relay not running) fails the job with a clear message, never a throw", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:8791");
+    }) as unknown as typeof fetch;
+    const h = new Harness({ fetch: fetchImpl });
+
+    const { text, isError } = await h.tool("dispatch", { task: "x", mode: "answer" });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("ECONNREFUSED");
+  });
+
+  it("a cli-kind lane in answer mode behaves exactly like agent mode: it spawns the harness", async () => {
+    const spawn = fakeSpawner({ code: 0, stdout: "cli answer", stderr: "", timedOut: false });
+    const h = new Harness({
+      spawn,
+      buildView: async () => view({ next: lane({ id: "agy", kind: "cli", invoke: { command: "agy", args: ["-p", "x"] } }) }),
+    });
+
+    const { text, isError } = await h.tool("dispatch", { task: "x", mode: "answer" });
+
+    expect(isError).toBe(false);
+    expect(text).toContain("cli answer");
+    expect(spawn.calls).toHaveLength(1);
+  });
+
+  it("mode defaults to agent — existing callers are unaffected", async () => {
+    const spawn = fakeSpawner({ code: 0, stdout: "agent answer", stderr: "", timedOut: false });
+    const h = new Harness({ spawn });
+    const { text } = await h.tool("dispatch", { task: "x" });
+    expect(text).toContain("agent answer");
+    expect(spawn.calls).toHaveLength(1);
+  });
+});
+
+describe("dispatch/dispatch_lanes tool schema and instructions — answer mode claims", () => {
+  it("states when to use answer mode vs agent mode in the initialize instructions", () => {
+    const text = MCP_INSTRUCTIONS.toLowerCase();
+    expect(text).toContain('mode: "answer"'.toLowerCase());
+    expect(text).toContain("no file access");
+    expect(text).toContain("read or edit files or run commands");
+  });
+
+  it("carries the same answer-mode guidance on the dispatch tool description too", async () => {
+    const h = new Harness();
+    const res = await h.request("tools/list");
+    const tools = (res["result"] as { tools: { name: string; description: string }[] }).tools;
+    const dispatch = tools.find((t) => t.name === "dispatch");
+    const description = dispatch?.description.toLowerCase() ?? "";
+    expect(description).toContain("no file access");
+    expect(description).toContain("read or edit files or run commands");
+  });
+
+  it("declares mode, system, schema and maxTokens on the dispatch tool's inputSchema", async () => {
+    const h = new Harness();
+    const res = await h.request("tools/list");
+    const tools = (res["result"] as { tools: { name: string; inputSchema: { properties: Record<string, unknown> } }[] }).tools;
+    const dispatch = tools.find((t) => t.name === "dispatch");
+    const props = dispatch?.inputSchema.properties ?? {};
+    expect(Object.keys(props)).toEqual(
+      expect.arrayContaining(["task", "mode", "system", "schema", "maxTokens", "tier", "lane", "cwd", "waitMs", "timeoutMs"]),
+    );
   });
 });
