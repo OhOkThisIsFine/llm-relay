@@ -164,7 +164,7 @@ export interface StickyRequestContext {
   provenance: string | null;
 }
 
-export type TargetUsability = "live" | "credential-fault" | "cooling";
+export type TargetUsability = "live" | "slow" | "credential-fault" | "cooling";
 export type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
 export type OutcomeClass = "ok" | "retriable" | "credential" | "client";
 
@@ -372,8 +372,8 @@ export function targetUsability(
   if (!breaker.isHealthy(identity, now)) return "cooling";
   if (cooledByAllowance(attempt, now, costClassOf?.(attempt))) return "cooling";
   if (cooledByQuota(attempt, breaker, quotaDemotion, now)) return "cooling";
-  if (latencyDemotion?.(attempt, now)) return "cooling";
   if (breaker.hasCredentialFault(identity, now)) return "credential-fault";
+  if (latencyDemotion?.(attempt, now)) return "slow";
   return "live";
 }
 
@@ -451,13 +451,29 @@ export function orderDeploymentGroupsByUsability(
   type Group = ReturnType<typeof groupCredentialAttempts>[number];
   const preferred = groupCredentialAttempts(attempts)[0]?.attempts[0];
   const live: Group[] = [];
+  const slow: Group[] = [];
   const faulted: Group[] = [];
   const cooling: Group[] = [];
   for (const group of groupCredentialAttempts(attempts)) {
     const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
-    if (usability === "cooling") cooling.push(group);
-    else if (usability === "credential-fault") faulted.push(group);
-    else live.push(group);
+    switch (usability) {
+      case "live":
+        live.push(group);
+        break;
+      case "slow":
+        slow.push(group);
+        break;
+      case "credential-fault":
+        faulted.push(group);
+        break;
+      case "cooling":
+        cooling.push(group);
+        break;
+      default: {
+        const _never: never = usability;
+        throw new Error(`unhandled TargetUsability: ${_never}`);
+      }
+    }
   }
 
   cooling.sort((a, b) => {
@@ -469,7 +485,7 @@ export function orderDeploymentGroupsByUsability(
     return liftA - liftB;
   });
 
-  const ordered = [...live, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  const ordered = [...live, ...slow, ...faulted, ...cooling].flatMap((group) => group.attempts);
   let latencyDemotedFirst: string | null = null;
   if (
     preferred !== undefined &&
@@ -478,8 +494,8 @@ export function orderDeploymentGroupsByUsability(
     ordered[0] !== undefined &&
     ordered[0] !== preferred
   ) {
-    const slow = latencyDemotion(preferred, now);
-    if (slow) latencyDemotedFirst = latencyDemotionLabel(specOfTarget(preferred.target), slow);
+    const slowDemoted = latencyDemotion(preferred, now);
+    if (slowDemoted) latencyDemotedFirst = latencyDemotionLabel(specOfTarget(preferred.target), slowDemoted);
   }
   let quotaDemotedFirst: string | null = null;
   if (
@@ -967,8 +983,11 @@ export function orderByUsability(
   attempts: ResolvedAttempt[],
   breaker = globalCircuitBreaker,
   now = Date.now(),
+  quotaDemotion?: QuotaDemotionFn | null,
+  costClassOf?: CostClassFn | null,
+  latencyDemotion?: LatencyDemotionFn | null,
 ): ResolvedAttempt[] {
-  const { ordered } = orderByUsabilityTracked(attempts, breaker, now);
+  const { ordered } = orderByUsabilityTracked(attempts, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
   return ordered;
 }
 
@@ -981,13 +1000,29 @@ export function orderByUsabilityTracked(
   latencyDemotion?: LatencyDemotionFn | null,
 ): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null; latencyDemotedFirst: string | null } {
   const live: ResolvedAttempt[] = [];
+  const slow: ResolvedAttempt[] = [];
   const faulted: ResolvedAttempt[] = [];
   const cooling: ResolvedAttempt[] = [];
   for (const attempt of attempts) {
     const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
-    if (usability === "cooling") cooling.push(attempt);
-    else if (usability === "credential-fault") faulted.push(attempt);
-    else live.push(attempt);
+    switch (usability) {
+      case "live":
+        live.push(attempt);
+        break;
+      case "slow":
+        slow.push(attempt);
+        break;
+      case "credential-fault":
+        faulted.push(attempt);
+        break;
+      case "cooling":
+        cooling.push(attempt);
+        break;
+      default: {
+        const _never: never = usability;
+        throw new Error(`unhandled TargetUsability: ${_never}`);
+      }
+    }
   }
 
   cooling.sort((a, b) => {
@@ -999,7 +1034,7 @@ export function orderByUsabilityTracked(
     return liftA - liftB;
   });
 
-  return { ordered: [...live, ...faulted, ...cooling], quotaDemotedFirst: null, latencyDemotedFirst: null };
+  return { ordered: [...live, ...slow, ...faulted, ...cooling], quotaDemotedFirst: null, latencyDemotedFirst: null };
 }
 
 export function classifyStatus(status: number): OutcomeClass {

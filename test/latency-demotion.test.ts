@@ -13,14 +13,21 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
-import { globalCircuitBreaker } from "../src/circuit-breaker.js";
+import { globalCircuitBreaker, CircuitBreaker } from "../src/circuit-breaker.js";
 import { LATENCY_DEMOTED_HEADER, SERVED_BY_HEADER } from "../src/backend.js";
 import { resetFacts } from "../src/target-facts.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { PingLoop } from "../src/ping/cadence.js";
-import type { Config, ProviderConfig } from "../src/config.js";
+import type { Config, ProviderConfig, ResolvedTarget } from "../src/config.js";
 import { countMsPerTokenSamples, getP95MsPerToken, type PingRecord } from "../src/ping/metrics.js";
-import type { ResolvedAttempt } from "../src/resolved-attempt.js";
+import { resolveAttempt, type ResolvedAttempt } from "../src/resolved-attempt.js";
+import {
+  orderByUsability,
+  orderByUsabilityTracked,
+  orderDeploymentGroupsByUsability,
+  targetIdentity,
+  targetUsability,
+} from "../src/candidate-runner.js";
 import {
   DEFAULT_LATENCY_MIN_SAMPLES,
   DEFAULT_LATENCY_MS_PER_TOKEN,
@@ -456,3 +463,89 @@ describe("latency demotion — end to end", () => {
     },
   );
 });
+
+describe("latency demotion — usability ranking and walk order", () => {
+  const now = 1_000_000;
+  const cb = new CircuitBreaker();
+
+  function mkTarget(provider: string, model: string): ResolvedTarget {
+    return {
+      provider,
+      model,
+      kind: "openai",
+      base: `http://${provider}`,
+      authHeader: "authorization",
+      timeoutMs: 1000,
+    };
+  }
+
+  const attemptA = resolveAttempt(mkTarget("pA", "mA"));
+  const attemptB = resolveAttempt(mkTarget("pB", "mB"));
+  const attemptC = resolveAttempt(mkTarget("pC", "mC"));
+  const attemptD = resolveAttempt(mkTarget("pD", "mD"));
+  const attemptBoth = resolveAttempt(mkTarget("pBoth", "mBoth"));
+
+  const latencyDemotion = createLatencyDemotionFn({
+    readPings: (provider, model) => {
+      if ((provider === "pA" && model === "mA") || (provider === "pBoth" && model === "mBoth")) {
+        return requests(8, 68_780, 100);
+      }
+      return [];
+    },
+  });
+
+  beforeEach(() => {
+    cb.reset();
+    // B: cooling on a 402 with a lift 50 minutes away
+    cb.recordOutcome(targetIdentity(attemptB), {
+      ok: false,
+      status: 402,
+      elapsedMs: 100,
+      at: now,
+      retryAfterMs: 50 * 60 * 1000,
+    });
+    // C: credential-faulted 401
+    cb.recordCredentialFault(targetIdentity(attemptC), 401, now);
+    // Both: 429 cooling and latency demoted
+    cb.recordOutcome(targetIdentity(attemptBoth), {
+      ok: false,
+      status: 429,
+      elapsedMs: 100,
+      at: now,
+      retryAfterMs: 60 * 1000,
+    });
+  });
+
+  it("orders latency-demoted member A ahead of credential-faulted C and cooling B (expected A, C, B; before fix C, B, A)", () => {
+    const attempts = [attemptA, attemptB, attemptC];
+    const { ordered } = orderDeploymentGroupsByUsability(attempts, cb, now, null, null, latencyDemotion);
+    expect(ordered.map((a) => a.target.provider)).toEqual(["pA", "pC", "pB"]);
+
+    const fromTracked = orderByUsabilityTracked(attempts, cb, now, null, null, latencyDemotion);
+    expect(fromTracked.ordered.map((a) => a.target.provider)).toEqual(["pA", "pC", "pB"]);
+
+    const fromOrderByUsability = orderByUsability(attempts, cb, now, null, null, latencyDemotion);
+    expect(fromOrderByUsability.map((a) => a.target.provider)).toEqual(["pA", "pC", "pB"]);
+  });
+
+  it("live member D outranks latency-demoted member A (expected D, A)", () => {
+    const attempts = [attemptA, attemptD];
+    const { ordered } = orderDeploymentGroupsByUsability(attempts, cb, now, null, null, latencyDemotion);
+    expect(ordered.map((a) => a.target.provider)).toEqual(["pD", "pA"]);
+
+    const fromTracked = orderByUsabilityTracked(attempts, cb, now, null, null, latencyDemotion);
+    expect(fromTracked.ordered.map((a) => a.target.provider)).toEqual(["pD", "pA"]);
+
+    const fromOrderByUsability = orderByUsability(attempts, cb, now, null, null, latencyDemotion);
+    expect(fromOrderByUsability.map((a) => a.target.provider)).toEqual(["pD", "pA"]);
+  });
+
+  it("a member that is BOTH latency-demoted and breaker-cooling is 'cooling', not 'slow'", () => {
+    expect(targetUsability(attemptBoth, cb, now, null, null, latencyDemotion)).toBe("cooling");
+  });
+
+  it("latency-demoted only member A has usability 'slow'", () => {
+    expect(targetUsability(attemptA, cb, now, null, null, latencyDemotion)).toBe("slow");
+  });
+});
+

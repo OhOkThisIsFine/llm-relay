@@ -173,3 +173,13 @@ describe("dashboard wire unions derive from their own const arrays", () => {
     expect([...RESETS_AT_BASES]).toEqual(["provider_stated", "reviewed_rule", "derived_boundary"]);
   });
 });
+
+describe("TargetUsability — usability classifiers are exhaustive over all bands", () => {
+  it("has ONE definition — orderByUsability consumers do not use an unconditional else", () => {
+    const text = src("candidate-runner.ts");
+    expect(text).toMatch(/switch \(usability\)/);
+    expect(text).toMatch(/const _never: never = usability/);
+    expect(text).not.toMatch(/else live\.push/);
+  });
+});
+
