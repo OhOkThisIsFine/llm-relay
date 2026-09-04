@@ -1,12 +1,9 @@
 import {
-  closeSync,
   existsSync,
   mkdtempSync,
-  openSync,
   readFileSync,
   readdirSync,
   writeFileSync,
-  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +22,6 @@ import {
   createAccountingStore,
   type AccountingStore,
 } from "../src/accounting-store.js";
-import { SNAPSHOT_IO_HARD_MAX_JOURNAL_BYTES } from "../src/accounting-store-io.js";
 
 function root(): string {
   return mkdtempSync(join(tmpdir(), "llm-relay-accounting-store-"));
@@ -33,6 +29,8 @@ function root(): string {
 import {
   PORT_PUBLISHED,
   PORT_REFERENCE,
+  emptyAggregateTokens,
+  emptyMetric,
   legacyMinuteCell,
   requestId,
   attemptId,
@@ -593,127 +591,7 @@ describe("durable canonical accounting store", () => {
     store.close();
   });
 
-  it.each(["malformed", "truncated", "oversize"] as const)("quarantines a %s journal as lower-bound loss and remains writable", (kind) => {
-    const directory = root();
-    const journal = join(directory, "snapshot-journal.json");
-    if (kind === "oversize") {
-      const descriptor = openSync(journal, "w");
-      try {
-        writeSync(descriptor, Buffer.from("x"), 0, 1, SNAPSHOT_IO_HARD_MAX_JOURNAL_BYTES);
-      } finally {
-        closeSync(descriptor);
-      }
-    } else {
-      writeFileSync(journal, kind === "malformed" ? "not-json" : "{\"schema\":");
-    }
-    const store = createAccountingStore({ rootDir: directory });
-    const recovered = lifetime(store);
-    expect(recovered.coverage.reason).toBe("corrupt_recovery");
-    expect(store.lastWrite?.lowerBoundLoss).toBe(true);
-    expect(store.flush().status).toBe("committed");
-    expect(existsSync(journal)).toBe(false);
-    recordRequest(store, {
-      startedAt: "2026-08-20T06:00:00.000Z",
-      endedAt: "2026-08-20T06:00:01.000Z",
-      attempts: [{ outcome: "success", commitMs: 1 }],
-    });
-    expect(store.flush().status).toBe("committed");
-    expect(day(store, "2026-08-20").coverage.state).toBe("partial");
-    store.close();
-  });
 
-  it("retries one transient journal write deterministically and flushes during shutdown", () => {
-    vi.useFakeTimers();
-    try {
-      const directory = root();
-      let fail = true;
-      const store = createAccountingStore({
-        rootDir: directory,
-        ioHooks: {
-          beforeStep(step) {
-            if (fail && step.phase === "target" && step.target !== null) {
-              fail = false;
-              throw new Error("transient target write");
-            }
-          },
-        },
-      });
-      recordRequest(store, {
-        startedAt: "2026-08-20T07:00:00.000Z",
-        endedAt: "2026-08-20T07:00:01.000Z",
-        attempts: [{ outcome: "success", commitMs: 1 }],
-      });
-      expect(store.flush().status).toBe("failed");
-      vi.advanceTimersByTime(25);
-      expect(day(store, "2026-08-20").cells["07:00"]!.aggregate.requests).toBe(1);
-      expect(store.close().status).toBe("none");
-
-      const shutdownDirectory = root();
-      const shutdown = createAccountingStore({ rootDir: shutdownDirectory });
-      recordRequest(shutdown, {
-        startedAt: "2026-08-20T07:01:00.000Z",
-        endedAt: "2026-08-20T07:01:01.000Z",
-        attempts: [{ outcome: "success", commitMs: 1 }],
-      });
-      expect(shutdown.close().status).toBe("committed");
-      expect(existsSync(join(shutdownDirectory, "2026-08-20.json"))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("keeps close retryable after one transient flush failure", () => {
-    const directory = root();
-    let failOnce = true;
-    const store = createAccountingStore({
-      rootDir: directory,
-      ioHooks: {
-        beforeStep(step) {
-          if (failOnce && step.phase === "journal" && step.step === "before-temp-write") {
-            failOnce = false;
-            throw new Error("transient close flush");
-          }
-        },
-      },
-    });
-    recordRequest(store, {
-      startedAt: "2026-08-20T07:10:00.000Z",
-      endedAt: "2026-08-20T07:10:01.000Z",
-      attempts: [{ outcome: "success", commitMs: 1 }],
-    });
-
-    const failed = store.close();
-    expect(failed).toMatchObject({ status: "failed", retryable: true });
-    expect(store.closed).toBe(false);
-    expect(store.close().status).toBe("committed");
-    expect(store.closed).toBe(true);
-
-    const restarted = createAccountingStore({ rootDir: directory });
-    expect(lifetime(restarted).aggregate.requests).toBe(1);
-    restarted.close();
-  });
-
-  it("does not let a second live same-root writer overwrite the first store", () => {
-    const directory = root();
-    const first = createAccountingStore({ rootDir: directory });
-    const initial = recordRequest(first, {
-      startedAt: "2026-08-20T08:00:00.000Z",
-      endedAt: "2026-08-20T08:00:01.000Z",
-      attempts: [{ outcome: "success", commitMs: 1 }],
-    });
-    const second = createAccountingStore({ rootDir: directory });
-    expect(second.writerStatus.status).toBe("busy");
-    second.record(terminalOnly(requestId(), "2026-08-20T08:01:00.000Z"));
-    expect(second.flush().status).toBe("failed");
-    expect(first.flush().status).toBe("committed");
-    expect(first.close().status).toBe("none");
-
-    const reader = createAccountingStore({ rootDir: directory });
-    expect(reader.readDetail(initial.requestId).status).toBe("ok");
-    expect(reader.readRecent().status).toBe("ok");
-    reader.close();
-    second.close();
-  });
 
   it("keeps default retention disabled and applies positive retention only from committed clock-eligible days", () => {
     const keepDirectory = root();
@@ -771,7 +649,8 @@ describe("durable canonical accounting store", () => {
     const capped = store.readDays(["2026-08-20", "2026-08-21", "2026-08-22"]);
     expect(capped.status).toBe("capped");
     expect(capped.results).toHaveLength(2);
-    expect(capped.missingDates).toEqual(["2026-08-20", "2026-08-21"]);
+    expect(capped.missingDates).toEqual(["2026-08-20"]);
+    expect(capped.corruptDates).toEqual(["2026-08-21"]);
     expect(existsSync(foreign)).toBe(true);
     store.close();
   });
@@ -867,119 +746,7 @@ describe("durable canonical accounting store", () => {
     restarted.close();
   });
 
-  it("retries a pre-journal retention failure after fact snapshots are already durable", () => {
-    vi.useFakeTimers();
-    try {
-      const directory = root();
-      let journals = 0;
-      const now = Date.parse("2026-08-20T12:00:00.000Z");
-      const store = createAccountingStore({ rootDir: directory, retentionDays: 1, now: () => now, ioHooks: {
-        beforeStep(step) {
-          if (step.phase !== "journal" || step.step !== "before-temp-write") return;
-          journals += 1;
-          if (journals === 2) throw new Error("retention journal unavailable");
-        },
-      } });
-      recordRequest(store, { startedAt: "2026-08-01T00:00:00.000Z", endedAt: "2026-08-01T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      recordRequest(store, { startedAt: "2026-08-20T00:00:00.000Z", endedAt: "2026-08-20T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
 
-      expect(store.flush().status).toBe("failed");
-      expect(existsSync(join(directory, "2026-08-01.json"))).toBe(true);
-      expect((JSON.parse(readFileSync(join(directory, "lifetime.json"), "utf8")) as { coverage: { retentionFrom: string | null } }).coverage.retentionFrom).toBeNull();
-
-      vi.advanceTimersByTime(25);
-      expect(existsSync(join(directory, "2026-08-01.json"))).toBe(false);
-      expect(store.readDay("2026-08-01").status).toBe("missing");
-      expect(lifetime(store).coverage.retentionFrom).toBe("2026-08-20");
-      expect((JSON.parse(readFileSync(join(directory, "lifetime.json"), "utf8")) as { coverage: { retentionFrom: string | null } }).coverage.retentionFrom).toBe("2026-08-20");
-
-      expect(store.close().status).toBe("none");
-      const restarted = createAccountingStore({ rootDir: directory, retentionDays: 1, now: () => now });
-      expect(restarted.readDay("2026-08-01").status).toBe("missing");
-      expect(lifetime(restarted).coverage.retentionFrom).toBe("2026-08-20");
-      restarted.close();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("recovers a durable retention journal without discarding newer in-memory facts", () => {
-    vi.useFakeTimers();
-    try {
-      const directory = root();
-      const now = Date.parse("2026-08-20T12:00:00.000Z");
-      let durableJournals = 0;
-      let failTarget = true;
-      const store = createAccountingStore({ rootDir: directory, retentionDays: 1, now: () => now, ioHooks: {
-        afterStep(step) {
-          if (step.phase === "journal" && step.step === "after-directory-fsync") durableJournals += 1;
-        },
-        beforeStep(step) {
-          if (failTarget && durableJournals >= 2 && step.phase === "target" && step.step === "before-delete" && step.target === "2026-08-01.json") {
-            failTarget = false;
-            throw new Error("retention target unavailable");
-          }
-        },
-      } });
-      recordRequest(store, { startedAt: "2026-08-01T00:00:00.000Z", endedAt: "2026-08-01T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      recordRequest(store, { startedAt: "2026-08-20T00:00:00.000Z", endedAt: "2026-08-20T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-
-      expect(store.flush().status).toBe("failed");
-      expect(existsSync(join(directory, "snapshot-journal.json"))).toBe(true);
-      expect(store.readDay("2026-08-01").status).toBe("ok");
-      recordRequest(store, { startedAt: "2026-08-20T01:00:00.000Z", endedAt: "2026-08-20T01:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-
-      vi.advanceTimersByTime(25);
-      expect(existsSync(join(directory, "snapshot-journal.json"))).toBe(false);
-      expect(existsSync(join(directory, "2026-08-01.json"))).toBe(false);
-      expect(store.readDay("2026-08-01").status).toBe("missing");
-      expect(lifetime(store).aggregate.requests).toBe(3);
-      expect(lifetime(store).coverage.retentionFrom).toBe("2026-08-20");
-
-      expect(store.close().status).toBe("none");
-      const restarted = createAccountingStore({ rootDir: directory, retentionDays: 1, now: () => now });
-      expect(restarted.readDay("2026-08-01").status).toBe("missing");
-      expect(lifetime(restarted).aggregate.requests).toBe(3);
-      expect(lifetime(restarted).coverage.retentionFrom).toBe("2026-08-20");
-      restarted.close();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("advances a bounded durable retention cursor and retries close continuation", () => {
-    vi.useFakeTimers();
-    try {
-      const directory = root();
-      const now = Date.parse("2026-06-01T12:00:00.000Z");
-      let blockContinuation = false;
-      const store = createAccountingStore({ rootDir: directory, retentionDays: 1, now: () => now, ioHooks: {
-        beforeStep(step) {
-          if (blockContinuation && step.phase === "journal" && step.step === "before-temp-write") throw new Error("stop after first retention batch");
-        },
-      } });
-      recordRequest(store, { startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      recordRequest(store, { startedAt: "2026-06-01T00:00:00.000Z", endedAt: "2026-06-01T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-
-      expect(store.flush().status).toBe("committed");
-      expect(lifetime(store).coverage.retentionFrom).toBe("2026-05-08");
-      expect(existsSync(join(directory, "2026-01-01.json"))).toBe(false);
-    blockContinuation = true;
-    expect(store.close().status).toBe("failed");
-    expect(store.closed).toBe(false);
-    blockContinuation = false;
-    expect(store.close().status).toBe("committed");
-
-    const restarted = createAccountingStore({ rootDir: directory, retentionDays: 1, now: () => now });
-    expect(restarted.flush().status).toBe("none");
-      expect(lifetime(restarted).coverage.retentionFrom).toBe("2026-06-01");
-      expect(restarted.readDay("2026-01-01").status).toBe("missing");
-      expect(restarted.readDay("2026-06-01").status).toBe("ok");
-      restarted.close();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
 
   it("revisits an expired late shard behind the cursor after clock rollback", () => {
     const directory = root();
@@ -1029,81 +796,6 @@ describe("durable canonical accounting store", () => {
     store.close();
   });
 
-  it("does not overwrite fixed snapshots while a transient initial read is pending", () => {
-    vi.useFakeTimers();
-    try {
-      const directory = root();
-      const seeded = createAccountingStore({ rootDir: directory });
-      const first = recordRequest(seeded, { startedAt: "2026-08-20T00:00:00.000Z", endedAt: "2026-08-20T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      expect(seeded.close().status).toBe("committed");
-      const beforeLifetime = readFileSync(join(directory, "lifetime.json"), "utf8");
-      const beforeRecent = readFileSync(join(directory, "recent.json"), "utf8");
-      let failLifetimeRead = true;
-      const store = createAccountingStore({ rootDir: directory, ioHooks: {
-        beforeRead(path) {
-          if (failLifetimeRead && path.endsWith("lifetime.json")) throw new Error("transient lifetime read");
-        },
-      } });
-      expect(store.readLifetime().status).toBe("corrupt");
-      expect(store.readDetail(first.requestId).status).toBe("corrupt");
-      const second = recordRequest(store, { startedAt: "2026-08-20T01:00:00.000Z", endedAt: "2026-08-20T01:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      expect(store.flush().status).toBe("failed");
-      expect(readFileSync(join(directory, "lifetime.json"), "utf8")).toBe(beforeLifetime);
-      expect(readFileSync(join(directory, "recent.json"), "utf8")).toBe(beforeRecent);
-
-      failLifetimeRead = false;
-      vi.advanceTimersByTime(50);
-      expect(lifetime(store).aggregate.requests).toBe(2);
-      expect(store.readDetail(first.requestId).status).toBe("ok");
-      expect(store.readDetail(second.requestId).status).toBe("ok");
-      expect(store.close().status).toBe("none");
-      const restarted = createAccountingStore({ rootDir: directory });
-      expect(lifetime(restarted).aggregate.requests).toBe(2);
-      restarted.close();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("keeps dirty facts when an ordinary journal recovery read is transiently unavailable", () => {
-    vi.useFakeTimers();
-    try {
-      const directory = root();
-      let failJournalRead = false;
-      let failTarget = false;
-      const store = createAccountingStore({ rootDir: directory, ioHooks: {
-        beforeRead(path) {
-          if (failJournalRead && path.endsWith("snapshot-journal.json")) throw new Error("transient journal read");
-        },
-        beforeStep(step) {
-          if (failTarget && step.phase === "target" && step.target === "2026-08-20.json") {
-            failTarget = false;
-            throw new Error("leave a durable fact journal");
-          }
-        },
-      } });
-      recordRequest(store, { startedAt: "2026-08-20T00:00:00.000Z", endedAt: "2026-08-20T00:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      expect(store.flush().status).toBe("committed");
-      recordRequest(store, { startedAt: "2026-08-20T01:00:00.000Z", endedAt: "2026-08-20T01:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      failTarget = true;
-      expect(store.flush().status).toBe("failed");
-      expect(existsSync(join(directory, "snapshot-journal.json"))).toBe(true);
-      recordRequest(store, { startedAt: "2026-08-20T02:00:00.000Z", endedAt: "2026-08-20T02:00:01.000Z", attempts: [{ outcome: "success", commitMs: 1 }] });
-      failJournalRead = true;
-      expect(store.flush().status).toBe("failed");
-      expect(lifetime(store).aggregate.requests).toBe(3);
-
-      failJournalRead = false;
-      vi.advanceTimersByTime(50);
-      expect(lifetime(store).aggregate.requests).toBe(3);
-      expect(store.close().status).toBe("none");
-      const restarted = createAccountingStore({ rootDir: directory });
-      expect(lifetime(restarted).aggregate.requests).toBe(3);
-      restarted.close();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
 
   it("caps array reads before indexing arbitrary later entries", () => {
     const store = createAccountingStore({ rootDir: root(), readDaysCap: 2 });
@@ -1345,4 +1037,106 @@ describe("spend aggregation into the four cells (Stage 4 / Gap 11)", () => {
     expect(aggregate.spend?.providerPublishedReported.known).toBe(2);
     store.close();
   });
+
+  describe("atomic store backward compatibility and stale journal isolation (DR-020)", () => {
+    it("loads pre-existing shards in the OLD on-disk layout", () => {
+      const seedDir = root();
+      const seedStore = createAccountingStore({ rootDir: seedDir });
+      recordRequest(seedStore, {
+        requestId: "preexisting-req-1",
+        startedAt: "2026-08-20T10:00:00.000Z",
+        endedAt: "2026-08-20T10:00:01.000Z",
+        outcome: "success",
+        attempts: [{ outcome: "success", commitMs: 1 }],
+      });
+      expect(seedStore.flush().status).toBe("committed");
+      seedStore.close();
+
+      const directory = root();
+      writeFileSync(join(directory, "lifetime.json"), readFileSync(join(seedDir, "lifetime.json"), "utf8"));
+      writeFileSync(join(directory, "recent.json"), readFileSync(join(seedDir, "recent.json"), "utf8"));
+      writeFileSync(join(directory, "2026-08-20.json"), readFileSync(join(seedDir, "2026-08-20.json"), "utf8"));
+
+      const store = createAccountingStore({ rootDir: directory });
+
+      const readLifetime = store.readLifetime();
+      expect(readLifetime.status).toBe("ok");
+      if (readLifetime.status !== "ok") throw new Error("lifetime not ok");
+      expect(readLifetime.value.firstRequestAt).toBe("2026-08-20T10:00:00.000Z");
+      expect(readLifetime.value.aggregate.requests).toBe(1);
+
+      const readRecent = store.readRecent();
+      expect(readRecent.status).toBe("ok");
+      if (readRecent.status !== "ok") throw new Error("recent not ok");
+      expect(readRecent.value).toHaveLength(1);
+      expect(readRecent.value[0]!.requestId).toBe("preexisting-req-1");
+
+      const readDay = store.readDay("2026-08-20");
+      expect(readDay.status).toBe("ok");
+      if (readDay.status !== "ok") throw new Error("day not ok");
+      expect(readDay.value.cells["10:00"]?.aggregate.requests).toBe(1);
+
+      store.close();
+    });
+
+    it("ignores a stale snapshot-journal.json from an older version without replaying or quarantining it", () => {
+      const seedDir = root();
+      const seedStore = createAccountingStore({ rootDir: seedDir });
+      recordRequest(seedStore, {
+        requestId: "preexisting-req-1",
+        startedAt: "2026-08-20T10:00:00.000Z",
+        endedAt: "2026-08-20T10:00:01.000Z",
+        outcome: "success",
+        attempts: [{ outcome: "success", commitMs: 1 }],
+      });
+      expect(seedStore.flush().status).toBe("committed");
+      seedStore.close();
+
+      const directory = root();
+      writeFileSync(join(directory, "lifetime.json"), readFileSync(join(seedDir, "lifetime.json"), "utf8"));
+
+      const staleJournal = JSON.stringify({
+        schema: "llm-relay.snapshot-journal.v1",
+        version: 1,
+        transactionId: "legacy-uncommitted-001",
+        createdAtMs: Date.now() - 60000,
+        targets: [
+          {
+            name: "lifetime.json",
+            operation: "replace",
+            bytes: 12,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            data: Buffer.from("mutated-data").toString("base64"),
+          },
+        ],
+      });
+      writeFileSync(join(directory, "snapshot-journal.json"), staleJournal);
+
+      const store = createAccountingStore({ rootDir: directory });
+
+      // Stale journal is ignored: lifetime is NOT overwritten with mutated-data or marked corrupt
+      const read = store.readLifetime();
+      expect(read.status).toBe("ok");
+      if (read.status !== "ok") throw new Error("lifetime should be ok");
+      expect(read.value.aggregate.requests).toBe(1);
+
+      // Stale journal is NOT quarantined or deleted: it remains intact as-is
+      expect(existsSync(join(directory, "snapshot-journal.json"))).toBe(true);
+      expect(readFileSync(join(directory, "snapshot-journal.json"), "utf8")).toBe(staleJournal);
+      const corruptFiles = readdirSync(directory).filter((f) => f.includes(".corrupt-"));
+      expect(corruptFiles).toEqual([]);
+
+      // Flushes/writes do not produce or touch snapshot-journal.json
+      recordRequest(store, {
+        startedAt: "2026-08-20T11:00:00.000Z",
+        endedAt: "2026-08-20T11:00:01.000Z",
+        attempts: [{ outcome: "success", commitMs: 1 }],
+      });
+      expect(store.flush().status).toBe("committed");
+      store.close();
+
+      expect(readFileSync(join(directory, "snapshot-journal.json"), "utf8")).toBe(staleJournal);
+    });
+  });
 });
+

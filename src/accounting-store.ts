@@ -23,13 +23,36 @@ import {
   type RequestCompletedEvent,
   type RequestStartedEvent,
 } from "./accounting.js";
-import {
-  createSnapshotJournalIo,
-  SNAPSHOT_IO_HARD_MAX_JOURNAL_BYTES,
-  type SnapshotJournalHooks,
-  type SnapshotMutationResult,
-  type SnapshotWriterResult,
-} from "./accounting-store-io.js";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { atomicWriteJsonSync } from "./storage/json-store.js";
+
+export interface SnapshotMutationResult {
+  readonly status:
+    | "none"
+    | "committed"
+    | "recovered"
+    | "recovery-loss"
+    | "invalid"
+    | "failed";
+  readonly transactionId: string | null;
+  readonly lowerBoundLoss: boolean;
+  readonly error: string | null;
+  readonly quarantinedPath: string | null;
+  readonly retryable: boolean;
+}
+
+export interface SnapshotWriterResult {
+  readonly status: "acquired" | "released" | "closed" | "failed";
+  readonly error: string | null;
+  readonly retryable: boolean;
+}
+
+export interface SnapshotJournalHooks {
+  readonly beforeRead?: (path: string) => void;
+  readonly beforeStep?: (step: unknown) => void;
+  readonly afterStep?: (step: unknown) => void;
+}
+
 import {
   emptyAccountingSpendCell,
   mergeAccountingSpendCells,
@@ -379,12 +402,6 @@ interface RetentionPlan {
   readonly candidates: readonly string[];
   readonly next: MutableLifetime;
   readonly truncated: boolean;
-}
-interface DeferredGlobalLoss {
-  reason: Exclude<AccountingCoverageReason, null>;
-  kind: AccountingLossKind;
-  field: string | null;
-  count: number;
 }
 
 function result(status: SnapshotMutationResult["status"], error: string | null = null, retryable = false, lowerBoundLoss = false): SnapshotMutationResult {
@@ -878,7 +895,6 @@ function parsedRecent(value: MutableRecent): AccountingRecentV1 | null { const p
 
 class AccountingStoreImpl implements AccountingStore {
   readonly directory: string;
-  private readonly io;
   private readonly timer = new WriteBehindTimer();
   private readonly retentionDays: number | null;
   private readonly recentLimit: number;
@@ -890,6 +906,7 @@ class AccountingStoreImpl implements AccountingStore {
   private readonly pendingAttemptLimit: number;
   private readonly now: () => number;
   private readonly readOnly: boolean;
+  private readonly ioHooks: SnapshotJournalHooks | undefined;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly queued = new Array<TerminalWork>();
   private readonly days = new Map<string, MutableDay>();
@@ -901,20 +918,13 @@ class AccountingStoreImpl implements AccountingStore {
   private recentReadState: "ok" | "missing" | "corrupt" = "missing";
   private dirtyLifetime = false;
   private dirtyRecent = false;
-  /** Fixed snapshots were not safely loaded yet; terminal facts must queue. */
-  private fixedLoadPending = false;
-  /** Quarantine/lower-bound evidence observed before both fixed reads complete. */
-  private pendingFixedLoss = false;
-  private pendingJournalLoss = false;
-  /** Losses observed before fixed snapshots load must not dirty empty state. */
-  private readonly deferredGlobalLosses: DeferredGlobalLoss[] = [];
   /**
-   * Retention is its own post-fact transaction.  Keep its intent separately so
+   * Retention is its own post-fact transaction. Keep its intent separately so
    * a fact commit followed by a failed tombstone commit cannot turn a retry
    * into an apparently clean no-op.
    */
   private pendingRetention: string | null = null;
-  /** The exact pending journal shape, retained only to merge a later recovery. */
+  /** The exact pending retention shape. */
   private pendingRetentionPlan: RetentionPlan | null = null;
   private retryTimer: NodeJS.Timeout | null = null;
   private retryDelay = RETRY_MIN_MS;
@@ -936,31 +946,16 @@ class AccountingStoreImpl implements AccountingStore {
     this.pendingAttemptLimit = positiveLimit(options.pendingAttemptLimit, ACCOUNTING_MAX_PENDING_ATTEMPTS_PER_REQUEST, ACCOUNTING_MAX_PENDING_ATTEMPTS_PER_REQUEST);
     this.now = options.now ?? (() => Date.now());
     this.readOnly = options.readOnly === true;
-    this.io = createSnapshotJournalIo({
-      rootDir: this.directory,
-      targets: [LIFETIME_TARGET, RECENT_TARGET],
-      acceptTarget: dayTarget,
-      maxFileBytes: ACCOUNTING_MAX_FILE_BYTES,
-      maxJournalBytes: SNAPSHOT_IO_HARD_MAX_JOURNAL_BYTES,
-      maxTargets: 128,
-      ...(options.ioHooks === undefined ? {} : { hooks: options.ioHooks }),
-    });
-    // A read-only store never takes the writer lease and never replays or quarantines
-    // anything — every one of those is a write against a directory a live relay may be
-    // committing to. It observes committed snapshots only; unflushed in-memory deltas of
-    // the running process stay invisible, which the CLI reports as lag rather than repairing.
+    this.ioHooks = options.ioHooks;
+
     if (this.readOnly) {
       this.writer = { status: "released", error: null, retryable: false };
       this.last = result("none", null, false, false);
       this.loadFixedSnapshotsReadOnly();
       return;
     }
-    this.writer = this.io.acquireWriter();
-    if (this.writer.status === "acquired") this.recoverAndLoad();
-    else {
-      this.last = result("failed", this.writer.error ?? "writer-busy", this.writer.retryable);
-      this.markGlobalLoss("unknown", "truncated", "writer");
-    }
+    this.writer = { status: "acquired", error: null, retryable: false };
+    this.loadFixedSnapshots();
   }
 
   get closed(): boolean { return this._closed; }
@@ -988,49 +983,79 @@ class AccountingStoreImpl implements AccountingStore {
 
   flush(): SnapshotMutationResult {
     if (this._closed) return result("invalid", "closed");
-    // Read-only: flushing is a write. Nothing is ever dirty here anyway because no
-    // record path runs; keep the answer explicit rather than relying on that accident.
     if (this.readOnly) return result("none", null, false, false);
     this.timer.clear();
     this.clearRetry();
-    if (this.writer.status !== "acquired") return this.setLast(result("failed", this.writer.error ?? "writer-busy", this.writer.retryable));
-    const recovered = this.io.recover();
-    if (recovered.status === "failed" || recovered.status === "invalid") return this.fail(recovered);
-    if (this.fixedLoadPending) {
-      this.recoverAndLoad();
-      if (this.fixedLoadPending) return this.last ?? result("failed", "snapshot-read", true, this.lowerBoundLoss);
-    }
-    if (recovered.lowerBoundLoss || recovered.status === "recovery-loss") this.consumeRecoveryLoss(recovered);
-    if (recovered.status === "recovered" && this.pendingRetentionPlan !== null) {
-      // Never replace current memory with the journal's saved lifetime: records
-      // may have arrived after the failed retention write.  Reconcile only the
-      // durable pruning effects, then let the ordinary fact commit persist any
-      // newer in-memory facts.
-      this.reconcileRecoveredRetention(this.pendingRetentionPlan);
+    if (this.writer.status !== "acquired") {
+      return this.setLast(result("failed", this.writer.error ?? "writer-busy", this.writer.retryable));
     }
     this.drainQueued();
-    if (this.queued.length > 0) return this.fail(result("failed", "day-read", true, this.lowerBoundLoss));
-    if (this.dirtyDays.size === 0 && !this.dirtyLifetime && !this.dirtyRecent) {
-      return this.commitRetention([]) ?? this.setLast(result("none", null, false, this.lowerBoundLoss));
+    if (this.queued.length > 0) {
+      return this.fail(result("failed", "day-read", true, this.lowerBoundLoss));
     }
-    if (this.dirtyDays.size + 2 > (this.io.maxTargets ?? 0)) return this.fail(result("invalid", "transaction-targets", false, this.lowerBoundLoss));
-    const snapshots = this.factSnapshots();
-    if (snapshots === null) return this.fail(result("invalid", "schema-or-size", false, this.lowerBoundLoss));
+
+    if (this.dirtyDays.size === 0 && !this.dirtyLifetime && !this.dirtyRecent) {
+      const retentionResult = this.commitRetention([]);
+      return retentionResult ?? this.setLast(result("none", null, false, this.lowerBoundLoss));
+    }
+
+    const daySnapshots: { date: string; data: AccountingDayShard }[] = [];
+    for (const date of [...this.dirtyDays].sort()) {
+      const day = this.days.get(date);
+      const parsed = day === undefined ? null : parsedDay(day);
+      if (parsed === null) return this.fail(result("invalid", "schema-or-size", false, this.lowerBoundLoss));
+      daySnapshots.push({ date, data: parsed });
+    }
+
+    let lifetimeSnapshot: AccountingLifetime | null = null;
+    if (this.dirtyLifetime) {
+      lifetimeSnapshot = parsedLifetime(this.lifetime);
+      if (lifetimeSnapshot === null) return this.fail(result("invalid", "schema-or-size", false, this.lowerBoundLoss));
+    }
+
+    let recentSnapshot: AccountingRecentV1 | null = null;
+    if (this.dirtyRecent) {
+      recentSnapshot = parsedRecent(this.recent);
+      if (recentSnapshot === null) return this.fail(result("invalid", "schema-or-size", false, this.lowerBoundLoss));
+    }
+
+    try {
+      for (const { date, data } of daySnapshots) {
+        const filePath = join(this.directory, targetForDay(date));
+        if (!atomicWriteJsonSync(filePath, data, { strict: true })) {
+          throw new Error(`Failed to write ${targetForDay(date)}`);
+        }
+      }
+      if (lifetimeSnapshot !== null) {
+        const filePath = join(this.directory, LIFETIME_TARGET);
+        if (!atomicWriteJsonSync(filePath, lifetimeSnapshot, { strict: true })) {
+          throw new Error(`Failed to write ${LIFETIME_TARGET}`);
+        }
+      }
+      if (recentSnapshot !== null) {
+        const filePath = join(this.directory, RECENT_TARGET);
+        if (!atomicWriteJsonSync(filePath, recentSnapshot, { strict: true })) {
+          throw new Error(`Failed to write ${RECENT_TARGET}`);
+        }
+      }
+    } catch (err) {
+      return this.fail(result("failed", err instanceof Error ? err.message : String(err), true, this.lowerBoundLoss));
+    }
+
     const committedDates = [...this.dirtyDays];
-    const written = this.io.commit(snapshots);
-    this.last = written;
-    if (written.status !== "committed" && written.status !== "recovered") return this.fail(written);
     this.dirtyDays.clear();
     this.dirtyLifetime = false;
     this.dirtyRecent = false;
-    if (Object.hasOwn(snapshots, LIFETIME_TARGET)) this.lifetimeReadState = "ok";
-    if (Object.hasOwn(snapshots, RECENT_TARGET)) this.recentReadState = "ok";
+    if (lifetimeSnapshot !== null) this.lifetimeReadState = "ok";
+    if (recentSnapshot !== null) this.recentReadState = "ok";
     this.retryDelay = RETRY_MIN_MS;
-    const retention = this.commitRetention(committedDates);
-    // A write-loaded shard stays outside the clean cache until this commit has
-    // made it durable. Re-admit it now, or evict it if every cache slot is
-    // still protected by dirty/in-flight facts.
+
     for (const date of [...committedDates].sort()) this.rememberKnownDay(date);
+
+    const written = result("committed", null, false, this.lowerBoundLoss);
+    this.last = written;
+
+    const retention = this.commitRetention(committedDates);
     return retention ?? written;
   }
 
@@ -1039,13 +1064,9 @@ class AccountingStoreImpl implements AccountingStore {
     this.timer.clear();
     this.clearRetry();
     const flushed = this.flush();
-    // Dirty facts and a recoverable journal still belong to this store. Keep
-    // it open so a later close can retry instead of irreversibly discarding
-    // the only in-process copy after one transient failure.
     if (flushed.retryable) return flushed;
-    const closed = this.io.close();
-    this._closed = closed.status === "closed";
-    if (closed.status === "failed") return this.setLast(result("failed", closed.error, closed.retryable, flushed.lowerBoundLoss));
+    this._closed = true;
+    this.writer = { status: "closed", error: null, retryable: false };
     return flushed;
   }
 
@@ -1056,16 +1077,37 @@ class AccountingStoreImpl implements AccountingStore {
       const parsed = parsedDay(cached);
       return parsed === null ? { status: "corrupt", value: null, error: "schema" } : { status: "ok", value: this.withDayLoss(parsed) };
     }
-    // Quarantine renames a file; an out-of-process reader reports corruption instead of
-    // touching a shard a live relay may be about to rewrite.
-    const read = this.io.readJson(targetForDay(date), (value): value is AccountingDayShard => parseAccountingDayShardV1(value).ok, { quarantineCorrupt: !this.readOnly });
+    const read = this.readJsonFile(targetForDay(date), parseAccountingDayShardV1);
     if (read.status === "missing") return { status: "missing", value: null };
-    if (read.status !== "ok" || read.value === null) return { status: "corrupt", value: null, error: read.error ?? read.status };
-    const parsed = parseAccountingDayShardV1(read.value);
-    if (!parsed.ok) return { status: "corrupt", value: null, error: "schema" };
-    this.days.set(date, mutableDay(parsed.value));
+    if (read.status !== "ok" || read.value === null) return { status: "corrupt", value: null, error: read.error };
+    this.days.set(date, mutableDay(read.value));
     this.rememberKnownDay(date);
-    return { status: "ok", value: this.withDayLoss(parsed.value) };
+    return { status: "ok", value: this.withDayLoss(read.value) };
+  }
+
+  private readJsonFile<T>(
+    filename: string,
+    parse: (raw: unknown) => { ok: true; value: T } | { ok: false; error?: unknown },
+  ): { status: "ok"; value: T } | { status: "missing"; value: null } | { status: "corrupt"; value: null; error: string } {
+    const filePath = join(this.directory, filename);
+    this.ioHooks?.beforeRead?.(filePath);
+    let text: string;
+    try {
+      text = readFileSync(filePath, "utf8");
+    } catch (err: unknown) {
+      const code = typeof err === "object" && err !== null && "code" in err ? (err as { code: unknown }).code : undefined;
+      if (code === "ENOENT") return { status: "missing", value: null };
+      return { status: "corrupt", value: null, error: err instanceof Error ? err.message : "read-error" };
+    }
+    let json: unknown;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      return { status: "corrupt", value: null, error: "invalid-json" };
+    }
+    const parsed = parse(json);
+    if (!parsed.ok) return { status: "corrupt", value: null, error: "schema" };
+    return { status: "ok", value: parsed.value };
   }
 
   readDays(dates: readonly string[], options?: { readonly cap?: number }): AccountingDaysRead;
@@ -1119,7 +1161,7 @@ class AccountingStoreImpl implements AccountingStore {
 
   readDetail(requestId: string): AccountingReadResult<AccountingRequestPacket> {
     if (!DASHBOARD_REQUEST_ID_PATTERN.test(requestId)) return { status: "missing", value: null };
-    if (this.fixedLoadPending || (this.recentReadState === "corrupt" && !this.dirtyRecent)) {
+    if (this.recentReadState === "corrupt" && !this.dirtyRecent) {
       return { status: "corrupt", value: null, error: "snapshot" };
     }
     if (this.recentReadState === "missing" && !this.dirtyRecent) return { status: "missing", value: null };
@@ -1282,7 +1324,7 @@ class AccountingStoreImpl implements AccountingStore {
     const pending = this.pending.get(event.requestId) ?? null;
     this.pending.delete(event.requestId);
     const work: TerminalWork = { event, pending };
-    if (!this.fixedLoadPending && this.applyTerminal(work)) return;
+    if (this.applyTerminal(work)) return;
     if (this.queued.length >= this.pendingRequestLimit) {
       this.markGlobalLoss("unknown", "truncated", "pending_terminals");
       return;
@@ -1317,13 +1359,12 @@ class AccountingStoreImpl implements AccountingStore {
   }
 
   private drainQueued(): void {
-    if (this.fixedLoadPending || this.queued.length === 0) return;
+    if (this.queued.length === 0) return;
     const pending = this.queued.splice(0);
     for (const work of pending) if (!this.applyTerminal(work)) this.queued.push(work);
   }
 
   private applyTerminal(work: TerminalWork): boolean {
-    if (this.fixedLoadPending) return false;
     const date = dayFor(work.event.endedAt);
     if (date === null || !this.ensureTransactionRoom(date)) return false;
     const day = this.loadDayForWrite(date);
@@ -1527,207 +1568,85 @@ class AccountingStoreImpl implements AccountingStore {
     return true;
   }
 
-  /** Keep a fact transaction within the journal's bounded target set. */
+  /** Keep a fact transaction within a bounded target set. */
   private ensureTransactionRoom(date: string): boolean {
     if (this.dirtyDays.has(date)) return true;
-    const maximum = this.io.maxTargets;
-    if (maximum === null || maximum < 3) return false;
+    const maximum = 128;
     if (this.dirtyDays.size + 3 <= maximum) return true;
 
-    // A terminal request owns a day + lifetime + recent atomically.  Commit the
-    // previous bounded batch before accepting a new day rather than allowing an
-    // unrepresentable journal transaction to accumulate.
+    // Commit previous batch before accepting a new day
     const flushed = this.flush();
-    return (flushed.status === "committed" || flushed.status === "recovered" || flushed.status === "none")
+    return (flushed.status === "committed" || flushed.status === "none")
       && this.dirtyDays.size + 3 <= maximum;
   }
 
-  /** Read one named day through the namespace-restricted journal I/O only. */
+  /** Read one named day. */
   private loadDayForWrite(date: string): MutableDay | null {
     const cached = this.days.get(date);
     if (cached !== undefined) return cached;
-    const read = this.io.readJson(
-      targetForDay(date),
-      (value): value is AccountingDayShard => parseAccountingDayShardV1(value).ok,
-      { quarantineCorrupt: true },
-    );
+    const read = this.readJsonFile(targetForDay(date), parseAccountingDayShardV1);
     if (read.status === "missing") {
       const created = emptyDay(date);
       this.days.set(date, created);
       return created;
     }
     if (read.status !== "ok" || read.value === null) {
-      // A quarantined day is intentionally restarted as a lower bound on the
-      // next queued pass.  A transient read failure remains queued and cannot
-      // overwrite an unreadable existing shard.
-      if (read.status === "corrupt" || read.status === "oversize") {
-        this.markGlobalLoss("corrupt_recovery", "corrupt", "day");
-      }
-      return null;
-    }
-    const parsed = parseAccountingDayShardV1(read.value);
-    if (!parsed.ok) {
       this.markGlobalLoss("corrupt_recovery", "corrupt", "day");
       return null;
     }
-    const mutable = mutableDay(parsed.value);
+    const mutable = mutableDay(read.value);
     this.days.set(date, mutable);
     return mutable;
   }
 
-  /** Keep unread fixed snapshots immutable until a retry has loaded both safely. */
-  private deferFixedLoad(value: SnapshotMutationResult): void {
-    this.fixedLoadPending = true;
-    this.lifetimeReadState = "corrupt";
-    this.recentReadState = "corrupt";
-    this.last = value;
-    if (value.retryable) this.scheduleRetry();
-  }
-
-  private flushDeferredGlobalLosses(): void {
-    const losses = this.deferredGlobalLosses.splice(0);
-    for (const loss of losses) this.markGlobalLoss(loss.reason, loss.kind, loss.field, loss.count);
-  }
-
-  /**
-   * Read-only constructor load: read the two fixed snapshots WITHOUT the writer lease and
-   * without any recovery/quarantine write. A corrupt or unreadable snapshot stays corrupt
-   * (reported by `readLifetime`/`readRecent`) rather than being renamed aside. Day shards
-   * are deliberately NOT preloaded — `readDay` reads them on demand through the same
-   * no-write readJson path.
-   */
+  /** Read-only constructor load: read the two fixed snapshots without writes. */
   private loadFixedSnapshotsReadOnly(): void {
-    const lifetime = this.io.readJson(
-      LIFETIME_TARGET,
-      (value): value is AccountingLifetime => parseAccountingLifetimeV1(value).ok,
-      { quarantineCorrupt: false },
-    );
+    const lifetime = this.readJsonFile(LIFETIME_TARGET, parseAccountingLifetimeV1);
     this.lifetimeReadState = lifetime.status === "ok" && lifetime.value !== null
       ? "ok"
       : lifetime.status === "missing" ? "missing" : "corrupt";
     if (this.lifetimeReadState === "ok") this.lifetime = mutableLifetime(lifetime.value!);
 
-    const recent = this.io.readJson(
-      RECENT_TARGET,
-      (value): value is AccountingRecentV1 => parseAccountingRecentV1(value).ok,
-      { quarantineCorrupt: false },
-    );
+    const recent = this.readJsonFile(RECENT_TARGET, parseAccountingRecentV1);
     this.recentReadState = recent.status === "ok" && recent.value !== null
       ? "ok"
       : recent.status === "missing" ? "missing" : "corrupt";
     if (this.recentReadState === "ok") this.recent = mutableRecent(recent.value!);
   }
 
-  /** Recover a committed journal first, then load the two fixed snapshots. */
-  private recoverAndLoad(): void {
-    const recovered = this.io.recover();
-    if (recovered.status === "failed" || recovered.status === "invalid") {
-      this.pendingJournalLoss ||= recovered.lowerBoundLoss;
-      this.deferFixedLoad(recovered);
-      return;
-    }
-
+  /** Load fixed snapshots at startup. */
+  private loadFixedSnapshots(): void {
     let fixedLoss = false;
-    let fixedReadFailed = false;
-    const lifetime = this.io.readJson(
-      LIFETIME_TARGET,
-      (value): value is AccountingLifetime => parseAccountingLifetimeV1(value).ok,
-      { quarantineCorrupt: true },
-    );
+    const lifetime = this.readJsonFile(LIFETIME_TARGET, parseAccountingLifetimeV1);
     if (lifetime.status === "ok" && lifetime.value !== null) {
-      const parsed = parseAccountingLifetimeV1(lifetime.value);
-      if (parsed.ok) {
-        this.lifetime = mutableLifetime(parsed.value);
-        this.lifetimeReadState = "ok";
-      } else {
-        this.lifetimeReadState = "corrupt";
-        fixedLoss = true;
-      }
+      this.lifetime = mutableLifetime(lifetime.value);
+      this.lifetimeReadState = "ok";
     } else if (lifetime.status === "missing") {
       this.lifetimeReadState = "missing";
-    } else if (lifetime.status === "failed") {
-      this.lifetimeReadState = "corrupt";
-      fixedReadFailed = true;
     } else {
       this.lifetimeReadState = "corrupt";
       fixedLoss = true;
     }
 
-    const recent = this.io.readJson(
-      RECENT_TARGET,
-      (value): value is AccountingRecentV1 => parseAccountingRecentV1(value).ok,
-      { quarantineCorrupt: true },
-    );
+    const recent = this.readJsonFile(RECENT_TARGET, parseAccountingRecentV1);
     if (recent.status === "ok" && recent.value !== null) {
-      const parsed = parseAccountingRecentV1(recent.value);
-      if (parsed.ok) {
-        this.recent = mutableRecent(parsed.value);
-        this.recentReadState = "ok";
-      } else {
-        this.recentReadState = "corrupt";
-        fixedLoss = true;
-      }
+      this.recent = mutableRecent(recent.value);
+      this.recentReadState = "ok";
     } else if (recent.status === "missing") {
       this.recentReadState = "missing";
-    } else if (recent.status === "failed") {
-      this.recentReadState = "corrupt";
-      fixedReadFailed = true;
     } else {
       this.recentReadState = "corrupt";
       fixedLoss = true;
     }
 
-    if (fixedReadFailed) {
-      this.pendingFixedLoss ||= fixedLoss;
-      this.pendingJournalLoss ||= recovered.lowerBoundLoss || recovered.status === "recovery-loss";
-      this.deferFixedLoad(result("failed", "snapshot-read", true, this.lowerBoundLoss || this.pendingJournalLoss));
-      return;
+    if (fixedLoss) {
+      this.markGlobalLoss("corrupt_recovery", "corrupt", "snapshot");
     }
-    fixedLoss ||= this.pendingFixedLoss;
-    const journalLoss = this.pendingJournalLoss || recovered.lowerBoundLoss || recovered.status === "recovery-loss";
-    this.pendingFixedLoss = false;
-    this.pendingJournalLoss = false;
-    this.fixedLoadPending = false;
-    this.flushDeferredGlobalLosses();
-    if (journalLoss) this.consumeRecoveryLoss(recovered);
-    if (fixedLoss) this.markGlobalLoss("corrupt_recovery", "corrupt", "snapshot");
     this.seedTrustedDateFromLifetime();
     const today = new Date(this.now()).toISOString().slice(0, 10);
     this.loadDayForWrite(today);
     this.queueRecoveredRetention();
-    this.last = recovered;
-  }
-
-  /** Validate every outgoing canonical object before handing it to the journal. */
-  private factSnapshots(): Record<string, string> | null {
-    const snapshots: Record<string, string> = {};
-    const encode = (name: string, value: unknown): boolean => {
-      let text: string;
-      try {
-        text = JSON.stringify(value);
-      } catch {
-        return false;
-      }
-      const ceiling = this.io.maxFileBytes;
-      if (ceiling === null || Buffer.byteLength(text, "utf8") > ceiling) return false;
-      snapshots[name] = text;
-      return true;
-    };
-
-    if (this.dirtyLifetime) {
-      const lifetime = parsedLifetime(this.lifetime);
-      if (lifetime === null || !encode(LIFETIME_TARGET, lifetime)) return null;
-    }
-    if (this.dirtyRecent) {
-      const recent = parsedRecent(this.recent);
-      if (recent === null || !encode(RECENT_TARGET, recent)) return null;
-    }
-    for (const date of [...this.dirtyDays].sort()) {
-      const day = this.days.get(date);
-      const parsed = day === undefined ? null : parsedDay(day);
-      if (parsed === null || !encode(targetForDay(date), parsed)) return null;
-    }
-    return snapshots;
+    this.last = result("none");
   }
 
   /**
@@ -1736,33 +1655,24 @@ class AccountingStoreImpl implements AccountingStore {
    */
   private commitRetention(committedDates: readonly string[]): SnapshotMutationResult | null {
     if (this.retentionDays === null) return null;
-    // A clock that previously rolled back may have caught the durable frontier
-    // since construction. Re-evaluate it on every flush, not only at startup.
     this.queueRecoveredRetention();
     const eligible = this.advanceTrustedDate(committedDates);
     if (eligible !== null) this.queueRetentionForDate(eligible);
     const cutoff = this.pendingRetention;
     if (cutoff === null) return null;
 
-    // A recovered or already-completed transaction can leave a stale in-memory
-    // intent, but it must not cause an endless no-op retry.
     if (!this.retentionNeedsWork(cutoff)) {
       this.pendingRetention = null;
       this.pendingRetentionPlan = null;
       return null;
     }
 
-    const maximum = this.io.maxTargets;
-    if (maximum === null || maximum < 1) return this.fail(result("invalid", "retention-targets", false, this.lowerBoundLoss));
-
     const current = parsedLifetime(this.lifetime);
     if (current === null) return this.fail(result("invalid", "lifetime-schema", false, this.lowerBoundLoss));
     const progress = validDate(current.coverage.retentionFrom) ? current.coverage.retentionFrom : null;
     const start = progress ?? dayFor(current.firstRequestAt ?? "");
-    const retention = this.retentionCandidates(start, cutoff, Math.max(0, maximum - 1));
+    const retention = this.retentionCandidates(start, cutoff, 127);
     const candidates = retention.dates;
-    // One target is consumed by lifetime.  Do not claim retention can make
-    // progress if a caller has configured no room for a tombstone at all.
     if (retention.truncated && candidates.length === 0) {
       return this.fail(result("invalid", "retention-targets", false, this.lowerBoundLoss));
     }
@@ -1770,9 +1680,6 @@ class AccountingStoreImpl implements AccountingStore {
     const next = mutableLifetime(current);
     const lastCandidate = candidates.at(-1) ?? null;
     const advanced = lastCandidate === null ? null : nextDate(lastCandidate);
-    // `retentionFrom` is the durable cursor: it may reach the policy cutoff
-    // only once every bounded tombstone batch before it has committed.  This
-    // lets a restarted store continue without discovering directory entries.
     next.coverage.retentionFrom = advanced ?? (retention.truncated
       ? progress
       : progress === null || progress < cutoff ? cutoff : progress);
@@ -1783,33 +1690,37 @@ class AccountingStoreImpl implements AccountingStore {
     }
 
     const plan: RetentionPlan = { cutoff, candidates, next, truncated: retention.truncated };
-
-    const snapshots: Record<string, string | null> = {};
     const retainedLifetime = parsedLifetime(next);
     if (retainedLifetime === null) return this.fail(result("invalid", "retention-schema-or-size", false, this.lowerBoundLoss));
-    const serialized = JSON.stringify(retainedLifetime);
-    const ceiling = this.io.maxFileBytes;
-    if (serialized === undefined || ceiling === null || Buffer.byteLength(serialized, "utf8") > ceiling) {
-      return this.fail(result("invalid", "retention-schema-or-size", false, this.lowerBoundLoss));
-    }
-    snapshots[LIFETIME_TARGET] = serialized;
-    for (const date of candidates) snapshots[targetForDay(date)] = null;
 
-    this.pendingRetentionPlan = plan;
-    const written = this.io.commit(snapshots);
-    this.last = written;
-    if (written.status !== "committed" && written.status !== "recovered") return this.fail(written);
+    try {
+      const filePath = join(this.directory, LIFETIME_TARGET);
+      if (!atomicWriteJsonSync(filePath, retainedLifetime, { strict: true })) {
+        throw new Error(`Failed to write ${LIFETIME_TARGET}`);
+      }
+      for (const date of candidates) {
+        try {
+          unlinkSync(join(this.directory, targetForDay(date)));
+        } catch (err: unknown) {
+          const code = typeof err === "object" && err !== null && "code" in err ? (err as { code: unknown }).code : undefined;
+          if (code !== "ENOENT") throw err;
+        }
+      }
+    } catch (err) {
+      return this.fail(result("failed", err instanceof Error ? err.message : String(err), true, this.lowerBoundLoss));
+    }
+
     this.applyRetentionPlan(plan);
     this.pendingRetentionPlan = null;
     if (plan.truncated) {
-      // A complete transaction can still have more bounded work.  This is a
-      // continuation, not a dirty fact write, so wake it explicitly.
       this.pendingRetention = plan.cutoff;
       this.retryDelay = RETRY_MIN_MS;
       this.scheduleRetry();
     } else {
       this.pendingRetention = null;
     }
+    const written = result("committed", null, false, this.lowerBoundLoss);
+    this.last = written;
     return written;
   }
 
@@ -1970,13 +1881,6 @@ class AccountingStoreImpl implements AccountingStore {
     return validDate(cutoff) ? cutoff : null;
   }
 
-  private consumeRecoveryLoss(_recovered: SnapshotMutationResult): void {
-    if (this.lowerBoundLoss) return;
-    this.lowerBoundLoss = true;
-    this.markGlobalLoss("corrupt_recovery", "corrupt", "journal");
-    this.scheduleFlush();
-  }
-
   /** Record a loss where it can be surfaced without claiming an exact total. */
   private markGlobalLoss(
     reason: Exclude<AccountingCoverageReason, null>,
@@ -1984,22 +1888,6 @@ class AccountingStoreImpl implements AccountingStore {
     field: string | null,
     count = 1,
   ): void {
-    if (this.fixedLoadPending) {
-      const existing = this.deferredGlobalLosses.find((loss) => loss.reason === reason && loss.kind === kind && loss.field === field);
-      if (existing !== undefined) {
-        if (!increase(existing as unknown as Record<string, number>, "count", count)) existing.count = Number.MAX_SAFE_INTEGER;
-      } else if (this.deferredGlobalLosses.length < ACCOUNTING_MAX_LOSS_MARKERS) {
-        this.deferredGlobalLosses.push({ reason, kind, field, count });
-      } else {
-        const summary = this.deferredGlobalLosses.find((loss) => loss.field === "deferred_loss");
-        if (summary !== undefined) {
-          if (!increase(summary as unknown as Record<string, number>, "count", count)) summary.count = Number.MAX_SAFE_INTEGER;
-        } else {
-          this.deferredGlobalLosses[this.deferredGlobalLosses.length - 1] = { reason: "unknown", kind: "truncated", field: "deferred_loss", count };
-        }
-      }
-      return;
-    }
     if (reason === "corrupt_recovery") this.lowerBoundLoss = true;
     markCoverage(this.lifetime.coverage, reason, kind, field, count);
     markCoverage(this.recent.coverage, reason, kind, field, count);

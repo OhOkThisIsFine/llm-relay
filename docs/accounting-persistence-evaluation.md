@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-This evaluation analyzes the persistence architecture of `llm-relay`'s accounting subsystem ([`src/accounting-store.ts`](../src/accounting-store.ts), [`src/accounting-store-io.ts`](../src/accounting-store-io.ts), [`src/accounting-store-schema.ts`](../src/accounting-store-schema.ts)), specifically assessing the trade-offs between the existing multi-file transactional snapshot journal model and an embedded SQLite/WAL storage engine.
+This evaluation analyzes the persistence architecture of `llm-relay`'s accounting subsystem ([`src/accounting-store.ts`](../src/accounting-store.ts), historical `src/accounting-store-io.ts`, [`src/accounting-store-schema.ts`](../src/accounting-store-schema.ts)), specifically assessing the trade-offs between the existing multi-file transactional snapshot journal model and an embedded SQLite/WAL storage engine.
 
 ---
 
@@ -52,4 +52,17 @@ The in-memory 60-minute sliding window and bounded lifetime rollups provide inst
 
 ## 6. Conclusion
 
-The current transactional snapshot journal engine in [`src/accounting-store-io.ts`](../src/accounting-store-io.ts) is **confirmed as the optimal storage architecture** for `llm-relay`. It satisfies all ACID durability and crash-safety requirements while preserving the zero-native-dependency lightweight footprint of the project.
+The historical transactional snapshot journal engine in `src/accounting-store-io.ts` was **confirmed as the optimal storage architecture** for `llm-relay` as of 2026-08-05. It satisfied all ACID durability and crash-safety requirements while preserving the zero-native-dependency lightweight footprint of the project.
+
+---
+
+## 7. 2026-09-03 Amendment: Storage Shrink (DR-020)
+
+**Owner decision 2026-09-03 (DR-020, Option A: "SHRINK IT")**:
+The custom transactional write-ahead snapshot journal, replay engine, quarantine renames, orphan tmp file management, and in-process writer lease in `accounting-store-io.ts` have been retired in favor of the shared atomic JSON writer (`atomicWriteJsonSync` from [`src/storage/json-store.ts`](../src/storage/json-store.ts)).
+
+The 2026-08-05 evaluation above is preserved for historical context. While the snapshot journal provided multi-file atomic commit guarantees, the operational reality of a personal single-user workstation proxy does not justify maintaining an ad-hoc 500+ line write-ahead journal and crash recovery engine for personal token counters. The accepted engineering trade-off is:
+- Target files (`lifetime.json`, `recent.json`, and daily shards `YYYY-MM-DD.json`) are written individually using atomic temp-file-and-rename (`atomicWriteJsonSync`).
+- A process crash between writing individual files can leave shards from two adjacent snapshot flushes on disk. The next write-behind flush re-converges the files from in-memory state; there is no journal replay or quarantine.
+- Legacy `snapshot-journal.json`, `.corrupt-*`, or `tmp-*` files pre-existing on disk are ignored without crashing, replay, or quarantine.
+- The `WriteBehindTimer` debouncing and in-memory aggregation remain unchanged.
