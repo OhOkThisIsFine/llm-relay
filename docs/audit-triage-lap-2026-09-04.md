@@ -1,16 +1,17 @@
 # Closeout — C:/Code/llm-relay
 
-Rendered 2026-09-04T20:50:21.295Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-04T20:54:23.694Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `029484dad748d5c9e28b7f55dcca6b8c3558d700`
+- HEAD: `ba4692dfe71ecd5105b21f36c957c451042956ac`
 - Sprint start: `8973500`
 
 ## Commits in the sprint range
 
+- ba4692d docs: closeout for the audit-triage lap (v0.71.1)
 - 029484d docs: the lap shipped as v0.71.1; the doc-links hermeticity gap and the shared-checkout rewrite get their homes
 - 659ef6b chore: release v0.71.1
 - a137d04 docs: Muse Spark 1.3 on OpenCode Zen — Responses-only SKU the relay cannot serve yet; CLI rung recipe; pools carry paid SKUs behind free with freeOnly off; CLAUDE.md dynamic-pools row corrected
@@ -30,13 +31,13 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-04T20:46:59.063Z on tree `8db7e401f843`
-- `verify-green check`: verify-green: PASS — tree 8db7e401f843 matches the passing run recorded 2026-09-04T20:46:59.063Z (npm run check) — PASS
+- Ledger: `npm run check` recorded 2026-09-04T20:50:52.766Z on tree `833f111c0b5b`
+- `verify-green check`: verify-green: PASS — tree 833f111c0b5b matches the passing run recorded 2026-09-04T20:50:52.766Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 33917867399) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33917867399
+- CI: completed/success (run 33918210578) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33918210578
 
 ## Operator-provided narrative (not machine-derived)
 
