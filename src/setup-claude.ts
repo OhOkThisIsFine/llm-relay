@@ -42,7 +42,7 @@ export interface SetupOptions {
  * upgraded in place rather than refused as foreign.
  */
 export const RELAY_AGENT_MARKER_PREFIX = "<!-- llm-relay:relay-agent";
-export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v3 -->";
+export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v4 -->";
 /**
  * DEFECT, measured live 2026-09-04: the three mcp__llm-relay__dispatch* tools are DEFERRED in
  * Claude Code — a subagent must call ToolSearch to load their schemas before it can call them.
@@ -55,14 +55,31 @@ export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v3 -->";
  * NOT re-read edits during a session — measured 2026-09-04, after `setup` rewrote this file to
  * v2 a running session still reported the v1 marker and the v1 tool list. A changed template
  * needs a new session (or the file deleted and recreated) before it takes effect.
+ *
+ * DEFECT, measured live 2026-09-04, same day: `model: haiku` answered a trivial one-line echo
+ * task ITSELF (4s, 0 tool calls, no provenance line) while a realistic task correctly dispatched
+ * (17s, 2 tool calls, provenance present) — haiku was weak enough to break its own rule 2 ("this
+ * holds for EVERY task, even one that looks trivial"). Pinning `sonnet` instead measured obeying
+ * (47s including the echo), but the owner's direction (2026-09-04) is not to hard-code a model
+ * name at all: a pinned model ties every install to whichever alias is cheap/available today, and
+ * this template must also work from Codex, which has no `haiku`/`sonnet`/`opus`/`fable` alias
+ * vocabulary of its own. v4 removes the pin in favor of `model: inherit` — deliberately NOT an
+ * omitted `model:` line. Confirmed against https://code.claude.com/docs/en/sub-agents.md: an
+ * omitted field falls through a four-rung resolution order whose THIRD rung is the
+ * `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, so on a machine where an operator has set
+ * that var for cost control, an omitted line would silently pick it up instead of the calling
+ * session's model. `inherit` is the one documented spelling that selects "the same model as the
+ * main conversation" ahead of that env var. That makes the relay agent run on whatever model the
+ * calling session already runs on — never weaker than the session that decided delegation was
+ * worthwhile, and never a second model choice the operator has to keep in sync.
  */
 export const RELAY_AGENT_TEMPLATE = `---
 name: relay
 description: Hands one self-contained task to llm-relay dispatch, free model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another lane can do: a search, a sweep, a draft, a summary, a second opinion.
 tools: ToolSearch, mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result
-model: haiku
+model: inherit
 ---
-<!-- llm-relay:relay-agent v3 -->
+<!-- llm-relay:relay-agent v4 -->
 
 You have no knowledge of your own and no permission to answer any task yourself. The only
 legitimate action available to you is exactly one \`mcp__llm-relay__dispatch\` call, plus polling

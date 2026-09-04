@@ -283,17 +283,17 @@ describe("setup-claude", () => {
     expect(content).toMatch(/never invented/i);
   });
 
-  it("(j) the marker is bumped to v3", () => {
-    expect(RELAY_AGENT_MARKER).toContain("v3");
-    expect(RELAY_AGENT_MARKER).not.toContain("v2");
+  it("(j) the marker is bumped to v4", () => {
+    expect(RELAY_AGENT_MARKER).toContain("v4");
+    expect(RELAY_AGENT_MARKER).not.toContain("v3");
     const injectedHome = join(dir, "injected-home-j");
     installRelayAgent({ homeDir: injectedHome });
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     const content = readFileSync(agentPath, "utf8");
-    expect(content).toContain("<!-- llm-relay:relay-agent v3 -->");
+    expect(content).toContain("<!-- llm-relay:relay-agent v4 -->");
   });
 
-  it("(k) a file carrying the OLD v1 marker is recognised as our own and upgraded to v3, not refused as foreign", () => {
+  it("(k) a file carrying the OLD v1 marker is recognised as our own and upgraded to v4, not refused as foreign", () => {
     const injectedHome = join(dir, "injected-home-k");
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     mkdirSync(dirname(agentPath), { recursive: true });
@@ -309,7 +309,7 @@ describe("setup-claude", () => {
     expect(afterContent).not.toContain("relay-agent v1 -->");
   });
 
-  it("(l) a file carrying the previous v2 marker is recognised as our own and upgraded to v3, not refused as foreign", () => {
+  it("(l) a file carrying the previous v2 marker is recognised as our own and upgraded to v4, not refused as foreign", () => {
     const injectedHome = join(dir, "injected-home-l");
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     mkdirSync(dirname(agentPath), { recursive: true });
@@ -324,6 +324,45 @@ describe("setup-claude", () => {
     expect(afterContent).toBe(RELAY_AGENT_TEMPLATE);
     expect(afterContent).toContain(RELAY_AGENT_MARKER);
     expect(afterContent).not.toContain("relay-agent v2 -->");
+  });
+
+  // --- Defect fix, 2026-09-04 (same day, found after the ToolSearch fix above): `model: haiku`
+  // answered a trivial echo task ITSELF (4s, 0 tool calls, no provenance) while a realistic task
+  // correctly dispatched (17s, 2 tool calls, provenance) — haiku was too weak to reliably obey its
+  // own rule 2. The owner's direction was not to hard-code a model name at all (the template must
+  // also work from Codex, which has no haiku/sonnet/opus alias vocabulary), so v4 removes the pin
+  // in favor of `model: inherit` rather than an omitted `model:` line — confirmed against
+  // https://code.claude.com/docs/en/sub-agents.md that an omitted field can fall through to the
+  // `CLAUDE_CODE_SUBAGENT_MODEL` environment variable before ever reaching the calling session's
+  // model, while `inherit` selects the calling session's model directly.
+
+  it("(m) a file carrying the previous v3 marker is recognised as our own and upgraded to v4, not refused as foreign", () => {
+    const injectedHome = join(dir, "injected-home-m");
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    mkdirSync(dirname(agentPath), { recursive: true });
+    const oldContent =
+      "---\nname: relay\ntools: ToolSearch, mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result\nmodel: haiku\n---\n<!-- llm-relay:relay-agent v3 -->\n\n1. Old rule text.\n";
+    writeFileSync(agentPath, oldContent);
+
+    const res = installRelayAgent({ homeDir: injectedHome });
+    expect(res.success).toBe(true);
+
+    const afterContent = readFileSync(agentPath, "utf8");
+    expect(afterContent).toBe(RELAY_AGENT_TEMPLATE);
+    expect(afterContent).toContain(RELAY_AGENT_MARKER);
+    expect(afterContent).not.toContain("relay-agent v3 -->");
+  });
+
+  it("(n) the content pins no model alias — model: inherit selects the calling session's model, never a hardcoded model: haiku or model: sonnet", () => {
+    const injectedHome = join(dir, "injected-home-n");
+    installRelayAgent({ homeDir: injectedHome });
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    const content = readFileSync(agentPath, "utf8");
+    const modelLine = content.split("\n").find((line) => line.startsWith("model:"));
+    expect(modelLine).toBe("model: inherit");
+    expect(content).not.toContain("model: haiku");
+    expect(content).not.toContain("model: sonnet");
+    expect(content).not.toContain("model: opus");
   });
 });
 

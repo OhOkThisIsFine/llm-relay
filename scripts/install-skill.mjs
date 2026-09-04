@@ -2,7 +2,8 @@
 /**
  * Install/refresh the llm-relay skill bundle for Claude Code, Codex and OpenCode from the same
  * shipped source directory, and provision Codex's global provider plus the host-independent MCP
- * dispatch entry point.
+ * dispatch entry point plus a Codex `relay` subagent file (`~/.codex/agents/relay.toml`) that
+ * pins no model, mirroring `src/setup-claude.ts`'s Claude `relay` agent.
  *
  * Runs from npm `postinstall`, but only acts on GLOBAL installs (`npm i -g llm-relay`)
  * so that a repo-local `npm install` (dev checkout, CI) never touches the developer's
@@ -52,6 +53,76 @@ const LEGACY_CODEX_AGENTS = [
     contents: `name = "relay_coding"\ndescription = "Read-only medium-effort child routed through llm-relay to the configured non-OpenAI pool."\ndeveloper_instructions = "Work read-only. Return a concise result to the parent and do not modify files."\n\nmodel_provider = "llm-relay"\nmodel = "pool/medium"\nmodel_reasoning_effort = "medium"\n`,
   },
 ];
+
+/**
+ * The REPLACEMENT for the two legacy agents above (owner direction 2026-09-04: "The relay should
+ * also work via Codex. I don't want to hard code a model name."). Confirmed against Codex's
+ * subagent docs (`/codex/agent-configuration/subagents`, fetched 2026-09-04) and three
+ * currently-installed sibling files on this machine (`~/.codex/agents/codebase-memory*.toml`,
+ * from codebase-memory-mcp): `name`, `description` and `developer_instructions` are the three
+ * REQUIRED fields; `model`/`model_reasoning_effort`/`sandbox_mode`/`mcp_servers` are optional,
+ * and — the load-bearing fact — "session settings... inherit from the parent when the custom
+ * agent file omits them." ⚠ `model_provider` is NOT a documented custom-agent-file field at all
+ * (only `model` is), which is one likely reason the legacy agents above needed retiring: they set
+ * BOTH `model_provider = "llm-relay"` and `model = "pool/medium"`, and Codex Desktop validates a
+ * child's model against the signed-in ChatGPT account before ever consulting `model_provider` —
+ * so a `pool/*` value fails that check regardless of the provider block backing it (the "Codex's
+ * installed relay-backed `default` subagent profile is unusable with a ChatGPT account" backlog
+ * item; C:\Code\docs\backlog.md). This template pins NEITHER field. With no `model`/
+ * `model_provider` of its own it inherits the CALLING session's — so Desktop's validation sees an
+ * ordinary child on the account's own model, never a `pool/*` value, and never even reaches the
+ * relay for that decision. The agent's own job, once spawned, is to call the already-configured
+ * `llm-relay` MCP `dispatch` tool for whichever task it was given — the SAME pass-through
+ * contract as the Claude `relay` agent in `src/setup-claude.ts`, ported to Codex's bare
+ * (unprefixed) MCP tool-name convention and with no ToolSearch step, because Codex's per-agent
+ * `enabled_tools` grants direct access with no deferred-loading discovery call to make first.
+ */
+const CODEX_RELAY_AGENT_MARKER_PREFIX = "# llm-relay:codex-relay-agent";
+const CODEX_RELAY_AGENT_MARKER = "# llm-relay:codex-relay-agent v1";
+const CODEX_RELAY_AGENT_TEMPLATE = `${CODEX_RELAY_AGENT_MARKER}
+name = "relay"
+description = "Hands one self-contained task to llm-relay dispatch, free model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another agent can do: a search, a sweep, a draft, a summary, a second opinion."
+sandbox_mode = "read-only"
+developer_instructions = """
+You have no knowledge of your own and no permission to answer any task yourself. The only
+legitimate action available to you is exactly one \`dispatch\` tool call, plus polling its status
+and result. The caller is measuring the LANE that \`dispatch\` reaches, not you — composing your
+own answer, however small, is never a valid response.
+
+1. Call the \`dispatch\` tool ONCE with the task text verbatim.
+2. This holds for EVERY task, even one that looks trivial — an echo, a one-word reply, a question you think you already know the answer to. Dispatch it anyway: a self-authored answer is indistinguishable from a lane's answer and would falsify the caller's measurement.
+3. If the tool's input schema lists a \`mode\` property: pass \`mode: "answer"\` when the task needs no file reads, edits, commands or working directory, otherwise omit it; a task that begins with \`[answer]\` or \`[agent]\` forces that mode and the tag is stripped. If the schema has no \`mode\` property, pass no mode.
+4. If the result is a jobId, poll \`dispatch_status\` about every 15 seconds, then call \`dispatch_result\`.
+5. Return the lane's answer VERBATIM, then one final line \`provenance: lane=<id> spec=<spec> elapsed=<seconds>\` copied from the tool result — never invented. A reply with no provenance line is a FAILURE: it means no lane ran.
+6. Add no analysis and no commentary.
+7. If the tool result says the lane FAILED, dispatch once more with \`tier: "high"\`; if that fails too, return exactly \`RELAY_DISPATCH_FAILED: <reason>\`.
+"""
+
+[mcp_servers.llm-relay]
+command = "llm-relay"
+args = ["mcp"]
+enabled_tools = ["dispatch", "dispatch_status", "dispatch_result"]
+`;
+
+/**
+ * Install/upgrade the Codex `relay` agent file. Ownership test mirrors `installRelayAgent` in
+ * `src/setup-claude.ts`: a PREFIX match against ANY versioned marker, not just the current one, so
+ * a file carrying an older marker is recognised as ours and upgraded in place rather than refused
+ * as foreign. `agentDir` is assumed to already exist — `installCodexSetup` creates it before
+ * calling this, the same order the legacy-agent retirement above already relies on.
+ */
+function installCodexRelayAgent(agentDir) {
+  const path = join(agentDir, "relay.toml");
+  const existed = existsSync(path);
+  if (existed) {
+    const existing = readFileSync(path, "utf8");
+    if (!existing.includes(CODEX_RELAY_AGENT_MARKER_PREFIX)) {
+      return { path, status: "refused" };
+    }
+  }
+  writeFileSync(path, CODEX_RELAY_AGENT_TEMPLATE);
+  return { path, status: existed ? "updated" : "installed" };
+}
 
 /** Add the provider section without disturbing unrelated Codex settings or duplicating it. */
 function hasConfiguredCodexTable(current, section, quotedSection) {
@@ -129,6 +200,13 @@ function installCodexSetup(home) {
     const result = retireGeneratedCodexAgent(agentDir, agent);
     if (result.status === "absent") continue;
     process.stderr.write(`llm-relay: Codex agent ${result.status} at ${result.path}\n`);
+  }
+
+  const relayResult = installCodexRelayAgent(agentDir);
+  if (relayResult.status === "refused") {
+    process.stderr.write(`llm-relay: Refusing to overwrite foreign Codex relay agent file at ${relayResult.path}\n`);
+  } else {
+    process.stderr.write(`llm-relay: Codex relay agent ${relayResult.status} at ${relayResult.path}\n`);
   }
 }
 

@@ -82,6 +82,7 @@ const installedPaths = (home: string) => ({
   codexConfig: join(home, ".codex", "config.toml"),
   defaultAgent: join(home, ".codex", "agents", "default.toml"),
   codingAgent: join(home, ".codex", "agents", "relay_coding.toml"),
+  relayAgent: join(home, ".codex", "agents", "relay.toml"),
 });
 
 const installedSkillDirs = (home: string) => [
@@ -207,6 +208,9 @@ describe("install-skill postinstall hook", () => {
       expect(r.stderr).toContain("Codex MCP server configured");
       // The operator's own bytes survive — the gate must not turn provisioning into a rewrite.
       expect(readFileSync(paths.codexConfig, "utf8")).toContain("# pre-existing codex config");
+      // The new no-model-pinned relay subagent is provisioned alongside the provider/MCP blocks.
+      expect(existsSync(paths.relayAgent)).toBe(true);
+      expect(r.stderr).toContain("Codex relay agent installed");
     });
 
     it("still copies the SKILL to every host even when Codex is not detected", () => {
@@ -286,6 +290,92 @@ describe("install-skill postinstall hook", () => {
     expect(existsSync(paths.defaultAgent)).toBe(false);
     expect(existsSync(paths.codingAgent)).toBe(false);
     expect(r.stderr.match(/Codex agent retired/g)).toHaveLength(2);
+  });
+
+  /**
+   * The REPLACEMENT for the retired agents above (owner direction 2026-09-04: "The relay should
+   * also work via Codex. I don't want to hard code a model name."). `~/.codex/agents/relay.toml`
+   * carries neither `model` nor `model_provider`, so — confirmed against Codex's subagent docs and
+   * three sibling files this exact machine already runs (`codebase-memory*.toml`) — it inherits
+   * whatever model/provider the CALLING session already uses, never a `pool/*` value the Desktop
+   * collaboration launcher would reject before ever consulting the provider. Mirrors
+   * `installRelayAgent`'s install/idempotent/refuse-foreign/upgrade-older-marker contract in
+   * `src/setup-claude.ts`, ported to a TOML `#`-comment marker instead of an HTML-comment one.
+   */
+  describe("the Codex relay subagent (no model pinned)", () => {
+    it("installs a relay.toml with no model or model_provider field, and the dispatch pass-through instructions", () => {
+      const codex = codexOnPath();
+      const paths = installedPaths(home);
+      const r = run([], home, { npm_config_global: "true", ...codex.env });
+      rmSync(codex.dir, { recursive: true, force: true });
+
+      expect(r.status).toBe(0);
+      const content = readFileSync(paths.relayAgent, "utf8");
+      expect(content).toContain('name = "relay"');
+      expect(content).toContain("# llm-relay:codex-relay-agent v1");
+      expect(content).toContain("[mcp_servers.llm-relay]");
+      expect(content).toContain('command = "llm-relay"');
+      expect(content).toContain('args = ["mcp"]');
+      expect(content).toContain("dispatch");
+      expect(content).toContain("provenance");
+      // The whole point: no line pins a model or provider for this agent.
+      const lines = content.split("\n").map((l) => l.trim());
+      expect(lines.some((l) => l.startsWith("model ="))).toBe(false);
+      expect(lines.some((l) => l.startsWith("model_provider ="))).toBe(false);
+      expect(lines.some((l) => l.startsWith("model_reasoning_effort ="))).toBe(false);
+      expect(r.stderr).toContain(`Codex relay agent installed at ${paths.relayAgent}`);
+    });
+
+    it("is idempotent — a second run reproduces byte-identical content", () => {
+      const codex = codexOnPath();
+      const paths = installedPaths(home);
+      const first = run([], home, { npm_config_global: "true", ...codex.env });
+      const firstContent = readFileSync(paths.relayAgent, "utf8");
+      const second = run([], home, { npm_config_global: "true", ...codex.env });
+      const secondContent = readFileSync(paths.relayAgent, "utf8");
+      rmSync(codex.dir, { recursive: true, force: true });
+
+      expect(first.status).toBe(0);
+      expect(second.status).toBe(0);
+      expect(secondContent).toBe(firstContent);
+    });
+
+    it("refuses to overwrite a foreign relay.toml that carries no llm-relay marker", () => {
+      const codex = codexOnPath();
+      const paths = installedPaths(home);
+      mkdirSync(join(home, ".codex", "agents"), { recursive: true });
+      const foreignContent = 'name = "relay"\ndescription = "my own custom relay agent"\ndeveloper_instructions = "do whatever"\n';
+      writeFileSync(paths.relayAgent, foreignContent);
+
+      const r = run([], home, { npm_config_global: "true", ...codex.env });
+      rmSync(codex.dir, { recursive: true, force: true });
+
+      expect(r.status).toBe(0);
+      expect(readFileSync(paths.relayAgent, "utf8")).toBe(foreignContent);
+      expect(r.stderr).toContain(`Refusing to overwrite foreign Codex relay agent file at ${paths.relayAgent}`);
+    });
+
+    it("upgrades a file carrying an older codex-relay-agent marker in place, not refused as foreign", () => {
+      const codex = codexOnPath();
+      const paths = installedPaths(home);
+      mkdirSync(join(home, ".codex", "agents"), { recursive: true });
+      // A fabricated PRIOR version: same marker PREFIX, older suffix, different body — the same
+      // synthetic-older-marker shape `test/setup-claude.test.ts` uses for the Claude template's
+      // own upgrade tests, standing in for a version that predates this one shipping.
+      const oldContent =
+        '# llm-relay:codex-relay-agent v0\nname = "relay"\ndescription = "old body"\ndeveloper_instructions = "old rule text"\n';
+      writeFileSync(paths.relayAgent, oldContent);
+
+      const r = run([], home, { npm_config_global: "true", ...codex.env });
+      rmSync(codex.dir, { recursive: true, force: true });
+
+      expect(r.status).toBe(0);
+      const afterContent = readFileSync(paths.relayAgent, "utf8");
+      expect(afterContent).toContain("# llm-relay:codex-relay-agent v1");
+      expect(afterContent).not.toContain("codex-relay-agent v0");
+      expect(afterContent).not.toContain("old rule text");
+      expect(r.stderr).toContain(`Codex relay agent updated at ${paths.relayAgent}`);
+    });
   });
 
   it.each([

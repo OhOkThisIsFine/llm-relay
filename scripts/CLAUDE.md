@@ -64,6 +64,25 @@ Offline / unit-test-safe (no external creds):
   `pool/*` children against the ChatGPT account before consulting `model_provider`; leaving them
   installed makes the model choose a path the relay never sees. Only byte-identical templates are
   removed—any user edit proves ownership and must be preserved.
+  ⚠ **It ALSO installs `~/.codex/agents/relay.toml` (2026-09-04), the direct replacement for the
+  two retired agents above.** Confirmed against Codex's own subagent docs
+  (`/codex/agent-configuration/subagents`) and three sibling files this exact machine already runs
+  (`~/.codex/agents/codebase-memory*.toml`, from codebase-memory-mcp): `name`, `description` and
+  `developer_instructions` are the three REQUIRED custom-agent-file fields; `model` is optional and
+  documented as `model_provider` is NOT — one likely reason the legacy pair needed retiring, since
+  they set both. This template pins NEITHER, so it inherits whatever model/provider the calling
+  session already uses instead of ever presenting a `pool/*` value for Desktop to reject. Its
+  `developer_instructions` carry the SAME pass-through contract as the Claude `relay` agent in
+  `src/setup-claude.ts` — call the `dispatch` MCP tool once, poll `dispatch_status`/`dispatch_result`,
+  return the answer with its `provenance:` line, never answer directly — ported to Codex's bare
+  (unprefixed) MCP tool names, with its own `[mcp_servers.llm-relay]` block scoped to exactly those
+  three tools (the same `enabled_tools` scoping pattern the codebase-memory-mcp siblings use).
+  `installCodexRelayAgent()` mirrors `installRelayAgent`'s ownership test — a `#`-comment marker
+  prefix (`# llm-relay:codex-relay-agent`), not an exact-version match, so an older-versioned file
+  upgrades in place rather than being refused as foreign. ⚠ Unverified by this change: whether a
+  spawned Codex subagent can reach the `llm-relay` MCP tools from every Codex surface — `codex
+  exec`'s own top-level session exposes none at all (see the user's global `CLAUDE.md`, "Peer agent
+  CLI lanes"); Codex Desktop is the confirmed working host for MCP `dispatch` generally.
 
 Need live creds (`NVIDIA_API_KEY` + `LLM_BACKEND_BASE_URL`, or any OpenAI-compatible provider):
 - `nim-front.mjs` — run the compiled proxy fronting a live backend end-to-end.

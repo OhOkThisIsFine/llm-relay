@@ -1079,7 +1079,7 @@ switch then reports ON and nothing changes.
 exact stale relay proxy environment values that old command authored and preserves every unrelated
 Desktop setting. Direct API routing remains available to a terminal-launched Claude CLI.
 
-Both `llm-relay setup claude-desktop` and `llm-relay setup claude-cli` (or bare `setup`) also install a custom `relay` agent definition at `~/.claude/agents/relay.md`. This allows Claude Code Workflow scripts (`agent(task, {agentType: "relay"})`) and the Agent tool (`subagent_type: relay`) to offload tasks directly to llm-relay's MCP dispatch lanes. Setup writes the definition when absent, updates it when the marker is present, and refuses to overwrite foreign agent files.
+Both `llm-relay setup claude-desktop` and `llm-relay setup claude-cli` (or bare `setup`) also install a custom `relay` agent definition at `~/.claude/agents/relay.md`. This allows Claude Code Workflow scripts (`agent(task, {agentType: "relay"})`) and the Agent tool (`subagent_type: relay`) to offload tasks directly to llm-relay's MCP dispatch lanes. Setup writes the definition when absent, updates it when the marker is present, and refuses to overwrite foreign agent files. The installed agent pins no model (`model: inherit`, since the v4 marker) — it runs on whatever model the calling session is on, never a hard-coded alias. Pass `model` on the `agent()`/Agent call to choose a different one for a single call. Measured 2026-09-04: pinned to `haiku` the wrapper answered a trivial echo task itself instead of dispatching (no provenance line), while a realistic task dispatched correctly; pinned to `sonnet` even the echo dispatched — `inherit` avoids picking either fixed point for every install.
 
 `llm-relay offload status` detects this and says so. And on such a host, `llm-relay offload claude
 on` installs a **`PreToolUse(Agent)` hook** into `~/.claude/settings.json` — the delivery mechanism
@@ -1253,6 +1253,24 @@ Use its `dispatch` tool for relay-backed work while the parent stays on its norm
 ⚠ **Do not create a `pool/*` collaboration child for Codex Desktop.** With a ChatGPT account,
 Desktop validates the child model against the account and ignores `model_provider` before the
 request reaches llm-relay, producing HTTP 400. MCP `dispatch` is the working Desktop route.
+
+A global install also provisions a Codex **`relay` subagent** at `~/.codex/agents/relay.toml` —
+Codex's own file-based custom-agent mechanism (`name`/`description`/`developer_instructions`
+required, `model`/`model_reasoning_effort`/`sandbox_mode`/`mcp_servers` optional; confirmed against
+Codex's subagent documentation and three sibling agent files already installed on this class of
+machine). It pins **neither** `model` nor `model_provider`, so it inherits whatever the calling
+session already uses — the same fix as the `pool/*` warning above, generalized: with nothing
+non-standard to validate, Desktop's collaboration launcher has nothing to reject. Its own
+`developer_instructions` mirror the Claude `relay` agent's pass-through contract exactly (call
+`dispatch` once with the task verbatim, poll `dispatch_status`/`dispatch_result`, return the
+answer with its `provenance:` line, never answer directly). Reach it with an ordinary delegation
+request in the session ("spawn a relay agent for this") — Codex has no dedicated tool call for
+addressing a named subagent the way Claude Code's Agent tool does. Setup writes the file when
+absent, upgrades it in place when the marker is present, and refuses to overwrite a foreign one,
+mirroring `installRelayAgent`. ⚠ Unverified end-to-end by this change: whether a spawned Codex
+subagent can reach the `llm-relay` MCP tools from every Codex surface. `codex exec`'s own
+top-level session exposes no MCP tools at all; Codex Desktop is the confirmed working host for MCP
+`dispatch` generally.
 
 Clients verified to honor custom providers can additionally use the direct Responses provider:
 

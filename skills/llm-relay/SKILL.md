@@ -85,7 +85,23 @@ Claude Code workflows and subagents can delegate tasks to llm-relay lanes via th
 - The `[answer]`/`[agent]` tag: a task that begins with `[answer]` or `[agent]` forces answer mode (`mode: "answer"`) when the task needs no file reads, edits, commands or working directory, and the tag is stripped before dispatch.
 - Installation: `llm-relay setup claude-desktop` or `llm-relay setup claude-cli` installs the definition at `~/.claude/agents/relay.md`.
 - The relay agent never answers a task itself, even a trivial one — it always dispatches and ends its reply with a `provenance: lane=<id> spec=<spec> elapsed=<seconds>` line, so a reply with no provenance line means no lane ran.
+- The relay agent pins no model — it runs on whatever model the calling session is on. Pass
+  `model` on the `agent()` call (`agent(task, {agentType: "relay", model: "sonnet"})`) or the
+  Agent tool call (`subagent_type: relay`, `model: "sonnet"`) to choose a different one for a
+  single call. Measured 2026-09-04: on `haiku` the wrapper answered a trivial echo task itself
+  instead of dispatching (no provenance line), while a realistic task dispatched correctly; on
+  `sonnet` even the echo dispatched.
 - A changed `relay.md` takes effect only in a new Claude Code session — the running session already loaded the agent definition and does not re-read edits to it.
+
+## Use from Codex
+
+A global install also provisions a Codex `relay` subagent (`~/.codex/agents/relay.toml`) with the
+same no-model-pinned pass-through contract — it inherits whichever model/provider the calling
+session already uses, so Desktop's collaboration launcher never sees a `pool/*` child to reject.
+Reach it with a delegation request ("spawn a relay agent for this", "delegate this in parallel") —
+Codex has no dedicated Agent-tool-style call for it. `codex exec`'s own top-level session exposes
+no MCP tools at all (a separate, pre-existing limitation); Codex Desktop is the confirmed working
+host for MCP `dispatch` generally.
 
 ## First use on a machine — ASK, do not assume
 
