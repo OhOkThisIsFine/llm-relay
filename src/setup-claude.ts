@@ -2,6 +2,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, platform } from "node:os";
 
+export interface SetupFs {
+  existsSync?: (path: string) => boolean;
+  mkdirSync?: (path: string, options?: { recursive?: boolean }) => unknown;
+  readFileSync?: (path: string, encoding: "utf8") => string;
+  writeFileSync?: (path: string, data: string) => void;
+}
+
 export interface SetupOptions {
   proxyUrl?: string;
   /** Legacy CLAUDE_CONFIG_DIR value removed when migrating an older llm-relay Desktop setup. */
@@ -15,11 +22,77 @@ export interface SetupOptions {
    * reformatting a live application's settings file on the developer's machine.
    */
   targetPath?: string;
+  /** Home directory used to resolve ~/.claude/agents/relay.md. Defaults to homedir(). */
+  homeDir?: string;
+  /** Direct target path for the relay agent markdown file. Defaults to <home>/.claude/agents/relay.md. */
+  agentPath?: string;
+  /** Injectable filesystem methods for testing. */
+  fs?: SetupFs;
   /**
    * Where human-readable setup output goes. Defaults to `console.log`. Used by the CLI helper;
    * the desktop writer prints nothing.
    */
   out?: (line: string) => void;
+}
+
+export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v1 -->";
+export const RELAY_AGENT_TEMPLATE = `---
+name: relay
+description: Hands one self-contained task to llm-relay dispatch, free model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another lane can do: a search, a sweep, a draft, a summary, a second opinion.
+tools: mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result
+model: haiku
+---
+<!-- llm-relay:relay-agent v1 -->
+
+1. Load the dispatch tool schema with ToolSearch if it is deferred, then call \`mcp__llm-relay__dispatch\` ONCE with the task text verbatim.
+2. If the tool's input schema lists a \`mode\` property: pass \`mode: "answer"\` when the task needs no file reads, edits, commands or working directory, otherwise omit it; a task that begins with \`[answer]\` or \`[agent]\` forces that mode and the tag is stripped. If the schema has no \`mode\` property, pass no mode.
+3. If the result is a jobId, poll \`dispatch_status\` about every 15 seconds, then call \`dispatch_result\`.
+4. Return the lane's answer VERBATIM, then one final line \`provenance: lane=<id> spec=<spec> elapsed=<seconds>\` taken from the tool result.
+5. Add no analysis and no commentary.
+6. If the tool result says the lane FAILED, dispatch once more with \`tier: "high"\`; if that fails too, return exactly \`RELAY_DISPATCH_FAILED: <reason>\`.
+`;
+
+export function getRelayAgentPath(opts: SetupOptions = {}): string {
+  if (opts.agentPath) return opts.agentPath;
+  const home = opts.homeDir ?? homedir();
+  return join(home, ".claude", "agents", "relay.md");
+}
+
+export function installRelayAgent(opts: SetupOptions = {}): { success: boolean; path: string; message: string } {
+  const agentPath = getRelayAgentPath(opts);
+  const exists = opts.fs?.existsSync ?? existsSync;
+  const mkdir = opts.fs?.mkdirSync ?? mkdirSync;
+  const read = opts.fs?.readFileSync ?? readFileSync;
+  const write = opts.fs?.writeFileSync ?? writeFileSync;
+
+  try {
+    if (exists(agentPath)) {
+      const existing = read(agentPath, "utf8");
+      if (!existing.includes(RELAY_AGENT_MARKER)) {
+        return {
+          success: false,
+          path: agentPath,
+          message: `Refusing to overwrite foreign agent file at ${agentPath}`,
+        };
+      }
+    } else {
+      mkdir(dirname(agentPath), { recursive: true });
+    }
+
+    write(agentPath, RELAY_AGENT_TEMPLATE);
+    return {
+      success: true,
+      path: agentPath,
+      message: `Installed relay agent at ${agentPath}`,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      path: agentPath,
+      message: `Failed to install relay agent at ${agentPath}: ${msg}`,
+    };
+  }
 }
 
 export function getClaudeDesktopConfigPath(): string {
@@ -83,10 +156,30 @@ export function setupClaudeDesktop(opts: SetupOptions = {}): { success: boolean;
     else existingConfig.env = currentEnv;
 
     writeFileSync(targetPath, JSON.stringify(existingConfig, null, 2) + "\n");
+
+    const agentRes = installRelayAgent(opts);
+    if (!agentRes.success) {
+      return {
+        success: false,
+        path: targetPath,
+        message: agentRes.message,
+      };
+    }
+
+    const lines = [
+      `Successfully configured Claude Desktop MCP dispatch at ${targetPath}`,
+      `Installed relay agent at ${agentRes.path}`,
+      'agent(task, {agentType: "relay"})',
+    ];
+
+    if (opts.out) {
+      for (const line of lines) opts.out(line);
+    }
+
     return {
       success: true,
       path: targetPath,
-      message: `Successfully configured Claude Desktop MCP dispatch at ${targetPath}`,
+      message: lines.join("\n"),
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -124,7 +217,22 @@ export function setupClaudeCli(opts: SetupOptions = {}): { success: boolean; mes
     '  export CLAUDE_CONFIG_DIR="$HOME/.llm-relay-claude"\n',
   ];
 
+  const agentRes = installRelayAgent(opts);
   const out = opts.out ?? ((line: string) => console.log(line));
+
+  if (!agentRes.success) {
+    lines.push(agentRes.message);
+    for (const line of lines) out(line);
+    return {
+      success: false,
+      message: agentRes.message,
+      lines,
+    };
+  }
+
+  lines.push(`Installed relay agent at ${agentRes.path}`);
+  lines.push('agent(task, {agentType: "relay"})');
+  lines.push("");
   for (const line of lines) out(line);
 
   return {

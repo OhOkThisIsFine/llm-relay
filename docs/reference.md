@@ -1079,6 +1079,8 @@ switch then reports ON and nothing changes.
 exact stale relay proxy environment values that old command authored and preserves every unrelated
 Desktop setting. Direct API routing remains available to a terminal-launched Claude CLI.
 
+Both `llm-relay setup claude-desktop` and `llm-relay setup claude-cli` (or bare `setup`) also install a custom `relay` agent definition at `~/.claude/agents/relay.md`. This allows Claude Code Workflow scripts (`agent(task, {agentType: "relay"})`) and the Agent tool (`subagent_type: relay`) to offload tasks directly to llm-relay's MCP dispatch lanes. Setup writes the definition when absent, updates it when the marker is present, and refuses to overwrite foreign agent files.
+
 `llm-relay offload status` detects this and says so. And on such a host, `llm-relay offload claude
 on` installs a **`PreToolUse(Agent)` hook** into `~/.claude/settings.json` — the delivery mechanism
 for the setting where HTTP rerouting cannot work, not a separate feature. `offload claude off`

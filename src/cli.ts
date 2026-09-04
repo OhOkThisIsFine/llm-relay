@@ -3982,8 +3982,10 @@ function runSetupSubcommand(target: string | undefined): void {
   if (target === "claude-desktop" || target === "desktop") {
     const res = setupClaudeDesktop();
     process.stdout.write(`${res.message}\n`);
+    if (!res.success) process.exit(1);
   } else if (target === undefined || target === "claude-cli" || target === "cli" || target === "claude") {
-    setupClaudeCli();
+    const res = setupClaudeCli();
+    if (!res.success) process.exit(1);
   } else {
     configCommandError(`setup: unknown target "${target}" (targets: claude-cli, claude-desktop)`);
   }

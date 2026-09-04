@@ -72,6 +72,15 @@ lane that WRITES, inspect the tree yourself (`git status --porcelain`, `git diff
 `git show --stat HEAD`) rather than trusting the lane's own report, and give every writing lane its
 own worktree.
 
+## Use from a Workflow or the Agent tool
+
+Claude Code workflows and subagents can delegate tasks to llm-relay lanes via the custom `relay` agent type:
+
+- In a Workflow script: `agent(task, {agentType: "relay"})`
+- On the Agent tool: `subagent_type: relay`
+- The `[answer]`/`[agent]` tag: a task that begins with `[answer]` or `[agent]` forces answer mode (`mode: "answer"`) when the task needs no file reads, edits, commands or working directory, and the tag is stripped before dispatch.
+- Installation: `llm-relay setup claude-desktop` or `llm-relay setup claude-cli` installs the definition at `~/.claude/agents/relay.md`.
+
 ## First use on a machine — ASK, do not assume
 
 A fresh install writes a config that **changes nothing**: every Claude model id reaches real
