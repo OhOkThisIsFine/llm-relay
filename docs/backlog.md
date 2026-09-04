@@ -28,18 +28,6 @@
   by disabling each with its invariant named, or by fixing the findings. Evidence:
   [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md).
 
-- **Verify the `relay` custom agent type end to end in a fresh Claude Code session.**
-  `llm-relay setup claude-cli|claude-desktop` now installs `~/.claude/agents/relay.md` (model
-  haiku; tools = the three dispatch MCP tools) so a Claude Workflow script can call
-  `agent(task, {agentType: "relay"})` instead of building its own dispatch call. The file is on
-  disk with the marker the installer checks for, but the session that ran `llm-relay setup` does
-  not reload its own agent registry mid-session, so `agentType: "relay"` has never actually been
-  invoked.
-
-  **Property:** a Workflow script naming `agentType: "relay"` resolves to the installed agent and
-  completes a real dispatch through it — not merely that the file exists on disk with the right
-  marker.
-
 - **Raise `publish.yml`'s `timeout-minutes: 15` — the v0.69.0 publish exhausted it on the first
   attempt.** `npm ci` took 5 min 2 s against a 10 s baseline on the v0.68.8 run, and the smoke
   test's two `npm install` calls cost about 5 min each; ordinary npm-registry slowness, with no
@@ -107,7 +95,42 @@
   mechanisms that exist after DR-020, so a reader does not have to check git history to learn which
   members are real.
 
+- **The `relay` agent on `model: haiku` answers trivial pure-text tasks itself instead of
+  dispatching** (2026-09-04, low). Found verifying the agent type end to end (Closed, above): a
+  realistic task dispatches correctly through ToolSearch → dispatch, but a trivial one-line echo is
+  answered by the wrapper's own model instead, with no `provenance:` line to flag it.
+
+  **Property:** a reply that did not come from a lane must never reach the caller as though it were
+  a lane answer — either the template's default model changes to one that obeys (`sonnet` measured
+  obeying, at +~40 s wrapper time), or the wrapper is made structurally unable to answer without a
+  preceding dispatch result (no text output allowed except after a dispatch result), whichever the
+  owner picks.
+
+  Evidence: haiku echo probe 4 s, 0 tool calls, no provenance; haiku realistic probe 17 s, 2 tool
+  calls, provenance; sonnet echo probe 47 s, 2 tool calls, provenance.
+
 ## Closed
+
+- ✅ **Verify the `relay` custom agent type end to end in a fresh Claude Code session — verified**
+  (2026-09-04). An agent tool probe — `[agent] Read C:\Code\llm-relay\package.json and reply
+  version=<field>` — returned `version=0.69.0` plus a `provenance: lane=claude-free-pool
+  spec=pool/medium elapsed=6s` line, 2 tool calls (ToolSearch, dispatch), 17 s wall. A three-call
+  Workflow, `agent(task, {agentType: "relay", model: "haiku"})` against two `package.json` fields
+  and one `vitest.config.ts` option, went 3/3 correct with 3/3 provenance lines, lane elapsed
+  35 s / 16 s / 16 s, 6 tool calls, 60 s wall. Not merely the file existing on disk with the right
+  marker — a real dispatch through the installed agent, completing correctly.
+
+  Verification found two defects, both fixed and shipped in v0.69.1: (a) the v1 template's
+  `tools:` list omitted `ToolSearch`, and the dispatch MCP tools are DEFERRED in Claude Code, so
+  the wrapper could never load their schemas and silently answered every task itself with zero
+  tool calls (`b8a90ae`, template v2: no own knowledge, dispatch every task, provenance line or
+  failure); (b) Claude Code loads a custom agent definition ONCE per session, so after `setup`
+  rewrote `relay.md` mid-session the running session kept reporting the stale v1 marker and tools
+  until the file was deleted (noticed only minutes later as "no longer available") and recreated
+  (`d9fd32a`, template v3: `tools:` now leads with ToolSearch).
+
+  ⚠ Residual: on `model: "haiku"` a trivial pure-text task is still answered by the wrapper itself
+  rather than dispatched, even under template v3 — tracked as its own Open entry, above.
 
 - ✅ **Re-check long `pool/medium` MCP dispatch after v0.68.4 — root-caused and fixed** (2026-09-04).
   Not a stall and not the MCP mechanics: `targetUsability` was collapsing a LATENCY demotion into

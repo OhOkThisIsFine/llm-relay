@@ -2,9 +2,16 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-04 (v0.69.0 published)
+## 0. State as of 2026-09-04 (v0.69.1 published)
 
-**v0.69.0 is on npm** (`dist-tags.latest` confirms `0.69.0`). Publish run
+**v0.69.1 is on npm**, released 2026-09-04, carrying three commits on top of the same day's earlier
+v0.69.0 release: `b8a90ae` "fix(setup): the relay agent must dispatch every task, never answer
+itself" (template v2: no own knowledge, dispatch every task, provenance line or failure), `77e9f67`
+"test: the setup-claude guard checks the real relay.md is unchanged, not absent" (the T3 test
+asserted the developer's real `~/.claude/agents/relay.md` was ABSENT, which fails on any machine
+where setup has already run), and `d9fd32a` "fix(setup): the relay agent needs ToolSearch to reach
+the deferred dispatch tools" (template v3: `tools:` now leads with ToolSearch). v0.69.0's own
+publish run —
 [33847892121](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33847892121) — the first
 attempt was CANCELLED by the job's own `timeout-minutes: 15`: `npm ci` took 5 min 2 s (10 s on the
 v0.68.8 run) and the smoke test's two `npm install` calls cost about 5 min each, so ordinary npm
@@ -62,16 +69,35 @@ feature:
   (`src/ping/cadence.ts:535`), and the dispatch depth test inherited `LLM_RELAY_DISPATCH_DEPTH`
   from a dispatched lane's own environment.
 
-⚠ **The `relay` agent type is installed but NOT yet verified end to end.** `~/.claude/agents/relay.md`
-is on disk with the marker the installer checks for, but the session that ran `llm-relay setup` does
-not reload its own agent registry mid-session, so `agent(task, {agentType: "relay"})` has never
-actually been invoked. Tracked in `docs/backlog.md`.
+✅ **The `relay` agent type was verified end to end in this session (2026-09-04).** Agent tool
+probe — `[agent] Read C:\Code\llm-relay\package.json and reply version=<field>` — returned
+`version=0.69.0` plus `provenance: lane=claude-free-pool spec=pool/medium elapsed=6s`, 2 tool calls
+(ToolSearch, dispatch), 17 s wall. A three-call Workflow, `agent(task, {agentType: "relay", model:
+"haiku"})` against two `package.json` fields and one `vitest.config.ts` option: 3/3 correct
+answers, 3/3 provenance lines, lane elapsed 35 s / 16 s / 16 s, 60 s wall, 6 tool calls. (Both ran
+in `agent` mode because the session's own MCP server process predates v0.69.0 and advertises no
+`mode`.)
+
+Probing found two defects, both fixed in v0.69.1: (a) the v1 template's `tools:` list omitted
+`ToolSearch`, and the dispatch MCP tools are DEFERRED in Claude Code, so the wrapper could never
+load their schemas and answered every task itself with zero tool calls; (b) Claude Code loads a
+custom agent definition ONCE per session — after `setup` rewrote `relay.md` to v2 the running
+session still reported the v1 marker and v1 tools; deleting the file was noticed only minutes later
+("no longer available"), and the recreated v3 file was loaded a few minutes after that.
+
+⚠ **RESIDUAL, measured:** with `model: "haiku"` a trivial pure-text task — `[answer] Reply with
+exactly: X` — is still answered by the wrapper itself (zero tool calls, no provenance line) even
+under the v3 wording; realistic tasks dispatch. A `model: "sonnet"` override on the same call
+dispatched the same echo with a provenance line, but spent 47 s wall. So a reply carrying no
+`provenance:` line means no lane ran — check for it whenever the task is trivial. Tracked as its
+own entry in `docs/backlog.md`.
 
 **Root cause of the pool-walk latency the previous lap's MCP dispatch entries were chasing** — now
 closed in `docs/backlog.md`. `targetUsability` was returning the SAME `cooling` band for a LATENCY
 demotion as for an outright failure, and unknown-lift candidates sort last within that band, so the
-pool's one fast-answering member — a latency-demoted `nim/moonshotai/kimi-k3`, p95 385–875 ms/token —
-was walked AFTER every 401/402/403/404/502 member instead of ahead of them. Measured before the fix
+pool's only member that answered requests at all — a latency-demoted `nim/moonshotai/kimi-k3`, p95
+385–875 ms/token, itself taking 9–38 s per one-line reply — was walked AFTER every
+401/402/403/404/502 member instead of ahead of them. Measured before the fix
 (one-line prompts, `pool/medium`): direct HTTP 5.7 / 8.5 / 10.8 / 6.6 s with 6–9 failing members
 walked per request (one probe: `9 tried, 1 served: 1x404, 1x401, 3x402, 1x403, 2x502, 1x200`); MCP
 dispatch to the `claude-free-pool` lane through the `claude -p` harness 22 s, of which the harness's
@@ -110,8 +136,6 @@ must never name a model — hence `auto`.
 Immediate next — each is also a [`docs/backlog.md`](docs/backlog.md) Open entry carrying its unmet
 property:
 
-- Verify `agent(task, {agentType: "relay"})` end to end in a fresh Claude Code session with a
-  three-agent Workflow.
 - Raise `publish.yml`'s `timeout-minutes: 15` to 30 — three npm installs at 4–5 minutes each leave
   almost no margin, and the first v0.69.0 attempt already burned it.
 - Calibrate `routing.hedge.floorMs` from data instead of the hand-set `8000`, and find why the
@@ -125,6 +149,8 @@ property:
 - Clean up the DR-020 residue in `accounting-store.ts`'s public types: `SnapshotMutationResult`
   still declares the dead `"recovered"`/`"recovery-loss"` members, and `ioHooks` is a seam with
   nothing left to inject.
+- Decide whether the `relay` agent template should default to `model: sonnet` (reliable on trivial
+  tasks, +~40 s wrapper time) or stay `haiku` (fast, shortcuts trivial echoes) — owner call.
 
 ## 0.1 Earlier releases
 
