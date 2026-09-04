@@ -85,6 +85,7 @@ Claude Code workflows and subagents can delegate tasks to llm-relay lanes via th
 - The `[answer]`/`[agent]` tag: a task that begins with `[answer]` or `[agent]` forces answer mode (`mode: "answer"`) when the task needs no file reads, edits, commands or working directory, and the tag is stripped before dispatch.
 - Installation: `llm-relay setup claude-desktop` or `llm-relay setup claude-cli` installs the definition at `~/.claude/agents/relay.md`.
 - The relay agent never answers a task itself, even a trivial one — it always dispatches and ends its reply with a `provenance: lane=<id> spec=<spec> elapsed=<seconds>` line, so a reply with no provenance line means no lane ran.
+- A changed `relay.md` takes effect only in a new Claude Code session — the running session already loaded the agent definition and does not re-read edits to it.
 
 ## First use on a machine — ASK, do not assume
 

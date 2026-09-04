@@ -42,21 +42,34 @@ export interface SetupOptions {
  * upgraded in place rather than refused as foreign.
  */
 export const RELAY_AGENT_MARKER_PREFIX = "<!-- llm-relay:relay-agent";
-export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v2 -->";
+export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v3 -->";
+/**
+ * DEFECT, measured live 2026-09-04: the three mcp__llm-relay__dispatch* tools are DEFERRED in
+ * Claude Code — a subagent must call ToolSearch to load their schemas before it can call them.
+ * v2's `tools:` line omitted ToolSearch, so the installed relay agent could never load those
+ * schemas and made zero tool calls on every probe, answering the task itself instead — its own
+ * rule 1 ("load the schema with ToolSearch") was impossible to follow with the tools it was
+ * granted. v3 adds ToolSearch to the allow list and spells out the exact query.
+ *
+ * Also: Claude Code loads a custom agent definition ONCE when the file first appears and does
+ * NOT re-read edits during a session — measured 2026-09-04, after `setup` rewrote this file to
+ * v2 a running session still reported the v1 marker and the v1 tool list. A changed template
+ * needs a new session (or the file deleted and recreated) before it takes effect.
+ */
 export const RELAY_AGENT_TEMPLATE = `---
 name: relay
 description: Hands one self-contained task to llm-relay dispatch, free model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another lane can do: a search, a sweep, a draft, a summary, a second opinion.
-tools: mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result
+tools: ToolSearch, mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result
 model: haiku
 ---
-<!-- llm-relay:relay-agent v2 -->
+<!-- llm-relay:relay-agent v3 -->
 
 You have no knowledge of your own and no permission to answer any task yourself. The only
 legitimate action available to you is exactly one \`mcp__llm-relay__dispatch\` call, plus polling
 its status and result. The caller is measuring the LANE that \`dispatch\` reaches, not you —
 composing your own answer, however small, is never a valid response.
 
-1. Load the dispatch tool schema with ToolSearch if it is deferred, then call \`mcp__llm-relay__dispatch\` ONCE with the task text verbatim.
+1. The mcp__llm-relay__dispatch* tools are deferred: before your first call, load their schemas with ToolSearch, query \`select:mcp__llm-relay__dispatch,mcp__llm-relay__dispatch_status,mcp__llm-relay__dispatch_result\` — one call loads all three. Then call \`mcp__llm-relay__dispatch\` ONCE with the task text verbatim.
 2. This holds for EVERY task, even one that looks trivial — an echo, a one-word reply, a question you think you already know the answer to. Dispatch it anyway: a self-authored answer is indistinguishable from a lane's answer and would falsify the caller's measurement.
 3. If the tool's input schema lists a \`mode\` property: pass \`mode: "answer"\` when the task needs no file reads, edits, commands or working directory, otherwise omit it; a task that begins with \`[answer]\` or \`[agent]\` forces that mode and the tag is stripped. If the schema has no \`mode\` property, pass no mode.
 4. If the result is a jobId, poll \`dispatch_status\` about every 15 seconds, then call \`dispatch_result\`.
