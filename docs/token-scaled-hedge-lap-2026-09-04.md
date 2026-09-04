@@ -1,16 +1,17 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-04T12:38:17.883Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-04T12:39:08.014Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `8d1649c3d30817718d9c2639ea26de13ed75d354`
+- HEAD: `95b5aa639c1c683f4bc4e18e1a86f27726fcadd2`
 - Sprint start: `6c9943f4f8a98d353607404e44948218d396dd72`
 
 ## Commits in the sprint range
 
+- 95b5aa6 docs: closeout for the token-scaled hedge and model-free relay agent lap (v0.70.0)
 - 8d1649c chore: release v0.70.0
 - fd6ed10 chore: re-baseline the package ceilings for the shipped calibration script
 - 6936aaa docs: record lap 2 — token-scaled hedge floor, model-free relay agent for Claude and Codex
@@ -25,20 +26,13 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-04T12:25:05.386Z on tree `2e849d1da723`
-- `verify-green check` FAILED: verify-green: FAIL
-content changed AFTER the recorded passing run (2026-09-04T12:25:05.386Z).
-Files changed since that run:
-M	package-lock.json
-M	package.json
-Re-run the suite through `record` before claiming green. — FAIL
+- Ledger: `npm run check` recorded 2026-09-04T12:39:00.679Z on tree `827d7ad0bc76`
+- `verify-green check`: verify-green: PASS — tree 827d7ad0bc76 matches the passing run recorded 2026-09-04T12:39:00.679Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- Publish to npm: completed/success (run 33872680480) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33872680480
-- CI: completed/success (run 33872678062) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33872678062
+- CI: in_progress/ (run 33873787723) — FAIL
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33873787723
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -109,4 +103,4 @@ before merge.
 
 ## Verdict
 
-- 1 section(s) FAIL: verify-green check.
+- 1 section(s) FAIL: CI CI.
