@@ -7,6 +7,7 @@
  * IncomingMessage/ServerResponse dependency makes its order of checks easy to
  * test and prevents a future catch-all from accidentally becoming an API.
  */
+import { BODY_TOO_LARGE_CODE } from "./stream-pipeline.js";
 import {
   DASHBOARD_MAX_BODY_BYTES,
   DASHBOARD_MAX_QUERY_BYTES,
@@ -587,7 +588,7 @@ function statusForQueryError(status: 400 | 413): DashboardErrorCode {
  * happened to contain "exceeded" — a timeout wrapper, a RangeError — was served as `oversized`,
  * and a future reader with different wording would silently become `internal`.
  */
-export const BODY_TOO_LARGE_CODE = "ERR_DASHBOARD_BODY_TOO_LARGE";
+export { BODY_TOO_LARGE_CODE } from "./stream-pipeline.js";
 
 function bodyReadErrorCode(error: unknown): DashboardErrorCode {
   return isRecord(error) && error.code === BODY_TOO_LARGE_CODE ? "oversized" : "internal";

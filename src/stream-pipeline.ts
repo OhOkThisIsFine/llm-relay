@@ -1,7 +1,24 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { TransformStream } from "node:stream/web";
-import { BODY_TOO_LARGE_CODE } from "./dashboard-routes.js";
 import type { AssistantMessage } from "./anthropic.js";
+
+/**
+ * The code `readBody` sets when it refused a body for exceeding the cap. Owned HERE, by the
+ * thrower, since 2026-09-04 (contract review DR-005): `dashboard-routes.ts` re-exports it for its
+ * own classifier, and `server.ts` classifies 413-vs-400 through `bodyReadStatus` below. Both
+ * consumers read this TAG. Until this date the data plane still regex-matched the MESSAGE
+ * ("too large") — the relay inferring its own intent from prose it had written itself, the
+ * inference the dashboard route had already stopped making.
+ */
+export const BODY_TOO_LARGE_CODE = "ERR_DASHBOARD_BODY_TOO_LARGE";
+
+/** 413 when `readBody` refused the body for size; 400 for any other body-read failure. */
+export function bodyReadStatus(error: unknown): 413 | 400 {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? (error as { code: unknown }).code
+    : undefined;
+  return code === BODY_TOO_LARGE_CODE ? 413 : 400;
+}
 
 export const MAX_VALIDATE_BYTES = 8 * 1024 * 1024;
 /** 25 MiB decoded document × base64 expansion, plus JSON-envelope headroom. */
@@ -75,9 +92,8 @@ export function readBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES
         cleanup();
         // Drain without retaining the rest so the client can receive the explicit 413 response.
         req.resume();
-        // Tagged, not described: the dashboard route classifies 413-vs-500 from this CODE. It used
-        // to regex-match this very message string, i.e. the relay inferring its own intent from
-        // prose — see `BODY_TOO_LARGE_CODE`. Harmless for the other caller, which ignores it.
+        // Tagged, not described: both consumers classify from this CODE — the dashboard route
+        // 413-vs-500, the data plane 413-vs-400 via `bodyReadStatus` — never from the message.
         reject(Object.assign(new Error("request body too large"), { code: BODY_TOO_LARGE_CODE }));
         return;
       }

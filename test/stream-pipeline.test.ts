@@ -2,11 +2,28 @@ import { PassThrough } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import { BODY_TOO_LARGE_CODE } from "../src/dashboard-routes.js";
-import { DEFAULT_MAX_BODY_BYTES, forwardLocalResponse, readBody } from "../src/stream-pipeline.js";
+import { DEFAULT_MAX_BODY_BYTES, bodyReadStatus, forwardLocalResponse, readBody } from "../src/stream-pipeline.js";
 
 function fakeRequest(): PassThrough & IncomingMessage {
   return new PassThrough() as unknown as PassThrough & IncomingMessage;
 }
+
+describe("bodyReadStatus — the data plane's 413-vs-400 reads the code, never the prose", () => {
+  // Contract review DR-005 (audit 2026-09-03): `server.ts` used to decide 413 with
+  // `message.includes("too large")` while the dashboard route already compared the CODE. One
+  // reader per meaning: a message that merely mentions size decides nothing.
+  it("answers 413 only for the declared code", () => {
+    expect(bodyReadStatus(Object.assign(new Error("anything at all"), { code: BODY_TOO_LARGE_CODE }))).toBe(413);
+  });
+
+  it("answers 400 for prose alone, for other errors, and for non-errors", () => {
+    expect(bodyReadStatus(new Error("request body too large"))).toBe(400);
+    expect(bodyReadStatus(new Error("socket hang up"))).toBe(400);
+    expect(bodyReadStatus(Object.assign(new Error("x"), { code: "ECONNRESET" }))).toBe(400);
+    expect(bodyReadStatus(null)).toBe(400);
+    expect(bodyReadStatus("too large")).toBe(400);
+  });
+});
 
 describe("readBody", () => {
   it("buffers a body that fits", async () => {

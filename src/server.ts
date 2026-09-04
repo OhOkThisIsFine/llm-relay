@@ -84,6 +84,7 @@ import {
 } from "./session-pin.js";
 import {
   DEFAULT_MAX_BODY_BYTES,
+  bodyReadStatus,
   failClosed,
   readBody,
 } from "./stream-pipeline.js";
@@ -427,7 +428,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     reqBuf = await readBody(req, cfg.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
   } catch (e) {
     const msg = (e as Error).message;
-    const status = msg.includes("too large") ? 413 : 400;
+    // Classified by the code `readBody` set, never by its message (contract review DR-005).
+    const status = bodyReadStatus(e);
     if (isCallerVisibleAccountingPath(req.method, pathname)) {
       recordEarlyTerminalAccounting(h.accountingRecorder, started, requestClient);
     }
