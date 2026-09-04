@@ -26,18 +26,20 @@ import {
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { atomicWriteJsonSync } from "./storage/json-store.js";
 
+/**
+ * The outcome of one flush/close. Only members a code path can RETURN are declared: the
+ * `"recovered"`/`"recovery-loss"` statuses and the `transactionId`/`quarantinedPath` fields of the
+ * write-ahead journal DR-020 deleted (`751fb52`) were removed on 2026-09-04, so a reader no longer
+ * has to check git history to learn which members are real.
+ */
 export interface SnapshotMutationResult {
   readonly status:
     | "none"
     | "committed"
-    | "recovered"
-    | "recovery-loss"
     | "invalid"
     | "failed";
-  readonly transactionId: string | null;
   readonly lowerBoundLoss: boolean;
   readonly error: string | null;
-  readonly quarantinedPath: string | null;
   readonly retryable: boolean;
 }
 
@@ -47,10 +49,12 @@ export interface SnapshotWriterResult {
   readonly retryable: boolean;
 }
 
-export interface SnapshotJournalHooks {
+/**
+ * Read seam for tests: observe which shard files the store opens (the `readDaysCap` cache tests
+ * count reads through it). The journal step hooks that used to sit beside it went with DR-020.
+ */
+export interface AccountingReadHooks {
   readonly beforeRead?: (path: string) => void;
-  readonly beforeStep?: (step: unknown) => void;
-  readonly afterStep?: (step: unknown) => void;
 }
 
 import {
@@ -216,13 +220,11 @@ export interface AccountingStoreOptions {
   readonly pendingRequestLimit?: number;
   readonly pendingAttemptLimit?: number;
   readonly now?: () => number;
-  readonly ioHooks?: SnapshotJournalHooks;
+  readonly ioHooks?: AccountingReadHooks;
   /**
-   * Out-of-process readers only (`llm-relay cost`): construct without the writer lease,
-   * without journal recovery, and without quarantine renames. Every one of those is a
-   * WRITE against a directory a live relay may be committing to, and cross-process
-   * writers are unsupported by the journal primitive — a reader observes only the
-   * committed snapshots and reports the resulting lag rather than repairing it.
+   * Out-of-process readers only (`llm-relay cost`): construct without the writer lease, so the
+   * reader performs no write against a directory a live relay may be committing to — it observes
+   * only the committed snapshots and reports the resulting lag rather than repairing it.
    */
   readonly readOnly?: boolean;
 }
@@ -398,14 +400,14 @@ interface TerminalWork {
 interface RetentionPlan {
   /** Desired policy cutoff; retained while a bounded tombstone batch continues. */
   readonly cutoff: string;
-  /** Exact shards named by the durable journal, used to reconcile recovery safely. */
+  /** The exact day shards this bounded retention batch will tombstone. */
   readonly candidates: readonly string[];
   readonly next: MutableLifetime;
   readonly truncated: boolean;
 }
 
 function result(status: SnapshotMutationResult["status"], error: string | null = null, retryable = false, lowerBoundLoss = false): SnapshotMutationResult {
-  return { status, transactionId: null, lowerBoundLoss, error, quarantinedPath: null, retryable };
+  return { status, lowerBoundLoss, error, retryable };
 }
 function clone<T>(value: T): T { return structuredClone(value); }
 function frozenClone<T>(value: T): T { return freezeDeep(clone(value)); }
@@ -906,7 +908,7 @@ class AccountingStoreImpl implements AccountingStore {
   private readonly pendingAttemptLimit: number;
   private readonly now: () => number;
   private readonly readOnly: boolean;
-  private readonly ioHooks: SnapshotJournalHooks | undefined;
+  private readonly ioHooks: AccountingReadHooks | undefined;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly queued = new Array<TerminalWork>();
   private readonly days = new Map<string, MutableDay>();

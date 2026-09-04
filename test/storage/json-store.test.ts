@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import {
   atomicWriteJsonSync,
   safeReadJsonSync,
-  JsonStore,
 } from "../../src/storage/json-store.js";
 
 let dir: string;
@@ -79,19 +78,3 @@ describe("safeReadJsonSync", () => {
   });
 });
 
-describe("JsonStore", () => {
-  it("reads and caches data, writing updates atomically", () => {
-    const target = join(dir, "store.json");
-    const store = new JsonStore<{ items: string[] }>({
-      path: target,
-      defaultData: () => ({ items: [] }),
-    });
-
-    expect(store.read()).toEqual({ items: [] });
-    store.write({ items: ["a", "b"] });
-
-    expect(store.read()).toEqual({ items: ["a", "b"] });
-    store.invalidate();
-    expect(store.read()).toEqual({ items: ["a", "b"] });
-  });
-});
