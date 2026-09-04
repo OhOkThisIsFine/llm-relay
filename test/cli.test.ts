@@ -142,6 +142,97 @@ describe("cli helper utilities", () => {
     expect(testedCount).toBeGreaterThan(0);
   });
 
+  it("derives VALUE_FLAGS with identical membership to the historical snapshot", () => {
+    const expectedValueFlags = [
+      "--after",
+      "--by",
+      "--class",
+      "--client",
+      "--config",
+      "--cost-class",
+      "--credential",
+      "--default",
+      "--effort",
+      "--env-name",
+      "--exhausted",
+      "--host",
+      "--import",
+      "--include",
+      "--label",
+      "--lane",
+      "--listen",
+      "--members",
+      "--mode",
+      "--out",
+      "--outcome",
+      "--provider",
+      "--rationale",
+      "--repo",
+      "--reset-field",
+      "--reset-ms",
+      "--retry-after-ms",
+      "--scope",
+      "--shell",
+      "--sig",
+      "--task",
+      "--tier",
+      "--window",
+      "-after",
+      "-by",
+      "-c",
+      "-class",
+      "-client",
+      "-config",
+      "-cost-class",
+      "-credential",
+      "-d",
+      "-default",
+      "-effort",
+      "-env-name",
+      "-exhausted",
+      "-host",
+      "-import",
+      "-include",
+      "-l",
+      "-label",
+      "-lane",
+      "-listen",
+      "-m",
+      "-members",
+      "-mode",
+      "-out",
+      "-outcome",
+      "-p",
+      "-provider",
+      "-rationale",
+      "-repo",
+      "-reset-field",
+      "-reset-ms",
+      "-retry-after-ms",
+      "-scope",
+      "-shell",
+      "-sig",
+      "-t",
+      "-task",
+      "-tier",
+      "-window",
+      "-x",
+    ];
+    expect([...VALUE_FLAGS].sort()).toEqual(expectedValueFlags);
+  });
+
+  it("ensures every short alias present in VALUE_FLAGS also appears in FLAG_ALIASES", () => {
+    const allAliases = new Set(Object.values(FLAG_ALIASES).flat());
+    const shortAliasesInValueFlags = [...VALUE_FLAGS].filter((flag) => /^-[a-zA-Z0-9]$/.test(flag));
+    expect(shortAliasesInValueFlags.length).toBeGreaterThan(0);
+    for (const short of shortAliasesInValueFlags) {
+      expect(
+        allAliases.has(short),
+        `short flag "${short}" in VALUE_FLAGS must be defined in FLAG_ALIASES`,
+      ).toBe(true);
+    }
+  });
+
   it("prints live telemetry first and falls back on connection, status, and JSON failures", async () => {
     const cfg = { host: "127.0.0.1", port: 8791 } as Config;
     const output: string[] = [];

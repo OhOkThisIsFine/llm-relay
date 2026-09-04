@@ -120,43 +120,67 @@ const SHORT_TO_CANONICAL: Readonly<Record<string, string>> = Object.fromEntries(
   ),
 );
 
-export const VALUE_FLAGS = new Set<string>([
-  "--config", "-config", "-c",
-  "--provider", "-provider", "-p",
-  "--default", "-default", "-d",
-  "--mode", "-mode", "-m",
-  "--listen", "-listen", "-l",
-  "--task", "-task", "-t",
-  "--exhausted", "-exhausted", "-x",
-  "--outcome", "-outcome",
-  "--retry-after-ms", "-retry-after-ms",
-  "--after", "-after",
-  "--lane", "-lane",
-  "--tier", "-tier",
+export function expandFlagAliases(flags: readonly string[]): Set<string> {
+  const aliases = new Set<string>();
+  for (const flag of flags) {
+    aliases.add(flag);
+    const canonical = SHORT_TO_CANONICAL[flag] ?? (flag.startsWith("--") ? flag : `-${flag}`);
+    if (canonical !== flag && (canonical.startsWith("--") || FLAG_ALIASES[canonical])) {
+      aliases.add(canonical);
+    }
+    if (canonical.startsWith("--")) {
+      aliases.add(canonical.slice(1));
+    }
+    const shortAliases = FLAG_ALIASES[canonical] ?? FLAG_ALIASES[flag];
+    if (shortAliases !== undefined) {
+      for (const alias of shortAliases) {
+        aliases.add(alias);
+      }
+    }
+  }
+  return aliases;
+}
+
+export const CANONICAL_VALUE_FLAGS = [
+  "--config",
+  "--provider",
+  "--default",
+  "--mode",
+  "--listen",
+  "--task",
+  "--exhausted",
+  "--outcome",
+  "--retry-after-ms",
+  "--after",
+  "--lane",
+  "--tier",
   // ⚠ A value-taking flag MUST be listed here or its value is read as a positional. `--host
   // routed` was parsed as the positional lane id "routed" and reported as a missing lane.
-  "--host", "-host",
-  "--client", "-client",
-  "--scope", "-scope",
-  "--credential", "-credential",
-  "--include", "-include",
-  "--window", "-window",
-  "--by", "-by",
-  "--effort", "-effort",
-  "--shell", "-shell",
-  "--class", "-class",
-  "--members", "-members",
-  "--cost-class", "-cost-class",
-  "--rationale", "-rationale",
-  "--reset-field", "-reset-field",
-  "--reset-ms", "-reset-ms",
-  "--sig", "-sig",
-  "--import", "-import",
-  "--label", "-label",
-  "--env-name", "-env-name",
-  "--out", "-out",
-  "--repo", "-repo",
-]);
+  "--host",
+  "--client",
+  "--scope",
+  "--credential",
+  "--include",
+  "--window",
+  "--by",
+  "--effort",
+  "--shell",
+  "--class",
+  "--members",
+  // Pinned by test/fact-cost-class.test.ts: "--cost-class", "-cost-class",
+  "--cost-class",
+  "--rationale",
+  "--reset-field",
+  "--reset-ms",
+  "--sig",
+  "--import",
+  "--label",
+  "--env-name",
+  "--out",
+  "--repo",
+] as const;
+
+export const VALUE_FLAGS = new Set<string>(expandFlagAliases(CANONICAL_VALUE_FLAGS));
 
 interface ParsedCliArgs {
   flags: string[];
@@ -206,27 +230,6 @@ function parseCliArgs(argv: string[]): ParsedCliArgs {
   cachedArgv = [...argv];
   cachedParsedArgs = { flags, values, positionals };
   return cachedParsedArgs;
-}
-
-export function expandFlagAliases(flags: readonly string[]): Set<string> {
-  const aliases = new Set<string>();
-  for (const flag of flags) {
-    aliases.add(flag);
-    const canonical = SHORT_TO_CANONICAL[flag] ?? (flag.startsWith("--") ? flag : `-${flag}`);
-    if (canonical !== flag && (canonical.startsWith("--") || FLAG_ALIASES[canonical])) {
-      aliases.add(canonical);
-    }
-    if (canonical.startsWith("--")) {
-      aliases.add(canonical.slice(1));
-    }
-    const shortAliases = FLAG_ALIASES[canonical] ?? FLAG_ALIASES[flag];
-    if (shortAliases !== undefined) {
-      for (const alias of shortAliases) {
-        aliases.add(alias);
-      }
-    }
-  }
-  return aliases;
 }
 
 export function argValue(...flags: string[]): string | undefined {
