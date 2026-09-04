@@ -1,29 +1,13 @@
 /**
  * When is an in-flight attempt slow enough to start the NEXT candidate beside it?
  *
- * ⚠ **This is the decision layer only. Nothing in this file duplicates a request, and nothing in
- * `src/` calls it yet — that is a deliberate intermediate state, declared here so it is not read
- * later as dead code.** The walk integration is stage 2; both request paths in `server.ts` are
- * serial `while` loops built around a single `await`, and turning that into a race is a separate,
- * larger change. Landing the decision first means its constants can be calibrated and its edge
- * cases pinned before any request behaviour moves.
- *
- * ⚠⚠ **STAGE 2 IS BLOCKED ON `CredentialWalk`, and the blocker is structural — read this before
- * attempting the wiring (found 2026-08-30, during that attempt).** The walk holds exactly ONE
- * `#pending` slot, and that is its documented contract: *"`next()` only offers a candidate. The
- * caller must call `recordStarted()` immediately before fetch/egress; that is the sole budget/LRU
- * mutation boundary."* Concretely, in `credential-select.ts`:
- *   - `next()` opens with `if (this.#pending) return this.#pending.attempt;` — while an attempt is
- *     in flight it re-offers **that same attempt**, so asking for a hedge candidate hands back the
- *     primary and the relay would fetch one deployment twice;
- *   - `recordStarted()` throws `"credential attempt already marked started"` on the second call;
- *   - `recordOutcome()` throws when the outcome does not match the single pending attempt.
- *
- * So hedging is not a restructuring of the loop — it first needs `CredentialWalk` to carry N
- * in-flight attempts, with its start budget, LRU touch and breadth-first ordering all still
- * correct. That is a change to a component whose whole job is being the one mutation boundary, and
- * it must be designed rather than patched around. Attempting the loop first would produce requests
- * that THROW, which is why this was worth finding before any of `server.ts` was touched.
+ * ⚠ **This is the decision layer only: nothing in this file duplicates a request.** The race lives
+ * in `hedge-race.ts` and is WIRED on both fronts through `candidate-runner.ts`
+ * `runAttemptWithHedge`, which calls `hedgeDelayDecision` below — stage 2 landed 2026-08-30. The
+ * paragraph that used to stand here still said "nothing in `src/` calls it yet" and "stage 2 is
+ * blocked on `CredentialWalk`" until 2026-09-04 (audit finding DR-014: prose rotted at the module
+ * it described). The blocker it named was real and is closed: `credential-select.ts` now carries
+ * `maxInFlight` attempts, and `next()` re-offers a pending-but-unstarted attempt — see that file.
  *
  * ⚠ **Hedging DUPLICATES, it does not reorder** — the first behaviour in this relay that does. The
  * `CLAUDE.md` invariant reads *"Acting on counts is optional, always announced, and may only
@@ -278,9 +262,13 @@ function hedgeThreshold(
  * viewed from either side, so this returns it rather than letting a caller derive a second one.
  *
  * ⚠ `tokensSeen` is 0 by construction here, and that is the honest input for the case this serves:
- * a race decided at RESPONSE RESOLUTION has, by definition, seen no tokens — the response has not
- * arrived. The per-token rung therefore cannot apply, which is correct rather than a limitation:
- * the measured hang produced no tokens for 120 s, so per-token could never have fired on it.
+ * the race is decided at COMMIT — the first meaningful content (since 2026-09-04; it was decided at
+ * response resolution before) — and by definition no output token exists before that point. The
+ * per-token rung therefore cannot apply on the hedge path, which is correct rather than a
+ * limitation: the measured hang produced no tokens for 120 s, and a provider that returns headers
+ * and then nothing produces none either. Per-token is the PRIMARY rung only for a consumer that
+ * can hand it output tokens; today no consumer does, and `CLAUDE.md` says so rather than calling
+ * it primary in production.
  *
  * Returns null when hedging is off or the deployment is not free — the D1 containment, applied
  * once, here, so no caller repeats it.

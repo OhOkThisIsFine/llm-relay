@@ -53,6 +53,8 @@ import {
   respondAllCapped,
   responseHeadersForTarget,
   runAttemptWithHedge,
+  takeCommitProbe,
+  withCommitProbe,
   shouldTryNext,
   stickyProvenanceHeaders,
   toolUseIdRewriteField,
@@ -681,7 +683,7 @@ export async function anthropicMessagesPath(
     if (!primaryOffer) break;
 
     const startAttempt = (run: AttemptRun, forwardHeaders: Record<string, string>): Promise<Response> =>
-      fetchBackend(run.resolvedAttempt, {
+      withCommitProbe(fetchBackend(run.resolvedAttempt, {
         path: ctx.path,
         method: ctx.req.method ?? "POST",
         reqBuf: ctx.reqBuf,
@@ -707,6 +709,11 @@ export async function anthropicMessagesPath(
           recordCredentialStarted(credentialWalk, credentialTrace, run.resolvedAttempt);
           tried.push(specOfTarget(run.target));
         },
+      }), {
+        // The commit probe runs inside the attempt so the hedge race settles at first content.
+        protocol: "anthropic-messages",
+        isCancelled: () => res.destroyed,
+        malformedProvenance: run.target.kind === "openai" ? "local" : "upstream",
       });
 
     const primaryRun = beginAttemptRun(res, primaryOffer);
@@ -907,13 +914,16 @@ export async function anthropicMessagesPath(
 
       const streamed = (backendRes.headers.get("content-type") ?? "").includes("text/event-stream");
       if (streamed && backendRes.status < 400) {
-        const probe = backendRes.body
+        // The probe already ran inside `startAttempt` (`withCommitProbe`), which is what lets the
+        // hedge race settle at commit; the inline probe is only the fallback for a response that
+        // did not come through that wrapper.
+        const probe = takeCommitProbe(backendRes) ?? (backendRes.body
           ? await probeStreamForCommit(backendRes.body, "anthropic-messages", {
               isCancelled: () => res.destroyed,
               malformedProvenance: target.kind === "openai" ? "local" : "upstream",
               ...(dialectRefusalSignalOf(backendRes) ? { relayRefusal: dialectRefusalSignalOf(backendRes)! } : {}),
             })
-          : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
+          : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const });
 
         if (probe.kind === "cancelled") {
           completeAttemptCancelled(h, attempt, "client disconnected before stream commit");

@@ -39,6 +39,7 @@ import {
   QUOTA_DEMOTED_HEADER,
   LATENCY_DEMOTED_HEADER,
   HEDGED_HEADER,
+  dialectRefusalSignalOf,
   errorOrigin,
   postHeaderBodyFailure,
   toolUseIdRewrites,
@@ -49,9 +50,10 @@ import {
   type PostHeaderBodyFailure,
 } from "./backend.js";
 import { STICKY_PROVENANCE_HEADER, type StickySessionManager } from "./session-pin.js";
+import { probeStreamForCommit, type StreamCommitProbe, type StreamCommitProtocol } from "./stream-commit.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE } from "./tool-dialects.js";
 import { MAX_LOG_ATTEMPTS, type MetadataLogger, type RequestAttemptLog, type RequestAttemptStatus, type RequestLog } from "./log.js";
-import type { ModelCallRecorder, RequestAccountingState } from "./accounting-state.js";
+import type { ModelCallRecorder, ProxyAccountingFailureKind, RequestAccountingState } from "./accounting-state.js";
 import { CircuitBreaker, globalCircuitBreaker } from "./circuit-breaker.js";
 import { parseCredentialId } from "./credential-id.js";
 import { resolveAttempt, type ResolvedAttempt } from "./resolved-attempt.js";
@@ -704,6 +706,73 @@ export function walkWouldFailOver(response: Response): boolean {
 }
 
 /**
+ * The commit-probe verdict `withCommitProbe` attached to a streamed 2xx response, keyed by the
+ * Response object itself so no signature on the walk changes. Consumed exactly once through
+ * `takeCommitProbe`.
+ */
+const COMMIT_PROBES = new WeakMap<Response, StreamCommitProbe>();
+
+export interface CommitProbeOptions {
+  readonly protocol: StreamCommitProtocol;
+  /** Client cancellation wins races with EOF/read failures and must never start another target. */
+  readonly isCancelled: () => boolean;
+  /** Malformed final wire produced by a response mapper is a local defect, not target health. */
+  readonly malformedProvenance: "upstream" | "local";
+}
+
+/**
+ * Run the stream-commit probe INSIDE the attempt's own promise, so the hedge race settles at
+ * COMMIT — the first meaningful content — rather than at header arrival (2026-09-04, owner
+ * direction: the hedge exists for wedged requests, and a provider that answers 200 + headers at
+ * once and then produces nothing is the common wedge; a race decided at RESPONSE RESOLUTION had
+ * already called that primary the winner, and `hedge-race.ts` recorded the gap in as many words).
+ * A non-streamed or non-2xx response passes through untouched — the walk's own status
+ * classification decides those. The verdict rides beside the response for the route to consume
+ * through `takeCommitProbe`; the route keeps its inline probe only as the fallback for a response
+ * that did not come through this wrapper.
+ *
+ * ⚠ The probe reads the body up to the first meaningful event and the `ready` verdict replays
+ * every byte it consumed, so a committed winner is served byte-exact as before. A LOSER's probe is
+ * left to settle on its own after `retireHedgeLoser` aborts its run — the race ignores a late
+ * settlement — and that abort is what cancels its body.
+ */
+export async function withCommitProbe(promise: Promise<Response>, options: CommitProbeOptions): Promise<Response> {
+  const response = await promise;
+  if (response.status >= 400) return response;
+  if (!(response.headers.get("content-type") ?? "").includes("text/event-stream")) return response;
+  const relayRefusal = dialectRefusalSignalOf(response);
+  const probe: StreamCommitProbe = response.body
+    ? await probeStreamForCommit(response.body, options.protocol, {
+        isCancelled: options.isCancelled,
+        malformedProvenance: options.malformedProvenance,
+        ...(relayRefusal ? { relayRefusal } : {}),
+      })
+    : { kind: "dead", reason: "stream has no body", provenance: "upstream" };
+  COMMIT_PROBES.set(response, probe);
+  return response;
+}
+
+/** The verdict `withCommitProbe` attached, removed on read so it is consumed exactly once. */
+export function takeCommitProbe(response: Response): StreamCommitProbe | undefined {
+  const probe = COMMIT_PROBES.get(response);
+  if (probe) COMMIT_PROBES.delete(response);
+  return probe;
+}
+
+/**
+ * Has this settlement WON the race? Two questions, one policy. The walk would not fail over from
+ * the status — a 429 has not won, it was going to be walked past anyway — AND a streamed response
+ * has COMMITTED: a probe that found the stream dead, or the client gone, has not won either, and
+ * the walk moves on from it exactly as it does from a failing status. A response the probe never
+ * touched — buffered, or not a stream — is judged on its status alone, as before.
+ */
+export function attemptWon(settled: Settled<Response>): boolean {
+  if (!settled.ok || walkWouldFailOver(settled.value)) return false;
+  const probe = COMMIT_PROBES.get(settled.value);
+  return probe === undefined || probe.kind === "ready";
+}
+
+/**
  * ⚠ **Carries the input-token count only when `basis` is `"input-size"`** — the case the flat
  * `floor` label used to cover alone. A `per-token`/`absolute` decision keeps its bare basis: the
  * DEPLOYMENT's own evidence set that bar, not the request's size, and stating a token count beside
@@ -764,7 +833,7 @@ export async function runAttemptWithHedge(
         hedge = started;
         return { promise: started.promise, abort: () => started.run.controller.abort() };
       },
-      isWin: (settled) => settled.ok && !walkWouldFailOver(settled.value),
+      isWin: attemptWon,
     });
   } catch (e) {
     if (hedge) retireHedgeLoser(deps, hedge.run);
@@ -1535,18 +1604,48 @@ export function observeAttemptHeaders(
   if (!result.ok) throw new Error(`attempt header observation rejected: ${result.error.kind}`);
 }
 
-export type ProxyAccountingFailureKind = "timeout" | "provider_error" | "auth_error" | "rate_limit" | "aborted" | "protocol" | "unknown";
+/**
+ * Which provenances name a failure the RELAY authored — a mapping refusal, a dialect-rescue
+ * destructive refusal, a malformed final wire the relay's own mapper produced. The breaker's
+ * `PROVENANCE_REACHES_HEALTH_PATH` declines to charge exactly these, and the ledger must not blame
+ * the provider for them either (contract review DR-003, 2026-09-04): until then a relay-authored
+ * refusal carrying `failure: "http"` fell through an unconditional `return "provider_error"`.
+ * A total table, never an `else` — a new provenance is a compile error here, not a silent
+ * `provider_error`. `ProxyAccountingFailureKind` itself is declared ONCE, in `accounting-state.ts`;
+ * this file used to carry a second identical declaration.
+ */
+const RELAY_AUTHORED_PROVENANCE = {
+  "upstream": false,
+  "invalid-upstream-envelope": false,
+  "deadline": false,
+  "client-cancellation": false,
+  "relay-mapper-defect": true,
+} as const satisfies Record<OutcomeProvenance, boolean>;
 
 export function accountingFailureForAttempt(options: {
   readonly failure: AttemptFailed["failure"];
   readonly provenance: OutcomeProvenance;
   readonly status: number | null;
 }): ProxyAccountingFailureKind {
+  // The relay's own decision is classified FIRST: a status the relay synthesized (a local 502, a
+  // refusal's 4xx) must never read as the provider's auth wall or back-pressure.
+  if (RELAY_AUTHORED_PROVENANCE[options.provenance]) return "protocol";
   if (options.status === 401 || options.status === 403) return "auth_error";
   if (options.status === 429) return "rate_limit";
-  if (options.failure === "protocol" || options.failure === "mapping") return "protocol";
-  if (options.failure === "transport" && options.provenance === "deadline") return "timeout";
-  return "provider_error";
+  switch (options.failure) {
+    case "protocol":
+    case "mapping":
+    case "invalid-response":
+      return "protocol";
+    case "transport":
+      return options.provenance === "deadline" ? "timeout" : "provider_error";
+    case "http":
+      return "provider_error";
+    default: {
+      const _never: never = options.failure;
+      return _never;
+    }
+  }
 }
 
 export function markAttemptCommitted(attempt: HealthAttempt | undefined): void {

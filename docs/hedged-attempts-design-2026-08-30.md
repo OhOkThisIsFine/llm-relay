@@ -302,3 +302,43 @@ Tests: `test/hedge-trigger.test.ts` (the formula, the legacy alias, the basis-pr
 `test/config.test.ts` (`loadConfig — routing.hedge`, the new keys and the alias), and
 `test/hedge-wiring.test.ts` (one end-to-end case per front proving a real request's estimate reaches
 the announced header, not just a unit test's direct call into `hedge-trigger.ts`).
+
+## 12. Amendment 2026-09-04 — the race settles at COMMIT, not at response resolution
+
+**Owner direction, in reply to audit finding DR-002 ("the per-token rung is unreachable while the
+feature is default-ON"):** *"The point of the hedge is to handle wedged requests, or requests so
+slow as to be practically wedged. Rule 1 seems important to that."*
+
+What that direction needed, and what was built:
+
+- **The race now settles at COMMIT** — the first meaningful content — instead of at response
+  resolution. `candidate-runner.ts` `withCommitProbe` runs the stream-commit probe inside each
+  attempt's own promise, `attemptWon` requires a `ready` verdict, and both fronts consume the
+  attached verdict through `takeCommitProbe` instead of probing a second time.
+- **The shape this closes.** `fetchBackend`'s structural preflight already made "resolution" mean
+  the first VALID DATA EVENT, so a provider that sent headers and then nothing was hedged before
+  this amendment. The uncovered shape was headers plus a metadata event — a role-only chunk, a
+  `message_start` — and then silence, which is how hidden-reasoning providers open a stream. That
+  primary had "resolved", was called the winner, and the request waited out the provider timeout.
+- **Measured, not assumed.** The first version of the pinning test sent headers and then nothing,
+  and with the wrapper disabled it stayed GREEN — which is how the preflight's contribution was
+  found. The test backend now sends the metadata preamble; with the wrapper disabled 4 cases fail,
+  and with `attemptWon` ignoring the probe 2 cases fail (the dead-stream pair).
+
+What rule 1 (per-token) can and cannot do, stated so it is not re-argued:
+
+- On the hedge path it is INERT by construction: no output token exists before commit, so
+  `hedgeDelayDecision` passes `tokensSeen: 0` and rules 2 and 3 decide. That is not a wiring
+  defect; it is what "decided before content" means.
+- After commit the client already holds the stream's bytes, so no hedge can replace a stream that
+  stalls or crawls. The only honest post-commit remedy is an ABORT that hands the failure to the
+  client to retry — which turns a slow-but-correct answer into a failed turn for a harness that
+  does not retry a mid-stream error. That is a product trade-off the owner has not decided;
+  `docs/backlog.md` carries it with the question stated.
+- The measured "practically wedged" streams on this machine (kimi-k3 at 385–875 ms/token) are
+  post-commit crawls. For those, latency demotion (v0.64+) and the `slow` band (v0.69.0) already
+  move traffic away on the NEXT request; nothing in-flight changes until that decision is taken.
+
+Tests: `test/hedge-wiring.test.ts` — "hedges a primary that sends headers and then stalls before
+any content", "a slow primary whose stream DIES before content is not a win", and the negative
+control "does NOT hedge a stream that commits inside the delay", each on both fronts.

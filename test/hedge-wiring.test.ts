@@ -15,7 +15,7 @@
  * positive case asserts the SECOND backend was really contacted (`calls()`), never just a header.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createServer, type Server, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
@@ -200,6 +200,146 @@ describe("hedged attempts — end to end on both fronts", () => {
     `http://127.0.0.1:${portOf(a.server)}`,
     `http://127.0.0.1:${portOf(b.server)}`,
   ];
+
+  /**
+   * An SSE backend that answers 200 + headers AT ONCE and sends its first content event only after
+   * `contentDelayMs` — the wedge shape a race decided at header arrival could never see: the
+   * primary had "resolved", and then nothing came. `closed()` settles when the relay drops the
+   * connection, which is how a loser's abort is observed from the backend's side.
+   */
+  function sseBackend(
+    contentDelayMs: number,
+    dieAfterMs?: number,
+  ): Promise<{ server: Server; calls: () => number; closed: () => Promise<void> }> {
+    let n = 0;
+    let markClosed: () => void = () => {};
+    const closed = new Promise<void>((r) => {
+      markClosed = r;
+    });
+    const chunk = (delta: Record<string, unknown>, finish: string | null, usage?: Record<string, number>): string =>
+      `data: ${JSON.stringify({
+        id: "cmpl",
+        object: "chat.completion.chunk",
+        model: "m",
+        choices: [{ index: 0, delta, finish_reason: finish }],
+        ...(usage ? { usage } : {}),
+      })}\n\n`;
+    const sendContent = (res: ServerResponse): void => {
+      if (res.writableEnded || res.destroyed) return;
+      res.write(chunk({ role: "assistant", content: "ok" }, null));
+      res.write(chunk({}, "stop", { prompt_tokens: 1, completion_tokens: 1 }));
+      res.write("data: [DONE]\n\n");
+      res.end();
+    };
+    /** An in-band error before any content: the probe classifies the stream dead, not committed. */
+    const die = (res: ServerResponse): void => {
+      if (res.writableEnded || res.destroyed) return;
+      res.write(`data: ${JSON.stringify({ error: { message: "boom", type: "server_error" } })}\n\n`);
+      res.end();
+    };
+    const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        n += 1;
+        open.push(res);
+        res.on("close", () => markClosed());
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.flushHeaders();
+        // A role-only chunk at once, the way hidden-reasoning providers open a stream: a VALID data
+        // event, so `fetchBackend`'s structural preflight resolves the attempt here — and then no
+        // content until `contentDelayMs`. Without this preamble the preflight itself blocks on the
+        // silence and a race decided at resolution already covers the case (measured: the wrapper
+        // mutation check stayed green until this line existed).
+        res.write(chunk({ role: "assistant" }, null));
+        if (dieAfterMs !== undefined) timers.push(setTimeout(() => die(res), dieAfterMs));
+        if (contentDelayMs === 0) sendContent(res);
+        else timers.push(setTimeout(() => sendContent(res), contentDelayMs));
+      });
+    };
+    return new Promise((resolve) => {
+      const s = createServer(onRequest);
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n, closed: () => closed }));
+    });
+  }
+
+  async function postStreaming(p: number, kind: "anthropic" | "openai"): Promise<Response> {
+    const path = kind === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
+    const body =
+      kind === "anthropic"
+        ? { model: "pool/coding", max_tokens: 20, stream: true, messages: [{ role: "user", content: "hi" }] }
+        : { model: "pool/coding", stream: true, messages: [{ role: "user", content: "hi" }] };
+    return fetch(`http://127.0.0.1:${p}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it.each(["anthropic", "openai"] as const)(
+    "hedges a primary that sends headers and then stalls before any content — the wedge a resolution race could not see (%s front)",
+    async (kind) => {
+      // Owner direction 2026-09-04: the hedge exists for wedged requests. A provider that answers
+      // 200 + headers at once and then produces nothing had "resolved", so a race decided at
+      // response resolution never started a hedge and the request waited out the provider timeout.
+      // The race now settles at COMMIT, the first meaningful content.
+      const a = await sseBackend(3000);
+      const b = await sseBackend(0);
+      const p = portOf(await startProxy(poolCfg(basesOf(a, b))));
+
+      const res = await postStreaming(p, kind);
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("ok");
+      expect(res.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+      expect(a.calls()).toBe(1);
+      expect(b.calls()).toBe(1);
+      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 120ms, input-size 2 tokens)");
+      // The loser's stalled stream is ABORTED, not left to run out its content timer.
+      const closedBeforeContent = await Promise.race([
+        a.closed().then(() => true),
+        new Promise<boolean>((r) => timers.push(setTimeout(() => r(false), 1500))),
+      ]);
+      expect(closedBeforeContent).toBe(true);
+    },
+  );
+
+  it.each(["anthropic", "openai"] as const)(
+    "a slow primary whose stream DIES before content is not a win, so the hedge still takes it (%s front)",
+    async (kind) => {
+      // The probe half of `attemptWon`: past the delay, a primary that settles with a DEAD stream
+      // must not end the race — the walk was going to move on from it anyway, exactly as it does
+      // from a 429. Under a status-only win test the dead primary "wins" at 500 ms, the hedge is
+      // aborted as the loser, and the walk then has to reach p2 serially a second time.
+      const a = await sseBackend(3000, 500);
+      const b = await sseBackend(1500);
+      const p = portOf(await startProxy(poolCfg(basesOf(a, b))));
+
+      const res = await postStreaming(p, kind);
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("ok");
+      expect(res.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+      expect(a.calls()).toBe(1);
+      expect(b.calls()).toBe(1);
+      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 120ms, input-size 2 tokens)");
+    },
+  );
+
+  it.each(["anthropic", "openai"] as const)(
+    "does NOT hedge a stream that commits inside the delay — a healthy stream is a win at first content (%s front)",
+    async (kind) => {
+      const a = await sseBackend(0);
+      const b = await sseBackend(0);
+      const p = portOf(await startProxy(poolCfg(basesOf(a, b))));
+
+      const res = await postStreaming(p, kind);
+      expect(res.status).toBe(200);
+      await res.text();
+      expect(res.headers.get(SERVED_BY_HEADER)).toBe("p1/m1");
+      expect(res.headers.get(HEDGED_HEADER)).toBeNull();
+      expect(b.calls()).toBe(0);
+    },
+  );
 
   it.each(["anthropic", "openai"] as const)(
     "starts the next candidate beside a slow primary, and the hedge answers (%s front)",

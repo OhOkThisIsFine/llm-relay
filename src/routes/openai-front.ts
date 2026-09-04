@@ -51,6 +51,8 @@ import {
   respondAllCapped,
   responseHeadersForTarget,
   runAttemptWithHedge,
+  takeCommitProbe,
+  withCommitProbe,
   shouldTryNext,
   toolUseIdRewriteField,
   walkOutcomeForResponse,
@@ -203,7 +205,7 @@ export async function openAiFrontPath(
         return fixed;
       };
 
-      return fetchOpenAiFront(run.resolvedAttempt, {
+      return withCommitProbe(fetchOpenAiFront(run.resolvedAttempt, {
         reqJson: ctx.reqJson,
         wantsStream: ctx.wantsStream,
         protocol: ctx.protocol,
@@ -231,6 +233,11 @@ export async function openAiFrontPath(
           recordCredentialStarted(credentialWalk, credentialTrace, run.resolvedAttempt);
           tried.push(specOfTarget(run.target));
         },
+      }), {
+        // The commit probe runs inside the attempt so the hedge race settles at first content.
+        protocol: ctx.protocol === "responses" ? "openai-responses" : "openai-chat",
+        isCancelled: () => res.destroyed,
+        malformedProvenance: run.target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
       });
     };
 
@@ -481,14 +488,17 @@ export async function openAiFrontPath(
       if (streamed && upstream.status < 400) {
         const protocol: StreamCommitProtocol =
           ctx.protocol === "responses" ? "openai-responses" : "openai-chat";
-        const probe = upstream.body
+        // The probe already ran inside `startAttempt` (`withCommitProbe`), which is what lets the
+        // hedge race settle at commit; the inline probe is only the fallback for a response that
+        // did not come through that wrapper.
+        const probe = takeCommitProbe(upstream) ?? (upstream.body
           ? await probeStreamForCommit(upstream.body, protocol, {
               isCancelled: () => res.destroyed,
               malformedProvenance:
                 target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
               ...(dialectRefusalSignalOf(upstream) ? { relayRefusal: dialectRefusalSignalOf(upstream)! } : {}),
             })
-          : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const };
+          : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const });
 
         if (probe.kind === "cancelled") {
           completeAttemptCancelled(h, attempt, "client disconnected before stream commit");
