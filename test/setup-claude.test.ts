@@ -22,15 +22,24 @@ const realPath = getClaudeDesktopConfigPath();
 const realBefore = existsSync(realPath) ? statSync(realPath).mtimeMs : null;
 
 const realAgentPath = join(homedir(), ".claude", "agents", "relay.md");
-const realAgentBefore = existsSync(realAgentPath) ? statSync(realAgentPath).mtimeMs : null;
+// Snapshot by BYTE CONTENT, not just absence: on a machine where
+// `llm-relay setup claude-cli`/`claude-desktop` has already installed the agent, this file
+// legitimately exists before the suite runs. An installed file is allowed; the guard below only
+// fails if the suite itself created, modified or deleted it.
+const realAgentBefore = existsSync(realAgentPath) ? readFileSync(realAgentPath) : null;
 
 afterAll(() => {
   const realAfter = existsSync(realPath) ? statSync(realPath).mtimeMs : null;
   expect(realAfter).toBe(realBefore);
 
-  const realAgentAfter = existsSync(realAgentPath) ? statSync(realAgentPath).mtimeMs : null;
-  expect(realAgentAfter).toBe(realAgentBefore);
-  expect(existsSync(realAgentPath)).toBe(false);
+  const realAgentExists = existsSync(realAgentPath);
+  if (realAgentBefore === null) {
+    expect(realAgentExists).toBe(false);
+  } else {
+    expect(realAgentExists).toBe(true);
+    const realAgentAfter = readFileSync(realAgentPath);
+    expect(Buffer.compare(realAgentAfter, realAgentBefore)).toBe(0);
+  }
 });
 
 describe("setup-claude", () => {
