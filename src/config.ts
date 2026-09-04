@@ -690,6 +690,9 @@ export interface LadderRung {
 /** Reserved provider-namespace prefix for `pool/<name>` routing. */
 export const POOL_PREFIX = "pool";
 
+/** Reserved model name for auto-dispatch to the ladder's first ready relay rung. */
+export const AUTO_MODEL = "auto";
+
 /**
  * Marker Claude Code stamps into the `system` block of SUBAGENT requests only (verified on wire,
  * Claude Code 2.1.220): `x-anthropic-billing-header: …; cc_entrypoint=…; cc_is_subagent=true;`.
@@ -1806,6 +1809,9 @@ function parseRouting(
   // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
   if (providers[POOL_PREFIX]) {
     throw new Error(`config.providers."${POOL_PREFIX}" is reserved — it would shadow "pool/<name>" routing`);
+  }
+  if (providers[AUTO_MODEL]) {
+    throw new Error(`config.providers."${AUTO_MODEL}" is reserved — it would shadow "${AUTO_MODEL}" routing`);
   }
   const dfltRaw = overrideDefault !== undefined ? overrideDefault : r.default;
   let dflt: string | string[];

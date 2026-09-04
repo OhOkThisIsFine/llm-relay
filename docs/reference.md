@@ -445,6 +445,8 @@ Code subagent frontmatter. A pool gives them ranking and failover anyway. `pool`
 provider name. Pool refs are legal in `routing.tiers`, `routing.default` and `routing.subagents`;
 pool-in-pool is rejected at load.
 
+**`auto` model:** Callers can address `model: "auto"` so requests never have to name a concrete model or pool. It resolves to the spec of the first ready rung of kind `relay` in the dispatch ladder for a tier. The tier is selected by the `x-llm-relay-tier` request header (`low` | `medium` | `high` | `xhigh`), defaulting to `medium`. If the ladder for that tier has no ready relay rung, or no ladder is configured, `auto` falls back to `routing.default`. The served response carries an `x-llm-relay-auto: <spec> (<tier>)` header announcing what `auto` resolved to. `auto` is a reserved provider name.
+
 A dynamic pool (`{ "preferred": [...], "include": "free" }`) may also declare
 `"exclude": ["provider/model", ...]`. These are permanent user tombstones: they remove matching
 entries from both the preferred prefix and the discovered tail. Unknown or no-longer-catalogued

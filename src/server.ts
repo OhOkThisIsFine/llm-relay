@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import {
+  AUTO_MODEL,
   resolveTargets,
   reshaperForTarget,
   subagentSpec,
@@ -59,6 +60,8 @@ import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { installBreakerPersistence } from "./breaker-persistence.js";
 import { installDispatchExhaustionPersistence } from "./dispatch-exhaustion-persistence.js";
+import { resolveAutoSpec } from "./dispatch.js";
+import { AUTO_HEADER, AUTO_TIER_HEADER } from "./backend.js";
 import { LaneCadence } from "./lane-cadence.js";
 import { estimateRequestTokens, assessCost, type CostClass } from "./metadata.js";
 import { materializeDynamicPools } from "./dynamic-pools.js";
@@ -476,11 +479,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   let addressedPool: string | null = null;
   try {
     const subSpec = subagentSpec(reqJson, model, cfg, req.headers, requestClient);
-    const routedModel = subSpec ?? model;
+    let routedModel = subSpec ?? model;
     materializeDynamicPools(cfg, h.catalog);
     if (subSpec !== null) {
       reqBuf = Buffer.from(JSON.stringify(reqJson), "utf8");
       estimatedRequestTokens = estimateRequestTokens(reqJson);
+    }
+    if (routedModel === AUTO_MODEL) {
+      const tierHeader = req.headers[AUTO_TIER_HEADER];
+      const autoResolved = resolveAutoSpec(
+        cfg,
+        typeof tierHeader === "string" ? tierHeader : Array.isArray(tierHeader) ? tierHeader[0] : undefined,
+        started,
+      );
+      routedModel = autoResolved.spec;
+      res.setHeader(AUTO_HEADER, `${autoResolved.spec} (${autoResolved.tier})`);
     }
     targetCandidates = resolveTargets(routedModel, cfg);
     if (typeof routedModel === "string" && routedModel.startsWith("pool/")) {

@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { unroutableOffloadClient, type Config, type OffloadScope } from "../config.js";
+import { AUTO_MODEL, unroutableOffloadClient, type Config, type OffloadScope } from "../config.js";
 import type { ModelCatalog } from "../catalog.js";
 import type { PingLoop } from "../ping/cadence.js";
 import type { MetadataLogger } from "../log.js";
@@ -50,6 +50,7 @@ function relayModels(
   collectModelAliases(cfg.routing.tiers, ids);
   collectModelAliases(cfg.routing.subagents, ids);
   for (const name of Object.keys(cfg.routing.pools ?? {})) ids.add(`pool/${name}`);
+  ids.add(AUTO_MODEL);
 
   // Build the context window resolver once, reusing the same machinery as dispatch.ts
   // `catalog.cachedLimits` never fetches — a cold cache degrades to "no window stated" rather than

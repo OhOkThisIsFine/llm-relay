@@ -922,3 +922,43 @@ export function buildDispatch(
         : `first ready lane (${next.position - 1} ahead of it unavailable)`;
   return { ...base, next, reason: why };
 }
+
+export const AUTO_TIERS = ["low", "medium", "high", "xhigh"] as const;
+export type AutoTier = (typeof AUTO_TIERS)[number];
+
+export function normalizeAutoTier(tier?: string | null): string {
+  if (typeof tier !== "string") return "medium";
+  const lower = tier.trim().toLowerCase();
+  return (AUTO_TIERS as readonly string[]).includes(lower) ? lower : "medium";
+}
+
+export interface AutoSpecResolution {
+  spec: string;
+  tier: string;
+}
+
+/**
+ * Resolves the `auto` model name to a concrete spec and tier:
+ * The spec of the first READY rung of kind `relay` in the dispatch ladder for the given tier.
+ * The tier comes from the `x-llm-relay-tier` request header (low | medium | high | xhigh), else `medium`.
+ * If the ladder for that tier has no ready relay rung, or no ladder is configured,
+ * `auto` falls back to `routing.default`.
+ */
+export function resolveAutoSpec(
+  cfg: Config,
+  rawTier?: string | null,
+  now: number = Date.now(),
+): AutoSpecResolution {
+  const tier = normalizeAutoTier(rawTier);
+  const selected = selectLadder(cfg, tier);
+  for (const rung of selected.rungs) {
+    if (rung.kind === "relay" && rung.spec && rung.enabled !== false && cooldownUntil(cfg, rung, now) === null) {
+      return { spec: rung.spec, tier };
+    }
+  }
+  const defaultSpec = Array.isArray(cfg.routing.default)
+    ? cfg.routing.default[0]!
+    : cfg.routing.default;
+  return { spec: defaultSpec, tier };
+}
+

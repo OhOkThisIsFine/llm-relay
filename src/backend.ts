@@ -101,6 +101,19 @@ export function errorOrigin(res: Response): ErrorOrigin | null {
 export const SERVED_BY_HEADER = "x-llm-relay-served-by";
 
 /**
+ * What the `auto` model name resolved to for this turn — `<spec> (<tier>)`.
+ * Announces both the concrete spec that served the turn and the ladder tier
+ * that selected it.
+ */
+export const AUTO_HEADER = "x-llm-relay-auto";
+
+/**
+ * Request header specifying the dispatch ladder tier for `auto` model resolution
+ * (`low` | `medium` | `high` | `xhigh`). Defaults to `medium` when omitted.
+ */
+export const AUTO_TIER_HEADER = "x-llm-relay-tier";
+
+/**
  * WHY each of those candidates dropped out — `"13 tried, 0 served: 4x402, 5x429, 3x403, 1x400"`.
  *
  * `SERVED_BY_HEADER` answers "who was tried"; this answers "what happened to them", which is the
@@ -674,7 +687,11 @@ async function fetchAnthropicBackend(
 ): Promise<Response> {
   const target = attempt.target;
   const init: RequestInit = { method: args.method, headers: args.anthropicHeaders, signal: args.signal };
-  if (args.reqBuf.length) init.body = args.reqBuf;
+  if (target.model && args.reqJson && typeof args.reqJson === "object" && (args.reqJson as Record<string, unknown>).model !== target.model) {
+    init.body = JSON.stringify({ ...(args.reqJson as Record<string, unknown>), model: target.model });
+  } else if (args.reqBuf.length) {
+    init.body = args.reqBuf;
+  }
   const native = await invokeFetch(target.base + args.path, init);
   const nativeStreamed = nativeResponseIsStreamed(native, args.wantsStream);
   const res = args.usage
