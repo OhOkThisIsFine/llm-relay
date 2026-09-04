@@ -18,7 +18,7 @@
  *
  * 4. Cost-Based Band Ordering & Guardrails:
  *    - Prioritizes 100% free model providers and subscription pools over metered paid endpoints.
- *    - Enforces operator cost blocks (`isCostBlocked()`) to guarantee zero unintended spend on offload lanes.
+ *    - Enforces operator cost blocks (`isCostBlockedForEverySlot()`) to guarantee zero unintended spend on offload lanes.
  */
 import { EFFORT_LEVELS, type Config, type EffortLevel, type ResolvedTarget } from "./config-types.js";
 import type { ModelCatalog } from "./catalog.js";
@@ -29,7 +29,7 @@ import { getRealWorldScore, loadRuntimeTelemetry, type TelemetryData } from "./p
 import { loadPersistedSamples, loadProbeCache, type ProbeCacheData } from "./ping/probe-cache.js";
 import { getStabilityScore } from "./ping/metrics.js";
 import { assessCost, type CostClass } from "./metadata.js";
-import { isCostBlocked } from "./target-facts.js";
+import { isCostBlockedForEverySlot } from "./target-facts.js";
 
 export const DYNAMIC_POOL_RANKING_EPOCH_MS = 30_000;
 
@@ -160,7 +160,7 @@ function discoverDynamicTargets(
       if (discoveredSpecs.has(spec)) continue;
 
       const cost = assessCost(model, catalog.cachedLimits(provider, model), p.tierType);
-      if (isCostBlocked(provider, null, model, { costClass: cost.costClass })) continue;
+      if (isCostBlockedForEverySlot(provider, model, cfg, { costClass: cost.costClass })) continue;
 
       discovered.push({
         provider,

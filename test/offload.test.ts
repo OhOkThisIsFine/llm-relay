@@ -17,6 +17,7 @@ import { offloadState, setOffload } from "../src/offload.js";
 import { buildCandidates } from "../src/candidates.js";
 import { CircuitBreaker } from "../src/circuit-breaker.js";
 import { makeCredentialId } from "../src/credential-id.js";
+import { recordFact, resetFacts } from "../src/target-facts.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { ModelCatalog } from "../src/catalog.js";
 import type { PingLoop } from "../src/ping/cadence.js";
@@ -952,6 +953,29 @@ describe("freeOnly offload guard", () => {
     expect(body.error.message).toContain("paidp/model-x");
     expect(paid.calls()).toBe(0); // refusal means NO request went anywhere
     expect(free.calls()).toBe(0);
+  });
+
+  it("refuses a deployment whose only slot carries a credential-scoped subscription-required fact and answers clean 503 with zero egress", async () => {
+    recordFact("subscription-required", {
+      kind: "credential",
+      provider: "freep",
+      credentialId: makeCredentialId("freep", "default"),
+    });
+    try {
+      const { paid, free, port } = await guardSetup("freeonly-credential-fact-refuse.json", {
+        offload: { claude: { enabled: true, scope: "subagents", freeOnly: true } },
+        pool: ["freep/model-y"],
+      });
+      const resp = await subagentCall(port);
+      expect(resp.status).toBe(503);
+      const body = (await resp.json()) as { error: { message: string } };
+      expect(body.error.message).toContain("freeOnly");
+      expect(body.error.message).toContain("freep/model-y");
+      expect(free.calls()).toBe(0);
+      expect(paid.calls()).toBe(0);
+    } finally {
+      resetFacts();
+    }
   });
 
   it("a per-call @relay: directive cannot outrank the owner's freeOnly flag", async () => {

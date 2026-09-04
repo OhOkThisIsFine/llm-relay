@@ -375,4 +375,121 @@ describe("dynamic free-model pools", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("excludes p/m from dynamic free pool when only slot carries credential-scoped subscription-required fact", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rp-dyn-cred-fact-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: {
+          p: { base: "https://p.test/v1", kind: "openai", tierType: "free" },
+        },
+        routing: {
+          default: "p/m",
+          pools: { freePool: { preferred: [], include: "free" } },
+        },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      await catalog.list("p", cfg.providers.p!, {
+        fetchFn: (async () => new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 })) as unknown as typeof fetch,
+      });
+      recordFact("subscription-required", {
+        kind: "credential",
+        provider: "p",
+        credentialId: makeCredentialId("p", "default"),
+      });
+      materializeDynamicPools(cfg, catalog);
+      expect(cfg.routing.pools!.freePool).not.toContain("p/m");
+    } finally {
+      resetFacts();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps p/m admitted when one of two enabled slots carries the fact", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rp-dyn-two-slots-"));
+    const prevK1 = process.env.TEST_K1;
+    const prevK2 = process.env.TEST_K2;
+    process.env.TEST_K1 = "k1";
+    process.env.TEST_K2 = "k2";
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: {
+          p: {
+            base: "https://p.test/v1",
+            kind: "openai",
+            tierType: "free",
+            credentials: [
+              { label: "default", authEnv: "TEST_K1" },
+              { label: "slot2", authEnv: "TEST_K2" },
+            ],
+          },
+        },
+        routing: {
+          default: "p/m",
+          pools: { freePool: { preferred: [], include: "free" } },
+        },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      await catalog.list("p", cfg.providers.p!, {
+        fetchFn: (async () => new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 })) as unknown as typeof fetch,
+      });
+      recordFact("subscription-required", {
+        kind: "credential",
+        provider: "p",
+        credentialId: makeCredentialId("p", "default"),
+      });
+      materializeDynamicPools(cfg, catalog);
+      expect(cfg.routing.pools!.freePool).toContain("p/m");
+    } finally {
+      resetFacts();
+      rmSync(dir, { recursive: true, force: true });
+      if (prevK1 === undefined) delete process.env.TEST_K1; else process.env.TEST_K1 = prevK1;
+      if (prevK2 === undefined) delete process.env.TEST_K2; else process.env.TEST_K2 = prevK2;
+    }
+  });
+
+  it("deployment-scoped fact excludes as before, but allowance-exhausted credential fact does not exclude", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rp-dyn-regress-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: {
+          p: { base: "https://p.test/v1", kind: "openai", tierType: "free" },
+        },
+        routing: {
+          default: "p/m-allowance",
+          pools: { freePool: { preferred: [], include: "free" } },
+        },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      await catalog.list("p", cfg.providers.p!, {
+        fetchFn: (async () => new Response(JSON.stringify({ data: [{ id: "m-dep" }, { id: "m-allowance" }] }), { status: 200 })) as unknown as typeof fetch,
+      });
+      recordFact("subscription-required", {
+        kind: "deployment",
+        provider: "p",
+        model: "m-dep",
+      });
+      recordFact("allowance-exhausted", {
+        kind: "credential",
+        provider: "p",
+        credentialId: makeCredentialId("p", "default"),
+      });
+      materializeDynamicPools(cfg, catalog);
+      expect(cfg.routing.pools!.freePool).not.toContain("p/m-dep");
+      expect(cfg.routing.pools!.freePool).toContain("p/m-allowance");
+    } finally {
+      resetFacts();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
+

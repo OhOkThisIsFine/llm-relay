@@ -10,6 +10,7 @@ import {
   factsFor as factsForV2,
   flushFacts,
   isCostBlocked as isCostBlockedV2,
+  isCostBlockedForEverySlot,
   keyOf,
   recordFact,
   resetFacts,
@@ -115,6 +116,66 @@ describe("credential-scoped v2 persistence", () => {
     expect(isCostBlockedV2("p", personal, "bound", { path })).toBe(true);
     expect(isCostBlockedV2("p", work, "bound", { path })).toBe(false);
     expect(isCostBlockedV2("p", null, "all", { path })).toBe(true);
+  });
+
+  it("evaluates cost-blocking across all enabled credential slots (isCostBlockedForEverySlot)", () => {
+    const singleSlotCfg = {
+      providers: {
+        p: { base: "https://p.test", kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 1000 },
+      },
+    };
+    recordFact("subscription-required", { kind: "credential", provider: "p", credentialId: defaultCredential("p") }, { path });
+    // Single implicit slot blocked -> every slot blocked
+    expect(isCostBlockedForEverySlot("p", "m", singleSlotCfg, { path })).toBe(true);
+
+    // Provider with 2 enabled slots: one blocked, one clear -> NOT blocked for every slot
+    const twoSlotCfg = {
+      providers: {
+        p: {
+          base: "https://p.test",
+          kind: "openai" as const,
+          authHeader: "authorization" as const,
+          timeoutMs: 1000,
+          credentials: [
+            { label: "personal", authEnv: "KEY_P", enabled: true },
+            { label: "work", authEnv: "KEY_W", enabled: true },
+          ],
+        },
+      },
+    };
+    recordFact("subscription-required", { kind: "credential", provider: "p", credentialId: personal }, { path });
+    expect(isCostBlockedForEverySlot("p", "bound", twoSlotCfg, { path })).toBe(false);
+
+    // If both slots are blocked -> blocked for every slot
+    recordFact("subscription-required", { kind: "credential", provider: "p", credentialId: work }, { path });
+    expect(isCostBlockedForEverySlot("p", "bound", twoSlotCfg, { path })).toBe(true);
+
+    // If one slot is blocked and the only other slot is disabled -> blocked for every slot
+    const oneDisabledCfg = {
+      providers: {
+        p2: {
+          base: "https://p.test",
+          kind: "openai" as const,
+          authHeader: "authorization" as const,
+          timeoutMs: 1000,
+          credentials: [
+            { label: "personal", authEnv: "KEY_P", enabled: true },
+            { label: "work", authEnv: "KEY_W", enabled: false },
+          ],
+        },
+      },
+    };
+    recordFact("subscription-required", { kind: "credential", provider: "p2", credentialId: makeCredentialId("p2", "personal") }, { path });
+    expect(isCostBlockedForEverySlot("p2", "bound", oneDisabledCfg, { path })).toBe(true);
+
+    // Demotion facts (e.g. allowance-exhausted) do not cost block
+    const allowanceCfg = {
+      providers: {
+        q: { base: "https://q.test", kind: "openai" as const, authHeader: "authorization" as const, timeoutMs: 1000 },
+      },
+    };
+    recordFact("allowance-exhausted", { kind: "credential", provider: "q", credentialId: defaultCredential("q") }, { path });
+    expect(isCostBlockedForEverySlot("q", "m", allowanceCfg, { path })).toBe(false);
   });
 
   it("clears conditions that cover the exact cell but never a context measurement", () => {

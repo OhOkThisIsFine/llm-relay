@@ -6,6 +6,8 @@ import { parseCredentialId, type CredentialId } from "./credential-id.js";
 import { WriteBehindTimer } from "./write-behind.js";
 import { COST_CLASSES, type CostClass } from "./metadata.js";
 import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
+import { implicitCredentialSlot, providerCredentialSlots } from "./credential-fleet.js";
+import type { Config } from "./config-types.js";
 
 /**
  * A learned condition or measurement about a routing target.
@@ -460,6 +462,25 @@ export function factsFor(
 
 export function isCostBlocked(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass } = {}): boolean {
   return factsFor(provider, credentialId, model, opts).some((fact) => COST_BLOCKING.has(fact.kind));
+}
+
+/**
+ * True only when EVERY enabled credential slot for this provider is cost-blocked.
+ * A deployment is admitted and passes the free-only guard when at least one enabled slot is clear.
+ */
+export function isCostBlockedForEverySlot(
+  provider: string,
+  model: string | null | undefined,
+  cfg: Pick<Config, "providers">,
+  opts: { path?: string; now?: number; costClass?: CostClass } = {},
+): boolean {
+  const providerConfig = cfg.providers[provider];
+  const slots = providerConfig
+    ? providerCredentialSlots(provider, providerConfig)
+    : [implicitCredentialSlot(provider)];
+  const enabledSlots = slots.filter((slot) => slot.enabled);
+  if (enabledSlots.length === 0) return true;
+  return enabledSlots.every((slot) => isCostBlocked(provider, slot.credentialId, model, opts));
 }
 
 export function cooldownUntil(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass } = {}): number | null {

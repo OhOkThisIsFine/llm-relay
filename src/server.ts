@@ -67,7 +67,7 @@ import { estimateRequestTokens, assessCost, type CostClass } from "./metadata.js
 import { materializeDynamicPools } from "./dynamic-pools.js";
 import { baseLog } from "./request-log.js";
 import { observedContextLimit } from "./context-limits.js";
-import { isCostBlocked } from "./target-facts.js";
+import { isCostBlockedForEverySlot } from "./target-facts.js";
 import { createQuotaDemotionFn, type QuotaDemotionFn } from "./quota-demotion.js";
 import { createLatencyDemotionFn, type LatencyDemotionFn } from "./latency-demotion.js";
 import { hedgeDelayDecision, resolveHedgeSettings, type HedgeVerdict } from "./hedge-trigger.js";
@@ -510,10 +510,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
         const assessment = t.kind === "openai" && t.model
           ? assessCost(t.model, h.catalog.cachedLimits(t.provider, t.model), cfg.providers[t.provider]?.tierType)
           : null;
-        if (assessment?.costClass === "free" && !isCostBlocked(
+        if (assessment?.costClass === "free" && !isCostBlockedForEverySlot(
           t.provider,
-          null,
           t.model,
+          cfg,
           { costClass: assessment.costClass },
         )) kept.push(t);
         else if (!blocked) {
