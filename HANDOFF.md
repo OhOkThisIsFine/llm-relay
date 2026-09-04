@@ -2,159 +2,64 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-04 (v0.70.0 published)
+## 0. State as of 2026-09-04 (v0.71.0, the audit-triage lap)
 
-**v0.70.0 is on npm**, released 2026-09-04, carrying two commits on top of the same day's earlier
-v0.69.1 release: `e73d113` "feat(setup): the relay agent pins no model; Codex relay agent (or
-documented absence)" and `cc4da1b` "feat(hedge): the hedge floor grows with the request's estimated
-input tokens". These implement two owner directions approved as lap 2 following lap 1's closeout
-earlier the same day: (1) *"The relay should also work via Codex. I don't want to hard code a model
-name."* (2) *"How about we make [the hedge delay] a multiple of the estimated or actual token count
-of the message?"*
+**v0.71.0** carries the audit-triage lap. Every finding in
+[docs/audit-findings-2026-09-03.md](docs/audit-findings-2026-09-03.md) now has a verdict in
+[docs/audit-triage-2026-09-04.md](docs/audit-triage-2026-09-04.md), and each verified defect is
+fixed with a pinning test. In one line each:
 
-Earlier on 2026-09-04, **v0.69.0 and v0.69.1** shipped the lap 1 scattershot dispatch changes (13
-commits, `e776534..eb88c02` plus follow-ups `b8a90ae`, `77e9f67`, `d9fd32a`): the `slow`
-usability band, `auto` model resolving to the first ready free pool rung, credential-scoped eviction
-facts, CLI option aliases (`-t`), DR-020 accounting-store journal deletion (1,247 lines removed),
-MCP `dispatch` answer mode with structural empty-output detection, and the initial Claude Code
-`relay` custom agent (`~/.claude/agents/relay.md`). On v0.69.0's publish run
-([33847892121](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33847892121)), the first
-attempt was CANCELLED by the job's `timeout-minutes: 15`: `npm ci` took 5 min 2 s (10 s on the
-v0.68.8 run) and the smoke test's two `npm install` calls cost about 5 min each, so ordinary npm
-registry slowness alone exhausted the budget before the job reached the publish step — no code or
-CI defect involved. `gh run rerun` on the same run published cleanly (`npm ci` still 4 min 17 s the
-second time), so CI's `npm run check` gate passed on the exact SHA. The 15-minute ceiling is
-marginal at three npm installs per run; raising it to 30 minutes is Immediate next, below.
+- **The configuration vocabulary has ONE declaration** (`config-types.ts`); `config.ts` re-exports
+  it. The two copies had already drifted (`HedgeConfig`'s lap-2 keys lived in one of them). The new
+  general guard `test/one-declaration.test.ts` — no exported name declared in two `src/` modules —
+  found two more pairs (`QuotaAxis`/`QuotaPeriod`, `AccountingSpendCoverage`) and a third copy of
+  two compat unions in `openai-request.ts`; all consolidated.
+- **The ledger no longer blames the provider for a relay-authored refusal**: a total
+  `RELAY_AUTHORED_PROVENANCE` table classifies `relay-mapper-defect` as `protocol`, matching the
+  breaker's own table.
+- **`GET /v1/models` omits an unresolved context window** instead of advertising a flat 272000,
+  states the figure's provenance in `description`, and resolves the relay-reserved `auto` id
+  through the ladder (it had borrowed `openrouter/auto`'s 2,000,000 tokens from the snapshot).
+  Codex v0.153.2 was measured tolerating the omission against a scratch relay.
+- **The data plane classifies 413 by the body reader's code**, never by its message;
+  `BODY_TOO_LARGE_CODE` moved to `stream-pipeline.ts` and the dashboard re-exports it.
+- **The hedge race settles at COMMIT** — first meaningful content — so a primary that sends
+  headers plus a metadata event and then goes silent is hedged. Mutation-checked both ways
+  (wrapper off ⇒ 4 red; probe ignored ⇒ 2 red). Per-token stays inert on the hedge path by
+  construction, stated in `CLAUDE.md` and §12 of the hedge design; the post-commit remedy is an
+  open owner decision.
+- **Dead code removed:** the DR-020 type residue (`recovered`/`recovery-loss`, `transactionId`,
+  `quarantinedPath`, the journal hooks) and the never-adopted `JsonStore` class.
+- **The analysis summary prints exit codes as exit codes**, and a `.json` report is written only
+  when it parses.
 
-The daemon (the global npm install, launched by the Startup `.vbs`) was restarted onto v0.69.0, and
-the operator's config gained `routing.hedge.floorMs: 8000`
-(`llm-relay config set routing.hedge.floorMs 8000`; revert with `llm-relay config unset
-routing.hedge`). With lap 2's token-scaled floor landed, `floorMs` is now an alias of `minFloorMs`,
-locking the floor at ≥8 s; the orchestrator will update it to `minFloorMs: 3000` at the next restart
-so the size scaling can show.
+**Owner decisions this lap (2026-09-04):** lap approved as stated; the groq TPM 429 interpretation
+accepted (`rate-limited`/`attempt`, both unit spellings); the 63 advisory eslint errors → switch
+off per file with the invariant named (scheduled outside this lap); the hedge — *"the point of the
+hedge is to handle wedged requests, or requests so slow as to be practically wedged; rule 1 seems
+important"* — → race-to-commit built, post-commit policy pending.
 
-**Lap 2 delivered:**
+**Lanes.** The 27 untriaged findings were swept by three `claude-free-pool` (`pool/medium`) jobs
+through MCP `dispatch` (7–21 minutes each); every claim adopted into a verdict was re-checked
+against source. ⚠ The first attempt through three `relay` subagents lost every job when the
+session hit its usage limit mid-run: the MCP server connection was replaced, job ids reset, and
+the agents saw "Request timed out" then "Connection closed". Direct `dispatch` with a short
+`waitMs` and polling worked afterwards.
 
-- **Model-free relay agent for Claude and Codex** (`e73d113`, Claude Sonnet lane):
-  - The Claude `relay` agent template now specifies `model: inherit` (marker
-    `# llm-relay:claude-relay-agent v4`), as official documentation states an omitted model can fall
-    through to `CLAUDE_CODE_SUBAGENT_MODEL`, making `inherit` the explicit form. Callers can still
-    pass `model` on the `agent()` or `Agent` call.
-  - Codex DOES support file-based custom agents: TOML under `~/.codex/agents/` with required
-    `name`, `description`, `developer_instructions` and optional `model` (confirmed from `codex
-    --help`, the docs page `/codex/agent-configuration/subagents`, and sibling files
-    `codebase-memory-mcp` already installs).
-  - `scripts/install-skill.mjs`, which already owned Codex's agent directory, now writes
-    `~/.codex/agents/relay.toml`: the same pass-through instructions, NO model pinned (so Codex
-    Desktop's account check never sees a `pool/*` child model — the failure recorded in the machine
-    backlog), `sandbox_mode = "read-only"`, and an `[mcp_servers.llm-relay]` block with
-    `enabled_tools` = the three dispatch tools; marker `# llm-relay:codex-relay-agent v1`,
-    prefix-upgrade rule, refuses a foreign file.
-  - ⚠ **RESIDUAL:** whether a spawned Codex subagent can reach the MCP `dispatch` tool from every
-    Codex surface is unverified — it needs a live Codex Desktop session, which only the owner can
-    drive; standalone `codex exec` exposes no MCP tools at all.
-- **The hedge floor grows with the request's estimated input tokens** (`cc4da1b`, Claude Sonnet lane):
-  - The hedge floor is no longer flat: `floorMs(request) = max(minFloorMs, msPerInputToken ×
-    estimatedInputTokens)`, where the estimate is the relay's existing chars/4 request estimate,
-    threaded from both fronts into the decision.
-  - Bases: `per-token`, `absolute`, `input-size` (the last replaces `floor`; the
-    `x-llm-relay-hedged` header names it with the token count).
-  - Config `routing.hedge`: `minFloorMs` (default 3000), `msPerInputToken` (default 0.15), `margin`,
-    `minSamples`; the legacy `floorMs` key still loads as an alias of `minFloorMs` (this machine's
-    config has `floorMs: 8000`, which now means the floor never drops below 8 s — the orchestrator
-    will replace it with `minFloorMs: 3000` at the restart so the size scaling can show).
-  - New script `scripts/calibrate-hedge-floor.mjs` fits ms per input token from
-    `~/.llm-relay/usage/recent.json`. Run 2026-09-04 on 100 successful requests (55 with ≥10,000
-    input tokens), it fitted 0.036 ms/token (p25 of latency÷inputTokens among the large-prompt
-    requests), which is below the accepted [0.05, 0.5] band, so the default stays 0.15 until a fit
-    lands in the band.
-  - **WHY a floor and not an expectation:** in the store, requests under 2,000 input tokens had a
-    median latency of 30.1 s (served by slow members) while requests of 10,000+ tokens had 10.9 s
-    (served by kilo/nemotron), so deployment identity dominates latency and an "expected time ×
-    margin" rule would hedge a slow member late. Design amendment written into
-    [`docs/hedged-attempts-design-2026-08-30.md`](docs/hedged-attempts-design-2026-08-30.md) by the lane.
+**Daemon:** the global install must be reinstalled and the daemon restarted onto v0.71.0 after
+the publish (the Startup `.vbs` launches the global install).
 
-**Root cause of the pool-walk latency the previous lap's MCP dispatch entries were chasing** — now
-closed in [`docs/backlog.md`](docs/backlog.md). `targetUsability` was returning the SAME `cooling`
-band for a LATENCY demotion as for an outright failure, and unknown-lift candidates sort last within
-that band, so the pool's only member that answered requests at all — a latency-demoted
-`nim/moonshotai/kimi-k3`, p95 385–875 ms/token, itself taking 9–38 s per one-line reply — was walked
-AFTER every 401/402/403/404/502 member instead of ahead of them. Measured before the fix
-(one-line prompts, `pool/medium`): direct HTTP 5.7 / 8.5 / 10.8 / 6.6 s with 6–9 failing members
-walked per request (one probe: `9 tried, 1 served: 1x404, 1x401, 3x402, 1x403, 2x502, 1x200`); MCP
-dispatch to the `claude-free-pool` lane through the `claude -p` harness 22 s, of which the harness's
-own overhead beyond API time measured only 0.06–0.26 s plus about 2 s of process start; AGY's
-`agy-gemini` on `gemini-3.8-flash-high` 8 s.
+Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
 
-The new `slow` band alone produced `2 tried, 1 served` walks, but the DEFAULT hedge floor then
-dominated the total: one-liners still took 21–38 s right after the restart, because the slow primary
-answered in 9–38 s and the hedge fired only at the built-in 20 s floor, with its member answering
-about a second later — every observed hedge reported basis `floor`. With
-`routing.hedge.floorMs` set to 8000, the same one-liners against the restarted v0.69.0 daemon
-completed in 17.3 s (first request after restart), 4.0 s, 10.2 s, 3.0 s; `auto` answered in 1.4 s on
-`/v1/messages` and 9.3 s on `/v1/chat/completions` (both carrying
-`x-llm-relay-auto: pool/medium (medium)`; `x-llm-relay-tier: high` gave `pool/high (high)`); MCP
-answer mode answered in 10.5 s and 13.5 s against the new server binary.
+- Owner: the post-commit remedy for a stream that stalls after first content (abort-and-retry, or
+  nothing), and whether hedging's duplicate free-tier requests need a terms review.
+- Owner: verify the Codex `relay` agent from Codex Desktop.
+- The 63 eslint errors: switch off per file with the invariant named.
+- `publish.yml` `timeout-minutes` 15 → 30.
+- Audit residue with properties: the metering silence channel (DR-006), listener-before-store
+  (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
+  pruning (DR-012), the default-ON routing keys in `docs/reference.md` (DR-024).
 
-✅ **The `relay` agent type was verified end to end in lap 1 (2026-09-04).** Agent tool
-probe — `[agent] Read C:\Code\llm-relay\package.json and reply version=<field>` — returned
-`version=0.69.0` plus `provenance: lane=claude-free-pool spec=pool/medium elapsed=6s`, 2 tool calls
-(ToolSearch, dispatch), 17 s wall. A three-call Workflow, `agent(task, {agentType: "relay", model:
-"haiku"})` against two `package.json` fields and one `vitest.config.ts` option: 3/3 correct
-answers, 3/3 provenance lines, lane elapsed 35 s / 16 s / 16 s, 60 s wall, 6 tool calls. Probing
-found two defects, both fixed in v0.69.1: (a) the v1 template's `tools:` list omitted `ToolSearch`,
-and the dispatch MCP tools are DEFERRED in Claude Code, so the wrapper could never load their
-schemas and answered every task itself with zero tool calls; (b) Claude Code loads a custom agent
-definition ONCE per session. In lap 2, `model: inherit` (template v4) supersedes the earlier
-fixed `haiku` default; the caller chooses the model, and residual small-model pure-echo behaviour is
-documented in the skill.
-
-**Suite and gates.** Suite after both merges: 148 files, 2920 passed, 5 skipped. Both lanes' diffs
-passed `llm-relay delegate-gate` except test-hygiene flags (a local `ask()` wrapper around the
-imported function; waived). One test, `test/os-keyring.test.ts` "sanitizes a thrown child error",
-fails inside a lane worktree whose node_modules is a junction and passes in the main checkout — a
-path-sensitive assertion, low, recorded as an Open item with the property "the test passes in any
-checkout location".
-
-**Lanes.** Across lap 1 and lap 2 on 2026-09-04: in lap 1, AGY on Gemini 3.8 Flash
-(`gemini-3.8-flash-high`, via MCP dispatch) did 7 of the 11 distinct code tasks (9 of the 13 code
-dispatches, counting two follow-ups), with Claude Sonnet doing the other 4 code tasks (MCP
-answer-mode lane, the two relay-template fixes, setup-claude test-guard fix) plus the refusal-queue
-research. In lap 2, Claude Sonnet executed both code lanes (`e73d113` and `cc4da1b`), and AGY on
-Gemini 3.8 Flash handled this documentation pass. Each ran in its own git worktree with a
-`node_modules` junction, 5–10 minutes each. The Anthropic monthly spend limit killed four Sonnet
-subagents at once mid-lap 1 (HTTP 429) — the AGY lanes were unaffected — and later the AGY lane hit
-its own individual quota (reset in about 1 h 46 min), prompting cross-lane handover. One
-investigation result worth keeping: the "second request" a `claude -p` harness sends per run is
-`HEAD /api/hello`, a connectivity probe, not a completion.
-
-**Owner decisions across lap 1 and lap 2 (2026-09-03/2026-09-04):** DR-020 → shrink, not replace
-(done); audit-tools items are out of scope for llm-relay laps; the refusal queue → research the 4
-highest-count items (done — item 1, the groq TPM 429, proposed as `rate-limited`/`attempt` and
-awaiting `llm-relay eligibility accept 2 --sig a568e0cbe2 --class rate-limited --scope attempt`;
-items 3, 4 and 6 got no verdict, reasons in
-[`docs/eligibility-proposals-2026-09-03.md`](docs/eligibility-proposals-2026-09-03.md)); the sweep
-must never name a model — hence `auto`; lap 2 owner directions approved Codex relay agent support
-without pinned models and token-scaled hedge delay.
-
-Immediate next — each is also a [`docs/backlog.md`](docs/backlog.md) Open entry carrying its unmet
-property:
-
-- Owner verifies the Codex `relay` agent from Codex Desktop: spawn the `relay` subagent with a task
-  such as "read C:\Code\llm-relay\package.json and reply version=<field>" and check the reply carries
-  a `provenance:` line.
-- Hedge calibration: re-run `node scripts/calibrate-hedge-floor.mjs` as traffic accumulates; the
-  default moves only when a fit lands in the band.
-- Remediate, or explicitly accept with reasons, the four `docs/audit-findings-2026-09-03.md`
-  findings verified against source this lap: DR-001 (`config-types.ts` duplicates `config.ts`,
-  including the runtime `EFFORT_LEVELS` array), DR-002 (the hedge ladder's adaptive rung, above),
-  contract-review DR-003 (the ledger blames the provider for relay-authored refusals), contract-review
-  DR-004 (`GET /v1/models` invents a 272000-token context window).
-- Raise `publish.yml`'s `timeout-minutes: 15` to 30 — three npm installs at 4–5 minutes each leave
-  almost no margin, and the first v0.69.0 attempt already burned it.
-- Clean up the DR-020 residue in `accounting-store.ts`'s public types: `SnapshotMutationResult`
-  still declares the dead `"recovered"`/`"recovery-loss"` members, and `ioHooks` is a seam with
-  nothing left to inject.
 
 ## 0.1 Earlier releases
 
@@ -162,6 +67,12 @@ Deliberately NOT restated here. This file holds current state plus the immediate
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
 tags are the trail. What survived each sprint lives in its own home:
 
+- **v0.69.0–v0.70.0, the dispatch fast-path and token-scaled-hedge laps (2026-09-04)** — the
+  `slow` usability band, the `auto` model, MCP `dispatch` answer mode, the `relay` agent for Claude
+  and Codex with no pinned model, the input-size-scaled hedge floor, and the DR-020 shrink of the
+  accounting writer:
+  [docs/dispatch-fast-path-lap-2026-09-04.md](docs/dispatch-fast-path-lap-2026-09-04.md),
+  [docs/token-scaled-hedge-lap-2026-09-04.md](docs/token-scaled-hedge-lap-2026-09-04.md).
 - **v0.68.7–v0.68.8, the `server.ts` decomposition audit** — a handed-over refactor arrived green
   with four defects the suite could not see (a lost second `tsc` pass, a downgraded HTTP status, a
   validator field `AssistantMessage` never declared, a broken multi-line SSE parse) plus three

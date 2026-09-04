@@ -9,6 +9,60 @@
 
 ## Open
 
+- **Muse Spark 1.3 — and every Responses-only OpenCode Zen SKU — is unreachable through the
+  relay, because no upstream speaks the OpenAI Responses API.** Zen serves
+  `muse-spark-1.3-contributor-free` and `muse-spark-1.2-contributor-free` on `/zen/v1/responses`
+  only; `/chat/completions` and `/messages` answer HTTP 500 for them (measured 2026-09-04, with and
+  without a key, at budgets 64–1024, while a sibling free SKU answers 200 on chat). `Kind` is
+  `"anthropic" | "openai"` (`src/config-types.ts:7`) and the upstream paths are `/chat/completions`
+  and `/v1/messages` (`src/backend.ts:799`, `:1586`, `:1723`); `src/responses-request.ts` is the
+  Codex FRONT direction. Owner decision on the *contributor* data-use terms comes first
+  ([`muse-spark-1.3-opencode-zen-2026-09-04.md`](muse-spark-1.3-opencode-zen-2026-09-04.md) §5).
+  **Property:** a provider whose models are served only on `/v1/responses` is addressable as
+  `provider/model` on both fronts with tools, streaming and usage (`reasoning_tokens`,
+  `cached_tokens`) intact. Prefer a `wire: "responses"` option on `kind: "openai"` over a third
+  `Kind` — the latter touches about 55 `kind ===` sites in 19 files. Rows 10–13 of the doc are the
+  request, response and stream shapes to speak; the doc's §3 route B lists the field mapping.
+
+- **`include: "free"` pools carry paid and unknown-cost deployments, and on this machine no guard
+  stops a walk from reaching them.** Deliberate since the admission reversal
+  (`test/dynamic-pools.test.ts`: "Reversed deliberately… the `freeOnly` guard (default ON for
+  offload) is what keeps a pool free-only"), but the live config has `freeOnly: false` on all three
+  offload rules, so `pool/medium` today lists `openrouter/anthropic/claude-opus-5`,
+  `kilo/anthropic/claude-fable-5` and 27 unknown-cost `opencode/*` paid SKUs behind the free
+  members (Zen's `/models` carries no prices). Nothing is spent today only because every paid
+  credential is dry (OpenRouter 402 at 0 % credit, Kilo 402, Zen `401 no payment method`); a
+  topped-up balance is spent by the first walk whose free members all fail. Side effect: each Zen
+  401 re-confirms the accepted `subscription-required` fact (scope `credential`,
+  `costClasses: ["paid","unknown"]`) for 24 h, it lapses, and the 27 members return —
+  `runtime-telemetry.json` counts 45 failed calls across five of them — and on 2026-09-04 the fact
+  vanished (837 min early) right after a success on a FREE Zen deployment the fact never covered.
+  The `dynamic-pools.ts` row of `CLAUDE.md` described the pre-reversal rule until 2026-09-04.
+  **Property (owner decision first):** either `freeOnly` is on for every rule that carries
+  unattended traffic, or the pools' "free" contract is restated where operators read it; and a
+  cost-class-filtered fact is retracted only by evidence inside its own cost classes.
+
+- **A zero-priced deployment with no exact tier-data row can never enter any effort pool, and a
+  `-free` / `-contributor-free` suffix defeats the match against its base SKU's row.**
+  `strengthAllowedForEffort` (`src/benchmarks.ts:164`) requires `basis: "snapshot"`,
+  `match: "exact"` and ≥3 published signals; `muse-spark-1.2-contributor-free` finds nothing although
+  `muse-spark-1.2` has a row, and every Zen `-free` SKU (`nemotron-3.5-lightning-free`,
+  `mimo-v2.5-free`, `nemotron-3-ultra-free`, `ling-3.0-flash-fin-free`, `big-pickle`) is absent
+  from all four pools while the paid Zen SKUs above are members. "A model clearing NO band is
+  admitted nowhere" is a stated rule (CLAUDE.md), so this is a cost, not a defect — but the cost now
+  falls on exactly the free capacity the pools exist to spend. **Property:** a free-class,
+  tool-capable deployment that no benchmark source has scored yet has some deliberate route into a
+  pool short of `preferred` — e.g. treating `-free`/`-contributor-free` as a PRICE suffix that
+  resolves to the base SKU's row (same weights, different price; unlike an effort suffix, which
+  `normName()` rightly never strips), or a bounded probation band — and the choice is recorded.
+
+- **`llm-relay keys` cannot verify a mixed provider whose completion probe model is paid.**
+  `opencode#default` reports `UNVERIFIED — /models is public and the probe model answers HTTP 401
+  with or without the key`; one completion on `opencode/nemotron-3.5-lightning-free` through the
+  relay answered 200 in 2.3 s and verified the key (2026-09-04). **Property:** the escalation probe
+  picks a free-class model of the provider when the catalog has one (`assessCost` over
+  `cachedModels`), so a valid key on a billing-gated account reports `valid`, not `unverified`.
+
 - **Decide what to do with the 63 advisory errors the eslint revert surfaced.** The
   `server.ts` decomposition had switched off 15 rules; the owner reverted that on 2026-09-01
   (`cde5d1c`). ⚠ The CODE producing the findings is **pre-existing**: curated parser regexes in
@@ -28,6 +82,10 @@
   by disabling each with its invariant named, or by fixing the findings. Evidence:
   [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md).
 
+  **Owner decision 2026-09-04 (audit-triage lap):** switch each rule off per file, with the
+  invariant named beside it in `eslint.config.mjs`, and do not rewrite the intentional code. The
+  work is scheduled outside that lap.
+
 - **Raise `publish.yml`'s `timeout-minutes: 15` — the v0.69.0 publish exhausted it on the first
   attempt.** `npm ci` took 5 min 2 s against a 10 s baseline on the v0.68.8 run, and the smoke
   test's two `npm install` calls cost about 5 min each; ordinary npm-registry slowness, with no
@@ -38,47 +96,6 @@
 
   **Property:** a publish run has enough timeout headroom to absorb ordinary npm-registry slowness
   without a human having to notice the cancellation and manually re-run it.
-
-- **Remediate, or explicitly accept with reasons, the four `docs/audit-findings-2026-09-03.md`
-  findings verified against source this lap but left unfixed.** All four were checked directly by
-  the lap orchestrator, distinct from the file's own 35-of-41-present bookkeeping note
-  (`5c6c60f`):
-  - **DR-001** (merged conceptual) — `src/config-types.ts` duplicates 31 exported names from
-    `src/config.ts`, including the RUNTIME array `EFFORT_LEVELS`, declared twice and imported by
-    different consumers (`cli.ts` from `config.ts`, `dynamic-pools.ts` from `config-types.ts`).
-    Adding a config key to one copy compiles clean and silently does nothing in every module bound
-    to the other — the closed-vocabulary defect class `CLAUDE.md` already tracks, at module scope
-    instead of union-member scope.
-  - **DR-002** (merged conceptual) — the hedge ladder's documented "per-token → absolute → floor"
-    order only ever runs the floor rung in production, because the one production call site passes
-    a literal `0` for `tokensSeen` and the per-token rung is gated on `tokensSeen > 0`. This lap's
-    own measurement (the hedge-calibration entry, above) reproduces the symptom the audit predicted
-    from source alone.
-  - **DR-003** (contract review) — `accountingFailureForAttempt` falls through to `provider_error`
-    for a relay-authored refusal (e.g. a dialect-rescue destructive refusal, `errorOrigin: "local"`),
-    so the ledger blames the provider for a decision the breaker correctly declines to charge
-    against it. No test references the function or the failure-kind type it classifies.
-  - **DR-004** (contract review) — `GET /v1/models` seeds every advertised entry's
-    `context_window`/`max_context_window` with a hardcoded `272000` (`CODEX_DEFAULT_CONTEXT_WINDOW`)
-    whenever the real resolvers return nothing, contradicting the provenance rule that an unknown
-    limit stays unknown and overshooting this repo's own measured pool minimums (131,072–163,840)
-    by roughly 1.7–2.1x.
-
-  **Property:** each finding is either fixed, or explicitly accepted with a named reason the way
-  [`advisory-findings-verification-2026-08-28.md`](advisory-findings-verification-2026-08-28.md)'s
-  Class B deferrals are — not merely present in an audit file nobody has acted on.
-
-- **Clean up the DR-020 residue in the accounting store's public types.**
-  `SnapshotMutationResult` still declares the `"recovered"`/`"recovery-loss"` members of a recovery
-  mechanism `751fb52` deleted, and `ioHooks` remains a seam with nothing left to inject behind it.
-  Neither is wrong today — a member of a closed union no code path returns is inert, not
-  incorrect — but it is exactly the "type wider than its producers" shape `CLAUDE.md`'s
-  closed-vocabulary gotcha distinguishes from the dangerous silent-fallback case, and it will read
-  as live behaviour to the next person who greps for it without reading the DR-020 history.
-
-  **Property:** `SnapshotMutationResult` and the accounting store's exported seams name only
-  mechanisms that exist after DR-020, so a reader does not have to check git history to learn which
-  members are real.
 
 - **Verify the Codex `relay` agent end to end in Codex Desktop** (owner-driven, 2026-09-04, lap 2).
   Commit `e73d113` added `~/.codex/agents/relay.toml` via `scripts/install-skill.mjs` (marker
@@ -97,7 +114,96 @@
 
   **Property:** the test passes in any checkout location, including worktrees with junctioned `node_modules`.
 
+- **Decide the post-commit remedy for a stream that stalls or crawls after first content**
+  (owner decision, 2026-09-04, from the audit-triage lap's hedge work). The hedge race now settles
+  at first content, so a primary that returns headers plus a metadata event and then nothing is
+  hedged. A stream that COMMITS and then stalls or crawls cannot be hedged: the client already
+  holds its bytes. The per-token rule (`hedge-trigger.ts` rule 1) has evidence only there, and its
+  only honest remedy is an ABORT that hands the failure to the client to retry — which turns a
+  slow-but-correct answer into a failed turn for a harness that does not retry a mid-stream error.
+  Options: (A) build the abort on a measured per-token stall threshold, after measuring what
+  Claude Code and Codex do on a mid-stream error; (B) leave in-flight streams alone and rely on
+  latency demotion plus the `slow` band for the NEXT request (today's behaviour).
+
+  **Property:** the owner has chosen A or B and the choice is recorded beside §12 of
+  [`hedged-attempts-design-2026-08-30.md`](hedged-attempts-design-2026-08-30.md); under A, a stream
+  crawling below the measured per-token floor is aborted with an announced reason and the
+  client's retry reaches another candidate.
+
+- **Owner question: does hedging need a terms review?** (audit DR-003, 2026-09-04). Hedging
+  duplicates requests against third-party FREE tiers by design (D1 confines it there), and the only
+  terms review on record ([`codex-review-2026-08-05.md`](codex-review-2026-08-05.md)) predates it
+  and covers Anthropic.
+
+  **Property:** the owner has answered whether duplicate free-tier requests are acceptable under
+  the terms of the providers this relay fronts, and the answer is recorded beside D1 in the hedge
+  design doc.
+
+- **Give the metering subsystem a channel to say it stopped metering** (audit DR-006, verified
+  2026-09-04). `writerStatus` and `lastWrite` on the accounting store have zero consumers outside
+  the store; the store keeps accepting events after a refused writer lease, and a null
+  `snapshots()` silently stops persistence while the relay keeps serving.
+
+  **Property:** `llm-relay cost` and `/telemetry` state when the store's last flush failed or the
+  writer lease was refused, so "no spend since noon" cannot be mistaken for "no traffic since
+  noon".
+
+- **Bind the listener before opening the writable accounting store, and handle the listener's
+  `error` event** (audit DR-009, verified 2026-09-04). `cli.ts` constructs the store before
+  `server.listen`, and `server.ts` registers no `error` handler, so a second relay process opens
+  the same directory with an in-process writer lease and then dies on `EADDRINUSE` with an
+  uncaught exception.
+
+  **Property:** a second `llm-relay` start against a bound port exits with a clear message and
+  touches no file under `usage/`.
+
+- **Make credential containment on the forward path an allow-list** (contract review DR-006,
+  verified 2026-09-04). `buildForwardHeaders` strips exactly `authorization` and `x-api-key` when
+  a target is contained; any other credential-bearing inbound header (`cookie`, `x-goog-api-key`,
+  `api-key`) is forwarded verbatim to a third-party anthropic-kind base. `log.ts` already uses the
+  allow-list shape for the same reason.
+
+  **Property:** a contained anthropic-kind target receives only headers from a declared
+  allow-list, and a test sends a `cookie` and asserts it does not egress.
+
+- **Prune `candidate-runner.ts` exports nothing consumes** (audit DR-012 / contract review
+  DR-007; 90 exports at HEAD, roughly a third with no consumer in `src/` or `test/`). The
+  decomposition published `server.ts` internals as public API; the test-only seams
+  `orderByUsability` and `classifyStatus` are recorded, the rest are not. Related, low:
+  `SPEND_CELL_KEYS` (`accounting-store-schema.ts`) and `SHARE_CELL_KEYS` (`dashboard-contract.ts`)
+  are two lists of one four-name set, and the schema module already imports the contract.
+
+  **Property:** every export of `candidate-runner.ts` has a consumer in `src/` or a test that names
+  it as a seam, and the four spend-cell names have one list.
+
+- **State the default-ON routing terms in the user docs** (audit DR-024 residual, 2026-09-04).
+  `routing.hedge`, `routing.latency` and `routing.laneProbe` default ON by owner decision;
+  `docs/reference.md` should list each with its default and the one-line revert.
+
+  **Property:** each default-ON routing key appears in `docs/reference.md` with its default and
+  its `false` form.
+
 ## Closed
+
+- ✅ **Remediate, or explicitly accept with reasons, the four verified audit findings**
+  (2026-09-04, audit-triage lap). DR-001 FIXED: the configuration vocabulary has one declaration in
+  `config-types.ts`, `config.ts` re-exports it, the drifted `HedgeConfig` keys are folded in, and
+  `test/config-vocabulary.test.ts` plus the general `test/one-declaration.test.ts` pin it (the
+  general guard found and closed two more pairs, `QuotaAxis`/`QuotaPeriod` and
+  `AccountingSpendCoverage`, and a third copy of two compat unions in `openai-request.ts`).
+  DR-002 BUILT as race-to-commit (`withCommitProbe`/`attemptWon`, both fronts, mutation-checked
+  both ways) after the owner said the hedge exists for wedged requests; per-token is documented
+  as inert on the hedge path by construction, and the post-commit remedy is the owner decision
+  above. Contract DR-003 FIXED: `RELAY_AUTHORED_PROVENANCE` total table,
+  `test/accounting-failure-kind.test.ts`. Contract DR-004 FIXED: `GET /v1/models` omits an
+  unresolved context window and resolves `auto` through the ladder; Codex v0.153.2 measured
+  tolerating the omission. Verdicts for all 35 findings:
+  [`audit-triage-2026-09-04.md`](audit-triage-2026-09-04.md).
+
+- ✅ **Clean up the DR-020 residue in the accounting store's public types** (2026-09-04,
+  audit-triage lap). `SnapshotMutationResult` lost `recovered`/`recovery-loss`, `transactionId`
+  and `quarantinedPath`; `SnapshotJournalHooks` became `AccountingReadHooks` with `beforeRead`
+  only. The unused `JsonStore` class went with it (audit DR-011).
 
 - ✅ **Calibrate `routing.hedge`'s floor from data, and token-scale the floor delay** (2026-09-04,
   lap 2, `cc4da1b`). Commit `cc4da1b` resolved the flat floor: the hedge floor now scales with the
@@ -198,7 +304,6 @@
   ⚠ Do NOT judge any of this by the suite. Every defect this audit found passed 2,860 tests.
   Evidence: [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md)
   §"Round three".
-
 
 - ✅ **Give the 4,096-mutation accounting cap test a contention-aware timeout.** The full suite
   timed out `test/accounting-store.test.ts` at Vitest's 5-second default while 2,845 other server
@@ -307,7 +412,6 @@
   cancelled attempt reaches neither `probe-cache.json` nor the `routing.latency`/`hedge-trigger`
   terms. That is correct rather than unfinished: a cancellation carries no token count, and a
   request sample with no token count already reaches NEITHER latency statistic by design.
-
 
 - ✅ **Hedged attempts — SHIPPED and wired on both fronts** (owner proposal 2026-08-30; the four
   decisions are in [hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md) §7).
@@ -638,7 +742,6 @@
   rebuild, and 58351 + 10622 = 68973. Ceilings were re-ratcheted keeping variant C's ~0.5%
   headroom. This is the lap's own work, so the ratchet moved ONCE.
 
-
 - ✅ **`check:package` now names the build instead of throwing a raw ENOENT** (2026-08-30).
   `scripts/dashboard-package-check.mjs` reads two BUILD OUTPUTS through `readBuiltJson`, which
   reports *"… is missing. It is a BUILD OUTPUT, and `npm run check` does not build. Run
@@ -656,3 +759,4 @@
 [quota-reprobe-design-2026-08-29.md](quota-reprobe-design-2026-08-29.md). The eligibility-and-probe
 lap shipped 2026-08-30 as v0.60.0:
 [eligibility-and-probe-lap-2026-08-30.md](eligibility-and-probe-lap-2026-08-30.md).)
+
