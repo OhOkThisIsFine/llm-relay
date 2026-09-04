@@ -2,9 +2,10 @@
 
 ⚠ Nearly every `.mjs` here reads the compiled `dist/` — **rebuild (`npm run build`) before running
 one** or you'll test stale code. (The root CLAUDE.md repeats this warning because it applies even
-when this file isn't loaded.) The three that do NOT touch `dist/` are `analysis-run.mjs`,
-`sync-tiers.mjs` and `tier-scoring.mjs`; they read the source tree, the package tree, or the
-network. Rebuilding first is still never wrong.
+when this file isn't loaded.) The four that do NOT touch `dist/` are `analysis-run.mjs`,
+`calibrate-hedge-floor.mjs`, `sync-tiers.mjs` and `tier-scoring.mjs`; they read the source tree, the
+package tree, this machine's own local accounting history, or the network. Rebuilding first is
+still never wrong.
 
 ⚠ **`install-skill.mjs` JOINED the dist-reading set on 2026-08-30 (v0.62.0), and that is a change
 of kind worth knowing.** It now `await import`s `../dist/installed-hosts.js` to decide whether Codex
@@ -44,6 +45,19 @@ red without anyone invoking a script by hand:
   adding a step here.
 
 Offline / unit-test-safe (no external creds):
+- `calibrate-hedge-floor.mjs` (`node scripts/calibrate-hedge-floor.mjs [--path <recent.json>]`) —
+  fits `routing.hedge.msPerInputToken` (owner direction 2026-09-04: the hedge floor grows with a
+  request's own estimated input size — see `src/hedge-trigger.ts`) from THIS machine's own
+  `~/.llm-relay/usage/recent.json` (or `XDG_CACHE_HOME`'s copy, or `--path`) — never `dist/`, never
+  the network. Method: the p25 (lower quartile) of `latencyMs / inputTokens` ratios among successful
+  SERVE attempts carrying >= 10,000 input tokens, across every deployment in the window, chosen over
+  an OLS-through-origin slope on "the fast deployments" because a typical window here cannot support
+  that classification robustly (a handful of deployments, several with 1-2 samples). ⚠ Applies the
+  SAME guardrail `hedge-trigger.ts` documents: a fit outside [0.05, 0.5] ms/token is REJECTED in
+  favour of the built-in 0.15 default, exactly the fail-safe direction as an unmeasured latency or
+  an unpublished context ceiling elsewhere in this relay — run 2026-09-04 against this machine's
+  window (100 samples, 55 >= 10,000 tokens), the fit came back 0.036 ms/token and was rejected. Exits
+  1 with no accounting history to fit against, rather than inventing a number.
 - `live-demo.mjs` — runs the compiled CLI against a local flaky backend + stub reshaper. Good smoke test.
 - `install-skill.mjs` — npm `postinstall` hook: copies the `skills/llm-relay/` bundle to THREE host
   directories — `~/.claude/skills/llm-relay/`, `~/.codex/skills/llm-relay/` and

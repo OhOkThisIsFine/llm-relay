@@ -168,6 +168,27 @@ describe("hedged attempts — end to end on both fronts", () => {
     });
   }
 
+  /**
+   * Like `post`, but with a `content` long enough to control the request's ESTIMATED input token
+   * count exactly — `estimateRequestTokens` is chars/4 over `"role":"user"` (4 chars) plus the
+   * content, so `contentChars` is chosen by the caller such that `(4 + contentChars) / 4` lands on
+   * a whole number: the owner direction 2026-09-04 test below wants an exact 1,000-token estimate,
+   * so it passes 3,996.
+   */
+  async function postSized(p: number, kind: "anthropic" | "openai", contentChars: number): Promise<Response> {
+    const path = kind === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
+    const content = "x".repeat(contentChars);
+    const body =
+      kind === "anthropic"
+        ? { model: "pool/coding", max_tokens: 20, messages: [{ role: "user", content }] }
+        : { model: "pool/coding", messages: [{ role: "user", content }] };
+    return fetch(`http://127.0.0.1:${p}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
   async function twoBackends(
     first: { delayMs?: number; status?: number },
     second: { delayMs?: number; status?: number } = {},
@@ -197,7 +218,11 @@ describe("hedged attempts — end to end on both fronts", () => {
       // label written by an ordinary failover.
       expect(a.calls()).toBe(1);
       expect(b.calls()).toBe(1);
-      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 120ms, floor)");
+      // `"hi"` estimates to 2 input tokens (`estimateRequestTokens`); at the default
+      // `msPerInputToken` that contributes ~0.3 ms, so the 120 ms `floorMs` override still decides
+      // the DELAY — but the BASIS is now `input-size` (the flat-floor fallback's new name), and it
+      // carries the token count that decided it, per owner direction 2026-09-04.
+      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 120ms, input-size 2 tokens)");
     },
   );
 
@@ -262,7 +287,7 @@ describe("hedged attempts — end to end on both fronts", () => {
       // DIFFERENT mechanism reaching the same header.
       expect(a.calls()).toBe(1);
       expect(b.calls()).toBe(1);
-      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 120ms, floor)");
+      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 120ms, input-size 2 tokens)");
     },
   );
 
@@ -280,7 +305,7 @@ describe("hedged attempts — end to end on both fronts", () => {
       await res.text();
       expect(res.headers.get(SERVED_BY_HEADER)).toBe("p1/m1");
       expect(b.calls()).toBe(1);
-      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (primary won after 120ms, floor)");
+      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (primary won after 120ms, input-size 2 tokens)");
     },
   );
 
@@ -299,6 +324,31 @@ describe("hedged attempts — end to end on both fronts", () => {
       expect(res.headers.get(SERVED_BY_HEADER)).toBe("p1/m1");
       expect(res.headers.get(HEDGED_HEADER)).toBeNull();
       expect(a.calls()).toBe(1);
+    },
+  );
+
+  it.each(["anthropic", "openai"] as const)(
+    "the floor grows with the request's own estimated input size, not just the flat minimum (%s front)",
+    async (kind) => {
+      // owner direction 2026-09-04. `msPerInputToken: 1` makes the size term dominate a tiny
+      // `minFloorMs` override, so a ~1,000-token request is hedged at ~1,000 ms — proving the real
+      // per-request estimate (`estimateRequestTokens`, computed once in `handle()` for the context
+      // guardrail) actually reaches the hedge decision and its announced header, not just a unit
+      // test's direct call into `hedge-trigger.ts`.
+      const { a, b } = await twoBackends({ delayMs: 1_600 }, { delayMs: 0 });
+      const p = portOf(
+        await startProxy(poolCfg(basesOf(a, b), { hedge: { minFloorMs: 50, msPerInputToken: 1 } })),
+      );
+
+      const res = await postSized(p, kind, 3_996); // estimates to exactly 1,000 input tokens
+      expect(res.status).toBe(200);
+      await res.text();
+      expect(res.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+      expect(a.calls()).toBe(1);
+      expect(b.calls()).toBe(1);
+      // floor = max(50, 1 ms/token x 1,000 tokens) = 1,000 ms — the size term, not the 50 ms flat
+      // minimum, decided the delay, and the header states the estimate that set it.
+      expect(res.headers.get(HEDGED_HEADER)).toBe("p1/m1 -> p2/m2 (hedge won after 1000ms, input-size 1000 tokens)");
     },
   );
 });

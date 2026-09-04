@@ -765,28 +765,51 @@ would have cut 22.5% of real successes. A hedge does not choose.
 
 ```json
 "routing": {
-  "hedge": { "enabled": true, "floorMs": 20000, "margin": 2, "minSamples": 5 }
+  "hedge": { "enabled": true, "minFloorMs": 3000, "msPerInputToken": 0.15, "margin": 2, "minSamples": 5 }
 }
 ```
 
 `"hedge": false` is shorthand for `{ "enabled": false }` and restores the previous behaviour
-exactly. An unknown key is a hard config error rather than a silently ignored one.
+exactly. An unknown key is a hard config error rather than a silently ignored one. `floorMs` is
+still accepted as a LEGACY ALIAS of `minFloorMs` — a config written before 2026-09-04
+(`{"floorMs": 8000}`) keeps loading and keeps meaning exactly what it always meant: the floor never
+drops below 8000 ms.
+
+**The floor GROWS with the request's own estimated input size** (owner direction 2026-09-04):
+
+```
+floorMs = max(minFloorMs, msPerInputToken × estimatedInputTokens)
+```
+
+`estimatedInputTokens` is the relay's own chars/4 estimate of the PROMPT (the same figure the
+context-window guardrail already computes), not anything about the answer. Without this, a large
+prompt was hedged against the time it simply takes a healthy deployment to read it, and a small one
+needed the flat minimum alone to avoid duplicating on ordinary noise — `minFloorMs` still does that
+job, unchanged.
 
 Every hedge is announced — whether it won or lost, because the duplication happened either way:
 
 ```
-x-llm-relay-hedged: nim/deepseek-ai/deepseek-v4-flash -> nim/nvidia/nemotron-3-ultra-550b-a55b (hedge won after 20000ms, floor)
+x-llm-relay-hedged: nim/deepseek-ai/deepseek-v4-flash -> nim/nvidia/nemotron-3-ultra-550b-a55b (hedge won after 3210ms, input-size 1180 tokens)
 ```
 
 The last field is the rung of evidence that set the delay: `per-token` from real request samples,
-`absolute` from probe samples, or `floor` when this deployment is unmeasured. ⚠ Unlike
-`routing.latency`, an **unmeasured deployment IS hedged**. The two rules point opposite ways on
-purpose: a demotion punishes, so with no evidence it must do nothing, while a hedge only starts an
-attempt the walk was already going to make.
+`absolute` from probe samples, or `input-size` when this deployment is unmeasured — carrying the
+estimated input-token count that decided the floor. A `per-token`/`absolute` verdict never carries a
+token count: the DEPLOYMENT's own evidence set that bar, not the request's size, even on the (rarer)
+occasions where the size-scaled floor would have set a larger number — only the rung reporting no
+evidence at all changes its name. ⚠ Unlike `routing.latency`, an **unmeasured deployment IS
+hedged**. The two rules point opposite ways on purpose: a demotion punishes, so with no evidence it
+must do nothing, while a hedge only starts an attempt the walk was already going to make.
 
-⚠ The three tunables are **placeholders awaiting calibration**, unlike `routing.latency`'s
-measured 250 ms/token. The population they need — how long an attempt runs before its first token —
-is not recorded yet. Watch the header's basis field on your own traffic before tuning them.
+⚠ `margin` and `minSamples` are still **placeholders awaiting calibration**, unlike
+`routing.latency`'s measured 250 ms/token. The population they need — how long an attempt runs
+before its first token — is not recorded yet. `msPerInputToken` is different: it IS calibrated
+(`scripts/calibrate-hedge-floor.mjs`, run against this machine's own accounting history), and its
+built-in default is 0.15 ms/token — the value that script fell back to on 2026-09-04 when its own
+fit came back too low to trust (0.036 ms/token, from a window with too little large-prompt traffic
+on enough distinct deployments to fit robustly). Re-run the script as traffic accumulates, and watch
+the header's basis field on your own traffic before tuning `margin`/`minSamples`.
 
 ⚠ An aborted loser teaches the circuit breaker nothing, so a hedged request does not record the
 slowness it routed around. Requests that do **not** hedge still cool a slow deployment for as long

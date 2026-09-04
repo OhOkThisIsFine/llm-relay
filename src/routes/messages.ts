@@ -111,6 +111,13 @@ export interface MessagesContext {
   accounting: RequestAccountingState | null;
   cfg: Config;
   /**
+   * The relay's own chars/4 estimate of this request's INPUT size (`estimateRequestTokens` in
+   * `metadata.ts`), captured once in `handle()` alongside `routingNow` — the same value the context
+   * guardrail already computed, threaded rather than re-estimated so a hedge decision and the
+   * guardrail can never disagree about how big this request is.
+   */
+  estimatedInputTokens: number;
+  /**
    * The ONE routing instant, captured in `handle` after route-level pruning.
    *
    * ⚠ It is threaded in rather than re-read here, and that is load-bearing. The same instant drives
@@ -738,6 +745,7 @@ export async function anthropicMessagesPath(
             walk: credentialWalk,
             credentialTrace,
             attemptTrace,
+            estimatedInputTokens: ctx.estimatedInputTokens,
             tracker: pool429,
             startRun: (offer) => {
               const hedgeRun = beginAttemptRun(res, offer);

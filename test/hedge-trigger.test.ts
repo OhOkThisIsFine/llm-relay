@@ -1,23 +1,29 @@
 /**
  * The hedge trigger's decision layer.
  *
- * ⚠ This module has NO `src/` caller yet, by design — the walk integration is stage 2. So these
- * tests are the only thing holding its behaviour, and the interesting assertions are the ones
- * about NOT hedging: hedging duplicates a request onto free quota, so every bound that keeps the
- * duplicate rate down is a case where it must do nothing.
+ * ⚠ `shouldHedge` has NO `src/` caller yet, by design — the walk reads `hedgeDelayDecision`
+ * instead, because a race is decided before any output token exists (see that function's own doc
+ * comment). So these tests are the only thing holding `shouldHedge`'s behaviour, and the
+ * interesting assertions are the ones about NOT hedging: hedging duplicates a request onto free
+ * quota, so every bound that keeps the duplicate rate down is a case where it must do nothing.
  *
- * The two rules most worth reading before changing anything here:
+ * The rules most worth reading before changing anything here:
  *  - probe samples must never reach the per-token statistic, and request samples must never reach
  *    the absolute one (the v0.65.2 defect, in both directions);
  *  - an UNMEASURED deployment IS hedged, which is the opposite of `latency-demotion.ts`, and the
- *    asymmetry is deliberate — see the module comment.
+ *    asymmetry is deliberate — see the module comment;
+ *  - the floor GROWS with the request's own estimated input size (owner direction 2026-09-04): it
+ *    is no longer a flat number, and every rung — not only the size-only fallback — is floored by
+ *    the SAME size-scaled value, though only the fallback rung reports `basis: "input-size"`.
  */
 import { describe, it, expect } from "vitest";
 import type { PingRecord } from "../src/ping/metrics.js";
 import {
-  DEFAULT_HEDGE_FLOOR_MS,
   DEFAULT_HEDGE_MARGIN,
+  DEFAULT_HEDGE_MIN_FLOOR_MS,
   DEFAULT_HEDGE_MIN_SAMPLES,
+  DEFAULT_HEDGE_MS_PER_INPUT_TOKEN,
+  hedgeDelayDecision,
   hedgeLabel,
   resolveHedgeSettings,
   shouldHedge,
@@ -42,9 +48,27 @@ function requests(n: number, ms: number, tokens: number): PingRecord[] {
   }));
 }
 
-function ask(o: Partial<{ elapsedMs: number; tokensSeen: number; pings: PingRecord[]; isFree: boolean }>, s = S) {
+function ask(
+  o: Partial<{
+    elapsedMs: number;
+    tokensSeen: number;
+    pings: PingRecord[];
+    isFree: boolean;
+    estimatedInputTokens: number;
+  }>,
+  s = S,
+) {
   return shouldHedge(
-    { elapsedMs: o.elapsedMs ?? 0, tokensSeen: o.tokensSeen ?? 0, pings: o.pings ?? [], isFree: o.isFree ?? true },
+    {
+      elapsedMs: o.elapsedMs ?? 0,
+      tokensSeen: o.tokensSeen ?? 0,
+      pings: o.pings ?? [],
+      isFree: o.isFree ?? true,
+      // Most cases below are not about request size, so this defaults to 0 — which, at the
+      // default `msPerInputToken`, contributes nothing and leaves `minFloorMs` as the whole floor,
+      // the same shape the flat pre-2026-09-04 floor had.
+      estimatedInputTokens: o.estimatedInputTokens ?? 0,
+    },
     s,
   );
 }
@@ -62,8 +86,8 @@ describe("hedge trigger — the containment, which matters more than the firing"
 
   it("NEVER hedges below the floor, however little is known about the deployment", () => {
     // Without a floor a fast pool would duplicate nearly every request.
-    expect(ask({ elapsedMs: DEFAULT_HEDGE_FLOOR_MS })).toBeNull();
-    expect(ask({ elapsedMs: DEFAULT_HEDGE_FLOOR_MS - 1 })).toBeNull();
+    expect(ask({ elapsedMs: DEFAULT_HEDGE_MIN_FLOOR_MS })).toBeNull();
+    expect(ask({ elapsedMs: DEFAULT_HEDGE_MIN_FLOOR_MS - 1 })).toBeNull();
   });
 
   it("NEVER hedges on a nonsense elapsed time", () => {
@@ -79,7 +103,7 @@ describe("hedge trigger — per-token, the owner's rule", () => {
     // the margin to 200 s — so 150 s of elapsed time is NOT slow for an answer that long.
     const pings = requests(8, 5_000, 100); // 50 ms/token
     expect(ask({ elapsedMs: 150_000, tokensSeen: 2_000, pings })).toBeNull();
-    // The same deployment producing only 10 tokens in 150 s IS slow: expected 500 ms, floor 20 s.
+    // The same deployment producing only 10 tokens in 150 s IS slow: expected 500 ms, floor 3 s.
     const d = ask({ elapsedMs: 150_000, tokensSeen: 10, pings });
     expect(d?.basis).toBe("per-token");
     expect(d?.tokensSeen).toBe(10);
@@ -94,9 +118,9 @@ describe("hedge trigger — per-token, the owner's rule", () => {
 
   it("does NOT use per-token below the sample floor, however slow the attempt", () => {
     // 4 request samples is under `minSamples`, so the rate is not trusted; it falls to the probe
-    // rung, and with no probes to the floor.
+    // rung, and with no probes to the size-scaled floor.
     const d = ask({ elapsedMs: 600_000, tokensSeen: 2_000, pings: requests(DEFAULT_HEDGE_MIN_SAMPLES - 1, 5_000, 100) });
-    expect(d?.basis).toBe("floor");
+    expect(d?.basis).toBe("input-size");
   });
 
   it("does NOT use per-token when the attempt has produced nothing yet", () => {
@@ -104,15 +128,40 @@ describe("hedge trigger — per-token, the owner's rule", () => {
     const d = ask({ elapsedMs: 100_000, tokensSeen: 0, pings: requests(8, 5_000, 100) });
     expect(d?.basis).not.toBe("per-token");
   });
+
+  it("keeps the per-token basis when its OWN computed value is the larger side of the floor comparison", () => {
+    // owner direction 2026-09-04: the size-scaled floor applies to every rung, but only ever RAISES
+    // what evidence decided — a per-token rung whose own value is already the larger operand is
+    // untouched, basis AND number.
+    const pings = requests(8, 5_000, 100); // 50 ms/token
+    // 50 ms/token x 2,000 tokens x margin 2 = 200,000 ms — far above even a 100,000-token size
+    // floor (15,000 ms at the calibrated default), so the size estimate changes nothing.
+    const d = ask({ elapsedMs: 250_000, tokensSeen: 2_000, pings, estimatedInputTokens: 100_000 });
+    expect(d?.basis).toBe("per-token");
+    expect(d?.thresholdMs).toBe(200_000);
+  });
+
+  it("keeps the per-token BASIS even when the size-scaled floor is the larger operand", () => {
+    // The floor still RAISES the number here (per-token's own raw value alone is smaller), but the
+    // basis stays "per-token" — evidence, not the request's size, decided a statistic applied at
+    // all. Reporting "input-size" here would hide that evidence existed.
+    const pings = requests(8, 5_000, 100); // 50 ms/token
+    // 50 ms/token x 10 tokens x margin 2 = 1,000 ms raw — below a 100,000-token size floor
+    // (15,000 ms at the default).
+    const d = ask({ elapsedMs: 20_000, tokensSeen: 10, pings, estimatedInputTokens: 100_000 });
+    expect(d?.basis).toBe("per-token");
+    expect(d?.thresholdMs).toBe(15_000);
+  });
 });
 
 describe("hedge trigger — the absolute rung reads PROBE samples only", () => {
   it("uses probe p90 when there is no per-token evidence", () => {
-    // p90 of 8 identical 4000 ms probes is 4000; margin 2 gives 8000, floored to 20000.
-    expect(ask({ elapsedMs: 19_999, pings: probes(8, 4_000) })).toBeNull();
-    const d = ask({ elapsedMs: 25_000, pings: probes(8, 4_000) });
+    // p90 of 8 identical 1000 ms probes is 1000; margin 2 gives 2000, floored to the 3000 ms
+    // default minimum.
+    expect(ask({ elapsedMs: 2_999, pings: probes(8, 1_000) })).toBeNull();
+    const d = ask({ elapsedMs: 3_001, pings: probes(8, 1_000) });
     expect(d?.basis).toBe("absolute");
-    expect(d?.thresholdMs).toBe(DEFAULT_HEDGE_FLOOR_MS);
+    expect(d?.thresholdMs).toBe(DEFAULT_HEDGE_MIN_FLOOR_MS);
   });
 
   it("raises the bar for a deployment whose PROBES are genuinely slow", () => {
@@ -124,18 +173,18 @@ describe("hedge trigger — the absolute rung reads PROBE samples only", () => {
   it("NEVER lets request samples raise the absolute bar", () => {
     // The v0.65.2 defect facing the other way. Four probes at 1 s and four 90-second REQUEST
     // samples: if the requests reached this statistic the bar would be 180 s and nothing would
-    // hedge. They must not, so this falls through to the floor — four probes is under the floor of
-    // five — and 30 s exceeds it.
+    // hedge. They must not, so this falls through to the size-scaled floor — four probes is under
+    // the floor of five — and 30 s exceeds the default 3 s minimum.
     const pings = [...probes(4, 1_000), ...requests(4, 90_000, 1)];
     const d = ask({ elapsedMs: 30_000, pings });
-    expect(d?.basis).toBe("floor");
+    expect(d?.basis).toBe("input-size");
   });
 
   it("counts PROBE samples toward its own floor, so request samples cannot unlock it", () => {
     const pings = [...probes(4, 30_000), ...requests(10, 1_000, 1_000)];
     // Ten request samples must not make the four probes count as nine.
     const d = ask({ elapsedMs: 25_000, tokensSeen: 0, pings });
-    expect(d?.basis).toBe("floor");
+    expect(d?.basis).toBe("input-size");
   });
 
   it("counts only MEASURABLE probes toward its floor, so one 200 among failures cannot unlock it", () => {
@@ -145,10 +194,11 @@ describe("hedge trigger — the absolute rung reads PROBE samples only", () => {
     const pings = [...probes(4, 1_000, "503"), ...probes(1, 30_000)];
     const d = ask({ elapsedMs: 30_000, tokensSeen: 0, pings });
     // Counting all five reaches the absolute rung, and p90 over the single 200 sets the bar at
-    // 60 s — so a 30 s hang is NOT hedged, on the strength of one probe. The floor is the honest
-    // answer: one measurement is below `minSamples`, so no per-deployment statistic applies.
-    expect(d?.basis).toBe("floor");
-    expect(d?.thresholdMs).toBe(DEFAULT_HEDGE_FLOOR_MS);
+    // 60 s — so a 30 s hang is NOT hedged, on the strength of one probe. The size-scaled floor is
+    // the honest answer: one measurement is below `minSamples`, so no per-deployment statistic
+    // applies.
+    expect(d?.basis).toBe("input-size");
+    expect(d?.thresholdMs).toBe(DEFAULT_HEDGE_MIN_FLOOR_MS);
   });
 });
 
@@ -159,17 +209,69 @@ describe("hedge trigger — an UNMEASURED deployment is hedged, unlike demotion"
    * hedging a deployment that was about to answer is one wasted FREE request, and the cost of not
    * hedging the measured 43-times-repeated hang is 120 seconds.
    */
-  it("falls back to the floor with no samples at all", () => {
-    const d = ask({ elapsedMs: DEFAULT_HEDGE_FLOOR_MS + 1, pings: [] });
-    expect(d?.basis).toBe("floor");
-    expect(d?.thresholdMs).toBe(DEFAULT_HEDGE_FLOOR_MS);
+  it("falls back to the size-scaled floor with no samples at all", () => {
+    const d = ask({ elapsedMs: DEFAULT_HEDGE_MIN_FLOOR_MS + 1, pings: [] });
+    expect(d?.basis).toBe("input-size");
+    expect(d?.thresholdMs).toBe(DEFAULT_HEDGE_MIN_FLOOR_MS);
   });
 
   it("covers the measured hang: no headers, no tokens, nothing known", () => {
     // `nim/deepseek-ai/deepseek-v4-flash-0731` produced nothing for 120 s, 43 times running.
     const d = ask({ elapsedMs: 120_000, tokensSeen: 0, pings: [] });
-    expect(d?.basis).toBe("floor");
+    expect(d?.basis).toBe("input-size");
     expect(d?.elapsedMs).toBe(120_000);
+  });
+});
+
+/**
+ * The floor GROWS with the request's own estimated input size (owner direction 2026-09-04).
+ *
+ * These pin the rule at `hedgeDelayDecision` — the entry point the walk actually calls, where
+ * `tokensSeen` is always 0 by construction, so only the size-scaled floor (never per-token) can
+ * apply. `shouldHedge`'s equivalent cases are covered above, alongside the per-token/absolute rungs
+ * they interact with.
+ */
+describe("hedge trigger — the floor grows with the request's own input size", () => {
+  it("a small request still gets the flat minimum floor, at the calibrated default", () => {
+    // 1,000 tokens x 0.15 ms/token = 150 ms, well under the 3,000 ms flat minimum.
+    const d = hedgeDelayDecision([], true, 1_000, resolveHedgeSettings());
+    expect(d).toEqual({ delayMs: DEFAULT_HEDGE_MIN_FLOOR_MS, basis: "input-size", estimatedInputTokens: 1_000 });
+  });
+
+  it("a large request's floor is dominated by its own size, at the calibrated default", () => {
+    // 100,000 tokens x 0.15 ms/token = 15,000 ms, above the 3,000 ms flat minimum.
+    const d = hedgeDelayDecision([], true, 100_000, resolveHedgeSettings());
+    expect(d).toEqual({ delayMs: 15_000, basis: "input-size", estimatedInputTokens: 100_000 });
+  });
+
+  it("the legacy floorMs alias still sets the FLAT floor's minimum", () => {
+    // An operator config written before 2026-09-04 (`{"floorMs": 8000}`) keeps meaning exactly
+    // what it always meant: the floor never drops below 8000 ms, however small the request.
+    const s = resolveHedgeSettings({ floorMs: 8_000 });
+    expect(s.minFloorMs).toBe(8_000);
+    const d = hedgeDelayDecision([], true, 1_000, s);
+    expect(d?.delayMs).toBe(8_000);
+    expect(d?.basis).toBe("input-size");
+  });
+
+  it("an explicit minFloorMs wins over the legacy floorMs alias when both are set", () => {
+    const s = resolveHedgeSettings({ floorMs: 8_000, minFloorMs: 500 });
+    expect(s.minFloorMs).toBe(500);
+  });
+
+  it("does not scale on a non-finite or non-positive estimate — the same fail-safe direction as everywhere else", () => {
+    const settings = resolveHedgeSettings({ minFloorMs: 1_000, msPerInputToken: 1 });
+    for (const bad of [Number.NaN, -5, 0, Number.POSITIVE_INFINITY]) {
+      const d = hedgeDelayDecision([], true, bad, settings);
+      expect(d?.delayMs).toBe(1_000);
+    }
+  });
+
+  it("scales linearly between the flat minimum and a large prompt", () => {
+    const settings = resolveHedgeSettings({ minFloorMs: 1_000, msPerInputToken: 2, margin: 2, minSamples: 5 });
+    expect(hedgeDelayDecision([], true, 100, settings)?.delayMs).toBe(1_000); // 200 < 1000 floor
+    expect(hedgeDelayDecision([], true, 1_000, settings)?.delayMs).toBe(2_000); // 2000 > 1000 floor
+    expect(hedgeDelayDecision([], true, 10_000, settings)?.delayMs).toBe(20_000);
   });
 });
 
@@ -180,9 +282,16 @@ describe("hedge trigger — settings and label", () => {
     expect(resolveHedgeSettings({ enabled: false }).enabled).toBe(false);
   });
 
-  it("honours operator overrides on every knob", () => {
+  it("resolves the calibrated defaults for the two floor tunables", () => {
+    const s = resolveHedgeSettings();
+    expect(s.minFloorMs).toBe(DEFAULT_HEDGE_MIN_FLOOR_MS);
+    expect(s.msPerInputToken).toBe(DEFAULT_HEDGE_MS_PER_INPUT_TOKEN);
+  });
+
+  it("honours operator overrides on every knob, including the legacy floorMs alias", () => {
     const s = resolveHedgeSettings({ floorMs: 1_000, margin: 10, minSamples: 2 });
-    // floorMs override: 1001 ms now clears a bar the default would not have.
+    // floorMs override (legacy alias for minFloorMs): 1001 ms now clears a bar the default would
+    // not have.
     expect(ask({ elapsedMs: 1_001, pings: [] }, s)?.thresholdMs).toBe(1_000);
     // minSamples override: 2 probes are now enough to reach the absolute rung at all.
     // margin override: p90 3000 x 10 = 30000, so 25000 must NOT fire and 35000 must.
@@ -193,7 +302,7 @@ describe("hedge trigger — settings and label", () => {
   it("labels metadata only — a rate, a basis and a count, never content", () => {
     const d = ask({ elapsedMs: 28_400, pings: [] })!;
     expect(hedgeLabel("nim/deepseek-ai/deepseek-v4-flash-0731", d)).toBe(
-      "nim/deepseek-ai/deepseek-v4-flash-0731 (28.4s > 20.0s, floor, 0 tokens seen)",
+      "nim/deepseek-ai/deepseek-v4-flash-0731 (28.4s > 3.0s, input-size, 0 tokens seen)",
     );
   });
 });

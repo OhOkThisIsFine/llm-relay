@@ -218,8 +218,11 @@ export const LATENCY_DEMOTED_HEADER = "x-llm-relay-latency-demoted";
  *
  * Value is one bounded line naming BOTH deployments and which one answered, e.g.
  * `nim/deepseek-ai/deepseek-v4-flash -> nim/nvidia/nemotron-3-ultra-550b-a55b (hedge won after
- * 20000ms, floor)` — the two specs, the winner, the delay that started the hedge and the rung of
- * evidence that set it. Metadata only: no credential values, no content, no token text.
+ * 3210ms, input-size 1180 tokens)` — the two specs, the winner, the delay that started the hedge
+ * and the rung of evidence that set it. `input-size` (owner direction 2026-09-04) additionally
+ * carries the estimated input-token count that decided the size-scaled floor, because a
+ * `per-token`/`absolute` rung's own bare name is unaffected — it is a statement about the
+ * DEPLOYMENT, not the request. Metadata only: no credential values, no content, no token text.
  *
  * ⚠ A hedge that starts and LOSES is announced too. The duplication happened either way, and a
  * header that appeared only when the hedge won would under-report exactly the case an operator

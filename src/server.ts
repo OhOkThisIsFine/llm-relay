@@ -70,7 +70,7 @@ import { observedContextLimit } from "./context-limits.js";
 import { isCostBlockedForEverySlot } from "./target-facts.js";
 import { createQuotaDemotionFn, type QuotaDemotionFn } from "./quota-demotion.js";
 import { createLatencyDemotionFn, type LatencyDemotionFn } from "./latency-demotion.js";
-import { hedgeDelayDecision, resolveHedgeSettings, type HedgeVerdict } from "./hedge-trigger.js";
+import { hedgeDelayDecision, resolveHedgeSettings, type HedgeDelayDecision } from "./hedge-trigger.js";
 import { createHardCapLedgerReader, evaluateHardCap, type HardCapVerdict } from "./hard-cap.js";
 import {
   createControlAuthorization,
@@ -357,7 +357,7 @@ export interface Handlers {
   server: Server;
   quotaDemotion: QuotaDemotionFn;
   latencyDemotion: LatencyDemotionFn;
-  hedgeDelay: (attempt: ResolvedAttempt) => { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] } | null;
+  hedgeDelay: (attempt: ResolvedAttempt, estimatedInputTokens: number) => HedgeDelayDecision | null;
   hedgeMaxInFlight: number;
   costClassOf: CostClassFn;
   hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null;
@@ -648,6 +648,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       wantsStream,
       protocol: openAiFrontProtocol,
       inboundHeaders: req.headers,
+      estimatedInputTokens: estimatedRequestTokens,
       started,
       path,
       hadTools,
@@ -692,6 +693,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     hadTools,
     tools,
     wantsStream,
+    estimatedInputTokens: estimatedRequestTokens,
     walkAttempts,
     addressedPool,
     degradedSpecs,
@@ -770,10 +772,16 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const hedgeSettings = resolveHedgeSettings(cfg.routing?.hedge);
   const hedgeDelay = (
     attempt: ResolvedAttempt,
-  ): { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] } | null => {
+    estimatedInputTokens: number,
+  ): HedgeDelayDecision | null => {
     const t = attempt.target;
     if (!t.model) return null;
-    return hedgeDelayDecision(pingLoop.getModelPings(t.provider, t.model), costClassOf(attempt) === "free", hedgeSettings);
+    return hedgeDelayDecision(
+      pingLoop.getModelPings(t.provider, t.model),
+      costClassOf(attempt) === "free",
+      estimatedInputTokens,
+      hedgeSettings,
+    );
   };
   const hardCapEvaluator = (attempt: ResolvedAttempt, now: number): HardCapVerdict | null => {
     try {

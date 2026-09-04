@@ -564,20 +564,35 @@ function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
  * shorthand for `{ enabled: false }` and restores the pre-hedge behaviour exactly, byte for byte.
  * An object with no keys is legal and means the defaults.
  *
- * The thresholds live in `src/hedge-trigger.ts`. ⚠ Unlike `routing.latency`'s 250 ms/token, they
- * are PLACEHOLDERS awaiting calibration and say so at their definition — do not quote them as
- * measurements.
+ * The thresholds live in `src/hedge-trigger.ts`. ⚠ `margin` and `minSamples` are still PLACEHOLDERS
+ * awaiting calibration and say so at their definition — do not quote them as measurements.
+ * `msPerInputToken` IS calibrated (`scripts/calibrate-hedge-floor.mjs`, 2026-09-04) — see its own
+ * doc comment in `hedge-trigger.ts` for why the fit came back out of range and what shipped instead.
  */
 export interface HedgeConfig {
   /** Default true. false disables hedging entirely. */
   enabled?: boolean;
   /**
-   * The floor under every threshold, in ms.
-   *
-   * Without it a deployment with a tiny p90 is hedged on ordinary noise, and a fast pool duplicates
-   * almost every request. It is the one bound that keeps the duplicate rate tied to real slowness.
+   * The floor's flat component, in ms. Owner direction 2026-09-04: the floor is no longer flat on
+   * its own — see `msPerInputToken` — but this still bounds the SMALL-prompt case, where the
+   * size-scaled component is negligible. Without it a deployment with a tiny p90 is hedged on
+   * ordinary noise, and a fast pool duplicates almost every request.
+   */
+  minFloorMs?: number;
+  /**
+   * LEGACY alias of `minFloorMs`, kept for backward compatibility — an operator config written
+   * before 2026-09-04 (`{"floorMs": 8000}`) keeps loading and keeps meaning exactly what it always
+   * meant: the floor never drops below 8000 ms. Honoured only when `minFloorMs` itself is absent;
+   * `resolveHedgeSettings` in `hedge-trigger.ts` is the ONE place that resolves the alias, so a new
+   * caller of that function can never re-decide the precedence.
    */
   floorMs?: number;
+  /**
+   * The floor's size-scaled component, in ms per estimated INPUT token
+   * (`estimateRequestTokens` in `metadata.ts`). Without it a large prompt is hedged against the
+   * time it simply takes a healthy deployment to read the prompt, not against real slowness.
+   */
+  msPerInputToken?: number;
   /** How far past the expected time an attempt must run before a hedge starts. */
   margin?: number;
   /** Minimum samples before a measured statistic may set the bar instead of the floor. */
@@ -592,7 +607,8 @@ export interface HedgeConfig {
  *
  * ⚠ Every number must be finite and positive. A `0` floor removes the one bound that stops a fast
  * pool duplicating almost every request, and a negative or `NaN` value bounds nothing while looking
- * like it does.
+ * like it does. `floorMs` and `minFloorMs` are both accepted and both validated the same way here —
+ * this function only checks shape; `resolveHedgeSettings` decides which one wins when both are set.
  */
 function parseHedge(raw: unknown): HedgeConfig {
   // ABSENT returns `{}`, not `undefined` — the `parseLatencyDemotion` precedent. Every key is
@@ -606,7 +622,7 @@ function parseHedge(raw: unknown): HedgeConfig {
     throw new Error("config.routing.hedge must be an object or a boolean");
   }
   const value = raw as Record<string, unknown>;
-  const known = new Set(["enabled", "floorMs", "margin", "minSamples"]);
+  const known = new Set(["enabled", "floorMs", "minFloorMs", "msPerInputToken", "margin", "minSamples"]);
   for (const key of Object.keys(value)) {
     if (!known.has(key)) {
       throw new Error(`config.routing.hedge has an unknown key "${key}"`);
@@ -617,7 +633,7 @@ function parseHedge(raw: unknown): HedgeConfig {
     if (typeof value.enabled !== "boolean") throw new Error("config.routing.hedge.enabled must be a boolean");
     out.enabled = value.enabled;
   }
-  for (const key of ["floorMs", "margin", "minSamples"] as const) {
+  for (const key of ["floorMs", "minFloorMs", "msPerInputToken", "margin", "minSamples"] as const) {
     const n = value[key];
     if (n === undefined) continue;
     if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {

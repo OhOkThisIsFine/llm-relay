@@ -78,7 +78,7 @@ import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit 
 import { clearFacts, cooldownUntil, factsFor, recordFact, type FactResetBasis } from "./target-facts.js";
 import { quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
 import { latencyDemotionLabel, type LatencyDemotionFn } from "./latency-demotion.js";
-import type { HedgeVerdict } from "./hedge-trigger.js";
+import type { HedgeDelayDecision } from "./hedge-trigger.js";
 import { raceWithHedge, type HedgeRaceResult, type RaceEntrant, type Settled } from "./hedge-race.js";
 import { hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
 import {
@@ -176,7 +176,7 @@ export interface CandidateRunnerHandlers {
   breaker: CircuitBreaker;
   logger: MetadataLogger;
   hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null;
-  hedgeDelay: (attempt: ResolvedAttempt) => { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] } | null;
+  hedgeDelay: (attempt: ResolvedAttempt, estimatedInputTokens: number) => HedgeDelayDecision | null;
   modelCallRecorder?: ModelCallRecorder;
   stickySessions?: StickySessionManager;
 }
@@ -681,6 +681,8 @@ export interface HedgedAttemptDeps {
   readonly credentialTrace: CredentialAttemptTrace;
   readonly attemptTrace: RequestAttemptTrace;
   readonly tracker: Pool429Tracker;
+  /** The relay's own chars/4 estimate of THIS request's input size — see `hedge-trigger.ts`. */
+  readonly estimatedInputTokens: number;
   startRun(offer: ResolvedAttempt): StartedAttempt | undefined;
 }
 
@@ -701,14 +703,24 @@ export function walkWouldFailOver(response: Response): boolean {
   return errorOrigin(response) !== "local" && shouldTryNext(classifyStatus(response.status));
 }
 
+/**
+ * ⚠ **Carries the input-token count only when `basis` is `"input-size"`** — the case the flat
+ * `floor` label used to cover alone. A `per-token`/`absolute` decision keeps its bare basis: the
+ * DEPLOYMENT's own evidence set that bar, not the request's size, and stating a token count beside
+ * it would claim size decided a number the deployment actually did.
+ */
 export function hedgedLabel(
   primary: AttemptRun,
   hedge: AttemptRun,
   winner: "primary" | "hedge",
-  decision: { readonly delayMs: number; readonly basis: HedgeVerdict["basis"] },
+  decision: HedgeDelayDecision,
 ): string {
   const side = winner === "hedge" ? "hedge won" : "primary won";
-  return `${specOfTarget(primary.target)} -> ${specOfTarget(hedge.target)} (${side} after ${decision.delayMs}ms, ${decision.basis})`;
+  const basis =
+    decision.basis === "input-size" && decision.estimatedInputTokens !== undefined
+      ? `input-size ${decision.estimatedInputTokens} tokens`
+      : decision.basis;
+  return `${specOfTarget(primary.target)} -> ${specOfTarget(hedge.target)} (${side} after ${decision.delayMs}ms, ${basis})`;
 }
 
 export function retireHedgeLoser(deps: HedgedAttemptDeps, loser: AttemptRun): void {
@@ -731,7 +743,7 @@ export async function runAttemptWithHedge(
   primary: StartedAttempt,
   deps: HedgedAttemptDeps,
 ): Promise<HedgedAttemptResult> {
-  const decision = deps.h.hedgeDelay(primary.run.resolvedAttempt);
+  const decision = deps.h.hedgeDelay(primary.run.resolvedAttempt, deps.estimatedInputTokens);
   if (decision === null) {
     return { run: primary.run, settled: await settleResponse(primary.promise), hedged: null };
   }

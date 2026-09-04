@@ -105,6 +105,12 @@ export interface OpenAiFrontContext {
   accounting: RequestAccountingState | null;
   quotaDemotedFirst?: string | null;
   latencyDemotedFirst?: string | null;
+  /**
+   * The relay's own chars/4 estimate of this request's INPUT size (`estimateRequestTokens` in
+   * `metadata.ts`) — the sibling of `AnthropicCtx`'s field in `routes/messages.ts`, threaded rather
+   * than re-estimated so the hedge floor and the context guardrail read the same number.
+   */
+  estimatedInputTokens: number;
 }
 
 export async function openAiFrontPath(
@@ -272,6 +278,7 @@ export async function openAiFrontPath(
             res,
             walk: credentialWalk,
             credentialTrace,
+            estimatedInputTokens: ctx.estimatedInputTokens,
             attemptTrace,
             tracker: pool429,
             startRun: (offer) => {

@@ -1763,18 +1763,47 @@ describe("loadConfig — routing.hedge", () => {
     ).toEqual({ floorMs: 30_000, margin: 3, minSamples: 8 });
   });
 
+  it("round-trips the new minFloorMs and msPerInputToken keys (owner direction 2026-09-04)", () => {
+    expect(
+      loadConfig(write("hedge-size.json", hedgeCfg({ minFloorMs: 5_000, msPerInputToken: 0.2 })))
+        .routing.hedge,
+    ).toEqual({ minFloorMs: 5_000, msPerInputToken: 0.2 });
+  });
+
+  it("still accepts the legacy floorMs key, byte for byte — an operator config written before " +
+    "2026-09-04 must keep loading and keep meaning what it always meant", () => {
+    expect(
+      loadConfig(write("hedge-legacy-floor.json", hedgeCfg({ floorMs: 8_000 }))).routing.hedge,
+    ).toEqual({ floorMs: 8_000 });
+  });
+
   it("REFUSES an unknown key rather than ignoring it", () => {
     expect(() => loadConfig(write("hedge-typo.json", hedgeCfg({ floorms: 30_000 })))).toThrow(
       /routing\.hedge has an unknown key "floorms"/,
     );
+    // The same guard covers a typo on either new key, so a misspelling of `minFloorMs` or
+    // `msPerInputToken` does not silently leave the default in force.
+    expect(() => loadConfig(write("hedge-typo-minfloor.json", hedgeCfg({ minfloorms: 5_000 })))).toThrow(
+      /routing\.hedge has an unknown key "minfloorms"/,
+    );
+    expect(() => loadConfig(write("hedge-typo-msper.json", hedgeCfg({ msperinputtoken: 0.2 })))).toThrow(
+      /routing\.hedge has an unknown key "msperinputtoken"/,
+    );
   });
 
-  it("refuses a floor that would bound nothing", () => {
+  it("refuses a floor or a per-token rate that would bound nothing", () => {
     // A 0 floor removes the one bound that stops a fast pool duplicating almost every request, and
-    // a negative or non-finite value bounds nothing while looking like it does.
+    // a negative or non-finite value bounds nothing while looking like it does. `minFloorMs` and
+    // `msPerInputToken` are validated the same way.
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "20000"]) {
       expect(() => loadConfig(write(`hedge-bad-${String(bad)}.json`, hedgeCfg({ floorMs: bad })))).toThrow(
         /routing\.hedge\.floorMs must be a positive finite number/,
+      );
+      expect(() => loadConfig(write(`hedge-bad-minfloor-${String(bad)}.json`, hedgeCfg({ minFloorMs: bad })))).toThrow(
+        /routing\.hedge\.minFloorMs must be a positive finite number/,
+      );
+      expect(() => loadConfig(write(`hedge-bad-msper-${String(bad)}.json`, hedgeCfg({ msPerInputToken: bad })))).toThrow(
+        /routing\.hedge\.msPerInputToken must be a positive finite number/,
       );
     }
     expect(() => loadConfig(write("hedge-bad-margin.json", hedgeCfg({ margin: 0 })))).toThrow(

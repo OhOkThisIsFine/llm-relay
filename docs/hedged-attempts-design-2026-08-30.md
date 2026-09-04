@@ -241,3 +241,64 @@ stands. Two findings, both from reading the code the change would have to touch:
 ⚠ This is the "an owner decision whose premise moved" pattern this repo already records twice. D3
 was taken before the race's resolution point was chosen. The decision is not overturned here — it is
 handed back with the measurement it did not have. Tracked in [backlog.md](backlog.md).
+
+## 11. Amendment 2026-09-04 — the floor grows with the request's own input size
+
+> **Owner direction, 2026-09-04**: make the hedge delay "a multiple of the estimated or actual token
+> count of the message."
+
+**The measured context that motivated it.** §8 left the floor's two constants as declared
+placeholders, and by this date every hedge on this machine was announcing basis `floor` — not
+because no evidence existed, but STRUCTURALLY: `hedgeDelayDecision` is called at RESPONSE
+RESOLUTION (§9, "the threshold IS the delay"), before any output token exists by construction, so
+the per-token rung can never fire from that entry point and the flat floor decided every real hedge.
+Separately, `~/.llm-relay/usage/recent.json` (100 successful requests) showed latency dominated by
+the DEPLOYMENT, not the input size: requests under 2,000 input tokens had a median latency of
+**30.1 s** (served by slow members such as `nim/kimi-k3`, 33 s at 1,300 tokens), while requests of
+10,000+ tokens had a median of **10.9 s** (`kilo/nemotron`, 10.4 s at 105,000 tokens). An "expected
+latency for this size × margin" rule built on that population would therefore hedge a SLOW member
+LATE — the opposite of the point — because size does not predict latency here; the deployment does.
+
+**The rule shipped instead is a FLOOR that grows with the prompt**, applied before egress from the
+request's own ESTIMATE, in place of the flat `floorMs` under every rung:
+
+```
+floorMs(request) = max(minFloorMs, msPerInputToken × estimatedInputTokens)
+```
+
+`estimatedInputTokens` is the relay's own chars/4 estimate that already existed for the context
+guardrail (`estimateRequestTokens` in `src/metadata.ts`; `estimatedRequestTokens` in
+`src/server.ts` `handle()`) — threaded into the hedge decision rather than re-estimated, so the two
+can never disagree about how large a request is. It protects the case the measured context above
+describes directly: a large prompt is not hedged against the time it simply takes a healthy
+deployment to read it, while a small prompt still gets the flat `minFloorMs` alone, unaffected.
+
+**Basis, precisely**: only the rung reporting NO per-deployment evidence renames itself from `floor`
+to `input-size` and additionally carries the estimated token count
+(`x-llm-relay-hedged: ... (hedge won after 3210ms, input-size 1180 tokens)`) — a `per-token` or
+`absolute` verdict keeps its bare name even on the rarer occasions where the size-scaled floor is
+the larger `Math.max` operand, because evidence (not size) decided that a statistic applied at all;
+stating a token count beside it would misattribute a number the deployment's own evidence set.
+
+**Config**: `routing.hedge` gains `minFloorMs` (default 3,000 ms) and `msPerInputToken` (default
+0.15 ms/token). `floorMs` survives as a LEGACY ALIAS of `minFloorMs`, resolved in
+`resolveHedgeSettings` — an operator config written before this date (this machine's own included:
+`routing.hedge.floorMs` had already been raised to 8,000 ms by hand, per `CLAUDE.md`'s
+`hedge-trigger.ts` row) keeps loading byte for byte and keeps meaning exactly what it always meant.
+An unknown key is still a hard load error.
+
+**Calibration**: `scripts/calibrate-hedge-floor.mjs`, run 2026-09-04 against this machine's own
+`~/.llm-relay/usage/recent.json` (100 successful serve attempts, 55 carrying ≥10,000 input tokens).
+Method: the p25 (lower quartile) of `latencyMs ÷ inputTokens` ratios among the ≥10,000-token
+requests, chosen over an OLS-through-origin slope on "the fast deployments" because that window
+cannot support the classification robustly (a handful of deployments in the slice, several with
+only 1-2 samples). The fit measured **0.036 ms/token** — OUTSIDE the script's accepted
+[0.05, 0.5] band — so it was REJECTED and the built-in default of **0.15 ms/token** shipped instead,
+the same fail-safe direction as every other "evidence too thin to trust" rule in this relay. Re-run
+the script as traffic accumulates; nothing about the design changes if a future run lands in range —
+only the shipped constant would.
+
+Tests: `test/hedge-trigger.test.ts` (the formula, the legacy alias, the basis-preservation rule),
+`test/config.test.ts` (`loadConfig — routing.hedge`, the new keys and the alias), and
+`test/hedge-wiring.test.ts` (one end-to-end case per front proving a real request's estimate reaches
+the announced header, not just a unit test's direct call into `hedge-trigger.ts`).
