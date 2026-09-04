@@ -39,21 +39,6 @@
   **Property:** a publish run has enough timeout headroom to absorb ordinary npm-registry slowness
   without a human having to notice the cancellation and manually re-run it.
 
-- **Calibrate `routing.hedge`'s floor from data, and find why its per-token and absolute rungs
-  never fire.** Every hedge observed this lap reported basis `floor` — none reported `per-token` or
-  `absolute` — across `pool/medium` traffic where the slow primary answered in 9–38 s.
-  [`audit-findings-2026-09-03.md`](audit-findings-2026-09-03.md) DR-002 (merged conceptual
-  findings) already names a candidate cause verified against source: `hedgeDelayDecision` calls
-  `hedgeThreshold` with `tokensSeen` hardcoded to `0`, and the per-token rung is gated on
-  `tokensSeen > 0`, so it may be structurally unreachable on the wired path rather than merely
-  unexercised by this lap's traffic. The operator's `routing.hedge.floorMs: 8000` is a hand-set
-  number chosen after watching four requests, not a calibrated one the way
-  `DEFAULT_LATENCY_MS_PER_TOKEN`'s 250 was measured from `usage/recent.json`.
-
-  **Property:** the hedge ladder's rungs fire in the order the source and `CLAUDE.md` claim
-  (`per-token → absolute → floor`, first rung with evidence final) — or the code and the
-  documentation describing it agree that the floor is the only rung that ever runs.
-
 - **Remediate, or explicitly accept with reasons, the four `docs/audit-findings-2026-09-03.md`
   findings verified against source this lap but left unfixed.** All four were checked directly by
   the lap orchestrator, distinct from the file's own 35-of-41-present bookkeeping note
@@ -95,21 +80,49 @@
   mechanisms that exist after DR-020, so a reader does not have to check git history to learn which
   members are real.
 
-- **The `relay` agent on `model: haiku` answers trivial pure-text tasks itself instead of
-  dispatching** (2026-09-04, low). Found verifying the agent type end to end (Closed, above): a
-  realistic task dispatches correctly through ToolSearch → dispatch, but a trivial one-line echo is
-  answered by the wrapper's own model instead, with no `provenance:` line to flag it.
+- **Verify the Codex `relay` agent end to end in Codex Desktop** (owner-driven, 2026-09-04, lap 2).
+  Commit `e73d113` added `~/.codex/agents/relay.toml` via `scripts/install-skill.mjs` (marker
+  `# llm-relay:codex-relay-agent v1`, read-only sandbox, dispatch tools enabled, no model pinned so
+  Codex Desktop's account check never sees a `pool/*` child model). Whether a spawned Codex subagent can
+  reach the MCP `dispatch` tool across every Codex surface remains unverified: standalone `codex exec`
+  exposes no MCP tools at all, so this requires a live Codex Desktop session driven by the owner.
 
-  **Property:** a reply that did not come from a lane must never reach the caller as though it were
-  a lane answer — either the template's default model changes to one that obeys (`sonnet` measured
-  obeying, at +~40 s wrapper time), or the wrapper is made structurally unable to answer without a
-  preceding dispatch result (no text output allowed except after a dispatch result), whichever the
-  owner picks.
+  **Property:** one Codex Desktop `relay` subagent reply carries a `provenance:` line (e.g.
+  spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>" returns
+  the version and provenance from a dispatch lane).
 
-  Evidence: haiku echo probe 4 s, 0 tool calls, no provenance; haiku realistic probe 17 s, 2 tool
-  calls, provenance; sonnet echo probe 47 s, 2 tool calls, provenance.
+- **Make `test/os-keyring.test.ts` "sanitizes a thrown child error" path-agnostic** (2026-09-04, lap 2, low).
+  The test passes cleanly in the main repository checkout, but fails inside a lane git worktree where
+  `node_modules` is a junction due to a path-sensitive error assertion.
+
+  **Property:** the test passes in any checkout location, including worktrees with junctioned `node_modules`.
 
 ## Closed
+
+- ✅ **Calibrate `routing.hedge`'s floor from data, and token-scale the floor delay** (2026-09-04,
+  lap 2, `cc4da1b`). Commit `cc4da1b` resolved the flat floor: the hedge floor now scales with the
+  request's estimated input tokens (`floorMs(request) = max(minFloorMs, msPerInputToken × estimatedInputTokens)`),
+  with the estimate threaded from both fronts into the decision. The flat `floor` basis is replaced by
+  `input-size` (announced in `x-llm-relay-hedged` alongside token count), operating beside `per-token`
+  and `absolute`. A new calibration script `scripts/calibrate-hedge-floor.mjs` fits `msPerInputToken`
+  from `~/.llm-relay/usage/recent.json`. Ran on 2026-09-04 against 100 successful requests (55 with
+  ≥10,000 input tokens), it fitted 0.036 ms/token (p25 of latency÷inputTokens among large-prompt
+  requests), below the accepted [0.05, 0.5] band, so the default stays 0.15 until traffic fits inside
+  the band. Analysis of recent requests also clarified why a floor rather than an expectation is used:
+  requests under 2,000 input tokens had a median latency of 30.1 s (served by slower members) while
+  requests of 10,000+ tokens had 10.9 s (served by kilo/nemotron), so deployment identity dominates
+  latency over prompt size and an "expected time × margin" rule would hedge slow members late. Design
+  amendment recorded in [`hedged-attempts-design-2026-08-30.md`](hedged-attempts-design-2026-08-30.md).
+
+- ✅ **The `relay` agent on `model: haiku` answers trivial pure-text tasks itself instead of
+  dispatching — superseded** (2026-09-04, lap 2, `e73d113`). The owner directed: "I don't want to
+  hard code a model name." Commit `e73d113` updated the Claude `relay` agent template to `model: inherit`
+  (template v4; the official docs state an omitted model can fall through to `CLAUDE_CODE_SUBAGENT_MODEL`,
+  so `inherit` is the explicit spelling), and callers can still pass `model` on the `agent()` or
+  `Agent` call. No model is pinned by default. The residual behaviour (that smaller models may answer
+  trivial pure-text echoes directly without dispatching) is documented in the skill reference
+  [`../skills/llm-relay/SKILL.md`](../skills/llm-relay/SKILL.md) alongside the rule that callers requiring
+  lane execution should verify the `provenance:` line.
 
 - ✅ **Verify the `relay` custom agent type end to end in a fresh Claude Code session — verified**
   (2026-09-04). An agent tool probe — `[agent] Read C:\Code\llm-relay\package.json and reply
