@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getClaudeDesktopConfigPath, setupClaudeDesktop, setupClaudeCli, installRelayAgent, RELAY_AGENT_MARKER, type SetupFs } from "../src/setup-claude.js";
+import { getClaudeDesktopConfigPath, setupClaudeDesktop, setupClaudeCli, installRelayAgent, RELAY_AGENT_MARKER, RELAY_AGENT_TEMPLATE, type SetupFs } from "../src/setup-claude.js";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 
@@ -231,6 +231,66 @@ describe("setup-claude", () => {
     const refusalLine = `Refusing to overwrite foreign agent file at ${agentPath}`;
     expect(res.lines).toContain(refusalLine);
     expect(seen).toContain(refusalLine);
+  });
+
+  // --- Defect fix, 2026-09-04: the wrapper answered a trivial probe task itself instead of
+  // dispatching (measured live: an `[answer]`-tagged echo returned in 4s with zero tool uses and
+  // no provenance line). The rules below pin the CLAIMS the strengthened template body must make,
+  // not their exact wording, so the prose can be revised without re-deriving the requirement.
+
+  it("(g) the content states the wrapper has no knowledge of its own, no permission to answer, and that the caller is measuring the lane, not the wrapper", () => {
+    const injectedHome = join(dir, "injected-home-g");
+    installRelayAgent({ homeDir: injectedHome });
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    const content = readFileSync(agentPath, "utf8");
+    expect(content).toMatch(/no knowledge of (its|your) own/i);
+    expect(content).toMatch(/no permission to answer/i);
+    expect(content).toMatch(/measuring the lane/i);
+  });
+
+  it("(h) the content states this holds for every task, even one that looks trivial, and that answering it directly would falsify the caller's measurement", () => {
+    const injectedHome = join(dir, "injected-home-h");
+    installRelayAgent({ homeDir: injectedHome });
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    const content = readFileSync(agentPath, "utf8");
+    expect(content).toMatch(/every task/i);
+    expect(content).toMatch(/trivial/i);
+    expect(content).toMatch(/falsify/i);
+  });
+
+  it("(i) the content states a reply with no provenance line is a failure, and that provenance values are copied from the tool result, never invented", () => {
+    const injectedHome = join(dir, "injected-home-i");
+    installRelayAgent({ homeDir: injectedHome });
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    const content = readFileSync(agentPath, "utf8");
+    expect(content).toMatch(/no provenance line[\s\S]{0,40}failure/i);
+    expect(content).toMatch(/never invented/i);
+  });
+
+  it("(j) the marker is bumped to v2", () => {
+    expect(RELAY_AGENT_MARKER).toContain("v2");
+    expect(RELAY_AGENT_MARKER).not.toContain("v1");
+    const injectedHome = join(dir, "injected-home-j");
+    installRelayAgent({ homeDir: injectedHome });
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    const content = readFileSync(agentPath, "utf8");
+    expect(content).toContain("<!-- llm-relay:relay-agent v2 -->");
+  });
+
+  it("(k) a file carrying the OLD v1 marker is recognised as our own and upgraded to v2, not refused as foreign", () => {
+    const injectedHome = join(dir, "injected-home-k");
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    mkdirSync(dirname(agentPath), { recursive: true });
+    const oldContent = "---\nname: relay\n---\n<!-- llm-relay:relay-agent v1 -->\n\n1. Old rule text.\n";
+    writeFileSync(agentPath, oldContent);
+
+    const res = installRelayAgent({ homeDir: injectedHome });
+    expect(res.success).toBe(true);
+
+    const afterContent = readFileSync(agentPath, "utf8");
+    expect(afterContent).toBe(RELAY_AGENT_TEMPLATE);
+    expect(afterContent).toContain(RELAY_AGENT_MARKER);
+    expect(afterContent).not.toContain("relay-agent v1 -->");
   });
 });
 
