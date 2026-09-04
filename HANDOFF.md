@@ -59,6 +59,14 @@ Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with 
 - Audit residue with properties: the metering silence channel (DR-006), listener-before-store
   (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
   pruning (DR-012), the default-ON routing keys in `docs/reference.md` (DR-024).
+- Owner: whether Meta's *contributor* SKUs (OpenCode Zen's free
+  `opencode/muse-spark-1.3-contributor-free` — prompts and completions become Meta training data)
+  may be routed automatically, only by name, or not at all —
+  [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md)
+  §5. Zen serves that SKU on the Responses API only, which no relay upstream speaks (backlog); the
+  OpenCode-CLI dispatch rung in that doc's §3 works today with no relay change. Same investigation:
+  `freeOnly` is `false` on all three live offload rules while the pools carry paid SKUs behind the
+  free members (backlog, owner decision).
 
 
 ## 0.1 Earlier releases
