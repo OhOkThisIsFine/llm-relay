@@ -121,18 +121,25 @@ Anthropic monthly spend limit killed four Sonnet subagents at once; `npm --prefi
 the caller's directory; the PowerShell tool blocks `cmd /c`; inline `\\$var` Windows paths do not
 expand for `cmd`; remove a node_modules junction before `git worktree remove`; the shell guard blocks
 `| tail` on a `gh run view` whose jq filter contains "npm run check". Repo (docs/BACKLOG.md and this
-closeout): the publish timeout; AGY Gemini's individual quota ran out after about 13 lane runs;
+closeout): the publish timeout; AGY Gemini's individual quota ran out after 11 completed lane runs in
+one evening; the 12th and 13th dispatches failed with `Individual quota reached … Resets in 1h45m57s`;
 Claude Code loads a custom agent definition once per session (edits and deletions are not re-read
 promptly); `delegate-gate` flags the common `servers` test pattern and `as unknown as typeof fetch`
 fixture casts. Memory: dispatch-fast-path-2026-09-04.
 
 ## Lanes
 
-AGY Gemini 3.8 Flash high (MCP `dispatch`, lane `agy-gemini`, tier `high`): 8 of 10 code lanes,
-the refusal research, 5-10 minutes each, own worktree each. Claude Sonnet: the MCP answer-mode lane,
-the template hardening, the test-guard fix, three records/docs lanes. Every lane was judged by its
-report, `git show --stat`, the source diff, `llm-relay delegate-gate`, and an orchestrator-run full
-suite before merge.
+AGY Gemini 3.8 Flash high (MCP `dispatch`, lane `agy-gemini`, tier `high`): 7 of the 11 distinct code
+tasks (9 of the 13 code dispatches, counting two follow-ups), with Claude Sonnet doing the other 4
+code tasks: the MCP answer-mode lane, the two relay-template fixes and the setup-claude test-guard
+fix (the `Co-Authored-By` trailers in `git log e776534..HEAD` give the commit-level split: AGY 9 code
+commits + 1 docs commit, Sonnet 4 code commits + 3 docs commits), the refusal research, 5-10 minutes
+each, own worktree each. Claude Sonnet: the MCP answer-mode lane, the template hardening, the
+test-guard fix, three records/docs lanes. Every lane was judged by its report, `git show --stat`, the
+source diff, `llm-relay delegate-gate`, and an orchestrator-run full suite before merge.
+
+The latency figures above are live measurements taken in the orchestrating session on 2026-09-04;
+they left no artifact in this repository, so they are reported, not reproducible from the tree.
 
 ## Verdict
 

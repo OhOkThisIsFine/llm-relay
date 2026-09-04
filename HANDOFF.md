@@ -116,8 +116,12 @@ answer mode answered in 10.5 s and 13.5 s against the new server binary. ⚠ Whe
 per-token and absolute rungs are unreachable by design or merely unexercised by this traffic is
 still open — see Immediate next.
 
-**Lanes.** AGY on Gemini 3.8 Flash (`gemini-3.8-flash-high`, via MCP dispatch) did 8 of the 10 code
-lanes this lap plus the refusal-queue research, each in its own git worktree with a `node_modules`
+**Lanes.** AGY on Gemini 3.8 Flash (`gemini-3.8-flash-high`, via MCP dispatch) did 7 of the 11
+distinct code tasks (9 of the 13 code dispatches, counting two follow-ups), with Claude Sonnet
+doing the other 4 code tasks: the MCP answer-mode lane, the two relay-template fixes and the
+setup-claude test-guard fix (the `Co-Authored-By` trailers in `git log e776534..HEAD` give the
+commit-level split: AGY 9 code commits + 1 docs commit, Sonnet 4 code commits + 3 docs commits)
+this lap plus the refusal-queue research, each in its own git worktree with a `node_modules`
 junction, 5–10 minutes each. Claude Sonnet did the MCP answer-mode lane (43 minutes) and this
 documentation pass. The Anthropic monthly spend limit killed four Sonnet subagents at once mid-lap
 (HTTP 429) — the AGY lanes were unaffected — and later the AGY lane hit its own individual quota
