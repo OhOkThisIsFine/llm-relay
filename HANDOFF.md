@@ -2,158 +2,129 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-01 (v0.68.8 published)
+## 0. State as of 2026-09-04 (v0.69.0 published)
 
-`src/server.ts` is decomposed (5,799 → 863 lines, a net −4,936). Its request path now lives in `routes/messages.ts`,
-`routes/openai-front.ts`, `candidate-runner.ts`, `stream-pipeline.ts` and `accounting-state.ts`;
-configuration types moved to `config-types.ts` and atomic JSON persistence to `storage/json-store.ts`.
-All 104 original top-level functions survive, and both fronts import ONE copy of every shared walk,
-hedge and hard-cap helper, so the "two fronts, one policy" rule holds structurally.
+**v0.69.0 is on npm** (`dist-tags.latest` confirms `0.69.0`). Publish run
+[33847892121](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33847892121) — the first
+attempt was CANCELLED by the job's own `timeout-minutes: 15`: `npm ci` took 5 min 2 s (10 s on the
+v0.68.8 run) and the smoke test's two `npm install` calls cost about 5 min each, so ordinary npm
+registry slowness alone exhausted the budget before the job reached the publish step — no code or
+CI defect involved. `gh run rerun` on the same run published cleanly (`npm ci` still 4 min 17 s the
+second time), so CI's `npm run check` gate passed on the exact SHA. The 15-minute ceiling is
+marginal at three npm installs per run; raising it is Immediate next, below.
 
-**The decomposition was produced by another model, as 98 uncommitted paths sitting in the working
-tree at lap start. It arrived green, and four defects passed the suite anyway.** That is the durable
-lesson of this lap: a green gate certified a tree that had reverted an owner decision and silently
-downgraded an HTTP status. This session audited it, repaired it, and committed it. Full ledger,
-method and evidence:
-[`docs/refactor-consistency-audit-2026-09-01.md`](docs/refactor-consistency-audit-2026-09-01.md).
+The daemon (the global npm install, launched by the Startup `.vbs`) was restarted onto v0.69.0, and
+the operator's config gained `routing.hedge.floorMs: 8000`
+(`llm-relay config set routing.hedge.floorMs 8000`; revert with `llm-relay config unset
+routing.hedge`) — the reasoning is in the measurements below.
 
-⚠⚠ **Do not try to check the four defects against `git`.** All were repaired in the working tree
-BEFORE the first commit, so no commit holds the broken state — `git show ec5c16f:package.json`
-matches HEAD exactly, and an independent auditor correctly returned UNVERIFIABLE for that half. The
-evidence is the measurements recorded in the audit document. Every claim that CAN be checked at HEAD
-was independently confirmed.
+**This was a scattershot dispatch lap** (13 commits, `git log --oneline e776534..eb88c02`), not one
+feature:
 
-- `build:server` had lost its second `tsc` pass — the 2026-08-30 package-size decision. It cost
-  243,757 `packBytes`, and `docs/dashboard-package-baseline.json` had been regenerated with the
-  inflated figures rather than root-caused. Restored; the baseline now records 937,955 / 4,875,246 /
-  389, of which the honest refactor cost is +20,328 bytes and +24 entries. ⚠ `check:package` measures
-  whatever `dist/` holds — rebuild before trusting any package figure.
-- `readBody` threw a plain `Error` embedding `BODY_TOO_LARGE_CODE` in its MESSAGE. `bodyReadErrorCode`
-  classifies on a DECLARED `error.code`, so every oversized dashboard body answered 500 instead of
-  413 — the exact defect `CLAUDE.md` records as fixed. The drain that lets the client receive that
-  response was dropped too. Restored, and `test/stream-pipeline.test.ts` now pins the code, the
-  drain, error propagation and the default ceiling.
-- `parseAssistant` demanded `role === "assistant"`, a field `AssistantMessage` does not declare, so a
-  body omitting it parsed as `null` and silently skipped validation and repair. It also stopped
-  normalizing an absent `stop_reason` to `null`, which `emitSse` writes back to the wire. Restored.
-- `frameOpensToolUse` parsed each `data:` line alone, so a multi-line `content_block_start` answered
-  `null` and the tool_use withholding trigger never fired. Restored to collect-and-join.
+- **`TargetUsability` gained a `slow` band** above the failure bands, ordered
+  live → slow → credential-fault → cooling (`bbe1d20`, owner-approved 2026-09-03) — see "Root cause"
+  below for why this mattered enough to lead the lap.
+- **An `auto` model resolves to the ladder's first ready free pool rung** (`7e889c9`):
+  `x-llm-relay-tier` selects the tier, `x-llm-relay-auto` announces the resolved pool, and `auto` is
+  now a reserved provider name. The same commit fixed `fetchAnthropicBackend` forwarding the
+  caller's literal model string byte-exact instead of rewriting it to the resolved target's model —
+  without that fix, an `auto`/`pool/*` spec reached the backend as the literal string `"auto"` or
+  `"pool/medium"` rather than a real model id.
+- **A `relay` custom Claude Code agent type ships from `llm-relay setup
+  claude-cli|claude-desktop`** (`cecb3e1`/`156f4c3`): `~/.claude/agents/relay.md` (model haiku,
+  tools = the three dispatch MCP tools), so a Workflow script can write
+  `agent(task, {agentType: "relay"})` instead of building its own dispatch call. A foreign
+  `relay.md` with no marker is refused as a warning, not a setup failure.
+- **Credential-scoped eviction facts now reach pool admission and the free-only guard per slot**
+  (`96d7ef8`, `isCostBlockedForEverySlot` in `src/target-facts.ts`) — both call sites previously
+  passed a null credential id, so a `subscription-required` fact on one slot (e.g.
+  `opencode#default/*`) excluded nothing.
+- **The CLI option guard accepts every short alias help and the parser already declare**
+  (`b93501d`/`22cf7fa`): `-t` exited "unsupported option" while `--task` worked, because
+  `expandFlagAliases` never expanded the short forms; `VALUE_FLAGS` is now derived from the one
+  `FLAG_ALIASES` table instead of hand-copied.
+- **DR-020 (owner decision, shrink option A): the accounting store's hand-built write-ahead
+  journal, replay and quarantine engine is deleted** (`751fb52`, `src/accounting-store-io.ts`,
+  1,247 lines). The store now writes each file through the shared `atomicWriteJsonSync`; on-disk
+  formats are unchanged, `snapshot-journal.json` is no longer written and a stale one is ignored.
+  Accepted trade: a crash between two file writes can leave files from two different snapshots
+  until the next flush.
+- **MCP `dispatch` gained an `answer` mode** (`cadefcc`): `mode: "agent" | "answer"` (default
+  agent), plus `system`, `schema`, `maxTokens` — answer mode POSTs a relay-kind lane straight to the
+  relay's own `/v1/messages`, no `claude -p` harness, and carries the relay's announcing headers as
+  provenance. The same commit added a structural `isContentEmpty` check (whitespace/punctuation/
+  markdown-scaffolding-only output is a distinct `empty-output` failure), a fifth `timed_out`
+  `JobStatus` so a bounded wait never returns nothing, and made `checkCwd` resolve `..` before its
+  containment test (audit finding DR-008 / contract finding DR-002, both closed).
+  `docs/audit-findings-2026-09-03.md` and `docs/eligibility-proposals-2026-09-03.md` were also
+  committed this lap (`5c6c60f`, `12a2ed7`).
+- **Two tests made hermetic** (`5e5d8f1`): the ping cadence test raced its own `void loop()`
+  (`src/ping/cadence.ts:535`), and the dispatch depth test inherited `LLM_RELAY_DISPATCH_DEPTH`
+  from a dispatched lane's own environment.
 
-1,267 lines of invariant prose (94 percent) were deleted from the request path. The three arguments
-`CLAUDE.md` cites by name are restored at their new homes: the "two ranking passes" rejection with
-its 2026-08-30 owner amendment above `orderByUsability`, the `SERVED_BY_HEADER` contract inside
-`responseHeadersForTarget`, and why `markAttemptCommitted` records on the attempt itself.
+⚠ **The `relay` agent type is installed but NOT yet verified end to end.** `~/.claude/agents/relay.md`
+is on disk with the marker the installer checks for, but the session that ran `llm-relay setup` does
+not reload its own agent registry mid-session, so `agent(task, {agentType: "relay"})` has never
+actually been invoked. Tracked in `docs/backlog.md`.
 
-Owner decisions taken 2026-09-01:
+**Root cause of the pool-walk latency the previous lap's MCP dispatch entries were chasing** — now
+closed in `docs/backlog.md`. `targetUsability` was returning the SAME `cooling` band for a LATENCY
+demotion as for an outright failure, and unknown-lift candidates sort last within that band, so the
+pool's one fast-answering member — a latency-demoted `nim/moonshotai/kimi-k3`, p95 385–875 ms/token —
+was walked AFTER every 401/402/403/404/502 member instead of ahead of them. Measured before the fix
+(one-line prompts, `pool/medium`): direct HTTP 5.7 / 8.5 / 10.8 / 6.6 s with 6–9 failing members
+walked per request (one probe: `9 tried, 1 served: 1x404, 1x401, 3x402, 1x403, 2x502, 1x200`); MCP
+dispatch to the `claude-free-pool` lane through the `claude -p` harness 22 s, of which the harness's
+own overhead beyond API time measured only 0.06–0.26 s plus about 2 s of process start; AGY's
+`agy-gemini` on `gemini-3.8-flash-high` 8 s.
 
-- `src/kernel/protocol-ir.ts` and its test are DELETED. ⚠ Read this as a FIFTH defect, not a neutral
-  design call: the refactor reintroduced the canonical IR that `CLAUDE.md` and
-  `src/kernel/contracts.ts` both say was deleted on 2026-08-04 and must not be rebuilt. That
-  prohibition is reaffirmed, and `contracts.ts` now carries the four technical reasons beside the
-  original history note rather than the prohibition alone.
-- The 15 static-analysis rule suppressions added to `eslint.config.mjs` are REVERTED; the four added
-  stream globals stay. ⚠ The CODE producing the 63 surfaced errors is PRE-EXISTING: the tree scored
-  155 errors at `ec5c16f` under that commit's own config against 63 at HEAD. The suppressions were
-  inherited-noise reduction, not concealment. ⚠ Do not restate this as "files the refactor never
-  touched" — a closeout auditor falsified that phrasing; the claim is about moved code. Analysis
-  stays advisory and outside the gate. Tracked in [`docs/backlog.md`](docs/backlog.md).
-- `vitest.config.ts` keeps `pool: "forks"`, for Windows flake resistance, with that reasoning now
-  recorded beside the line. Measured: the suite passes with it and without it.
+The new `slow` band alone produced `2 tried, 1 served` walks, but the DEFAULT hedge floor then
+dominated the total: one-liners still took 21–38 s right after the restart, because the slow primary
+answered in 9–38 s and the hedge fired only at the built-in 20 s floor, with its member answering
+about a second later — every observed hedge reported basis `floor`. With
+`routing.hedge.floorMs` set to 8000, the same one-liners against the restarted v0.69.0 daemon
+completed in 17.3 s (first request after restart), 4.0 s, 10.2 s, 3.0 s; `auto` answered in 1.4 s on
+`/v1/messages` and 9.3 s on `/v1/chat/completions` (both carrying
+`x-llm-relay-auto: pool/medium (medium)`; `x-llm-relay-tier: high` gave `pool/high (high)`); MCP
+answer mode answered in 10.5 s and 13.5 s against the new server binary. ⚠ Whether the hedge's
+per-token and absolute rungs are unreachable by design or merely unexercised by this traffic is
+still open — see Immediate next.
 
-Verification: `npm run check` green — server 147 files, 2,861 passed, 5 skipped; dashboard 5 files,
-32 passed; package checks passed. CI green on the exact SHA.
+**Lanes.** AGY on Gemini 3.8 Flash (`gemini-3.8-flash-high`, via MCP dispatch) did 8 of the 10 code
+lanes this lap plus the refusal-queue research, each in its own git worktree with a `node_modules`
+junction, 5–10 minutes each. Claude Sonnet did the MCP answer-mode lane (43 minutes) and this
+documentation pass. The Anthropic monthly spend limit killed four Sonnet subagents at once mid-lap
+(HTTP 429) — the AGY lanes were unaffected — and later the AGY lane hit its own individual quota
+(reset in about 1 h 46 min), which is why this docs pass moved to Sonnet. One investigation result
+worth keeping: the "second request" a `claude -p` harness sends per run is `HEAD /api/hello`, a
+connectivity probe, not a completion.
 
-**Released as v0.68.7** (owner decision 2026-09-01: patch — no public surface moved, and two live
-defect fixes reach users). Publish run
-[33537515414](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33537515414) succeeded. The
-packed artifact carries `tier-data.json` with 801 models.
+**Owner decisions this lap (2026-09-03):** DR-020 → shrink, not replace (done); audit-tools items
+are out of scope for llm-relay laps; the refusal queue → research the 4 highest-count items (done —
+item 1, the groq TPM 429, proposed as `rate-limited`/`attempt` and awaiting
+`llm-relay eligibility accept 2 --sig a568e0cbe2 --class rate-limited --scope attempt`; items 3, 4
+and 6 got no verdict, reasons in
+[docs/eligibility-proposals-2026-09-03.md](docs/eligibility-proposals-2026-09-03.md)); the sweep
+must never name a model — hence `auto`.
 
-**Then v0.68.8**, carrying the three control-flow fixes below. Publish run
-[33578564713](https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33578564713) succeeded;
-registry `dist-tags.latest` and the reinstalled global executable both report `0.68.8`.
+Immediate next — each is also a [`docs/backlog.md`](docs/backlog.md) Open entry carrying its unmet
+property:
 
-⚠ **A green publish run prints `::error::tier-data.json missing or empty`.** That is the workflow's
-own negative control deleting the asset from a throwaway copy to prove the probe catches it; the
-same step then prints `PASS-AS-EXPECTED`. Do not re-cut a release on that line.
-
-⚠⚠ **Three CI-verdict traps are now recorded in
-[`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md), all met live this lap.** Never
-read a verdict off a piped `gh run watch` (the pipe reports `tail`'s exit code, so a FAILED run
-reads as green); never take the run from `gh run list --limit 1` right after a push (it returns the
-PREVIOUS run — this bit twice, and `gh run watch` then cheerfully reports that run's old success);
-select by tag or SHA and confirm with `gh run view --json status,conclusion,headSha`.
-
-✅ **The daemon was restarted onto v0.68.8 and the decomposed request path is PROVEN LIVE**
-(2026-09-01). It had been running since 13:15, i.e. pre-decomposition code, because it autostarts at
-logon and a publish does not replace a running process. Restarted with
-`wscript.exe "<Startup>\llm-relay.vbs"` — ⚠ never `cmd /c start` on a `.vbs`, which opens a shell
-instead.
-
-Four things the restart proved that no test could:
-
-- **Anthropic front, `/v1/messages`, `pool/low`** → HTTP 200 in 1.46 s with the exact expected text,
-  and `x-llm-relay-pool-attempts: 3 tried, 1 served: 2x402, 1x200` — the walk FAILED OVER TWICE
-  before serving, so `nextUncappedAttempt`, the failover classification, `beginHealthAttempt` and
-  the served-announcement set all ran for real.
-- **OpenAI front, `/v1/chat/completions`, streamed** → HTTP 200 in 1.01 s, one 402 failover, frames
-  assembling to the expected text. Both fronts, one policy, live.
-- **The breaker LEARNED from it**: `huggingface/moonshotai/Kimi-K3` reads `OPEN 3521s`, i.e. 58.7
-  minutes remaining of the 1-hour cooldown a 402 earns. Attempt accounting works through the new
-  path.
-- ⚠ **The new learned context rung is INERT on this machine today** — `target-facts.json` holds NO
-  `context-limit` fact, so the guardrail still resolves through the published figure alone. Its
-  blast radius is zero until a provider refuses an over-length request.
-
-⚠ A `/candidates` query without the control token answers **403**, and a parser that reads the error
-object for a row array reports "0 candidates" — a vacuous pass. Use `llm-relay candidates`, which
-carries the token.
-
-**Round two — v0.68.8, three CONTROL-FLOW changes the first pass could not see.** The first audit
-compared function BODIES; `handle` shrank 683 → 271 lines and `openAiFrontPath` grew 17 → 561, so
-those two handlers were RESTRUCTURED, not moved, and a body diff cannot see a reordered guard. All
-three below are confirmed against `git show ec5c16f:src/server.ts`, and all three shipped in
-v0.68.7.
-
-- **The Anthropic front re-read the clock per candidate.** The original built ONE `CredentialWalk`
-  before the front branch on the frozen `routingNow`, so the ordering and the walk could not
-  disagree. The split gave `routes/messages.ts` its own walk with `selectionNow: Date.now()` AND an
-  `evidenceFor` calling `Date.now()` again per invocation, while `server.ts` kept `routingNow` for
-  the OpenAI front — two fronts, two clocks, and a non-deterministic walk. `routingNow` is now
-  threaded through `MessagesContext`.
-- **The context guardrail gained a second rung and its 400 body named the wrong source.**
-  `observedContextLimit` has ZERO hits in the original. The learned rung is KEPT — it is first-party
-  evidence about the exact deployment — but the body claimed the provider "publishes" the limit
-  whatever rung produced it. `contextCeilingFor` now returns the basis with the number.
-- **`forwardLocalResponse` inverted its fail-clean ordering**, committing the head before reading
-  the body on the local-failure exit of both loops. Restored.
-
-✅ **All four regions are now reviewed** (owner decision 2026-09-01: review the remaining three by
-hand rather than re-run the multi-agent workflow, which had lost nine of ten agents to a spend limit
-and reported the surviving region's findings as "refuted" with EMPTY reason lists — a zero-vote
-result read as a unanimous one). `headers-accounting` is clean; `openai-front` and `anthropic-walk`
-each carried ONE defect, the same one: both fronts hand-built `ProviderTargetIdentity` field by
-field instead of calling `targetIdentity` through `beginHealthAttempt`, making a THIRD private copy
-of a construction `kernel/contracts.ts` records having already closed once, and both dropped its
-`Object.freeze`. ⚠ The values were identical, so nothing user-visible changed. Both fronts now diff
-clean against the original.
-
-⚠ Round three also CORRECTS a round-two measurement: `openAiFrontPath` went 630 → 590 lines, not
-"17 → 561". That figure came from a textual extractor matching a multi-line signature's parameter
-braces instead of the body — the same false-match class the audit already warns about. The OpenAI
-front largely MOVED; it was not rewritten.
-
-Immediate next:
-
-- Investigate the 1,594-second `pool/medium` MCP survey job recorded in
-  [`docs/backlog.md`](docs/backlog.md); it was cancelled without an answer and was not used as
-  evidence. The same investigation includes `pool/high` job `job-0002`, which exited 0 after
-  75 seconds but returned only the incomplete fragment `Based on the evidence`. Neither symptom is
-  yet attributed to the serving model, pool walking, lane output capture, or MCP job storage.
-- Release the `targetIdentity` fix (`7e16acc`) when something else earns a version. It changes no
-  behaviour — the hand-built identity produced identical values — so there is nothing for users to
-  receive and it did not justify a release of its own.
-- Claude→MCP→AGY end-to-end validation remains deferred until Claude subscription access returns.
-  Codex→MCP→AGY already passed with no visible or foreground AGY window.
+- Verify `agent(task, {agentType: "relay"})` end to end in a fresh Claude Code session with a
+  three-agent Workflow.
+- Raise `publish.yml`'s `timeout-minutes: 15` to 30 — three npm installs at 4–5 minutes each leave
+  almost no margin, and the first v0.69.0 attempt already burned it.
+- Calibrate `routing.hedge.floorMs` from data instead of the hand-set `8000`, and find why the
+  per-token and absolute rungs never fire (`docs/audit-findings-2026-09-03.md` DR-002 names a
+  candidate cause: `tokensSeen` hardcoded to `0` at the one production call site).
+- Remediate, or explicitly accept with reasons, the four `docs/audit-findings-2026-09-03.md`
+  findings verified against source this lap: DR-001 (`config-types.ts` duplicates `config.ts`,
+  including the runtime `EFFORT_LEVELS` array), DR-002 (the hedge ladder's adaptive rung, above),
+  contract-review DR-003 (the ledger blames the provider for relay-authored refusals), contract-review
+  DR-004 (`GET /v1/models` invents a 272000-token context window).
+- Clean up the DR-020 residue in `accounting-store.ts`'s public types: `SnapshotMutationResult`
+  still declares the dead `"recovered"`/`"recovery-loss"` members, and `ioHooks` is a seam with
+  nothing left to inject.
 
 ## 0.1 Earlier releases
 
@@ -161,6 +132,11 @@ Deliberately NOT restated here. This file holds current state plus the immediate
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
 tags are the trail. What survived each sprint lives in its own home:
 
+- **v0.68.7–v0.68.8, the `server.ts` decomposition audit** — a handed-over refactor arrived green
+  with four defects the suite could not see (a lost second `tsc` pass, a downgraded HTTP status, a
+  validator field `AssistantMessage` never declared, a broken multi-line SSE parse) plus three
+  control-flow changes a function-body diff couldn't see either; repaired, remediated and every
+  region reviewed: [docs/refactor-consistency-audit-2026-09-01.md](docs/refactor-consistency-audit-2026-09-01.md).
 - **v0.58.0, the max-output-caps lap** — the display-only `max-output` measurement fact (parser
   beside the context parser, observer on both fronts, live-verified on groq), and the stale-digest
   lesson (recorded signature digests go stale across a normalizer migration — list before
@@ -408,3 +384,8 @@ probe paths and the `withBudget` non-cancelling race are named as out of scope i
   (`key-checker`'s initial-probe 401/403, and an anthropic-kind provider only ever reporting
   `unverified`); the pre-existing mis-indentation in `src/key-checker.ts` stands so a reformat
   cannot obscure a real diff.
+- **`delegate-gate` findings WAIVED across this lap's lane diffs** (2026-09-04): the module-level
+  `servers` test-fixture pattern and `as unknown as typeof fetch` casts, both flagged repeatedly
+  across this lap's AGY-lane packets, were judged pre-existing repository convention rather than
+  new defects and let through — the same shape as the dashboard-fixture `as unknown as` entry
+  above, now also seen on the server side.

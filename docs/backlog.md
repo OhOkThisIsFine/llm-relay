@@ -28,19 +28,114 @@
   by disabling each with its invariant named, or by fixing the findings. Evidence:
   [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md).
 
-- **Re-check long `pool/medium` MCP dispatch after v0.68.4.** During the universal-entrypoint lap,
-  read-only survey job `job-0001` stayed `running` with no answer for 1,594 seconds and was
-  cancelled. The caller-side MCP mechanics were correct; no claim is made yet about whether the
-  delay was pool walking, a provider think, or a stuck agent loop. Compare its usage window and
-  process exit evidence against the latency-demotion/cumulative-walk correction before deciding
-  whether this is a regression. A later `pool/high` closeout-audit job (`job-0002`) exited 0 after
-  75 seconds, but `dispatch_result` returned only the incomplete fragment `Based on the evidence`;
-  its audit was discarded. Determine whether that truncation came from the serving model, lane
-  output capture, or MCP job storage while investigating the longer run. Home for the eventual
-  mechanism and verdict:
-  [`dispatch-smoothness-2026-08-31.md`](dispatch-smoothness-2026-08-31.md).
+- **Verify the `relay` custom agent type end to end in a fresh Claude Code session.**
+  `llm-relay setup claude-cli|claude-desktop` now installs `~/.claude/agents/relay.md` (model
+  haiku; tools = the three dispatch MCP tools) so a Claude Workflow script can call
+  `agent(task, {agentType: "relay"})` instead of building its own dispatch call. The file is on
+  disk with the marker the installer checks for, but the session that ran `llm-relay setup` does
+  not reload its own agent registry mid-session, so `agentType: "relay"` has never actually been
+  invoked.
+
+  **Property:** a Workflow script naming `agentType: "relay"` resolves to the installed agent and
+  completes a real dispatch through it — not merely that the file exists on disk with the right
+  marker.
+
+- **Raise `publish.yml`'s `timeout-minutes: 15` — the v0.69.0 publish exhausted it on the first
+  attempt.** `npm ci` took 5 min 2 s against a 10 s baseline on the v0.68.8 run, and the smoke
+  test's two `npm install` calls cost about 5 min each; ordinary npm-registry slowness, with no
+  code or CI defect, ran the job past 15 minutes and GitHub Actions cancelled it before it reached
+  the publish step. A `gh run rerun` of the exact same run then published cleanly (`npm ci` still
+  4 min 17 s the second time), so this is a live-fire risk on every future release rather than a
+  one-off.
+
+  **Property:** a publish run has enough timeout headroom to absorb ordinary npm-registry slowness
+  without a human having to notice the cancellation and manually re-run it.
+
+- **Calibrate `routing.hedge`'s floor from data, and find why its per-token and absolute rungs
+  never fire.** Every hedge observed this lap reported basis `floor` — none reported `per-token` or
+  `absolute` — across `pool/medium` traffic where the slow primary answered in 9–38 s.
+  [`audit-findings-2026-09-03.md`](audit-findings-2026-09-03.md) DR-002 (merged conceptual
+  findings) already names a candidate cause verified against source: `hedgeDelayDecision` calls
+  `hedgeThreshold` with `tokensSeen` hardcoded to `0`, and the per-token rung is gated on
+  `tokensSeen > 0`, so it may be structurally unreachable on the wired path rather than merely
+  unexercised by this lap's traffic. The operator's `routing.hedge.floorMs: 8000` is a hand-set
+  number chosen after watching four requests, not a calibrated one the way
+  `DEFAULT_LATENCY_MS_PER_TOKEN`'s 250 was measured from `usage/recent.json`.
+
+  **Property:** the hedge ladder's rungs fire in the order the source and `CLAUDE.md` claim
+  (`per-token → absolute → floor`, first rung with evidence final) — or the code and the
+  documentation describing it agree that the floor is the only rung that ever runs.
+
+- **Remediate, or explicitly accept with reasons, the four `docs/audit-findings-2026-09-03.md`
+  findings verified against source this lap but left unfixed.** All four were checked directly by
+  the lap orchestrator, distinct from the file's own 35-of-41-present bookkeeping note
+  (`5c6c60f`):
+  - **DR-001** (merged conceptual) — `src/config-types.ts` duplicates 31 exported names from
+    `src/config.ts`, including the RUNTIME array `EFFORT_LEVELS`, declared twice and imported by
+    different consumers (`cli.ts` from `config.ts`, `dynamic-pools.ts` from `config-types.ts`).
+    Adding a config key to one copy compiles clean and silently does nothing in every module bound
+    to the other — the closed-vocabulary defect class `CLAUDE.md` already tracks, at module scope
+    instead of union-member scope.
+  - **DR-002** (merged conceptual) — the hedge ladder's documented "per-token → absolute → floor"
+    order only ever runs the floor rung in production, because the one production call site passes
+    a literal `0` for `tokensSeen` and the per-token rung is gated on `tokensSeen > 0`. This lap's
+    own measurement (the hedge-calibration entry, above) reproduces the symptom the audit predicted
+    from source alone.
+  - **DR-003** (contract review) — `accountingFailureForAttempt` falls through to `provider_error`
+    for a relay-authored refusal (e.g. a dialect-rescue destructive refusal, `errorOrigin: "local"`),
+    so the ledger blames the provider for a decision the breaker correctly declines to charge
+    against it. No test references the function or the failure-kind type it classifies.
+  - **DR-004** (contract review) — `GET /v1/models` seeds every advertised entry's
+    `context_window`/`max_context_window` with a hardcoded `272000` (`CODEX_DEFAULT_CONTEXT_WINDOW`)
+    whenever the real resolvers return nothing, contradicting the provenance rule that an unknown
+    limit stays unknown and overshooting this repo's own measured pool minimums (131,072–163,840)
+    by roughly 1.7–2.1x.
+
+  **Property:** each finding is either fixed, or explicitly accepted with a named reason the way
+  [`advisory-findings-verification-2026-08-28.md`](advisory-findings-verification-2026-08-28.md)'s
+  Class B deferrals are — not merely present in an audit file nobody has acted on.
+
+- **Clean up the DR-020 residue in the accounting store's public types.**
+  `SnapshotMutationResult` still declares the `"recovered"`/`"recovery-loss"` members of a recovery
+  mechanism `751fb52` deleted, and `ioHooks` remains a seam with nothing left to inject behind it.
+  Neither is wrong today — a member of a closed union no code path returns is inert, not
+  incorrect — but it is exactly the "type wider than its producers" shape `CLAUDE.md`'s
+  closed-vocabulary gotcha distinguishes from the dangerous silent-fallback case, and it will read
+  as live behaviour to the next person who greps for it without reading the DR-020 history.
+
+  **Property:** `SnapshotMutationResult` and the accounting store's exported seams name only
+  mechanisms that exist after DR-020, so a reader does not have to check git history to learn which
+  members are real.
 
 ## Closed
+
+- ✅ **Re-check long `pool/medium` MCP dispatch after v0.68.4 — root-caused and fixed** (2026-09-04).
+  Not a stall and not the MCP mechanics: `targetUsability` was collapsing a LATENCY demotion into
+  the same `cooling` band as an outright failure, and unknown-lift candidates sort last within that
+  band — so the pool's one fast-answering member, a latency-demoted `nim/moonshotai/kimi-k3`
+  (p95 385–875 ms/token), was walked AFTER every 401/402/403/404/502 member instead of ahead of
+  them. Measured before the fix, one-line prompts on `pool/medium`: direct HTTP 5.7 / 8.5 / 10.8 /
+  6.6 s with 6–9 failing members walked per request (one probe:
+  `9 tried, 1 served: 1x404, 1x401, 3x402, 1x403, 2x502, 1x200`); MCP dispatch to `claude-free-pool`
+  through the `claude -p` harness 22 s, of which the harness's own overhead beyond API time measured
+  0.06–0.26 s plus about 2 s of process start.
+
+  Fixed by `bbe1d20` (owner-approved 2026-09-03): `TargetUsability` gained a fourth band, `slow`,
+  ordered live → slow → credential-fault → cooling, so a latency-demoted member is walked ahead of
+  anything actually broken instead of behind it. That alone produced `2 tried, 1 served` walks, but
+  the DEFAULT hedge floor then dominated the total — one-liners still took 21–38 s after the
+  restart, because the hedge fired only at the built-in 20 s floor and its member answered about a
+  second later. With the operator's `routing.hedge.floorMs` set to 8000, the same one-liners against
+  the restarted v0.69.0 daemon completed in 3.0–17.3 s. Hedge-floor calibration is tracked as its
+  own Open entry above, not folded into this close.
+
+  The entry's second symptom — `job-0002` exiting 0 with only the fragment `Based on the evidence`
+  — is reclassified rather than separately root-caused: `cadefcc` gave the MCP dispatch server a
+  structural `isContentEmpty` check, so output that is only whitespace, punctuation or Markdown
+  scaffolding is now reported as its own `empty-output` failure instead of returned as a truncated
+  success. Whether that particular truncation came from the serving model or from lane-output
+  capture was never re-derived; what changed is that the class it falls into no longer reads as a
+  completed answer.
 
 - ✅ **Control-flow review of the three unexamined request-path regions** (2026-09-01). The
   `server.ts` decomposition was first audited by comparing function BODIES, which cannot see a
