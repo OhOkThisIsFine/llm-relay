@@ -7,9 +7,9 @@ import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { loadLaneManifest } from "../lane-manifest.js";
-import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, specContextWindow, type DispatchOutcome } from "../dispatch.js";
+import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, specContextWindow, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
-import { contextWindowResolver } from "../metadata.js";
+import { contextWindowResolver, type ContextWindowSource } from "../metadata.js";
 import { snapshotContextWindow } from "../tier-data.js";
 import { observedContextLimit } from "../context-limits.js";
 import { getTelemetryReport } from "../telemetry.js";
@@ -34,11 +34,14 @@ function collectModelAliases(value: unknown, out: Set<string>): void {
 }
 
 /**
- * Codex-shaped default context window for an unresolvable id.
- * Under-promising is safe; over-promising causes the defect this fixes.
- * 272000 = 272k, the pre-existing hardcoded value.
+ * How a resolved context window is described to the client, per resolver rung — a total table,
+ * so a new `ContextWindowSource` is a compile error here rather than an unlabelled figure.
  */
-const CODEX_DEFAULT_CONTEXT_WINDOW = 272000;
+const CONTEXT_SOURCE_LABEL = {
+  observed: "stated by this deployment when it refused an over-length request",
+  provider: "published by the serving provider",
+  snapshot: "from the synced capability snapshot for this model id",
+} as const satisfies Record<ContextWindowSource, string>;
 
 /** OpenAI-compatible model discovery for clients such as local Codex. */
 function relayModels(
@@ -62,31 +65,40 @@ function relayModels(
   );
 
   return [...ids].sort().map((id) => {
-    // Resolve context window per id: pool/<name> -> pool minimum; provider spec -> deployment; nothing -> fallback
-    let contextWindow: number = CODEX_DEFAULT_CONTEXT_WINDOW;
-    let maxContextWindow: number = CODEX_DEFAULT_CONTEXT_WINDOW;
-
-    // For pool/<name>, resolve to the pool-minimum context window
-    if (id.startsWith("pool/")) {
-      const resolved = specContextWindow(id, cfg, publishedContextWindow);
-      if (resolved !== null && Number.isFinite(resolved.tokens) && resolved.tokens > 0) {
-        contextWindow = resolved.tokens;
-        maxContextWindow = resolved.tokens;
-      }
+    // Resolve per id: pool/<name> -> the minimum over its resolving members; a provider spec -> the
+    // deployment's own three-rung resolution. NOTHING resolves -> the two fields are OMITTED
+    // (contract review DR-004, 2026-09-04). Until then an unresolvable id advertised a flat 272000,
+    // roughly 1.7-2.1x this machine's measured pool minimums: an invented ceiling on the surface
+    // Codex budgets compaction against, contradicting the rule every other limit surface here
+    // keeps — an unknown ceiling stays unknown, never a large guess. The description states what
+    // was resolved and how, because the wire schema has no provenance field of its own.
+    // `auto` is a relay-reserved name, resolved through the ladder at request time; resolving it
+    // as a MODEL id would borrow whatever the snapshot holds under that last segment — it did:
+    // `openrouter/auto`'s 2,000,000 tokens, measured 2026-09-04 on this machine.
+    const isAuto = id === AUTO_MODEL;
+    const spec = isAuto ? resolveAutoSpec(cfg).spec : id;
+    const isPool = spec.startsWith("pool/");
+    const poolResolved = isPool ? specContextWindow(spec, cfg, publishedContextWindow) : null;
+    const resolved = isPool ? poolResolved : publishedContextWindow(spec);
+    const tokens = resolved !== null && Number.isFinite(resolved.tokens) && resolved.tokens > 0 ? resolved.tokens : null;
+    const autoNote = isAuto ? `auto currently resolves to ${spec}; ` : "";
+    let contextNote: string;
+    if (resolved === null || tokens === null) {
+      contextNote = "context window unknown, so it is not advertised";
+    } else if (isPool) {
+      const unresolved = poolResolved !== null && poolResolved.unknownMembers > 0
+        ? ` (${poolResolved.unknownMembers} members unresolved)`
+        : "";
+      contextNote = `context window ${tokens} tokens, the minimum over the pool's resolving members${unresolved}`;
     } else {
-      // For a concrete provider spec, try to resolve it directly
-      const resolved = publishedContextWindow(id);
-      if (resolved !== null && Number.isFinite(resolved.tokens) && resolved.tokens > 0) {
-        contextWindow = resolved.tokens;
-        maxContextWindow = resolved.tokens;
-      }
+      contextNote = `context window ${tokens} tokens, ${CONTEXT_SOURCE_LABEL[resolved.source]}`;
     }
 
     return {
       id,
       slug: id,
       display_name: id,
-      description: "Model routed through llm-relay.",
+      description: `Model routed through llm-relay; ${autoNote}${contextNote}.`,
       default_reasoning_level: "medium",
       supported_reasoning_levels: [
         { effort: "minimal", description: "Fast responses with minimal reasoning" },
@@ -114,8 +126,7 @@ function relayModels(
       truncation_policy: { mode: "tokens", limit: 10000 },
       supports_parallel_tool_calls: true,
       supports_image_detail_original: true,
-      context_window: contextWindow,
-      max_context_window: maxContextWindow,
+      ...(tokens === null ? {} : { context_window: tokens, max_context_window: tokens }),
       comp_hash: "llm-relay",
       effective_context_window_percent: 95,
       experimental_supported_tools: [],

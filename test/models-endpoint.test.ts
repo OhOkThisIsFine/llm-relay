@@ -62,15 +62,19 @@ describe("GET /v1/models context window resolution", () => {
     const url = await boot();
     const res = await fetch(`${url}/v1/models`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { data: Array<{ id: string; context_window: number; max_context_window: number }> };
+    const body = (await res.json()) as { data: Array<{ id: string; description: string; context_window?: number; max_context_window?: number }> };
 
     const poolEntry = body.data.find((d) => d.id === "pool/coding");
     expect(poolEntry).toBeDefined();
     expect(poolEntry!.context_window).toBe(131072);
     expect(poolEntry!.max_context_window).toBe(131072);
+    // The description states the figure and how it was resolved: the wire schema has no
+    // provenance field, so the one free-text field carries it.
+    expect(poolEntry!.description).toContain("131072");
+    expect(poolEntry!.description).toContain("minimum over the pool");
   });
 
-  it("reports the Codex default (272000) for completely unresolvable ids", async () => {
+  it("omits the context window for a completely unresolvable pool and says so", async () => {
     // Create a config with a pool that has a member that won't resolve
     const cfg: Config = {
       listen: "127.0.0.1:0",
@@ -102,30 +106,48 @@ describe("GET /v1/models context window resolution", () => {
     try {
       const res = await fetch(`${testUrl}/v1/models`);
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { data: Array<{ id: string; context_window: number; max_context_window: number }> };
+      const body = (await res.json()) as { data: Array<{ id: string; description: string; context_window?: number; max_context_window?: number }> };
 
-      // Find the pool/unresolvable entry
       const poolEntry = body.data.find((d) => d.id === "pool/unresolvable");
       expect(poolEntry).toBeDefined();
-      // With no resolvable data, it should fall back to the default
-      expect(poolEntry!.context_window).toBe(272000);
-      expect(poolEntry!.max_context_window).toBe(272000);
+      // Nothing resolved, so nothing is advertised: an unknown ceiling stays unknown (contract
+      // review DR-004). Until 2026-09-04 this entry carried a flat 272000.
+      expect(poolEntry).not.toHaveProperty("context_window");
+      expect(poolEntry).not.toHaveProperty("max_context_window");
+      expect(poolEntry!.description).toContain("context window unknown");
     } finally {
       await new Promise<void>((r) => testServer.close(() => r()));
     }
   });
 
-  it("reports the Codex default (272000) for an unresolvable provider spec", async () => {
+  it("omits the context window for an unresolvable provider spec", async () => {
     const url = await boot();
     const res = await fetch(`${url}/v1/models`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { data: Array<{ id: string; context_window: number; max_context_window: number }> };
+    const body = (await res.json()) as { data: Array<{ id: string; description: string; context_window?: number; max_context_window?: number }> };
 
-    // Find the anthropic entry (no model specified, so it won't resolve)
+    // The bare provider spec names no model, so no rung can answer for it.
     const anthropicEntry = body.data.find((d) => d.id === "anthropic");
     expect(anthropicEntry).toBeDefined();
-    expect(anthropicEntry!.context_window).toBe(272000);
-    expect(anthropicEntry!.max_context_window).toBe(272000);
+    expect(anthropicEntry).not.toHaveProperty("context_window");
+    expect(anthropicEntry).not.toHaveProperty("max_context_window");
+    expect(anthropicEntry!.description).toContain("context window unknown");
+    // And no entry anywhere carries the retired constant.
+    for (const entry of body.data) expect(entry.context_window).not.toBe(272000);
+  });
+
+  it("resolves the relay-reserved auto id through the ladder, never as a model id", async () => {
+    // With no ladder configured, `auto` resolves to `routing.default` (the bare `anthropic` spec,
+    // which names no model), so nothing is advertised — and the description says what it resolved
+    // to. Before 2026-09-04 the snapshot rung matched the last segment `auto` against
+    // `openrouter/auto` and advertised that SKU's 2,000,000-token window as the relay's own.
+    const url = await boot();
+    const res = await fetch(`${url}/v1/models`);
+    const body = (await res.json()) as { data: Array<{ id: string; description: string; context_window?: number }> };
+    const autoEntry = body.data.find((d) => d.id === "auto");
+    expect(autoEntry).toBeDefined();
+    expect(autoEntry!.description).toContain("auto currently resolves to anthropic");
+    expect(autoEntry).not.toHaveProperty("context_window");
   });
 
   it("returns both /v1/models and /models paths", async () => {
