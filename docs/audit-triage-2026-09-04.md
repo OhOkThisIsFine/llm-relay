@@ -2,7 +2,8 @@
 
 Lap goal (`.claude/lap-start.json`, start commit `8973500`): *Triage the 2026-09-03 audit findings
 against HEAD; remediate or explicitly accept the verified items.* Approved by the owner on
-2026-09-04. Shipped as **v0.71.0**.
+2026-09-04. Shipped as **v0.71.1** (v0.71.0's publish run failed on a documentation-link check
+against a document a concurrent session had not yet committed; HANDOFF §0 records it).
 
 **Scope.** The 35 findings present in [audit-findings-2026-09-03.md](audit-findings-2026-09-03.md):
 27 merged conceptual and 8 contract-review findings. The 6 process findings the file's totals line

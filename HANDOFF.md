@@ -2,9 +2,15 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-04 (v0.71.0, the audit-triage lap)
+## 0. State as of 2026-09-04 (v0.71.1, the audit-triage lap)
 
-**v0.71.0** carries the audit-triage lap. Every finding in
+**v0.71.1** carries the audit-triage lap. (v0.71.0 was tagged first and its publish run failed on
+`test/doc-links.test.ts`: the backlog rewrite in this lap had committed four entries a concurrent
+session in the same checkout had added uncommitted, one of them linking a document that session had
+not yet committed — the untracked file satisfied the check locally and did not exist in CI. That
+session then committed the document as `a137d04`; v0.71.1 is the fix-forward on the tree holding
+both. Both traps are recorded: the test's hermeticity gap in [docs/backlog.md](docs/backlog.md), the
+shared-checkout rewrite in the machine backlog.) Every finding in
 [docs/audit-findings-2026-09-03.md](docs/audit-findings-2026-09-03.md) now has a verdict in
 [docs/audit-triage-2026-09-04.md](docs/audit-triage-2026-09-04.md), and each verified defect is
 fixed with a pinning test. In one line each:
@@ -46,8 +52,9 @@ session hit its usage limit mid-run: the MCP server connection was replaced, job
 the agents saw "Request timed out" then "Connection closed". Direct `dispatch` with a short
 `waitMs` and polling worked afterwards.
 
-**Daemon:** the global install must be reinstalled and the daemon restarted onto v0.71.0 after
-the publish (the Startup `.vbs` launches the global install).
+**Daemon:** reinstalled and restarted onto v0.71.1 (pid 29232) through the Startup `.vbs`; its
+live catalog shows `auto` resolving to `pool/medium` at 131,072 tokens, the minimum over the pool's
+resolving members, where the previous build advertised 2,000,000.
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
 

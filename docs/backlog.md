@@ -176,6 +176,15 @@
   **Property:** every export of `candidate-runner.ts` has a consumer in `src/` or a test that names
   it as a seam, and the four spend-cell names have one list.
 
+- **`test/doc-links.test.ts` resolves links against the working tree, so an untracked file makes a
+  local green that CI cannot reproduce** (2026-09-04, found by the v0.71.0 publish failure). The
+  backlog linked `muse-spark-1.3-opencode-zen-2026-09-04.md` while that document was still
+  untracked in this checkout; the test passed locally and failed in CI, and the release had to be
+  re-cut as v0.71.1.
+
+  **Property:** the test resolves a relative link only against files git tracks (`git ls-files`),
+  so the local and the CI verdict agree.
+
 - **State the default-ON routing terms in the user docs** (audit DR-024 residual, 2026-09-04).
   `routing.hedge`, `routing.latency` and `routing.laneProbe` default ON by owner decision;
   `docs/reference.md` should list each with its default and the one-line revert.
