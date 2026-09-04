@@ -43,6 +43,11 @@ red without anyone invoking a script by hand:
   ⚠ Deliberately NOT in `npm run check`, and CI does not run it. Tools are invoked through `npx`, so
   knip cannot see them — keep the `ignoreDependencies` list in `knip.config.json` in step when
   adding a step here.
+  ⚠ `run-summary.txt` prints each tool's process EXIT CODE, labelled as such (`jscpd: exit 0`),
+  never a finding count. Until 2026-09-04 it printed the bare number under the tool's name beside
+  `Failures: none` while the run it summarized held 572 clone blocks (audit DR-018). A `.json`
+  report is written only from stdout and only when it parses; jscpd's JSON comes from its own
+  reporter (`jscpd-report.json` in the report directory).
 
 Offline / unit-test-safe (no external creds):
 - `calibrate-hedge-floor.mjs` (`node scripts/calibrate-hedge-floor.mjs [--path <recent.json>]`) —

@@ -52,10 +52,12 @@ const steps = [
     txt: 'ts-prune.txt',
   },
   {
+    // The JSON report is written by jscpd's own reporter (`jscpd-report.json` in the report
+    // directory), never by capturing console text under a `.json` name — which is what this step
+    // did until 2026-09-04 (audit finding DR-018: `jscpd.json` held ANSI console output).
     name: 'jscpd',
-    command: 'npx jscpd src test scripts',
+    command: 'npx jscpd src test scripts --reporters console,json --output analysis-reports',
     txt: 'jscpd.txt',
-    json: 'jscpd.json',
   },
   {
     name: 'similarity-ts-attempt',
@@ -97,8 +99,23 @@ async function runStep(step) {
       const txtFile = join(reportDir, step.txt);
       writeFileSync(txtFile, output.length ? output : '(no output)');
 
+      // A `.json` file is written only from STDOUT and only when it parses: stderr noise glued to
+      // a JSON report, or a tool that printed console text, used to land under a `.json` name.
+      let jsonState = 'none';
       if (step.json) {
-        writeFileSync(join(reportDir, step.json), output.length ? output : '[]');
+        let parsed = false;
+        try {
+          JSON.parse(stdout);
+          parsed = true;
+        } catch {
+          parsed = false;
+        }
+        if (parsed) {
+          writeFileSync(join(reportDir, step.json), stdout);
+          jsonState = 'written';
+        } else {
+          jsonState = 'stdout was not JSON, no .json written';
+        }
       }
 
       writeFileSync(join(reportDir, `${step.name}.exit.txt`), `${status}`);
@@ -106,6 +123,7 @@ async function runStep(step) {
       resolve({
         name: step.name,
         status,
+        jsonState,
         optional: Boolean(step.optional),
       });
     });
@@ -116,6 +134,7 @@ async function runStep(step) {
       resolve({
         name: step.name,
         status: 1,
+        jsonState: 'spawn failed',
         optional: Boolean(step.optional),
       });
     });
@@ -124,17 +143,24 @@ async function runStep(step) {
 
 const results = await Promise.all(steps.map(runStep));
 
-const summary = [`Generated: ${new Date().toISOString()}`];
+// The summary states each figure for what it is. Until 2026-09-04 it printed the process EXIT
+// CODE under the tool's bare name (`jscpd: 0`) beside `Failures: none`, which read as a finding
+// count — while the jscpd run it summarized had reported 572 clone blocks (audit finding DR-018).
+// Findings live in the per-tool files; this summary only says whether each tool RAN.
+const summary = [
+  `Generated: ${new Date().toISOString()}`,
+  'Each line is the tool\'s process exit code, not a finding count. Read the per-tool report files for findings.',
+];
 const failures = [];
 
 for (const res of results) {
-  summary.push(`${res.name}: ${res.status}`);
+  summary.push(`${res.name}: exit ${res.status}${res.jsonState === 'none' ? '' : ` (json: ${res.jsonState})`}`);
   if (res.status !== 0 && !res.optional) {
     failures.push(res.name);
   }
 }
 
-summary.push(`\nFailures: ${failures.length ? failures.join(', ') : 'none'}`);
+summary.push(`\nTools exiting non-zero: ${failures.length ? failures.join(', ') : 'none'}`);
 writeFileSync(join(reportDir, 'run-summary.txt'), `${summary.join('\n')}\n`);
 
 if (failures.length > 0) {
