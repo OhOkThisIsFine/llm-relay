@@ -1,7 +1,10 @@
-/** The finite set of quota dimensions understood by the relay. */
-export type QuotaAxis = "requests" | "tokens";
-
-export type QuotaPeriod = "minute" | "day" | "month" | "unknown";
+// The finite set of quota dimensions and periods understood by the relay is declared ONCE, in
+// `dashboard-contract.ts` (derived from `QUOTA_AXES` / `QUOTA_PERIODS`), and re-exported here for
+// the internal producers. This file restated both unions by hand until 2026-09-04 (audit DR-004:
+// the same closed-vocabulary duplication as `config-types.ts`, found by `test/one-declaration.test.ts`).
+// Adding an axis or period is therefore an explicit wire-contract change, which is what it is.
+import type { QuotaAxis, QuotaPeriod } from "./dashboard-contract.js";
+export type { QuotaAxis, QuotaPeriod };
 
 export interface QuotaObservation {
   axis: QuotaAxis;

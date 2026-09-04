@@ -141,8 +141,17 @@ export interface AccountingSpendPricesV1 {
  *   separate estimated-output metering never silently widens spend.
  * - "partial": at least one present token kind was left out (cache kinds, or one of
  *   in/out unpublished). The amount is a lower bound.
+ *
+ * The list is the ONE declaration: the validator below reads it and the type derives from it,
+ * so a coverage the ledger accepts can never be refused by the store, or the reverse.
+ * `accounting.ts` imports and re-exports both — it restated the union by hand until 2026-09-04
+ * (audit DR-004, found by `test/one-declaration.test.ts`); this module is the home because
+ * `accounting.ts` already imports it, and the other direction would be a cycle.
  */
-export type AccountingSpendCoverage = "full" | "input_only" | "partial";
+export const ACCOUNTING_SPEND_COVERAGES = Object.freeze(["full", "input_only", "partial"] as const);
+export type AccountingSpendCoverage = (typeof ACCOUNTING_SPEND_COVERAGES)[number];
+const isSpendCoverage = (value: unknown): value is AccountingSpendCoverage =>
+  typeof value === "string" && (ACCOUNTING_SPEND_COVERAGES as readonly string[]).includes(value);
 
 /** Token kinds observed but NOT priced, per kind; null when the kind itself was absent. */
 export interface AccountingUnpricedTokensV1 {
@@ -1033,7 +1042,7 @@ function isSpend(value: unknown): value is AccountingSpendV1 {
     (value.priceSource === "provider_published" || value.priceSource === "reference") &&
     (value.tokenBasis === "reported" || value.tokenBasis === "estimated") &&
     (value.source === "provider_reported" || value.source === "relay_estimated") &&
-    (value.coverage === "full" || value.coverage === "input_only" || value.coverage === "partial") &&
+    isSpendCoverage(value.coverage) &&
     hasExactKeys(value.unpricedTokens, ["cacheRead", "cacheCreation", "cachedInput"]) &&
     isNullableCounter(value.unpricedTokens.cacheRead) &&
     isNullableCounter(value.unpricedTokens.cacheCreation) &&

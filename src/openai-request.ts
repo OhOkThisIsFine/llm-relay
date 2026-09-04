@@ -1,4 +1,5 @@
 import { isRecord } from "./json-shape.js";
+import type { ThoughtSignatureMode, ToolCallIdMode } from "./config-types.js";
 
 /**
  * Anthropic Messages REQUEST → OpenAI Chat Completions REQUEST.
@@ -80,11 +81,10 @@ export interface AnthropicToOpenAiOptions {
   onThoughtSignatureSentinels?: ((count: number) => void) | undefined;
 }
 
-/** Mirrors `config.ts`'s `ToolCallIdMode`, restated so this module imports no config surface. */
-export type ToolCallIdMode = "preserve" | "strict9";
-
-/** Mirrors `config.ts`'s `ThoughtSignatureMode`, restated for the same reason. */
-export type ThoughtSignatureMode = "none" | "sentinel";
+// `ToolCallIdMode` and `ThoughtSignatureMode` are imported from `config-types.ts`, the ONE
+// declaration of the configuration vocabulary (DR-001, 2026-09-04). A type-only import is erased
+// at runtime, so this module still loads no config surface; it used to restate both unions here,
+// a third copy beside the two that `config.ts` and `config-types.ts` carried.
 
 /**
  * Google's documented opt-out token for a replayed tool call that carries no real thought

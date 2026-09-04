@@ -1,5 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { freezeDeep, isLoadableId } from "./accounting-store-schema.js";
+import {
+  ACCOUNTING_SPEND_COVERAGES,
+  freezeDeep,
+  isLoadableId,
+  type AccountingSpendCoverage,
+} from "./accounting-store-schema.js";
 import {
   DASHBOARD_REQUEST_ID_PATTERN,
   isDashboardFailureKind,
@@ -17,8 +22,11 @@ import {
 /** Explicit provenance for estimates whose method was omitted or unusable. */
 export const ACCOUNTING_UNSPECIFIED_ESTIMATION_METHOD = "unspecified";
 
-/** Coverage of one priced spend; see {@link AccountingSpend}. */
-export type AccountingSpendCoverage = "full" | "input_only" | "partial";
+// `AccountingSpendCoverage` and its list are declared ONCE, in `accounting-store-schema.ts` (this
+// file already imports that module; the reverse direction would be a cycle) and re-exported here
+// for the ledger's consumers — see {@link AccountingSpend}. This file restated the union by hand
+// until 2026-09-04 (audit DR-004, found by `test/one-declaration.test.ts`).
+export { ACCOUNTING_SPEND_COVERAGES, type AccountingSpendCoverage };
 
 export type AccountingRequestId = string;
 export type AccountingAttemptId = string;
