@@ -28,7 +28,9 @@
   terms question is settled; this entry is now engineering only. After route B lands, pin both
   contributor ids as `preferred` in the effort pools (finding 6: no tier-data row, so no automatic
   admission), and the property above gains: `opencode/muse-spark-1.3-contributor-free` answers a
-  real request through `pool/*` on both fronts.
+  real request through `pool/*` on both fronts. Route A (four `opencode-muse-spark` OpenCode-CLI
+  rungs, one per ladder) went live the same day and is verified through MCP `dispatch`
+  (HANDOFF §0), so this entry is route B only.
 
 - **`include: "free"` pools carry paid and unknown-cost deployments, and on this machine no guard
   stops a walk from reaching them.** Deliberate since the admission reversal
@@ -44,9 +46,12 @@
   `runtime-telemetry.json` counts 45 failed calls across five of them — and on 2026-09-04 the fact
   vanished (837 min early) right after a success on a FREE Zen deployment the fact never covered.
   The `dynamic-pools.ts` row of `CLAUDE.md` described the pre-reversal rule until 2026-09-04.
-  **Property (owner decision first):** either `freeOnly` is on for every rule that carries
-  unattended traffic, or the pools' "free" contract is restated where operators read it; and a
-  cost-class-filtered fact is retracted only by evidence inside its own cost classes.
+  **Owner decision 2026-09-04: `freeOnly` stays off** — paid capacity strictly behind every free
+  member is the deliberate last resort (HANDOFF §6; the contract is now stated in the
+  `dynamic-pools.ts` row of `CLAUDE.md`). **Property (what remains):** a cost-class-filtered fact
+  is retracted only by evidence inside its own cost classes, so a success on a FREE deployment can
+  no longer re-admit the paid SKUs the fact excluded; and the pool section of `docs/reference.md`
+  is checked for the pre-reversal "free-only" wording and restated if it carries it.
 
 - **A zero-priced deployment with no exact tier-data row can never enter any effort pool, and a
   `-free` / `-contributor-free` suffix defeats the match against its base SKU's row.**

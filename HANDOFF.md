@@ -68,15 +68,17 @@ Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with 
 - Audit residue with properties: the metering silence channel (DR-006), listener-before-store
   (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
   pruning (DR-012), the default-ON routing keys in `docs/reference.md` (DR-024).
-- Contributor SKUs (owner decision 2026-09-04, option A: allow in automatic routing): Meta's
-  `opencode/muse-spark-1.3-contributor-free` may be routed automatically although its prompts and
-  completions become Meta training data —
+- Contributor SKUs (owner decisions 2026-09-04: option A — allow in automatic routing; route A
+  now, route B as a lap): Meta's `opencode/muse-spark-1.3-contributor-free` may be routed
+  automatically although its prompts and completions become Meta training data —
   [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md)
-  §5. The enabling engineering is route B, a Responses upstream (`wire: "responses"` on
-  `kind: "openai"`), then pinning both contributor ids as `preferred`; the OpenCode-CLI dispatch
-  rung in that doc's §3 works today with no relay change. Same investigation, still open:
-  `freeOnly` is `false` on all three live offload rules while the pools carry paid SKUs behind the
-  free members (backlog, owner decision).
+  §5. **Route A is live:** four `opencode-muse-spark` cli rungs (one per ladder,
+  `--variant <tier>`) sit right after `claude-free-pool` in the live config (revert file
+  `config.json.bak-2026-09-04-pre-opencode-muse`); the v0.71.1 daemon loaded them, and MCP
+  `dispatch` with `lane: "opencode-muse-spark"` answered `OK` in 6 s (`job-0001`). Route B — a
+  Responses upstream (`wire: "responses"` on `kind: "openai"`), then pinning both contributor ids
+  as `preferred` — is the backlog lap. `freeOnly`: owner decision 2026-09-04, stays `false` on all
+  three rules (§6); the backlog entry is narrowed to the cost-class-aware retraction rule.
 
 
 ## 0.1 Earlier releases
@@ -288,6 +290,17 @@ owner.
 
 **Owner decisions on record:**
 
+- **DECIDED 2026-09-04: `freeOnly` stays `false` on all three offload rules.** Since the
+  admission reversal (`28efb91`) an `include: "free"` pool lists paid and unknown-cost deployments
+  strictly behind every free member; the owner chose to keep them reachable as the last resort
+  rather than answer 503 when the free lane is spent. The accepted cost: a paid balance that is
+  topped up (OpenRouter, Kilo) is spent by the first walk whose free members all fail. Re-raise only
+  if a balance is funded. Contract stated in the `dynamic-pools.ts` row of `CLAUDE.md`; evidence in
+  [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md) §4.
+- **DECIDED 2026-09-04: Meta contributor SKUs may be routed automatically (option A).** Prompts
+  and completions sent to `opencode/muse-spark-1.3-contributor-free` become Meta training data, and
+  the owner accepted that for offloaded traffic. Route A (the OpenCode-CLI `opencode-muse-spark`
+  rungs) is live; route B (a Responses-API upstream) is a backlog lap.
 - **WITHDRAWN: the currency-per-week spend ceiling.** The owner never asked for it; it was an
   agent-recorded candidate. Do not re-raise it as an open item.
 - **EXECUTED: the OpenRouter weekly-limit interpretation is accepted**

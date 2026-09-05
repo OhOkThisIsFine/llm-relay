@@ -86,7 +86,15 @@ is unpublished. Rows 10-13 are what a Responses backend has to speak.
 
 ## 3. Three routes, in order of availability
 
-### Route A — a `cli` dispatch rung on the OpenCode CLI (works today, config only)
+### Route A — a `cli` dispatch rung on the OpenCode CLI (LIVE since 2026-09-04)
+
+**Status: live.** Four `opencode-muse-spark` rungs — one per ladder, `--variant
+low|medium|high|xhigh` — sit right after `claude-free-pool` in `~/.llm-relay/config.json`
+(inserted 13:34 local; revert file `config.json.bak-2026-09-04-pre-opencode-muse`). The daemon
+restarted onto v0.71.1 at 13:42 loaded them: `dispatch_lanes medium` lists the rung `[ready]` at
+position 4, and MCP `dispatch` with `lane: "opencode-muse-spark"` from an empty directory answered
+`OK` in 6 s (`job-0001`, exit 0). Owner decisions behind it: automatic routing of the contributor
+SKU allowed; route A now, route B as a lap (§5).
 
 Mirror the agy rungs: same launcher, same timeout, the binary named by full path. One rung per
 ladder so the tier carries the effort, exactly as the agy Gemini rungs bake the effort into the id.
@@ -211,6 +219,12 @@ file contents, diffs, instructions — to a contributor SKU makes it Meta traini
 
 Route B (the Responses backend) is worth building under A or B; under C it is only worth building
 if another Responses-only provider appears.
+
+**Decided 2026-09-04 (owner):** option **A** — contributor SKUs may be routed automatically. Build
+route A now (done, §3) and route B as a lap (backlog). On the side finding, `freeOnly` stays
+`false` on all three offload rules: paid capacity strictly behind every free member is the
+deliberate last resort, and the pools' free-first contract is stated in the `dynamic-pools.ts` row
+of `CLAUDE.md` and in HANDOFF §6.
 
 **Owner decision 2026-09-04: A — allow contributor SKUs in automatic routing.** The terms
 question is settled; what remains is engineering. Route B (the Responses upstream) is the enabling
