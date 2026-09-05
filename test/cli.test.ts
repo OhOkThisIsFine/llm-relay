@@ -99,7 +99,7 @@ describe("cli helper utilities", () => {
 
   it("accepts short aliases -t and -x on dispatch option guard", () => {
     expect(commandOptionError(["node", "cli.js", "dispatch", "--next-command", "-t", "probe"])).toBeNull();
-    expect(commandOptionError(["node", "cli.js", "dispatch", "-x", "claude-free-pool"])).toBeNull();
+    expect(commandOptionError(["node", "cli.js", "dispatch", "-x", "free-pool"])).toBeNull();
   });
 
   it("rejects unknown short flag -q on dispatch as unsupported option", () => {

@@ -9,6 +9,35 @@
 
 ## Open
 
+- **`llm-relay mcp` answers ONE request at a time per process: a `tools/call` written while
+  another is in flight is not even read until the first one returns** (2026-09-04, read from
+  the code while audit-tools built its dispatch client; not yet measured against a live host).
+  `runMcp` in `src/cli.ts` drives the server with `for await (const chunk of process.stdin)
+  { await server.ingest(chunk) }`, and `McpDispatchServer.ingest` awaits `Promise.all` of the
+  chunk's handlers, each of which awaits `awaitOrPoll` for up to `waitMs` (60 s by default).
+  So two requests are concurrent only when they land in the same stdin chunk; a host that
+  issues parallel tool calls in separate writes — Claude Code does — has its second `dispatch`
+  wait behind the first's full `waitMs` before the server reads it, and `dispatch_status` /
+  `dispatch_cancel` cannot reach a job while a blocking `dispatch` holds the loop. audit-tools
+  worked around it with a POOL of `llm-relay mcp` children, one per concurrent call
+  (`scripts/shared/mcp-dispatch-lane.mjs`). **Property:** a request is read and dispatched the
+  moment it arrives, independent of any in-flight handler — read stdin without awaiting
+  `ingest`, and let each handler settle on its own promise; the wait/poll policy per job is
+  unchanged. Measure with two `dispatch` calls in separate writes: the second's `elapsed`
+  must not include the first's wait.
+
+- **Triage the eligibility queue — 10 unrecognized refusals await interpretation** (owner
+  decision 2026-09-05: a separate lap, not folded into the MCP-concurrency lap). `llm-relay
+  eligibility` lists them: [1] groq `access denied. please check your network settings.` (×116)
+  is the client-side VPN block and stays PENDING by rule (`network-block.ts`: never `reject`);
+  [2] nim `moonshotai/kimi-k3` HTTP 400 `degraded function cannot be invoked` (×48, the
+  most-repeated live refusal); four gemini 429 `resource has been exhausted (e.g. check quota)`
+  rows across four models; two groq JSON-mode 400s (`failed to validate/generate json`); one
+  huggingface `max_completion_tokens is limited to <n>` 400; one openrouter
+  `free-models-per-min` 429. The dispatcher may `propose`; only the owner may `accept`.
+  **Property:** every queued item carries an accepted verdict, a `reject`, or a stated reason to
+  stay pending, each addressed by digest (`--sig`), so the listing shows no item without one.
+
 - **Muse Spark 1.3 — and every Responses-only OpenCode Zen SKU — is unreachable through the
   relay, because no upstream speaks the OpenAI Responses API.** Zen serves
   `muse-spark-1.3-contributor-free` and `muse-spark-1.2-contributor-free` on `/zen/v1/responses`

@@ -68,7 +68,7 @@ Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with 
   automatically although its prompts and completions become Meta training data —
   [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md)
   §5. **Route A is live:** four `opencode-muse-spark` cli rungs (one per ladder,
-  `--variant <tier>`) sit right after `claude-free-pool` in the live config (revert file
+  `--variant <tier>`) sit right after `free-pool` in the live config (revert file
   `config.json.bak-2026-09-04-pre-opencode-muse`); the v0.71.1 daemon loaded them, and MCP
   `dispatch` with `lane: "opencode-muse-spark"` answered `OK` in 6 s (`job-0001`). Route B — a
   Responses upstream (`wire: "responses"` on `kind: "openai"`), then pinning both contributor ids

@@ -89,7 +89,7 @@ is unpublished. Rows 10-13 are what a Responses backend has to speak.
 ### Route A — a `cli` dispatch rung on the OpenCode CLI (LIVE since 2026-09-04)
 
 **Status: live.** Four `opencode-muse-spark` rungs — one per ladder, `--variant
-low|medium|high|xhigh` — sit right after `claude-free-pool` in `~/.llm-relay/config.json`
+low|medium|high|xhigh` — sit right after `free-pool` in `~/.llm-relay/config.json`
 (inserted 13:34 local; revert file `config.json.bak-2026-09-04-pre-opencode-muse`). The daemon
 restarted onto v0.71.1 at 13:42 loaded them: `dispatch_lanes medium` lists the rung `[ready]` at
 position 4, and MCP `dispatch` with `lane: "opencode-muse-spark"` from an empty directory answered
