@@ -22,6 +22,7 @@ import { WriteBehindTimer } from "./write-behind.js";
 import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 import { isDashboardSafeId } from "./dashboard-contract.js";
 import type { Config } from "./config.js";
+import type { LadderRung } from "./config-types.js";
 
 /**
  * The lane KIND travels as data, never as two hand-copies: the `as const` array is the ONE
@@ -57,6 +58,14 @@ export interface DispatchedTelemetryReport {
   estimatedOutputTokens: number;
 }
 
+/**
+ * The report's exact key set, bound to the interface TWICE (the `SHARE_CELL_KEYS` precedent
+ * in `dashboard-contract.ts`): `satisfies` rejects a listed key the interface does not declare,
+ * and `_REPORT_KEYS_COMPLETE` rejects an interface key nobody listed — a new field is a
+ * compile error here rather than a silent 400 for every report that carries it (the
+ * closed-union gotcha in CLAUDE.md). `spec` is optional on the interface but still a
+ * permitted key, so it is listed like the rest; the parser below accepts its absence.
+ */
 const REPORT_KEYS = Object.freeze([
   "jobId",
   "laneId",
@@ -67,7 +76,9 @@ const REPORT_KEYS = Object.freeze([
   "status",
   "estimatedInputTokens",
   "estimatedOutputTokens",
-] as const);
+] as const satisfies readonly (keyof DispatchedTelemetryReport)[]);
+type _UnlistedReportKeys = Exclude<keyof DispatchedTelemetryReport, (typeof REPORT_KEYS)[number]>;
+const _REPORT_KEYS_COMPLETE: _UnlistedReportKeys extends never ? true : false = true;
 const REPORT_KEY_SET = new Set<string>(REPORT_KEYS);
 
 const MAX_JOB_ID_CHARS = 64;
@@ -150,6 +161,52 @@ export function medianWallClockMs(samples: readonly number[]): number | null {
 
 function freshLaneStats(): LaneStats {
   return { calls: 0, successes: 0, failures: 0, timeouts: 0, wallClockMs: [], lastAt: null };
+}
+
+/**
+ * The CLOSED list of env names that can route a lane's harness traffic back through this
+ * relay. Any other name — however credential-shaped — never counts: an open list would let
+ * a future env var silently reclassify a lane's accounting.
+ */
+export const RELAY_ROUTED_ENV_NAMES = ["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"] as const;
+
+/**
+ * Whether this rung's declared env routes its harness traffic back through the relay
+ * listener at `listener` — i.e. the daemon's own HTTP pipeline already meters the run, so
+ * a telemetry accounting row would double count it (finding C1).
+ *
+ * A labelled fact about the lane's own wiring, config-derived, never guessed: true only
+ * when a closed-list env name holds a parseable URL whose origin (scheme://host:port,
+ * IPv6-bracket-aware, default ports applied) equals the listener's own origin, built with
+ * the same IPv6 bracketing rule `proxyUrl` applies. A `null` env value (unset), an absent
+ * name, an unparseable URL, or any other name ⇒ false. Pure, so the daemon route and the
+ * suite share the one definition.
+ */
+export function laneRoutesThroughRelay(
+  rung: Pick<LadderRung, "env">,
+  listener: { host: string; port: number },
+): boolean {
+  const env = rung.env;
+  if (env === undefined) return false;
+  let listenerOrigin: string;
+  try {
+    const host = listener.host.includes(":") ? `[${listener.host}]` : listener.host;
+    listenerOrigin = new URL(`http://${host}:${listener.port}`).origin;
+  } catch {
+    return false;
+  }
+  for (const name of RELAY_ROUTED_ENV_NAMES) {
+    const value = env[name];
+    if (typeof value !== "string") continue;
+    let origin: string;
+    try {
+      origin = new URL(value).origin;
+    } catch {
+      continue;
+    }
+    if (origin === listenerOrigin) return true;
+  }
+  return false;
 }
 
 /**
@@ -280,8 +337,12 @@ function isLaneStatsRow(value: unknown): value is LaneStatsRow {
   for (const key of ["calls", "successes", "failures", "timeouts"] as const) {
     if (!isTokenCount(row[key])) return false;
   }
-  if (!Array.isArray(row["wallClockMs"])) return false;
-  for (const sample of row["wallClockMs"]) {
+  const wallClockMs = row["wallClockMs"];
+  if (!Array.isArray(wallClockMs)) return false;
+  // The relay never writes more than MAX_LANE_STAT_SAMPLES, so a longer window is corruption,
+  // not history — drop the row alone rather than transiently allocating through a trusted loader.
+  if (wallClockMs.length > MAX_LANE_STAT_SAMPLES) return false;
+  for (const sample of wallClockMs) {
     if (typeof sample !== "number" || !Number.isFinite(sample) || sample < 0) return false;
   }
   const lastAt = row["lastAt"];

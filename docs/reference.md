@@ -1344,7 +1344,8 @@ chars/4 of the task text and chars/4 of the lane's final output, labelled `estim
 attribution `unknown`, client `mcp-dispatch`, no credential, unpriced. It is NOT the lane's
 provider consumption, which the relay cannot see (the lane's own harness runs its own tool
 loop against its own credentials); `llm-relay cost --by client` prints this caveat beside
-any `mcp-dispatch` row.
+any `mcp-dispatch` row. For `cli` lanes, which carry no spec, the ledger `model` is the
+lane id.
 
 #### Background lane re-probing (`routing.laneProbe`)
 

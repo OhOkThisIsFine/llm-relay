@@ -117,6 +117,10 @@ On a valid report:
   `serve`, client `mcp-dispatch`, attribution `unknown`, `tokenBasis: "estimated"`,
   `method: "relay_estimate"`, no credential id, no price — and complete it with the two
   estimates. `failed`/`timed_out` complete as failures; nothing is ever written as `0` tokens.
+  Whether a run is "metered by the relay" is decided by the DAEMON from the rung's declared
+  env — a `cli` rung whose env routes its harness back through this listener is already
+  metered by the HTTP pipeline, and the report's own `kind` is never trusted (the C1
+  finding: the rung's kind is the authority, a mismatch records stats only).
 - **Lane stats (both kinds):** a per-rung series — calls, successes, failures, timeouts, a
   bounded wall-clock sample window — held per `Config` beside the exhaustion state, mirrored to
   a cache-kind file through the shared `WriteBehindTimer`, restored on start with field-by-field

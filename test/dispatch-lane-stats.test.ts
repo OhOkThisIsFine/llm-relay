@@ -20,6 +20,7 @@ import {
   exportLaneStatsRows,
   getDispatchLaneStatsPath,
   installDispatchLaneStatsPersistence,
+  laneRoutesThroughRelay,
   laneStatsFor,
   loadLaneStatsRows,
   medianWallClockMs,
@@ -240,6 +241,42 @@ describe("medianWallClockMs", () => {
   });
 });
 
+describe("laneRoutesThroughRelay", () => {
+  const listener = { host: "127.0.0.1", port: 8791 };
+
+  it("matches a closed-list env URL on the listener's own origin", () => {
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8791" } }, listener)).toBe(true);
+    expect(laneRoutesThroughRelay({ env: { OPENAI_BASE_URL: "http://127.0.0.1:8791/v1" } }, listener)).toBe(true);
+  });
+
+  it("rejects a different port, host, or scheme", () => {
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:8792" } }, listener)).toBe(false);
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.2:8791" } }, listener)).toBe(false);
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "https://127.0.0.1:8791" } }, listener)).toBe(false);
+    expect(laneRoutesThroughRelay({ env: { OPENAI_BASE_URL: "https://api.openai.com/v1" } }, listener)).toBe(false);
+  });
+
+  it("compares origins, not strings: IPv6 brackets and default ports", () => {
+    const v6 = { host: "::1", port: 8791 };
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "http://[::1]:8791" } }, v6)).toBe(true);
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "http://[::1]:8792" } }, v6)).toBe(false);
+    expect(
+      laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1" } }, { host: "127.0.0.1", port: 80 }),
+    ).toBe(true);
+    expect(
+      laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:80" } }, { host: "127.0.0.1", port: 80 }),
+    ).toBe(true);
+  });
+
+  it("is false for an unset (null) value, an unparseable URL, or any other name", () => {
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: null } }, listener)).toBe(false);
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_BASE_URL: "not a url at all" } }, listener)).toBe(false);
+    expect(laneRoutesThroughRelay({ env: { ANTHROPIC_AUTH_TOKEN: "http://127.0.0.1:8791" } }, listener)).toBe(false);
+    expect(laneRoutesThroughRelay({ env: { CLAUDE_CONFIG_DIR: "/home/me/.llm-relay-claude" } }, listener)).toBe(false);
+    expect(laneRoutesThroughRelay({}, listener)).toBe(false);
+  });
+});
+
 describe("lane stats persistence", () => {
   it("redirects its default path under vitest", () => {
     expect(getDispatchLaneStatsPath()).toContain("llm-relay-vitest");
@@ -293,6 +330,34 @@ describe("lane stats persistence", () => {
           null,
         ],
       }),
+    );
+    expect(loadLaneStatsRows({ path: statePath })).toEqual([good]);
+  });
+
+  it("⚠ drops a row whose sample window exceeds the bound the relay ever writes", () => {
+    // The relay never writes more than MAX_LANE_STAT_SAMPLES, so a longer window is
+    // corruption, not history — the loader drops the row alone (finding N3).
+    const good: LaneStatsRow = {
+      laneId: "good",
+      calls: 1,
+      successes: 1,
+      failures: 0,
+      timeouts: 0,
+      wallClockMs: new Array(MAX_LANE_STAT_SAMPLES).fill(10),
+      lastAt: null,
+    };
+    const oversized: LaneStatsRow = {
+      laneId: "oversized",
+      calls: MAX_LANE_STAT_SAMPLES + 1,
+      successes: MAX_LANE_STAT_SAMPLES + 1,
+      failures: 0,
+      timeouts: 0,
+      wallClockMs: new Array(MAX_LANE_STAT_SAMPLES + 1).fill(10),
+      lastAt: null,
+    };
+    writeFileSync(
+      statePath,
+      JSON.stringify({ version: CURRENT_DISPATCH_LANE_STATS_VERSION, rows: [good, oversized] }),
     );
     expect(loadLaneStatsRows({ path: statePath })).toEqual([good]);
   });

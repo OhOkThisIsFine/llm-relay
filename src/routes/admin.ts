@@ -7,7 +7,7 @@ import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { loadLaneManifest } from "../lane-manifest.js";
-import { buildDispatch, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, specContextWindow, type DispatchOutcome } from "../dispatch.js";
+import { buildDispatch, findLadderRung, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, specContextWindow, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
 import { contextWindowResolver, type ContextWindowSource } from "../metadata.js";
 import { snapshotContextWindow } from "../tier-data.js";
@@ -19,6 +19,7 @@ import { baseLog } from "../request-log.js";
 import { createAccountingRequest, type AccountingRecorder } from "../accounting.js";
 import type { FailureKind } from "../dashboard-contract.js";
 import {
+  laneRoutesThroughRelay,
   parseTelemetryReport,
   recordLaneRun,
   type DispatchedTelemetryReport,
@@ -475,10 +476,12 @@ export async function handleAdminRoutes(
     return ok(view, true);
   }
 
-  if (req.method === "GET" && pathname === "/dispatch/telemetry") {
+  if ((req.method === "GET" || req.method === "HEAD") && pathname === "/dispatch/telemetry") {
     // POST-only, like `/cooldowns/clear`: an explicit 404 rather than the model-path
     // fall-through, so a mistyped read can never walk candidates or egress upstream.
-    return bad(404, `GET /dispatch/telemetry is not a route — POST a telemetry report`);
+    // HEAD is matched beside GET — an authenticated HEAD would otherwise skip this guard
+    // into model routing (finding N6); nothing is reachable off the exact POST either way.
+    return bad(404, `${req.method} /dispatch/telemetry is not a route — POST a telemetry report`);
   }
 
   if (req.method === "POST" && pathname === "/dispatch/telemetry") {
@@ -487,19 +490,35 @@ export async function handleAdminRoutes(
       // The reason never echoes the body: a report carries job ids and token counts.
       return bad(400, `POST /dispatch/telemetry body must be a telemetry report`);
     }
+    // P1: ladder membership, mirroring the `POST /dispatch` exhaustion branch — any holder
+    // of the control token could otherwise mint unlimited distinct lane ids (one bad row is
+    // dropped alone, but nothing would bound the NUMBER of lanes). `findLadderRung` is the
+    // shared lookup in `dispatch.ts`, not a second copy; the 400 echoes only the bounded,
+    // dashboard-safe lane id the parser already validated, like the exhaustion branch.
+    const rung = findLadderRung(cfg, report.laneId);
+    if (!rung) {
+      return bad(400, `POST /dispatch/telemetry: no lane "${report.laneId}" in routing.ladder`);
+    }
     recordLaneRun(cfg, report);
     // Owner decision D1: `cli` lanes are metered here because nothing else sees them; a
     // `relay` lane's harness traffic already flows through the daemon's own HTTP pipeline,
-    // so a second row would double count. Lane stats record BOTH kinds.
-    if (report.kind === "cli") {
-      recordDispatchLaneAccounting(h.accountingRecorder, report);
-      return ok({ recorded: true, accounting: "recorded" }, true);
+    // so a second row would double count. Lane stats record BOTH kinds. "Metered by the
+    // relay" is decided by the DAEMON from the rung's declared env (finding C1): a `cli`
+    // rung whose env routes its harness back through this listener is already metered by
+    // the HTTP pipeline, and the report's own `kind` is never trusted — the rung's kind is
+    // the authority, so a stale MCP snapshot (renamed rung, daemon not yet restarted) can
+    // never mint a ledger row.
+    if (report.kind !== rung.kind) {
+      return ok({ recorded: true, accounting: "skipped", reason: "kind-mismatch" }, true);
     }
-    if (report.kind === "relay") {
-      return ok({ recorded: true, accounting: "skipped" }, true);
+    if (rung.kind === "relay") {
+      return ok({ recorded: true, accounting: "skipped", reason: "relay-kind" }, true);
     }
-    const _never: never = report.kind;
-    return bad(400, `POST /dispatch/telemetry kind must be "cli" or "relay" (got ${String(_never)})`);
+    if (laneRoutesThroughRelay(rung, cfg)) {
+      return ok({ recorded: true, accounting: "skipped", reason: "relay-routed" }, true);
+    }
+    recordDispatchLaneAccounting(h.accountingRecorder, report);
+    return ok({ recorded: true, accounting: "recorded" }, true);
   }
 
   if (req.method === "GET" && pathname === "/telemetry") {

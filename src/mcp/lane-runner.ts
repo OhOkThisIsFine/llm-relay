@@ -72,6 +72,34 @@ export type JobStatus = "running" | "completed" | "failed" | "cancelled" | "time
  */
 export const TERMINAL_JOB_STATUSES = ["completed", "failed", "cancelled", "timed_out"] as const satisfies readonly JobStatus[];
 
+export type TerminalJobStatus = (typeof TERMINAL_JOB_STATUSES)[number];
+
+/**
+ * Terminal statuses worth reporting as lane telemetry: every terminal status but
+ * `cancelled` — a caller cancellation is not lane evidence, so it is discarded, never
+ * reported. Keyed as a `Record` over `Exclude<…, "cancelled">` so a NEW terminal status is
+ * a compile error HERE, at the classifier, rather than a silent drop at the forwarder (the
+ * closed-union gotcha in CLAUDE.md); the forwarder ranges over this list, never a hand copy.
+ */
+const REPORTABLE_JOB_STATUS_MAP: Record<Exclude<TerminalJobStatus, "cancelled">, true> = {
+  completed: true,
+  failed: true,
+  timed_out: true,
+};
+export type ReportableJobStatus = keyof typeof REPORTABLE_JOB_STATUS_MAP;
+export const REPORTABLE_JOB_STATUSES = Object.freeze(
+  Object.keys(REPORTABLE_JOB_STATUS_MAP) as ReportableJobStatus[],
+);
+
+/**
+ * Narrowing guard over `REPORTABLE_JOB_STATUSES` — the forwarder ranges over the list
+ * through this, so the statuses stay narrowed past the check (a bare `.includes` would
+ * not narrow, and the report below needs the `cancelled`/`running` members gone).
+ */
+export function isReportableJobStatus(status: JobStatus): status is ReportableJobStatus {
+  return (REPORTABLE_JOB_STATUSES as readonly JobStatus[]).includes(status);
+}
+
 /**
  * The relay's own response headers that announce what happened during an answer-mode HTTP call —
  * the direct-fetch sibling of the provenance every spawned-lane answer already carries (lane id,

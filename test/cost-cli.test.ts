@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runCostCommand, type CostCommandDependencies } from "../src/cli.js";
+import { loadConfig, type Config } from "../src/config.js";
 import {
   assertCostReportV1,
   DASHBOARD_COST_SCHEMA,
@@ -109,7 +110,7 @@ describe("llm-relay cost CLI", () => {
   }
 
   /** Drive `runCostCommand` with argv + injected output/exit, mirroring main()'s wiring. */
-  async function runCost(argv: readonly string[], usageDir: string): Promise<RunResult> {
+  async function runCost(argv: readonly string[], usageDir: string, loadConfigFn?: () => Config): Promise<RunResult> {
     const originalArgv = process.argv;
     process.argv = ["node", "cli.js", "cost", ...argv];
     let output = "";
@@ -125,6 +126,7 @@ describe("llm-relay cost CLI", () => {
       },
       usageDir,
       now: () => Date.parse(NOW),
+      ...(loadConfigFn !== undefined ? { loadConfig: loadConfigFn } : {}),
     };
     try {
       await runCostCommand(dependencies);
@@ -233,6 +235,9 @@ describe("llm-relay cost CLI", () => {
     expect(output).toContain("Provider/model");
     expect(output).toContain("nim/z-ai/glm-5.2");
     expect(output).toContain("gemini/gemini-3-flash");
+    // No config injected (and none loadable under vitest): the roll-up still works and the
+    // lane-id footnote is silently omitted rather than breaking the command (N4 fail-soft).
+    expect(output).not.toContain("estimated dispatch envelope");
   });
 
   it("excludes repair spend until --include-repair, which also shows the share separately", async () => {
@@ -370,6 +375,72 @@ describe("llm-relay cost CLI", () => {
     });
     const withoutDispatch = await runCost(["--by", "client"], plain);
     expect(withoutDispatch.output).not.toContain("estimated dispatch envelope");
+  });
+
+  function configWithLanes(usageDir: string, ladder: unknown[]): Config {
+    const path = join(usageDir, `cost-lanes-${Math.random().toString(36).slice(2)}.json`);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic", credentialMode: "passthrough" } },
+        routing: { default: "anthropic", ladder },
+      }),
+    );
+    return loadConfig(path);
+  }
+
+  it("prints the envelope footnote under --by model when a row's model is a cli lane id (N4)", async () => {
+    // For `cli` lanes, which carry no spec, the ledger `model` is the lane id — so a model
+    // row naming a configured `cli` lane id is the estimated envelope, not metered provider
+    // usage. The projector keys model rows `provider/model`, hence the match on the key.
+    const usageDir = tempUsageDir();
+    seed(usageDir, {
+      client: "mcp-dispatch",
+      attempts: [{
+        role: "serve",
+        provider: "nim",
+        model: "codex-sol",
+        credentialId: "nim#primary",
+        tokens: { estimated: { inputTokens: 25, outputTokens: 400, inputMethod: "relay_estimate", outputMethod: "relay_estimate" } },
+      }],
+    });
+    const cfg = configWithLanes(usageDir, [
+      { id: "codex-sol", kind: "cli", command: "codex", args: ["exec", "{task}"] },
+      { id: "anthropic", kind: "relay", spec: "anthropic" },
+    ]);
+    const { output, exitCode } = await runCost(["--by", "model"], usageDir, () => cfg);
+    expect(exitCode).toBeNull();
+    expect(output).toContain("nim/codex-sol");
+    expect(output).toContain(
+      "Rows keyed by cli lane id (nim/codex-sol) are the estimated dispatch envelope (task text + lane output), not the lane's provider consumption, which the relay cannot see; they are unpriced.",
+    );
+    expect(output.split("estimated dispatch envelope").length - 1).toBe(1);
+  });
+
+  it("prints no model footnote without a cli lane-id row, or when the id is a relay lane (N4)", async () => {
+    const usageDir = tempUsageDir();
+    seed(usageDir, {
+      attempts: [{ role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    const cfg = configWithLanes(usageDir, [
+      { id: "codex-sol", kind: "cli", command: "codex", args: ["exec", "{task}"] },
+    ]);
+    const plain = await runCost(["--by", "model"], usageDir, () => cfg);
+    expect(plain.output).toContain("nim/z-ai/glm-5.2");
+    expect(plain.output).not.toContain("estimated dispatch envelope");
+
+    // Same model string, but the ladder knows it as a RELAY lane: metered traffic, no caveat.
+    const relayDir = tempUsageDir();
+    seed(relayDir, {
+      attempts: [{ role: "serve", provider: "nim", model: "free-pool", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    const relayCfg = configWithLanes(relayDir, [
+      { id: "free-pool", kind: "relay", spec: "anthropic" },
+    ]);
+    const relay = await runCost(["--by", "model"], relayDir, () => relayCfg);
+    expect(relay.output).toContain("nim/free-pool");
+    expect(relay.output).not.toContain("estimated dispatch envelope");
   });  it("reports the lifetime window as an empty store, not a broken one, when lifetime.json is absent", async () => {
     // A MISSING lifetime.json is a fresh install; only a corrupt/throwing read is
     // unavailable. This was rendered as "the local accounting store could not be read"

@@ -10,7 +10,7 @@
  * read off captured events, never inferred.
  */
 import { describe, it, expect, afterAll } from "vitest";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, type Config } from "../src/config.js";
@@ -18,6 +18,9 @@ import { createProxy } from "../src/server.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { AccountingEvent, AttemptCompletedEvent, RequestCompletedEvent } from "../src/accounting.js";
 import { laneStatsFor } from "../src/dispatch-lane-stats.js";
+import { createAccountingStore } from "../src/accounting-store.js";
+import { parseAccountingDayShardV1 } from "../src/accounting-store-schema.js";
+import type { AccountingRecorder } from "../src/accounting.js";
 
 const controlToken = "telemetry-test-control-token";
 const CONTROL_HEADERS = {
@@ -43,6 +46,9 @@ function cfgWithLadder(): Config {
         ladder: [
           { id: "telemetry-cli", kind: "cli", command: "codex", args: ["exec", "{task}"], quota: "chatgpt" },
           { id: "telemetry-relay", kind: "relay", spec: "anthropic" },
+          // A second cli rung so the runtime-telemetry negative control can use a lane id no
+          // other test in this file records (P1: unknown lanes now 400, so it must be a rung).
+          { id: "telemetry-cli-negative", kind: "cli", command: "codex", args: ["exec", "{task}"] },
         ],
       },
       mode: "detect",
@@ -77,7 +83,7 @@ function fakeRecorder(events: AccountingEvent[]): { record(event: AccountingEven
 async function withProxy<T>(
   cfg: Config,
   events: AccountingEvent[],
-  fn: (base: string) => Promise<T>,
+  fn: (base: string, port: number) => Promise<T>,
 ): Promise<T> {
   const proxy = createProxy(cfg, {
     controlAuthorization: { validate: (candidate) => candidate === controlToken },
@@ -86,7 +92,7 @@ async function withProxy<T>(
   await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
   const { port } = proxy.address() as { port: number };
   try {
-    return await fn(`http://127.0.0.1:${port}`);
+    return await fn(`http://127.0.0.1:${port}`, port);
   } finally {
     proxy.close();
   }
@@ -194,7 +200,7 @@ describe("POST /dispatch/telemetry", () => {
         cliReport({ jobId: "job-0002", laneId: "telemetry-relay", kind: "relay", spec: undefined }),
       );
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ recorded: true, accounting: "skipped" });
+      expect(await res.json()).toEqual({ recorded: true, accounting: "skipped", reason: "relay-kind" });
     });
     expect(laneStatsFor(cfg, "telemetry-relay")).toMatchObject({ calls: 1, successes: 1 });
     expect(events).toEqual([]);
@@ -284,18 +290,158 @@ describe("POST /dispatch/telemetry", () => {
     expect(events).toEqual([]);
   });
 
+  it("answers HEAD with 404 too — no read may slip past the guard into model routing (N6)", async () => {
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      const res = await fetch(`${base}/dispatch/telemetry`, { method: "HEAD", headers: CONTROL_HEADERS });
+      expect(res.status).toBe(404);
+    });
+    expect(laneStatsFor(cfg, "telemetry-cli")).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it("400s an unknown lane and records NOTHING — stats or ledger (P1)", async () => {
+    // Mirrors the `POST /dispatch` exhaustion branch: a stale MCP snapshot (renamed rung,
+    // daemon not yet restarted) or a foreign token holder must not mint lane rows.
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      const res = await postTelemetry(base, cliReport({ jobId: "job-0007", laneId: "no-such-lane" }));
+      expect(res.status).toBe(400);
+      // Same wording shape as the exhaustion branch; read off the parsed body — the raw
+      // text JSON-escapes the quotes.
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toBe(`POST /dispatch/telemetry: no lane "no-such-lane" in routing.ladder`);
+    });
+    expect(laneStatsFor(cfg, "no-such-lane")).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ["ANTHROPIC_BASE_URL", "relay-routed claude rung"],
+    ["OPENAI_BASE_URL", "relay-routed openai rung"],
+  ])(
+    "skips accounting for a cli rung routed back through this listener via %s (C1)",
+    async (envName) => {
+      const cfg = cfgWithLadder();
+      const events: AccountingEvent[] = [];
+      await withProxy(cfg, events, async (base) => {
+        // The rung's declared env is the authority. The daemon compares against its own
+        // listener from cfg (host:port) — the test proxy binds an ephemeral port, so the
+        // env URL uses cfg.port, the address the daemon believes it listens on.
+        const rung = cfg.routing.ladder!.find((r) => r.id === "telemetry-cli")!;
+        rung.env = { [envName]: `http://127.0.0.1:${cfg.port}` };
+        const res = await postTelemetry(base, cliReport({ jobId: `job-routed-${envName}` }));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ recorded: true, accounting: "skipped", reason: "relay-routed" });
+      });
+      expect(laneStatsFor(cfg, "telemetry-cli")).toMatchObject({ calls: 1, successes: 1 });
+      expect(events).toEqual([]);
+    },
+  );
+
+  it("records accounting when the rung's env points at ANOTHER origin", async () => {
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      // Same env name, different port: somebody else's relay, not this daemon's pipeline.
+      const rung = cfg.routing.ladder!.find((r) => r.id === "telemetry-cli")!;
+      rung.env = { ANTHROPIC_BASE_URL: `http://127.0.0.1:${cfg.port + 1}` };
+      const res = await postTelemetry(base, cliReport({ jobId: "job-0008" }));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ recorded: true, accounting: "recorded" });
+    });
+    expect(events.map((e) => e.type)).toEqual([
+      "request-started",
+      "attempt-started",
+      "attempt-completed",
+      "request-completed",
+    ]);
+  });
+
+  it("treats the rung's kind as the authority: a mismatched report records stats only (C1)", async () => {
+    // A stale MCP snapshot (rung renamed from relay to cli, daemon not yet restarted) must
+    // never mint a ledger row on the report's word alone.
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      const res = await postTelemetry(
+        base,
+        cliReport({ jobId: "job-0009", kind: "relay", spec: undefined }),
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ recorded: true, accounting: "skipped", reason: "kind-mismatch" });
+    });
+    expect(laneStatsFor(cfg, "telemetry-cli")).toMatchObject({ calls: 1, successes: 1 });
+    expect(events).toEqual([]);
+  });
+
   it("⚠ negative control: the HTTP scoring store never sees a lane id", async () => {
     // F2: CLI wall-clock must live in the lane-stats series ONLY. If this report ever
     // reached `recordModelCall`, the lane id would surface as a model key in /telemetry.
     const cfg = cfgWithLadder();
     const events: AccountingEvent[] = [];
     await withProxy(cfg, events, async (base) => {
-      const laneId = "telemetry-cli-negative-control";
+      const laneId = "telemetry-cli-negative";
       const res = await postTelemetry(base, cliReport({ jobId: "job-0006", laneId }));
       expect(res.status).toBe(200);
       expect(laneStatsFor(cfg, laneId)).toMatchObject({ calls: 1 });
       const telemetry = await (await fetch(`${base}/telemetry`)).text();
       expect(telemetry).not.toContain(laneId);
     });
+  });
+});
+
+describe("POST /dispatch/telemetry against a real AccountingStore", () => {
+  it("persists cli reports through the store's schema guard: day shard carries requests:2, unpricedRequests:2", async () => {
+    // Review checklist item 3: every suite above reads ledger claims off a FAKE recorder —
+    // event shapes only. A row the persisted schema guard rejects would be green there while
+    // silently stopping persistence. This replays two reports into a REAL store in a fresh
+    // temp dir and asserts the day shard on disk parses and counts both rows.
+    const cfg = cfgWithLadder();
+    const usageDir = mkdtempSync(join(tmpdir(), "rp-telemetry-store-"));
+    try {
+      const store = createAccountingStore({ rootDir: usageDir });
+      const recorder: AccountingRecorder = { record: (event) => store.record(event) };
+      const proxy = createProxy(cfg, {
+        controlAuthorization: { validate: (candidate) => candidate === controlToken },
+        accountingRecorder: recorder,
+      });
+      await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
+      const { port } = proxy.address() as { port: number };
+      try {
+        const base = `http://127.0.0.1:${port}`;
+        const completed = await postTelemetry(base, cliReport({ jobId: "job-0101" }));
+        expect(completed.status).toBe(200);
+        const timedOut = await postTelemetry(
+          base,
+          cliReport({ jobId: "job-0102", status: "timed_out", exitCode: null }),
+        );
+        expect(timedOut.status).toBe(200);
+      } finally {
+        proxy.close();
+      }
+      // The same durability boundary the proxy relies on at shutdown.
+      const closed = store.close();
+      expect(closed.retryable).toBe(false);
+      expect(closed.status).toBe("committed");
+      const day = new Date().toISOString().slice(0, 10);
+      const parsed = parseAccountingDayShardV1(
+        JSON.parse(readFileSync(join(usageDir, `${day}.json`), "utf8")),
+      );
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+      let requests = 0;
+      let unpricedRequests = 0;
+      for (const cell of Object.values(parsed.value.cells)) {
+        requests += cell.aggregate.requests;
+        unpricedRequests += cell.aggregate.unpricedRequests;
+      }
+      expect(requests).toBe(2);
+      expect(unpricedRequests).toBe(2);
+    } finally {
+      rmSync(usageDir, { recursive: true, force: true });
+    }
   });
 });

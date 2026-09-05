@@ -26,7 +26,7 @@ import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
-import { buildDispatch, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
@@ -1812,6 +1812,12 @@ export interface CostCommandDependencies {
   readonly exit?: (code: number) => never;
   /** Overrides the store directory; defaults to the production `~/.llm-relay/usage/`. */
   readonly usageDir?: string;
+  /**
+   * Loads the relay config for the `--by model` lane-id footnote. Defaults to the live
+   * `loadOrExit`; tests inject a config holding the ladder under test. Read ONLY when
+   * `--by model` is asked — every other dimension must keep working config-less.
+   */
+  readonly loadConfig?: () => Config;
 }
 
 /** `--window` spelling → the projector's WindowId. `all` is the CLI's lifetime alias. */
@@ -1888,7 +1894,19 @@ export async function runCostCommand(dependencies: CostCommandDependencies = {})
       write(JSON.stringify(report, null, 2) + "\n");
       return;
     }
-    renderCostReport(report, write);
+    // N4: the `--by model` lane-id footnote needs the loaded config's ladders. Fail SOFT —
+    // `cost` has always worked config-less, and a missing config must not break the roll-up;
+    // without lane ids the footnote is simply omitted.
+    let cliLaneIds: ReadonlySet<string> | undefined;
+    if (by === "model") {
+      try {
+        const cfg = (dependencies.loadConfig ?? loadOrExit)();
+        cliLaneIds = new Set(allLadderRungs(cfg).filter((rung) => rung.kind === "cli").map((rung) => rung.id));
+      } catch {
+        cliLaneIds = undefined;
+      }
+    }
+    renderCostReport(report, write, cliLaneIds === undefined ? {} : { cliLaneIds });
   } finally {
     store.close();
   }
@@ -2020,6 +2038,7 @@ function writeCoveredPeriod(
 function renderCostReport(
   report: Awaited<ReturnType<ReturnType<typeof createDashboardSnapshotReadPort>["readCostReport"]>>,
   write: (message: string) => void,
+  opts: { cliLaneIds?: ReadonlySet<string> } = {},
 ): void {
   if (report.coverage === "empty") {
     write("No accounting data yet.\n\nThe relay records per-request usage under ~/.llm-relay/usage/ once it serves\ntraffic through configured providers. Run the proxy, send a request, then retry.\n");
@@ -2046,9 +2065,26 @@ function renderCostReport(
   // ledger row carries the estimated dispatch envelope under client `mcp-dispatch` — never the
   // lane's provider consumption. Say so once, wherever that row renders, so the figure is not
   // read as metered provider usage. Other `--by` dimensions aggregate the same requests under
-  // their own keys (the spec or lane id), so only the client dimension can name this row.
+  // their own keys (the spec or lane id) — the client dimension names the row directly, the
+  // model dimension names it when its model part is a configured `cli` lane id (see below).
   if (report.by === "client" && report.rows.some((row) => row.key === "mcp-dispatch")) {
     write("mcp-dispatch rows are the estimated dispatch envelope (task text + lane output), not the lane's provider consumption, which the relay cannot see; they are unpriced.\n");
+  }
+
+  // N4: the same envelope under `--by model`. The projector keys model rows
+  // `provider/model` and drops provider-null rows into partial coverage, so a bare lane-id
+  // key never occurs — match the full key AND the model component after the `/`. For `cli`
+  // lanes, which carry no spec, the ledger `model` is the lane id, so a model row naming a
+  // configured `cli` lane id is the estimated envelope, not metered provider usage.
+  if (report.by === "model" && opts.cliLaneIds !== undefined) {
+    const laneKeys = [...new Set(
+      report.rows
+        .map((row) => row.key)
+        .filter((key) => opts.cliLaneIds!.has(key) || opts.cliLaneIds!.has(key.slice(key.indexOf("/") + 1))),
+    )].sort();
+    if (laneKeys.length > 0) {
+      write(`Rows keyed by cli lane id (${laneKeys.join(", ")}) are the estimated dispatch envelope (task text + lane output), not the lane's provider consumption, which the relay cannot see; they are unpriced.\n`);
+    }
   }
 
   writeRepairShare(report, write);

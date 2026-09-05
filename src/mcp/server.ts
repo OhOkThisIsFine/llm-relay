@@ -40,6 +40,7 @@ import {
   defaultAnswerFetch,
   defaultLaneSpawner,
   isContentEmpty,
+  isReportableJobStatus,
   readRelayAnnouncements,
   relayLoopbackUrl,
   type AnswerFetch,
@@ -686,8 +687,9 @@ export class McpDispatchServer {
 
   /**
    * Forward one lane-execution report after an agent-mode job reaches a terminal state.
-   * Answer-mode jobs never reach here — the daemon's HTTP pipeline already accounts them
-   * (finding F3) — and a cancelled job is discarded, never reported.
+   * Never a RELAY-kind answer-mode job (the daemon's HTTP pipeline already accounts it —
+   * finding F3); a `cli`-kind rung dispatched with `mode: "answer"` spawns like agent mode
+   * and IS forwarded. A cancelled job is discarded, never reported.
    *
    * Fire-and-forget by design: the reporter is never awaited on the response path, and a
    * throwing or rejecting reporter is swallowed after ONE metadata-only stderr line (lane id
@@ -700,8 +702,12 @@ export class McpDispatchServer {
     outputChars: number,
   ): void {
     const job = this.jobs.get(jobId);
-    if (!job || job.status === "cancelled") return;
-    if (job.status !== "completed" && job.status !== "failed" && job.status !== "timed_out") return;
+    if (!job) return;
+    // Ranges over REPORTABLE_JOB_STATUSES (`lane-runner.ts`) — every terminal status but
+    // `cancelled` — never a hand-listed copy, so a new terminal status is a compile error at
+    // the classifier rather than a silent drop here. Narrows, so `job.status` below is a
+    // reportable status, never `cancelled` or `running`.
+    if (!isReportableJobStatus(job.status)) return;
     const report: DispatchedTelemetryReport = {
       jobId: job.id,
       laneId: captured.laneId,

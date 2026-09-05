@@ -656,6 +656,30 @@ function selectLadder(cfg: Config, requested?: string): { tier: string | null; r
   return { tier, rungs: cfg.routing.ladders[tier] };
 }
 
+/**
+ * Every rung across EVERY ladder the config declares — each tiered ladder, then the legacy
+ * single ladder. The ONE ladder walk: `POST /dispatch/telemetry` (unknown-lane 400) and the
+ * CLI's `--by model` lane-id check both read through here or through `findLadderRung`, so a
+ * new ladder shape is fixed once. (`markExhausted` stays tier-scoped via `selectLadder` — an
+ * exhaustion report arrives on a tier's dispatch view.)
+ */
+export function allLadderRungs(cfg: Config): LadderRung[] {
+  const ladders = cfg.routing.ladders;
+  const tiered = ladders ? Object.values(ladders).flat() : [];
+  return [...tiered, ...(cfg.routing.ladder ?? [])];
+}
+
+/**
+ * Find one rung by id across every ladder the config declares, whatever tier holds it.
+ * Tier-agnostic on purpose: a telemetry report names a lane, not a tier. `markExhausted`
+ * stays tier-scoped (an exhaustion report arrives on a tier's dispatch view); this is the
+ * shared lookup both branches mean — one walk, not two.
+ */
+export function findLadderRung(cfg: Config, laneId: string): LadderRung | undefined {
+  if (typeof laneId !== "string" || laneId.length === 0) return undefined;
+  return allLadderRungs(cfg).find((rung) => rung.id === laneId);
+}
+
 /** C0 + C1 control characters, including ESC — never legal in a rung id, and the ANSI carrier. */
 function stripControlCharacters(value: string): string {
   let out = "";

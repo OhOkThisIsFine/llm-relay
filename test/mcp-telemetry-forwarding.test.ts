@@ -159,6 +159,29 @@ describe("mcp telemetry forwarding", () => {
     expect(reports).toHaveLength(0);
   });
 
+  it("forwards exactly one kind:cli report for answer mode on a cli lane (P2)", async () => {
+    // Only answer+RELAY takes the direct-HTTP path (`dispatchAnswer`, never forwarded). An
+    // answer+cli rung falls through to the shared spawn path, whose settle forwards — a
+    // future reader trusting the old "never answer mode" comment who gates the forward on
+    // mode would silently drop every cli-answer ledger row, so this pins the fall-through.
+    const reports: DispatchedTelemetryReport[] = [];
+    const stdout = "the cli answer-mode answer";
+    const task = "cli answer-mode probe task";
+    const h = new Harness({
+      buildView: async () => view({ next: lane({ id: "agy", kind: "cli", spec: "agy" }) }),
+      spawn: fakeSpawner({ code: 0, stdout, stderr: "", timedOut: false }),
+      reportTelemetry: (report) => { reports.push(report); },
+    });
+    const { text, isError } = await h.tool("dispatch", { task, mode: "answer" });
+    expect(isError).toBe(false);
+    expect(text).toContain(stdout);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.kind).toBe("cli");
+    expect(reports[0]!.laneId).toBe("agy");
+    expect(reports[0]!.status).toBe("completed");
+    expect(parseTelemetryReport(JSON.parse(JSON.stringify(reports[0])))).toEqual(reports[0]);
+  });
+
   it("forwards nothing for a cancelled job", async () => {
     vi.useFakeTimers();
     try {
