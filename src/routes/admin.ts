@@ -16,6 +16,14 @@ import { getTelemetryReport } from "../telemetry.js";
 import type { CircuitBreaker } from "../circuit-breaker.js";
 import { clearCooldowns } from "../cooldown-clear.js";
 import { baseLog } from "../request-log.js";
+import { createAccountingRequest, type AccountingRecorder } from "../accounting.js";
+import type { FailureKind } from "../dashboard-contract.js";
+import {
+  parseTelemetryReport,
+  recordLaneRun,
+  type DispatchedTelemetryReport,
+  type DispatchLaneStatus,
+} from "../dispatch-lane-stats.js";
 
 const MAX_TASK_LEN = 4096;
 
@@ -153,6 +161,13 @@ export interface AdminHandlers {
    * proxy has no store; its `/candidates` then reports no reached caps (unknown ⇒ no refusal).
    */
   accountingReader?: Pick<import("../accounting-store.js").AccountingStore, "usedInWindow">;
+  /**
+   * The server's accounting ledger writer, narrowed to the recorder the request path writes
+   * through. Required (unlike the reader): `POST /dispatch/telemetry` records the estimated
+   * dispatch envelope for `cli` lanes, and a bare programmatic proxy without a store passes
+   * the shared no-op recorder — the same default `createProxy` uses.
+   */
+  accountingRecorder: AccountingRecorder;
 }
 
 function failClosed(res: ServerResponse, status: number, message: string): void {
@@ -165,6 +180,69 @@ function pickQuery(url: string, param: string): string | undefined {
   if (qIdx === -1) return undefined;
   const search = new URLSearchParams(url.slice(qIdx + 1));
   return search.get(param) ?? undefined;
+}
+
+/**
+ * The failure kind a lane's terminal status completes as in the accounting ledger — a total
+ * table, so a new `DispatchLaneStatus` is a compile error here rather than a silent guess
+ * (the closed-union gotcha in CLAUDE.md). `completed` carries none (a success cannot carry a
+ * failure kind); `timed_out` is the vocabulary's own `timeout` member; `failed` is `unknown`
+ * because the daemon sees only an exit code — claiming `auth_error`, `rate_limit`,
+ * `provider_error`, `aborted` or `protocol` for a subprocess it never observes would label a
+ * guess as a measurement, and the fallback must resolve to the WEAKER claim.
+ */
+const TELEMETRY_FAILURE_KIND = {
+  completed: null,
+  failed: "unknown",
+  timed_out: "timeout",
+} as const satisfies Record<DispatchLaneStatus, FailureKind | null>;
+
+/**
+ * Record one `cli`-kind lane run as a single estimated-envelope request: role `serve`,
+ * client `mcp-dispatch`, attribution `unknown` (the lane ran on credentials the relay never
+ * held), no provider, no credential id, model = the lane's spec (what it claimed to serve)
+ * falling back to the lane id. Tokens are the dispatch envelope (`chars/4` estimates), never
+ * the lane's provider consumption, which the relay cannot see — so `method: "relay_estimate"`
+ * for both. No price port ⇒ spend null (unpriced, never $0).
+ */
+function recordDispatchLaneAccounting(recorder: AccountingRecorder, report: DispatchedTelemetryReport): void {
+  const model = report.spec ?? report.laneId;
+  const tokens = {
+    estimated: {
+      inputTokens: report.estimatedInputTokens,
+      outputTokens: report.estimatedOutputTokens,
+      inputMethod: "relay_estimate",
+      outputMethod: "relay_estimate",
+    },
+  };
+  const req = createAccountingRequest({
+    recorder,
+    client: "mcp-dispatch",
+    attribution: "unknown",
+    provider: null,
+    model,
+    credentialId: null,
+  });
+  const attempt = req.startAttempt({
+    role: "serve",
+    attribution: "unknown",
+    provider: null,
+    model,
+    credentialId: null,
+  });
+  if (report.status === "completed") {
+    attempt.complete({ outcome: "success", tokens });
+    req.complete({});
+    return;
+  }
+  if (report.status === "failed" || report.status === "timed_out") {
+    const failureKind = TELEMETRY_FAILURE_KIND[report.status];
+    attempt.complete({ outcome: "error", failureKind, tokens });
+    req.complete({ outcome: "error", failureKind });
+    return;
+  }
+  const _never: never = report.status;
+  throw new Error(`unhandled dispatch lane status: ${String(_never)}`);
 }
 
 /**
@@ -395,6 +473,33 @@ export async function handleAdminRoutes(
       ),
     });
     return ok(view, true);
+  }
+
+  if (req.method === "GET" && pathname === "/dispatch/telemetry") {
+    // POST-only, like `/cooldowns/clear`: an explicit 404 rather than the model-path
+    // fall-through, so a mistyped read can never walk candidates or egress upstream.
+    return bad(404, `GET /dispatch/telemetry is not a route — POST a telemetry report`);
+  }
+
+  if (req.method === "POST" && pathname === "/dispatch/telemetry") {
+    const report = parseTelemetryReport(reqJson);
+    if (!report) {
+      // The reason never echoes the body: a report carries job ids and token counts.
+      return bad(400, `POST /dispatch/telemetry body must be a telemetry report`);
+    }
+    recordLaneRun(cfg, report);
+    // Owner decision D1: `cli` lanes are metered here because nothing else sees them; a
+    // `relay` lane's harness traffic already flows through the daemon's own HTTP pipeline,
+    // so a second row would double count. Lane stats record BOTH kinds.
+    if (report.kind === "cli") {
+      recordDispatchLaneAccounting(h.accountingRecorder, report);
+      return ok({ recorded: true, accounting: "recorded" }, true);
+    }
+    if (report.kind === "relay") {
+      return ok({ recorded: true, accounting: "skipped" }, true);
+    }
+    const _never: never = report.kind;
+    return bad(400, `POST /dispatch/telemetry kind must be "cli" or "relay" (got ${String(_never)})`);
   }
 
   if (req.method === "GET" && pathname === "/telemetry") {

@@ -60,6 +60,7 @@ import type { AttributionPolicy } from "./dashboard-contract.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { installBreakerPersistence } from "./breaker-persistence.js";
 import { installDispatchExhaustionPersistence } from "./dispatch-exhaustion-persistence.js";
+import { installDispatchLaneStatsPersistence } from "./dispatch-lane-stats.js";
 import { resolveAutoSpec } from "./dispatch.js";
 import { AUTO_HEADER, AUTO_TIER_HEADER } from "./backend.js";
 import { LaneCadence } from "./lane-cadence.js";
@@ -119,6 +120,7 @@ const TOKENLESS_CONTROL_READS = new Set<string>(TOKENLESS_CONTROL_READ_PATHS);
 const CONTROL_ROUTES = new Set([
   ...TOKENLESS_CONTROL_READS,
   "/cooldowns/clear",
+  "/dispatch/telemetry",
   "/registry",
   "/ping",
   "/health/stats",
@@ -723,6 +725,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const breaker = deps.breaker ?? new CircuitBreaker();
   if (!process.env.VITEST) installBreakerPersistence(breaker);
   if (!process.env.VITEST) installDispatchExhaustionPersistence(cfg);
+  if (!process.env.VITEST) installDispatchLaneStatsPersistence(cfg);
   const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
   const accountingRecorder = deps.accountingRecorder ?? NOOP_ACCOUNTING_RECORDER;

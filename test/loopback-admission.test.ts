@@ -83,6 +83,44 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     expect(res.status).toBe(403);
   });
 
+  it("rejects a cross-origin POST to /dispatch/telemetry", async () => {
+    const url = await boot();
+    const res = await fetch(`${url}/dispatch/telemetry`, {
+      method: "POST",
+      headers: { origin: "https://evil.example", "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({
+        jobId: "job-0001",
+        laneId: "agy-gemini",
+        kind: "cli",
+        wallClockMs: 1000,
+        exitCode: 0,
+        status: "completed",
+        estimatedInputTokens: 1,
+        estimatedOutputTokens: 1,
+      }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("requires a valid capability for /dispatch/telemetry", async () => {
+    const url = await boot();
+    const missing = await fetch(`${url}/dispatch/telemetry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jobId: "job-0001",
+        laneId: "agy-gemini",
+        kind: "cli",
+        wallClockMs: 1000,
+        exitCode: 0,
+        status: "completed",
+        estimatedInputTokens: 1,
+        estimatedOutputTokens: 1,
+      }),
+    });
+    expect(missing.status).toBe(403);
+  });
+
   it("allows a request with NO Origin — what a CLI sends", async () => {
     const url = await boot();
     const res = await fetch(`${url}/offload`, { method: "GET" });

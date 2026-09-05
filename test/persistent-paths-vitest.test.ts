@@ -10,6 +10,8 @@ import { claudeHookPaths } from "../src/claude-hook.js";
 import { resolveConfigPath } from "../src/cli.js";
 import { defaultCatalogCachePath } from "../src/catalog.js";
 import { defaultUpdateCachePath } from "../src/self-update.js";
+import { getDispatchExhaustionPath } from "../src/dispatch-exhaustion-persistence.js";
+import { getDispatchLaneStatsPath } from "../src/dispatch-lane-stats.js";
 
 /**
  * The persistent-storage invariant, pinned mechanically: under vitest EVERY default resolver
@@ -39,6 +41,8 @@ const DEFAULT_PATHS: ReadonlyArray<readonly [name: string, resolve: () => string
   ["config.json — resolveConfigPath CREATES it when absent", resolveConfigPath, join(VITEST_ROOT, "config.json")],
   ["models-cache.json — the /models roster", defaultCatalogCachePath, join(VITEST_ROOT, "models-cache.json")],
   ["update-check.json — suppresses or forces an upgrade prompt", defaultUpdateCachePath, join(VITEST_ROOT, "update-check.json")],
+  ["dispatch-exhaustion.json — ladder cooldowns re-learnable from host reports", getDispatchExhaustionPath, join(VITEST_ROOT, "dispatch-exhaustion.json")],
+  ["dispatch-lane-stats.json — advisory per-lane run counts and wall-clocks", getDispatchLaneStatsPath, join(VITEST_ROOT, "dispatch-lane-stats.json")],
 ];
 
 describe("persistent storage paths redirect under VITEST (invariant)", () => {
