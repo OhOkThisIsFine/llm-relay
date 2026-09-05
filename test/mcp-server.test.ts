@@ -1119,3 +1119,196 @@ describe("dispatch/dispatch_lanes tool schema and instructions — answer mode c
     );
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// The stdio serve loop (2026-09-05). `cli.ts` used to `await server.ingest(chunk)` per chunk, and
+// `ingest` resolves only when every handler in that chunk has settled — so a request written
+// while another was in flight was not even READ until the first returned. These tests drive
+// `serve` with a hand-fed source, one push per host write, exactly as a host writes.
+
+/** A push-driven async source: one `push` is one stdin write, `end` is the host closing the pipe. */
+class ChunkSource implements AsyncIterable<string> {
+  private readonly queue: string[] = [];
+  private waiting: ((r: IteratorResult<string>) => void) | undefined;
+  private ended = false;
+
+  push(chunk: string): void {
+    const waiting = this.waiting;
+    if (waiting) {
+      this.waiting = undefined;
+      waiting({ value: chunk, done: false });
+    } else {
+      this.queue.push(chunk);
+    }
+  }
+
+  end(): void {
+    this.ended = true;
+    const waiting = this.waiting;
+    if (waiting) {
+      this.waiting = undefined;
+      waiting({ value: undefined as unknown as string, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<string> {
+    return {
+      next: () =>
+        new Promise<IteratorResult<string>>((resolve) => {
+          const queued = this.queue.shift();
+          if (queued !== undefined) resolve({ value: queued, done: false });
+          else if (this.ended) resolve({ value: undefined as unknown as string, done: true });
+          else this.waiting = resolve;
+        }),
+    };
+  }
+}
+
+function frame(id: number, method: string, params?: unknown): string {
+  return JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
+}
+
+function toolFrame(id: number, name: string, args: Record<string, unknown>): string {
+  return frame(id, "tools/call", { name, arguments: args });
+}
+
+/** Every response written so far, in write order, with the tool text when the result carries one. */
+function responses(lines: readonly string[]): { id: number; text: string }[] {
+  return lines.map((line) => {
+    const parsed = JSON.parse(line) as { id: number; result?: { content?: { text: string }[] } };
+    return { id: parsed.id, text: parsed.result?.content?.[0]?.text ?? "" };
+  });
+}
+
+/** A spawner whose FIRST call answers at once and whose later calls take `slowMs`. */
+function firstFastThenSlow(slowMs: number): LaneSpawner {
+  const result: LaneRunResult = { code: 0, stdout: "lane answer", stderr: "", timedOut: false };
+  const fast = fakeSpawner(result, 0);
+  const slow = fakeSpawner(result, slowMs);
+  let calls = 0;
+  return (command, args, opts) => (calls++ === 0 ? fast : slow)(command, args, opts);
+}
+
+describe("stdio serve loop", () => {
+  it("answers a request written while an earlier dispatch still blocks on waitMs", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = new Harness({ spawn: firstFastThenSlow(5000) });
+      // Job ids are monotonic per process, so a dispatch that completes at once tells us the
+      // id the NEXT dispatch will get — the one we need to address while it is still blocking.
+      const warmup = await h.tool("dispatch", { task: "warm-up" });
+      const previous = Number(/job: job-(\d+)/.exec(warmup.text)?.[1]);
+      expect(Number.isFinite(previous)).toBe(true);
+      const jobId = `job-${String(previous + 1).padStart(4, "0")}`;
+      const before = h.out.length;
+
+      const source = new ChunkSource();
+      const served = h.server.serve(source);
+
+      source.push(toolFrame(10, "dispatch", { task: "slow", waitMs: 1000 }));
+      await vi.advanceTimersByTimeAsync(1);
+      // A SEPARATE write while the dispatch above is inside its 1000 ms wait.
+      source.push(toolFrame(11, "dispatch_status", { jobId }));
+      await vi.advanceTimersByTimeAsync(10);
+
+      const early = responses(h.out.slice(before));
+      expect(early.map((r) => r.id)).toEqual([11]);
+      expect(early[0]?.text).toContain("status: running");
+
+      // A cancel from a third write reaches the job and ends the blocking dispatch early: the
+      // job tools work while a `dispatch` holds the loop, which is the whole point.
+      source.push(toolFrame(12, "dispatch_cancel", { jobId }));
+      await vi.advanceTimersByTimeAsync(10);
+      const all = responses(h.out.slice(before));
+      expect(all.map((r) => r.id)).toEqual([11, 12, 10]);
+      expect(all.find((r) => r.id === 10)?.text).toContain("status: cancelled");
+
+      source.end();
+      await served;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs two dispatches from separate writes beside each other: the second's wait excludes the first's", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = new Harness({ spawn: fakeSpawner({ code: 0, stdout: "slow answer", stderr: "", timedOut: false }, 5000) });
+      const source = new ChunkSource();
+      const served = h.server.serve(source);
+
+      source.push(toolFrame(1, "dispatch", { task: "first", waitMs: 1000 }));
+      await vi.advanceTimersByTimeAsync(1);
+      source.push(toolFrame(2, "dispatch", { task: "second", waitMs: 1000 }));
+      await vi.advanceTimersByTimeAsync(1100);
+
+      // Both handles are back after ONE wait. A serial loop hands the second back at ~2000 ms,
+      // because it does not read the second write until the first handler returns.
+      const seen = responses(h.out);
+      expect(seen.map((r) => r.id).sort()).toEqual([1, 2]);
+      for (const r of seen) expect(r.text).toContain("status: running");
+
+      source.end();
+      await served;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves only after the source ends and every handler it started has settled", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = new Harness({ spawn: fakeSpawner({ code: 0, stdout: "late answer", stderr: "", timedOut: false }, 500) });
+      const source = new ChunkSource();
+      let settled = false;
+      const served = h.server.serve(source).then(() => {
+        settled = true;
+      });
+      source.push(toolFrame(1, "dispatch", { task: "x", waitMs: 5000 }));
+      await vi.advanceTimersByTimeAsync(1);
+      source.end();
+      await vi.advanceTimersByTimeAsync(1);
+      // The pipe is closed but the dispatch still waits on its lane: serve must not resolve yet.
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(600);
+      await served;
+      expect(responses(h.out)[0]?.text).toContain("late answer");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("contains a transport failure on one response and keeps serving later writes", async () => {
+    const out: string[] = [];
+    const h = new Harness({
+      // Every write of the FIRST request's answer fails, result and error alike — the host closed
+      // the pipe mid-response. Later writes succeed.
+      write: (chunk) => {
+        if (chunk.includes('"id":1,')) throw new Error("EPIPE");
+        out.push(chunk);
+      },
+    });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const source = new ChunkSource();
+      const served = h.server.serve(source);
+      source.push(frame(1, "ping"));
+      source.push(frame(2, "ping"));
+      source.end();
+      await served;
+      expect(responses(out).map((r) => r.id)).toEqual([2]);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("ingest failed"));
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("splits synchronously in ingest, so un-awaited calls keep message order across a split frame", async () => {
+    const h = new Harness();
+    const msg = frame(7, "ping");
+    const a = h.server.ingest(msg.slice(0, 12));
+    const b = h.server.ingest(msg.slice(12));
+    await Promise.all([a, b]);
+    expect(responses(h.out).map((r) => r.id)).toEqual([7]);
+  });
+});

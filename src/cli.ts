@@ -2553,9 +2553,10 @@ export async function runMcp(): Promise<void> {
   process.stdin.on("close", stop);
 
   process.stdin.setEncoding("utf8");
-  for await (const chunk of process.stdin) {
-    await server.ingest(chunk as string);
-  }
+  // ⚠ `serve` reads each chunk the moment it arrives and never awaits a handler. The old loop
+  // here awaited `ingest` per chunk, which serialized every request behind the one in flight —
+  // see `McpDispatchServer.serve` for the measured consequence.
+  await server.serve(process.stdin);
   server.shutdown();
 }
 

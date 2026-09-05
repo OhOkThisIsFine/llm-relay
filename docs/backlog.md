@@ -9,23 +9,6 @@
 
 ## Open
 
-- **`llm-relay mcp` answers ONE request at a time per process: a `tools/call` written while
-  another is in flight is not even read until the first one returns** (2026-09-04, read from
-  the code while audit-tools built its dispatch client; not yet measured against a live host).
-  `runMcp` in `src/cli.ts` drives the server with `for await (const chunk of process.stdin)
-  { await server.ingest(chunk) }`, and `McpDispatchServer.ingest` awaits `Promise.all` of the
-  chunk's handlers, each of which awaits `awaitOrPoll` for up to `waitMs` (60 s by default).
-  So two requests are concurrent only when they land in the same stdin chunk; a host that
-  issues parallel tool calls in separate writes — Claude Code does — has its second `dispatch`
-  wait behind the first's full `waitMs` before the server reads it, and `dispatch_status` /
-  `dispatch_cancel` cannot reach a job while a blocking `dispatch` holds the loop. audit-tools
-  worked around it with a POOL of `llm-relay mcp` children, one per concurrent call
-  (`scripts/shared/mcp-dispatch-lane.mjs`). **Property:** a request is read and dispatched the
-  moment it arrives, independent of any in-flight handler — read stdin without awaiting
-  `ingest`, and let each handler settle on its own promise; the wait/poll policy per job is
-  unchanged. Measure with two `dispatch` calls in separate writes: the second's `elapsed`
-  must not include the first's wait.
-
 - **Triage the eligibility queue — 10 unrecognized refusals await interpretation** (owner
   decision 2026-09-05: a separate lap, not folded into the MCP-concurrency lap). `llm-relay
   eligibility` lists them: [1] groq `access denied. please check your network settings.` (×116)
@@ -227,6 +210,19 @@
   its `false` form.
 
 ## Closed
+
+- ✅ **`llm-relay mcp` reads and dispatches each request the moment it arrives** (filed
+  2026-09-04, closed 2026-09-05, v0.72.1). `McpDispatchServer.serve` replaced the per-chunk
+  `await server.ingest(chunk)` in `runMcp`; `ingest` splits synchronously and is no longer
+  `async`. Five pinning tests (`test/mcp-server.test.ts`, "stdio serve loop") and a mutation
+  check (the restored await turned exactly the two concurrency tests red). Measured live against
+  the released v0.72.0 binary on an isolated daemon: a `dispatch_status` written 400 ms after a
+  blocking `dispatch` was answered after 6621 ms on v0.72.0 (only once the dispatch returned) and
+  in under 1 ms on the fix; a second `dispatch` written 150 ms after a first finished 12 s after
+  its own write while the first still ran for 63 s. Numbers, method and the stated trades (no
+  concurrency cap; out-of-order responses are JSON-RPC-legal):
+  [`mcp-concurrent-ingest-2026-09-05.md`](mcp-concurrent-ingest-2026-09-05.md). audit-tools'
+  per-call child pool (`scripts/shared/mcp-dispatch-lane.mjs`) is a workaround it can now retire.
 
 - ✅ **Owner question: does hedging need a terms review?** (audit DR-003; closed 2026-09-04 by
   owner decision: no review needed). Duplicate free-tier requests are within the relay's use as the

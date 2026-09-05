@@ -421,12 +421,49 @@ export class McpDispatchServer {
     this.maxDepth = deps.maxDepth ?? DEFAULT_MAX_DEPTH;
   }
 
-  /** Feed raw stdin bytes. Complete messages are handled concurrently; a partial tail is carried over. */
-  async ingest(chunk: string): Promise<void> {
+  /**
+   * Feed raw stdin bytes. Complete messages are handled concurrently; a partial tail is carried
+   * over. Resolves once every handler in THIS chunk has settled.
+   *
+   * ⚠ Deliberately not `async`: the split runs to completion before the first handler starts, so
+   * two calls in flight at once cannot interleave or reorder the buffer — message order is the
+   * write order whatever the caller awaits. `serve` depends on exactly that.
+   */
+  ingest(chunk: string): Promise<void> {
     this.buffer += chunk;
     const { lines, rest } = splitMessages(this.buffer);
     this.buffer = rest;
-    await Promise.all(lines.map((line) => this.handleLine(line)));
+    return Promise.all(lines.map((line) => this.handleLine(line))).then(() => undefined);
+  }
+
+  /**
+   * Serve a stream of stdin chunks until the source ends.
+   *
+   * ⚠ Reads every chunk the moment it arrives and NEVER awaits a handler. Until 2026-09-05
+   * `cli.ts` ran `for await (chunk) { await server.ingest(chunk) }`, and `ingest` resolves only
+   * when every handler in the chunk has settled — so a `tools/call` written while another was in
+   * flight was not even READ until the first returned. Two requests were concurrent only when
+   * they landed in the same chunk; a host that issues parallel tool calls in separate writes
+   * (Claude Code does) had its second `dispatch` wait behind the first's full `waitMs`, and
+   * `dispatch_status` / `dispatch_cancel` could not reach a job while a blocking `dispatch` held
+   * the loop. Each handler now settles on its own promise; the per-job wait/poll policy
+   * (`awaitOrPoll`) is unchanged. Responses may therefore leave out of request order, which
+   * JSON-RPC permits — ids correlate.
+   *
+   * A rejected `ingest` (a response write failed — the host closed the pipe mid-answer; every
+   * handler error is already contained inside `handleLine`) is reported on stderr and never
+   * takes the loop down. Resolves after the source ends AND every handler it started has settled.
+   */
+  async serve(source: AsyncIterable<string>): Promise<void> {
+    const inFlight = new Set<Promise<void>>();
+    for await (const chunk of source) {
+      const pending: Promise<void> = this.ingest(chunk).catch((e: unknown) => {
+        logStderr(`ingest failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+      inFlight.add(pending);
+      void pending.then(() => inFlight.delete(pending));
+    }
+    await Promise.all(inFlight);
   }
 
   /** Kill every running child. Wired to process exit so nothing is orphaned. */

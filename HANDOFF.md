@@ -2,78 +2,50 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-04 (v0.72.0, the dispatch-telemetry lap)
+## 0. State as of 2026-09-05 (v0.72.1, the concurrent-ingest lap)
 
-**v0.72.0** carries the dispatch-telemetry lap: "MCP reports, daemon records". Design, adversarial
-review findings and the three owner decisions are in
-[docs/dispatch-telemetry-design-2026-09-04.md](docs/dispatch-telemetry-design-2026-09-04.md);
-§6 there holds the result, the review verdicts and the stated trades. In one line each:
+**v0.72.1** makes `llm-relay mcp` read and dispatch each stdin request the moment it arrives.
+Until now `runMcp` awaited `server.ingest(chunk)` per chunk, and `ingest` resolves only when
+every handler in that chunk has settled, so a `dispatch` blocking on `waitMs` held the whole
+loop: a host issuing parallel tool calls in separate writes (Claude Code does) waited a full
+`waitMs` before its second call was even read, and `dispatch_status`/`dispatch_cancel` could
+not reach a running job. `McpDispatchServer.serve` now reads every chunk on arrival and never
+awaits a handler; `ingest` splits synchronously (it is no longer `async`), so message order is
+write order whatever the caller awaits; the per-job wait/poll policy is unchanged. Five pinning
+tests plus a mutation check, and a live measurement against the released v0.72.0 binary on an
+isolated daemon (a status probe answered in under 1 ms instead of after 6.6 s; a second dispatch
+finished 12 s after its own write while the first still ran for 63 s):
+[docs/mcp-concurrent-ingest-2026-09-05.md](docs/mcp-concurrent-ingest-2026-09-05.md).
+Stated trades: responses may leave out of request order (JSON-RPC permits it), and there is no
+concurrency cap. ⚠ A host keeps the OLD behaviour until it restarts its `llm-relay mcp` child.
 
-- **`llm-relay mcp` forwards one metadata-only report per settled agent-mode job** (lane id and
-  kind, wall-clock, exit code, terminal status, chars/4 of the task and of the output) to the
-  daemon's new `POST /dispatch/telemetry` — fire-and-forget after the job is terminal, never a
-  cancelled job, never a relay-kind answer-mode job (the HTTP pipeline already accounts it). A
-  `cli`-kind rung in answer mode spawns like agent mode and IS forwarded.
-- **The daemon records lane stats for every rung kind** (`dispatch-lane-stats.ts`: calls,
-  successes, failures, timeouts, a 25-sample wall-clock window; `dispatch-lane-stats.json`,
-  cache-kind, restore never overwrites live state) and renders them as an advisory `stats:`
-  column on `dispatch_lanes`, `llm-relay dispatch`, `GET /dispatch` and `--json`. Stats never
-  reorder the ladder and never reach `runtime-telemetry.json` or pool scoring.
-- **Owner decision D1 — accounting for `cli`-kind lanes only, decided by the DAEMON from its own
-  ladder:** a rung is metered here when its kind is `cli` AND its declared env does not point
-  `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` at this listener (`laneRoutesThroughRelay`; the review's
-  C1 finding — a relay-routed `claude` rung's harness traffic already flows through the daemon,
-  so a second row would double count). Unknown lane ids are 400, like the exhaustion report, and
-  the report's own `kind` is never trusted over the rung's.
-- **Owner decision D2 — the ledger row is the ESTIMATED ENVELOPE:** client `mcp-dispatch`,
-  attribution `unknown`, `tokenBasis: "estimated"` / `method: "relay_estimate"`, no credential,
-  unpriced; `failed` completes as failure kind `unknown` (the weaker claim), `timed_out` as
-  `timeout`. `llm-relay cost --by client` (and `--by model` for a cli lane id) prints the caveat:
-  the figure is the dispatch envelope, not the lane's provider consumption, which the relay
-  cannot see.
-- **Live proof before release:** an isolated daemon (port 8792, HOME overridden) plus a real
-  `llm-relay mcp` child driven over JSON-RPC dispatched one `opencode-muse-spark` task — one
-  `mcp-dispatch` request (tokens 14/1 estimated, spend null), one stats row (5882 ms), no runtime
-  telemetry, real state untouched; 11 of 11 assertions.
+**Owner decisions this lap (2026-09-05):** lap approved as stated (patch release); machine
+backlog P52 takes form (B), the PreToolUse staging-scope refusal (recorded in
+`C:\Code\docs\backlog.md`, not yet scheduled); the Codex `relay` verification stays deferred;
+the eligibility queue (10 refusals) is its own lap, filed in [docs/backlog.md](docs/backlog.md).
 
-**Owner decisions this lap (2026-09-04):** lap approved as stated with the cli-only accounting
-refinement; ledger tokens are the estimated envelope (declined: null tokens with request
-counting; no ledger row); MINOR release; a dedicated OpenCode agent `relay-lane` (machine-wide,
-`~/.config/opencode/opencode.json`, backed up) so a headless Muse Spark lane may edit and run the
-suite.
-
-**Lanes.** Every packet went to the free `opencode-muse-spark` lane (Meta Muse Spark 1.3 through
-OpenCode, `--variant xhigh` for code): three read-only recon lanes, four implementation packets,
-one scripted live proof and one adversarial review — every packet verified here by `git diff`,
-`llm-relay delegate-gate` and the full suite before its commit, and two mutation checks run
-after the review fix. Two traps cost a lane run each and are recorded: a task over 4096
-characters makes the MCP server fall back to its start-time config snapshot
-([docs/backlog.md](docs/backlog.md)), and headless OpenCode auto-rejects every `ask` permission
-(machine backlog, global `CLAUDE.md`).
+**The previous lap (v0.72.0) never ran its closeout.** Its code was tagged and published; its
+doc residue (the `free-pool` lane rename and the backlog entry this lap closed) went in first
+as `c1c1b81`.
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
 
+- Triage the eligibility queue: 10 unrecognized refusals; item [1] (the VPN network block) stays
+  pending by rule; the dispatcher proposes by digest, only the owner accepts.
 - Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry): a
   bounded lap measures what Claude Code and Codex do on a mid-stream SSE `error` after content;
-  the per-token abort is built only if a retry reaches another candidate. The terms review for
-  hedging is closed by owner decision: no review needed, recorded beside D1 in the hedge design.
-- Owner: verify the Codex `relay` agent from Codex Desktop.
+  the per-token abort is built only if a retry reaches another candidate.
+- Owner: verify the Codex `relay` agent from Codex Desktop (deferred again 2026-09-05).
 - The 63 eslint errors: switch off per file with the invariant named.
 - `publish.yml` `timeout-minutes` 15 → 30.
 - Audit residue with properties: the metering silence channel (DR-006), listener-before-store
   (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
   pruning (DR-012), the default-ON routing keys in `docs/reference.md` (DR-024).
-- Contributor SKUs (owner decisions 2026-09-04: option A — allow in automatic routing; route A
-  now, route B as a lap): Meta's `opencode/muse-spark-1.3-contributor-free` may be routed
-  automatically although its prompts and completions become Meta training data —
-  [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md)
-  §5. **Route A is live:** four `opencode-muse-spark` cli rungs (one per ladder,
-  `--variant <tier>`) sit right after `free-pool` in the live config (revert file
-  `config.json.bak-2026-09-04-pre-opencode-muse`); the v0.71.1 daemon loaded them, and MCP
-  `dispatch` with `lane: "opencode-muse-spark"` answered `OK` in 6 s (`job-0001`). Route B — a
-  Responses upstream (`wire: "responses"` on `kind: "openai"`), then pinning both contributor ids
-  as `preferred` — is the backlog lap. `freeOnly`: owner decision 2026-09-04, stays `false` on all
-  three rules (§6); the backlog entry is narrowed to the cost-class-aware retraction rule.
+- Contributor SKUs route B (a Responses upstream, `wire: "responses"` on `kind: "openai"`, then
+  pinning both contributor ids as `preferred`). Route A — four `opencode-muse-spark` cli rungs,
+  one per ladder, right after `free-pool` — is live and verified through MCP `dispatch`
+  (owner decision 2026-09-04, option A; `freeOnly` stays `false` on all three rules):
+  [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md).
 
 
 ## 0.1 Earlier releases
@@ -82,6 +54,13 @@ Deliberately NOT restated here. This file holds current state plus the immediate
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
 tags are the trail. What survived each sprint lives in its own home:
 
+- **v0.72.0, the dispatch-telemetry lap (2026-09-04)** — "MCP reports, daemon records": the MCP
+  server forwards one metadata-only report per settled agent-mode job to
+  `POST /dispatch/telemetry`; the daemon records per-lane stats (`dispatch-lane-stats.ts`, the
+  advisory `stats:` column) and one estimated-envelope ledger row for `cli`-kind lanes only
+  (owner decisions D1/D2); every packet ran on the free `opencode-muse-spark` lane and a live
+  proof on an isolated daemon preceded the release:
+  [docs/dispatch-telemetry-design-2026-09-04.md](docs/dispatch-telemetry-design-2026-09-04.md).
 - **v0.71.1, the audit-triage lap (2026-09-04)** — every finding in
   [docs/audit-findings-2026-09-03.md](docs/audit-findings-2026-09-03.md) has a verdict in
   [docs/audit-triage-2026-09-04.md](docs/audit-triage-2026-09-04.md) and each verified defect is
