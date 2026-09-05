@@ -1,6 +1,7 @@
 # Unified telemetry and accounting for dispatched lanes (MCP and CLI) — 2026-09-04
 
-**Status:** approved by the owner 2026-09-04, implementation lap open (lap start `48a5bbb`).
+**Status:** shipped in v0.72.0 (2026-09-04); lap start `48a5bbb`, commits `3c69d94`, `272cf69`,
+`5877049`, `7221dba`. §6 holds the result and the stated trades.
 **Provenance:** an AGY + Meta Muse Spark 1.3 design pass. The first draft proposed direct disk
 persistence (`AccountingStore` and `recordModelCall`) inside the `llm-relay mcp` process. Meta Muse
 Spark 1.3 (`opencode-muse-spark`, `job-0006`) reviewed that draft adversarially and rejected it.
@@ -116,7 +117,8 @@ On a valid report:
 - **Accounting (cli-kind only, D1):** open a request on the daemon's existing store — role
   `serve`, client `mcp-dispatch`, attribution `unknown`, `tokenBasis: "estimated"`,
   `method: "relay_estimate"`, no credential id, no price — and complete it with the two
-  estimates. `failed`/`timed_out` complete as failures; nothing is ever written as `0` tokens.
+  estimates. `failed`/`timed_out` complete as failures and still carry their estimates; an empty
+  or absent output is an honest `0` (a measurement of emptiness), never unknown-as-zero.
   Whether a run is "metered by the relay" is decided by the DAEMON from the rung's declared
   env — a `cli` rung whose env routes its harness back through this listener is already
   metered by the HTTP pipeline, and the report's own `kind` is never trusted (the C1
@@ -153,3 +155,45 @@ Automated:
 Manual, after release and global reinstall: run MCP `dispatch` on `opencode-muse-spark`; confirm
 the estimated envelope appears in `llm-relay cost`; confirm `llm-relay telemetry` HTTP speed
 scores are unchanged and the lane row shows the call.
+
+## 6. Result (2026-09-04)
+
+Shipped in v0.72.0 as four commits on `main`, each authored by the free `opencode-muse-spark`
+lane (Meta Muse Spark 1.3 through OpenCode) and verified here — `git diff`,
+`llm-relay delegate-gate`, both typechecks, the full suite — before its commit:
+
+- `3c69d94` — `src/dispatch-lane-stats.ts` (report type and fail-closed parser, per-Config
+  stats, `dispatch-lane-stats.json`), `POST /dispatch/telemetry`, the accounting write; 27 tests.
+- `272cf69` — `McpServerDeps.reportTelemetry`, `forwardTelemetry` after every settled agent-mode
+  job, `reportMcpTelemetry`; 10 tests.
+- `5877049` — the `stats` column on every ladder surface, the `--by client` cost caveat, the
+  reference docs; 20 tests.
+- `7221dba` — the adversarial review closed: the daemon decides "metered by the relay" from the
+  rung's declared env (`laneRoutesThroughRelay`), unknown lanes are 400, the report's `kind` is
+  never trusted over the rung's, compiler-linked status and key lists, HEAD joins GET on the 404,
+  the `--by model` caveat; 15 tests.
+
+**Adversarial review** (a fresh lane, read-only, on the first three commits): CONFIRMED 1 — C1,
+a `cli` rung whose env points `ANTHROPIC_BASE_URL` at the relay (the shape `docs/reference.md`
+documents) was metered twice; PLAUSIBLE 2 — P1 unbounded lane ids, P2 "never answer mode" was
+false for a `cli` rung; NIT 8. C1, P1, P2, N1, N3, N4, N6 are closed by `7221dba`. Stated and kept:
+N2, the write-behind flush ignores the atomic writer's boolean exactly as the exhaustion store
+does; N7, delivery is at-least-once with no idempotency key — `jobId` restarts per MCP process, so
+it cannot serve as one; N8, an in-flight forward can hold MCP exit for up to the 5 s request
+timeout, not measured as a nuisance. Mutation checks after the fix: disabling the relay-routed
+skip and dropping the persisted-window bound each turned their test file red.
+
+**Live proof before release:** an isolated daemon (port 8792, `HOME` overridden to a scratch
+root) plus a real `llm-relay mcp` child driven over JSON-RPC dispatched one `opencode-muse-spark`
+task ("Reply with exactly the two letters OK"): `dispatch-lane-stats.json` held
+`{ calls: 1, successes: 1, wallClockMs: [5882] }`; `usage/` held one `mcp-dispatch` request
+(`in 14 / out 1`, `relay_estimate`, `spend null`, attribution `unknown`); `runtime-telemetry.json`
+was absent; the real `~/.llm-relay` state was untouched. 11 of 11 assertions passed.
+
+**Stated trades.** The forward is fire-and-forget, so a `GET /dispatch` issued within
+milliseconds of a job's return can precede its stats row (seen once in the proof). A `failed`
+run's output estimate is chars/4 of whatever output survived — an honest 0 when none did.
+The recon map that guided the packets (`dispatch-telemetry-implementation-map-2026-09-04.md`)
+was deleted at closeout: its line numbers were true for `48a5bbb` only, and the seams it named
+now live in the CLAUDE.md rows for `dispatch-lane-stats.ts`, `routes/admin.ts`, `mcp/server.ts`,
+`cli.ts` and `dispatch.ts`.

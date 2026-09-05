@@ -2,62 +2,60 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-04 (v0.71.1, the audit-triage lap)
+## 0. State as of 2026-09-04 (v0.72.0, the dispatch-telemetry lap)
 
-**v0.71.1** carries the audit-triage lap. (v0.71.0 was tagged first and its publish run failed on
-`test/doc-links.test.ts`: the backlog rewrite in this lap had committed four entries a concurrent
-session in the same checkout had added uncommitted, one of them linking a document that session had
-not yet committed — the untracked file satisfied the check locally and did not exist in CI. That
-session then committed the document as `a137d04`; v0.71.1 is the fix-forward on the tree holding
-both. Both traps are recorded: the test's hermeticity gap in [docs/backlog.md](docs/backlog.md), the
-shared-checkout rewrite in the machine backlog.) Every finding in
-[docs/audit-findings-2026-09-03.md](docs/audit-findings-2026-09-03.md) now has a verdict in
-[docs/audit-triage-2026-09-04.md](docs/audit-triage-2026-09-04.md), and each verified defect is
-fixed with a pinning test. In one line each:
+**v0.72.0** carries the dispatch-telemetry lap: "MCP reports, daemon records". Design, adversarial
+review findings and the three owner decisions are in
+[docs/dispatch-telemetry-design-2026-09-04.md](docs/dispatch-telemetry-design-2026-09-04.md);
+§6 there holds the result, the review verdicts and the stated trades. In one line each:
 
-- **The configuration vocabulary has ONE declaration** (`config-types.ts`); `config.ts` re-exports
-  it. The two copies had already drifted (`HedgeConfig`'s lap-2 keys lived in one of them). The new
-  general guard `test/one-declaration.test.ts` — no exported name declared in two `src/` modules —
-  found two more pairs (`QuotaAxis`/`QuotaPeriod`, `AccountingSpendCoverage`) and a third copy of
-  two compat unions in `openai-request.ts`; all consolidated.
-- **The ledger no longer blames the provider for a relay-authored refusal**: a total
-  `RELAY_AUTHORED_PROVENANCE` table classifies `relay-mapper-defect` as `protocol`, matching the
-  breaker's own table.
-- **`GET /v1/models` omits an unresolved context window** instead of advertising a flat 272000,
-  states the figure's provenance in `description`, and resolves the relay-reserved `auto` id
-  through the ladder (it had borrowed `openrouter/auto`'s 2,000,000 tokens from the snapshot).
-  Codex v0.153.2 was measured tolerating the omission against a scratch relay.
-- **The data plane classifies 413 by the body reader's code**, never by its message;
-  `BODY_TOO_LARGE_CODE` moved to `stream-pipeline.ts` and the dashboard re-exports it.
-- **The hedge race settles at COMMIT** — first meaningful content — so a primary that sends
-  headers plus a metadata event and then goes silent is hedged. Mutation-checked both ways
-  (wrapper off ⇒ 4 red; probe ignored ⇒ 2 red). Per-token stays inert on the hedge path by
-  construction, stated in `CLAUDE.md` and §12 of the hedge design; the post-commit remedy is an
-  open owner decision.
-- **Dead code removed:** the DR-020 type residue (`recovered`/`recovery-loss`, `transactionId`,
-  `quarantinedPath`, the journal hooks) and the never-adopted `JsonStore` class.
-- **The analysis summary prints exit codes as exit codes**, and a `.json` report is written only
-  when it parses.
+- **`llm-relay mcp` forwards one metadata-only report per settled agent-mode job** (lane id and
+  kind, wall-clock, exit code, terminal status, chars/4 of the task and of the output) to the
+  daemon's new `POST /dispatch/telemetry` — fire-and-forget after the job is terminal, never a
+  cancelled job, never a relay-kind answer-mode job (the HTTP pipeline already accounts it). A
+  `cli`-kind rung in answer mode spawns like agent mode and IS forwarded.
+- **The daemon records lane stats for every rung kind** (`dispatch-lane-stats.ts`: calls,
+  successes, failures, timeouts, a 25-sample wall-clock window; `dispatch-lane-stats.json`,
+  cache-kind, restore never overwrites live state) and renders them as an advisory `stats:`
+  column on `dispatch_lanes`, `llm-relay dispatch`, `GET /dispatch` and `--json`. Stats never
+  reorder the ladder and never reach `runtime-telemetry.json` or pool scoring.
+- **Owner decision D1 — accounting for `cli`-kind lanes only, decided by the DAEMON from its own
+  ladder:** a rung is metered here when its kind is `cli` AND its declared env does not point
+  `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` at this listener (`laneRoutesThroughRelay`; the review's
+  C1 finding — a relay-routed `claude` rung's harness traffic already flows through the daemon,
+  so a second row would double count). Unknown lane ids are 400, like the exhaustion report, and
+  the report's own `kind` is never trusted over the rung's.
+- **Owner decision D2 — the ledger row is the ESTIMATED ENVELOPE:** client `mcp-dispatch`,
+  attribution `unknown`, `tokenBasis: "estimated"` / `method: "relay_estimate"`, no credential,
+  unpriced; `failed` completes as failure kind `unknown` (the weaker claim), `timed_out` as
+  `timeout`. `llm-relay cost --by client` (and `--by model` for a cli lane id) prints the caveat:
+  the figure is the dispatch envelope, not the lane's provider consumption, which the relay
+  cannot see.
+- **Live proof before release:** an isolated daemon (port 8792, HOME overridden) plus a real
+  `llm-relay mcp` child driven over JSON-RPC dispatched one `opencode-muse-spark` task — one
+  `mcp-dispatch` request (tokens 14/1 estimated, spend null), one stats row (5882 ms), no runtime
+  telemetry, real state untouched; 11 of 11 assertions.
 
-**Owner decisions this lap (2026-09-04):** lap approved as stated; the groq TPM 429 interpretation
-accepted (`rate-limited`/`attempt`, both unit spellings); the 63 advisory eslint errors → switch
-off per file with the invariant named (scheduled outside this lap); the hedge — *"the point of the
-hedge is to handle wedged requests, or requests so slow as to be practically wedged; rule 1 seems
-important"* — → race-to-commit built, post-commit policy pending.
+**Owner decisions this lap (2026-09-04):** lap approved as stated with the cli-only accounting
+refinement; ledger tokens are the estimated envelope (declined: null tokens with request
+counting; no ledger row); MINOR release; a dedicated OpenCode agent `relay-lane` (machine-wide,
+`~/.config/opencode/opencode.json`, backed up) so a headless Muse Spark lane may edit and run the
+suite.
 
-**Lanes.** The 27 untriaged findings were swept by three `claude-free-pool` (`pool/medium`) jobs
-through MCP `dispatch` (7–21 minutes each); every claim adopted into a verdict was re-checked
-against source. ⚠ The first attempt through three `relay` subagents lost every job when the
-session hit its usage limit mid-run: the MCP server connection was replaced, job ids reset, and
-the agents saw "Request timed out" then "Connection closed". Direct `dispatch` with a short
-`waitMs` and polling worked afterwards.
-
-**Daemon:** reinstalled and restarted onto v0.71.1 (pid 29232) through the Startup `.vbs`; its
-live catalog shows `auto` resolving to `pool/medium` at 131,072 tokens, the minimum over the pool's
-resolving members, where the previous build advertised 2,000,000.
+**Lanes.** Every packet went to the free `opencode-muse-spark` lane (Meta Muse Spark 1.3 through
+OpenCode, `--variant xhigh` for code): three read-only recon lanes, four implementation packets,
+one scripted live proof and one adversarial review — every packet verified here by `git diff`,
+`llm-relay delegate-gate` and the full suite before its commit, and two mutation checks run
+after the review fix. Two traps cost a lane run each and are recorded: a task over 4096
+characters makes the MCP server fall back to its start-time config snapshot
+([docs/backlog.md](docs/backlog.md)), and headless OpenCode auto-rejects every `ask` permission
+(machine backlog, global `CLAUDE.md`).
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
 
+- The MCP server's stale-config fallback (this lap's trap): stop sending the task on the view
+  request, or reload config per call, and name a fallback in the job's provenance.
+- `delegate-gate`'s tautological-assertion detector: resolve the called identifier's binding.
 - Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry): a
   bounded lap measures what Claude Code and Codex do on a mid-stream SSE `error` after content;
   the per-token abort is built only if a retry reaches another candidate. The terms review for
@@ -87,6 +85,16 @@ Deliberately NOT restated here. This file holds current state plus the immediate
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
 tags are the trail. What survived each sprint lives in its own home:
 
+- **v0.71.1, the audit-triage lap (2026-09-04)** — every finding in
+  [docs/audit-findings-2026-09-03.md](docs/audit-findings-2026-09-03.md) has a verdict in
+  [docs/audit-triage-2026-09-04.md](docs/audit-triage-2026-09-04.md) and each verified defect is
+  fixed with a pinning test: one declaration for the config vocabulary (`config-types.ts`,
+  guarded by `test/one-declaration.test.ts`), the ledger no longer blames the provider for a
+  relay-authored refusal, `GET /v1/models` omits an unresolved context window and resolves
+  `auto` through the ladder, 413 is classified by the body reader's code, the hedge race settles
+  at COMMIT (post-commit remedy: owner decision 2026-09-04, measure first), DR-020 residue and
+  `JsonStore` removed. v0.71.0's publish died on a doc link to a concurrent session's untracked
+  file; both traps are recorded.
 - **v0.69.0–v0.70.0, the dispatch fast-path and token-scaled-hedge laps (2026-09-04)** — the
   `slow` usability band, the `auto` model, MCP `dispatch` answer mode, the `relay` agent for Claude
   and Codex with no pinned model, the input-size-scaled hedge floor, and the DR-020 shrink of the

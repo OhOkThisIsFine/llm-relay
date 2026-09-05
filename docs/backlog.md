@@ -9,6 +9,33 @@
 
 ## Open
 
+- **`llm-relay mcp` silently falls back to the config snapshot it took at start whenever the live
+  `/dispatch` view rejects the request — a task over 4096 characters is enough** (2026-09-04,
+  medium, friction: false_green). `resolveDispatchView` (`src/cli.ts`) sends the whole task as
+  `?task=` on `GET /dispatch`; the daemon answers 400 above `MAX_TASK_LEN` (`src/routes/admin.ts`),
+  `tryServer` returns null, and the fallback `buildDispatch(cfg)` renders the lane command from the
+  `cfg` object `runMcp` captured at process start. Measured 2026-09-04: after `--agent relay-lane`
+  was added to the four `opencode-muse-spark` rungs and the daemon restarted, a 6 k-character brief
+  (`job-0010`) ran OpenCode as `agent=build` with the OLD args, while a short task (`job-0008`) ran
+  as `agent=relay-lane`; nothing in the job output said which config produced the command. Cost: a
+  rung edit is invisible to long tasks until every host restarts its MCP server, and the failure
+  reads as a model failure (empty output). **Property:** the MCP server renders every lane command
+  from the same configuration the daemon serves, whatever the task length — the view request stops
+  carrying the task (substitute `{task}` locally, as `lane-quota-probe.ts` does), or carries it in a
+  POST body, or the fallback reloads the config from disk per call — and a fallback that DOES happen
+  is named in the job's provenance lines.
+
+- **`delegate-gate`'s tautological-assertion detector flags every call whose argument is built by a
+  local helper** (2026-09-04, low, friction: false_positive). 31 findings on
+  `test/dispatch-lane-stats.test.ts`, 0 real: the file imports `parseTelemetryReport` from
+  `../src/dispatch-lane-stats.js`, but each call wraps its argument in a local `validReport(...)`
+  helper, and the detector reported the imported function as "declared locally in this test file,
+  never imported". The packet's verdict `pass: false` was wrong on all 33 findings (the other two
+  were the `dispatch.ts` WeakMap pattern). Cost: a gate that is wrong on every finding gets skipped,
+  which is the state the gate was built to end. **Property:** the detector resolves the CALLED
+  identifier's binding (import versus local declaration), not any identifier inside the call
+  expression, so a local helper that builds the argument never makes the assertion tautological.
+
 - **Muse Spark 1.3 — and every Responses-only OpenCode Zen SKU — is unreachable through the
   relay, because no upstream speaks the OpenAI Responses API.** Zen serves
   `muse-spark-1.3-contributor-free` and `muse-spark-1.2-contributor-free` on `/zen/v1/responses`
