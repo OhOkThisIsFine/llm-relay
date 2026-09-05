@@ -1,16 +1,17 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-05T04:00:00.361Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-05T04:04:52.577Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `8096c874ac481ac0b52e778c232550eff23114c7`
+- HEAD: `8a95223105020a61c5617a5a08ae35b84452fa2f`
 - Sprint start: `48a5bbb9fd62820441350d974a14bbe12a5cde23`
 
 ## Commits in the sprint range
 
+- 8a95223 docs: closeout for the dispatch-telemetry lap (v0.72.0)
 - 8096c87 docs: correct Packet 3 test count in telemetry design doc (13 tests)
 - b1820a8 chore: release v0.72.0
 - 97b2f2b docs: dispatch-telemetry lap; §6 result, package baseline ratchet, backlog, and handoff
@@ -26,17 +27,13 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-05T03:56:41.409Z on tree `4bbd8abad778`
-- `verify-green check` FAILED: verify-green: FAIL
-content changed AFTER the recorded passing run (2026-09-05T03:56:41.409Z).
-Files changed since that run:
-D	docs/dispatch-telemetry-lap-2026-09-04.md
-Re-run the suite through `record` before claiming green. — FAIL
+- Ledger: `npm run check` recorded 2026-09-05T04:00:46.788Z on tree `dde8d4e8384a`
+- `verify-green check`: verify-green: PASS — tree dde8d4e8384a matches the passing run recorded 2026-09-05T04:00:46.788Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 33943229903) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33943229903
+- CI: completed/success (run 33943406432) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/33943406432
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -60,4 +57,4 @@ Pre-release verification and proof:
 
 ## Verdict
 
-- 1 section(s) FAIL: verify-green check.
+- All machine-derived sections PASS.
