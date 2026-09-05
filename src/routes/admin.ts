@@ -473,6 +473,7 @@ export async function handleAdminRoutes(
         observedContextLimit,
       ),
     });
+    view.source = "daemon";
     return ok(view, true);
   }
 

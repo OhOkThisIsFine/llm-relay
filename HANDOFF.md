@@ -53,9 +53,6 @@ characters makes the MCP server fall back to its start-time config snapshot
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
 
-- The MCP server's stale-config fallback (this lap's trap): stop sending the task on the view
-  request, or reload config per call, and name a fallback in the job's provenance.
-- `delegate-gate`'s tautological-assertion detector: resolve the called identifier's binding.
 - Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry): a
   bounded lap measures what Claude Code and Codex do on a mid-stream SSE `error` after content;
   the per-token abort is built only if a retry reaches another candidate. The terms review for

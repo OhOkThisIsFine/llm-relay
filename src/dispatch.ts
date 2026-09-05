@@ -181,6 +181,10 @@ export interface DispatchView {
   next: DispatchLane | null;
   /** Why `next` is what it is — including why it is null. */
   reason: string;
+  /** Dispatched task text when one was given. */
+  task?: string;
+  /** Source of this dispatch view: live daemon, or local fallback when daemon is unreachable. */
+  source?: "daemon" | "local-fallback";
 }
 
 export interface DispatchOptions {

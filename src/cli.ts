@@ -26,7 +26,7 @@ import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
-import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
@@ -2201,6 +2201,47 @@ export function normalizeDispatchCommands(
   };
 }
 
+/**
+ * Substitute `{task}` placeholder into lane arguments and set `view.task`.
+ * Applied locally so dispatch view queries never need to send arbitrary task text in HTTP query strings.
+ */
+export function substituteTaskInView(view: DispatchView, task: string | undefined): DispatchView {
+  if (!task) return view;
+  const substituteArgs = (args: string[]): string[] => args.map((a) => a.split(TASK_TOKEN).join(task));
+  const substituteLane = (lane: DispatchLane): DispatchLane => {
+    if (!lane.invoke) return lane;
+    return {
+      ...lane,
+      invoke: {
+        ...lane.invoke,
+        args: substituteArgs(lane.invoke.args),
+      },
+    };
+  };
+
+  return {
+    ...view,
+    task,
+    ladder: view.ladder.map(substituteLane),
+    next: view.next ? substituteLane(view.next) : null,
+  };
+}
+
+/** Safely reload configuration from disk without exiting if unreadable. */
+export function loadConfigSafely(): Config | null {
+  try {
+    const configPath = resolveConfigPath();
+    const overrides: ConfigOverrides = {
+      routeDefault: argValue("--default", "-d"),
+      mode: argValue("--mode", "-m"),
+      listen: argValue("--listen", "-l"),
+    };
+    return loadConfig(configPath, overrides);
+  } catch {
+    return null;
+  }
+}
+
 /** Which shell's literal-quoting rules a rendered command line is written for. */
 export type RenderShell = "sh" | "pwsh";
 
@@ -2433,7 +2474,10 @@ export async function resolveDispatchView(opts: {
 }): Promise<DispatchView> {
   const cfg = opts.cfg ?? loadOrExit();
   const qs = new URLSearchParams();
-  if (opts.task) qs.set("task", opts.task);
+  // ⚠ Do NOT pass opts.task in GET query string: URLs have practical length limits,
+  // and the daemon caps ?task= at MAX_TASK_LEN (4096) on query strings. A dispatch task can
+  // be an arbitrary multi-KB prompt or brief. The daemon's ladder ranking and lane selection
+  // do not depend on the task; {task} placeholder substitution is applied locally below.
   if (opts.lane) qs.set("lane", opts.lane);
   if (opts.tier) qs.set("tier", opts.tier);
   if (opts.client) qs.set("client", opts.client);
@@ -2456,18 +2500,26 @@ export async function resolveDispatchView(opts: {
   // as though relay rungs were addressable, which for this caller is never true.
   const live = liveRaw !== null && liveRaw.host === "bypassed" ? liveRaw : null;
   restoreExhaustedRows(cfg, loadExhaustedRows());
-  return normalizeDispatchCommands(
-    live ??
-      buildDispatch(cfg, {
-        ...(opts.task ? { task: opts.task } : {}),
-        ...(opts.lane ? { lane: opts.lane } : {}),
-        ...(opts.tier ? { tier: opts.tier } : {}),
-        ...(opts.client ? { client: opts.client } : {}),
-        host: "bypassed",
-        publishedContextWindow: cachedContextWindow,
-        manifest: loadLaneManifest(),
-      }),
+
+  if (live !== null) {
+    const view = normalizeDispatchCommands(live);
+    return substituteTaskInView({ ...view, source: "daemon" }, opts.task);
+  }
+
+  // Fallback path: daemon is unavailable. Reload config from disk so edits made after process start
+  // are picked up instead of using a stale snapshot.
+  const fallbackCfg = loadConfigSafely() ?? cfg;
+  const fallbackView = normalizeDispatchCommands(
+    buildDispatch(fallbackCfg, {
+      ...(opts.lane ? { lane: opts.lane } : {}),
+      ...(opts.tier ? { tier: opts.tier } : {}),
+      ...(opts.client ? { client: opts.client } : {}),
+      host: "bypassed",
+      publishedContextWindow: cachedContextWindow,
+      manifest: loadLaneManifest(),
+    }),
   );
+  return substituteTaskInView({ ...fallbackView, source: "local-fallback" }, opts.task);
 }
 
 /**
@@ -2589,7 +2641,6 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   }
 
   const qs = new URLSearchParams();
-  if (task) qs.set("task", task);
   if (lane) qs.set("lane", lane);
   if (after) qs.set("after", after);
   if (tier) qs.set("tier", tier);
@@ -2626,20 +2677,20 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const live = staleProxy ? null : liveRaw;
 
   restoreExhaustedRows(cfg, loadExhaustedRows());
-  const view = normalizeDispatchCommands(
+  const rawView = normalizeDispatchCommands(
     live ??
       buildDispatch(cfg, {
-      ...(task ? { task } : {}),
-      ...(lane ? { lane } : {}),
-      ...(after ? { after } : {}),
-      ...(tier ? { tier } : {}),
-      ...(client ? { client } : {}),
-      host: hostRouting.state,
-      ...(hostRouting.entrypoint ? { entrypoint: hostRouting.entrypoint } : {}),
-      publishedContextWindow: cachedContextWindow,
-      manifest: loadLaneManifest(),
+        ...(lane ? { lane } : {}),
+        ...(after ? { after } : {}),
+        ...(tier ? { tier } : {}),
+        ...(client ? { client } : {}),
+        host: hostRouting.state,
+        ...(hostRouting.entrypoint ? { entrypoint: hostRouting.entrypoint } : {}),
+        publishedContextWindow: cachedContextWindow,
+        manifest: loadLaneManifest(),
       }),
   );
+  const view = substituteTaskInView(rawView, task);
 
   if (hasFlag("--json")) {
     process.stdout.write(JSON.stringify(view, null, 2) + "\n");

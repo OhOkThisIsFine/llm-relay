@@ -309,6 +309,30 @@ describe("dispatch tool", () => {
     expect(spawn.calls).toHaveLength(1);
   });
 
+  it("names local fallback in provenance when dispatch view fell back", async () => {
+    const spawn = fakeSpawner({ code: 0, stdout: "fallback answer", stderr: "", timedOut: false });
+    const h = new Harness({
+      spawn,
+      buildView: async () => view({ source: "local-fallback" }),
+    });
+    const { text, isError } = await h.tool("dispatch", { task: "do something" });
+    expect(isError).toBe(false);
+    expect(text).toContain("dispatch-source: local-fallback (daemon unreachable)");
+    expect(text).toContain("fallback answer");
+  });
+
+  it("omits fallback note in provenance when dispatch view came from live daemon", async () => {
+    const spawn = fakeSpawner({ code: 0, stdout: "live answer", stderr: "", timedOut: false });
+    const h = new Harness({
+      spawn,
+      buildView: async () => view({ source: "daemon" }),
+    });
+    const { text, isError } = await h.tool("dispatch", { task: "do something" });
+    expect(isError).toBe(false);
+    expect(text).not.toContain("dispatch-source: local-fallback");
+    expect(text).toContain("live answer");
+  });
+
   it("refuses an empty task", async () => {
     const h = new Harness();
     const { text, isError } = await h.tool("dispatch", {});

@@ -133,6 +133,8 @@ export interface LaneJob {
   error: string | undefined;
   /** Set only for an answer-mode job whose relay response reached the 2xx branch. */
   relay?: RelayAnnouncements;
+  /** Set when the job's dispatch view came from a fallback rather than the live daemon. */
+  dispatchSource?: "daemon" | "fallback";
 }
 
 /** What a completed run looks like to a caller. */
@@ -519,7 +521,7 @@ export class LaneJobStore {
   private readonly jobs = new Map<string, LaneJob>();
   private readonly kills = new Map<string, () => void>();
 
-  create(laneId: string, spec: string | undefined, cwd: string): LaneJob {
+  create(laneId: string, spec: string | undefined, cwd: string, dispatchSource?: "daemon" | "fallback"): LaneJob {
     const job: LaneJob = {
       id: nextJobId(),
       status: "running",
@@ -533,6 +535,7 @@ export class LaneJobStore {
       timedOut: false,
       cwd,
       error: undefined,
+      ...(dispatchSource !== undefined ? { dispatchSource } : {}),
     };
     this.jobs.set(job.id, job);
     return job;

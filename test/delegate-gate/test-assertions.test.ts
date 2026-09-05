@@ -88,6 +88,26 @@ describe("analyzeTestAssertions", () => {
     expect(analyzeTestAssertions(parseUnifiedDiff(diff), noOriginal)).toEqual([]);
   });
 
+  it("does NOT flag an imported function call whose argument is constructed by a local helper", () => {
+    const diff = newFileDiff("t.test.ts", [
+      'import { expect, it } from "vitest";',
+      'import { parseThing } from "../src/parser.js";',
+      'function makeInput(s: string) { return { text: s }; }',
+      'it("x", () => { expect(parseThing(makeInput("hello"))).toBe("hello"); });',
+    ]);
+    expect(analyzeTestAssertions(parseUnifiedDiff(diff), noOriginal)).toEqual([]);
+  });
+
+  it("does NOT flag a namespace-imported function call whose argument is constructed by a local helper", () => {
+    const diff = newFileDiff("t.test.ts", [
+      'import { expect, it } from "vitest";',
+      'import * as parser from "../src/parser.js";',
+      'const makeInput = (s: string) => ({ text: s });',
+      'it("x", () => { expect(parser.parseThing(makeInput("hello"))).toBe("hello"); });',
+    ]);
+    expect(analyzeTestAssertions(parseUnifiedDiff(diff), noOriginal)).toEqual([]);
+  });
+
   it("does NOT flag an ordinary assertion built from local primitive variables (no function call)", () => {
     const diff = newFileDiff("t.test.ts", [
       'import { expect, it } from "vitest";',

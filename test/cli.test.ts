@@ -21,6 +21,8 @@ import {
   SHELL_LABEL,
   classifyCommand,
   normalizeDispatchCommands,
+  resolveDispatchView,
+  substituteTaskInView,
   proxyUrl,
   run,
   runDispatch,
@@ -809,6 +811,68 @@ describe("llm-relay dispatch — printed ladder", () => {
     // The defect: the raw join put `; report` outside the quotes as its own shell command.
     expect(printed).not.toContain(`${command} -p ${task} --model g-flash`);
     expect(printed).toMatch(/quoted for (PowerShell 7\+ \(pwsh\)|sh\/bash)/);
+  });
+
+  const dispatchCfgPath = join(dir, "dispatch-test-config.json");
+  writeFileSync(dispatchCfgPath, JSON.stringify({
+    ...CONFIG,
+    routing: {
+      ...CONFIG.routing,
+      ladder: [
+        {
+          id: "agy-gemini",
+          kind: "cli",
+          command: "agy",
+          args: ["-p", "{task}", "--model", "g-flash"],
+          enabled: true,
+        },
+      ],
+    },
+  }, null, 2));
+  const dispatchConfig = loadConfig(dispatchCfgPath);
+
+  it("does NOT put task into GET /dispatch query string, avoiding URL length caps for long tasks", async () => {
+    const longTask = "a".repeat(5000);
+    let capturedUrl: string | null = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      capturedUrl = String(input);
+      return new Response(JSON.stringify({
+        tier: "medium",
+        offload: false,
+        client: "default",
+        host: "bypassed",
+        ladder: [{
+          id: "agy-gemini",
+          kind: "cli",
+          position: 1,
+          state: "ready",
+          invoke: { command: "agy", args: ["-p", "{task}", "--model", "g-flash"] },
+        }],
+        next: {
+          id: "agy-gemini",
+          kind: "cli",
+          position: 1,
+          state: "ready",
+          invoke: { command: "agy", args: ["-p", "{task}", "--model", "g-flash"] },
+        },
+        reason: "first ready lane",
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const view = await resolveDispatchView({ task: longTask, cfg: dispatchConfig });
+    expect(capturedUrl).not.toBeNull();
+    expect(capturedUrl).not.toContain("task=");
+    expect(view.source).toBe("daemon");
+    expect(view.task).toBe(longTask);
+    expect(view.next?.invoke?.args).toEqual(["-p", longTask, "--model", "g-flash"]);
+  });
+
+  it("marks source: 'local-fallback' when daemon is offline", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+    const view = await resolveDispatchView({ task: "hello", cfg: dispatchConfig });
+    expect(view.source).toBe("local-fallback");
+    expect(view.task).toBe("hello");
+    expect(view.next?.invoke?.args).toEqual(["-p", "hello", "--model", "g-flash"]);
   });
 });
 

@@ -179,15 +179,48 @@ function collectLocallyDeclaredFunctionNames(sourceFile: ts.SourceFile): Readonl
   return names;
 }
 
-/** Does `node` contain a call whose callee is a bare identifier naming one of `names`? */
-function containsCallTo(node: ts.Node, names: ReadonlySet<string>): boolean {
-  if (names.size === 0) return false;
+function rootIdentifierOf(expr: ts.Expression): string | null {
+  let curr: ts.Expression = expr;
+  while (ts.isPropertyAccessExpression(curr)) {
+    curr = curr.expression;
+  }
+  return ts.isIdentifier(curr) ? curr.text : null;
+}
+
+/**
+ * Does `node` contain a call to a local non-imported function as the function under test?
+ *
+ * When a call invokes an IMPORTED function (or a method on an imported object/namespace),
+ * that call is the invocation of code under test. Any calls within its argument list are test
+ * fixtures or helper builders, not the function under test, so we do not descend into them.
+ */
+function containsLocalReplicaCall(
+  node: ts.Node,
+  localNonImportedFunctions: ReadonlySet<string>,
+  importedNames: ReadonlySet<string>,
+): boolean {
+  if (localNonImportedFunctions.size === 0) return false;
   let found = false;
   const visit = (n: ts.Node): void => {
     if (found) return;
-    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && names.has(n.expression.text)) {
-      found = true;
-      return;
+    if (ts.isCallExpression(n)) {
+      if (ts.isIdentifier(n.expression)) {
+        const callee = n.expression.text;
+        if (localNonImportedFunctions.has(callee)) {
+          found = true;
+          return;
+        }
+        if (importedNames.has(callee)) {
+          // Callee is imported: this is an invocation of code under test. Do not descend into arguments.
+          return;
+        }
+      } else if (ts.isPropertyAccessExpression(n.expression)) {
+        const root = rootIdentifierOf(n.expression);
+        if (root !== null && importedNames.has(root)) {
+          // Callee is accessed on an imported object/namespace. Do not descend into arguments.
+          return;
+        }
+      }
     }
     ts.forEachChild(n, visit);
   };
@@ -212,7 +245,7 @@ function describeLocalReplicaCall(chain: ExpectChain, importedNames: ReadonlySet
   if (actual === undefined || matcherName === undefined) return null;
   if (importedNames.size === 0) return null; // nothing to contrast "local" against
   const nonImportedLocalFunctions = new Set([...localFunctionNames].filter((n) => !importedNames.has(n)));
-  if (!containsCallTo(actual, nonImportedLocalFunctions)) return null;
+  if (!containsLocalReplicaCall(actual, nonImportedLocalFunctions, importedNames)) return null;
   return `expect(${actual.getText().slice(0, 80)}).${matcherName}(...) calls a function declared locally in this test file, never imported — it may assert against a hand-copied replica rather than the code under test`;
 }
 

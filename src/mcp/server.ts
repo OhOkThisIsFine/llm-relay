@@ -349,6 +349,7 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.relay?.hedged) head.push(`hedged: ${job.relay.hedged}`);
   if (job.relay?.latencyDemoted) head.push(`latency-demoted: ${job.relay.latencyDemoted}`);
   if (job.relay?.degraded) head.push(`degraded: ${job.relay.degraded}`);
+  if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
   return head.join("\n");
 }
 
@@ -602,6 +603,7 @@ export class McpDispatchServer {
         maxTokens: readNumber(args, "maxTokens"),
         waitMs,
         timeoutMs,
+        dispatchSource: view.source === "local-fallback" ? "fallback" : "daemon",
       });
     }
 
@@ -619,7 +621,8 @@ export class McpDispatchServer {
       );
     }
 
-    const job = this.jobs.create(lane.id, lane.spec, cwd);
+    const dispatchSource = view.source === "local-fallback" ? "fallback" : "daemon";
+    const job = this.jobs.create(lane.id, lane.spec, cwd, dispatchSource);
     const env = applyLaneEnv(process.env, lane.invoke.env);
     env[DEPTH_ENV] = String(depth + 1);
 
@@ -752,13 +755,14 @@ export class McpDispatchServer {
       maxTokens: number | undefined;
       waitMs: number;
       timeoutMs: number;
+      dispatchSource?: "daemon" | "fallback";
     },
   ): Promise<unknown> {
     if (!lane.spec) {
       return textResult(`Lane "${lane.id}" has no relay spec to address in answer mode.`, true);
     }
     const spec = lane.spec;
-    const job = this.jobs.create(lane.id, spec, this.cwd());
+    const job = this.jobs.create(lane.id, spec, this.cwd(), opts.dispatchSource);
 
     const controller = new AbortController();
     this.jobs.registerKill(job.id, () => controller.abort());
