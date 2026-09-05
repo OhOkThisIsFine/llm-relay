@@ -167,7 +167,7 @@ lane (Meta Muse Spark 1.3 through OpenCode) and verified here — `git diff`,
 - `272cf69` — `McpServerDeps.reportTelemetry`, `forwardTelemetry` after every settled agent-mode
   job, `reportMcpTelemetry`; 10 tests.
 - `5877049` — the `stats` column on every ladder surface, the `--by client` cost caveat, the
-  reference docs; 20 tests.
+  reference docs; 13 tests.
 - `7221dba` — the adversarial review closed: the daemon decides "metered by the relay" from the
   rung's declared env (`laneRoutesThroughRelay`), unknown lanes are 400, the report's `kind` is
   never trusted over the rung's, compiler-linked status and key lists, HEAD joins GET on the 404,
