@@ -24,6 +24,8 @@ import type { Config } from "../config.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
+import { estimateTokensFromCharacters } from "../metadata.js";
+import type { DispatchedTelemetryReport } from "../dispatch-lane-stats.js";
 import {
   DEFAULT_LANE_TIMEOUT_MS,
   DEFAULT_MAX_DEPTH,
@@ -56,6 +58,7 @@ import {
   errorResponse,
   isJsonRpcNotification,
   isJsonRpcRequest,
+  logStderr,
   negotiateProtocolVersion,
   resultResponse,
   splitMessages,
@@ -102,6 +105,12 @@ export interface McpServerDeps {
   version?: string;
   /** Reports positive lane quota evidence to the relay's exhaustion state. */
   reportExhaustion?: (report: DispatchedQuotaReport) => Promise<void> | void;
+  /**
+   * Forwards one metadata-only lane-execution report per settled agent-mode job to the
+   * daemon's `POST /dispatch/telemetry`. Counts and lengths only — never the task text,
+   * never the lane's output.
+   */
+  reportTelemetry?: (report: DispatchedTelemetryReport) => Promise<void> | void;
   write: (chunk: string) => void;
 }
 
@@ -610,11 +619,17 @@ export class McpDispatchServer {
     const env = applyLaneEnv(process.env, lane.invoke.env);
     env[DEPTH_ENV] = String(depth + 1);
 
+    // Telemetry capture: the task text lives only as this local, and the job never carries
+    // the lane KIND, so snapshot both now — the settled handlers below only see the job.
+    const telemetry = { taskLength: task.length, laneId: lane.id, kind: lane.kind, spec: lane.spec };
+
     let run: { result: Promise<LaneRunResult>; kill: () => void };
     try {
       run = this.spawn(lane.invoke.command, lane.invoke.args, { env, cwd, timeoutMs });
     } catch (e) {
       this.jobs.fail(job.id, (e as Error).message);
+      // No run exists on the spawn-throw path, so there is no output to estimate from.
+      this.forwardTelemetry(job.id, telemetry, 0);
       return textResult(jobAnswer(this.jobs.get(job.id) ?? job, this.now()), true);
     }
     this.jobs.registerKill(job.id, run.kill);
@@ -653,15 +668,60 @@ export class McpDispatchServer {
           semanticFailure = EMPTY_OUTPUT_REASON;
         }
         this.jobs.complete(job.id, r, semanticFailure);
+        this.forwardTelemetry(job.id, telemetry, r.stdout.length);
         return "done" as const;
       },
       (e: Error) => {
         this.jobs.fail(job.id, e.message);
+        this.forwardTelemetry(job.id, telemetry, 0);
         return "done" as const;
       },
     );
 
     return this.awaitOrPoll(job.id, settled, waitMs);
+  }
+
+  /**
+   * Forward one lane-execution report after an agent-mode job reaches a terminal state.
+   * Answer-mode jobs never reach here — the daemon's HTTP pipeline already accounts them
+   * (finding F3) — and a cancelled job is discarded, never reported.
+   *
+   * Fire-and-forget by design: the reporter is never awaited on the response path, and a
+   * throwing or rejecting reporter is swallowed after ONE metadata-only stderr line (lane id
+   * and job id; never the task text), so forwarding can never change the dispatch result,
+   * the job, or the stdio protocol.
+   */
+  private forwardTelemetry(
+    jobId: string,
+    captured: { taskLength: number; laneId: string; kind: DispatchLane["kind"]; spec: string | undefined },
+    outputChars: number,
+  ): void {
+    const job = this.jobs.get(jobId);
+    if (!job || job.status === "cancelled") return;
+    if (job.status !== "completed" && job.status !== "failed" && job.status !== "timed_out") return;
+    const report: DispatchedTelemetryReport = {
+      jobId: job.id,
+      laneId: captured.laneId,
+      kind: captured.kind,
+      ...(captured.spec === undefined ? {} : { spec: captured.spec }),
+      wallClockMs: Math.max(0, (job.endedAt ?? this.now()) - job.startedAt),
+      exitCode: job.exitCode,
+      status: job.status,
+      estimatedInputTokens: estimateTokensFromCharacters(captured.taskLength),
+      estimatedOutputTokens: estimateTokensFromCharacters(outputChars),
+    };
+    let pending: Promise<void> | void;
+    try {
+      pending = this.deps.reportTelemetry?.(report);
+    } catch {
+      logStderr(`telemetry report failed for lane "${captured.laneId}" job "${job.id}"`);
+      return;
+    }
+    if (pending && typeof (pending as Promise<void>).catch === "function") {
+      (pending as Promise<void>).catch(() => {
+        logStderr(`telemetry report failed for lane "${captured.laneId}" job "${job.id}"`);
+      });
+    }
   }
 
   /**

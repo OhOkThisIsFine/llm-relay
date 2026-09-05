@@ -36,6 +36,7 @@ import {
   commandOptionError,
   runTelemetry,
   reportMcpExhaustion,
+  reportMcpTelemetry,
   FLAG_ALIASES,
   CLI_OPTIONS,
   ACTION_OPTIONS,
@@ -278,6 +279,30 @@ describe("cli helper utilities", () => {
     await reportMcpExhaustion(cfg, { laneId: "agy", tier: undefined, outcome: "rate_limited" }, request);
     expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ exhausted: "agy", outcome: "rate_limited" });
     await expect(reportMcpExhaustion(cfg, { laneId: "x", tier: undefined, outcome: "rate_limited" }, async () => null)).rejects.toThrow("no proxy running");
+  });
+
+  it("reports MCP telemetry best-effort: POSTs /dispatch/telemetry, false (never throw) with no proxy", async () => {
+    const cfg = { host: "127.0.0.1", port: 8791 } as Config;
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const request = async (_cfg: Config, path: string, init: RequestInit): Promise<unknown | null> => { calls.push({ path, init }); return { ok: true }; };
+    const report = {
+      jobId: "job-1",
+      laneId: "agy",
+      kind: "cli" as const,
+      wallClockMs: 123,
+      exitCode: 0,
+      status: "completed" as const,
+      estimatedInputTokens: 10,
+      estimatedOutputTokens: 20,
+    };
+    await expect(reportMcpTelemetry(cfg, report, request)).resolves.toBe(true);
+    expect(calls[0]!.path).toBe("/dispatch/telemetry");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.init.headers).toEqual({ "content-type": "application/json" });
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual(report);
+    // No proxy listening: false, not a throw — a lost telemetry row changes only a ledger.
+    await expect(reportMcpTelemetry(cfg, report, async () => null)).resolves.toBe(false);
+    await expect(reportMcpTelemetry(cfg, report, async () => { throw new Error("refused"); })).resolves.toBe(false);
   });
 
   it("normalizes AGY in structured output returned by an older live proxy", () => {

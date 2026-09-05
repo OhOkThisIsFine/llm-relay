@@ -29,6 +29,7 @@ import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
+import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
 import { loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { contextWindowResolver, COST_CLASSES, type ContextWindowSource, type CostClass } from "./metadata.js";
@@ -1225,6 +1226,30 @@ export async function reportMcpExhaustion(
   if (live === null) throw new Error("no proxy running — quota report not recorded");
 }
 
+/**
+ * Forward one MCP lane-execution report to the live relay's `POST /dispatch/telemetry`.
+ *
+ * ⚠ Asymmetry with `reportMcpExhaustion` is deliberate: it throws because a lost quota
+ * report changes routing; a lost telemetry row changes only a ledger, so this is
+ * best-effort — false when no proxy answered, and it NEVER throws.
+ */
+export async function reportMcpTelemetry(
+  cfg: Config,
+  report: DispatchedTelemetryReport,
+  request: DispatchReportRequest = tryServer,
+): Promise<boolean> {
+  try {
+    const live = await request(cfg, "/dispatch/telemetry", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(report),
+    });
+    return live !== null;
+  } catch {
+    return false;
+  }
+}
+
 /** Render a normalized listener address as an HTTP URL, including required IPv6 brackets. */
 export function proxyUrl(cfg: Pick<Config, "host" | "port">, path: string): string {
   const host = cfg.host.includes(":") ? `[${cfg.host}]` : cfg.host;
@@ -2416,6 +2441,7 @@ export async function runMcp(): Promise<void> {
     ...(allowedRoots ? { allowedRoots } : {}),
     version: currentVersion(),
     reportExhaustion: (report) => reportMcpExhaustion(cfg, report),
+    reportTelemetry: (report) => { void reportMcpTelemetry(cfg, report); },
     write: (chunk) => process.stdout.write(chunk),
   });
 
