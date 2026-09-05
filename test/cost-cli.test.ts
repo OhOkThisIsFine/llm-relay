@@ -341,7 +341,36 @@ describe("llm-relay cost CLI", () => {
     expect(output).toContain("No accounting data yet");
   });
 
-  it("reports the lifetime window as an empty store, not a broken one, when lifetime.json is absent", async () => {
+  it("names the mcp-dispatch envelope for what it is, once, and only under --by client", async () => {
+    // A `cli`-kind lane's serving member is unknowable to the relay (owner decision D2), so its
+    // ledger row carries the estimated dispatch envelope — never metered provider usage. The
+    // renderer must say so wherever that row renders, exactly once.
+    const usageDir = tempUsageDir();
+    seed(usageDir, {
+      client: "mcp-dispatch",
+      attempts: [{
+        role: "serve",
+        provider: "nim",
+        model: "codex-sol",
+        credentialId: "nim#primary",
+        tokens: { estimated: { inputTokens: 25, outputTokens: 400, inputMethod: "relay_estimate", outputMethod: "relay_estimate" } },
+      }],
+    });
+    const byClient = await runCost(["--by", "client"], usageDir);
+    expect(byClient.output).toContain("mcp-dispatch");
+    expect(byClient.output).toContain(
+      "mcp-dispatch rows are the estimated dispatch envelope (task text + lane output), not the lane's provider consumption, which the relay cannot see; they are unpriced.",
+    );
+    // Exactly one footnote, however many rows render.
+    expect(byClient.output.split("estimated dispatch envelope").length - 1).toBe(1);
+
+    const plain = tempUsageDir();
+    seed(plain, {
+      attempts: [{ role: "serve", provider: "nim", model: "z-ai/glm-5.2", credentialId: "nim#primary", tokens: { reported: { inputTokens: 1000, outputTokens: 500 } } }],
+    });
+    const withoutDispatch = await runCost(["--by", "client"], plain);
+    expect(withoutDispatch.output).not.toContain("estimated dispatch envelope");
+  });  it("reports the lifetime window as an empty store, not a broken one, when lifetime.json is absent", async () => {
     // A MISSING lifetime.json is a fresh install; only a corrupt/throwing read is
     // unavailable. This was rendered as "the local accounting store could not be read"
     // before the projector distinguished the two statuses.

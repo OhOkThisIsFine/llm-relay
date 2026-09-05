@@ -24,6 +24,7 @@ import type { Config } from "../config.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
+import { formatLaneStats } from "../dispatch.js";
 import { estimateTokensFromCharacters } from "../metadata.js";
 import type { DispatchedTelemetryReport } from "../dispatch-lane-stats.js";
 import {
@@ -396,6 +397,8 @@ function laneSummary(lane: DispatchLane): string {
   if (lane.notServable) bits.push(`not servable: ${lane.notServable}`);
   if (lane.unreachable) bits.push(`unreachable: ${lane.unreachable}`);
   if (lane.note) bits.push(lane.note);
+  // Advisory only: a rung that never ran here carries no `stats` and renders as before.
+  if (lane.stats) bits.push(formatLaneStats(lane.stats));
   return bits.join(" ");
 }
 

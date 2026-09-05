@@ -22,6 +22,7 @@ import {
   installDispatchLaneStatsPersistence,
   laneStatsFor,
   loadLaneStatsRows,
+  medianWallClockMs,
   parseTelemetryReport,
   recordLaneRun,
   restoreLaneStatsRows,
@@ -216,6 +217,26 @@ describe("lane run counting", () => {
     expect(restoreLaneStatsRows(cfg, rows)).toBe(1);
     expect(laneStatsFor(cfg, "a")).toMatchObject({ calls: 1, successes: 1 });
     expect(laneStatsFor(cfg, "b")).toMatchObject({ calls: 3, successes: 2, failures: 1 });
+  });
+});
+
+describe("medianWallClockMs", () => {
+  it("returns null for an empty window — unknown, never 0", () => {
+    expect(medianWallClockMs([])).toBeNull();
+  });
+
+  it("returns the middle sample for an odd count", () => {
+    expect(medianWallClockMs([30_000])).toBe(30_000);
+    expect(medianWallClockMs([10, 30, 20])).toBe(20);
+  });
+
+  it("averages the two middle samples for an even count", () => {
+    expect(medianWallClockMs([10, 30])).toBe(20);
+    expect(medianWallClockMs([10, 20, 30, 40])).toBe(25);
+  });
+
+  it("sorts before picking — insertion order is not the answer", () => {
+    expect(medianWallClockMs([50, 10, 30, 20, 40])).toBe(30);
   });
 });
 

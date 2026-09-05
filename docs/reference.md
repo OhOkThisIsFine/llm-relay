@@ -144,7 +144,7 @@ the prompt deliberately does not require a config edit.
 block. State lives under `~/.llm-relay/`: `config.json`, `.env`, `keystore.json`,
 `control-token`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`,
 `target-facts.json`, `refusal-interpretations.json`, `lane-manifest.json`,
-`dispatch-exhaustion.json`, `breaker-state.json`, `update-check.json`, the `hooks/` script, and
+`dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `breaker-state.json`, `update-check.json`, the `hooks/` script, and
 the `usage/` accounting subtree.
 
 ### Where state actually lives
@@ -155,7 +155,7 @@ split by what the artifact is:
 | Honours | Artifacts |
 |---|---|
 | `XDG_CONFIG_HOME/llm-relay/` | `config.json`, `.env`, `keystore.json`, `control-token`, `target-facts.json`, `refusal-interpretations.json`, the `hooks/` script |
-| `XDG_CACHE_HOME/llm-relay/` | `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `lane-manifest.json`, `dispatch-exhaustion.json`, `breaker-state.json`, `update-check.json`, the `usage/` ledger |
+| `XDG_CACHE_HOME/llm-relay/` | `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `lane-manifest.json`, `dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `breaker-state.json`, `update-check.json`, the `usage/` ledger |
 
 The rule is the XDG spec's own: anything you authored or that holds a credential is config;
 anything the relay can rebuild by asking a provider again is cache. A variable that is unset,
@@ -1322,6 +1322,30 @@ Exhaustion reports survive a relay restart: still-future cooldowns are mirrored 
 `dispatch-exhaustion.json` (cache directory) and restored at startup, so a vendor-stated
 "spent until <date>" is not forgotten on a bounce. Lapsed rows are never restored.
 
+#### Lane telemetry
+
+Every settled agent-mode lane run teaches the relay two things, reported by `llm-relay mcp`
+to the daemon's `POST /dispatch/telemetry` (counts and lengths only — never the task text,
+never the lane's output). Forwarded for agent-mode jobs only: answer-mode jobs already POST
+to the daemon's own `/v1/messages`, whose pipeline meters them, so a second report would
+double count; cancelled jobs are discarded, never reported.
+
+The daemon records lane stats for EVERY rung kind — calls, successes, failures, timeouts
+and a bounded wall-clock window per lane, mirrored to `dispatch-lane-stats.json` (cache
+directory) and rendered as an advisory `stats:` column on `dispatch_lanes`,
+`llm-relay dispatch` and `GET /dispatch`. Lane stats never reorder the ladder and never
+feed HTTP pool scoring: a CLI wall-clock includes process launch and tool execution, which
+would poison the provider latency figures.
+
+For `cli`-kind lanes ONLY, the daemon also records one accounting request — a `relay`-kind
+lane's harness traffic already flows through the daemon's own HTTP pipeline with reported
+tokens, so a second row would double count. The ledger row carries the ESTIMATED ENVELOPE:
+chars/4 of the task text and chars/4 of the lane's final output, labelled `estimated`,
+attribution `unknown`, client `mcp-dispatch`, no credential, unpriced. It is NOT the lane's
+provider consumption, which the relay cannot see (the lane's own harness runs its own tool
+loop against its own credentials); `llm-relay cost --by client` prints this caveat beside
+any `mcp-dispatch` row.
+
 #### Background lane re-probing (`routing.laneProbe`)
 
 A recorded lane death is a snapshot, not a standing fact — a quota can reset early. The relay
@@ -1622,6 +1646,16 @@ and it does not change the rule that no HTTP request causes a lane to be spawned
 own HTTP call is this server's OWN outbound request to the relay, not an inbound one triggering a
 spawn. It needs a configured `routing.ladder`, which is a per-machine choice — a fresh install
 ships none, and `dispatch_lanes` says so plainly.
+
+When an agent-mode lane run settles (anything but cancelled), the server forwards one
+metadata-only telemetry report to the daemon's `POST /dispatch/telemetry` — the lane id and
+kind, the wall-clock, the exit code, the terminal status, and the two estimated token counts
+(chars/4 of the task text and of the lane's final output). The forward is best-effort and
+never interrupts the stdio protocol: a lane answer is never held for a telemetry write.
+`dispatch_lanes` shows each rung's recorded stats as an advisory `stats:` segment
+(`stats: 4 calls, 3 ok, 1 failed, 0 timed out, median 24s`; `median n/a` when the lane never
+ran here) — see Lane telemetry above for what the daemon records and what the ledger row
+means.
 
 ---
 
@@ -2029,6 +2063,7 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 | `GET /candidates` | Deployment × credential policy/state/quota/breaker data |
 | `GET\|POST /offload` | Read/set offload rules |
 | `GET\|POST /dispatch` | Read/advance the dispatch ladder |
+| `POST /dispatch/telemetry` | Record lane-execution telemetry (lane stats for every kind; an accounting row for `cli`-kind lanes only) |
 | `POST /cooldowns/clear` | Clear scoped live cooling state; identifiers-only grouped response |
 | `GET /telemetry`, `GET /ping`, `GET /health`, `GET /health/stats` | Provider telemetry, probe, health (`/health/stats` is the protected `/health` alias) |
 | `GET|HEAD /dashboard/`, `GET|HEAD /dashboard/assets/*` | Read-only dashboard SPA shell and static assets |
@@ -2042,7 +2077,10 @@ materialize provider state (`/registry`, `/candidates`, `/ping`, `/health/stats`
 request's `Host` must exactly equal the bound listener authority; any present `Origin` must match
 the exact scheme, host, and effective port, and `Origin: null` is rejected. An absent `Origin` is
 allowed for non-browser clients such as the CLI. Writes also require `content-type:
-application/json`; the capability travels in `x-llm-relay-control-token`. `/telemetry` remains
+application/json`; the capability travels in `x-llm-relay-control-token`. `POST
+/dispatch/telemetry` joins that same boundary: it is a mutating control route, so it needs the
+exact `Host`, the `Origin`/`content-type` rules, and the control token (the CLI carries it
+automatically). `/telemetry` remains
 tokenless provider-aggregate data. Response attribution and walk headers are documented under
 Failover above.
 

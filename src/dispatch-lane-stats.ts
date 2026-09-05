@@ -131,6 +131,23 @@ export interface LaneStats {
 /** Rolling wall-clock window per lane; bound keeps one chatty lane from growing the file. */
 export const MAX_LANE_STAT_SAMPLES = 25;
 
+/**
+ * Median of one lane's rolling wall-clock window, in milliseconds. Null when the window is
+ * empty — unknown stays null, never 0, so a surface cannot print a measured-looking figure for
+ * a lane that never ran here. Pure: `buildDispatch` (`dispatch.ts`) calls this rather than
+ * re-implementing the percentile, so the view and the tests share the one definition.
+ */
+export function medianWallClockMs(samples: readonly number[]): number | null {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid] ?? null;
+  const lo = sorted[mid - 1] ?? null;
+  const hi = sorted[mid] ?? null;
+  if (lo === null || hi === null) return null;
+  return (lo + hi) / 2;
+}
+
 function freshLaneStats(): LaneStats {
   return { calls: 0, successes: 0, failures: 0, timeouts: 0, wallClockMs: [], lastAt: null };
 }

@@ -26,7 +26,7 @@ import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
-import { buildDispatch, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
@@ -2042,6 +2042,15 @@ function renderCostReport(
   }
   write(`${formatTextTable(rows)}\n`);
 
+  // A `cli`-kind lane's serving member is unknowable to the relay (owner decision D2), so its
+  // ledger row carries the estimated dispatch envelope under client `mcp-dispatch` — never the
+  // lane's provider consumption. Say so once, wherever that row renders, so the figure is not
+  // read as metered provider usage. Other `--by` dimensions aggregate the same requests under
+  // their own keys (the spec or lane id), so only the client dimension can name this row.
+  if (report.by === "client" && report.rows.some((row) => row.key === "mcp-dispatch")) {
+    write("mcp-dispatch rows are the estimated dispatch envelope (task text + lane output), not the lane's provider consumption, which the relay cannot see; they are unpriced.\n");
+  }
+
   writeRepairShare(report, write);
   writeAbandonedShare(report, write);
 
@@ -2685,6 +2694,9 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
       process.stdout.write(`   hint: add "@relay: ${l.spec}" to the subagent prompt (offload is off)\n`);
     }
     if (l.note) process.stdout.write(`   note: ${l.note}\n`);
+    // Advisory execution stats, same wording as `dispatch_lanes`. A rung that never ran here
+    // carries no `stats` and renders as before.
+    if (l.stats) process.stdout.write(`   ${formatLaneStats(l.stats)}\n`);
   }
 
   // Say which shell the quoting is for. A command line that is safe in one shell and not in

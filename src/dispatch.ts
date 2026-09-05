@@ -3,6 +3,7 @@ import type { Config, LadderRung } from "./config-types.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
+import { allLaneStats, medianWallClockMs } from "./dispatch-lane-stats.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -53,6 +54,34 @@ export const OUTCOME_DEFAULT_MS: Record<DispatchOutcome, number> = {
 const MAX_ECHOED_ID = 120;
 
 export type LaneState = "ready" | "exhausted" | "disabled" | "not-servable";
+
+/**
+ * Advisory per-lane execution stats for one ladder rung: how often this config took the lane
+ * and how long it took. The median is over the rolling wall-clock window held by
+ * `dispatch-lane-stats.ts` (null when the window is empty — unknown, never 0) and `lastAt`
+ * is epoch ms of the last recorded run (null when the lane never ran here). Present only
+ * when the rung HAS a stats entry; omitted otherwise. Advisory columns only: stats never
+ * change a lane's `state`, never change `next`, and never reorder the ladder.
+ */
+export interface DispatchLaneStats {
+  calls: number;
+  successes: number;
+  failures: number;
+  timeouts: number;
+  medianWallClockMs: number | null;
+  lastAt: number | null;
+}
+
+/**
+ * One-line advisory rendering of a lane's stats, shared by `dispatch_lanes` and
+ * `llm-relay dispatch` so the wording cannot drift between the two surfaces:
+ * `stats: 4 calls, 3 ok, 1 failed, 0 timed out, median 24s` (`median n/a` when unknown).
+ * Median seconds are rounded to one decimal.
+ */
+export function formatLaneStats(stats: DispatchLaneStats): string {
+  const median = stats.medianWallClockMs === null ? "n/a" : `${Math.round(stats.medianWallClockMs / 100) / 10}s`;
+  return `stats: ${stats.calls} calls, ${stats.successes} ok, ${stats.failures} failed, ${stats.timeouts} timed out, median ${median}`;
+}
 
 export interface DispatchLane {
   id: string;
@@ -126,6 +155,12 @@ export interface DispatchLane {
    * never auto-selected as `next` — offering a lane known not to work is the defect being fixed.
    */
   unreachable?: string;
+  /**
+   * Advisory execution stats for this rung (`DispatchLaneStats`), filled from
+   * `dispatch-lane-stats.ts` for every rung that ran under this config and OMITTED otherwise.
+   * Never changes `state`, `next`, or the ladder order — a column, not an input.
+   */
+  stats?: DispatchLaneStats;
 }
 
 export interface DispatchView {
@@ -842,6 +877,22 @@ export function buildDispatch(
   // the rendered view, and the lane builder must tell those two apart: an absent verdict keeps
   // the pre-existing subagent path, a STATED "unknown" has no subagent mechanism to keep.
   const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client, platform, opts.host, opts.entrypoint));
+  // Advisory lane-execution stats, filled for every rung that ran under this config and omitted
+  // otherwise. This mutates only the `stats` column: `state`, `next` and the ladder order were
+  // decided above from cooldowns and availability, and nothing here revisits them.
+  const statsByLane = new Map(allLaneStats(cfg).map((row) => [row.laneId, row]));
+  for (const lane of ladder) {
+    const row = statsByLane.get(lane.id);
+    if (row === undefined) continue;
+    lane.stats = {
+      calls: row.calls,
+      successes: row.successes,
+      failures: row.failures,
+      timeouts: row.timeouts,
+      medianWallClockMs: medianWallClockMs(row.wallClockMs),
+      lastAt: row.lastAt,
+    };
+  }
   const offload = offloadRule(cfg, client).enabled;
   const base = { tier: selected.tier, offload, client, host, ladder };
 
