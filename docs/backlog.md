@@ -24,6 +24,12 @@
   `Kind` — the latter touches about 55 `kind ===` sites in 19 files. Rows 10–13 of the doc are the
   request, response and stream shapes to speak; the doc's §3 route B lists the field mapping.
 
+  **Owner decision 2026-09-04 (option A):** contributor SKUs may be routed automatically. The
+  terms question is settled; this entry is now engineering only. After route B lands, pin both
+  contributor ids as `preferred` in the effort pools (finding 6: no tier-data row, so no automatic
+  admission), and the property above gains: `opencode/muse-spark-1.3-contributor-free` answers a
+  real request through `pool/*` on both fronts.
+
 - **`include: "free"` pools carry paid and unknown-cost deployments, and on this machine no guard
   stops a walk from reaching them.** Deliberate since the admission reversal
   (`test/dynamic-pools.test.ts`: "Reversed deliberately… the `freeOnly` guard (default ON for
@@ -121,23 +127,17 @@
   holds its bytes. The per-token rule (`hedge-trigger.ts` rule 1) has evidence only there, and its
   only honest remedy is an ABORT that hands the failure to the client to retry — which turns a
   slow-but-correct answer into a failed turn for a harness that does not retry a mid-stream error.
-  Options: (A) build the abort on a measured per-token stall threshold, after measuring what
-  Claude Code and Codex do on a mid-stream error; (B) leave in-flight streams alone and rely on
-  latency demotion plus the `slow` band for the NEXT request (today's behaviour).
+  Options were (A) build the abort on a measured per-token stall threshold, or (B) leave in-flight
+  streams alone and rely on latency demotion plus the `slow` band for the NEXT request.
 
-  **Property:** the owner has chosen A or B and the choice is recorded beside §12 of
-  [`hedged-attempts-design-2026-08-30.md`](hedged-attempts-design-2026-08-30.md); under A, a stream
-  crawling below the measured per-token floor is aborted with an announced reason and the
-  client's retry reaches another candidate.
+  **Owner decision 2026-09-04: measure first, then build only if clients retry.** Recorded beside
+  §12 of [`hedged-attempts-design-2026-08-30.md`](hedged-attempts-design-2026-08-30.md).
 
-- **Owner question: does hedging need a terms review?** (audit DR-003, 2026-09-04). Hedging
-  duplicates requests against third-party FREE tiers by design (D1 confines it there), and the only
-  terms review on record ([`codex-review-2026-08-05.md`](codex-review-2026-08-05.md)) predates it
-  and covers Anthropic.
-
-  **Property:** the owner has answered whether duplicate free-tier requests are acceptable under
-  the terms of the providers this relay fronts, and the answer is recorded beside D1 in the hedge
-  design doc.
+  **Property:** a dated doc records what Claude Code and Codex do when a stream carries an SSE
+  `error` after content has arrived — retry the request, or fail the turn — measured against a
+  scratch relay on both fronts. If a retry reaches another candidate, the abort on a per-token
+  stall threshold is built with an announced reason and a pinning test; if not, option B stands and
+  this entry closes on the measurement alone.
 
 - **Give the metering subsystem a channel to say it stopped metering** (audit DR-006, verified
   2026-09-04). `writerStatus` and `lastWrite` on the accounting store have zero consumers outside
@@ -193,6 +193,12 @@
   its `false` form.
 
 ## Closed
+
+- ✅ **Owner question: does hedging need a terms review?** (audit DR-003; closed 2026-09-04 by
+  owner decision: no review needed). Duplicate free-tier requests are within the relay's use as the
+  owner runs it; recorded beside D1 in §12 of
+  [`hedged-attempts-design-2026-08-30.md`](hedged-attempts-design-2026-08-30.md). The finding
+  closes on the decision, not on a review.
 
 - ✅ **Remediate, or explicitly accept with reasons, the four verified audit findings**
   (2026-09-04, audit-triage lap). DR-001 FIXED: the configuration vocabulary has one declaration in

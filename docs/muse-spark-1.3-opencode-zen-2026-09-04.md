@@ -212,6 +212,13 @@ file contents, diffs, instructions — to a contributor SKU makes it Meta traini
 Route B (the Responses backend) is worth building under A or B; under C it is only worth building
 if another Responses-only provider appears.
 
+**Owner decision 2026-09-04: A — allow contributor SKUs in automatic routing.** The terms
+question is settled; what remains is engineering. Route B (the Responses upstream) is the enabling
+work, and finding 6 still holds: with no tier-data row the model enters no effort pool on its own,
+so both contributor ids are to be pinned as `preferred` once route B lands. Route A (the
+OpenCode-CLI dispatch rung in §3) is available before that with no relay change. Work items:
+`docs/backlog.md`.
+
 ## Sources
 
 - Announcement: <https://x.com/opencode/status/2095332254855647493>

@@ -342,3 +342,14 @@ What rule 1 (per-token) can and cannot do, stated so it is not re-argued:
 Tests: `test/hedge-wiring.test.ts` — "hedges a primary that sends headers and then stalls before
 any content", "a slow primary whose stream DIES before content is not a win", and the negative
 control "does NOT hedge a stream that commits inside the delay", each on both fronts.
+
+**Owner decisions at the lap hand-back (2026-09-04):**
+
+- **Post-commit remedy: measure first, then build only if clients retry.** A bounded lap measures
+  what Claude Code and Codex do when a stream carries an SSE `error` after content has arrived —
+  retry the request, or fail the turn. The abort on a per-token stall threshold is built only if a
+  retry reaches another candidate; otherwise in-flight streams stay untouched and latency demotion
+  plus the `slow` band keep moving the NEXT request. Work item: `docs/backlog.md`.
+- **Terms review for hedging: no review needed.** Duplicate free-tier requests are within the
+  relay's use as the owner runs it. Recorded here beside D1 (§7), which already confines hedging to
+  free deployments; audit finding DR-003 is closed on this decision, not on a review.

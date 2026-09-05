@@ -58,20 +58,23 @@ resolving members, where the previous build advertised 2,000,000.
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
 
-- Owner: the post-commit remedy for a stream that stalls after first content (abort-and-retry, or
-  nothing), and whether hedging's duplicate free-tier requests need a terms review.
+- Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry): a
+  bounded lap measures what Claude Code and Codex do on a mid-stream SSE `error` after content;
+  the per-token abort is built only if a retry reaches another candidate. The terms review for
+  hedging is closed by owner decision: no review needed, recorded beside D1 in the hedge design.
 - Owner: verify the Codex `relay` agent from Codex Desktop.
 - The 63 eslint errors: switch off per file with the invariant named.
 - `publish.yml` `timeout-minutes` 15 → 30.
 - Audit residue with properties: the metering silence channel (DR-006), listener-before-store
   (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
   pruning (DR-012), the default-ON routing keys in `docs/reference.md` (DR-024).
-- Owner: whether Meta's *contributor* SKUs (OpenCode Zen's free
-  `opencode/muse-spark-1.3-contributor-free` — prompts and completions become Meta training data)
-  may be routed automatically, only by name, or not at all —
+- Contributor SKUs (owner decision 2026-09-04, option A: allow in automatic routing): Meta's
+  `opencode/muse-spark-1.3-contributor-free` may be routed automatically although its prompts and
+  completions become Meta training data —
   [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md)
-  §5. Zen serves that SKU on the Responses API only, which no relay upstream speaks (backlog); the
-  OpenCode-CLI dispatch rung in that doc's §3 works today with no relay change. Same investigation:
+  §5. The enabling engineering is route B, a Responses upstream (`wire: "responses"` on
+  `kind: "openai"`), then pinning both contributor ids as `preferred`; the OpenCode-CLI dispatch
+  rung in that doc's §3 works today with no relay change. Same investigation, still open:
   `freeOnly` is `false` on all three live offload rules while the pools carry paid SKUs behind the
   free members (backlog, owner decision).
 
