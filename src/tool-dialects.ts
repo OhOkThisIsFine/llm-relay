@@ -267,12 +267,16 @@ function fromDeepSeekForm(text: string): DialectToolCall[] {
     const name = m[1];
     const payload = m[2];
     if (!name || payload === undefined) continue;
-    let input: Record<string, unknown> = {};
     try {
       const parsed = JSON.parse(payload.trim()) as unknown;
-      if (typeof parsed === "object" && parsed !== null) input = parsed as Record<string, unknown>;
+      // Owner ruling 2026-09-05 (CLONE-26, option A): a payload that is not a JSON object states no
+      // arguments this parser can honestly commit. A scalar used to commit an EMPTY-argument call
+      // and an array used to be cast to a `Record` it is not — both are the relay deciding what the
+      // model meant, which is the inference `recoverToolCalls` exists to refuse. Discard this
+      // dialect's whole contribution instead, exactly as `fromKimiTokenForm` already does.
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+      calls.push({ name: name.trim(), input: parsed as Record<string, unknown> });
     } catch { /* an unparseable body leaves `detected` to the caller */ return []; }
-    calls.push({ name: name.trim(), input });
   }
   return calls;
 }

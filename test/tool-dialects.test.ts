@@ -63,6 +63,47 @@ describe("tool-call dialect recovery", () => {
     expect(h.status === "parsed" && h.calls).toEqual([{ name: "write_note", input: { path: "a.txt" } }]);
   });
 
+  /**
+   * CLONE-26, owner ruling 2026-09-05, option A. `fromDeepSeekForm` used to commit a call whose
+   * arguments it could not honestly read: a scalar payload became an EMPTY argument object, and an
+   * array was cast to a `Record` it is not. Both are the relay deciding what the model meant, which
+   * is the inference this whole module refuses. Both now discard that dialect's contribution and
+   * the turn fails clean to `detected`, so failover reaches a host that parses — the strictness
+   * `fromKimiTokenForm` has carried all along.
+   *
+   * ⚠ Accepted cost, recorded so it is not rediscovered as a bug: one malformed block now discards
+   * well-formed DeepSeek calls found EARLIER in the same message. That is the same whole-or-nothing
+   * rule the destructive filter already follows.
+   */
+  const deepSeekPayload = (payload: string): string =>
+    `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_note\n` +
+    "```json\n" + payload + "\n```" +
+    `<｜tool▁call▁end｜><｜tool▁calls▁end｜>`;
+
+  it.each([
+    ["a number", "42"],
+    ["a string", `"ls -la"`],
+    ["a boolean", "true"],
+    ["null", "null"],
+    ["an array", "[1,2]"],
+  ])("discards a DeepSeek payload that parses to %s", (_label, payload) => {
+    const out = recoverToolCalls(deepSeekPayload(payload), schemas, NO_DESTRUCTIVE);
+    expect(out.status).toBe("detected");
+    expect(out.status === "detected" && out.dialect).toBe("deepseek");
+  });
+
+  /**
+   * The negative control, and it is load-bearing. Without it every assertion above would also pass
+   * on a parser that discarded EVERY DeepSeek payload — which would break the dialect rather than
+   * tighten it. Restoring the lenient branch turns the cases above red and leaves this one green.
+   */
+  it("leaves a well-formed DeepSeek object payload untouched", () => {
+    const out = recoverToolCalls(deepSeekPayload(`{"path":"a.txt"}`), schemas, NO_DESTRUCTIVE);
+    expect(out.status === "parsed" && out.calls).toEqual([
+      { name: "write_note", input: { path: "a.txt" } },
+    ]);
+  });
+
   it("reports a TRUNCATED envelope as detected, and never guesses a call out of it", () => {
     // The other measured failure: 70 bytes, the tail of a stream. There is no call to recover
     // here — the caller must fail clean so failover reaches a host that parses, rather than
