@@ -2,51 +2,72 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-05 (v0.72.1, the concurrent-ingest lap)
+## 0. State as of 2026-09-05 (the Phase 1a duplication lap)
 
-**v0.72.1** makes `llm-relay mcp` read and dispatch each stdin request the moment it arrives.
-Until now `runMcp` awaited `server.ingest(chunk)` per chunk, and `ingest` resolves only when
-every handler in that chunk has settled, so a `dispatch` blocking on `waitMs` held the whole
-loop: a host issuing parallel tool calls in separate writes (Claude Code does) waited a full
-`waitMs` before its second call was even read, and `dispatch_status`/`dispatch_cancel` could
-not reach a running job. `McpDispatchServer.serve` now reads every chunk on arrival and never
-awaits a handler; `ingest` splits synchronously (it is no longer `async`), so message order is
-write order whatever the caller awaits; the per-job wait/poll policy is unchanged. Five pinning
-tests plus a mutation check, and a live measurement against the released v0.72.0 binary on an
-isolated daemon (a status probe answered in under 1 ms instead of after 6.6 s; a second dispatch
-finished 12 s after its own write while the first still ran for 63 s):
-[docs/mcp-concurrent-ingest-2026-09-05.md](docs/mcp-concurrent-ingest-2026-09-05.md).
-Stated trades: responses may leave out of request order (JSON-RPC permits it), and there is no
-concurrency cap. ⚠ A host keeps the OLD behaviour until it restarts its `llm-relay mcp` child.
+**Phase 1a of the duplication-and-complexity program.** The owner's audit — a runbook, a catalog of
+27 CLONE / 7 SEM / 15 HOTSPOT / 5 BENIGN items, an adversarial verification giving all of them a
+verdict, and twelve per-item plans — is committed under [docs/reviews/](docs/reviews). This lap
+landed the module-local, behaviour-preserving half of it: **P1-01** (one file driver for the three
+delegate-gate AST detectors), three of **P1-02**'s four families (**CLONE-13** one scan and one
+record for both learned ceilings, **CLONE-17** one dispatch-catalog setup for both view builders,
+**CLONE-21** one shared envelope tail in the accounting schema), and **P1-07** (one status-verdict
+table for `classifyStatus` and `carriesEligibilityFact`). Plus the four recorded fold-ins the owner
+selected: the publish timeout, `doc-links` resolving against the git index, the default-ON routing
+index in `docs/reference.md`, and partial eslint work (99 → 82).
 
-**Owner decisions this lap (2026-09-05):** lap approved as stated (patch release); machine
-backlog P52 takes form (B), the PreToolUse staging-scope refusal (recorded in
-`C:\Code\docs\backlog.md`, not yet scheduled); the Codex `relay` verification stays deferred;
-the eligibility queue (10 refusals) is its own lap, filed in [docs/backlog.md](docs/backlog.md).
+**Two findings worth carrying forward, both from verifying rather than from writing:**
 
-**The previous lap (v0.72.0) never ran its closeout.** Its code was tagged and published; its
-doc residue (the `free-pool` lane rename and the backlog entry this lap closed) went in first
-as `c1c1b81`.
+- The free lane's P1-01 draft turned `path.endsWith(".tsx")` into a literal `{ tsx: true }` at three
+  call sites, so every plain `.ts` file would have parsed as TSX. The whole delegate-gate suite
+  stayed green — no fixture holds a file the two grammars read differently. Caught in the body diff;
+  `test/delegate-gate/script-kind-follows-path.test.ts` now guards the caller side, and the flag test
+  beside it explains why it cannot.
+- The accounting schema's shared envelope tail — seven checks on both persisted packet kinds — was
+  **entirely uncovered**. Disabling the whole guard left all 126 accounting tests green. Found by
+  mutation-checking the extraction, and the missing case is now in
+  `test/accounting-store-schema.test.ts`.
+
+**Owner decisions this lap (2026-09-05):** lap approved as Phase 1a, 7 items; the runbook's Tier 1
+duplication CI gate is **deferred** until after one green release cycle (it contradicts the standing
+`CLAUDE.md` invariant that static analysis is advisory and outside the gate); the CLONE-07 and
+CLONE-26 evidence was requested and is written; all four small fold-ins were folded in.
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
+
+- **Phase 1b**: P1-04 (SSE scaffold), P1-06 (cooldown resolution), HOTSPOT-03 (routing parser),
+  HOTSPOT-10 (backend envelope), and CLONE-12 folded in. Each plan is committed; each entry records
+  why Phase 1a stopped where it did.
+- **Owner: rule on CLONE-07 and CLONE-26.** The evidence is written and committed. CLONE-07 needs no
+  behaviour decision; CLONE-26 does.
+- **Owner: the deferred Tier 1 CI gate**, after this release cycle.
+- Finish the eslint fold-in: 82 errors, 41 file-and-rule pairs, inventory in the backlog.
+- The `dispatch` `waitMs` trap: above the host's tool-call timeout it fails AND orphans the lane.
+
+Carried unchanged from the previous lap, none of them touched here:
 
 - Triage the eligibility queue: 10 unrecognized refusals; item [1] (the VPN network block) stays
   pending by rule; the dispatcher proposes by digest, only the owner accepts.
 - Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry): a
-  bounded lap measures what Claude Code and Codex do on a mid-stream SSE `error` after content;
-  the per-token abort is built only if a retry reaches another candidate.
+  bounded lap measures what Claude Code and Codex do on a mid-stream SSE `error` after content; the
+  per-token abort is built only if a retry reaches another candidate.
 - Owner: verify the Codex `relay` agent from Codex Desktop (deferred again 2026-09-05).
-- The 63 eslint errors: switch off per file with the invariant named.
-- `publish.yml` `timeout-minutes` 15 → 30.
 - Audit residue with properties: the metering silence channel (DR-006), listener-before-store
   (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
-  pruning (DR-012), the default-ON routing keys in `docs/reference.md` (DR-024).
+  pruning (DR-012). ✅ DR-024, the default-ON routing keys in `docs/reference.md`, closed this lap.
 - Contributor SKUs route B (a Responses upstream, `wire: "responses"` on `kind: "openai"`, then
-  pinning both contributor ids as `preferred`). Route A — four `opencode-muse-spark` cli rungs,
-  one per ladder, right after `free-pool` — is live and verified through MCP `dispatch`
-  (owner decision 2026-09-04, option A; `freeOnly` stays `false` on all three rules):
+  pinning both contributor ids as `preferred`). Route A — four `opencode-muse-spark` cli rungs, one
+  per ladder, right after `free-pool` — is live (owner decision 2026-09-04, option A; `freeOnly`
+  stays `false` on all three rules):
   [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md).
+- `test/os-keyring.test.ts` "sanitizes a thrown child error" is path-sensitive and fails inside a
+  lane worktree with a junctioned `node_modules`.
 
+⚠ **The free `opencode-muse-spark` lane delivered one packet and then stopped delivering.** It
+returned P1-01 in 275 s, then produced nothing across three further packets — 11 minutes each,
+cancelled — including one narrowed to a single 229-line file. The first of those was my own error
+(the brief asked it to read 7,627 lines across four files); the later two were not. Everything after
+P1-01 in this lap was written by hand. Before planning a lane-heavy lap, probe the lane with one
+small packet first.
 
 ## 0.1 Earlier releases
 
@@ -54,6 +75,14 @@ Deliberately NOT restated here. This file holds current state plus the immediate
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
 tags are the trail. What survived each sprint lives in its own home:
 
+- **v0.72.1, the concurrent-ingest lap (2026-09-05)** — `llm-relay mcp` reads and dispatches each
+  stdin request the moment it arrives. `McpDispatchServer.serve` replaced the per-chunk
+  `await server.ingest(chunk)`, and `ingest` splits synchronously so message order stays write
+  order whatever the caller awaits. Measured live against the released v0.72.0 binary on an
+  isolated daemon: a status probe answered in under 1 ms instead of after 6.6 s. Stated trades —
+  responses may leave out of request order, and there is no concurrency cap; ⚠ a host keeps the OLD
+  behaviour until it restarts its `llm-relay mcp` child:
+  [docs/mcp-concurrent-ingest-2026-09-05.md](docs/mcp-concurrent-ingest-2026-09-05.md).
 - **v0.72.0, the dispatch-telemetry lap (2026-09-04)** — "MCP reports, daemon records": the MCP
   server forwards one metadata-only report per settled agent-mode job to
   `POST /dispatch/telemetry`; the daemon records per-lane stats (`dispatch-lane-stats.ts`, the

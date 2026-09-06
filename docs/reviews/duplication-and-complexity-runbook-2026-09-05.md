@@ -217,6 +217,18 @@ large renames if the top-10 looks stale.
 
 ## 6. Threshold ratchets for CI / pre-commit
 
+> ⚠ **Status: Tier 1 is DEFERRED, not adopted — owner decision, 2026-09-05 (the Phase 1a lap).**
+>
+> Tier 1 as written contradicts a standing invariant in `CLAUDE.md`: *"Static analysis is ADVISORY
+> and deliberately outside the gate… it is **not** in `npm run check` and CI does not run it — the
+> gate stays the two typechecks, the server suite, the dashboard checks and the package checks."*
+> The owner deferred the choice until after one full green release cycle, which is what this section
+> already proposes for its own Tiers 2 and 3.
+>
+> Nothing below is in force. Adopting it means amending that `CLAUDE.md` paragraph in the same
+> change, so the two documents cannot state opposite rules. Declining it means saying so here.
+> Tracked in [`../backlog.md`](../backlog.md).
+
 Recommended three-tier gating. Tier 1 ships first; tiers 2–3 are opt-in once
 Tier 1 is green for a full release cycle.
 

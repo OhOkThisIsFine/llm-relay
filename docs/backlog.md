@@ -21,6 +21,92 @@
   **Property:** every queued item carries an accepted verdict, a `reject`, or a stated reason to
   stay pending, each addressed by digest (`--sig`), so the listing shows no item without one.
 
+- **Phase 1b of the duplication-and-complexity program — four verified items the Phase 1a lap did
+  not reach.** Phase 1a (2026-09-05) landed P1-01, three of P1-02's four families (CLONE-13,
+  CLONE-17, CLONE-21) and P1-07. Every plan is committed under
+  [`reviews/refactor-plans/`](reviews/refactor-plans), and every item below is ACCEPT or REFINE in
+  [`reviews/adversarial-verification-2026-09-05.md`](reviews/adversarial-verification-2026-09-05.md).
+
+  - **P1-04 — the SSE transform scaffold** (CLONE-20 + CLONE-11 ACCEPT; SEM-02 phased).
+    `stripThinkTagsInStream` and `rewriteToolUseIdsInStream` hold byte-identical read loops and
+    byte-identical error tails; only `processFrames` and the `flushHeld` hook differ — verified by
+    reading both. ⚠ Not landed because unifying them re-indents about fifty lines inside the module
+    whose stated purpose is losslessness, and that same lap had already found one silent behaviour
+    change in a lane-drafted extraction. **Property:** one `createSseTransformStream` in `sse.ts`
+    owns the decoder, encoder, frame buffer, read loop and error tail; each transform keeps its own
+    visitor; the SSE bytes are unchanged on the think-tags and tool-use-ids fixtures, `event: error`
+    trailer included.
+  - **P1-06 — cooldown resolution** (SEM-06, ACCEPT). "Explicit beats default" is re-implemented in
+    `dispatch.ts`, `circuit-breaker.ts`, `lane-cadence.ts`, `lane-quota-probe.ts`, `target-facts.ts`
+    and `routes/admin.ts`. **Property:** one pure `resolveCooldownMs(explicit, outcome, caps)`
+    reports the figure and the rung that produced it, and the breaker's measured-waste property
+    still holds — a slow failure cools for what it wasted, a fast one keeps the floor.
+  - **HOTSPOT-03 — routing-parser extraction** (ACCEPT). Move `parseRouting` and its ten callees out
+    of `config.ts` into `src/config/routing-parser.ts`. ⚠ Confirm the governing complexity figure
+    first: the catalog says 137, the in-source comment says 124, and the verification flags the
+    discrepancy. **Property:** `config.ts` declares no moved symbol, the new module imports nothing
+    from the request path, and `parseRouting` is pure over its inputs.
+  - **HOTSPOT-10 — backend envelope validation** (ACCEPT). Move `invalidEnvelopeReason` and the
+    stream preflight into `src/backend/envelope-validator.ts` and `src/backend/health-prober.ts`;
+    stated as the precondition for SEM-04's wider unification. **Property:** `backend.ts` declares
+    neither moved symbol, the prober imports nothing from `backend.js`, and a protocol-by-streamed-
+    by-shape table test covers `invalidEnvelopeReason`.
+
+  Folded in here rather than filed separately: **CLONE-12**, the keystore mutation prologue. Read
+  during Phase 1a and deliberately left. The genuinely shared block is four lines
+  (`resolveKeystorePath`, `requireStoreForMutation`, `findEntry`,
+  `refuseCryptographicDegradationWhenUnlockable`) across exactly two entry points, `revokeEntry` and
+  `setDisabled`; `removeEntry` needs an index rather than an entry and `rotateEntry` performs no
+  degradation refusal at all, so neither can share it. Four lines, two sites, inside credential
+  custody — the lowest value-to-risk ratio in the catalog. **Property:** either it is extracted with
+  the keystore suite green and the refusal ORDER preserved, or this paragraph is deleted and the
+  clone is recorded in `CLAUDE.md` as a benign one.
+
+- **Finish the eslint fold-in: 82 errors across 41 file-and-rule pairs.** Phase 1a took 99 → 82.
+  `analysis-reports/` — gitignored generated output that eslint was linting through the
+  `**/*.{js,mjs}` block — is now ignored, and `sonarjs/regex-complexity` is off for the three
+  curated parser modules with the invariant named in `eslint.config.mjs`. ⚠ The 63 recorded on
+  2026-09-01 was already stale; count before planning. Remaining groups, largest first:
+  `sonarjs/different-types-comparison` 15; `@typescript-eslint/no-unused-vars` 13 with
+  `sonarjs/unused-import` 12, of which twelve sit in `config.ts`, a re-export barrel since DR-001;
+  `sonarjs/no-hardcoded-passwords` 9, every one a keystore-adjacent test fixture;
+  `sonarjs/no-nested-functions` 8, every one in a test; `sonarjs/redundant-type-aliases` 6;
+  `sonarjs/deprecation` 4; `no-control-regex` 3; then eleven singles and pairs.
+  **Property:** every remaining rule is either fixed in the code or switched off for its file with
+  the invariant named beside it, so `eslint.config.mjs`'s own convention is satisfied by the state
+  the tree is actually in.
+
+- **Owner decision: rule on CLONE-07 and CLONE-26.** The evidence is
+  [`reviews/clone-07-clone-26-evidence-2026-09-05.md`](reviews/clone-07-clone-26-evidence-2026-09-05.md),
+  written at the owner's request. CLONE-07 needs no behaviour decision — the two
+  `malformedProvenance` predicates are ONE rule spelled against each front's own passthrough
+  condition, proven by a truth table over all six reachable combinations — so the only question is
+  whether to name that predicate once. CLONE-26 IS a behaviour question: a DeepSeek tool-call
+  payload that parses to a scalar commits an empty-argument call, and one that parses to an array
+  commits the array AS the arguments, where the Kimi parser discards both. Repair model, or
+  failover? **Property:** each item carries a recorded owner verdict, and CLONE-26's is implemented
+  in its own commit with a pinning test rather than folded into a duplication cleanup.
+
+- **Owner decision, DEFERRED 2026-09-05: whether to adopt the runbook's Tier 1 duplication CI
+  gate.** [`reviews/duplication-and-complexity-runbook-2026-09-05.md`](reviews/duplication-and-complexity-runbook-2026-09-05.md)
+  proposes a blocking CI check on jscpd clone counts. `CLAUDE.md` states the opposite invariant —
+  static analysis is advisory, CI does not run it, and the gate is the two typechecks, the server
+  suite, the dashboard checks and the package checks. The owner deferred the choice until after one
+  full green release cycle, which is what the runbook itself proposes for its own Tiers 2 and 3.
+  **Property:** the two documents agree — either `CLAUDE.md` records the amendment and CI carries
+  the gate, or the runbook records that Tier 1 was declined, and why.
+
+- **`dispatch` loses the job when `waitMs` exceeds the host's tool-call timeout.** Measured three
+  times on 2026-09-05 against Claude Code: `waitMs` of 100000 and of 240000 both returned
+  `Error: Request timed out` to the caller, and a concurrent pair returned `Error: Connection
+  closed`. Each time the `llm-relay mcp` child RESTARTED — job ids reset to `job-0001` — so the
+  running lane was orphaned and `dispatch_status` answered `unknown jobId`. One packet's 100 seconds
+  of lane work was lost outright. `waitMs: 45000` returns a job handle every time. The tool's own
+  description promises that a slow dispatch "degrades to polling instead of failing"; above the
+  host's timeout it fails AND loses the job. **Property:** a dispatch whose `waitMs` exceeds the
+  host's tool-call timeout still leaves a pollable job, or the server refuses the `waitMs` up front
+  and states the ceiling it accepts.
+
 - **Muse Spark 1.3 — and every Responses-only OpenCode Zen SKU — is unreachable through the
   relay, because no upstream speaks the OpenAI Responses API.** Zen serves
   `muse-spark-1.3-contributor-free` and `muse-spark-1.2-contributor-free` on `/zen/v1/responses`
