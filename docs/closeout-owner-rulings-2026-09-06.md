@@ -1,16 +1,18 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-06T19:18:09.984Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-06T19:32:08.200Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `ac6c38046bad7b13a80c651f229e784cdb1e4437`
+- HEAD: `9cfb197a1777fa752f3c77def7560c77d0ef688c`
 - Sprint start: `b610dc1`
 
 ## Commits in the sprint range
 
+- 9cfb197 docs: the destructive-filter gap is thirteen days older than I said, and v0.46.0 opened it
+- 4b5a40f docs: closeout for the Phase 1b completion lap (v0.73.0)
 - ac6c380 docs: name the release the Phase 1b completion lap shipped as
 - acb2e00 chore: release v0.73.1
 - 408c8b1 docs: record the owner's three rulings and what they closed
@@ -24,13 +26,13 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-06T19:13:54.004Z on tree `16245fee8001`
-- `verify-green check`: verify-green: PASS — tree 16245fee8001 matches the passing run recorded 2026-09-06T19:13:54.004Z (npm run check) — PASS
+- Ledger: `npm run check` recorded 2026-09-06T19:30:59.397Z on tree `ab544858a1a3`
+- `verify-green check`: verify-green: PASS — tree ab544858a1a3 matches the passing run recorded 2026-09-06T19:30:59.397Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 34054226111) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34054226111
+- CI: in_progress/ (run 34055150257) — FAIL
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34055150257
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -43,16 +45,32 @@ scheduled with its risk written down. **Phase 1b is now closed.**
 
 | Commit | Ruling acted on | Pinning test | Mutation check |
 |---|---|---|---|
-| `057fca7` | Restore the destructive refusal ahead of the argument check | yes, 6 refusals + 2 controls | yes |
+| `057fca7` | Restore the destructive refusal ahead of the argument check (also regenerates `AGENTS.md`) | yes, 6 refusals + 2 controls | yes |
 | `449bf9d` | Extract only the surviving cooldown-clamp pair in `dispatch.ts` | existing dispatch suites | n/a, identical by construction |
 | `408c8b1` | Schedule the `parseRouting` decomposition; record the rulings | — | — |
 
 ## The defect the first ruling fixed, and why it matters beyond itself
 
 `recoverToolCalls` read the calls the four dialect parsers had **committed**, and only then asked
-whether any of them named a destructive tool. CLONE-26 (shipped the previous day) made three of
-those parsers discard a call whose arguments are not a JSON object — which removed the name from
-the matcher's view entirely.
+whether any of them named a destructive tool. A parser that discards a call therefore removes the
+name from the matcher's view entirely.
+
+⚠⚠ **The gap is thirteen days older than I first wrote, and v0.46.0 opened it.** My first draft of
+this closeout blamed CLONE-26 (v0.72.3, the previous day) for making "three parsers" discard. The
+auditor refuted that, and the dates settle it:
+
+| date | commit | what landed |
+|---|---|---|
+| 2026-08-08 | `44b0724` | `fromTaggedJsonForms`, with its `catch { continue; }` |
+| 2026-08-13 | `0a38e42` | `fromKimiTokenForm`, with its three `return []` discards |
+| 2026-08-24 | `091cf7c` | the destructive filter (v0.46.0), reading COMMITTED calls |
+| 2026-09-05 | `f9006e7` | CLONE-26 extends the same discard to `fromDeepSeekForm` |
+
+So on the day the filter was written, two of the four parsers already discarded and it already
+could not see those names. **v0.46.0 closed one safety-shaped gap and opened another in the same
+commit.** CLONE-26 touched one parser; what it did was make the existing hole visible. That also
+falsifies a sentence `CLAUDE.md` has carried since: "the last known safety-shaped code gap closed
+in v0.46.0" was false the day it was written, and the paragraph is now the correction.
 
 The consequence: a `Bash` call the relay had recognised in model TEXT stopped yielding
 `refused-destructive` — 502, blamed on the relay, no failover, no health penalty — and became an
@@ -78,6 +96,15 @@ recognises no name at all — containment, not an exemption.
 CLONE-26 itself is untouched: a NON-destructive name with a malformed payload still commits nothing
 and still fails clean, so failover reaches a host that parses. That is one of the two negative
 controls.
+
+## Why this is a PATCH release
+
+Stated because the auditor observed the closeout asserted it without argument. The release skill
+records that this project is pre-1.0 and patch is the norm, and the immediate precedent is CLONE-26
+itself — explicitly self-labelled "a behaviour change on the wire" and shipped as a patch one
+release earlier. The contrasting case in the record is hedging (v0.66.0), bumped to MINOR because it
+added a config key and a default-ON feature; this adds neither. A bug fix restoring intended
+behaviour is a patch.
 
 ## The second ruling, and what it declined
 
@@ -116,6 +143,30 @@ Rewalked from the transcript.
    catalogue label without explaining it. Rewriting for a cold reader took one pass and made the
    questions genuinely answerable without context.
 
+## What the closeout auditor found, and what changed because of it
+
+The auditor re-ran the work rather than reading it: it copied the pre-lap parser over the current
+one and confirmed exactly six failures with both negative controls green, read the old
+`recoverToolCalls` to confirm the described behaviour, checked the `clampExhaustedDeadline`
+"identical by construction" reasoning against the preceding guard line, and verified CI, the tag,
+the registry and the tree.
+
+One refutation, and it is the important one:
+
+- ⚠ **The causal story was wrong.** CLONE-26 touched ONE parser, not three; the Kimi and
+  `<function=NAME>` legs of the gap predate it by weeks and predate the destructive filter itself.
+  Corrected above and in `CLAUDE.md`, including the now-false "last known safety-shaped code gap
+  closed in v0.46.0" sentence. The fix needs no change — only the attribution was wrong, and the
+  truth makes the finding larger, not smaller.
+
+Three smaller observations, all now addressed: the PATCH classification is argued rather than
+assumed; `AGENTS.md` is named in the commit table; and the closeout commit's own message carries a
+stale "(v0.73.0)" label from a reused template while the lap shipped as v0.73.1 — recorded here
+because a commit message cannot be edited after the fact.
+
+⚠ It correctly declined to verify the friction section, which rests on this session's transcript
+rather than on anything in git. That section is labelled operator-provided in the render.
+
 ## Verdict
 
-- All machine-derived sections PASS.
+- 1 section(s) FAIL: CI CI.
