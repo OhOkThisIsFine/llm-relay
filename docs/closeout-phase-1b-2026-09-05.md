@@ -1,16 +1,18 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-06T05:09:11.278Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-06T05:32:04.561Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `368467d82fb1939284dbf73e761517565f7e37b1`
+- HEAD: `358cd776a4646be6d613aa846861eccdfb3e47c7`
 - Sprint start: `eb862c2bcd065dba29fb56124c1444f9823e57cd`
 
 ## Commits in the sprint range
 
+- 358cd77 docs: resolve the closeout auditor's flags, and make one of them true instead of weaker
+- 04f2be3 docs: closeout for the Phase 1b duplication lap (v0.72.3)
 - 368467d docs: name the release the Phase 1b lap shipped as
 - 3a0d228 chore: release v0.72.3
 - e342f52 docs: route the Phase 1b results to their homes
@@ -22,25 +24,18 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## Working tree and remote
 
-- Working tree: NOT clean — FAIL
-```
-?? docs/closeout-phase-1b-2026-09-05.md
-```
+- Working tree: clean — PASS
 - `origin/main` equals HEAD — PASS
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-06T05:05:21.118Z on tree `6e97faceb231`
-- `verify-green check` FAILED: verify-green: FAIL
-content changed AFTER the recorded passing run (2026-09-06T05:05:21.118Z).
-Files changed since that run:
-A	docs/closeout-phase-1b-2026-09-05.md
-Re-run the suite through `record` before claiming green. — FAIL
+- Ledger: `npm run check` recorded 2026-09-06T05:28:36.241Z on tree `a5abb9df65fb`
+- `verify-green check`: verify-green: PASS — tree a5abb9df65fb matches the passing run recorded 2026-09-06T05:28:36.241Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 34013112291) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34013112291
+- CI: completed/success (run 34014092267) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34014092267
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -52,24 +47,43 @@ Advance the tracked Phase 1b work, and offload every delegatable task through ll
 the free `opencode-muse-spark` lane at its highest reasoning variant. The owner amended that at the
 start: other agents were dispatching to Muse Spark concurrently, so any free target was acceptable.
 
-## Delivered — five of Phase 1b's seven items, each with a pinning test and a mutation check
+## Delivered — five of Phase 1b's seven items
 
-| Commit | Item |
-|---|---|
-| `f9006e7` | **CLONE-26** — a DeepSeek payload that is not a JSON object commits nothing |
-| `6b1c099` | **P1-04** — one `createSseTransformStream` for both stream transforms |
-| `c04a56a` | **HOTSPOT-10** — envelope validation and stream preflight get their own modules |
-| `a4f9e2b` | **CLONE-12** — one prologue for both new-entry keystore mutations |
-| `8f6e9d4` | **eslint fold-in** — 82 errors to 0 |
-| `e342f52` | Results routed to the backlog, HANDOFF and a dated recon record |
+| Commit | Item | Pinning test | Mutation check |
+|---|---|---|---|
+| `f9006e7` | **CLONE-26** — a DeepSeek payload that is not a JSON object commits nothing | yes | yes |
+| `6b1c099` | **P1-04** — one `createSseTransformStream` for both stream transforms | yes | yes |
+| `c04a56a` | **HOTSPOT-10** — envelope validation and stream preflight get their own modules | yes, 31-row table | yes |
+| `a4f9e2b` | **CLONE-12** — one prologue for both new-entry keystore mutations | yes | yes |
+| `8f6e9d4` | **eslint fold-in** — 82 errors to 0 | **no, and correctly** | **no** |
+| `e342f52` | Results routed to the backlog, HANDOFF, and `docs/phase-1b-recon-2026-09-05.md` — a new 220-line dated record, itself a deliverable of this lap | — | — |
 
-Every extraction was mutation-checked, and every mutation was killed by the intended test:
+⚠ **The eslint fold-in carries neither, and that is right, not an omission.** It is a lint-config
+change plus the deletion of genuinely dead code; `npm run check` plus a before/after error count is
+its whole verification. An earlier draft of this closeout claimed "each with a pinning test and a
+mutation check" for all five — the closeout auditor flagged that as an overstatement, and it was.
+
+Every CODE item was mutation-checked, and every mutation was killed by the intended test and only
+by it:
 
 - P1-04, removing the error frame: 2 tests fail. Removing the held-text release: 1 test fails, and
   only the think-tags one — correct, because the tool-use-ids transform holds nothing.
 - CLONE-12, reordering the prologue: the test fails with `KeystoreUnlockError` where it expects
   `KeystoreEntryExistsError` — exactly the failure the order exists to prevent.
 - CLONE-26, restoring the lenient branch: the five new cases fail, the negative control stays green.
+- HOTSPOT-10, accepting a missing `choices` array: 1 row fails. Accepting an unknown Anthropic event
+  type: 1 row fails. (Added after the auditor observed the commit claimed no mutation check — the
+  claim was made true rather than weakened.)
+
+## Not done, and named rather than left implied
+
+- **CLONE-07 is completely unaddressed.** It was the other half of the seventh backlog item, and
+  the `malformedProvenance` predicate is still spelled twice. No decision is outstanding — the
+  evidence document proves by truth table that the two spellings are one rule — so this is ordinary
+  refactor work, now filed on its own.
+- **HOTSPOT-03 and P1-06 were not built**, for the reasons below.
+- The eslint inventory corrected a stale backlog figure along the way: **42** distinct
+  (file, rule) pairs, not 41.
 
 ## The offload result, which is the most reusable thing this lap produced
 
@@ -112,9 +126,20 @@ capacity.
   `packageEntries` 392 → 398 and `packBytes` to 959904 both crossed their ceilings, so both were
   raised to observed + ~0.5%, the file's existing convention. `unpackedBytes` still fits and was
   left alone rather than loosened.
-- **One deviation from a committed plan, stated in the commit and in `CLAUDE.md`:** P1-04's scaffold
-  lives in `src/sse-frames.ts`, not `src/sse.ts`. The plan's reason for `sse.ts` was that it already
-  owns shared SSE vocabulary through `iterateDataPayloads`; that generator is private to `sse.ts`.
+- **One deviation from a committed plan, stated in the commit, in `HANDOFF.md` and now in
+  `CLAUDE.md`'s `sse-frames.ts` row:** P1-04's scaffold lives in `src/sse-frames.ts`, not
+  `src/sse.ts`. The plan's reason for `sse.ts` was that it already owns shared SSE vocabulary
+  through `iterateDataPayloads`; that generator is private to `sse.ts`. (An earlier draft claimed
+  the deviation was already in `CLAUDE.md` when only the source comment carried it. The auditor
+  caught that; the architecture row now records the new export and the deviation together, which is
+  where the map should have carried it anyway.)
+
+- ⚠ **CLONE-26 shipped a live wire-visible consequence its ruling did not name, and it is now
+  documented rather than left pending.** A DeepSeek block with a scalar or array payload whose name
+  is in `repair.destructiveTools` used to reach the destructive filter and yield
+  `refused-destructive`; it is now discarded before the filter sees it and yields `detected`, with a
+  pool reroll and a breaker charge. The docs must describe what the code does, so `CLAUDE.md`'s
+  dialect gotcha now records it; whether to KEEP it is the open owner decision.
 
 ## Friction hit during the lap
 
@@ -136,7 +161,32 @@ Rewalked from the transcript, not from memory.
 5. **A `$TEMP` path inside a single-quoted `node -e` script lost its backslashes** and wrote to a
    mangled relative path. Windows-specific; the fix is to avoid interpolating Windows paths into
    inline scripts.
+6. **The closeout renderer is circular by construction.** It runs `verify-green check`, so writing
+   the closeout file makes the tree dirty and the render reports itself as two FAIL sections. The
+   resolution is to commit the render and re-record, which is what happened; the sections are not
+   evidence of an ungreen tree. Worth knowing before reading a first render as a failure.
+
+## What the closeout auditor found, and what changed because of it
+
+The independent auditor (sonnet, given only the repo path, the start commit and the closeout text)
+verified the load-bearing claims by REVERTING each fix and re-running the named test, and by
+counting eslint errors at the pre-lap commit itself. It substantiated the release, CI on both HEADs,
+the 82→0 count, all four mutation-check claims it could test, the CLONE-12 misidentification, the
+CLAUDE.md rows for the new modules, and the +6 `dist/` entry delta.
+
+It flagged four claims and four omissions. Every one is resolved above rather than argued with:
+
+- "each with a pinning test and a mutation check" overreached — the table now states the truth per
+  item, and HOTSPOT-10's missing mutation check was performed rather than the claim weakened.
+- The P1-04 deviation was in `HANDOFF.md`, not `CLAUDE.md` as claimed — now in both.
+- HOTSPOT-10's case count was stated three different ways — the real figures are recorded.
+- The 14-verdict offload narrative has no in-tree primary evidence — the recon doc now says exactly
+  where the journal lives and that it is session-local.
+- CLONE-07, the recon doc as a deliverable, the 42-not-41 correction, and CLONE-26's shipped
+  destructive consequence were all unnamed — each is now named, and the last is in `CLAUDE.md`.
+- The pre-lap package baseline did not reproduce (389 against a measured 392). Pre-existing metric
+  drift, not this lap's doing; recorded in the recon document with the reason it cannot be caught.
 
 ## Verdict
 
-- 2 section(s) FAIL: working tree, verify-green check.
+- All machine-derived sections PASS.
