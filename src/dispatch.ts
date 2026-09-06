@@ -277,6 +277,23 @@ function normalizeTtl(ttlMs: unknown): number {
 }
 
 /**
+ * Clamp an ABSOLUTE cooldown deadline into the window this relay is willing to hold one for —
+ * the sibling of `normalizeTtl` above, which does the same for a DURATION.
+ *
+ * Both write sites had their own copy: the persistence restore and the quota probe's
+ * `markExhaustedKey`. They differed only in that the restore path had already rejected a past
+ * deadline one line earlier, so its copy omitted the floor — which makes the floor a no-op there
+ * and the two expressions the same rule (owner ruling 2026-09-06, the surviving half of SEM-06).
+ *
+ * ⚠ The ceiling is not cosmetic. The report route accepts a vendor-stated cooldown, and an
+ * unclamped one parks a lane for longer than this relay will ever admit is reasonable; the floor
+ * stops a deadline already in the past from being stored as a live cooldown.
+ */
+function clampExhaustedDeadline(untilMs: number, now: number): number {
+  return Math.min(Math.max(now, untilMs), now + MAX_EXHAUSTED_MS);
+}
+
+/**
  * Report a rung spent (quota gone, rate-limited, CLI missing). Rungs sharing a `quota` bucket
  * are cooled down together — that is the whole point of the bucket, since one CLI can meter two
  * model families against two independent balances and only one of them may be gone.
@@ -370,7 +387,7 @@ export function restoreExhaustedRows(cfg: Config, rows: readonly ExhaustedRow[],
     if (row.key.length === 0) continue;
     if (!Number.isFinite(row.until) || row.until <= now) continue;
     if (map.has(row.key)) continue;
-    map.set(row.key, Math.min(row.until, now + MAX_EXHAUSTED_MS));
+    map.set(row.key, clampExhaustedDeadline(row.until, now));
     restored++;
   }
   if (restored > 0) notifyExhaustion(cfg);
@@ -381,7 +398,7 @@ export function restoreExhaustedRows(cfg: Config, rows: readonly ExhaustedRow[],
 export function markExhaustedKey(cfg: Config, key: string, untilMs: number, now: number = Date.now()): void {
   if (typeof key !== "string" || key.length === 0) return;
   if (typeof untilMs !== "number" || !Number.isFinite(untilMs)) return;
-  cooldownsFor(cfg).set(key, Math.min(Math.max(now, untilMs), now + MAX_EXHAUSTED_MS));
+  cooldownsFor(cfg).set(key, clampExhaustedDeadline(untilMs, now));
   notifyExhaustion(cfg);
 }
 
