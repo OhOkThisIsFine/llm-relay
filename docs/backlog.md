@@ -21,6 +21,42 @@
   **Property:** every queued item carries an accepted verdict, a `reject`, or a stated reason to
   stay pending, each addressed by digest (`--sig`), so the listing shows no item without one.
 
+- **A `cli` dispatch lane has ordering but no health-based reordering: it can be arbitrarily slow
+  and stay `next` forever.** Owner question, 2026-09-05, after a lane produced nothing across three
+  packets while the ladder went on recommending it. Everything below is verified, not inferred.
+
+  - **The existing machinery cannot reach it.** `latency-demotion.ts` and `hedge-trigger.ts` are
+    imported only by `backend.ts`, `candidate-runner.ts`, `circuit-breaker.ts`, `config-types.ts`,
+    `ping/cadence.ts`, `server.ts` and each other — `dispatch.ts` is absent. Demotion feeds
+    `targetUsability` inside a candidate WALK, and a lane never enters a walk; hedging duplicates one
+    HTTP attempt, and `dispatch` runs a single rung, so there is no second entrant to race.
+  - **The only lane demotion vocabulary is exhaustion** (`rate_limited` / `quota_exhausted`, from an
+    explicit host report or a quota probe finding a STATED rate/quota message). "Ran a long time and
+    returned nothing" cannot be expressed, so it cannot be recorded.
+  - **The one lane observation that exists is display-only and uses the wrong statistic.**
+    `medianWallClockMs` has three consumers — two print sites and the view field — and nothing
+    orders by it. Measured on the live store the same day: median **111.5 s**, p95 **900 s**, max
+    **1500 s**. `latency-demotion.ts` uses p95 precisely because a median hides a fat tail; the lane
+    view uses the median.
+  - **Cancellation teaches it nothing**, deliberately: `forwardTelemetry` narrows to
+    `REPORTABLE_JOB_STATUSES`, every terminal status but `cancelled`. An operator who gives up on a
+    slow lane leaves no trace, which is the case most likely to matter.
+  - ⚠ **Nothing was late by the lane's own contract** — the rung carries `--timeout 2100`, 35
+    minutes, and the longest observed wait was 680 s. The relay behaved exactly as configured.
+
+  ⚠ **Do NOT fix this by pointing the HTTP terms at the ladder.** 250 ms/token and the 30 s absolute
+  ceiling are calibrated for single completions; a lane legitimately runs an agent loop for minutes,
+  and 900 s is not self-evidently unhealthy for one. Reusing those numbers would demote every
+  healthy lane at once — the same mistake `latency-demotion.ts` records having made when an
+  absolute ceiling calibrated on probes was pointed at generation traffic.
+
+  **Property:** a lane whose recent wall-clock distribution is an outlier against ITS OWN history is
+  demoted below a comparable lane, on a threshold calibrated from `dispatch-lane-stats.json` rather
+  than borrowed from the HTTP path; the ladder view reports the statistic the decision actually uses;
+  and an operator cancellation is distinguishable in the record from a lane that was never asked.
+  ⚠ Calibrate before building: the current window mixes several sessions' traffic, so per-lane
+  history has to be attributable before any threshold drawn from it means anything.
+
 - **Phase 1b of the duplication-and-complexity program — four verified items the Phase 1a lap did
   not reach.** Phase 1a (2026-09-05) landed P1-01, three of P1-02's four families (CLONE-13,
   CLONE-17, CLONE-21) and P1-07. Every plan is committed under

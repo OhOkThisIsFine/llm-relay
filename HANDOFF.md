@@ -72,6 +72,15 @@ cancelled — including one narrowed to a single 229-line file. The first of tho
 P1-01 in this lap was written by hand. Before planning a lane-heavy lap, probe the lane with one
 small packet first.
 
+⚠ **And the ladder went on recommending it throughout, which is a GAP and not a misconfiguration**
+(owner question, same day). A `cli` lane has ordering but no health-based reordering: neither
+`latency-demotion.ts` nor `hedge-trigger.ts` is reachable from `dispatch.ts`, the only lane
+demotion vocabulary is exhaustion, the one wall-clock observation that exists is display-only and
+uses a median where the request path deliberately uses p95, and a cancelled job is never reported —
+so giving up on a slow lane leaves no trace. ⚠ Nothing was LATE either: the rung's own timeout is
+2100 s against a longest wait of 680 s. Full evidence, and why pointing the HTTP thresholds at the
+ladder would be the wrong fix, in [docs/backlog.md](docs/backlog.md).
+
 ## 0.1 Earlier releases
 
 Deliberately NOT restated here. This file holds current state plus the immediate next; a
