@@ -7,17 +7,24 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 **Phase 1b is finished except for two owner decisions.** This lap landed the three items that
 needed no ruling: **CLONE-07** (one named `relayAuthoredResponse` predicate for four call sites),
 the **`extractQuotaPercent` removal**, and **HOTSPOT-03** in two stages — `src/spec.ts` first, then
-`src/config/routing-parser.ts`. `config.ts` is 1994 → 1268 lines.
+`src/config/routing-parser.ts`. `config.ts` is **2001 → 1261** lines across the lap.
 
 The previous lap (v0.72.3) landed CLONE-26, P1-04, HOTSPOT-10, CLONE-12 and the eslint fold-in;
 its record is [docs/closeout-phase-1b-2026-09-05.md](docs/closeout-phase-1b-2026-09-05.md) and
 [docs/phase-1b-recon-2026-09-05.md](docs/phase-1b-recon-2026-09-05.md).
 
 **How the HOTSPOT-03 move was verified, because "the suite is green" is not evidence for a 700-line
-extraction.** A multiset comparison of every non-blank, non-comment line between
-`git show HEAD:src/config.ts` and the union of the two new files reports exactly TWO removals — the
-spec import line losing its now-unused `AUTO_MODEL`, and `function parseRouting(` gaining an
-`export` — and ten additions, every one import or export plumbing. No functional line changed.
+extraction.** A multiset comparison of every non-blank, non-comment line, scoped to STAGE 2 —
+`git show e5d3074^:src/config.ts` against the union of `e5d3074:src/config.ts` and
+`e5d3074:src/config/routing-parser.ts` — reports exactly TWO removals: the spec import line losing
+its now-unused `AUTO_MODEL`, and `function parseRouting(` gaining an `export`. Ten additions, every
+one import or export plumbing. No functional line changed. An independent auditor reproduced both
+numbers.
+⚠ **State the scope and the hashes, or the check does not reproduce.** Run the same comparison from
+the SPRINT START instead and it reports 8 removals and 11 additions — not a hidden change, but
+stage 1's own move of `POOL_PREFIX`, `AUTO_MODEL` and `splitSpec` into `src/spec.ts`, a file that
+"the two new files" union excludes. The wording "HEAD" was lifted from the stage-2 commit message,
+where it meant that commit's parent; quoted later it means something else.
 ⚠ A naive per-function body diff reports FOUR false positives, because comment blocks legitimately
 move between neighbours when the code around them moves; compare code lines, not spans.
 
@@ -31,6 +38,12 @@ move between neighbours when the code around them moves; compare code lines, not
 - The complexity discrepancy is settled: `parseRouting` measures **125**, so the in-source comment's
   124 was right and the catalog's 137 was not. ⚠ The extraction MOVED that hotspot; it did not
   shrink it. Filed with its own property.
+
+**The package baseline moved twice this lap**, once per HOTSPOT-03 stage: `packageEntries` 398 →
+401 → 404, three `dist/` entries per new module. Its ceiling went 401 → 407 on the file's existing
++3 convention; `packBytes` and `unpackedBytes` stayed under theirs and were left alone rather than
+loosened. `AGENTS.md` is the generated multi-host pointer, refreshed by
+`~/.agent-config/sync.mjs --projects` after each `CLAUDE.md` edit.
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry:
 

@@ -1,16 +1,17 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-06T18:14:00.001Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-06T18:31:52.153Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `c5a854f841ce908fd8376e715fc626c5435bcc67`
+- HEAD: `4abbd6ccfd5e56a1825322af97e418856c84fe25`
 - Sprint start: `f65afb1`
 
 ## Commits in the sprint range
 
+- 4abbd6c docs: closeout for the Phase 1b completion lap (v0.73.0)
 - c5a854f docs: name the release the Phase 1b completion lap shipped as
 - b4ca089 chore: release v0.73.0
 - d6acd8a docs: route the Phase 1b completion results to their homes
@@ -21,18 +22,21 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## Working tree and remote
 
-- Working tree: clean — PASS
+- Working tree: NOT clean — FAIL
+```
+M HANDOFF.md
+```
 - `origin/main` equals HEAD — PASS
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-06T18:09:29.983Z on tree `94c91dfd70b4`
-- `verify-green check`: verify-green: PASS — tree 94c91dfd70b4 matches the passing run recorded 2026-09-06T18:09:29.983Z (npm run check) — PASS
+- Ledger: `npm run check` recorded 2026-09-06T18:31:42.592Z on tree `00b47cf3e019`
+- `verify-green check`: verify-green: PASS — tree 00b47cf3e019 matches the passing run recorded 2026-09-06T18:31:42.592Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 34050815352) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34050815352
+- CI: completed/success (run 34051123706) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34051123706
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -51,12 +55,13 @@ finished except for two decisions that are the owner's to make.
 | `e5d3074` | **HOTSPOT-03 stage 2** — `src/config/routing-parser.ts`, 700 lines out of `config.ts` | yes, a leaf/purity guard | n/a, a pure move |
 | `d6acd8a` | Results routed to the backlog and HANDOFF | — | — |
 
-`config.ts` is 1994 → 1268 lines.
+`config.ts` is **2001 → 1261** lines across the lap — 2001 at the sprint start, 1993 immediately before stage 2, 1261 after it.
 
 ## How the 700-line move was verified, because a green suite is not evidence
 
-A multiset comparison of every non-blank, non-comment line, between `git show HEAD:src/config.ts`
-and the union of the two new files:
+A multiset comparison of every non-blank, non-comment line, **scoped to stage 2**:
+`git show e5d3074^:src/config.ts` against the union of `e5d3074:src/config.ts` and
+`e5d3074:src/config/routing-parser.ts`.
 
 - **REMOVED: exactly 2.** The spec import line, which lost its now-unused `AUTO_MODEL`, and
   `function parseRouting(`, which gained an `export`.
@@ -70,6 +75,15 @@ No functional line changed.
 before anyone repeats the check. Comment blocks legitimately move between neighbours when the code
 around them moves, so a span that runs "declaration to next declaration" picks up a different
 trailing comment in each file. Compare code lines, not spans.
+
+⚠⚠ **And state the SCOPE and the hashes, or the check does not reproduce.** Run the same comparison
+from the sprint start instead of from stage 2's parent and it reports 8 removals and 11 additions.
+That is not a hidden change: the six extra removals are `POOL_PREFIX`, `AUTO_MODEL` and
+`splitSpec` leaving `config.ts` in STAGE 1, for `src/spec.ts` — a file that "the union of the two
+new files" excludes. The original wording said "HEAD", which meant the parent commit in the message
+where it was written and something else entirely once quoted here. An auditor applying the stated
+method literally got the different numbers, which is the point: a verification recipe has to carry
+its own scope.
 
 ## Two corrections to the item, both from reading HEAD rather than the plan
 
@@ -128,6 +142,34 @@ Rewalked from the transcript, not from recall.
 5. **`check:package` measures whatever `dist/` holds**, met again: the ceiling breach only appeared
    after a rebuild. Already in `CLAUDE.md`.
 
+## What the closeout auditor found, and what changed because of it
+
+The independent auditor (sonnet, given only the repo path, the start commit and the closeout text)
+re-ran the work rather than reading it: it reproduced the stage-2 multiset comparison line for line,
+reverted `relayAuthoredResponse` twice and confirmed the mutation counts of 8 and 4, re-measured
+`parseRouting` at 125, confirmed the leaf import set, and checked CI, the tag and the registry.
+
+It found two things this document had wrong, both now corrected above:
+
+- **The line counts were false on both ends.** 1994 → 1268 was claimed; the truth is 1993 → 1261 for
+  stage 2, and 2001 → 1261 across the lap. The bad pair came from a script reporting array lengths
+  before the later import pruning, and it had already propagated from the stage-2 commit message
+  into `HANDOFF.md`. Not load-bearing — the multiset proof is what establishes correctness — but
+  false as stated, and both documents are fixed.
+- **The multiset recipe did not carry its own scope**, so applying it literally across the whole lap
+  gives 8/11 rather than 2/10. Now stated with the commit hashes and with stage 1's own move called
+  out.
+
+It also named three things the narrative was silent on, all now added: the package baseline moved
+twice (`packageEntries` 398 → 401 → 404, ceiling 401 → 407), `AGENTS.md` was regenerated, and the
+render's Identity section names `c5a854f` while the true HEAD is one commit later — the renderer's
+own circularity, disclosed in that commit's message.
+
+⚠ It correctly declined to verify the three narrative-only claims that rest on dispatch logs outside
+this repository: the 208-second lane review, the prior lap's 7-of-7 fabrication finding, and the
+`unknown jobId` incident. Those are labelled operator-provided in the render, which is the right
+status for them.
+
 ## Verdict
 
-- All machine-derived sections PASS.
+- 1 section(s) FAIL: working tree.
