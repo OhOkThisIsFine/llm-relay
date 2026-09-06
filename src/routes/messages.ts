@@ -9,7 +9,7 @@ import {
   dialectRefusalSignalOf,
   POOL_ATTEMPTS_HEADER,
 } from "../backend.js";
-import { probeStreamForCommit } from "../stream-commit.js";
+import { probeStreamForCommit, relayAuthoredResponse } from "../stream-commit.js";
 import { reconstructFromSse } from "../sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "../emitSse.js";
 import { repair, type RepairOutcome } from "../repair.js";
@@ -713,7 +713,7 @@ export async function anthropicMessagesPath(
         // The commit probe runs inside the attempt so the hedge race settles at first content.
         protocol: "anthropic-messages",
         isCancelled: () => res.destroyed,
-        malformedProvenance: run.target.kind === "openai" ? "local" : "upstream",
+        malformedProvenance: relayAuthoredResponse(run.target.kind, "anthropic-messages"),
       });
 
     const primaryRun = beginAttemptRun(res, primaryOffer);
@@ -920,7 +920,7 @@ export async function anthropicMessagesPath(
         const probe = takeCommitProbe(backendRes) ?? (backendRes.body
           ? await probeStreamForCommit(backendRes.body, "anthropic-messages", {
               isCancelled: () => res.destroyed,
-              malformedProvenance: target.kind === "openai" ? "local" : "upstream",
+              malformedProvenance: relayAuthoredResponse(target.kind, "anthropic-messages"),
               ...(dialectRefusalSignalOf(backendRes) ? { relayRefusal: dialectRefusalSignalOf(backendRes)! } : {}),
             })
           : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const });

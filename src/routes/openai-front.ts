@@ -10,7 +10,7 @@ import {
   upstreamReportedModel,
   type OpenAiFrontProtocol,
 } from "../backend.js";
-import { probeStreamForCommit, type StreamCommitProtocol } from "../stream-commit.js";
+import { probeStreamForCommit, relayAuthoredResponse, type StreamCommitProtocol } from "../stream-commit.js";
 import { toolSchemaMap, type AssistantMessage } from "../anthropic.js";
 import type { RecoveredOpenAiChat, RecoveredOpenAiChatProcessor } from "../openai-dialect.js";
 import { repair, type RepairOutcome } from "../repair.js";
@@ -237,7 +237,7 @@ export async function openAiFrontPath(
         // The commit probe runs inside the attempt so the hedge race settles at first content.
         protocol: ctx.protocol === "responses" ? "openai-responses" : "openai-chat",
         isCancelled: () => res.destroyed,
-        malformedProvenance: run.target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
+        malformedProvenance: relayAuthoredResponse(run.target.kind, ctx.protocol),
       });
     };
 
@@ -494,8 +494,7 @@ export async function openAiFrontPath(
         const probe = takeCommitProbe(upstream) ?? (upstream.body
           ? await probeStreamForCommit(upstream.body, protocol, {
               isCancelled: () => res.destroyed,
-              malformedProvenance:
-                target.kind === "openai" && ctx.protocol === "chat" ? "upstream" : "local",
+              malformedProvenance: relayAuthoredResponse(target.kind, ctx.protocol),
               ...(dialectRefusalSignalOf(upstream) ? { relayRefusal: dialectRefusalSignalOf(upstream)! } : {}),
             })
           : { kind: "dead" as const, reason: "stream has no body", provenance: "upstream" as const });

@@ -43,6 +43,45 @@ export interface StreamCommitProbeOptions {
   relayRefusal?: DialectRefusalSignal;
 }
 
+/**
+ * The client protocol a front is answering, as far as provenance is concerned.
+ *
+ * Deliberately NOT `ResponseProtocol` (`backend/envelope-validator.ts`), which names the shape a
+ * response mapper reads. This names the shape the CLIENT asked for, and the two front doors do not
+ * offer the same set: `/v1/messages` only ever answers `anthropic-messages`, while the OpenAI front
+ * answers `chat` or `responses`.
+ */
+export type FrontProtocol = "anthropic-messages" | "chat" | "responses";
+
+/**
+ * Did the RELAY author the bytes of this response, or did the provider?
+ *
+ * `upstream` means the provider produced them, so a malformed final wire is the PROVIDER's fault:
+ * the outcome is retriable and the walk fails over to the next candidate. `local` means the relay
+ * produced them by translating, so the outcome is TERMINAL — the same line this module draws for a
+ * relay-authored refusal, and the same one `CLAUDE.md` draws when it says a hard cap "is config,
+ * not health".
+ *
+ * ⚠ The rule is ONE rule: the relay authored the bytes unless the response was a byte passthrough,
+ * and a passthrough happens exactly when the target's native protocol is the one the client asked
+ * for. Until 2026-09-06 (CLONE-07) it was spelled twice, once per front, against each front's own
+ * passthrough condition — `openai`-kind means translated on the Anthropic front, while on the
+ * OpenAI front only `openai`-kind PLUS `chat` is a passthrough. The two spellings never disagreed:
+ * a truth table over all six reachable combinations is in
+ * `docs/reviews/clone-07-clone-26-evidence-2026-09-05.md`, and `test/stream-commit.test.ts` pins
+ * every row. Naming it once is what stops a fifth call site inventing a seventh row, because a new
+ * front or a new protocol currently has two places to get right and no compiler help.
+ */
+export function relayAuthoredResponse(
+  targetKind: "anthropic" | "openai",
+  frontProtocol: FrontProtocol,
+): "upstream" | "local" {
+  const passthrough =
+    (targetKind === "anthropic" && frontProtocol === "anthropic-messages") ||
+    (targetKind === "openai" && frontProtocol === "chat");
+  return passthrough ? "upstream" : "local";
+}
+
 /** Shared by structural preflight and final-wire commit probing. */
 export const STREAM_PREFLIGHT_LIMIT = 64 * 1024;
 

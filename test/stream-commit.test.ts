@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   probeStreamForCommit,
+  relayAuthoredResponse,
   STREAM_PREFLIGHT_LIMIT,
+  type FrontProtocol,
   type StreamCommitProtocol,
 } from "../src/stream-commit.js";
 
@@ -235,5 +237,69 @@ describe("final-wire stream commit probe", () => {
     });
     const result = await probeStreamForCommit(body, "anthropic-messages", { isCancelled: () => true });
     expect(result).toEqual({ kind: "cancelled" });
+  });
+});
+
+/**
+ * CLONE-07. The rule "did the relay author these bytes" used to be spelled twice, once per front,
+ * against each front's own passthrough condition. The two spellings never disagreed — the truth
+ * table in `docs/reviews/clone-07-clone-26-evidence-2026-09-05.md` proves it over all six reachable
+ * combinations — so naming it once is behaviour-preserving by construction, and this table is what
+ * makes that checkable rather than asserted.
+ *
+ * ⚠ The value is not cosmetic. `upstream` makes a malformed final wire the PROVIDER's fault, so the
+ * outcome is retriable and the walk fails over; `local` makes it terminal. Getting one row wrong
+ * either strands a request the pool could have served, or rerolls the whole pool on the relay's own
+ * mapper defect.
+ */
+describe("relayAuthoredResponse", () => {
+  const ROWS: ReadonlyArray<{
+    readonly targetKind: "anthropic" | "openai";
+    readonly front: FrontProtocol;
+    readonly expected: "upstream" | "local";
+    readonly why: string;
+  }> = [
+    { targetKind: "anthropic", front: "anthropic-messages", expected: "upstream", why: "byte passthrough — the vendor's own shape" },
+    { targetKind: "openai", front: "anthropic-messages", expected: "local", why: "translated OpenAI -> Anthropic" },
+    { targetKind: "openai", front: "chat", expected: "upstream", why: "byte passthrough — the direct Chat lane" },
+    { targetKind: "openai", front: "responses", expected: "local", why: "translated for the Responses front" },
+    { targetKind: "anthropic", front: "chat", expected: "local", why: "translated Anthropic -> OpenAI" },
+    { targetKind: "anthropic", front: "responses", expected: "local", why: "translated Anthropic -> Responses" },
+  ];
+
+  it.each(ROWS.map((row) => [`${row.targetKind}-kind target on the ${row.front} front (${row.why})`, row] as const))(
+    "reports %s",
+    (_name, row) => {
+      expect(relayAuthoredResponse(row.targetKind, row.front)).toBe(row.expected);
+    },
+  );
+
+  /**
+   * The negative control, and it is what makes the table above mean something: exactly TWO of the
+   * six combinations are a passthrough. A predicate that answered `local` everywhere would satisfy
+   * four rows on its own, and one that answered `upstream` everywhere would satisfy two.
+   */
+  it("calls exactly two of the six combinations a passthrough", () => {
+    const upstream = ROWS.filter((row) => relayAuthoredResponse(row.targetKind, row.front) === "upstream");
+    expect(upstream.map((row) => `${row.targetKind}/${row.front}`)).toEqual([
+      "anthropic/anthropic-messages",
+      "openai/chat",
+    ]);
+  });
+
+  /**
+   * Pins the behaviour-preservation claim directly: each front's ORIGINAL expression, transcribed
+   * verbatim from the code CLONE-07 replaced, must agree with the shared predicate on every row it
+   * could reach. Delete this and the "no behaviour changed" claim rests on a document.
+   */
+  it("agrees with both original per-front spellings on every reachable row", () => {
+    for (const { targetKind, front } of ROWS) {
+      const shared = relayAuthoredResponse(targetKind, front);
+      if (front === "anthropic-messages") {
+        expect(shared).toBe(targetKind === "openai" ? "local" : "upstream");
+      } else {
+        expect(shared).toBe(targetKind === "openai" && front === "chat" ? "upstream" : "local");
+      }
+    }
   });
 });
