@@ -17,6 +17,7 @@ import {
   addEntry,
   createKeystoreResolutionWalk,
   keystoreStatus,
+  KeystoreEntryExistsError,
   KeystoreMutationRefusedError,
   KeystoreReadError,
   KeystoreUnlockError,
@@ -1591,4 +1592,24 @@ describe("encrypted credential keystore", () => {
       expect(statSync(directory).mode & 0o777).toBe(0o700);
     },
   );
+
+  /**
+   * ⚠ CLONE-12's extracted prologue documents its ORDER as a contract, and the order was entirely
+   * uncovered before this test: moving the duplicate check to AFTER `unlockStoreForWrite` left
+   * every other test in this file green. That order is what stops a REJECTED add from opening the
+   * keyring — a custody prompt, or a custody error, for a write that was never going to happen.
+   *
+   * The wrong passphrase is the probe. `lock()` first drops the process-held KEK, so an unlock
+   * would really run; then the error the caller actually receives says which check ran first.
+   */
+  it("rejects a duplicate entry before it opens the keystore for writing", () => {
+    addEntry({
+      id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: FIRST_SECRET,
+    }, options());
+    lock({ path });
+
+    expect(() => addEntry({
+      id: "nim#personal", provider: "nim", envName: "NVIDIA_API_KEY", value: SECOND_SECRET,
+    }, options({ passphrase: "not the passphrase" }))).toThrow(KeystoreEntryExistsError);
+  });
 });

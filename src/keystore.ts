@@ -1063,11 +1063,26 @@ export function keystoreStatus(opts: KeystoreOptions = {}): KeystoreStatus {
   }
 }
 
-export function addEntry(input: AddEntryInput, opts: KeystoreOptions = {}): KeystoreEntryDescriptor {
-  validateEntryIdentity(input.id, input.provider, input.envName);
-  validateValue(input.value);
-  validateExpiresAt(input.expiresAt);
-  const now = writeTime(opts);
+/**
+ * The prologue both NEW-entry mutations share (CLONE-12): resolve the store path, load it, refuse
+ * a store that is unreadable or degraded, clone it for mutation, reject a duplicate id or env
+ * name, and open the KEK — creating the store when there is none yet.
+ *
+ * ⚠ The ORDER is the contract, not an implementation detail, and it is why this is worth naming
+ * once. `refuseMutation` runs BEFORE the duplicate check, so an unreadable store reports a custody
+ * failure instead of a spurious "entry exists"; and the duplicate check runs BEFORE
+ * `unlockStoreForWrite`, so a rejected add never spawns a keyring unlock the operator would have
+ * to answer. Both call sites already had exactly this order — extracting it is what stops a third
+ * one arriving with a different one.
+ *
+ * ⚠ Not to be confused with the `revokeEntry` / `setDisabled` prologue further down. That one
+ * shares three lines, and its two sites order their surrounding preconditions differently, so any
+ * shared placement there would change an operator-visible message. It is recorded as benign.
+ */
+function openStoreForNewEntry(
+  input: { id: string; envName: string },
+  opts: KeystoreOptions,
+): { path: string; initialized: { store: StoredKeystore; kek: Buffer } } {
   const path = resolveKeystorePath(opts);
   const loaded = loadStore(path, opts);
   if (loaded.status === "unreadable" || loaded.status === "degraded") refuseMutation(loaded);
@@ -1079,6 +1094,15 @@ export function addEntry(input: AddEntryInput, opts: KeystoreOptions = {}): Keys
     store: existing,
     kek: unlockStoreForWrite(existing, path, opts),
   };
+  return { path, initialized };
+}
+
+export function addEntry(input: AddEntryInput, opts: KeystoreOptions = {}): KeystoreEntryDescriptor {
+  validateEntryIdentity(input.id, input.provider, input.envName);
+  validateValue(input.value);
+  validateExpiresAt(input.expiresAt);
+  const now = writeTime(opts);
+  const { path, initialized } = openStoreForNewEntry(input, opts);
   const entry: StoredEntry = {
     id: input.id,
     provider: input.provider,
@@ -1388,16 +1412,7 @@ export function restoreEntryFromExport(
   opts: KeystoreOptions = {},
 ): KeystoreEntryDescriptor {
   if (!validExportEntry(input)) throw new KeystoreExportError();
-  const path = resolveKeystorePath(opts);
-  const loaded = loadStore(path, opts);
-  if (loaded.status === "unreadable" || loaded.status === "degraded") refuseMutation(loaded);
-  const existing = loaded.status === "fresh" ? null : cloneStoreForMutation(loaded.store);
-  if (existing?.entries.some((entry) => entry.id === input.id || entry.envName === input.envName)) {
-    throw new KeystoreEntryExistsError();
-  }
-  const initialized = existing === null
-    ? createStore(path, opts)
-    : { store: existing, kek: unlockStoreForWrite(existing, path, opts) };
+  const { path, initialized } = openStoreForNewEntry(input, opts);
   const entry: StoredEntry = {
     id: input.id,
     provider: input.provider,
