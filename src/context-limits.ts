@@ -53,6 +53,62 @@ export const OBSERVED_LIMIT_TTL_MS = FACT_TTL_MS["context-limit"];
 /** A stated ceiling above this is a parse artifact, not a context window. */
 const MAX_CREDIBLE_TOKENS = 100_000_000;
 
+/** The two ceilings this module learns. Named as a union rather than taken as a bare `FactKind`
+ * so a caller cannot hand `recordDeploymentCeiling` a kind that is not a ceiling at all. */
+type CeilingFactKind = "context-limit" | "max-output";
+
+/**
+ * Scan an error body for the first explicitly stated ceiling one of `patterns` captures, or null.
+ *
+ * The one scan both halves of this module run. It is the discipline, not the regexes: bound the
+ * body before the regex engine sees it, take the FIRST capture that survives the credibility
+ * check, and answer null for everything else. What differs between the two halves is only which
+ * table is scanned — `STATED_LIMIT_PATTERNS` or `STATED_MAX_OUTPUT_PATTERNS` — and each table
+ * carries its own rule that every pattern must capture the MAXIMUM rather than the requested
+ * count.
+ *
+ * ⚠ Null is the fail-safe answer and it is load-bearing: a body that proves a request was too
+ * long, but states no number, must teach this store nothing. See the file header.
+ */
+function scanStatedLimit(body: string, patterns: readonly RegExp[]): number | null {
+  if (typeof body !== "string" || body.length === 0) return null;
+  // Bodies are small; this bound only stops a pathological one from driving the regex engine.
+  const text = body.length > 8192 ? body.slice(0, 8192) : body;
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (!m?.[1]) continue;
+    const n = Number(m[1].replace(/[,_]/g, ""));
+    if (Number.isFinite(n) && n > 0 && n <= MAX_CREDIBLE_TOKENS) return Math.floor(n);
+  }
+  return null;
+}
+
+/**
+ * Persist a ceiling a deployment stated about itself, under the fact kind the caller names.
+ *
+ * Deployment scope for both kinds, because both messages name the model and neither names the
+ * account. A fresh observation always replaces an older one: the deployment is the authority on
+ * its own ceiling, and a provider that raised or lowered it is telling us so.
+ *
+ * ⚠ An implausible figure is DROPPED without touching the store, rather than clamped. A value
+ * outside the credible range is a parse artifact, and this store's whole worth is that everything
+ * in it was measured.
+ */
+function recordDeploymentCeiling(
+  factName: CeilingFactKind,
+  provider: string,
+  model: string,
+  tokens: number,
+  opts: { path?: string; now?: number } = {},
+): void {
+  if (!Number.isFinite(tokens) || tokens <= 0 || tokens > MAX_CREDIBLE_TOKENS) return;
+  recordFact(factName, { kind: "deployment", provider, model }, {
+    ...(opts.path !== undefined ? { path: opts.path } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+    value: Math.floor(tokens),
+  });
+}
+
 /**
  * Patterns that carry an explicitly stated ceiling. Deliberately a small, literal set rather than
  * anything clever: a loose pattern that captured the *requested* count instead of the *maximum*
@@ -77,16 +133,7 @@ const STATED_LIMIT_PATTERNS: RegExp[] = [
  * proves the request was too long. See the file header for why that asymmetry is deliberate.
  */
 export function parseStatedContextLimit(body: string): number | null {
-  if (typeof body !== "string" || body.length === 0) return null;
-  // Bodies are small; this bound only stops a pathological one from driving the regex engine.
-  const text = body.length > 8192 ? body.slice(0, 8192) : body;
-  for (const re of STATED_LIMIT_PATTERNS) {
-    const m = re.exec(text);
-    if (!m?.[1]) continue;
-    const n = Number(m[1].replace(/[,_]/g, ""));
-    if (Number.isFinite(n) && n > 0 && n <= MAX_CREDIBLE_TOKENS) return Math.floor(n);
-  }
-  return null;
+  return scanStatedLimit(body, STATED_LIMIT_PATTERNS);
 }
 
 /** Does this error body describe a context-length rejection at all? */
@@ -105,12 +152,7 @@ export function recordObservedContextLimit(
   tokens: number,
   opts: { path?: string; now?: number } = {},
 ): void {
-  if (!Number.isFinite(tokens) || tokens <= 0 || tokens > MAX_CREDIBLE_TOKENS) return;
-  recordFact("context-limit", { kind: "deployment", provider, model }, {
-    ...(opts.path !== undefined ? { path: opts.path } : {}),
-    ...(opts.now !== undefined ? { now: opts.now } : {}),
-    value: Math.floor(tokens),
-  });
+  recordDeploymentCeiling("context-limit", provider, model, tokens, opts);
 }
 
 /** The learned ceiling for a deployment, or null when none was observed or it has expired. */
@@ -169,16 +211,7 @@ const STATED_MAX_OUTPUT_PATTERNS: RegExp[] = [
  * `parseStatedContextLimit`: if nothing parses, nothing is learned.
  */
 export function parseStatedMaxOutput(body: string): number | null {
-  if (typeof body !== "string" || body.length === 0) return null;
-  // Bodies are small; this bound only stops a pathological one from driving the regex engine.
-  const text = body.length > 8192 ? body.slice(0, 8192) : body;
-  for (const re of STATED_MAX_OUTPUT_PATTERNS) {
-    const m = re.exec(text);
-    if (!m?.[1]) continue;
-    const n = Number(m[1].replace(/[,_]/g, ""));
-    if (Number.isFinite(n) && n > 0 && n <= MAX_CREDIBLE_TOKENS) return Math.floor(n);
-  }
-  return null;
+  return scanStatedLimit(body, STATED_MAX_OUTPUT_PATTERNS);
 }
 
 /** Does this error body describe a `max_tokens` / output-cap rejection at all? */
@@ -197,12 +230,7 @@ export function recordObservedMaxOutput(
   tokens: number,
   opts: { path?: string; now?: number } = {},
 ): void {
-  if (!Number.isFinite(tokens) || tokens <= 0 || tokens > MAX_CREDIBLE_TOKENS) return;
-  recordFact("max-output", { kind: "deployment", provider, model }, {
-    ...(opts.path !== undefined ? { path: opts.path } : {}),
-    ...(opts.now !== undefined ? { now: opts.now } : {}),
-    value: Math.floor(tokens),
-  });
+  recordDeploymentCeiling("max-output", provider, model, tokens, opts);
 }
 
 /** The learned output ceiling for a deployment, or null when none was observed or it expired. */
