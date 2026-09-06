@@ -296,6 +296,34 @@ describe("accounting persisted schema", () => {
     expect(isAccountingDimensionRowV1({ ...row(), extra: true })).toBe(false);
   });
 
+  it("rejects a bad value in every field of the shared envelope tail, on BOTH packet kinds", () => {
+    // ⚠ These seven checks were entirely uncovered until 2026-09-05: disabling the whole tail guard
+    // left all 126 accounting tests green. Found while extracting it as `validateCommonEnvelopeTail`
+    // (CLONE-21) — the extraction was correct, and the suite could not have told anyone either way.
+    // Each case below fails if the guard stops running, which is the point.
+    const badTails = {
+      latencyMs: ["1000", -1, 1.5, Number.NaN],
+      commitMs: ["0", -1, 1.5],
+      provider: [1, "bad\nprovider", {}],
+      model: [1, "bad\nmodel"],
+      credentialId: [1, "bad\ncredential"],
+      tokens: [null, {}, "tokens"],
+      spend: [1, "spend", {}],
+    } as const;
+
+    for (const [field, values] of Object.entries(badTails)) {
+      for (const bad of values) {
+        expect(isAccountingAttemptPacketV1({ ...attempt(), [field]: bad }), `attempt.${field} = ${JSON.stringify(bad)}`).toBe(false);
+        expect(isAccountingRequestPacketV1({ ...packet(), [field]: bad }), `request.${field} = ${JSON.stringify(bad)}`).toBe(false);
+      }
+    }
+
+    // And the two values the tail deliberately ADMITS, so the cases above cannot pass by rejecting
+    // everything. `spend: null` is every pre-2026-08-22 shard; a null duration is an unmeasured one.
+    expect(isAccountingAttemptPacketV1({ ...attempt(), spend: null, latencyMs: null })).toBe(true);
+    expect(isAccountingAttemptPacketV1({ ...attempt(), provider: null, model: null, credentialId: null })).toBe(true);
+  });
+
   it("requires complete terminal packet lifecycle and attribution", () => {
     const valid = packet();
     expect(isAccountingAttemptPacketV1(valid.attempts[0])).toBe(true);

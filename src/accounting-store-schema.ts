@@ -1059,6 +1059,51 @@ function isNullableNumber(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0);
 }
 
+/**
+ * The seven fields both persisted packet envelopes carry, and the shape they carry them in.
+ *
+ * Declared so `validateCommonEnvelopeTail` can be a NARROWING guard rather than a boolean: the
+ * request validator reads `value.tokens` and `value.spend` again further down, in
+ * `tokenTotalsEqual` and `spendEqual`, and a plain boolean helper would have taken that
+ * narrowing away from it.
+ */
+interface CommonEnvelopeTailV1 {
+  readonly latencyMs: number | null;
+  readonly commitMs: number | null;
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly credentialId: string | null;
+  readonly tokens: AccountingAggregateTokenTotalsV1;
+  readonly spend: AccountingSpendV1 | null;
+}
+
+/**
+ * The guard chain `isAttemptPacket` and `isRequestPacket` converge on.
+ *
+ * Their HEADS differ — one carries a role and an attempt id, the other a client, an attempt list
+ * and its metadata — and then both end with exactly these seven checks: the two nullable
+ * durations, the three nullable identity fields, the token totals and the optional spend cell.
+ * CLONE-21 in the 2026-09-05 duplication catalog, ACCEPT in the adversarial verification
+ * ("shared tail confirmed; heads differ as claimed").
+ *
+ * ⚠ It answers TRUE when the tail is valid, so each caller negates it in place of the seven
+ * `||` clauses it replaces. Carrying the surrounding chain's polarity into the helper would have
+ * made a guard that narrows on failure.
+ *
+ * ⚠ `spend === null` is admitted deliberately, and is not laxity: every shard written before the
+ * 2026-08-22 spend fields carries `spend: null`, so rejecting it here would quarantine history
+ * rather than validate it.
+ */
+function validateCommonEnvelopeTail(value: Record<string, unknown>): value is Record<string, unknown> & CommonEnvelopeTailV1 {
+  return isNullableCounter(value.latencyMs)
+    && isNullableCounter(value.commitMs)
+    && isNullableId(value.provider)
+    && isNullableId(value.model)
+    && isNullableId(value.credentialId)
+    && isAggregateTokens(value.tokens)
+    && (value.spend === null || isSpend(value.spend));
+}
+
 function isAttemptPacket(value: unknown): value is AccountingAttemptPacketV1 {
   if (
     !hasExactKeys(value, [
@@ -1088,13 +1133,7 @@ function isAttemptPacket(value: unknown): value is AccountingAttemptPacketV1 {
     (value.failureKind !== null && !isFailure(value.failureKind)) ||
     !isFailureCoherent(value.outcome, value.failureKind) ||
     !isAttribution(value.attribution) ||
-    !isNullableCounter(value.latencyMs) ||
-    !isNullableCounter(value.commitMs) ||
-    !isNullableId(value.provider) ||
-    !isNullableId(value.model) ||
-    !isNullableId(value.credentialId) ||
-    !isAggregateTokens(value.tokens) ||
-    !(value.spend === null || isSpend(value.spend))
+    !validateCommonEnvelopeTail(value)
   ) return false;
   if (value.commitMs !== null && value.role !== "serve") return false;
   return true;
@@ -1159,13 +1198,7 @@ function isRequestPacket(value: unknown): value is AccountingRequestPacketV1 {
     typeof value.repairIncluded !== "boolean" ||
     !(value.winningAttemptId === null || isAttemptId(value.winningAttemptId)) ||
     !(value.commitAttemptId === null || isAttemptId(value.commitAttemptId)) ||
-    !isNullableCounter(value.latencyMs) ||
-    !isNullableCounter(value.commitMs) ||
-    !isNullableId(value.provider) ||
-    !isNullableId(value.model) ||
-    !isNullableId(value.credentialId) ||
-    !isAggregateTokens(value.tokens) ||
-    !(value.spend === null || isSpend(value.spend)) ||
+    !validateCommonEnvelopeTail(value) ||
     !hasExactArray(value.attempts, ACCOUNTING_MAX_DETAIL_ATTEMPTS, isAttemptPacket) ||
     !isAttemptMetadata(value.attemptMetadata)
   ) return false;
