@@ -83,9 +83,18 @@
   condition, proven by a truth table over all six reachable combinations — so the only question is
   whether to name that predicate once. CLONE-26 IS a behaviour question: a DeepSeek tool-call
   payload that parses to a scalar commits an empty-argument call, and one that parses to an array
-  commits the array AS the arguments, where the Kimi parser discards both. Repair model, or
-  failover? **Property:** each item carries a recorded owner verdict, and CLONE-26's is implemented
-  in its own commit with a pinning test rather than folded into a duplication cleanup.
+  commits the array AS the arguments, where the Kimi parser discards both.
+
+  **✅ RULED 2026-09-05, option A: give `fromDeepSeekForm` the strictness `fromKimiTokenForm`
+  already has.** A scalar or array payload discards that dialect's contribution rather than
+  committing a call; the turn fails clean to `detected` and failover reaches a host that parses.
+  ⚠ Still OPEN as WORK — it is a behaviour change on the wire and needs its own commit and its own
+  pinning test, not a fold-in. **Property:** a scalar payload yields no DeepSeek call, an array
+  payload yields no DeepSeek call, a well-formed object payload is unaffected, and restoring the
+  lenient branch turns that test red. Accepted cost, recorded so it is not rediscovered as a bug:
+  one malformed block now discards well-formed DeepSeek calls found EARLIER in the same message —
+  the same whole-or-nothing rule the destructive filter already follows.
+  CLONE-07 needs no behaviour decision; naming its predicate once is ordinary refactor work.
 
 - **Owner decision, DEFERRED 2026-09-05: whether to adopt the runbook's Tier 1 duplication CI
   gate.** [`reviews/duplication-and-complexity-runbook-2026-09-05.md`](reviews/duplication-and-complexity-runbook-2026-09-05.md)

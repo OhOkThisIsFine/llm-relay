@@ -190,7 +190,26 @@ and the gate was right.
 
 ---
 
+---
+
+## Owner verdicts, 2026-09-05
+
+**CLONE-26 — option A.** Give `fromDeepSeekForm` the strictness `fromKimiTokenForm` already has: a
+payload that parses to a scalar, or to an array, discards that dialect's contribution instead of
+committing a call. The turn then fails clean to `detected` and failover reaches a host that parses.
+
+⚠ This is a behaviour change on the wire and belongs in **its own commit with its own pinning
+test**, not folded into a duplication cleanup. Two cases to pin, and one negative control: a scalar
+payload yields no DeepSeek call; an array payload yields no DeepSeek call; a well-formed object
+payload is unaffected. Mutation-check it — restoring the lenient branch must turn the new test red.
+The accepted cost, stated so it is not rediscovered as a bug: one malformed block now discards
+well-formed DeepSeek calls found EARLIER in the same message, which is the same whole-or-nothing
+rule the destructive filter already follows.
+
+**CLONE-07 — no behaviour decision needed**, as the analysis above shows. Whether to name the
+predicate once (option A) stays open and is ordinary refactor work, not a ruling.
+
 ## What this document does not do
 
-It specifies nothing. Neither item is touched by the Phase 1a lap. Both stay recorded in
-[`../backlog.md`](../backlog.md) until you rule.
+It specifies nothing and changes no code. Neither item was touched by the Phase 1a lap. Both remain
+tracked in [`../backlog.md`](../backlog.md), CLONE-26 now carrying its verdict.

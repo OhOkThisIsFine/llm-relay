@@ -225,6 +225,10 @@ large renames if the top-10 looks stale.
 > The owner deferred the choice until after one full green release cycle, which is what this section
 > already proposes for its own Tiers 2 and 3.
 >
+> **Revisited the same day, after v0.72.2 published with CI green: still DEFERRED.** One publish is
+> a thin cycle, and the duplication numbers have not had a chance to move yet. Raise it again after
+> a few more releases.
+>
 > Nothing below is in force. Adopting it means amending that `CLAUDE.md` paragraph in the same
 > change, so the two documents cannot state opposite rules. Declining it means saying so here.
 > Tracked in [`../backlog.md`](../backlog.md).

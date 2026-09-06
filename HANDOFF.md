@@ -34,12 +34,15 @@ CLONE-26 evidence was requested and is written; all four small fold-ins were fol
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
 
-- **Phase 1b**: P1-04 (SSE scaffold), P1-06 (cooldown resolution), HOTSPOT-03 (routing parser),
-  HOTSPOT-10 (backend envelope), and CLONE-12 folded in. Each plan is committed; each entry records
-  why Phase 1a stopped where it did.
-- **Owner: rule on CLONE-07 and CLONE-26.** The evidence is written and committed. CLONE-07 needs no
-  behaviour decision; CLONE-26 does.
-- **Owner: the deferred Tier 1 CI gate**, after this release cycle.
+- **Phase 1b — the owner's chosen next lap (2026-09-05).** P1-04 (SSE scaffold), P1-06 (cooldown
+  resolution), HOTSPOT-03 (routing parser), HOTSPOT-10 (backend envelope), and CLONE-12 folded in.
+  Each plan is committed; each entry records why Phase 1a stopped where it did. ⚠ Probe the free
+  lane with one small packet before planning around it.
+- **CLONE-26 — RULED, not yet built.** Owner verdict 2026-09-05, option A: `fromDeepSeekForm` gets
+  the strictness `fromKimiTokenForm` already has. A behaviour change on the wire, so it needs its
+  own commit and its own pinning test rather than a fold-in. CLONE-07 needs no behaviour decision.
+- **The Tier 1 CI gate stays DEFERRED.** Revisited after v0.72.2 published green and deferred again
+  — one publish is a thin cycle. Raise it after a few more releases.
 - Finish the eslint fold-in: 82 errors, 41 file-and-rule pairs, inventory in the backlog.
 - The `dispatch` `waitMs` trap: above the host's tool-call timeout it fails AND orphans the lane.
 
