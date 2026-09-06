@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { AUTO_MODEL, POOL_PREFIX, splitSpec } from "./spec.js";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
 import {
   credentialCandidateEnvNames,
@@ -50,6 +51,10 @@ import {
 
 // The configuration vocabulary has ONE declaration, in `config-types.ts` (DR-001, 2026-09-04).
 // Re-exported here so every `from "./config.js"` importer keeps its binding.
+// Spec spelling moved to its own leaf so `config/routing-parser.ts` can depend on it without a
+// cycle back into this file (HOTSPOT-03 stage 1). Re-exported so no importer had to change.
+export { AUTO_MODEL, POOL_PREFIX, splitSpec } from "./spec.js";
+
 export {
   EFFORT_LEVELS,
   CLAUDE_TIER_NAMES,
@@ -300,12 +305,6 @@ function parseHedge(raw: unknown): HedgeConfig {
   }
   return out;
 }
-
-/** Reserved provider-namespace prefix for `pool/<name>` routing. */
-export const POOL_PREFIX = "pool";
-
-/** Reserved model name for auto-dispatch to the ladder's first ready relay rung. */
-export const AUTO_MODEL = "auto";
 
 /**
  * Marker Claude Code stamps into the `system` block of SUBAGENT requests only (verified on wire,
@@ -677,13 +676,6 @@ export function expandPoolSpecs(specs: string[], cfg: Config): string[] {
     out.push(...pool);
   }
   return out;
-}
-
-/** Split a "provider/model" spec into its parts (model may contain further slashes). */
-export function splitSpec(spec: string): { provider: string; model?: string } {
-  const slash = spec.indexOf("/");
-  if (slash === -1) return { provider: spec };
-  return { provider: spec.slice(0, slash), model: spec.slice(slash + 1) };
 }
 
 /** Resolve a single spec string to a ResolvedTarget. */
