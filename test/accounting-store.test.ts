@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   createAccountingRequest,
   type AccountingEvent,
@@ -29,8 +29,6 @@ function root(): string {
 import {
   PORT_PUBLISHED,
   PORT_REFERENCE,
-  emptyAggregateTokens,
-  emptyMetric,
   legacyMinuteCell,
   requestId,
   attemptId,

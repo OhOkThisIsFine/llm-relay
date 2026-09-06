@@ -6,11 +6,10 @@ import {
   keyIsPresent,
 } from "./authEnv.js";
 import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
-import { parseConfiguredLimits, type ProviderLimitsConfig } from "./configured-limits.js";
+import { parseConfiguredLimits } from "./configured-limits.js";
 import {
   providerCredentialSlots,
   resolveCredentialSlot,
-  type CredentialSlot,
   type ProviderCredentialConfig,
 } from "./credential-fleet.js";
 import {
@@ -25,10 +24,7 @@ import {
   type Mode,
   type AuthHeader,
   type Kind,
-  type ProviderTierType,
   type EffortLevel,
-  type ClaudeTierName,
-  type OffloadScope,
   type OffloadRule,
   type OffloadConfig,
   type ReshaperConfig,
@@ -39,7 +35,6 @@ import {
   type ProviderConfig,
   type Routing,
   type StickyRoutingConfig,
-  type StickyConfig,
   type QuotaEnforcementConfig,
   type LatencyDemotionConfig,
   type HedgeConfig,

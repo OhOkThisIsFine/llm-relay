@@ -23,7 +23,7 @@ import {
   type RequestCompletedEvent,
   type RequestStartedEvent,
 } from "./accounting.js";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { atomicWriteJsonSync } from "./storage/json-store.js";
 
 /**
@@ -66,7 +66,6 @@ import {
   ACCOUNTING_MAX_DAY_ROWS,
   ACCOUNTING_MAX_DEDUP_IDS,
   ACCOUNTING_MAX_DETAIL_ATTEMPTS,
-  ACCOUNTING_MAX_FILE_BYTES,
   ACCOUNTING_MAX_LOSS_MARKERS,
   ACCOUNTING_MAX_MONTHS,
   ACCOUNTING_MAX_PACKET_ATTEMPTS,
@@ -149,7 +148,6 @@ export const ACCOUNTING_DEFAULT_DETAIL_ROWS = ACCOUNTING_MAX_RECENT_ROWS;
 
 const LIFETIME_TARGET = "lifetime.json";
 const RECENT_TARGET = "recent.json";
-const DAY_TARGET = /^(\d{4}-\d{2}-\d{2})\.json$/;
 const RETRY_MIN_MS = 25;
 
 export type AccountingReadResult<T> =
@@ -428,7 +426,6 @@ function validTimestamp(value: unknown): value is string { return typeof value =
 function dayFor(value: string): string | null { return validTimestamp(value) ? value.slice(0, 10) : null; }
 function minuteFor(value: string): string | null { return validTimestamp(value) ? value.slice(11, 16) : null; }
 function monthFor(value: string): string | null { return validTimestamp(value) ? value.slice(0, 7) : null; }
-function dayTarget(value: string): boolean { const match = DAY_TARGET.exec(value); return match !== null && validDate(match[1]); }
 function targetForDay(date: string): string { return `${date}.json`; }
 function defaultDirectory(): string {
   if (process.env.VITEST !== undefined) return join(tmpdir(), "llm-relay-vitest", `accounting-${process.pid}-${randomBytes(8).toString("hex")}`);

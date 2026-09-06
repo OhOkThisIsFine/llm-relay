@@ -197,4 +197,107 @@ export default [
       'sonarjs/regex-complexity': 'off',
     },
   },
+  {
+    // INVARIANT: these comparisons are runtime guards at boundaries the TYPE system believes are
+    // total, and every one of those boundaries is real. `AccountingRecorder` is a published
+    // interface, so `accounting-store.ts` must degrade rather than throw on a caller that hands it
+    // null; `dispatch.ts` states the rule on the line above the one flagged ("never throw
+    // mid-render or evict on garbage"); `circuit-breaker.ts` casts `handle as unknown` FIRST,
+    // precisely to signal that the value being checked is foreign; and `keystore.ts` is narrowing
+    // an overload's own arguments. A type that describes the INTENDED caller is not evidence about
+    // the actual one — the same reasoning `key-checker.ts` follows when it declines to call an
+    // unproven credential bad.
+    files: [
+      'src/accounting-store.ts',
+      'src/accounting-store-schema.ts',
+      'src/circuit-breaker.ts',
+      'src/cli.ts',
+      'src/dashboard-snapshot.ts',
+      'src/dispatch.ts',
+      'src/keystore.ts',
+      'src/mcp/lane-runner.ts',
+    ],
+    rules: {
+      'sonarjs/different-types-comparison': 'off',
+    },
+  },
+  {
+    // INVARIANT: `!(cell.known > 0)` is NOT `cell.known <= 0`. The two differ on NaN, and this
+    // predicate decides whether a token cell counts as MEASURED at all — the comment above it
+    // states the rule in as many words ("absence of evidence, not evidence of consumption"). The
+    // rewrite this lint suggests would admit an unusable reading as a measurement, which is the
+    // provenance invariant facing the wrong way.
+    files: ['src/accounting-store.ts'],
+    rules: {
+      'sonarjs/no-inverted-boolean-check': 'off',
+    },
+  },
+  {
+    // INVARIANT: the control-character range IS the guard. `dashboard-static.ts` rejects a manifest
+    // path containing one because that is how a traversal is smuggled through, and
+    // `dashboard-routes.ts` does the same for a query value it may echo. Deleting the range to
+    // satisfy the rule removes exactly the defect the rule imagines it is preventing.
+    files: ['src/dashboard-static.ts', 'src/dashboard-routes.ts'],
+    rules: {
+      'no-control-regex': 'off',
+    },
+  },
+  {
+    // INVARIANT: an alias here names a DOMAIN concept that happens to share another's underlying
+    // type today. `HardCapSource` is `ConfiguredLimitSource` because a hard cap resolves through
+    // the same per-axis ladder, not because the two are the same idea. Collapsing them couples two
+    // vocabularies this repository documents as separate and leaves free to diverge.
+    files: ['src/accounting-store-schema.ts', 'src/accounting.ts', 'src/configured-limits.ts'],
+    rules: {
+      'sonarjs/redundant-type-aliases': 'off',
+    },
+  },
+  {
+    // INVARIANT: a result-or-error union return is this repository's established shape for a parser
+    // that must not throw. `parsePairs` returns rows or a `QueryParseError`; `credentialAttemptLabel`
+    // returns a closed label union. Narrowing either to a single type would force a throw or a
+    // sentinel, and the surrounding code exists to avoid both.
+    files: ['src/candidate-runner.ts', 'src/dashboard-routes.ts'],
+    rules: {
+      'sonarjs/function-return-type': 'off',
+    },
+  },
+  {
+    // INVARIANT: the Windows `.cmd` fallback is a callback inside a callback because
+    // `child_process.exec` is callback-shaped and the retry can only be issued from the first
+    // call's error path. Flattening it would lose the `killed` and `child` state the retry reads.
+    files: ['src/mcp/lane-runner.ts'],
+    rules: {
+      'sonarjs/no-nested-functions': 'off',
+    },
+  },
+  {
+    // INVARIANT: each of these fires on something the SUITE does on purpose, which is the same
+    // reasoning the test block above already records — fixture and assertion style is not a defect
+    // class. `no-hardcoded-passwords` fires on fixture secrets that exist so custody tests never
+    // touch a real keystore; `no-nested-functions` on test scaffolding; `no-empty` on a stub's
+    // deliberate `catch {}`; `no-all-duplicated-branches` and `no-identical-functions` on table
+    // rows that are MEANT to read identically; and `no-floating-point-equality`,
+    // `prefer-regexp-exec` and `no-non-null-asserted-optional-chain` on assertion spellings.
+    //
+    // ⚠ `sonarjs/deprecation` is here for ONE reason: `extractQuotaPercent` is deprecated, has ZERO
+    // consumers in `src/`, and is still a published export — so its test must keep covering it
+    // until it is REMOVED. Removing it is filed in the backlog, not silenced here.
+    //
+    // ⚠ Still NOT relaxed, for the reason the block above gives: `@typescript-eslint/no-unused-vars`
+    // and `sonarjs/unused-import`. A stale import in a test is how an assertion silently stops
+    // covering what its name claims, and this lap deleted eight such imports rather than hide them.
+    files: ['test/**/*.ts'],
+    rules: {
+      'sonarjs/no-hardcoded-passwords': 'off',
+      'sonarjs/no-nested-functions': 'off',
+      'no-empty': 'off',
+      'sonarjs/no-all-duplicated-branches': 'off',
+      'sonarjs/no-identical-functions': 'off',
+      'sonarjs/no-floating-point-equality': 'off',
+      'sonarjs/prefer-regexp-exec': 'off',
+      '@typescript-eslint/no-non-null-asserted-optional-chain': 'off',
+      'sonarjs/deprecation': 'off',
+    },
+  },
 ];

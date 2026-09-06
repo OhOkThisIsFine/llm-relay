@@ -22,7 +22,6 @@ import {
   classifyCommand,
   normalizeDispatchCommands,
   resolveDispatchView,
-  substituteTaskInView,
   proxyUrl,
   run,
   runDispatch,
