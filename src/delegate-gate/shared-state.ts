@@ -1,7 +1,6 @@
 import ts from "typescript";
 import type { DiffFile } from "./diff-parser.js";
-import { reportedPath } from "./diff-parser.js";
-import { reconstructPostImage } from "./post-image.js";
+import { findingPreamble, runFileAnalyzer } from "./file-driver.js";
 import type { Finding } from "./types.js";
 
 const TS_FILE = /\.(ts|tsx|mts|cts)$/;
@@ -117,12 +116,9 @@ function findMutationSites(sourceFile: ts.SourceFile): MutationSite[] {
 }
 
 function findingsForFile(file: DiffFile, path: string, readOriginal: (path: string) => string | null): Finding[] {
-  const original = file.isNew ? null : readOriginal(path);
-  const { lines, addedLines } = reconstructPostImage(original, file);
-  if (addedLines.size === 0) return [];
-
-  const content = lines.join("\n");
-  const sourceFile = ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, path.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  const preamble = findingPreamble(file, path, readOriginal, { tsx: path.endsWith(".tsx") });
+  if (preamble === null) return [];
+  const { addedLines, sourceFile } = preamble;
   const moduleScope = collectModuleScopeBindings(sourceFile);
   if (moduleScope.size === 0) return [];
 
@@ -157,11 +153,8 @@ function findingsForFile(file: DiffFile, path: string, readOriginal: (path: stri
  * delegate did not touch is not this diff's defect.
  */
 export function analyzeSharedStateMutation(files: readonly DiffFile[], readOriginal: (path: string) => string | null): Finding[] {
-  const findings: Finding[] = [];
-  for (const file of files) {
-    const path = reportedPath(file);
-    if (!TS_FILE.test(path) || file.hunks.length === 0) continue;
-    findings.push(...findingsForFile(file, path, readOriginal));
-  }
-  return findings;
+  return runFileAnalyzer(files, readOriginal, (file, path, readOriginal) => {
+    if (!TS_FILE.test(path)) return [];
+    return findingsForFile(file, path, readOriginal);
+  });
 }

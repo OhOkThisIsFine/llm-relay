@@ -1,7 +1,7 @@
 import ts from "typescript";
 import type { DiffFile } from "./diff-parser.js";
 import { reportedPath } from "./diff-parser.js";
-import { reconstructPostImage } from "./post-image.js";
+import { findingPreamble } from "./file-driver.js";
 import type { Finding } from "./types.js";
 
 /** A file this pass considers a test file — the diff-minimality and cast detectors run over
@@ -250,12 +250,9 @@ function describeLocalReplicaCall(chain: ExpectChain, importedNames: ReadonlySet
 }
 
 function findingsForFile(file: DiffFile, path: string, readOriginal: (path: string) => string | null): Finding[] {
-  const original = file.isNew ? null : readOriginal(path);
-  const { lines, addedLines } = reconstructPostImage(original, file);
-  if (addedLines.size === 0) return [];
-
-  const content = lines.join("\n");
-  const sourceFile = ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const preamble = findingPreamble(file, path, readOriginal, { tsx: false });
+  if (preamble === null) return [];
+  const { addedLines, sourceFile } = preamble;
   const importedNames = collectImportedNames(sourceFile);
   const localFunctionNames = collectLocallyDeclaredFunctionNames(sourceFile);
 

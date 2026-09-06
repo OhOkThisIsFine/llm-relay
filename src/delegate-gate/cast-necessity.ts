@@ -1,7 +1,7 @@
 import ts from "typescript";
 import type { DiffFile, DiffLine } from "./diff-parser.js";
 import { reportedPath } from "./diff-parser.js";
-import { reconstructPostImage } from "./post-image.js";
+import { findingPreamble, runFileAnalyzer } from "./file-driver.js";
 import type { Finding } from "./types.js";
 
 /** A single-line, mechanical correction to one `+` line of the diff — the raw-index-addressed
@@ -78,12 +78,9 @@ function describeCast(node: ts.AsExpression): { detail: string; autoFixable: boo
  * syntactic rather than risk a false positive on a cast that genuinely narrows or widens a type.
  */
 function findingsForFile(file: DiffFile, path: string, readOriginal: (path: string) => string | null): Finding[] {
-  const original = file.isNew ? null : readOriginal(path);
-  const { lines, addedLines } = reconstructPostImage(original, file);
-  if (addedLines.size === 0) return [];
-
-  const content = lines.join("\n");
-  const sourceFile = ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, path.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  const preamble = findingPreamble(file, path, readOriginal, { tsx: path.endsWith(".tsx") });
+  if (preamble === null) return [];
+  const { addedLines, sourceFile } = preamble;
 
   const findings: Finding[] = [];
   for (const node of findAsExpressionsOnAddedLines(sourceFile, addedLines)) {
@@ -102,13 +99,10 @@ function findingsForFile(file: DiffFile, path: string, readOriginal: (path: stri
 }
 
 export function analyzeCastNecessity(files: readonly DiffFile[], readOriginal: (path: string) => string | null): Finding[] {
-  const findings: Finding[] = [];
-  for (const file of files) {
-    const path = reportedPath(file);
-    if (!TS_FILE.test(path) || file.hunks.length === 0) continue;
-    findings.push(...findingsForFile(file, path, readOriginal));
-  }
-  return findings;
+  return runFileAnalyzer(files, readOriginal, (file, path, readOriginal) => {
+    if (!TS_FILE.test(path)) return [];
+    return findingsForFile(file, path, readOriginal);
+  });
 }
 
 /** The diff's own `add` line at post-image line `newLine`, or undefined if none matches — used to
@@ -123,12 +117,9 @@ function addedDiffLine(file: DiffFile, newLine: number): DiffLine | undefined {
 }
 
 function castEditsForFile(file: DiffFile, path: string, readOriginal: (path: string) => string | null): CastFixEdit[] {
-  const original = file.isNew ? null : readOriginal(path);
-  const { lines, addedLines } = reconstructPostImage(original, file);
-  if (addedLines.size === 0) return [];
-
-  const content = lines.join("\n");
-  const sourceFile = ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, path.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  const preamble = findingPreamble(file, path, readOriginal, { tsx: path.endsWith(".tsx") });
+  if (preamble === null) return [];
+  const { lines, addedLines, sourceFile } = preamble;
 
   const edits: CastFixEdit[] = [];
   for (const node of findAsExpressionsOnAddedLines(sourceFile, addedLines)) {
