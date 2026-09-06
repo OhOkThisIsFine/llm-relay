@@ -96,16 +96,17 @@
   **Property:** the two documents agree — either `CLAUDE.md` records the amendment and CI carries
   the gate, or the runbook records that Tier 1 was declined, and why.
 
-- **`dispatch` loses the job when `waitMs` exceeds the host's tool-call timeout.** Measured three
-  times on 2026-09-05 against Claude Code: `waitMs` of 100000 and of 240000 both returned
-  `Error: Request timed out` to the caller, and a concurrent pair returned `Error: Connection
-  closed`. Each time the `llm-relay mcp` child RESTARTED — job ids reset to `job-0001` — so the
-  running lane was orphaned and `dispatch_status` answered `unknown jobId`. One packet's 100 seconds
-  of lane work was lost outright. `waitMs: 45000` returns a job handle every time. The tool's own
-  description promises that a slow dispatch "degrades to polling instead of failing"; above the
-  host's timeout it fails AND loses the job. **Property:** a dispatch whose `waitMs` exceeds the
-  host's tool-call timeout still leaves a pollable job, or the server refuses the `waitMs` up front
-  and states the ceiling it accepts.
+- **`dispatch` loses the job when `waitMs` exceeds the host's tool-call timeout — the SERVER half.**
+  ⚠ The item itself is MACHINE-WIDE and already filed as the first entry of `C:\Code\docs\backlog.md`
+  (opened 2026-09-05 at the tutor-sync lap, corroborated three more times the same evening at this
+  repository's Phase 1a lap: `waitMs` of 100000 and 240000 both returned `Error: Request timed out`
+  with no job id, a concurrent pair returned `Error: Connection closed`, the job counter restarted
+  at `job-0001` every time, and one packet lost 100 seconds of lane work). It is recorded here as
+  well only because the fix is partly ours: `src/mcp/server.ts` decides what `dispatch` returns and
+  what the `waitMs` ceiling is. **Property (this repository's half):** the server either returns a
+  pollable job id whatever `waitMs` says, or refuses a `waitMs` it cannot honour and states the
+  ceiling it accepts. Do not restate the host half here; keep it in the machine backlog, which is
+  where every other host that hits it will look.
 
 - **Muse Spark 1.3 — and every Responses-only OpenCode Zen SKU — is unreachable through the
   relay, because no upstream speaks the OpenAI Responses API.** Zen serves
