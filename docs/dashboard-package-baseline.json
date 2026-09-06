@@ -1,5 +1,5 @@
 {
-  "observedAt": "2026-09-04",
+  "observedAt": "2026-09-05",
   "exactMetrics": [
     "dashboardFiles",
     "dashboardRawBytes",
@@ -15,14 +15,14 @@
     "cssBytes": 11841,
     "htmlBytes": 383,
     "manifestBytes": 185,
-    "packBytes": 952273,
-    "unpackedBytes": 4880876,
-    "packageEntries": 389
+    "packBytes": 959904,
+    "unpackedBytes": 4898916,
+    "packageEntries": 398
   },
   "ceilings": {
     "dashboardRawBytes": 291600,
-    "packBytes": 957100,
+    "packBytes": 964800,
     "unpackedBytes": 4906000,
-    "packageEntries": 392
+    "packageEntries": 401
   }
 }
