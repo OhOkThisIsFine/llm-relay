@@ -104,6 +104,60 @@ describe("tool-call dialect recovery", () => {
     ]);
   });
 
+  /**
+   * Owner ruling 2026-09-06. The destructive check runs BEFORE the argument check.
+   *
+   * ⚠ CLONE-26 (2026-09-05) made three parsers discard a call whose arguments are not a JSON
+   * object. That silently moved WHEN the destructive filter fires, because the filter used to read
+   * the calls a parser had COMMITTED — so discarding the payload removed the name from its view
+   * entirely. A `Bash` call the relay had recognised in model TEXT stopped being refused and became
+   * an ordinary unparseable envelope: still a 502, but blamed upstream, retried across the whole
+   * pool, and charged against that provider's health.
+   *
+   * The refusal is about the relay having recognised a destructive call in TEXT at all. Whether its
+   * arguments happened to parse is a separate question, and it must not gate the refusal.
+   */
+  const REFUSES_BASH = (name: string): boolean => name.toLowerCase() === "bash";
+
+  const kimiPayload = (name: string, payload: string): string =>
+    `<|tool_call_begin|>functions.${name}:0<|tool_call_argument_begin|>${payload}<|tool_call_end|>`;
+  const functionTagPayload = (name: string, payload: string): string =>
+    `<function=${name}>${payload}</function>`;
+
+  it.each([
+    ["a DeepSeek scalar payload", `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>Bash\n` + "```json\n42\n```" + `<｜tool▁call▁end｜><｜tool▁calls▁end｜>`],
+    ["a DeepSeek array payload", `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>Bash\n` + "```json\n[1,2]\n```" + `<｜tool▁call▁end｜><｜tool▁calls▁end｜>`],
+    ["an unparseable DeepSeek payload", `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>Bash\n` + "```json\n{oops\n```" + `<｜tool▁call▁end｜><｜tool▁calls▁end｜>`],
+    ["a Kimi scalar payload", kimiPayload("Bash", "42")],
+    ["an unparseable Kimi payload", kimiPayload("Bash", "{oops")],
+    ["an unparseable function-tag payload", functionTagPayload("Bash", "{oops")],
+  ])("refuses a destructive name recognised alongside %s", (_label, text) => {
+    const out = recoverToolCalls(text, schemas, REFUSES_BASH);
+    expect(out.status).toBe("refused-destructive");
+    expect(out.status === "refused-destructive" && out.refused).toEqual(["Bash"]);
+  });
+
+  /**
+   * The two negative controls that stop this from being "refuse everything".
+   *
+   * The first keeps CLONE-26 intact: a NON-destructive name with a malformed payload still commits
+   * nothing and still fails clean to `detected`, so failover reaches a host that parses. The second
+   * is the case that always worked and must keep working.
+   */
+  it("still discards a non-destructive malformed payload rather than refusing it", () => {
+    const out = recoverToolCalls(deepSeekPayload("42"), schemas, REFUSES_BASH);
+    expect(out.status).toBe("detected");
+  });
+
+  it("still refuses a WELL-FORMED destructive call, as it always did", () => {
+    const text =
+      `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>Bash\n` +
+      "```json\n" + `{"command":"ls"}` + "\n```" +
+      `<｜tool▁call▁end｜><｜tool▁calls▁end｜>`;
+    const out = recoverToolCalls(text, schemas, REFUSES_BASH);
+    expect(out.status).toBe("refused-destructive");
+  });
+
   it("reports a TRUNCATED envelope as detected, and never guesses a call out of it", () => {
     // The other measured failure: 70 bytes, the tail of a stream. There is no call to recover
     // here — the caller must fail clean so failover reaches a host that parses, rather than

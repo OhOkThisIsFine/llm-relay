@@ -83,6 +83,23 @@ export interface DialectToolCall {
   input: Record<string, unknown>;
 }
 
+/**
+ * What one dialect parser found: the calls it is willing to COMMIT, and every tool name it
+ * RECOGNISED — including names whose call it then discarded.
+ *
+ * ⚠ The second list exists so the destructive check can run BEFORE the argument check (owner
+ * ruling 2026-09-06). A parser that discards a malformed payload used to remove the name from
+ * the matcher's view entirely, so a Bash call the relay had recognised in model TEXT stopped
+ * being refused and became an ordinary unparseable envelope — blamed upstream and retried
+ * across the whole pool instead of stopping dead. What the refusal is about is that the relay
+ * recognised a destructive call in TEXT at all; whether its arguments happened to parse is a
+ * separate question and must not gate it.
+ */
+interface DialectScan {
+  readonly calls: DialectToolCall[];
+  readonly names: string[];
+}
+
 export type DialectOutcome =
   /** No tool-call framing present. The text is just text. */
   | { status: "none" }
@@ -239,13 +256,15 @@ function fromJsonPayload(raw: string): DialectToolCall | null {
 }
 
 /** `<invoke name="x"><parameter name="p">v</parameter></invoke>`, with or without DSML markers. */
-function fromInvokeForm(text: string, schemas: Map<string, SchemaLike>): DialectToolCall[] {
+function fromInvokeForm(text: string, schemas: Map<string, SchemaLike>): DialectScan {
   const calls: DialectToolCall[] = [];
+  const names: string[] = [];
   const invoke = /<(?:｜DSML｜)?invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:｜DSML｜)?invoke>/g;
   for (const m of text.matchAll(invoke)) {
     const name = m[1];
     const bodyText = m[2];
     if (!name || bodyText === undefined) continue;
+    names.push(name);
     const input: Record<string, unknown> = {};
     const param = /<(?:｜DSML｜)?parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:｜DSML｜)?parameter>/g;
     for (const p of bodyText.matchAll(param)) {
@@ -256,17 +275,19 @@ function fromInvokeForm(text: string, schemas: Map<string, SchemaLike>): Dialect
     }
     calls.push({ name, input });
   }
-  return calls;
+  return { calls, names };
 }
 
 /** DeepSeek native: `…begin｜>function<｜tool▁sep｜>NAME\n```json\n{…}\n``` `. */
-function fromDeepSeekForm(text: string): DialectToolCall[] {
+function fromDeepSeekForm(text: string): DialectScan {
   const calls: DialectToolCall[] = [];
+  const names: string[] = [];
   const re = /<｜tool▁sep｜>([^\n<]+)\n+(?:```(?:json)?\n)?([\s\S]*?)(?:\n?```)?\s*<｜tool▁call▁end｜>/g;
   for (const m of text.matchAll(re)) {
     const name = m[1];
     const payload = m[2];
     if (!name || payload === undefined) continue;
+    names.push(name.trim());
     try {
       const parsed = JSON.parse(payload.trim()) as unknown;
       // Owner ruling 2026-09-05 (CLONE-26, option A): a payload that is not a JSON object states no
@@ -274,16 +295,17 @@ function fromDeepSeekForm(text: string): DialectToolCall[] {
       // and an array used to be cast to a `Record` it is not — both are the relay deciding what the
       // model meant, which is the inference `recoverToolCalls` exists to refuse. Discard this
       // dialect's whole contribution instead, exactly as `fromKimiTokenForm` already does.
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { calls: [], names };
       calls.push({ name: name.trim(), input: parsed as Record<string, unknown> });
-    } catch { /* an unparseable body leaves `detected` to the caller */ return []; }
+    } catch { /* an unparseable body leaves `detected` to the caller */ return { calls: [], names }; }
   }
-  return calls;
+  return { calls, names };
 }
 
 /** Kimi ASCII token blocks: `<|tool_call_begin|>functions.NAME:0<|tool_call_argument_begin|>{…}<|tool_call_end|>`. */
-function fromKimiTokenForm(text: string): DialectToolCall[] {
+function fromKimiTokenForm(text: string): DialectScan {
   const calls: DialectToolCall[] = [];
+  const names: string[] = [];
   const re = /<\|tool_call_begin\|>\s*([\s\S]*?)\s*<\|tool_call_argument_begin\|>\s*([\s\S]*?)\s*<\|tool_call_end\|>/g;
   for (const m of text.matchAll(re)) {
     const idToken = m[1];
@@ -294,30 +316,35 @@ function fromKimiTokenForm(text: string): DialectToolCall[] {
     // tool was meant — unparseable, so the whole recovery fails clean to `detected` rather than
     // guessing a target.
     const nameMatch = /^functions\.([A-Za-z0-9_.-]+):\d+$/.exec(idToken.trim());
-    if (!nameMatch) return [];
+    if (!nameMatch) return { calls: [], names };
+    names.push(nameMatch[1]!);
     try {
       const parsed = JSON.parse(payload.trim()) as unknown;
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { calls: [], names };
       calls.push({ name: nameMatch[1]!, input: parsed as Record<string, unknown> });
     } catch {
-      return [];
+      return { calls: [], names };
     }
   }
-  return calls;
+  return { calls, names };
 }
 
 /** `<tool_call>{json}</tool_call>` (Hermes/Qwen) and `<function=NAME>{json}</function>`. */
-function fromTaggedJsonForms(text: string): DialectToolCall[] {
+function fromTaggedJsonForms(text: string): DialectScan {
   const calls: DialectToolCall[] = [];
+  const names: string[] = [];
   for (const m of text.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)) {
     if (m[1] === undefined) continue;
     const c = fromJsonPayload(m[1]);
-    if (c) calls.push(c);
+    // This form carries its name INSIDE the payload, so an unparseable one recognises no name at
+    // all — there is nothing for the destructive check to refuse, and nothing hidden from it.
+    if (c) { calls.push(c); names.push(c.name); }
   }
   for (const m of text.matchAll(/<function=([^>]+)>([\s\S]*?)<\/function>/g)) {
     const name = m[1];
     const payload = m[2];
     if (!name || payload === undefined) continue;
+    names.push(name.trim());
     let input: Record<string, unknown> = {};
     try {
       const parsed = JSON.parse(payload.trim()) as unknown;
@@ -325,7 +352,7 @@ function fromTaggedJsonForms(text: string): DialectToolCall[] {
     } catch { continue; }
     calls.push({ name: name.trim(), input });
   }
-  return calls;
+  return { calls, names };
 }
 
 /** Everything the envelope occupied, so the surviving prose can stay a text block. */
@@ -365,15 +392,22 @@ export function recoverToolCalls(
   const dialect = detectDialect(text);
   if (!dialect) return { status: "none" };
 
-  const calls = [
-    ...fromInvokeForm(text, schemas),
-    ...fromDeepSeekForm(text),
-    ...fromKimiTokenForm(text),
-    ...fromTaggedJsonForms(text),
-  ].filter((c) => c.name.length > 0);
+  const scans = [
+    fromInvokeForm(text, schemas),
+    fromDeepSeekForm(text),
+    fromKimiTokenForm(text),
+    fromTaggedJsonForms(text),
+  ];
 
-  if (calls.length === 0) return { status: "detected", dialect };
-  const refused = [...new Set(calls.filter((c) => isDestructive(c.name)).map((c) => c.name))];
+  // ⚠ The destructive check runs FIRST, over every name a parser RECOGNISED — not over the calls
+  // it managed to commit (owner ruling 2026-09-06). Ordered the other way, the refusal depended on
+  // whether the arguments happened to parse: a Bash call the relay had recognised in model text
+  // became an ordinary unparseable envelope, blamed upstream and retried across the whole pool,
+  // instead of stopping dead. Recognising a destructive call in TEXT is what the refusal is about.
+  const refused = [...new Set(scans.flatMap((s) => s.names).filter((n) => n.length > 0 && isDestructive(n)))];
   if (refused.length > 0) return { status: "refused-destructive", dialect, refused };
+
+  const calls = scans.flatMap((s) => s.calls).filter((c) => c.name.length > 0);
+  if (calls.length === 0) return { status: "detected", dialect };
   return { status: "parsed", calls, text: stripEnvelopes(text), dialect };
 }

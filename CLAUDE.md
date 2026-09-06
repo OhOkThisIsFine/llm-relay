@@ -481,20 +481,28 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   ⚠ `test/openai-dialect-passthrough.test.ts` carried a test named *"validates a recovered
   destructive call without refusing or reshaping it"* asserting HTTP 200 — another case of a test
   written to pin the defect it should have caught. It was flipped in the same commit as the fix.
-  ⚠⚠ **CLONE-26 (v0.72.3, 2026-09-05) MOVED WHEN THIS REFUSAL FIRES, and the move is live on the
-  wire.** `recoverToolCalls` runs the destructive matcher over the calls the four parsers already
-  COMMITTED, so a parser that discards a block removes it from the matcher's view. `fromDeepSeekForm`
-  used to commit a scalar payload with empty arguments and an array payload cast as the arguments;
-  under the owner's option-A ruling it now discards both. **So a DeepSeek block whose payload is a
-  scalar or an array and whose name is in `repair.destructiveTools` no longer yields
-  `refused-destructive`** — 502, `origin: "local"`, code `tool_dialect_refused_destructive`, the
-  `x-llm-relay-tool-dialect` header, no failover, no breaker charge — **and yields `detected`
-  instead**: 502, `origin: "upstream"`, no header, a full pool reroll and a breaker charge.
-  ⚠ The invariant is unharmed either way: no destructive call is FABRICATED on either path, which is
-  what "refused, never fabricated" actually protects. What moved is the error code, the header, the
-  failover and the health accounting. It is recorded here because the docs must describe what the
-  code does; whether to keep it, or to move the destructive check ahead of the payload check so the
-  refusal still fires, is an open owner decision in [docs/backlog.md](docs/backlog.md).
+  ⚠⚠ **The destructive check runs BEFORE the argument check, over every name a parser RECOGNISED —
+  not over the calls it committed** (owner ruling 2026-09-06). Each of the four parsers returns a
+  `DialectScan`: the calls it is willing to commit, AND every tool name it recognised, including
+  names whose call it then discarded. `recoverToolCalls` refuses on that name list first.
+  ⚠ **This exists because CLONE-26 silently moved when the refusal fires, and it took a day to
+  notice.** That change (v0.72.3) made three parsers discard a call whose arguments are not a JSON
+  object. The matcher read COMMITTED calls, so discarding the payload removed the name from its
+  view entirely: a `Bash` call the relay had recognised in model TEXT stopped yielding
+  `refused-destructive` — 502, `origin: "local"`, code `tool_dialect_refused_destructive`, the
+  `x-llm-relay-tool-dialect` header, no failover, no breaker charge — and became an ordinary
+  `detected`: 502, `origin: "upstream"`, no header, a full pool reroll and a breaker charge.
+  ⚠ The invariant was unharmed either way — no destructive call is FABRICATED on either path, which
+  is what "refused, never fabricated" actually protects — but the error code, the header, the
+  failover and the health accounting all moved, on a safety-shaped surface, as a side effect of an
+  unrelated parser fix. **The lesson generalises: a filter that reads what an earlier stage
+  COMMITTED inherits that stage's discard policy as its own trigger condition.**
+  ⚠ The rule is now the same across all four parsers, which CLONE-26 had left inconsistent: a
+  malformed payload under a destructive name refuses on the DeepSeek, Kimi and `<function=NAME>`
+  forms alike. The `<tool_call>` form carries its name INSIDE the payload, so an unparseable one
+  recognises no name and there is nothing to refuse — containment, not an exemption. Pinned by six
+  refusal cases plus two negative controls in `test/tool-dialects.test.ts`; reverting the parsers
+  fails exactly those six and leaves the controls green.
 - **Loopback is not authorization; the mutating endpoints have admission checks.** Any page the
   user visits can POST cross-origin to the listener, and a `text/plain` POST is a CORS *simple
   request* — no preflight. The attacker cannot read the response, but `/offload` rewrites
