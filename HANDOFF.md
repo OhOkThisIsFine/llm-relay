@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-05 (the Phase 1a duplication lap)
+## 0. State as of 2026-09-05 (v0.72.2, the Phase 1a duplication lap)
 
 **Phase 1a of the duplication-and-complexity program.** The owner's audit — a runbook, a catalog of
 27 CLONE / 7 SEM / 15 HOTSPOT / 5 BENIGN items, an adversarial verification giving all of them a
