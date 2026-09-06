@@ -1118,11 +1118,61 @@ export function orderByUsabilityTracked(
   return { ordered: [...live, ...slow, ...faulted, ...cooling], quotaDemotedFirst: null, latencyDemotedFirst: null };
 }
 
+/** What one HTTP status means to the walk: how to classify the outcome, and whether the body may
+ * carry an eligibility fact worth interpreting. */
+export interface StatusVerdict {
+  readonly outcome: OutcomeClass;
+  readonly carriesEligibilityFact: boolean;
+}
+
+/**
+ * The statuses this relay has a specific opinion about — SEM-04 in the 2026-09-05 duplication
+ * catalog, REFINE ("outcome-class table only") in the adversarial verification.
+ *
+ * `classifyStatus` and `carriesEligibilityFact` each carried their own membership list, and the
+ * two lists were the same seven statuses written twice. They read this table now, so a status
+ * cannot be retriable in one and eligibility-bearing in neither.
+ *
+ * ⚠ It is deliberately NOT the whole classification. HTTP status is an unbounded integer domain,
+ * not a closed union, so the two RANGE rules — under 400, and 500 and above — stay in
+ * `statusVerdict` below where a table cannot express them.
+ *
+ * ⚠ Membership here is policy. Do not add or move a row as part of a mechanical change; every
+ * entry is a decision about failover, and `CLAUDE.md` records why 402 sits with the retriable
+ * statuses rather than the client ones (on the free providers this proxy fronts it means
+ * depleted credits, not a malformed request).
+ */
+export const STATUS_VERDICT_TABLE: Readonly<Record<number, StatusVerdict>> = Object.freeze({
+  400: { outcome: "retriable", carriesEligibilityFact: true },
+  401: { outcome: "credential", carriesEligibilityFact: true },
+  402: { outcome: "retriable", carriesEligibilityFact: true },
+  403: { outcome: "credential", carriesEligibilityFact: true },
+  404: { outcome: "retriable", carriesEligibilityFact: true },
+  410: { outcome: "retriable", carriesEligibilityFact: true },
+  429: { outcome: "retriable", carriesEligibilityFact: true },
+});
+
+const UNLISTED_BELOW_400: StatusVerdict = Object.freeze({ outcome: "ok", carriesEligibilityFact: false });
+const UNLISTED_SERVER_ERROR: StatusVerdict = Object.freeze({ outcome: "retriable", carriesEligibilityFact: false });
+const UNLISTED_CLIENT_ERROR: StatusVerdict = Object.freeze({ outcome: "client", carriesEligibilityFact: false });
+
+/**
+ * The one reading of an HTTP status both classifiers now share.
+ *
+ * ⚠ An unlisted 4xx falls to `client` — the WEAKER claim, meaning the walk does NOT fail over.
+ * That direction is the safe one for a status nobody has reasoned about, and it is what both
+ * hand-written chains already did.
+ */
+export function statusVerdict(status: number): StatusVerdict {
+  const listed = STATUS_VERDICT_TABLE[status];
+  if (listed !== undefined) return listed;
+  if (status < 400) return UNLISTED_BELOW_400;
+  if (status >= 500) return UNLISTED_SERVER_ERROR;
+  return UNLISTED_CLIENT_ERROR;
+}
+
 export function classifyStatus(status: number): OutcomeClass {
-  if (status < 400) return "ok";
-  if (status === 401 || status === 403) return "credential";
-  if (status === 400 || status === 402 || status === 404 || status === 410 || status === 429 || status >= 500) return "retriable";
-  return "client";
+  return statusVerdict(status).outcome;
 }
 
 export function shouldTryNext(cls: OutcomeClass): boolean {
@@ -1513,15 +1563,7 @@ export function resolveReset(
 }
 
 export function carriesEligibilityFact(status: number): boolean {
-  return (
-    status === 400 ||
-    status === 401 ||
-    status === 402 ||
-    status === 403 ||
-    status === 404 ||
-    status === 410 ||
-    status === 429
-  );
+  return statusVerdict(status).carriesEligibilityFact;
 }
 
 export type InspectedCandidateResponse =
