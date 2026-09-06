@@ -485,10 +485,15 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
   not over the calls it committed** (owner ruling 2026-09-06). Each of the four parsers returns a
   `DialectScan`: the calls it is willing to commit, AND every tool name it recognised, including
   names whose call it then discarded. `recoverToolCalls` refuses on that name list first.
-  ⚠ **This exists because CLONE-26 silently moved when the refusal fires, and it took a day to
-  notice.** That change (v0.72.3) made three parsers discard a call whose arguments are not a JSON
-  object. The matcher read COMMITTED calls, so discarding the payload removed the name from its
-  view entirely: a `Bash` call the relay had recognised in model TEXT stopped yielding
+  ⚠⚠ **The filter was BORN with this gap, on 2026-08-24 — it is not something a recent commit
+  introduced.** Dates, because the causal story is easy to get wrong and this file got it wrong
+  first: `fromTaggedJsonForms` and its `catch { continue; }` landed 2026-08-08 (`44b0724`);
+  `fromKimiTokenForm` and its three `return []` discards landed 2026-08-13 (`0a38e42`); the
+  destructive filter itself landed 2026-08-24 (`091cf7c`, v0.46.0), reading COMMITTED calls. So on
+  the day the filter was written, two of the four parsers already discarded a malformed payload and
+  the filter already could not see those names. CLONE-26 (v0.72.3, 2026-09-05) did NOT create the
+  class — it touched `fromDeepSeekForm` alone, extending an existing hole to a third parser.
+  ⚠ What the gap cost: a `Bash` call the relay had recognised in model TEXT did not yield
   `refused-destructive` — 502, `origin: "local"`, code `tool_dialect_refused_destructive`, the
   `x-llm-relay-tool-dialect` header, no failover, no breaker charge — and became an ordinary
   `detected`: 502, `origin: "upstream"`, no header, a full pool reroll and a breaker charge.
@@ -1203,12 +1208,27 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
 living state; what follows is the durable residue — decisions, standing warnings and lessons that
 outlive any one release. Per-release narration belongs there and in git, never here.
 
-**The last known safety-shaped code gap closed in v0.46.0** — the dialect-rescue destructive
-filter (`091cf7c`). `destructive` had reached none of `tool-dialects.ts`, `openai-dialect.ts`,
-`dialect-stream.ts`, so a WELL-FORMED destructive call the relay reconstructed out of assistant
-prose was served unfiltered. It is now refused whole and terminally at all four rescue commit
-points, with provenance declared rather than read off the wire; see the gotcha above and
+**v0.46.0 closed a safety-shaped code gap and opened another one in the same commit** — the
+dialect-rescue destructive filter (`091cf7c`, 2026-08-24). What it closed: `destructive` had
+reached none of `tool-dialects.ts`, `openai-dialect.ts`, `dialect-stream.ts`, so a WELL-FORMED
+destructive call the relay reconstructed out of assistant prose was served unfiltered. That half
+holds — such a call is refused whole and terminally at all four rescue commit points, with
+provenance declared rather than read off the wire; see the gotcha above and
 [docs/dialect-rescue-destructive-refusal-2026-08-24.md](docs/dialect-rescue-destructive-refusal-2026-08-24.md).
+
+⚠⚠ **What it opened, unnoticed for thirteen days: the filter read the calls the parsers had
+COMMITTED.** Two parsers already discarded a malformed payload on that date —
+`fromTaggedJsonForms` since 2026-08-08 and `fromKimiTokenForm` since 2026-08-13 — so a destructive
+name inside a malformed envelope was already invisible to the filter the day it was written. It
+was found on 2026-09-06 only because CLONE-26 extended the same discard to a third parser and the
+change was verified afterwards rather than trusted. Fixed in v0.73.1: each parser now reports every
+name it RECOGNISED and the filter reads that list first.
+
+⚠ **So this section previously said "the last known safety-shaped code gap closed in v0.46.0", and
+that sentence was false the day it was written.** Kept here as the correction rather than deleted,
+because the lesson is the durable part: a check that reads what an earlier stage COMMITTED inherits
+that stage's discard policy as its own trigger condition, and no test, typecheck or gate can see it.
+Do not replace this with a fresh "no known gaps" claim — say what has been LOOKED at instead.
 HANDOFF §6 still lists only recorded trades — no open code gaps.
 
 **The metering sprint is complete (2026-08-22, evening)** — Stages 0–6 of
