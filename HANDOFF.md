@@ -2,66 +2,44 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-06 (v0.73.0, the Phase 1b completion lap)
+## 0. State as of 2026-09-06 (the owner-rulings lap, unreleased on top of v0.73.0)
 
-**Phase 1b is finished except for two owner decisions.** This lap landed the three items that
-needed no ruling: **CLONE-07** (one named `relayAuthoredResponse` predicate for four call sites),
-the **`extractQuotaPercent` removal**, and **HOTSPOT-03** in two stages — `src/spec.ts` first, then
-`src/config/routing-parser.ts`. `config.ts` is **2001 → 1261** lines across the lap.
+**Phase 1b is closed.** The owner ruled on all three open questions and two of them were built the
+same lap; the third is scheduled.
 
-The previous lap (v0.72.3) landed CLONE-26, P1-04, HOTSPOT-10, CLONE-12 and the eslint fold-in;
-its record is [docs/closeout-phase-1b-2026-09-05.md](docs/closeout-phase-1b-2026-09-05.md) and
-[docs/phase-1b-recon-2026-09-05.md](docs/phase-1b-recon-2026-09-05.md).
+- ✅ **The destructive check now runs BEFORE the argument check** (`057fca7`). CLONE-26 had silently
+  moved when the dialect-rescue refusal fires: the matcher read the calls parsers had COMMITTED, so
+  a parser that discarded a malformed payload removed the name from its view. A `Bash` call the
+  relay recognised in model TEXT stopped yielding `refused-destructive` and became an ordinary
+  `detected` — blamed upstream, retried across the whole pool, charged against provider health.
+  Each parser now returns a `DialectScan` carrying every name it RECOGNISED, and the refusal reads
+  that list first. Six refusal cases and two negative controls; reverting the parsers fails exactly
+  those six.
+- ✅ **One clamp for both absolute-deadline write sites in `dispatch.ts`** (`449bf9d`). The owner
+  declined the general SEM-06 extraction and took only the pair that survived the analysis.
+- 📅 **`parseRouting` will be decomposed in a later lap.** Owner's choice over accepting its size.
+  It is still cognitive complexity 125; the HOTSPOT-03 move relocated the hotspot without shrinking
+  it. The backlog entry carries the property and the risk.
 
-**How the HOTSPOT-03 move was verified, because "the suite is green" is not evidence for a 700-line
-extraction.** A multiset comparison of every non-blank, non-comment line, scoped to STAGE 2 —
-`git show e5d3074^:src/config.ts` against the union of `e5d3074:src/config.ts` and
-`e5d3074:src/config/routing-parser.ts` — reports exactly TWO removals: the spec import line losing
-its now-unused `AUTO_MODEL`, and `function parseRouting(` gaining an `export`. Ten additions, every
-one import or export plumbing. No functional line changed. An independent auditor reproduced both
-numbers.
-⚠ **State the scope and the hashes, or the check does not reproduce.** Run the same comparison from
-the SPRINT START instead and it reports 8 removals and 11 additions — not a hidden change, but
-stage 1's own move of `POOL_PREFIX`, `AUTO_MODEL` and `splitSpec` into `src/spec.ts`, a file that
-"the two new files" union excludes. The wording "HEAD" was lifted from the stage-2 commit message,
-where it meant that commit's parent; quoted later it means something else.
-⚠ A naive per-function body diff reports FOUR false positives, because comment blocks legitimately
-move between neighbours when the code around them moves; compare code lines, not spans.
+⚠ **The lesson from the destructive defect generalises past this filter: a check that reads what an
+earlier stage COMMITTED inherits that stage's discard policy as its own trigger condition.** An
+unrelated parser fix moved a safety-shaped behaviour, and nothing failed — no test, no typecheck, no
+gate. It surfaced only because the change was verified afterwards rather than trusted.
 
-**Two corrections to the item, both from reading HEAD rather than the plan:**
-
-- The closure is 19 symbols, not 11. `DEFAULT_LANE_PROBE`, `parseOffload` and `parseRouting` have
-  real importers outside `config.ts`, so the new module exports them and `config.ts` re-exports all
-  three — no other importer changed. Three names the survey flagged (`assertSpecResolvable` at the
-  old `config.ts:538`, `parseHedge` in `hedge-trigger.ts`, the second `parseLatencyDemotion` hit)
-  are COMMENTS, not calls.
-- The complexity discrepancy is settled: `parseRouting` measures **125**, so the in-source comment's
-  124 was right and the catalog's 137 was not. ⚠ The extraction MOVED that hotspot; it did not
-  shrink it. Filed with its own property.
-
-**The package baseline moved twice this lap**, once per HOTSPOT-03 stage: `packageEntries` 398 →
-401 → 404, three `dist/` entries per new module. Its ceiling went 401 → 407 on the file's existing
-+3 convention; `packBytes` and `unpackedBytes` stayed under theirs and were left alone rather than
-loosened. `AGENTS.md` is the generated multi-host pointer, refreshed by
-`~/.agent-config/sync.mjs --projects` after each `CLAUDE.md` edit.
+⚠ **Behaviour change beyond restoring the DeepSeek case, stated rather than left to be discovered:**
+a destructive name with a malformed payload on the Kimi or `<function=NAME>` form now refuses where
+it previously fell through to `detected`. Both move in the ruling's direction, and leaving the four
+parsers inconsistent is what let the original defect hide.
 
 Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry:
 
-- **Two owner decisions, both with their evidence written.** **(1) P1-06 / SEM-06 — recommend
-  DECLINE.** Four genuinely different clamps plus three uses of `??` is not one rule, and
-  `failureCooldown`'s floor changes the reported RUNG rather than the value; a shared evaluator
-  would need a mode flag. This reverses an ACCEPT verdict, so nothing was built. **(2) CLONE-26
-  moved a second thing its ruling did not name** — a scalar or array payload under a destructive
-  tool name now yields `detected` with a pool reroll instead of `refused-destructive` with no
-  failover. Live on the wire since v0.72.3, and now documented in `CLAUDE.md`'s dialect gotcha
-  whatever the ruling turns out to be.
-- **`parseRouting` is still complexity 125.** Decompose it deliberately or record that it is
-  accepted — but read the standing invariant first: `CLAUDE.md` records that restructuring to
-  satisfy that rule is the enterprise-shaped refactor the 2026-08-04 review already rejected.
+- **Decompose `parseRouting`** (ruled, scheduled). ⚠ The risk is ORDER, not size: which error an
+  operator sees for a config with two mistakes depends on the validation sequence, and a reordering
+  is invisible to the suite — exactly how the keystore prologue's order turned out to be uncovered.
+  Pin the order before splitting.
 - **The Tier 1 CI gate stays DEFERRED.** Unchanged.
-- The `dispatch` `waitMs` trap: above the host's tool-call timeout it fails AND orphans the lane.
-  ⚠ Hit again this lap in a new form — a review job vanished with `unknown jobId` mid-run because
-  the MCP child restarted, so the handle could not be polled at all.
+- The `dispatch` `waitMs` trap, now met in a second form: a job can vanish with `unknown jobId`
+  because the MCP child restarted, so the handle cannot be polled at all.
 
 Carried unchanged, none of them touched here:
 
@@ -77,13 +55,14 @@ Carried unchanged, none of them touched here:
 - `test/os-keyring.test.ts` "sanitizes a thrown child error" is path-sensitive and fails inside a
   lane worktree with a junctioned `node_modules`.
 
-⚠ **On offload, with the measurement from both laps.** Free lanes CANNOT do open-ended
+⚠ **On offload, with the measurement from three laps.** Free lanes CANNOT do open-ended
 reconnaissance here — 7 of 7 packets failed adversarial verification on 2026-09-05, fabricating
 symbol names and line ranges with total confidence. They ARE useful for reviewing a CONCRETE diff
-against a STATED claim: a `free-pool` lane checked the CLONE-07 change in 208 s, rebuilt the truth
-table from source and correctly reported no differences. The distinction that predicts which way it
+against a STATED claim: a `free-pool` lane checked the CLONE-07 change in 208 s, rebuilt its truth
+table from source and correctly found no differences. The distinction that predicts which way it
 goes is whether the output can be checked by running or reading something specific. ⚠ Do not key a
-fallback on a `null` result — a lane that fabricates returns something.
+fallback on a `null` result — a lane that fabricates returns something. ⚠ And never make a lane the
+only check: one review job vanished mid-run when the MCP child restarted.
 
 ⚠ **`opencode-muse-spark` is congested, not broken** (owner, 2026-09-05: other agents dispatch to it
 concurrently). A probe at `--variant xhigh` ran 683 s on a one-file line count and was cancelled.

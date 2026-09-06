@@ -57,64 +57,34 @@
   ⚠ Calibrate before building: the current window mixes several sessions' traffic, so per-lane
   history has to be attributable before any threshold drawn from it means anything.
 
-- **`parseRouting` is still cognitive complexity 125 — HOTSPOT-03 moved it, it did not shrink it**
-  (measured 2026-09-06, after the extraction). This also settles the discrepancy the item flagged:
-  the catalog said 137, the in-source comment said 124, and the real figure at
-  `src/config/routing-parser.ts:173` is **125**. The comment was right; the catalog was not.
+- **✅ RULED 2026-09-06, and SCHEDULED: decompose `parseRouting`.** The owner chose to split it in a
+  later lap rather than accept its size. Measured after the HOTSPOT-03 extraction, it is still
+  cognitive complexity **125** against a threshold of 15 — the move relocated the hotspot, it did
+  not shrink it. That measurement also settles the discrepancy the item flagged: the catalog said
+  137, the in-source comment said 124, and the real figure at `src/config/routing-parser.ts:173` is
+  125. The comment was right; the catalog was not.
 
-  ⚠ This is not a regression and the extraction was not mis-scoped. HOTSPOT-03's stated property was
-  about the MOVE — that `config.ts` declares no moved symbol, that the new module is a leaf, and
-  that the parser is pure — and all three hold and are pinned. But a reader who expects "the hotspot
-  is dealt with" should know the function itself is unchanged; what changed is that it no longer
-  sits in the middle of a 2,000-line file. Two smaller functions in the same module measure 32 and
-  36.
+  ⚠ Not a regression, and the extraction was not mis-scoped. HOTSPOT-03's stated property was about
+  the MOVE — that `config.ts` declares no moved symbol, that the new module is a leaf, and that the
+  parser is pure — and all three hold and are pinned by
+  `test/config/routing-parser-is-a-leaf.test.ts`. What changed is that the function no longer sits
+  in the middle of a 2,000-line file. Two smaller functions in the same module measure 32 and 36.
 
-  ⚠ Before splitting it, read the standing invariant: `CLAUDE.md` records that restructuring
-  `server.ts`/`config.ts` to satisfy `sonarjs/cognitive-complexity` is the enterprise-shaped
-  refactor [`suggestion-review-2026-08-04.md`](suggestion-review-2026-08-04.md) already rejected
-  against the project's own rubric, and the rule is a WARNING for exactly that reason. So this entry
-  is a decision to take deliberately or not at all.
+  ⚠ **The risk to plan around is ORDER, not size.** `parseRouting` validates sub-blocks in a
+  sequence, and which error an operator sees for a config with two mistakes in it depends on that
+  sequence. A reordering is invisible to the suite — that is exactly how the keystore prologue's
+  precondition order turned out to be uncovered on 2026-09-05, where moving one check past another
+  left all 94 tests green. Pin the order before splitting, not after.
 
-  **Property:** either `parseRouting` is decomposed with each part's validation order preserved and
-  the config suite green, or a line in `CLAUDE.md` records that its complexity is accepted and why.
+  ⚠ Read the standing invariant first: `CLAUDE.md` records that restructuring `server.ts`/`config.ts`
+  to satisfy `sonarjs/cognitive-complexity` is the enterprise-shaped refactor
+  [`suggestion-review-2026-08-04.md`](suggestion-review-2026-08-04.md) already rejected against the
+  project's own rubric, and the rule is a WARNING for that reason. The owner has now chosen to do it
+  for this one function; that choice does not generalise to the others.
 
-
-- **Owner decision: P1-06 / SEM-06 — recommend DECLINE, and record it.** The item says "explicit
-  beats default" is re-implemented across six modules. Read at HEAD on 2026-09-05, there is no one
-  rule to extract, and the full site-by-site table is in
-  [`phase-1b-recon-2026-09-05.md`](phase-1b-recon-2026-09-05.md). In short: four genuinely different
-  clamps (floors 0 against `MIN_RETRY_AFTER_MS`, ceilings 30 days against 15 minutes, absent-handling
-  a default against `null`, two of them on an ABSOLUTE time rather than a duration) plus three sites
-  whose entire contribution is the `??` operator.
-
-  ⚠ `failureCooldown` is the case that settles it: its floor does not raise the value, it changes the
-  RUNG — a measurement that fails to beat the default is reported `source: "default"`, and that
-  source is persisted breaker state. One shared evaluator would need a mode flag to express it, which
-  is the two-policies-under-one-name shape this repository already warns against. Wrapping `a ?? b`
-  in a function call makes the code worse.
-
-  This reverses an ACCEPT verdict from the adversarial verification, so it is the owner's call and
-  nothing was built. What survives, and it is small, is the intra-`dispatch.ts` pair at `:373` and
-  `:384`, which really do clamp an absolute time the same way.
-
-  **Property:** the two documents agree — either the plan records that SEM-06 was declined and why,
-  or an owner instruction says to build it anyway and the mode flag is designed deliberately.
-
-- **Owner decision: CLONE-26 moved a second thing its ruling did not name.** Shipped 2026-09-05
-  (`f9006e7`) as ruled, option A, with five pinning cases and a mutation check. The ruling covered
-  the scalar and array payloads; it did not cover what happens when such a payload carries a name in
-  `repair.destructiveTools`. Before: the parser committed a call, so the destructive filter saw it
-  and returned `refused-destructive` — HTTP 502, `origin: "local"`, code
-  `tool_dialect_refused_destructive`, the `x-llm-relay-tool-dialect` header, no failover, no breaker
-  charge. After: the payload is discarded before the filter sees it, so the same input returns
-  `detected` — HTTP 502, `origin: "upstream"`, no header, a full pool reroll and a breaker charge.
-
-  No destructive call is fabricated on either path, so the safety invariant is unharmed. What moved
-  is the error code, the header, the failover and the health accounting.
-
-  **Property:** the owner either accepts the new behaviour and it is recorded in `CLAUDE.md` beside
-  the dialect-rescue gotcha, or the destructive check is moved ahead of the payload validity check so
-  the refusal still fires.
+  **Property:** `parseRouting` is decomposed into per-sub-block functions, each part's validation
+  ORDER is preserved and pinned by a test that fails if two checks are swapped, and the config suite
+  is green.
 
 - **Owner decision, DEFERRED 2026-09-05: whether to adopt the runbook's Tier 1 duplication CI
   gate.** [`reviews/duplication-and-complexity-runbook-2026-09-05.md`](reviews/duplication-and-complexity-runbook-2026-09-05.md)
