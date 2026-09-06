@@ -280,10 +280,6 @@ export default [
     // rows that are MEANT to read identically; and `no-floating-point-equality`,
     // `prefer-regexp-exec` and `no-non-null-asserted-optional-chain` on assertion spellings.
     //
-    // ⚠ `sonarjs/deprecation` is here for ONE reason: `extractQuotaPercent` is deprecated, has ZERO
-    // consumers in `src/`, and is still a published export — so its test must keep covering it
-    // until it is REMOVED. Removing it is filed in the backlog, not silenced here.
-    //
     // ⚠ Still NOT relaxed, for the reason the block above gives: `@typescript-eslint/no-unused-vars`
     // and `sonarjs/unused-import`. A stale import in a test is how an assertion silently stops
     // covering what its name claims, and this lap deleted eight such imports rather than hide them.
@@ -297,7 +293,6 @@ export default [
       'sonarjs/no-floating-point-equality': 'off',
       'sonarjs/prefer-regexp-exec': 'off',
       '@typescript-eslint/no-non-null-asserted-optional-chain': 'off',
-      'sonarjs/deprecation': 'off',
     },
   },
 ];

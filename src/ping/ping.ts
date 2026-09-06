@@ -2,8 +2,6 @@ import type { ProviderConfig } from "../config.js";
 import { buildAuthHeaders } from "../authEnv.js";
 import {
   extractQuotaObservations,
-  headroomPercent,
-  type QuotaHeaders,
   type QuotaObservation,
 } from "../quota-observation.js";
 
@@ -16,15 +14,6 @@ export interface PingResult {
   code: string;
   ms: number;
   quotaObservations: QuotaObservation[];
-}
-
-/**
- * @deprecated Quota has more than one independent axis. Use `extractQuotaObservations()` and
- * render each observation directly. This compatibility adapter declines ambiguous responses.
- */
-export function extractQuotaPercent(headers: QuotaHeaders): number | null {
-  const observations = extractQuotaObservations(headers);
-  return observations.length === 1 ? headroomPercent(observations[0]!) : null;
 }
 
 export function markDisabledThinkingUnsupported(providerName: string): void {

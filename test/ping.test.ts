@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { getAvg, getP95, getJitter, getSpikeRate, getUptime, getStabilityScore, getVerdict, type PingRecord } from "../src/ping/metrics.js";
-import { extractQuotaPercent, buildPingRequest, pingProviderModel } from "../src/ping/ping.js";
+import { buildPingRequest, pingProviderModel } from "../src/ping/ping.js";
 import {
   BROKEN_PROBE_BACKOFF_BASE_MS,
   loadProbeCache,
@@ -161,26 +161,6 @@ describe("Ping Metrics", () => {
   });
 });
 
-
-describe("Header Quota Parsing", () => {
-  it("keeps the deprecated scalar wrapper only for one unambiguous observation", () => {
-    const headers = {
-      "x-ratelimit-remaining-requests": "45",
-      "x-ratelimit-limit-requests": "100",
-    };
-    expect(extractQuotaPercent(headers)).toBe(45);
-  });
-
-  it("returns null for absent or ambiguous quota", () => {
-    expect(extractQuotaPercent({})).toBeNull();
-    expect(extractQuotaPercent({
-      "x-ratelimit-remaining-requests-day": "45",
-      "x-ratelimit-limit-requests-day": "100",
-      "x-ratelimit-remaining-tokens-minute": "800",
-      "x-ratelimit-limit-tokens-minute": "1000",
-    })).toBeNull();
-  });
-});
 
 describe("Ping Requests", () => {
   it("builds OpenAI-compatible probe body with disabled thinking toggle", () => {
