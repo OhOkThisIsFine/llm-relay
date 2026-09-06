@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-05 (the Phase 1b duplication lap, unreleased on top of v0.72.2)
+## 0. State as of 2026-09-05 (v0.72.3, the Phase 1b duplication lap)
 
 **Five of Phase 1b's seven items landed; two are owner decisions and one is scoped for the next
 lap.** Shipped, each with its own commit, its own pinning test and a recorded mutation check:
