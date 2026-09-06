@@ -10,6 +10,17 @@ change anything observable).
 
 21 agents, 0 errors, 3.48 M subagent tokens, 21 minutes.
 
+⚠ **Where the primary evidence lives, stated because it is NOT in this repository.** The per-agent
+return values are one `{"type":"result",…}` line each in the orchestrating session's workflow
+journal, under
+`~/.claude/projects/C--Code-llm-relay/<session>/subagents/workflows/wf_a9613828-abe/journal.jsonl`,
+with a full transcript per agent beside it. That directory is session-local and is not committed —
+so the counts and quotations below are a faithful summary of it, not something a later reader can
+re-derive from the tree. An independent auditor flagged exactly this, and it is the right flag: the
+narrative rests on an operator-authored document. The parts that ARE independently checkable, and
+were checked by hand in the orchestrating session before anything was written, are the corrected
+FACTS — the real symbol names, line numbers and module shapes recorded under each item below.
+
 ## Headline: the free lane cannot do reconnaissance in this repository
 
 **All 7 lane packets failed both lenses. 14 verdicts, 14 times `packetSound: false`.**
@@ -180,6 +191,20 @@ the same way.
 
 ⚠ This reverses an ACCEPT verdict from the adversarial verification, so it is the owner's call, not
 a silent decision. Nothing was built.
+
+### The package baseline's pre-lap `observed` figures were already stale
+
+Raised by the closeout auditor and worth recording, because it is a property of the metric rather
+than of this lap. `docs/dashboard-package-baseline.json` carried `packageEntries: 389` and
+`packBytes: 952273` from 2026-09-04. A fresh build at this lap's start commit measures **392** and
+**956714** on this machine. Nothing was wrong: `scripts/dashboard-package-check.mjs` compares those
+two fields against CEILINGS only — `exactMetrics` covers the dashboard asset figures, not these —
+so an `observed` value that drifts is never equality-checked and cannot be caught. The same class
+was recorded once before, for a stale `observed.unpackedBytes`.
+
+What this lap changed is the DELTA, and that reproduces: HOTSPOT-10 adds exactly six `dist/`
+entries, 392 → 398, which the auditor confirmed by building at both commits. The `observed` block
+is now the measured truth again.
 
 ### HOTSPOT-03 is buildable but is its own lap
 

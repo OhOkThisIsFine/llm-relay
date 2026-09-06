@@ -5,7 +5,10 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 ## 0. State as of 2026-09-05 (v0.72.3, the Phase 1b duplication lap)
 
 **Five of Phase 1b's seven items landed; two are owner decisions and one is scoped for the next
-lap.** Shipped, each with its own commit, its own pinning test and a recorded mutation check:
+lap.** Shipped, each with its own commit. The four CODE items each carry a pinning test and a
+recorded mutation check; the eslint fold-in carries neither, and correctly — it is a lint-config
+change plus the deletion of genuinely dead code, and `npm run check` is its whole verification.
+Shipped:
 **CLONE-26** (a DeepSeek payload that is not a JSON object commits nothing — the owner's option A),
 **P1-04** (one `createSseTransformStream` for both stream transforms), **HOTSPOT-10** (envelope
 validation and stream preflight get their own modules under `src/backend/`), **CLONE-12** (one
