@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -22,9 +23,45 @@ import { describe, expect, it } from "vitest";
  * ⚠ A `#Lnn` fragment on a SOURCE file is a GitHub blob anchor and is allowed; the same fragment
  * on a `.md` target is not, because a rendered markdown page has no line anchors — it would look
  * like a precise pointer and land nowhere.
+ *
+ * ⚠⚠ A link TARGET resolves against the files git TRACKS, never against the working tree. An
+ * `existsSync` check passed for a file that existed only in one checkout, so a link written beside
+ * an uncommitted document was green locally and red in CI — the v0.71.0 publish died exactly that
+ * way, on a backlog link to a design doc a concurrent session had not committed. The INDEX is the
+ * right granularity rather than HEAD: `git add` is enough, so a document and the link to it still
+ * pass together before either is committed.
+ *
+ * ⚠ Link SOURCES stay the working tree on purpose. A doc you have just written is checked
+ * immediately, which is the early warning this guard is for; only what it POINTS AT has to be
+ * staged.
  */
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+
+/**
+ * Every path git has in its index, repo-relative with `/` separators — `ls-files` emits exactly
+ * that shape on every platform, so no separator translation is needed here.
+ */
+const trackedFiles = new Set(
+  execFileSync("git", ["ls-files", "-z"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  })
+    .split("\0")
+    .filter((entry) => entry.length > 0),
+);
+
+/**
+ * Every directory holding a tracked file. `ls-files` lists files only, and a link may legitimately
+ * point at a directory (`](docs/)`), which would otherwise read as broken.
+ */
+const trackedDirs = new Set<string>();
+for (const file of trackedFiles) {
+  for (let cut = file.lastIndexOf("/"); cut !== -1; cut = file.lastIndexOf("/", cut - 1)) {
+    trackedDirs.add(file.slice(0, cut));
+  }
+}
 
 function walkMarkdown(dir: string): string[] {
   const out: string[] = [];
@@ -67,21 +104,39 @@ function linksIn(file: string): Link[] {
   return out;
 }
 
+/**
+ * Resolve one link the way a reader on github.com would, then ask the index — not the disk —
+ * whether the answer exists. A target outside the repository can never be tracked, so it is
+ * reported broken rather than silently passed.
+ */
+function resolvesInIndex(from: string, target: string): boolean {
+  // A `path.ts:120` suffix is this repo's own file:line notation, not part of the filename.
+  const abs = resolve(dirname(join(repoRoot, from)), target.replace(/:\d+(-\d+)?$/, ""));
+  const rel = relative(repoRoot, abs).split(sep).join("/");
+  if (rel === "") return true;
+  if (rel === ".." || rel.startsWith("../")) return false;
+  return trackedFiles.has(rel) || trackedDirs.has(rel);
+}
+
 const allLinks = docFiles.flatMap(linksIn);
 
 describe("documentation links", () => {
+  it("reads the tracked-file set from git", () => {
+    // A silent empty set would pass every other case here by reporting nothing broken.
+    expect(trackedFiles.size).toBeGreaterThan(100);
+  });
+
   it("finds links to check", () => {
     expect(allLinks.length).toBeGreaterThan(50);
   });
 
-  it("every relative link resolves to a file that exists", () => {
+  it("every relative link resolves to a file git tracks", () => {
     const broken = allLinks
-      // A `path.ts:120` suffix is this repo's own file:line notation, not part of the filename.
-      .filter(({ from, target }) => !existsSync(resolve(dirname(join(repoRoot, from)), target.replace(/:\d+(-\d+)?$/, ""))))
+      .filter(({ from, target }) => !resolvesInIndex(from, target))
       .map(({ from, target }) => `${from}  ->  ${target}`);
     expect(
       [...new Set(broken)].sort(),
-      `These documentation links do not resolve:\n  ${[...new Set(broken)].sort().join("\n  ")}`,
+      `These documentation links do not resolve against the git index:\n  ${[...new Set(broken)].sort().join("\n  ")}`,
     ).toEqual([]);
   });
 
