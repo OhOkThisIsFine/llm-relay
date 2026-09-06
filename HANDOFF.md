@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-06 (the Phase 1b completion lap, unreleased on top of v0.72.3)
+## 0. State as of 2026-09-06 (v0.73.0, the Phase 1b completion lap)
 
 **Phase 1b is finished except for two owner decisions.** This lap landed the three items that
 needed no ruling: **CLONE-07** (one named `relayAuthoredResponse` predicate for four call sites),
