@@ -112,3 +112,91 @@ export function sseEventFields(frame: string): SseEventFields {
   }
   return { eventLines, dataLines };
 }
+
+/**
+ * What a stream transform contributes, beyond the scaffold every one of them shares.
+ *
+ * The scaffold owns the machinery; the visitor owns the policy. `processFrames` drains whatever the
+ * scaffold has buffered and pushes what should reach the client. `flushHeld` is OPTIONAL, and it
+ * exists for a visitor that can be mid-decision when the stream ends: the scaffold calls it at
+ * exactly one point, in BOTH the success tail and the error tail, immediately before the trailing
+ * remainder is pushed. A visitor that never holds anything omits it and the call is a no-op — which
+ * is why one scaffold serves both callers byte-for-byte.
+ */
+export interface SseStreamVisitor {
+  processFrames: () => void;
+  flushHeld?: () => void;
+}
+
+/** What the scaffold hands a visitor at stream start. */
+export interface SseStreamContext {
+  /** Enqueue text for the client. An empty write is suppressed, as every caller already did. */
+  push: (text: string) => void;
+  /** The frame buffer the scaffold feeds and the visitor drains. */
+  frames: BufferedSseFrames;
+}
+
+/**
+ * The ONE read loop, error tail and lifecycle for an SSE-rewriting `ReadableStream` transform.
+ *
+ * `stripThinkTagsInStream` and `rewriteToolUseIdsInStream` each privately owned a byte-identical
+ * copy of all of it: a `TextDecoder`, a `TextEncoder`, a `BufferedSseFrames`, an empty-suppressing
+ * `push`, a `for(;;) reader.read()` loop, an end-of-stream `decoder.decode()` with a final drain,
+ * `push(frames.takeRemainder())`, a catch that drains and then emits the `event: error` frame, and
+ * `controller.close()` in `finally`. Only the frame policy and one optional flush ever differed
+ * (CLONE-20).
+ *
+ * ⚠ The error tail is not incidental, and no future visitor may skip it: a broken upstream is ALSO
+ * an unclosed candidate, so held text is released before the error is reported. Otherwise a
+ * transform whose stated purpose is losslessness turns transport doubt into silent content
+ * deletion. Owning that once is the point of this function.
+ *
+ * ⚠ It lives here, in the leaf both callers already import, rather than in `sse.ts` as the P1-04
+ * plan proposed. The plan's stated reason — that `sse.ts` already owns shared SSE vocabulary
+ * through `iterateDataPayloads` — does not hold: that generator is PRIVATE to `sse.ts`, whose
+ * domain is rebuilding an `AssistantMessage`. Putting a framing primitive there would make two
+ * stream wrappers depend on the message reconstructor for nothing.
+ */
+export function createSseTransformStream(
+  upstream: ReadableStream<Uint8Array>,
+  makeVisitor: (ctx: SseStreamContext) => SseStreamVisitor,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const frames = new BufferedSseFrames();
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const push = (text: string): void => {
+        if (text.length > 0) controller.enqueue(encoder.encode(text));
+      };
+      const visitor = makeVisitor({ push, frames });
+      const reader = upstream.getReader();
+
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          frames.append(decoder.decode(value, { stream: true }));
+          visitor.processFrames();
+        }
+        frames.append(decoder.decode());
+        visitor.processFrames();
+        visitor.flushHeld?.();
+        // A truncated non-event tail is outside every visitor's seam; preserve it verbatim.
+        push(frames.takeRemainder());
+      } catch (e) {
+        // A broken upstream is also an unclosed candidate. Release held text before reporting the
+        // stream error so no visitor turns transport doubt into silent content deletion.
+        frames.append(decoder.decode());
+        visitor.processFrames();
+        visitor.flushHeld?.();
+        push(frames.takeRemainder());
+        const message = e instanceof Error ? e.message : String(e);
+        push(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `llm-relay: stream failed: ${message}` } })}\n\n`);
+      } finally {
+        controller.close();
+      }
+    },
+  });
+}

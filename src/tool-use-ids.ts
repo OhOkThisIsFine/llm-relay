@@ -1,5 +1,5 @@
 import { isRecord } from "./json-shape.js";
-import { BufferedSseFrames, sseEventFields } from "./sse-frames.js";
+import { createSseTransformStream, sseEventFields } from "./sse-frames.js";
 
 /**
  * Make a translated response's `tool_use` ids unique against the conversation that produced it.
@@ -183,19 +183,14 @@ export function rewriteToolUseIdsInStream(
   takenIds: () => Iterable<string>,
   onRewrite?: (count: number) => void,
 ): ReadableStream<Uint8Array> {
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  const frames = new BufferedSseFrames();
-  let minter: ToolUseIdMinter | null = null;
+  // The decoder, encoder, frame buffer, read loop and error tail live in
+  // `createSseTransformStream` (CLONE-20). This transform holds nothing between frames, so it
+  // declares no `flushHeld` and the scaffold's flush point is a no-op for it — which is exactly
+  // what this function did before the scaffold existed.
+  return createSseTransformStream(upstream, ({ push, frames }) => {
+    let minter: ToolUseIdMinter | null = null;
 
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const push = (text: string) => {
-        if (text.length > 0) controller.enqueue(encoder.encode(text));
-      };
-      const reader = upstream.getReader();
-
-      const rewriteOne = (block: string): string | null => {
+    const rewriteOne = (block: string): string | null => {
         // Cheap gate: a tool_use content_block_start always spells the type literally, so ordinary
         // text deltas cost a substring scan rather than a JSON parse.
         if (!block.includes("tool_use")) return null;
@@ -217,35 +212,13 @@ export function rewriteToolUseIdsInStream(
         return replaceEventData(block, JSON.stringify({ ...parsed, content_block: { ...cb, id: minted } }));
       };
 
-      const processFrames = () => {
+    return {
+      processFrames: () => {
         for (const { frame: block, separator } of frames) {
           const rewritten = rewriteOne(block);
           push((rewritten ?? block) + separator);
         }
-      };
-
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          frames.append(decoder.decode(value, { stream: true }));
-          processFrames();
-        }
-        frames.append(decoder.decode());
-        processFrames();
-        // A truncated final event is outside this seam; preserve it verbatim.
-        push(frames.takeRemainder());
-      } catch (e) {
-        // Release what is held before reporting: an id fix must never turn a transport failure
-        // into deleted content. Same contract as `stripThinkTagsInStream`.
-        frames.append(decoder.decode());
-        processFrames();
-        push(frames.takeRemainder());
-        const message = e instanceof Error ? e.message : String(e);
-        push(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `llm-relay: stream failed: ${message}` } })}\n\n`);
-      } finally {
-        controller.close();
-      }
-    },
+      },
+    };
   });
 }

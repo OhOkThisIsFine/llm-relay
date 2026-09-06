@@ -102,4 +102,35 @@ describe("message-opening think-tag strip", () => {
     expect(emittedText(out)).toBe("<think>unfinished");
     expect(out.indexOf("<think>unfinished")).toBeLessThan(out.indexOf("event: content_block_stop"));
   });
+
+  /**
+   * ⚠ The error tail had NO coverage before P1-04 moved it into `createSseTransformStream`:
+   * deleting the whole `catch` block left every other test in this file green. It carries this
+   * module's losslessness guarantee, so it is pinned rather than trusted — the same uncovered-tail
+   * class the Phase 1a accounting-schema extraction found.
+   *
+   * A broken upstream is also an UNCLOSED think tag. The held text must therefore reach the client
+   * BEFORE the error frame, or a transport failure silently deletes content the model produced.
+   */
+  it("releases held text before it reports a broken upstream", async () => {
+    const encoder = new TextEncoder();
+    const source = OPEN_STREAM + textDelta("<think>unfinished");
+    let sent = false;
+    const broken = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (!sent) {
+          sent = true;
+          controller.enqueue(encoder.encode(source));
+          return;
+        }
+        controller.error(new Error("socket reset"));
+      },
+    });
+
+    const out = await collect(stripThinkTagsInStream(broken));
+
+    expect(emittedText(out)).toBe("<think>unfinished");
+    expect(out).toContain("llm-relay: stream failed: socket reset");
+    expect(out.indexOf("<think>unfinished")).toBeLessThan(out.indexOf("event: error"));
+  });
 });

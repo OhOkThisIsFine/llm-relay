@@ -6,7 +6,7 @@
  * unnested block; every uncertain shape is released byte-for-byte as ordinary text.
  */
 
-import { BufferedSseFrames, parseSseEvent } from "./sse-frames.js";
+import { createSseTransformStream, parseSseEvent } from "./sse-frames.js";
 
 const OPEN_TAG = "<think>";
 const CLOSE_TAG = "</think>";
@@ -142,24 +142,22 @@ function sseDelta(index: number, text: string): string {
 export function stripThinkTagsInStream(
   upstream: ReadableStream<Uint8Array>,
 ): ReadableStream<Uint8Array> {
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  const filter = new ThinkTagStripFilter();
-  const frames = new BufferedSseFrames();
-  let blockIndex = 0;
+  // The decoder, encoder, frame buffer, read loop and error tail live in
+  // `createSseTransformStream`; only the frame policy and the held-text flush are this filter's
+  // (CLONE-20). The flush runs at the scaffold's one flush point, which is where this function
+  // always called it: after the final drain, before the trailing remainder, in both tails.
+  return createSseTransformStream(upstream, ({ push, frames }) => {
+    const filter = new ThinkTagStripFilter();
+    let blockIndex = 0;
 
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const push = (text: string) => {
-        if (text.length > 0) controller.enqueue(encoder.encode(text));
-      };
-      const flushHeld = () => {
-        const tail = filter.flush();
-        if (tail.length > 0) push(sseDelta(blockIndex, tail));
-      };
-      const reader = upstream.getReader();
+    const flushHeld = (): void => {
+      const tail = filter.flush();
+      if (tail.length > 0) push(sseDelta(blockIndex, tail));
+    };
 
-      const processFrames = () => {
+    return {
+      flushHeld,
+      processFrames: () => {
         for (const { frame: block, raw } of frames) {
           const ev = parseSseEvent(block);
           if (!ev) {
@@ -186,32 +184,7 @@ export function stripThinkTagsInStream(
           if (ev.type === "content_block_stop" || ev.type === "message_stop") flushHeld();
           push(raw);
         }
-      };
-
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          frames.append(decoder.decode(value, { stream: true }));
-          processFrames();
-        }
-        frames.append(decoder.decode());
-        processFrames();
-        flushHeld();
-        // A truncated non-event tail is outside the filter's text seam; preserve it verbatim.
-        push(frames.takeRemainder());
-      } catch (e) {
-        // A broken upstream is also an unclosed candidate. Release held text before reporting the
-        // stream error so this filter never turns transport doubt into silent content deletion.
-        frames.append(decoder.decode());
-        processFrames();
-        flushHeld();
-        push(frames.takeRemainder());
-        const message = e instanceof Error ? e.message : String(e);
-        push(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `llm-relay: stream failed: ${message}` } })}\n\n`);
-      } finally {
-        controller.close();
-      }
-    },
+      },
+    };
   });
 }

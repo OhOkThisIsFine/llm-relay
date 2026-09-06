@@ -227,4 +227,32 @@ describe("rewriteToolUseIdsInStream", () => {
     expect(out).toBe(raw);
     expect(asked).toBe(0);
   });
+
+  /**
+   * ⚠ The error tail had NO coverage before P1-04 moved it into `createSseTransformStream`:
+   * deleting the whole `catch` block left every other test in this file green. This transform holds
+   * nothing between frames, so the property here is narrower than the think-tags one — every byte
+   * already forwarded survives, and the error frame follows it — but the tail is shared now, so
+   * both callers pin it.
+   */
+  it("keeps the bytes it already forwarded and then reports a broken upstream", async () => {
+    const enc = new TextEncoder();
+    const raw = OPEN + ev("content_block_delta", { index: 0, delta: { type: "text_delta", text: "hi" } });
+    let sent = false;
+    const broken = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (!sent) {
+          sent = true;
+          c.enqueue(enc.encode(raw));
+          return;
+        }
+        c.error(new Error("socket reset"));
+      },
+    });
+
+    const out = await collect(rewriteToolUseIdsInStream(broken, () => new Set()));
+
+    expect(out.startsWith(raw)).toBe(true);
+    expect(out).toContain("llm-relay: stream failed: socket reset");
+  });
 });
