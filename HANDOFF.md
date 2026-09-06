@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-06 (the owner-rulings lap, unreleased on top of v0.73.0)
+## 0. State as of 2026-09-06 (v0.73.1, the owner-rulings lap)
 
 **Phase 1b is closed.** The owner ruled on all three open questions and two of them were built the
 same lap; the third is scheduled.
