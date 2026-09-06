@@ -2,95 +2,79 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-05 (v0.72.3, the Phase 1b duplication lap)
+## 0. State as of 2026-09-06 (the Phase 1b completion lap, unreleased on top of v0.72.3)
 
-**Five of Phase 1b's seven items landed; two are owner decisions and one is scoped for the next
-lap.** Shipped, each with its own commit. The four CODE items each carry a pinning test and a
-recorded mutation check; the eslint fold-in carries neither, and correctly — it is a lint-config
-change plus the deletion of genuinely dead code, and `npm run check` is its whole verification.
-Shipped:
-**CLONE-26** (a DeepSeek payload that is not a JSON object commits nothing — the owner's option A),
-**P1-04** (one `createSseTransformStream` for both stream transforms), **HOTSPOT-10** (envelope
-validation and stream preflight get their own modules under `src/backend/`), **CLONE-12** (one
-prologue for both new-entry keystore mutations), and the **eslint fold-in**, which took 82 errors
-to **0**.
+**Phase 1b is finished except for two owner decisions.** This lap landed the three items that
+needed no ruling: **CLONE-07** (one named `relayAuthoredResponse` predicate for four call sites),
+the **`extractQuotaPercent` removal**, and **HOTSPOT-03** in two stages — `src/spec.ts` first, then
+`src/config/routing-parser.ts`. `config.ts` is 1994 → 1268 lines.
 
-**Three findings, all from verifying rather than from writing.**
+The previous lap (v0.72.3) landed CLONE-26, P1-04, HOTSPOT-10, CLONE-12 and the eslint fold-in;
+its record is [docs/closeout-phase-1b-2026-09-05.md](docs/closeout-phase-1b-2026-09-05.md) and
+[docs/phase-1b-recon-2026-09-05.md](docs/phase-1b-recon-2026-09-05.md).
 
-- ⚠ **The free lane cannot do reconnaissance in this repository.** All seven recon packets were
-  dispatched to free lanes and all seven failed both adversarial verification lenses — 14 verdicts,
-  14 times `packetSound: false`. The P1-04 packet invented two symbol names that exist nowhere in
-  the tree, invented line ranges for them, and argued against the real plan on the strength of the
-  invention. The `null` fallback never fired and could not: every lane returned something plausible,
-  structured and wrong. Only the verify stage caught it.
-  [docs/phase-1b-recon-2026-09-05.md](docs/phase-1b-recon-2026-09-05.md) has the full ledger.
-- ⚠ **Three duplicated tails in a row had no coverage at all.** P1-04's shared `event: error` tail,
-  CLONE-12's prologue ORDER, and (in Phase 1a) the accounting envelope tail. Deleting P1-04's whole
-  `catch` left both stream suites green; moving CLONE-12's duplicate check after
-  `unlockStoreForWrite` left all 94 keystore tests green while letting a rejected add open the
-  keyring. **A duplicated block survives duplication precisely because nothing tests it, so a
-  duplication sweep is also a coverage audit.** Mutation-check every extraction.
-- ⚠ **The backlog named the wrong code for CLONE-12.** Its paragraph described the
-  `revokeEntry` / `setDisabled` prologue; the catalog's CLONE-12 is `addEntry` /
-  `restoreEntryFromExport`. The real one was worth extracting and the described one was not; the
-  described pair is now recorded as benign in the source comment a maintainer will be looking at.
+**How the HOTSPOT-03 move was verified, because "the suite is green" is not evidence for a 700-line
+extraction.** A multiset comparison of every non-blank, non-comment line between
+`git show HEAD:src/config.ts` and the union of the two new files reports exactly TWO removals — the
+spec import line losing its now-unused `AUTO_MODEL`, and `function parseRouting(` gaining an
+`export` — and ten additions, every one import or export plumbing. No functional line changed.
+⚠ A naive per-function body diff reports FOUR false positives, because comment blocks legitimately
+move between neighbours when the code around them moves; compare code lines, not spans.
 
-**Deviation recorded, not silent:** P1-04's scaffold lives in `src/sse-frames.ts`, not `src/sse.ts`
-as the plan proposed. The plan's stated reason was that `sse.ts` already owns shared SSE vocabulary
-through `iterateDataPayloads` — that generator is PRIVATE to `sse.ts`, whose domain is rebuilding an
-`AssistantMessage`. `sse-frames.ts` is the leaf both callers already import.
+**Two corrections to the item, both from reading HEAD rather than the plan:**
 
-**The package baseline moved deliberately.** HOTSPOT-10 adds exactly six `dist/` entries, so
-`packageEntries` went 392 → 398 through its ceiling and `packBytes` to 959904 through its. Both
-ceilings are raised to observed + ~0.5%, the file's existing convention; `unpackedBytes` still fits
-and was left alone rather than loosened.
+- The closure is 19 symbols, not 11. `DEFAULT_LANE_PROBE`, `parseOffload` and `parseRouting` have
+  real importers outside `config.ts`, so the new module exports them and `config.ts` re-exports all
+  three — no other importer changed. Three names the survey flagged (`assertSpecResolvable` at the
+  old `config.ts:538`, `parseHedge` in `hedge-trigger.ts`, the second `parseLatencyDemotion` hit)
+  are COMMENTS, not calls.
+- The complexity discrepancy is settled: `parseRouting` measures **125**, so the in-source comment's
+  124 was right and the catalog's 137 was not. ⚠ The extraction MOVED that hotspot; it did not
+  shrink it. Filed with its own property.
 
-Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry with its property:
+Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry:
 
-- **Two owner decisions are waiting, and both are in the backlog with their evidence.**
-  **(1) P1-06 / SEM-06 — recommend DECLINE.** Read at HEAD there is no one rule to extract: four
-  genuinely different clamps plus three sites whose whole contribution is the `??` operator, and
-  `failureCooldown`'s floor changes the reported RUNG rather than the value. This reverses an ACCEPT
-  verdict, so nothing was built. **(2) CLONE-26 moved a second thing its ruling did not name** — a
-  scalar or array payload under a destructive tool name now yields `detected` with a pool reroll
-  instead of `refused-destructive` with no failover. No destructive call is fabricated either way.
-- **HOTSPOT-03 is the one Phase 1b item still to build, and it is its own lap.** The closure is 17
-  symbols, not 11, and `POOL_PREFIX`, `AUTO_MODEL` and `splitSpec` must relocate to a leaf first or
-  the new module cycles back into `config.ts`. Both corrections are in the backlog entry.
-- **CLONE-07** — ordinary refactor work, no decision outstanding: name the `malformedProvenance`
-  predicate once, with the truth-table test.
-- **Remove `extractQuotaPercent`, or say what keeps it alive.** Deprecated, zero `src/` consumers,
-  still a published export — which is why `sonarjs/deprecation` is off for `test/**` rather than the
-  test deleted.
-- **The Tier 1 CI gate stays DEFERRED.** Unchanged this lap.
+- **Two owner decisions, both with their evidence written.** **(1) P1-06 / SEM-06 — recommend
+  DECLINE.** Four genuinely different clamps plus three uses of `??` is not one rule, and
+  `failureCooldown`'s floor changes the reported RUNG rather than the value; a shared evaluator
+  would need a mode flag. This reverses an ACCEPT verdict, so nothing was built. **(2) CLONE-26
+  moved a second thing its ruling did not name** — a scalar or array payload under a destructive
+  tool name now yields `detected` with a pool reroll instead of `refused-destructive` with no
+  failover. Live on the wire since v0.72.3, and now documented in `CLAUDE.md`'s dialect gotcha
+  whatever the ruling turns out to be.
+- **`parseRouting` is still complexity 125.** Decompose it deliberately or record that it is
+  accepted — but read the standing invariant first: `CLAUDE.md` records that restructuring to
+  satisfy that rule is the enterprise-shaped refactor the 2026-08-04 review already rejected.
+- **The Tier 1 CI gate stays DEFERRED.** Unchanged.
 - The `dispatch` `waitMs` trap: above the host's tool-call timeout it fails AND orphans the lane.
+  ⚠ Hit again this lap in a new form — a review job vanished with `unknown jobId` mid-run because
+  the MCP child restarted, so the handle could not be polled at all.
 
-Carried unchanged from the previous lap, none of them touched here:
+Carried unchanged, none of them touched here:
 
 - Triage the eligibility queue: 10 unrecognized refusals; item [1] (the VPN network block) stays
   pending by rule; the dispatcher proposes by digest, only the owner accepts.
-- Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry): a
-  bounded lap measures what Claude Code and Codex do on a mid-stream SSE `error` after content; the
-  per-token abort is built only if a retry reaches another candidate.
-- Owner: verify the Codex `relay` agent from Codex Desktop (deferred again 2026-09-05).
+- Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry).
+- Owner: verify the Codex `relay` agent from Codex Desktop.
 - Audit residue with properties: the metering silence channel (DR-006), listener-before-store
   (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
   pruning (DR-012).
-- Contributor SKUs route B (a Responses upstream, `wire: "responses"` on `kind: "openai"`, then
-  pinning both contributor ids as `preferred`). Route A — four `opencode-muse-spark` cli rungs, one
-  per ladder, right after `free-pool` — is live (owner decision 2026-09-04, option A; `freeOnly`
-  stays `false` on all three rules):
-  [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md).
+- Contributor SKUs route B (a Responses upstream, `wire: "responses"` on `kind: "openai"`). Route A
+  is live: [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md).
 - `test/os-keyring.test.ts` "sanitizes a thrown child error" is path-sensitive and fails inside a
   lane worktree with a junctioned `node_modules`.
 
-⚠ **The `opencode-muse-spark` lane is congested, not broken** (owner, 2026-09-05: other agents are
-dispatching to it concurrently). A probe at `--variant xhigh` asking for one file's line count ran
-**683 seconds** without answering and was cancelled. Its recorded history is healthy — 49 calls, 47
-ok, median 111.5 s — so treat this as contention, and prefer `free-pool` or `agy-gemini` while it
-lasts. The previous lap's note that the lane "delivered one packet and then stopped delivering"
-stands, and the ladder still recommends it either way, which is the open `cli`-lane health item
-below.
+⚠ **On offload, with the measurement from both laps.** Free lanes CANNOT do open-ended
+reconnaissance here — 7 of 7 packets failed adversarial verification on 2026-09-05, fabricating
+symbol names and line ranges with total confidence. They ARE useful for reviewing a CONCRETE diff
+against a STATED claim: a `free-pool` lane checked the CLONE-07 change in 208 s, rebuilt the truth
+table from source and correctly reported no differences. The distinction that predicts which way it
+goes is whether the output can be checked by running or reading something specific. ⚠ Do not key a
+fallback on a `null` result — a lane that fabricates returns something.
+
+⚠ **`opencode-muse-spark` is congested, not broken** (owner, 2026-09-05: other agents dispatch to it
+concurrently). A probe at `--variant xhigh` ran 683 s on a one-file line count and was cancelled.
+Prefer `free-pool` or `agy-gemini` while that lasts.
 
 ⚠ **And the ladder went on recommending it throughout, which is a GAP and not a misconfiguration**
 (owner question, 2026-09-05). A `cli` lane has ordering but no health-based reordering: neither

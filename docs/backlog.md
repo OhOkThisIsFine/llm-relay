@@ -57,32 +57,27 @@
   ⚠ Calibrate before building: the current window mixes several sessions' traffic, so per-lane
   history has to be attributable before any threshold drawn from it means anything.
 
-- **HOTSPOT-03 — the routing-parser extraction, the one Phase 1b item still to build.** Move
-  `parseRouting` and its callees out of `config.ts` into `src/config/routing-parser.ts`. Verified
-  against HEAD 2026-09-05: all 12 line numbers the plan cites are correct
-  (`parseQuotaEnforcement:193`, `parseLatencyDemotion:228`, `parseHedge:275`, `parseRouting:1320`,
-  `parseMcpSettings:1553`, `parseLaneProbe:1583`, `parseSticky:1612`, `parseOffload:1656`,
-  `dropDisabledSpecs:1723`, `parseCliLane:1787`, `parseLadder:1835`, `assertSpecResolvable:1888`),
-  and `parseRouting`'s body plus every callee is free of IO, clock, random and `await`, so the
-  purity claim holds structurally.
+- **`parseRouting` is still cognitive complexity 125 — HOTSPOT-03 moved it, it did not shrink it**
+  (measured 2026-09-06, after the extraction). This also settles the discrepancy the item flagged:
+  the catalog said 137, the in-source comment said 124, and the real figure at
+  `src/config/routing-parser.ts:173` is **125**. The comment was right; the catalog was not.
 
-  Two corrections the plan does not carry, both from reading HEAD:
+  ⚠ This is not a regression and the extraction was not mis-scoped. HOTSPOT-03's stated property was
+  about the MOVE — that `config.ts` declares no moved symbol, that the new module is a leaf, and
+  that the parser is pure — and all three hold and are pinned. But a reader who expects "the hotspot
+  is dealt with" should know the function itself is unchanged; what changed is that it no longer
+  sits in the middle of a 2,000-line file. Two smaller functions in the same module measure 32 and
+  36.
 
-  - **The movable closure is 17 symbols, not 11.** Add `DEFAULT_LANE_PROBE`, `hasAsciiControl`,
-    `LADDER_TASK_TOKEN`, `LADDER_SPEC_TOKEN`, `LADDER_CONTEXT_TOKEN` and `parseSpawnEnv`. Move all
-    of them or none — leaving `parseSpawnEnv` or `hasAsciiControl` behind reintroduces the import
-    the move exists to remove.
-  - ⚠ **There is a cycle to kill first, not to create.** `routing-parser.ts` must import ONLY from
-    `./config-types.js`, but the moved code needs `POOL_PREFIX` (`config.ts:305`), `AUTO_MODEL`
-    (`:308`) and `splitSpec` (`:683`), all exported from `config.ts`. Relocate those three to a leaf
-    (`config-types.ts`, or a new `src/spec.ts`) and have `config.ts` re-export them for its six
-    existing importers. That is a separate, ordered move that has to land first.
+  ⚠ Before splitting it, read the standing invariant: `CLAUDE.md` records that restructuring
+  `server.ts`/`config.ts` to satisfy `sonarjs/cognitive-complexity` is the enterprise-shaped
+  refactor [`suggestion-review-2026-08-04.md`](suggestion-review-2026-08-04.md) already rejected
+  against the project's own rubric, and the rule is a WARNING for exactly that reason. So this entry
+  is a decision to take deliberately or not at all.
 
-  ⚠ Also confirm the governing complexity figure before starting: the catalog says 137, the
-  in-source comment says 124, and the verification flags the discrepancy without resolving it.
+  **Property:** either `parseRouting` is decomposed with each part's validation order preserved and
+  the config suite green, or a line in `CLAUDE.md` records that its complexity is accepted and why.
 
-  **Property:** `config.ts` declares no moved symbol, the new module imports nothing from the
-  request path, and `parseRouting` is pure over its inputs.
 
 - **Owner decision: P1-06 / SEM-06 — recommend DECLINE, and record it.** The item says "explicit
   beats default" is re-implemented across six modules. Read at HEAD on 2026-09-05, there is no one
@@ -120,27 +115,6 @@
   **Property:** the owner either accepts the new behaviour and it is recorded in `CLAUDE.md` beside
   the dialect-rescue gotcha, or the destructive check is moved ahead of the payload validity check so
   the refusal still fires.
-
-- **Remove `extractQuotaPercent`, or state why it stays** (found 2026-09-05 during the eslint
-  fold-in). `src/ping/ping.ts:25` carries an `@deprecated` marker pointing at
-  `extractQuotaObservations()`, and it has ZERO consumers in `src/` — only its own declaration and
-  `test/ping.test.ts`. It is still a published export, which is why `sonarjs/deprecation` is switched
-  off for `test/**` rather than the test being deleted: a shipped export must stay covered until it
-  is removed. The `kernel/` and `JsonStore` precedent is to delete unadopted machinery.
-
-  **Property:** either the export is gone with its test, or a line in `CLAUDE.md` says which
-  consumer keeps it alive.
-
-- **CLONE-07 — name the `malformedProvenance` predicate once.** No behaviour decision is needed and
-  none is outstanding: the evidence
-  ([`reviews/clone-07-clone-26-evidence-2026-09-05.md`](reviews/clone-07-clone-26-evidence-2026-09-05.md))
-  proves by truth table over all six reachable combinations that the two spellings in
-  `routes/messages.ts` and `routes/openai-front.ts` are ONE rule — did the relay author these bytes —
-  stated against each front's own passthrough condition. This is ordinary refactor work, held only
-  because `item-p1-03-front-walk-candidate-runner.md` puts it in its own scope.
-
-  **Property:** one named predicate is called at all four sites, with a truth-table test, so a fifth
-  site cannot invent a seventh row.
 
 - **Owner decision, DEFERRED 2026-09-05: whether to adopt the runbook's Tier 1 duplication CI
   gate.** [`reviews/duplication-and-complexity-runbook-2026-09-05.md`](reviews/duplication-and-complexity-runbook-2026-09-05.md)
