@@ -1,0 +1,774 @@
+/**
+ * Parsing and validating the `routing` block of a config document (HOTSPOT-03).
+ *
+ * `parseRouting` plus the seventeen declarations only it reaches: the six sub-block parsers
+ * (`parseQuotaEnforcement`, `parseLatencyDemotion`, `parseHedge`, `parseMcpSettings`,
+ * `parseLaneProbe`, `parseSticky`), `parseOffload`, the ladder family (`parseLadder`,
+ * `parseCliLane`, `parseSpawnEnv` and its three placeholder tokens), `dropDisabledSpecs`,
+ * `assertSpecResolvable`, `hasAsciiControl`, `DEFAULT_LANE_PROBE` and `EFFORT_LEVEL_SET`.
+ * Roughly 700 lines out of a 2,000-line `config.ts`.
+ *
+ * ⚠ **It imports `config-types.js` and `spec.js`, and NOTHING else.** That is the property the item
+ * asks for, and it is why `spec.ts` had to exist first: this parser needs `POOL_PREFIX`,
+ * `AUTO_MODEL` and `splitSpec`, and reaching into `config.js` for them would be a cycle straight
+ * back into the file it was extracted from. The dependency runs one way — `config.ts` imports this
+ * module and re-exports its three publicly-consumed names, so no other importer changed.
+ *
+ * ⚠ Everything here is PURE over its inputs: no IO, no clock, no randomness, no `await`. A config
+ * document goes in and either a validated `Routing` comes out or a `ConfigError` is thrown. Keep it
+ * that way — the request path must never be reachable from a parser, and a parser that read the
+ * filesystem could not be tested by handing it a literal.
+ *
+ * ⚠ A parse failure here is LOUD by design. An unknown key in a `compat`, `limits`, `hedge`,
+ * `latency` or `laneProbe` block is a hard load error naming the key, because an ignored typo reads
+ * as a declaration that took effect while the wire was unchanged. The one deliberate exception is
+ * an unset `${ENV}`, which DISABLES one provider rather than aborting startup: this proxy fronts
+ * every client session, so refusing to start would turn one unused optional provider into a total
+ * outage. See the degradation rules in `CLAUDE.md`.
+ */
+
+import {
+  EFFORT_LEVELS,
+  type CliLaneTemplate,
+  type EffortLevel,
+  type HedgeConfig,
+  type LadderRung,
+  type LaneProbeSettings,
+  type LatencyDemotionConfig,
+  type McpSettings,
+  type OffloadConfig,
+  type OffloadRule,
+  type PoolPolicy,
+  type ProviderConfig,
+  type QuotaEnforcementConfig,
+  type Routing,
+  type StickyRoutingConfig,
+} from "../config-types.js";
+import { AUTO_MODEL, POOL_PREFIX, splitSpec } from "../spec.js";
+
+const EFFORT_LEVEL_SET: ReadonlySet<string> = new Set(EFFORT_LEVELS);
+
+/**
+ * Validate `routing.quota`. A malformed block is a hard error rather than silently ignored:
+ * an operator who wrote `"enforceLearned": "yes"` believes they opted into gating on learned
+ * limits when they have not, which is precisely the silent-divergence shape this file's other
+ * parsers reject by name.
+ */
+function parseQuotaEnforcement(raw: unknown): QuotaEnforcementConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.quota must be an object");
+  }
+  const value = raw as Record<string, unknown>;
+  const out: QuotaEnforcementConfig = {};
+  if (value.enforce !== undefined) {
+    if (typeof value.enforce !== "boolean") throw new Error("config.routing.quota.enforce must be a boolean");
+    out.enforce = value.enforce;
+  }
+  if (value.enforceLearned !== undefined) {
+    if (typeof value.enforceLearned !== "boolean") {
+      throw new Error("config.routing.quota.enforceLearned must be a boolean");
+    }
+    out.enforceLearned = value.enforceLearned;
+  }
+  if (value.hardCaps !== undefined) {
+    if (typeof value.hardCaps !== "boolean") {
+      throw new Error("config.routing.quota.hardCaps must be a boolean");
+    }
+    out.hardCaps = value.hardCaps;
+  }
+  return out;
+}
+
+/**
+ * Validate `routing.latency`. Malformed is a hard error, and an UNKNOWN KEY is a hard error too —
+ * the `compat`/`configured-limits` precedent rather than the looser `routing.quota` one. An
+ * operator who wrote `"p95ms": 5000` (wrong case) believes they lowered the ceiling; silently
+ * ignoring the key would leave the default in force while looking like it had been changed.
+ *
+ * ⚠ Both numbers must be finite and positive. `0` would demote every measured deployment at once
+ * and a negative or `NaN` ceiling bounds nothing while looking like it does.
+ */
+function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
+  // ABSENT returns `{}`, not `undefined`, and the two are the same thing here: every key is
+  // optional and the module resolves its own defaults, so "{}" IS "all defaults". Returning a
+  // total value lets the caller assign unconditionally — the `laneProbe` precedent — which keeps
+  // `parseRouting` free of another branch. That function is already at cognitive complexity 124
+  // against a limit of 15, and CLAUDE.md records the decision NOT to restructure it.
+  if (raw === undefined || raw === null) return {};
+  // The boolean shorthand is NORMALIZED here rather than carried through the type. One shape
+  // downstream means the demotion module never re-implements "what does `false` mean".
+  if (typeof raw === "boolean") return { enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.latency must be an object or a boolean");
+  }
+  const value = raw as Record<string, unknown>;
+  const known = new Set(["enabled", "p95Ms", "msPerToken", "minSamples"]);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      throw new Error(`config.routing.latency has an unknown key "${key}"`);
+    }
+  }
+  const out: LatencyDemotionConfig = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== "boolean") throw new Error("config.routing.latency.enabled must be a boolean");
+    out.enabled = value.enabled;
+  }
+  for (const key of ["p95Ms", "msPerToken", "minSamples"] as const) {
+    const n = value[key];
+    if (n === undefined) continue;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new Error(`config.routing.latency.${key} must be a positive finite number`);
+    }
+    out[key] = n;
+  }
+  return out;
+}
+
+/**
+ * Validate `routing.hedge`. Malformed is a hard error, and an UNKNOWN KEY is a hard error too —
+ * the `routing.latency` precedent, for the same reason: an operator who wrote `"floorms": 40000`
+ * believes they raised the floor, and a silently ignored key leaves the default in force while
+ * looking like it was changed.
+ *
+ * ⚠ Every number must be finite and positive. A `0` floor removes the one bound that stops a fast
+ * pool duplicating almost every request, and a negative or `NaN` value bounds nothing while looking
+ * like it does. `floorMs` and `minFloorMs` are both accepted and both validated the same way here —
+ * this function only checks shape; `resolveHedgeSettings` decides which one wins when both are set.
+ */
+function parseHedge(raw: unknown): HedgeConfig {
+  // ABSENT returns `{}`, not `undefined` — the `parseLatencyDemotion` precedent. Every key is
+  // optional and `resolveHedgeSettings` owns the defaults, so `{}` IS "all defaults", and a total
+  // return lets the caller assign unconditionally without another branch in `parseRouting`.
+  if (raw === undefined || raw === null) return {};
+  // The boolean shorthand is NORMALIZED here rather than carried through the type, so the trigger
+  // module never re-implements "what does `false` mean".
+  if (typeof raw === "boolean") return { enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.hedge must be an object or a boolean");
+  }
+  const value = raw as Record<string, unknown>;
+  const known = new Set(["enabled", "floorMs", "minFloorMs", "msPerInputToken", "margin", "minSamples"]);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      throw new Error(`config.routing.hedge has an unknown key "${key}"`);
+    }
+  }
+  const out: HedgeConfig = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== "boolean") throw new Error("config.routing.hedge.enabled must be a boolean");
+    out.enabled = value.enabled;
+  }
+  for (const key of ["floorMs", "minFloorMs", "msPerInputToken", "margin", "minSamples"] as const) {
+    const n = value[key];
+    if (n === undefined) continue;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new Error(`config.routing.hedge.${key} must be a positive finite number`);
+    }
+    out[key] = n;
+  }
+  return out;
+}
+
+export function parseRouting(
+  raw: unknown,
+  providers: Record<string, ProviderConfig>,
+  overrideDefault: string | undefined,
+  warnings: string[] = [],
+  disabledProviders: Set<string> = new Set(),
+): Routing {
+  const r = (typeof raw === "object" && raw !== null ? raw : {}) as {
+    default?: unknown;
+    tiers?: unknown;
+    pools?: unknown;
+    offload?: unknown;
+    subagents?: unknown;
+    benchmarkSort?: unknown;
+    sticky?: unknown;
+    quota?: unknown;
+    latency?: unknown;
+    hedge?: unknown;
+    laneProbe?: unknown;
+    mcp?: unknown;
+    ladder?: unknown;
+    ladders?: unknown;
+    cliLane?: unknown;
+  };
+  // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
+  if (providers[POOL_PREFIX]) {
+    throw new Error(`config.providers."${POOL_PREFIX}" is reserved — it would shadow "pool/<name>" routing`);
+  }
+  if (providers[AUTO_MODEL]) {
+    throw new Error(`config.providers."${AUTO_MODEL}" is reserved — it would shadow "${AUTO_MODEL}" routing`);
+  }
+  const dfltRaw = overrideDefault !== undefined ? overrideDefault : r.default;
+  let dflt: string | string[];
+
+  if (Array.isArray(dfltRaw)) {
+    dflt = dfltRaw.filter((s): s is string => typeof s === "string" && s.length > 0);
+    if (dflt.length === 0) {
+      throw new Error(`config.routing.default array must contain at least one valid spec string`);
+    }
+  } else if (typeof dfltRaw === "string" && dfltRaw.length > 0) {
+    dflt = dfltRaw;
+  } else {
+    throw new Error(`config.routing.default ("provider/model") is required`);
+  }
+
+  const tiers: Record<string, string | string[]> = {};
+  if (typeof r.tiers === "object" && r.tiers !== null) {
+    for (const [k, v] of Object.entries(r.tiers as Record<string, unknown>)) {
+      if (Array.isArray(v)) {
+        const arr = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+        if (arr.length > 0) tiers[k] = arr;
+      } else if (typeof v === "string" && v.length > 0) {
+        tiers[k] = v;
+      }
+    }
+  }
+
+  const pools: Record<string, string[]> = {};
+  const poolPolicies: Record<string, PoolPolicy> = {};
+  if (typeof r.pools === "object" && r.pools !== null) {
+    for (const [k, v] of Object.entries(r.pools as Record<string, unknown>)) {
+      let declared: string[];
+      if (Array.isArray(v)) {
+        declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+      } else if (typeof v === "object" && v !== null) {
+        const policy = v as { preferred?: unknown; include?: unknown; exclude?: unknown; effort?: unknown };
+        if (!Array.isArray(policy.preferred) || policy.preferred.some((s) => typeof s !== "string" || s.length === 0)) {
+          throw new Error(`config.routing.pools.${k}.preferred must be an array of non-empty "provider/model" specs`);
+        }
+        if (policy.include !== "free") {
+          throw new Error(`config.routing.pools.${k}.include must be "free"`);
+        }
+        if (
+          policy.exclude !== undefined &&
+          (!Array.isArray(policy.exclude) ||
+            policy.exclude.some(
+              (s) =>
+                typeof s !== "string" ||
+                !/^\S+\/\S+$/.test(s) ||
+                s.startsWith(`${POOL_PREFIX}/`),
+            ))
+        ) {
+          throw new Error(`config.routing.pools.${k}.exclude must be an array of "provider/model" specs`);
+        }
+        if (policy.effort !== undefined && !EFFORT_LEVEL_SET.has(policy.effort as string)) {
+          throw new Error(`config.routing.pools.${k}.effort must be low, medium, high, or xhigh`);
+        }
+        const exclude = [...((policy.exclude as string[] | undefined) ?? [])];
+        const excluded = new Set(exclude);
+        declared = (policy.preferred as string[]).filter((spec) => !excluded.has(spec));
+        poolPolicies[k] = {
+          preferred: declared,
+          include: "free",
+          ...(exclude.length > 0 ? { exclude } : {}),
+          ...(policy.effort ? { effort: policy.effort as EffortLevel } : {}),
+        };
+      } else {
+        throw new Error(
+          `config.routing.pools.${k} must be an array of specs or {"preferred":[...],"include":"free"}`,
+        );
+      }
+      // Members of a DISABLED provider are dropped, not fatal — the pool's whole purpose is
+      // surviving the loss of one candidate. A member naming a provider that simply doesn't
+      // exist is still an error below: that's a typo, and silently dropping it would spend
+      // primary quota via the passthrough instead of failing loudly.
+      const arr = declared.filter((s) => {
+        const { provider } = splitSpec(s);
+        if (!disabledProviders.has(provider)) return true;
+        warnings.push(`routing.pools.${k}: dropped "${s}" — provider "${provider}" is disabled`);
+        return false;
+      });
+      if (arr.length === 0 && !poolPolicies[k]) {
+        throw new Error(`config.routing.pools.${k} must contain at least one valid spec string`);
+      }
+      // Members are provider specs only — pool-in-pool would make expansion recursive.
+      const nested = arr.find((s) => s.startsWith(`${POOL_PREFIX}/`));
+      if (nested) {
+        throw new Error(`config.routing.pools.${k} member "${nested}" — a pool cannot reference another pool`);
+      }
+      pools[k] = arr;
+      if (poolPolicies[k]) poolPolicies[k] = { ...poolPolicies[k]!, preferred: arr, include: "free" };
+    }
+  }
+
+  const subagents: Record<string, string> = {};
+  if (typeof r.subagents === "object" && r.subagents !== null) {
+    for (const [k, v] of Object.entries(r.subagents as Record<string, unknown>)) {
+      if (typeof v === "string" && v.length > 0) subagents[k] = v;
+    }
+  }
+
+  const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
+  const offload = parseOffload(r.offload);
+  const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
+  const sticky = parseSticky(r.sticky);
+  if (sticky) routing.sticky = sticky;
+  const quota = parseQuotaEnforcement(r.quota);
+  if (quota) routing.quota = quota;
+  routing.latency = parseLatencyDemotion(r.latency);
+  routing.hedge = parseHedge(r.hedge);
+  routing.laneProbe = parseLaneProbe(r.laneProbe);
+  const mcpSettings = parseMcpSettings(r.mcp);
+  if (mcpSettings) routing.mcp = mcpSettings;
+  if (Object.keys(pools).length > 0) routing.pools = pools;
+  if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
+  if (Object.keys(subagents).length > 0) routing.subagents = subagents;
+  const ladder = parseLadder(r.ladder, "config.routing.ladder");
+  if (ladder.length > 0) routing.ladder = ladder;
+  if (r.ladders !== undefined && (typeof r.ladders !== "object" || r.ladders === null || Array.isArray(r.ladders))) {
+    throw new Error(`config.routing.ladders must be an object of named ladder arrays`);
+  }
+  const ladders: Record<string, LadderRung[]> = {};
+  for (const [tier, rawLadder] of Object.entries((r.ladders ?? {}) as Record<string, unknown>)) {
+    const parsed = parseLadder(rawLadder, `config.routing.ladders.${tier}`);
+    if (parsed.length === 0) throw new Error(`config.routing.ladders.${tier} must contain at least one rung`);
+    ladders[tier] = parsed;
+  }
+  if (Object.keys(ladders).length > 0) routing.ladders = ladders;
+  const cliLane = parseCliLane(r.cliLane, "config.routing.cliLane");
+  if (cliLane) routing.cliLane = cliLane;
+
+  // A spec naming a DISABLED provider is dropped with a warning, exactly like a pool member;
+  // a spec naming a provider that was never declared is still fatal below. Doing this before
+  // the assertions is what keeps "one optional provider lost its ${ENV}" from being a total
+  // outage: assertSpecResolvable sees the post-disabling provider map, so it cannot tell the
+  // two apart and used to abort startup for the degraded case too.
+  for (const [tier, spec] of Object.entries(tiers)) {
+    const kept = dropDisabledSpecs(spec, disabledProviders, warnings, `routing.tiers.${tier}`);
+    if (kept === null) delete tiers[tier];
+    else tiers[tier] = kept;
+  }
+  for (const [tier, spec] of Object.entries(subagents)) {
+    // A subagent entry is a single spec, so the result is a string or nothing.
+    const kept = dropDisabledSpecs(spec, disabledProviders, warnings, `routing.subagents.${tier}`) as
+      | string
+      | null;
+    if (kept === null) delete subagents[tier];
+    else subagents[tier] = kept;
+  }
+  if (Array.isArray(routing.default)) {
+    // Only an ARRAY default can degrade — the survivors still answer. A single-spec default
+    // has nothing left to fall back to, so it stays fatal below.
+    const kept = dropDisabledSpecs(routing.default, disabledProviders, warnings, "routing.default");
+    if (kept !== null) routing.default = kept;
+  }
+  routing.ladder = ladder.filter((rung) => {
+    if (rung.kind !== "relay" || !rung.spec) return true;
+    return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `routing.ladder[${rung.id}].spec`) !== null;
+  });
+  if (routing.ladder.length === 0) delete routing.ladder;
+  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
+    const kept = tierLadder.filter((rung) => {
+      if (rung.kind !== "relay" || !rung.spec) return true;
+      return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `routing.ladders.${tier}[${rung.id}].spec`) !== null;
+    });
+    if (kept.length === 0) delete routing.ladders![tier];
+    else routing.ladders![tier] = kept;
+  }
+  if (routing.ladders && Object.keys(routing.ladders).length === 0) delete routing.ladders;
+
+  // Fail loudly at load time if any spec names an unknown provider or pool. Only
+  // `routing.default` can still trip on a DISABLED provider — everything else degraded
+  // above — and it is fatal on purpose: it is the fall-through for everything, so there
+  // is nowhere left to fall through to.
+  assertSpecResolvable(routing.default, providers, pools, "routing.default", disabledProviders);
+  for (const [tier, spec] of Object.entries(tiers)) {
+    assertSpecResolvable(spec, providers, pools, `routing.tiers.${tier}`);
+  }
+  for (const [pool, specs] of Object.entries(pools)) {
+    assertSpecResolvable(specs, providers, {}, `routing.pools.${pool}`);
+  }
+  for (const [tier, spec] of Object.entries(subagents)) {
+    assertSpecResolvable(spec, providers, pools, `routing.subagents.${tier}`);
+  }
+  for (const rung of routing.ladder ?? []) {
+    if (rung.kind === "relay" && rung.spec) {
+      assertSpecResolvable(rung.spec, providers, pools, `routing.ladder[${rung.id}].spec`);
+    }
+  }
+  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
+    for (const rung of tierLadder) {
+      if (rung.kind === "relay" && rung.spec) {
+        assertSpecResolvable(rung.spec, providers, pools, `routing.ladders.${tier}[${rung.id}].spec`);
+      }
+    }
+  }
+  return routing;
+}
+
+/**
+ * Absent ⇒ every default. An unknown key is a hard error naming it (the `laneProbe` and `compat`
+ * precedent: an ignored typo reads as a setting that took effect while bounding nothing).
+ */
+function parseMcpSettings(raw: unknown): McpSettings | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`config.routing.mcp must be an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  for (const key of Object.keys(o)) {
+    if (key !== "allowedRoots") {
+      throw new Error(`config.routing.mcp.${key} is not a recognized key (allowedRoots)`);
+    }
+  }
+  if (o.allowedRoots === undefined) return {};
+  if (!Array.isArray(o.allowedRoots) || o.allowedRoots.some((r) => typeof r !== "string" || r.length === 0)) {
+    throw new Error(`config.routing.mcp.allowedRoots must be an array of non-empty strings`);
+  }
+  return { allowedRoots: [...(o.allowedRoots as string[])] };
+}
+
+export const DEFAULT_LANE_PROBE: LaneProbeSettings = {
+  enabled: true,
+  quotaIntervalMs: 6 * 60 * 60 * 1000,
+  catalogIntervalMs: 24 * 60 * 60 * 1000,
+};
+
+/**
+ * Absent ⇒ the defaults (ON — the owner's 2026-08-29 decision that background metadata polling
+ * is the relay's job). Boolean toggles `enabled`. An unknown key is a hard error naming it (the
+ * `compat` precedent: an ignored typo would read as a setting that took effect while changing
+ * nothing).
+ */
+function parseLaneProbe(raw: unknown): LaneProbeSettings {
+  if (raw === undefined || raw === null) return { ...DEFAULT_LANE_PROBE };
+  if (typeof raw === "boolean") return { ...DEFAULT_LANE_PROBE, enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`config.routing.laneProbe must be a boolean or an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  for (const key of Object.keys(o)) {
+    if (key !== "enabled" && key !== "quotaIntervalMs" && key !== "catalogIntervalMs") {
+      throw new Error(`config.routing.laneProbe.${key} is not a recognized key (enabled, quotaIntervalMs, catalogIntervalMs)`);
+    }
+  }
+  if (typeof o.enabled !== "boolean") {
+    throw new Error(`config.routing.laneProbe.enabled must be a boolean`);
+  }
+  const interval = (name: string, value: unknown, fallback: number): number => {
+    if (value === undefined) return fallback;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 60_000 || value > 2_592_000_000) {
+      throw new Error(`config.routing.laneProbe.${name} must be between 60000 (1m) and 2592000000 ms (30d)`);
+    }
+    return Math.floor(value);
+  };
+  return {
+    enabled: o.enabled,
+    quotaIntervalMs: interval("quotaIntervalMs", o.quotaIntervalMs, DEFAULT_LANE_PROBE.quotaIntervalMs),
+    catalogIntervalMs: interval("catalogIntervalMs", o.catalogIntervalMs, DEFAULT_LANE_PROBE.catalogIntervalMs),
+  };
+}
+
+function parseSticky(raw: unknown): StickyRoutingConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === "boolean") {
+    return { enabled: raw, ttlMs: 1_800_000, maxSessions: 1000 };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`config.routing.sticky must be a boolean or an object`);
+  }
+
+  const sticky = raw as Record<string, unknown>;
+  if (typeof sticky.enabled !== "boolean") {
+    throw new Error(`config.routing.sticky.enabled must be a boolean`);
+  }
+
+  let ttlMs = 1_800_000;
+  if (sticky.ttlMs !== undefined) {
+    if (
+      typeof sticky.ttlMs !== "number" ||
+      !Number.isFinite(sticky.ttlMs) ||
+      sticky.ttlMs < 1000 ||
+      sticky.ttlMs > 86_400_000
+    ) {
+      throw new Error(`config.routing.sticky.ttlMs must be between 1000 and 86400000 ms (1s to 24h)`);
+    }
+    ttlMs = Math.floor(sticky.ttlMs);
+  }
+
+  let maxSessions = 1000;
+  if (sticky.maxSessions !== undefined) {
+    if (
+      typeof sticky.maxSessions !== "number" ||
+      !Number.isFinite(sticky.maxSessions) ||
+      sticky.maxSessions < 10 ||
+      sticky.maxSessions > 100_000
+    ) {
+      throw new Error(`config.routing.sticky.maxSessions must be an integer between 10 and 100000`);
+    }
+    maxSessions = Math.floor(sticky.maxSessions);
+  }
+
+  return { enabled: sticky.enabled, ttlMs, maxSessions };
+}
+
+/** Parse the legacy global switch or the independently keyed client-rule form. */
+export function parseOffload(raw: unknown): OffloadConfig {
+  // Absent => false. Offload is opt-in: a missing key must never mean "send every request to
+  // another provider, which is what an implicit-on default would do to an existing config.
+  let out: OffloadConfig = false;
+
+  if (typeof raw === "boolean") {
+    out = raw;
+  } else if (raw !== undefined) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      throw new Error(`config.routing.offload must be a boolean or an object keyed by client`);
+    }
+
+    const parsed: Record<string, OffloadRule> = {};
+    for (const [client, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (client.length === 0) throw new Error(`config.routing.offload client name must not be empty`);
+      if (typeof value === "boolean") {
+        parsed[client] = { enabled: value, scope: "subagents" };
+        continue;
+      }
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error(`config.routing.offload.${client} must be a boolean or {"enabled":bool,"scope":...}`);
+      }
+      const rule = value as { enabled?: unknown; scope?: unknown; freeOnly?: unknown };
+      if (typeof rule.enabled !== "boolean") {
+        throw new Error(`config.routing.offload.${client}.enabled must be true or false`);
+      }
+      const scope = rule.scope === undefined ? "subagents" : rule.scope;
+      if (scope !== "subagents" && scope !== "all") {
+        throw new Error(`config.routing.offload.${client}.scope must be "subagents" or "all"`);
+      }
+      if (rule.freeOnly !== undefined && typeof rule.freeOnly !== "boolean") {
+        throw new Error(`config.routing.offload.${client}.freeOnly must be true or false`);
+      }
+      // ⚠ Stored EXACTLY as configured — absent stays absent. The default is applied where the
+      // rule is consulted (`freeOnlyApplies` in server.ts), not baked in here, because "unset"
+      // and "explicitly false" have to stay distinguishable: an unset flag defaults ON for
+      // offload-rerouted traffic and OFF for a directly addressed pool, and materializing a value
+      // here would collapse that into one answer. It also keeps `setOffload` from inventing a
+      // field the operator never wrote.
+      parsed[client] = { enabled: rule.enabled, scope, ...(rule.freeOnly !== undefined ? { freeOnly: rule.freeOnly } : {}) };
+    }
+    out = parsed;
+  }
+
+  return out;
+}
+
+/** ASCII control characters are never valid in environment variable names. */
+function hasAsciiControl(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
+
+/**
+ * Drop the members of a spec (or spec list) whose provider was disabled by an unset `${ENV}`,
+ * warning for each. Returns the survivors, or `null` when nothing survives.
+ *
+ * ⚠ The warning states the CONSEQUENCE, not just the fact. When a `routing.subagents` entry
+ * disappears, that traffic falls through to `routing.default` — the Anthropic passthrough — so
+ * the dispatcher believes it offloaded while spending primary quota, and nothing in the
+ * response says otherwise. That is the same hazard an unresolvable `@relay:` directive is a
+ * hard error for; the difference is that this one is visible once, at startup, where the
+ * operator can act on it, and the alternative (aborting) takes down every client session for
+ * a provider that may not even be in use.
+ */
+function dropDisabledSpecs(
+  spec: string | string[],
+  disabled: Set<string>,
+  warnings: string[],
+  where: string,
+): string | string[] | null {
+  if (disabled.size === 0) return spec;
+  const specs = Array.isArray(spec) ? spec : [spec];
+  const kept = specs.filter((s) => {
+    const { provider } = splitSpec(s);
+    if (provider === POOL_PREFIX || !disabled.has(provider)) return true;
+    warnings.push(
+      `config.${where}: dropped "${s}" — provider "${provider}" is disabled. ` +
+        `That routing now falls through to routing.default, which for a passthrough default ` +
+        `means primary quota.`,
+    );
+    return false;
+  });
+  if (kept.length === 0) return null;
+  return Array.isArray(spec) ? kept : kept[0]!;
+}
+
+/** Placeholder a cli rung's args must contain. Duplicated from dispatch.ts as a literal rather
+ *  than imported, to keep config.ts free of dependencies on modules that import it. */
+const LADDER_TASK_TOKEN = "{task}";
+
+/** Placeholder a cliLane template's args must contain, replaced by the rung's routing spec. */
+const LADDER_SPEC_TOKEN = "{spec}";
+
+/** Optional cliLane placeholder for the spec's published context window. Legal in args AND env. */
+const LADDER_CONTEXT_TOKEN = "{contextWindow}";
+
+/**
+ * Environment a HOST applies when spawning a rendered command — shared by `cli` rungs and the
+ * `cliLane` template, because a divergence between the two would be a silent one: both are
+ * handed to the same spawn site, and the stricter of two copies is whichever was edited last.
+ */
+function parseSpawnEnv(raw: unknown, where: string): Record<string, string | null> | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`${where}.env must be an object mapping variable names to a string (set) or null (unset)`);
+  }
+  const env: Record<string, string | null> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    // "=", whitespace and control characters cannot appear in an environment variable NAME on any
+    // platform this runs on; accepting one would render a command that silently sets a different
+    // variable than the config names.
+    if (name.length === 0 || name.includes("=") || /\s/.test(name) || hasAsciiControl(name)) {
+      throw new Error(`${where}.env has an invalid variable name ${JSON.stringify(name)}`);
+    }
+    if (typeof value !== "string" && value !== null) {
+      throw new Error(`${where}.env.${name} must be a string (set) or null (unset)`);
+    }
+    env[name] = value;
+  }
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
+/**
+ * Validate `routing.cliLane` at load. A template missing `{spec}` cannot address a target: every
+ * rung it rendered would invoke the same default model, so the ladder would appear to fail over
+ * while sending every lane to one place. That is worse than having no template at all, which is
+ * why it is a hard error rather than a warning.
+ */
+function parseCliLane(raw: unknown, root: string): CliLaneTemplate | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${root} must be an object`);
+  const e = raw as Record<string, unknown>;
+
+  if (typeof e.command !== "string" || e.command.length === 0) {
+    throw new Error(`${root}.command must be a non-empty string`);
+  }
+  if (!Array.isArray(e.args) || e.args.some((a) => typeof a !== "string")) {
+    throw new Error(`${root}.args must be an array of strings`);
+  }
+  const args = e.args as string[];
+  if (!args.some((a) => a.includes(LADDER_SPEC_TOKEN))) {
+    throw new Error(
+      `${root}.args must contain "${LADDER_SPEC_TOKEN}" in one argument — otherwise every transposed rung ` +
+        `invokes ${e.command} with the same model and the ladder only appears to fail over`,
+    );
+  }
+  if (!args.some((a) => a.includes(LADDER_TASK_TOKEN))) {
+    throw new Error(`${root}.args must contain "${LADDER_TASK_TOKEN}" in one argument — otherwise the task is never passed to ${e.command}`);
+  }
+
+  const lane: CliLaneTemplate = { command: e.command, args };
+  const env = parseSpawnEnv(e.env, root);
+  if (env) {
+    // `{task}` in an env value would put text a model or user wrote into a spawned process's
+    // environment. It is never substituted, so leaving it legal would silently pass the literal
+    // string `{task}` to the child — the operator would believe it worked. Reject it by name.
+    // `{contextWindow}` IS substituted here, deliberately: it is a number this relay resolved from
+    // published provider metadata, i.e. configuration rather than request content.
+    for (const [name, value] of Object.entries(env)) {
+      if (typeof value === "string" && value.includes(LADDER_TASK_TOKEN)) {
+        throw new Error(
+          `${root}.env.${name} must not contain "${LADDER_TASK_TOKEN}" — task text is never placed in a spawned ` +
+            `process's environment (use args for the task; "${LADDER_CONTEXT_TOKEN}" is available here)`,
+        );
+      }
+    }
+    lane.env = env;
+  }
+  return lane;
+}
+
+/**
+ * Validate `routing.ladder` at load, not at request time — a ladder whose rung cannot be invoked
+ * is a configuration mistake, and discovering it only when the host is mid-fallback is exactly
+ * when it is least useful. Absent/empty is legal and simply means "no opinion".
+ */
+function parseLadder(raw: unknown, root: string): LadderRung[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`${root} must be an array of rungs`);
+
+  const out: LadderRung[] = [];
+  const seen = new Set<string>();
+  for (const [i, entry] of raw.entries()) {
+    const where = `${root}[${i}]`;
+    if (typeof entry !== "object" || entry === null) throw new Error(`${where} must be an object`);
+    const e = entry as Record<string, unknown>;
+
+    const id = e.id;
+    if (typeof id !== "string" || id.length === 0) throw new Error(`${where}.id must be a non-empty string`);
+    // Ids address rungs in /dispatch overrides and exhaustion reports; a duplicate would make
+    // "use lane X" ambiguous, and silently picking the first is not a decision to make for the user.
+    if (seen.has(id)) throw new Error(`${where}.id "${id}" is already used by an earlier rung`);
+    seen.add(id);
+
+    const kind = e.kind;
+    if (kind !== "cli" && kind !== "relay") throw new Error(`${where}.kind must be "cli" or "relay" (got ${JSON.stringify(kind)})`);
+
+    const rung: LadderRung = { id, kind, enabled: e.enabled !== false };
+    if (typeof e.quota === "string" && e.quota.length > 0) rung.quota = e.quota;
+    if (typeof e.note === "string" && e.note.length > 0) rung.note = e.note;
+
+    if (kind === "cli") {
+      if (typeof e.command !== "string" || e.command.length === 0) {
+        throw new Error(`${where}.command must be a non-empty string for a "cli" rung`);
+      }
+      if (!Array.isArray(e.args) || e.args.some((a) => typeof a !== "string")) {
+        throw new Error(`${where}.args must be an array of strings for a "cli" rung`);
+      }
+      const args = e.args as string[];
+      // Without the placeholder the task text has nowhere to go and the rung would invoke the
+      // agent with an empty prompt — a failure that looks like the model ignoring the request.
+      if (!args.some((a) => a.includes(LADDER_TASK_TOKEN))) {
+        throw new Error(`${where}.args must contain "${LADDER_TASK_TOKEN}" in one argument — otherwise the task is never passed to ${e.command}`);
+      }
+      rung.command = e.command;
+      rung.args = args;
+      const env = parseSpawnEnv(e.env, where);
+      if (env) rung.env = env;
+    } else {
+      if (typeof e.spec !== "string" || e.spec.length === 0) {
+        throw new Error(`${where}.spec must be a non-empty string for a "relay" rung`);
+      }
+      rung.spec = e.spec;
+    }
+    out.push(rung);
+  }
+  return out;
+}
+
+function assertSpecResolvable(
+  spec: string | string[],
+  providers: Record<string, ProviderConfig>,
+  pools: Record<string, string[]>,
+  where: string,
+  disabled: Set<string> = new Set(),
+): void {
+  const specs = Array.isArray(spec) ? spec : [spec];
+  for (const s of specs) {
+    const { provider, model } = splitSpec(s);
+    if (provider === POOL_PREFIX) {
+      if (!model || !pools[model]) {
+        throw new Error(
+          `config.${where} "${s}" names unknown pool "${model ?? ""}" (available: ${Object.keys(pools).join(", ") || "none"})`,
+        );
+      }
+      continue;
+    }
+    const p = providers[provider];
+    // A disabled provider is absent from `providers`, so without this it is reported as a
+    // typo — sending the operator to look for a misspelling that isn't there instead of at
+    // the unset environment variable that actually caused it.
+    if (!p && disabled.has(provider)) {
+      throw new Error(
+        `config.${where} "${s}" names provider "${provider}", which is DISABLED because its ` +
+          `base references an unset \${ENV} (see the warning above). Set the variable, or point ` +
+          `${where} somewhere else.`,
+      );
+    }
+    if (!p) throw new Error(`config.${where} "${s}" names unknown provider "${provider}"`);
+    if (p.kind === "openai" && !model) throw new Error(`config.${where} "${s}" needs a model id for openai provider "${provider}"`);
+  }
+}
