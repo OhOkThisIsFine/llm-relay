@@ -57,80 +57,90 @@
   ⚠ Calibrate before building: the current window mixes several sessions' traffic, so per-lane
   history has to be attributable before any threshold drawn from it means anything.
 
-- **Phase 1b of the duplication-and-complexity program — four verified items the Phase 1a lap did
-  not reach.** Phase 1a (2026-09-05) landed P1-01, three of P1-02's four families (CLONE-13,
-  CLONE-17, CLONE-21) and P1-07. Every plan is committed under
-  [`reviews/refactor-plans/`](reviews/refactor-plans), and every item below is ACCEPT or REFINE in
-  [`reviews/adversarial-verification-2026-09-05.md`](reviews/adversarial-verification-2026-09-05.md).
+- **HOTSPOT-03 — the routing-parser extraction, the one Phase 1b item still to build.** Move
+  `parseRouting` and its callees out of `config.ts` into `src/config/routing-parser.ts`. Verified
+  against HEAD 2026-09-05: all 12 line numbers the plan cites are correct
+  (`parseQuotaEnforcement:193`, `parseLatencyDemotion:228`, `parseHedge:275`, `parseRouting:1320`,
+  `parseMcpSettings:1553`, `parseLaneProbe:1583`, `parseSticky:1612`, `parseOffload:1656`,
+  `dropDisabledSpecs:1723`, `parseCliLane:1787`, `parseLadder:1835`, `assertSpecResolvable:1888`),
+  and `parseRouting`'s body plus every callee is free of IO, clock, random and `await`, so the
+  purity claim holds structurally.
 
-  - **P1-04 — the SSE transform scaffold** (CLONE-20 + CLONE-11 ACCEPT; SEM-02 phased).
-    `stripThinkTagsInStream` and `rewriteToolUseIdsInStream` hold byte-identical read loops and
-    byte-identical error tails; only `processFrames` and the `flushHeld` hook differ — verified by
-    reading both. ⚠ Not landed because unifying them re-indents about fifty lines inside the module
-    whose stated purpose is losslessness, and that same lap had already found one silent behaviour
-    change in a lane-drafted extraction. **Property:** one `createSseTransformStream` in `sse.ts`
-    owns the decoder, encoder, frame buffer, read loop and error tail; each transform keeps its own
-    visitor; the SSE bytes are unchanged on the think-tags and tool-use-ids fixtures, `event: error`
-    trailer included.
-  - **P1-06 — cooldown resolution** (SEM-06, ACCEPT). "Explicit beats default" is re-implemented in
-    `dispatch.ts`, `circuit-breaker.ts`, `lane-cadence.ts`, `lane-quota-probe.ts`, `target-facts.ts`
-    and `routes/admin.ts`. **Property:** one pure `resolveCooldownMs(explicit, outcome, caps)`
-    reports the figure and the rung that produced it, and the breaker's measured-waste property
-    still holds — a slow failure cools for what it wasted, a fast one keeps the floor.
-  - **HOTSPOT-03 — routing-parser extraction** (ACCEPT). Move `parseRouting` and its ten callees out
-    of `config.ts` into `src/config/routing-parser.ts`. ⚠ Confirm the governing complexity figure
-    first: the catalog says 137, the in-source comment says 124, and the verification flags the
-    discrepancy. **Property:** `config.ts` declares no moved symbol, the new module imports nothing
-    from the request path, and `parseRouting` is pure over its inputs.
-  - **HOTSPOT-10 — backend envelope validation** (ACCEPT). Move `invalidEnvelopeReason` and the
-    stream preflight into `src/backend/envelope-validator.ts` and `src/backend/health-prober.ts`;
-    stated as the precondition for SEM-04's wider unification. **Property:** `backend.ts` declares
-    neither moved symbol, the prober imports nothing from `backend.js`, and a protocol-by-streamed-
-    by-shape table test covers `invalidEnvelopeReason`.
+  Two corrections the plan does not carry, both from reading HEAD:
 
-  Folded in here rather than filed separately: **CLONE-12**, the keystore mutation prologue. Read
-  during Phase 1a and deliberately left. The genuinely shared block is four lines
-  (`resolveKeystorePath`, `requireStoreForMutation`, `findEntry`,
-  `refuseCryptographicDegradationWhenUnlockable`) across exactly two entry points, `revokeEntry` and
-  `setDisabled`; `removeEntry` needs an index rather than an entry and `rotateEntry` performs no
-  degradation refusal at all, so neither can share it. Four lines, two sites, inside credential
-  custody — the lowest value-to-risk ratio in the catalog. **Property:** either it is extracted with
-  the keystore suite green and the refusal ORDER preserved, or this paragraph is deleted and the
-  clone is recorded in `CLAUDE.md` as a benign one.
+  - **The movable closure is 17 symbols, not 11.** Add `DEFAULT_LANE_PROBE`, `hasAsciiControl`,
+    `LADDER_TASK_TOKEN`, `LADDER_SPEC_TOKEN`, `LADDER_CONTEXT_TOKEN` and `parseSpawnEnv`. Move all
+    of them or none — leaving `parseSpawnEnv` or `hasAsciiControl` behind reintroduces the import
+    the move exists to remove.
+  - ⚠ **There is a cycle to kill first, not to create.** `routing-parser.ts` must import ONLY from
+    `./config-types.js`, but the moved code needs `POOL_PREFIX` (`config.ts:305`), `AUTO_MODEL`
+    (`:308`) and `splitSpec` (`:683`), all exported from `config.ts`. Relocate those three to a leaf
+    (`config-types.ts`, or a new `src/spec.ts`) and have `config.ts` re-export them for its six
+    existing importers. That is a separate, ordered move that has to land first.
 
-- **Finish the eslint fold-in: 82 errors across 41 file-and-rule pairs.** Phase 1a took 99 → 82.
-  `analysis-reports/` — gitignored generated output that eslint was linting through the
-  `**/*.{js,mjs}` block — is now ignored, and `sonarjs/regex-complexity` is off for the three
-  curated parser modules with the invariant named in `eslint.config.mjs`. ⚠ The 63 recorded on
-  2026-09-01 was already stale; count before planning. Remaining groups, largest first:
-  `sonarjs/different-types-comparison` 15; `@typescript-eslint/no-unused-vars` 13 with
-  `sonarjs/unused-import` 12, of which twelve sit in `config.ts`, a re-export barrel since DR-001;
-  `sonarjs/no-hardcoded-passwords` 9, every one a keystore-adjacent test fixture;
-  `sonarjs/no-nested-functions` 8, every one in a test; `sonarjs/redundant-type-aliases` 6;
-  `sonarjs/deprecation` 4; `no-control-regex` 3; then eleven singles and pairs.
-  **Property:** every remaining rule is either fixed in the code or switched off for its file with
-  the invariant named beside it, so `eslint.config.mjs`'s own convention is satisfied by the state
-  the tree is actually in.
+  ⚠ Also confirm the governing complexity figure before starting: the catalog says 137, the
+  in-source comment says 124, and the verification flags the discrepancy without resolving it.
 
-- **Owner decision: rule on CLONE-07 and CLONE-26.** The evidence is
-  [`reviews/clone-07-clone-26-evidence-2026-09-05.md`](reviews/clone-07-clone-26-evidence-2026-09-05.md),
-  written at the owner's request. CLONE-07 needs no behaviour decision — the two
-  `malformedProvenance` predicates are ONE rule spelled against each front's own passthrough
-  condition, proven by a truth table over all six reachable combinations — so the only question is
-  whether to name that predicate once. CLONE-26 IS a behaviour question: a DeepSeek tool-call
-  payload that parses to a scalar commits an empty-argument call, and one that parses to an array
-  commits the array AS the arguments, where the Kimi parser discards both.
+  **Property:** `config.ts` declares no moved symbol, the new module imports nothing from the
+  request path, and `parseRouting` is pure over its inputs.
 
-  **✅ RULED 2026-09-05, option A: give `fromDeepSeekForm` the strictness `fromKimiTokenForm`
-  already has.** A scalar or array payload discards that dialect's contribution rather than
-  committing a call; the turn fails clean to `detected` and failover reaches a host that parses.
-  ⚠ Still OPEN as WORK — it is a behaviour change on the wire and needs its own commit and its own
-  pinning test, not a fold-in. **Property:** a scalar payload yields no DeepSeek call, an array
-  payload yields no DeepSeek call, a well-formed object payload is unaffected, and restoring the
-  lenient branch turns that test red. Accepted cost, recorded so it is not rediscovered as a bug:
-  one malformed block now discards well-formed DeepSeek calls found EARLIER in the same message —
-  the same whole-or-nothing rule the destructive filter already follows.
-  CLONE-07 needs no behaviour decision; naming its predicate once is ordinary refactor work.
+- **Owner decision: P1-06 / SEM-06 — recommend DECLINE, and record it.** The item says "explicit
+  beats default" is re-implemented across six modules. Read at HEAD on 2026-09-05, there is no one
+  rule to extract, and the full site-by-site table is in
+  [`phase-1b-recon-2026-09-05.md`](phase-1b-recon-2026-09-05.md). In short: four genuinely different
+  clamps (floors 0 against `MIN_RETRY_AFTER_MS`, ceilings 30 days against 15 minutes, absent-handling
+  a default against `null`, two of them on an ABSOLUTE time rather than a duration) plus three sites
+  whose entire contribution is the `??` operator.
+
+  ⚠ `failureCooldown` is the case that settles it: its floor does not raise the value, it changes the
+  RUNG — a measurement that fails to beat the default is reported `source: "default"`, and that
+  source is persisted breaker state. One shared evaluator would need a mode flag to express it, which
+  is the two-policies-under-one-name shape this repository already warns against. Wrapping `a ?? b`
+  in a function call makes the code worse.
+
+  This reverses an ACCEPT verdict from the adversarial verification, so it is the owner's call and
+  nothing was built. What survives, and it is small, is the intra-`dispatch.ts` pair at `:373` and
+  `:384`, which really do clamp an absolute time the same way.
+
+  **Property:** the two documents agree — either the plan records that SEM-06 was declined and why,
+  or an owner instruction says to build it anyway and the mode flag is designed deliberately.
+
+- **Owner decision: CLONE-26 moved a second thing its ruling did not name.** Shipped 2026-09-05
+  (`f9006e7`) as ruled, option A, with five pinning cases and a mutation check. The ruling covered
+  the scalar and array payloads; it did not cover what happens when such a payload carries a name in
+  `repair.destructiveTools`. Before: the parser committed a call, so the destructive filter saw it
+  and returned `refused-destructive` — HTTP 502, `origin: "local"`, code
+  `tool_dialect_refused_destructive`, the `x-llm-relay-tool-dialect` header, no failover, no breaker
+  charge. After: the payload is discarded before the filter sees it, so the same input returns
+  `detected` — HTTP 502, `origin: "upstream"`, no header, a full pool reroll and a breaker charge.
+
+  No destructive call is fabricated on either path, so the safety invariant is unharmed. What moved
+  is the error code, the header, the failover and the health accounting.
+
+  **Property:** the owner either accepts the new behaviour and it is recorded in `CLAUDE.md` beside
+  the dialect-rescue gotcha, or the destructive check is moved ahead of the payload validity check so
+  the refusal still fires.
+
+- **Remove `extractQuotaPercent`, or state why it stays** (found 2026-09-05 during the eslint
+  fold-in). `src/ping/ping.ts:25` carries an `@deprecated` marker pointing at
+  `extractQuotaObservations()`, and it has ZERO consumers in `src/` — only its own declaration and
+  `test/ping.test.ts`. It is still a published export, which is why `sonarjs/deprecation` is switched
+  off for `test/**` rather than the test being deleted: a shipped export must stay covered until it
+  is removed. The `kernel/` and `JsonStore` precedent is to delete unadopted machinery.
+
+  **Property:** either the export is gone with its test, or a line in `CLAUDE.md` says which
+  consumer keeps it alive.
+
+- **CLONE-07 — name the `malformedProvenance` predicate once.** No behaviour decision is needed and
+  none is outstanding: the evidence
+  ([`reviews/clone-07-clone-26-evidence-2026-09-05.md`](reviews/clone-07-clone-26-evidence-2026-09-05.md))
+  proves by truth table over all six reachable combinations that the two spellings in
+  `routes/messages.ts` and `routes/openai-front.ts` are ONE rule — did the relay author these bytes —
+  stated against each front's own passthrough condition. This is ordinary refactor work, held only
+  because `item-p1-03-front-walk-candidate-runner.md` puts it in its own scope.
+
+  **Property:** one named predicate is called at all four sites, with a truth-table test, so a fifth
+  site cannot invent a seventh row.
 
 - **Owner decision, DEFERRED 2026-09-05: whether to adopt the runbook's Tier 1 duplication CI
   gate.** [`reviews/duplication-and-complexity-runbook-2026-09-05.md`](reviews/duplication-and-complexity-runbook-2026-09-05.md)
@@ -217,29 +227,6 @@
   relay answered 200 in 2.3 s and verified the key (2026-09-04). **Property:** the escalation probe
   picks a free-class model of the provider when the catalog has one (`assessCost` over
   `cachedModels`), so a valid key on a billing-gated account reports `valid`, not `unverified`.
-
-- **Decide what to do with the 63 advisory errors the eslint revert surfaced.** The
-  `server.ts` decomposition had switched off 15 rules; the owner reverted that on 2026-09-01
-  (`cde5d1c`). ⚠ The CODE producing the findings is **pre-existing**: curated parser regexes in
-  `refusal-interpretation.ts`, `rate-limits.ts` and `quota-observation.ts`; keystore-test fixture
-  passphrases; `no-control-regex` in `dashboard-static.ts`. The tree scored **155 errors at
-  `ec5c16f` under that commit's own config against 63 at HEAD**, so the refactor left it cleaner by
-  this measure.
-
-  ⚠ Do NOT restate this as "in files the refactor never touched" — an auditor falsified that
-  phrasing on 2026-09-01. Twelve of the sixteen error-bearing files WERE modified, and
-  `candidate-runner.ts` was created by the refactor; its one error sits on `credentialAttemptLabel`,
-  a body moved byte-for-byte from `server.ts`. The claim is about moved code, not untouched files.
-
-  Analysis is advisory and deliberately outside the gate, so nothing is broken. The unmet property
-  is that `eslint.config.mjs`'s convention — one **named invariant** beside each disabled rule — is
-  currently satisfied by neither state: the rules are on and noisy, or off and unlabelled. Resolve
-  by disabling each with its invariant named, or by fixing the findings. Evidence:
-  [`refactor-consistency-audit-2026-09-01.md`](refactor-consistency-audit-2026-09-01.md).
-
-  **Owner decision 2026-09-04 (audit-triage lap):** switch each rule off per file, with the
-  invariant named beside it in `eslint.config.mjs`, and do not rewrite the intentional code. The
-  work is scheduled outside that lap.
 
 - **Raise `publish.yml`'s `timeout-minutes: 15` — the v0.69.0 publish exhausted it on the first
   attempt.** `npm ci` took 5 min 2 s against a 10 s baseline on the v0.68.8 run, and the smoke
