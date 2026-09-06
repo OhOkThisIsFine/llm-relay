@@ -2465,6 +2465,34 @@ ${lane} — ${entry.models.length} models, probed ${entry.probedAt} via \`${entr
  * is the only mechanism it has — so `bypassed` is the literally accurate answer for this caller,
  * and it is what makes every rung come back with an `invoke`.
  */
+/**
+ * The catalog, dynamic-pool materialization and context-window resolver that BOTH dispatch-view
+ * builders open with — `resolveDispatchView` and `runDispatch` (CLONE-17 in the 2026-09-05
+ * duplication catalog, ACCEPT in the adversarial verification).
+ *
+ * Returns the resolver alone rather than the catalog beside it: the catalog is read only from
+ * inside the resolver's own closure at both sites, so handing it back would publish a value
+ * neither caller has ever used.
+ *
+ * ⚠ A pool this cannot materialize stays EMPTY rather than throwing — the same degradation as a
+ * cold cache, and the reason the `catch` is empty. Both call sites depended on that already;
+ * a dispatch view is advisory, and refusing to render one because a pool would not expand would
+ * turn a missing hint into a dead command.
+ */
+function setupDispatchCatalog(cfg: Config): ReturnType<typeof contextWindowResolver> {
+  const catalog = new ModelCatalog();
+  try {
+    materializeDynamicPools(cfg, catalog);
+  } catch {
+    // A pool we cannot materialize stays empty — the same degradation as a cold cache.
+  }
+  return contextWindowResolver(
+    (provider, model) => catalog.cachedLimits(provider, model)?.contextLength ?? null,
+    snapshotContextWindow,
+    observedContextLimit,
+  );
+}
+
 export async function resolveDispatchView(opts: {
   task?: string | undefined;
   tier?: string | undefined;
@@ -2483,17 +2511,7 @@ export async function resolveDispatchView(opts: {
   if (opts.client) qs.set("client", opts.client);
   qs.set("host", "bypassed");
 
-  const catalog = new ModelCatalog();
-  try {
-    materializeDynamicPools(cfg, catalog);
-  } catch {
-    // A pool we cannot materialize stays empty — the same degradation as a cold cache.
-  }
-  const cachedContextWindow = contextWindowResolver(
-    (provider, model) => catalog.cachedLimits(provider, model)?.contextLength ?? null,
-    snapshotContextWindow,
-    observedContextLimit,
-  );
+  const cachedContextWindow = setupDispatchCatalog(cfg);
 
   const liveRaw = (await tryServer(cfg, `/dispatch?${qs}`)) as WireDispatchView | null;
   // Same staleness discriminator `runDispatch` applies: a proxy that ignores `?host=` would answer
@@ -2650,17 +2668,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   if (hostRouting.entrypoint) qs.set("entrypoint", hostRouting.entrypoint);
   const path = `/dispatch${qs.toString() ? `?${qs}` : ""}`;
 
-  const catalog = new ModelCatalog();
-  try {
-    materializeDynamicPools(cfg, catalog);
-  } catch {
-    // A pool we cannot materialize simply stays empty — the same degradation as a cold cache.
-  }
-  const cachedContextWindow = contextWindowResolver(
-    (provider, model) => catalog.cachedLimits(provider, model)?.contextLength ?? null,
-    snapshotContextWindow,
-    observedContextLimit,
-  );
+  const cachedContextWindow = setupDispatchCatalog(cfg);
 
   const liveRaw = (await tryServer(cfg, path)) as WireDispatchView | null;
   const hostStale = liveRaw !== null && hostRouting.state !== "unknown" && liveRaw.host !== hostRouting.state;
