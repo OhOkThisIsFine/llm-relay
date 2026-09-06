@@ -42,7 +42,7 @@ jobs:
   publish:
     if: github.repository == 'OhOkThisIsFine/llm-relay' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment:
       name: npm-publish
       url: https://www.npmjs.com/package/llm-relay

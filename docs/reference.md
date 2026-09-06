@@ -631,6 +631,22 @@ Ordering also **interleaves providers** within a rank band, so the first N attem
 distinct quota domains rather than N members sharing one credential. The top-ranked candidate is
 still tried first; interleaving only decides who is tried second.
 
+**Three routing terms are ON by default**, each reverting with one boolean. Each is documented in
+full below, except `routing.laneProbe`, which belongs to dispatch and lives under
+[Background lane re-probing](#background-lane-re-probing-routinglaneprobe). This table is the index
+— it states no policy of its own.
+
+| Key | Default | Revert | What the term does |
+|---|---|---|---|
+| `routing.latency` | ON | `"latency": false` | Demotes a candidate whose MEASURED p95 exceeds a ceiling, into the `slow` band. |
+| `routing.hedge` | ON, and confined to FREE deployments | `"hedge": false` | Starts the next candidate BESIDE a slow one and serves whichever commits first. The only term that duplicates a request. |
+| `routing.laneProbe` | ON | `"laneProbe": false` | Re-probes recorded `cli` lane deaths and stale rosters on the relay's own background cadence. |
+
+Each `false` is the boolean shorthand for `{ "enabled": false }` and is a byte-for-byte revert to
+the behaviour before the term existed. `routing.quota` below is also on by default, but it has no
+single boolean: it gates on provider-stated and configured figures always, and on learned figures
+only under the `enforceLearned` opt-in.
+
 #### Quota as a demotion term (`routing.quota`)
 
 When a candidate's own quota evidence says its allowance is **spent** (`remaining ≤ 0`), that
