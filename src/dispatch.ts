@@ -3,7 +3,8 @@ import type { Config, LadderRung } from "./config-types.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
-import { allLaneStats, medianWallClockMs } from "./dispatch-lane-stats.js";
+import { allLaneStats, medianWallClockMs, p95WallClockMs } from "./dispatch-lane-stats.js";
+import { laneDemotion, lanePin, type LaneAffinityRow } from "./lane-affinity.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -69,18 +70,28 @@ export interface DispatchLaneStats {
   failures: number;
   timeouts: number;
   medianWallClockMs: number | null;
+  /**
+   * 95th percentile of the same window. Reported BESIDE the median rather than instead of it,
+   * because the two answer different questions and the median alone hid the answer an operator
+   * giving up on a lane was actually looking for (median 111.5 s against p95 900 s on the live
+   * store, 2026-09-05). Null when the window is empty — unknown stays null, never 0.
+   */
+  p95WallClockMs: number | null;
   lastAt: number | null;
 }
 
 /**
  * One-line advisory rendering of a lane's stats, shared by `dispatch_lanes` and
  * `llm-relay dispatch` so the wording cannot drift between the two surfaces:
- * `stats: 4 calls, 3 ok, 1 failed, 0 timed out, median 24s` (`median n/a` when unknown).
- * Median seconds are rounded to one decimal.
+ * `stats: 4 calls, 3 ok, 1 failed, 0 timed out, median 24s, p95 91s` (`n/a` when unknown).
+ * Seconds are rounded to one decimal.
  */
 export function formatLaneStats(stats: DispatchLaneStats): string {
-  const median = stats.medianWallClockMs === null ? "n/a" : `${Math.round(stats.medianWallClockMs / 100) / 10}s`;
-  return `stats: ${stats.calls} calls, ${stats.successes} ok, ${stats.failures} failed, ${stats.timeouts} timed out, median ${median}`;
+  const seconds = (ms: number | null): string => (ms === null ? "n/a" : `${Math.round(ms / 100) / 10}s`);
+  return (
+    `stats: ${stats.calls} calls, ${stats.successes} ok, ${stats.failures} failed, ` +
+    `${stats.timeouts} timed out, median ${seconds(stats.medianWallClockMs)}, p95 ${seconds(stats.p95WallClockMs)}`
+  );
 }
 
 export interface DispatchLane {
@@ -161,6 +172,33 @@ export interface DispatchLane {
    * Never changes `state`, `next`, or the ladder order — a column, not an input.
    */
   stats?: DispatchLaneStats;
+  /**
+   * This lane answered recently, so it is preferred over its ladder position for a window
+   * (`lane-affinity.ts`). Present only while the pin is live.
+   *
+   * ⚠ **A pin PROMOTES; it never RESURRECTS.** It reorders lanes that are already selectable and
+   * nothing more — a pinned lane that is exhausted, disabled, unreachable or not servable is still
+   * not selected, and this field never appears on one. That is the mirror of "health demotes,
+   * never drops": a memory of past success must not outrank present evidence of unavailability.
+   */
+  pinned?: { until: string; reason: string };
+  /**
+   * This lane recently failed to answer inside the budget a dispatch walk gave it, so ready lanes
+   * carrying no demotion are tried ahead of it for a window (`lane-affinity.ts`).
+   *
+   * ⚠ **It is a FIELD, not a `LaneState` member, and that is load-bearing.** `buildDispatch`
+   * selects on `state === "ready"`, so a `slow` member of that union would REMOVE a slow lane
+   * rather than demote it — breaking "health demotes, never drops" inside the very change that
+   * exists to honour it. Demotion is a TERM in the ordering, exactly as quota demotion is a term
+   * inside `targetUsability` on the HTTP path rather than a state.
+   *
+   * ⚠ **The evidence is first-party and needs no threshold.** `docs/backlog.md` asks for a
+   * calibrated wall-clock statistic and warns, correctly, never to borrow the HTTP path's numbers
+   * — a lane legitimately runs an agent loop for minutes. This carries no statistic at all: "the
+   * walk gave this lane its budget and it did not answer" is a measurement of this lane, by this
+   * relay, moments ago.
+   */
+  demoted?: { until: string; reason: string };
 }
 
 export interface DispatchView {
@@ -177,6 +215,21 @@ export interface DispatchView {
    */
   host: HostRoutingState;
   ladder: DispatchLane[];
+  /**
+   * Lane ids that MAY be selected, best first — the ONE definition of selection order.
+   * `next` is `order[0]` resolved against `ladder`; a dispatch WALK iterates the same list.
+   *
+   * ⚠ It exists so the order has one owner. The alternative — a walking caller re-deriving the
+   * order from `ladder` — puts two definitions of one rule in two files, which is the shape this
+   * repository's history warns about more often than any other (`orderByUsability` versus
+   * `targetUsability`, the pool-failover incident, the two hand-assembled announcement sets).
+   *
+   * ⚠ `ladder` itself stays in CONFIG order, because `position` is documented as stable and a
+   * reader needs to see the configured ladder rather than a re-sorted one. Unselectable rungs
+   * (exhausted, disabled, unreachable, not servable) are absent from `order` entirely — this is
+   * the order of what may be TRIED, not a ranking of everything.
+   */
+  order: string[];
   /** The lane the host should use now, or null when every rung is spent or none configured. */
   next: DispatchLane | null;
   /** Why `next` is what it is — including why it is null. */
@@ -935,22 +988,34 @@ export function buildDispatch(
       failures: row.failures,
       timeouts: row.timeouts,
       medianWallClockMs: medianWallClockMs(row.wallClockMs),
+      p95WallClockMs: p95WallClockMs(row.wallClockMs),
       lastAt: row.lastAt,
     };
   }
+  // Routing memory from previous walks (`lane-affinity.ts`): which lane answered, and which lane
+  // failed to answer inside the budget it was given. Like the stats above these are COLUMNS — they
+  // never change a lane's `state`, and an unavailable lane carries neither. Only the ordering of
+  // already-selectable lanes reads them, below.
+  annotateAffinity(cfg, ladder, selected.tier, now);
   const offload = offloadRule(cfg, client).enabled;
   const base = { tier: selected.tier, offload, client, host, ladder };
 
   if (selected.missing) {
     return {
       ...base,
+      order: [],
       next: null,
       reason: `no dispatch tier "${describeId(selected.missing)}" configured (have: ${Object.keys(cfg.routing.ladders ?? {}).join(", ")})`,
     };
   }
 
   if (ladder.length === 0) {
-    return { ...base, next: null, reason: "no routing.ladder configured — dispatch order is the host's to choose" };
+    return {
+      ...base,
+      order: [],
+      next: null,
+      reason: "no routing.ladder configured — dispatch order is the host's to choose",
+    };
   }
 
   if (opts.lane !== undefined) {
@@ -958,6 +1023,7 @@ export function buildDispatch(
     if (!forced) {
       return {
         ...base,
+        order: [],
         next: null,
         reason: `no lane "${describeId(opts.lane)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
       };
@@ -966,8 +1032,13 @@ export function buildDispatch(
     // from this host: the host asked for THIS target, and second-guessing it would defeat the
     // point of an override. The `unreachable` field still travels on the lane, so the caller can
     // see what it overrode rather than discovering it at spawn time.
+    //
+    // ⚠ `order` is that ONE lane, so a walking caller honours the override too: an override means
+    // "use this target", and walking past it to a lane the caller did not ask for would defeat the
+    // override just as silently as ignoring it.
     return {
       ...base,
+      order: [forced.id],
       next: forced,
       reason:
         forced.unreachable !== undefined
@@ -984,6 +1055,7 @@ export function buildDispatch(
     if (idx < 0) {
       return {
         ...base,
+        order: [],
         next: null,
         reason: `no lane "${describeId(opts.after)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
       };
@@ -996,7 +1068,8 @@ export function buildDispatch(
   // discovering it, and in the Desktop case would discover it as a silent no-op rather than an
   // error. An explicit `?lane=` override above still reaches it.
   const usable = pool.filter((l) => l.state === "ready" && l.unreachable === undefined && l.notServable === undefined);
-  const next = usable[0] ?? null;
+  const ranked = rankSelectable(usable);
+  const next = ranked[0] ?? null;
   if (!next) {
     const blocked = pool.filter((l) => l.unreachable !== undefined).length;
     const why =
@@ -1005,18 +1078,64 @@ export function buildDispatch(
         : "every lane is exhausted or disabled";
     return {
       ...base,
+      order: [],
       next: null,
       reason: blocked > 0 ? `${why} (${blocked} unreachable from this host)` : why,
     };
   }
 
-  const why =
-    opts.after !== undefined
-      ? `first ready lane after "${describeId(opts.after)}"`
-      : next.position === 1
-        ? "first lane in the ladder"
-        : `first ready lane (${next.position - 1} ahead of it unavailable)`;
-  return { ...base, next, reason: why };
+  const why = selectionReason(next, opts.after);
+  return { ...base, order: ranked.map((l) => l.id), next, reason: why };
+}
+
+/**
+ * Attach each lane's live pin and demotion, when it has one and is selectable.
+ *
+ * ⚠ The `state === "ready"` guard is the "a pin promotes, never resurrects" rule made mechanical.
+ * A pin rendered on an exhausted lane would read as a recommendation to use it, on the one surface
+ * a host reads to decide; and a demotion on a lane nothing can select says nothing at all. Neither
+ * memory is DELETED by the guard — both stay in the store and reappear the moment the lane is
+ * selectable again, because unavailability disproves neither.
+ */
+function annotateAffinity(cfg: Config, ladder: DispatchLane[], tier: string | null, now: number): void {
+  const render = (row: LaneAffinityRow): { until: string; reason: string } => ({
+    until: new Date(row.until).toISOString(),
+    reason: row.reason,
+  });
+  for (const lane of ladder) {
+    if (lane.state !== "ready" || lane.unreachable !== undefined || lane.notServable !== undefined) continue;
+    const pin = lanePin(cfg, tier, lane.id, now);
+    if (pin) lane.pinned = render(pin);
+    const demotion = laneDemotion(cfg, tier, lane.id, now);
+    if (demotion) lane.demoted = render(demotion);
+  }
+}
+
+/**
+ * Order the selectable lanes: pinned first, then undemoted, then demoted. Within a band the
+ * configured ladder order is preserved, because `Array.prototype.sort` is stable and the input is
+ * already in that order — the operator's own ordering remains the tie-break, exactly as pool
+ * ranking keeps config order on a tie.
+ *
+ * ⚠ A lane carrying BOTH memories ranks as PINNED. That state is reachable — a lane can answer,
+ * be pinned, then miss a budget on a later walk — and the pin is the more recent evidence in the
+ * only case that matters, because a demotion RETRACTS the pin when it is recorded and a success
+ * retracts the demotion (`clearLaneAffinity`). Ranking it as demoted instead would let one missed
+ * budget outrank a fresh success.
+ */
+function rankSelectable(usable: readonly DispatchLane[]): DispatchLane[] {
+  const rank = (lane: DispatchLane): number => (lane.pinned ? 0 : lane.demoted ? 2 : 1);
+  return [...usable].sort((a, b) => rank(a) - rank(b));
+}
+
+/** Why `next` is what it is, in one line the ladder view and the CLI both print. */
+function selectionReason(next: DispatchLane, after: string | undefined): string {
+  if (next.pinned) return `lane "${next.id}" is pinned (${next.pinned.reason})`;
+  if (after !== undefined) return `first ready lane after "${describeId(after)}"`;
+  if (next.demoted) return `every ready lane is demoted; "${next.id}" is the least recently demoted`;
+  return next.position === 1
+    ? "first lane in the ladder"
+    : `first ready lane (${next.position - 1} ahead of it unavailable)`;
 }
 
 export const AUTO_TIERS = ["low", "medium", "high", "xhigh"] as const;

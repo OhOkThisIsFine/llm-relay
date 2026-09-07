@@ -68,6 +68,7 @@ function view(over: Partial<DispatchView> = {}): DispatchView {
     client: "claude",
     host: "bypassed",
     ladder: next ? [next] : [],
+    order: next ? [next.id] : [],
     next,
     reason: "first ready lane",
     ...over,

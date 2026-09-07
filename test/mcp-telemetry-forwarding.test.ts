@@ -1,8 +1,13 @@
 /**
- * MCP-side telemetry forwarding (packet 2): the server forwards one metadata-only
- * `DispatchedTelemetryReport` per settled agent-mode job — never for answer-mode jobs,
- * never for cancelled jobs — fire-and-forget so a bad reporter cannot touch the dispatch
- * result, the job, or the stdio protocol.
+ * MCP-side telemetry forwarding: the server forwards one metadata-only
+ * `DispatchedTelemetryReport` per settled lane ATTEMPT — never for a cancelled job —
+ * fire-and-forget so a bad reporter cannot touch the dispatch result, the job, or the stdio
+ * protocol.
+ *
+ * ⚠ "Per attempt", not "per job", and answer-mode relay jobs ARE forwarded: both changed on
+ * 2026-09-06 with the dispatch walk, because the daemon records the lane pin and the lane
+ * demotion from these reports and the lane the walk exists to route around is a relay lane.
+ * The reasoning is quoted in full above the flipped test below.
  *
  * Harness and fixtures follow the `test/mcp-server.test.ts` pattern; `reportTelemetry`
  * is injected as a recording fake.
@@ -48,6 +53,7 @@ function view(over: Partial<DispatchView> = {}): DispatchView {
     client: "claude",
     host: "bypassed",
     ladder: next ? [next] : [],
+    order: next ? [next.id] : [],
     next,
     reason: "first ready lane",
     ...over,
@@ -145,7 +151,21 @@ describe("mcp telemetry forwarding", () => {
     expect(parseTelemetryReport(JSON.parse(JSON.stringify(report)))).toEqual(report);
   });
 
-  it("forwards nothing for an answer-mode job", async () => {
+  // ⚠ FLIPPED 2026-09-06, in the same change as the source, and the old assertion is quoted here
+  // rather than deleted: this test used to be `forwards nothing for an answer-mode job` and
+  // asserted `reports` was EMPTY. That was the right contract while telemetry existed only to
+  // meter lanes — a `relay` lane's HTTP traffic is already metered by the daemon's own pipeline,
+  // so a second row would have double counted.
+  //
+  // The dispatch WALK gave the same channel a second job: the daemon records the lane PIN and the
+  // lane DEMOTION from these reports. The lane this feature exists to route around is `free-pool`,
+  // a `relay` lane — so under the old contract the walk could never learn anything about its own
+  // primary target, and the feature would have been inert on exactly the case the owner reported.
+  //
+  // Double counting is still prevented, but by the DAEMON rather than by silence here: its
+  // `/dispatch/telemetry` route skips the accounting ledger for a `relay`-kind rung on its own
+  // (`accounting: "skipped", reason: "relay-kind"`), while still recording lane stats and affinity.
+  it("forwards a report for an answer-mode relay job, so the daemon can pin the lane", async () => {
     const reports: DispatchedTelemetryReport[] = [];
     const fetchImpl = (async () => assistantTextResponse("the direct answer")) as unknown as typeof fetch;
     const h = new Harness({
@@ -156,7 +176,12 @@ describe("mcp telemetry forwarding", () => {
     const { text, isError } = await h.tool("dispatch", { task: "answer-mode probe task", mode: "answer" });
     expect(isError).toBe(false);
     expect(text).toContain("the direct answer");
-    expect(reports).toHaveLength(0);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.kind).toBe("relay");
+    expect(reports[0]!.laneId).toBe("free-pool");
+    expect(reports[0]!.status).toBe("completed");
+    // Still metadata only, and still a shape the daemon's own validator accepts.
+    expect(parseTelemetryReport(JSON.parse(JSON.stringify(reports[0])))).toEqual(reports[0]);
   });
 
   it("forwards exactly one kind:cli report for answer mode on a cli lane (P2)", async () => {
@@ -282,6 +307,11 @@ describe("mcp telemetry forwarding", () => {
         "laneId",
         "kind",
         "spec",
+        // Added 2026-09-06 with the dispatch walk. The daemon's routing memory is keyed by TIER —
+        // each tier is its own ladder, so a pin recorded without it would let one lane's success on
+        // a cheap tier steer every reasoning level. A configured ladder name is metadata like the
+        // lane id beside it, never task content, which the value assertions below still enforce.
+        "tier",
         "wallClockMs",
         "exitCode",
         "status",

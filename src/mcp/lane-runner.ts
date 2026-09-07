@@ -27,6 +27,7 @@ import { resolve as resolvePath } from "node:path";
 import { quoteCmdArg } from "../lane-probe.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
 import { laneOfRung } from "../lane-manifest.js";
+import type { DispatchLaneStatus } from "../dispatch-lane-stats.js";
 
 /** Depth marker written into every child's environment, read back to bound recursion. */
 export const DEPTH_ENV = "LLM_RELAY_DISPATCH_DEPTH";
@@ -115,13 +116,74 @@ export interface RelayAnnouncements {
   degraded?: string;
 }
 
+/**
+ * One lane a dispatch WALK tried, in the order it tried them.
+ *
+ * ⚠ Its `status` is a `DispatchLaneStatus`, IMPORTED rather than restated. Two hand-written copies
+ * of one closed set is the most-repeated defect in this repository's history, and here the type
+ * additionally buys a guarantee: that union has no `cancelled` member, so "a caller cancellation is
+ * never reported as lane evidence" becomes a property the compiler enforces at every call site
+ * rather than a runtime check somebody can forget.
+ */
+export interface LaneAttempt {
+  laneId: string;
+  spec: string | undefined;
+  status: DispatchLaneStatus;
+  /** Wall clock for THIS attempt, not for the walk. */
+  elapsedMs: number;
+  /** Why the attempt ended this way, when it did not succeed. */
+  reason?: string;
+}
+
+/**
+ * The status one lane attempt earns. Shares its PRIORITY ORDER with `LaneJobStore.complete()`
+ * below, and `test/mcp-server.test.ts` pins that the two agree — they cannot share one
+ * implementation because `complete()` maps onto `JobStatus`, which describes the WALK, while this
+ * maps onto `DispatchLaneStatus`, which describes one lane.
+ *
+ * ⚠ `abandoned` is tested FIRST, ahead of `timedOut`. A lane the walk kills at its budget usually
+ * reports `timedOut` from the killed child as well, and between the two the walk's own decision is
+ * the MORE SPECIFIC claim: the relay knows it stopped this lane after N seconds, whereas the
+ * child's timeout flag would report it as having exhausted a ceiling it never reached.
+ */
+export function classifyLaneAttempt(
+  run: LaneRunResult,
+  // `| undefined` on both, deliberately: this repository compiles with
+  // `exactOptionalPropertyTypes`, and every caller builds these from values that are genuinely
+  // absent sometimes. Widening here beats making each call site spread conditionally.
+  opts: { abandoned?: boolean | undefined; semanticFailure?: string | undefined } = {},
+): DispatchLaneStatus {
+  if (opts.abandoned === true) return "abandoned";
+  if (run.timedOut) return "timed_out";
+  return run.code === 0 && opts.semanticFailure === undefined ? "completed" : "failed";
+}
+
 export interface LaneJob {
   id: string;
   status: JobStatus;
-  /** Ladder rung this job is running. */
+  /**
+   * Ladder rung this job is running NOW. A walk repoints it as it advances, so a `dispatch_status`
+   * poll always names the lane currently doing the work; `attempts` holds the ones already tried.
+   */
   laneId: string;
   /** What the rung addresses (`pool/high`, `agy`, …), when it names one. */
   spec: string | undefined;
+  /**
+   * Every lane this job tried, oldest first. Empty for a job that never advanced past its first
+   * lane and is still running; one entry for an ordinary single-lane dispatch that settled.
+   *
+   * ⚠ The JOB is the WALK, not one lane, and this field is what makes that legible. The walk
+   * cannot finish inside one blocking call — the measured client tool-call ceiling on this machine
+   * is between 45 s and 100 s, and above it the call fails AND destroys the job handle — so it
+   * continues in the background behind ONE handle. Re-pointing the handle at each new lane instead
+   * would break polling outright.
+   */
+  attempts: LaneAttempt[];
+  /**
+   * Selectable lanes the walk's `maxLanes` bound kept it from trying. Absent when it tried
+   * everything the ladder offered — see `LaneJobStore.noteLanesNotTried`.
+   */
+  lanesNotTried?: number;
   startedAt: number;
   endedAt: number | undefined;
   exitCode: number | null;
@@ -535,6 +597,7 @@ export class LaneJobStore {
       timedOut: false,
       cwd,
       error: undefined,
+      attempts: [],
       ...(dispatchSource !== undefined ? { dispatchSource } : {}),
     };
     this.jobs.set(job.id, job);
@@ -543,6 +606,45 @@ export class LaneJobStore {
 
   registerKill(id: string, kill: () => void): void {
     this.kills.set(id, kill);
+  }
+
+  /**
+   * Point a still-RUNNING walk at the lane it has just moved to, so a `dispatch_status` poll
+   * names the lane currently doing the work rather than the one already abandoned.
+   *
+   * ⚠ The `running` guard is what keeps a cancelled walk cancelled. `cancel()` sets the status
+   * synchronously and the walk loop checks it, but the two are not atomic with respect to each
+   * other; without the guard a walk that advanced in the same tick would repoint a job the
+   * operator had already stopped.
+   */
+  setCurrentLane(id: string, laneId: string, spec: string | undefined): void {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running") return;
+    job.laneId = laneId;
+    job.spec = spec;
+  }
+
+  /**
+   * Append one tried lane to the walk's record. Appended for EVERY attempt, the winner included,
+   * so the answer can say what it cost to get there — and so an abandoned lane leaves a trace,
+   * which is the case `docs/backlog.md` says matters most ("an operator who gives up on a slow
+   * lane leaves no trace").
+   */
+  recordAttempt(id: string, attempt: LaneAttempt): void {
+    this.jobs.get(id)?.attempts.push(attempt);
+  }
+
+  /**
+   * Record how many selectable lanes the walk's own `maxLanes` bound kept it from trying.
+   *
+   * ⚠ No silent caps. A walk that stopped at four of nine lanes and then reported "every lane has
+   * been tried" would be false on the one surface the caller acts on. Zero is not stored, so an
+   * uncapped walk renders exactly as it did before this field existed.
+   */
+  noteLanesNotTried(id: string, count: number): void {
+    const job = this.jobs.get(id);
+    if (!job || count <= 0) return;
+    job.lanesNotTried = count;
   }
 
   get(id: string): LaneJob | undefined {

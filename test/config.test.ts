@@ -1622,6 +1622,71 @@ describe("loadConfig — provider compat (thought signature)", () => {
   });
 });
 
+describe("routing.dispatchWalk", () => {
+  it("defaults ON with the standard budget when absent — the 2026-09-06 owner request", () => {
+    const cfg = loadConfig(write("dw-absent.json", base()));
+    expect(cfg.routing.dispatchWalk).toEqual({
+      enabled: true,
+      attemptMs: 90_000,
+      maxLanes: 4,
+      pinMs: 15 * 60 * 1000,
+      demoteMs: 15 * 60 * 1000,
+    });
+  });
+
+  it("boolean `false` is a byte-for-byte revert to one lane per dispatch", () => {
+    const off = loadConfig(
+      write("dw-false.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: false } })),
+    );
+    expect(off.routing.dispatchWalk?.enabled).toBe(false);
+    // The other settings keep their defaults, so turning it back on needs no second edit.
+    expect(off.routing.dispatchWalk?.attemptMs).toBe(90_000);
+  });
+
+  it("accepts a partial object, filling the rest from the defaults, and floors to integers", () => {
+    const cfg = loadConfig(
+      write("dw-obj.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { attemptMs: 45_000.9, maxLanes: 2 } },
+      })),
+    );
+    expect(cfg.routing.dispatchWalk).toEqual({
+      enabled: true,
+      attemptMs: 45_000,
+      maxLanes: 2,
+      pinMs: 15 * 60 * 1000,
+      demoteMs: 15 * 60 * 1000,
+    });
+  });
+
+  it("⚠ rejects an unknown key by name — an ignored typo would read as a setting that took effect", () => {
+    expect(() =>
+      loadConfig(write("dw-unknown.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { attemptms: 45_000 } },
+      }))),
+    ).toThrow(/dispatchWalk\.attemptms is not a recognized key/);
+  });
+
+  it("rejects an out-of-bounds budget, a bad lane count and a non-boolean enabled", () => {
+    expect(() =>
+      loadConfig(write("dw-lowbudget.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { attemptMs: 10 } },
+      }))),
+      // Floor 1000 ms: a budget below that abandons every lane before a process can even start,
+      // which would read to an operator as "every lane is broken".
+    ).toThrow(/dispatchWalk\.attemptMs must be a number between 1000 and 3600000/);
+    expect(() =>
+      loadConfig(write("dw-lanes.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { maxLanes: 0 } },
+      }))),
+    ).toThrow(/dispatchWalk\.maxLanes must be a number between 1 and 20/);
+    expect(() =>
+      loadConfig(write("dw-enabled.json", base({
+        routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { enabled: "yes" } },
+      }))),
+    ).toThrow(/dispatchWalk\.enabled must be a boolean/);
+  });
+});
+
 describe("routing.laneProbe", () => {
   it("defaults ON with the standard intervals when absent — the 2026-08-29 owner decision", () => {
     const cfg = loadConfig(write("lp-absent.json", base()));

@@ -323,6 +323,23 @@ export interface Routing {
    */
   laneProbe?: LaneProbeSettings;
   /**
+   * The automatic dispatch lane WALK (owner request 2026-09-06,
+   * docs/dispatch-lane-walk-design-2026-09-06.md). **Default ON.**
+   *
+   * Before it, `dispatch` ran ONE lane and reported a failure when that lane was slow; the calling
+   * agent then picked the next lane by hand, which is the friction the owner reported. With it,
+   * the relay walks the ladder past a lane that does not answer inside `attemptMs`, pins the lane
+   * that does, and demotes the lane it left.
+   *
+   * ⚠ Read ONLY by `llm-relay mcp`, exactly like `mcp` below — the walk spawns lanes, and the
+   * daemon never spawns a lane for an HTTP turn. The daemon does read the PIN and the DEMOTION
+   * those walks record, because ordering a ladder is not spawning one.
+   *
+   * `false` is the shorthand for `{ enabled: false }` and restores the pre-walk behaviour exactly:
+   * one lane per call, no memory.
+   */
+  dispatchWalk?: DispatchWalkSettings;
+  /**
    * Settings for `llm-relay mcp`, the stdio MCP server that exposes the dispatch verb to any MCP
    * host. Read ONLY by that server — the daemon never consults this block, because the daemon
    * never serves MCP and never spawns a lane for an HTTP turn.
@@ -613,6 +630,35 @@ export interface LaneProbeSettings {
   quotaIntervalMs: number;
   /** Gate between catalog re-probes of ONE lane. Metadata commands, no quota spent. */
   catalogIntervalMs: number;
+}
+
+/** Automatic dispatch lane-walk settings — see the `dispatchWalk` field doc on `Routing`. */
+export interface DispatchWalkSettings {
+  enabled: boolean;
+  /**
+   * How long ONE lane gets to answer before the walk kills it and starts the next.
+   *
+   * ⚠ This is a BUDGET the operator sets, not a health threshold derived from measurement — which
+   * is why it may carry a default at all. `docs/backlog.md` warns, correctly, never to point the
+   * HTTP path's calibrated latency numbers at a lane: a lane legitimately runs an agent loop for
+   * minutes, so 250 ms/token and a 30 s ceiling would demote every healthy lane at once. Nothing
+   * here is borrowed from there.
+   *
+   * ⚠ It is NOT the lane's own timeout. A rung's `--timeout` (2100 s on this machine's slowest
+   * rung) still bounds a lane the walk is content to wait for; this bounds how long the WALK
+   * waits before trying someone else.
+   */
+  attemptMs: number;
+  /**
+   * How many lanes one dispatch may try. Bounded so a ladder of a dozen dead rungs cannot spend
+   * a dozen budgets before reporting; the walk states how many it tried and how many it skipped,
+   * because a silent cap reads as "everything was tried" when it was not.
+   */
+  maxLanes: number;
+  /** How long a lane that answered is preferred. See `lane-affinity.ts` for the promote-only rule. */
+  pinMs: number;
+  /** How long a lane the walk abandoned is ordered behind undemoted lanes. */
+  demoteMs: number;
 }
 
 /** `llm-relay mcp` settings — see the `mcp` field doc on `Routing`. */

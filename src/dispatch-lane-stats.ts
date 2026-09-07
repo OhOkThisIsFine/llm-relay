@@ -33,8 +33,19 @@ import type { LadderRung } from "./config-types.js";
 export const DISPATCH_LANE_KINDS = Object.freeze(["cli", "relay"] as const);
 export type DispatchLaneKind = (typeof DISPATCH_LANE_KINDS)[number];
 
-/** Terminal lane states worth recording. A `cancelled` job is discarded, never reported. */
-export const DISPATCH_LANE_STATUSES = Object.freeze(["completed", "failed", "timed_out"] as const);
+/**
+ * Terminal lane states worth recording. A job the OPERATOR cancelled is discarded, never reported:
+ * a caller changing its mind is not evidence about the lane.
+ *
+ * ⚠ `abandoned` is the fourth member and is the OPPOSITE case, which is why it had to be told
+ * apart from `cancelled` rather than folded into it (`docs/backlog.md`: *"an operator cancellation
+ * is distinguishable in the record from a lane that was never asked"*). The relay's own walk
+ * stopped this lane because it did not answer inside the budget it was given. That IS evidence
+ * about the lane, so it is recorded — and it is distinct from `timed_out`, which means the lane
+ * exceeded its OWN configured ceiling (35 minutes on this machine's slowest rung, against a walk
+ * budget measured in seconds). Conflating the two would report a 90-second miss as a 35-minute one.
+ */
+export const DISPATCH_LANE_STATUSES = Object.freeze(["completed", "failed", "timed_out", "abandoned"] as const);
 export type DispatchLaneStatus = (typeof DISPATCH_LANE_STATUSES)[number];
 
 /**
@@ -51,6 +62,16 @@ export interface DispatchedTelemetryReport {
   laneId: string;
   kind: DispatchLaneKind;
   spec?: string;
+  /**
+   * Ladder tier the lane was taken from, when the dispatch selected one. Absent for the legacy
+   * single ladder.
+   *
+   * ⚠ It is here because the daemon's routing MEMORY is keyed by tier: each tier is its own
+   * ladder with its own rungs, so a lane that answered a `low` task says nothing about the
+   * `xhigh` ladder, and a pin recorded without the tier would let one cheap success steer every
+   * reasoning level. Metadata like every other field — a configured ladder name, never task text.
+   */
+  tier?: string;
   wallClockMs: number;
   exitCode: number | null;
   status: DispatchLaneStatus;
@@ -71,6 +92,7 @@ const REPORT_KEYS = Object.freeze([
   "laneId",
   "kind",
   "spec",
+  "tier",
   "wallClockMs",
   "exitCode",
   "status",
@@ -84,6 +106,7 @@ const REPORT_KEY_SET = new Set<string>(REPORT_KEYS);
 const MAX_JOB_ID_CHARS = 64;
 const MAX_LANE_ID_CHARS = 200;
 const MAX_SPEC_CHARS = 200;
+const MAX_TIER_CHARS = 64;
 
 function isBoundedId(value: unknown, maxChars: number): value is string {
   return typeof value === "string"
@@ -107,10 +130,11 @@ export function parseTelemetryReport(value: unknown): DispatchedTelemetryReport 
   for (const key of Object.keys(body)) {
     if (!REPORT_KEY_SET.has(key)) return null;
   }
-  const { jobId, laneId, kind, spec, wallClockMs, exitCode, status, estimatedInputTokens, estimatedOutputTokens } = body;
+  const { jobId, laneId, kind, spec, tier, wallClockMs, exitCode, status, estimatedInputTokens, estimatedOutputTokens } = body;
   if (!isBoundedId(jobId, MAX_JOB_ID_CHARS)) return null;
   if (!isBoundedId(laneId, MAX_LANE_ID_CHARS)) return null;
   if (spec !== undefined && !isBoundedId(spec, MAX_SPEC_CHARS)) return null;
+  if (tier !== undefined && !isBoundedId(tier, MAX_TIER_CHARS)) return null;
   if (!DISPATCH_LANE_KINDS.includes(kind as DispatchLaneKind)) return null;
   if (!DISPATCH_LANE_STATUSES.includes(status as DispatchLaneStatus)) return null;
   if (typeof wallClockMs !== "number" || !Number.isFinite(wallClockMs) || wallClockMs < 0) return null;
@@ -121,6 +145,7 @@ export function parseTelemetryReport(value: unknown): DispatchedTelemetryReport 
     laneId,
     kind: kind as DispatchLaneKind,
     ...(spec === undefined ? {} : { spec }),
+    ...(tier === undefined ? {} : { tier }),
     wallClockMs,
     exitCode,
     status: status as DispatchLaneStatus,
@@ -157,6 +182,31 @@ export function medianWallClockMs(samples: readonly number[]): number | null {
   const hi = sorted[mid] ?? null;
   if (lo === null || hi === null) return null;
   return (lo + hi) / 2;
+}
+
+/**
+ * 95th percentile of one lane's rolling wall-clock window, in milliseconds. Null when the window
+ * is empty, the same unknown-stays-null rule as the median beside it.
+ *
+ * ⚠ It exists because the MEDIAN HIDES THE TAIL, and the tail is what an operator giving up on a
+ * lane is actually looking at. Measured on the live store 2026-09-05: median 111.5 s, p95 900 s,
+ * max 1500 s — three figures that support three different conclusions, of which the ladder printed
+ * only the smallest. `latency-demotion.ts` uses p95 on the HTTP path for exactly this reason, and
+ * `docs/backlog.md` names the mismatch as a defect.
+ *
+ * ⚠ It is REPORTED, never acted on. Nothing here demotes a lane on a wall-clock threshold: the
+ * recorded window mixes several sessions' traffic, so no threshold drawn from it means anything
+ * yet, and borrowing the HTTP path's numbers would demote every healthy lane at once. The
+ * demotion that DOES happen is first-party evidence from the walk (`lane-affinity.ts`).
+ *
+ * Nearest-rank, so the answer is always an OBSERVED sample rather than an interpolation between
+ * two: a percentile that reports a duration nothing ever took is a fabricated measurement.
+ */
+export function p95WallClockMs(samples: readonly number[]): number | null {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const rank = Math.ceil(0.95 * sorted.length);
+  return sorted[Math.min(sorted.length, Math.max(1, rank)) - 1] ?? null;
 }
 
 function freshLaneStats(): LaneStats {
@@ -251,6 +301,12 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
       break;
     case "timed_out":
       entry.timeouts += 1;
+      entry.failures += 1;
+      break;
+    case "abandoned":
+      // ⚠ A failure, but NOT a timeout. The lane did not answer inside the walk's budget, which
+      // is a failure of this attempt; it never reached its own configured ceiling, so counting it
+      // in `timeouts` would inflate a figure that means something narrower.
       entry.failures += 1;
       break;
     default: {

@@ -18,6 +18,8 @@ import { createProxy } from "../src/server.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import type { AccountingEvent, AttemptCompletedEvent, RequestCompletedEvent } from "../src/accounting.js";
 import { laneStatsFor } from "../src/dispatch-lane-stats.js";
+import { laneDemotion, lanePin } from "../src/lane-affinity.js";
+import { buildDispatch } from "../src/dispatch.js";
 import { createAccountingStore } from "../src/accounting-store.js";
 import { parseAccountingDayShardV1 } from "../src/accounting-store-schema.js";
 import type { AccountingRecorder } from "../src/accounting.js";
@@ -105,6 +107,95 @@ async function postTelemetry(base: string, body: unknown, headers: Record<string
     body: JSON.stringify(body),
   });
 }
+
+describe("POST /dispatch/telemetry — the daemon's routing memory", () => {
+  // "The MCP child reports, the daemon records." The child runs the walk and knows what each lane
+  // did; the daemon owns the pin and the demotion, because the child restarts often (one restart
+  // destroyed five lanes) and is not the process that builds the ladder view.
+
+  it("a completed report PINS the lane, on the tier the report names", async () => {
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      const res = await postTelemetry(base, cliReport({ status: "completed", tier: "medium", wallClockMs: 4_000 }));
+      expect(res.status).toBe(200);
+    });
+    expect(lanePin(cfg, "medium", "telemetry-cli")?.reason).toBe("answered in 4s");
+    // ⚠ Another tier is another ladder, so it learned nothing about `xhigh`.
+    expect(lanePin(cfg, "xhigh", "telemetry-cli")).toBeNull();
+  });
+
+  it("the recorded pin reaches the LADDER the next caller is handed", async () => {
+    // ⚠ End to end, and it is worth its own test: the report's tier and the tier `buildDispatch`
+    // annotates with have to be the same key, or every pin would be written where nothing reads it.
+    // This fixture is a LEGACY single ladder, so both are null — which is exactly the pairing the
+    // walk produces, since it passes `view.tier` back and the view got it from `selectLadder`.
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      await postTelemetry(base, cliReport({ laneId: "telemetry-cli-negative", status: "completed", wallClockMs: 2_000 }));
+    });
+    const view = buildDispatch(cfg);
+    expect(view.ladder.find((l) => l.id === "telemetry-cli-negative")?.pinned?.reason).toBe("answered in 2s");
+    expect(view.order[0]).toBe("telemetry-cli-negative");
+    expect(view.next?.id).toBe("telemetry-cli-negative");
+  });
+
+  it("an abandoned report DEMOTES the lane, and a later success RETRACTS the demotion", async () => {
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      await postTelemetry(base, cliReport({ status: "abandoned", tier: "medium", exitCode: null, wallClockMs: 90_000 }));
+      expect(laneDemotion(cfg, "medium", "telemetry-cli")?.reason).toBe("abandoned after 90s");
+      // ⚠ A success must not merely be recorded BESIDE the demotion — it disproves it, exactly as a
+      // served 200 clears a cooling condition in `target-facts.ts`.
+      await postTelemetry(base, cliReport({ status: "completed", tier: "medium", wallClockMs: 3_000 }));
+    });
+    expect(laneDemotion(cfg, "medium", "telemetry-cli")).toBeNull();
+    expect(lanePin(cfg, "medium", "telemetry-cli")).not.toBeNull();
+  });
+
+  it("every non-completed status demotes — one rule, including a plain failure", async () => {
+    for (const status of ["failed", "timed_out", "abandoned"] as const) {
+      const cfg = cfgWithLadder();
+      const events: AccountingEvent[] = [];
+      await withProxy(cfg, events, async (base) => {
+        await postTelemetry(base, cliReport({ status, tier: "high", exitCode: status === "failed" ? 1 : null }));
+      });
+      expect(laneDemotion(cfg, "high", "telemetry-cli"), status).not.toBeNull();
+      expect(lanePin(cfg, "high", "telemetry-cli"), status).toBeNull();
+    }
+  });
+
+  it("records NOTHING when the walk is disabled — no invented window", async () => {
+    // ⚠ Absent or disabled settings mean no expiry is declared, and this relay never invents a
+    // duration. A memory with a made-up window would be exactly that.
+    const cfg = cfgWithLadder();
+    cfg.routing.dispatchWalk = { ...cfg.routing.dispatchWalk!, enabled: false };
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      const res = await postTelemetry(base, cliReport({ status: "completed", tier: "medium" }));
+      expect(res.status).toBe(200);
+    });
+    expect(lanePin(cfg, "medium", "telemetry-cli")).toBeNull();
+  });
+
+  it("a relay-kind report still records the memory, though it mints no ledger row", async () => {
+    // The lane this feature exists to route around is a `relay` lane, so a memory recorded only for
+    // `cli` lanes would be inert on its own primary target. Accounting stays skipped either way.
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      const res = await postTelemetry(
+        base,
+        cliReport({ laneId: "telemetry-relay", kind: "relay", status: "completed", tier: "medium" }),
+      );
+      expect(await res.json()).toEqual({ recorded: true, accounting: "skipped", reason: "relay-kind" });
+    });
+    expect(lanePin(cfg, "medium", "telemetry-relay")).not.toBeNull();
+    expect(events).toEqual([]);
+  });
+});
 
 describe("POST /dispatch/telemetry", () => {
   it("records a valid cli report: 200, lane stats, and exactly one ledger request", async () => {

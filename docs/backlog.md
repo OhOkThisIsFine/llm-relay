@@ -21,41 +21,32 @@
   **Property:** every queued item carries an accepted verdict, a `reject`, or a stated reason to
   stay pending, each addressed by digest (`--sig`), so the listing shows no item without one.
 
-- **A `cli` dispatch lane has ordering but no health-based reordering: it can be arbitrarily slow
-  and stay `next` forever.** Owner question, 2026-09-05, after a lane produced nothing across three
-  packets while the ladder went on recommending it. Everything below is verified, not inferred.
+- **A slow `cli` lane is now reordered, but on WALK EVIDENCE rather than on a calibrated statistic
+  — the statistic is still open.** Opened as *"a `cli` dispatch lane has ordering but no
+  health-based reordering: it can be arbitrarily slow and stay `next` forever"* (owner question,
+  2026-09-05). Most of it SHIPPED on 2026-09-06 with the dispatch walk
+  ([`dispatch-lane-walk-design-2026-09-06.md`](dispatch-lane-walk-design-2026-09-06.md)); what
+  remains is recorded here rather than closed, because the original property is not fully met.
 
-  - **The existing machinery cannot reach it.** `latency-demotion.ts` and `hedge-trigger.ts` are
-    imported only by `backend.ts`, `candidate-runner.ts`, `circuit-breaker.ts`, `config-types.ts`,
-    `ping/cadence.ts`, `server.ts` and each other — `dispatch.ts` is absent. Demotion feeds
-    `targetUsability` inside a candidate WALK, and a lane never enters a walk; hedging duplicates one
-    HTTP attempt, and `dispatch` runs a single rung, so there is no second entrant to race.
-  - **The only lane demotion vocabulary is exhaustion** (`rate_limited` / `quota_exhausted`, from an
-    explicit host report or a quota probe finding a STATED rate/quota message). "Ran a long time and
-    returned nothing" cannot be expressed, so it cannot be recorded.
-  - **The one lane observation that exists is display-only and uses the wrong statistic.**
-    `medianWallClockMs` has three consumers — two print sites and the view field — and nothing
-    orders by it. Measured on the live store the same day: median **111.5 s**, p95 **900 s**, max
-    **1500 s**. `latency-demotion.ts` uses p95 precisely because a median hides a fat tail; the lane
-    view uses the median.
-  - **Cancellation teaches it nothing**, deliberately: `forwardTelemetry` narrows to
-    `REPORTABLE_JOB_STATUSES`, every terminal status but `cancelled`. An operator who gives up on a
-    slow lane leaves no trace, which is the case most likely to matter.
-  - ⚠ **Nothing was late by the lane's own contract** — the rung carries `--timeout 2100`, 35
-    minutes, and the longest observed wait was 680 s. The relay behaved exactly as configured.
+  **Met.** A demotion vocabulary beyond exhaustion now exists (`lane-affinity.ts`), the ladder
+  reorders on it (`DispatchView.order`), the operator's give-up leaves a trace (the new
+  `abandoned` lane status, distinguished from an operator `cancelled`, which is still discarded),
+  and the ladder view reports the statistic beside the median it used to print alone
+  (`p95WallClockMs`).
 
-  ⚠ **Do NOT fix this by pointing the HTTP terms at the ladder.** 250 ms/token and the 30 s absolute
-  ceiling are calibrated for single completions; a lane legitimately runs an agent loop for minutes,
-  and 900 s is not self-evidently unhealthy for one. Reusing those numbers would demote every
-  healthy lane at once — the same mistake `latency-demotion.ts` records having made when an
-  absolute ceiling calibrated on probes was pointed at generation traffic.
+  **Not met.** The demotion is EVIDENCE — "the walk gave this lane its budget and it did not
+  answer" — not a threshold drawn from the lane's own recorded distribution. The original property
+  asked for the latter, and it is still not possible for the reason the entry always gave: the
+  recorded wall-clock window mixes several sessions' traffic, so no threshold drawn from it means
+  anything until per-lane history is attributable. ⚠ The standing warning is unchanged and still
+  binds: do NOT point the HTTP path's numbers (250 ms/token, a 30 s absolute ceiling) at a lane —
+  a lane legitimately runs an agent loop for minutes, and reusing them would demote every healthy
+  lane at once.
 
-  **Property:** a lane whose recent wall-clock distribution is an outlier against ITS OWN history is
-  demoted below a comparable lane, on a threshold calibrated from `dispatch-lane-stats.json` rather
-  than borrowed from the HTTP path; the ladder view reports the statistic the decision actually uses;
-  and an operator cancellation is distinguishable in the record from a lane that was never asked.
-  ⚠ Calibrate before building: the current window mixes several sessions' traffic, so per-lane
-  history has to be attributable before any threshold drawn from it means anything.
+  **Property (what remains):** per-lane wall-clock history is attributable to a session, and a lane
+  whose recent distribution is an outlier against ITS OWN history is demoted on a threshold
+  calibrated from that history — with the calibration recorded the way
+  `DEFAULT_LATENCY_MS_PER_TOKEN`'s 250 was.
 
 - **✅ RULED 2026-09-06, and SCHEDULED: decompose `parseRouting`.** The owner chose to split it in a
   later lap rather than accept its size. Measured after the HOTSPOT-03 extraction, it is still
@@ -85,15 +76,6 @@
   **Property:** `parseRouting` is decomposed into per-sub-block functions, each part's validation
   ORDER is preserved and pinned by a test that fails if two checks are swapped, and the config suite
   is green.
-
-- **Owner decision, DEFERRED 2026-09-05: whether to adopt the runbook's Tier 1 duplication CI
-  gate.** [`reviews/duplication-and-complexity-runbook-2026-09-05.md`](reviews/duplication-and-complexity-runbook-2026-09-05.md)
-  proposes a blocking CI check on jscpd clone counts. `CLAUDE.md` states the opposite invariant —
-  static analysis is advisory, CI does not run it, and the gate is the two typechecks, the server
-  suite, the dashboard checks and the package checks. The owner deferred the choice until after one
-  full green release cycle, which is what the runbook itself proposes for its own Tiers 2 and 3.
-  **Property:** the two documents agree — either `CLAUDE.md` records the amendment and CI carries
-  the gate, or the runbook records that Tier 1 was declined, and why.
 
 - **`dispatch` loses the job when `waitMs` exceeds the host's tool-call timeout — the SERVER half.**
   ⚠ The item itself is MACHINE-WIDE and already filed as the first entry of `C:\Code\docs\backlog.md`
@@ -273,6 +255,20 @@
   its `false` form.
 
 ## Closed
+
+- ✅ **The runbook's Tier 1 duplication CI gate is DECLINED** (filed 2026-09-05, closed
+  2026-09-06 by owner decision). Asked a third time, with four green releases behind the
+  deferral condition, the owner declined it for CI and named the replacement carrier: *"It's fine
+  if we leave static analysis out of the pipeline, but I'd like to make it a machine wide process
+  separately. I mean that each repo should define whatever static analysis tools apply to it, and
+  they should run, for example on a nightly routine."* So the `CLAUDE.md` invariant stands
+  UNAMENDED, and §6 of
+  [`reviews/duplication-and-complexity-runbook-2026-09-05.md`](reviews/duplication-and-complexity-runbook-2026-09-05.md)
+  records the refusal and its reasoning. The property is met: the two documents agree.
+  ⚠ The signal is not dropped, it moves — the nightly per-repository run is filed in
+  `C:\Code\docs\backlog.md`, because the fix is a shared scheduled task plus a per-repository
+  declaration convention and no single repository can hold it. This repository's declaration
+  already exists as `npm run analysis:run`.
 
 - ✅ **`llm-relay mcp` reads and dispatches each request the moment it arrives** (filed
   2026-09-04, closed 2026-09-05, v0.72.1). `McpDispatchServer.serve` replaced the per-chunk

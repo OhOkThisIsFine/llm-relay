@@ -2790,6 +2790,11 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
       process.stdout.write(`   hint: add "@relay: ${l.spec}" to the subagent prompt (offload is off)\n`);
     }
     if (l.note) process.stdout.write(`   note: ${l.note}\n`);
+    // The routing memory from previous walks. Shown ON THE LANE, not only in the selection reason,
+    // because the reason names one lane while the reordering it caused affects the whole list —
+    // an operator seeing rung 3 tried first must be able to see WHY without inferring it.
+    if (l.pinned) process.stdout.write(`   pinned until ${l.pinned.until} (${l.pinned.reason})\n`);
+    if (l.demoted) process.stdout.write(`   demoted until ${l.demoted.until} (${l.demoted.reason})\n`);
     // Advisory execution stats, same wording as `dispatch_lanes`. A rung that never ran here
     // carries no `stats` and renders as before.
     if (l.stats) process.stdout.write(`   ${formatLaneStats(l.stats)}\n`);

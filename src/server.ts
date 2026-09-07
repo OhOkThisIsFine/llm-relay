@@ -61,6 +61,7 @@ import { CircuitBreaker } from "./circuit-breaker.js";
 import { installBreakerPersistence } from "./breaker-persistence.js";
 import { installDispatchExhaustionPersistence } from "./dispatch-exhaustion-persistence.js";
 import { installDispatchLaneStatsPersistence } from "./dispatch-lane-stats.js";
+import { installLaneAffinityPersistence } from "./lane-affinity.js";
 import { resolveAutoSpec } from "./dispatch.js";
 import { AUTO_HEADER, AUTO_TIER_HEADER } from "./backend.js";
 import { LaneCadence } from "./lane-cadence.js";
@@ -726,6 +727,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   if (!process.env.VITEST) installBreakerPersistence(breaker);
   if (!process.env.VITEST) installDispatchExhaustionPersistence(cfg);
   if (!process.env.VITEST) installDispatchLaneStatsPersistence(cfg);
+  // Lane pins and demotions survive a restart for the same reason cooldowns do: the daemon is the
+  // ONE writer (the MCP child reports, the daemon records), and a preference re-learned from
+  // scratch on every restart would send every walk back to the lane it just abandoned.
+  if (!process.env.VITEST) installLaneAffinityPersistence(cfg);
   const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
   const accountingRecorder = deps.accountingRecorder ?? NOOP_ACCOUNTING_RECORDER;

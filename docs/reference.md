@@ -144,7 +144,7 @@ the prompt deliberately does not require a config edit.
 block. State lives under `~/.llm-relay/`: `config.json`, `.env`, `keystore.json`,
 `control-token`, `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`,
 `target-facts.json`, `refusal-interpretations.json`, `lane-manifest.json`,
-`dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `breaker-state.json`, `update-check.json`, the `hooks/` script, and
+`dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `lane-affinity.json`, `breaker-state.json`, `update-check.json`, the `hooks/` script, and
 the `usage/` accounting subtree.
 
 ### Where state actually lives
@@ -155,7 +155,7 @@ split by what the artifact is:
 | Honours | Artifacts |
 |---|---|
 | `XDG_CONFIG_HOME/llm-relay/` | `config.json`, `.env`, `keystore.json`, `control-token`, `target-facts.json`, `refusal-interpretations.json`, the `hooks/` script |
-| `XDG_CACHE_HOME/llm-relay/` | `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `lane-manifest.json`, `dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `breaker-state.json`, `update-check.json`, the `usage/` ledger |
+| `XDG_CACHE_HOME/llm-relay/` | `models-cache.json`, `probe-cache.json`, `runtime-telemetry.json`, `lane-manifest.json`, `dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `lane-affinity.json`, `breaker-state.json`, `update-check.json`, the `usage/` ledger |
 
 The rule is the XDG spec's own: anything you authored or that holds a credential is config;
 anything the relay can rebuild by asking a provider again is cache. A variable that is unset,
@@ -631,16 +631,18 @@ Ordering also **interleaves providers** within a rank band, so the first N attem
 distinct quota domains rather than N members sharing one credential. The top-ranked candidate is
 still tried first; interleaving only decides who is tried second.
 
-**Three routing terms are ON by default**, each reverting with one boolean. Each is documented in
-full below, except `routing.laneProbe`, which belongs to dispatch and lives under
-[Background lane re-probing](#background-lane-re-probing-routinglaneprobe). This table is the index
-— it states no policy of its own.
+**Four routing terms are ON by default**, each reverting with one boolean. Each is documented in
+full below, except the two that belong to dispatch rather than to the HTTP request path —
+`routing.laneProbe` under [Background lane re-probing](#background-lane-re-probing-routinglaneprobe)
+and `routing.dispatchWalk` under [The automatic lane walk](#the-automatic-lane-walk-routingdispatchwalk).
+This table is the index — it states no policy of its own.
 
 | Key | Default | Revert | What the term does |
 |---|---|---|---|
 | `routing.latency` | ON | `"latency": false` | Demotes a candidate whose MEASURED p95 exceeds a ceiling, into the `slow` band. |
 | `routing.hedge` | ON, and confined to FREE deployments | `"hedge": false` | Starts the next candidate BESIDE a slow one and serves whichever commits first. The only term that duplicates a request. |
 | `routing.laneProbe` | ON | `"laneProbe": false` | Re-probes recorded `cli` lane deaths and stale rosters on the relay's own background cadence. |
+| `routing.dispatchWalk` | ON | `"dispatchWalk": false` | Walks the DISPATCH ladder past a lane that does not answer, pins the lane that does. Read by `llm-relay mcp`, not by the request path. |
 
 Each `false` is the boolean shorthand for `{ "enabled": false }` and is a byte-for-byte revert to
 the behaviour before the term existed. `routing.quota` below is also on by default, but it has no
@@ -1362,6 +1364,54 @@ provider consumption, which the relay cannot see (the lane's own harness runs it
 loop against its own credentials); `llm-relay cost --by client` prints this caveat beside
 any `mcp-dispatch` row. For `cli` lanes, which carry no spec, the ledger `model` is the
 lane id.
+
+#### The automatic lane walk (`routing.dispatchWalk`)
+
+Before this existed, one `dispatch` call ran exactly ONE lane. If that lane was slow, the calling
+agent had to notice, give up, and name a different lane by hand — which is what this replaces.
+
+A dispatch now WALKS the ladder:
+
+- Each lane gets an **attempt budget** (`attemptMs`, default 90 s). If it has not answered by
+  then, the relay stops that lane and starts the next one.
+- ⚠ **The LAST lane gets no budget.** There is nowhere to move to, so killing a lane that is still
+  working would throw away the only answer still coming. Its own `--timeout` still bounds it.
+- The lane that answers is **pinned** for `pinMs` (default 15 min), so the next dispatch on that
+  tier takes it first. A lane that did not answer is **demoted** for `demoteMs` and is tried after
+  the lanes that carry no demotion.
+- When every lane is spent, the answer is an instruction to do the work in the calling session
+  instead. The relay cannot start your agent's own subagent — it decides ORDER, the host executes —
+  so the last rung of the ladder is an answer, not a spawn.
+
+```jsonc
+"routing": {
+  "dispatchWalk": {
+    "enabled": true,
+    "attemptMs": 90000,   // how long ONE lane gets before the walk moves on
+    "maxLanes": 4,        // how many lanes one dispatch may try
+    "pinMs": 900000,      // how long the lane that answered is preferred
+    "demoteMs": 900000    // how long a lane that did not answer is ordered behind the rest
+  }
+  // or the boolean shorthand: "dispatchWalk": false
+}
+```
+
+Default ON; `"dispatchWalk": false` is a byte-for-byte revert to one lane per call with no memory.
+An unknown key is a config error.
+
+⚠ **`attemptMs` is a BUDGET you set, not a health threshold derived from measurement.** The
+request path's latency numbers (250 ms/token, a 30 s ceiling) are calibrated for single completions
+and must never be pointed at a lane: a lane legitimately runs an agent loop for minutes, so those
+numbers would stop every healthy lane at once. Nothing here is borrowed from them.
+
+⚠ **A pin promotes; it never resurrects.** A pinned lane that is exhausted, disabled, unreachable
+or not servable is still not selected — the pin only reorders lanes that were already selectable.
+
+⚠ **The memory is the daemon's.** `llm-relay mcp` runs the walk and reports each attempt to
+`POST /dispatch/telemetry`; the daemon records the pin and the demotion in `lane-affinity.json`, so
+they survive an MCP restart and are visible to `llm-relay dispatch` as well. With the daemon
+unreachable the walk still runs, but the memory has nowhere to go and the ladder falls back to
+configured order.
 
 #### Background lane re-probing (`routing.laneProbe`)
 

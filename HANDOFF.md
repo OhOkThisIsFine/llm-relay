@@ -2,10 +2,65 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-06 (v0.73.1, the owner-rulings lap)
+## 0. State as of 2026-09-06 (the dispatch lane-walk lap)
 
-**Phase 1b is closed.** The owner ruled on all three open questions and two of them were built the
-same lap; the third is scheduled.
+**`dispatch` now picks lanes for the caller.** Owner request, in their words: *"Agents keep manually
+deciding that the free lane is too slow and moving to some other dispatch type. That shouldn't be
+necessary."* And the principle behind it: *"Callers shouldn't have to specifically pick models; they
+should have the option to if they want, but the default should just be to call the relay with a
+reasoning level and have the relay do the rest."*
+
+- ✅ **The MCP `dispatch` tool WALKS the ladder.** Each lane gets an attempt budget (`attemptMs`,
+  90 s); a lane that does not answer is killed and the next is started. The LAST lane gets NO
+  budget — there is nowhere to move to, so killing it would discard the only answer still coming.
+- ✅ **The last rung is an ANSWER, not a spawn.** When every lane is spent, `dispatch` returns
+  `LANE_LADDER_EXHAUSTED_ADVICE`: do the work here, with your own subagent, and do NOT re-dispatch.
+  The relay cannot start the caller's subagent — it decides ORDER, the host executes.
+- ✅ **The lane that answered is PINNED; a lane that did not is DEMOTED** (`src/lane-affinity.ts`,
+  `lane-affinity.json`). The daemon is the only writer, through the existing
+  `POST /dispatch/telemetry` channel, so the memory survives an MCP restart and `llm-relay dispatch`
+  sees it too.
+- ✅ **`DispatchView.order` is the ONE definition of selection order**, read by `next` and by the
+  walk. Ranking is pinned → undemoted → demoted, stable, so config order remains the tie-break.
+- ✅ `p95WallClockMs` now prints beside the median on the ladder view, because the median hid the
+  tail an operator giving up on a lane was actually looking at.
+- ✅ Settled the same lap: **the runbook's Tier 1 duplication CI gate is DECLINED** (owner
+  decision). Static analysis stays advisory and out of CI; the replacement — a machine-wide nightly
+  run where each repository declares its own tools — is filed in `C:\Code\docs\backlog.md`.
+
+⚠ **Three deliberate behaviour changes, stated rather than left to be discovered.**
+
+1. **Telemetry now reports per ATTEMPT and for BOTH lane kinds**, where it used to report once per
+   agent-mode job. The daemon needs those reports to record the pin, and the lane this feature
+   exists to route around (`free-pool`) is a `relay` lane — under the old contract the walk could
+   never have learned anything about its own primary target. Accounting is unchanged: the daemon
+   already skips a ledger row for `relay`-kind rungs.
+2. **A lane that fails for reasons specific to ONE task is demoted for 15 minutes.** One rule —
+   an attempt that produced an answer pins, anything else demotes — chosen over a narrower split
+   because a lane returning a lone `#` is `failed`, and that IS a lane not answering. Bounded three
+   ways: it only reorders, it lapses, and the lane's next success retracts it.
+3. **When every lane HANGS, the caller gets a job handle and polls** rather than the terminal
+   advice, because the last lane is still being waited for. The advice appears only when the walk
+   truly ends.
+
+⚠ **The demotion is EVIDENCE, not a calibrated statistic, and the backlog entry says so.** "The walk
+gave this lane its budget and it did not answer" needs no threshold. The calibrated per-lane
+statistic the original backlog item asked for is still open, for the reason it always gave: the
+recorded wall-clock window mixes several sessions' traffic. ⚠ Do NOT point the HTTP path's numbers
+(250 ms/token, a 30 s ceiling) at a lane.
+
+⚠ **`packBytes` grew 962837 → 978083 and the baseline was ratcheted knowingly**, not regenerated to
+make a red gate green. Every metric that moved is explained: `packageEntries` +3 for one new module,
+`unpackedBytes` +60601 for that module plus documentation comments, which by the standing
+two-`tsc`-pass design land in the `.d.ts` files. The dashboard metrics are untouched.
+
+Immediate next: **decompose `parseRouting`** (ruled and scheduled; the risk is validation ORDER, not
+size — pin the order before splitting). Then the eligibility queue triage.
+
+### 0.1 The previous lap (v0.73.1, the owner rulings)
+
+The owner ruled on all three open questions and two of them were built the same lap; the third is
+scheduled.
 
 - ✅ **The destructive check now runs BEFORE the argument check** (`057fca7`). CLONE-26 had silently
   moved when the dialect-rescue refusal fires: the matcher read the calls parsers had COMMITTED, so
@@ -31,29 +86,21 @@ a destructive name with a malformed payload on the Kimi or `<function=NAME>` for
 it previously fell through to `detected`. Both move in the ruling's direction, and leaving the four
 parsers inconsistent is what let the original defect hide.
 
-Immediate next — each is a [docs/backlog.md](docs/backlog.md) Open entry:
+### 0.2 Carried, untouched by this lap
 
-- **Decompose `parseRouting`** (ruled, scheduled). ⚠ The risk is ORDER, not size: which error an
-  operator sees for a config with two mistakes depends on the validation sequence, and a reordering
-  is invisible to the suite — exactly how the keystore prologue's order turned out to be uncovered.
-  Pin the order before splitting.
-- **The Tier 1 CI gate stays DEFERRED.** Unchanged.
-- The `dispatch` `waitMs` trap, now met in a second form: a job can vanish with `unknown jobId`
-  because the MCP child restarted, so the handle cannot be polled at all.
+Each is an Open entry in [docs/backlog.md](docs/backlog.md); that file, not this one, is the queue.
 
-Carried unchanged, none of them touched here:
-
-- Triage the eligibility queue: 10 unrecognized refusals; item [1] (the VPN network block) stays
-  pending by rule; the dispatcher proposes by digest, only the owner accepts.
-- Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry).
+- Triage the eligibility queue (10 unrecognized refusals; the dispatcher proposes by digest, only
+  the owner accepts).
 - Owner: verify the Codex `relay` agent from Codex Desktop.
-- Audit residue with properties: the metering silence channel (DR-006), listener-before-store
-  (DR-009), the forward-path header allow-list (contract DR-006), `candidate-runner.ts` export
-  pruning (DR-012).
-- Contributor SKUs route B (a Responses upstream, `wire: "responses"` on `kind: "openai"`). Route A
-  is live: [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md).
-- `test/os-keyring.test.ts` "sanitizes a thrown child error" is path-sensitive and fails inside a
-  lane worktree with a junctioned `node_modules`.
+- Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry).
+- Audit residue with properties: the metering silence channel, listener-before-store, the
+  forward-path header allow-list, `candidate-runner.ts` export pruning.
+- Contributor SKUs route B; route A is live.
+- `test/os-keyring.test.ts` "sanitizes a thrown child error" is path-sensitive in a lane worktree.
+- The `dispatch` `waitMs` trap: a job can vanish with `unknown jobId` when the MCP child restarts.
+  ⚠ The walk does not close this — it makes ONE dispatch cover more lanes, so a lost handle now
+  costs more work, not less. The server half is still an Open entry.
 
 ⚠ **On offload, with the measurement from three laps.** Free lanes CANNOT do open-ended
 reconnaissance here — 7 of 7 packets failed adversarial verification on 2026-09-05, fabricating
@@ -65,20 +112,12 @@ fallback on a `null` result — a lane that fabricates returns something. ⚠ An
 only check: one review job vanished mid-run when the MCP child restarted.
 
 ⚠ **`opencode-muse-spark` is congested, not broken** (owner, 2026-09-05: other agents dispatch to it
-concurrently). A probe at `--variant xhigh` ran 683 s on a one-file line count and was cancelled.
-Prefer `free-pool` or `agy-gemini` while that lasts.
-
-⚠ **And the ladder went on recommending it throughout, which is a GAP and not a misconfiguration**
-(owner question, 2026-09-05). A `cli` lane has ordering but no health-based reordering: neither
-`latency-demotion.ts` nor `hedge-trigger.ts` is reachable from `dispatch.ts`, the only lane
-demotion vocabulary is exhaustion, the one wall-clock observation that exists is display-only and
-uses a median where the request path deliberately uses p95, and a cancelled job is never reported —
-so giving up on a slow lane leaves no trace. ⚠ Nothing was LATE either: the rung's own timeout is
-2100 s against a longest wait of 680 s. Full evidence, and why pointing the HTTP thresholds at the
-ladder would be the wrong fix, in [docs/backlog.md](docs/backlog.md).
+concurrently). Prefer `free-pool` or `agy-gemini` while that lasts. ⚠ The lane walk now routes
+around this automatically rather than requiring the operator to notice it, which is what the lap
+above was for — but congestion itself is unchanged.
 
 
-## 0.1 Earlier releases
+## 0.3 Earlier releases
 
 Deliberately NOT restated here. This file holds current state plus the immediate next; a
 release-by-release narration is a changelog, and git already has it. `git log --oneline` and the

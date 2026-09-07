@@ -79,6 +79,7 @@ export {
   type RequestHeaders,
   type ResolvedTarget,
   type Config,
+  type DispatchWalkSettings,
   type LaneProbeSettings,
   type McpSettings,
 } from "./config-types.js";

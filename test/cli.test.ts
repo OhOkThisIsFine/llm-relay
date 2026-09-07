@@ -313,6 +313,7 @@ describe("cli helper utilities", () => {
       client: "default",
       ladder: [{ id: "agy", kind: "cli" as const, position: 1, state: "ready" as const, invoke: { command: "agy", args: ["-p", "task"] } }],
       next: { id: "agy", kind: "cli" as const, position: 1, state: "ready" as const, invoke: { command: "agy", args: ["-p", "task"] } },
+      order: ["agy"],
       reason: "first lane",
     };
 

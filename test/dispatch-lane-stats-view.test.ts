@@ -87,6 +87,10 @@ describe("buildDispatch lane stats columns", () => {
       failures: 1,
       timeouts: 0,
       medianWallClockMs: 20_000,
+      // p95 is nearest-rank over a two-sample window, so it is the LARGER observed sample rather
+      // than an interpolation. That is deliberate: a percentile reporting a duration nothing ever
+      // took would be a fabricated measurement.
+      p95WallClockMs: 30_000,
       lastAt: 1_700_000_060_000,
     });
     // The rung that never ran still omits the key.
@@ -122,17 +126,41 @@ describe("buildDispatch lane stats columns", () => {
 describe("formatLaneStats", () => {
   it("renders whole seconds without a decimal and fractions with one", () => {
     expect(
-      formatLaneStats({ calls: 4, successes: 3, failures: 1, timeouts: 0, medianWallClockMs: 24_000, lastAt: null }),
-    ).toBe("stats: 4 calls, 3 ok, 1 failed, 0 timed out, median 24s");
+      formatLaneStats({
+        calls: 4,
+        successes: 3,
+        failures: 1,
+        timeouts: 0,
+        medianWallClockMs: 24_000,
+        p95WallClockMs: 91_000,
+        lastAt: null,
+      }),
+    ).toBe("stats: 4 calls, 3 ok, 1 failed, 0 timed out, median 24s, p95 91s");
     expect(
-      formatLaneStats({ calls: 1, successes: 1, failures: 0, timeouts: 0, medianWallClockMs: 24_321, lastAt: 1 }),
-    ).toBe("stats: 1 calls, 1 ok, 0 failed, 0 timed out, median 24.3s");
+      formatLaneStats({
+        calls: 1,
+        successes: 1,
+        failures: 0,
+        timeouts: 0,
+        medianWallClockMs: 24_321,
+        p95WallClockMs: 24_321,
+        lastAt: 1,
+      }),
+    ).toBe("stats: 1 calls, 1 ok, 0 failed, 0 timed out, median 24.3s, p95 24.3s");
   });
 
   it("prints `median n/a` when the window is empty (unknown, never 0)", () => {
     expect(
-      formatLaneStats({ calls: 0, successes: 0, failures: 0, timeouts: 0, medianWallClockMs: null, lastAt: null }),
-    ).toContain("median n/a");
+      formatLaneStats({
+        calls: 0,
+        successes: 0,
+        failures: 0,
+        timeouts: 0,
+        medianWallClockMs: null,
+        p95WallClockMs: null,
+        lastAt: null,
+      }),
+    ).toContain("median n/a, p95 n/a");
   });
 });
 
@@ -144,14 +172,23 @@ describe("dispatch_lanes stats segment", () => {
       position: 1,
       state: "ready",
       invoke: { command: "codex", args: ["exec", "{task}"] },
-      stats: { calls: 4, successes: 3, failures: 1, timeouts: 0, medianWallClockMs: 24_000, lastAt: null },
+      stats: { calls: 4, successes: 3, failures: 1, timeouts: 0, medianWallClockMs: 24_000, p95WallClockMs: 91_000, lastAt: null },
       ...over,
     };
   }
 
   function lanesView(ladder: DispatchLane[]): DispatchView {
     const next = ladder[0] ?? null;
-    return { tier: "medium", offload: false, client: "claude", host: "bypassed", ladder, next, reason: "first ready lane" };
+    return {
+      tier: "medium",
+      offload: false,
+      client: "claude",
+      host: "bypassed",
+      ladder,
+      order: ladder.map((l) => l.id),
+      next,
+      reason: "first ready lane",
+    };
   }
 
   class LanesHarness {
@@ -203,9 +240,35 @@ describe("dispatch_lanes stats segment", () => {
     expect(plainLine as string).not.toContain("stats:");
   });
 
+  it("renders the routing memory on the LANE, not only in the selection reason", async () => {
+    // ⚠ The reason names ONE lane while the reordering it caused affects the whole list, so an
+    // operator looking at why rung 3 is being tried first must see it on the lane itself. The CLI
+    // renderer in `cli.ts` prints the same two fields for the same reason; two surfaces reading one
+    // pair of fields is the shape this repository keeps, rather than one surface knowing more.
+    const pinned: DispatchLane = {
+      id: "free-pool",
+      kind: "relay",
+      position: 1,
+      state: "ready",
+      spec: "pool/medium",
+      pinned: { until: "2026-09-06T12:00:00.000Z", reason: "answered in 4s" },
+    };
+    const demoted: DispatchLane = {
+      id: "agy-gemini",
+      kind: "cli",
+      position: 2,
+      state: "ready",
+      spec: "agy",
+      demoted: { until: "2026-09-06T12:00:00.000Z", reason: "abandoned after 90s" },
+    };
+    const text = await new LanesHarness(async () => lanesView([pinned, demoted])).lanesText();
+    expect(text).toContain("pinned until 2026-09-06T12:00:00.000Z (answered in 4s)");
+    expect(text).toContain("demoted until 2026-09-06T12:00:00.000Z (abandoned after 90s)");
+  });
+
   it("renders `median n/a` for a stats entry with an empty window", async () => {
     const h = new LanesHarness(async () =>
-      lanesView([statsLane({ stats: { calls: 1, successes: 1, failures: 0, timeouts: 0, medianWallClockMs: null, lastAt: 1 } })]),
+      lanesView([statsLane({ stats: { calls: 1, successes: 1, failures: 0, timeouts: 0, medianWallClockMs: null, p95WallClockMs: null, lastAt: 1 } })]),
     );
     expect(await h.lanesText()).toContain("median n/a");
   });

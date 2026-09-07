@@ -26,7 +26,7 @@ import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
 import { formatLaneStats } from "../dispatch.js";
 import { estimateTokensFromCharacters } from "../metadata.js";
-import type { DispatchedTelemetryReport } from "../dispatch-lane-stats.js";
+import type { DispatchedTelemetryReport, DispatchLaneStatus } from "../dispatch-lane-stats.js";
 import {
   DEFAULT_LANE_TIMEOUT_MS,
   DEFAULT_MAX_DEPTH,
@@ -35,12 +35,12 @@ import {
   EMPTY_OUTPUT_REASON,
   LaneJobStore,
   classifyDispatchedResult,
+  classifyLaneAttempt,
   checkCwd,
   currentDepth,
   defaultAnswerFetch,
   defaultLaneSpawner,
   isContentEmpty,
-  isReportableJobStatus,
   readRelayAnnouncements,
   relayLoopbackUrl,
   type AnswerFetch,
@@ -152,6 +152,9 @@ export const MCP_INSTRUCTIONS =
   "Desktop rejects that child model before reaching the relay and ignores its custom provider. " +
   "Call dispatch instead. If this MCP server is unavailable, run `llm-relay dispatch " +
   "--next-command -t <task>` and follow its returned command or target; do not guess from the host.\n\n" +
+  "Do not switch lanes by hand. If a lane is slow or silent, dispatch moves to the next one " +
+  "itself and prefers the lane that answered on your next call. When it reports that every lane " +
+  "was tried, do the work here — re-dispatching the same task picks the same lanes.\n\n" +
   "Pass mode: \"answer\" for a question, draft, summary, or second opinion that needs no file " +
   "access — for a relay lane it posts straight to this relay's own /v1/messages with no spawned " +
   "harness, so it answers faster. Use the default agent mode when the lane must read or edit " +
@@ -175,7 +178,9 @@ const TOOLS: ToolDefinition[] = [
       "whenever a task is self-contained and its result is a conclusion you can check — a broad " +
       "code search, a file-by-file sweep, a survey, a draft, a second opinion — because the " +
       "default lane is free capacity and it saves this session's context. Picks the lane from " +
-      "the configured ladder unless you name one. Runs the lane correctly — working directory, " +
+      "the configured ladder unless you name one, and WALKS that ladder for you: a lane that does " +
+      "not answer inside its budget is stopped and the next one is started, and the lane that " +
+      "answers is preferred next time. Runs the lane correctly — working directory, " +
       "environment and idle timeouts are handled here, so you never build a command line. If the " +
       "lane is still running after waitMs, returns a jobId to poll with dispatch_status. In Codex " +
       "Desktop, use this instead of a pool/* collaboration child, which the ChatGPT launcher " +
@@ -350,12 +355,68 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.relay?.latencyDemoted) head.push(`latency-demoted: ${job.relay.latencyDemoted}`);
   if (job.relay?.degraded) head.push(`degraded: ${job.relay.degraded}`);
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
-  return head.join("\n");
+  // ⚠ The lanes already tried belong HERE, not only on the final answer. A poll of a running walk
+  // has to say which lanes it has already spent — otherwise `dispatch_status` reports one lane
+  // name and the operator cannot tell a walk on its third lane from one that never moved.
+  const walked = describeAttempts(job);
+  return walked ? `${head.join("\n")}\n\n${walked}` : head.join("\n");
+}
+
+/**
+ * What a caller is told when the walk tried every lane it had and none of them answered.
+ *
+ * ⚠ **This IS the last rung of the ladder.** The owner's request ends *"until finally reaching the
+ * base agent's own subagents"*, and the relay cannot start the caller's subagent — it decides
+ * ORDER, the host executes, which is the standing boundary this project keeps everywhere else. So
+ * the final fallback is an ANSWER, and the text carries the whole instruction: what to do now, and
+ * what NOT to do. Without the second half a caller retries `dispatch` for the same task, which is
+ * the loop this feature exists to end.
+ *
+ * Pinned by `test/mcp-server.test.ts` on its CLAIMS rather than its wording — reword it freely,
+ * but change the assertion deliberately instead of deleting it.
+ */
+export const LANE_LADDER_EXHAUSTED_ADVICE =
+  "Every dispatch lane has now been tried for this task and none of them answered. "
+  + "Do NOT call dispatch again for this task — it would pick the same lanes. "
+  + "Do the work in this session instead, with your own subagent if you have one.";
+
+/**
+ * Render the lanes a walk tried, oldest first, so both a poll and the final answer show what it
+ * cost to get here.
+ *
+ * ⚠ Empty string for a walk that has tried nothing yet. A bare "lanes tried:" header with no lanes
+ * under it reads as a walk that tried and found nothing, which is the opposite of the truth for a
+ * walk still on its first lane — or for one the caller cancelled before any lane settled.
+ */
+function describeAttempts(job: LaneJob): string {
+  if (job.attempts.length === 0 && !job.lanesNotTried) return "";
+  const lines = job.attempts.map((a, i) => {
+    const seconds = Math.round(a.elapsedMs / 1000);
+    const why = a.reason ? ` — ${a.reason}` : "";
+    return `  ${i + 1}. ${a.laneId}${a.spec ? ` (${a.spec})` : ""}: ${a.status} after ${seconds}s${why}`;
+  });
+  // No silent caps: a walk that stopped at its `maxLanes` bound says so, because "lanes tried"
+  // with nothing after it reads as "all of them".
+  const capped = job.lanesNotTried
+    ? `\n  (${job.lanesNotTried} further lane${job.lanesNotTried === 1 ? "" : "s"} not tried — the walk's maxLanes bound)`
+    : "";
+  return `lanes tried:\n${lines.join("\n")}${capped}`;
 }
 
 function jobAnswer(job: LaneJob, now: number): string {
   const header = describeJob(job, now);
   const body = job.stdout.trim();
+  // ⚠ The lanes tried are NOT rendered here — `describeJob` owns them now, so a poll and the final
+  // answer show the same list rather than two nearly-identical renderings that can drift apart.
+  // The terminal fallback fires only when the walk ended with NO answer from any lane. A cancelled
+  // job is excluded: the caller stopped it, so the ladder was never exhausted.
+  const exhausted =
+    job.status !== "running"
+    && job.status !== "cancelled"
+    && job.attempts.length > 0
+    && job.attempts.every((a) => a.status !== "completed")
+      ? `\n\n${LANE_LADDER_EXHAUSTED_ADVICE}`
+      : "";
   if (job.status === "running") {
     return `${header}\n\nStill running. Poll dispatch_status, then call dispatch_result.`;
   }
@@ -368,7 +429,7 @@ function jobAnswer(job: LaneJob, now: number): string {
     const tail = isContentEmpty(body) ? job.stderr.trim().slice(-1500) : "";
     return `${header}\n\nThe lane exceeded its timeout and was stopped before it finished.${partial}${
       tail ? `\n\nstderr tail:\n${tail}` : ""
-    }`;
+    }${exhausted}`;
   }
   if (isContentEmpty(body)) {
     // ⚠ Exit 0 (or HTTP 200) with content-empty output is a KNOWN lane failure mode (agy discards
@@ -377,9 +438,86 @@ function jobAnswer(job: LaneJob, now: number): string {
     const tail = job.stderr.trim().slice(-1500);
     return `${header}\n\nThe lane returned NO output. Treat this as a lane failure and retry, or pick another lane.${
       tail ? `\n\nstderr tail:\n${tail}` : ""
-    }`;
+    }${exhausted}`;
   }
-  return `${header}\n\n${body}`;
+  return `${header}\n\n${body}${exhausted}`;
+}
+
+/**
+ * Everything one dispatch WALK needs, snapshotted once so no stage re-reads `args`.
+ *
+ * `attemptMs` is `null` when the walk is turned off — never `Infinity`. Node's `setTimeout` clamps
+ * a value above 2^31-1 to 1 ms and warns, so an "infinite" budget would abandon every lane
+ * IMMEDIATELY, which is the exact opposite of what it would be claiming to do.
+ */
+interface WalkOptions {
+  mode: "agent" | "answer";
+  cwd: string;
+  depth: number;
+  /** Ladder tier the lanes came from, for quota reports and the daemon's routing memory. */
+  tier: string | undefined;
+  /** The lane's OWN ceiling, unchanged by this feature. */
+  timeoutMs: number;
+  /** The WALK's per-lane budget, or null for no budget (walk off, or the last lane). */
+  attemptMs: number | null;
+  system: string | undefined;
+  schema: Record<string, unknown> | undefined;
+  maxTokens: number | undefined;
+  dispatchSource: "daemon" | "fallback";
+}
+
+/** What running one lane produced. */
+interface LaneAttemptOutcome {
+  run: LaneRunResult;
+  relay?: RelayAnnouncements;
+  semanticFailure?: string;
+  /** The walk stopped this lane at its budget so it could try the next one. */
+  abandoned: boolean;
+  /**
+   * The CALLER made an error no lane can fix — today only a working directory that does not exist
+   * or sits outside the operator's declared roots. It ENDS the walk, because every remaining lane
+   * would hit it identically and walking on would hide the caller's own mistake behind a lane
+   * failure.
+   */
+  refusal?: string;
+}
+
+/** A run that produced nothing: the shape an abandoned or never-started attempt reports. */
+function emptyRun(): LaneRunResult {
+  return { code: null, stdout: "", stderr: "", timedOut: false };
+}
+
+/** An attempt that failed before it could produce anything, carrying why. */
+function failedOutcome(message: string): LaneAttemptOutcome {
+  return {
+    run: { code: null, stdout: "", stderr: message, timedOut: false },
+    abandoned: false,
+    semanticFailure: message,
+  };
+}
+
+/**
+ * One line saying why an attempt ended as it did, for the `lanes tried:` list. Undefined for a
+ * success — the status already says everything, and repeating it would be noise.
+ *
+ * ⚠ The abandoned wording names the BUDGET, not the lane's own timeout. An operator reading
+ * "abandoned after 90s" against a rung configured with `--timeout 2100` must be able to tell that
+ * the relay made a routing decision rather than the lane running out of its own time.
+ */
+function attemptReason(
+  status: DispatchLaneStatus,
+  outcome: LaneAttemptOutcome,
+  elapsedMs: number,
+  budgetMs: number | null,
+): string | undefined {
+  if (status === "completed") return undefined;
+  if (status === "abandoned") {
+    const budget = budgetMs === null ? `${Math.round(elapsedMs / 1000)}s` : `${Math.round(budgetMs / 1000)}s`;
+    return `no answer within the ${budget} walk budget, so the next lane was started`;
+  }
+  if (outcome.semanticFailure !== undefined) return outcome.semanticFailure;
+  if (status === "timed_out") return "the lane exceeded its own configured timeout";
+  return "the lane failed";
 }
 
 /** Apply a rung's declared env deltas: a string sets, `null` unsets an inherited variable. */
@@ -399,6 +537,10 @@ function laneSummary(lane: DispatchLane): string {
   if (lane.notServable) bits.push(`not servable: ${lane.notServable}`);
   if (lane.unreachable) bits.push(`unreachable: ${lane.unreachable}`);
   if (lane.note) bits.push(lane.note);
+  // The routing memory from previous walks, on the lane rather than only in the selection reason —
+  // an operator reading `dispatch_lanes` to understand an unexpected order needs to see it here.
+  if (lane.pinned) bits.push(`pinned until ${lane.pinned.until} (${lane.pinned.reason})`);
+  if (lane.demoted) bits.push(`demoted until ${lane.demoted.until} (${lane.demoted.reason})`);
   // Advisory only: a rung that never ran here carries no `stats` and renders as before.
   if (lane.stats) bits.push(formatLaneStats(lane.stats));
   return bits.join(" ");
@@ -603,8 +745,8 @@ export class McpDispatchServer {
 
     // ⚠ Recursion bound. A dispatched lane is itself an agent that can reach this same server, so
     // without this a delegation loop is reachable and would spend quota until something died.
-    // Checked before either mode branches, and before the spawn/fetch it bounds — the refusal
-    // must cost nothing.
+    // Checked before anything branches, and before the spawn/fetch it bounds — the refusal must
+    // cost nothing.
     const depth = currentDepth();
     if (depth >= this.maxDepth) {
       return textResult(
@@ -619,110 +761,319 @@ export class McpDispatchServer {
       tier: readString(args, "tier"),
       lane: readString(args, "lane"),
     });
-    const lane = view.next;
-    if (!lane) {
+    if (!view.next) {
       return textResult(`No lane is available. ${view.reason}`, true);
     }
 
+    // ⚠ `?.` on `routing`, not just on the key. `McpServerDeps.config` is a public interface and a
+    // programmatic caller may hand over a partial config; a bare `.routing.dispatchWalk` throws
+    // there, and a throw inside a tool handler becomes a JSON-RPC error with no lane run at all.
+    // Absent settings mean the walk is off, which is the WEAKER claim and the safe fall-through.
+    const declared = this.deps.config.routing?.dispatchWalk;
+    const walk = declared !== undefined && declared.enabled ? declared : null;
+    // `view.order` is the ONE definition of selection order (`dispatch.ts`). With the walk turned
+    // off — or with a view that carries no order — this collapses to EXACTLY the pre-walk
+    // behaviour: the single lane the view named as `next`, tried once, with no attempt budget.
+    //
+    // ⚠ The `Array.isArray` test is a VERSION SKEW guard, not defensive noise. `buildView` reaches
+    // the running daemon over HTTP, and a daemon started before this field existed answers without
+    // it — an MCP child upgraded ahead of a long-running daemon is the normal state on a machine
+    // that starts the relay at logon and leaves it up for days. Reading `.length` off `undefined`
+    // there would throw on EVERY dispatch, turning a new optional field into a total outage.
+    const order = Array.isArray(view.order) ? view.order : [];
+    const ordered = walk !== null && order.length > 0 ? order.slice(0, walk.maxLanes) : [view.next.id];
+
+    const opts: WalkOptions = {
+      mode: readMode(args),
+      cwd: readString(args, "cwd") ?? this.cwd(),
+      depth,
+      tier: view.tier ?? undefined,
+      timeoutMs: readNumber(args, "timeoutMs") ?? DEFAULT_LANE_TIMEOUT_MS,
+      attemptMs: walk !== null ? walk.attemptMs : null,
+      system: readString(args, "system"),
+      schema: readRecord(args, "schema"),
+      maxTokens: readNumber(args, "maxTokens"),
+      dispatchSource: view.source === "local-fallback" ? "fallback" : "daemon",
+    };
+
+    const first = view.ladder.find((l) => l.id === ordered[0]) ?? view.next;
+    const job = this.jobs.create(first.id, first.spec, opts.cwd, opts.dispatchSource);
+    // No silent caps: when `maxLanes` bound the walk below what the ladder offered, say by how
+    // much. A capped walk that reports "every lane was tried" would be false.
+    this.jobs.noteLanesNotTried(job.id, Math.max(0, order.length - ordered.length));
     const waitMs = readNumber(args, "waitMs") ?? DEFAULT_WAIT_MS;
-    const timeoutMs = readNumber(args, "timeoutMs") ?? DEFAULT_LANE_TIMEOUT_MS;
-    const mode = readMode(args);
+    // ⚠ A walk must ALWAYS leave the job terminal. `runWalk` is written not to reject — every
+    // failure a lane can produce is an attempt — but the worst outcome available here is a caller
+    // polling a handle that can never settle, so an unexpected throw is caught and turned into a
+    // terminal failure rather than trusted not to happen.
+    const settled = this.runWalk(job.id, view, ordered, task, opts).catch((e: Error) => {
+      this.jobs.fail(job.id, `dispatch walk failed: ${e.message}`);
+      return "done" as const;
+    });
+    return this.awaitOrPoll(job.id, settled, waitMs);
+  }
 
-    if (mode === "answer" && lane.kind === "relay") {
-      // ⚠ Skips the whole cwd/invoke/spawn path below on purpose: a direct HTTP call to this
-      // relay's own /v1/messages needs no working directory and no harness. `lane.invoke` may
-      // still be present (a bypassed/unknown host transposes every relay rung into a CLI
-      // invocation), but answer mode deliberately never looks at it — that transposed command IS
-      // the slow path this mode exists to skip. See `dispatchAnswer`.
-      return this.dispatchAnswer(lane, task, {
-        system: readString(args, "system"),
-        schema: readRecord(args, "schema"),
-        maxTokens: readNumber(args, "maxTokens"),
-        waitMs,
-        timeoutMs,
-        dispatchSource: view.source === "local-fallback" ? "fallback" : "daemon",
+  /**
+   * Try each lane in turn until one answers. THE JOB IS THE WALK.
+   *
+   * ⚠ That is the load-bearing choice, and it is forced by a measurement: an MCP client tool call
+   * on this machine fails somewhere between 45 s and 100 s, and above that ceiling it destroys the
+   * job handle as well (a filed machine-wide defect; five lanes were lost to it in one night). So
+   * the walk cannot finish inside the blocking call. It continues in the background behind ONE
+   * handle, `dispatch_status` reports the lane running now, and `attempts` records the rest.
+   * Re-pointing the handle at each new lane instead would break polling outright.
+   *
+   * Never rejects: every failure a lane can produce is an ATTEMPT, and the walk decides what to do
+   * with it. Only a caller error ends the walk early — see `refusal` on `LaneAttemptOutcome`.
+   */
+  private async runWalk(
+    jobId: string,
+    view: DispatchView,
+    laneIds: readonly string[],
+    task: string,
+    opts: WalkOptions,
+  ): Promise<"done"> {
+    for (let i = 0; i < laneIds.length; i++) {
+      // A cancellation is checked at the TOP of every iteration, so an operator who stops a walk
+      // stops it — rather than watching it advance to the next lane.
+      if (this.jobs.get(jobId)?.status !== "running") return "done";
+      const laneId = laneIds[i];
+      const lane = laneId === undefined ? undefined : view.ladder.find((l) => l.id === laneId);
+      if (lane === undefined) continue;
+      this.jobs.setCurrentLane(jobId, lane.id, lane.spec);
+
+      // ⚠ The LAST lane gets NO attempt budget. The budget exists to move on; with nowhere to move
+      // to, killing a lane that is still working would throw away the only answer still coming.
+      // Its own `timeoutMs` still bounds it, exactly as before this feature existed.
+      const isLast = i === laneIds.length - 1;
+      const startedAt = this.now();
+      const outcome = await this.runOneLane(jobId, lane, task, opts, isLast ? null : opts.attemptMs);
+      const elapsedMs = Math.max(0, this.now() - startedAt);
+
+      // A cancellation that landed WHILE the attempt ran discards it whole: the caller changed its
+      // mind, which is not evidence about this lane. `LaneJobStore.cancel()` has already set the
+      // status, and nothing further may write to the job.
+      if (this.jobs.get(jobId)?.status === "cancelled") return "done";
+
+      if (outcome.refusal !== undefined) {
+        // The CALLER's error, not the lane's. Walking on would hide a bad `cwd` behind a lane
+        // failure and send the operator looking in the wrong place.
+        this.jobs.fail(jobId, outcome.refusal);
+        return "done";
+      }
+
+      const status = classifyLaneAttempt(outcome.run, {
+        abandoned: outcome.abandoned,
+        semanticFailure: outcome.semanticFailure,
       });
-    }
-
-    const cwd = readString(args, "cwd") ?? this.cwd();
-    const cwdCheck = checkCwd(cwd, this.deps.allowedRoots);
-    if (!cwdCheck.ok) return textResult(`dispatch refused: ${cwdCheck.reason}`, true);
-
-    if (!lane.invoke) {
-      // The view builder asks for a host with no subagent mechanism, so every usable rung comes
-      // back with a command. Reaching here means the rung is genuinely unreachable as configured —
-      // report why rather than inventing a command, the rule `cli.ts` already states.
-      return textResult(
-        `Lane "${lane.id}" cannot be run from here: ${lane.unreachable ?? `it is a relay target (${lane.spec ?? "?"}) with no cliLane template configured`}.`,
-        true,
+      const reason = attemptReason(status, outcome, elapsedMs, opts.attemptMs);
+      this.jobs.recordAttempt(jobId, {
+        laneId: lane.id,
+        spec: lane.spec,
+        status,
+        elapsedMs,
+        ...(reason === undefined ? {} : { reason }),
+      });
+      // ⚠ Forwarded for EVERY attempt and for BOTH lane kinds, which widens what the MCP child used
+      // to send (agent-mode jobs only). The daemon needs these reports to record the pin and the
+      // demotion, and the lane this feature exists to route around — the free pool — is a `relay`
+      // lane, so without them the whole feature would be inert on its own target. Accounting is
+      // unaffected: the daemon skips a ledger row for `relay`-kind rungs on its own, so no traffic
+      // is double counted.
+      this.forwardTelemetry(
+        jobId,
+        { taskLength: task.length, laneId: lane.id, kind: lane.kind, spec: lane.spec, tier: opts.tier },
+        outcome.run.stdout.length,
+        { status, wallClockMs: elapsedMs, exitCode: outcome.run.code },
       );
+
+      if (status === "completed" || isLast) {
+        this.jobs.complete(
+          jobId,
+          outcome.run,
+          status === "completed" ? undefined : (outcome.semanticFailure ?? reason),
+          outcome.relay,
+        );
+        return "done";
+      }
+    }
+    // Reached only when the selection order named ids the ladder does not hold — a view and a
+    // ladder that disagree, which a stale local fallback can produce. Report it rather than
+    // returning a job that silently never ran anything.
+    //
+    // ⚠ The message distinguishes the two cases, because the first wording would otherwise LIE
+    // about a walk that did run lanes: with any attempt recorded, "no lane matched" is false and
+    // would send the reader looking for a configuration fault that is not there.
+    const ran = this.jobs.get(jobId)?.attempts.length ?? 0;
+    this.jobs.fail(
+      jobId,
+      ran === 0
+        ? "no lane in the dispatch ladder matched the selection order"
+        : `no lane answered, and the ladder no longer holds the remaining lanes in the selection order (${ran} tried)`,
+    );
+    return "done";
+  }
+
+  /**
+   * Run ONE lane, optionally bounded by an attempt budget. Returns what happened; never throws.
+   *
+   * With `budgetMs === null` the lane is simply awaited — its own `timeoutMs` is the only bound.
+   * With a budget, the lane races a timer: if the timer wins, the lane is KILLED and reported as
+   * `abandoned`.
+   *
+   * ⚠ It kills rather than hedges. The HTTP request path hedges — it starts a second attempt
+   * beside the first — and that is deliberate there, bounded to free deployments by an owner
+   * amendment. A lane hedge is a different trade: it spends two lanes' quota at once, and this
+   * machine already carries a filed defect in which lane processes are never reaped and go on
+   * burning processor time after their job returns. So the walk leaves nothing running behind it.
+   */
+  private async runOneLane(
+    jobId: string,
+    lane: DispatchLane,
+    task: string,
+    opts: WalkOptions,
+    budgetMs: number | null,
+  ): Promise<LaneAttemptOutcome> {
+    const started = this.startLane(jobId, lane, task, opts);
+    if ("refusal" in started) return { run: emptyRun(), abandoned: false, refusal: started.refusal };
+    this.jobs.registerKill(jobId, started.kill);
+
+    // The attempt promise is made total here, once, so neither branch below has to repeat it and
+    // no rejection can escape into the walk.
+    const guarded = started.result.catch(
+      (e: Error): LaneAttemptOutcome => ({
+        run: { code: null, stdout: "", stderr: e.message, timedOut: false },
+        abandoned: false,
+        semanticFailure: e.message,
+      }),
+    );
+    if (budgetMs === null) return guarded;
+
+    const raced = await Promise.race([
+      guarded.then((o) => ({ kind: "settled" as const, outcome: o })),
+      new Promise<{ kind: "budget" }>((resolve) => {
+        const t = setTimeout(() => resolve({ kind: "budget" }), budgetMs);
+        // Do not hold the event loop open on the budget timer alone.
+        if (typeof t.unref === "function") t.unref();
+      }),
+    ]);
+    if (raced.kind === "settled") return raced.outcome;
+
+    // The budget passed and another lane remains. Kill this one and move on. `guarded` never
+    // rejects, so the killed child's late settlement needs no further handler — it resolves into a
+    // value nobody reads.
+    started.kill();
+    return { run: emptyRun(), abandoned: true };
+  }
+
+  /**
+   * Start ONE lane and hand back its promise plus a kill handle. Two shapes, decided exactly as
+   * `toolDispatch` used to decide them: a `relay` rung in answer mode is a direct HTTP call to
+   * this relay's own `/v1/messages`; everything else is a spawned command.
+   *
+   * ⚠ A lane that cannot run HERE returns a failed OUTCOME, not a refusal, so the walk moves on.
+   * Only a bad working directory is a `refusal`, because that is the caller's own error and every
+   * remaining lane would hit it identically.
+   */
+  private startLane(
+    jobId: string,
+    lane: DispatchLane,
+    task: string,
+    opts: WalkOptions,
+  ): { result: Promise<LaneAttemptOutcome>; kill: () => void } | { refusal: string } {
+    if (opts.mode === "answer" && lane.kind === "relay") {
+      // ⚠ Skips the whole cwd/invoke/spawn path on purpose: a direct HTTP call to this relay's own
+      // /v1/messages needs no working directory and no harness. `lane.invoke` may still be present
+      // (a bypassed or unknown host transposes every relay rung into a CLI invocation), but answer
+      // mode deliberately never looks at it — that transposed command IS the slow path this mode
+      // exists to skip.
+      if (!lane.spec) {
+        return {
+          result: Promise.resolve(failedOutcome(`Lane "${lane.id}" has no relay spec to address in answer mode.`)),
+          kill: () => {},
+        };
+      }
+      const controller = new AbortController();
+      // AbortSignal.timeout self-cleans and needs no manual clearTimeout; `AbortSignal.any`
+      // composes it with the cancel/abandon handle without either seam knowing about the other.
+      const signal = AbortSignal.any([AbortSignal.timeout(opts.timeoutMs), controller.signal]);
+      const result = this.runAnswerFetch(lane.spec, task, opts, signal).then((o): LaneAttemptOutcome => {
+        // ⚠ The content-empty check applies HERE too, not only on the spawned path. HTTP 200 with
+        // a lone `#` is the same known lane failure as exit 0 with one, and reading it as a
+        // successful empty answer would also PIN the lane that produced it.
+        const semanticFailure =
+          o.semanticFailure === undefined && !o.run.timedOut && isContentEmpty(o.run.stdout)
+            ? EMPTY_OUTPUT_REASON
+            : o.semanticFailure;
+        return {
+          run: o.run,
+          abandoned: false,
+          ...(o.relay === undefined ? {} : { relay: o.relay }),
+          ...(semanticFailure === undefined ? {} : { semanticFailure }),
+        };
+      });
+      return { result, kill: () => controller.abort() };
     }
 
-    const dispatchSource = view.source === "local-fallback" ? "fallback" : "daemon";
-    const job = this.jobs.create(lane.id, lane.spec, cwd, dispatchSource);
-    const env = applyLaneEnv(process.env, lane.invoke.env);
-    env[DEPTH_ENV] = String(depth + 1);
+    const cwdCheck = checkCwd(opts.cwd, this.deps.allowedRoots);
+    if (!cwdCheck.ok) return { refusal: `dispatch refused: ${cwdCheck.reason}` };
 
-    // Telemetry capture: the task text lives only as this local, and the job never carries
-    // the lane KIND, so snapshot both now — the settled handlers below only see the job.
-    const telemetry = { taskLength: task.length, laneId: lane.id, kind: lane.kind, spec: lane.spec };
+    const invoke = lane.invoke;
+    if (!invoke) {
+      // `buildDispatch` already excludes an unreachable rung from the selection order, so this is
+      // defence rather than an expected path — report why rather than inventing a command, the
+      // rule `cli.ts` already states.
+      return {
+        result: Promise.resolve(
+          failedOutcome(
+            `Lane "${lane.id}" cannot be run from here: ${lane.unreachable ?? `it is a relay target (${lane.spec ?? "?"}) with no cliLane template configured`}.`,
+          ),
+        ),
+        kill: () => {},
+      };
+    }
 
+    const env = applyLaneEnv(process.env, invoke.env);
+    env[DEPTH_ENV] = String(opts.depth + 1);
     let run: { result: Promise<LaneRunResult>; kill: () => void };
     try {
-      run = this.spawn(lane.invoke.command, lane.invoke.args, { env, cwd, timeoutMs });
+      run = this.spawn(invoke.command, invoke.args, { env, cwd: opts.cwd, timeoutMs: opts.timeoutMs });
     } catch (e) {
-      this.jobs.fail(job.id, (e as Error).message);
-      // No run exists on the spawn-throw path, so there is no output to estimate from.
-      this.forwardTelemetry(job.id, telemetry, 0);
-      return textResult(jobAnswer(this.jobs.get(job.id) ?? job, this.now()), true);
+      return { result: Promise.resolve(failedOutcome((e as Error).message)), kill: () => {} };
     }
-    this.jobs.registerKill(job.id, run.kill);
 
-    const settled = run.result.then(
-      async (r) => {
-        // A caller cancellation is not lane evidence, even if the child later exits with text
-        // that happens to contain quota vocabulary.
-        if (this.jobs.get(job.id)?.status === "cancelled") return "done" as const;
-        const report = classifyDispatchedResult({
-          result: r,
-          laneId: lane.id,
-          tier: view.tier ?? undefined,
-          command: lane.invoke!.command,
-          args: lane.invoke!.args,
-        });
-        let semanticFailure: string | undefined = report ? `lane reported ${report.outcome}` : undefined;
-        if (report) {
-          if (this.jobs.get(job.id)?.status === "cancelled") return "done" as const;
-          try {
-            await this.deps.reportExhaustion?.(report);
-          } catch (e) {
-            // Reporting is advisory, but the lane's semantic failure is not. Keep the diagnostic
-            // bounded because it may originate in an injected integration.
-            const detail = e instanceof Error ? e.message : String(e);
-            semanticFailure = `${semanticFailure}; quota report failed: ${detail.slice(0, 500)}`;
-            r = { ...r, stderr: `${r.stderr}${r.stderr ? "\n" : ""}${semanticFailure}` };
-          }
+    const result = run.result.then(async (r): Promise<LaneAttemptOutcome> => {
+      // A caller cancellation is not lane evidence, even if the child later exits with text that
+      // happens to contain quota vocabulary.
+      if (this.jobs.get(jobId)?.status === "cancelled") return { run: r, abandoned: false };
+      const report = classifyDispatchedResult({
+        result: r,
+        laneId: lane.id,
+        tier: opts.tier,
+        command: invoke.command,
+        args: invoke.args,
+      });
+      let semanticFailure: string | undefined = report ? `lane reported ${report.outcome}` : undefined;
+      let out = r;
+      if (report) {
+        try {
+          await this.deps.reportExhaustion?.(report);
+        } catch (e) {
+          // Reporting is advisory, but the lane's semantic failure is not. Keep the diagnostic
+          // bounded because it may originate in an injected integration.
+          const detail = e instanceof Error ? e.message : String(e);
+          semanticFailure = `${semanticFailure}; quota report failed: ${detail.slice(0, 500)}`;
+          out = { ...r, stderr: `${r.stderr}${r.stderr ? "\n" : ""}${semanticFailure}` };
         }
-        // ⚠ Priority order: an established quota/timeout signal always outranks the content-empty
-        // check — never override a MORE specific claim with a LESS specific one. `complete()`
-        // additionally treats `r.timedOut` as the outright winner regardless of what is passed
-        // here, so this guard mainly keeps a genuine (non-timeout) empty answer from being
-        // reported merely as "failed" with no reason.
-        if (semanticFailure === undefined && !r.timedOut && isContentEmpty(r.stdout)) {
-          semanticFailure = EMPTY_OUTPUT_REASON;
-        }
-        this.jobs.complete(job.id, r, semanticFailure);
-        this.forwardTelemetry(job.id, telemetry, r.stdout.length);
-        return "done" as const;
-      },
-      (e: Error) => {
-        this.jobs.fail(job.id, e.message);
-        this.forwardTelemetry(job.id, telemetry, 0);
-        return "done" as const;
-      },
-    );
-
-    return this.awaitOrPoll(job.id, settled, waitMs);
+      }
+      // ⚠ Priority order: an established quota/timeout signal always outranks the content-empty
+      // check — never override a MORE specific claim with a LESS specific one.
+      if (semanticFailure === undefined && !out.timedOut && isContentEmpty(out.stdout)) {
+        semanticFailure = EMPTY_OUTPUT_REASON;
+      }
+      return { run: out, abandoned: false, ...(semanticFailure === undefined ? {} : { semanticFailure }) };
+    });
+    return { result, kill: run.kill };
   }
 
   /**
@@ -738,24 +1089,37 @@ export class McpDispatchServer {
    */
   private forwardTelemetry(
     jobId: string,
-    captured: { taskLength: number; laneId: string; kind: DispatchLane["kind"]; spec: string | undefined },
+    captured: {
+      taskLength: number;
+      laneId: string;
+      kind: DispatchLane["kind"];
+      spec: string | undefined;
+      tier: string | undefined;
+    },
     outputChars: number,
+    attempt: { status: DispatchLaneStatus; wallClockMs: number; exitCode: number | null },
   ): void {
     const job = this.jobs.get(jobId);
     if (!job) return;
-    // Ranges over REPORTABLE_JOB_STATUSES (`lane-runner.ts`) — every terminal status but
-    // `cancelled` — never a hand-listed copy, so a new terminal status is a compile error at
-    // the classifier rather than a silent drop here. Narrows, so `job.status` below is a
-    // reportable status, never `cancelled` or `running`.
-    if (!isReportableJobStatus(job.status)) return;
+    // ⚠ A caller cancellation is never lane evidence. That guarantee used to come from narrowing
+    // the JOB's status through `isReportableJobStatus`; with a walk the job stays `running`
+    // BETWEEN lanes, so that test no longer describes the attempt being reported. The guarantee
+    // moved into the TYPE instead, where it is stronger: `DispatchLaneStatus` has no `cancelled`
+    // member, so no caller can pass one. This check remains for the walk's own race — a
+    // cancellation landing while an attempt was in flight.
+    if (job.status === "cancelled") return;
     const report: DispatchedTelemetryReport = {
       jobId: job.id,
       laneId: captured.laneId,
       kind: captured.kind,
       ...(captured.spec === undefined ? {} : { spec: captured.spec }),
-      wallClockMs: Math.max(0, (job.endedAt ?? this.now()) - job.startedAt),
-      exitCode: job.exitCode,
-      status: job.status,
+      ...(captured.tier === undefined ? {} : { tier: captured.tier }),
+      // ⚠ THIS ATTEMPT's wall clock, not the walk's. The daemon's lane statistics and its routing
+      // memory are both per lane, so charging a third lane's answer with the two abandoned budgets
+      // ahead of it would make every late lane look slow.
+      wallClockMs: Math.max(0, attempt.wallClockMs),
+      exitCode: attempt.exitCode,
+      status: attempt.status,
       estimatedInputTokens: estimateTokensFromCharacters(captured.taskLength),
       estimatedOutputTokens: estimateTokensFromCharacters(outputChars),
     };
@@ -771,60 +1135,6 @@ export class McpDispatchServer {
         logStderr(`telemetry report failed for lane "${captured.laneId}" job "${job.id}"`);
       });
     }
-  }
-
-  /**
-   * Answer mode for a `relay`-kind rung: skip the harness, POST straight to this relay's own
-   * `/v1/messages`. `lane.spec` is the rung's own pool/model spec — the relay resolves it through
-   * the SAME failover walk any other client's request would get, so pool/failover/hedge behaviour
-   * is unchanged; this call merely avoids spawning a `claude -p` process to make it.
-   *
-   * ⚠ If `spec` resolves to the plain Anthropic passthrough, the dummy `x-api-key` this call sends
-   * fails there and the walk moves on to the next candidate — acceptable, since a pool answering
-   * from its own passthrough member was never the fast path this mode targets.
-   */
-  private async dispatchAnswer(
-    lane: DispatchLane,
-    task: string,
-    opts: {
-      system: string | undefined;
-      schema: Record<string, unknown> | undefined;
-      maxTokens: number | undefined;
-      waitMs: number;
-      timeoutMs: number;
-      dispatchSource?: "daemon" | "fallback";
-    },
-  ): Promise<unknown> {
-    if (!lane.spec) {
-      return textResult(`Lane "${lane.id}" has no relay spec to address in answer mode.`, true);
-    }
-    const spec = lane.spec;
-    const job = this.jobs.create(lane.id, spec, this.cwd(), opts.dispatchSource);
-
-    const controller = new AbortController();
-    this.jobs.registerKill(job.id, () => controller.abort());
-    // AbortSignal.timeout self-cleans and needs no manual clearTimeout; `AbortSignal.any` composes
-    // it with the cancel handle above without either seam needing to know about the other.
-    const signal = AbortSignal.any([AbortSignal.timeout(opts.timeoutMs), controller.signal]);
-
-    const settled = this.runAnswerFetch(spec, task, opts, signal).then(
-      (outcome) => {
-        if (this.jobs.get(job.id)?.status === "cancelled") return "done" as const;
-        let semanticFailure = outcome.semanticFailure;
-        if (semanticFailure === undefined && !outcome.run.timedOut && isContentEmpty(outcome.run.stdout)) {
-          semanticFailure = EMPTY_OUTPUT_REASON;
-        }
-        this.jobs.complete(job.id, outcome.run, semanticFailure, outcome.relay);
-        return "done" as const;
-      },
-      (e: Error) => {
-        if (this.jobs.get(job.id)?.status === "cancelled") return "done" as const;
-        this.jobs.fail(job.id, e.message);
-        return "done" as const;
-      },
-    );
-
-    return this.awaitOrPoll(job.id, settled, opts.waitMs);
   }
 
   /**

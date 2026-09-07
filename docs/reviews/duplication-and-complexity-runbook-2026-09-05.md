@@ -217,21 +217,35 @@ large renames if the top-10 looks stale.
 
 ## 6. Threshold ratchets for CI / pre-commit
 
-> ⚠ **Status: Tier 1 is DEFERRED, not adopted — owner decision, 2026-09-05 (the Phase 1a lap).**
+> ⚠⚠ **Status: Tier 1 is DECLINED for CI — owner decision, 2026-09-06. Nothing below is in force,
+> and this is the settled answer, not a third deferral.**
 >
 > Tier 1 as written contradicts a standing invariant in `CLAUDE.md`: *"Static analysis is ADVISORY
 > and deliberately outside the gate… it is **not** in `npm run check` and CI does not run it — the
 > gate stays the two typechecks, the server suite, the dashboard checks and the package checks."*
-> The owner deferred the choice until after one full green release cycle, which is what this section
-> already proposes for its own Tiers 2 and 3.
+> The owner deferred the choice on 2026-09-05, revisited it the same day after v0.72.2 published
+> green, and deferred again. Asked a third time on 2026-09-06, with four green releases behind the
+> deferral condition, the owner **declined it for CI** in these words: *"It's fine if we leave
+> static analysis out of the pipeline, but I'd like to make it a machine wide process separately.
+> I mean that each repo should define whatever static analysis tools apply to it, and they should
+> run, for example on a nightly routine."*
 >
-> **Revisited the same day, after v0.72.2 published with CI green: still DEFERRED.** One publish is
-> a thin cycle, and the duplication numbers have not had a chance to move yet. Raise it again after
-> a few more releases.
+> So the `CLAUDE.md` invariant stands UNAMENDED and the two documents now agree. The reasoning is
+> not that duplication does not matter — it is that a **blocking build gate is the wrong carrier**
+> for an advisory signal. A ceiling drawn from one day's snapshot fails an honest change that
+> happens to repeat a pattern, and a build that fails on a warning teaches the operator to bypass
+> the gate.
 >
-> Nothing below is in force. Adopting it means amending that `CLAUDE.md` paragraph in the same
-> change, so the two documents cannot state opposite rules. Declining it means saying so here.
-> Tracked in [`../backlog.md`](../backlog.md).
+> ⚠ **The signal is NOT dropped; it moves to a different carrier.** The replacement is a
+> machine-wide nightly run in which each repository declares the static-analysis tools that apply
+> to it. That item's home is `C:\Code\docs\backlog.md`, not this repository, because the fix is a
+> shared scheduled task plus a per-repository declaration convention — filing it here would hide it
+> from every other repository that needs it. This repository's half is already built and is what it
+> would declare: `npm run analysis:run` (eslint + sonarjs, knip, madge, dependency-cruiser,
+> ts-prune, jscpd → `analysis-reports/`).
+>
+> Tiers 2 and 3 below are untouched by this ruling. Both were already advisory-first and neither
+> was ever proposed as a blocking CI gate; read them as candidate content for the nightly run.
 
 Recommended three-tier gating. Tier 1 ships first; tiers 2–3 are opt-in once
 Tier 1 is green for a full release cycle.

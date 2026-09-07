@@ -25,6 +25,7 @@ import {
   type DispatchedTelemetryReport,
   type DispatchLaneStatus,
 } from "../dispatch-lane-stats.js";
+import { clearLaneAffinity, demoteLane, pinLane } from "../lane-affinity.js";
 
 const MAX_TASK_LEN = 4096;
 
@@ -196,7 +197,64 @@ const TELEMETRY_FAILURE_KIND = {
   completed: null,
   failed: "unknown",
   timed_out: "timeout",
+  // ⚠ `aborted`, NOT `timeout`. The lane did not exceed its own ceiling — the relay's dispatch
+  // walk stopped it because it had not answered inside the budget the walk gave it, and started
+  // the next lane instead. `aborted` is the vocabulary's word for "the relay ended this attempt",
+  // and it is the honest one: reporting a 90-second walk budget as the lane's own 35-minute
+  // timeout would label a routing decision as a lane failure.
+  abandoned: "aborted",
 } as const satisfies Record<DispatchLaneStatus, FailureKind | null>;
+
+/**
+ * Whether one settled lane attempt PINS its lane or DEMOTES it — a total table, so a new
+ * `DispatchLaneStatus` is a compile error here rather than a silent guess (the closed-union
+ * gotcha in CLAUDE.md).
+ *
+ * ⚠ One rule, deliberately: **an attempt that produced an answer pins the lane; any attempt that
+ * did not, demotes it.** The narrower alternative — demote only on `abandoned` and `timed_out`,
+ * because a `failed` lane at least produced something — was considered and rejected. It reads well
+ * until you meet the measured case: a lane that returns a lone `#` is `failed` (empty output), and
+ * that is exactly a lane not answering. Splitting the rule would also put the reason for a failure
+ * on the wire, widening a channel that carries counts and lengths only.
+ *
+ * The cost of the simple rule is stated rather than hidden: a lane that fails for reasons specific
+ * to ONE task is ordered behind its peers for the demotion window. That cost is bounded three ways
+ * — it only reorders, it lapses on its own, and the lane's next success retracts it.
+ */
+const LANE_AFFINITY_EFFECT = {
+  completed: "pin",
+  failed: "demote",
+  timed_out: "demote",
+  abandoned: "demote",
+} as const satisfies Record<DispatchLaneStatus, "pin" | "demote">;
+
+/**
+ * Update the daemon's routing memory from one lane report — "the MCP child reports, the daemon
+ * records", the same split the telemetry lap already established.
+ *
+ * ⚠ The DAEMON owns this memory, and it is the only writer. The MCP child could keep its own copy,
+ * but the child restarts often (a filed machine-wide defect records one restart destroying five
+ * lanes at once) and it is not the process that builds the ladder view. One writer, one owner.
+ *
+ * ⚠ A success RETRACTS the lane's demotion before recording the pin, so a lane that recovers is
+ * not left carrying both memories. That mirrors `target-facts.ts`, where a success clears a cooling
+ * condition rather than merely being recorded beside it.
+ */
+function recordLaneAffinity(cfg: Config, report: DispatchedTelemetryReport): void {
+  const walk = cfg.routing.dispatchWalk;
+  // Absent settings mean the walk was never parsed into this config (a hand-built `Config` in a
+  // test, a programmatic caller). Record nothing rather than inventing a window: this relay never
+  // invents a duration, and a memory with a made-up expiry is exactly that.
+  if (!walk || !walk.enabled) return;
+  const tier = report.tier ?? null;
+  const seconds = Math.round(report.wallClockMs / 1000);
+  if (LANE_AFFINITY_EFFECT[report.status] === "pin") {
+    clearLaneAffinity(cfg, tier, report.laneId);
+    pinLane(cfg, tier, report.laneId, `answered in ${seconds}s`, walk.pinMs);
+    return;
+  }
+  demoteLane(cfg, tier, report.laneId, `${report.status.replace("_", " ")} after ${seconds}s`, walk.demoteMs);
+}
 
 /**
  * Record one `cli`-kind lane run as a single estimated-envelope request: role `serve`,
@@ -236,7 +294,7 @@ function recordDispatchLaneAccounting(recorder: AccountingRecorder, report: Disp
     req.complete({});
     return;
   }
-  if (report.status === "failed" || report.status === "timed_out") {
+  if (report.status === "failed" || report.status === "timed_out" || report.status === "abandoned") {
     const failureKind = TELEMETRY_FAILURE_KIND[report.status];
     attempt.complete({ outcome: "error", failureKind, tokens });
     req.complete({ outcome: "error", failureKind });
@@ -501,6 +559,7 @@ export async function handleAdminRoutes(
       return bad(400, `POST /dispatch/telemetry: no lane "${report.laneId}" in routing.ladder`);
     }
     recordLaneRun(cfg, report);
+    recordLaneAffinity(cfg, report);
     // Owner decision D1: `cli` lanes are metered here because nothing else sees them; a
     // `relay` lane's harness traffic already flows through the daemon's own HTTP pipeline,
     // so a second row would double count. Lane stats record BOTH kinds. "Metered by the

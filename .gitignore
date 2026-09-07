@@ -17,3 +17,6 @@ control-token
 .claude/verify-green/
 # /start-lap writes it, /closeout consumes and deletes it — machine-lap state, never shipped.
 .claude/lap-start.json
+# A live pointer the harness overwrites so a session can compact — same class as the file above:
+# session state, not source. Committing it would add churn on every lap and ship nothing useful.
+.claude/compaction-checkpoint.md

@@ -1,12 +1,13 @@
 /**
  * Parsing and validating the `routing` block of a config document (HOTSPOT-03).
  *
- * `parseRouting` plus the seventeen declarations only it reaches: the six sub-block parsers
+ * `parseRouting` plus the nineteen declarations only it reaches: the seven sub-block parsers
  * (`parseQuotaEnforcement`, `parseLatencyDemotion`, `parseHedge`, `parseMcpSettings`,
- * `parseLaneProbe`, `parseSticky`), `parseOffload`, the ladder family (`parseLadder`,
- * `parseCliLane`, `parseSpawnEnv` and its three placeholder tokens), `dropDisabledSpecs`,
- * `assertSpecResolvable`, `hasAsciiControl`, `DEFAULT_LANE_PROBE` and `EFFORT_LEVEL_SET`.
- * Roughly 700 lines out of a 2,000-line `config.ts`.
+ * `parseLaneProbe`, `parseDispatchWalk`, `parseSticky`), `parseOffload`, the ladder family
+ * (`parseLadder`, `parseCliLane`, `parseSpawnEnv` and its three placeholder tokens),
+ * `dropDisabledSpecs`, `assertSpecResolvable`, `hasAsciiControl`, `DEFAULT_LANE_PROBE`,
+ * `DEFAULT_DISPATCH_WALK` and `EFFORT_LEVEL_SET`. Roughly 700 lines out of a 2,000-line
+ * `config.ts`.
  *
  * ⚠ **It imports `config-types.js` and `spec.js`, and NOTHING else.** That is the property the item
  * asks for, and it is why `spec.ts` had to exist first: this parser needs `POOL_PREFIX`,
@@ -30,6 +31,7 @@
 import {
   EFFORT_LEVELS,
   type CliLaneTemplate,
+  type DispatchWalkSettings,
   type EffortLevel,
   type HedgeConfig,
   type LadderRung,
@@ -189,6 +191,7 @@ export function parseRouting(
     latency?: unknown;
     hedge?: unknown;
     laneProbe?: unknown;
+    dispatchWalk?: unknown;
     mcp?: unknown;
     ladder?: unknown;
     ladders?: unknown;
@@ -311,6 +314,7 @@ export function parseRouting(
   routing.latency = parseLatencyDemotion(r.latency);
   routing.hedge = parseHedge(r.hedge);
   routing.laneProbe = parseLaneProbe(r.laneProbe);
+  routing.dispatchWalk = parseDispatchWalk(r.dispatchWalk);
   const mcpSettings = parseMcpSettings(r.mcp);
   if (mcpSettings) routing.mcp = mcpSettings;
   if (Object.keys(pools).length > 0) routing.pools = pools;
@@ -459,6 +463,68 @@ function parseLaneProbe(raw: unknown): LaneProbeSettings {
     enabled: o.enabled,
     quotaIntervalMs: interval("quotaIntervalMs", o.quotaIntervalMs, DEFAULT_LANE_PROBE.quotaIntervalMs),
     catalogIntervalMs: interval("catalogIntervalMs", o.catalogIntervalMs, DEFAULT_LANE_PROBE.catalogIntervalMs),
+  };
+}
+
+/**
+ * Defaults for the automatic lane walk. **ON**, per the owner's 2026-09-06 request that the relay
+ * stop making callers pick lanes by hand.
+ *
+ * ⚠ `attemptMs` is 90 s, and the figure is REASONED rather than measured — say so, rather than
+ * letting a later reader mistake it for a calibration. Two facts bound it. Below, the measured
+ * client tool-call ceiling on this machine is between 45 s and 100 s, so a budget near it lets the
+ * common case finish inside ONE blocking call rather than degrading to a poll. Above, the recorded
+ * lane wall-clock window has a median of 111.5 s, so a much smaller budget would abandon lanes
+ * that were about to answer. 90 s sits under the ceiling and just under the median, which is the
+ * right side to err on: abandoning costs one wasted free lane run, waiting costs the whole turn.
+ * ⚠ It is NOT a calibrated statistic and must not be quoted as one — the recorded window mixes
+ * several sessions' traffic, which is exactly why `docs/backlog.md` still carries the calibration
+ * as open work.
+ */
+export const DEFAULT_DISPATCH_WALK: DispatchWalkSettings = {
+  enabled: true,
+  attemptMs: 90_000,
+  maxLanes: 4,
+  pinMs: 15 * 60 * 1000,
+  demoteMs: 15 * 60 * 1000,
+};
+
+/**
+ * Absent ⇒ the defaults (ON). Boolean toggles `enabled`. An unknown key is a hard error naming it
+ * — the `compat`/`laneProbe` precedent, because an ignored typo would read as a setting that took
+ * effect while changing nothing.
+ */
+function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
+  if (raw === undefined || raw === null) return { ...DEFAULT_DISPATCH_WALK };
+  if (typeof raw === "boolean") return { ...DEFAULT_DISPATCH_WALK, enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`config.routing.dispatchWalk must be a boolean or an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  const keys = ["enabled", "attemptMs", "maxLanes", "pinMs", "demoteMs"] as const;
+  for (const key of Object.keys(o)) {
+    if (!(keys as readonly string[]).includes(key)) {
+      throw new Error(`config.routing.dispatchWalk.${key} is not a recognized key (${keys.join(", ")})`);
+    }
+  }
+  if (o.enabled !== undefined && typeof o.enabled !== "boolean") {
+    throw new Error(`config.routing.dispatchWalk.enabled must be a boolean`);
+  }
+  const bounded = (name: string, value: unknown, fallback: number, min: number, max: number): number => {
+    if (value === undefined) return fallback;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+      throw new Error(`config.routing.dispatchWalk.${name} must be a number between ${min} and ${max}`);
+    }
+    return Math.floor(value);
+  };
+  return {
+    enabled: o.enabled ?? DEFAULT_DISPATCH_WALK.enabled,
+    // Floor 1 s: a budget under that abandons every lane before a process can start, which reads
+    // as "every lane is broken". Ceiling 1 h matches the longest a lane rung is configured for.
+    attemptMs: bounded("attemptMs", o.attemptMs, DEFAULT_DISPATCH_WALK.attemptMs, 1_000, 3_600_000),
+    maxLanes: bounded("maxLanes", o.maxLanes, DEFAULT_DISPATCH_WALK.maxLanes, 1, 20),
+    pinMs: bounded("pinMs", o.pinMs, DEFAULT_DISPATCH_WALK.pinMs, 0, 6 * 60 * 60 * 1000),
+    demoteMs: bounded("demoteMs", o.demoteMs, DEFAULT_DISPATCH_WALK.demoteMs, 0, 6 * 60 * 60 * 1000),
   };
 }
 
