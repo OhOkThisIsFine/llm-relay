@@ -49,10 +49,14 @@ statistic the original backlog item asked for is still open, for the reason it a
 recorded wall-clock window mixes several sessions' traffic. ⚠ Do NOT point the HTTP path's numbers
 (250 ms/token, a 30 s ceiling) at a lane.
 
-⚠ **`packBytes` grew 962837 → 978083 and the baseline was ratcheted knowingly**, not regenerated to
-make a red gate green. Every metric that moved is explained: `packageEntries` +3 for one new module,
-`unpackedBytes` +60601 for that module plus documentation comments, which by the standing
-two-`tsc`-pass design land in the `.d.ts` files. The dashboard metrics are untouched.
+⚠ **The package baseline was corrected from same-toolchain rebuilds of the last green commit and
+current HEAD**, not regenerated from a red gate. `packageEntries` 404 → 407 is the three outputs for
+the new `lane-affinity` module. `unpackedBytes` 4905674 → 4967123 (+61449) decomposes with no
+residue: `lane-affinity` 19655 + `mcp/server` 15126 + `dispatch` 6617 + `mcp/lane-runner` 5951 +
+`config/routing-parser` 5089 + `dispatch-lane-stats` 3886 + `config-types` 2495 + `routes/admin`
+1830 + `cli` 512 + `server` 261 + `config` 27. The prior 4964932 observation was stale by 2191
+bytes; the ceiling moved only to the next thousand, 4968000. `packBytes` is recorded at 978581 but
+remains a ceiling-only gzip metric. Dashboard metrics are untouched.
 
 Immediate next: **decompose `parseRouting`** (ruled and scheduled; the risk is validation ORDER, not
 size — pin the order before splitting). Then the eligibility queue triage.
