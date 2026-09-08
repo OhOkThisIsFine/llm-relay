@@ -28,9 +28,24 @@ describe("cold dispatch restores into the config it builds from", () => {
     expect(SOURCE).toContain("buildDispatch(fallbackCfg,");
   });
 
-  it("restores BOTH ladder stores into `fallbackCfg`, never the pre-reload `cfg`", () => {
+  it("restores EVERY ladder store into `fallbackCfg`, never the pre-reload `cfg`", () => {
     expect(SOURCE).toContain("restoreExhaustedRows(fallbackCfg, loadExhaustedRows());");
     expect(SOURCE).toContain("restoreLaneAffinityRows(fallbackCfg, loadLaneAffinityRows());");
+    expect(SOURCE).toContain("restoreLaneStatsRows(fallbackCfg, loadLaneStatsRows());");
+  });
+
+  it("⚠ restores the same three on BOTH dispatch surfaces, not just one", () => {
+    // Found by running the built binary: lane stats were restored on the reloading surface only,
+    // so `llm-relay dispatch` reported a flat budget and "0 recorded runs" for a lane the daemon
+    // knew had a full window. Two surfaces, one policy — this repository's recurring incident
+    // shape, and it recurred here inside a single lap.
+    for (const call of [
+      "restoreExhaustedRows(cfg, loadExhaustedRows());",
+      "restoreLaneAffinityRows(cfg, loadLaneAffinityRows());",
+      "restoreLaneStatsRows(cfg, loadLaneStatsRows());",
+    ]) {
+      expect(SOURCE, call).toContain(call);
+    }
   });
 
   it("⚠ the restores come BEFORE the view is built, or they cannot reach it", () => {

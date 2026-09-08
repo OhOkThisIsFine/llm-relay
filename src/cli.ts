@@ -28,6 +28,7 @@ import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, formatAttemptBudget, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
+import { loadLaneStatsRows, restoreLaneStatsRows } from "./dispatch-lane-stats.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
@@ -2538,6 +2539,11 @@ export async function resolveDispatchView(opts: {
   // daemon stays the only writer.
   restoreExhaustedRows(fallbackCfg, loadExhaustedRows());
   restoreLaneAffinityRows(fallbackCfg, loadLaneAffinityRows());
+  // ⚠ Lane STATS matter here too, and only became load-bearing on 2026-09-08: each lane's walk
+  // budget is derived from its own recorded runs, so a cold view without them reports the flat
+  // figure and "0 recorded runs" for a lane the daemon knows has a hundred. That is a wrong number
+  // on the operator's screen, not merely a missing column — found by running the built binary.
+  restoreLaneStatsRows(fallbackCfg, loadLaneStatsRows());
   const fallbackView = normalizeDispatchCommands(
     buildDispatch(fallbackCfg, {
       ...(opts.lane ? { lane: opts.lane } : {}),
@@ -2703,6 +2709,10 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   // the file sat on disk beside the cooldowns it DID read, so the two halves of the same
   // ladder state disagreed on one surface.
   restoreLaneAffinityRows(cfg, loadLaneAffinityRows());
+  // Lane stats too, for the same reason and on both dispatch surfaces: each lane's walk budget is
+  // derived from its recorded runs, so a cold view without them reports the flat figure and
+  // "0 recorded runs" for a lane the daemon knows has a hundred.
+  restoreLaneStatsRows(cfg, loadLaneStatsRows());
   const rawView = normalizeDispatchCommands(
     live ??
       buildDispatch(cfg, {
