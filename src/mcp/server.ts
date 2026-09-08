@@ -381,6 +381,20 @@ export const LANE_LADDER_EXHAUSTED_ADVICE =
   + "Do the work in this session instead, with your own subagent if you have one.";
 
 /**
+ * What a caller is told when lanes REMAIN untried — the walk stopped at its own `maxLanes` bound.
+ *
+ * ⚠ This exists because the advice above was firing on a walk that had not exhausted anything
+ * (found by adversarial review, 2026-09-06). Both of its sentences were then false: lanes remained,
+ * and "it would pick the same lanes" is wrong precisely because the walk has just DEMOTED every
+ * lane it tried, so the next dispatch reorders around them. Telling an autonomous caller to stop
+ * delegating, on a false premise, abandons free capacity that was never contacted.
+ */
+export const LANE_LADDER_PARTIAL_ADVICE =
+  "Lanes remain untried: this dispatch stopped at its maxLanes bound. Call dispatch again to "
+  + "reach them — the lanes above are now demoted, so it will pick different ones — or do the "
+  + "work in this session.";
+
+/**
  * Render the lanes a walk tried, oldest first, so both a poll and the final answer show what it
  * cost to get here.
  *
@@ -410,13 +424,25 @@ function jobAnswer(job: LaneJob, now: number): string {
   // answer show the same list rather than two nearly-identical renderings that can drift apart.
   // The terminal fallback fires only when the walk ended with NO answer from any lane. A cancelled
   // job is excluded: the caller stopped it, so the ladder was never exhausted.
-  const exhausted =
+  // ⚠ Three conditions, and the last two were MISSING until adversarial review found it
+  // (2026-09-06). "No lane answered" is not the same claim as "every lane was tried":
+  //   - with `routing.dispatchWalk: false` exactly ONE lane runs, and the pre-walk answer carried
+  //     no advice at all — emitting it there breaks the documented byte-for-byte revert;
+  //   - with `maxLanes` below the selectable count the walk stopped early, and the answer would
+  //     then contain BOTH "N further lanes not tried" and "every lane has now been tried".
+  // A caller that stops delegating on a false premise abandons free capacity nothing contacted.
+  const nothingAnswered =
     job.status !== "running"
     && job.status !== "cancelled"
     && job.attempts.length > 0
-    && job.attempts.every((a) => a.status !== "completed")
-      ? `\n\n${LANE_LADDER_EXHAUSTED_ADVICE}`
-      : "";
+    && job.attempts.every((a) => a.status !== "completed");
+  const exhausted = !nothingAnswered
+    ? ""
+    : job.walkEnabled !== true
+      ? ""
+      : job.lanesNotTried
+        ? `\n\n${LANE_LADDER_PARTIAL_ADVICE}`
+        : `\n\n${LANE_LADDER_EXHAUSTED_ADVICE}`;
   if (job.status === "running") {
     return `${header}\n\nStill running. Poll dispatch_status, then call dispatch_result.`;
   }
@@ -798,9 +824,12 @@ export class McpDispatchServer {
 
     const first = view.ladder.find((l) => l.id === ordered[0]) ?? view.next;
     const job = this.jobs.create(first.id, first.spec, opts.cwd, opts.dispatchSource);
-    // No silent caps: when `maxLanes` bound the walk below what the ladder offered, say by how
-    // much. A capped walk that reports "every lane was tried" would be false.
-    this.jobs.noteLanesNotTried(job.id, Math.max(0, order.length - ordered.length));
+    // What this dispatch was allowed to reach. Both halves gate the terminal advice below: it may
+    // claim the ladder was exhausted only when a walk actually ran and nothing was left untried.
+    this.jobs.noteWalkScope(job.id, {
+      enabled: walk !== null,
+      lanesNotTried: Math.max(0, order.length - ordered.length),
+    });
     const waitMs = readNumber(args, "waitMs") ?? DEFAULT_WAIT_MS;
     // ⚠ A walk must ALWAYS leave the job terminal. `runWalk` is written not to reject — every
     // failure a lane can produce is an attempt — but the worst outcome available here is a caller

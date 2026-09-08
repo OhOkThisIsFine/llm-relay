@@ -43,6 +43,22 @@ reasoning level and have the relay do the rest."*
    advice, because the last lane is still being waited for. The advice appears only when the walk
    truly ends.
 
+⚠ **An adversarial review of the change found one real defect, and it was fixed the same lap.** The
+terminal "every lane has been tried, do NOT call dispatch again" instruction fired whenever no lane
+answered — not when the ladder was actually exhausted. So `dispatchWalk: false` (one lane, the
+documented byte-for-byte revert) and any walk capped by `maxLanes` both told an autonomous caller to
+stop delegating while lanes it never contacted remained; the capped answer contradicted itself in
+one breath, carrying "N further lanes not tried" beside "every lane has now been tried". The
+instruction is now gated on `walkEnabled` and `lanesNotTried`, the capped case gets its own advice
+that invites a retry (the lanes just tried are demoted, so a retry does reach different ones), and
+the walk-off case emits nothing at all. Two tests pin it; both die when the gate is removed.
+
+⚠ **The review's coverage was PARTIAL and must not be read as a clean bill.** Five lenses ran, but
+81 of its 116 agents died on the monthly spend limit mid-run. Only the concurrency lens completed
+verification. The findings from the closed-union, invariant, test-quality and documentation lenses
+were raised and never verified, so they are neither confirmed nor refuted — that ground is
+unexamined, not clear.
+
 ⚠ **The demotion is EVIDENCE, not a calibrated statistic, and the backlog entry says so.** "The walk
 gave this lane its budget and it did not answer" needs no threshold. The calibrated per-lane
 statistic the original backlog item asked for is still open, for the reason it always gave: the

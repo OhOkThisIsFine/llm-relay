@@ -181,9 +181,20 @@ export interface LaneJob {
   attempts: LaneAttempt[];
   /**
    * Selectable lanes the walk's `maxLanes` bound kept it from trying. Absent when it tried
-   * everything the ladder offered — see `LaneJobStore.noteLanesNotTried`.
+   * everything the ladder offered — see `LaneJobStore.noteWalkScope`.
    */
   lanesNotTried?: number;
+  /**
+   * Whether this job ran as a WALK at all, or as the single pre-walk lane
+   * (`routing.dispatchWalk: false`).
+   *
+   * ⚠ It exists because a renderer cannot tell those apart from `attempts` alone: a walk that
+   * legitimately exhausted a one-rung ladder and a walk-disabled dispatch that tried its one lane
+   * produce the same record. Saying "every lane has been tried" for the second is false, and it
+   * also breaks the documented promise that `dispatchWalk: false` restores the pre-walk behaviour
+   * exactly — the pre-walk answer carried no such advice at all.
+   */
+  walkEnabled?: boolean;
   startedAt: number;
   endedAt: number | undefined;
   exitCode: number | null;
@@ -635,16 +646,20 @@ export class LaneJobStore {
   }
 
   /**
-   * Record how many selectable lanes the walk's own `maxLanes` bound kept it from trying.
+   * Record what this dispatch was allowed to reach: whether it ran as a WALK, and how many
+   * selectable lanes its own `maxLanes` bound kept it from trying.
    *
-   * ⚠ No silent caps. A walk that stopped at four of nine lanes and then reported "every lane has
-   * been tried" would be false on the one surface the caller acts on. Zero is not stored, so an
-   * uncapped walk renders exactly as it did before this field existed.
+   * ⚠ No silent caps, and no false claim of exhaustion. Both halves feed the same decision — a
+   * dispatch may only tell the caller "every lane has been tried" when it actually walked and
+   * nothing was left over. A walk that stopped at four of nine lanes, or a dispatch with the walk
+   * turned off entirely, saying that would be false on the one surface the caller acts on. Zero is
+   * not stored, so an uncapped walk renders exactly as it did before this field existed.
    */
-  noteLanesNotTried(id: string, count: number): void {
+  noteWalkScope(id: string, scope: { enabled: boolean; lanesNotTried: number }): void {
     const job = this.jobs.get(id);
-    if (!job || count <= 0) return;
-    job.lanesNotTried = count;
+    if (!job) return;
+    job.walkEnabled = scope.enabled;
+    if (scope.lanesNotTried > 0) job.lanesNotTried = scope.lanesNotTried;
   }
 
   get(id: string): LaneJob | undefined {

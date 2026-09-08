@@ -1382,6 +1382,11 @@ A dispatch now WALKS the ladder:
 - When every lane is spent, the answer is an instruction to do the work in the calling session
   instead. The relay cannot start your agent's own subagent — it decides ORDER, the host executes —
   so the last rung of the ladder is an answer, not a spawn.
+- ⚠ That instruction says "every lane has been tried", so it appears ONLY when that is true. When
+  the walk stopped at its own `maxLanes` bound, the answer says lanes remain and invites a retry
+  instead — the lanes it just tried are now demoted, so a second dispatch reaches different ones.
+  With `dispatchWalk: false` there is no such instruction at all, because one lane was tried and
+  nothing was learned about the rest.
 
 ```jsonc
 "routing": {

@@ -17,7 +17,12 @@
  * bounds are covered in `test/config.test.ts`.
  */
 import { describe, it, expect } from "vitest";
-import { McpDispatchServer, LANE_LADDER_EXHAUSTED_ADVICE, type McpServerDeps } from "../src/mcp/server.js";
+import {
+  McpDispatchServer,
+  LANE_LADDER_EXHAUSTED_ADVICE,
+  LANE_LADDER_PARTIAL_ADVICE,
+  type McpServerDeps,
+} from "../src/mcp/server.js";
 import type { Config, DispatchWalkSettings } from "../src/config.js";
 import type { DispatchLane, DispatchView } from "../src/dispatch.js";
 import type { DispatchedTelemetryReport } from "../src/dispatch-lane-stats.js";
@@ -214,6 +219,14 @@ describe("dispatch lane walk", () => {
     const { text } = await h.tool("dispatch", { task: "do it" });
     expect(spawn.started).toEqual(["l1", "l2"]);
     expect(text).toContain("2 further lanes not tried");
+    // ⚠ And it must NOT also claim the ladder was exhausted. The two statements contradicted each
+    // other in one answer until adversarial review caught it (2026-09-06): "2 further lanes not
+    // tried" beside "Every dispatch lane has now been tried for this task".
+    expect(text).not.toContain(LANE_LADDER_EXHAUSTED_ADVICE);
+    expect(text).toContain(LANE_LADDER_PARTIAL_ADVICE);
+    // The partial advice must not repeat the exhausted one's stop-delegating instruction: the
+    // walk just demoted every lane it tried, so a retry genuinely reaches different ones.
+    expect(LANE_LADDER_PARTIAL_ADVICE).not.toContain("Do NOT call dispatch again");
   });
 
   it("a non-zero exit is an ordinary failed attempt: the walk moves on", async () => {
@@ -314,6 +327,24 @@ describe("dispatch lane walk — disabled", () => {
     expect(spawn.started).toEqual(["l1"]);
     expect(spawn.killed).toEqual([]);
     expect(text).toContain("Still running");
+  });
+
+  it("⚠ with the walk OFF, a failed lane claims NOTHING about the rest of the ladder", async () => {
+    // The documented promise is that `dispatchWalk: false` restores the pre-walk behaviour
+    // EXACTLY, and the pre-walk answer carried no terminal advice at all. Until adversarial review
+    // caught it (2026-09-06), one failed lane under the documented revert told the caller "Every
+    // dispatch lane has now been tried for this task… Do NOT call dispatch again" — with a dozen
+    // rungs never contacted. An autonomous caller acting on that abandons free capacity.
+    const spawn = laneRunner({ l1: nonZero("no") });
+    const h = new Harness({
+      config: config({ ...WALK, enabled: false }),
+      buildView: async () => view(["l1", "l2", "l3"]),
+      spawn,
+    });
+    const { text } = await h.tool("dispatch", { task: "do it" });
+    expect(spawn.started).toEqual(["l1"]);
+    expect(text).not.toContain(LANE_LADDER_EXHAUSTED_ADVICE);
+    expect(text).not.toContain(LANE_LADDER_PARTIAL_ADVICE);
   });
 
   it("with NO dispatchWalk configured at all, behaviour is the pre-walk single lane", async () => {
