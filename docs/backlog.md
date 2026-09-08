@@ -9,6 +9,20 @@
 
 ## Open
 
+- **The `llm-relay` skill and the `relay` agent drift from the CLI and from each other
+  (2026-09-08, machine-wide hooks-and-skills review, low).**
+  `skills/llm-relay/references/operations.md` documents `eligibility propose … --rationale "…"`;
+  `llm-relay --help` lists `--sig`, `--class`, `--scope`, `--members`, `--all-credentials`,
+  `--cost-class` and no `--rationale`. `~/.claude/agents/relay.md` (from `setup-claude.ts`'s
+  `RELAY_AGENT_TEMPLATE`) declares only `dispatch`, `dispatch_status`, `dispatch_result` — not
+  `dispatch_cancel` or `dispatch_lanes`, which `SKILL.md` treats as standard. "Lane output is
+  advisory" is stated in `SKILL.md`, `references/dispatch-lanes.md`, `references/direct-routing.md`
+  and the global CLAUDE.md; the Codex Desktop `pool/*` rejection in four places too; the
+  answer-mode paragraph appears verbatim in `SKILL.md` and `references/dispatch-lanes.md`. The
+  skill description is 986 characters, loaded into every Claude session. **Property:** each fact
+  has one home in the skill; the agent template names every tool the skill's guide uses; the
+  reference matches `--help`.
+
 - **Accounting-store tests leak legacy journal artifacts into Windows Temp.** A WizTree MFT scan on
   2026-09-07 found 36,094 `llm-relay-accounting-store-*` directories beneath
   `%LOCALAPPDATA%\Temp`, consuming 59.09 GiB. A sampled directory held three small accounting
