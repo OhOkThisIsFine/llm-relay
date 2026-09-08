@@ -45,19 +45,29 @@
   and the ladder view reports the statistic beside the median it used to print alone
   (`p95WallClockMs`).
 
-  **Not met.** The demotion is EVIDENCE — "the walk gave this lane its budget and it did not
-  answer" — not a threshold drawn from the lane's own recorded distribution. The original property
-  asked for the latter, and it is still not possible for the reason the entry always gave: the
-  recorded wall-clock window mixes several sessions' traffic, so no threshold drawn from it means
-  anything until per-lane history is attributable. ⚠ The standing warning is unchanged and still
-  binds: do NOT point the HTTP path's numbers (250 ms/token, a 30 s absolute ceiling) at a lane —
-  a lane legitimately runs an agent loop for minutes, and reusing them would demote every healthy
-  lane at once.
+  **Also met, on 2026-09-08 (v0.75.0), and this entry was WRONG about it.** Each lane's WALK
+  BUDGET is now the 80th percentile of that lane's own recorded window (`attemptBudget` in
+  `dispatch.ts`; window raised 25 → 100 samples). ⚠ This entry previously said such a threshold was
+  "still not possible" because the window mixes several sessions' traffic. That reasoning was mine
+  and it was wrong — the owner asked what had become of the request path's distribution-based
+  thresholds, and the live per-lane data answered it: p50 runs of 81 s, 114 s and 583 s across the
+  three working lanes, a spread of 7× that any aggregate hides. Session attribution turned out not
+  to be needed for a BUDGET: "how long does this lane usually take" is answered by that lane's own
+  samples whoever produced them. ⚠ It IS still needed for the demotion below, which asks a
+  different question — "is this lane unusual *against its own recent behaviour*" — and that one
+  cannot be answered by a window that cannot separate recent from old.
 
-  **Property (what remains):** per-lane wall-clock history is attributable to a session, and a lane
-  whose recent distribution is an outlier against ITS OWN history is demoted on a threshold
-  calibrated from that history — with the calibration recorded the way
-  `DEFAULT_LATENCY_MS_PER_TOKEN`'s 250 was.
+  **Still not met.** The DEMOTION remains EVIDENCE — "the walk gave this lane its budget and it did
+  not answer" — rather than an outlier test against the lane's own distribution. ⚠ The standing
+  warning is unchanged and still binds: do NOT point the HTTP path's numbers (250 ms/token, a 30 s
+  absolute ceiling) at a lane; a lane legitimately runs an agent loop for minutes. The METHOD
+  transfers and now does; the NUMBERS never will.
+
+  **Property (what remains):** per-lane wall-clock history is attributable in time, and a lane
+  whose RECENT distribution is an outlier against its own earlier history is demoted on a threshold
+  calibrated from that history — with the calibration recorded the way the budget's 0.8 quantile
+  now is (live p80: 165 s, 224 s, 1383 s; chosen because p90/p95 saturate at the slowest lane's own
+  timeout).
 
 - **✅ RULED 2026-09-06, and SCHEDULED: decompose `parseRouting`.** The owner chose to split it in a
   later lap rather than accept its size. Measured after the HOTSPOT-03 extraction, it is still
