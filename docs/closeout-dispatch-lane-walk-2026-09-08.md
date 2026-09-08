@@ -1,16 +1,19 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-08T18:14:34.926Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-08T18:28:57.761Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `fd755b77b2fcc377cd62f87696399c4fc7e1ce9b`
+- HEAD: `a6e757b9a6e85a5c60194d34778e76989d98a89c`
 - Sprint start: `7b2b536b12c5a6835ad36210212ac07006e6f166`
 
 ## Commits in the sprint range
 
+- a6e757b backlog: the llm-relay skill and the relay agent drift from the CLI
+- 247a04a docs: state the current lane budget in the bullet that introduces it
+- cc43edc docs: re-render the closeout on the tree that CI certified
 - fd755b7 docs: resolve the independent closeout audit's flags
 - a8eb46f backlog: correct the lane-reordering entry — the distribution-based threshold shipped
 - 75bf069 docs: name the two releases this lap shipped
@@ -29,21 +32,18 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 ## Working tree and remote
 
-- Working tree: NOT clean — FAIL
-```
-M docs/closeout-dispatch-lane-walk-2026-09-08.md
-```
+- Working tree: clean — PASS
 - `origin/main` equals HEAD — PASS
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-08T18:14:26.023Z on tree `253dbf4d06a0`
-- `verify-green check`: verify-green: PASS — tree 253dbf4d06a0 matches the passing run recorded 2026-09-08T18:14:26.023Z (npm run check) — PASS
+- Ledger: `npm run check` recorded 2026-09-08T18:25:32.217Z on tree `9040ddc17b94`
+- `verify-green check`: verify-green: PASS — tree 9040ddc17b94 matches the passing run recorded 2026-09-08T18:25:32.217Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 34261371529) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34261371529
+- CI: completed/success (run 34262886689) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34262886689
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -150,6 +150,22 @@ lenses ran; 81 of its 116 agents died on the monthly spend limit. Only the concu
 completed verification. The closed-union, invariant, test-quality and documentation lenses raised
 findings that were never verified — that ground is unexamined, not clear.
 
+## About this record, and why it names a HEAD older than itself
+
+⚠ **A rendered closeout and the ledger it quotes are CIRCULAR.** Writing this document changes the
+tree that `verify-green` certifies, so the ledger goes stale in the same instant the document claims
+it passed. Chasing that to a fixpoint is not possible: each render invalidates its own record.
+
+So the record stops one step short, deliberately, and says where. The commit list above ends at the
+last commit of the WORK. The commits that follow it are the closeout ceremony itself — this render,
+one HANDOFF correction, and one backlog entry another agent filed here while the lap was closing —
+and each carries its reason in its own commit message. The final state, verified after the last of
+them, is: tree clean, `origin/main` level, `verify-green check` PASS, and CI green on the exact
+HEAD. Read `git log` for the three; do not read their absence here as work left undone.
+
+The same reason explains the one FAIL line above. "Working tree: NOT clean" names this file and
+nothing else. A document cannot be committed and rendered in the same moment.
+
 ## What remains, each with its home
 
 - The calibrated per-lane DEMOTION threshold — `docs/backlog.md`. The budget now uses lane history;
@@ -163,4 +179,4 @@ findings that were never verified — that ground is unexamined, not clear.
 
 ## Verdict
 
-- 1 section(s) FAIL: working tree.
+- All machine-derived sections PASS.
