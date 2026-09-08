@@ -372,8 +372,11 @@ function describeJob(job: LaneJob, now: number): string {
  * what NOT to do. Without the second half a caller retries `dispatch` for the same task, which is
  * the loop this feature exists to end.
  *
- * Pinned by `test/mcp-server.test.ts` on its CLAIMS rather than its wording — reword it freely,
- * but change the assertion deliberately instead of deleting it.
+ * Pinned by `test/dispatch-lane-walk.test.ts` on its CLAIMS rather than its wording — reword it
+ * freely, but change the assertion deliberately instead of deleting it. (This said
+ * `test/mcp-server.test.ts` until an independent closeout audit caught it on 2026-09-08; the
+ * assertions never lived there. A citation that sends the reader to the wrong file is the exact
+ * failure the repository's cite-symbols-not-line-numbers rule exists to avoid.)
  */
 export const LANE_LADDER_EXHAUSTED_ADVICE =
   "Every dispatch lane has now been tried for this task and none of them answered. "
