@@ -16,9 +16,12 @@ necessary."* And the principle behind it: *"Callers shouldn't have to specifical
 should have the option to if they want, but the default should just be to call the relay with a
 reasoning level and have the relay do the rest."*
 
-- ✅ **The MCP `dispatch` tool WALKS the ladder.** Each lane gets an attempt budget (`attemptMs`,
-  90 s); a lane that does not answer is killed and the next is started. The LAST lane gets NO
-  budget — there is nowhere to move to, so killing it would discard the only answer still coming.
+- ✅ **The MCP `dispatch` tool WALKS the ladder.** Each lane gets an attempt budget — the 80th
+  percentile of that lane's OWN recorded runs, falling back to the flat `attemptMs` (90 s) when the
+  lane has too little history, and never dropping below it; see the ⚠ block below for why the flat
+  figure alone was wrong. A lane that does not answer is killed and the next is started. The LAST
+  lane gets NO budget — there is nowhere to move to, so killing it would discard the only answer
+  still coming.
 - ✅ **The last rung is an ANSWER, not a spawn.** When every lane is spent, `dispatch` returns
   `LANE_LADDER_EXHAUSTED_ADVICE`: do the work here, with your own subagent, and do NOT re-dispatch.
   The relay cannot start the caller's subagent — it decides ORDER, the host executes.
