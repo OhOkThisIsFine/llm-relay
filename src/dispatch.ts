@@ -3,7 +3,7 @@ import type { Config, LadderRung } from "./config-types.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
-import { allLaneStats, medianWallClockMs, p95WallClockMs } from "./dispatch-lane-stats.js";
+import { allLaneStats, medianWallClockMs, p95WallClockMs, quantileWallClockMs } from "./dispatch-lane-stats.js";
 import { laneDemotion, lanePin, type LaneAffinityRow } from "./lane-affinity.js";
 
 /**
@@ -94,6 +94,22 @@ export function formatLaneStats(stats: DispatchLaneStats): string {
   );
 }
 
+/**
+ * One-line rendering of a lane's walk budget, shared by `dispatch_lanes` and `llm-relay dispatch`
+ * so the wording cannot drift between the two surfaces — the `formatLaneStats` precedent:
+ * `budget: 224s (p80 of 25 runs)` or `budget: 90s (too few runs, 2)`.
+ *
+ * It names the BASIS as well as the number, because those two figures mean different things: one is
+ * derived from this lane's own history and moves as the lane does, the other is the operator's flat
+ * default standing in until there is history to read.
+ */
+export function formatAttemptBudget(budget: { ms: number; basis: "history" | "floor"; samples: number }): string {
+  const seconds = `${Math.round(budget.ms / 100) / 10}s`;
+  return budget.basis === "history"
+    ? `budget: ${seconds} (from ${budget.samples} recorded runs)`
+    : `budget: ${seconds} (flat — too few recorded runs, ${budget.samples})`;
+}
+
 export interface DispatchLane {
   id: string;
   kind: "cli" | "relay";
@@ -182,6 +198,20 @@ export interface DispatchLane {
    * never drops": a memory of past success must not outrank present evidence of unavailability.
    */
   pinned?: { until: string; reason: string };
+  /**
+   * How long a dispatch WALK gives this lane to answer before it stops it and starts the next —
+   * derived from THIS lane's own recorded wall-clock history when it has enough of one.
+   *
+   * ⚠ It is computed HERE, in the daemon, because this is where the history lives: the walk runs in
+   * the `llm-relay mcp` child, which holds no stats. Carrying the resolved number on the lane keeps
+   * one definition of the budget and lets an operator read it off the ladder, rather than the child
+   * re-deriving a figure from data it does not have.
+   *
+   * ⚠ `basis` says which it is. `history` means the lane cleared `attemptMinSamples` and the number
+   * is its own quantile; `floor` means it did not, and the flat `attemptMs` applies — unmeasured is
+   * "no opinion", never "slow". Absent entirely when the walk is off or unconfigured.
+   */
+  attemptBudget?: { ms: number; basis: "history" | "floor"; samples: number };
   /**
    * This lane recently failed to answer inside the budget a dispatch walk gave it, so ready lanes
    * carrying no demotion are tried ahead of it for a window (`lane-affinity.ts`).
@@ -992,6 +1022,13 @@ export function buildDispatch(
       lastAt: row.lastAt,
     };
   }
+  // Every lane gets a budget, whether or not it has ever run: a lane with no history takes the flat
+  // figure at `floor` basis. Written in one pass over the whole ladder rather than only over rungs
+  // that carry stats, so a never-run lane still shows the operator what it will be given.
+  for (const lane of ladder) {
+    const budget = attemptBudget(cfg, statsByLane.get(lane.id)?.wallClockMs ?? []);
+    if (budget !== undefined) lane.attemptBudget = budget;
+  }
   // Routing memory from previous walks (`lane-affinity.ts`): which lane answered, and which lane
   // failed to answer inside the budget it was given. Like the stats above these are COLUMNS — they
   // never change a lane's `state`, and an unavailable lane carries neither. Only the ordering of
@@ -1086,6 +1123,49 @@ export function buildDispatch(
 
   const why = selectionReason(next, opts.after);
   return { ...base, order: ranked.map((l) => l.id), next, reason: why };
+}
+
+/**
+ * How long a dispatch walk gives ONE lane to answer, derived from that lane's own recorded runs.
+ *
+ * ⚠ This is the owner's request-path mechanism — a threshold read off what THIS endpoint has
+ * actually done — applied to lanes (owner direction 2026-09-08). The METHOD carries over; none of
+ * the request path's NUMBERS do, and must not: `latency-demotion.ts`'s 250 ms/token and 30 s
+ * ceiling are calibrated for single completions, and a lane legitimately runs an agent loop for
+ * minutes. Measured on this machine the same day, a flat 90 s budget sat BELOW the median run of
+ * two of the three working lanes and below the free pool's median by a factor of six.
+ *
+ * ⚠ The quantile defaults to 0.8, not the 0.95 the request path uses, and the data says why: at
+ * p90 and p95 the slowest lane's figure IS its own configured timeout, so a budget there could
+ * never fire for the lane that most needs bounding. p80 is the highest point still carrying
+ * information for every lane measured (165 s, 224 s, 1383 s against timeouts of 1800 s).
+ *
+ * ⚠ Too little history means the FLAT budget, never a quantile over two samples. Unmeasured is "no
+ * opinion", never "slow" — the same asymmetry `latency-demotion.ts` states, and for the same
+ * reason: a brand-new lane must not inherit a ceiling drawn from its single unluckiest run.
+ *
+ * ⚠ The TOKEN-normalised half of the request-path ladder is deliberately absent. A walk budget must
+ * fire BEFORE any answer arrives, so there is no output token to normalise by — which is also why
+ * `hedge-trigger.ts`'s own per-token rung is documented inert on the hedge path. Token
+ * normalisation only has a home in a post-commit policy, which does not exist here.
+ */
+function attemptBudget(
+  cfg: Config,
+  samples: readonly number[],
+): { ms: number; basis: "history" | "floor"; samples: number } | undefined {
+  const walk = cfg.routing.dispatchWalk;
+  if (!walk || !walk.enabled) return undefined;
+  if (samples.length < walk.attemptMinSamples) {
+    return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
+  }
+  const quantile = quantileWallClockMs(samples, walk.attemptQuantile);
+  // A window that cleared the sample floor cannot yield null, but a null here must never become a
+  // zero budget — that would abandon every lane instantly. Fall to the flat figure, the weaker claim.
+  if (quantile === null) return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
+  // ⚠ Never BELOW the flat budget. The floor is what the operator declared a lane is always worth
+  // waiting for; a lane whose history happens to be fast must not be given less than that, or a
+  // single quick run would make the relay impatient with it forever.
+  return { ms: Math.max(walk.attemptMs, Math.round(quantile)), basis: "history", samples: samples.length };
 }
 
 /**

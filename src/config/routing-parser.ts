@@ -484,6 +484,8 @@ function parseLaneProbe(raw: unknown): LaneProbeSettings {
 export const DEFAULT_DISPATCH_WALK: DispatchWalkSettings = {
   enabled: true,
   attemptMs: 90_000,
+  attemptQuantile: 0.8,
+  attemptMinSamples: 5,
   maxLanes: 4,
   pinMs: 15 * 60 * 1000,
   demoteMs: 15 * 60 * 1000,
@@ -501,7 +503,7 @@ function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
     throw new Error(`config.routing.dispatchWalk must be a boolean or an object`);
   }
   const o = raw as Record<string, unknown>;
-  const keys = ["enabled", "attemptMs", "maxLanes", "pinMs", "demoteMs"] as const;
+  const keys = ["enabled", "attemptMs", "attemptQuantile", "attemptMinSamples", "maxLanes", "pinMs", "demoteMs"] as const;
   for (const key of Object.keys(o)) {
     if (!(keys as readonly string[]).includes(key)) {
       throw new Error(`config.routing.dispatchWalk.${key} is not a recognized key (${keys.join(", ")})`);
@@ -522,6 +524,23 @@ function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
     // Floor 1 s: a budget under that abandons every lane before a process can start, which reads
     // as "every lane is broken". Ceiling 1 h matches the longest a lane rung is configured for.
     attemptMs: bounded("attemptMs", o.attemptMs, DEFAULT_DISPATCH_WALK.attemptMs, 1_000, 3_600_000),
+    // Not floored to an integer: a quantile is a fraction. Bounded strictly inside (0, 1) — 0 would
+    // take the fastest run ever seen and 1 the slowest, and neither is a budget.
+    attemptQuantile: (() => {
+      const v = o.attemptQuantile;
+      if (v === undefined) return DEFAULT_DISPATCH_WALK.attemptQuantile;
+      if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v >= 1) {
+        throw new Error(`config.routing.dispatchWalk.attemptQuantile must be a number greater than 0 and less than 1`);
+      }
+      return v;
+    })(),
+    // Bounded 1..1000 rather than against the rolling window size, because this module imports
+    // `config-types.js` and `spec.js` and NOTHING else (the leaf rule, pinned by a test), and
+    // hand-copying `MAX_LANE_STAT_SAMPLES` here would be the copied-constant defect this repository
+    // records against `UNTIL_BASES` and `CooldownSource`. Asking for more samples than the window
+    // holds is safe on its own terms: the lane simply never has enough history and keeps the flat
+    // `attemptMs`, which is the weaker claim and the right fall-through.
+    attemptMinSamples: bounded("attemptMinSamples", o.attemptMinSamples, DEFAULT_DISPATCH_WALK.attemptMinSamples, 1, 1000),
     maxLanes: bounded("maxLanes", o.maxLanes, DEFAULT_DISPATCH_WALK.maxLanes, 1, 20),
     pinMs: bounded("pinMs", o.pinMs, DEFAULT_DISPATCH_WALK.pinMs, 0, 6 * 60 * 60 * 1000),
     demoteMs: bounded("demoteMs", o.demoteMs, DEFAULT_DISPATCH_WALK.demoteMs, 0, 6 * 60 * 60 * 1000),

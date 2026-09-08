@@ -650,6 +650,33 @@ export interface DispatchWalkSettings {
    */
   attemptMs: number;
   /**
+   * Which point of a lane's OWN recorded wall-clock history the budget sits at, when that lane has
+   * enough history to have one (`attemptMinSamples`). Default 0.8.
+   *
+   * ⚠ This is the owner's own mechanism from the request path — a threshold derived from what THIS
+   * endpoint has actually done — applied to lanes. The METHOD transfers; none of the request path's
+   * NUMBERS do, and must not: a lane legitimately runs an agent loop for minutes.
+   *
+   * ⚠ 0.8 rather than the request path's 0.95, by owner direction 2026-09-08, and the live data
+   * says why: at the 90th and 95th percentiles the slowest lane's figure IS its own timeout, so a
+   * budget there could never fire for the one lane it most needs to bound. p80 is the highest point
+   * that still carries information for every lane measured.
+   *
+   * ⚠ The token-normalised half of the request-path ladder is deliberately NOT carried over. A walk
+   * budget must fire BEFORE any answer arrives, so no output token exists to normalise by — the
+   * same reason `hedge-trigger.ts`'s own per-token rung is inert on the hedge path.
+   */
+  attemptQuantile: number;
+  /**
+   * How many recorded runs a lane needs before its own history is used at all. Below this the
+   * budget is the flat `attemptMs`. Default 5.
+   *
+   * ⚠ Unmeasured must mean "no opinion", never "slow": a quantile over one or two samples is not a
+   * distribution, and treating it as one would hand a brand-new lane a budget drawn from its single
+   * unluckiest run.
+   */
+  attemptMinSamples: number;
+  /**
    * How many lanes one dispatch may try. Bounded so a ladder of a dozen dead rungs cannot spend
    * a dozen budgets before reporting; the walk states how many it tried and how many it skipped,
    * because a silent cap reads as "everything was tried" when it was not.

@@ -1372,8 +1372,11 @@ agent had to notice, give up, and name a different lane by hand — which is wha
 
 A dispatch now WALKS the ladder:
 
-- Each lane gets an **attempt budget** (`attemptMs`, default 90 s). If it has not answered by
-  then, the relay stops that lane and starts the next one.
+- Each lane gets an **attempt budget** drawn from ITS OWN recorded runs: the 80th percentile of
+  the last 100 wall-clock times for that lane. If it has not answered by then, the relay stops it
+  and starts the next one. A lane with fewer than `attemptMinSamples` recorded runs gets the flat
+  `attemptMs` instead — unmeasured means no opinion, never "slow" — and the budget never falls
+  below that flat figure however fast a lane's history is.
 - ⚠ **The LAST lane gets no budget.** There is nowhere to move to, so killing a lane that is still
   working would throw away the only answer still coming. Its own `--timeout` still bounds it.
 - The lane that answers is **pinned** for `pinMs` (default 15 min), so the next dispatch on that
@@ -1392,7 +1395,9 @@ A dispatch now WALKS the ladder:
 "routing": {
   "dispatchWalk": {
     "enabled": true,
-    "attemptMs": 90000,   // how long ONE lane gets before the walk moves on
+    "attemptMs": 90000,        // the budget for a lane with too little history, and the floor
+    "attemptQuantile": 0.8,    // which point of a lane's own history the budget sits at
+    "attemptMinSamples": 5,    // recorded runs a lane needs before its own history is used
     "maxLanes": 4,        // how many lanes one dispatch may try
     "pinMs": 900000,      // how long the lane that answered is preferred
     "demoteMs": 900000    // how long a lane that did not answer is ordered behind the rest
@@ -1404,10 +1409,20 @@ A dispatch now WALKS the ladder:
 Default ON; `"dispatchWalk": false` is a byte-for-byte revert to one lane per call with no memory.
 An unknown key is a config error.
 
-⚠ **`attemptMs` is a BUDGET you set, not a health threshold derived from measurement.** The
-request path's latency numbers (250 ms/token, a 30 s ceiling) are calibrated for single completions
-and must never be pointed at a lane: a lane legitimately runs an agent loop for minutes, so those
-numbers would stop every healthy lane at once. Nothing here is borrowed from them.
+⚠ **The METHOD comes from the request path; none of its NUMBERS do.** Deriving a threshold from
+what an endpoint has actually done is the same mechanism `hedge-trigger.ts` and
+`latency-demotion.ts` use. But their figures (250 ms/token, a 30 s ceiling) are calibrated for
+single completions, and a lane legitimately runs an agent loop for minutes — pointing them at a
+lane would stop every healthy one at once. Every figure here comes from lane data.
+
+⚠ **The quantile is 0.8, not the 0.95 the request path uses, and the measurement says why.** On
+this machine the three working lanes read p80 at 165 s, 224 s and 1383 s; at p90 and p95 the
+slowest lane's figure IS its own configured timeout, so a budget there could never fire for the one
+lane most in need of bounding. p80 is the highest point still carrying information for every lane.
+
+⚠ **The token-normalised half of that ladder is deliberately absent.** A walk budget fires BEFORE
+any answer arrives, so there is no output token to normalise by — the same reason the request
+path's own per-token rung is inert when it decides whether to hedge.
 
 ⚠ **A pin promotes; it never resurrects.** A pinned lane that is exhausted, disabled, unreachable
 or not servable is still not selected — the pin only reorders lanes that were already selectable.

@@ -31,6 +31,12 @@ import type { LaneRunResult, LaneSpawner } from "../src/mcp/lane-runner.js";
 const WALK: DispatchWalkSettings = {
   enabled: true,
   attemptMs: 40,
+  // ⚠ A sample floor far above anything these fixtures record, so every lane here keeps the flat
+  // `attemptMs` and the walk's timing stays deterministic. The per-lane quantile budget has its own
+  // suite (`test/dispatch-attempt-budget.test.ts`); mixing it in here would make every walk
+  // assertion depend on recorded history that these tests never write.
+  attemptQuantile: 0.8,
+  attemptMinSamples: 1000,
   maxLanes: 4,
   pinMs: 60_000,
   demoteMs: 60_000,

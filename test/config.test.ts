@@ -1628,6 +1628,8 @@ describe("routing.dispatchWalk", () => {
     expect(cfg.routing.dispatchWalk).toEqual({
       enabled: true,
       attemptMs: 90_000,
+      attemptQuantile: 0.8,
+      attemptMinSamples: 5,
       maxLanes: 4,
       pinMs: 15 * 60 * 1000,
       demoteMs: 15 * 60 * 1000,
@@ -1652,6 +1654,8 @@ describe("routing.dispatchWalk", () => {
     expect(cfg.routing.dispatchWalk).toEqual({
       enabled: true,
       attemptMs: 45_000,
+      attemptQuantile: 0.8,
+      attemptMinSamples: 5,
       maxLanes: 2,
       pinMs: 15 * 60 * 1000,
       demoteMs: 15 * 60 * 1000,

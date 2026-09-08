@@ -43,6 +43,18 @@ reasoning level and have the relay do the rest."*
    advice, because the last lane is still being waited for. The advice appears only when the walk
    truly ends.
 
+⚠ **v0.74.0 shipped a FLAT 90-second lane budget, and the owner's question exposed it as wrong.**
+Asked what had become of the request path's dynamic, distribution-based thresholds, the honest
+answer was that I had ruled the mechanism out along with its numbers. The live per-lane store then
+settled it: p50 runs of 81 s, 114 s and 583 s across the three working lanes, so a flat 90 s sat
+below the median of two of them and below the free pool's by a factor of six — the relay would have
+abandoned the free pool on nearly every dispatch, which is the opposite of the walk's purpose.
+The budget is now the 80th percentile of each lane's OWN rolling window (raised 25 → 100 samples),
+with the flat figure as both the too-little-history fallback and a floor it never drops below.
+⚠ 0.8 rather than the request path's 0.95 because at p90/p95 the slowest lane's figure is its own
+timeout, so a budget there could never fire. ⚠ The token-normalised rung genuinely cannot transfer:
+a walk budget fires before any answer exists to count tokens in.
+
 ⚠ **An adversarial review of the change found one real defect, and it was fixed the same lap.** The
 terminal "every lane has been tried, do NOT call dispatch again" instruction fired whenever no lane
 answered — not when the ladder was actually exhausted. So `dispatchWalk: false` (one lane, the

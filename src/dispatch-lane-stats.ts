@@ -164,8 +164,19 @@ export interface LaneStats {
   lastAt: number | null;
 }
 
-/** Rolling wall-clock window per lane; bound keeps one chatty lane from growing the file. */
-export const MAX_LANE_STAT_SAMPLES = 25;
+/**
+ * Rolling wall-clock window per lane; the bound keeps one chatty lane from growing the file.
+ *
+ * Raised 25 -> 100 on 2026-09-08 (owner direction) when the walk began deriving each lane's
+ * ATTEMPT BUDGET from this window. At 25 samples a p80 rests on the 20th value, so one unusual
+ * run moves the budget a long way; at 100 it rests on the 80th. The cost is four numbers a run
+ * instead of one — a few kilobytes across the whole ladder.
+ *
+ * ⚠ Raising it is backward compatible in the direction that matters: `isLaneStatsRow` rejects a
+ * window LONGER than this bound, so a file written under the old 25 still loads. Lowering it
+ * later would drop every existing row instead, which is why this constant only ever grows.
+ */
+export const MAX_LANE_STAT_SAMPLES = 100;
 
 /**
  * Median of one lane's rolling wall-clock window, in milliseconds. Null when the window is
@@ -203,9 +214,26 @@ export function medianWallClockMs(samples: readonly number[]): number | null {
  * two: a percentile that reports a duration nothing ever took is a fabricated measurement.
  */
 export function p95WallClockMs(samples: readonly number[]): number | null {
+  return quantileWallClockMs(samples, 0.95);
+}
+
+/**
+ * Nearest-rank quantile over one lane's rolling window, in milliseconds. Null for an empty window
+ * — unknown stays null, never 0.
+ *
+ * ⚠ Nearest-rank, so the answer is always an OBSERVED sample rather than an interpolation between
+ * two: a duration nothing ever took, used as a budget, would be a fabricated measurement.
+ *
+ * ⚠ The quantile is CLAMPED to (0, 1]. A caller asking for 0 would otherwise take rank 0, and the
+ * floor below turns that into the fastest sample ever seen — a budget nothing could meet. Clamping
+ * to the nearest usable value is the fail-safe direction here, because a config typo must not make
+ * every lane look instantly slow.
+ */
+export function quantileWallClockMs(samples: readonly number[], quantile: number): number | null {
   if (samples.length === 0) return null;
+  const q = Number.isFinite(quantile) ? Math.min(1, Math.max(Number.EPSILON, quantile)) : 1;
   const sorted = [...samples].sort((a, b) => a - b);
-  const rank = Math.ceil(0.95 * sorted.length);
+  const rank = Math.ceil(q * sorted.length);
   return sorted[Math.min(sorted.length, Math.max(1, rank)) - 1] ?? null;
 }
 

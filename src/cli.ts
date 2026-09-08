@@ -26,7 +26,7 @@ import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
-import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, formatAttemptBudget, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
@@ -2810,6 +2810,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     // The routing memory from previous walks. Shown ON THE LANE, not only in the selection reason,
     // because the reason names one lane while the reordering it caused affects the whole list —
     // an operator seeing rung 3 tried first must be able to see WHY without inferring it.
+    if (l.attemptBudget) process.stdout.write(`   ${formatAttemptBudget(l.attemptBudget)}\n`);
     if (l.pinned) process.stdout.write(`   pinned until ${l.pinned.until} (${l.pinned.reason})\n`);
     if (l.demoted) process.stdout.write(`   demoted until ${l.demoted.until} (${l.demoted.reason})\n`);
     // Advisory execution stats, same wording as `dispatch_lanes`. A rung that never ran here

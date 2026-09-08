@@ -24,7 +24,7 @@ import type { Config } from "../config.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
-import { formatLaneStats } from "../dispatch.js";
+import { formatAttemptBudget, formatLaneStats } from "../dispatch.js";
 import { estimateTokensFromCharacters } from "../metadata.js";
 import type { DispatchedTelemetryReport, DispatchLaneStatus } from "../dispatch-lane-stats.js";
 import {
@@ -565,6 +565,7 @@ function laneSummary(lane: DispatchLane): string {
   if (lane.note) bits.push(lane.note);
   // The routing memory from previous walks, on the lane rather than only in the selection reason —
   // an operator reading `dispatch_lanes` to understand an unexpected order needs to see it here.
+  if (lane.attemptBudget) bits.push(formatAttemptBudget(lane.attemptBudget));
   if (lane.pinned) bits.push(`pinned until ${lane.pinned.until} (${lane.pinned.reason})`);
   if (lane.demoted) bits.push(`demoted until ${lane.demoted.until} (${lane.demoted.reason})`);
   // Advisory only: a rung that never ran here carries no `stats` and renders as before.
@@ -876,7 +877,12 @@ export class McpDispatchServer {
       // Its own `timeoutMs` still bounds it, exactly as before this feature existed.
       const isLast = i === laneIds.length - 1;
       const startedAt = this.now();
-      const outcome = await this.runOneLane(jobId, lane, task, opts, isLast ? null : opts.attemptMs);
+      // ⚠ The lane's OWN budget when the view carries one, and it usually does: the daemon derives
+      // it from that lane's recorded history (`attemptBudget` in `dispatch.ts`), because the daemon
+      // is where the history lives and this child holds none. `opts.attemptMs` is the fall-back for
+      // a view that carries no budget — a daemon older than this field, or the local fallback view.
+      const budgetMs = lane.attemptBudget?.ms ?? opts.attemptMs;
+      const outcome = await this.runOneLane(jobId, lane, task, opts, isLast ? null : budgetMs);
       const elapsedMs = Math.max(0, this.now() - startedAt);
 
       // A cancellation that landed WHILE the attempt ran discards it whole: the caller changed its
@@ -895,7 +901,7 @@ export class McpDispatchServer {
         abandoned: outcome.abandoned,
         semanticFailure: outcome.semanticFailure,
       });
-      const reason = attemptReason(status, outcome, elapsedMs, opts.attemptMs);
+      const reason = attemptReason(status, outcome, elapsedMs, isLast ? null : budgetMs);
       this.jobs.recordAttempt(jobId, {
         laneId: lane.id,
         spec: lane.spec,

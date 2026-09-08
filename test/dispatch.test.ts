@@ -385,7 +385,11 @@ describe("dispatch ladder — order, never execution", () => {
     // rendering defect the audit is removing — the task must stay inside one argv element.
     const view = buildDispatch(cfgWith({ ladder: LADDER }), { task: "rm -rf /; echo $(whoami)" });
     const lane = view.next!;
-    expect(Object.keys(lane).sort()).toEqual(["id", "invoke", "kind", "position", "quota", "state"]);
+    // `attemptBudget` joined the shape on 2026-09-08 (the walk's per-lane budget). The guarantee
+    // this test exists for is the two assertions BELOW — the task stays inside one argv element and
+    // no field carries a pre-joined command line — so a new structured field is an update, not a
+    // weakening. Keep the exact-key list: it is what would catch a convenience "commandLine" string.
+    expect(Object.keys(lane).sort()).toEqual(["attemptBudget", "id", "invoke", "kind", "position", "quota", "state"]);
     expect(lane.invoke?.args).toEqual(["-p", "rm -rf /; echo $(whoami)", "--model", "g-flash"]);
     for (const value of Object.values(view)) {
       expect(typeof value === "string" ? value : "").not.toContain("rm -rf /;");
