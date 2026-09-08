@@ -9,6 +9,17 @@
 
 ## Open
 
+- **Accounting-store tests leak legacy journal artifacts into Windows Temp.** A WizTree MFT scan on
+  2026-09-07 found 36,094 `llm-relay-accounting-store-*` directories beneath
+  `%LOCALAPPDATA%\Temp`, consuming 59.09 GiB. A sampled directory held three small accounting
+  JSON files and a 128 MiB `snapshot-journal.json.corrupt-*` file. The exact directory prefix is
+  created by `root()` in `test/accounting-store.test.ts`; the current legacy-artifact rule in
+  `docs/accounting-persistence-evaluation.md` says `.corrupt-*` snapshot journals are ignored, so
+  this is orphaned test residue rather than live accounting state. **Property:** every temporary
+  accounting-store root created by a test is removed after that test in both success and failure
+  paths; the test suite leaves no `llm-relay-accounting-store-*` directory behind in the Windows
+  temporary directory. Any diagnostic-retention exception must be explicit and bounded.
+
 - **Triage the eligibility queue — 10 unrecognized refusals await interpretation** (owner
   decision 2026-09-05: a separate lap, not folded into the MCP-concurrency lap). `llm-relay
   eligibility` lists them: [1] groq `access denied. please check your network settings.` (×116)
@@ -863,4 +874,3 @@
 [quota-reprobe-design-2026-08-29.md](quota-reprobe-design-2026-08-29.md). The eligibility-and-probe
 lap shipped 2026-08-30 as v0.60.0:
 [eligibility-and-probe-lap-2026-08-30.md](eligibility-and-probe-lap-2026-08-30.md).)
-
