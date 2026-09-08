@@ -27,6 +27,7 @@ import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js"
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
@@ -2517,8 +2518,6 @@ export async function resolveDispatchView(opts: {
   // Same staleness discriminator `runDispatch` applies: a proxy that ignores `?host=` would answer
   // as though relay rungs were addressable, which for this caller is never true.
   const live = liveRaw !== null && liveRaw.host === "bypassed" ? liveRaw : null;
-  restoreExhaustedRows(cfg, loadExhaustedRows());
-
   if (live !== null) {
     const view = normalizeDispatchCommands(live);
     return substituteTaskInView({ ...view, source: "daemon" }, opts.task);
@@ -2527,6 +2526,18 @@ export async function resolveDispatchView(opts: {
   // Fallback path: daemon is unavailable. Reload config from disk so edits made after process start
   // are picked up instead of using a stale snapshot.
   const fallbackCfg = loadConfigSafely() ?? cfg;
+  // ⚠ Restored into `fallbackCfg`, NOT `cfg`, and that is the whole point of restoring here rather
+  // than above the live check. Both stores are keyed per `Config` OBJECT (a `WeakMap`), and the
+  // line above hands back a freshly loaded one — so restoring into `cfg` wrote the rows somewhere
+  // `buildDispatch` below never looks. The exhaustion restore had that shape from the start; a cold
+  // `llm-relay dispatch` has therefore never shown a restored cooldown whenever the reload
+  // succeeded, which is every ordinary run. Found 2026-09-08 by running the CLI to check that the
+  // pin renders, which it did not.
+  //
+  // Read-only in both cases: no listener is installed, so this process never writes back and the
+  // daemon stays the only writer.
+  restoreExhaustedRows(fallbackCfg, loadExhaustedRows());
+  restoreLaneAffinityRows(fallbackCfg, loadLaneAffinityRows());
   const fallbackView = normalizeDispatchCommands(
     buildDispatch(fallbackCfg, {
       ...(opts.lane ? { lane: opts.lane } : {}),
@@ -2686,6 +2697,12 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
   const live = staleProxy ? null : liveRaw;
 
   restoreExhaustedRows(cfg, loadExhaustedRows());
+  // The routing memory the daemon recorded, restored READ-ONLY exactly as the exhaustion rows
+  // above are. No listener is installed, so this process never writes back — the daemon stays
+  // the only writer. Without it a cold `llm-relay dispatch` showed no pin and no demotion while
+  // the file sat on disk beside the cooldowns it DID read, so the two halves of the same
+  // ladder state disagreed on one surface.
+  restoreLaneAffinityRows(cfg, loadLaneAffinityRows());
   const rawView = normalizeDispatchCommands(
     live ??
       buildDispatch(cfg, {

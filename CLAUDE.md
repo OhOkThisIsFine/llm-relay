@@ -75,6 +75,15 @@ amount, and a few hundred bytes of build noise is not that. ⚠ Do not chase the
 `observed` block is a record, never an equality check, so a small drift between your machine and
 CI's is expected and means nothing.
 
+⚠⚠ **And the ceiling is now a ROUND NUMBER well clear of the observation (1000000 / 5000000), not a
+tight fit — because the tight fit failed a SECOND time, in the very lap that wrote the paragraph
+above.** The second failure had a different cause worth naming: the baseline was measured, and then
+more documentation prose was added, and every added comment lands in a `.d.ts` by the two-pass
+design at the top of this section. **Measure LAST.** A ceiling fitted to a mid-lap measurement is
+stale before the lap ends, and each re-fit costs a red CI run. A regression this metric should
+actually catch — a stray dependency, a data file, a doubled bundle — is hundreds of kilobytes, not
+hundreds of bytes, so slack here costs nothing and churn costs a release cycle.
+
 **`test/` is type-checked by `tsconfig.test.json`, not by `tsconfig.json` or by vitest.**
 `tsconfig.json` is `include: ["src/**/*.ts"]` with `exclude: [… "**/*.test.ts"]` because it drives
 `dist/`, and vitest **transpiles** tests rather than type-checking them (`vitest.config.ts` declares
