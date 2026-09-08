@@ -156,6 +156,28 @@ describe("dispatch lane walk", () => {
     expect(spawn.killed).toEqual(["l1"]);
   });
 
+  it("⚠ honours the LANE's own budget, not the configuration default", async () => {
+    // ⚠ Every other test in this file sets `attemptMinSamples` high, so each lane's budget equals
+    // the flat `attemptMs` and the two are indistinguishable — wiring the walk to `opts.attemptMs`
+    // instead of `lane.attemptBudget.ms` would leave them all green. This case separates them: the
+    // configuration says 5 seconds, the LANE says 30 ms, and only one of those lets the walk reach
+    // the second lane inside this test.
+    const spawn = laneRunner({ l2: ok("the second lane answered") });
+    const withBudget = view(["l1", "l2"]);
+    withBudget.ladder[0]!.attemptBudget = { ms: 30, basis: "history", samples: 10 };
+    const h = new Harness({
+      config: config({ ...WALK, attemptMs: 5_000 }),
+      buildView: async () => withBudget,
+      spawn,
+    });
+    const { text, isError } = await h.tool("dispatch", { task: "do it" });
+    expect(isError).toBe(false);
+    expect(text).toContain("the second lane answered");
+    expect(spawn.started).toEqual(["l1", "l2"]);
+    // And the reason names the budget that actually applied, not the configured one.
+    expect(text).toContain("no answer within the 0s walk budget");
+  });
+
   it("names every lane it tried and why, so the walk is legible", async () => {
     const h = new Harness({ spawn: laneRunner({ l3: ok("third time") }) });
     const { text } = await h.tool("dispatch", { task: "do it" });
