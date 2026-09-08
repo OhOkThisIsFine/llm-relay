@@ -2,7 +2,13 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-06 (the dispatch lane-walk lap)
+## 0. State as of 2026-09-08 (the dispatch lane-walk lap — v0.74.0 and v0.75.0)
+
+**Both released and live**, global binary reinstalled. `v0.74.0` carries the walk, the terminal
+fallback, the pin and the demotion. `v0.75.0` replaces that release's flat 90-second lane budget
+with each lane's own 80th percentile, after the owner's question exposed the flat figure as wrong
+against live data, and fixes two cold-dispatch restore defects found by running the built binary.
+
 
 **`dispatch` now picks lanes for the caller.** Owner request, in their words: *"Agents keep manually
 deciding that the free lane is too slow and moving to some other dispatch type. That shouldn't be
