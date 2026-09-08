@@ -1,16 +1,17 @@
 # Closeout — C:\Code\llm-relay
 
-Rendered 2026-09-08T18:09:12.561Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-08T18:14:34.926Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `a8eb46fd67b49e54c3c64e819957a856b3185726`
+- HEAD: `fd755b77b2fcc377cd62f87696399c4fc7e1ce9b`
 - Sprint start: `7b2b536b12c5a6835ad36210212ac07006e6f166`
 
 ## Commits in the sprint range
 
+- fd755b7 docs: resolve the independent closeout audit's flags
 - a8eb46f backlog: correct the lane-reordering entry — the distribution-based threshold shipped
 - 75bf069 docs: name the two releases this lap shipped
 - fcf7a98 chore: release v0.75.0
@@ -30,22 +31,19 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 - Working tree: NOT clean — FAIL
 ```
-M AGENTS.md
- M CLAUDE.md
- M src/mcp/server.ts
-?? docs/closeout-dispatch-lane-walk-2026-09-08.md
+M docs/closeout-dispatch-lane-walk-2026-09-08.md
 ```
 - `origin/main` equals HEAD — PASS
 
 ## verify-green ledger
 
-- Ledger: `npm run check` recorded 2026-09-08T18:09:07.169Z on tree `470c74e2d0e9`
-- `verify-green check`: verify-green: PASS — tree 470c74e2d0e9 matches the passing run recorded 2026-09-08T18:09:07.169Z (npm run check) — PASS
+- Ledger: `npm run check` recorded 2026-09-08T18:14:26.023Z on tree `253dbf4d06a0`
+- `verify-green check`: verify-green: PASS — tree 253dbf4d06a0 matches the passing run recorded 2026-09-08T18:14:26.023Z (npm run check) — PASS
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 34260173247) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34260173247
+- CI: completed/success (run 34261371529) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34261371529
 
 ## Operator-provided narrative (not machine-derived)
 
