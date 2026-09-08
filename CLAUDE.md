@@ -64,6 +64,17 @@ passes into one. ⚠ The only comment surviving in a `dist/*.js` is its `//# sou
 which must stay. Evidence, the four costed variants and the commands to re-measure:
 [docs/package-size-2026-08-30.md](docs/package-size-2026-08-30.md).
 
+⚠ **When you ratchet `docs/dashboard-package-baseline.json`, leave REAL headroom — a ceiling fitted
+to your own machine's bytes fails on CI.** Measured 2026-09-06/07: the lane-walk commit set
+`packBytes` and `unpackedBytes` about 0.2% above a local measurement, which is roughly what the
+existing entries carried, and CI came in **123 bytes over** on the same toolchain and the same
+source. `packBytes` is gzip output and is not byte-reproducible; `unpackedBytes` moves with `tsc`
+output too. The correction (`d498b46`) rounded the ceiling up to the next thousand instead, which is
+the rule to follow — the ceiling exists to catch a change that grows the package by a MEANINGFUL
+amount, and a few hundred bytes of build noise is not that. ⚠ Do not chase the difference: the
+`observed` block is a record, never an equality check, so a small drift between your machine and
+CI's is expected and means nothing.
+
 **`test/` is type-checked by `tsconfig.test.json`, not by `tsconfig.json` or by vitest.**
 `tsconfig.json` is `include: ["src/**/*.ts"]` with `exclude: [… "**/*.test.ts"]` because it drives
 `dist/`, and vitest **transpiles** tests rather than type-checking them (`vitest.config.ts` declares
