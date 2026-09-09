@@ -110,7 +110,19 @@ const INTERNAL_REQUEST_HEADERS = new Set([
   STICKY_SESSION_HEADER,
   CONTROL_AUTHORIZATION_HEADER,
 ]);
-const INBOUND_AUTH = ["authorization", "x-api-key"];
+
+/** Inbound header names a CONTAINED target is allowed to receive (allow-list).
+ * Everything else inbound is dropped. `authorization`/`x-api-key` are deliberately absent:
+ * the inbound client's own auth must not reach a third-party base — the relay's backend
+ * credential is injected after this loop by `buildAuthHeaders`. Passthrough targets
+ * (not-declared) keep the old behaviour.
+ */
+const ALLOWED_FORWARD_HEADERS = new Set([
+  "content-type",
+  "accept",
+  "anthropic-version",
+  "anthropic-beta",
+]);
 
 const MID_STREAM_ERROR_KIND = "backend_stream_failed";
 
@@ -139,13 +151,13 @@ export class CredentialConfigError extends Error {
 
 export function buildForwardHeaders(inbound: IncomingMessage["headers"], attempt: ResolvedAttempt): Record<string, string> {
   const { target, credential } = attempt;
-  const stripAuth = credential.state !== "not-declared" || target.credentialMode === "contained";
+  const isContained = credential.state !== "not-declared" || target.credentialMode === "contained";
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(inbound)) {
     const key = k.toLowerCase();
     if (HOP_BY_HOP.has(key)) continue;
     if (INTERNAL_REQUEST_HEADERS.has(key)) continue;
-    if (stripAuth && INBOUND_AUTH.includes(key)) continue;
+    if (isContained && !ALLOWED_FORWARD_HEADERS.has(key)) continue;
     if (v === undefined) continue;
     out[key] = Array.isArray(v) ? v.join(", ") : v;
   }

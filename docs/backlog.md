@@ -185,17 +185,3 @@
   `snapshots()` silently stops persistence while the relay keeps serving. **Property:**
   `llm-relay cost` and `/telemetry` state when the store's last flush failed or the writer lease
   was refused, so "no spend since noon" cannot be mistaken for "no traffic since noon".
-
-- **Bind the listener before opening the writable accounting store, and handle the listener's
-  `error` event** (audit DR-009, verified 2026-09-04). `cli.ts` constructs the store before
-  `server.listen`, and `server.ts` registers no `error` handler, so a second relay process opens
-  the same `usage/` directory and then dies on `EADDRINUSE` with an uncaught exception.
-  **Property:** a second `llm-relay` start against a bound port exits with a clear message and
-  touches no file under `usage/`.
-
-- **Make credential containment on the forward path an allow-list** (contract review DR-006,
-  verified 2026-09-04). `buildForwardHeaders` strips exactly `authorization` and `x-api-key` when
-  a target is contained; any other credential-bearing inbound header (`cookie`, `x-goog-api-key`,
-  `api-key`) is forwarded verbatim to a third-party anthropic-kind base. `log.ts` already uses the
-  allow-list shape. **Property:** a contained anthropic-kind target receives only headers from a
-  declared allow-list, and a test sends a `cookie` and asserts it does not egress.

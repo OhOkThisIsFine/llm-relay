@@ -924,6 +924,31 @@ export async function warmAndValidate(cfg: Config, catalog: ModelCatalog): Promi
   }
 }
 
+/**
+ * What `runProxy` does when the listener cannot bind — ONE policy, exported for its test.
+ *
+ * `EADDRINUSE` means another relay already fronts this address, and the right answer is one
+ * line and exit 1, never an uncaught exception with a stack. Everything else is rethrown so a
+ * genuine bug still fails loudly. ⚠ The exit deliberately skips every shutdown flush: the
+ * accounting store's constructor only READS `usage/` (`loadFixedSnapshots`) and its first
+ * write is a flush, so a second relay that exits here has touched no file under the first
+ * relay's ledger — which is the whole point of refusing to start (backlog item, audit DR-009).
+ */
+export function onListenError(
+  err: NodeJS.ErrnoException,
+  cfg: Pick<Config, "host" | "port">,
+  io: { stderr: (line: string) => void; exit: (code: number) => never },
+): never {
+  if (err.code === "EADDRINUSE") {
+    io.stderr(
+      `llm-relay: another relay is already listening on http://${cfg.host}:${cfg.port} — ` +
+        `not starting a second one (nothing under usage/ was written)\n`,
+    );
+    return io.exit(1);
+  }
+  throw err;
+}
+
 export function runProxy() {
   const cfg = loadOrExit();
   const catalog = new ModelCatalog();
@@ -978,6 +1003,15 @@ export function runProxy() {
     dashboardAttributionPolicy: "include_all_labeled",
   });
   server.once("close", closeAccountingStore);
+  // ⚠ Registered BEFORE `listen`, and it must never reach `closeAccountingStore`: `process.exit`
+  // skips `beforeExit`, which is where the safety net would have flushed the store — and a flush
+  // is the first thing that WRITES under `usage/`. See `onListenError`.
+  server.once("error", (err: NodeJS.ErrnoException) =>
+    onListenError(err, cfg, {
+      stderr: (line) => process.stderr.write(line),
+      exit: (code) => process.exit(code),
+    }),
+  );
   server.listen(cfg.port, cfg.host, () => {
     const providers = Object.keys(cfg.providers).join(",");
     const addr = server.address();
