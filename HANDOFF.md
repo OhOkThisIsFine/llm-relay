@@ -98,9 +98,13 @@ history - do not reintroduce them.
 ## 3. Verification — the one gate
 
 ```bash
-npm run build && npm run check
+npm run gate
 ```
 
+- `npm run gate` = `npm run build && npm run check`. It is ONE script because
+  `verify-green.mjs record -- <cmd>` takes one command, and a fresh lap worktree has no `dist/`
+  (gitignored), so `check:package` fails unless the build ran first. Record the ledger with
+  `node ~/.agent-config/verify-green.mjs record -- npm run gate`.
 - `npm run check` = both typechecks (`src/` and `test/`) + the server vitest suite + the dashboard
   checks (`tsc -p dashboard/tsconfig.json --noEmit` and the dashboard suite) + the package checks
   (bundle-inventory equality, size ratchets, packed smoke). **CI runs exactly this and nothing
@@ -137,7 +141,7 @@ npm run build && npm run check
 
 ## 5. Definition of done
 
-- `npm run build && npm run check` green on a clean, committed tree.
+- `npm run gate` green on a clean, committed tree.
 - Both request paths covered by any new policy.
 - New behaviour pinned by a test. Failover tests use **≥2 candidates** — with one candidate,
   "fails over correctly" and "cannot fail over" are the same observation.

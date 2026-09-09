@@ -174,26 +174,12 @@
   free-class model of the provider when the catalog has one (`assessCost` over `cachedModels`), so
   a valid key on a billing-gated account reports `valid`, not `unverified`.
 
-- **Raise `publish.yml`'s `timeout-minutes: 15` — the v0.69.0 publish exhausted it on the first
-  attempt.** Ordinary npm-registry slowness (`npm ci` at 5 min, two smoke `npm install` calls at
-  about 5 min each) ran the job past 15 minutes; a `gh run rerun` then published cleanly, so this
-  is a live-fire risk on every release. **Property:** a publish run has enough timeout headroom to
-  absorb ordinary npm-registry slowness without a human having to notice the cancellation and
-  manually re-run it.
-
 - **Verify the Codex `relay` agent end to end in Codex Desktop** (owner-driven, 2026-09-04).
   Commit `e73d113` added `~/.codex/agents/relay.toml` via `scripts/install-skill.mjs`; standalone
   `codex exec` exposes no MCP tools, so only a live Codex Desktop session driven by the owner can
   verify it. **Property:** one Codex Desktop `relay` subagent reply carries a `provenance:` line
   (e.g. spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>"
   returns the version and provenance from a dispatch lane).
-
-- **The MCP `dispatch_lanes` view omits each lane's walk budget, which the CLI ladder prints
-  (2026-09-08, breaker-persistence lap, low).** `llm-relay dispatch` renders
-  `budget: <ms> (from N recorded runs)` per lane through `formatAttemptBudget`; the MCP text for
-  the same ladder shows the median and no budget, so a caller watching a lane cannot see when the
-  walk will abandon it. **Property:** the MCP `dispatch_lanes` text carries the same per-lane
-  budget line and basis as the CLI ladder, from the same `attemptBudget` field.
 
 - **Decide the post-commit remedy for a stream that stalls or crawls after first content**
   (owner decision 2026-09-04: measure first, then build only if clients retry; recorded beside
@@ -237,16 +223,6 @@
   one four-name set. **Property:** every export of `candidate-runner.ts` has a consumer in `src/`
   or a test that names it as a seam, and the four spend-cell names have one list.
 
-- **`test/doc-links.test.ts` resolves links against the working tree, so an untracked file makes
-  a local green that CI cannot reproduce** (2026-09-04, found by the v0.71.0 publish failure,
-  which had to be re-cut as v0.71.1). **Property:** the test resolves a relative link only against
-  files git tracks (`git ls-files`), so the local and the CI verdict agree.
-
-- **State the default-ON routing terms in the user docs** (audit DR-024 residual, 2026-09-04).
-  `routing.hedge`, `routing.latency` and `routing.laneProbe` default ON by owner decision.
-  **Property:** each default-ON routing key appears in `docs/reference.md` with its default and
-  its `false` form.
-
 - **Write `docs/project-philosophy.md`** (owner convention 2026-09-06: every project carries one
   beside its handoff and backlog documents; the `question-philosophy-gate` hook reports it missing
   on every `AskUserQuestion` here). Two halves, PRODUCT and WORKING, each line a conviction that
@@ -254,14 +230,6 @@
   **Property:** the file exists with both halves and a `<!-- BEGIN philosophy-brief -->` …
   `<!-- END philosophy-brief -->` block, and the gate injects that block instead of reporting the
   document missing.
-
-- **The one gate is two commands, and the ledger recorder takes one (2026-09-09, doc-trim lap,
-  low).** `npm run build && npm run check` is the gate, but `verify-green.mjs record -- <cmd>`
-  takes a single command, and a fresh lap worktree has no `dist/` (gitignored), so `check:package`
-  fails unless a build is run by hand first and the ledger then records `npm run check` alone.
-  **Property:** `package.json` declares one script that runs the build and the check, `CLAUDE.md`
-  and `HANDOFF.md` name it as the gate command, and `verify-green.mjs record -- npm run <that
-  script>` records the whole gate in one run.
 
 - **`test/keystore.test.ts` "round-trips a passphrase-backed entry in the exact closed
   non-plaintext v1 shape" fails under full-suite contention and passes alone (2026-09-09, doc-trim

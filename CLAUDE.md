@@ -38,7 +38,8 @@ npm run build          # build:server (TWO tsc passes -> dist/, see below) + bui
 npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
 npm run typecheck      # tsc --noEmit — src/ (tsconfig.json)
 npm run typecheck:test # tsc — the SUITE (tsconfig.test.json). See the note below.
-npm run check          # typecheck + typecheck:test + test + check:dashboard (tsc for dashboard/ + the dashboard suite's own vitest config) + check:package (bundle inventory check + packed smoke). The one gate; CI runs exactly this.
+npm run check          # typecheck + typecheck:test + test + check:dashboard (tsc for dashboard/ + the dashboard suite's own vitest config) + check:package (bundle inventory check + packed smoke). The one gate's second half; CI runs exactly this after the build.
+npm run gate           # build + check, in ONE command — THE gate. Record the ledger through it.
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
 
@@ -48,7 +49,12 @@ llm-relay pools --probe # will each configured MODEL actually answer? (the only 
 npx vitest run test/repair.test.ts             # one file
 npx vitest run -t "refuses to reshape a destructive"   # one test by name
 ```
-**Always verify green before AND after a change:** `npm run build && npm run check`.
+**Always verify green before AND after a change:** `npm run gate` — the ONE gate command, which is
+exactly `npm run build && npm run check`. It exists as a single script because
+`verify-green.mjs record -- <cmd>` takes ONE command, and a fresh lap worktree has no `dist/`
+(gitignored), so `check:package` fails unless the build ran first; recording `npm run check` alone
+therefore certified a gate that had not built. Record the ledger with
+`node ~/.agent-config/verify-green.mjs record -- npm run gate`.
 
 ⚠ **`build:server` runs `tsc` TWICE, and the second pass is load-bearing** (owner decision
 2026-08-30, package-size variant C). Pass 1 is the ordinary `tsc -p tsconfig.json` and emits the
