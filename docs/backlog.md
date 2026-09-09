@@ -254,3 +254,11 @@
   **Property:** the file exists with both halves and a `<!-- BEGIN philosophy-brief -->` …
   `<!-- END philosophy-brief -->` block, and the gate injects that block instead of reporting the
   document missing.
+
+- **The one gate is two commands, and the ledger recorder takes one (2026-09-09, doc-trim lap,
+  low).** `npm run build && npm run check` is the gate, but `verify-green.mjs record -- <cmd>`
+  takes a single command, and a fresh lap worktree has no `dist/` (gitignored), so `check:package`
+  fails unless a build is run by hand first and the ledger then records `npm run check` alone.
+  **Property:** `package.json` declares one script that runs the build and the check, `CLAUDE.md`
+  and `HANDOFF.md` name it as the gate command, and `verify-green.mjs record -- npm run <that
+  script>` records the whole gate in one run.
