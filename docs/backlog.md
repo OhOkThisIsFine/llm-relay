@@ -262,3 +262,14 @@
   **Property:** `package.json` declares one script that runs the build and the check, `CLAUDE.md`
   and `HANDOFF.md` name it as the gate command, and `verify-green.mjs record -- npm run <that
   script>` records the whole gate in one run.
+
+- **`test/keystore.test.ts` "round-trips a passphrase-backed entry in the exact closed
+  non-plaintext v1 shape" fails under full-suite contention and passes alone (2026-09-09, doc-trim
+  lap, low, flake).** One `npm run check` on a docs-only tree recorded it red at
+  `expectNoSecretLeaks` (`expected true to be false`) while two records of the same source minutes
+  earlier and a solo `npx vitest run test/keystore.test.ts` were green; log
+  `~/.agent-config/run-logs/2026-09-09-trim-docs-backlog-md-and-handoff-md-t-9fff1792/2026-09-09T17-23-59-457Z-check-FAIL-6bb1562616dd.log`.
+  The server-side integration tests share the worker-default keystore path (a recorded custody
+  residual), which is the hermeticity seam to suspect first. **Property:** the test passes under
+  the full suite as reliably as alone, with its keystore path isolated per test, so the gate cannot
+  go red on a tree that changed no source.

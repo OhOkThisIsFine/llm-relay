@@ -152,8 +152,8 @@ Everything here is a settled trade kept for its reason, not work; the queue is `
 
 1. **Custody residuals (v0.45.0):** `keys rotate` mints the control token when no relay runs (same
    side effect as `cooldowns clear`); the macOS `security` and Linux `secret-tool` lanes have
-   injected-double coverage only, no CI leg runs them; the server-side integration tests share
-   the worker-default keystore path. Plan:
+   injected-double coverage only, no CI leg runs them. (The shared worker-default keystore path
+   is a backlog item since 2026-09-09: it made the gate flake.) Plan:
    [docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md).
 2. **SPA and test nits standing:** the flat 30 s poll with no failure backoff (mitigated by
    abort-on-hide/offline), the CSS-structure test mirroring styles.css, a few wall-clock-sleep
