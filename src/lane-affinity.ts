@@ -43,6 +43,7 @@ import { relayStatePath } from "./state-paths.js";
 import { WriteBehindRegistry, WriteBehindTimer } from "./write-behind.js";
 import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 import { isDashboardSafeId } from "./dashboard-contract.js";
+import { medianWallClockMs, quantileWallClockMs } from "./dispatch-lane-stats.js";
 import type { Config } from "./config-types.js";
 
 /**
@@ -233,6 +234,130 @@ export function laneDemotion(
   now: number = Date.now(),
 ): LaneAffinityRow | null {
   return recall(cfg, "demote", tier, laneId, now);
+}
+
+/**
+ * Tunables for the recent-versus-earlier outlier demotion (backlog item 9, owner question
+ * 2026-09-05: demote a lane whose RECENT distribution is an outlier against its OWN earlier
+ * history, on a threshold calibrated from that history).
+ *
+ * `DEFAULT_OUTLIER_FACTOR` (7.6) is the CALIBRATED default — `scripts/calibrate-lane-outlier.mjs`,
+ * run 2026-09-09 21:37Z against this machine's `~/.llm-relay/dispatch-lane-stats.json`: 3 (lane,
+ * tier) windows with enough history (agy-gemini 25 samples, free-pool 100, opencode-muse-spark
+ * 57), 155 sliding recent-median / history-p80 ratios, pooled p50 0.62, p90 2.03, p95 7.57,
+ * max 33.32. The method is the pooled p95 — the point above which a lane is more extreme than
+ * 95% of its own-history comparisons — ACCEPTED inside the script's [1.5, 10.0] band and rounded
+ * to one decimal.
+ *
+ * ⚠ **A first draft of this comment reported a run that never happened** (p95 1.44, rejected as
+ * too LOW, default 2.5): the script did not exist in the tree when it was written. The real run
+ * says the opposite. Per lane, free-pool's HEALTHY ratio reaches 4.18 at p95 (max 33.32) and
+ * opencode-muse-spark's 12.54 (max 13.65) — a lane here legitimately runs an agent loop whose
+ * wall clock swings several-fold — so a factor of 2.5 would have demoted both on ordinary wobble,
+ * the exact harm this rule must not do, and the band's upper edge moved from 5.0 to 10.0 on that
+ * evidence. 7.6 still fires on the real 13x and 33x events in the same window.
+ *
+ * ⚠ Figures are PERISHABLE — they describe one machine's traffic on one date. Re-run the script
+ * as lane history accumulates and move this constant with it; never quote these as measurements
+ * of anything but that window. The parser mirrors the three defaults in
+ * `DEFAULT_DISPATCH_WALK_OUTLIER` (`config/routing-parser.ts`), pinned equal by a test.
+ */
+export const DEFAULT_OUTLIER_RECENT_COUNT = 5;
+export const DEFAULT_OUTLIER_HISTORY_QUANTILE = 0.8;
+export const DEFAULT_OUTLIER_FACTOR = 7.6;
+
+/** Resolved outlier settings: the operator's overrides with the defaults above filled in. */
+export interface LaneOutlierSettings {
+  recentCount: number;
+  historyQuantile: number;
+  outlierFactor: number;
+  minSamples: number;
+}
+
+/** What the rule found, carrying the evidence that produced it so the reason can state it. */
+export interface LaneOutlierEvidence {
+  recentMedianMs: number;
+  historyMs: number;
+}
+
+/**
+ * Recent-versus-earlier outlier test on ONE lane's OWN (lane, tier) window, oldest first.
+ *
+ * The window splits into the most recent `recentCount` samples and the rest; the lane is an
+ * outlier when the recent MEDIAN exceeds the earlier window's `historyQuantile` by more than
+ * `outlierFactor`. Both halves need at least `minSamples` samples or the rule is silent —
+ * unmeasured is no opinion, never "slow" (the `latency-demotion.ts` rule). Nearest-rank
+ * quantiles only, reused from `dispatch-lane-stats.ts`, never re-implemented: a percentile
+ * reporting a duration nothing ever took would be a fabricated measurement.
+ *
+ * ⚠ The statistic is meaningful only because each sample is attributable in TIME
+ * (`wallClockAt` in `dispatch-lane-stats.ts`): "recent" is the tail of the window, not a
+ * subsample. And no HTTP-path number is borrowed here — a lane legitimately runs an agent
+ * loop for minutes, so pointing 250 ms/token or a 30 s ceiling at it would demote every
+ * healthy lane at once.
+ */
+export function checkLaneOutlier(
+  samples: readonly number[],
+  settings: LaneOutlierSettings,
+): LaneOutlierEvidence | null {
+  const { recentCount, historyQuantile, outlierFactor, minSamples } = settings;
+  if (!Number.isInteger(recentCount) || recentCount < 1) return null;
+  if (samples.length < recentCount + minSamples) return null;
+  const recent = samples.slice(-recentCount);
+  const earlier = samples.slice(0, samples.length - recentCount);
+  // Both halves need a distribution, not a anecdote: the recent half is exactly `recentCount`
+  // long, so it clears the floor only when the operator sized it at or above `minSamples`.
+  if (recent.length < minSamples || earlier.length < minSamples) return null;
+  const recentMedian = medianWallClockMs(recent);
+  const history = quantileWallClockMs(earlier, historyQuantile);
+  if (recentMedian === null || history === null || history <= 0) return null;
+  if (recentMedian <= history * outlierFactor) return null;
+  return { recentMedianMs: recentMedian, historyMs: history };
+}
+
+/**
+ * The demotion reason for an outlier hit. It names BOTH figures and the factor — a reason
+ * string is a claim about the ordering code, printed on the ladder view, so an operator
+ * reading it can see the measurement rather than taking the demotion on faith.
+ */
+export function outlierDemotionReason(
+  evidence: LaneOutlierEvidence,
+  opts: { historyQuantile: number; outlierFactor: number },
+): string {
+  const seconds = (ms: number): number => Math.round(ms / 1000);
+  const point = Math.round(opts.historyQuantile * 100);
+  return `recent median ${seconds(evidence.recentMedianMs)} s vs history p${point} ${seconds(evidence.historyMs)} s ×${opts.outlierFactor}`;
+}
+
+/**
+ * Evaluate the outlier rule for one (lane, tier) window and, on a hit, demote through the
+ * SHARED entry: retract first (`clearLaneAffinity`), then `demoteLane` — the same
+ * retract-then-record sequence `recordLaneAffinity` uses for a walk demotion, so an outlier
+ * demotion retracts an existing pin rather than sitting beside it. It never touches the pin
+ * directly; the shared entry already handles that.
+ *
+ * Returns the reason recorded, or null when the rule is inert (`false`), silent (too little
+ * history), or the window is steady. Pure evaluation, one write on a hit.
+ */
+export function recordLaneOutlier(
+  cfg: Config,
+  tier: string | null,
+  laneId: string,
+  samples: readonly number[],
+  outlier: false | Omit<LaneOutlierSettings, "minSamples">,
+  opts: { minSamples: number; demoteMs: number },
+  now: number = Date.now(),
+): string | null {
+  if (outlier === false) return null;
+  const hit = checkLaneOutlier(samples, { ...outlier, minSamples: opts.minSamples });
+  if (!hit) return null;
+  const reason = outlierDemotionReason(hit, {
+    historyQuantile: outlier.historyQuantile,
+    outlierFactor: outlier.outlierFactor,
+  });
+  clearLaneAffinity(cfg, tier, laneId);
+  demoteLane(cfg, tier, laneId, reason, opts.demoteMs, now);
+  return reason;
 }
 
 /**

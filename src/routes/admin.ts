@@ -20,12 +20,13 @@ import { createAccountingRequest, type AccountingRecorder } from "../accounting.
 import type { FailureKind } from "../dashboard-contract.js";
 import {
   laneRoutesThroughRelay,
+  laneStatsFor,
   parseTelemetryReport,
   recordLaneRun,
   type DispatchedTelemetryReport,
   type DispatchLaneStatus,
 } from "../dispatch-lane-stats.js";
-import { clearLaneAffinity, demoteLane, pinLane } from "../lane-affinity.js";
+import { clearLaneAffinity, demoteLane, pinLane, recordLaneOutlier } from "../lane-affinity.js";
 
 const MAX_TASK_LEN = 4096;
 
@@ -270,9 +271,22 @@ function recordLaneAffinity(cfg: Config, report: DispatchedTelemetryReport): voi
   clearLaneAffinity(cfg, tier, report.laneId);
   if (LANE_AFFINITY_EFFECT[report.status] === "pin") {
     pinLane(cfg, tier, report.laneId, `answered in ${seconds}s`, walk.pinMs);
-    return;
+  } else {
+    demoteLane(cfg, tier, report.laneId, `${report.status.replace("_", " ")} after ${seconds}s`, walk.demoteMs);
   }
-  demoteLane(cfg, tier, report.laneId, `${report.status.replace("_", " ")} after ${seconds}s`, walk.demoteMs);
+  // Recent-versus-earlier outlier demotion (backlog item 9), evaluated AFTER the sample lands
+  // AND after the pin/demotion above — in that order deliberately. The sample must be in the
+  // window before the rule can read it, and the rule must run after the pin: a lane that
+  // answered and THEN slowed keeps no stale pin, because the outlier demotion goes through the
+  // same retract-then-record entry and the pin it just earned is retracted with it. `false`
+  // makes the rule inert; rows still carry their timestamps either way.
+  if (walk.outlier !== false) {
+    const window = laneStatsFor(cfg, report.laneId, tier)?.wallClockMs ?? [];
+    recordLaneOutlier(cfg, tier, report.laneId, window, walk.outlier, {
+      minSamples: walk.attemptMinSamples,
+      demoteMs: walk.demoteMs,
+    });
+  }
 }
 
 /**

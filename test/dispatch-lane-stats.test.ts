@@ -402,3 +402,104 @@ describe("lane stats persistence", () => {
     expect(rows.map((row) => row.laneId).sort()).toEqual(["a", "b"]);
   });
 });
+
+describe("tier-keyed windows (backlog item 4)", () => {
+  function tieredReport(
+    laneId: string,
+    tier: string | null,
+    wallClockMs: number,
+    jobId: string,
+  ): DispatchedTelemetryReport {
+    const parsed = parseTelemetryReport(
+      validReport({ jobId, laneId, wallClockMs, ...(tier === null ? {} : { tier }) }),
+    );
+    if (!parsed) throw new Error("fixture telemetry report rejected");
+    return parsed;
+  }
+
+  it("a v0.77.1-shaped file restores with the same counts — rows with no `tier`, samples with no `at`", () => {
+    // ⚠ The fixture MUST be raw JSON text (the `catalog.ts` precedent): it pins what the
+    // previous release wrote — no `tier` key on the row, bare numbers for samples — so a
+    // change to the writer cannot silently rewrite the past it claims to load.
+    writeFileSync(
+      statePath,
+      '{"version":1,"rows":[' +
+        '{"laneId":"a","calls":2,"successes":2,"failures":0,"timeouts":0,"wallClockMs":[10000,12000],"lastAt":1700000000000},' +
+        '{"laneId":"b","calls":1,"successes":0,"failures":1,"timeouts":0,"wallClockMs":[30000],"lastAt":null}' +
+        "]}",
+    );
+    const rows = loadLaneStatsRows({ path: statePath });
+    expect(rows).toHaveLength(2);
+    const cfg = freshConfig();
+    expect(restoreLaneStatsRows(cfg, rows)).toBe(2);
+    // A legacy row loads unchanged, as the tier-less window: nothing is rewritten or copied.
+    expect(laneStatsFor(cfg, "a")).toMatchObject({ calls: 2, successes: 2 });
+    expect(laneStatsFor(cfg, "a")!.wallClockMs).toEqual([10000, 12000]);
+    expect(laneStatsFor(cfg, "b")).toMatchObject({ calls: 1, failures: 1 });
+    expect(allLaneStats(cfg)).toMatchObject([
+      { laneId: "a", tier: null },
+      { laneId: "b", tier: null },
+    ]);
+  });
+
+  it("records under the report's tier and keeps one tier's runs out of another's window", () => {
+    const cfg = freshConfig();
+    for (let i = 0; i < 3; i++) recordLaneRun(cfg, tieredReport("a", "low", 10_000 + i, `low-${i}`));
+    for (let i = 0; i < 2; i++) recordLaneRun(cfg, tieredReport("a", "high", 500_000 + i, `high-${i}`));
+    recordLaneRun(cfg, tieredReport("a", null, 30_000, "legacy-0"));
+    expect(laneStatsFor(cfg, "a", "low")).toMatchObject({ calls: 3, successes: 3 });
+    expect(laneStatsFor(cfg, "a", "low")!.wallClockMs).toEqual([10000, 10001, 10002]);
+    expect(laneStatsFor(cfg, "a", "high")).toMatchObject({ calls: 2, successes: 2 });
+    expect(laneStatsFor(cfg, "a", "high")!.wallClockMs).toEqual([500000, 500001]);
+    expect(laneStatsFor(cfg, "a")).toMatchObject({ calls: 1, successes: 1 });
+    expect(laneStatsFor(cfg, "a", "ghost")).toBeUndefined();
+  });
+
+  it("stamps each sample's ISO time and keeps the parallel window in step", () => {
+    const cfg = freshConfig();
+    recordLaneRun(cfg, tieredReport("a", "low", 10_000, "job-1"), 1_700_000_000_000);
+    recordLaneRun(cfg, tieredReport("a", "low", 20_000, "job-2"), 1_700_000_060_000);
+    const stats = laneStatsFor(cfg, "a", "low")!;
+    expect(stats.wallClockAt).toEqual(["2023-11-14T22:13:20.000Z", "2023-11-14T22:14:20.000Z"]);
+    // An abandoned run contributes no duration AND no timestamp — the two windows stay aligned.
+    recordLaneRun(
+      cfg,
+      parseTelemetryReport(validReport({ jobId: "job-3", laneId: "a", tier: "low", status: "abandoned", exitCode: null }))!,
+      1_700_000_120_000,
+    );
+    const after = laneStatsFor(cfg, "a", "low")!;
+    expect(after.calls).toBe(3);
+    expect(after.wallClockMs).toHaveLength(2);
+    expect(after.wallClockAt).toHaveLength(2);
+    // A legacy sample carries a null timestamp, never a guess.
+    expect(laneStatsFor(cfg, "ghost", "low")).toBeUndefined();
+  });
+
+  it("⚠ drops a row whose `tier` is a number, alone", () => {
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: CURRENT_DISPATCH_LANE_STATS_VERSION,
+        rows: [
+          { laneId: "good", calls: 1, successes: 1, failures: 0, timeouts: 0, wallClockMs: [10], lastAt: null },
+          { laneId: "bad-tier", tier: 42, calls: 1, successes: 1, failures: 0, timeouts: 0, wallClockMs: [10], lastAt: null },
+        ],
+      }),
+    );
+    const rows = loadLaneStatsRows({ path: statePath });
+    expect(rows.map((row) => row.laneId)).toEqual(["good"]);
+  });
+
+  it("round-trips tiered rows through an explicit path", () => {
+    const cfg = freshConfig();
+    recordLaneRun(cfg, tieredReport("a", "low", 10_000, "job-1"), 1_700_000_000_000);
+    recordLaneRun(cfg, tieredReport("a", null, 30_000, "job-2"), 1_700_000_060_000);
+    const rows = exportLaneStatsRows(cfg);
+    expect(rows).toHaveLength(2);
+
+    const after = freshConfig();
+    expect(restoreLaneStatsRows(after, rows)).toBe(2);
+    expect(laneStatsFor(after, "a", "low")).toEqual(laneStatsFor(cfg, "a", "low"));
+    expect(laneStatsFor(after, "a", null)).toEqual(laneStatsFor(cfg, "a", null));
+  });
+});

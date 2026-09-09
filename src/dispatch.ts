@@ -3,7 +3,7 @@ import type { Config, LadderRung } from "./config-types.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
-import { allLaneStats, medianWallClockMs, p95WallClockMs, quantileWallClockMs } from "./dispatch-lane-stats.js";
+import { allLaneStats, laneStatsFor, medianWallClockMs, p95WallClockMs, quantileWallClockMs } from "./dispatch-lane-stats.js";
 import { laneDemotion, lanePin, type LaneAffinityRow } from "./lane-affinity.js";
 
 /**
@@ -1054,7 +1054,30 @@ export function buildDispatch(
   // Advisory lane-execution stats, filled for every rung that ran under this config and omitted
   // otherwise. This mutates only the `stats` column: `state`, `next` and the ladder order were
   // decided above from cooldowns and availability, and nothing here revisits them.
-  const statsByLane = new Map(allLaneStats(cfg).map((row) => [row.laneId, row]));
+  // Advisory `stats` column: a PER-LANE aggregate across tiers. One lane's runs under two
+  // tiers count once, in one column — the column answers "how often was this lane taken", and
+  // splitting it per tier would halve every figure the moment a second ladder is configured.
+  const statsByLane = new Map<string, { calls: number; successes: number; failures: number; timeouts: number; wallClockMs: number[]; lastAt: number | null }>();
+  for (const row of allLaneStats(cfg)) {
+    const agg = statsByLane.get(row.laneId);
+    if (!agg) {
+      statsByLane.set(row.laneId, {
+        calls: row.calls,
+        successes: row.successes,
+        failures: row.failures,
+        timeouts: row.timeouts,
+        wallClockMs: [...row.wallClockMs],
+        lastAt: row.lastAt,
+      });
+      continue;
+    }
+    agg.calls += row.calls;
+    agg.successes += row.successes;
+    agg.failures += row.failures;
+    agg.timeouts += row.timeouts;
+    agg.wallClockMs.push(...row.wallClockMs);
+    agg.lastAt = agg.lastAt === null ? row.lastAt : row.lastAt === null ? agg.lastAt : Math.max(agg.lastAt, row.lastAt);
+  }
   for (const lane of ladder) {
     const row = statsByLane.get(lane.id);
     if (row === undefined) continue;
@@ -1071,8 +1094,9 @@ export function buildDispatch(
   // Every lane gets a budget, whether or not it has ever run: a lane with no history takes the flat
   // figure at `floor` basis. Written in one pass over the whole ladder rather than only over rungs
   // that carry stats, so a never-run lane still shows the operator what it will be given.
+  // ⚠ The budget reads the (lane, tier) window for THIS ladder — never the aggregate above.
   for (const lane of ladder) {
-    const budget = attemptBudget(cfg, statsByLane.get(lane.id)?.wallClockMs ?? []);
+    const budget = attemptBudget(cfg, lane.id, selected.tier);
     if (budget !== undefined) lane.attemptBudget = budget;
   }
   // Routing memory from previous walks (`lane-affinity.ts`): which lane answered, and which lane
@@ -1172,7 +1196,12 @@ export function buildDispatch(
 }
 
 /**
- * How long a dispatch walk gives ONE lane to answer, derived from that lane's own recorded runs.
+ * How long a dispatch walk gives ONE lane to answer, derived from that lane's own recorded runs
+ * on THIS tier's ladder.
+ *
+ * ⚠ Tier-keyed since 2026-09-09 (backlog item 4): the stats window beside it is keyed by
+ * (lane, tier), and the budget reads that window — one tier's runs never set another tier's
+ * kill budget. See the fallback comment in the body for how legacy tier-less rows are honoured.
  *
  * ⚠ This is the owner's request-path mechanism — a threshold read off what THIS endpoint has
  * actually done — applied to lanes (owner direction 2026-09-08). The METHOD carries over; none of
@@ -1197,10 +1226,33 @@ export function buildDispatch(
  */
 function attemptBudget(
   cfg: Config,
-  samples: readonly number[],
+  laneId: string,
+  tier: string | null,
 ): DispatchLane["attemptBudget"] {
   const walk = cfg.routing.dispatchWalk;
   if (!walk || !walk.enabled) return undefined;
+  // ⚠ The budget is derived ONLY from runs on the ladder it will be used on. When the tier's
+  // own window holds fewer than `attemptMinSamples` samples it FALLS BACK to the tier-less
+  // window — the legacy rows, which predate tiering and belong to no ladder — and reports the
+  // basis from whichever window it used. It never merges the two windows into one quantile:
+  // that would attribute one tier's runs to another, the defect this closes. The fallback is
+  // the legacy file's whole purpose, and it expires on its own as tier-keyed samples
+  // accumulate past the floor.
+  const tiered = laneStatsFor(cfg, laneId, tier)?.wallClockMs ?? [];
+  if (tiered.length >= walk.attemptMinSamples) {
+    return budgetFromSamples(tiered, walk);
+  }
+  if (tier === null) {
+    return budgetFromSamples(tiered, walk);
+  }
+  const legacy = laneStatsFor(cfg, laneId, null)?.wallClockMs ?? [];
+  return budgetFromSamples(legacy, walk);
+}
+
+function budgetFromSamples(
+  samples: readonly number[],
+  walk: { attemptMs: number; attemptMinSamples: number; attemptQuantile: number },
+): DispatchLane["attemptBudget"] {
   if (samples.length < walk.attemptMinSamples) {
     return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
   }

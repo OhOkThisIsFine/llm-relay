@@ -1674,7 +1674,28 @@ describe("routing.dispatchWalk", () => {
       maxLanes: 4,
       pinMs: 15 * 60 * 1000,
       demoteMs: 15 * 60 * 1000,
+      outlier: { recentCount: 5, historyQuantile: 0.8, outlierFactor: 7.6 },
     });
+  });
+
+  it("dispatchWalk.outlier: `false` is inert, a partial object fills from the defaults, an unknown key or an out-of-range value is refused by name", () => {
+    const off = loadConfig(
+      write("dw-outlier-false.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { outlier: false } } })),
+    );
+    expect(off.routing.dispatchWalk?.outlier).toBe(false);
+    const partial = loadConfig(
+      write("dw-outlier-partial.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { outlier: { outlierFactor: 3 } } } })),
+    );
+    expect(partial.routing.dispatchWalk?.outlier).toEqual({ recentCount: 5, historyQuantile: 0.8, outlierFactor: 3 });
+    expect(() =>
+      loadConfig(write("dw-outlier-typo.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { outlier: { factor: 3 } } } }))),
+    ).toThrow(/dispatchWalk\.outlier\.factor is not a recognized key/);
+    expect(() =>
+      loadConfig(write("dw-outlier-range.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { outlier: { outlierFactor: 1 } } } }))),
+    ).toThrow(/dispatchWalk\.outlier\.outlierFactor must be a number greater than 1/);
+    expect(() =>
+      loadConfig(write("dw-outlier-q.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { outlier: { historyQuantile: 1 } } } }))),
+    ).toThrow(/dispatchWalk\.outlier\.historyQuantile must be a number greater than 0 and less than 1/);
   });
 
   it("boolean `false` is a byte-for-byte revert to one lane per dispatch", () => {
@@ -1700,6 +1721,7 @@ describe("routing.dispatchWalk", () => {
       maxLanes: 2,
       pinMs: 15 * 60 * 1000,
       demoteMs: 15 * 60 * 1000,
+      outlier: { recentCount: 5, historyQuantile: 0.8, outlierFactor: 7.6 },
     });
   });
 

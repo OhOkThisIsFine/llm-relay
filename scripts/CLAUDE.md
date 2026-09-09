@@ -50,6 +50,16 @@ red without anyone invoking a script by hand:
   reporter (`jscpd-report.json` in the report directory).
 
 Offline / unit-test-safe (no external creds):
+- `calibrate-lane-outlier.mjs` (`node scripts/calibrate-lane-outlier.mjs [--file <dispatch-lane-stats.json>]
+  [--recent 5] [--quantile 0.8] [--min-samples 5]`) — fits
+  `routing.dispatchWalk.outlier.outlierFactor` (backlog item 9, 2026-09-09: a `cli` lane whose RECENT
+  runs are an outlier against its OWN earlier history is demoted — see `checkLaneOutlier` in
+  `src/lane-affinity.ts`) from THIS machine's `~/.llm-relay/dispatch-lane-stats.json` (or
+  `XDG_CACHE_HOME`'s copy, or `--file`) — never `dist/`, never the network. Method: for every (lane,
+  tier) window with enough history, slide a split across the window in time order and pool every
+  `median(recent 5) / p80(earlier)` ratio; propose the pooled p95; ACCEPT it only inside [1.5, 5.0],
+  else print the built-in 2.5 and say so. Nearest-rank quantiles, so every figure is an observed
+  sample. ⚠ Output is perishable and machine-local — record it beside the default with its date.
 - `calibrate-hedge-floor.mjs` (`node scripts/calibrate-hedge-floor.mjs [--path <recent.json>]`) —
   fits `routing.hedge.msPerInputToken` (owner direction 2026-09-04: the hedge floor grows with a
   request's own estimated input size — see `src/hedge-trigger.ts`) from THIS machine's own

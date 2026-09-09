@@ -155,12 +155,22 @@ export function parseTelemetryReport(value: unknown): DispatchedTelemetryReport 
 }
 
 export interface LaneStats {
+  /** Lane this window belongs to (the map key is composite, so the entry carries its parts). */
+  laneId: string;
+  /** Ladder tier this window belongs to, or null for the legacy single ladder. */
+  tier: string | null;
   calls: number;
   successes: number;
   failures: number;
   timeouts: number;
   /** Bounded wall-clock sample window, oldest dropped — advisory percentiles, not scoring. */
   wallClockMs: number[];
+  /**
+   * Per-sample ISO timestamps, parallel to `wallClockMs` — entry `i` is when sample `i` ran.
+   * `null` on a sample recorded before timestamps existed. The parallelism is the invariant:
+   * both windows trim together, so position `i` always means the same run in both.
+   */
+  wallClockAt: (string | null)[];
   lastAt: number | null;
 }
 
@@ -244,8 +254,20 @@ export function quantileWallClockMs(samples: readonly number[], quantile: number
   return sorted[Math.min(sorted.length, Math.max(1, rank)) - 1] ?? null;
 }
 
-function freshLaneStats(): LaneStats {
-  return { calls: 0, successes: 0, failures: 0, timeouts: 0, wallClockMs: [], lastAt: null };
+function freshLaneStats(laneId: string, tier: string | null): LaneStats {
+  return { laneId, tier, calls: 0, successes: 0, failures: 0, timeouts: 0, wallClockMs: [], wallClockAt: [], lastAt: null };
+}
+
+/**
+ * In-memory key for one (lane, tier) window. The same spelling as `memoryKey` in
+ * `lane-affinity.ts` minus the memory kind (this store holds one window per key, not one row
+ * per kind): the tier is part of it because each tier is its OWN ladder with its own rungs, so
+ * a lane that answered a `low` task says nothing about the `xhigh` ladder — and since
+ * 2026-09-08 this window sets each lane's walk budget, so sharing it across tiers would let one
+ * tier's runs set another tier's kill budget.
+ */
+function statsKey(tier: string | null, laneId: string): string {
+  return `${tier ?? ""}:${laneId}`;
 }
 
 /**
@@ -312,19 +334,25 @@ function laneStatsForWrite(cfg: Config): Map<string, LaneStats> {
 }
 
 function copyStats(stats: LaneStats): LaneStats {
-  return { ...stats, wallClockMs: [...stats.wallClockMs] };
+  return { ...stats, wallClockMs: [...stats.wallClockMs], wallClockAt: [...stats.wallClockAt] };
 }
 
 /**
  * Record one settled lane run. `completed` counts a success; `failed` a failure; `timed_out`
  * a timeout AND a failure (a timeout did not succeed). Stats never reorder the ladder.
+ *
+ * The run lands in the (lane, tier) window named by the report's own `tier` (null when the
+ * report names none — the legacy single ladder). The `POST /dispatch/telemetry` route passes
+ * nothing extra: the report already carries `tier`, so tiering flows through this one argument.
  */
 export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, now: number = Date.now()): void {
   const map = laneStatsForWrite(cfg);
-  let entry = map.get(report.laneId);
+  const tier = report.tier ?? null;
+  const key = statsKey(tier, report.laneId);
+  let entry = map.get(key);
   if (!entry) {
-    entry = freshLaneStats();
-    map.set(report.laneId, entry);
+    entry = freshLaneStats(report.laneId, tier);
+    map.set(key, entry);
   }
   entry.calls += 1;
   switch (report.status) {
@@ -363,25 +391,44 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
   // ⚠ Exactly the rule `circuit-breaker.ts` already states for a cancelled attempt: `status` is
   // deliberately absent there so the outcome stays out of `MEASURABLE_CODES`, "so an attempt of
   // unknown true duration moves uptime and never enters a latency statistic". Same reason here.
-  if (report.status !== "abandoned") entry.wallClockMs.push(report.wallClockMs);
+  // ⚠ The timestamp window moves with the duration window, sample for sample: an abandoned
+  // run contributes NEITHER (its wall clock is the relay's own budget, not a lane duration),
+  // so position `i` always names the same run in both windows.
+  if (report.status !== "abandoned") {
+    entry.wallClockMs.push(report.wallClockMs);
+    entry.wallClockAt.push(new Date(now).toISOString());
+  }
   if (entry.wallClockMs.length > MAX_LANE_STAT_SAMPLES) {
-    entry.wallClockMs.splice(0, entry.wallClockMs.length - MAX_LANE_STAT_SAMPLES);
+    const drop = entry.wallClockMs.length - MAX_LANE_STAT_SAMPLES;
+    entry.wallClockMs.splice(0, drop);
+    entry.wallClockAt.splice(0, drop);
   }
   entry.lastAt = now;
   notifyLaneStats(cfg);
 }
 
-/** One lane's stats for this config, or undefined when the lane never ran here. A copy. */
-export function laneStatsFor(cfg: Config, laneId: string): LaneStats | undefined {
-  const entry = laneStats.get(cfg)?.get(laneId);
+/** One (lane, tier) window for this config, or undefined when that lane never ran on that tier. A copy. */
+export function laneStatsFor(cfg: Config, laneId: string, tier: string | null = null): LaneStats | undefined {
+  const entry = laneStats.get(cfg)?.get(statsKey(tier, laneId));
   return entry ? copyStats(entry) : undefined;
 }
 
-/** Every lane with stats for this config, sorted by lane id so surfaces render stably. Copies. */
+/**
+ * Every (lane, tier) window for this config, sorted by lane id then tier (tier-less first) so
+ * surfaces render stably. Copies.
+ */
 export function allLaneStats(cfg: Config): Array<{ laneId: string } & LaneStats> {
-  return [...(laneStats.get(cfg) ?? new Map<string, LaneStats>()).entries()]
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([laneId, stats]) => ({ laneId, ...copyStats(stats) }));
+  const compareRows = (a: LaneStats, b: LaneStats): number => {
+    if (a.laneId !== b.laneId) return a.laneId < b.laneId ? -1 : 1;
+    // Tier-less (legacy) rows sort first — the same nulls-first shape `statsKey` gives.
+    const ta = a.tier ?? "";
+    const tb = b.tier ?? "";
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    return 0;
+  };
+  return [...(laneStats.get(cfg) ?? new Map<string, LaneStats>()).values()]
+    .sort(compareRows)
+    .map((stats) => ({ ...copyStats(stats) }));
 }
 
 /**
@@ -410,28 +457,61 @@ function notifyLaneStats(cfg: Config): void {
   }
 }
 
-/** One exported/persisted lane row: the lane id plus its counters and sample window. */
+/**
+ * One exported/persisted lane row: the (lane, tier) key plus its counters and sample window.
+ *
+ * ⚠ `tier` and `wallClockAt` are OPTIONAL on the wire, and that is the whole backward-compat
+ * story: a row written before tiering (no `tier` key, bare-number samples) loads here with
+ * `tier: null` and all-null timestamps — nothing is rewritten or copied — and a row written
+ * here loads on the previous release, whose validator reads the fields it knows (`laneId`,
+ * the counters, the numeric `wallClockMs`, `lastAt`) and ignores the two keys it does not.
+ * No existing field changed meaning, so the schema version does NOT bump (the
+ * `breaker-persistence.ts` rule: bump only when the MEANING of an existing field changes).
+ */
 export interface LaneStatsRow {
   laneId: string;
+  tier?: string | null;
   calls: number;
   successes: number;
   failures: number;
   timeouts: number;
   wallClockMs: number[];
+  wallClockAt?: (string | null)[];
   lastAt: number | null;
 }
 
 /** Still-live rows for persistence and ladder surfaces. */
 export function exportLaneStatsRows(cfg: Config): LaneStatsRow[] {
-  return allLaneStats(cfg).map(({ laneId, calls, successes, failures, timeouts, wallClockMs, lastAt }) => ({
+  return allLaneStats(cfg).map(({ laneId, tier, calls, successes, failures, timeouts, wallClockMs, wallClockAt, lastAt }) => ({
     laneId,
+    tier,
     calls,
     successes,
     failures,
     timeouts,
     wallClockMs: [...wallClockMs],
+    wallClockAt: [...wallClockAt],
     lastAt,
   }));
+}
+
+function isLaneTier(value: unknown): value is string | null {
+  if (value === undefined || value === null) return true;
+  return isBoundedId(value, MAX_TIER_CHARS);
+}
+
+function isWallClockAt(value: unknown, samples: number): value is (string | null)[] {
+  // Absent on a legacy row — every sample then reads as unattributed in time (`null`).
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) return false;
+  // The relay always writes the two windows in step, so a ragged pair is corruption, not
+  // history — drop the row alone rather than guessing which timestamp belongs to which run.
+  if (value.length !== samples) return false;
+  for (const stamp of value) {
+    if (stamp === null) continue;
+    if (typeof stamp !== "string" || Number.isNaN(Date.parse(stamp))) return false;
+  }
+  return true;
 }
 
 /** Validate ONE row completely; anything unexpected drops this row and only this row. */
@@ -439,6 +519,9 @@ function isLaneStatsRow(value: unknown): value is LaneStatsRow {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
   if (!isBoundedId(row["laneId"], MAX_LANE_ID_CHARS)) return false;
+  // A numeric tier is not a tier that failed to parse — it is a shape this file never wrote,
+  // so the row alone goes rather than the file.
+  if (!isLaneTier(row["tier"])) return false;
   for (const key of ["calls", "successes", "failures", "timeouts"] as const) {
     if (!isTokenCount(row[key])) return false;
   }
@@ -450,6 +533,7 @@ function isLaneStatsRow(value: unknown): value is LaneStatsRow {
   for (const sample of wallClockMs) {
     if (typeof sample !== "number" || !Number.isFinite(sample) || sample < 0) return false;
   }
+  if (!isWallClockAt(row["wallClockAt"], wallClockMs.length)) return false;
   const lastAt = row["lastAt"];
   if (lastAt !== null && (typeof lastAt !== "number" || !Number.isFinite(lastAt) || lastAt < 0)) return false;
   return true;
@@ -463,13 +547,18 @@ export function restoreLaneStatsRows(cfg: Config, rows: readonly LaneStatsRow[])
   const map = laneStatsForWrite(cfg);
   let restored = 0;
   for (const row of rows) {
-    if (map.has(row.laneId)) continue;
-    map.set(row.laneId, {
+    const tier = row.tier ?? null;
+    const key = statsKey(tier, row.laneId);
+    if (map.has(key)) continue;
+    map.set(key, {
+      laneId: row.laneId,
+      tier,
       calls: row.calls,
       successes: row.successes,
       failures: row.failures,
       timeouts: row.timeouts,
       wallClockMs: row.wallClockMs.slice(-MAX_LANE_STAT_SAMPLES),
+      wallClockAt: (row.wallClockAt ?? new Array<string | null>(row.wallClockMs.length).fill(null)).slice(-MAX_LANE_STAT_SAMPLES),
       lastAt: row.lastAt,
     });
     restored++;

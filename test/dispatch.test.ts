@@ -12,7 +12,9 @@ import {
   clearExhausted,
   MAX_EXHAUSTED_MS,
   normalizeCliCommand,
+  type DispatchLane,
 } from "../src/dispatch.js";
+import { parseTelemetryReport, recordLaneRun } from "../src/dispatch-lane-stats.js";
 
 /** Just enough of the `/dispatch` payload for the assertions below — `Response.json()` is
  *  `unknown`, and an untyped `any` here would let a renamed field pass silently. */
@@ -497,5 +499,73 @@ describe("dispatch ladder — endpoint", () => {
       expect(res.status).toBe(400);
       expect((await res.text())).toContain("rate_limited");
     });
+  });
+});
+
+describe("tier-keyed attempt budgets (backlog item 4)", () => {
+  const WALK = { attemptMs: 90_000, attemptMinSamples: 5, attemptQuantile: 0.8 };
+
+  function cfgWithTiers(): Config {
+    const rung = { id: "slow", kind: "cli", command: "a", args: ["{task}"] };
+    return cfgWith({
+      dispatchWalk: WALK,
+      ladders: { low: [{ ...rung }], high: [{ ...rung }] },
+    });
+  }
+
+  function recordOn(cfg: Config, tier: string | null, durationsMs: readonly number[]): void {
+    durationsMs.forEach((ms, i) => {
+      const parsed = parseTelemetryReport({
+        jobId: `job-${tier ?? "legacy"}-${i}`,
+        laneId: "slow",
+        kind: "cli",
+        ...(tier === null ? {} : { tier }),
+        wallClockMs: ms,
+        exitCode: 0,
+        status: "completed",
+        estimatedInputTokens: 1,
+        estimatedOutputTokens: 1,
+      });
+      if (!parsed) throw new Error("fixture telemetry report rejected");
+      recordLaneRun(cfg, parsed, 1_700_000_000_000 + i);
+    });
+  }
+
+  function budgetOf(cfg: Config, tier: string): DispatchLane["attemptBudget"] {
+    return buildDispatch(cfg, { tier }).ladder.find((l) => l.id === "slow")?.attemptBudget;
+  }
+
+  it("runs recorded under `low` do not move `attemptBudget(lane, 'high')`", () => {
+    const cfg = cfgWithTiers();
+    recordOn(cfg, "low", [200_000, 210_000, 220_000, 230_000, 240_000, 250_000]);
+    // The low window cleared the sample floor: its own p80.
+    expect(budgetOf(cfg, "low")).toEqual({ ms: 240_000, basis: "history", samples: 6 });
+    // High never ran: the flat figure, never a quantile over another tier's runs.
+    expect(budgetOf(cfg, "high")).toEqual({ ms: 90_000, basis: "floor", samples: 0 });
+  });
+
+  it("below the sample floor the tier falls back to the legacy window and reports its basis honestly", () => {
+    const cfg = cfgWithTiers();
+    recordOn(cfg, null, [300_000, 310_000, 320_000, 330_000, 340_000, 350_000]);
+    recordOn(cfg, "high", [10_000, 11_000]);
+    // Two high runs are not a distribution, so the legacy window answers — and the basis says
+    // so: `history` with the legacy window's six samples, never a merge of the two.
+    expect(budgetOf(cfg, "high")).toEqual({ ms: 340_000, basis: "history", samples: 6 });
+  });
+
+  it("with no legacy window either, the fallback is still the flat figure", () => {
+    const cfg = cfgWithTiers();
+    recordOn(cfg, "high", [600_000, 600_000]);
+    expect(budgetOf(cfg, "high")).toEqual({ ms: 90_000, basis: "floor", samples: 0 });
+  });
+
+  it("the advisory `stats` column stays a per-lane aggregate across tiers", () => {
+    // The backlog entry says the column may still want the aggregate: one lane's runs under
+    // two tiers count once, in one column, while the budgets above stay separate.
+    const cfg = cfgWithTiers();
+    recordOn(cfg, "low", [10_000, 11_000]);
+    recordOn(cfg, "high", [20_000, 21_000, 22_000]);
+    const lane = buildDispatch(cfg, { tier: "low" }).ladder.find((l) => l.id === "slow");
+    expect(lane?.stats).toMatchObject({ calls: 5, successes: 5 });
   });
 });

@@ -76,15 +76,6 @@
   admission boundary, or a documented console-signal launcher) that runs the same shutdown path
   as `SIGTERM`, and the way this machine restarts the daemon uses it.
 
-- **The per-lane stats window is keyed by lane id ALONE, so one tier's runs set another tier's
-  walk budget (2026-09-08, safety review, medium).** `recordLaneRun` in
-  `src/dispatch-lane-stats.ts` keys by `report.laneId`, while `memoryKey` in
-  `src/lane-affinity.ts` is tier-keyed; since 2026-09-08 that window sets each lane's kill budget.
-  Not fixed with the rest of the review because it changes the persisted key space of
-  `dispatch-lane-stats.json`, and the advisory `stats` column may still want a per-lane aggregate.
-  **Property:** a lane's walk budget is derived only from runs on the ladder it will be used on;
-  an existing stats file still loads.
-
 - **Accept or decline the 26 triaged refusals** (owner-only; triaged 2026-09-09 in
   [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries every
   verdict pinned to its digest and the exact `accept`/`reject` commands). Nineteen accepts, six
@@ -94,19 +85,6 @@
   `propose`; only the owner may `accept`. **Property (what remains):** the owner has run, or
   declined by name, each listed command, so `llm-relay eligibility` shows no item without a
   verdict except item 1, whose pending state is the stated verdict.
-
-- **A slow `cli` lane is reordered on WALK EVIDENCE, not on a calibrated statistic** (owner
-  question 2026-09-05). Most of it shipped with the dispatch walk
-  ([`dispatch-lane-walk-design-2026-09-06.md`](dispatch-lane-walk-design-2026-09-06.md)):
-  `lane-affinity.ts` demotes, `DispatchView.order` reorders, and each lane's budget is its own p80
-  (`attemptBudget` in `dispatch.ts`). The demotion is still "the walk gave this lane its budget
-  and it did not answer", not an outlier test against the lane's own history, which needs samples
-  attributable in time. ⚠ Never point the HTTP path's numbers (250 ms/token, 30 s) at a lane.
-  **Property (what remains):** per-lane wall-clock history is attributable in time, and a lane
-  whose RECENT distribution is an outlier against its own earlier history is demoted on a threshold
-  calibrated from that history — with the calibration recorded the way the budget's 0.8 quantile
-  now is (live p80: 165 s, 224 s, 1383 s; chosen because p90/p95 saturate at the slowest lane's own
-  timeout).
 
 - **Route B is built; prove it live on this machine once the daemon runs the release that
   carries it** (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider,

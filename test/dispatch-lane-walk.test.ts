@@ -37,6 +37,9 @@ const WALK: DispatchWalkSettings = {
   // assertion depend on recorded history that these tests never write.
   attemptQuantile: 0.8,
   attemptMinSamples: 1000,
+  // The outlier rule reads recorded history these fixtures never write; off keeps the walk's
+  // timing the only thing under test here.
+  outlier: false,
   maxLanes: 4,
   pinMs: 60_000,
   demoteMs: 60_000,

@@ -1462,6 +1462,26 @@ lane most in need of bounding. p80 is the highest point still carrying informati
 any answer arrives, so there is no output token to normalise by — the same reason the request
 path's own per-token rung is inert when it decides whether to hedge.
 
+⚠ **The window is keyed by lane AND tier.** Each tier is its own ladder, so a lane's budget on
+`high` is derived only from its runs on `high`; runs on `low` never move it. A stats file written
+before tiering loads unchanged as tier-less rows, and a tier whose own window holds fewer than
+`attemptMinSamples` samples falls back to that tier-less window — never merging the two into one
+quantile — until its own samples pass the floor.
+
+**A lane whose RECENT runs are an outlier against its OWN history is demoted.** Every recorded run
+carries its timestamp, so "recent" is the tail of the window in time. When the median of the last
+`recentCount` runs (default 5) exceeds the p`historyQuantile` (default 0.8) of the earlier runs by
+more than `outlierFactor` (default 7.6), the lane is demoted through the same entry the walk's own
+missed-budget demotion uses, with a reason naming both figures and the factor. Both halves need at
+least `attemptMinSamples` runs or the rule is silent — too little history is no opinion, never
+"slow". `routing.dispatchWalk.outlier: false` makes the rule inert; the object form takes
+`recentCount`, `historyQuantile` and `outlierFactor`, each validated by name. The 7.6 default was
+fit by `scripts/calibrate-lane-outlier.mjs` from this machine's own lane history (2026-09-09: the
+pooled p95 of recent-median / history-p80 ratios across the three lanes with enough history); a
+healthy lane here swings several-fold between runs, so a smaller factor would demote on ordinary
+wobble. Re-run the script as history accumulates; no HTTP-path number (250 ms/token, a 30 s
+ceiling) is ever pointed at a lane.
+
 ⚠ **A pin promotes; it never resurrects.** A pinned lane that is exhausted, disabled, unreachable
 or not servable is still not selected — the pin only reorders lanes that were already selectable.
 

@@ -36,6 +36,7 @@ import {
   DEFAULT_MCP_MAX_WAIT_MS,
   EFFORT_LEVELS,
   type CliLaneTemplate,
+  type DispatchWalkOutlierSettings,
   type DispatchWalkSettings,
   type EffortLevel,
   type HedgeConfig,
@@ -341,6 +342,19 @@ function parseLaneProbe(raw: unknown): LaneProbeSettings {
  * several sessions' traffic, which is exactly why `docs/backlog.md` still carries the calibration
  * as open work.
  */
+// ⚠ Literals mirroring `DEFAULT_OUTLIER_RECENT_COUNT` / `DEFAULT_OUTLIER_HISTORY_QUANTILE` /
+// `DEFAULT_OUTLIER_FACTOR` in `lane-affinity.ts` (5 / 0.8 / 7.6 — the factor calibrated by
+// `scripts/calibrate-lane-outlier.mjs` on 2026-09-09, pooled p95 7.57 over 155 ratios; the
+// figures and the band are recorded beside that constant). This module imports
+// `config-types.js` and `spec.js` and NOTHING else (the leaf rule, pinned by a test), so the
+// numbers are hand-copied here rather than imported; `test/lane-affinity.test.ts` pins the two
+// sides together, so drift fails loudly instead of silently moving the demotion threshold.
+export const DEFAULT_DISPATCH_WALK_OUTLIER: DispatchWalkOutlierSettings = {
+  recentCount: 5,
+  historyQuantile: 0.8,
+  outlierFactor: 7.6,
+};
+
 export const DEFAULT_DISPATCH_WALK: DispatchWalkSettings = {
   enabled: true,
   attemptMs: 90_000,
@@ -349,6 +363,7 @@ export const DEFAULT_DISPATCH_WALK: DispatchWalkSettings = {
   maxLanes: 4,
   pinMs: 15 * 60 * 1000,
   demoteMs: 15 * 60 * 1000,
+  outlier: { ...DEFAULT_DISPATCH_WALK_OUTLIER },
 };
 
 /**
@@ -363,7 +378,7 @@ function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
     throw new Error(`config.routing.dispatchWalk must be a boolean or an object`);
   }
   const o = raw as Record<string, unknown>;
-  const keys = ["enabled", "attemptMs", "attemptQuantile", "attemptMinSamples", "maxLanes", "pinMs", "demoteMs"] as const;
+  const keys = ["enabled", "attemptMs", "attemptQuantile", "attemptMinSamples", "maxLanes", "pinMs", "demoteMs", "outlier"] as const;
   for (const key of Object.keys(o)) {
     if (!(keys as readonly string[]).includes(key)) {
       throw new Error(`config.routing.dispatchWalk.${key} is not a recognized key (${keys.join(", ")})`);
@@ -404,7 +419,61 @@ function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
     maxLanes: bounded("maxLanes", o.maxLanes, DEFAULT_DISPATCH_WALK.maxLanes, 1, 20),
     pinMs: bounded("pinMs", o.pinMs, DEFAULT_DISPATCH_WALK.pinMs, 0, 6 * 60 * 60 * 1000),
     demoteMs: bounded("demoteMs", o.demoteMs, DEFAULT_DISPATCH_WALK.demoteMs, 0, 6 * 60 * 60 * 1000),
+    outlier: parseDispatchWalkOutlier(o.outlier),
   };
+}
+
+/**
+ * Absent ⇒ the defaults (ON). `false` makes the rule inert. An object overrides per key.
+ * Anything else — including `true`, which is neither `false` nor an object — is a hard error
+ * naming the key: the declared type is `false | {...}`, and silently reading `true` as
+ * "defaults" would invent a third member (the closed-union gotcha in CLAUDE.md). Unknown
+ * keys and out-of-range values are hard errors for the same reason an ignored typo here
+ * would read as a setting that took effect while changing nothing.
+ */
+/**
+ * `false` is the operator's own spelling for "off" and stays `false` on the settings (the
+ * `recordLaneOutlier` caller reads it as inert); everything else is the object form parsed below.
+ * One typed return, so the union is stated once rather than assembled from two return sites.
+ */
+function parseDispatchWalkOutlier(raw: unknown): DispatchWalkSettings["outlier"] {
+  const parsed: DispatchWalkSettings["outlier"] = raw === false ? false : parseDispatchWalkOutlierObject(raw);
+  return parsed;
+}
+
+function parseDispatchWalkOutlierObject(raw: unknown): DispatchWalkOutlierSettings {
+  if (raw === undefined) return { ...DEFAULT_DISPATCH_WALK_OUTLIER };
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config.routing.dispatchWalk.outlier must be false or an object`);
+  }
+  const o = raw as Record<string, unknown>;
+  const keys = ["recentCount", "historyQuantile", "outlierFactor"] as const;
+  for (const key of Object.keys(o)) {
+    if (!(keys as readonly string[]).includes(key)) {
+      throw new Error(`config.routing.dispatchWalk.outlier.${key} is not a recognized key (${keys.join(", ")})`);
+    }
+  }
+  const d = DEFAULT_DISPATCH_WALK_OUTLIER;
+  const recentCount = o.recentCount;
+  if (recentCount !== undefined && (typeof recentCount !== "number" || !Number.isInteger(recentCount) || recentCount < 1 || recentCount > 100)) {
+    throw new Error(`config.routing.dispatchWalk.outlier.recentCount must be an integer between 1 and 100`);
+  }
+  const historyQuantile = o.historyQuantile;
+  if (historyQuantile !== undefined && (typeof historyQuantile !== "number" || !Number.isFinite(historyQuantile) || historyQuantile <= 0 || historyQuantile >= 1)) {
+    throw new Error(`config.routing.dispatchWalk.outlier.historyQuantile must be a number greater than 0 and less than 1`);
+  }
+  const outlierFactor = o.outlierFactor;
+  if (outlierFactor !== undefined && (typeof outlierFactor !== "number" || !Number.isFinite(outlierFactor) || outlierFactor <= 1 || outlierFactor > 100)) {
+    throw new Error(`config.routing.dispatchWalk.outlier.outlierFactor must be a number greater than 1 and at most 100`);
+  }
+  // Annotated, so a new key on `DispatchWalkOutlierSettings` is a compile error HERE —
+  // the parser must decide how it loads, not silently drop it.
+  const parsed: DispatchWalkOutlierSettings = {
+    recentCount: recentCount ?? d.recentCount,
+    historyQuantile: historyQuantile ?? d.historyQuantile,
+    outlierFactor: outlierFactor ?? d.outlierFactor,
+  };
+  return parsed;
 }
 
 function parseSticky(raw: unknown): StickyRoutingConfig | undefined {

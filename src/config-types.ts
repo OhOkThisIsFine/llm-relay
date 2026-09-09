@@ -716,6 +716,35 @@ export interface DispatchWalkSettings {
   pinMs: number;
   /** How long a lane the walk abandoned is ordered behind undemoted lanes. */
   demoteMs: number;
+  /**
+   * Recent-versus-earlier outlier demotion (backlog item 9): demote a lane whose recent runs
+   * are an outlier against its OWN earlier history, on a threshold calibrated from that
+   * history (`scripts/calibrate-lane-outlier.mjs`, defaults in `lane-affinity.ts`).
+   * Default ON; `false` makes the rule inert while rows still carry their timestamps.
+   */
+  outlier: false | DispatchWalkOutlierSettings;
+}
+
+/**
+ * Automatic dispatch outlier-demotion settings — see the `outlier` field doc on
+ * `DispatchWalkSettings`.
+ */
+export interface DispatchWalkOutlierSettings {
+  /**
+   * How many of the window's most recent samples form the "recent" half of the comparison.
+   * Default 5. Both halves need at least `attemptMinSamples` samples or the rule is silent.
+   */
+  recentCount: number;
+  /**
+   * Which point of the EARLIER window the recent median is judged against — the budget's own
+   * quantile by default (0.8), for the reason its field doc states. Strictly inside (0, 1).
+   */
+  historyQuantile: number;
+  /**
+   * How far above the earlier quantile the recent median must sit to demote. Default 2.5
+   * (calibrated — see `DEFAULT_OUTLIER_FACTOR` in `lane-affinity.ts`). Greater than 1.
+   */
+  outlierFactor: number;
 }
 
 /** `llm-relay mcp` settings — see the `mcp` field doc on `Routing`. */

@@ -20,9 +20,13 @@ import { loadConfig, type Config } from "../src/config.js";
 import { buildDispatch, markExhausted } from "../src/dispatch.js";
 import {
   DEFAULT_DEMOTE_MS,
+  DEFAULT_OUTLIER_FACTOR,
+  DEFAULT_OUTLIER_HISTORY_QUANTILE,
+  DEFAULT_OUTLIER_RECENT_COUNT,
   LANE_AFFINITY_DEFAULT_TTL_MS,
   LANE_AFFINITY_KINDS,
   MAX_AFFINITY_MS,
+  checkLaneOutlier,
   clearLaneAffinity,
   demoteLane,
   exportLaneAffinityRows,
@@ -31,12 +35,15 @@ import {
   laneDemotion,
   lanePin,
   loadLaneAffinityRows,
+  outlierDemotionReason,
   pinLane,
+  recordLaneOutlier,
   restoreLaneAffinityRows,
   saveLaneAffinityRows,
   type LaneAffinityKind,
   type LaneAffinityRow,
 } from "../src/lane-affinity.js";
+import { DEFAULT_DISPATCH_WALK_OUTLIER } from "../src/config/routing-parser.js";
 
 const dir = mkdtempSync(join(tmpdir(), "llm-relay-lane-affinity-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -436,5 +443,85 @@ describe("the per-kind default window has one total owner", () => {
     // person to add a kind cannot reintroduce the per-kind branch.
     const text = readFileSync(join(__dirname, "..", "src", "lane-affinity.ts"), "utf8");
     expect(text).toMatch(/satisfies Record<LaneAffinityKind,/);
+  });
+});
+
+describe("recent-versus-earlier outlier demotion (backlog item 9)", () => {
+  const SETTINGS = {
+    recentCount: 5,
+    historyQuantile: 0.8,
+    outlierFactor: 2.5,
+    minSamples: 5,
+  };
+  /** Twenty 100 s runs, then five 600 s runs — a lane that fell off a cliff. */
+  const CLIFF = [...new Array<number>(20).fill(100_000), ...new Array<number>(5).fill(600_000)];
+
+  it("demotes a lane whose recent median exceeds its own history p80 by the factor, naming both figures", () => {
+    const hit = checkLaneOutlier(CLIFF, SETTINGS);
+    expect(hit).not.toBeNull();
+    expect(hit).toMatchObject({ recentMedianMs: 600_000, historyMs: 100_000 });
+    const reason = outlierDemotionReason(hit!, {
+      historyQuantile: SETTINGS.historyQuantile,
+      outlierFactor: SETTINGS.outlierFactor,
+    });
+    expect(reason).toContain("600 s");
+    expect(reason).toContain("100 s");
+  });
+
+  it("records the demotion through the shared entry, on the same tier and window", () => {
+    const cfg = freshConfig();
+    const now = 1_700_000_000_000;
+    const reason = recordLaneOutlier(cfg, "medium", "second", CLIFF, { ...SETTINGS }, { minSamples: SETTINGS.minSamples, demoteMs: 60_000 }, now);
+    expect(reason).not.toBeNull();
+    expect(laneDemotion(cfg, "medium", "second", now)?.reason).toBe(reason);
+    // Another tier is another ladder: it learned nothing about `xhigh`.
+    expect(laneDemotion(cfg, "xhigh", "second", now)).toBeNull();
+  });
+
+  it("is silent when the history half is too thin — unmeasured is no opinion", () => {
+    // The same five slow recent runs, but only three earlier ones: no distribution to judge by.
+    const thin = [...new Array<number>(3).fill(100_000), ...new Array<number>(5).fill(600_000)];
+    expect(checkLaneOutlier(thin, SETTINGS)).toBeNull();
+    const cfg = freshConfig();
+    expect(recordLaneOutlier(cfg, null, "first", thin, { ...SETTINGS }, { minSamples: SETTINGS.minSamples, demoteMs: 60_000 })).toBeNull();
+    expect(laneDemotion(cfg, null, "first")).toBeNull();
+  });
+
+  it("`outlier: false` makes the rule inert and leaves the pin alone", () => {
+    const cfg = freshConfig();
+    const now = 1_700_000_000_000;
+    pinLane(cfg, null, "first", "answered in 2s", 60_000, now);
+    expect(recordLaneOutlier(cfg, null, "first", CLIFF, false, { minSamples: SETTINGS.minSamples, demoteMs: 60_000 }, now)).toBeNull();
+    expect(laneDemotion(cfg, null, "first", now)).toBeNull();
+    expect(lanePin(cfg, null, "first", now)?.reason).toBe("answered in 2s");
+  });
+
+  it("a demotion here retracts an existing pin, through the shared entry", () => {
+    // The walk demotion already retracts the pin this way (`recordLaneAffinity` clears first);
+    // the outlier demotion goes through the same entry, so a lane that answered and THEN slowed
+    // does not keep a stale pin beside its demotion.
+    const cfg = freshConfig();
+    const now = 1_700_000_000_000;
+    pinLane(cfg, null, "first", "answered in 2s", 60_000, now);
+    recordLaneOutlier(cfg, null, "first", CLIFF, { ...SETTINGS }, { minSamples: SETTINGS.minSamples, demoteMs: 60_000 }, now);
+    expect(lanePin(cfg, null, "first", now)).toBeNull();
+    expect(laneDemotion(cfg, null, "first", now)).not.toBeNull();
+  });
+
+  it("a steady lane is not an outlier — the recent median sits inside its own history", () => {
+    const steady = [...new Array<number>(20).fill(100_000), ...new Array<number>(5).fill(110_000)];
+    expect(checkLaneOutlier(steady, SETTINGS)).toBeNull();
+  });
+
+  it("the parser default and the rule default are one number, pinned together", () => {
+    // `routing-parser.ts` is a leaf (it imports `config-types.js` and `spec.js` and nothing
+    // else), so the outlier defaults are hand-copied there rather than imported — and a
+    // hand-copied number drifts silently. This pins the two sides together: changing one
+    // without the other fails here, not in production as a halved demotion threshold.
+    expect(DEFAULT_DISPATCH_WALK_OUTLIER).toEqual({
+      recentCount: DEFAULT_OUTLIER_RECENT_COUNT,
+      historyQuantile: DEFAULT_OUTLIER_HISTORY_QUANTILE,
+      outlierFactor: DEFAULT_OUTLIER_FACTOR,
+    });
   });
 });
