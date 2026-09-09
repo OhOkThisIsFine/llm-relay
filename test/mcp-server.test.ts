@@ -536,6 +536,132 @@ describe("async job path", () => {
   });
 });
 
+/**
+ * The `dispatch` waitMs ceiling, `routing.mcp.maxWaitMs` (packet P8, 2026-09-09) — the server
+ * half of the machine-wide job-handle-loss defect. An MCP host tool call fails between 45 s
+ * and 100 s and destroys the job handle, so `dispatch` blocks at most the ceiling (40 s by
+ * default), clamps a larger `waitMs` and announces it, and refuses a `waitMs` it cannot
+ * honour at all. Uses the injected spawner and fake timers throughout; never real sleeps.
+ */
+describe("dispatch waitMs ceiling (routing.mcp.maxWaitMs)", () => {
+  /** A lane that never settles, so the blocking wait — not the lane — decides when we hear back. */
+  function neverSettlingSpawner(): LaneSpawner {
+    return () => ({ result: new Promise<LaneRunResult>(() => {}), kill: () => {} });
+  }
+
+  function ceilingConfig(maxWaitMs: number): Partial<McpServerDeps> {
+    return {
+      config: { host: "127.0.0.1", port: 8791, routing: { mcp: { maxWaitMs } } } as unknown as Config,
+    };
+  }
+
+  it("clamps a waitMs above the ceiling and announces the clamp on its own line", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = new Harness({ spawn: neverSettlingSpawner() });
+      let settled = false;
+      const call = h.tool("dispatch", { task: "x", waitMs: 60000 }).then((r) => {
+        settled = true;
+        return r;
+      });
+      // The ceiling answers at 40 s; the requested 60 s would still be blocking.
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(settled).toBe(true);
+      const { text, isError } = await call;
+      expect(isError).toBe(false);
+      expect(text).toMatch(/jobId "job-\d+"/);
+      expect(text).toContain("waited 40 s (waitMs 60000 clamped to routing.mcp.maxWaitMs 40000)");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honours a waitMs at or below the ceiling exactly, byte-for-byte the old text", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = new Harness({ spawn: neverSettlingSpawner() });
+      const call = h.tool("dispatch", { task: "x", waitMs: 5000 });
+      await vi.advanceTimersByTimeAsync(5000);
+      const { text, isError } = await call;
+      expect(isError).toBe(false);
+      expect(text).toContain("Still running after 5s.");
+      expect(text).not.toContain("clamped");
+      expect(text).not.toContain("maxWaitMs");
+      const jobId = /job: (job-\d+)/.exec(text)?.[1] as string;
+      expect(text).toContain(`Poll dispatch_status with jobId "${jobId}", then call dispatch_result.`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits the ceiling — not the old 60 s default — when waitMs is absent", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = new Harness({ spawn: neverSettlingSpawner() });
+      let settled = false;
+      const call = h.tool("dispatch", { task: "x" }).then((r) => {
+        settled = true;
+        return r;
+      });
+      await vi.advanceTimersByTimeAsync(39_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      const { text } = await call;
+      expect(text).toContain("Still running after 40s.");
+      expect(text).not.toContain("clamped");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses a waitMs the server cannot honour, naming the ceiling", async () => {
+    // The lane answers at once here, so a refusal — which happens before any spawn — is the
+    // only way these calls can come back as errors.
+    const h = new Harness();
+    for (const bad of [-1, 0]) {
+      const { text, isError } = await h.tool("dispatch", { task: "x", waitMs: bad });
+      expect(isError, String(bad)).toBe(true);
+      expect(text, String(bad)).toContain("routing.mcp.maxWaitMs");
+    }
+  });
+
+  it("a configured maxWaitMs moves the ceiling for the clamp and the default", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = new Harness({ spawn: neverSettlingSpawner(), ...ceilingConfig(10_000) });
+      const clamped = h.tool("dispatch", { task: "x", waitMs: 60000 });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect((await clamped).text).toContain(
+        "waited 10 s (waitMs 60000 clamped to routing.mcp.maxWaitMs 10000)",
+      );
+      let settled = false;
+      const dflt = h.tool("dispatch", { task: "x" }).then((r) => {
+        settled = true;
+        return r;
+      });
+      await vi.advanceTimersByTimeAsync(9999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect((await dflt).text).toContain("Still running after 10s.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the tool description names the ceiling's config key, not a literal", async () => {
+    const h = new Harness();
+    const res = await h.request("tools/list");
+    const tools = (res["result"] as { tools: { name: string; description: string; inputSchema: { properties: Record<string, { description?: string }> } }[] }).tools;
+    const dispatch = tools.find((t) => t.name === "dispatch");
+    const waitMsDesc = dispatch?.inputSchema.properties["waitMs"]?.description ?? "";
+    expect(waitMsDesc).toContain("routing.mcp.maxWaitMs");
+    expect(waitMsDesc).not.toContain("40000");
+    expect(dispatch?.description).toContain("routing.mcp.maxWaitMs");
+  });
+});
+
 describe("dispatch_lanes", () => {
   it("renders the ladder with each lane's state", async () => {
     const h = new Harness({

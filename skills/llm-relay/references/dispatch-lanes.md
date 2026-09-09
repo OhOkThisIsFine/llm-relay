@@ -108,7 +108,8 @@ dispatch(task: "...", lane: "agy-gemini")     -> force one rung
 dispatch(task: "...", mode: "answer")         -> no harness — a direct call, for speed
 ```
 
-If the lane outlives `waitMs` (default 60 s) you get a `jobId` instead. Then:
+If the lane outlives the wait (`routing.mcp.maxWaitMs`, default 40 s; a larger `waitMs` is
+clamped to it and the reply says so) you get a `jobId` instead. Then:
 `dispatch_status(jobId)` -> `dispatch_result(jobId)`, and `dispatch_cancel(jobId)` to stop it.
 `dispatch_lanes()` shows the ladder if you want to choose deliberately.
 

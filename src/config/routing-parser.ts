@@ -33,6 +33,7 @@
  */
 
 import {
+  DEFAULT_MCP_MAX_WAIT_MS,
   EFFORT_LEVELS,
   type CliLaneTemplate,
   type DispatchWalkSettings,
@@ -250,6 +251,11 @@ export function parseRouting(
 /**
  * Absent ⇒ every default. An unknown key is a hard error naming it (the `laneProbe` and `compat`
  * precedent: an ignored typo reads as a setting that took effect while bounding nothing).
+ *
+ * `maxWaitMs` is the ceiling on one `dispatch` tool call's blocking wait. It must be a positive
+ * INTEGER: 0 or a negative bounds nothing, a fraction is not a whole millisecond, and a string
+ * is never a duration even when it spells one. Absent fills the default rather than staying
+ * absent, so a present-but-silent block still declares the ceiling the server enforces.
  */
 function parseMcpSettings(raw: unknown): McpSettings | undefined {
   if (raw === undefined || raw === null) return undefined;
@@ -258,15 +264,25 @@ function parseMcpSettings(raw: unknown): McpSettings | undefined {
   }
   const o = raw as Record<string, unknown>;
   for (const key of Object.keys(o)) {
-    if (key !== "allowedRoots") {
-      throw new Error(`config.routing.mcp.${key} is not a recognized key (allowedRoots)`);
+    if (key !== "allowedRoots" && key !== "maxWaitMs") {
+      throw new Error(`config.routing.mcp.${key} is not a recognized key (allowedRoots, maxWaitMs)`);
     }
   }
-  if (o.allowedRoots === undefined) return {};
-  if (!Array.isArray(o.allowedRoots) || o.allowedRoots.some((r) => typeof r !== "string" || r.length === 0)) {
-    throw new Error(`config.routing.mcp.allowedRoots must be an array of non-empty strings`);
+  const out: McpSettings = {};
+  if (o.allowedRoots !== undefined) {
+    if (!Array.isArray(o.allowedRoots) || o.allowedRoots.some((r) => typeof r !== "string" || r.length === 0)) {
+      throw new Error(`config.routing.mcp.allowedRoots must be an array of non-empty strings`);
+    }
+    out.allowedRoots = [...(o.allowedRoots as string[])];
   }
-  return { allowedRoots: [...(o.allowedRoots as string[])] };
+  if (o.maxWaitMs === undefined) {
+    out.maxWaitMs = DEFAULT_MCP_MAX_WAIT_MS;
+  } else if (typeof o.maxWaitMs !== "number" || !Number.isInteger(o.maxWaitMs) || o.maxWaitMs <= 0) {
+    throw new Error(`config.routing.mcp.maxWaitMs must be a positive integer (milliseconds)`);
+  } else {
+    out.maxWaitMs = o.maxWaitMs;
+  }
+  return out;
 }
 
 export const DEFAULT_LANE_PROBE: LaneProbeSettings = {

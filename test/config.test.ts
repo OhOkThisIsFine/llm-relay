@@ -1892,3 +1892,52 @@ describe("loadConfig — routing.hedge", () => {
     );
   });
 });
+
+/**
+ * `routing.mcp.maxWaitMs` (packet P8, 2026-09-09) — the server half of the machine-wide
+ * `dispatch`-loses-the-job defect: an MCP host tool call fails between 45 s and 100 s and
+ * destroys the job handle above that, so `dispatch` must never block past a ceiling 5 s under
+ * the lowest measured host failure. What the file is allowed to say is pinned here; what the
+ * server DOES with the ceiling is pinned in test/mcp-server.test.ts.
+ */
+describe("loadConfig — routing.mcp.maxWaitMs", () => {
+  function mcpCfg(mcp: unknown) {
+    return base({ routing: { default: "nim/z-ai/glm-5.2", mcp } });
+  }
+
+  it("defaults to 40000 when the block is present but silent, and stays absent when absent", () => {
+    expect(loadConfig(write("mcp-maxwait-absent.json", base())).routing.mcp).toBeUndefined();
+    expect(loadConfig(write("mcp-maxwait-empty.json", mcpCfg({}))).routing.mcp).toEqual({
+      maxWaitMs: 40_000,
+    });
+  });
+
+  it("keeps an explicit value", () => {
+    expect(
+      loadConfig(write("mcp-maxwait-set.json", mcpCfg({ maxWaitMs: 10_000 }))).routing.mcp,
+    ).toEqual({ maxWaitMs: 10_000 });
+  });
+
+  it("keeps allowedRoots beside the defaulted ceiling", () => {
+    expect(
+      loadConfig(write("mcp-maxwait-roots.json", mcpCfg({ allowedRoots: ["C:/Code"] }))).routing.mcp,
+    ).toEqual({ allowedRoots: ["C:/Code"], maxWaitMs: 40_000 });
+  });
+
+  it("refuses 0, -1, 1.5 and \"40000\" by name — none of them bounds the blocking wait", () => {
+    // 0/negative bounds nothing, 1.5 is not a whole millisecond, and a string is never a
+    // duration even when it spells one — each must fail loudly naming the key, never load as a
+    // ceiling the server then trusts.
+    for (const bad of [0, -1, 1.5, "40000"]) {
+      expect(
+        () => loadConfig(write(`mcp-maxwait-bad-${String(bad)}.json`, mcpCfg({ maxWaitMs: bad }))),
+      ).toThrow(/routing\.mcp\.maxWaitMs/);
+    }
+  });
+
+  it("still refuses an unknown key under routing.mcp by name", () => {
+    expect(() => loadConfig(write("mcp-maxwait-typo.json", mcpCfg({ maxwaitms: 10_000 })))).toThrow(
+      /routing\.mcp\.maxwaitms is not a recognized key/,
+    );
+  });
+});

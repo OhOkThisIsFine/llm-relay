@@ -42,16 +42,6 @@ export const DEFAULT_MAX_DEPTH = 3;
 /** Hard ceiling on captured lane output, so one runaway lane cannot exhaust memory. */
 export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-/**
- * How long `dispatch` waits before it stops blocking and hands back a job handle instead.
- *
- * Chosen BELOW a typical MCP client tool timeout on purpose: a fast lane answers in one call, and
- * a slow one degrades to polling automatically rather than failing. That is the behaviour the
- * Tasks extension would give us natively — see `docs/mcp-dispatch-prior-art-2026-08-30.md` §3.1 for
- * why we cannot use it yet.
- */
-export const DEFAULT_WAIT_MS = 60_000;
-
 /** Ceiling on one lane run. agy's own `--print-timeout` convention here is 30 minutes. */
 export const DEFAULT_LANE_TIMEOUT_MS = 30 * 60 * 1000;
 

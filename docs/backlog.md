@@ -116,14 +116,6 @@
   now is (live p80: 165 s, 224 s, 1383 s; chosen because p90/p95 saturate at the slowest lane's own
   timeout).
 
-- **`dispatch` loses the job when `waitMs` exceeds the host's tool-call timeout — the SERVER
-  half.** The item is MACHINE-WIDE and is the first entry of `C:\Code\docs\backlog.md`; it is
-  here only because `src/mcp/server.ts` decides what `dispatch` returns and what the `waitMs`
-  ceiling is. **Property (this repository's half):** the server either returns a pollable job id
-  whatever `waitMs` says, or refuses a `waitMs` it cannot honour and states the ceiling it
-  accepts. Do not restate the host half here; keep it in the machine backlog, which is where every
-  other host that hits it will look.
-
 - **Muse Spark 1.3 — and every Responses-only OpenCode Zen SKU — is unreachable through the
   relay, because no upstream speaks the OpenAI Responses API.** Zen serves the contributor SKUs
   on `/zen/v1/responses` only (measured 2026-09-04,

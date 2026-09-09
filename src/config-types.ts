@@ -699,5 +699,22 @@ export interface McpSettings {
    * to narrow it is the operator's decision to record here, not this file's to assume.
    */
   allowedRoots?: string[];
+  /**
+   * Ceiling (ms) on how long one `dispatch` tool call blocks before handing back a pollable job
+   * id. A `waitMs` above it is clamped to it (and the clamp announced); a non-positive,
+   * non-finite or non-numeric `waitMs` is refused. Absent ⇒ `DEFAULT_MCP_MAX_WAIT_MS`.
+   */
+  maxWaitMs?: number;
 }
 
+/**
+ * Default `routing.mcp.maxWaitMs` — the longest one `dispatch` tool call blocks before handing
+ * back a job id to poll.
+ *
+ * 5 s under the lowest measured MCP host tool-call failure on this machine (45 s): above that
+ * ceiling the host fails the call AND destroys the job handle, so a caller that passes nothing
+ * already waits past the point of no return. The default sits below the floor rather than on
+ * it, and the tool description names the config key rather than this figure so an operator
+ * override never leaves the text stale.
+ */
+export const DEFAULT_MCP_MAX_WAIT_MS = 40_000;

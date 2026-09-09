@@ -21,6 +21,7 @@
  * discipline as `lane-quota-probe.ts` and `availability-snapshot.ts`.
  */
 import type { Config } from "../config.js";
+import { DEFAULT_MCP_MAX_WAIT_MS } from "../config-types.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
@@ -30,7 +31,6 @@ import type { DispatchedTelemetryReport, DispatchLaneStatus } from "../dispatch-
 import {
   DEFAULT_LANE_TIMEOUT_MS,
   DEFAULT_MAX_DEPTH,
-  DEFAULT_WAIT_MS,
   DEPTH_ENV,
   EMPTY_OUTPUT_REASON,
   LaneJobStore,
@@ -182,7 +182,9 @@ const TOOLS: ToolDefinition[] = [
       "not answer inside its budget is stopped and the next one is started, and the lane that " +
       "answers is preferred next time. Runs the lane correctly — working directory, " +
       "environment and idle timeouts are handled here, so you never build a command line. If the " +
-      "lane is still running after waitMs, returns a jobId to poll with dispatch_status. In Codex " +
+      "lane is still running, returns a jobId to poll with dispatch_status — it blocks at most " +
+      "routing.mcp.maxWaitMs first, so a slow lane degrades to polling instead of hitting the " +
+      "host's tool timeout. In Codex " +
       "Desktop, use this instead of a pool/* collaboration child, which the ChatGPT launcher " +
       "rejects before the custom provider or relay is reached. Set mode to \"answer\" for a " +
       "question, draft, summary, or second opinion that needs no file access — it posts straight " +
@@ -234,7 +236,9 @@ const TOOLS: ToolDefinition[] = [
         },
         waitMs: {
           type: "number",
-          description: `How long to block before returning a jobId instead (default ${DEFAULT_WAIT_MS}).`,
+          description:
+            "How long to block before returning a jobId instead (default routing.mcp.maxWaitMs; " +
+            "a larger waitMs is clamped to that ceiling and the clamp is announced in the reply).",
         },
         timeoutMs: {
           type: "number",
@@ -313,6 +317,38 @@ function readNumber(params: Record<string, unknown>, key: string): number | unde
 /** Any value other than exactly `"answer"` — including absence, garbage, or `"agent"` — is agent mode. */
 function readMode(params: Record<string, unknown>): "agent" | "answer" {
   return params["mode"] === "answer" ? "answer" : "agent";
+}
+
+/**
+ * What one `dispatch` call may block for, decided in exactly one place.
+ *
+ * An MCP host tool call fails between 45 s and 100 s on this machine and destroys the job
+ * handle above that, so no call may block past `routing.mcp.maxWaitMs` (the `ceiling`): absent
+ * waits the full ceiling, a larger `waitMs` is clamped to it (and `awaitOrPoll` announces the
+ * clamp), and a `waitMs` the server cannot honour at all — negative, zero, non-finite, or not
+ * a number — is a `refusal`, the property's second branch. The union is narrowed with `in`
+ * at the one call site, never an unconditional `else` resolving to a wait.
+ */
+export type ResolvedWaitMs = { waitMs: number; clamped: boolean; requested: number } | { refusal: string };
+
+export function resolveWaitMs(requested: unknown, ceiling: number): ResolvedWaitMs {
+  if (requested === undefined || requested === null) {
+    return { waitMs: ceiling, clamped: false, requested: ceiling };
+  }
+  if (typeof requested !== "number" || !Number.isFinite(requested) || requested <= 0) {
+    const seen = typeof requested === "string" ? JSON.stringify(requested) : String(requested);
+    return {
+      refusal:
+        `dispatch refused: waitMs must be a positive finite number of milliseconds (got ${seen}). ` +
+        `The blocking wait is bounded by routing.mcp.maxWaitMs (currently ${ceiling} ms): omit ` +
+        `waitMs to wait the full ceiling, or pass a smaller one — a larger one is clamped to the ` +
+        `ceiling and the clamp is announced.`,
+    };
+  }
+  if (requested > ceiling) {
+    return { waitMs: ceiling, clamped: true, requested };
+  }
+  return { waitMs: requested, clamped: false, requested };
 }
 
 /** A JSON Schema object for `schema`. Arrays and `null` are not schemas, so both are declined. */
@@ -840,7 +876,15 @@ export class McpDispatchServer {
       enabled: walk !== null,
       lanesNotTried: Math.max(0, order.length - ordered.length),
     });
-    const waitMs = readNumber(args, "waitMs") ?? DEFAULT_WAIT_MS;
+    // ⚠ The blocking wait is bounded by the host's tool-call ceiling, never by the caller's
+    // ask alone: above ~45 s the host fails the call AND destroys the job handle. `?.` on
+    // `routing` for the same partial-config reason the walk lookup states above; an absent
+    // ceiling means the default.
+    const ceiling = this.deps.config.routing?.mcp?.maxWaitMs ?? DEFAULT_MCP_MAX_WAIT_MS;
+    const waitMs = resolveWaitMs(args["waitMs"], ceiling);
+    // A `waitMs` the server cannot honour is refused BEFORE anything spawns — the refusal must
+    // cost no lane run, exactly like the recursion bound above.
+    if ("refusal" in waitMs) return textResult(waitMs.refusal, true);
     // ⚠ A walk must ALWAYS leave the job terminal. `runWalk` is written not to reject — every
     // failure a lane can produce is an attempt — but the worst outcome available here is a caller
     // polling a handle that can never settle, so an unexpected throw is caught and turned into a
@@ -849,7 +893,12 @@ export class McpDispatchServer {
       this.jobs.fail(job.id, `dispatch walk failed: ${e.message}`);
       return "done" as const;
     });
-    return this.awaitOrPoll(job.id, settled, waitMs);
+    return this.awaitOrPoll(
+      job.id,
+      settled,
+      waitMs.waitMs,
+      waitMs.clamped ? { requested: waitMs.requested, ceiling } : undefined,
+    );
   }
 
   /**
@@ -1257,12 +1306,22 @@ export class McpDispatchServer {
   }
 
   /**
-   * Block for `waitMs`, then hand back a job handle. A fast lane therefore costs ONE call, and a
-   * slow one degrades to polling instead of hitting the client's tool timeout. Shared by both
-   * dispatch modes so there is exactly one wait/poll/render policy — the "two paths, one policy"
-   * shape this repo's own history warns against.
+   * Block for the resolved `waitMs`, then hand back a job handle. A fast lane therefore costs
+   * ONE call, and a slow one degrades to polling instead of hitting the client's tool timeout.
+   * Shared by both dispatch modes so there is exactly one wait/poll/render policy — the "two
+   * paths, one policy" shape this repo's own history warns against.
+   *
+   * When the caller's `waitMs` was clamped to the ceiling, `clamp` carries the ask and the
+   * ceiling and the reply announces it on its own line — the SAME code path that renders
+   * "Still running after N s", so the announcement can never drift from the wait it explains.
+   * Without a clamp the text below is byte-for-byte what it always was.
    */
-  private async awaitOrPoll(jobId: string, settled: Promise<"done">, waitMs: number): Promise<unknown> {
+  private async awaitOrPoll(
+    jobId: string,
+    settled: Promise<"done">,
+    waitMs: number,
+    clamp?: { requested: number; ceiling: number },
+  ): Promise<unknown> {
     const raced = await Promise.race([
       settled,
       new Promise<"pending">((resolve) => {
@@ -1275,8 +1334,13 @@ export class McpDispatchServer {
     const current = this.jobs.get(jobId);
     if (!current) return textResult(`unknown jobId: ${jobId}`, true);
     if (raced === "pending") {
+      const waitedS = Math.round(waitMs / 1000);
+      const announcement =
+        clamp === undefined
+          ? ""
+          : `waited ${waitedS} s (waitMs ${clamp.requested} clamped to routing.mcp.maxWaitMs ${clamp.ceiling})\n`;
       return textResult(
-        `${describeJob(current, this.now())}\n\nStill running after ${Math.round(waitMs / 1000)}s. ` +
+        `${describeJob(current, this.now())}\n\n${announcement}Still running after ${waitedS}s. ` +
           `Poll dispatch_status with jobId "${jobId}", then call dispatch_result.`,
       );
     }

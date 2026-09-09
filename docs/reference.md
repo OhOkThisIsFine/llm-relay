@@ -1675,10 +1675,20 @@ Five tools:
 | `dispatch_cancel(jobId)` | Stop a running lane. |
 | `dispatch_lanes(tier?)` | Show the ladder, to choose a lane deliberately. |
 
-`dispatch` blocks for `waitMs` (default 60 s) and then hands back a `jobId`. A fast lane therefore
-costs one call, and a long one degrades to polling rather than hitting the host's tool timeout.
-Every answer names the lane that produced it — the relay never presents another agent's text as
-its own.
+`dispatch` blocks for at most `routing.mcp.maxWaitMs` (default 40 s) and then hands back
+a `jobId`. A fast lane therefore costs one call, and a long one degrades to polling rather
+than hitting the host's tool timeout. Every answer names the lane that produced it — the
+relay never presents another agent's text as its own.
+
+`routing.mcp.maxWaitMs` bounds that blocking wait because the host bounds it first: an MCP
+client tool call fails between 45 s and 100 s, and above that ceiling the job handle is
+destroyed with it — so the default sits 5 s under the lowest measured failure rather than
+on it. A `waitMs` above the ceiling is clamped to it, never refused, and the reply announces
+the clamp on its own line (`waited 40 s (waitMs 60000 clamped to
+routing.mcp.maxWaitMs 40000)`); a `waitMs` at or below the ceiling is honoured exactly. A
+`waitMs` that is negative, zero, non-finite or not a number is refused, naming the ceiling
+and the accepted range. `dispatch_status` and `dispatch_result` are unaffected — they poll
+and collect whatever the wait handed back.
 
 ### `mode: "agent"` vs `mode: "answer"`
 
