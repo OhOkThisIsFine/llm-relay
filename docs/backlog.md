@@ -93,15 +93,15 @@
   stated in four places each. **Property:** each fact has one home in the skill; the agent
   template names every tool the skill's guide uses; the reference matches `--help`.
 
-- **Triage the eligibility queue — 10 unrecognized refusals await interpretation** (owner
-  decision 2026-09-05: a separate lap). `llm-relay eligibility` lists them: groq `access denied.
-  please check your network settings.` (×116, the client-side VPN block, stays PENDING by the
-  `network-block.ts` rule: never `reject`); nim `moonshotai/kimi-k3` HTTP 400 `degraded function
-  cannot be invoked` (×48); four gemini 429 quota rows; two groq JSON-mode 400s; one huggingface
-  `max_completion_tokens is limited to <n>` 400; one openrouter `free-models-per-min` 429. The
-  dispatcher may `propose`; only the owner may `accept`. **Property:** every queued item carries
-  an accepted verdict, a `reject`, or a stated reason to stay pending, each addressed by digest
-  (`--sig`), so the listing shows no item without one.
+- **Accept or decline the 26 triaged refusals** (owner-only; triaged 2026-09-09 in
+  [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries every
+  verdict pinned to its digest and the exact `accept`/`reject` commands). Nineteen accepts, six
+  rejects, one deliberate pending (the groq client-side network block, never rejected by the
+  `network-block.ts` rule). Two accepts evict: `nim/moonshotai/kimi-k3` (48 × "degraded function
+  cannot be invoked") and seven ollama-cloud paid-plan SKUs seen once each. The dispatcher may
+  `propose`; only the owner may `accept`. **Property (what remains):** the owner has run, or
+  declined by name, each listed command, so `llm-relay eligibility` shows no item without a
+  verdict except item 1, whose pending state is the stated verdict.
 
 - **A slow `cli` lane is reordered on WALK EVIDENCE, not on a calibrated statistic** (owner
   question 2026-09-05). Most of it shipped with the dispatch walk
