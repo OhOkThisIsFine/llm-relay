@@ -17,6 +17,7 @@ import { makeCredentialId, parseCredentialId, type CredentialId } from "../crede
 import { mergeQuotaObservations, type QuotaObservation } from "../quota-observation.js";
 import { fetchProviderQuota } from "./quota.js";
 import { applySpendHeadroom, classifySpendHeadroom } from "../spend-headroom.js";
+import { assessCost, type CostClass } from "../metadata.js";
 import { clearFacts } from "../target-facts.js";
 
 export type PingMode = "speed" | "normal" | "slow" | "forced";
@@ -232,7 +233,13 @@ export class PingLoop {
     // ⚠ Contained: the fact store must never be able to break the probe loop.
     if (res.code === "200") {
       try {
-        clearFacts(providerKey, credentialId, modelId);
+        let costClass: CostClass | undefined;
+        try {
+          costClass = assessCost(modelId, this.catalog.cachedLimits?.(providerKey, modelId), this.cfg.providers[providerKey]?.tierType).costClass;
+        } catch {
+          costClass = undefined;
+        }
+        clearFacts(providerKey, credentialId, modelId, { costClass });
       } catch {
         /* best-effort */
       }

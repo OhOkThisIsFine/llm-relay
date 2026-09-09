@@ -442,7 +442,7 @@ export function factsFor(
   provider: string,
   credentialId: CredentialId | null,
   model: string | null | undefined,
-  opts: { path?: string; now?: number; costClass?: CostClass } = {},
+  opts: { path?: string; now?: number; costClass?: CostClass | undefined } = {},
 ): Array<{ kind: FactKind; scope: FactScope; until: number; untilBasis?: FactResetBasis; value?: number }> {
   const now = opts.now ?? Date.now();
   const m = typeof model === "string" ? model : null;
@@ -460,7 +460,7 @@ export function factsFor(
   return hits.sort((a, b) => SCOPE_PRECEDENCE.indexOf(a.scope.kind) - SCOPE_PRECEDENCE.indexOf(b.scope.kind));
 }
 
-export function isCostBlocked(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass } = {}): boolean {
+export function isCostBlocked(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass | undefined } = {}): boolean {
   return factsFor(provider, credentialId, model, opts).some((fact) => COST_BLOCKING.has(fact.kind));
 }
 
@@ -472,7 +472,7 @@ export function isCostBlockedForEverySlot(
   provider: string,
   model: string | null | undefined,
   cfg: Pick<Config, "providers">,
-  opts: { path?: string; now?: number; costClass?: CostClass } = {},
+  opts: { path?: string; now?: number; costClass?: CostClass | undefined } = {},
 ): boolean {
   const providerConfig = cfg.providers[provider];
   const slots = providerConfig
@@ -483,7 +483,7 @@ export function isCostBlockedForEverySlot(
   return enabledSlots.every((slot) => isCostBlocked(provider, slot.credentialId, model, opts));
 }
 
-export function cooldownUntil(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass } = {}): number | null {
+export function cooldownUntil(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number; costClass?: CostClass | undefined } = {}): number | null {
   let latest: number | null = null;
   for (const fact of factsFor(provider, credentialId, model, opts)) {
     if (COOLING.has(fact.kind)) latest = latest === null ? fact.until : Math.max(latest, fact.until);
@@ -492,15 +492,28 @@ export function cooldownUntil(provider: string, credentialId: CredentialId | nul
 }
 
 /** A success retracts conditions covering this credential/model cell, never measurements. */
-export function clearFacts(provider: string, credentialId: CredentialId | null, model: string | null | undefined, opts: { path?: string; now?: number } = {}): FactKind[] {
+export function clearFacts(
+  provider: string,
+  credentialId: CredentialId | null,
+  model: string | null | undefined,
+  opts: { path?: string; now?: number; costClass?: CostClass | undefined } = {},
+): FactKind[] {
   const path = opts.path ?? defaultPath();
   const now = opts.now ?? Date.now();
+  const costClass = opts.costClass;
   const m = typeof model === "string" ? model : null;
   const store = load(path);
   const cleared: FactKind[] = [];
   let changed = false;
   for (const [key, fact] of Object.entries(store.facts)) {
     if (!CONDITIONS.has(fact.kind) || !covers(fact, provider, credentialId, m)) continue;
+    // Cost-class filter: a fact with costClasses is only retracted when the caller's costClass
+    // is a member of that list. A fact WITHOUT costClasses is retracted as before (legacy behavior).
+    // When the caller passes no costClass, filtered facts survive (success of unknown class
+    // disproves nothing about a subset).
+    if (fact.costClasses !== undefined) {
+      if (costClass === undefined || !fact.costClasses.includes(costClass)) continue;
+    }
     delete store.facts[key];
     // Callers use this return value to clear credential-wide breaker symptoms. A success at a
     // narrower scope must still delete its fact, but must not claim the credential itself recovered.

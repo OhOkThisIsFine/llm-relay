@@ -733,6 +733,56 @@ describe("facts expire and yield to better evidence", () => {
     expect(allFacts({ path, now: now + 1 })).toHaveLength(1);
     expect(allFacts({ path, now: now + FACT_TTL_MS["not-servable"] + 1 })).toHaveLength(0);
   });
+
+  it("cost-class-bounded retraction: a paid-only fact survives a free success but clears on paid success", () => {
+    const personal = makeCredentialId("p", "personal");
+    // Record a paid-only subscription-required fact at credential scope
+    recordFact("subscription-required", { kind: "credential", provider: "p", credentialId: personal }, {
+      path,
+      costClasses: ["paid"] as const,
+    });
+    // The fact should apply when querying with paid cost class
+    expect(factsForV2("p", personal, "m", { path, costClass: "paid" })).toHaveLength(1);
+    // But should NOT apply when querying with free cost class
+    expect(factsForV2("p", personal, "m", { path, costClass: "free" })).toHaveLength(0);
+    // And should NOT apply when querying with no cost class (filtered facts match nothing without class)
+    expect(factsForV2("p", personal, "m", { path })).toHaveLength(0);
+
+    // A FREE success (costClass: "free") should NOT clear the paid-only fact
+    expect(clearFactsV2("p", personal, "m", { path, costClass: "free" })).toEqual([]);
+    expect(factsForV2("p", personal, "m", { path, costClass: "paid" })).toHaveLength(1);
+
+    // A PAID success (costClass: "paid") SHOULD clear the paid-only fact
+    expect(clearFactsV2("p", personal, "m", { path, costClass: "paid" })).toEqual(["subscription-required"]);
+    expect(factsForV2("p", personal, "m", { path, costClass: "paid" })).toHaveLength(0);
+  });
+
+  it("cost-class-bounded retraction: unfiltered facts are cleared by any cost class", () => {
+    const personal = makeCredentialId("p", "personal");
+    // Record an unfiltered (legacy-style) subscription-required fact
+    recordFact("subscription-required", { kind: "credential", provider: "p", credentialId: personal }, { path });
+
+    // It should apply regardless of cost class
+    expect(factsForV2("p", personal, "m", { path, costClass: "paid" })).toHaveLength(1);
+    expect(factsForV2("p", personal, "m", { path, costClass: "free" })).toHaveLength(1);
+    expect(factsForV2("p", personal, "m", { path })).toHaveLength(1);
+
+    // A FREE success should clear it
+    expect(clearFactsV2("p", personal, "m", { path, costClass: "free" })).toEqual(["subscription-required"]);
+    expect(factsForV2("p", personal, "m", { path })).toHaveLength(0);
+  });
+
+  it("cost-class-bounded retraction: when no costClass is passed, filtered facts survive", () => {
+    const personal = makeCredentialId("p", "personal");
+    // Record a paid-only fact
+    recordFact("subscription-required", { kind: "credential", provider: "p", credentialId: personal }, {
+      path,
+      costClasses: ["paid"] as const,
+    });
+    // Call clearFacts WITHOUT costClass (legacy behavior) - filtered facts should survive
+    expect(clearFactsV2("p", personal, "m", { path })).toEqual([]);
+    expect(factsForV2("p", personal, "m", { path, costClass: "paid" })).toHaveLength(1);
+  });
 });
 
 describe("signatures identify a refusal without identifying a request", () => {

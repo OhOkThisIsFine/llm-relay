@@ -127,18 +127,6 @@
   Once route B lands the property gains: `opencode/muse-spark-1.3-contributor-free` answers a real
   request through `pool/*` on both fronts.
 
-- **`include: "free"` pools carry paid and unknown-cost deployments, and on this machine no guard
-  stops a walk from reaching them.** Deliberate since the admission reversal, and the live config
-  has `freeOnly: false` on all three offload rules, so `pool/medium` lists paid and unknown-cost
-  members behind the free ones; nothing is spent today only because every paid credential is dry.
-  Owner decision 2026-09-04: `freeOnly` stays off (contract in the `dynamic-pools.ts` row of
-  `CLAUDE.md`). Side effect seen on 2026-09-04: the accepted `subscription-required` fact on the
-  Zen credential vanished 837 min early after a success on a FREE Zen deployment it never covered.
-  **Property (what remains):** a cost-class-filtered fact is retracted only by evidence inside its
-  own cost classes, so a success on a FREE deployment can no longer re-admit the paid SKUs the fact
-  excluded; and the pool section of `docs/reference.md` is checked for the pre-reversal
-  "free-only" wording and restated if it carries it.
-
 - **A zero-priced deployment with no exact tier-data row can never enter any effort pool, and a
   `-free` / `-contributor-free` suffix defeats the match against its base SKU's row.**
   `strengthAllowedForEffort` in `src/benchmarks.ts` requires `basis: "snapshot"`,

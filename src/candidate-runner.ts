@@ -1711,11 +1711,19 @@ export function markAttemptCommitted(attempt: HealthAttempt | undefined): void {
 }
 
 export function completeAttemptSuccess(
-  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder; costClassOf?: CostClassFn | null },
   attempt: HealthAttempt,
   status: number,
 ): void {
   if (attempt.completed) return;
+  // A success retracts the CONDITIONS on this cell — but a fact filtered to a cost class is
+  // retracted only by a success INSIDE that class. Measured 2026-09-04: a success on a FREE Zen
+  // deployment retracted the accepted `subscription-required` fact filtered to `paid`, 837 min
+  // early, and re-admitted the paid SKUs it excluded. The class comes from the SAME resolver the
+  // walk orders by (`h.costClassOf`), so cost has one definition here rather than a fifth one
+  // re-derived per route; a caller with no resolver passes `undefined`, and a filtered fact then
+  // survives (a success of unknown class disproves nothing about a subset).
+  const costClass = h.costClassOf?.(attempt.resolvedAttempt);
   const completedAt = Date.now();
   const result = h.breaker.completeAttempt(attempt.handle, {
     terminal: "succeeded",
@@ -1736,6 +1744,7 @@ export function completeAttemptSuccess(
       attempt.target.provider,
       attempt.resolvedAttempt.credentialId,
       attempt.target.model ?? null,
+      { costClass },
     );
     if (cleared.includes("credential-invalid")) {
       h.breaker.clearCredentialFaults(attempt.resolvedAttempt.credentialId);
