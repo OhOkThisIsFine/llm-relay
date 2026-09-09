@@ -482,8 +482,9 @@ function emptyAggregate(): MutableAggregate {
   return { requests: 0, attempts: 0, served: 0, errored: 0, cancelled: 0, tokens: emptyTokens(), requestTokens: emptyTokens(), latency: emptyMetric(), commit: emptyMetric(), spend: emptySpend(), unpricedRequests: 0 };
 }
 
-// Cell keys are owned by the schema module's SPEND_CELL_KEYS; the adders below
-// reach them through emptyAccountingAggregateSpend() rather than a second list.
+// Cell keys are owned by `SHARE_CELL_KEYS` in `dashboard-contract.ts` — the ONE list, which the
+// schema module imports; the adders below reach them through emptyAccountingAggregateSpend()
+// rather than a second list.
 function emptySpend(): MutableSpend {
   return {
     providerPublishedReported: emptyAccountingSpendCell(),

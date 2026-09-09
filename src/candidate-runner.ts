@@ -112,7 +112,7 @@ const INTERNAL_REQUEST_HEADERS = new Set([
 ]);
 const INBOUND_AUTH = ["authorization", "x-api-key"];
 
-export const MID_STREAM_ERROR_KIND = "backend_stream_failed";
+const MID_STREAM_ERROR_KIND = "backend_stream_failed";
 
 export function toolUseIdRewriteField(source: Response): {
   toolUseIdRewrites?: number;
@@ -167,8 +167,8 @@ export interface StickyRequestContext {
 }
 
 export type TargetUsability = "live" | "slow" | "credential-fault" | "cooling";
-export type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
-export type OutcomeClass = "ok" | "retriable" | "credential" | "client";
+type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
+type OutcomeClass = "ok" | "retriable" | "credential" | "client";
 
 export const DEFAULT_WALK_BUDGET_MS = 45_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 90_000;
@@ -183,7 +183,7 @@ export interface CandidateRunnerHandlers {
   stickySessions?: StickySessionManager;
 }
 
-export interface ServedAnnouncementContext {
+interface ServedAnnouncementContext {
   readonly target: ResolvedTarget;
   readonly retryAfterOverrideMs?: number | null | undefined;
   readonly poolSummary?: string | null | undefined;
@@ -198,7 +198,7 @@ export interface ServedAnnouncementContext {
   readonly sticky?: StickyRequestContext | null | undefined;
 }
 
-export function filterResponseHeaders(hh: Headers): Record<string, string | string[]> {
+function filterResponseHeaders(hh: Headers): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [k, v] of hh.entries()) {
     const lower = k.toLowerCase();
@@ -253,7 +253,7 @@ export function responseHeadersForTarget(
   return responseHeaders;
 }
 
-export function endMidStreamFailure(
+function endMidStreamFailure(
   res: ServerResponse,
   errorFrame: string | null,
   message: string,
@@ -267,7 +267,7 @@ export function endMidStreamFailure(
   }
 }
 
-export function midStreamMessage(e: unknown): string {
+function midStreamMessage(e: unknown): string {
   const errStr =
     e && typeof e === "object" && "message" in e && typeof (e as { message: unknown }).message === "string"
       ? (e as { message: string }).message
@@ -336,7 +336,7 @@ export function degradedLabel(pool: string | null, degraded: Set<string> | null,
   return degraded.has(spec) ? `${spec} (below ${pool})` : null;
 }
 
-export function cooledByAllowance(attempt: ResolvedAttempt, now: number, costClass: CostClass | undefined): boolean {
+function cooledByAllowance(attempt: ResolvedAttempt, now: number, costClass: CostClass | undefined): boolean {
   try {
     const { target } = attempt;
     const until = cooldownUntil(target.provider, attempt.credentialId, target.model ?? null, {
@@ -349,7 +349,7 @@ export function cooledByAllowance(attempt: ResolvedAttempt, now: number, costCla
   }
 }
 
-export function cooledByQuota(
+function cooledByQuota(
   attempt: ResolvedAttempt,
   breaker: CircuitBreaker,
   quotaDemotion: QuotaDemotionFn | null | undefined,
@@ -420,7 +420,7 @@ export function credentialEvidence(
   };
 }
 
-export function coolingLiftTime(
+function coolingLiftTime(
   attempt: ResolvedAttempt,
   breaker: CircuitBreaker,
   now: number,
@@ -582,7 +582,7 @@ export class CredentialAttemptTrace {
   }
 }
 
-export function credentialAttemptLabel(outcome: CredentialWalkOutcome | undefined): CredentialAttemptLabel {
+function credentialAttemptLabel(outcome: CredentialWalkOutcome | undefined): CredentialAttemptLabel {
   if (outcome?.status !== undefined) return outcome.status;
   if (outcome?.kind === "provider-transport") return "transport";
   if (outcome?.kind === "timeout") return "timeout";
@@ -671,12 +671,12 @@ export function releaseAttemptRun(res: ServerResponse, run: AttemptRun): void {
   res.off("close", run.onResClose);
 }
 
-export interface StartedAttempt {
+interface StartedAttempt {
   readonly run: AttemptRun;
   readonly promise: Promise<Response>;
 }
 
-export interface HedgedAttemptDeps {
+interface HedgedAttemptDeps {
   readonly h: CandidateRunnerHandlers;
   readonly res: ServerResponse;
   readonly walk: CredentialWalk;
@@ -688,20 +688,20 @@ export interface HedgedAttemptDeps {
   startRun(offer: ResolvedAttempt): StartedAttempt | undefined;
 }
 
-export interface HedgedAttemptResult {
+interface HedgedAttemptResult {
   readonly run: AttemptRun;
   readonly settled: Settled<Response>;
   readonly hedged: string | null;
 }
 
-export function settleResponse(promise: Promise<Response>): Promise<Settled<Response>> {
+function settleResponse(promise: Promise<Response>): Promise<Settled<Response>> {
   return promise.then(
     (value) => ({ ok: true, value }) as Settled<Response>,
     (error: unknown) => ({ ok: false, error }) as Settled<Response>,
   );
 }
 
-export function walkWouldFailOver(response: Response): boolean {
+function walkWouldFailOver(response: Response): boolean {
   return errorOrigin(response) !== "local" && shouldTryNext(classifyStatus(response.status));
 }
 
@@ -712,7 +712,7 @@ export function walkWouldFailOver(response: Response): boolean {
  */
 const COMMIT_PROBES = new WeakMap<Response, StreamCommitProbe>();
 
-export interface CommitProbeOptions {
+interface CommitProbeOptions {
   readonly protocol: StreamCommitProtocol;
   /** Client cancellation wins races with EOF/read failures and must never start another target. */
   readonly isCancelled: () => boolean;
@@ -849,9 +849,9 @@ export async function runAttemptWithHedge(
   return { run: winner, settled: raced.settled, hedged: hedgedLabel(primary.run, hedge.run, raced.winner, decision) };
 }
 
-export type WalkExitKind = "transport" | "post-header-body-failure" | "dead-stream";
+type WalkExitKind = "transport" | "post-header-body-failure" | "dead-stream";
 
-export interface WalkExitData {
+interface WalkExitData {
   kind: WalkExitKind;
   message: string;
   errorType?: string | undefined;
@@ -1010,7 +1010,7 @@ export function applyStickyOrdering(
   return { targets: reordered, status: "pinned, reordered" };
 }
 
-export function stickyHeaderValue(
+function stickyHeaderValue(
   sticky: StickyRequestContext | null | undefined,
   target: ResolvedTarget,
   status: number,
@@ -1120,7 +1120,7 @@ export function orderByUsabilityTracked(
 
 /** What one HTTP status means to the walk: how to classify the outcome, and whether the body may
  * carry an eligibility fact worth interpreting. */
-export interface StatusVerdict {
+interface StatusVerdict {
   readonly outcome: OutcomeClass;
   readonly carriesEligibilityFact: boolean;
 }
@@ -1290,7 +1290,7 @@ export class Pool429Tracker {
   }
 }
 
-export function recordCall(
+function recordCall(
   h: { modelCallRecorder?: ModelCallRecorder },
   attempt: HealthAttempt,
   ok: boolean,
@@ -1383,7 +1383,7 @@ export function beginHealthAttempt(
   };
 }
 
-export function abortOnClientClose(
+function abortOnClientClose(
   res: ServerResponse,
   callerController: AbortController,
   controller: AbortController,
@@ -1396,7 +1396,7 @@ export function abortOnClientClose(
   };
 }
 
-export function observeContextLimit(status: number, target: ResolvedTarget, body: string): void {
+function observeContextLimit(status: number, target: ResolvedTarget, body: string): void {
   if (status !== 400 && status !== 413) return;
   if (target.model === undefined) return;
   try {
@@ -1409,7 +1409,7 @@ export function observeContextLimit(status: number, target: ResolvedTarget, body
   }
 }
 
-export function observeMaxOutput(status: number, target: ResolvedTarget, body: string): void {
+function observeMaxOutput(status: number, target: ResolvedTarget, body: string): void {
   if (status !== 400 && status !== 413) return;
   if (target.model === undefined) return;
   try {
@@ -1422,7 +1422,7 @@ export function observeMaxOutput(status: number, target: ResolvedTarget, body: s
   }
 }
 
-export function observeStatedRateLimits(attempt: HealthAttempt, observations: QuotaObservation[]): void {
+function observeStatedRateLimits(attempt: HealthAttempt, observations: QuotaObservation[]): void {
   if (observations.length === 0) return;
   const { target } = attempt;
   if (target.model === undefined) return;
@@ -1439,7 +1439,7 @@ export function observeStatedRateLimits(attempt: HealthAttempt, observations: Qu
   }
 }
 
-export function observeRateLimit(attempt: ResolvedAttempt, status: number, body: string): void {
+function observeRateLimit(attempt: ResolvedAttempt, status: number, body: string): void {
   if (status !== 429) return;
   if (attempt.target.model === undefined) return;
   try {
@@ -1452,9 +1452,9 @@ export function observeRateLimit(attempt: ResolvedAttempt, status: number, body:
   }
 }
 
-export type EligibilityObservation = { readonly unknown: boolean; readonly scope?: ReturnType<typeof materializeScope> };
+type EligibilityObservation = { readonly unknown: boolean; readonly scope?: ReturnType<typeof materializeScope> };
 
-export function refusalBodyCandidates(body: string): string[] {
+function refusalBodyCandidates(body: string): string[] {
   const candidates: string[] = [];
   const queued: string[] = [body];
   const seen = new Set<string>();
@@ -1566,7 +1566,7 @@ export function carriesEligibilityFact(status: number): boolean {
   return statusVerdict(status).carriesEligibilityFact;
 }
 
-export type InspectedCandidateResponse =
+type InspectedCandidateResponse =
   | {
       kind: "response";
       response: Response;
@@ -1788,7 +1788,7 @@ export function completeAttemptCancelled(
   );
 }
 
-export function completeAttemptAbandoned(
+function completeAttemptAbandoned(
   h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
   attempt: HealthAttempt,
   reason: string | null,
@@ -1796,7 +1796,7 @@ export function completeAttemptAbandoned(
   completeCancellation(h, attempt, reason, "relay-abandoned");
 }
 
-export function completeCancellation(
+function completeCancellation(
   h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
   attempt: HealthAttempt,
   reason: string | null,
@@ -1827,7 +1827,7 @@ export function completeCancellation(
   );
 }
 
-export type PostHeaderBodyDisposition = "cancelled" | "timeout" | "protocol";
+type PostHeaderBodyDisposition = "cancelled" | "timeout" | "protocol";
 
 export function completePostHeaderBodyFailure(
   h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },

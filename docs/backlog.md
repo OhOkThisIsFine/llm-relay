@@ -70,12 +70,6 @@
   **Property:** a lane's walk budget is derived only from runs on the ladder it will be used on;
   an existing stats file still loads.
 
-- **`LANE_AFFINITY_KINDS` promises a compile-time protection that does not exist (2026-09-08,
-  safety review, low).** Its docstring in `src/lane-affinity.ts` says a third memory kind is a
-  compile error at every total table; no total table over `LaneAffinityKind` exists in `src/`.
-  **Property:** adding a member to `LANE_AFFINITY_KINDS` fails `npm run typecheck` at a named
-  table, verified by adding one and removing it again.
-
 - **The `llm-relay` skill and the `relay` agent drift from the CLI and from each other
   (2026-09-08, machine-wide hooks-and-skills review, low).**
   `skills/llm-relay/references/operations.md` documents a `--rationale` flag that
@@ -206,10 +200,3 @@
   `api-key`) is forwarded verbatim to a third-party anthropic-kind base. `log.ts` already uses the
   allow-list shape. **Property:** a contained anthropic-kind target receives only headers from a
   declared allow-list, and a test sends a `cookie` and asserts it does not egress.
-
-- **Prune `candidate-runner.ts` exports nothing consumes** (audit DR-012 / contract review
-  DR-007). The `server.ts` decomposition published its internals as public API; only
-  `orderByUsability` and `classifyStatus` are recorded test seams. Related, low: `SPEND_CELL_KEYS`
-  (`accounting-store-schema.ts`) and `SHARE_CELL_KEYS` (`dashboard-contract.ts`) are two lists of
-  one four-name set. **Property:** every export of `candidate-runner.ts` has a consumer in `src/`
-  or a test that names it as a seam, and the four spend-cell names have one list.

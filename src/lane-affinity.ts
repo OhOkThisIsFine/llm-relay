@@ -81,10 +81,28 @@ export interface LaneAffinityRow {
 /**
  * The two memories, as a closed set derived from ONE `as const` array. A hand-copied second list
  * is the most-repeated defect in this repository's history; deriving the type from the list means
- * a third memory is a compile error at every total table rather than a silent drop at a loader.
+ * a third memory is a compile error at `LANE_AFFINITY_DEFAULT_TTL_MS` below rather than a silent
+ * drop at a loader.
  */
 export const LANE_AFFINITY_KINDS = Object.freeze(["pin", "demote"] as const);
 export type LaneAffinityKind = (typeof LANE_AFFINITY_KINDS)[number];
+
+/**
+ * Default window per memory kind — the ONE place that chooses a number per kind, as a total
+ * table closed with `satisfies` (the `buildAuthHeaders` precedent in `src/authEnv.ts`). A third
+ * memory kind is a compile error HERE, at the table, rather than a silent drop wherever the new
+ * kind's default was forgotten. `pinLane`/`demoteLane` read their fallback through
+ * `defaultWindowFor` so no second per-kind branch can drift out of step with this one.
+ */
+export const LANE_AFFINITY_DEFAULT_TTL_MS = {
+  pin: DEFAULT_PIN_MS,
+  demote: DEFAULT_DEMOTE_MS,
+} satisfies Record<LaneAffinityKind, number>;
+
+/** Default window for one memory kind, read off the total table above. */
+function defaultWindowFor(kind: LaneAffinityKind): number {
+  return LANE_AFFINITY_DEFAULT_TTL_MS[kind];
+}
 
 /** tier key → lane id → row. One map per `Config`, alive exactly as long as that config is. */
 const affinity = new WeakMap<Config, Map<string, LaneAffinityRow>>();
@@ -179,10 +197,10 @@ export function pinLane(
   tier: string | null,
   laneId: string,
   reason: string,
-  ttlMs: number = DEFAULT_PIN_MS,
+  ttlMs: number = defaultWindowFor("pin"),
   now: number = Date.now(),
 ): void {
-  remember(cfg, "pin", tier, laneId, reason, clampWindow(ttlMs, DEFAULT_PIN_MS), now);
+  remember(cfg, "pin", tier, laneId, reason, clampWindow(ttlMs, defaultWindowFor("pin")), now);
 }
 
 /** Demote a lane that failed to answer inside its budget, so ready lanes are tried ahead of it. */
@@ -191,10 +209,10 @@ export function demoteLane(
   tier: string | null,
   laneId: string,
   reason: string,
-  ttlMs: number = DEFAULT_DEMOTE_MS,
+  ttlMs: number = defaultWindowFor("demote"),
   now: number = Date.now(),
 ): void {
-  remember(cfg, "demote", tier, laneId, reason, clampWindow(ttlMs, DEFAULT_DEMOTE_MS), now);
+  remember(cfg, "demote", tier, laneId, reason, clampWindow(ttlMs, defaultWindowFor("demote")), now);
 }
 
 /** This lane's live pin on this tier, or null. */

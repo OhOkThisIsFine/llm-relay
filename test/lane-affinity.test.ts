@@ -13,13 +13,15 @@
  *    healthy rung).
  */
 import { describe, it, expect, afterAll } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, type Config } from "../src/config.js";
 import { buildDispatch, markExhausted } from "../src/dispatch.js";
 import {
   DEFAULT_DEMOTE_MS,
+  LANE_AFFINITY_DEFAULT_TTL_MS,
+  LANE_AFFINITY_KINDS,
   MAX_AFFINITY_MS,
   clearLaneAffinity,
   demoteLane,
@@ -32,6 +34,7 @@ import {
   pinLane,
   restoreLaneAffinityRows,
   saveLaneAffinityRows,
+  type LaneAffinityKind,
   type LaneAffinityRow,
 } from "../src/lane-affinity.js";
 
@@ -409,5 +412,29 @@ describe("routing.dispatchWalk: false restores the pre-walk behaviour exactly", 
     pinLane(cfg, null, "third", "answered in 4s", 60_000);
     demoteLane(cfg, null, "first", "missed budget", 60_000);
     expect(buildDispatch(cfg).order).toEqual(["third", "second", "first"]);
+  });
+});
+
+/**
+ * The default window per memory kind is ONE total table, so a third memory kind
+ * is a compile error AT THE TABLE rather than a silent drop at a loader (the
+ * closed-union gotcha in CLAUDE.md — the `buildAuthHeaders` precedent).
+ */
+describe("the per-kind default window has one total owner", () => {
+  it("covers every member of LANE_AFFINITY_KINDS with a finite positive window, and nothing else", () => {
+    const table = LANE_AFFINITY_DEFAULT_TTL_MS as Record<LaneAffinityKind, number>;
+    expect(new Set(Object.keys(table))).toEqual(new Set(LANE_AFFINITY_KINDS));
+    for (const kind of LANE_AFFINITY_KINDS) {
+      expect(table[kind]).toEqual(expect.any(Number));
+      expect(Number.isFinite(table[kind])).toBe(true);
+      expect(table[kind]).toBeGreaterThan(0);
+    }
+  });
+
+  it("has ONE definition — the expiry clamp must not hand-roll the per-kind default", () => {
+    // The `destructive-coverage` precedent: pin the single owner mechanically, so the next
+    // person to add a kind cannot reintroduce the per-kind branch.
+    const text = readFileSync(join(__dirname, "..", "src", "lane-affinity.ts"), "utf8");
+    expect(text).toMatch(/satisfies Record<LaneAffinityKind,/);
   });
 });

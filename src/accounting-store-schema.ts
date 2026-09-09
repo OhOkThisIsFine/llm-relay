@@ -2,6 +2,7 @@ import {
   DASHBOARD_ATTEMPT_ID_MAX_BYTES,
   DASHBOARD_MAX_DETAIL_ATTEMPTS,
   DASHBOARD_REQUEST_ID_PATTERN,
+  SHARE_CELL_KEYS,
   isDashboardAttemptId,
   isDashboardSafeId,
   isDashboardUtcTimestamp,
@@ -754,11 +755,9 @@ function isAggregateSpendCell(value: unknown): value is AccountingAggregateSpend
   );
 }
 
-const SPEND_CELL_KEYS = Object.freeze(["providerPublishedReported", "providerPublishedEstimated", "referenceReported", "referenceEstimated"] as const);
-
 function isAggregateSpend(value: unknown): value is AccountingAggregateSpendV1 {
-  if (!hasExactKeys(value, SPEND_CELL_KEYS)) return false;
-  for (const key of SPEND_CELL_KEYS) {
+  if (!hasExactKeys(value, SHARE_CELL_KEYS)) return false;
+  for (const key of SHARE_CELL_KEYS) {
     const cell = (value as Record<string, unknown>)[key];
     // hasExactKeys guarantees every key present; the undefined case cannot occur,
     // but the guard keeps the record access total.
@@ -828,7 +827,7 @@ function isEmptyAggregateSpend(spend: unknown): boolean {
   return (
     typeof spend === "object" &&
     spend !== null &&
-    SPEND_CELL_KEYS.every((key) => {
+    SHARE_CELL_KEYS.every((key) => {
       const cell = (spend as Record<string, unknown>)[key];
       return cell !== undefined && typeof cell === "object" && cell !== null && isEmptyAggregateSpendCell(cell as AccountingAggregateSpendCellV1);
     })
@@ -1392,7 +1391,7 @@ export function emptyAccountingSpendCell(): AccountingAggregateSpendCellV1 {
 
 export function emptyAccountingAggregateSpend(): AccountingAggregateSpendV1 {
   return Object.fromEntries(
-    SPEND_CELL_KEYS.map((key) => [key, emptyAccountingSpendCell()]),
+    SHARE_CELL_KEYS.map((key) => [key, emptyAccountingSpendCell()]),
   ) as unknown as AccountingAggregateSpendV1;
 }
 
