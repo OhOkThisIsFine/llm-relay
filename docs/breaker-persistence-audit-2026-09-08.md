@@ -82,9 +82,13 @@ without a graceful stop; it is filed in `docs/backlog.md` with the property a fi
   the new fields, the ten-sample trim, the flush handle, and that the credential-axis writers
   notify the listener. `test/write-behind.test.ts` (5) pins `flushNow` and the registry; one test
   in each sibling store's suite pins its shutdown flush.
-- Mutation-checked: restoring the old future-only rule in `restoreState` fails eight tests;
-  removing the notify from `applyCredentialFault` fails exactly the listener test. Both mutants
-  were reverted and the file is back at 25 passing.
+- Mutation-checked: restoring the old future-only rule in `restoreState` fails **twelve of the
+  file's 25 tests** (every restore test, since the file's synthetic epoch of 1,000,000,000,000 ms
+  reads as lapsed against the real clock); removing the notify from `applyCredentialFault` fails
+  exactly the listener test. Both mutants were reverted and the file is back at 25 passing.
+  ⚠ An earlier draft of this line said "eight": that count was read off a `head -8`-truncated
+  test listing. The independent closeout audit caught it; the figure above is from an untruncated
+  re-run of the same mutation on `main`.
 - The escalation-ladder assertion in the lapsed test uses the 24-hour top rung, so it also dies if
   the counter were restored but the ladder index were reset.
 

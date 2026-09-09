@@ -25,7 +25,10 @@ included. Evidence, method and the before/after tables:
   `flush<Store>Persistence()` each; `runProxy` calls all four beside the six older flushes in both
   shutdown sites. Until now those four armed timers inside closures nothing could reach.
 - ✅ Version stays 1: every added field is optional on the wire, so a v0.76.0 file loads with
-  fresh-cell defaults and a file written now still loads on v0.76.0.
+  fresh-cell defaults and a file written now still loads on v0.76.0. **Verified on the production
+  daemon's first restart onto v0.77.0:** the 41-row cooling-only file written by v0.76.0 restored
+  (the four still-active cooldowns read `OPEN` in `candidates` before any traffic), and one warm
+  request later the daemon rewrote it with 42 rows in the new format.
 - ✅ **The path-sensitive keyring test is fixed.** `test/os-keyring.test.ts` "sanitizes a thrown
   child error" checked every 4-character window of English-shaped needles against an error whose
   stack carries the checkout's absolute path, so `stdout-super-secret`'s `er-s` matched a worktree
