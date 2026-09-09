@@ -2,200 +2,60 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-09 (the parseRouting decomposition lap, v0.77.1)
+## 0. State as of 2026-09-09 (v0.77.1)
 
-**The scheduled `parseRouting` split is done, and the validation ORDER was pinned before a line
-moved.** Owner ruling 2026-09-06. The backlog item's own warning was that a reordering of two
-checks is invisible to the suite, so the lap wrote the pin first, proved it red against swapped
-checks, and only then split the function.
+- **What shipped:** the `parseRouting` split with its validation order pinned FIRST
+  (`test/config/routing-parser-order.test.ts`; cognitive complexity 125 → 12; `parseOffload` and
+  `parseLadder` untouched by design). The `config/routing-parser.ts` row of `CLAUDE.md` names the
+  helpers.
+- **Two pre-existing quirks pinned as behaviour:** the pool-member warning lacks the `config.`
+  prefix and the consequence sentence the other five degradation warnings carry;
+  `routing.subagents` stays attached as `{}` when its only entry is dropped.
+- **Daemon note:** the logon-started daemon runs v0.77.0 until the next logon (owner decision
+  2026-09-09), while `llm-relay --version` reports 0.77.1.
+- **Offload record:** both packets of the v0.77.1 lap went to the free pool through MCP
+  `dispatch`, and both needed repair here. The measurement: a free lane follows the SHAPE of a
+  brief and drops its finest constraints, so verify with the suite AND a typecheck; and cancel a
+  stalled lane by hand once its file stops changing, because the walk budget is the lane's own p80.
+- **Docs trimmed (2026-09-09, this lap):** this file and `docs/backlog.md` hold current state and
+  open work only. The backlog's former Closed section and this file's release list are in git
+  history (`git log -p -- docs/backlog.md HANDOFF.md`), not restated anywhere.
+- **Immediate next:** triage the eligibility queue (10 unrecognized refusals; the dispatcher
+  proposes by digest, only the owner accepts). Then the Open entries of `docs/backlog.md`, which
+  is the queue.
 
-- ✅ **The order pin.** `test/config/routing-parser-order.test.ts` holds an ordered table of every
-  check `parseRouting` runs (31 rows: the two reserved provider names, `default`, the seven pool
-  checks per key, the eight sub-block parsers, ladder/ladders/cliLane, the six resolvability
-  groups). Each row alone must yield its exact message; every combinable ordered pair (444) must
-  yield the EARLIER row's message; the six disabled-provider warnings must arrive in exact order
-  with exact text, and the degraded results must match. Mutation-checked four times — the
-  reserved-name swap, the sticky/quota swap, the tiers/subagents degradation swap, the tiers/pools
-  assertion swap — and each failed exactly one test.
-- ✅ **The split.** `parseRouting` (`src/config/routing-parser.ts`) is a sequence of fourteen
-  private helpers, named in the `config/routing-parser.ts` row of `CLAUDE.md`. Cognitive
-  complexity 125 → 12; every helper ≤ 13; `parseOffload` (32) and `parseLadder` (36) untouched by
-  design. Every error and warning string byte-identical; the returned object's keys and insertion
-  order unchanged; `routing.tiers` / `routing.subagents` remain the same mutated instances; the
-  leaf and purity test green; `delegate-gate` clean; the plain eslint findings on the file are the
-  same three as on `main`.
-- ✅ Two pre-existing quirks are pinned as behaviour rather than silently carried: the pool-member
-  warning lacks the `config.` prefix and the consequence sentence the other five degradation
-  warnings carry, and `routing.subagents` stays attached as `{}` when its only entry is dropped.
-  Changing either is a visible decision now.
+### 0.1 Previous laps
 
-⚠ **Offload record, stated plainly.** Both packets went to the free pool through MCP `dispatch`
-(`free-pool`, `pool/high`); the fallback was the one the owner named for this lap.
+- **v0.77.0, breaker persistence (2026-09-08/09).** The WHOLE circuit-breaker cell survives a
+  restart (failure counters, the credential fault, the served-request ping window
+  `GET /telemetry` scores from, quota observations), and every write-behind store flushes at a
+  graceful shutdown. Three stated behaviour changes: restore is faithful, not future-only; a
+  credential fault survives for its five-minute window (owner-accepted); every outcome dirties
+  the file, bounded by `WriteBehindTimer`. Residue: the logon-started daemon dies by
+  `TerminateProcess`, so the flush never runs there (backlog). Evidence:
+  [docs/breaker-persistence-audit-2026-09-08.md](docs/breaker-persistence-audit-2026-09-08.md).
+- **v0.74.0–v0.76.0, the dispatch lane walk and its safety review.** `dispatch` walks the
+  ladder, pins the lane that answered, demotes the one that did not, and budgets each lane from
+  its own p80. Three defects fixed in review: a demotion did not retract the pin; the budget
+  measured itself; a clamped budget was labelled `history`. ⚠ Review coverage was PARTIAL — 24 of
+  33 second-pass findings are UNVERIFIED, two filed in the backlog. ⚠ The demotion is EVIDENCE,
+  not a calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
+  [docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md).
 
-1. **The order test (job-0002).** The lane wrote a 440-line draft in five minutes, then its
-   harness died at 439 s on HTTP 402 from a HuggingFace member whose monthly credits were depleted.
-   17 of 479 tests failed on two deviations from explicit brief lines — seven mutators REPLACED
-   `pools` / `tiers` / `subagents` / `ladders` where the brief said merge, and `${ENV}` was left
-   unescaped in a template literal — plus two strict-typing errors. Repaired here in ten small
-   edits; nothing was re-dispatched.
-2. **The split (job-0003).** In 16 minutes the lane extracted seven helpers but wired three
-   (complexity 125 → 95), then wrote nothing for seven minutes. Cancelled at 1426 s, before its
-   walk budget could hand the half-edited tree to a second lane. It had also written a fabricated
-   rationale comment (a `${ENV}` claim that belongs to a different function). A Sonnet subagent
-   finished the split from a brief stating exactly where the lane stopped; its diff was read in
-   full, gated, typechecked, measured and mutation-checked here, and its `Partial<Routing>` return
-   type with four non-null assertions was tightened here to a precise type.
+### 0.2 Offload, measured
 
-⚠ The measurement to carry: a free lane follows the SHAPE of a brief and drops its finest
-constraints — verify with the suite AND a typecheck, never by reading alone. And the lane walk's
-budget is the lane's own p80, so a stalled lane costs up to that long before the walk moves on;
-cancel by hand once the file has stopped changing.
+Free lanes CANNOT do open-ended reconnaissance here — 7 of 7 packets fabricated on 2026-09-05.
+They CAN review a concrete diff against a stated claim, and they carry a mechanical rewrite with
+a stated rule. The test is whether the output can be checked by running or reading something
+specific. Never key a fallback on a `null` result; never make a lane the only check.
+`opencode-muse-spark` is congested, not broken (owner, 2026-09-05), and the lane walk routes
+around it.
 
-⚠ **The logon-started daemon still runs v0.77.0 until the next logon** (owner decision
-2026-09-09: no restart, because this release changes load-time parsing only and a restart would
-interrupt every session routed through it). `llm-relay --version` reports the installed 0.77.1;
-the two disagree by design until then.
+### 0.3 Earlier releases
 
-Immediate next: **triage the eligibility queue** (10 unrecognized refusals; the dispatcher
-proposes by digest, only the owner accepts). Then the carried items in §0.2.
-
-### 0.1 The two previous laps, condensed
-
-- **v0.77.0, breaker persistence (2026-09-08/09).** The WHOLE circuit-breaker cell now survives a
-  restart (failure counters, the credential fault, the served-request ping window `GET /telemetry`
-  scores from, quota observations), and every write-behind store flushes at a graceful shutdown.
-  Three stated behaviour changes: restore is faithful, not future-only; a credential fault survives
-  for its five-minute window (owner-accepted); every outcome dirties the file, bounded by
-  `WriteBehindTimer`. Evidence and the before/after tables:
-  [docs/breaker-persistence-audit-2026-09-08.md](docs/breaker-persistence-audit-2026-09-08.md);
-  the `breaker-persistence.ts` and `write-behind.ts` rows of `CLAUDE.md`. Residue: the
-  logon-started daemon dies by `TerminateProcess`, so the flush never runs there (backlog).
-- **v0.74.0–v0.76.0, the dispatch lane walk and its safety review.** `dispatch` walks the ladder,
-  pins the lane that answered, demotes the one that did not, and budgets each lane from its own
-  p80. Three defects fixed in review: a demotion did not retract the pin; the budget measured
-  itself; a clamped budget was labelled `history`. ⚠ Review coverage was PARTIAL — 24 of 33
-  second-pass findings are UNVERIFIED, two filed in the backlog. ⚠ The demotion is EVIDENCE, not a
-  calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
-  [docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md) and the
-  `dispatch.ts`, `lane-affinity.ts`, `dispatch-lane-stats.ts`, `mcp/server.ts` rows of `CLAUDE.md`.
-
-### 0.2 Carried, untouched by this lap
-
-Each is an Open entry in [docs/backlog.md](docs/backlog.md); that file, not this one, is the queue.
-
-- The logon-started daemon is stopped by `TerminateProcess`, so the shutdown flush that every
-  write-behind store now has never runs on this machine; a hard kill loses at most the last two
-  seconds (filed 2026-09-08, with the property a fix must meet).
-- Triage the eligibility queue (10 unrecognized refusals; the dispatcher proposes by digest, only
-  the owner accepts).
-- Owner: verify the Codex `relay` agent from Codex Desktop.
-- Post-commit stalls (owner decision 2026-09-04: measure first, build only if clients retry).
-- Audit residue with properties: the metering silence channel, listener-before-store, the
-  forward-path header allow-list, `candidate-runner.ts` export pruning.
-- Contributor SKUs route B; route A is live.
-- The `dispatch` `waitMs` trap: a job can vanish with `unknown jobId` when the MCP child restarts.
-  ⚠ The walk does not close this — it makes ONE dispatch cover more lanes, so a lost handle now
-  costs more work, not less. The server half is still an Open entry.
-
-⚠ **On offload, with the measurement from three laps.** Free lanes CANNOT do open-ended
-reconnaissance here — 7 of 7 packets failed adversarial verification on 2026-09-05, fabricating
-symbol names and line ranges with total confidence. They ARE useful for reviewing a CONCRETE diff
-against a STATED claim: a `free-pool` lane checked the CLONE-07 change in 208 s, rebuilt its truth
-table from source and correctly found no differences. The distinction that predicts which way it
-goes is whether the output can be checked by running or reading something specific. ⚠ Do not key a
-fallback on a `null` result — a lane that fabricates returns something. ⚠ And never make a lane the
-only check: one review job vanished mid-run when the MCP child restarted.
-
-⚠ **`opencode-muse-spark` is congested, not broken** (owner, 2026-09-05: other agents dispatch to it
-concurrently). Prefer `free-pool` or `agy-gemini` while that lasts. ⚠ The lane walk now routes
-around this automatically rather than requiring the operator to notice it, which is what the lap
-above was for — but congestion itself is unchanged.
-
-
-## 0.3 Earlier releases
-
-Deliberately NOT restated here. This file holds current state plus the immediate next; a
-release-by-release narration is a changelog, and git already has it. `git log --oneline` and the
-tags are the trail. What survived each sprint lives in its own home:
-
-- **v0.73.1, the owner rulings (2026-09-06)** — the dialect-rescue destructive check now runs
-  BEFORE the argument check (`057fca7`): each parser returns a `DialectScan` carrying every name it
-  RECOGNISED, so a malformed payload under a destructive name refuses instead of falling through to
-  a retryable `detected`. One clamp for both absolute-deadline write sites in `dispatch.ts`
-  (`449bf9d`); the general SEM-06 extraction was declined. The lesson that generalises — a check
-  that reads what an earlier stage COMMITTED inherits that stage's discard policy as its own
-  trigger — lives in the `CLAUDE.md` gotcha and Status sections. `parseRouting` decomposition was
-  scheduled, not done.
-- **v0.72.1, the concurrent-ingest lap (2026-09-05)** — `llm-relay mcp` reads and dispatches each
-  stdin request the moment it arrives. `McpDispatchServer.serve` replaced the per-chunk
-  `await server.ingest(chunk)`, and `ingest` splits synchronously so message order stays write
-  order whatever the caller awaits. Measured live against the released v0.72.0 binary on an
-  isolated daemon: a status probe answered in under 1 ms instead of after 6.6 s. Stated trades —
-  responses may leave out of request order, and there is no concurrency cap; ⚠ a host keeps the OLD
-  behaviour until it restarts its `llm-relay mcp` child:
-  [docs/mcp-concurrent-ingest-2026-09-05.md](docs/mcp-concurrent-ingest-2026-09-05.md).
-- **v0.72.0, the dispatch-telemetry lap (2026-09-04)** — "MCP reports, daemon records": the MCP
-  server forwards one metadata-only report per settled agent-mode job to
-  `POST /dispatch/telemetry`; the daemon records per-lane stats (`dispatch-lane-stats.ts`, the
-  advisory `stats:` column) and one estimated-envelope ledger row for `cli`-kind lanes only
-  (owner decisions D1/D2); every packet ran on the free `opencode-muse-spark` lane and a live
-  proof on an isolated daemon preceded the release:
-  [docs/dispatch-telemetry-design-2026-09-04.md](docs/dispatch-telemetry-design-2026-09-04.md).
-- **v0.71.1, the audit-triage lap (2026-09-04)** — every finding in
-  [docs/audit-findings-2026-09-03.md](docs/audit-findings-2026-09-03.md) has a verdict in
-  [docs/audit-triage-2026-09-04.md](docs/audit-triage-2026-09-04.md) and each verified defect is
-  fixed with a pinning test: one declaration for the config vocabulary (`config-types.ts`,
-  guarded by `test/one-declaration.test.ts`), the ledger no longer blames the provider for a
-  relay-authored refusal, `GET /v1/models` omits an unresolved context window and resolves
-  `auto` through the ladder, 413 is classified by the body reader's code, the hedge race settles
-  at COMMIT (post-commit remedy: owner decision 2026-09-04, measure first), DR-020 residue and
-  `JsonStore` removed. v0.71.0's publish died on a doc link to a concurrent session's untracked
-  file; both traps are recorded.
-- **v0.69.0–v0.70.0, the dispatch fast-path and token-scaled-hedge laps (2026-09-04)** — the
-  `slow` usability band, the `auto` model, MCP `dispatch` answer mode, the `relay` agent for Claude
-  and Codex with no pinned model, the input-size-scaled hedge floor, and the DR-020 shrink of the
-  accounting writer:
-  [docs/dispatch-fast-path-lap-2026-09-04.md](docs/dispatch-fast-path-lap-2026-09-04.md),
-  [docs/token-scaled-hedge-lap-2026-09-04.md](docs/token-scaled-hedge-lap-2026-09-04.md).
-- **v0.68.7–v0.68.8, the `server.ts` decomposition audit** — a handed-over refactor arrived green
-  with four defects the suite could not see (a lost second `tsc` pass, a downgraded HTTP status, a
-  validator field `AssistantMessage` never declared, a broken multi-line SSE parse) plus three
-  control-flow changes a function-body diff couldn't see either; repaired, remediated and every
-  region reviewed: [docs/refactor-consistency-audit-2026-09-01.md](docs/refactor-consistency-audit-2026-09-01.md).
-- **v0.58.0, the max-output-caps lap** — the display-only `max-output` measurement fact (parser
-  beside the context parser, observer on both fronts, live-verified on groq), and the stale-digest
-  lesson (recorded signature digests go stale across a normalizer migration — list before
-  addressing): [docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md).
-- **v0.57.0, the eligibility triage lap** — queue 199 → 4 with owner-approved family verdicts,
-  the lane-split signature fix and its load-time store migration, the Tailwind scan leak:
-  [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
-- **v0.56.0, digest-keyed `eligibility accept` + provider-stated spend headroom** — the
-  eligibility gotchas and the `spend-headroom.ts` row in `CLAUDE.md`.
-- **v0.53.0–v0.54.0, the three-axis assessment and its follow-ups** — the report, every verified
-  and refuted claim, the retracted finding, and the closed "Remaining open items" ledger:
-  [docs/three-axis-assessment-2026-08-28.md](docs/three-axis-assessment-2026-08-28.md).
-- **v0.52.0, the advisory-findings verification** — the closed-vocabulary bug class (also a
-  `CLAUDE.md` gotcha) and the full verdict ledger:
-  [docs/advisory-findings-verification-2026-08-28.md](docs/advisory-findings-verification-2026-08-28.md).
-- **v0.50.0–v0.51.0, the documentation pass and the XDG unification** —
-  [docs/documentation-pass-2026-08-27.md](docs/documentation-pass-2026-08-27.md), and the
-  `state-paths.ts` row in `CLAUDE.md`.
-- **v0.49.0, the uncovered-areas sprint** —
-  [docs/uncovered-areas-review-2026-08-26.md](docs/uncovered-areas-review-2026-08-26.md).
-- **v0.47.x–v0.48.0, the complexity review and its §5 implementation** —
-  [docs/complexity-review-2026-08-25.md](docs/complexity-review-2026-08-25.md).
-- **v0.46.0, the dialect-rescue destructive filter** — the last safety-shaped code gap. Its rule
-  is a `CLAUDE.md` gotcha, and its design is
-  [docs/dialect-rescue-destructive-refusal-2026-08-24.md](docs/dialect-rescue-destructive-refusal-2026-08-24.md).
-- **v0.45.0, the custody program** — plan, recon corrections and the seven build decisions:
-  [docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md). Residuals: §6.
-- **v0.40.0–v0.44.0, the metering program** — closeout ledger and every gap/stage/decision table:
-  [docs/metering-reconciliation-2026-08-22.md](docs/metering-reconciliation-2026-08-22.md) §7.
-- **Every standing trade and open question** those sprints produced: §6 below, which is the one
-  place they are tracked.
-- **Process lessons that generalize** (run the pre-fix control yourself; lane discipline; the
-  evidence-only closeout auditor) live in agent memory (`llm-relay-revival`,
-  `free-lane-playbook`).
+Earlier releases are deliberately not restated here. `git log --oneline`, the tags, and the dated
+documents under `docs/` are the trail; what survived each release lives in the `CLAUDE.md` rows
+and gotchas.
 
 ## 1. What still binds
 
@@ -222,18 +82,18 @@ history - do not reintroduce them.
 | Document | For |
 |---|---|
 | `CLAUDE.md` | Architecture map, file-to-responsibility table, gotchas. Invariants are authoritative there. |
-| `docs/metering-reconciliation-2026-08-22.md` | Implemented vs open against the quota-metering spec: gap/stage/decision tables, both-fronts and provenance checks, remaining-items list. |
-| `docs/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections |
-| `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting - components, staged build order |
-| `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline - metrics, collection sites, storage, stages |
-| `docs/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA implementation design, protocol, contract, staged gates |
-| `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind |
-| `docs/reference.md` | Full user-facing reference, including provider credential fleets and protected diagnostic surfaces. |
-| `docs/three-axis-assessment-2026-08-28.md` | The owner's three-axis capability assessment: verdicts per axis, the live-signal finding, the closed follow-up ledger. |
-| `docs/advisory-findings-verification-2026-08-28.md` | The pass over the 32 advisory findings the 2026-08-26 review left unverified: the closed-vocabulary bug class and all eight instances, Class A vs Class B, the verdict ledger. |
-| `docs/documentation-pass-2026-08-27.md` | The doc-vs-source pass: what was wrong and in what classes, what was deliberately left, and the friction. |
-| `docs/dispatch-integration-review-2026-08-27.md` | Historical cross-CLI dispatch review: execution model, AGY permissions, ACP transport, and the original immediate-child window fix. Its AGY focus-safety conclusion is superseded by the 2026-08-31 report below. |
-| `docs/dispatch-smoothness-2026-08-31.md` | Current per-agent routing matrix, MCP spawn guarantees, PowerShell/OpenCode repairs, completed AGY focus-safety revalidation, and the deferred Claude host boundary. |
+| `docs/metering-reconciliation-2026-08-22.md` | Implemented vs open against the quota-metering spec: gap/stage/decision tables. |
+| `docs/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections. |
+| `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting: components, staged build order. |
+| `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline: metrics, collection sites, storage, stages. |
+| `docs/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA design, protocol, contract, staged gates. |
+| `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind. |
+| `docs/reference.md` | Full user-facing reference: credential fleets, protected diagnostic surfaces. |
+| `docs/three-axis-assessment-2026-08-28.md` | The owner's three-axis capability assessment: verdicts per axis, the live-signal finding. |
+| `docs/advisory-findings-verification-2026-08-28.md` | The 32 advisory findings: the closed-vocabulary bug class and all eight instances. |
+| `docs/documentation-pass-2026-08-27.md` | The doc-vs-source pass: what was wrong, in what classes, what was deliberately left. |
+| `docs/dispatch-integration-review-2026-08-27.md` | Historical cross-CLI dispatch review; its AGY focus-safety conclusion is superseded by the next row. |
+| `docs/dispatch-smoothness-2026-08-31.md` | Current per-agent routing matrix, MCP spawn guarantees, PowerShell/OpenCode repairs. |
 
 ## 3. Verification — the one gate
 
@@ -241,88 +101,39 @@ history - do not reintroduce them.
 npm run build && npm run check
 ```
 
-`npm run check` = both typechecks (`src/` and `test/`) + the server vitest suite + the dashboard
-checks (`tsc -p dashboard/tsconfig.json --noEmit` and the dashboard suite) + the package checks
-(bundle-inventory equality, size ratchets, packed smoke). **CI runs exactly this and nothing
-else.**
-
+- `npm run check` = both typechecks (`src/` and `test/`) + the server vitest suite + the dashboard
+  checks (`tsc -p dashboard/tsconfig.json --noEmit` and the dashboard suite) + the package checks
+  (bundle-inventory equality, size ratchets, packed smoke). **CI runs exactly this and nothing
+  else.**
 - Bundle sizes live in `docs/dashboard-package-baseline.json` and are ratcheted: regenerate the
   baseline in the SAME change that adds or removes bundle weight, or `check:package` goes red.
 - Tests read `src/` directly; `scripts/*.mjs` read `dist/` - rebuild before running any script.
-- Some tests are POSIX-only (`skipIf(process.platform === "win32")`) and skip on Windows; CI's
-  ubuntu leg is the only place they run, so a green local Windows run is not full coverage of
-  secret-file permissions. A store path nested
-  under a regular file reads as `ENOENT` on Windows but `ENOTDIR` on Linux, so fixtures that
-  require an absent load must inject the stat/read seam rather than relying on that filesystem shape.
-- A failing test may be pinning a defect it should have caught. Read its stated reasoning before
-  assuming your change is wrong, and fix test and source in the same commit.
-- **A test that does real machine work has the machine's worst case in its 5 s budget.** A spawn
-  measured at ~50 ms idle took 2.8–4 s under full-suite process contention and flaked for weeks.
-  Fix at the root with an injected seam, never by raising one test's timeout — the flake just
-  moves to the next test on the same path. The worked example is the `winenv.ts` row in
-  `CLAUDE.md`.
+- Some tests are POSIX-only and skip on Windows; CI's ubuntu leg is the only place they run. A
+  store path nested under a regular file reads `ENOENT` on Windows but `ENOTDIR` on Linux, so
+  fixtures inject the stat/read seam.
+- A failing test may pin a defect it should have caught; fix test and source in one commit.
+- A test doing real machine work has the machine's worst case in its 5 s budget: a spawn measured
+  at ~50 ms idle took 2.8–4 s under full-suite contention and flaked two CLI tests for weeks. Fix
+  at the root with an injected seam, never by raising one test's timeout.
 - Static analysis (`npm run analysis:run`) is advisory and deliberately outside the gate.
 
 ## 4. Things that will bite you
 
-- **Do not trust this repo's documentation without checking source.** Drift here has been
-  recurrent. THREE mechanical axes are guarded now — `test/architecture-map.test.ts` (every
-  non-index `src/` file has a `CLAUDE.md` table row), `test/scripts-inventory.test.ts` (every
-  `scripts/*.mjs` is named in `scripts/CLAUDE.md`, and no name there is dead), and
-  `test/doc-links.test.ts` (every relative link in the shipped doc set resolves, and no `.md`
-  target wears a line-number fragment). ⚠ Everything a doc SAYS is still unguarded: what a module
-  does, what a default is, which release shipped what. Verify before inheriting such claims.
-- **A recorded "open gap" is a claim like any other — verify its MECHANISM before working it.**
-  A §6 entry once cited a mechanism (backslash paths failing `check:package` on Windows) that had
-  never existed on this tree; ten minutes of reproduction beat an afternoon of fixing a defect
-  that did not exist.
-- **A CLI process's environment is not the running relay's environment.** On Windows a User-scope var
-  enters a process only at start, and the relay launches at logon. `llm-relay keys` reports *its own*
-  env; `GET /registry` is authoritative. A whole "half the pool is dead" finding was once this.
-- **Worktrees.** If work happens in a git worktree, edit and run tests *in that path*. `vitest.config.ts`
-  scopes the suite to this checkout's `test/` on purpose — do not widen it.
-- **Liveness checks.** llm-relay's `/health` and `/ping` return **403 by design** (they are control
-  routes); use `/telemetry`. freellmapi's `/health` returns **200 unconditionally** from an SPA
-  catch-all — its real route is `/api/health`.
-- **Never put `--permission-mode plan` in a `cliLane` template.** Headless `claude -p` has no
-  `ExitPlanMode`, so the lane can never leave plan mode and looks healthy while completing nothing.
-- **Headless offload lanes must be told not to stop and ask.** A lane that ends its turn with a
-  clarifying question reads as a completed task that did nothing. Instruct it to decide and
-  proceed on its own judgement, and to report rather than await approval.
-- **Keep `{task}` BEFORE any variadic flag in a `cli` rung template.** Some shells let a variadic
-  option swallow what follows it, and the owner's template once lost the whole prompt to
-  `--allowedTools`. Confirm a template with one real headless run before trusting a lane built
-  from it.
-- **Claude Code has THREE client-side idle timers that abort a long silent generation at ~300 s
-  on a custom base URL** — event-level + byte-level streaming watchdogs, and the body idle
-  timeout. The relay's commit probe (`src/stream-commit.ts`) holds bytes until meaningful
-  content, so a long think looks idle to all three. Set
-  `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` and
-  `API_FORCE_IDLE_TIMEOUT=0` in any hand-written CLI rung's `env`; the owner's
-  `routing.cliLane.env` already carries all three.
-- **A spent pool member stays walkable by design** (health demotes, never drops), so a headless
-  session can die on a member with a standing 402/403 when the preferred member is rate-limited.
-  Addressing a healthy member directly (`--model <provider>/<model>`) avoids the fall-through;
-  the durable fix direction is eligibility facts and the G2 cap, never dropping.
-- **A multi-lane burst degrades the free pool it runs on.** Lanes sharing one quota domain die
-  together (a weekly spend-limit 403 ends a headless `claude -p` lane outright). Relaunch each
-  dead lane pinned to a DIFFERENT healthy member from `/candidates`, so lanes sit in separate
-  quota domains.
-- **`gh run watch` on a PASSING publish run shows an `X tier-data.json missing or empty`
-  annotation.** It comes from the smoke step's DELIBERATE negative test (publish.yml deletes the
-  file and requires exactly that error — "PASS-AS-EXPECTED"), and GitHub renders the `::error::`
-  as a failure annotation anyway. Judge a run by `conclusion`, never by its annotations.
-- **Refusal signatures converge across lanes since the 2026-08-29 fix, with one stated residual.**
-  A provider message CUT by the wrapper's 300-char body cap converges only when both lanes'
-  extractions share the same 240-char signature prefix; otherwise each lane keeps its own
-  signature and each binds for the lane it was learned on. An accepted verdict therefore covers
-  the lane whose traffic produced it — which is the walk lane for everything pool-routed. An
-  EMPTY wrapped body teaches and queues nothing, by design. Diagnosis and resolution:
-  [docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md).
-- **The vitest interpretations/fact stores are per-PROCESS files, so entries leak between tests
-  in one file.** `resetInterpretations()` drops the memo, not the file — a later test's
-  `pendingRefusals()` sees every entry earlier tests flushed. Assert entry-specific facts
-  ("this signature is still pending"), never queue lengths.
+1. Do not trust this repo's documentation without checking source; three mechanical guards exist
+   (`test/architecture-map.test.ts`, `test/scripts-inventory.test.ts`, `test/doc-links.test.ts`)
+   and everything a doc SAYS is still unguarded.
+2. A recorded "open gap" is a claim; verify its mechanism before working it.
+3. A CLI process's environment is not the running relay's environment; `GET /registry` is
+   authoritative for `has_key`.
+4. `/health` and `/ping` return 403 by design; use `/telemetry`.
+5. Headless offload lanes must be told not to stop and ask.
+6. A spent pool member stays walkable by design; address a healthy member directly with
+   `--model <provider>/<model>`.
+7. A multi-lane burst degrades the free pool it runs on; relaunch each dead lane pinned to a
+   different healthy member from `/candidates`.
+8. The vitest interpretations/fact stores are per-PROCESS files; assert entry-specific facts,
+   never queue lengths.
+9. Worktrees: edit and run tests in that path; `vitest.config.ts` scopes the suite on purpose.
 
 ## 5. Definition of done
 
@@ -335,93 +146,27 @@ else.**
 - No half-done state. Deliberate intermediate states must be called out explicitly so they are not
   mistaken for bugs.
 
-## 6. Outstanding, unclaimed
+## 6. Recorded trades with no other home
 
-⚠ What follows is **recorded trades, deferrals and settled decisions kept for their reasons**, not
-a work queue. The queue is [docs/backlog.md](docs/backlog.md). Nothing here currently awaits the
-owner.
+Everything here is a settled trade kept for its reason, not work; the queue is `docs/backlog.md`.
 
-**From the 2026-08-29 triage
-([docs/eligibility-triage-2026-08-29.md](docs/eligibility-triage-2026-08-29.md)):**
-
-- **EXECUTED: the lane-split refusal-signature fix** (owner decision 2026-08-29: fix and
-  re-migrate). Shipped in v0.57.0 with the load-time store migration; residuals recorded in §4
-  and in the `refusal-interpretation.ts` row of `CLAUDE.md`.
-- **EXECUTED: the max-output-caps design (accepted 2026-08-29, implemented the same day in
-  v0.58.0).** Display-only learning of stated output ceilings, shipped exactly as scoped
-  ([docs/max-output-caps-design-2026-08-29.md](docs/max-output-caps-design-2026-08-29.md));
-  the carrier groq signature was rejected from the queue on landing.
-
-**Owner decisions on record:**
-
-- **DECIDED 2026-09-04: `freeOnly` stays `false` on all three offload rules.** Since the
-  admission reversal (`28efb91`) an `include: "free"` pool lists paid and unknown-cost deployments
-  strictly behind every free member; the owner chose to keep them reachable as the last resort
-  rather than answer 503 when the free lane is spent. The accepted cost: a paid balance that is
-  topped up (OpenRouter, Kilo) is spent by the first walk whose free members all fail. Re-raise only
-  if a balance is funded. Contract stated in the `dynamic-pools.ts` row of `CLAUDE.md`; evidence in
-  [docs/muse-spark-1.3-opencode-zen-2026-09-04.md](docs/muse-spark-1.3-opencode-zen-2026-09-04.md) §4.
-- **DECIDED 2026-09-04: Meta contributor SKUs may be routed automatically (option A).** Prompts
-  and completions sent to `opencode/muse-spark-1.3-contributor-free` become Meta training data, and
-  the owner accepted that for offloaded traffic. Route A (the OpenCode-CLI `opencode-muse-spark`
-  rungs) is live; route B (a Responses-API upstream) is a backlog lap.
-- **WITHDRAWN: the currency-per-week spend ceiling.** The owner never asked for it; it was an
-  agent-recorded candidate. Do not re-raise it as an open item.
-- **EXECUTED: the OpenRouter weekly-limit interpretation is accepted**
-  (`allowance-exhausted`, scope credential, `--cost-class paid`) — paid OpenRouter deployments
-  demote while the condition cools and free ones stay walkable. Self-healing on both sides: any
-  paid success, or the spend-headroom poll, clears it.
-- **Type-level 7 stays as recorded** (a hard cap's `used` carries no basis provenance) — owner
-  chose keep-as-is. A transparency gap, not a wrong refusal.
-- **ACCEPTED AS-IS (owner decision 2026-08-23):** streaming cross-protocol usage parity in
-  llm-bridge — the ledger observes the BACKEND stream, so accounting is correct; only the
-  client-facing translated SSE loses cache fields.
-- **DROPPED (owner decision 2026-08-23), not deferred — Gaps 15/16, P4.** Removed from the
-  program of record entirely: Gap 15 (single-file HTML dashboard) was superseded by the shipped
-  SPA, Gap 16 (in-flight quota leases) had spec §5.4 arguing against it with no measured
-  overshoot, P4 (server-enforced system prompts) never acquired a purpose.
-
-**Deferred hardening (2026-08-28 verification sprint)** — every reason in
-[docs/advisory-findings-verification-2026-08-28.md](docs/advisory-findings-verification-2026-08-28.md)
-"Still open, with its home". In short: four **Class B** findings (a type wider than its producers,
-which no producer can reach) are hardening and deferred — type-level 2, 8, 14, 15; type-level 12
-is deferred until someone can show acceptance-equivalence by differential fuzzing, because it
-governs what LOADS and a quarantined shard is a lost day of ledger. Response-SIZE bounds on the
-probe paths and the `withBudget` non-cancelling race are named as out of scope in `cd6e5f8`.
-
-**Standing trades, each judged in its packet review — do not re-litigate them as discoveries:**
-
-- Orphan `tmp-*` journal files are never swept. Crash-only residue (at most one per hard kill,
-  bounded by the file caps), unreadable by anything, and a sweeper cannot distinguish an orphan
-  from another process's in-flight temp. If ever built: gate on prefix + inside-root + age > 24h,
-  and leave `.corrupt-*` alone — that is deliberate evidence.
-- `methodSnapshot` accepts bounded arbitrary JSON as an estimation "method" — deliberate and
-  pinned (it snapshots a structured descriptor away from later caller mutation).
-- The dashboard session token rides `sessionStorage`; the mitigation is the strict CSP.
-- Misleading error codes for body problems (N8): fixing it is a versioned WIRE change for a code
-  no consumer reads. SPA/test nits standing: flat 30 s poll with no failure backoff (mitigated by
-  abort-on-hide/offline), CSS-structure test mirroring styles.css, a few wall-clock-sleep tests,
-  dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
-  described-by, theme preference not persisted, SIGKILL leaking the test interpretations file.
-- Unverified residual (metering reconciliation §5): rotation-triggered fact clearing is verified
-  only in adjacent machinery, not the rotation path itself. (The ≥2-candidate accounting walk IS
-  pinned on both fronts in `test/accounting-lifecycle.test.ts`.)
-- Custody residuals (v0.45.0): `keys rotate` mints the control token when no relay runs — same
-  side effect as `cooldowns clear`, noted, not a defect; the keystore read surface is deliberately
-  wider than the strict `keys add`/`import` write gate (documented in `docs/reference.md`); macOS
-  `security` and Linux `secret-tool` lanes have injected-double coverage only — no CI leg runs
-  them, so any "CI-verified" claim about them would be false; the server-side integration tests
-  share the worker-default keystore path; `keystoreStatus` retains the KEK after a successful
-  read (deliberate, serves the spawn-once discipline).
-- From the 2026-08-27 uncovered-areas sprint
-  ([docs/uncovered-areas-review-2026-08-26.md](docs/uncovered-areas-review-2026-08-26.md)
-  "Not fixed, and why"): §5 item 24 REJECTED on a measured line delta; items 9, 11, 12, 13,
-  19-remainder and 23 keep their verdicts; two behaviours recorded rather than changed
-  (`key-checker`'s initial-probe 401/403, and an anthropic-kind provider only ever reporting
-  `unverified`); the pre-existing mis-indentation in `src/key-checker.ts` stands so a reformat
-  cannot obscure a real diff.
-- **`delegate-gate` findings WAIVED across this lap's lane diffs** (2026-09-04): the module-level
-  `servers` test-fixture pattern and `as unknown as typeof fetch` casts, both flagged repeatedly
-  across this lap's AGY-lane packets, were judged pre-existing repository convention rather than
-  new defects and let through — the same shape as the dashboard-fixture `as unknown as` entry
-  above, now also seen on the server side.
+1. **Custody residuals (v0.45.0):** `keys rotate` mints the control token when no relay runs (same
+   side effect as `cooldowns clear`); the macOS `security` and Linux `secret-tool` lanes have
+   injected-double coverage only, no CI leg runs them; the server-side integration tests share
+   the worker-default keystore path. Plan:
+   [docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md).
+2. **SPA and test nits standing:** the flat 30 s poll with no failure backoff (mitigated by
+   abort-on-hide/offline), the CSS-structure test mirroring styles.css, a few wall-clock-sleep
+   tests, dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
+   described-by, theme preference not persisted, SIGKILL leaking the test interpretations file;
+   and the misleading body-problem error codes (N8), a versioned wire change no consumer reads.
+3. **`delegate-gate` findings waived (2026-09-04):** the module-level `servers` test-fixture
+   pattern and `as unknown as typeof fetch` casts are pre-existing repository convention, not new
+   defects.
+4. **Where every other settled decision lives:** the owner decisions of 2026-09-04 (`freeOnly`
+   stays `false`; contributor SKUs route automatically) in the `dynamic-pools.ts` row of
+   `CLAUDE.md` and `docs/muse-spark-1.3-opencode-zen-2026-09-04.md`; the Class B deferrals, the
+   type-level 7 keep and the WITHDRAWN currency-per-week spend ceiling in
+   `docs/advisory-findings-verification-2026-08-28.md`; the dropped Gaps 15/16/P4 and the accepted
+   streaming usage parity in `docs/metering-reconciliation-2026-08-22.md` §7; the uncovered-areas
+   verdicts in `docs/uncovered-areas-review-2026-08-26.md`.
