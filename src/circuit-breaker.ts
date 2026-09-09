@@ -43,24 +43,41 @@ export interface CircuitState {
 }
 
 /**
- * The COOLING half of one cell, in a shape that can be written to disk and read back.
+ * One whole circuit-breaker cell, in a shape that can be written to disk and read back.
  *
  * Declared here rather than in `breaker-persistence.ts` so the dependency runs one way only
- * (persistence imports the breaker, never the reverse) and `exportCooldowns`/`restoreCooldowns`
- * can stay IO-free. See that module for what is deliberately NOT carried.
+ * (persistence imports the breaker, never the reverse) and `exportState`/`restoreState`
+ * can stay IO-free.
+ *
+ * All fields are OPTIONAL on the wire; absent means the value a fresh cell has.
  */
-export interface BreakerCooldownRow {
+export interface BreakerCellRow {
   readonly provider: string;
   readonly model: string | null;
   readonly kind: string;
   readonly credentialId: string;
   readonly base?: string | undefined;
-  /** Absolute epoch ms. A row whose value is not in the future is never restored. */
+  /** Absolute epoch ms. A row whose value is not in the future restores as lapsed. */
   readonly cooldownUntil: number;
   readonly cooldownSource: CooldownSource | null;
   /** Consecutive unexplained 429s — the ladder index that makes the next 429 escalate correctly. */
   readonly unexplained429s: number;
   readonly lastStatus?: number | undefined;
+  // ── Added 2026-09-08 (owner decision: the WHOLE cell survives a restart). Every field below is
+  // optional on the wire so a file written before that date still loads, with fresh-cell defaults.
+  /** Failures since the last success on this cell; `MAX_FAILURES_BEFORE_TRIP` reads it. */
+  readonly consecutiveFailures?: number;
+  /** Epoch ms of the last failure; the dashboard's Cooldowns panel shows it as `observedAt`. */
+  readonly lastFailureTime?: number;
+  /** 401/403 count on this credential×model cell — the credential axis, never health. */
+  readonly credentialFailures?: number;
+  readonly lastCredentialStatus?: number | undefined;
+  /** Epoch ms; the fault is active only while this is in the future (`CREDENTIAL_FAULT_TTL_MS`). */
+  readonly credentialFaultUntil?: number;
+  /** The served-request window (`MAX_PING_HISTORY` newest); `telemetry.ts` scores stability from it. */
+  readonly pings?: PingRecord[];
+  /** Provider-stated quota headers; `availability.ts` discards a stale one at read time. */
+  readonly quotaObservations?: QuotaObservation[];
 }
 
 /** Provisional upstream metadata, committed only with a terminal attempt outcome. */
@@ -588,7 +605,6 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     });
     if (state.pings.length > MAX_PING_HISTORY) state.pings.shift();
     if (outcome.ok) {
-      const wasCooling = state.cooldownUntil > now;
       state.consecutiveFailures = 0;
       state.cooldownUntil = 0;
       state.cooldownSource = null;
@@ -597,9 +613,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       state.credentialFailures = 0;
       state.credentialFaultUntil = 0;
       delete state.lastCredentialStatus;
-      // A success RETRACTS a persisted cooldown, so the file must be rewritten too. Skipping the
-      // notify when nothing was cooling keeps a healthy relay from writing on every request.
-      if (wasCooling) this.notifyCoolingChanged();
+      this.notifyStateChanged();
       return;
     }
     state.consecutiveFailures += 1;
@@ -639,9 +653,10 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       state.cooldownUntil = now + cooling.ms;
       state.cooldownSource = cooling.source;
     }
-    // One notify for the whole ladder above, whichever branch set the cooldown. A failure that
-    // set none (below the trip threshold, no Retry-After) leaves nothing new to persist.
-    if (state.cooldownUntil > now) this.notifyCoolingChanged();
+    // One unconditional notify for the whole ladder above — every outcome now dirties the file,
+    // and the WriteBehindTimer bounds writes to one per 250 ms of quiet and one per 2 s under
+    // sustained load.
+    this.notifyStateChanged();
   }
 
   /** Retain a fresh axis/period tuple without discarding another axis from an earlier response. */
@@ -675,6 +690,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     state.credentialFailures += 1;
     state.lastCredentialStatus = status;
     state.credentialFaultUntil = at + CREDENTIAL_FAULT_TTL_MS;
+    this.notifyStateChanged();
   }
 
   /** Clear faults only for the stated credential across its own model cells. */
@@ -689,6 +705,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       delete state.lastCredentialStatus;
       cleared += 1;
     }
+    if (cleared > 0) this.notifyStateChanged();
     return cleared;
   }
 
@@ -707,6 +724,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       delete state.lastCredentialStatus;
       credentialFaults.push(clearedCell(state.target));
     }
+    if (credentialFaults.length > 0) this.notifyStateChanged();
     return credentialFaults.sort(compareClearedCells);
   }
 
@@ -747,7 +765,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     credentialFaults.sort(compareClearedCells);
     // `llm-relay cooldowns clear` must reach the FILE too. Without this a cleared cooldown would
     // come back on the next restart, which is exactly the state the operator just retracted.
-    if (breakerCells.length > 0) this.notifyCoolingChanged();
+    if (breakerCells.length > 0 || credentialFaults.length > 0) this.notifyStateChanged();
     return { breakerCells, credentialFaults };
   }
 
@@ -782,7 +800,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     if (state.cooldownUntil >= until) return; // an existing longer cooldown keeps its own source
     state.cooldownUntil = until;
     state.cooldownSource = "quota";
-    this.notifyCoolingChanged();
+    this.notifyStateChanged();
   }
 
   /** Active backend attempts for one credential slot across all of its deployments. */
@@ -801,16 +819,16 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   }
 
   /**
-   * The cooling half of every cell that is still cooling, for `breaker-persistence.ts`.
+   * Every cell — cooling or not — with every persisted field, for `breaker-persistence.ts`.
    *
    * Pure and IO-free on purpose: this module holds no file handles, so persistence stays a
-   * separate concern that a bare programmatic proxy can simply not install. Cells that are not
-   * cooling are omitted rather than written as empty rows.
+   * separate concern that a bare programmatic proxy can simply not install. An optional field is
+   * omitted only when it is `undefined` (`lastStatus`, `lastCredentialStatus`, `base`); `pings`
+   * is written as held, already capped at `MAX_PING_HISTORY`.
    */
-  exportCooldowns(now: number = Date.now()): BreakerCooldownRow[] {
-    const rows: BreakerCooldownRow[] = [];
+  exportState(): BreakerCellRow[] {
+    const rows: BreakerCellRow[] = [];
     for (const state of this.states.values()) {
-      if (state.cooldownUntil <= now) continue;
       rows.push({
         provider: state.target.provider,
         model: state.target.model,
@@ -821,24 +839,39 @@ export class CircuitBreaker implements AttemptLifecyclePort {
         cooldownSource: state.cooldownSource,
         unexplained429s: state.unexplained429s,
         ...(state.lastStatus === undefined ? {} : { lastStatus: state.lastStatus }),
+        consecutiveFailures: state.consecutiveFailures,
+        lastFailureTime: state.lastFailureTime,
+        credentialFailures: state.credentialFailures,
+        ...(state.lastCredentialStatus === undefined ? {} : { lastCredentialStatus: state.lastCredentialStatus }),
+        credentialFaultUntil: state.credentialFaultUntil,
+        pings: state.pings,
+        quotaObservations: state.quotaObservations,
       });
     }
     return rows;
   }
 
   /**
-   * Re-apply persisted cooling rows, returning how many were applied.
+   * Re-apply persisted rows, returning how many were applied.
    *
-   * ⚠ NEVER overwrites a cooldown this process has already learned. A restore runs at startup, but
-   * making it defensive costs nothing and means a late or repeated call cannot shorten or extend
-   * live state — the same rule `recordQuotaCooldown` follows ("a quota demotion never SHORTENS
-   * someone else's cooldown"). Rows at or before `now` are already excluded by
-   * `loadBreakerCooldowns`; the check is repeated here so a direct caller cannot bypass it.
+   * ⚠ NEVER touches a cell this process has already created. A restore runs at startup, where that
+   * is every row; making it defensive costs nothing and means a late or repeated call cannot
+   * shorten, extend or overwrite live state — the `recordQuotaCooldown` rule ("a quota demotion
+   * never SHORTENS someone else's cooldown"), generalised to the whole cell.
+   *
+   * ⚠ FAITHFUL, not future-only. Every field is copied as it was, `cooldownUntil` included even when
+   * it is already in the past: a lapsed cooldown restores as lapsed and the cell reads ready,
+   * exactly as in memory. The old rule — restore only while the cooldown is still in the future —
+   * reset the escalation ladder on every restart, a behaviour the running process does not have.
+   * In memory a lapsed cooldown keeps its `unexplained429s`; the counter alone demotes nothing,
+   * only a FRESH 429 applies it, and that 429 is a fresh measurement of the same condition. A
+   * restart is not a success. Absent optional fields take the fresh-cell defaults; `pings` is
+   * trimmed to the newest `MAX_PING_HISTORY` defensively. Nothing here notifies persistence —
+   * rewriting the file with what was just read from it would be a pointless write.
    */
-  restoreCooldowns(rows: readonly BreakerCooldownRow[], now: number = Date.now()): number {
+  restoreState(rows: readonly BreakerCellRow[]): number {
     let applied = 0;
     for (const row of rows) {
-      if (row.cooldownUntil <= now) continue;
       const target: ProviderTargetIdentity = {
         provider: row.provider,
         model: row.model,
@@ -846,12 +879,20 @@ export class CircuitBreaker implements AttemptLifecyclePort {
         credentialId: row.credentialId as ProviderTargetIdentity["credentialId"],
         ...(row.base === undefined ? {} : { base: row.base }),
       };
+      const key = this.getKey(target);
+      if (this.states.has(key)) continue;
       const state = this.getOrCreate(target);
-      if (state.cooldownUntil > now) continue;
       state.cooldownUntil = row.cooldownUntil;
       state.cooldownSource = row.cooldownSource;
       state.unexplained429s = row.unexplained429s;
       if (row.lastStatus !== undefined) state.lastStatus = row.lastStatus;
+      state.consecutiveFailures = row.consecutiveFailures ?? 0;
+      state.lastFailureTime = row.lastFailureTime ?? 0;
+      state.credentialFailures = row.credentialFailures ?? 0;
+      if (row.lastCredentialStatus !== undefined) state.lastCredentialStatus = row.lastCredentialStatus;
+      state.credentialFaultUntil = row.credentialFaultUntil ?? 0;
+      state.pings = row.pings ? row.pings.slice(-MAX_PING_HISTORY) : [];
+      state.quotaObservations = row.quotaObservations ?? [];
       applied += 1;
     }
     return applied;
@@ -861,17 +902,19 @@ export class CircuitBreaker implements AttemptLifecyclePort {
    * Register the persistence listener. At most one: a second install would double every write,
    * and there is exactly one file.
    */
-  onCoolingChanged(listener: () => void): void {
-    this.#coolingChanged = listener;
+  onStateChanged(listener: () => void): void {
+    this.#stateChanged = listener;
   }
 
-  /** Fired wherever cooling state changes; a no-op until persistence is installed. */
-  #coolingChanged: (() => void) | null = null;
+  /** Fired wherever persisted state changes; a no-op until persistence is installed. */
+  #stateChanged: (() => void) | null = null;
 
-  private notifyCoolingChanged(): void {
+  private notifyStateChanged(): void {
     // Never let a persistence failure reach the request path — this runs inside outcome recording.
+    // Every outcome now dirties the file, and the WriteBehindTimer bounds writes to one per 250 ms
+    // of quiet and one per 2 s under sustained load.
     try {
-      this.#coolingChanged?.();
+      this.#stateChanged?.();
     } catch {
       /* best-effort persistence */
     }

@@ -18,7 +18,7 @@
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { relayStatePath } from "./state-paths.js";
-import { WriteBehindTimer } from "./write-behind.js";
+import { WriteBehindRegistry, WriteBehindTimer } from "./write-behind.js";
 import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 import {
   exportExhaustedRows,
@@ -88,9 +88,21 @@ export function installDispatchExhaustionPersistence(
   const path = opts.path ?? getDispatchExhaustionPath();
   const clock = opts.now ?? Date.now;
   const restored = restoreExhaustedRows(cfg, loadExhaustedRows({ path, now: clock() }), clock());
-  const timer = new WriteBehindTimer();
+  const timer = installed.register(new WriteBehindTimer());
   onExhaustionChanged(cfg, () => {
     timer.touch(() => saveExhaustedRows(exportExhaustedRows(cfg, clock()), { path }));
   });
   return restored;
+}
+
+/** Every timer an install armed, so the shutdown flush needs no handle from the installer. */
+const installed = new WriteBehindRegistry();
+
+/**
+ * The shutdown seam: write every dirty death NOW. Until 2026-09-08 nothing could — a
+ * vendor-stated cooldown reported in the last two seconds before a graceful stop was lost, and
+ * the lane retried. Returns how many files were written.
+ */
+export function flushDispatchExhaustionPersistence(): number {
+  return installed.flushAll();
 }

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
@@ -7,9 +7,39 @@ import tailwindcss from "tailwindcss";
 import autoprefixer from "autoprefixer";
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const nodeModulesRoot = join(projectRoot, "node_modules");
+/**
+ * Where `node_modules` PHYSICALLY lives. In a lap worktree it is a junction to the main
+ * checkout's directory (`lap-worktree.mjs open` wires it that way), and Vite hands this plugin the
+ * RESOLVED module id — so `relative(projectRoot, directory)` walked up and out
+ * (`../../../Code/llm-relay/node_modules/react`), and `scripts/dashboard-package-check.mjs`
+ * rightly refused it as non-portable (2026-09-08). The junction IS this checkout's
+ * `node_modules`, so a package under its real target is reported as `node_modules/<name>`.
+ */
+const realNodeModulesRoot = ((): string => {
+  try {
+    return realpathSync(nodeModulesRoot);
+  } catch {
+    return nodeModulesRoot;
+  }
+})();
 
 function toPortablePath(path: string): string {
   return path.replace(/\\/gu, "/");
+}
+
+/**
+ * A package directory relative to this checkout, expressed as `node_modules/...` whether the
+ * directory sits under the checkout's own `node_modules` or under the junction target it resolves
+ * to. A directory under neither is returned as the plain relative path, so the package check still
+ * refuses a genuinely escaping resolution (an EMPTY `node_modules` that resolved upward).
+ */
+function packageRelativePath(directory: string): string {
+  const direct = relative(projectRoot, directory);
+  if (!direct.startsWith("..")) return toPortablePath(direct);
+  const viaRealRoot = relative(realNodeModulesRoot, directory);
+  if (!viaRealRoot.startsWith("..")) return toPortablePath(join("node_modules", viaRealRoot));
+  return toPortablePath(direct);
 }
 
 function packageForModule(moduleId: string): { packagePath: string; name: string; version: string; license: string } | null {
@@ -28,7 +58,7 @@ function packageForModule(moduleId: string): { packagePath: string; name: string
           throw new Error(`Bundled module has incomplete package metadata: ${toPortablePath(relative(projectRoot, manifestPath))}`);
         }
         return {
-          packagePath: toPortablePath(relative(projectRoot, directory)),
+          packagePath: packageRelativePath(directory),
           name: (manifest as { name: string }).name,
           version: (manifest as { version: string }).version,
           license: (manifest as { license: string }).license,

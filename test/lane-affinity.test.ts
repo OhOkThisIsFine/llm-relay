@@ -24,6 +24,8 @@ import {
   clearLaneAffinity,
   demoteLane,
   exportLaneAffinityRows,
+  flushLaneAffinityPersistence,
+  installLaneAffinityPersistence,
   laneDemotion,
   lanePin,
   loadLaneAffinityRows,
@@ -127,6 +129,23 @@ describe("lane affinity persistence", () => {
     expect(restoreLaneAffinityRows(cfg, loadLaneAffinityRows({ path }), now)).toBe(1);
     expect(lanePin(cfg, "medium", "first", now)).not.toBeNull();
     expect(laneDemotion(cfg, "medium", "second", now)).toBeNull();
+  });
+
+  it("the shutdown flush writes a memory recorded inside the write-behind window", () => {
+    // Until 2026-09-08 the installer's timer lived in a closure nothing could reach, so a pin or
+    // demotion learned in the last two seconds before a graceful stop died with the process.
+    const path = join(dir, `affinity-flush-${Math.random().toString(36).slice(2)}.json`);
+    const now = Date.now();
+    const cfg = freshConfig();
+    installLaneAffinityPersistence(cfg, { path });
+    pinLane(cfg, "medium", "first", "answered", 60_000, now);
+    // Same tick: the debounced timer has not fired, so the file does not carry the row yet.
+    expect(loadLaneAffinityRows({ path })).toEqual([]);
+
+    expect(flushLaneAffinityPersistence()).toBeGreaterThanOrEqual(1);
+    expect(loadLaneAffinityRows({ path }).map((row) => [row.laneId, row.kind])).toEqual([["first", "pin"]]);
+    // Nothing is dirty any more: a second shutdown pass writes nothing for this store.
+    expect(flushLaneAffinityPersistence()).toBe(0);
   });
 
   it("⚠ CLAMPS a restored row to the ceiling — the write path is not the only entrance", () => {

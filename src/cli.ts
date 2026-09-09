@@ -27,12 +27,12 @@ import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js"
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, formatAttemptBudget, type DispatchLane, type DispatchView } from "./dispatch.js";
-import { loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
-import { loadLaneStatsRows, restoreLaneStatsRows } from "./dispatch-lane-stats.js";
+import { flushLaneAffinityPersistence, loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
+import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsRows } from "./dispatch-lane-stats.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
-import { loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
+import { flushDispatchExhaustionPersistence, loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
 import { detectHostRouting, parseHostRoutingState, type HostRoutingState } from "./host-routing.js";
 import { contextWindowResolver, COST_CLASSES, type ContextWindowSource, type CostClass } from "./metadata.js";
 import { snapshotContextWindow } from "./tier-data.js";
@@ -72,6 +72,7 @@ import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp, SHARE_CELL_KEYS, type Co
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
 import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { flushProbeCache } from "./ping/probe-cache.js";
+import { flushBreakerPersistence } from "./breaker-persistence.js";
 import {
   runKeysAddLocal,
   runKeysDisableLocal,
@@ -957,6 +958,11 @@ export function runProxy() {
       flushObservedContextLimits();
       flushFacts();
       flushInterpretations();
+      // The four write-behind stores that armed timers nothing could reach until 2026-09-08.
+      flushBreakerPersistence();
+      flushDispatchExhaustionPersistence();
+      flushDispatchLaneStatsPersistence();
+      flushLaneAffinityPersistence();
     },
   });
   // M5 (open-decisions-2026-08-16.md row M5, approved 2026-08-21): prune usage day shards
@@ -1000,6 +1006,11 @@ export function runProxy() {
       flushObservedContextLimits();
       flushFacts();
       flushInterpretations();
+      // The four write-behind stores that armed timers nothing could reach until 2026-09-08.
+      flushBreakerPersistence();
+      flushDispatchExhaustionPersistence();
+      flushDispatchLaneStatsPersistence();
+      flushLaneAffinityPersistence();
       process.exit(0);
     });
   };

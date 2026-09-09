@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   CURRENT_DISPATCH_EXHAUSTION_VERSION,
+  flushDispatchExhaustionPersistence,
   getDispatchExhaustionPath,
   installDispatchExhaustionPersistence,
   loadExhaustedRows,
@@ -131,6 +132,22 @@ describe("dispatch exhaustion persistence", () => {
     const later = freshConfig();
     expect(installDispatchExhaustionPersistence(later, { path: statePath, now: () => now + 3 * HOUR })).toBe(0);
     expect(exportExhaustedRows(later, now + 3 * HOUR)).toEqual([]);
+  });
+
+  it("the shutdown flush writes a death recorded inside the write-behind window", () => {
+    // Until 2026-09-08 the installer's timer lived in a closure nothing could reach, so a
+    // vendor-stated cooldown reported in the last two seconds before a graceful stop was lost.
+    const now = Date.now();
+    const cfg = freshConfig();
+    installDispatchExhaustionPersistence(cfg, { path: statePath, now: () => now });
+    markExhaustedKey(cfg, "quota:codex-sol", now + HOUR, now);
+    // Same tick: the debounced timer has not fired, so the file does not carry the row yet.
+    expect(loadExhaustedRows({ path: statePath, now })).toEqual([]);
+
+    expect(flushDispatchExhaustionPersistence()).toBeGreaterThanOrEqual(1);
+    expect(loadExhaustedRows({ path: statePath, now })).toEqual([{ key: "quota:codex-sol", until: now + HOUR }]);
+    // Nothing is dirty any more: a second shutdown pass writes nothing for this store.
+    expect(flushDispatchExhaustionPersistence()).toBe(0);
   });
 
   it("⚠ restore never overwrites a cooldown the live process already learned", () => {

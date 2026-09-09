@@ -40,7 +40,7 @@
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { relayStatePath } from "./state-paths.js";
-import { WriteBehindTimer } from "./write-behind.js";
+import { WriteBehindRegistry, WriteBehindTimer } from "./write-behind.js";
 import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 import { isDashboardSafeId } from "./dashboard-contract.js";
 import type { Config } from "./config-types.js";
@@ -374,11 +374,24 @@ export function saveLaneAffinityRows(rows: readonly LaneAffinityRow[], opts: { p
 export function installLaneAffinityPersistence(cfg: Config, opts: { path?: string } = {}): number {
   const path = opts.path ?? getLaneAffinityPath();
   const restored = restoreLaneAffinityRows(cfg, loadLaneAffinityRows({ path }));
-  const timer = new WriteBehindTimer();
+  const timer = installed.register(new WriteBehindTimer());
   onLaneAffinityChanged(cfg, () => {
     timer.touch(() => saveLaneAffinityRows(exportLaneAffinityRows(cfg), { path }));
   });
   return restored;
+}
+
+/** Every timer an install armed, so the shutdown flush needs no handle from the installer. */
+const installed = new WriteBehindRegistry();
+
+/**
+ * The shutdown seam: write every dirty memory NOW. Until 2026-09-08 nothing could — `runProxy`
+ * flushed six sibling stores at shutdown and this one held its timer in a closure nobody could
+ * reach, so a pin or demotion learned in the last two seconds died with the process.
+ * Returns how many files were written.
+ */
+export function flushLaneAffinityPersistence(): number {
+  return installed.flushAll();
 }
 
 /** Test seam: forget every memory for this config. Never called from `src/`. */

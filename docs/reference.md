@@ -147,6 +147,13 @@ block. State lives under `~/.llm-relay/`: `config.json`, `.env`, `keystore.json`
 `dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `lane-affinity.json`, `breaker-state.json`, `update-check.json`, the `hooks/` script, and
 the `usage/` accounting subtree.
 
+`breaker-state.json` is the circuit breaker's own memory: every credential×model cell it has
+learned about — the cooldown and its source, the unexplained-429 ladder, the failure counters, the
+credential fault, the last ten served-request samples and the quota observations — restored when the
+relay starts, so a restart does not send it back into a wall it already knows. Every field is
+re-learnable, so the file is cache-kind and safe to delete. Written on a short debounce (at most
+two seconds behind) and flushed on a graceful shutdown; a hard kill can lose that last window.
+
 ### Where state actually lives
 
 `~/.llm-relay/` is the default. If you set an XDG base directory, **every** artifact honours it,

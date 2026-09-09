@@ -19,6 +19,7 @@ import {
   allLaneStats,
   exportLaneStatsRows,
   getDispatchLaneStatsPath,
+  flushDispatchLaneStatsPersistence,
   installDispatchLaneStatsPersistence,
   laneRoutesThroughRelay,
   laneStatsFor,
@@ -373,6 +374,21 @@ describe("lane stats persistence", () => {
     const after = freshConfig();
     expect(installDispatchLaneStatsPersistence(after, { path: statePath })).toBe(1);
     expect(laneStatsFor(after, "a")).toMatchObject({ calls: 1, successes: 1 });
+  });
+
+  it("the shutdown flush writes a run recorded inside the write-behind window", () => {
+    // Until 2026-09-08 the installer's timer lived in a closure nothing could reach, so a lane
+    // run recorded in the last two seconds before a graceful stop never reached the file.
+    const cfg = freshConfig();
+    installDispatchLaneStatsPersistence(cfg, { path: statePath });
+    recordLaneRun(cfg, parseTelemetryReport(validReport({ jobId: "job-1", laneId: "a" }))!);
+    // Same tick: the debounced timer has not fired, so the file does not carry the row yet.
+    expect(loadLaneStatsRows({ path: statePath })).toEqual([]);
+
+    expect(flushDispatchLaneStatsPersistence()).toBeGreaterThanOrEqual(1);
+    expect(loadLaneStatsRows({ path: statePath }).map((row) => row.laneId)).toEqual(["a"]);
+    // Nothing is dirty any more: a second shutdown pass writes nothing for this store.
+    expect(flushDispatchLaneStatsPersistence()).toBe(0);
   });
 
   it("flushes mutations through the change listener (debounced), including a second lane", async () => {

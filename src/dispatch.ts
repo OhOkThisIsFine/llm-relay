@@ -504,7 +504,7 @@ export function exportExhaustedRows(cfg: Config, now: number = Date.now()): Exha
 
 /**
  * Restore persisted rows into this config's live map. Field-validated per row, future-only, and
- * it NEVER overwrites a cooldown this process already learned — the `restoreCooldowns` contract.
+ * it NEVER overwrites a cooldown this process already learned — the `restoreState` contract.
  * An `until` beyond `MAX_EXHAUSTED_MS` from now is clamped, mirroring `normalizeTtl` at write.
  */
 export function restoreExhaustedRows(cfg: Config, rows: readonly ExhaustedRow[], now: number = Date.now()): number {

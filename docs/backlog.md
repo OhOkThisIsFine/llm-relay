@@ -9,6 +9,20 @@
 
 ## Open
 
+- **The logon-started daemon is stopped by `TerminateProcess`, so no shutdown flush ever runs on
+  this machine (2026-09-08, breaker-persistence lap, low).** Every write-behind store now flushes
+  at a graceful shutdown (`flushBreakerPersistence` and its three siblings beside the six older
+  flushes in `runProxy`), but that path runs only when a signal is delivered — `SIGINT` from a
+  console, or `SIGTERM` on POSIX. `Startup\llm-relay.vbs` starts the relay with no console, and a
+  `Stop-Process` / `child.kill()` is `TerminateProcess`, which runs no handler. Measured in
+  [`breaker-persistence-audit-2026-09-08.md`](breaker-persistence-audit-2026-09-08.md) §3: a kill
+  50 ms after a request lost that request's outcome. The bound is `MAX_FLUSH_DELAY_MS` (2 s), so
+  the loss is small and re-learnable; it is filed because "flushed on shutdown" is now a documented
+  promise that this machine's own stop mechanism cannot keep. **Property:** the relay exposes a
+  control-token-admitted stop (a `POST` on the existing admission boundary, or a documented
+  console-signal launcher) that runs the same shutdown path as `SIGTERM`, and the way this machine
+  restarts the daemon uses it.
+
 - **The per-lane stats window is keyed by lane id ALONE, so one tier's runs set another tier's walk
   budget (2026-09-08, safety review, medium).** `recordLaneRun` in `src/dispatch-lane-stats.ts` does
   `map.get(report.laneId)`. The routing memory beside it IS tier-keyed — `memoryKey` in

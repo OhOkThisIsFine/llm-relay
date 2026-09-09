@@ -139,9 +139,14 @@ describe("DPAPI custody", () => {
   });
 
   it("sanitizes a thrown child error without retaining argv or child output", () => {
-    const argvLeak = "--child-argv-secret";
-    const stdoutLeak = "stdout-super-secret";
-    const stderrLeak = "stderr-ultra-secret";
+    // ⚠ High-entropy needles, like the sibling test below, NOT English-shaped ones. `leaks()`
+    // checks every 4-character window of each needle against `inspect(caught)`, whose stack trace
+    // carries this checkout's absolute PATH — so "stdout-super-secret" matched the "er-s" of a lap
+    // worktree named `…circuit-breaker-state…` and failed the suite there for a reason that had
+    // nothing to do with the sanitizer (2026-09-08). A needle must not share a 4-gram with any path.
+    const argvLeak = "Zq4vT7kRwX2mN9pL";
+    const stdoutLeak = "Hf8sJ3dQy6bWc1eV";
+    const stderrLeak = "Gm5tKx9nPz2rUa7B";
     const spawn: KeyringSpawnSync = () => {
       const childError = new Error(`failed ${argvLeak}`) as Error & Record<string, unknown>;
       childError.stdout = stdoutLeak;

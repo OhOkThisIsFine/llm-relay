@@ -18,7 +18,7 @@
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { relayStatePath } from "./state-paths.js";
-import { WriteBehindTimer } from "./write-behind.js";
+import { WriteBehindRegistry, WriteBehindTimer } from "./write-behind.js";
 import { atomicWriteJsonSync, safeReadJsonSync } from "./storage/json-store.js";
 import { isDashboardSafeId } from "./dashboard-contract.js";
 import type { Config } from "./config.js";
@@ -526,9 +526,21 @@ export function installDispatchLaneStatsPersistence(
 ): number {
   const path = opts.path ?? getDispatchLaneStatsPath();
   const restored = restoreLaneStatsRows(cfg, loadLaneStatsRows({ path }));
-  const timer = new WriteBehindTimer();
+  const timer = installed.register(new WriteBehindTimer());
   onLaneStatsChanged(cfg, () => {
     timer.touch(() => saveLaneStatsRows(exportLaneStatsRows(cfg), { path }));
   });
   return restored;
+}
+
+/** Every timer an install armed, so the shutdown flush needs no handle from the installer. */
+const installed = new WriteBehindRegistry();
+
+/**
+ * The shutdown seam: write every dirty window NOW. Until 2026-09-08 nothing could — the timer
+ * lived in a closure only the change listener held, so a lane run recorded in the last two
+ * seconds before a graceful stop never reached the file. Returns how many files were written.
+ */
+export function flushDispatchLaneStatsPersistence(): number {
+  return installed.flushAll();
 }
