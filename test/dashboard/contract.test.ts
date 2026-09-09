@@ -9,6 +9,7 @@ import {
   COOLDOWN_REASONS,
   COVERAGE_REASONS,
   COVERAGE_STATES,
+  DASHBOARD_COST_SCHEMA,
   DASHBOARD_DETAIL_SCHEMA,
   DASHBOARD_ERROR_CODES,
   DASHBOARD_ERROR_MESSAGES,
@@ -53,6 +54,8 @@ import {
   assertDashboardErrorV1,
   assertDetailV1,
   assertSnapshotV1,
+  isCostReportV1,
+  isWriterHealth,
   isDashboardAttemptId,
   isDashboardAttemptRole,
   isDashboardAttributionPolicy,
@@ -98,6 +101,7 @@ import {
   type BucketV1,
   type ClientDimensionRowV1,
   type CooldownRowV1,
+  type CostReportV1,
   type CredentialDimensionRowV1,
   type DetailV1,
   type ErrorDistributionRowV1,
@@ -110,6 +114,8 @@ import {
   type SpendTotalsV1,
   type SummaryV1,
   type TokenTotalsV1,
+  type WriterHealth,
+  WRITER_STATES,
 } from "../../src/dashboard-contract.js";
 
 const now = "2026-08-20T12:00:00Z";
@@ -708,5 +714,95 @@ describe("dashboard v1 contract", () => {
       compilerOptions?: { lib?: string[] };
     };
     expect(tsconfig.compilerOptions?.lib ?? []).not.toContain("DOM");
+  });
+});
+
+describe("writer health vocabulary — the metering subsystem says when it stopped metering (backlog item 19)", () => {
+  it("closes the writer-state vocabulary", () => {
+    expect([...WRITER_STATES]).toEqual(["writing", "lease_refused", "flush_failed", "schema_refused", "read_only"]);
+  });
+
+  it("validates writer health blocks", () => {
+    const healthy: WriterHealth = {
+      state: "writing",
+      lastSuccessfulWriteAt: null,
+      lastFailureAt: null,
+      lastFailureReason: null,
+    };
+    expect(isWriterHealth(healthy)).toBe(true);
+    const failed: WriterHealth = {
+      state: "flush_failed",
+      lastSuccessfulWriteAt: "2026-08-20T12:00:00.000Z",
+      lastFailureAt: "2026-08-20T12:05:00.000Z",
+      lastFailureReason: "Failed to write 2026-08-20.json",
+    };
+    expect(isWriterHealth(failed)).toBe(true);
+    expect(isWriterHealth({ ...failed, state: "stopped" })).toBe(false);
+    expect(isWriterHealth({ ...failed, lastFailureAt: 0 })).toBe(false);
+    expect(isWriterHealth({ ...failed, lastFailureAt: "noon" })).toBe(false);
+    expect(isWriterHealth({ ...failed, extra: 1 })).toBe(false);
+    expect(isWriterHealth(null)).toBe(false);
+  });
+
+  it("accepts cost reports with or without the writer block, and rejects a bad one", () => {
+    const reportedCell = <P extends "provider_published" | "reference">(priceSource: P) => ({
+      amountMicrousd: null,
+      priceSource,
+      tokenBasis: "reported",
+      source: "provider_reported",
+      observedAt: null,
+    } as const);
+    const estimatedCell = <P extends "provider_published" | "reference">(priceSource: P) => ({
+      amountMicrousd: null,
+      priceSource,
+      tokenBasis: "estimated",
+      source: "relay_estimated",
+      observedAt: null,
+    } as const);
+    const total = {
+      key: "nim",
+      requests: 1,
+      pricedRequests: 0,
+      spend: {
+        providerPublishedReported: reportedCell("provider_published"),
+        providerPublishedEstimated: estimatedCell("provider_published"),
+        referenceReported: reportedCell("reference"),
+        referenceEstimated: estimatedCell("reference"),
+        unpricedRequests: 1,
+        partiallyPricedRequests: 0,
+      },
+    };
+    const base: CostReportV1 = {
+      schema: DASHBOARD_COST_SCHEMA,
+      generatedAt: "2026-08-20T12:34:56.000Z",
+      from: "2026-08-19T12:30:00.000Z",
+      to: "2026-08-20T12:30:00.000Z",
+      window: "24h",
+      includeRepair: false,
+      by: "provider",
+      rows: [],
+      total,
+      repair: null,
+      abandoned: {
+        providerPublishedReported: reportedCell("provider_published"),
+        providerPublishedEstimated: estimatedCell("provider_published"),
+        referenceReported: reportedCell("reference"),
+        referenceEstimated: estimatedCell("reference"),
+      },
+      coverage: "complete",
+      coverageReason: null,
+      recentMinutesMayLag: true,
+    };
+    expect(isCostReportV1(base)).toBe(true);
+    expect(isCostReportV1({
+      ...base,
+      writer: {
+        state: "flush_failed",
+        lastSuccessfulWriteAt: "2026-08-20T12:00:00.000Z",
+        lastFailureAt: "2026-08-20T12:05:00.000Z",
+        lastFailureReason: "Failed to write 2026-08-20.json",
+      } satisfies WriterHealth,
+    })).toBe(true);
+    expect(isCostReportV1({ ...base, writer: { state: "stopped" } })).toBe(false);
   });
 });

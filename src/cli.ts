@@ -68,7 +68,7 @@ import {
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
 import { isCooldownClearResult, type CooldownClearTargetKey } from "./cooldown-clear.js";
 import { createDashboardSnapshotReadPort, type CostReportQuery } from "./dashboard-snapshot.js";
-import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp, SHARE_CELL_KEYS, type CostReportV1, type CostRowV1 } from "./dashboard-contract.js";
+import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp, SHARE_CELL_KEYS, type CostReportV1, type CostRowV1, type WriterHealth, type WriterState } from "./dashboard-contract.js";
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
 import { flushRuntimeTelemetry } from "./ping/runtime-telemetry.js";
 import { flushProbeCache } from "./ping/probe-cache.js";
@@ -1860,6 +1860,11 @@ export interface CostCommandDependencies {
   /** Overrides the store directory; defaults to the production `~/.llm-relay/usage/`. */
   readonly usageDir?: string;
   /**
+   * Overrides the read-only store construction; tests inject a store in a failing writer
+   * state. Defaults to a read-only store over `usageDir`, which reports `read_only`.
+   */
+  readonly store?: AccountingStore;
+  /**
    * Loads the relay config for the `--by model` lane-id footnote. Defaults to the live
    * `loadOrExit`; tests inject a config holding the ladder under test. Read ONLY when
    * `--by model` is asked — every other dimension must keep working config-less.
@@ -1930,15 +1935,16 @@ export async function runCostCommand(dependencies: CostCommandDependencies = {})
   // Read-only on purpose: constructing a normal store here would take the writer lease,
   // replay journals and quarantine corrupt shards — all writes against a directory a live
   // relay may be committing to. This reader observes committed snapshots only.
-  const store = createAccountingStore({
+  const store = dependencies.store ?? createAccountingStore({
     ...(dependencies.usageDir !== undefined ? { rootDir: dependencies.usageDir } : {}),
     readOnly: true,
   });
   const port = createDashboardSnapshotReadPort({ accounting: store, relayVersion: currentVersion(), ...(dependencies.now !== undefined ? { now: dependencies.now } : {}) });
   try {
     const report = await port.readCostReport({ window: windowId, includeRepair: hasFlag("--include-repair"), ...(by !== undefined ? { by } : {}) });
+    const writer = store.writerHealth();
     if (hasFlag("--json")) {
-      write(JSON.stringify(report, null, 2) + "\n");
+      write(JSON.stringify({ ...report, writer }, null, 2) + "\n");
       return;
     }
     // N4: the `--by model` lane-id footnote needs the loaded config's ladders. Fail SOFT —
@@ -1953,7 +1959,7 @@ export async function runCostCommand(dependencies: CostCommandDependencies = {})
         cliLaneIds = undefined;
       }
     }
-    renderCostReport(report, write, cliLaneIds === undefined ? {} : { cliLaneIds });
+    renderCostReport(report, write, cliLaneIds === undefined ? { writer } : { cliLaneIds, writer });
   } finally {
     store.close();
   }
@@ -2040,6 +2046,29 @@ function writeAbandonedShare(report: CostReportV1, write: (message: string) => v
   );
 }
 
+/** One consequence-stating line for a stopped meter (backlog item 19). */
+function writerStoppedLine(health: WriterHealth): string {
+  return `⚠ metering stopped at ${health.lastFailureAt ?? "an unknown time"}: ${health.lastFailureReason ?? "unknown"} — figures above exclude traffic since then`;
+}
+
+/**
+ * One footer line per non-`writing` writer state, printed after the lag note.
+ *
+ * Total over `WriterState`, so a new member is a compile error here rather than a
+ * silently missing warning (the closed-union gotcha in CLAUDE.md). `writing` and
+ * `read_only` print nothing: a healthy store keeps the old footer byte-for-byte, and
+ * `cost`'s own store is read-only by construction — warning about that on every run
+ * would be a false alarm, and `--json` still carries the `read_only` block for machines.
+ */
+const WRITER_FOOTER_LINE: Record<WriterState, (health: WriterHealth) => string | null> = {
+  writing: () => null,
+  read_only: () => null,
+  lease_refused: (health) =>
+    `⚠ metering is not recording: writer lease refused at ${health.lastFailureAt ?? "an unknown time"} — another relay may own the store`,
+  flush_failed: writerStoppedLine,
+  schema_refused: writerStoppedLine,
+};
+
 /** Human rendering of one cost report: cells side by side, never blended into one total. */
 /**
  * State the period the report actually covers — the window NAME is not it.
@@ -2085,7 +2114,7 @@ function writeCoveredPeriod(
 function renderCostReport(
   report: Awaited<ReturnType<ReturnType<typeof createDashboardSnapshotReadPort>["readCostReport"]>>,
   write: (message: string) => void,
-  opts: { cliLaneIds?: ReadonlySet<string> } = {},
+  opts: { cliLaneIds?: ReadonlySet<string>; writer?: WriterHealth | null } = {},
 ): void {
   if (report.coverage === "empty") {
     write("No accounting data yet.\n\nThe relay records per-request usage under ~/.llm-relay/usage/ once it serves\ntraffic through configured providers. Run the proxy, send a request, then retry.\n");
@@ -2155,6 +2184,10 @@ function renderCostReport(
     (report.recentMinutesMayLag ? "\nA running relay flushes its ledger to disk shortly after each request; the most recent\nminutes may lag until then." : "") +
     "\n",
   );
+  const writerLine = opts.writer === undefined || opts.writer === null
+    ? null
+    : WRITER_FOOTER_LINE[opts.writer.state](opts.writer);
+  if (writerLine !== null) write(`${writerLine}\n`);
 }
 
 export interface DashboardCommandRouteDependencies {

@@ -309,6 +309,42 @@ export interface SpendTotalsV1 {
 }
 
 /**
+ * Why the metering subsystem stopped persisting (backlog item 19: the metering subsystem
+ * says when it stopped metering, so "no spend since noon" cannot be mistaken for
+ * "no traffic since noon").
+ *
+ * Closed here (`as const` + a derived type, never a hand-written union) so the store
+ * accessor, the `/telemetry` block, the `cost` footer and the `CostReportV1.writer`
+ * validator cannot drift apart: a new member is a compile error at every total table,
+ * not a silently unhandled state.
+ */
+export const WRITER_STATES = Object.freeze([
+  "writing",
+  "lease_refused",
+  "flush_failed",
+  "schema_refused",
+  "read_only",
+] as const);
+export type WriterState = (typeof WRITER_STATES)[number];
+
+/**
+ * One read-only snapshot of the accounting store's writer health, as returned by the
+ * store's `writerHealth()` accessor and carried on `/telemetry` (`accounting`) and on
+ * `llm-relay cost --json` (`writer`). Timestamps are ISO strings or `null` — never a
+ * fabricated time, never `0` (the provenance invariant). The reason is a bounded,
+ * metadata-only head of the failure (an error's code/message head, never user data).
+ */
+export interface WriterHealth {
+  readonly state: WriterState;
+  /** ISO stamp of the last committed flush; null when this store never committed one. */
+  readonly lastSuccessfulWriteAt: string | null;
+  /** ISO stamp of the last failed/invalid flush; null when none ever failed. Retained after recovery: history is evidence. */
+  readonly lastFailureAt: string | null;
+  /** Bounded head of the last failure; null when none ever failed. Retained after recovery. */
+  readonly lastFailureReason: string | null;
+}
+
+/**
  * One row of the `llm-relay cost` roll-up (open-decisions C1): a dimension value's
  * REQUEST-scoped spend in the four provenance-labelled cells, plus the counters the
  * provenance story needs. Deliberately NOT a blended total — cells are printed side by
@@ -393,6 +429,14 @@ export interface CostReportV1 {
    * unflushed in-memory deltas: the last minutes of the window can lag until flush.
    */
   readonly recentMinutesMayLag: boolean;
+  /**
+   * The writer health of the store this report was read from, present only when the
+   * producer knows it: `llm-relay cost --json` attaches its own store's `writerHealth()`
+   * beside the roll-up (a read-only `cost` reader reports `read_only`). Absent on reports
+   * from producers that read through a narrow reader without writer state — absence is
+   * "not stated", never "healthy".
+   */
+  readonly writer?: WriterHealth | undefined;
 }
 
 export interface SummaryV1 {
@@ -833,23 +877,34 @@ const isRepairShareV1 = (value: unknown): value is RepairShareV1 =>
   isNonNegativeInteger(value.unpricedAttempts) &&
   value.unpricedAttempts <= value.attempts &&
   isShareSpendCells(value.spend);
+export const isWriterState = (value: unknown): value is WriterState => isValueIn(WRITER_STATES, value);
+export const isWriterHealth = (value: unknown): value is WriterHealth =>
+  isExactRecord(value, ["state", "lastSuccessfulWriteAt", "lastFailureAt", "lastFailureReason"]) &&
+  isWriterState(value.state) &&
+  isNullable(value.lastSuccessfulWriteAt, isDashboardUtcTimestamp) &&
+  isNullable(value.lastFailureAt, isDashboardUtcTimestamp) &&
+  isNullable(value.lastFailureReason, isString);
+/** The `dashboard.cost.v1` keys without the optional writer block. */
+const COST_REPORT_V1_KEYS = [
+  "schema",
+  "generatedAt",
+  "from",
+  "to",
+  "window",
+  "includeRepair",
+  "by",
+  "rows",
+  "total",
+  "repair",
+  "abandoned",
+  "coverage",
+  "coverageReason",
+  "recentMinutesMayLag",
+] as const;
+/** The same keys with the optional `writer` block `llm-relay cost --json` attaches. */
+const COST_REPORT_V1_KEYS_WITH_WRITER = [...COST_REPORT_V1_KEYS, "writer"] as const;
 export const isCostReportV1 = (value: unknown): value is CostReportV1 =>
-  isExactRecord(value, [
-    "schema",
-    "generatedAt",
-    "from",
-    "to",
-    "window",
-    "includeRepair",
-    "by",
-    "rows",
-    "total",
-    "repair",
-    "abandoned",
-    "coverage",
-    "coverageReason",
-    "recentMinutesMayLag",
-  ]) &&
+  (isExactRecord(value, COST_REPORT_V1_KEYS) || isExactRecord(value, COST_REPORT_V1_KEYS_WITH_WRITER)) &&
   value.schema === DASHBOARD_COST_SCHEMA &&
   isDashboardUtcTimestamp(value.generatedAt) &&
   isNullableTimestamp(value.from) &&
@@ -863,7 +918,8 @@ export const isCostReportV1 = (value: unknown): value is CostReportV1 =>
   isShareSpendCells(value.abandoned) &&
   isDashboardCoverage(value.coverage) &&
   isNullable(value.coverageReason, isDashboardCoverageReason) &&
-  isBoolean(value.recentMinutesMayLag);
+  isBoolean(value.recentMinutesMayLag) &&
+  (!("writer" in value) || isWriterHealth(value.writer));
 
 export const isPanelCoverageV1 = (value: unknown): value is PanelCoverageV1 =>
   isExactRecord(value, ["panel", "state", "reason", "provenance", "observedAt"]) &&

@@ -1,5 +1,6 @@
 import type { Config, ProviderTierType } from "./config.js";
 import type { CircuitBreaker, CircuitState } from "./circuit-breaker.js";
+import type { WriterHealth } from "./dashboard-contract.js";
 import { aggregateHasKey } from "./credential-fleet.js";
 import { ALL_PROVIDER_PRESETS } from "./presets.js";
 import type { ProviderTargetIdentity } from "./kernel/contracts.js";
@@ -30,6 +31,14 @@ export interface TelemetryReport {
   subscriptionProvidersCount: number;
   providers: ProviderTelemetry[];
   routingTiers: Record<string, string | string[]>;
+  /**
+   * The metering subsystem's writer health, from the store's `writerHealth()` accessor
+   * (backlog item 19): when the store's last flush failed or the writer lease was
+   * refused, this names the stop so "no spend since noon" cannot be mistaken for
+   * "no traffic since noon". Null when no ledger is attached to the reporter (a bare
+   * programmatic proxy): unknown stays null, never a fabricated state.
+   */
+  accounting: WriterHealth | null;
 }
 
 type StoredCircuitState = CircuitState & { readonly target: ProviderTargetIdentity };
@@ -82,7 +91,12 @@ function lastSeen(state: CircuitState): number {
 }
 
 /** Aggregate live telemetry and health status across all configured providers. */
-export function getTelemetryReport(cfg: Config, cb: CircuitBreaker, now = Date.now()): TelemetryReport {
+export function getTelemetryReport(
+  cfg: Config,
+  cb: CircuitBreaker,
+  now = Date.now(),
+  accounting: WriterHealth | null = null,
+): TelemetryReport {
   const providers: ProviderTelemetry[] = [];
   const deployments = deploymentAggregates(cb);
 
@@ -147,5 +161,6 @@ export function getTelemetryReport(cfg: Config, cb: CircuitBreaker, now = Date.n
     subscriptionProvidersCount,
     providers,
     routingTiers: cfg.routing.tiers,
+    accounting,
   };
 }

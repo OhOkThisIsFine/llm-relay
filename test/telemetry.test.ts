@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { getTelemetryReport } from "../src/telemetry.js";
+import { createAccountingStore } from "../src/accounting-store.js";
 import { candidateEnvNames } from "../src/authEnv.js";
 import { CircuitBreaker, UNMEASURED_STABILITY } from "../src/circuit-breaker.js";
 import { makeCredentialId } from "../src/credential-id.js";
@@ -281,5 +282,32 @@ describe("telemetry", () => {
     expect(open.observedTargets).toBe(0);
     expect(open.isHealthy).toBeNull();
     expect(report.providers.find((p) => p.provider === "openai")!.isHealthy).toBe(true);
+  });
+
+  it("carries the accounting writer health, matching the store accessor", () => {
+    const store = createAccountingStore({});
+    try {
+      const health = store.writerHealth();
+      const report = getTelemetryReport(twoProviderCfg(), new CircuitBreaker(), NOW, health);
+      expect(report.accounting).toEqual(health);
+      expect(report.accounting?.state).toBe("writing");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("a read-only ledger reports read_only through telemetry", () => {
+    const store = createAccountingStore({ readOnly: true });
+    try {
+      const report = getTelemetryReport(twoProviderCfg(), new CircuitBreaker(), NOW, store.writerHealth());
+      expect(report.accounting?.state).toBe("read_only");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("reports null accounting without a ledger — unknown stays null, never a guess", () => {
+    const report = getTelemetryReport(twoProviderCfg(), new CircuitBreaker(), NOW);
+    expect(report.accounting).toBeNull();
   });
 });

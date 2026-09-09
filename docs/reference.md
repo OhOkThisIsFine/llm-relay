@@ -2154,6 +2154,17 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
   store reports failure; a malformed flag prints a usage line and exits 1.
 - "Coverage: partial" means the store held (or should have held) data this report omits — never a
   request that simply carried no token kind. See the coverage note above.
+- **When metering itself stops, the footer says so.** The store keeps serving while
+  persistence is stopped, so a flat spend figure is ambiguous — and the report refuses to
+  leave it that way. After the lag note it prints one line naming the consequence:
+  `⚠ metering stopped at <lastFailureAt>: <reason> — figures above exclude traffic since then`
+  when the last flush failed (`flush_failed`) or an in-memory snapshot failed its schema
+  guard (`schema_refused`); `⚠ metering is not recording: writer lease refused at <t> — another
+  relay may own the store` when the writer lease is refused (`lease_refused`). A healthy
+  store prints nothing new, and the read-only reader `cost` itself uses reports `read_only`
+  (likewise silent — warning about that on every run would be a false alarm). `--json`
+  carries the same block under `writer`, with the failure time and reason retained after
+  recovery, so a machine can tell a quiet window from a blind one.
 
 ### Endpoints
 
@@ -2174,6 +2185,15 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 | `GET|HEAD /dashboard/api/v1/snapshot`, `GET|HEAD /dashboard/api/v1/requests/:requestId` | Session-authenticated dashboard reads |
 | `POST /dashboard/api/v1/bootstrap`, `POST /dashboard/api/v1/session` | Mint and exchange a one-use dashboard bootstrap |
 | `POST /dashboard/api/v1/logout` | Revoke the current dashboard session |
+
+`GET /telemetry` carries an `accounting` block with the metering subsystem's writer health —
+the store's `writerHealth()`: `{ state, lastSuccessfulWriteAt, lastFailureAt,
+lastFailureReason }`, where `state` is one of `writing`, `lease_refused`, `flush_failed`,
+`schema_refused`, `read_only` and the timestamps are ISO strings or `null` (never a
+fabricated time, never `0`; the reason is a bounded metadata-only head, never user data).
+It is `null` when no ledger is attached to the reporter. The block names metering state
+only — no credential, key, or spend figures — so `/telemetry` stays tokenless
+provider-aggregate data.
 
 ⚠ **Loopback is not authorization.** Mutating control endpoints and control reads that expose or
 materialize provider state (`/registry`, `/candidates`, `/ping`, `/health/stats`, `/health`) require the per-install

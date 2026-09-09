@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -38,12 +38,17 @@ import {
   runTelemetry,
   reportMcpExhaustion,
   reportMcpTelemetry,
+  runCostCommand,
+  type CostCommandDependencies,
   FLAG_ALIASES,
   CLI_OPTIONS,
   ACTION_OPTIONS,
   VALUE_FLAGS,
 } from "../src/cli.js";
 import { loadConfig, type Config } from "../src/config.js";
+import { createAccountingStore, type AccountingStore } from "../src/accounting-store.js";
+import type { RequestCompletedEvent } from "../src/accounting.js";
+import { assertCostReportV1 } from "../src/dashboard-contract.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { interpretRefusal, pendingRefusals, proposeInterpretation, recordUnknownRefusal, refusalSignature, resetInterpretations, signatureDigest } from "../src/refusal-interpretation.js";
 
@@ -2052,5 +2057,254 @@ describe("llm-relay command arity — an ignored argument is a lie", () => {
     // ... and nothing in the table is a command the dispatcher does not know.
     const unknown = ARITY_GUARDED_COMMANDS.filter((name) => !CLI_COMMAND_NAMES.has(name));
     expect(unknown, `not real commands: ${unknown.join(", ")}`).toEqual([]);
+  });
+});
+
+/**
+ * `llm-relay cost` states when metering stopped (backlog item 19). The command runs
+ * against an injected live store in a failing writer state — its production store is
+ * always read-only and reports `read_only`, which prints nothing new — and the footer
+ * names the consequence so "no spend since noon" cannot be mistaken for "no traffic".
+ */
+describe("llm-relay cost — metering-stopped footer", () => {
+  const STORE_MS = Date.parse("2026-08-20T12:00:00.000Z");
+  const STORE_ISO = "2026-08-20T12:00:00.000Z";
+  const CLI_NOW = "2026-08-20T12:34:56.000Z";
+  const AT = "2026-08-20T12:29:56.000Z";
+  const directories: string[] = [];
+  let seedCounter = 0;
+
+  function tempDir(): string {
+    const directory = mkdtempSync(join(tmpdir(), "llm-relay-cost-footer-"));
+    directories.push(directory);
+    return directory;
+  }
+
+  afterEach(() => {
+    for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  });
+
+  function requestId(): string {
+    seedCounter += 1;
+    return `costfooter${seedCounter.toString().padStart(8, "0")}`;
+  }
+
+  /** One committed served request, so the report is non-empty and the footer renders. */
+  function seedLiveStore(directory: string): AccountingStore {
+    const store = createAccountingStore({ rootDir: directory, now: () => STORE_MS });
+    const id = requestId();
+    store.record({
+      type: "request-started",
+      requestId: id,
+      startedAt: AT,
+      client: "claude",
+      attribution: "relay_held",
+      provider: null,
+      model: null,
+      credentialId: null,
+    });
+    store.record({
+      type: "request-completed",
+      requestId: id,
+      endedAt: AT,
+      outcome: "success",
+      failureKind: null,
+      attribution: "relay_held",
+      attemptCount: 0,
+      repairIncluded: false,
+      winningAttemptId: null,
+      commitAttemptId: null,
+      latencyMs: 20,
+      commitMs: 5,
+      provider: "nim",
+      model: "z-ai/glm-5.2",
+      credentialId: "nim#primary",
+      tokens: {} as RequestCompletedEvent["tokens"],
+      spend: null,
+      abandonedSpend: [],
+    });
+    expect(store.flush().status).toBe("committed");
+    return store;
+  }
+
+  /** Drive `runCostCommand` against an injected store, mirroring main()'s wiring. */
+  async function runCost(argv: readonly string[], store: AccountingStore): Promise<{ output: string; exitCode: number | null }> {
+    const originalArgv = process.argv;
+    process.argv = ["node", "cli.js", "cost", ...argv];
+    let output = "";
+    let exitCode: number | null = null;
+    const dependencies: CostCommandDependencies = {
+      write: (message) => {
+        output += message;
+      },
+      exit: (code) => {
+        exitCode = code;
+        throw new Error("__exit__");
+      },
+      store,
+      now: () => Date.parse(CLI_NOW),
+    };
+    try {
+      await runCostCommand(dependencies);
+    } catch (error) {
+      if ((error as Error).message !== "__exit__") throw error;
+    } finally {
+      process.argv = originalArgv;
+    }
+    return { output, exitCode };
+  }
+
+  /** The pre-change footer, pinned byte-for-byte: a healthy store prints nothing new. */
+  const HEALTHY_FOOTER =
+    "Prices are each deployment's published per-(provider, model) figures, or another provider's\n" +
+    "figure for the same model id (labelled reference); there is no fallback price. Cache token kinds\n" +
+    "are NOT priced (no published factor), so requests carrying them count under Partial and every\n" +
+    "amount is a LOWER BOUND while Partial > 0. Cells are never blended: the only single-figure total\n" +
+    "is Published/reported, printed above with its basis. Repair attempts are excluded unless\n" +
+    "--include-repair was given.\n" +
+    "A running relay flushes its ledger to disk shortly after each request; the most recent\n" +
+    "minutes may lag until then.\n";
+
+  it("a healthy store prints the old footer exactly — no metering line", async () => {
+    const store = seedLiveStore(tempDir());
+    const { output, exitCode } = await runCost([], store);
+    expect(exitCode).toBeNull();
+    expect(output).toContain("llm-relay cost");
+    expect(output).not.toContain("metering stopped");
+    expect(output).not.toContain("metering is not recording");
+    expect(output.slice(output.indexOf("Prices are"))).toBe(HEALTHY_FOOTER);
+  });
+
+  it("a failed flush prints the metering-stopped line with the failure time and reason", async () => {
+    const directory = tempDir();
+    const store = seedLiveStore(directory);
+    // One more terminal, then break the writer underneath: the flush fails, serving continues.
+    const id = requestId();
+    store.record({
+      type: "request-started",
+      requestId: id,
+      startedAt: AT,
+      client: "claude",
+      attribution: "relay_held",
+      provider: null,
+      model: null,
+      credentialId: null,
+    });
+    store.record({
+      type: "request-completed",
+      requestId: id,
+      endedAt: AT,
+      outcome: "success",
+      failureKind: null,
+      attribution: "relay_held",
+      attemptCount: 0,
+      repairIncluded: false,
+      winningAttemptId: null,
+      commitAttemptId: null,
+      latencyMs: 20,
+      commitMs: 5,
+      provider: "nim",
+      model: "z-ai/glm-5.2",
+      credentialId: "nim#primary",
+      tokens: {} as RequestCompletedEvent["tokens"],
+      spend: null,
+      abandonedSpend: [],
+    });
+    rmSync(directory, { recursive: true, force: true });
+    writeFileSync(directory, "a file where the usage directory was");
+    expect(store.flush().status).toBe("failed");
+
+    const { output, exitCode } = await runCost([], store);
+    expect(exitCode).toBeNull();
+    // The mkdir throw is Node-version-worded, so pin the stable parts: the state line
+    // names the failure time and the consequence — and never the absolute store path.
+    expect(output).toContain(`⚠ metering stopped at ${STORE_ISO}:`);
+    expect(output).toContain("mkdir");
+    expect(output).toContain("figures above exclude traffic since then");
+    expect(output).not.toContain(directory);
+  });
+
+  it("a refused writer lease prints the not-recording line", async () => {
+    const store = seedLiveStore(tempDir());
+    const exposed = store.writerStatus as unknown as { status: string; error: string | null };
+    exposed.status = "failed";
+    exposed.error = "writer-busy-test-lease";
+    expect(store.flush().status).toBe("failed");
+
+    const { output, exitCode } = await runCost([], store);
+    expect(exitCode).toBeNull();
+    expect(output).toContain(
+      `⚠ metering is not recording: writer lease refused at ${STORE_ISO} — another relay may own the store`,
+    );
+  });
+
+  it("an invalid last write prints the metering-stopped line", async () => {
+    const store = seedLiveStore(tempDir());
+    store.close();
+    expect(store.flush().status).toBe("invalid");
+
+    const { output, exitCode } = await runCost([], store);
+    expect(exitCode).toBeNull();
+    expect(output).toContain(
+      `⚠ metering stopped at ${STORE_ISO}: closed — figures above exclude traffic since then`,
+    );
+  });
+
+  it("cost --json carries the writer block beside the report", async () => {
+    const healthy = seedLiveStore(tempDir());
+    const { output: healthyJson, exitCode: healthyExit } = await runCost(["--json"], healthy);
+    expect(healthyExit).toBeNull();
+    const healthyReport: unknown = JSON.parse(healthyJson);
+    assertCostReportV1(healthyReport);
+    expect(healthyReport.writer).toEqual({
+      state: "writing",
+      lastSuccessfulWriteAt: STORE_ISO,
+      lastFailureAt: null,
+      lastFailureReason: null,
+    });
+
+    const directory = tempDir();
+    const failing = seedLiveStore(directory);
+    rmSync(directory, { recursive: true, force: true });
+    writeFileSync(directory, "a file where the usage directory was");
+    // Dirty the store so the flush has something to fail on, then break it.
+    const id = requestId();
+    failing.record({
+      type: "request-started",
+      requestId: id,
+      startedAt: AT,
+      client: "claude",
+      attribution: "relay_held",
+      provider: null,
+      model: null,
+      credentialId: null,
+    });
+    failing.record({
+      type: "request-completed",
+      requestId: id,
+      endedAt: AT,
+      outcome: "success",
+      failureKind: null,
+      attribution: "relay_held",
+      attemptCount: 0,
+      repairIncluded: false,
+      winningAttemptId: null,
+      commitAttemptId: null,
+      latencyMs: 20,
+      commitMs: 5,
+      provider: "nim",
+      model: "z-ai/glm-5.2",
+      credentialId: "nim#primary",
+      tokens: {} as RequestCompletedEvent["tokens"],
+      spend: null,
+      abandonedSpend: [],
+    });
+    expect(failing.flush().status).toBe("failed");
+    const { output: failingJson } = await runCost(["--json"], failing);
+    const failingReport: unknown = JSON.parse(failingJson);
+    assertCostReportV1(failingReport);
+    expect(failingReport.writer).toBeDefined();
+    expect(failingReport.writer?.state).toBe("flush_failed");
+    expect(failingReport.writer?.lastFailureAt).toBe(STORE_ISO);
   });
 });

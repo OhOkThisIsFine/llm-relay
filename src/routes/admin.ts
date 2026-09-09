@@ -161,8 +161,11 @@ export interface AdminHandlers {
    * The server's accounting ledger when it has one, narrowed to the same in-memory window read
    * the availability producer and G2's cap evaluator take. Optional because a bare programmatic
    * proxy has no store; its `/candidates` then reports no reached caps (unknown ⇒ no refusal).
+   * The writer-health half is optional for the same reason: `/telemetry` reports
+   * `accounting: null` without a ledger rather than a fabricated state.
    */
-  accountingReader?: Pick<import("../accounting-store.js").AccountingStore, "usedInWindow">;
+  accountingReader?: Pick<import("../accounting-store.js").AccountingStore, "usedInWindow"> &
+    Partial<Pick<import("../accounting-store.js").AccountingStore, "writerHealth">>;
   /**
    * The server's accounting ledger writer, narrowed to the recorder the request path writes
    * through. Required (unlike the reader): `POST /dispatch/telemetry` records the estimated
@@ -598,7 +601,9 @@ export async function handleAdminRoutes(
   }
 
   if (req.method === "GET" && pathname === "/telemetry") {
-    return ok(getTelemetryReport(cfg, h.breaker), true);
+    const accounting =
+      typeof h.accountingReader?.writerHealth === "function" ? h.accountingReader.writerHealth() : null;
+    return ok(getTelemetryReport(cfg, h.breaker, Date.now(), accounting), true);
   }
 
   return false;

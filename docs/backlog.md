@@ -166,10 +166,3 @@
   reaches another candidate, the abort on a per-token stall threshold is built with an announced
   reason and a pinning test; if not, option B stands and this entry closes on the measurement
   alone.
-
-- **Give the metering subsystem a channel to say it stopped metering** (audit DR-006, verified
-  2026-09-04). `writerStatus` and `lastWrite` on the accounting store have zero consumers outside
-  the store; the store keeps accepting events after a refused writer lease, and a null
-  `snapshots()` silently stops persistence while the relay keeps serving. **Property:**
-  `llm-relay cost` and `/telemetry` state when the store's last flush failed or the writer lease
-  was refused, so "no spend since noon" cannot be mistaken for "no traffic since noon".

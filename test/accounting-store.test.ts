@@ -1,5 +1,6 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -1162,6 +1163,138 @@ describe("spend aggregation into the four cells (Stage 4 / Gap 11)", () => {
 
       expect(readFileSync(join(directory, "snapshot-journal.json"), "utf8")).toBe(staleJournal);
     });
+  });
+});
+
+describe("accounting writer health — the metering subsystem says when it stopped metering (backlog item 19)", () => {
+  const FAIL_MS = Date.parse("2026-08-20T12:00:00.000Z");
+  const OK_MS = Date.parse("2026-08-20T12:05:00.000Z");
+  const FAIL_ISO = "2026-08-20T12:00:00.000Z";
+  const OK_ISO = "2026-08-20T12:05:00.000Z";
+  const AT = "2026-08-20T11:59:00.000Z";
+
+  function terminal(store: AccountingStore, id: string): void {
+    store.record(startedOnly(id, AT));
+    store.record(terminalOnly(id, AT));
+  }
+
+  it("a fresh store reports writing with null timestamps — unknown stays null, never 0", () => {
+    const store = createAccountingStore({ rootDir: root(), now: () => FAIL_MS });
+    try {
+      expect(store.writerHealth()).toEqual({
+        state: "writing",
+        lastSuccessfulWriteAt: null,
+        lastFailureAt: null,
+        lastFailureReason: null,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("a failed flush reports flush_failed with the injected reason; recovery returns to writing with the failure retained", () => {
+    const directory = root();
+    let nowMs = FAIL_MS;
+    const store = createAccountingStore({ rootDir: directory, now: () => nowMs });
+    try {
+      terminal(store, "writer-health-0001");
+      expect(store.flush().status).toBe("committed");
+      expect(store.writerHealth().lastSuccessfulWriteAt).toBe(FAIL_ISO);
+
+      // Break the writer underneath the store: the directory becomes a file, so the
+      // next atomic write throws and the flush fails while record() keeps serving.
+      terminal(store, "writer-health-0002");
+      rmSync(directory, { recursive: true, force: true });
+      writeFileSync(directory, "a file where the usage directory was");
+      const failed = store.flush();
+      expect(failed.status).toBe("failed");
+
+      const health = store.writerHealth();
+      expect(health.state).toBe("flush_failed");
+      expect(health.lastFailureAt).toBe(FAIL_ISO);
+      // The mkdir throw names the operation, and the absolute store path it embeds
+      // is scrubbed before the reason is kept: never a path to user data.
+      expect(health.lastFailureReason).toContain("mkdir");
+      expect(health.lastFailureReason).not.toContain(directory);
+      expect(health.lastFailureReason!.length).toBeLessThanOrEqual(256);
+
+      // Serving continued while persistence was stopped: both terminals are in memory.
+      const live = store.readLifetime();
+      expect(live.status).toBe("ok");
+      if (live.status !== "ok") throw new Error("lifetime should be ok");
+      expect(live.value.aggregate.requests).toBe(2);
+
+      // Recovery: the writer heals, the next flush commits, the failure stays as evidence.
+      nowMs = OK_MS;
+      rmSync(directory, { force: true });
+      mkdirSync(directory, { recursive: true });
+      expect(store.flush().status).toBe("committed");
+      const after = store.writerHealth();
+      expect(after.state).toBe("writing");
+      expect(after.lastSuccessfulWriteAt).toBe(OK_ISO);
+      expect(after.lastFailureAt).toBe(FAIL_ISO);
+      expect(after.lastFailureReason).toContain("mkdir");
+      expect(after.lastFailureReason).not.toContain(directory);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+      mkdirSync(directory, { recursive: true });
+      store.close();
+    }
+  });
+
+  it("a refused writer lease reports lease_refused", () => {
+    const store = createAccountingStore({ rootDir: root(), now: () => FAIL_MS });
+    try {
+      terminal(store, "writer-health-0003");
+      expect(store.flush().status).toBe("committed");
+      // The single-process code never refuses the lease itself — another relay owning the
+      // store is the scenario — so the test reaches flush()'s writer-busy branch through
+      // the store's own exposed writerStatus object, which the getter returns by reference.
+      const exposed = store.writerStatus as unknown as { status: string; error: string | null };
+      exposed.status = "failed";
+      exposed.error = "writer-busy-test-lease";
+      const refused = store.flush();
+      expect(refused.status).toBe("failed");
+      expect(refused.error).toBe("writer-busy-test-lease");
+      const health = store.writerHealth();
+      expect(health.state).toBe("lease_refused");
+      expect(health.lastFailureAt).toBe(FAIL_ISO);
+      expect(health.lastFailureReason).toBe("writer-busy-test-lease");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("an invalid last write maps to schema_refused (reached here via flush-after-close; serving already stopped)", () => {
+    const store = createAccountingStore({ rootDir: root(), now: () => FAIL_MS });
+    terminal(store, "writer-health-0004");
+    expect(store.flush().status).toBe("committed");
+    store.close();
+    const res = store.flush();
+    expect(res.status).toBe("invalid");
+    const health = store.writerHealth();
+    expect(health.state).toBe("schema_refused");
+    expect(health.lastFailureReason).toBe("closed");
+    expect(health.lastFailureAt).toBe(FAIL_ISO);
+  });
+
+  it("a read-only store reports read_only and never a failure it could not have had", () => {
+    const directory = root();
+    const seed = createAccountingStore({ rootDir: directory, now: () => FAIL_MS });
+    terminal(seed, "writer-health-0005");
+    expect(seed.flush().status).toBe("committed");
+    seed.close();
+    const store = createAccountingStore({ rootDir: directory, readOnly: true, now: () => FAIL_MS });
+    try {
+      expect(store.writerHealth()).toEqual({
+        state: "read_only",
+        lastSuccessfulWriteAt: null,
+        lastFailureAt: null,
+        lastFailureReason: null,
+      });
+    } finally {
+      store.close();
+    }
   });
 });
 

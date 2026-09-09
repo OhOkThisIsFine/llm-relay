@@ -104,6 +104,8 @@ import {
   isDashboardOutcome,
   isDashboardSafeId,
   isDashboardUtcTimestamp,
+  type WriterHealth,
+  type WriterState,
 } from "./dashboard-contract.js";
 import { DEFAULT_FLUSH_DELAY_MS, MAX_FLUSH_DELAY_MS, WriteBehindTimer } from "./write-behind.js";
 
@@ -237,6 +239,15 @@ export interface AccountingStore extends AccountingRecorder, AccountingReader {
   reader(): AccountingReader;
   /** The availability lane's narrow in-memory window read (see usedInWindow below). */
   usedInWindow(options: UsedInWindowOptions): UsedInWindowReading;
+  /**
+   * Whether this store is still metering (backlog item 19). ONE read-only accessor over
+   * the existing `writerStatus`/`lastWrite` fields — the backlog entry's "zero consumers"
+   * finding — so `llm-relay cost` and `/telemetry` can state when the store's last flush
+   * failed or the writer lease was refused, and "no spend since noon" cannot be mistaken
+   * for "no traffic since noon". Serving never stops on a failed writer: `record()` keeps
+   * accepting events into memory; only persistence stops, and this names the stop.
+   */
+  writerHealth(): WriterHealth;
 }
 
 type MutableTokenCell = {
@@ -933,6 +944,12 @@ class AccountingStoreImpl implements AccountingStore {
   private last: SnapshotMutationResult | null = null;
   private lowerBoundLoss = false;
   private trustedDate: string | null = null;
+  /** ISO stamp of the last committed flush; null until the first commit (unknown stays null). */
+  private lastOkAt: string | null = null;
+  /** ISO stamp of the last failed/invalid flush, retained after recovery: history is evidence. */
+  private lastFailAt: string | null = null;
+  /** Bounded metadata-only head of the last failure, retained after recovery. */
+  private lastFailReason: string | null = null;
 
   constructor(options: AccountingStoreOptions) {
     this.directory = options.rootDir ?? options.directory ?? options.path ?? defaultDirectory();
@@ -950,7 +967,7 @@ class AccountingStoreImpl implements AccountingStore {
 
     if (this.readOnly) {
       this.writer = { status: "released", error: null, retryable: false };
-      this.last = result("none", null, false, false);
+      this.setLast(result("none", null, false, false));
       this.loadFixedSnapshotsReadOnly();
       return;
     }
@@ -962,6 +979,60 @@ class AccountingStoreImpl implements AccountingStore {
   get writerStatus(): SnapshotWriterResult { return this.writer; }
   get lastWrite(): SnapshotMutationResult | null { return this.last; }
   reader(): AccountingReader { return this; }
+
+  /**
+   * Whether this store is still metering, as one closed-vocabulary state plus the
+   * evidence behind it. Every distinct way persistence can stop while the relay keeps
+   * serving maps onto a `WriterState` member — serving continues in ALL of them:
+   *
+   * - `writing`: the last flush committed (or nothing was dirty). The healthy state.
+   * - `flush_failed`: the last flush returned `failed` — an atomic write threw or
+   *   refused (`Failed to write <target>`), or terminal work is stuck behind an
+   *   unreadable day shard (`day-read`, from `loadDayForWrite` returning null on a
+   *   corrupt shard). Dirty flags are NOT cleared and the retry is re-armed, so the
+   *   stop persists until a flush commits.
+   * - `schema_refused`: the last flush returned `invalid` — an in-memory snapshot
+   *   failed its schema guard (`schema-or-size`, `lifetime-schema`,
+   *   `retention-schema-or-size`). The guards are total by construction, so a live
+   *   store reaches this only through defense-in-depth branches; the member exists so
+   *   the footer can name the consequence if one ever fires.
+   * - `lease_refused`: the writer lease is not held (`writer.status === "failed"`) or
+   *   the last flush was refused at the lease check (`writer-busy`). The
+   *   single-process code never refuses the lease itself — another relay owning the
+   *   store is the scenario — but `flush()` contains the branch, so the state is real.
+   * - `read_only`: a `readOnly: true` store (`llm-relay cost`'s own), which observes
+   *   committed snapshots only and performs no write. Reports nulls, never a failure
+   *   it could not have had.
+   *
+   * A closed store reports from its last write (a committed close reads `writing`;
+   * a close over a failed flush keeps the failure): the object is terminal, serving
+   * already stopped, so the while-serving property above is unaffected.
+   */
+  writerHealth(): WriterHealth {
+    if (this.readOnly) {
+      return Object.freeze({
+        state: "read_only",
+        lastSuccessfulWriteAt: null,
+        lastFailureAt: null,
+        lastFailureReason: null,
+      });
+    }
+    const last = this.last;
+    let state: WriterState = "writing";
+    if (this.writer.status === "failed" || (last !== null && last.error === "writer-busy")) {
+      state = "lease_refused";
+    } else if (last !== null && last.status === "failed") {
+      state = "flush_failed";
+    } else if (last !== null && last.status === "invalid") {
+      state = "schema_refused";
+    }
+    return Object.freeze({
+      state,
+      lastSuccessfulWriteAt: this.lastOkAt,
+      lastFailureAt: this.lastFailAt,
+      lastFailureReason: this.lastFailReason,
+    });
+  }
 
   record(event: AccountingEvent): void {
     if (this._closed || event === null || typeof event !== "object") return;
@@ -982,7 +1053,7 @@ class AccountingStoreImpl implements AccountingStore {
   }
 
   flush(): SnapshotMutationResult {
-    if (this._closed) return result("invalid", "closed");
+    if (this._closed) return this.setLast(result("invalid", "closed"));
     if (this.readOnly) return result("none", null, false, false);
     this.timer.clear();
     this.clearRetry();
@@ -1053,7 +1124,7 @@ class AccountingStoreImpl implements AccountingStore {
     for (const date of [...committedDates].sort()) this.rememberKnownDay(date);
 
     const written = result("committed", null, false, this.lowerBoundLoss);
-    this.last = written;
+    this.setLast(written);
 
     const retention = this.commitRetention(committedDates);
     return retention ?? written;
@@ -1646,7 +1717,7 @@ class AccountingStoreImpl implements AccountingStore {
     const today = new Date(this.now()).toISOString().slice(0, 10);
     this.loadDayForWrite(today);
     this.queueRecoveredRetention();
-    this.last = result("none");
+    this.setLast(result("none"));
   }
 
   /**
@@ -1720,7 +1791,7 @@ class AccountingStoreImpl implements AccountingStore {
       this.pendingRetention = null;
     }
     const written = result("committed", null, false, this.lowerBoundLoss);
-    this.last = written;
+    this.setLast(written);
     return written;
   }
 
@@ -1938,14 +2009,45 @@ class AccountingStoreImpl implements AccountingStore {
   }
 
   private fail(value: SnapshotMutationResult): SnapshotMutationResult {
-    this.last = value;
+    this.setLast(value);
     if (value.retryable) this.scheduleRetry();
     return value;
   }
 
   private setLast(value: SnapshotMutationResult): SnapshotMutationResult {
     this.last = value;
+    if (value.status === "committed") {
+      const stamp = this.clockStamp();
+      if (stamp !== null) this.lastOkAt = stamp;
+    } else if (value.status === "failed" || value.status === "invalid") {
+      const stamp = this.clockStamp();
+      if (stamp !== null) this.lastFailAt = stamp;
+      // Bounded metadata-only head: every error this store produces names a snapshot
+      // target basename (`Failed to write <target>`), a check (`day-read`,
+      // `schema-or-size`, `writer-busy`) or a writer refusal — but an IO throw also
+      // embeds the absolute store path (mkdir/write/rename all do), and that path
+      // names a file holding user data, so it is replaced before the reason is kept.
+      // A broken clock keeps the previous stamp (stale evidence beats none) but still
+      // records the new reason.
+      const raw = typeof value.error === "string" && value.error.length > 0 ? value.error : "unknown";
+      const scrubbed = this.directory.length > 0 ? raw.split(this.directory).join("<store>") : raw;
+      this.lastFailReason = scrubbed.slice(0, 256);
+    }
     return value;
+  }
+
+  /**
+   * This store's clock as an ISO stamp, or null when the clock is unusable — never
+   * fabricated, never 0 (the provenance invariant).
+   */
+  private clockStamp(): string | null {
+    try {
+      const value = this.now();
+      if (typeof value !== "number" || !Number.isFinite(value)) return null;
+      return new Date(value).toISOString();
+    } catch {
+      return null;
+    }
   }
 }
 
