@@ -9,6 +9,21 @@
 
 ## Open
 
+- **A Codex run on the relay's Responses front dies the moment a tool-call argument string
+  arrives truncated — five of five DeepSeek lanes, 2026-09-09.** `codex exec -c
+  model_provider=llm-relay -m deepseek/deepseek-v4-pro` reaches `/v1/responses`; on every run the
+  model's `exec_command` arguments were cut mid-string (Codex: `failed to parse function
+  arguments: EOF while parsing a string at line 1 column 86`), Codex replayed the item on its next
+  turn, and `responses-request.ts` refused the replay (`function_call "exec_command" arguments are
+  not valid JSON`), ending an agentic run at 3k–20k tokens. Which side truncates is NOT known: the
+  provider's stream, or the relay's translation of `function_call_arguments` deltas on the
+  Responses front → Anthropic → Chat → back path. **Property:** a capture of one failing run's
+  upstream Chat stream beside the relay's emitted Responses stream shows where the string was cut.
+  If the relay drops or truncates a delta, that is fixed with a pinning test on ≥2 candidates. If
+  the provider truncates, the Responses front refuses the REPLAYED item with a message naming the
+  call id and that its arguments were truncated, so a harness can repair the turn instead of
+  replaying a broken one forever.
+
 - **A NON-STREAMED request has no time-to-first-byte protection, so a slow QUEUE reads as a dead
   backend (2026-09-09, DeepSeek provider survey, medium).** `beginAttemptRun` in
   `src/candidate-runner.ts` arms one flat `target.timeoutMs` deadline for the whole request.
