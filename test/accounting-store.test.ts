@@ -3,11 +3,12 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   createAccountingRequest,
   type AccountingEvent,
@@ -23,9 +24,35 @@ import {
   type AccountingStore,
 } from "../src/accounting-store.js";
 
+/**
+ * Every temporary store root this file creates, so `afterEach` can remove them.
+ *
+ * ⚠ These leaked for the life of the file: a scan on 2026-09-07 found 36,094
+ * `llm-relay-accounting-store-*` directories holding 59 GiB under the Windows temporary
+ * directory. `afterEach` runs on a FAILING test too, which is the half a `finally` inside each
+ * test would not give without repeating it thirty times.
+ */
+const createdRoots: string[] = [];
+
 function root(): string {
-  return mkdtempSync(join(tmpdir(), "llm-relay-accounting-store-"));
+  const dir = mkdtempSync(join(tmpdir(), "llm-relay-accounting-store-"));
+  createdRoots.push(dir);
+  return dir;
 }
+
+afterEach(() => {
+  // `force` so an already-removed root is not an error, and a removal failure on Windows
+  // (a handle still open) never fails the test that just passed.
+  while (createdRoots.length > 0) {
+    const dir = createdRoots.pop();
+    if (dir === undefined) continue;
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // A leaked directory is a hygiene problem, never a reason to fail a green test.
+    }
+  }
+});
 import {
   PORT_PUBLISHED,
   PORT_REFERENCE,

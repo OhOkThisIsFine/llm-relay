@@ -84,15 +84,6 @@
   stated in four places each. **Property:** each fact has one home in the skill; the agent
   template names every tool the skill's guide uses; the reference matches `--help`.
 
-- **Accounting-store tests leak legacy journal artifacts into Windows Temp.** A scan on
-  2026-09-07 found 36,094 `llm-relay-accounting-store-*` directories (59 GiB) under
-  `%LOCALAPPDATA%\Temp`, created by `root()` in `test/accounting-store.test.ts`; the rule in
-  `docs/accounting-persistence-evaluation.md` says `.corrupt-*` journals are ignored, so this is
-  orphaned test residue. **Property:** every temporary accounting-store root created by a test is
-  removed after that test in both success and failure paths; the test suite leaves no
-  `llm-relay-accounting-store-*` directory behind in the Windows temporary directory. Any
-  diagnostic-retention exception must be explicit and bounded.
-
 - **Triage the eligibility queue — 10 unrecognized refusals await interpretation** (owner
   decision 2026-09-05: a separate lap). `llm-relay eligibility` lists them: groq `access denied.
   please check your network settings.` (×116, the client-side VPN block, stays PENDING by the
@@ -222,14 +213,3 @@
   (`accounting-store-schema.ts`) and `SHARE_CELL_KEYS` (`dashboard-contract.ts`) are two lists of
   one four-name set. **Property:** every export of `candidate-runner.ts` has a consumer in `src/`
   or a test that names it as a seam, and the four spend-cell names have one list.
-
-- **`test/keystore.test.ts` "round-trips a passphrase-backed entry in the exact closed
-  non-plaintext v1 shape" fails under full-suite contention and passes alone (2026-09-09, doc-trim
-  lap, low, flake).** One `npm run check` on a docs-only tree recorded it red at
-  `expectNoSecretLeaks` (`expected true to be false`) while two records of the same source minutes
-  earlier and a solo `npx vitest run test/keystore.test.ts` were green; log
-  `~/.agent-config/run-logs/2026-09-09-trim-docs-backlog-md-and-handoff-md-t-9fff1792/2026-09-09T17-23-59-457Z-check-FAIL-6bb1562616dd.log`.
-  The server-side integration tests share the worker-default keystore path (a recorded custody
-  residual), which is the hermeticity seam to suspect first. **Property:** the test passes under
-  the full suite as reliably as alone, with its keystore path isolated per test, so the gate cannot
-  go red on a tree that changed no source.

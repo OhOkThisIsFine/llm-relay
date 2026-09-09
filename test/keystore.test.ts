@@ -39,9 +39,22 @@ import type { SecretFileAclSpawnSync } from "../src/secret-file-acl.js";
 import { resolveCredential } from "../src/authEnv.js";
 
 const PASSPHRASE = "correct horse battery staple";
-const FIRST_SECRET = "sk_A7vQ2mX9pL4rT8uN6wC3";
-const SECOND_SECRET = "sk_B8yR3nW0qM5sU9vP7xD4";
-const ATTEMPTED_SECRET = "sk_C9zS4oX1rN6tV0wQ8yE5";
+/**
+ * ⚠ Every FOUR-character window of each secret carries a `_`, and that is load-bearing.
+ *
+ * `leaks()` below matches every sliding four-character window of a secret against the haystack —
+ * and the haystack is often the store FILE, which is base64 ciphertext, salts and nonces. A
+ * four-character window over the base64 alphabet is 24 bits, so against a few thousand
+ * ciphertext characters a random match is expected now and then: the "round-trips a
+ * passphrase-backed entry" test went red on `expectNoSecretLeaks` (`expected true to be false`)
+ * on a docs-only tree (2026-09-09) and green on the next run of the same source. `_` is outside
+ * the base64 alphabet AND the hex alphabet, so a window holding one can never appear in either
+ * encoding, and the check is exact again rather than probabilistic. Same class as the
+ * `test/os-keyring.test.ts` 4-gram needles that matched a worktree path in an error stack.
+ */
+const FIRST_SECRET = "sk_A7v_Q2m_X9p_L4r_T8u";
+const SECOND_SECRET = "sk_B8y_R3n_W0q_M5s_U9v";
+const ATTEMPTED_SECRET = "sk_C9z_S4o_X1r_N6t_V0w";
 const OWNER_SID = "S-1-5-21-111-222-333-1001";
 const CAPTURED_ACL_OPTIONS = {
   windowsHide: true,
@@ -1570,6 +1583,13 @@ describe("encrypted credential keystore", () => {
     if (dirname(defaultPath) !== expectedDirectory) {
       throw new Error("unsafe VITEST keystore redirect");
     }
+    // The worker-default path is SHARED: vitest reuses a worker process across test files, and
+    // four other files (`credential-containment`, `registry`, `offload`,
+    // `reshaper-credential-binding`) write a store at this same path. Each of them clears it
+    // before writing; this test did not, so it read whatever entries a preceding file left. Clear
+    // it here too, so the file this test then inspects holds exactly this test's one entry.
+    lock({ path: defaultPath });
+    rmSync(expectedDirectory, { recursive: true, force: true });
     try {
       addEntry({
         id: "nim#default", provider: "nim", envName: "NVIDIA_API_KEY", value: FIRST_SECRET,
