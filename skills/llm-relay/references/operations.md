@@ -109,7 +109,7 @@ pool you addressed and whether the task then succeeded elsewhere.
 When there is a pending item you can interpret, **propose it and ask the user to confirm**:
 
 ```
-llm-relay eligibility propose 1 --class subscription-required --scope deployment --rationale "..."
+llm-relay eligibility propose 1 --class subscription-required --scope deployment --sig 3f2a91c04d
 ```
 
 Then say what you read and why, and let them decide. Hand them the accept command `propose`

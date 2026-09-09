@@ -85,14 +85,6 @@
   **Property:** a lane's walk budget is derived only from runs on the ladder it will be used on;
   an existing stats file still loads.
 
-- **The `llm-relay` skill and the `relay` agent drift from the CLI and from each other
-  (2026-09-08, machine-wide hooks-and-skills review, low).**
-  `skills/llm-relay/references/operations.md` documents a `--rationale` flag that
-  `llm-relay --help` does not list; `RELAY_AGENT_TEMPLATE` in `setup-claude.ts` omits
-  `dispatch_cancel` and `dispatch_lanes`, which `SKILL.md` treats as standard; three facts are
-  stated in four places each. **Property:** each fact has one home in the skill; the agent
-  template names every tool the skill's guide uses; the reference matches `--help`.
-
 - **Accept or decline the 26 triaged refusals** (owner-only; triaged 2026-09-09 in
   [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries every
   verdict pinned to its digest and the exact `accept`/`reject` commands). Nineteen accepts, six

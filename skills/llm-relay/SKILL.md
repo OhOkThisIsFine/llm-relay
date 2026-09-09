@@ -58,7 +58,7 @@ you cannot reverse.
    ⚠ Pass `mode: "answer"` for a question, draft, summary, or second opinion that needs no file
    access — it skips spawning a harness and posts straight to the relay, so it answers in seconds
    rather than tens of seconds. Keep the default agent mode when the lane must read or edit files
-   or run commands. See [references/dispatch-lanes.md](references/dispatch-lanes.md).
+   or run commands. Full `mode` details: [references/dispatch-lanes.md](references/dispatch-lanes.md).
 2. `llm-relay dispatch --next-command -t "<task>"` — when the MCP tools are absent. Exit 0 prints
    one runnable command line. Exit 2 means the rung is a relay target, so address the named spec
    as an ordinary subagent.
@@ -121,6 +121,9 @@ that marker exists. When you see it:
    - **Free lanes only, never spend money** — add `"freeOnly": true` to the rule. It refuses with a
      clean 503 rather than falling through to paid.
    - **Nothing yet** — a real answer. Leave the routing alone.
+   > Operational details: the `--scope` parameter, `freeOnly` flag, and the PreToolUse(Agent) hook
+   > installed by `offload claude on` on bypassed hosts are documented in
+   > [references/direct-routing.md](references/direct-routing.md).
 2. Apply the answer with the ordinary verbs. Do not hand-edit `config.json`.
 3. Run `llm-relay routing answered` to retire the notice — including when the answer was "nothing
    yet". Forcing a config edit just to silence a prompt is how a default gets changed for the
@@ -141,8 +144,10 @@ llm-relay offload status                        # inspect direct-routing rules
 ```
 
 When MCP `dispatch` outlives its initial wait, use `dispatch_status`, then
-`dispatch_result`; use `dispatch_cancel` only when the task should stop. Do not relaunch a
-still-running job.
+`dispatch_result`; use `dispatch_cancel` only when the task should stop. Use
+`dispatch_lanes` to pick a rung deliberately. Do not relaunch a still-running job.
+> Full dispatch tool reference including `dispatch_cancel` and `dispatch_lanes` is in
+> [references/dispatch-lanes.md](references/dispatch-lanes.md).
 
 ## Load only the reference needed
 
