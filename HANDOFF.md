@@ -51,6 +51,11 @@ constraints — verify with the suite AND a typecheck, never by reading alone. A
 budget is the lane's own p80, so a stalled lane costs up to that long before the walk moves on;
 cancel by hand once the file has stopped changing.
 
+⚠ **The logon-started daemon still runs v0.77.0 until the next logon** (owner decision
+2026-09-09: no restart, because this release changes load-time parsing only and a restart would
+interrupt every session routed through it). `llm-relay --version` reports the installed 0.77.1;
+the two disagree by design until then.
+
 Immediate next: **triage the eligibility queue** (10 unrecognized refusals; the dispatcher
 proposes by digest, only the owner accepts). Then the carried items in §0.2.
 
