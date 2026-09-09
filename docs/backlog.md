@@ -223,14 +223,6 @@
   one four-name set. **Property:** every export of `candidate-runner.ts` has a consumer in `src/`
   or a test that names it as a seam, and the four spend-cell names have one list.
 
-- **Write `docs/project-philosophy.md`** (owner convention 2026-09-06: every project carries one
-  beside its handoff and backlog documents; the `question-philosophy-gate` hook reports it missing
-  on every `AskUserQuestion` here). Two halves, PRODUCT and WORKING, each line a conviction that
-  would change a decision; `docs/project-goals.md` already holds the product half's material.
-  **Property:** the file exists with both halves and a `<!-- BEGIN philosophy-brief -->` …
-  `<!-- END philosophy-brief -->` block, and the gate injects that block instead of reporting the
-  document missing.
-
 - **`test/keystore.test.ts` "round-trips a passphrase-backed entry in the exact closed
   non-plaintext v1 shape" fails under full-suite contention and passes alone (2026-09-09, doc-trim
   lap, low, flake).** One `npm run check` on a docs-only tree recorded it red at
