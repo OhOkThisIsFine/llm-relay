@@ -96,18 +96,40 @@ export function formatLaneStats(stats: DispatchLaneStats): string {
 
 /**
  * One-line rendering of a lane's walk budget, shared by `dispatch_lanes` and `llm-relay dispatch`
- * so the wording cannot drift between the two surfaces — the `formatLaneStats` precedent:
- * `budget: 224s (p80 of 25 runs)` or `budget: 90s (too few runs, 2)`.
+ * so the wording cannot drift between the two surfaces — the `formatLaneStats` precedent.
  *
- * It names the BASIS as well as the number, because those two figures mean different things: one is
- * derived from this lane's own history and moves as the lane does, the other is the operator's flat
- * default standing in until there is history to read.
+ * It names the BASIS as well as the number, because the three mean different things: one is derived
+ * from this lane's own history and moves as the lane does, one is the operator's flat default
+ * standing in until there is history to read, and one is that same flat default winning over a
+ * history that IS present and faster than it.
+ *
+ * ⚠ The `clamped` wording states BOTH facts — the floor applied, AND what the lane's own quantile
+ * actually was — because the second is the number the operator came to the ladder to see, and the
+ * two-member version of this function hid it behind the word "recorded". See the `basis` doc on
+ * `DispatchLane.attemptBudget` for what that cost.
  */
-export function formatAttemptBudget(budget: { ms: number; basis: "history" | "floor"; samples: number }): string {
-  const seconds = `${Math.round(budget.ms / 100) / 10}s`;
-  return budget.basis === "history"
-    ? `budget: ${seconds} (from ${budget.samples} recorded runs)`
-    : `budget: ${seconds} (flat — too few recorded runs, ${budget.samples})`;
+export function formatAttemptBudget(budget: {
+  ms: number;
+  basis: "history" | "floor" | "clamped";
+  samples: number;
+  quantileMs?: number;
+}): string {
+  const render = (ms: number): string => `${Math.round(ms / 100) / 10}s`;
+  const seconds = render(budget.ms);
+  switch (budget.basis) {
+    case "history":
+      return `budget: ${seconds} (from ${budget.samples} recorded runs)`;
+    case "clamped":
+      return budget.quantileMs === undefined
+        ? `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs are faster)`
+        : `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs put it at ${render(budget.quantileMs)})`;
+    case "floor":
+      return `budget: ${seconds} (flat — too few recorded runs, ${budget.samples})`;
+    default: {
+      const _never: never = budget.basis;
+      return _never;
+    }
+  }
 }
 
 export interface DispatchLane {
@@ -207,11 +229,35 @@ export interface DispatchLane {
    * one definition of the budget and lets an operator read it off the ladder, rather than the child
    * re-deriving a figure from data it does not have.
    *
-   * ⚠ `basis` says which it is. `history` means the lane cleared `attemptMinSamples` and the number
-   * is its own quantile; `floor` means it did not, and the flat `attemptMs` applies — unmeasured is
-   * "no opinion", never "slow". Absent entirely when the walk is off or unconfigured.
+   * ⚠ `basis` names WHERE THE NUMBER CAME FROM, and there are THREE real cases, not two:
+   * `history` — the lane cleared `attemptMinSamples` and the number IS its own quantile;
+   * `floor` — it did not clear the floor, so the flat `attemptMs` applies, because unmeasured is
+   * "no opinion", never "slow";
+   * `clamped` — it DID clear the floor, its quantile was read, and that quantile came out BELOW
+   * `attemptMs`, so the operator's flat figure won the `Math.max`. There is history, and the
+   * number is not from it.
+   * Absent entirely when the walk is off or unconfigured.
+   *
+   * ⚠⚠ `clamped` exists because it was `history` until 2026-09-08, which reported the operator's
+   * own configured default as a measurement of this lane's runs — the provenance invariant's
+   * exact prohibition, reached by the closed-union collapse this repository records more than any
+   * other defect: three real cases mapped onto a two-member union, with the fall-through resolving
+   * to the STRONGER claim. Measured at the time on a fast answer-mode relay lane (5.7–10.8 s runs
+   * against a 90 s floor), `llm-relay dispatch` printed `budget: 90s (from 25 recorded runs)` when
+   * no run had ever taken anywhere near 90 s. It also hid the very signal the budget exists to
+   * expose: that this lane's real p80 is nine seconds. Found by an adversarial review, and pinned
+   * by `test/dispatch-attempt-budget.test.ts`.
    */
-  attemptBudget?: { ms: number; basis: "history" | "floor"; samples: number };
+  attemptBudget?: {
+    ms: number;
+    basis: "history" | "floor" | "clamped";
+    samples: number;
+    /**
+     * The lane's OWN quantile, present only on `clamped` — where it is the figure the operator
+     * came to read and `ms` is not it. Never a guess: absent unless a quantile was computed.
+     */
+    quantileMs?: number;
+  };
   /**
    * This lane recently failed to answer inside the budget a dispatch walk gave it, so ready lanes
    * carrying no demotion are tried ahead of it for a window (`lane-affinity.ts`).
@@ -1121,7 +1167,7 @@ export function buildDispatch(
     };
   }
 
-  const why = selectionReason(next, opts.after);
+  const why = selectionReason(next, opts.after, usable);
   return { ...base, order: ranked.map((l) => l.id), next, reason: why };
 }
 
@@ -1152,7 +1198,7 @@ export function buildDispatch(
 function attemptBudget(
   cfg: Config,
   samples: readonly number[],
-): { ms: number; basis: "history" | "floor"; samples: number } | undefined {
+): DispatchLane["attemptBudget"] {
   const walk = cfg.routing.dispatchWalk;
   if (!walk || !walk.enabled) return undefined;
   if (samples.length < walk.attemptMinSamples) {
@@ -1162,10 +1208,18 @@ function attemptBudget(
   // A window that cleared the sample floor cannot yield null, but a null here must never become a
   // zero budget — that would abandon every lane instantly. Fall to the flat figure, the weaker claim.
   if (quantile === null) return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
+  const own = Math.round(quantile);
   // ⚠ Never BELOW the flat budget. The floor is what the operator declared a lane is always worth
   // waiting for; a lane whose history happens to be fast must not be given less than that, or a
   // single quick run would make the relay impatient with it forever.
-  return { ms: Math.max(walk.attemptMs, Math.round(quantile)), basis: "history", samples: samples.length };
+  // ⚠⚠ But the LABEL must follow the number, not the clamp. When the floor wins, the figure served
+  // is the operator's configured default and calling it `history` reports a configuration value as
+  // a measurement of this lane — which is what it did until 2026-09-08. The lane's own quantile
+  // travels beside it, because that is the figure the operator actually wants.
+  if (own < walk.attemptMs) {
+    return { ms: walk.attemptMs, basis: "clamped", samples: samples.length, quantileMs: own };
+  }
+  return { ms: own, basis: "history", samples: samples.length };
 }
 
 /**
@@ -1176,8 +1230,22 @@ function attemptBudget(
  * a host reads to decide; and a demotion on a lane nothing can select says nothing at all. Neither
  * memory is DELETED by the guard — both stay in the store and reappear the moment the lane is
  * selectable again, because unavailability disproves neither.
+ *
+ * ⚠⚠ **It reads nothing at all when the walk is OFF**, and that gate was MISSING until 2026-09-08.
+ * `DispatchWalkSettings`'s own field doc promises that `dispatchWalk: false` "restores the pre-walk
+ * behaviour exactly: one lane per call, no memory" — and `recordLaneAffinity` does honour it, so no
+ * NEW memory is written. But rows written while the walk was ON are still restored from
+ * `lane-affinity.json` at startup, and this function annotated them regardless, so `rankSelectable`
+ * kept reordering the ladder and `next` kept naming a pinned lane. An operator who turned the walk
+ * off to revert got the old behaviour only once every surviving memory had lapsed — up to the
+ * six-hour `MAX_AFFINITY_MS` ceiling. Gating HERE rather than at the call site makes
+ * `rankSelectable` a no-op by construction: with no lane carrying either field, every lane ranks 1
+ * and the sort is stable, so the configured order is returned unchanged. Found by an adversarial
+ * review; pinned in `test/dispatch-lane-walk.test.ts`.
  */
 function annotateAffinity(cfg: Config, ladder: DispatchLane[], tier: string | null, now: number): void {
+  const walk = cfg.routing.dispatchWalk;
+  if (!walk || !walk.enabled) return;
   const render = (row: LaneAffinityRow): { until: string; reason: string } => ({
     until: new Date(row.until).toISOString(),
     reason: row.reason,
@@ -1208,14 +1276,38 @@ function rankSelectable(usable: readonly DispatchLane[]): DispatchLane[] {
   return [...usable].sort((a, b) => rank(a) - rank(b));
 }
 
-/** Why `next` is what it is, in one line the ladder view and the CLI both print. */
-function selectionReason(next: DispatchLane, after: string | undefined): string {
+/**
+ * Why `next` is what it is, in one line the ladder view and the CLI both print.
+ *
+ * ⚠⚠ **A reason string is a CLAIM about the ordering code, and two of these were false until
+ * 2026-09-08** — found by an adversarial review, reproduced against the built binary, and pinned
+ * in `test/dispatch-lane-walk.test.ts`. Both said something `rankSelectable` does not do:
+ *
+ * 1. `"the least recently demoted"` — `rankSelectable` consults NO timestamp. Its comparator is a
+ *    stable sort on a three-valued band rank, so the lane named is simply the FIRST IN LADDER ORDER
+ *    among the demoted ones. Demoting `beta` and then `alpha` named `alpha`, i.e. the MOST recently
+ *    demoted, while claiming the opposite.
+ * 2. `"N ahead of it unavailable"` — with demotion reordering, a lane ahead in ladder order can be
+ *    perfectly READY and merely demoted. It reported available lanes as unavailable.
+ *
+ * The counts are therefore taken from the selectable set rather than from `position` arithmetic,
+ * and the two populations are named separately, because they call for opposite responses: an
+ * unavailable lane needs attention, a demoted one is the walk working as intended.
+ */
+function selectionReason(next: DispatchLane, after: string | undefined, usable: readonly DispatchLane[]): string {
   if (next.pinned) return `lane "${next.id}" is pinned (${next.pinned.reason})`;
   if (after !== undefined) return `first ready lane after "${describeId(after)}"`;
-  if (next.demoted) return `every ready lane is demoted; "${next.id}" is the least recently demoted`;
-  return next.position === 1
-    ? "first lane in the ladder"
-    : `first ready lane (${next.position - 1} ahead of it unavailable)`;
+  if (next.demoted) return `every ready lane is demoted; "${next.id}" is first among them in the ladder`;
+  if (next.position === 1) return "first lane in the ladder";
+  // Ahead of `next` in LADDER order, split by why they did not lead. `next` is undemoted and
+  // unpinned here, so any selectable lane ahead of it must be demoted — a pinned one would be
+  // `next` itself.
+  const aheadDemoted = usable.filter((l) => l.position < next.position).length;
+  const aheadUnavailable = next.position - 1 - aheadDemoted;
+  const parts: string[] = [];
+  if (aheadUnavailable > 0) parts.push(`${aheadUnavailable} ahead of it unavailable`);
+  if (aheadDemoted > 0) parts.push(`${aheadDemoted} ahead of it ready but demoted`);
+  return parts.length === 0 ? "first lane in the ladder" : `first undemoted lane (${parts.join(", ")})`;
 }
 
 export const AUTO_TIERS = ["low", "medium", "high", "xhigh"] as const;

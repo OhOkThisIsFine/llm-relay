@@ -2,7 +2,34 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-08 (the dispatch lane-walk lap — v0.74.0 and v0.75.0)
+## 0. State as of 2026-09-08 (the dispatch lane-walk lap, and the safety review that followed it)
+
+⚠⚠ **A second review pass found EIGHT more defects in the lane walk, six of them behavioural, and
+they are fixed.** Full record, with the mutation that killed each test:
+[docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md). Read that
+before trusting anything below about how the walk orders lanes, because three of the fixes changed
+behaviour the section beneath describes.
+
+The three worth carrying in your head:
+
+1. **A demotion did not retract the pin.** So the walk re-tried the lane it had just abandoned,
+   FIRST, for the rest of its 15-minute pin window — the demotion half of the feature was inert in
+   exactly the case the feature exists for. Both `CLAUDE.md` and `rankSelectable`'s own doc asserted
+   the retraction was symmetric while it was not.
+2. **The budget measured itself.** An abandoned lane's wall clock IS the budget the walk killed it
+   at, and it was fed back into the window the next budget is derived from — a ratchet that would
+   have locked `free-pool` out permanently, since its median run is about five times the flat
+   default.
+3. **A clamped budget was labelled `history`,** reporting the operator's own configured default as a
+   measurement of that lane's runs.
+
+⚠ The review's coverage is PARTIAL and stated as such: six of six reviewers returned, but 24 of the
+33 findings they raised were never verified, because their refuters died on the monthly spend limit.
+Nine of those were verified by hand afterwards; the rest are listed in the review document, and two
+are filed in `docs/backlog.md`. **They are UNVERIFIED, not refuted** — the harness scored a
+zero-vote finding the same as an argued-down one, which is a defect in the harness, not a verdict.
+
+## Where the lane-walk lap itself landed (v0.74.0 and v0.75.0)
 
 **Both released and live**, global binary reinstalled. `v0.74.0` carries the walk, the terminal
 fallback, the pin and the demotion. `v0.75.0` replaces that release's flat 90-second lane budget

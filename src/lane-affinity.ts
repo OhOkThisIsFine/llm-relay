@@ -270,7 +270,13 @@ export function restoreLaneAffinityRows(
     if (row.until <= now) continue;
     const key = memoryKey(row.tier, row.laneId, row.kind);
     if (map.has(key)) continue;
-    map.set(key, { ...row });
+    // ⚠ The CEILING is enforced on this path too, not only on the write path (2026-09-08). Until
+    // then `clampWindow` bounded what this process recorded while the restore admitted whatever the
+    // file said, so a hand-edited or corrupt `lane-affinity.json` could park a lane pinned or
+    // demoted for years — past the six-hour ceiling this module states as its own rule, and with no
+    // way to notice, because a memory is silent by design. A row is not rejected for it: the clamp
+    // CORRECTS, the same direction `clampWindow` takes for a nonsense duration on the write side.
+    map.set(key, { ...row, until: Math.min(row.until, now + MAX_AFFINITY_MS) });
     restored++;
   }
   if (restored > 0) notify(cfg);

@@ -129,6 +129,33 @@ describe("lane affinity persistence", () => {
     expect(laneDemotion(cfg, "medium", "second", now)).toBeNull();
   });
 
+  it("⚠ CLAMPS a restored row to the ceiling — the write path is not the only entrance", () => {
+    // ⚠ `clampWindow` bounded what this process RECORDS, while the restore admitted whatever the
+    // file said. So a hand-edited or corrupt `lane-affinity.json` could park a lane pinned for
+    // years, past the six-hour ceiling this module states as its own rule, silently — a memory
+    // leaves no trace by design. The clamp CORRECTS rather than rejecting, the same direction
+    // `clampWindow` takes for a nonsense duration on the write side.
+    const path = join(dir, `affinity-${Math.random().toString(36).slice(2)}.json`);
+    const now = 1_700_000_000_000;
+    const century = now + MAX_AFFINITY_MS * 10_000;
+    saveLaneAffinityRows([{ tier: null, laneId: "first", kind: "pin", until: century, reason: "forever" }], { path });
+    const cfg = freshConfig();
+    expect(restoreLaneAffinityRows(cfg, loadLaneAffinityRows({ path }), now)).toBe(1);
+    expect(lanePin(cfg, null, "first", now)?.until).toBe(now + MAX_AFFINITY_MS);
+    // And it therefore lapses on schedule instead of never.
+    expect(lanePin(cfg, null, "first", now + MAX_AFFINITY_MS)).toBeNull();
+  });
+
+  it("a restored row INSIDE the ceiling keeps its own expiry untouched", () => {
+    // Negative control: the clamp must not rewrite an ordinary row.
+    const path = join(dir, `affinity-${Math.random().toString(36).slice(2)}.json`);
+    const now = 1_700_000_000_000;
+    saveLaneAffinityRows([{ tier: null, laneId: "second", kind: "demote", until: now + 60_000, reason: "ok" }], { path });
+    const cfg = freshConfig();
+    expect(restoreLaneAffinityRows(cfg, loadLaneAffinityRows({ path }), now)).toBe(1);
+    expect(laneDemotion(cfg, null, "second", now)?.until).toBe(now + 60_000);
+  });
+
   it("never overwrites what the live process already learned", () => {
     const path = join(dir, `affinity-${Math.random().toString(36).slice(2)}.json`);
     const now = 1_700_000_000_000;
@@ -269,5 +296,99 @@ describe("buildDispatch ordering reads the routing memory", () => {
     // ⚠ A walking caller must honour the override too. Walking past it would defeat the override
     // just as silently as ignoring it.
     expect(view.order).toEqual(["second"]);
+  });
+});
+
+/**
+ * The one-line `reason` the ladder view and the CLI both print is a CLAIM about the ordering code.
+ * Two of its branches described behaviour `rankSelectable` does not implement (found by adversarial
+ * review, 2026-09-08). These pin the corrected wording against the code that produces it.
+ */
+describe("the selection reason states what the ordering actually did", () => {
+  it("⚠ does NOT claim recency among demoted lanes — nothing consults a timestamp", () => {
+    const cfg = freshConfig();
+    // Demote `second` five minutes ago, then `first` and `third` now. Under the old wording the
+    // answer named `first` and called it "the least recently demoted", which is precisely
+    // backwards: it is the MOST recently demoted, and it leads only because it is earlier in the
+    // configured ladder. ⚠ The older row needs a window long enough to still be LIVE — `remember`
+    // stores `now + ttlMs`, so a 60 s window recorded five minutes ago has already lapsed, and a
+    // lapsed row is deleted on read.
+    demoteLane(cfg, null, "second", "missed budget", 600_000, Date.now() - 5 * 60_000);
+    demoteLane(cfg, null, "first", "missed budget", 600_000, Date.now());
+    demoteLane(cfg, null, "third", "missed budget", 600_000, Date.now());
+    const view = buildDispatch(cfg);
+    expect(view.next?.id).toBe("first");
+    expect(view.reason).not.toContain("least recently demoted");
+    expect(view.reason).toContain("first among them in the ladder");
+  });
+
+  it("⚠ does NOT call a ready-but-demoted lane unavailable", () => {
+    const cfg = freshConfig();
+    // `first` is demoted but perfectly READY, so `second` leads. The old wording reported
+    // "1 ahead of it unavailable" — reporting an available lane as unavailable.
+    demoteLane(cfg, null, "first", "missed budget", 60_000);
+    const view = buildDispatch(cfg);
+    expect(view.next?.id).toBe("second");
+    expect(view.reason).not.toContain("unavailable");
+    expect(view.reason).toContain("ready but demoted");
+  });
+
+  it("still reports a genuinely unavailable lane as unavailable", () => {
+    // Negative control: the correction must not blind the message to the real case.
+    const cfg = freshConfig();
+    markExhausted(cfg, "first", 60_000);
+    const view = buildDispatch(cfg);
+    expect(view.next?.id).toBe("second");
+    expect(view.reason).toContain("1 ahead of it unavailable");
+    expect(view.reason).not.toContain("ready but demoted");
+  });
+});
+
+describe("routing.dispatchWalk: false restores the pre-walk behaviour exactly", () => {
+  /** The same three-rung ladder, with the walk explicitly OFF. */
+  function walkOffConfig(): Config {
+    const path = join(dir, `config-off-${Math.random().toString(36).slice(2)}.json`);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: {
+          anthropic: { base: "https://api.anthropic.com", kind: "anthropic", credentialMode: "passthrough" },
+        },
+        routing: {
+          default: "anthropic",
+          dispatchWalk: false,
+          ladder: [
+            { id: "first", kind: "cli", command: "a", args: ["{task}"] },
+            { id: "second", kind: "cli", command: "b", args: ["{task}"] },
+            { id: "third", kind: "cli", command: "c", args: ["{task}"] },
+          ],
+        },
+      }),
+    );
+    return loadConfig(path);
+  }
+
+  it("⚠ a memory restored from disk no longer reorders the ladder once the walk is off", () => {
+    // ⚠⚠ `recordLaneAffinity` already declined to WRITE with the walk off, but rows written while
+    // it was on are restored at startup, and `annotateAffinity` read them regardless. So the
+    // documented byte-for-byte revert was not one: an operator who turned the walk off got the old
+    // behaviour only after every surviving memory lapsed — up to the six-hour clamp.
+    const cfg = walkOffConfig();
+    pinLane(cfg, null, "third", "answered in 4s", 60_000);
+    demoteLane(cfg, null, "first", "missed budget", 60_000);
+    const view = buildDispatch(cfg);
+    expect(view.order).toEqual(["first", "second", "third"]);
+    expect(view.next?.id).toBe("first");
+    expect(view.ladder.find((l) => l.id === "third")?.pinned).toBeUndefined();
+    expect(view.ladder.find((l) => l.id === "first")?.demoted).toBeUndefined();
+    expect(view.reason).toBe("first lane in the ladder");
+  });
+
+  it("negative control: the same memories DO reorder while the walk is on", () => {
+    const cfg = freshConfig();
+    pinLane(cfg, null, "third", "answered in 4s", 60_000);
+    demoteLane(cfg, null, "first", "missed budget", 60_000);
+    expect(buildDispatch(cfg).order).toEqual(["third", "second", "first"]);
   });
 });

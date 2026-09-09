@@ -236,9 +236,23 @@ const LANE_AFFINITY_EFFECT = {
  * but the child restarts often (a filed machine-wide defect records one restart destroying five
  * lanes at once) and it is not the process that builds the ladder view. One writer, one owner.
  *
- * ⚠ A success RETRACTS the lane's demotion before recording the pin, so a lane that recovers is
- * not left carrying both memories. That mirrors `target-facts.ts`, where a success clears a cooling
- * condition rather than merely being recorded beside it.
+ * ⚠ RECORDING EITHER MEMORY RETRACTS THE OTHER, in BOTH directions. A success retracts the
+ * demotion before recording the pin, and a failure retracts the pin before recording the demotion.
+ * That mirrors `target-facts.ts`, where a success clears a cooling condition rather than merely
+ * being recorded beside it.
+ *
+ * ⚠⚠ The second direction was MISSING until 2026-09-08, and its absence defeated the demotion half
+ * of the walk in exactly the case the feature exists for. `remember` writes one key per KIND
+ * (`${kind}:${tier}:${laneId}`), so `demoteLane` could never touch the pin row on its own; only
+ * this call site can. Without it a lane that answered, was pinned, and then hung on a later walk
+ * carried BOTH memories — and `rankSelectable` ranks a lane holding both as PINNED, i.e. FIRST. So
+ * the lane the walk had just abandoned was tried first again on the very next dispatch, and kept
+ * that position for the rest of its pin window (15 minutes by default). Found by an adversarial
+ * review, confirmed by reading, and pinned by `test/lane-affinity-retraction.test.ts`.
+ *
+ * ⚠ `rankSelectable`'s own doc rests on this being true — it ranks a both-memories lane as pinned
+ * BECAUSE "the pin is the more recent evidence", which only holds while recording one retracts the
+ * other. Its handling of that state stays as a defence for a row restored from an older file.
  */
 function recordLaneAffinity(cfg: Config, report: DispatchedTelemetryReport): void {
   const walk = cfg.routing.dispatchWalk;
@@ -248,8 +262,10 @@ function recordLaneAffinity(cfg: Config, report: DispatchedTelemetryReport): voi
   if (!walk || !walk.enabled) return;
   const tier = report.tier ?? null;
   const seconds = Math.round(report.wallClockMs / 1000);
+  // Retract first, whichever way this report points: the memory being written is the newer
+  // evidence, and leaving the older one beside it is what let an abandoned lane keep a stale pin.
+  clearLaneAffinity(cfg, tier, report.laneId);
   if (LANE_AFFINITY_EFFECT[report.status] === "pin") {
-    clearLaneAffinity(cfg, tier, report.laneId);
     pinLane(cfg, tier, report.laneId, `answered in ${seconds}s`, walk.pinMs);
     return;
   }

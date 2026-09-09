@@ -18,8 +18,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, type Config } from "../src/config.js";
-import { buildDispatch, formatAttemptBudget } from "../src/dispatch.js";
-import { parseTelemetryReport, recordLaneRun, MAX_LANE_STAT_SAMPLES, quantileWallClockMs } from "../src/dispatch-lane-stats.js";
+import { buildDispatch, formatAttemptBudget, type DispatchLane } from "../src/dispatch.js";
+import { parseTelemetryReport, recordLaneRun, laneStatsFor, MAX_LANE_STAT_SAMPLES, quantileWallClockMs } from "../src/dispatch-lane-stats.js";
 
 const dir = mkdtempSync(join(tmpdir(), "llm-relay-attempt-budget-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -59,7 +59,27 @@ function record(cfg: Config, durationsMs: readonly number[]): void {
   });
 }
 
-function budgetOf(cfg: Config): { ms: number; basis: string; samples: number } | undefined {
+/** Record `n` runs the WALK killed at `budgetMs` — the samples that must never enter the window. */
+function recordAbandoned(cfg: Config, budgetMs: number, n: number): void {
+  for (let i = 0; i < n; i++) {
+    const report = parseTelemetryReport({
+      jobId: `abandoned-${i}`,
+      laneId: "slow",
+      kind: "cli",
+      wallClockMs: budgetMs,
+      exitCode: null,
+      status: "abandoned",
+      estimatedInputTokens: 1,
+      estimatedOutputTokens: 1,
+    });
+    expect(report, "fixture report must parse").not.toBeNull();
+    recordLaneRun(cfg, report!, 1_700_000_100_000 + i);
+  }
+}
+
+// ⚠ Derived from the field, never re-declared. A hand-written local shape here would have hidden
+// the `clamped` basis and `quantileMs` from every assertion in this file.
+function budgetOf(cfg: Config): DispatchLane["attemptBudget"] {
   return buildDispatch(cfg).ladder.find((l) => l.id === "slow")?.attemptBudget;
 }
 
@@ -94,7 +114,80 @@ describe("per-lane attempt budget", () => {
     // would make the relay permanently impatient with it.
     const cfg = freshConfig({ attemptMs: 90_000, attemptMinSamples: 3 });
     record(cfg, [1_000, 1_200, 1_400, 1_600]);
-    expect(budgetOf(cfg)).toEqual({ ms: 90_000, basis: "history", samples: 4 });
+    expect(budgetOf(cfg)?.ms).toBe(90_000);
+  });
+
+  it("⚠ a clamped budget is labelled `clamped`, NOT `history` — it is the operator's number", () => {
+    // ⚠ This assertion was `basis: "history"` until 2026-09-08, i.e. it PINNED the defect it should
+    // have caught: the served figure is the operator's configured floor, and calling it `history`
+    // reports a configuration value as a measurement of this lane's runs. Flipped in the same
+    // commit as the source fix, which is this repository's standing protocol.
+    const cfg = freshConfig({ attemptMs: 90_000, attemptMinSamples: 3 });
+    record(cfg, [1_000, 1_200, 1_400, 1_600]);
+    expect(budgetOf(cfg)).toEqual({ ms: 90_000, basis: "clamped", samples: 4, quantileMs: 1_600 });
+  });
+
+  it("a clamped budget carries the lane's OWN quantile, because that is the figure being hidden", () => {
+    // The whole point of a per-lane budget is to expose what this lane actually takes. When the
+    // floor wins, `ms` is not that number, so the number travels beside it or it is lost.
+    const cfg = freshConfig({ attemptMs: 90_000, attemptMinSamples: 3, attemptQuantile: 0.8 });
+    const runs = [6_000, 7_000, 8_000, 9_000, 10_000];
+    record(cfg, runs);
+    const budget = budgetOf(cfg);
+    expect(budget?.quantileMs).toBe(quantileWallClockMs(runs, 0.8));
+    expect(budget?.quantileMs).toBeLessThan(budget?.ms ?? 0);
+  });
+
+  it("renders a clamped budget as the floor AND the lane's own figure, never as 'recorded runs'", () => {
+    const cfg = freshConfig({ attemptMs: 90_000, attemptMinSamples: 3 });
+    record(cfg, [1_000, 1_200, 1_400, 1_600]);
+    const budget = budgetOf(cfg);
+    expect(budget).toBeDefined();
+    const line = formatAttemptBudget(budget!);
+    expect(line).toContain("flat floor");
+    expect(line).toContain("1.6s");
+    // The defect's user-visible face: "90s (from 4 recorded runs)" when no run took 90s.
+    expect(line).not.toContain("recorded runs");
+  });
+
+  it("⚠⚠ an ABANDONED run contributes no duration — the budget must not measure itself", () => {
+    // ⚠ The walk kills an abandoned lane AT its budget, so that wall clock IS the budget. Feeding
+    // it back would make the next budget a measurement of the relay's own impatience, and it
+    // ratchets: a lane slower than its budget is killed at B, B enters the window, the quantile is
+    // pulled toward B, and the lane can never show it needed longer. That would lock out exactly
+    // the slow-but-working lane the walk exists to route around.
+    const cfg = freshConfig({ attemptMs: 1_000, attemptMinSamples: 3, attemptQuantile: 0.8 });
+    record(cfg, [300_000, 310_000, 320_000, 330_000]);
+    const before = budgetOf(cfg);
+    // Ten abandonments at the 1 s budget. Under the old code these ten 1 000 ms samples would
+    // dominate the window and collapse the quantile.
+    recordAbandoned(cfg, 1_000, 10);
+    const after = budgetOf(cfg);
+    expect(after?.ms).toBe(before?.ms);
+    expect(after?.samples).toBe(before?.samples);
+  });
+
+  it("an abandoned run still counts as a FAILURE — only its duration is withheld", () => {
+    // Negative control in the other direction: that a lane did not answer IS evidence about the
+    // lane, and the affinity memory acts on it. Withholding the count would hide a real signal.
+    const cfg = freshConfig({ attemptMinSamples: 3 });
+    record(cfg, [10_000, 11_000, 12_000]);
+    const callsBefore = laneStatsFor(cfg, "slow")?.calls ?? 0;
+    recordAbandoned(cfg, 1_000, 2);
+    const stats = laneStatsFor(cfg, "slow");
+    expect(stats?.calls).toBe(callsBefore + 2);
+    expect(stats?.failures).toBe(2);
+    expect(stats?.wallClockMs).toHaveLength(3);
+  });
+
+  it("a quantile ABOVE the floor keeps basis `history` and carries no quantileMs", () => {
+    // Negative control: the clamp branch must not swallow the ordinary case.
+    const cfg = freshConfig({ attemptMs: 1_000, attemptMinSamples: 3, attemptQuantile: 0.8 });
+    record(cfg, [50_000, 60_000, 70_000, 80_000]);
+    const budget = budgetOf(cfg);
+    expect(budget?.basis).toBe("history");
+    expect(budget?.quantileMs).toBeUndefined();
+    expect(budget?.ms).toBeGreaterThan(1_000);
   });
 
   it("the quantile is configurable, and a higher one yields a longer budget", () => {

@@ -155,6 +155,33 @@ describe("POST /dispatch/telemetry — the daemon's routing memory", () => {
     expect(lanePin(cfg, "medium", "telemetry-cli")).not.toBeNull();
   });
 
+  it("⚠ a lane that ANSWERED and then hung loses its pin — the mirror direction", async () => {
+    // ⚠⚠ The retraction above ran in ONE direction until 2026-09-08. `remember` in
+    // `lane-affinity.ts` writes one key per KIND, so `demoteLane` can never touch the pin row;
+    // only `recordLaneAffinity` can, and it retracted solely on the pin path. A lane that answered,
+    // was pinned, and then hung on a later walk therefore carried BOTH memories — and
+    // `rankSelectable` ranks a lane holding both as PINNED, i.e. FIRST. So the walk re-tried the
+    // lane it had just abandoned, first, for the rest of the 15-minute pin window: the demotion
+    // half of the feature was inert in exactly the case the feature exists for.
+    // ⚠ No `tier` on either report: this fixture is a LEGACY single ladder, so the report's tier
+    // and the tier `buildDispatch` annotates with are both null — the pairing the walk produces.
+    const cfg = cfgWithLadder();
+    const events: AccountingEvent[] = [];
+    await withProxy(cfg, events, async (base) => {
+      await postTelemetry(base, cliReport({ status: "completed", wallClockMs: 3_000 }));
+      expect(lanePin(cfg, null, "telemetry-cli")).not.toBeNull();
+      await postTelemetry(base, cliReport({ status: "abandoned", exitCode: null, wallClockMs: 90_000 }));
+    });
+    expect(lanePin(cfg, null, "telemetry-cli")).toBeNull();
+    expect(laneDemotion(cfg, null, "telemetry-cli")?.reason).toBe("abandoned after 90s");
+    // The consequence the retraction exists to prevent: the lane the walk just abandoned must not
+    // lead the ladder handed to the next caller.
+    const view = buildDispatch(cfg);
+    expect(view.ladder.find((l) => l.id === "telemetry-cli")?.pinned).toBeUndefined();
+    expect(view.ladder.find((l) => l.id === "telemetry-cli")?.demoted).toBeDefined();
+    expect(view.order[0]).not.toBe("telemetry-cli");
+  });
+
   it("every non-completed status demotes — one rule, including a plain failure", async () => {
     for (const status of ["failed", "timed_out", "abandoned"] as const) {
       const cfg = cfgWithLadder();

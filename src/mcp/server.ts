@@ -546,7 +546,13 @@ function attemptReason(
   }
   if (outcome.semanticFailure !== undefined) return outcome.semanticFailure;
   if (status === "timed_out") return "the lane exceeded its own configured timeout";
-  return "the lane failed";
+  if (status === "failed") return "the lane failed";
+  // ⚠ Total over `DispatchLaneStatus`, not a bare fall-through. The union GREW this sprint
+  // (`abandoned`), which is the proof it grows; before this, a fifth member would have rendered
+  // silently as "the lane failed" — the repository's most repeated defect class, an unhandled
+  // member of a closed union resolving to a claim nobody checked.
+  const _never: never = status;
+  return String(_never);
 }
 
 /** Apply a rung's declared env deltas: a string sets, `null` unsets an inherited variable. */

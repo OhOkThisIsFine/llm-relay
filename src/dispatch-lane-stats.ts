@@ -224,10 +224,17 @@ export function p95WallClockMs(samples: readonly number[]): number | null {
  * ⚠ Nearest-rank, so the answer is always an OBSERVED sample rather than an interpolation between
  * two: a duration nothing ever took, used as a budget, would be a fabricated measurement.
  *
- * ⚠ The quantile is CLAMPED to (0, 1]. A caller asking for 0 would otherwise take rank 0, and the
- * floor below turns that into the fastest sample ever seen — a budget nothing could meet. Clamping
- * to the nearest usable value is the fail-safe direction here, because a config typo must not make
- * every lane look instantly slow.
+ * ⚠ The quantile is bounded to (0, 1] here, and the OPERATOR's guard is elsewhere: `parseRouting`
+ * rejects an `attemptQuantile` outside (0, 1) as a hard load error, so a config typo never reaches
+ * this function at all. What is left here is a defence for a direct caller.
+ *
+ * ⚠⚠ **Do not read the `Math.max(Number.EPSILON, …)` as protection against a quantile of 0 — it
+ * changes no answer, and the comment here claimed the opposite until 2026-09-08.** With `q` at
+ * EPSILON, `Math.ceil(q * n)` is 1; with `q` at 0 it is 0, which `Math.max(1, rank)` below then
+ * lifts to 1. Both paths return `sorted[0]`, the fastest sample — which is precisely the outcome
+ * the old comment said the clamp prevented. The clamp survives as a statement of the intended
+ * domain; the `Math.max(1, rank)` floor is what actually holds the bottom, and a non-finite
+ * quantile falling to 1 is what actually holds the top.
  */
 export function quantileWallClockMs(samples: readonly number[], quantile: number): number | null {
   if (samples.length === 0) return null;
@@ -342,7 +349,21 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
       throw new Error(`unhandled dispatch lane status: ${String(_never)}`);
     }
   }
-  entry.wallClockMs.push(report.wallClockMs);
+  // ⚠⚠ **An ABANDONED run contributes NO duration sample, and that is load-bearing since the window
+  // began setting each lane's walk budget (2026-09-08).** The relay killed that lane AT its budget,
+  // so `wallClockMs` is by construction the BUDGET, not a duration the lane produced. Feeding it
+  // back in makes the next budget partly a measurement of the relay's own impatience, and it
+  // RATCHETS: a lane slower than its budget is killed at B, B enters the window, the quantile is
+  // pulled toward B, and the lane can never demonstrate that it needed longer — because it is never
+  // allowed to run longer. Measured shape of the harm: `free-pool`'s median run is ~5x the flat 90 s
+  // default, so under a walk it would be killed at 90 s repeatedly, its window would fill with 90 s
+  // samples, and the lane the whole feature exists to route AROUND would instead be locked out.
+  // ⚠ The COUNT still lands (`failures` above) — that a lane did not answer IS first-party evidence
+  // about the lane, and `lane-affinity.ts` acts on it. Only the DURATION is withheld.
+  // ⚠ Exactly the rule `circuit-breaker.ts` already states for a cancelled attempt: `status` is
+  // deliberately absent there so the outcome stays out of `MEASURABLE_CODES`, "so an attempt of
+  // unknown true duration moves uptime and never enters a latency statistic". Same reason here.
+  if (report.status !== "abandoned") entry.wallClockMs.push(report.wallClockMs);
   if (entry.wallClockMs.length > MAX_LANE_STAT_SAMPLES) {
     entry.wallClockMs.splice(0, entry.wallClockMs.length - MAX_LANE_STAT_SAMPLES);
   }

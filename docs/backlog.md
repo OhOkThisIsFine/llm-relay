@@ -9,6 +9,30 @@
 
 ## Open
 
+- **The per-lane stats window is keyed by lane id ALONE, so one tier's runs set another tier's walk
+  budget (2026-09-08, safety review, medium).** `recordLaneRun` in `src/dispatch-lane-stats.ts` does
+  `map.get(report.laneId)`. The routing memory beside it IS tier-keyed — `memoryKey` in
+  `src/lane-affinity.ts` builds `${kind}:${tier}:${laneId}` — and this sprint added `tier` to the
+  telemetry report expressly because "the daemon's routing memory is keyed by it". The stated reason
+  is that "a lane that answered a `low` task says nothing about the `xhigh` ladder". That reasoning
+  applies with equal force to a BUDGET, and more so: an `xhigh` task legitimately runs far longer
+  than a `low` one, so mixing them makes the quantile meaningless for both. Since 2026-09-08 that
+  window sets each lane's kill budget, so this is no longer advisory. **Not fixed with the rest of
+  that review because it changes the persisted key space** (`dispatch-lane-stats.json`), which needs
+  a back-compatible restore decision — and because the advisory `stats` column arguably still wants
+  a per-lane aggregate, so the two consumers may need different keys.
+  **Property:** a lane's walk budget is derived only from runs on the ladder it will be used on;
+  an existing stats file still loads.
+
+- **`LANE_AFFINITY_KINDS` promises a compile-time protection that does not exist (2026-09-08, safety
+  review, low).** Its docstring in `src/lane-affinity.ts` states that deriving the type from the
+  `as const` array means "a third memory is a compile error at every total table rather than a
+  silent drop at a loader". There is no total table over `LaneAffinityKind` anywhere in `src/`, so a
+  third kind would compile clean and be handled nowhere. The claim is the right one — it is the
+  remedy this repository prescribes for its most repeated defect — but it is currently unearned.
+  **Property:** adding a member to `LANE_AFFINITY_KINDS` fails `npm run typecheck` at a named table,
+  verified by adding one and removing it again.
+
 - **The `llm-relay` skill and the `relay` agent drift from the CLI and from each other
   (2026-09-08, machine-wide hooks-and-skills review, low).**
   `skills/llm-relay/references/operations.md` documents `eligibility propose … --rationale "…"`;
