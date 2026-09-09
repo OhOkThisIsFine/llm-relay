@@ -121,35 +121,6 @@
   now is (live p80: 165 s, 224 s, 1383 s; chosen because p90/p95 saturate at the slowest lane's own
   timeout).
 
-- **✅ RULED 2026-09-06, and SCHEDULED: decompose `parseRouting`.** The owner chose to split it in a
-  later lap rather than accept its size. Measured after the HOTSPOT-03 extraction, it is still
-  cognitive complexity **125** against a threshold of 15 — the move relocated the hotspot, it did
-  not shrink it. That measurement also settles the discrepancy the item flagged: the catalog said
-  137, the in-source comment said 124, and the real figure at `src/config/routing-parser.ts:173` is
-  125. The comment was right; the catalog was not.
-
-  ⚠ Not a regression, and the extraction was not mis-scoped. HOTSPOT-03's stated property was about
-  the MOVE — that `config.ts` declares no moved symbol, that the new module is a leaf, and that the
-  parser is pure — and all three hold and are pinned by
-  `test/config/routing-parser-is-a-leaf.test.ts`. What changed is that the function no longer sits
-  in the middle of a 2,000-line file. Two smaller functions in the same module measure 32 and 36.
-
-  ⚠ **The risk to plan around is ORDER, not size.** `parseRouting` validates sub-blocks in a
-  sequence, and which error an operator sees for a config with two mistakes in it depends on that
-  sequence. A reordering is invisible to the suite — that is exactly how the keystore prologue's
-  precondition order turned out to be uncovered on 2026-09-05, where moving one check past another
-  left all 94 tests green. Pin the order before splitting, not after.
-
-  ⚠ Read the standing invariant first: `CLAUDE.md` records that restructuring `server.ts`/`config.ts`
-  to satisfy `sonarjs/cognitive-complexity` is the enterprise-shaped refactor
-  [`suggestion-review-2026-08-04.md`](suggestion-review-2026-08-04.md) already rejected against the
-  project's own rubric, and the rule is a WARNING for that reason. The owner has now chosen to do it
-  for this one function; that choice does not generalise to the others.
-
-  **Property:** `parseRouting` is decomposed into per-sub-block functions, each part's validation
-  ORDER is preserved and pinned by a test that fails if two checks are swapped, and the config suite
-  is green.
-
 - **`dispatch` loses the job when `waitMs` exceeds the host's tool-call timeout — the SERVER half.**
   ⚠ The item itself is MACHINE-WIDE and already filed as the first entry of `C:\Code\docs\backlog.md`
   (opened 2026-09-05 at the tutor-sync lap, corroborated three more times the same evening at this
@@ -331,6 +302,20 @@
   its `false` form.
 
 ## Closed
+
+- ✅ **`parseRouting` is decomposed into per-sub-block functions, with its validation ORDER pinned
+  first** (ruled 2026-09-06, closed 2026-09-09). The pin came before the split, as the item
+  required: `test/config/routing-parser-order.test.ts` holds the ordered table of every check,
+  asserts each alone for its exact message, asserts every combinable ordered pair (444) yields the
+  earlier check's message, and pins the six disabled-provider warnings and the degraded results;
+  mutation-checked four times, one failing test per swap. Then `parseRouting`
+  (`src/config/routing-parser.ts`) became a sequence of fourteen private helpers, named in its
+  `CLAUDE.md` row: cognitive complexity 125 → 12, every helper ≤ 13, every error and warning
+  string byte-identical, the returned object's keys and insertion order unchanged, the leaf and
+  purity test green, `delegate-gate` clean. The property is met. ⚠ `parseOffload` (32) and
+  `parseLadder` (36) are untouched — the owner's choice covered this one function and does not
+  generalise (the `CLAUDE.md` static-analysis paragraph and the rejected enterprise-shaped
+  refactor). Offload record and lane measurements: `HANDOFF.md` §0.
 
 - ✅ **The runbook's Tier 1 duplication CI gate is DECLINED** (filed 2026-09-05, closed
   2026-09-06 by owner decision). Asked a third time, with four green releases behind the

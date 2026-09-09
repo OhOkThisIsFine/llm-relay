@@ -2,102 +2,77 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-09 (the breaker-persistence lap, v0.77.0)
+## 0. State as of 2026-09-09 (the parseRouting decomposition lap, v0.77.1)
 
-**The owner's premise — "circuit breaker state lives only in memory and disappears on restart" —
-was partly true, and the part that was true is closed.** Cooldowns had survived a restart since
-2026-08-30; the failure counters, the credential fault, the served-request ping window (which
-`GET /telemetry` scores stability from) and the quota observations had not, and nothing flushed
-the file at shutdown. Owner decision 2026-09-08: persist the WHOLE cell, credential faults
-included. Evidence, method and the before/after tables:
-[docs/breaker-persistence-audit-2026-09-08.md](docs/breaker-persistence-audit-2026-09-08.md).
+**The scheduled `parseRouting` split is done, and the validation ORDER was pinned before a line
+moved.** Owner ruling 2026-09-06. The backlog item's own warning was that a reordering of two
+checks is invisible to the suite, so the lap wrote the pin first, proved it red against swapped
+checks, and only then split the function.
 
-- ✅ **`breaker-state.json` now carries every field of every cell**, restored faithfully at start
-  (`exportState` / `restoreState` / `onStateChanged` in `src/circuit-breaker.ts`;
-  `loadBreakerState` / `saveBreakerState` / `installBreakerPersistence` in
-  `src/breaker-persistence.ts`). Measured on an isolated relay against a mock upstream: on v0.76.0
-  a hard kill and restart turned `AUTH 401` into `closed` and telemetry into
-  `stabilityScore null, observedTargets 0`; on this binary every surface reads after the restart
-  exactly as before the kill, with zero requests re-learned from the upstream.
-- ✅ **Every write-behind store flushes at a graceful shutdown.** `WriteBehindTimer.flushNow()` and
-  `WriteBehindRegistry` (`src/write-behind.ts`) give `breaker-persistence.ts`,
-  `dispatch-exhaustion-persistence.ts`, `dispatch-lane-stats.ts` and `lane-affinity.ts` a
-  `flush<Store>Persistence()` each; `runProxy` calls all four beside the six older flushes in both
-  shutdown sites. Until now those four armed timers inside closures nothing could reach.
-- ✅ Version stays 1: every added field is optional on the wire, so a v0.76.0 file loads with
-  fresh-cell defaults and a file written now still loads on v0.76.0. **Verified on the production
-  daemon's first restart onto v0.77.0:** the 41-row cooling-only file written by v0.76.0 restored
-  (the four still-active cooldowns read `OPEN` in `candidates` before any traffic), and one warm
-  request later the daemon rewrote it with 42 rows in the new format.
-- ✅ **The path-sensitive keyring test is fixed.** `test/os-keyring.test.ts` "sanitizes a thrown
-  child error" checked every 4-character window of English-shaped needles against an error whose
-  stack carries the checkout's absolute path, so `stdout-super-secret`'s `er-s` matched a worktree
-  named `…circuit-breaker-state…` and failed the gate for no reason of the sanitizer's. The needles
-  are high-entropy now, as the sibling test's already were.
-- ✅ **The dashboard bundle graph is junction-aware.** A lap worktree's `node_modules` is a junction
-  to the main checkout, and Vite hands the graph plugin the resolved path, so `check:package`
-  refused `../../../Code/llm-relay/node_modules/react` as non-portable. `packageRelativePath` in
-  `dashboard/vite.config.ts` maps a directory under the junction's real target back to
-  `node_modules/…`; a directory under neither root still fails, which is the case the check exists
-  for. The package ceilings moved to round numbers with headroom (1100000 / 5500000) after this
-  lap's validators and doc comments crossed 5,000,000 unpacked bytes.
+- ✅ **The order pin.** `test/config/routing-parser-order.test.ts` holds an ordered table of every
+  check `parseRouting` runs (31 rows: the two reserved provider names, `default`, the seven pool
+  checks per key, the eight sub-block parsers, ladder/ladders/cliLane, the six resolvability
+  groups). Each row alone must yield its exact message; every combinable ordered pair (444) must
+  yield the EARLIER row's message; the six disabled-provider warnings must arrive in exact order
+  with exact text, and the degraded results must match. Mutation-checked four times — the
+  reserved-name swap, the sticky/quota swap, the tiers/subagents degradation swap, the tiers/pools
+  assertion swap — and each failed exactly one test.
+- ✅ **The split.** `parseRouting` (`src/config/routing-parser.ts`) is a sequence of fourteen
+  private helpers, named in the `config/routing-parser.ts` row of `CLAUDE.md`. Cognitive
+  complexity 125 → 12; every helper ≤ 13; `parseOffload` (32) and `parseLadder` (36) untouched by
+  design. Every error and warning string byte-identical; the returned object's keys and insertion
+  order unchanged; `routing.tiers` / `routing.subagents` remain the same mutated instances; the
+  leaf and purity test green; `delegate-gate` clean; the plain eslint findings on the file are the
+  same three as on `main`.
+- ✅ Two pre-existing quirks are pinned as behaviour rather than silently carried: the pool-member
+  warning lacks the `config.` prefix and the consequence sentence the other five degradation
+  warnings carry, and `routing.subagents` stays attached as `{}` when its only entry is dropped.
+  Changing either is a visible decision now.
 
-⚠ **Three deliberate behaviour changes, stated rather than left to be discovered.**
+⚠ **Offload record, stated plainly.** Both packets went to the free pool through MCP `dispatch`
+(`free-pool`, `pool/high`); the fallback was the one the owner named for this lap.
 
-1. **Restore is faithful, not future-only.** A lapsed cooldown restores as lapsed (the cell reads
-   ready) and KEEPS its `unexplained429s`. The old loader dropped the row, arguing a resurrected
-   counter would "send the next single 429 to the top of the ladder" — but the running process does
-   exactly that in memory, the counter alone demotes nothing, and only a fresh 429 applies it. A
-   restart is not a success. Live consequence: `gemini/models/gemini-3.1-pro-preview` sits at
-   `unexplained429s: 78`; a restart after its 24 h cooldown lapses no longer costs four real 429s
-   to climb back to that rung.
-2. **A credential fault survives a restart while its five-minute window is open.** Stated cost,
-   accepted by the owner: a key rotated during a restart reads as faulted for at most that long,
-   cleared by the first success or by `llm-relay cooldowns clear`.
-3. **Every outcome now dirties the file.** The old "notify only on a cooling change" saving is gone
-   because the ping window moves on every request; `WriteBehindTimer` bounds it to one write per
-   250 ms of quiet and one per 2 s under load, and the file is one row per credential×model cell
-   with a ten-sample window.
+1. **The order test (job-0002).** The lane wrote a 440-line draft in five minutes, then its
+   harness died at 439 s on HTTP 402 from a HuggingFace member whose monthly credits were depleted.
+   17 of 479 tests failed on two deviations from explicit brief lines — seven mutators REPLACED
+   `pools` / `tiers` / `subagents` / `ladders` where the brief said merge, and `${ENV}` was left
+   unescaped in a template literal — plus two strict-typing errors. Repaired here in ten small
+   edits; nothing was re-dispatched.
+2. **The split (job-0003).** In 16 minutes the lane extracted seven helpers but wired three
+   (complexity 125 → 95), then wrote nothing for seven minutes. Cancelled at 1426 s, before its
+   walk budget could hand the half-edited tree to a second lane. It had also written a fabricated
+   rationale comment (a `${ENV}` claim that belongs to a different function). A Sonnet subagent
+   finished the split from a brief stating exactly where the lane stopped; its diff was read in
+   full, gated, typechecked, measured and mutation-checked here, and its `Partial<Routing>` return
+   type with four non-null assertions was tightened here to a precise type.
 
-⚠ **Residue, filed not hidden.** The logon-started daemon on this machine is stopped by
-`TerminateProcess`, which runs no handler, so the graceful flush never runs there and a hard kill
-still loses the last two seconds (measured: a kill 50 ms after a request lost that outcome on both
-binaries). `docs/backlog.md` carries the property a fix must meet.
+⚠ The measurement to carry: a free lane follows the SHAPE of a brief and drops its finest
+constraints — verify with the suite AND a typecheck, never by reading alone. And the lane walk's
+budget is the lane's own p80, so a stalled lane costs up to that long before the walk moves on;
+cancel by hand once the file has stopped changing.
 
-⚠ **Offload record.** The implementation packet went to the free pool through MCP `dispatch`
-(`job-0001`, `pool/high`). The lane wrote the whole SOURCE half faithfully to the brief and then hit
-its 1800 s ceiling before touching the test file — the walk did not move on, because a timeout is
-the lane's own ceiling, not the walk budget. The test file was then written by a Sonnet subagent,
-the fallback the owner named; the source cleanup (no `now` parameters, one flush mechanism) and
-every verification were done here. Nothing the lane wrote was taken on trust: the diff was read,
-typechecked, linted, and proven live.
+Immediate next: **triage the eligibility queue** (10 unrecognized refusals; the dispatcher
+proposes by digest, only the owner accepts). Then the carried items in §0.2.
 
-Immediate next is UNCHANGED from the previous lap: **decompose `parseRouting`** (ruled and
-scheduled; the risk is validation ORDER, not size — pin the order before splitting). Then the
-eligibility queue triage.
+### 0.1 The two previous laps, condensed
 
-### 0.1 The previous lap (v0.74.0–v0.76.0, the dispatch lane walk and its safety review)
-
-`dispatch` walks the ladder for the caller, pins the lane that answered, demotes the one that did
-not, and gives each lane a budget derived from its own recorded runs (the 80th percentile of its
-window, floored at the flat `attemptMs`). The full mechanism, every invariant and every measured
-number lives in the `dispatch.ts`, `lane-affinity.ts`, `dispatch-lane-stats.ts` and
-`mcp/server.ts` rows of `CLAUDE.md`, and the review record is
-[docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md). Three
-things worth carrying in your head:
-
-1. **A demotion did not retract the pin** until v0.76.0, so the walk re-tried the lane it had just
-   abandoned, first, for the rest of its pin window. Fixed; the symmetry is now real.
-2. **The budget measured itself**: an abandoned lane's wall clock was fed back into the window the
-   next budget derives from. Fixed; an `abandoned` run contributes no duration sample.
-3. **A clamped budget was labelled `history`.** Fixed; `basis` has three members.
-
-⚠ **Review coverage was PARTIAL.** 24 of 33 findings from the second pass and most of the first
-pass's non-concurrency lenses were never verified — their refuters died on the monthly spend limit.
-They are UNVERIFIED, not refuted; two are filed in `docs/backlog.md`. ⚠ **The demotion is EVIDENCE,
-not a calibrated statistic** — do not point the HTTP path's numbers (250 ms/token, a 30 s ceiling)
-at a lane. ⚠ The per-lane stats window is keyed by lane id alone and ignores `tier`; open in the
-backlog because it changes the persisted key space.
+- **v0.77.0, breaker persistence (2026-09-08/09).** The WHOLE circuit-breaker cell now survives a
+  restart (failure counters, the credential fault, the served-request ping window `GET /telemetry`
+  scores from, quota observations), and every write-behind store flushes at a graceful shutdown.
+  Three stated behaviour changes: restore is faithful, not future-only; a credential fault survives
+  for its five-minute window (owner-accepted); every outcome dirties the file, bounded by
+  `WriteBehindTimer`. Evidence and the before/after tables:
+  [docs/breaker-persistence-audit-2026-09-08.md](docs/breaker-persistence-audit-2026-09-08.md);
+  the `breaker-persistence.ts` and `write-behind.ts` rows of `CLAUDE.md`. Residue: the
+  logon-started daemon dies by `TerminateProcess`, so the flush never runs there (backlog).
+- **v0.74.0–v0.76.0, the dispatch lane walk and its safety review.** `dispatch` walks the ladder,
+  pins the lane that answered, demotes the one that did not, and budgets each lane from its own
+  p80. Three defects fixed in review: a demotion did not retract the pin; the budget measured
+  itself; a clamped budget was labelled `history`. ⚠ Review coverage was PARTIAL — 24 of 33
+  second-pass findings are UNVERIFIED, two filed in the backlog. ⚠ The demotion is EVIDENCE, not a
+  calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
+  [docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md) and the
+  `dispatch.ts`, `lane-affinity.ts`, `dispatch-lane-stats.ts`, `mcp/server.ts` rows of `CLAUDE.md`.
 
 ### 0.2 Carried, untouched by this lap
 

@@ -1,13 +1,17 @@
 /**
  * Parsing and validating the `routing` block of a config document (HOTSPOT-03).
  *
- * `parseRouting` plus the nineteen declarations only it reaches: the seven sub-block parsers
+ * `parseRouting` plus the thirty-four declarations only it reaches: the seven sub-block parsers
  * (`parseQuotaEnforcement`, `parseLatencyDemotion`, `parseHedge`, `parseMcpSettings`,
- * `parseLaneProbe`, `parseDispatchWalk`, `parseSticky`), `parseOffload`, the ladder family
- * (`parseLadder`, `parseCliLane`, `parseSpawnEnv` and its three placeholder tokens),
- * `dropDisabledSpecs`, `assertSpecResolvable`, `hasAsciiControl`, `DEFAULT_LANE_PROBE`,
- * `DEFAULT_DISPATCH_WALK` and `EFFORT_LEVEL_SET`. Roughly 700 lines out of a 2,000-line
- * `config.ts`.
+ * `parseLaneProbe`, `parseDispatchWalk`, `parseSticky`) assembled by `parseOptionalBlocks`,
+ * `parseOffload`, the top-level field parsers `assertNoReservedProviderNames`, `parseDefault`,
+ * `parseTiers` and `parseSubagents`, the pool trio `parsePoolPolicy`/`parsePoolEntry`/`parsePools`,
+ * the ladder family (`parseLadder`, `parseLadders`, `parseCliLane`, `parseSpawnEnv` and its three
+ * placeholder tokens), the disabled-provider degradation family (`dropDisabledSpecs`,
+ * `dropDisabledRungs`, `pruneDisabledSpecEntries`, `degradeDisabledRouting`), the resolvability
+ * trio `assertSpecResolvable`/`assertRungsResolvable`/`assertRoutingResolvable`,
+ * `hasAsciiControl`, `DEFAULT_LANE_PROBE`, `DEFAULT_DISPATCH_WALK` and `EFFORT_LEVEL_SET`.
+ * Roughly 700 lines out of a 2,000-line `config.ts`.
  *
  * ⚠ **It imports `config-types.js` and `spec.js`, and NOTHING else.** That is the property the item
  * asks for, and it is why `spec.ts` had to exist first: this parser needs `POOL_PREFIX`,
@@ -95,8 +99,9 @@ function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
   // ABSENT returns `{}`, not `undefined`, and the two are the same thing here: every key is
   // optional and the module resolves its own defaults, so "{}" IS "all defaults". Returning a
   // total value lets the caller assign unconditionally — the `laneProbe` precedent — which keeps
-  // `parseRouting` free of another branch. That function is already at cognitive complexity 124
-  // against a limit of 15, and CLAUDE.md records the decision NOT to restructure it.
+  // `parseOptionalBlocks` and `parseRouting` free of another branch. (`parseRouting` was split
+  // into per-sub-block helpers on 2026-09-09, 125 → 12; the total return is what keeps the copy
+  // onto `Routing` a plain assignment rather than a fifth conditional.)
   if (raw === undefined || raw === null) return {};
   // The boolean shorthand is NORMALIZED here rather than carried through the type. One shape
   // downstream means the demotion module never re-implements "what does `false` mean".
@@ -141,7 +146,7 @@ function parseLatencyDemotion(raw: unknown): LatencyDemotionConfig {
 function parseHedge(raw: unknown): HedgeConfig {
   // ABSENT returns `{}`, not `undefined` — the `parseLatencyDemotion` precedent. Every key is
   // optional and `resolveHedgeSettings` owns the defaults, so `{}` IS "all defaults", and a total
-  // return lets the caller assign unconditionally without another branch in `parseRouting`.
+  // return lets the caller assign unconditionally without another branch in `parseOptionalBlocks`.
   if (raw === undefined || raw === null) return {};
   // The boolean shorthand is NORMALIZED here rather than carried through the type, so the trigger
   // module never re-implements "what does `false` mean".
@@ -197,140 +202,32 @@ export function parseRouting(
     ladders?: unknown;
     cliLane?: unknown;
   };
-  // "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
-  if (providers[POOL_PREFIX]) {
-    throw new Error(`config.providers."${POOL_PREFIX}" is reserved — it would shadow "pool/<name>" routing`);
-  }
-  if (providers[AUTO_MODEL]) {
-    throw new Error(`config.providers."${AUTO_MODEL}" is reserved — it would shadow "${AUTO_MODEL}" routing`);
-  }
-  const dfltRaw = overrideDefault !== undefined ? overrideDefault : r.default;
-  let dflt: string | string[];
+  // Reject reserved provider names that would shadow routing syntax.
+  assertNoReservedProviderNames(providers);
+  const dflt = parseDefault(r.default, overrideDefault);
+  const tiers = parseTiers(r.tiers);
 
-  if (Array.isArray(dfltRaw)) {
-    dflt = dfltRaw.filter((s): s is string => typeof s === "string" && s.length > 0);
-    if (dflt.length === 0) {
-      throw new Error(`config.routing.default array must contain at least one valid spec string`);
-    }
-  } else if (typeof dfltRaw === "string" && dfltRaw.length > 0) {
-    dflt = dfltRaw;
-  } else {
-    throw new Error(`config.routing.default ("provider/model") is required`);
-  }
+  const { pools, poolPolicies } = parsePools(r.pools, disabledProviders, warnings);
 
-  const tiers: Record<string, string | string[]> = {};
-  if (typeof r.tiers === "object" && r.tiers !== null) {
-    for (const [k, v] of Object.entries(r.tiers as Record<string, unknown>)) {
-      if (Array.isArray(v)) {
-        const arr = v.filter((s): s is string => typeof s === "string" && s.length > 0);
-        if (arr.length > 0) tiers[k] = arr;
-      } else if (typeof v === "string" && v.length > 0) {
-        tiers[k] = v;
-      }
-    }
-  }
-
-  const pools: Record<string, string[]> = {};
-  const poolPolicies: Record<string, PoolPolicy> = {};
-  if (typeof r.pools === "object" && r.pools !== null) {
-    for (const [k, v] of Object.entries(r.pools as Record<string, unknown>)) {
-      let declared: string[];
-      if (Array.isArray(v)) {
-        declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
-      } else if (typeof v === "object" && v !== null) {
-        const policy = v as { preferred?: unknown; include?: unknown; exclude?: unknown; effort?: unknown };
-        if (!Array.isArray(policy.preferred) || policy.preferred.some((s) => typeof s !== "string" || s.length === 0)) {
-          throw new Error(`config.routing.pools.${k}.preferred must be an array of non-empty "provider/model" specs`);
-        }
-        if (policy.include !== "free") {
-          throw new Error(`config.routing.pools.${k}.include must be "free"`);
-        }
-        if (
-          policy.exclude !== undefined &&
-          (!Array.isArray(policy.exclude) ||
-            policy.exclude.some(
-              (s) =>
-                typeof s !== "string" ||
-                !/^\S+\/\S+$/.test(s) ||
-                s.startsWith(`${POOL_PREFIX}/`),
-            ))
-        ) {
-          throw new Error(`config.routing.pools.${k}.exclude must be an array of "provider/model" specs`);
-        }
-        if (policy.effort !== undefined && !EFFORT_LEVEL_SET.has(policy.effort as string)) {
-          throw new Error(`config.routing.pools.${k}.effort must be low, medium, high, or xhigh`);
-        }
-        const exclude = [...((policy.exclude as string[] | undefined) ?? [])];
-        const excluded = new Set(exclude);
-        declared = (policy.preferred as string[]).filter((spec) => !excluded.has(spec));
-        poolPolicies[k] = {
-          preferred: declared,
-          include: "free",
-          ...(exclude.length > 0 ? { exclude } : {}),
-          ...(policy.effort ? { effort: policy.effort as EffortLevel } : {}),
-        };
-      } else {
-        throw new Error(
-          `config.routing.pools.${k} must be an array of specs or {"preferred":[...],"include":"free"}`,
-        );
-      }
-      // Members of a DISABLED provider are dropped, not fatal — the pool's whole purpose is
-      // surviving the loss of one candidate. A member naming a provider that simply doesn't
-      // exist is still an error below: that's a typo, and silently dropping it would spend
-      // primary quota via the passthrough instead of failing loudly.
-      const arr = declared.filter((s) => {
-        const { provider } = splitSpec(s);
-        if (!disabledProviders.has(provider)) return true;
-        warnings.push(`routing.pools.${k}: dropped "${s}" — provider "${provider}" is disabled`);
-        return false;
-      });
-      if (arr.length === 0 && !poolPolicies[k]) {
-        throw new Error(`config.routing.pools.${k} must contain at least one valid spec string`);
-      }
-      // Members are provider specs only — pool-in-pool would make expansion recursive.
-      const nested = arr.find((s) => s.startsWith(`${POOL_PREFIX}/`));
-      if (nested) {
-        throw new Error(`config.routing.pools.${k} member "${nested}" — a pool cannot reference another pool`);
-      }
-      pools[k] = arr;
-      if (poolPolicies[k]) poolPolicies[k] = { ...poolPolicies[k]!, preferred: arr, include: "free" };
-    }
-  }
-
-  const subagents: Record<string, string> = {};
-  if (typeof r.subagents === "object" && r.subagents !== null) {
-    for (const [k, v] of Object.entries(r.subagents as Record<string, unknown>)) {
-      if (typeof v === "string" && v.length > 0) subagents[k] = v;
-    }
-  }
+  const subagents = parseSubagents(r.subagents);
 
   const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
   const offload = parseOffload(r.offload);
   const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
-  const sticky = parseSticky(r.sticky);
-  if (sticky) routing.sticky = sticky;
-  const quota = parseQuotaEnforcement(r.quota);
-  if (quota) routing.quota = quota;
-  routing.latency = parseLatencyDemotion(r.latency);
-  routing.hedge = parseHedge(r.hedge);
-  routing.laneProbe = parseLaneProbe(r.laneProbe);
-  routing.dispatchWalk = parseDispatchWalk(r.dispatchWalk);
-  const mcpSettings = parseMcpSettings(r.mcp);
-  if (mcpSettings) routing.mcp = mcpSettings;
+  const optionalBlocks = parseOptionalBlocks(r);
+  if (optionalBlocks.sticky) routing.sticky = optionalBlocks.sticky;
+  if (optionalBlocks.quota) routing.quota = optionalBlocks.quota;
+  routing.latency = optionalBlocks.latency;
+  routing.hedge = optionalBlocks.hedge;
+  routing.laneProbe = optionalBlocks.laneProbe;
+  routing.dispatchWalk = optionalBlocks.dispatchWalk;
+  if (optionalBlocks.mcp) routing.mcp = optionalBlocks.mcp;
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
   const ladder = parseLadder(r.ladder, "config.routing.ladder");
   if (ladder.length > 0) routing.ladder = ladder;
-  if (r.ladders !== undefined && (typeof r.ladders !== "object" || r.ladders === null || Array.isArray(r.ladders))) {
-    throw new Error(`config.routing.ladders must be an object of named ladder arrays`);
-  }
-  const ladders: Record<string, LadderRung[]> = {};
-  for (const [tier, rawLadder] of Object.entries((r.ladders ?? {}) as Record<string, unknown>)) {
-    const parsed = parseLadder(rawLadder, `config.routing.ladders.${tier}`);
-    if (parsed.length === 0) throw new Error(`config.routing.ladders.${tier} must contain at least one rung`);
-    ladders[tier] = parsed;
-  }
+  const ladders = parseLadders(r.ladders);
   if (Object.keys(ladders).length > 0) routing.ladders = ladders;
   const cliLane = parseCliLane(r.cliLane, "config.routing.cliLane");
   if (cliLane) routing.cliLane = cliLane;
@@ -340,66 +237,13 @@ export function parseRouting(
   // the assertions is what keeps "one optional provider lost its ${ENV}" from being a total
   // outage: assertSpecResolvable sees the post-disabling provider map, so it cannot tell the
   // two apart and used to abort startup for the degraded case too.
-  for (const [tier, spec] of Object.entries(tiers)) {
-    const kept = dropDisabledSpecs(spec, disabledProviders, warnings, `routing.tiers.${tier}`);
-    if (kept === null) delete tiers[tier];
-    else tiers[tier] = kept;
-  }
-  for (const [tier, spec] of Object.entries(subagents)) {
-    // A subagent entry is a single spec, so the result is a string or nothing.
-    const kept = dropDisabledSpecs(spec, disabledProviders, warnings, `routing.subagents.${tier}`) as
-      | string
-      | null;
-    if (kept === null) delete subagents[tier];
-    else subagents[tier] = kept;
-  }
-  if (Array.isArray(routing.default)) {
-    // Only an ARRAY default can degrade — the survivors still answer. A single-spec default
-    // has nothing left to fall back to, so it stays fatal below.
-    const kept = dropDisabledSpecs(routing.default, disabledProviders, warnings, "routing.default");
-    if (kept !== null) routing.default = kept;
-  }
-  routing.ladder = ladder.filter((rung) => {
-    if (rung.kind !== "relay" || !rung.spec) return true;
-    return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `routing.ladder[${rung.id}].spec`) !== null;
-  });
-  if (routing.ladder.length === 0) delete routing.ladder;
-  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
-    const kept = tierLadder.filter((rung) => {
-      if (rung.kind !== "relay" || !rung.spec) return true;
-      return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `routing.ladders.${tier}[${rung.id}].spec`) !== null;
-    });
-    if (kept.length === 0) delete routing.ladders![tier];
-    else routing.ladders![tier] = kept;
-  }
-  if (routing.ladders && Object.keys(routing.ladders).length === 0) delete routing.ladders;
+  degradeDisabledRouting(routing, tiers, subagents, ladder, disabledProviders, warnings);
 
   // Fail loudly at load time if any spec names an unknown provider or pool. Only
   // `routing.default` can still trip on a DISABLED provider — everything else degraded
   // above — and it is fatal on purpose: it is the fall-through for everything, so there
   // is nowhere left to fall through to.
-  assertSpecResolvable(routing.default, providers, pools, "routing.default", disabledProviders);
-  for (const [tier, spec] of Object.entries(tiers)) {
-    assertSpecResolvable(spec, providers, pools, `routing.tiers.${tier}`);
-  }
-  for (const [pool, specs] of Object.entries(pools)) {
-    assertSpecResolvable(specs, providers, {}, `routing.pools.${pool}`);
-  }
-  for (const [tier, spec] of Object.entries(subagents)) {
-    assertSpecResolvable(spec, providers, pools, `routing.subagents.${tier}`);
-  }
-  for (const rung of routing.ladder ?? []) {
-    if (rung.kind === "relay" && rung.spec) {
-      assertSpecResolvable(rung.spec, providers, pools, `routing.ladder[${rung.id}].spec`);
-    }
-  }
-  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
-    for (const rung of tierLadder) {
-      if (rung.kind === "relay" && rung.spec) {
-        assertSpecResolvable(rung.spec, providers, pools, `routing.ladders.${tier}[${rung.id}].spec`);
-      }
-    }
-  }
+  assertRoutingResolvable(routing, tiers, pools, subagents, providers, disabledProviders);
   return routing;
 }
 
@@ -588,6 +432,232 @@ function parseSticky(raw: unknown): StickyRoutingConfig | undefined {
   }
 
   return { enabled: sticky.enabled, ttlMs, maxSessions };
+}
+
+// "pool" as a provider name would make `pool/<name>` ambiguous. Reject at load, not at request.
+function assertNoReservedProviderNames(providers: Record<string, ProviderConfig>): void {
+  if (providers[POOL_PREFIX]) {
+    throw new Error(`config.providers."${POOL_PREFIX}" is reserved — it would shadow "pool/<name>" routing`);
+  }
+  if (providers[AUTO_MODEL]) {
+    throw new Error(`config.providers."${AUTO_MODEL}" is reserved — it would shadow "${AUTO_MODEL}" routing`);
+  }
+}
+
+/**
+ * Parse `routing.default` — supports array of specs, single spec string, or throws if missing.
+ * `overrideDefault` takes precedence when provided (used by CLI --default).
+ */
+function parseDefault(
+  dfltRaw: unknown,
+  overrideDefault: string | undefined,
+): string | string[] {
+  const raw = overrideDefault !== undefined ? overrideDefault : dfltRaw;
+
+  let result: string | string[];
+  if (Array.isArray(raw)) {
+    const filtered = raw.filter((s): s is string => typeof s === "string" && s.length > 0);
+    if (filtered.length === 0) {
+      throw new Error(`config.routing.default array must contain at least one valid spec string`);
+    }
+    result = filtered;
+  } else if (typeof raw === "string" && raw.length > 0) {
+    result = raw;
+  } else {
+    throw new Error(`config.routing.default ("provider/model") is required`);
+  }
+  return result;
+}
+
+/**
+ * Parse `routing.tiers` — supports array of specs or single spec string per tier.
+ * Empty arrays and empty strings are dropped (tier not added).
+ */
+function parseTiers(
+  raw: unknown,
+): Record<string, string | string[]> {
+  const tiers: Record<string, string | string[]> = {};
+  if (typeof raw === "object" && raw !== null) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (Array.isArray(v)) {
+        const arr = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+        if (arr.length > 0) tiers[k] = arr;
+      } else if (typeof v === "string" && v.length > 0) {
+        tiers[k] = v;
+      }
+    }
+  }
+  return tiers;
+}
+
+/**
+ * Validate the object-policy form of a pool entry (`{preferred, include, exclude, effort}`) —
+ * shape checks in that order — and build the filtered member list plus the policy object.
+ */
+function parsePoolPolicy(
+  k: string,
+  policy: { preferred?: unknown; include?: unknown; exclude?: unknown; effort?: unknown },
+): { declared: string[]; poolPolicy: PoolPolicy } {
+  if (!Array.isArray(policy.preferred) || policy.preferred.some((s) => typeof s !== "string" || s.length === 0)) {
+    throw new Error(`config.routing.pools.${k}.preferred must be an array of non-empty "provider/model" specs`);
+  }
+  if (policy.include !== "free") {
+    throw new Error(`config.routing.pools.${k}.include must be "free"`);
+  }
+  if (
+    policy.exclude !== undefined &&
+    (!Array.isArray(policy.exclude) ||
+      policy.exclude.some(
+        (s) =>
+          typeof s !== "string" ||
+          !/^\S+\/\S+$/.test(s) ||
+          s.startsWith(`${POOL_PREFIX}/`),
+      ))
+  ) {
+    throw new Error(`config.routing.pools.${k}.exclude must be an array of "provider/model" specs`);
+  }
+  if (policy.effort !== undefined && !EFFORT_LEVEL_SET.has(policy.effort as string)) {
+    throw new Error(`config.routing.pools.${k}.effort must be low, medium, high, or xhigh`);
+  }
+  const exclude = [...((policy.exclude as string[] | undefined) ?? [])];
+  const excluded = new Set(exclude);
+  const declared = (policy.preferred as string[]).filter((spec) => !excluded.has(spec));
+  const poolPolicy: PoolPolicy = {
+    preferred: declared,
+    include: "free",
+    ...(exclude.length > 0 ? { exclude } : {}),
+    ...(policy.effort ? { effort: policy.effort as EffortLevel } : {}),
+  };
+  return { declared, poolPolicy };
+}
+
+/**
+ * Parse a single pool entry — validates shape, applies disabled-member filtering,
+ * detects nested pools, and builds the pool policy object.
+ * Returns { members, poolPolicy } where poolPolicy is undefined for array-form pools.
+ */
+function parsePoolEntry(
+  k: string,
+  v: unknown,
+  disabledProviders: Set<string>,
+  warnings: string[],
+): { members: string[]; poolPolicy: PoolPolicy | undefined } {
+  let declared: string[];
+  let poolPolicy: PoolPolicy | undefined;
+
+  if (Array.isArray(v)) {
+    declared = v.filter((s): s is string => typeof s === "string" && s.length > 0);
+  } else if (typeof v === "object" && v !== null) {
+    const parsed = parsePoolPolicy(k, v as { preferred?: unknown; include?: unknown; exclude?: unknown; effort?: unknown });
+    declared = parsed.declared;
+    poolPolicy = parsed.poolPolicy;
+  } else {
+    throw new Error(
+      `config.routing.pools.${k} must be an array of specs or {"preferred":[...],"include":"free"}`,
+    );
+  }
+
+  // Members of a DISABLED provider are dropped, not fatal — the pool's whole purpose is
+  // surviving the loss of one candidate. A member naming a provider that simply doesn't
+  // exist is still an error below: that's a typo, and silently dropping it would spend
+  // primary quota via the passthrough instead of failing loudly.
+  const arr = declared.filter((s) => {
+    const { provider } = splitSpec(s);
+    if (!disabledProviders.has(provider)) return true;
+    warnings.push(`routing.pools.${k}: dropped "${s}" — provider "${provider}" is disabled`);
+    return false;
+  });
+  if (arr.length === 0 && !poolPolicy) {
+    throw new Error(`config.routing.pools.${k} must contain at least one valid spec string`);
+  }
+  // Members are provider specs only — pool-in-pool would make expansion recursive.
+  const nested = arr.find((s) => s.startsWith(`${POOL_PREFIX}/`));
+  if (nested) {
+    throw new Error(`config.routing.pools.${k} member "${nested}" — a pool cannot reference another pool`);
+  }
+  if (poolPolicy) {
+    poolPolicy = { ...poolPolicy, preferred: arr, include: "free" };
+  }
+  return { members: arr, poolPolicy };
+}
+
+/**
+ * Parse `routing.pools` — iterates keys IN INSERTION ORDER and delegates to parsePoolEntry.
+ * Returns { pools, poolPolicies }.
+ */
+function parsePools(
+  raw: unknown,
+  disabledProviders: Set<string>,
+  warnings: string[],
+): { pools: Record<string, string[]>; poolPolicies: Record<string, PoolPolicy> } {
+  const pools: Record<string, string[]> = {};
+  const poolPolicies: Record<string, PoolPolicy> = {};
+  if (typeof raw === "object" && raw !== null) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      const { members, poolPolicy } = parsePoolEntry(k, v, disabledProviders, warnings);
+      pools[k] = members;
+      if (poolPolicy) poolPolicies[k] = poolPolicy;
+    }
+  }
+  return { pools, poolPolicies };
+}
+
+/**
+ * The seven optional sub-blocks as `parseRouting` copies them onto the result. `latency`, `hedge`,
+ * `laneProbe` and `dispatchWalk` are REQUIRED here because their parsers return a total value for
+ * an absent block (the `parseLatencyDemotion` precedent); the other three stay absent when absent.
+ */
+type OptionalRoutingBlocks = Pick<Routing, "sticky" | "quota" | "mcp"> &
+  Required<Pick<Routing, "latency" | "hedge" | "laneProbe" | "dispatchWalk">>;
+
+/**
+ * Parse the seven optional sub-blocks (sticky, quota, latency, hedge, laneProbe, dispatchWalk, mcp)
+ * in their current validation order. `parseRouting` copies the result key by key in that same
+ * order, so the returned object's own key order is not what decides `Routing`'s.
+ */
+function parseOptionalBlocks(
+  r: {
+    sticky?: unknown;
+    quota?: unknown;
+    latency?: unknown;
+    hedge?: unknown;
+    laneProbe?: unknown;
+    dispatchWalk?: unknown;
+    mcp?: unknown;
+  },
+): OptionalRoutingBlocks {
+  const sticky = parseSticky(r.sticky);
+  const quota = parseQuotaEnforcement(r.quota);
+  const latency = parseLatencyDemotion(r.latency);
+  const hedge = parseHedge(r.hedge);
+  const laneProbe = parseLaneProbe(r.laneProbe);
+  const dispatchWalk = parseDispatchWalk(r.dispatchWalk);
+  const mcp = parseMcpSettings(r.mcp);
+  return {
+    ...(sticky ? { sticky } : {}),
+    ...(quota ? { quota } : {}),
+    latency,
+    hedge,
+    laneProbe,
+    dispatchWalk,
+    ...(mcp ? { mcp } : {}),
+  };
+}
+
+/**
+ * Parse `routing.subagents` — single spec string per subagent key.
+ * Empty strings are dropped (key not added).
+ */
+function parseSubagents(
+  raw: unknown,
+): Record<string, string> {
+  const subagents: Record<string, string> = {};
+  if (typeof raw === "object" && raw !== null) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "string" && v.length > 0) subagents[k] = v;
+    }
+  }
+  return subagents;
 }
 
 /** Parse the legacy global switch or the independently keyed client-rule form. */
@@ -824,6 +894,98 @@ function parseLadder(raw: unknown, root: string): LadderRung[] {
   return out;
 }
 
+/**
+ * Validate `routing.ladders` at load — an object of named ladder arrays, each parsed the same
+ * way as `routing.ladder`. Absent is legal and simply means "no opinion"; a named ladder that
+ * parses to zero rungs is a hard error, because a key that resolves to nothing was clearly meant
+ * to name something.
+ */
+function parseLadders(raw: unknown): Record<string, LadderRung[]> {
+  if (raw !== undefined && (typeof raw !== "object" || raw === null || Array.isArray(raw))) {
+    throw new Error(`config.routing.ladders must be an object of named ladder arrays`);
+  }
+  const ladders: Record<string, LadderRung[]> = {};
+  for (const [tier, rawLadder] of Object.entries((raw ?? {}) as Record<string, unknown>)) {
+    const parsed = parseLadder(rawLadder, `config.routing.ladders.${tier}`);
+    if (parsed.length === 0) throw new Error(`config.routing.ladders.${tier} must contain at least one rung`);
+    ladders[tier] = parsed;
+  }
+  return ladders;
+}
+
+/**
+ * Drop the rungs of a ladder whose `relay` spec names a DISABLED provider, warning for each —
+ * the `dropDisabledSpecs` rule applied per rung. Shared by `routing.ladder` and each tier of
+ * `routing.ladders`; `prefix` is `routing.ladder` or `routing.ladders.<tier>` so the `where`
+ * string built here matches what each call site produced inline.
+ */
+function dropDisabledRungs(
+  rungs: LadderRung[],
+  disabledProviders: Set<string>,
+  warnings: string[],
+  prefix: string,
+): LadderRung[] {
+  return rungs.filter((rung) => {
+    if (rung.kind !== "relay" || !rung.spec) return true;
+    return dropDisabledSpecs(rung.spec, disabledProviders, warnings, `${prefix}[${rung.id}].spec`) !== null;
+  });
+}
+
+/**
+ * Drop the disabled-provider entries of a `routing.tiers`- or `routing.subagents`-shaped map,
+ * mutating it in place. `prefix` is `routing.tiers` or `routing.subagents`, matching the `where`
+ * string each call site built inline.
+ */
+function pruneDisabledSpecEntries(
+  map: Record<string, string | string[]>,
+  disabledProviders: Set<string>,
+  warnings: string[],
+  prefix: string,
+): void {
+  for (const [tier, spec] of Object.entries(map)) {
+    const kept = dropDisabledSpecs(spec, disabledProviders, warnings, `${prefix}.${tier}`);
+    if (kept === null) delete map[tier];
+    else map[tier] = kept;
+  }
+}
+
+/**
+ * A spec naming a DISABLED provider is dropped with a warning, exactly like a pool member; a spec
+ * naming a provider that was never declared is still fatal below. Doing this before the
+ * assertions is what keeps "one optional provider lost its ${ENV}" from being a total outage:
+ * `assertSpecResolvable` sees the post-disabling provider map, so it cannot tell the two apart
+ * and used to abort startup for the degraded case too.
+ *
+ * Mutates `tiers` and `subagents` in place — they are the SAME objects `routing.tiers` and
+ * `routing.subagents` reference — and mutates `routing.default`, `routing.ladder` and
+ * `routing.ladders` directly.
+ */
+function degradeDisabledRouting(
+  routing: Routing,
+  tiers: Record<string, string | string[]>,
+  subagents: Record<string, string>,
+  ladder: LadderRung[],
+  disabledProviders: Set<string>,
+  warnings: string[],
+): void {
+  pruneDisabledSpecEntries(tiers, disabledProviders, warnings, "routing.tiers");
+  pruneDisabledSpecEntries(subagents, disabledProviders, warnings, "routing.subagents");
+  if (Array.isArray(routing.default)) {
+    // Only an ARRAY default can degrade — the survivors still answer. A single-spec default
+    // has nothing left to fall back to, so it stays fatal below.
+    const kept = dropDisabledSpecs(routing.default, disabledProviders, warnings, "routing.default");
+    if (kept !== null) routing.default = kept;
+  }
+  routing.ladder = dropDisabledRungs(ladder, disabledProviders, warnings, "routing.ladder");
+  if (routing.ladder.length === 0) delete routing.ladder;
+  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
+    const kept = dropDisabledRungs(tierLadder, disabledProviders, warnings, `routing.ladders.${tier}`);
+    if (kept.length === 0) delete routing.ladders![tier];
+    else routing.ladders![tier] = kept;
+  }
+  if (routing.ladders && Object.keys(routing.ladders).length === 0) delete routing.ladders;
+}
+
 function assertSpecResolvable(
   spec: string | string[],
   providers: Record<string, ProviderConfig>,
@@ -855,5 +1017,49 @@ function assertSpecResolvable(
     }
     if (!p) throw new Error(`config.${where} "${s}" names unknown provider "${provider}"`);
     if (p.kind === "openai" && !model) throw new Error(`config.${where} "${s}" needs a model id for openai provider "${provider}"`);
+  }
+}
+
+/** Assert every `relay`-kind rung's spec is resolvable, sharing one `where`-string shape between
+ *  `routing.ladder` and each tier of `routing.ladders`. */
+function assertRungsResolvable(
+  rungs: LadderRung[],
+  providers: Record<string, ProviderConfig>,
+  pools: Record<string, string[]>,
+  prefix: string,
+): void {
+  for (const rung of rungs) {
+    if (rung.kind === "relay" && rung.spec) {
+      assertSpecResolvable(rung.spec, providers, pools, `${prefix}[${rung.id}].spec`);
+    }
+  }
+}
+
+/**
+ * Fail loudly at load time if any spec names an unknown provider or pool. Only `routing.default`
+ * can still trip on a DISABLED provider — everything else degraded above — and it is fatal on
+ * purpose: it is the fall-through for everything, so there is nowhere left to fall through to.
+ */
+function assertRoutingResolvable(
+  routing: Routing,
+  tiers: Record<string, string | string[]>,
+  pools: Record<string, string[]>,
+  subagents: Record<string, string>,
+  providers: Record<string, ProviderConfig>,
+  disabledProviders: Set<string>,
+): void {
+  assertSpecResolvable(routing.default, providers, pools, "routing.default", disabledProviders);
+  for (const [tier, spec] of Object.entries(tiers)) {
+    assertSpecResolvable(spec, providers, pools, `routing.tiers.${tier}`);
+  }
+  for (const [pool, specs] of Object.entries(pools)) {
+    assertSpecResolvable(specs, providers, {}, `routing.pools.${pool}`);
+  }
+  for (const [tier, spec] of Object.entries(subagents)) {
+    assertSpecResolvable(spec, providers, pools, `routing.subagents.${tier}`);
+  }
+  assertRungsResolvable(routing.ladder ?? [], providers, pools, "routing.ladder");
+  for (const [tier, tierLadder] of Object.entries(routing.ladders ?? {})) {
+    assertRungsResolvable(tierLadder, providers, pools, `routing.ladders.${tier}`);
   }
 }
