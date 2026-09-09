@@ -249,11 +249,14 @@
   spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>" returns
   the version and provenance from a dispatch lane).
 
-- **Make `test/os-keyring.test.ts` "sanitizes a thrown child error" path-agnostic** (2026-09-04, lap 2, low).
-  The test passes cleanly in the main repository checkout, but fails inside a lane git worktree where
-  `node_modules` is a junction due to a path-sensitive error assertion.
-
-  **Property:** the test passes in any checkout location, including worktrees with junctioned `node_modules`.
+- **The MCP `dispatch_lanes` view omits each lane's walk budget, which the CLI ladder prints
+  (2026-09-08, breaker-persistence lap, low, friction: missing_affordance).** `llm-relay dispatch`
+  renders `budget: <ms> (from N recorded runs)` per lane through `formatAttemptBudget`; the MCP
+  tool's text for the same ladder showed `stats: … median 347.9s` and no budget line, so a caller
+  watching a lane run cannot see when the walk will abandon it. Measured while waiting on
+  `job-0001` at 700 s with no way to tell whether the lane's p80 budget was 20 or 25 minutes.
+  **Property:** the MCP `dispatch_lanes` text carries the same per-lane budget line and basis as
+  the CLI ladder, from the same `attemptBudget` field.
 
 - **Decide the post-commit remedy for a stream that stalls or crawls after first content**
   (owner decision, 2026-09-04, from the audit-triage lap's hedge work). The hedge race now settles
