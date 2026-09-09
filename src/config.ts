@@ -31,6 +31,8 @@ import {
   type ToolCallIdMode,
   type ThoughtSignatureMode,
   type ProviderCompatConfig,
+  PROVIDER_WIRE_MODES,
+  type ProviderWireMode,
   type ProviderConfig,
   type Routing,
   type RequestHeaders,
@@ -66,6 +68,7 @@ export {
   type ToolCallIdMode,
   type ThoughtSignatureMode,
   type ProviderCompatConfig,
+  type ProviderWireMode,
   type ProviderConfig,
   type Routing,
   type StickyRoutingConfig,
@@ -121,6 +124,26 @@ function parseProviderCompat(raw: unknown, where: string): ProviderCompatConfig 
     }
   }
   return Object.keys(out).length > 0 ? out : {};
+}
+
+/**
+ * Parse a provider's `wire` field — the `compat` precedent: an unknown VALUE is a hard load error
+ * naming the key, because an ignored typo would read as a declaration that took effect while the
+ * wire stayed unchanged. Declaring it on an `anthropic`-kind provider is a hard error too — that
+ * kind never speaks either OpenAI endpoint, so the field could only ever be a lie about what the
+ * provider does.
+ */
+function parseProviderWire(raw: unknown, kind: Kind, name: string): ProviderWireMode | undefined {
+  if (raw === undefined) return undefined;
+  if (kind === "anthropic") {
+    throw new Error(
+      `config.providers.${name}.wire is only valid on an openai-kind provider (this provider is anthropic-kind)`,
+    );
+  }
+  if (typeof raw !== "string" || !PROVIDER_WIRE_MODES.includes(raw as ProviderWireMode)) {
+    throw new Error(`config.providers.${name}.wire must be one of: ${PROVIDER_WIRE_MODES.join(", ")}`);
+  }
+  return raw as ProviderWireMode;
 }
 
 /** The host of a base URL, lowercased — or null when it is not a URL at all. */
@@ -572,6 +595,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     ...(p.credentialMode !== undefined ? { credentialMode: p.credentialMode } : {}),
     toolCallIds: resolveToolCallIdMode(p),
     thoughtSignature: resolveThoughtSignatureMode(p),
+    ...(p.wire !== undefined ? { wire: p.wire } : {}),
   };
 }
 
@@ -1067,6 +1091,67 @@ function validateProviderConcurrency(name: string, rawMaxConcurrent: unknown): n
   return rawMaxConcurrent;
 }
 
+/** Raw (unvalidated) shape of one `config.providers.<name>` entry. */
+interface RawProviderFields {
+  base?: unknown;
+  kind?: unknown;
+  authEnv?: unknown;
+  credentials?: unknown;
+  credentialMode?: unknown;
+  maxConcurrent?: unknown;
+  authHeader?: unknown;
+  timeoutMs?: unknown;
+  stallTimeoutMs?: unknown;
+  tierType?: unknown;
+  signupUrl?: unknown;
+  limits?: unknown;
+  compat?: unknown;
+  wire?: unknown;
+}
+
+/**
+ * Assemble the validated `ProviderConfig` from its already-parsed pieces.
+ *
+ * Split out of `parseSingleProvider` (2026-09-09, `wire` field addition) purely to keep that
+ * function's cognitive complexity under the repo's linted ceiling — every field here is optional
+ * via a conditional spread, and `wire` was the branch that tipped it over. No behaviour moved with
+ * it: this is the same object literal `parseSingleProvider` used to return inline.
+ */
+function buildProviderConfig(
+  p: RawProviderFields,
+  expanded: { value: string },
+  kind: Kind,
+  defaultAuthHeader: AuthHeader,
+  declaredAuthEnv: string | undefined,
+  credentials: ProviderCredentialConfig[] | undefined,
+  credentialMode: CredentialMode | undefined,
+  maxConcurrent: number | null | undefined,
+  limits: ReturnType<typeof parseConfiguredLimits>,
+  compat: ProviderCompatConfig | undefined,
+  wire: ProviderWireMode | undefined,
+): ProviderConfig {
+  return {
+    base: expanded.value.trim().replace(/\/+$/, ""),
+    kind,
+    authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
+    timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
+    ...(typeof p.stallTimeoutMs === "number" && Number.isFinite(p.stallTimeoutMs) && p.stallTimeoutMs >= 0
+      ? { stallTimeoutMs: Math.floor(p.stallTimeoutMs) }
+      : {}),
+    ...(declaredAuthEnv ? { authEnv: declaredAuthEnv } : {}),
+    ...(credentials !== undefined ? { credentials } : {}),
+    ...(credentialMode !== undefined ? { credentialMode } : {}),
+    ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
+    ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
+      ? { tierType: p.tierType }
+      : {}),
+    ...(limits !== undefined ? { limits } : {}),
+    ...(compat !== undefined ? { compat } : {}),
+    ...(wire !== undefined ? { wire } : {}),
+    ...(typeof p.signupUrl === "string" && p.signupUrl.length > 0 ? { signupUrl: p.signupUrl } : {}),
+  };
+}
+
 function parseSingleProvider(
   name: string,
   v: unknown,
@@ -1076,21 +1161,7 @@ function parseSingleProvider(
   if (typeof v !== "object" || v === null) {
     throw new Error(`config.providers.${name} must be an object`);
   }
-  const p = v as {
-    base?: unknown;
-    kind?: unknown;
-    authEnv?: unknown;
-    credentials?: unknown;
-    credentialMode?: unknown;
-    maxConcurrent?: unknown;
-    authHeader?: unknown;
-    timeoutMs?: unknown;
-    stallTimeoutMs?: unknown;
-    tierType?: unknown;
-    signupUrl?: unknown;
-    limits?: unknown;
-    compat?: unknown;
-  };
+  const p = v as RawProviderFields;
   try {
     makeCredentialId(name);
   } catch {
@@ -1115,6 +1186,7 @@ function parseSingleProvider(
   const maxConcurrent = validateProviderConcurrency(name, p.maxConcurrent);
   const limits = parseConfiguredLimits(p.limits, `config.providers.${name}.limits`);
   const compat = parseProviderCompat(p.compat, `config.providers.${name}.compat`);
+  const wire = parseProviderWire(p.wire, kind, name);
 
   if (expanded.missing.length > 0) {
     warnings.push(
@@ -1133,25 +1205,9 @@ function parseSingleProvider(
     );
   }
 
-  return {
-    base: expanded.value.trim().replace(/\/+$/, ""),
-    kind,
-    authHeader: parseAuthHeader(p.authHeader, defaultAuthHeader),
-    timeoutMs: typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs) && p.timeoutMs > 0 ? p.timeoutMs : 120000,
-    ...(typeof p.stallTimeoutMs === "number" && Number.isFinite(p.stallTimeoutMs) && p.stallTimeoutMs >= 0
-      ? { stallTimeoutMs: Math.floor(p.stallTimeoutMs) }
-      : {}),
-    ...(declaredAuthEnv ? { authEnv: declaredAuthEnv } : {}),
-    ...(credentials !== undefined ? { credentials } : {}),
-    ...(credentialMode !== undefined ? { credentialMode } : {}),
-    ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
-    ...(p.tierType === "free" || p.tierType === "mixed" || p.tierType === "subscription"
-      ? { tierType: p.tierType }
-      : {}),
-    ...(limits !== undefined ? { limits } : {}),
-    ...(compat !== undefined ? { compat } : {}),
-    ...(typeof p.signupUrl === "string" && p.signupUrl.length > 0 ? { signupUrl: p.signupUrl } : {}),
-  };
+  return buildProviderConfig(
+    p, expanded, kind, defaultAuthHeader, declaredAuthEnv, credentials, credentialMode, maxConcurrent, limits, compat, wire,
+  );
 }
 
 function parseProviders(

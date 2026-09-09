@@ -1622,6 +1622,47 @@ describe("loadConfig — provider compat (thought signature)", () => {
   });
 });
 
+/**
+ * `providers.<name>.wire` — which upstream endpoint an openai-kind provider speaks
+ * (backlog item 11: OpenCode Zen's contributor SKUs, Muse Spark 1.3 included, answer 500 on
+ * `/chat/completions` and 200 only on `/responses`; docs/muse-spark-1.3-opencode-zen-2026-09-04.md
+ * rows 3, 6-8). Resolved onto `ResolvedTarget.wire` exactly like `toolCallIds`/`thoughtSignature`.
+ */
+describe("loadConfig — provider wire (Responses vs. Chat upstream)", () => {
+  const provider = (p: Record<string, unknown>) => (name: string) =>
+    loadConfig(write(name, base({ providers: { x: { kind: "openai", base: "https://nim.test/v1", ...p } }, routing: { default: "x/m" } })));
+
+  it("defaults to absent (chat) when not declared", () => {
+    const c = provider({})("wire-absent.json");
+    expect(c.providers.x!.wire).toBeUndefined();
+    expect(resolveTarget("m", c).wire).toBeUndefined();
+  });
+
+  it("round-trips an explicit chat and an explicit responses declaration", () => {
+    expect(provider({ wire: "chat" })("wire-chat.json").providers.x!.wire).toBe("chat");
+    const c = provider({ wire: "responses" })("wire-responses.json");
+    expect(c.providers.x!.wire).toBe("responses");
+    expect(resolveTarget("m", c).wire).toBe("responses");
+  });
+
+  it("rejects an unknown VALUE by name — an ignored typo reads as a declaration that took effect", () => {
+    expect(() => provider({ wire: "response" })("wire-typo.json"))
+      .toThrow(/config\.providers\.x\.wire must be one of: chat, responses/);
+    expect(() => provider({ wire: 1 })("wire-number.json"))
+      .toThrow(/config\.providers\.x\.wire must be one of: chat, responses/);
+  });
+
+  it("rejects wire on an anthropic-kind provider", () => {
+    const cfg = write("wire-anthropic.json", base({
+      providers: { x: { kind: "anthropic", base: "https://api.anthropic.com", wire: "responses" } },
+      routing: { default: "x" },
+    }));
+    expect(() => loadConfig(cfg)).toThrow(
+      /config\.providers\.x\.wire is only valid on an openai-kind provider \(this provider is anthropic-kind\)/,
+    );
+  });
+});
+
 describe("routing.dispatchWalk", () => {
   it("defaults ON with the standard budget when absent — the 2026-09-06 owner request", () => {
     const cfg = loadConfig(write("dw-absent.json", base()));

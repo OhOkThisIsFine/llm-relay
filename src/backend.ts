@@ -13,7 +13,7 @@ import { buildAuthHeaders } from "./authEnv.js";
 import { isRecord } from "./json-shape.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
-import { anthropicRequestToOpenAi, RequestMappingError } from "./openai-request.js";
+import { anthropicRequestToOpenAi, RequestMappingError, ToolCallIds, ThoughtSignatures } from "./openai-request.js";
 import { openaiResponsesRequestToAnthropic } from "./responses-request.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, dialectRefusalSignal, recoverToolCalls, type DialectRefusalSignal, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
@@ -28,6 +28,9 @@ import {
   type RecoveredOpenAiChatProcessor,
 } from "./openai-dialect.js";
 import { observeUsage, type UsageAccumulator } from "./usage-observer.js";
+import { createSseTransformStream, parseSseEvent } from "./sse-frames.js";
+import { syntheticMessageId } from "./emitSse.js";
+import type { ThoughtSignatureMode, ToolCallIdMode } from "./config-types.js";
 
 /**
  * A tool-call envelope was present in the response text but could not be parsed — truncated, or a
@@ -491,6 +494,14 @@ async function fetchOpenAiBackend(
   args: FetchBackendArgs,
   invokeFetch: typeof fetch,
 ): Promise<Response> {
+  // A `wire: "responses"` target (OpenCode Zen's contributor SKUs; see
+  // docs/muse-spark-1.3-opencode-zen-2026-09-04.md) speaks the OpenAI Responses API, not Chat
+  // Completions, so it needs its own request/response mapping and its own upstream path. Kept as
+  // an early dispatch rather than threading `wire` through every branch below, so the existing
+  // (far more common) Chat Completions path is untouched byte for byte.
+  if (attempt.target.wire === "responses") {
+    return fetchOpenAiResponsesBackend(attempt, args, invokeFetch);
+  }
   const target = attempt.target;
   // Documents are transcoded to markdown BEFORE the request mapper, or refused: a `document`
   // block has no OpenAI representation, and the pre-mapper behaviour put its whole base64
@@ -720,6 +731,1137 @@ async function fetchOpenAiBackend(
   // No header for this one — see `UpstreamResponseMetadata.thoughtSignatureSentinels`.
   if (sentinelsStamped > 0) metadata.thoughtSignatureSentinels = sentinelsStamped;
   return attachUpstreamMetadata(response, metadata);
+}
+
+/**
+ * ============================================================================================
+ * OpenAI RESPONSES wire (`wire: "responses"`) — the UPSTREAM speaker.
+ * ============================================================================================
+ *
+ * OpenCode Zen serves its contributor SKUs (Meta Muse Spark 1.3 included) on `POST /responses`
+ * only — `/chat/completions` and Zen's Anthropic-shaped `/messages` both answer HTTP 500 for them
+ * (measured 2026-08-04, `docs/muse-spark-1.3-opencode-zen-2026-09-04.md` rows 3, 6-8). Until this
+ * section, `Kind` was `"anthropic" | "openai"` and every `openai`-kind target spoke Chat
+ * Completions; a `wire: "responses"` target instead speaks the OpenAI Responses API, and this is
+ * the mirror of the existing `openai`-kind (Chat) machinery above: a request mapper
+ * (`anthropicRequestToOpenAiResponses`, the inverse of `src/responses-request.ts`'s Responses→
+ * Anthropic FRONT mapper), a buffered response mapper (`openAiResponsesToAnthropicMessage`, the
+ * sibling of `openAiResponseToAnthropic` above), and a streaming translator
+ * (`translateResponsesStreamToAnthropic`) that turns the Responses typed SSE event stream into
+ * Anthropic SSE — llm-bridge has no Responses-as-a-backend translation to reuse, only the Chat one
+ * this file already calls via `handleUniversalStreamRequest(..., "openai", "anthropic")`.
+ *
+ * Kept in THIS file rather than a new `src/responses-upstream.ts` (which the packet brief for this
+ * work offered as a normal split, conditioned on "if backend.ts would otherwise grow past
+ * readability"): `test/architecture-map.test.ts` pins every `src/*.ts` file to a CLAUDE.md
+ * Architecture-table row, and the row would have to be CLAUDE.md's — which this change is
+ * forbidden from touching. Folding the mapping into `backend.ts`, which already has a row, avoids
+ * that conflict entirely; nothing else motivated the choice.
+ *
+ * The dialect-rescue orchestration (`recoverOpenAiTextDialect`, `DialectUnparseableError`,
+ * `DialectDestructiveError`) stays exactly where it already lives, a few hundred lines below —
+ * `openAiResponsesToAnthropicMessage` calls it directly rather than re-declaring a second set of
+ * error classes, the same reuse `ToolCallIds`/`ThoughtSignatures` get from `openai-request.ts`.
+ */
+
+type ResponsesRec = Record<string, unknown>;
+
+/** Name an unexpected block/item type without echoing an arbitrary payload back at the caller. */
+function describeResponsesType(t: unknown): string {
+  return typeof t === "string" && t.length > 0 ? `"${t.slice(0, 40)}"` : "(missing type)";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Request direction: Anthropic Messages -> OpenAI Responses.
+//
+// The inverse of `src/responses-request.ts` (`openaiResponsesRequestToAnthropic`) — read that
+// file's header first; the per-field decisions below mirror its reasoning in the opposite
+// direction, and diverge only where the two wire shapes are not symmetric (noted inline).
+// ---------------------------------------------------------------------------------------------
+
+export interface AnthropicToOpenAiResponsesOptions {
+  /** The resolved deployment's model id. Absent => no `model` key, same convention as `openai-request.ts`. */
+  model?: string | undefined;
+  /** Whether THIS hop streams — a relay decision, not the caller's. Falls back to the body. */
+  stream?: boolean | undefined;
+  /** Same resolved mode `anthropicRequestToOpenAi` receives; see that module for the provenance. */
+  toolCallIds?: ToolCallIdMode | undefined;
+  onToolCallIdsRewritten?: ((count: number) => void) | undefined;
+  thoughtSignature?: ThoughtSignatureMode | undefined;
+  onThoughtSignatureSentinels?: ((count: number) => void) | undefined;
+}
+
+/**
+ * `system` (string or text blocks) -> the `instructions` string. Joined with a blank line, the
+ * same convention `openai-request.ts`'s `systemText` uses for Chat's `system` message — these are
+ * independent documents (harness preamble, project instructions, …), not one continuous sentence.
+ */
+function responsesSystemText(system: unknown): string {
+  if (typeof system === "string") return system;
+  if (!Array.isArray(system)) return "";
+  const parts: string[] = [];
+  for (const block of system) {
+    if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * One Anthropic `image` block -> a Responses `input_image` part. Unlike Chat's `image_url`, the
+ * Responses shape carries the URL as a plain STRING field, not a nested `{url}` object.
+ */
+function responsesInputImagePart(block: ResponsesRec): ResponsesRec {
+  const source = isRecord(block.source) ? block.source : {};
+  if (source.type === "url" && typeof source.url === "string") return { type: "input_image", image_url: source.url };
+  if (source.type === "base64" && typeof source.data === "string" && typeof source.media_type === "string") {
+    return { type: "input_image", image_url: `data:${source.media_type};base64,${source.data}` };
+  }
+  throw new RequestMappingError("image block needs a base64 or url source");
+}
+
+/**
+ * Split one Anthropic `tool_result` into a Responses `function_call_output.output` string and
+ * its image parts — the SAME lossless-carry decision `openai-request.ts`'s `toolResultParts`
+ * makes for Chat: a `function_call_output.output` is a plain string, so an image has nowhere to
+ * go there and is instead carried on the trailing user item (see `responsesUserItems`). Refusing
+ * it would kill the whole request on every Responses-wire lane over one screenshot; the relay
+ * chose losslessness there and the same reasoning applies here unchanged.
+ */
+function responsesToolResultParts(content: unknown): { text: string; images: ResponsesRec[] } {
+  if (content === undefined || content === null) return { text: "", images: [] };
+  if (typeof content === "string") return { text: content, images: [] };
+  if (!Array.isArray(content)) {
+    throw new RequestMappingError("tool_result content must be text or a list of blocks");
+  }
+  const texts: string[] = [];
+  const images: ResponsesRec[] = [];
+  for (const raw of content) {
+    if (!isRecord(raw)) throw new RequestMappingError("tool_result content block is not an object");
+    switch (raw.type) {
+      case "text":
+        texts.push(typeof raw.text === "string" ? raw.text : "");
+        break;
+      case "image":
+        images.push(responsesInputImagePart(raw));
+        break;
+      default:
+        throw new RequestMappingError(
+          `tool_result carries an unsupported ${describeResponsesType(raw.type)} block; a Responses function_call_output carries text and images only`,
+        );
+    }
+  }
+  return { text: texts.join("\n"), images };
+}
+
+/** One Anthropic `tool_result` block -> a Responses `function_call_output` item, plus its images. */
+function responsesToolResultItem(
+  block: ResponsesRec,
+  ids: ToolCallIds | null,
+): { item: ResponsesRec; images: ResponsesRec[] } {
+  if (typeof block.tool_use_id !== "string" || block.tool_use_id.length === 0) {
+    throw new RequestMappingError("tool_result block without a tool_use_id");
+  }
+  const callId = ids === null ? block.tool_use_id : ids.map(block.tool_use_id);
+  const { text, images } = responsesToolResultParts(block.content);
+  return { item: { type: "function_call_output", call_id: callId, output: text }, images };
+}
+
+/**
+ * One Anthropic `tool_use` block -> a Responses `function_call` item (no `role`, unlike a
+ * `message` item). `ids`/`sigs` are the SAME per-run passes `anthropicRequestToOpenAi` runs for
+ * Chat — reused via `ToolCallIds`/`ThoughtSignatures` from `openai-request.ts` rather than
+ * hand-copied, so a `strict9`/`sentinel` provider fact applies identically regardless of wire.
+ */
+function responsesFunctionCallItem(
+  block: ResponsesRec,
+  ids: ToolCallIds | null,
+  sigs: ThoughtSignatures | null,
+): ResponsesRec {
+  if (typeof block.id !== "string" || block.id.length === 0) {
+    throw new RequestMappingError("tool_use block without an id");
+  }
+  if (typeof block.name !== "string" || block.name.length === 0) {
+    throw new RequestMappingError("tool_use block without a name");
+  }
+  const input = block.input ?? {};
+  const item: ResponsesRec = {
+    type: "function_call",
+    call_id: ids === null ? block.id : ids.map(block.id),
+    name: block.name,
+    arguments: typeof input === "string" ? input : JSON.stringify(input),
+  };
+  return sigs === null ? item : sigs.stamp(item);
+}
+
+/**
+ * An Anthropic assistant turn -> zero or more Responses input items: one `{role:"assistant"}`
+ * message item per non-empty text block, one `function_call` item per `tool_use` block, in the
+ * turn's original order. Unlike the Chat mapper this does NOT merge consecutive text blocks into
+ * one item — Responses' `input` is a flat item array with no Chat-style "one message per role run"
+ * constraint, so one item per block is simplest and equally correct. `thinking`/`redacted_thinking`
+ * are DROPPED — no representation, and a guessed `reasoning.effort` would be an invention (the rule
+ * `openai-request.ts` already states for the Chat direction).
+ */
+function responsesAssistantItems(
+  turn: ResponsesRec,
+  ids: ToolCallIds | null,
+  sigs: ThoughtSignatures | null,
+): ResponsesRec[] {
+  const content = turn.content;
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ role: "assistant", content: [{ type: "output_text", text: content }] }] : [];
+  }
+  const out: ResponsesRec[] = [];
+  for (const raw of Array.isArray(content) ? content : []) {
+    if (!isRecord(raw)) throw new RequestMappingError("assistant content block is not an object");
+    switch (raw.type) {
+      case "text": {
+        const text = typeof raw.text === "string" ? raw.text : "";
+        if (text.length > 0) out.push({ role: "assistant", content: [{ type: "output_text", text }] });
+        break;
+      }
+      case "tool_use":
+        out.push(responsesFunctionCallItem(raw, ids, sigs));
+        break;
+      case "thinking":
+      case "redacted_thinking":
+        break;
+      default:
+        throw new RequestMappingError(`unsupported assistant content block ${describeResponsesType(raw.type)}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * An Anthropic user turn -> Responses input items: every `function_call_output` FIRST (mirroring
+ * `openai-request.ts`'s "tool messages lead" rule for Chat — the assistant's `function_call` a
+ * result answers was already emitted, and a provider's own linkage check is at least as strict as
+ * Chat's), then one `{role:"user"}` item carrying any images those results carried (the same
+ * trailing placement `toolResultParts`/`userMessages` use for Chat), then one `{role:"user"}` item
+ * for the turn's own text/image content, in original order. A wholly empty turn (no tool results,
+ * no content) emits nothing — Anthropic itself rejects an empty turn, so this is never reached in
+ * practice; inventing an empty `input_text` part risks a Responses-side rejection for no benefit.
+ */
+function responsesUserItems(turn: ResponsesRec, ids: ToolCallIds | null): ResponsesRec[] {
+  const content = turn.content;
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ role: "user", content: [{ type: "input_text", text: content }] }] : [];
+  }
+  const toolResultItems: ResponsesRec[] = [];
+  const trailingImages: ResponsesRec[] = [];
+  const contentParts: ResponsesRec[] = [];
+  for (const raw of Array.isArray(content) ? content : []) {
+    if (!isRecord(raw)) throw new RequestMappingError("user content block is not an object");
+    switch (raw.type) {
+      case "text": {
+        const text = typeof raw.text === "string" ? raw.text : "";
+        if (text.length > 0) contentParts.push({ type: "input_text", text });
+        break;
+      }
+      case "image":
+        contentParts.push(responsesInputImagePart(raw));
+        break;
+      case "tool_result": {
+        const { item, images } = responsesToolResultItem(raw, ids);
+        toolResultItems.push(item);
+        trailingImages.push(...images);
+        break;
+      }
+      case "thinking":
+      case "redacted_thinking":
+        break;
+      default:
+        throw new RequestMappingError(`unsupported user content block ${describeResponsesType(raw.type)}`);
+    }
+  }
+  const out: ResponsesRec[] = [...toolResultItems];
+  if (trailingImages.length > 0) out.push({ role: "user", content: trailingImages });
+  if (contentParts.length > 0) out.push({ role: "user", content: contentParts });
+  return out;
+}
+
+/**
+ * `tools[]` -> Responses' FLAT function declarations (`{type:"function", name, description,
+ * parameters}` — no nested `function` envelope, unlike Chat). Anthropic's built-in typed tools
+ * declare no schema, so the empty object schema is used, matching `openai-request.ts`'s Chat
+ * mapper exactly.
+ */
+function mapAnthropicToolsToResponses(tools: unknown): ResponsesRec[] | null {
+  if (!Array.isArray(tools) || tools.length === 0) return null;
+  const out: ResponsesRec[] = [];
+  for (const raw of tools) {
+    if (!isRecord(raw)) throw new RequestMappingError("tool declaration is not an object");
+    if (typeof raw.name !== "string" || raw.name.length === 0) {
+      throw new RequestMappingError("tool declaration without a name");
+    }
+    const fn: ResponsesRec = { type: "function", name: raw.name };
+    if (typeof raw.description === "string" && raw.description.length > 0) fn.description = raw.description;
+    fn.parameters = isRecord(raw.input_schema) ? raw.input_schema : { type: "object", properties: {} };
+    out.push(fn);
+  }
+  return out;
+}
+
+/**
+ * `tool_choice` -> the Responses spelling: `any` -> `required`, a named tool -> `{type:"function",
+ * name}` (flat, unlike Chat's nested form), `disable_parallel_tool_use` -> the top-level
+ * `parallel_tool_calls: false` (only when the choice can still call a tool — `none` calling no
+ * tool makes the flag meaningless there, the same guard `responses-request.ts` keeps for the
+ * inverse direction). An unrecognised shape is dropped rather than guessed at, same as Chat.
+ */
+function mapAnthropicToolChoiceToResponses(choice: unknown): { toolChoice?: unknown; parallelToolCalls?: boolean } {
+  if (!isRecord(choice)) return {};
+  let toolChoice: unknown;
+  switch (choice.type) {
+    case "auto": toolChoice = "auto"; break;
+    case "any": toolChoice = "required"; break;
+    case "none": toolChoice = "none"; break;
+    case "tool":
+      toolChoice = typeof choice.name === "string" && choice.name.length > 0
+        ? { type: "function", name: choice.name }
+        : undefined;
+      break;
+    default:
+      toolChoice = undefined;
+  }
+  if (toolChoice === undefined) return {};
+  const parallelToolCalls = choice.disable_parallel_tool_use === true && choice.type !== "none" ? false : undefined;
+  return parallelToolCalls === undefined ? { toolChoice } : { toolChoice, parallelToolCalls };
+}
+
+/** The non-`input` options half of an OpenAI Responses request body — split out of the exported
+ * mapper purely to keep ITS cognitive complexity under the repo's linted ceiling. */
+function responsesRequestOptions(
+  body: ResponsesRec,
+  opts: AnthropicToOpenAiResponsesOptions,
+  out: ResponsesRec,
+): void {
+  if (opts.model !== undefined) out.model = opts.model;
+  const stream = opts.stream ?? (typeof body.stream === "boolean" ? body.stream : undefined);
+  if (stream !== undefined) out.stream = stream;
+  const instructions = responsesSystemText(body.system);
+  if (instructions.length > 0) out.instructions = instructions;
+  if (typeof body.max_tokens === "number") out.max_output_tokens = body.max_tokens;
+  if (typeof body.temperature === "number") out.temperature = body.temperature;
+  if (typeof body.top_p === "number") out.top_p = body.top_p;
+  const tools = mapAnthropicToolsToResponses(body.tools);
+  if (!tools) return;
+  out.tools = tools;
+  // `tool_choice` without `tools` means nothing anyway.
+  const { toolChoice, parallelToolCalls } = mapAnthropicToolChoiceToResponses(body.tool_choice);
+  if (toolChoice !== undefined) out.tool_choice = toolChoice;
+  if (parallelToolCalls !== undefined) out.parallel_tool_calls = parallelToolCalls;
+}
+
+/**
+ * Translate one Anthropic Messages request body into an OpenAI Responses request body.
+ *
+ * Item order is preserved exactly. Unknown top-level fields are not forwarded — a translation
+ * between two contracts, not a passthrough, the same rule `anthropicRequestToOpenAi` states.
+ *
+ * @throws {RequestMappingError} for a block or declaration that cannot be represented.
+ */
+export function anthropicRequestToOpenAiResponses(
+  reqJson: unknown,
+  opts: AnthropicToOpenAiResponsesOptions = {},
+): Record<string, unknown> {
+  const body = isRecord(reqJson) ? reqJson : {};
+  const input: ResponsesRec[] = [];
+  const ids = opts.toolCallIds === "strict9" ? new ToolCallIds() : null;
+  const sigs = opts.thoughtSignature === "sentinel" ? new ThoughtSignatures() : null;
+
+  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+    if (!isRecord(raw)) throw new RequestMappingError("message is not an object");
+    if (raw.role === "assistant") input.push(...responsesAssistantItems(raw, ids, sigs));
+    else input.push(...responsesUserItems(raw, ids));
+  }
+  if (ids !== null) opts.onToolCallIdsRewritten?.(ids.count());
+  if (sigs !== null) opts.onThoughtSignatureSentinels?.(sigs.count());
+
+  const out: ResponsesRec = { input };
+  responsesRequestOptions(body, opts, out);
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Response direction, BUFFERED: OpenAI Responses -> Anthropic Messages.
+// ---------------------------------------------------------------------------------------------
+
+interface ParsedResponsesOutput {
+  /** `message`/`refusal` output text, concatenated in order (reasoning items dropped). */
+  text: string;
+  /** Native `function_call` output items, in order. */
+  functionCalls: Array<{ id: string; name: string; input: unknown }>;
+}
+
+/** One `function_call` output item -> its id/name/parsed-arguments triple. */
+function parseResponsesFunctionCallOutputItem(
+  raw: Record<string, unknown>,
+  ordinal: number,
+): { id: string; name: string; input: unknown } {
+  const id = typeof raw.call_id === "string" ? raw.call_id
+    : typeof raw.id === "string" ? raw.id : `tu_${ordinal}`;
+  const name = typeof raw.name === "string" ? raw.name : "";
+  const rawArgs = typeof raw.arguments === "string" ? raw.arguments : "";
+  let input: unknown;
+  try {
+    input = rawArgs.length > 0 ? JSON.parse(rawArgs) : {};
+  } catch {
+    input = rawArgs;
+  }
+  return { id, name, input };
+}
+
+/** One `message` output item's `content[]` -> its `output_text`/`refusal` text parts, in order. */
+function parseResponsesMessageOutputItem(raw: Record<string, unknown>): string[] {
+  const textParts: string[] = [];
+  if (!Array.isArray(raw.content)) return textParts;
+  for (const part of raw.content) {
+    if (!isRecord(part)) continue;
+    if (part.type === "output_text" && typeof part.text === "string" && part.text.length > 0) {
+      textParts.push(part.text);
+    } else if (part.type === "refusal" && typeof part.refusal === "string" && part.refusal.length > 0) {
+      textParts.push(part.refusal);
+    }
+  }
+  return textParts;
+}
+
+/**
+ * Walk a Responses `output[]` array into text + native tool calls. `reasoning` items and any
+ * other item kind this relay does not model are DROPPED — the same rule the request-direction
+ * mapper applies to `thinking`/`redacted_thinking`: no representation, no invented one.
+ */
+function parseOpenAiResponsesOutput(j: Record<string, unknown>): ParsedResponsesOutput {
+  const outputs = Array.isArray(j.output) ? j.output : [];
+  const textParts: string[] = [];
+  const functionCalls: Array<{ id: string; name: string; input: unknown }> = [];
+  for (const raw of outputs) {
+    if (!isRecord(raw)) continue;
+    const type = typeof raw.type === "string" ? raw.type : "";
+    if (type === "function_call") {
+      functionCalls.push(parseResponsesFunctionCallOutputItem(raw, functionCalls.length));
+    } else if (type === "message") {
+      textParts.push(...parseResponsesMessageOutputItem(raw));
+    }
+    // "reasoning" and any other item kind: dropped.
+  }
+  return { text: textParts.join(""), functionCalls };
+}
+
+/**
+ * `status`/`incomplete_details` -> the Anthropic `stop_reason`. `hasToolCalls` is the caller's to
+ * decide (it may include dialect-RECOVERED calls found after this function's own native-call
+ * count), so it is a parameter rather than re-derived here — the same split
+ * `mapOpenAiFinishToAnthropicStopReason` keeps for the Chat direction.
+ */
+function mapResponsesStopReason(j: Record<string, unknown>, hasToolCalls: boolean): string {
+  if (hasToolCalls) return "tool_use";
+  const status = typeof j.status === "string" ? j.status : undefined;
+  const incompleteReason = isRecord(j.incomplete_details) && typeof j.incomplete_details.reason === "string"
+    ? j.incomplete_details.reason
+    : undefined;
+  if (status === "incomplete" && incompleteReason === "max_output_tokens") return "max_tokens";
+  return "end_turn";
+}
+
+/**
+ * A cache figure this relay is willing to repeat downstream: a finite, non-negative number. The
+ * SAME check `measuredCacheTokens` performs for the Chat direction a few hundred lines below —
+ * duplicated here as a one-line pure predicate rather than imported, because importing it would
+ * require exporting it FROM this file and this file already imports the request/response mappers
+ * of the module it would be exported to reuse it in — there is no such module here to create a
+ * cycle with, but the duplication is kept deliberately trivial (one line) rather than threading a
+ * new cross-file dependency for a three-token check.
+ */
+function measuredResponsesCacheTokens(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+/**
+ * OpenAI Responses `usage` -> Anthropic's `usage` shape.
+ *
+ * ⚠ Inclusion semantics, verified from the doc rather than guessed: Responses' `input_tokens` is
+ * documented (row 12 of `docs/muse-spark-1.3-opencode-zen-2026-09-04.md`) alongside
+ * `input_tokens_details.cached_tokens` using the SAME `<total>_details.<subset>_tokens` naming
+ * convention Chat Completions uses for `prompt_tokens`/`prompt_tokens_details.cached_tokens` — a
+ * convention `src/backend.ts`'s own `openAiUsage`/`openAiPromptUsageToAnthropic` pair already
+ * documents as INCLUSIVE for Chat (`prompt_tokens` INCLUDES the cached subset). Responses is the
+ * same vendor's sibling API reusing the identical sub-object name, so `input_tokens` is treated as
+ * inclusive here too and the cached count is split back OUT to build Anthropic's EXCLUSIVE
+ * `input_tokens` + separate `cache_read_input_tokens` — the same split `openAiPromptUsageToAnthropic`
+ * performs for Chat, field names renamed for the Responses wire.
+ *
+ * `output_tokens_details.reasoning_tokens` is the OUTPUT-side sibling of that same convention: a
+ * SUBSET already counted inside `output_tokens` (exactly like a Chat `completion_tokens_details.
+ * reasoning_tokens`, which this relay's Chat-direction usage mapping also does not split out —
+ * neither Anthropic's wire `usage` nor `src/usage-observer.ts`'s `UsageAccumulator` has a field
+ * for a reasoning-token subset today). So it needs no separate handling: it reaches the caller
+ * already folded into `output_tokens`, carried through the SAME accumulator path
+ * (`applyResponsesUsage`, below) that every other reported figure takes — "the observer path" the
+ * Chat direction already uses, not a second one.
+ */
+function extractAnthropicUsageFromResponses(
+  rawUsage: unknown,
+): { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number } | null {
+  if (!isRecord(rawUsage)) return null;
+  if (typeof rawUsage.input_tokens !== "number" && typeof rawUsage.output_tokens !== "number") return null;
+  const out: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number } = {};
+  if (typeof rawUsage.input_tokens === "number") {
+    const details = isRecord(rawUsage.input_tokens_details) ? rawUsage.input_tokens_details : undefined;
+    const cached = details ? measuredResponsesCacheTokens(details.cached_tokens) : undefined;
+    if (cached !== undefined && cached <= rawUsage.input_tokens) {
+      out.input_tokens = rawUsage.input_tokens - cached;
+      out.cache_read_input_tokens = cached;
+    } else {
+      out.input_tokens = rawUsage.input_tokens;
+    }
+  }
+  if (typeof rawUsage.output_tokens === "number") out.output_tokens = rawUsage.output_tokens;
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/**
+ * Write a parsed Responses usage object into the request's `UsageAccumulator` — the SAME field
+ * semantics `usage-observer.ts`'s `inspectUsageRecord` applies for an `anthropic-messages` body
+ * (`inputTokens`/`outputTokens`+`completionTokens` alias/`cacheReadInputTokens`), applied directly
+ * rather than through that module's byte-level SSE/JSON parsers.
+ *
+ * `src/usage-observer.ts` is deliberately unmodified by this packet: its `UsageProtocol` union is
+ * `"anthropic-messages" | "openai-chat"` ONLY, and its own header states why — "no call site
+ * observes a native OpenAI Responses body… so there is no `"openai-responses"` member to re-add
+ * if one ever appears". That was true until this section existed; rather than widen a module
+ * outside this packet's scope, the BUFFERED response mapper (which has already parsed the JSON)
+ * writes the accumulator directly, and the STREAMED path (`fetchOpenAiResponsesBackend`, below)
+ * observes `"anthropic-messages"` on this relay's OWN translated output instead of the raw
+ * Responses bytes — reusing the SAME existing machinery rather than bypassing it a second way.
+ */
+function applyResponsesUsage(
+  accumulator: UsageAccumulator,
+  usage: ReturnType<typeof extractAnthropicUsageFromResponses>,
+): void {
+  if (!usage) return;
+  if (typeof usage.input_tokens === "number") accumulator.inputTokens = usage.input_tokens;
+  if (typeof usage.output_tokens === "number") {
+    accumulator.outputTokens = usage.output_tokens;
+    accumulator.completionTokens = usage.output_tokens;
+  }
+  if (typeof usage.cache_read_input_tokens === "number") accumulator.cacheReadInputTokens = usage.cache_read_input_tokens;
+}
+
+/**
+ * Map a non-streaming OpenAI Responses body into an Anthropic message — the Responses sibling of
+ * `openAiResponseToAnthropic` above, including the SAME text-dialect rescue for a host that
+ * returns its tool call as plain output text instead of a native `function_call` item.
+ * `recoverOpenAiTextDialect` and the two error classes it throws (`DialectUnparseableError`,
+ * `DialectDestructiveError`) are the EXISTING Chat-direction ones a few hundred lines below —
+ * reused rather than re-declared, so a caller catching them (`fetchOpenAiResponsesBackend`) needs
+ * no second set of `instanceof` checks.
+ */
+function openAiResponsesToAnthropicMessage(
+  j: Record<string, unknown>,
+  model: string,
+  schemas: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }> | undefined,
+  isDestructive: (name: string) => boolean,
+): object {
+  const parsed = parseOpenAiResponsesOutput(j);
+  const content: object[] = [];
+  let functionCalls = parsed.functionCalls;
+
+  if (functionCalls.length === 0 && parsed.text.length > 0) {
+    const { recoveredCalls, textParts } = recoverOpenAiTextDialect(parsed.text, schemas, isDestructive);
+    content.push(...textParts);
+    if (recoveredCalls.length > 0) {
+      functionCalls = recoveredCalls.map((c, i) => ({ id: `tu_recovered_${i}`, name: c.name, input: c.input }));
+    }
+  } else if (parsed.text.length > 0) {
+    content.push({ type: "text", text: parsed.text });
+  }
+
+  for (const fc of functionCalls) {
+    content.push({ type: "tool_use", id: fc.id, name: fc.name, input: fc.input });
+  }
+
+  return {
+    id: typeof j.id === "string" ? j.id : "msg_translated",
+    type: "message",
+    role: "assistant",
+    model: model || (typeof j.model === "string" ? j.model : ""),
+    content,
+    stop_reason: mapResponsesStopReason(j, functionCalls.length > 0),
+    stop_sequence: null,
+    ...(extractAnthropicUsageFromResponses(j.usage) ? { usage: extractAnthropicUsageFromResponses(j.usage) } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Response direction, STREAMED: OpenAI Responses SSE -> Anthropic SSE.
+//
+// llm-bridge has no Responses-as-a-backend translator to reuse (its Responses support is the
+// FRONT direction only — Anthropic -> Responses, `handleUniversalStreamRequest(…, "anthropic",
+// "openai-responses")`, already used elsewhere in this file for the Responses FRONT). This is the
+// missing mirror, hand-rolled on `src/sse-frames.ts`'s shared framing primitives per the packet
+// brief ("do NOT write a fifth SSE parser").
+// ---------------------------------------------------------------------------------------------
+
+/** One Anthropic SSE frame: `event: <type>\ndata: {"type":<type>,...}\n\n`. */
+function anthropicSseEvent(type: string, data: Record<string, unknown>): string {
+  return `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+}
+
+function anthropicSseError(message: string): string {
+  return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `llm-relay: ${message}` } })}\n\n`;
+}
+
+/**
+ * Incremental per-stream state: which Responses `output_index` (and, for a message item's text
+ * parts, `content_index`) has already been assigned an Anthropic content-block index, so deltas
+ * can be routed to the right block and `output_item.done` can close every block an item opened.
+ */
+interface ResponsesStreamState {
+  messageStarted: boolean;
+  messageStopped: boolean;
+  nextBlockIndex: number;
+  /** `${output_index}:${content_index}` -> Anthropic block index, for message/refusal text parts. */
+  textBlocks: Map<string, number>;
+  /** `output_index` -> Anthropic block index, for `function_call` items (exactly one block each). */
+  toolBlocks: Map<number, number>;
+  /** `output_index` -> Anthropic block indices opened for it, closed together on `output_item.done`. */
+  openBlocksByItem: Map<number, number[]>;
+}
+
+function newResponsesStreamState(): ResponsesStreamState {
+  return {
+    messageStarted: false,
+    messageStopped: false,
+    nextBlockIndex: 0,
+    textBlocks: new Map(),
+    toolBlocks: new Map(),
+    openBlocksByItem: new Map(),
+  };
+}
+
+function ensureResponsesMessageStarted(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  response: Record<string, unknown> | undefined,
+): void {
+  if (state.messageStarted) return;
+  state.messageStarted = true;
+  push(anthropicSseEvent("message_start", {
+    message: {
+      id: typeof response?.id === "string" ? response.id : syntheticMessageId(),
+      type: "message",
+      role: "assistant",
+      model: typeof response?.model === "string" ? response.model : "",
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      // Unknown at message_start (Responses' usage arrives only once the response settles) —
+      // never guessed. The full figure rides on `message_delta` instead; see `finishResponsesStream`.
+      usage: {},
+    },
+  }));
+}
+
+function openResponsesTextBlock(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  outputIndex: number,
+  contentIndex: number,
+): number {
+  const key = `${outputIndex}:${contentIndex}`;
+  const existing = state.textBlocks.get(key);
+  if (existing !== undefined) return existing;
+  const index = state.nextBlockIndex++;
+  state.textBlocks.set(key, index);
+  const opened = state.openBlocksByItem.get(outputIndex) ?? [];
+  opened.push(index);
+  state.openBlocksByItem.set(outputIndex, opened);
+  push(anthropicSseEvent("content_block_start", { index, content_block: { type: "text", text: "" } }));
+  return index;
+}
+
+function openResponsesToolBlock(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  outputIndex: number,
+  callId: string,
+  name: string,
+): number {
+  const existing = state.toolBlocks.get(outputIndex);
+  if (existing !== undefined) return existing;
+  const index = state.nextBlockIndex++;
+  state.toolBlocks.set(outputIndex, index);
+  state.openBlocksByItem.set(outputIndex, [index]);
+  push(anthropicSseEvent("content_block_start", {
+    index, content_block: { type: "tool_use", id: callId, name, input: {} },
+  }));
+  return index;
+}
+
+function closeResponsesItemBlocks(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  outputIndex: number,
+): void {
+  const opened = state.openBlocksByItem.get(outputIndex);
+  if (!opened) return;
+  for (const index of opened) push(anthropicSseEvent("content_block_stop", { index }));
+  state.openBlocksByItem.delete(outputIndex);
+}
+
+/**
+ * A `function_call` output item this translator never saw `output_item.added` for — synthesize
+ * its block from the COMPLETED item's own final `call_id`/`name`/`arguments` at `response.completed`
+ * time.
+ */
+function synthesizeResponsesFunctionCallBlock(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  outputIndex: number,
+  item: Record<string, unknown>,
+): void {
+  if (state.toolBlocks.has(outputIndex)) return;
+  const callId = typeof item.call_id === "string" ? item.call_id
+    : typeof item.id === "string" ? item.id : `tu_${outputIndex}`;
+  const index = openResponsesToolBlock(state, push, outputIndex, callId, typeof item.name === "string" ? item.name : "");
+  const args = typeof item.arguments === "string" ? item.arguments : "";
+  if (args.length > 0) {
+    push(anthropicSseEvent("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: args } }));
+  }
+}
+
+/**
+ * A `message` output item's text/refusal parts this translator never saw `content_part.added`
+ * for — synthesized the same way as `synthesizeResponsesFunctionCallBlock`, one block per part.
+ */
+function synthesizeResponsesMessageBlocks(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  outputIndex: number,
+  item: Record<string, unknown>,
+): void {
+  if (!Array.isArray(item.content)) return;
+  item.content.forEach((part, contentIndex) => {
+    if (!isRecord(part) || (part.type !== "output_text" && part.type !== "refusal")) return;
+    if (state.textBlocks.has(`${outputIndex}:${contentIndex}`)) return;
+    const text = typeof part.text === "string" ? part.text : typeof part.refusal === "string" ? part.refusal : "";
+    const index = openResponsesTextBlock(state, push, outputIndex, contentIndex);
+    if (text.length > 0) {
+      push(anthropicSseEvent("content_block_delta", { index, delta: { type: "text_delta", text } }));
+    }
+  });
+}
+
+/**
+ * A provider may answer `response.completed` with output the incremental events never announced
+ * (a short response that skips streaming altogether, or an event this translator dropped) —
+ * `state` alone would then describe an EMPTY message even though `response.output[]` carries the
+ * whole answer. Walk it once more here and synthesize whatever block the incremental path missed,
+ * keyed by each item's array position (which is what a real `output_index` names). Already-tracked
+ * items are left untouched, so a fully-streamed response synthesizes nothing.
+ */
+function synthesizeMissingResponsesBlocks(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  response: Record<string, unknown>,
+): void {
+  if (!Array.isArray(response.output)) return;
+  response.output.forEach((raw, outputIndex) => {
+    if (!isRecord(raw)) return;
+    if (raw.type === "function_call") synthesizeResponsesFunctionCallBlock(state, push, outputIndex, raw);
+    else if (raw.type === "message") synthesizeResponsesMessageBlocks(state, push, outputIndex, raw);
+    // "reasoning" and any other item kind: dropped, same rule as everywhere else in this module.
+  });
+}
+
+function finishResponsesStream(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  response: Record<string, unknown> | undefined,
+): void {
+  if (state.messageStopped) return;
+  state.messageStopped = true;
+  ensureResponsesMessageStarted(state, push, response);
+  if (response) synthesizeMissingResponsesBlocks(state, push, response);
+  // Close anything still open — an abrupt/incomplete stream must not leave a dangling block.
+  for (const outputIndex of [...state.openBlocksByItem.keys()]) closeResponsesItemBlocks(state, push, outputIndex);
+  const hasToolCalls = state.toolBlocks.size > 0;
+  const stopReason = response ? mapResponsesStopReason(response, hasToolCalls) : (hasToolCalls ? "tool_use" : "end_turn");
+  const usage = response ? extractAnthropicUsageFromResponses(response.usage) : null;
+  push(anthropicSseEvent("message_delta", {
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    ...(usage ? { usage } : {}),
+  }));
+  push(anthropicSseEvent("message_stop", {}));
+}
+
+function handleResponsesOutputItemAdded(state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>): void {
+  ensureResponsesMessageStarted(state, push, undefined);
+  const item = isRecord(data.item) ? data.item : undefined;
+  const outputIndex = typeof data.output_index === "number" ? data.output_index : -1;
+  if (item?.type === "function_call" && outputIndex >= 0) {
+    const callId = typeof item.call_id === "string" ? item.call_id
+      : typeof item.id === "string" ? item.id : `tu_${outputIndex}`;
+    openResponsesToolBlock(state, push, outputIndex, callId, typeof item.name === "string" ? item.name : "");
+  }
+  // "message" waits for `content_part.added` to learn output_text vs. refusal; "reasoning" is
+  // dropped entirely — no block is ever opened for it.
+}
+
+function handleResponsesContentPartAdded(state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>): void {
+  const outputIndex = typeof data.output_index === "number" ? data.output_index : -1;
+  const contentIndex = typeof data.content_index === "number" ? data.content_index : 0;
+  const part = isRecord(data.part) ? data.part : undefined;
+  if (outputIndex >= 0 && (part?.type === "output_text" || part?.type === "refusal")) {
+    ensureResponsesMessageStarted(state, push, undefined);
+    openResponsesTextBlock(state, push, outputIndex, contentIndex);
+  }
+}
+
+function handleResponsesTextDelta(state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>): void {
+  const outputIndex = typeof data.output_index === "number" ? data.output_index : -1;
+  const contentIndex = typeof data.content_index === "number" ? data.content_index : 0;
+  const delta = typeof data.delta === "string" ? data.delta : "";
+  const index = state.textBlocks.get(`${outputIndex}:${contentIndex}`);
+  if (index !== undefined && delta.length > 0) {
+    push(anthropicSseEvent("content_block_delta", { index, delta: { type: "text_delta", text: delta } }));
+  }
+}
+
+function handleResponsesToolArgumentsDelta(state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>): void {
+  const outputIndex = typeof data.output_index === "number" ? data.output_index : -1;
+  const delta = typeof data.delta === "string" ? data.delta : "";
+  const index = state.toolBlocks.get(outputIndex);
+  if (index !== undefined && delta.length > 0) {
+    push(anthropicSseEvent("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: delta } }));
+  }
+}
+
+function handleResponsesOutputItemDone(state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>): void {
+  const outputIndex = typeof data.output_index === "number" ? data.output_index : -1;
+  if (outputIndex >= 0) closeResponsesItemBlocks(state, push, outputIndex);
+}
+
+/**
+ * A post-commit in-band failure — a pre-commit one already failed `stream-commit.ts`'s probe and
+ * never reaches here. Forwarded as an Anthropic error event, same as `dialect-stream.ts` does for
+ * its own mid-stream refusals; honesty beats replay once the client holds bytes.
+ */
+function handleResponsesFailure(state: ResponsesStreamState, push: (text: string) => void, type: string, data: Record<string, unknown>): void {
+  const response = isRecord(data.response) ? data.response : undefined;
+  ensureResponsesMessageStarted(state, push, response);
+  const message = isRecord(response?.error) && typeof response.error.message === "string"
+    ? response.error.message
+    : typeof data.message === "string" ? data.message
+      : isRecord(data.error) && typeof data.error.message === "string" ? data.error.message
+        : `stream ended: ${type}`;
+  push(anthropicSseError(message));
+  state.messageStopped = true; // an error event terminates the stream; no message_stop follows
+}
+
+/**
+ * Every Responses event name this translator acts on, mapped to its handler — a total-in-spirit
+ * lookup rather than a long if/else chain, so `processResponsesStreamEvent`'s own cognitive
+ * complexity stays a flat dispatch. Any event NOT in this map (a reasoning delta/done,
+ * `output_text.done`, `content_part.done`, `function_call_arguments.done`, a future event type,
+ * …) is DROPPED, not an error — a redundant boundary already covered by `output_item.done`, or
+ * content this relay drops by rule (the doc's row 13, plus `function_call_arguments.delta/done`
+ * from §3 route B, is the authority for what is handled at all).
+ */
+const RESPONSES_STREAM_HANDLERS: Record<string, (state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>) => void> = {
+  "response.created": (state, push, data) => ensureResponsesMessageStarted(state, push, isRecord(data.response) ? data.response : undefined),
+  "response.in_progress": (state, push, data) => ensureResponsesMessageStarted(state, push, isRecord(data.response) ? data.response : undefined),
+  "response.output_item.added": handleResponsesOutputItemAdded,
+  "response.content_part.added": handleResponsesContentPartAdded,
+  "response.output_text.delta": handleResponsesTextDelta,
+  "response.refusal.delta": handleResponsesTextDelta,
+  "response.function_call_arguments.delta": handleResponsesToolArgumentsDelta,
+  "response.output_item.done": handleResponsesOutputItemDone,
+  "response.completed": (state, push, data) => finishResponsesStream(state, push, isRecord(data.response) ? data.response : undefined),
+  "response.incomplete": (state, push, data) => finishResponsesStream(state, push, isRecord(data.response) ? data.response : undefined),
+  "response.failed": (state, push, data) => handleResponsesFailure(state, push, "response.failed", data),
+  "response.cancelled": (state, push, data) => handleResponsesFailure(state, push, "response.cancelled", data),
+  error: (state, push, data) => handleResponsesFailure(state, push, "error", data),
+  ping: (_state, push) => push(`event: ping\ndata: {"type":"ping"}\n\n`),
+};
+
+/** Handle one parsed Responses SSE event, pushing zero or more Anthropic SSE frames. */
+function processResponsesStreamEvent(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  type: string,
+  data: Record<string, unknown>,
+): void {
+  RESPONSES_STREAM_HANDLERS[type]?.(state, push, data);
+}
+
+/**
+ * Translate an upstream OpenAI Responses SSE byte stream into Anthropic SSE.
+ *
+ * Reuses `src/sse-frames.ts`'s `createSseTransformStream` scaffold (the read loop, decoder/
+ * encoder, error tail and lifecycle) rather than writing a fifth SSE parser — only the frame
+ * policy below is this translator's own, the same division `stripThinkTagsInStream` and
+ * `rewriteToolUseIdsInStream` already keep.
+ */
+function translateResponsesStreamToAnthropic(upstream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  return createSseTransformStream(upstream, ({ push, frames }) => {
+    const state = newResponsesStreamState();
+    return {
+      flushHeld: () => finishResponsesStream(state, push, undefined),
+      processFrames: () => {
+        for (const { frame } of frames) {
+          const ev = parseSseEvent(frame);
+          if (!ev || !ev.data) continue;
+          const type = typeof ev.data.type === "string" ? ev.data.type : ev.type;
+          processResponsesStreamEvent(state, push, type, ev.data);
+        }
+      },
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Wiring: the Responses-wire upstream speaker `fetchOpenAiBackend` dispatches to.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Map the Responses-wire request, POST it, and translate a non-ok status into the same
+ * `openai backend HTTP <n>…` error shape the Chat path returns — split out of
+ * `fetchOpenAiResponsesBackend` purely for that function's cognitive complexity.
+ */
+async function postResponsesRequest(
+  attempt: ResolvedAttempt,
+  args: FetchBackendArgs,
+  reqJson: unknown,
+  invokeFetch: typeof fetch,
+): Promise<{ ok: true; res: Response; toolCallIdsRewritten: number; sentinelsStamped: number } | { ok: false; response: Response }> {
+  const target = attempt.target;
+  let responsesBody: Record<string, unknown>;
+  let toolCallIdsRewritten = 0;
+  let sentinelsStamped = 0;
+  try {
+    responsesBody = anthropicRequestToOpenAiResponses(reqJson, {
+      model: target.model,
+      stream: args.wantsStream,
+      ...(target.toolCallIds !== undefined ? { toolCallIds: target.toolCallIds } : {}),
+      onToolCallIdsRewritten: (n) => { toolCallIdsRewritten = n; },
+      ...(target.thoughtSignature !== undefined ? { thoughtSignature: target.thoughtSignature } : {}),
+      onThoughtSignatureSentinels: (n) => { sentinelsStamped = n; },
+    });
+  } catch (e) {
+    if (e instanceof RequestMappingError) {
+      return { ok: false, response: anthropicError(400, `llm-relay: ${e.message}`, "local") };
+    }
+    return { ok: false, response: anthropicError(502, `request translation failed: ${(e as Error).message}`, "local") };
+  }
+
+  const res = await invokeFetch(target.base + "/responses", {
+    method: "POST",
+    headers: buildTargetHeaders(attempt),
+    body: JSON.stringify(responsesBody),
+    signal: args.signal,
+  });
+
+  if (!res.ok) {
+    let body: string;
+    try {
+      body = await res.text();
+    } catch (cause) {
+      return { ok: false, response: attachPostHeaderBodyFailure(res, cause) };
+    }
+    const hint =
+      res.status === 404
+        ? ` — model "${target.model}" is not served by provider "${target.provider}" (a model can be listed in /models and still 404 here)`
+        : "";
+    return {
+      ok: false,
+      response: anthropicError(res.status, `openai backend HTTP ${res.status}${hint}: ${body.slice(0, 300)}`, "upstream", {
+        ...retryAfterHeader(res.headers),
+      }),
+    };
+  }
+  return { ok: true, res, toolCallIdsRewritten, sentinelsStamped };
+}
+
+/**
+ * The streamed half of `fetchOpenAiResponsesBackend` — mirrors the Chat path's own streamed
+ * branch exactly: preflight, translate, strip think tags, dialect-rescue, mint tool-use ids,
+ * announce. The ONLY difference from Chat is the first two steps (`"openai-responses"` preflight
+ * protocol and `translateResponsesStreamToAnthropic` instead of llm-bridge's
+ * `handleUniversalStreamRequest(…, "openai", "anthropic")`) and the usage tee, which observes
+ * THIS relay's own translated Anthropic-shaped output rather than the raw Responses bytes (see
+ * `applyResponsesUsage`'s header comment for why).
+ */
+async function fetchResponsesStreamed(
+  args: FetchBackendArgs,
+  res: Response,
+  toolCallIdsRewritten: number,
+  sentinelsStamped: number,
+): Promise<Response> {
+  if (!res.body) {
+    return anthropicError(502, "llm-relay: invalid OpenAI upstream envelope: empty stream", "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
+  }
+  const preflight = await preflightResponseStream(res.body, "openai-responses");
+  if (!preflight.ok) {
+    return anthropicError(502, `llm-relay: invalid OpenAI upstream envelope: ${preflight.reason}`, "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
+  }
+  try {
+    const anthStream = translateResponsesStreamToAnthropic(preflight.body);
+    // Tee usage off THIS relay's own translated Anthropic-shaped bytes (protocol
+    // "anthropic-messages", which `usage-observer.ts` already fully supports) rather than the raw
+    // Responses bytes (no `"openai-responses"` `UsageProtocol` member exists, deliberately, per
+    // that module's own header — out of this packet's Scope to widen).
+    const observedStream = args.usage
+      ? observeUsage(new Response(anthStream), "anthropic-messages", args.usage, { streamed: true }).body ?? anthStream
+      : anthStream;
+    const strippedStream = stripThinkTagsInStream(observedStream);
+    const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
+    const refusalSignal = dialectRefusalSignal();
+    const recovered = schemas.size > 0
+      ? recoverDialectInStream(strippedStream, schemas, args.isDestructive, refusalSignal)
+      : strippedStream;
+    const metadata = preflight.metadata;
+    if (toolCallIdsRewritten > 0) metadata.toolCallIdRewrites = toolCallIdsRewritten;
+    if (sentinelsStamped > 0) metadata.thoughtSignatureSentinels = sentinelsStamped;
+    const body = rewriteToolUseIdsInStream(
+      recovered,
+      () => knownToolUseIds(args.reqJson),
+      (count) => { metadata.toolUseIdRewrites = count; },
+    );
+    const streamResponse = attachUpstreamMetadata(
+      new Response(body, {
+        status: res.status,
+        headers: {
+          "content-type": "text/event-stream",
+          ...(toolCallIdsRewritten > 0 ? { [TOOL_CALL_IDS_HEADER]: `${toolCallIdsRewritten} rewritten` } : {}),
+        },
+      }),
+      metadata,
+    );
+    dialectRefusalSignals.set(streamResponse, refusalSignal);
+    return streamResponse;
+  } catch (e) {
+    return anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect");
+  }
+}
+
+/**
+ * The buffered half of `fetchOpenAiResponsesBackend` — mirrors the Chat path's own buffered
+ * branch: parse, validate the envelope, map to Anthropic (with dialect rescue), mint tool-use
+ * ids, announce, and populate `args.usage` directly (see `applyResponsesUsage`).
+ */
+/** `openAiResponsesToAnthropicMessage`, with its three thrown outcomes mapped to a Response. */
+function mapResponsesJsonToAnthropicOrError(
+  upstreamJson: Record<string, unknown>,
+  target: ResolvedAttempt["target"],
+  args: FetchBackendArgs,
+): { ok: true; message: object } | { ok: false; response: Response } {
+  try {
+    const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
+    const message = openAiResponsesToAnthropicMessage(upstreamJson, target.model ?? "", schemas, args.isDestructive);
+    return { ok: true, message };
+  } catch (e) {
+    if (e instanceof DialectUnparseableError) {
+      return { ok: false, response: anthropicError(502, `llm-relay: ${e.message}`, "upstream", {}, "tool_dialect_unparseable") };
+    }
+    if (e instanceof DialectDestructiveError) {
+      return {
+        ok: false,
+        response: anthropicError(
+          502,
+          `llm-relay: ${e.message}`,
+          "local",
+          { [TOOL_DIALECT_HEADER]: "refused-destructive" },
+          DIALECT_REFUSED_DESTRUCTIVE_CODE,
+        ),
+      };
+    }
+    return { ok: false, response: anthropicError(502, `llm-relay: response translation failed: ${(e as Error).message}`, "local", {}, "relay_mapper_defect") };
+  }
+}
+
+async function fetchResponsesBuffered(
+  args: FetchBackendArgs,
+  target: ResolvedAttempt["target"],
+  res: Response,
+  toolCallIdsRewritten: number,
+  sentinelsStamped: number,
+): Promise<Response> {
+  let upstreamJson: unknown;
+  try {
+    upstreamJson = await res.json();
+  } catch (cause) {
+    if (!(cause instanceof SyntaxError)) return attachPostHeaderBodyFailure(res, cause);
+    return anthropicError(502, "llm-relay: invalid OpenAI upstream envelope: body is not valid JSON", "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
+  }
+  const invalidReason = invalidEnvelopeReason(upstreamJson, "openai-responses", false);
+  if (invalidReason) {
+    return anthropicError(502, `llm-relay: invalid OpenAI upstream envelope: ${invalidReason}`, "upstream", {
+      ...retryAfterHeader(res.headers),
+    }, "invalid_upstream_envelope");
+  }
+
+  const mapped = mapResponsesJsonToAnthropicOrError(upstreamJson as Record<string, unknown>, target, args);
+  if (!mapped.ok) return mapped.response;
+  let anthropicJson: object = mapped.message;
+  const mintedIds = mintUniqueToolUseIds(anthropicJson, args.reqJson);
+  if (mintedIds.message) anthropicJson = mintedIds.message;
+  const recoveredDialect = recoveredDialectOf(anthropicJson);
+  if (args.usage) {
+    applyResponsesUsage(args.usage, extractAnthropicUsageFromResponses((upstreamJson as Record<string, unknown>).usage));
+  }
+  const response = new Response(JSON.stringify(anthropicJson), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      ...(recoveredDialect ? { [TOOL_DIALECT_HEADER]: recoveredDialect } : {}),
+      ...(mintedIds.rewritten > 0 ? { [TOOL_USE_IDS_HEADER]: `${mintedIds.rewritten} rewritten` } : {}),
+      ...(toolCallIdsRewritten > 0 ? { [TOOL_CALL_IDS_HEADER]: `${toolCallIdsRewritten} rewritten` } : {}),
+    },
+  });
+  const metadata: UpstreamResponseMetadata = {};
+  captureReportedModel(metadata, upstreamJson, "openai-responses", false);
+  if (mintedIds.rewritten > 0) metadata.toolUseIdRewrites = mintedIds.rewritten;
+  if (toolCallIdsRewritten > 0) metadata.toolCallIdRewrites = toolCallIdsRewritten;
+  if (sentinelsStamped > 0) metadata.thoughtSignatureSentinels = sentinelsStamped;
+  return attachUpstreamMetadata(response, metadata);
+}
+
+/**
+ * The `wire: "responses"` upstream speaker `fetchOpenAiBackend` dispatches to. Documents are
+ * transcoded exactly as the Chat path does (a `document` block has no Responses representation
+ * either); everything else forks into `postResponsesRequest` + `fetchResponsesStreamed` /
+ * `fetchResponsesBuffered`, above.
+ */
+async function fetchOpenAiResponsesBackend(
+  attempt: ResolvedAttempt,
+  args: FetchBackendArgs,
+  invokeFetch: typeof fetch,
+): Promise<Response> {
+  let reqJson = args.reqJson;
+  try {
+    reqJson = await transcodeDocuments(reqJson);
+  } catch (e) {
+    if (e instanceof DocumentError) return anthropicError(400, `llm-relay: ${e.message}`, "local");
+    return anthropicError(502, `document conversion failed: ${(e as Error).message}`, "local");
+  }
+
+  const posted = await postResponsesRequest(attempt, args, reqJson, invokeFetch);
+  if (!posted.ok) return posted.response;
+
+  if (args.wantsStream) {
+    return fetchResponsesStreamed(args, posted.res, posted.toolCallIdsRewritten, posted.sentinelsStamped);
+  }
+  return fetchResponsesBuffered(args, attempt.target, posted.res, posted.toolCallIdsRewritten, posted.sentinelsStamped);
 }
 
 /**
@@ -1618,7 +2760,12 @@ export async function fetchOpenAiFront(
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
   const protocol = args.protocol ?? "chat";
-  if (attempt.target.kind === "openai" && protocol === "chat") {
+  // The direct byte-transparent Chat passthrough is only valid when the TARGET actually speaks
+  // Chat Completions upstream. A `wire: "responses"` target never does (that is the whole reason
+  // the field exists), so a Chat-front request to one must still go through the translated path —
+  // front -> Anthropic -> `fetchBackend` -> `fetchOpenAiBackend`'s `wire` dispatch -> `/responses`
+  // — never a raw `/chat/completions` POST the upstream would 500 on.
+  if (attempt.target.kind === "openai" && protocol === "chat" && attempt.target.wire !== "responses") {
     const invokeFetch = oneShotFetch(fetchFn, args.signal, args.onEgress);
     return fetchDirectOpenAiChat(attempt, args, invokeFetch);
   }

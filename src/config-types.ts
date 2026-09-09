@@ -117,6 +117,23 @@ export interface ProviderCompatConfig {
   thoughtSignature?: ThoughtSignatureMode;
 }
 
+/**
+ * Which HTTP endpoint an `openai`-kind provider speaks upstream: `"chat"` (`/chat/completions`,
+ * the default) or `"responses"` (`/responses`).
+ *
+ * OpenCode Zen's contributor SKUs — Muse Spark 1.3 included — answer HTTP 500 on
+ * `/chat/completions` and on Zen's Anthropic-shaped `/messages`, and 200 only on `/responses`
+ * (measured 2026-09-04, `docs/muse-spark-1.3-opencode-zen-2026-09-04.md` rows 3 and 6-8). A third
+ * `Kind` value for this would touch roughly 55 `kind === "openai"` sites across 19 files (same
+ * doc, §3 route B); this narrower option forks only the request/response builders `src/backend.ts`
+ * selects on, leaving discovery, catalog and key-check paths unchanged. Declaring it on an
+ * `anthropic`-kind provider is a hard config-load error — that kind never speaks either OpenAI
+ * endpoint.
+ */
+export const PROVIDER_WIRE_MODES = ["chat", "responses"] as const;
+/** Derived from `PROVIDER_WIRE_MODES` — one list, never a hand-copied second declaration. */
+export type ProviderWireMode = (typeof PROVIDER_WIRE_MODES)[number];
+
 /** The closed set of axes an operator may assert: requests/tokens per minute/day. Nothing else. */
 export const CONFIGURED_LIMIT_AXES = ["rpm", "rpd", "tpm", "tpd"] as const;
 
@@ -228,6 +245,12 @@ export interface ProviderConfig {
    * explicit value always wins.
    */
   compat?: ProviderCompatConfig;
+  /**
+   * Which upstream endpoint an `openai`-kind provider speaks. Absent ⇒ `"chat"`. Hard config-load
+   * error on an `anthropic`-kind provider, and on any value outside `ProviderWireMode`. See
+   * `ProviderWireMode`.
+   */
+  wire?: ProviderWireMode;
   /** Web URL where users can sign up or obtain API keys. */
   signupUrl?: string;
 }
@@ -572,6 +595,13 @@ export interface ResolvedTarget {
    * from. Absent (a hand-built target) reads as `"none"` — the pre-2026-08-23 bytes exactly.
    */
   thoughtSignature?: ThoughtSignatureMode;
+  /**
+   * RESOLVED wire mode (`ProviderConfig.wire`, absent ⇒ `"chat"`) — carried onto the target at
+   * resolution time, exactly like `toolCallIds`/`thoughtSignature`, so `src/backend.ts` is handed
+   * a mode and never re-derives one from provider identity. Absent (a hand-built target) reads as
+   * `"chat"`, the pre-2026-09-09 behaviour byte for byte.
+   */
+  wire?: ProviderWireMode;
 }
 
 export interface Config {

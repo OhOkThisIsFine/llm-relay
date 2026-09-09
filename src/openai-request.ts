@@ -221,8 +221,11 @@ export class ToolCallIds {
  * report that a parallel pair rejects it — against this endpoint and model, on that date, it did
  * not). Stamping every entry is also the only placement whose correctness does not depend on which
  * entry the validator happens to inspect.
+ *
+ * Exported so the Responses-wire request mapper (`src/backend.ts`, `anthropicRequestToOpenAiResponses`)
+ * can share it rather than hand-copy the stamping logic — the same reuse `ToolCallIds` already gets.
  */
-class ThoughtSignatures {
+export class ThoughtSignatures {
   private stamped = 0;
 
   stamp(call: Rec): Rec {

@@ -61,9 +61,15 @@ export function captureReportedModel(
   streamed: boolean,
 ): void {
   if (metadata.reportedModel !== undefined || !isRecord(value)) return;
+  // Anthropic's streamed model lives one level down, inside `message_start.message`; Responses'
+  // lives one level down too, inside EVERY event's `.response` (created/in_progress/completed/…) —
+  // both nestings are read here rather than added as a third branch to `invalidEnvelopeReason`,
+  // because a miss here only means "model not captured yet", not a wrong structural verdict.
   const envelope = protocol === "anthropic-messages" && streamed && value.type === "message_start"
     ? value.message
-    : value;
+    : protocol === "openai-responses" && streamed && isRecord(value.response)
+      ? value.response
+      : value;
   if (isRecord(envelope) && typeof envelope.model === "string") {
     metadata.reportedModel = envelope.model;
   }

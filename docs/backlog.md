@@ -108,24 +108,17 @@
   now is (live p80: 165 s, 224 s, 1383 s; chosen because p90/p95 saturate at the slowest lane's own
   timeout).
 
-- **Muse Spark 1.3 — and every Responses-only OpenCode Zen SKU — is unreachable through the
-  relay, because no upstream speaks the OpenAI Responses API.** Zen serves the contributor SKUs
-  on `/zen/v1/responses` only (measured 2026-09-04,
-  [`muse-spark-1.3-opencode-zen-2026-09-04.md`](muse-spark-1.3-opencode-zen-2026-09-04.md));
-  `Kind` in `src/config-types.ts` is `"anthropic" | "openai"`, and `src/backend.ts` speaks only
-  `/chat/completions` and `/v1/messages` upstream; `src/responses-request.ts` is the Codex FRONT
-  direction. Owner decision 2026-09-04 (option A): contributor SKUs may be routed automatically,
-  so this is engineering only. Route A (the four `opencode-muse-spark` OpenCode-CLI rungs) is
-  live; this entry is route B. After route B lands, pin both contributor ids as `preferred` in
-  the effort pools (no tier-data row, so no automatic admission).
-  **Property:** a provider whose models are served only on `/v1/responses` is addressable as
-  `provider/model` on both fronts with tools, streaming and usage (`reasoning_tokens`,
-  `cached_tokens`) intact. Prefer a `wire: "responses"` option on `kind: "openai"` over a third
-  `Kind` — the latter touches about 55 `kind ===` sites in 19 files. Rows 10–13 of the doc are the
-  request, response and stream shapes to speak; the doc's §3 route B lists the field mapping.
-
-  Once route B lands the property gains: `opencode/muse-spark-1.3-contributor-free` answers a real
-  request through `pool/*` on both fronts.
+- **Route B is built; prove it live on this machine once the daemon runs the release that
+  carries it** (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider,
+  `src/backend.ts`; the code half of the 2026-09-04 entry is met, tests in
+  `test/backend-responses-upstream.test.ts`). The logon-started daemon keeps its old binary until
+  the owner's next restart, so the live half waits. **Property (what remains):** the operator's
+  `~/.llm-relay/config.json` declares `wire: "responses"` on the `opencode` provider and pins
+  `opencode/muse-spark-1.3-contributor-free` as `preferred` in the effort pools (with price-suffix
+  resolution landed, the pool may also admit it on its own — check `llm-relay pools`); then one
+  real request through `pool/medium` on each front is served by that deployment, with a tool
+  call and streaming, and `llm-relay cost` shows its `cached_tokens`. Recorded with the served-by
+  header and the date.
 
 - **A zero-priced deployment with no exact tier-data row can never enter any effort pool, and a
   `-free` / `-contributor-free` suffix defeats the match against its base SKU's row.**

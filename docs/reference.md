@@ -535,6 +535,37 @@ deliberate asymmetry as tool-use-id minting, and for the same reason: responsibi
 authorship. An OpenAI-native client wrote its own ids and sees mistral's 400 verbatim, which is
 its own to fix; on a translated lane the client cannot fix what the relay wrote.
 
+### Which upstream endpoint a provider speaks (`wire`)
+
+Most `openai`-kind providers speak Chat Completions (`/chat/completions`). A few serve their
+models on the OpenAI Responses API (`/responses`) only — OpenCode Zen's contributor SKUs (Meta
+Muse Spark 1.3 included) answer HTTP 500 on `/chat/completions` and on Zen's Anthropic-shaped
+`/messages`, and 200 only on `/responses`. `wire` names which one a provider speaks:
+
+```jsonc
+"providers": {
+  "opencode": { "base": "https://opencode.ai/zen/v1", "kind": "openai",
+                "wire": "responses" }
+}
+```
+
+- **`wire`: `"chat"` (default) | `"responses"`.** Absent means Chat Completions — the pre-existing
+  behaviour, byte for byte. `"responses"` posts to `/responses` instead, using the OpenAI Responses
+  request/response/stream shapes; the relay still translates everything to and from Anthropic
+  Messages internally, so tool calls, streaming, usage (including cached and reasoning token
+  figures), the destructive-tool refusal, and the `compat` quirks above all keep working
+  identically to a Chat-wire provider. A `wire: "responses"` target is reachable as an ordinary
+  `provider/model` spec on **both** fronts (`/v1/messages` and the OpenAI front, streamed or not);
+  the OpenAI front's direct Chat passthrough is skipped for it, since the upstream cannot answer
+  that shape.
+- **`wire` on an `anthropic`-kind provider is a hard startup error** naming the provider — that
+  kind never speaks either OpenAI endpoint, so the field could only ever misdescribe it. An unknown
+  `wire` value is a hard startup error too, the same `compat`/`limits` precedent: an ignored typo
+  would read as a declaration that took effect while the wire stayed unchanged.
+- A third `Kind` value was considered and rejected: it would have touched roughly 55
+  `kind === "openai"` call sites across 19 files, where `wire` forks only the request/response
+  builders and leaves discovery, catalog and key-check paths untouched.
+
 ### Pools — static and dynamic
 
 A pool is either a static array of specs, or a dynamic free pool:
