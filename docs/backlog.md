@@ -9,6 +9,48 @@
 
 ## Open
 
+- **A NON-STREAMED request has no time-to-first-byte protection, so a slow QUEUE reads as a dead
+  backend (2026-09-09, DeepSeek provider survey, medium).** `beginAttemptRun` in
+  `src/candidate-runner.ts` arms one flat `target.timeoutMs` deadline for the whole request.
+  `routes/messages.ts` and `routes/openai-front.ts` then clear that timer and install
+  `withStallWatchdog` — but only `if (streamed && backendRes.status < 400 && stallMs > 0)`. The
+  doc comment on `stallTimeoutMs` in `src/config-types.ts` states the intent plainly: "one flat
+  deadline kills a healthy long generation at minute two while letting a dead stream hang until
+  the same minute two". **That reasoning applies to a non-streamed request too, and a non-streamed
+  request gets none of the protection.** It keeps the flat deadline for its whole life, including
+  the queue wait before the backend emits anything.
+  Measured against `nim` at `timeoutMs: 100000`: `deepseek-ai/deepseek-v4-flash-0731` returned 504
+  at 100.03 s and again at 100.04 s, while `deepseek-ai/deepseek-v4-pro-0813` answered 200 in
+  81.6 s for TWO output tokens, and `relay-restart.log` holds the same Flash model answering 200
+  in 38.1 s on 2026-08-27. The model was never unservable; the free NIM queue simply exceeded the
+  deadline. A 504 does not write a `not-servable` fact, so nothing is poisoned — but an operator
+  reading the 504 concludes the model is gone, which is what happened here.
+  Raising `timeoutMs` is the wrong lever alone: it lengthens the wait for a genuinely dead
+  backend by exactly as much.
+  **Property:** a non-streamed attempt separates a time-to-first-byte deadline from the total
+  deadline, so a backend that has produced no bytes fails fast while one that is merely slow to
+  finish is not killed; the existing streamed path keeps its current behaviour.
+
+- **A config change needs a full daemon restart, and the shape of the server makes that avoidable
+  (2026-09-09, DeepSeek provider survey, low).** `runProxy` calls `loadOrExit()` once and captures
+  `cfg` in the `createServer` closure; every request then receives it as `handle(req, res, cfg,
+  …)`. So the per-request read is already indirect — swapping one binding would move every
+  SUBSEQUENT request onto a new config while in-flight requests keep the one they started with.
+  `loadConfigSafely()` in `src/cli.ts` is already the exact primitive (it returns `null` instead
+  of exiting on an unreadable file), and today only the dispatch CLI path calls it.
+  ⚠ **The work is not the swap; it is deciding which startup-built objects must be rebuilt.**
+  `catalog`, `pingLoop`, `breaker`, `credentialLru`, `dashboardAuth`, `dashboardStatic` and the
+  validator are all constructed once from `cfg`. A naive assignment leaves them keyed to the old
+  providers. The listen address cannot change at all without rebinding.
+  ⚠ **A reload can never pick up a new OS environment variable.** A running process holds the
+  environment block it was given. `~/.llm-relay/.env` and the DPAPI keystore ARE files, so a
+  reload does cover a new credential written to either of those.
+  Measured on 2026-09-09: raising `providers.nim.timeoutMs` from 100000 to 300000 had no effect
+  until the daemon was restarted — a probe after the edit still aborted at exactly 100.04 s.
+  **Property:** an operator edit to `~/.llm-relay/config.json` takes effect on the next request
+  without a restart, or the relay states clearly that it will not; a malformed edit leaves the
+  running config untouched and logs the parse failure.
+
 - **The logon-started daemon is stopped by `TerminateProcess`, so no shutdown flush ever runs on
   this machine (2026-09-08, breaker-persistence lap, low).** Every write-behind store now flushes
   at a graceful shutdown (`flushBreakerPersistence` and its three siblings beside the six older
