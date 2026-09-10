@@ -3,7 +3,7 @@ import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, type Config } from "../src/config.js";
-import { buildDispatch, type DispatchOptions } from "../src/dispatch.js";
+import { buildDispatch, resolveLaneLauncherPath, type DispatchOptions } from "../src/dispatch.js";
 import { detectHostRouting, parseHostRoutingState } from "../src/host-routing.js";
 import { getPositionalArgs } from "../src/cli.js";
 
@@ -497,5 +497,128 @@ describe("routing.cliLane validation", () => {
 
   it("accepts absence — no template simply means no transposition is possible", () => {
     expect(cfgWith({ ladder: LADDER }).routing.cliLane).toBeUndefined();
+  });
+});
+
+/**
+ * docs/agy-popup-fix-2026-09-07.md closed the console-popup gap for hand-authored `cli` ladder
+ * rungs (agy, opencode) — every one of them wraps its own `command`/`args` with
+ * `pwsh -File lane-launch.ps1` IN CONFIG. `routing.cliLane` is a SEPARATE template this module
+ * synthesizes at "transposing relay rungs for a bypassed host" above, with no per-rung config entry
+ * an operator would think to wrap the same way — so it never was, and inherits the exact
+ * `execFile(..., { windowsHide: true })`-is-insufficient-for-descendants gap that document measured
+ * (see `wrapForWindowsConsoleSafety`'s doc comment in dispatch.ts). These pin the fix: applied once,
+ * uniformly, to whatever `toLane` renders — a transposition OR a ladder rung an operator forgot to
+ * wrap by hand — and inert unless a caller explicitly resolves and passes a launcher path.
+ */
+describe("windowless-console launcher wrap (docs/agy-popup-fix-2026-09-07.md)", () => {
+  const FAKE_LAUNCHER = "C:\\fake-home\\.llm-relay\\bin\\lane-launch.ps1";
+  const EXPECTED_PREAMBLE = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", FAKE_LAUNCHER];
+
+  const laneOn = (
+    c: Config,
+    id: string,
+    opts: DispatchOptions,
+    launcherPath: string | null,
+    platform: NodeJS.Platform = "win32",
+  ) => buildDispatch(c, opts, platform, launcherPath).ladder.find((l) => l.id === id)!;
+
+  describe("resolveLaneLauncherPath", () => {
+    it("is null off Windows, whatever exists() would say", () => {
+      expect(resolveLaneLauncherPath("linux", () => true)).toBeNull();
+      expect(resolveLaneLauncherPath("darwin", () => true)).toBeNull();
+    });
+
+    it("is null on win32 when nothing is installed — the ordinary case on a fresh machine", () => {
+      expect(resolveLaneLauncherPath("win32", () => false)).toBeNull();
+    });
+
+    it("returns the resolved config-kind path on win32 once exists() confirms it", () => {
+      let asked: string | undefined;
+      const path = resolveLaneLauncherPath("win32", (p) => {
+        asked = p;
+        return true;
+      });
+      expect(path).toBe(asked);
+      expect(path).toMatch(/lane-launch\.ps1$/);
+    });
+  });
+
+  it("wraps a routing.cliLane TRANSPOSITION — the gap this fix closes", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE });
+    const l = laneOn(c, "pools", { host: "bypassed", task: "audit src/" }, FAKE_LAUNCHER);
+    expect(l.invoke?.command).toBe("pwsh");
+    expect(l.invoke?.args?.slice(0, 5)).toEqual(EXPECTED_PREAMBLE);
+    // The ORIGINAL transposed command and args survive byte-for-byte, appended after the launcher.
+    expect(l.invoke?.args?.slice(5)).toEqual(["claude", "-p", "--model", "pool/coding", "audit src/"]);
+    // The wrap touches command/args only — env still reaches the launcher's own process, which a
+    // real child inherits from (see the doc comment on wrapForWindowsConsoleSafety).
+    expect(l.invoke?.env).toEqual(CLI_LANE.env);
+  });
+
+  it("wraps an UNWRAPPED cli-kind ladder rung the same way — not just transpositions", () => {
+    const c = cfgWith({ ladder: LADDER });
+    const l = laneOn(c, "codex", {}, FAKE_LAUNCHER);
+    expect(l.invoke?.command).toBe("pwsh");
+    expect(l.invoke?.args?.slice(0, 5)).toEqual(EXPECTED_PREAMBLE);
+    expect(l.invoke?.args?.slice(5)).toEqual(["codex", "exec", "{task}"]);
+  });
+
+  it("does NOT double-wrap a rung that already invokes lane-launch.ps1 itself", () => {
+    const already = {
+      id: "agyish",
+      kind: "cli" as const,
+      command: "pwsh",
+      args: [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "C:\\real\\lane-launch.ps1",
+        "--timeout",
+        "2100",
+        "agy.exe",
+        "-p",
+        "{task}",
+      ],
+    };
+    const c = cfgWith({ ladder: [already] });
+    const l = laneOn(c, "agyish", {}, FAKE_LAUNCHER);
+    // Untouched — nesting one windowless-console session inside another buys nothing.
+    expect(l.invoke?.command).toBe("pwsh");
+    expect(l.invoke?.args).toEqual(already.args);
+  });
+
+  it("recognises powershell.exe / -File case-insensitively too, so it still declines to double-wrap", () => {
+    const already = {
+      id: "already2",
+      kind: "cli" as const,
+      command: "POWERSHELL.EXE",
+      args: ["/File", "C:\\Other\\LANE-LAUNCH.PS1", "real.exe", "{task}"],
+    };
+    const c = cfgWith({ ladder: [already] });
+    const l = laneOn(c, "already2", {}, FAKE_LAUNCHER);
+    expect(l.invoke?.args).toEqual(already.args);
+  });
+
+  it("leaves an invocation untouched off Windows, even with a launcher path resolved", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE });
+    const l = laneOn(c, "pools", { host: "bypassed", task: "x" }, FAKE_LAUNCHER, "linux");
+    expect(l.invoke?.command).toBe("claude");
+  });
+
+  it("leaves every invocation untouched when no launcher path is resolved — the default for every existing caller", () => {
+    const c = cfgWith({ ladder: LADDER, cliLane: CLI_LANE });
+    const bypassedTransposed = laneOn(c, "pools", { host: "bypassed", task: "x" }, null);
+    expect(bypassedTransposed.invoke?.command).toBe("claude");
+    const cliRung = laneOn(c, "codex", {}, null);
+    expect(cliRung.invoke?.command).toBe("codex");
+  });
+
+  it("a rung with no invoke at all (unreachable, no cliLane) is untouched — nothing to wrap", () => {
+    const c = cfgWith({ ladder: LADDER });
+    const l = laneOn(c, "pools", { host: "bypassed", entrypoint: "claude-desktop" }, FAKE_LAUNCHER);
+    expect(l.invoke).toBeUndefined();
+    expect(l.unreachable).toBeDefined();
   });
 });

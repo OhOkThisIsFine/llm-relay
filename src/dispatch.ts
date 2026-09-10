@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX } from "./config.js";
 import type { Config, LadderRung } from "./config-types.js";
 import type { HostRoutingState } from "./host-routing.js";
@@ -5,6 +6,7 @@ import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
 import { allLaneStats, laneStatsFor, medianWallClockMs, p95WallClockMs, quantileWallClockMs } from "./dispatch-lane-stats.js";
 import { laneDemotion, lanePin, type LaneAffinityRow } from "./lane-affinity.js";
+import { relayStatePath } from "./state-paths.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -741,6 +743,87 @@ export function normalizeCliCommand(command: string, platform: NodeJS.Platform =
 }
 
 /**
+ * Where the windowless-console launcher lives, if the operator has installed one.
+ *
+ * Not shipped by this package or by any of its installers (verified: no `lane-launch.ps1` exists
+ * anywhere under this repository) — it is a hand-maintained artifact documented in CLAUDE.md's AGY
+ * lane notes and `docs/agy-popup-fix-2026-09-07.md`. So absence is the ORDINARY case on a fresh
+ * machine and on every non-Windows host, not a misconfiguration to warn about. Resolved through the
+ * same config-kind XDG base every other operator-authored artifact under this directory uses
+ * (`state-paths.ts`), so an XDG override on the config side moves this alongside `config.json`
+ * itself — matching where every hand-authored `cli` ladder rung already points its own `-File`
+ * argument. (`state-paths.ts` stays the one module naming the XDG variables directly, per
+ * `test/state-paths.test.ts` — this reaches them only through `relayStatePath`.)
+ *
+ * Deliberately the ONE impure seam in this module (the `buildDispatch`/`platform` precedent): every
+ * function below it stays pure over a caller-resolved `launcherPath: string | null`. ⚠ Guarded like
+ * `winenv.ts`/`os-keyring.ts`/`lane-runner.ts`'s default spawner: under vitest, a caller that omits
+ * `exists` gets `null` unconditionally rather than the real filesystem — a suite must never depend
+ * on whether THIS machine happens to have the launcher installed (it does), which is exactly what
+ * broke `routes/admin.ts` and `cli.ts`'s own call sites (neither injects a seam) before this guard
+ * existed. A test that wants the real check injects `exists` itself, same as every seam above it.
+ */
+export function resolveLaneLauncherPath(
+  platform: NodeJS.Platform = process.platform,
+  exists?: (path: string) => boolean,
+): string | null {
+  if (platform !== "win32") return null;
+  if (exists === undefined && process.env["VITEST"]) return null;
+  const path = relayStatePath("config", ["bin", "lane-launch.ps1"]);
+  return (exists ?? existsSync)(path) ? path : null;
+}
+
+/**
+ * Does this invocation already run through the windowless-console launcher? A config that has
+ * already adopted the convention by hand — every ladder `cli` rung addressing agy/opencode does —
+ * must not be wrapped a second time, which would nest one windowless console session inside another
+ * for no benefit and double the `-File` indirection in every rendered command.
+ */
+function isAlreadyLaneLaunched(command: string, args: readonly string[]): boolean {
+  if (!/^(pwsh|powershell)(\.exe)?$/i.test(command)) return false;
+  const fileIdx = args.findIndex((a) => a === "-File" || a === "/File");
+  if (fileIdx === -1) return false;
+  const target = args[fileIdx + 1];
+  if (!target) return false;
+  const basename = target.split(/[\\/]/).pop() ?? "";
+  return /^lane-launch\.ps1$/i.test(basename);
+}
+
+/**
+ * Wrap a lane invocation through the windowless-console launcher, so the console-subsystem process
+ * this relay spawns — and every descendant IT spawns after it starts — cannot allocate a visible
+ * console and steal the desktop's foreground the way `docs/agy-popup-fix-2026-09-07.md` measured.
+ *
+ * ⚠ The `execFile` call in `mcp/lane-runner.ts` — `windowsHide: true` — covers only the IMMEDIATE child;
+ * that document's own finding is that a console-subsystem descendant spawned later — a detached
+ * updater probe, an IDE-detection helper, a nested nested MCP client — is unaffected by a flag the
+ * relay set on a process two generations up, and allocates its own new, VISIBLE console. That is
+ * exactly the shape `routing.cliLane`'s transposition left open: every hand-authored `cli` ladder
+ * rung already wraps itself with `pwsh -File lane-launch.ps1` in its own configured `command`/`args`,
+ * but the SEPARATE `routing.cliLane` template — the fallback this module itself synthesizes when a
+ * relay-kind rung must be reached by shelling out (see `transposeToCli`) — has no per-rung config
+ * entry an operator would think to wrap the same way, so it never was. Applying the wrap HERE, once,
+ * to whatever `toLane` ends up with covers both shapes uniformly: a ladder rung a future config adds
+ * without remembering the convention, and every `routing.cliLane` transposition alike.
+ *
+ * `launcherPath` is null on every non-Windows host and on a Windows host with nothing installed
+ * (`resolveLaneLauncherPath`), in which case this returns `invoke` UNCHANGED — byte-identical to
+ * this fix's absence, so an operator who has not installed the launcher sees no behaviour change.
+ */
+function wrapForWindowsConsoleSafety(
+  invoke: { command: string; args: string[] },
+  launcherPath: string | null,
+  platform: NodeJS.Platform,
+): { command: string; args: string[] } {
+  if (platform !== "win32" || launcherPath === null) return invoke;
+  if (isAlreadyLaneLaunched(invoke.command, invoke.args)) return invoke;
+  return {
+    command: "pwsh",
+    args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcherPath, invoke.command, ...invoke.args],
+  };
+}
+
+/**
  * Normalize the caller's options. `DispatchOptions` is typed, but nothing type-checks the values
  * that actually arrive: they come off a raw query string (`GET /dispatch?task=…&lane=…`) or a
  * JSON body, so at runtime any field can be a number, an array, an object or null. TypeScript
@@ -904,6 +987,7 @@ function toLane(
   platform: NodeJS.Platform,
   host: HostRoutingState | undefined,
   entrypoint: string | undefined,
+  launcherPath: string | null,
 ): DispatchLane {
   const until = cooldownUntil(cfg, rung, now);
   const state: LaneState = !rung.enabled ? "disabled" : until !== null ? "exhausted" : "ready";
@@ -978,6 +1062,14 @@ function toLane(
           `configure routing.cliLane to reach it by shelling out`;
       }
     }
+  }
+  // Applied LAST, to whatever `lane.invoke` ended up as above — a ladder `cli` rung's own command,
+  // or a `routing.cliLane` transposition — so one wrap step covers both shapes uniformly rather than
+  // each branch needing to remember it. A rung the not-servable check above already deleted `invoke`
+  // from has nothing to wrap.
+  if (lane.invoke) {
+    const wrapped = wrapForWindowsConsoleSafety(lane.invoke, launcherPath, platform);
+    lane.invoke = { ...lane.invoke, command: wrapped.command, args: wrapped.args };
   }
   return lane;
 }
@@ -1054,6 +1146,13 @@ export function buildDispatch(
   cfg: Config,
   rawOpts: DispatchOptions = {},
   platform: NodeJS.Platform = process.platform,
+  // ⚠ Defaults to `null` — OFF — rather than auto-resolving via `resolveLaneLauncherPath(platform)`.
+  // This keeps `buildDispatch` byte-identical for every existing caller and every existing test: a
+  // default that read the real filesystem would change the rendered `invoke` for every test on a
+  // machine that happens to have the launcher installed (this one does), including tests that pass
+  // `platform: "win32"` to exercise unrelated Windows-only behaviour. A real caller opts in
+  // explicitly by resolving the path itself and passing it — see `cli.ts` and `routes/admin.ts`.
+  launcherPath: string | null = null,
 ): DispatchView {
   const opts = normalizeOptions(rawOpts ?? {});
   const client = opts.client ?? "default";
@@ -1064,7 +1163,9 @@ export function buildDispatch(
   // ⚠ `opts.host`, NOT the `host` above. `host` collapses an ABSENT verdict into "unknown" for
   // the rendered view, and the lane builder must tell those two apart: an absent verdict keeps
   // the pre-existing subagent path, a STATED "unknown" has no subagent mechanism to keep.
-  const ladder = rungs.map((r, i) => toLane(r, i + 1, cfg, opts, now, client, platform, opts.host, opts.entrypoint));
+  const ladder = rungs.map((r, i) =>
+    toLane(r, i + 1, cfg, opts, now, client, platform, opts.host, opts.entrypoint, launcherPath),
+  );
   // Advisory lane-execution stats, filled for every rung that ran under this config and omitted
   // otherwise. This mutates only the `stats` column: `state`, `next` and the ladder order were
   // decided above from cooldowns and availability, and nothing here revisits them.

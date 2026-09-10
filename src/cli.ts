@@ -27,7 +27,7 @@ import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
-import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, formatAttemptBudget, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, allLadderRungs, normalizeCliCommand, resolveLaneLauncherPath, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, formatAttemptBudget, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { flushLaneAffinityPersistence, loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
 import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsRows } from "./dispatch-lane-stats.js";
 import { McpDispatchServer } from "./mcp/server.js";
@@ -2667,7 +2667,7 @@ export async function resolveDispatchView(opts: {
       host: "bypassed",
       publishedContextWindow: cachedContextWindow,
       manifest: loadLaneManifest(),
-    }),
+    }, process.platform, resolveLaneLauncherPath()),
   );
   return substituteTaskInView({ ...fallbackView, source: "local-fallback" }, opts.task);
 }
@@ -2844,7 +2844,7 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
         ...(hostRouting.entrypoint ? { entrypoint: hostRouting.entrypoint } : {}),
         publishedContextWindow: cachedContextWindow,
         manifest: loadLaneManifest(),
-      }),
+      }, process.platform, resolveLaneLauncherPath()),
   );
   const view = substituteTaskInView(rawView, task);
 
