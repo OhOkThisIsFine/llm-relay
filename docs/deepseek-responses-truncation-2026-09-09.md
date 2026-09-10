@@ -143,6 +143,46 @@ conversation back onto an OpenAI Chat request. DeepSeek's own API requires the p
 it (by design, per that row — there is no Anthropic-side representation to carry it in), so
 DeepSeek rejects the second real multi-turn request outright.
 
+
+## Aggregate over all 68 captures (added 2026-09-10, after an independent audit)
+
+⚠ **This section exists because the figure it states was cited in four places and lived in none.**
+The commit that shipped the fix (`6a17905`), the `responses-request.ts` row of `CLAUDE.md`,
+`HANDOFF.md` §0 and the lap closeout all quoted "20 of 68 answers ended at exactly 1024, and all
+44 `response.completed` events said `completed`" — and an independent auditor, reading only this
+document, correctly reported that no such tally appeared anywhere in it and that this document's
+own headline verdict is the opposite ("could not reproduce"). Both things were true at once: the
+CUT STRING was never reproduced, and the aggregate was real but unwritten. It is written now, and
+it is re-derivable by anyone with the captures.
+
+Re-derived mechanically from `captures/upstream-*.sse` and `captures/emitted-*.sse` — no prose was
+read to produce these numbers:
+
+| Figure | Count |
+|---|---|
+| upstream captures | 68 |
+| upstream captures carrying a `usage` block | 64 |
+| upstream answers ending `finish_reason: "length"` | **20** |
+| …of those, ending at exactly `completion_tokens: 1024` | **19** |
+| …the one exception, `upstream-2.sse` | `completion_tokens: 1` (a one-token probe, not the cap) |
+| emitted captures | 69 |
+| emitted `response.completed` events | **44** |
+| …of those, carrying `incomplete_details` | **0** |
+| emitted `response.incomplete` events | **0** |
+
+The nineteen capped answers are `upstream-3,4,5,6,7,9,10,11,12,13,14,15,16,23,24,62,63,64,65`.
+
+**What the aggregate does and does not establish.** It establishes the MECHANISM the fix in
+`6a17905` addresses: the relay substituted a `max_tokens` nobody asked for, roughly a quarter of
+the upstream answers hit it, and the relay then announced every single completion as `completed`
+with no `incomplete_details` — so a caller had no way to learn that an answer was cut. It does NOT
+establish that this is what killed the five Codex runs; the truncated tool-call argument was never
+reproduced in three read-only runs, exactly as §1 of this document says. Read the fix as a
+response to a demonstrated announcement defect, not as a reproduction of the death.
+
+⚠ Two corrections to the wording that was in circulation, both from this re-derivation: it is
+**19** of 68 at exactly 1024 (20 ended `length`, one of them at one token), and 44 is the count of
+`response.completed` events across the emitted captures, not of upstream answers.
 ## Why the target bug never showed up: three ancillary findings
 
 None of these is the backlog's cut-string bug (that bug is about a tool call's `arguments`

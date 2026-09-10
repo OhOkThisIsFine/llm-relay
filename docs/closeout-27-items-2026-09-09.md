@@ -1,16 +1,17 @@
 # Closeout — C:/Code/llm-relay
 
-Rendered 2026-09-10T06:24:30.848Z by ~/.agent-config/render-closeout.mjs.
+Rendered 2026-09-10T06:37:00.733Z by ~/.agent-config/render-closeout.mjs.
 Verification below is rendered from commands, arguments, and the verify-green ledger.
 
 ## Identity
 
 - Branch: `main`
-- HEAD: `4436225d554820ab06934a8e38678f9318c75117`
+- HEAD: `48db4bc1abc83535b86ab3890edb52e7e2b6b68d`
 - Sprint start: `3abbafd`
 
 ## Commits in the sprint range
 
+- 48db4bc docs: the 27-items lap closeout, and `llm-relay stop` proven on the daemon that carries it
 - 4436225 docs: record the closeout — the daemon on v0.78.0, and route B measured to the vendor
 - 497a99d docs(agents): regenerate the shared region after this lap's CLAUDE.md growth
 - b534b6a chore: release v0.78.0
@@ -48,26 +49,27 @@ Verification below is rendered from commands, arguments, and the verify-green le
 
 - Working tree: NOT clean — FAIL
 ```
-M HANDOFF.md
-?? docs/closeout-27-items-2026-09-09.md
+M CLAUDE.md
+ M HANDOFF.md
+ M docs/deepseek-responses-truncation-2026-09-09.md
 ```
 - `origin/main` equals HEAD — PASS
 
 ## verify-green ledger
 
-- Ledger: `npm run gate` recorded 2026-09-10T06:14:00.339Z on tree `99ec765c8279`
+- Ledger: `npm run gate` recorded 2026-09-10T06:25:53.426Z on tree `7619d0ba14d7`
 - `verify-green check` FAILED: verify-green: FAIL
-content changed AFTER the recorded passing run (2026-09-10T06:14:00.339Z).
+content changed AFTER the recorded passing run (2026-09-10T06:25:53.426Z).
 Files changed since that run:
+M	CLAUDE.md
 M	HANDOFF.md
-M	docs/backlog.md
-M	docs/closeout-27-items-2026-09-09.md
+M	docs/deepseek-responses-truncation-2026-09-09.md
 Re-run the suite through `record` before claiming green. — FAIL
 
 ## CI for exact HEAD
 
-- CI: completed/success (run 34444677345) — PASS
-  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34444677345
+- CI: completed/success (run 34445099806) — PASS
+  https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34445099806
 
 ## Operator-provided narrative (not machine-derived)
 
@@ -101,24 +103,44 @@ verdict for a relay-aborted committed stream on both fronts.
 **Measurements the build rested on.** Both clients RETRY after a post-commit failure
 (`docs/post-commit-stall-measurement-2026-09-09.md`). The DeepSeek capture
 (`docs/deepseek-responses-truncation-2026-09-09.md`) never reproduced the cut string in three
-read-only runs but found the mechanism: 20 of 68 upstream answers ended at exactly the relay's
-own 1024-token default, and all 44 `response.completed` events said `completed`.
+read-only runs but found the mechanism, and an independent auditor was right that the aggregate
+was cited in four places and written in none. It is re-derived from the raw captures and tabulated
+in that document now: 19 of 68 upstream answers were cut at exactly the relay's own 1024-token
+default (20 ended `finish_reason: "length"`; the twentieth was a one-token probe), and all 44
+`response.completed` events the relay emitted carried NO `incomplete_details`, so every capped
+answer was announced whole. ⚠ The aggregate establishes the ANNOUNCEMENT defect, not the death:
+the cut tool-call string itself was never reproduced, exactly as that document says.
 
-**Lanes, measured.** Muse Spark carried six packets alone (101–998 s) and starved every packet
-dispatched beside another (2100 s, nothing written). The free pool hit its 1800 s ceiling on
-every implementation packet and left partial trees that were finished by hand. Codex Spark spent
+**Lanes, measured.** Six commits carry a `Meta Muse Spark 1.3` trailer, and an independent
+auditor was right that "carried six packets alone" overstated it. What the commit messages say:
+FOUR completed solo — `a703db5` (the philosophy document), `88fa2d5` (45 s and 100 s across two
+attempts), `3e68fbb` (512 s) and `99342b3` (998 s). The other two did not: `42a0737` stopped at
+its own 1800 s ceiling with the source, config and route wiring complete and was finished in this
+session, and `ccac58e` was written by the lane with its server wiring by a Sonnet lane in the same
+worktree. Muse Spark also starved every packet dispatched BESIDE another (2100 s, nothing
+written) — the finding that became the `maxConcurrent` cap. The free pool hit its 1800 s ceiling
+on its implementation packets too and left partial trees that were finished by hand. Codex Spark spent
 two whole usage windows reading (193k and 477k tokens) and wrote nothing. DeepSeek on the Codex
 harness died 5 of 5 — on the relay defect above. Nine Sonnet lanes carried the eleven largest
-packets at 25–41 minutes each with red-then-green evidence. DeepSeek spend for the day: $0.24
-across 98 requests (`llm-relay cost --window 24h`).
+packets at 25–41 minutes each with red-then-green evidence. DeepSeek spend: 98 requests and
+237,895 micro-USD — about $0.24 — read back from the ledger with `llm-relay cost --window 7d
+--json`. ⚠ That figure is a LOWER BOUND and its provenance is `reference`, not
+`provider_published`: 92 of the 98 rows are `partiallyPricedRequests`, so the relay priced part of
+each and says so rather than reporting one undifferentiated total.
+
+⚠ Every figure in the paragraph above — lane counts, wall-clock ranges, token totals — comes from this
+session's own dispatch records and the relay's lane-stats store, NOT from anything in the repository.
+A later reader cannot reconstruct them from `git log`, and a rolling window overwrites the lane
+stats as new traffic arrives. Read them as a report, not as a reproducible measurement.
 
 **Verification discipline.** Every lane patch was regenerated from its tree, gated with
 `delegate-gate` before judgment (waivers named in each commit and in HANDOFF §6.3), applied
 three-way, typechecked twice, run through its named test files, and had its fix inverted by hand
 once before its commit. That caught a test that passed without its fix, a six-step fallback that
 silently changed a legacy rule, a threshold triple that could never fire, and a key literal in a
-scratch launcher. The recorded gate on the final tree: 172 files, 3916 tests, dashboard 32,
-packed smoke green (`verify-green` ledger, tree `19b9221bbebf`).
+scratch launcher. The recorded gate on the final tree: 172 test files, 3916 tests passed with 5
+skipped (3921 declared), the dashboard suite 32, and the packed smoke green — `verify-green`
+ledger, tree `7619d0ba14d7`, log `2026-09-10T06-25-09-765Z-check-PASS-7619d0ba14d7.log`.
 
 **Release.** `v0.78.0` at `b534b6a` (`npm version minor`), publish run
 https://github.com/OhOkThisIsFine/llm-relay/actions/runs/34432601110 concluded `success`; the CI
@@ -139,8 +161,13 @@ proof: `docs/backlog.md` (the operator-config half is in this closeout's hand-ba
 rows need `maxConcurrent: 1`, the global instruction's stale `waitMs` default, the edit hook that
 misreads a shifted complexity score; plus four standing traps from today's lanes. That file's
 working copy also carries another session's uncommitted entries, so this lap did not commit it.
-Memory: `free-lane-playbook.md` and the index line. Twenty packet worktrees (`pkt-*`) remain on
-disk with lane work that is all integrated; the sweep keeps them because they are dirty.
+Memory: `free-lane-playbook.md`, `machine-environment-traps.md` and the index line. NINETEEN packet
+worktrees (`pkt-P1` … `pkt-PLOG`) remain on disk, each with its own branch of the same name — so
+nineteen branches remain too, which the earlier wording did not say. Every one is DIRTY and every
+branch is UNMERGED, because the lane patches were applied three-way onto the lap branch rather
+than merged; `sweep --remove` therefore keeps all of them and prints why. Their content is
+integrated; the trees are the only copy of what each lane raw-produced. Removing them is an owner
+decision and it is asked in the hand-back.
 
 ## Closeout phase (post-release)
 
@@ -199,7 +226,11 @@ committed — a closeout cannot both describe a clean tree and be the file that 
 `working tree: NOT clean` line here as naming THIS file plus the HANDOFF paragraph that records
 the live `llm-relay stop` proof, which was measured after the previous commit; `git show --stat` on the
 commit that carries it is the check. Remote equality and the CI verdict are real checks and both
-must pass, and they do: HEAD was pushed and CI ran green on it before this render.
+must pass, and they do: HEAD was pushed and CI ran green on it before this render. ⚠ The same
+self-reference reaches the CI section, and the first audit of this document flagged it: `CI for
+exact HEAD` names the CI run for the commit BEFORE the one that carries this file, because a
+commit cannot be tested before it exists. The run for the commit that carries it is named in the
+hand-back and in the next line of the lap record.
 
 **`llm-relay stop` proven live, against the daemon that carries it.** With v0.78.0 running
 (PID 28920), `llm-relay stop` printed `stopping llm-relay at http://127.0.0.1:8791`, the process
@@ -209,6 +240,44 @@ warmed with one request through `pool/low` (HTTP 200,
 `x-llm-relay-served-by: nim/nvidia/nemotron-3-ultra-550b-a55b`). So both halves of backlog item 3
 are now measured on this machine: the OLD daemon refuses the verb because it has no route, and the
 NEW one obeys it.
+
+## Independent audit — RAN, three flags, all resolved
+
+A Sonnet auditor was given only the repository path, the start commit `3abbafd`, and this
+document, and told to reconstruct the lap from `git log`, the diffs and the GitHub API. It
+substantiated the commit range, every run id and version string, the registry state, the backlog
+count, the eligibility triage table, the 33 pruned exports, the forward-header allow-list, the
+`/stop` admission and the recorded gate figures. It raised three flags. Each is resolved here, and
+two of them changed this document.
+
+1. **"20 of 68 answers ended at exactly 1024, and all 44 `response.completed` events said
+   `completed`" was cited in four places and appeared in none of them.** The auditor read
+   `docs/deepseek-responses-truncation-2026-09-09.md` in full, found no such tally, and noted that
+   the document's own headline verdict is "could not reproduce". That was a fair reading and a real
+   defect in the record. **Resolved by re-deriving the aggregate from the raw captures**
+   (68 `upstream-*.sse`, 69 `emitted-*.sse`) with a script that reads no prose: 20 upstream answers
+   ended `finish_reason: "length"`, **19** of them at exactly `completion_tokens: 1024` (the
+   twentieth, `upstream-2.sse`, at one token — a probe), and of 44 emitted `response.completed`
+   events **none** carried `incomplete_details`, with zero `response.incomplete` events. The
+   aggregate is now a table in that document under "Aggregate over all 68 captures", the figure is
+   corrected from 20 to 19 in `CLAUDE.md`, in `HANDOFF.md` and here, and the claim is bounded: it
+   establishes the ANNOUNCEMENT defect, never the death. The auditor was right that the figure had
+   no home; it was wrong that it was unsupported.
+2. **"Muse Spark carried six packets alone (101–998 s)" overstated it.** Correct, and corrected
+   above from the commit messages: four solo, one stopped at its 1800 s ceiling and was finished in
+   this session, one had its server wiring written by a Sonnet lane.
+3. **"CI for exact HEAD" was CI for HEAD's parent at claim time.** Correct, and structural — a
+   commit cannot be tested before it exists. Stated in the verification caveat above rather than
+   left implied.
+
+The auditor also noted that the nineteen `pkt/*` BRANCHES were never named beside the worktrees.
+Corrected in the residue paragraph.
+
+⚠ One thing the audit could not do, and neither can any later reader of this repository: every
+live-machine measurement here — daemon PIDs, `llm-relay stop`'s output, the port freeing, the
+telemetry bodies, the OpenCode 429 and its headers, the operator config edits, the launcher edit —
+has no artifact under version control. The auditor listed them and so does this paragraph. They
+rest on this session's report.
 
 ## Verdict
 

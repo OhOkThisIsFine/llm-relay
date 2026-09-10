@@ -22,8 +22,9 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   ([docs/post-commit-stall-measurement-2026-09-09.md](docs/post-commit-stall-measurement-2026-09-09.md)),
   which is what the crawl abort rests on. The DeepSeek capture
   ([docs/deepseek-responses-truncation-2026-09-09.md](docs/deepseek-responses-truncation-2026-09-09.md))
-  never reproduced the cut string but found the mechanism — 20 of 68 answers hit the relay's own
-  1024 cap and every one was announced `completed` — and filed a second defect, the
+  never reproduced the cut string but found the mechanism — 19 of 68 answers hit the relay's own
+  1024 cap, and all 44 `response.completed` events it emitted carried no `incomplete_details`, so
+  every capped answer was announced whole — and filed a second defect, the
   `reasoning_content` replay.
 - **Closeout, done 2026-09-10.** The daemon now runs v0.78.0: the old one (PID 51960) predated
   `POST /stop`, so `llm-relay stop` answered `the running relay returned an invalid response` and
