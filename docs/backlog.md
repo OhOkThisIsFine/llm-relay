@@ -9,6 +9,82 @@
 
 ## Open
 
+- **The dispatch walk abandons the only working lane, then tells the agent to stop (2026-09-10,
+  live diagnosis, high).** At tier `medium` the walk gives `free-pool` the 90 s `attemptMs` floor:
+  its window holds 100 short answer-mode calls (p80 39.5 s), an abandoned run adds no sample so the
+  p80 can never rise above the budget, and a `timed_out` run does add one (so
+  `opencode-muse-spark`, 0 of 12 at `medium`, earned a 900 s budget). The walk then runs lanes that
+  cannot answer and ends on `anthropic`. Evidence and the full plan:
+  [`dispatch-giveup-diagnosis-2026-09-10.md`](dispatch-giveup-diagnosis-2026-09-10.md) §3 and §9
+  F1–F2. **Property:** `runWalk` never abandons a lane at its budget while no later lane in the
+  selection order has answered in its recent record; the budget window is keyed by dispatch mode
+  and fed only by `completed` runs; and an abandoned run raises the lane's next budget (bounded by
+  its timeout) instead of leaving the window unchanged.
+
+- **The MCP walk selects the `anthropic` pass-through rung, which the MCP server cannot run
+  (2026-09-10, live diagnosis, high).** `resolveDispatchView` states `host: "bypassed"`, and `toLane`
+  keeps a pass-through rung for that host because a bypassed host has an `Agent` tool; the MCP
+  server has none. Agent mode fails in 0 s with "no cliLane template configured" (false: the
+  template exists), answer mode with HTTP 401. 0 of 21 runs answered, and as the last lane its error
+  heads the final reply. Diagnosis §4, plan F3. **Property:** the MCP view marks every rung that the
+  MCP server cannot run `unreachable` with a true reason, so no walk attempt runs one; and
+  `startLane`'s default text never claims that a configured template is missing.
+
+- **`LANE_LADDER_EXHAUSTED_ADVICE` tells agents to stop dispatching after a working lane was
+  stopped, or after one forced lane ran (2026-09-10, live diagnosis, high).** `jobAnswer` prints "Do
+  NOT call dispatch again … Do the work in this session instead" whenever nothing answered and no
+  lane is untried — including after the walk abandoned `free-pool` mid-run and after a one-lane
+  `lane:` override (jobs 0023 and 0024 on 2026-09-10). `MCP_INSTRUCTIONS` repeats it, and says "the
+  default lane is free capacity", which the operator config made false on 2026-09-10 (paid DeepSeek
+  is first in every pool). Diagnosis §5, plan F4. **Property:** the stop advice appears only when
+  every lane in the ladder ran and failed on its own; an abandoned lane is named with the call that
+  lets it finish; a forced one-lane run says that only that lane ran; and `MCP_INSTRUCTIONS` makes no
+  cost claim that the operator config can make false.
+
+- **`dispatch` cannot run a named model, so agents that must use DeepSeek go around it (2026-09-10,
+  live diagnosis, high).** `dispatch` takes a rung id and a tier only, and no rung names the direct
+  `deepseek` provider. The lap-232d8bef orchestrator wrote its own HTTP client (`plan.mjs`, posting
+  `deepseek/deepseek-flash` to `/v1/chat/completions`) to reach it. Diagnosis §7, plan F5.
+  **Property:** `dispatch` accepts a routing spec (`model`) and runs exactly that spec — posted as
+  `model` in answer mode, rendered into the `routing.cliLane` template in agent mode — with no walk,
+  and the reply names the spec that served.
+
+- **An AGY lane's quota death reaches the relay only when a run lasts until AGY gives up
+  (2026-09-10, live diagnosis, medium).** AGY logs `RESOURCE_EXHAUSTED … Resets in 144h` to
+  `~/.gemini/antigravity-cli/cli.log` and retries in silence. The walk kills it at 90 s, so
+  `agy-claude-opus` stayed `ready` through 34 failed runs, until one forced 604 s probe recorded the
+  death. No rule demotes a lane with a long run of zero successes. Diagnosis §4, plan F6.
+  **Property:** when the walk stops or ends an AGY lane whose run logged `RESOURCE_EXHAUSTED`, the
+  relay records a quota death with the stated reset; and a lane with no success in its last N runs
+  is demoted until a probe answers. Change the AGY launch path only after the console-window fix of
+  2026-09-10 lands, because both touch it.
+
+- **`/telemetry` labels a provider with no `tierType` as free, and DeepSeek attempts run unhedged
+  for up to 10 minutes (2026-09-10, live diagnosis, medium).** `getTelemetryReport` falls back
+  `p.tierType ?? preset?.tierType ?? "free"`, so paid DeepSeek reads `free` while `assessCost` says
+  `unknown`. A DeepSeek attempt gets no hedge (hedging is for free deployments), and the operator
+  config gives `deepseek` a `timeoutMs` and a `stallTimeoutMs` of 600,000 while DeepSeek is the first
+  member of every pool. Diagnosis §7, plan F7. **Property:** the telemetry label for an undeclared
+  tier is `unknown`, never `free`; and a stalled DeepSeek attempt fails over within a bound that the
+  operator states in minutes (the bound is an operator-config change and an owner decision).
+
+- **A running dispatch's status gives no expected duration, so agents stop polling (2026-09-10, live
+  diagnosis, low).** `dispatch_status` shows the lane and the elapsed time only, while `free-pool`
+  agent-mode runs at tier `high` took up to 2,700 s on 2026-09-10 (median 778 s). Diagnosis §9, plan
+  F8. **Property:** the status of a running job states the lane's usual time to answer in the job's
+  mode (p50 and p80 from completed runs), or says that no record exists.
+
+- **A dispatch call waits longer than some hosts allow, so the caller loses the job handle
+  (2026-09-10, transcript sweep, high).** Codex's code-mode `exec` tool returns "Script running with
+  cell ID N / Wall time 31.0 seconds" with empty output, so a dispatch that blocks for the 40 s
+  `routing.mcp.maxWaitMs` default loses its job id: 29 of 266 first Codex dispatch calls since
+  2026-09-07. In Claude Code, a call with `waitMs: 60000` at 15:14 on 2026-09-10 failed with "Error:
+  Request timed out"; the MCP process that served it was most likely one started before v0.78.0,
+  which honours a wait above the host ceiling (inference from process start times, not measured).
+  Diagnosis Appendix A, plan F9. **Property:** the blocking wait of every dispatch call ends before
+  the lowest host ceiling measured on this machine (Codex: 31 s), and an `llm-relay mcp` process
+  that runs older code than the installed version says so in every reply.
+
 - **DeepSeek refuses a multi-turn tool-call replay from the relay with HTTP 400 because the relay
   drops `reasoning_content` between turns (2026-09-09, DeepSeek capture, medium).** In thinking
   mode DeepSeek requires the `reasoning_content` of the assistant turn that made a tool call to be
