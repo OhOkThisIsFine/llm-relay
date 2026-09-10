@@ -183,7 +183,35 @@ response to a demonstrated announcement defect, not as a reproduction of the dea
 ⚠ Two corrections to the wording that was in circulation, both from this re-derivation: it is
 **19** of 68 at exactly 1024 (20 ended `length`, one of them at one token), and 44 is the count of
 `response.completed` events across the emitted captures, not of upstream answers.
-## Why the target bug never showed up: three ancillary findings
+
+## Fix landed (2026-09-10, lap 232d8bef package-0)
+
+The three ancillary findings below became the work of the "move llm-relay onto DeepSeek V4.1
+Flash (`deepseek-flash`)" lap. Two of the three are now fixed in `src/`; the third (Codex's
+`exec` shape) is the model's own output and stays with repair mode. What changed:
+
+- **The Anthropic path carries the caller's thinking intent.** `src/openai-request.ts` previously
+  dropped the request-level `thinking` control ("mapping it to `reasoning_effort` would be a
+  guess"). Under a RESOLVED `compat.reasoning: "deepseek"` mode — a new `compat` key defaulting
+  from the labelled host fact `api.deepseek.com`, an explicit value winning both ways, the
+  `toolCallIds`/`thoughtSignature` precedent — the mapper now forwards `thinking: {type:"disabled"}`
+  verbatim and maps an explicit effort (`output_config.effort` / `reasoning.effort`) or the routed
+  pool's effort band to DeepSeek's `reasoning_effort` (`low|high|max`; the pool's `medium`→`high`
+  and `xhigh`→`max`). Every other provider's outbound bytes are unchanged.
+- **A DeepSeek lane defaults thinking OFF when the caller sent no thinking control.** Finding #3
+  below is the cheaper safe route, chosen explicitly over round-tripping `reasoning_content`:
+  DeepSeek's thinking mode requires the prior turn's `reasoning_content` to be replayed on a
+  multi-turn conversation (HTTP 400 otherwise), and this relay deliberately holds no store to
+  round-trip it, so a multi-turn agent lane must not think by default. A caller that explicitly
+  asks for thinking (`thinking: {type:"enabled"}` or an explicit effort) still gets it.
+- **Pool admission.** `deepseek/deepseek-flash` was missing from the pools because the synced
+  `docs/tier-data.json` snapshot carries no `deepseek-flash` row with capability signals (its only
+  namesakes are `deepseek-v4-flash` — a different, dated SKU — and `deepseek-v4-flash-latest`, a
+  zero-signal stub), so `findTierModel` resolves it as `neutral`/`fuzzy` and it clears no effort
+  band; `deepseek-v4-pro` has a 4-signal snapshot row and clears every band. Fixed by routing each
+  pool's `preferred` prefix to `deepseek/deepseek-flash` (a live config edit, not a source change —
+  stated in the lap report as exact JSON).
+
 
 None of these is the backlog's cut-string bug (that bug is about a tool call's `arguments`
 string itself being **truncated mid-JSON** — invalid JSON, an `EOF while parsing a string`).

@@ -554,6 +554,8 @@ async function fetchOpenAiBackend(
       onToolCallIdsRewritten: (n) => { toolCallIdsRewritten = n; },
       ...(target.thoughtSignature !== undefined ? { thoughtSignature: target.thoughtSignature } : {}),
       onThoughtSignatureSentinels: (n) => { sentinelsStamped = n; },
+      ...(target.reasoning !== undefined ? { reasoning: target.reasoning } : {}),
+      ...(target.effort !== undefined ? { effort: target.effort } : {}),
     });
   } catch (e) {
     // A block we will not put on the wire is the caller's request being unrepresentable, not a

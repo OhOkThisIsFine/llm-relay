@@ -30,6 +30,8 @@ import {
   type CredentialMode,
   type ToolCallIdMode,
   type ThoughtSignatureMode,
+  type ReasoningMode,
+  type EffortLevel,
   type ProviderCompatConfig,
   PROVIDER_WIRE_MODES,
   type ProviderWireMode,
@@ -67,6 +69,7 @@ export {
   type CredentialMode,
   type ToolCallIdMode,
   type ThoughtSignatureMode,
+  type ReasoningMode,
   type ProviderCompatConfig,
   type ProviderWireMode,
   type ProviderConfig,
@@ -88,11 +91,13 @@ export {
 } from "./config-types.js";
 
 /** The closed set of `compat` keys, so an unknown one can be named in the error. */
-const COMPAT_KEYS = ["toolCallIds", "thoughtSignature"] as const satisfies readonly (keyof ProviderCompatConfig)[];
+const COMPAT_KEYS = ["toolCallIds", "thoughtSignature", "reasoning"] as const satisfies readonly (keyof ProviderCompatConfig)[];
 
 const TOOL_CALL_ID_MODES: readonly ToolCallIdMode[] = ["preserve", "strict9"];
 
 const THOUGHT_SIGNATURE_MODES: readonly ThoughtSignatureMode[] = ["none", "sentinel"];
+
+const REASONING_MODES: readonly ReasoningMode[] = ["none", "deepseek"];
 
 /**
  * Parse a provider's `compat` block. Adding the next key is one entry in `COMPAT_KEYS` plus its
@@ -121,6 +126,12 @@ function parseProviderCompat(raw: unknown, where: string): ProviderCompatConfig 
         throw new Error(`${where}.thoughtSignature must be one of: ${THOUGHT_SIGNATURE_MODES.join(", ")}`);
       }
       out.thoughtSignature = value as ThoughtSignatureMode;
+    }
+    if (key === "reasoning") {
+      if (typeof value !== "string" || !REASONING_MODES.includes(value as ReasoningMode)) {
+        throw new Error(`${where}.reasoning must be one of: ${REASONING_MODES.join(", ")}`);
+      }
+      out.reasoning = value as ReasoningMode;
     }
   }
   return Object.keys(out).length > 0 ? out : {};
@@ -223,6 +234,28 @@ export function resolveToolCallIdMode(p: { base: string; compat?: ProviderCompat
 export function resolveThoughtSignatureMode(p: { base: string; compat?: ProviderCompatConfig }): ThoughtSignatureMode {
   if (p.compat?.thoughtSignature !== undefined) return p.compat.thoughtSignature;
   return isGoogleGenerativeLanguageHost(p.base) ? "sentinel" : "none";
+}
+
+/** Is this base URL DeepSeek's own API host? Deliberately the ONE exact host. */
+function isDeepSeekHost(base: string): boolean {
+  return baseHost(base) === "api.deepseek.com";
+}
+
+/**
+ * The resolved reasoning-mapping mode for one provider.
+ *
+ * The SAME labelled-fact mechanism as `resolveToolCallIdMode` / `resolveThoughtSignatureMode`, and
+ * allowed by the SAME invariant — "Provider knowledge is data, not routing configuration" permits a
+ * labelled provider fact in `src/` only while config can override it. DeepSeek's own API states its
+ * thinking/reasoning vocabulary (thinking ON by default; `thinking: {type:"disabled"}` /
+ * `reasoning_effort: low|high|max`; first-party evidence in
+ * docs/deepseek-responses-truncation-2026-09-09.md), so `api.deepseek.com` defaults to `"deepseek"`
+ * and every other host to `"none"`. An explicit `compat.reasoning` wins in BOTH directions —
+ * `"none"` on deepseek, `"deepseek"` on anything else.
+ */
+export function resolveReasoningMode(p: { base: string; compat?: ProviderCompatConfig }): ReasoningMode {
+  if (p.compat?.reasoning !== undefined) return p.compat.reasoning;
+  return isDeepSeekHost(p.base) ? "deepseek" : "none";
 }
 
 /**
@@ -622,6 +655,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     ...(p.credentialMode !== undefined ? { credentialMode: p.credentialMode } : {}),
     toolCallIds: resolveToolCallIdMode(p),
     thoughtSignature: resolveThoughtSignatureMode(p),
+    reasoning: resolveReasoningMode(p),
     ...(p.wire !== undefined ? { wire: p.wire } : {}),
   };
 }
@@ -676,7 +710,23 @@ export function resolveTargets(
   const specs = expandPoolSpecs(picked, cfg);
   const rawTargets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
   const activeTargets = filterUsableTargets(rawTargets, scopedKeystoreOptions);
+  // The routed pool's effort band, when the request was resolved through a single dynamic pool
+  // whose policy declares one. Stamped here so the request mapper can map "pool effort →
+  // `reasoning_effort`" for a `"deepseek"` target without reaching back into routing. A direct
+  // spec or a static pool leaves `target.effort` absent — then there is no effort to map.
+  const poolEffort = poolEffortFor(picked, cfg);
+  if (poolEffort !== undefined) {
+    for (const t of activeTargets) if (t.effort === undefined) t.effort = poolEffort;
+  }
   return rankNonDynamicTargets(picked, activeTargets, cfg);
+}
+
+/** The effort band of the ONE dynamic pool `picked` resolved through, or undefined. */
+function poolEffortFor(picked: string[], cfg: Config): EffortLevel | undefined {
+  if (picked.length !== 1) return undefined;
+  const first = picked[0];
+  if (first === undefined || !first.startsWith(`${POOL_PREFIX}/`)) return undefined;
+  return cfg.routing.poolPolicies?.[first.slice(POOL_PREFIX.length + 1)]?.effort;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { isRecord } from "./json-shape.js";
-import type { ThoughtSignatureMode, ToolCallIdMode } from "./config-types.js";
+import type { ThoughtSignatureMode, ToolCallIdMode, ReasoningMode, EffortLevel } from "./config-types.js";
 
 /**
  * Anthropic Messages REQUEST → OpenAI Chat Completions REQUEST.
@@ -26,6 +26,14 @@ import type { ThoughtSignatureMode, ToolCallIdMode } from "./config-types.js";
  * something to forward to a different vendor); `metadata` is dropped (llm-bridge dropped it too,
  * and `metadata.user_id` is a caller identifier that has never reached these providers); the
  * request-level `thinking` budget is dropped (mapping it to `reasoning_effort` would be a guess).
+ *
+ * ⚠ ONE opt-in exception, since 2026-09-10: under `reasoning: "deepseek"` (a RESOLVED
+ * `compat.reasoning` mode defaulting from `api.deepseek.com` — never sniffed from provider identity
+ * here) the caller's `thinking` CONTROL and effort are carried onto DeepSeek's own vocabulary, by
+ * `deepSeekThinkingSpec` below. It forwards only the caller's explicit `thinking: {type:"disabled"}`
+ * and a CLOSED effort mapping; it never fabricates a `reasoning_content` or an effort nobody
+ * stated. The default with no thinking control is `thinking: {type:"disabled"}`, so a multi-turn
+ * DeepSeek lane cannot hit the "reasoning_content must be passed back" 400.
  */
 
 import { createHash } from "node:crypto";
@@ -79,6 +87,19 @@ export interface AnthropicToOpenAiOptions {
    * not part of the body it returns.
    */
   onThoughtSignatureSentinels?: ((count: number) => void) | undefined;
+  /**
+   * The RESOLVED reasoning-mapping mode for this deployment (`config.ts` `resolveReasoningMode`).
+   * Absent ⇒ `"none"` ⇒ the outbound bytes are identical to what this mapper emitted before the
+   * mode existed — the caller's `thinking` control and effort are DROPPED, same rule as before.
+   * Never a provider name: the mapper is handed a decision, it does not make one.
+   */
+  reasoning?: ReasoningMode | undefined;
+  /**
+   * The routed pool's effort band, when this deployment was resolved through a single dynamic pool
+   * whose policy declares an `effort` (`ResolvedTarget.effort`). Only read under `reasoning:
+   * "deepseek"` — the band is what maps to `reasoning_effort`. Absent ⇒ no effort to map.
+   */
+  effort?: EffortLevel | undefined;
 }
 
 // `ToolCallIdMode` and `ThoughtSignatureMode` are imported from `config-types.ts`, the ONE
@@ -551,6 +572,75 @@ function stopSequences(raw: unknown): string[] | null {
 }
 
 /**
+ * The effort spellings this mapper may translate onto a `"deepseek"` target, closed over the ONE
+ * value set DeepSeek states (`thinking: {type:"disabled"}` / `reasoning_effort: low|high|max`,
+ * first-party evidence in docs/deepseek-responses-truncation-2026-09-09.md). The keys are the
+ * union of the caller's effort spellings (`none|low|high|max` — Anthropic's `output_config.effort`
+ * / `reasoning.effort`) and the routed pool's bands (`low|medium|high|xhigh`) — a cross-vendor
+ * vocabulary, so the lookup is deliberately a table, not an enum: a spelling outside it falls
+ * through to "no opinion", never an invented effort.
+ *
+ * `medium` → `high` and `xhigh` → `max` are the monotone quantization of the pool's four bands onto
+ * DeepSeek's three levels — a deterministic translation, not a measurement, exactly as
+ * `mapToolChoice` maps Anthropic's `any` to OpenAI's `required`.
+ */
+const DEEPSEEK_EFFORT: Record<string, DeepSeekReasoningEffort | "disabled"> = {
+  none: "disabled",
+  low: "low",
+  medium: "high",
+  high: "high",
+  xhigh: "max",
+  max: "max",
+};
+
+type DeepSeekReasoningEffort = "low" | "high" | "max";
+
+/** The caller's explicit effort spelling, from the Anthropic formats the brief records. */
+function explicitEffort(body: Rec): string | undefined {
+  const out = isRecord(body.output_config) ? body.output_config.effort : undefined;
+  if (typeof out === "string") return out;
+  const reasoning = isRecord(body.reasoning) ? body.reasoning.effort : undefined;
+  return typeof reasoning === "string" ? reasoning : undefined;
+}
+
+/** An effort spelling → the DeepSeek field it maps to, or undefined for a spelling nobody stated. */
+function deepSeekEffortSpec(level: string): Rec | undefined {
+  const mapped = DEEPSEEK_EFFORT[level];
+  if (mapped === undefined) return undefined;
+  return mapped === "disabled"
+    ? { thinking: { type: "disabled" } }
+    : { reasoning_effort: mapped };
+}
+
+/**
+ * What a `"deepseek"` target gets for the caller's reasoning/thinking intent, or undefined when
+ * nothing should be added.
+ *
+ * 1. `thinking: {type:"disabled"}` is forwarded VERBATIM — the caller's own words, and the field
+ *    the 36k-token probe in docs/deepseek-responses-truncation-2026-09-09.md showed the Anthropic
+ *    path dropping (all 32,000 output tokens were reasoning, no answer).
+ * 2. An explicit effort (`output_config.effort` / `reasoning.effort`) maps to `reasoning_effort`.
+ * 3. The routed pool's effort band maps to `reasoning_effort` — "map pool effort → reasoning_effort
+ *    when thinking is on".
+ * 4. `thinking: {type:"enabled"}` with no level to map leaves DeepSeek's OWN default (thinking ON)
+ *    alone: the caller asked for thinking, so the relay must not switch it off, and it has no
+ *    level to assert.
+ * 5. No thinking control at all: default to `thinking: {type:"disabled"}` — DeepSeek's thinking
+ *    mode requires the prior turn's `reasoning_content` to be replayed on a multi-turn conversation
+ *    (HTTP 400 otherwise), and this relay deliberately holds no store to round-trip it, so the
+ *    default must not think.
+ */
+function deepSeekThinkingSpec(body: Rec, effort: EffortLevel | undefined): Rec | undefined {
+  const thinking = isRecord(body.thinking) ? body.thinking : undefined;
+  if (thinking?.type === "disabled") return { thinking: { type: "disabled" } };
+  const explicit = explicitEffort(body);
+  if (explicit !== undefined) return deepSeekEffortSpec(explicit);
+  if (effort !== undefined) return deepSeekEffortSpec(effort);
+  if (thinking?.type === "enabled") return undefined;
+  return { thinking: { type: "disabled" } };
+}
+
+/**
  * Translate one Anthropic Messages request body into an OpenAI Chat Completions request body.
  *
  * Turn order is preserved exactly; no turn is merged or dropped. Unknown top-level fields are not
@@ -622,6 +712,12 @@ export function anthropicRequestToOpenAi(
     // `tool_choice` without `tools` is rejected by strict hosts and means nothing anyway.
     const toolChoice = mapToolChoice(body.tool_choice);
     if (toolChoice !== undefined) out.tool_choice = toolChoice;
+  }
+  // Only under the explicit `"deepseek"` mode — every other provider's outbound bytes are the
+  // pre-2026-09-10 document, untouched.
+  if (opts.reasoning === "deepseek") {
+    const spec = deepSeekThinkingSpec(body, opts.effort);
+    if (spec) Object.assign(out, spec);
   }
   return out;
 }

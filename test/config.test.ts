@@ -1618,7 +1618,7 @@ describe("loadConfig — provider compat (thought signature)", () => {
     expect(() => provider({
       base: "https://nim.test/v1", compat: { thoughtSignatures: "sentinel" },
     })("ts-key.json")).toThrow(
-      /config\.providers\.x\.compat\.thoughtSignatures is not a known compat option \(known: toolCallIds, thoughtSignature\)/,
+      /config\.providers\.x\.compat\.thoughtSignatures is not a known compat option \(known: toolCallIds, thoughtSignature, reasoning\)/,
     );
   });
 });

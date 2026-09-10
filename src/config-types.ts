@@ -100,6 +100,24 @@ export type ToolCallIdMode = "preserve" | "strict9";
 export type ThoughtSignatureMode = "none" | "sentinel";
 
 /**
+ * How the relay maps the CALLER's reasoning/thinking intent onto an `openai`-kind target.
+ *
+ *  - `"none"` — emit nothing (the pre-2026-09-10 behaviour byte for byte): the caller's
+ *    request-level `thinking` control and any `output_config.effort` are DROPPED, because a
+ *    guessed `reasoning_effort` would be an invention for a provider that never stated one.
+ *  - `"deepseek"` — DeepSeek's reasoning vocabulary. The caller's `thinking: {type:"disabled"}`
+ *    is forwarded verbatim as OpenAI's `thinking: {type:"disabled"}`; an explicit thinking-on
+ *    intent (a `thinking: {type:"enabled", budget_tokens}` block or an `output_config.effort`)
+ *    maps to `reasoning_effort` at the caller's stated level or the routed pool's effort band;
+ *    and when the caller sent NO thinking control at all the mapper defaults to
+ *    `thinking: {type:"disabled"}` — DeepSeek's thinking mode requires the prior turn's
+ *    `reasoning_content` to be replayed on a multi-turn conversation (HTTP 400 otherwise), and
+ *    this relay deliberately holds no store to round-trip it (see
+ *    docs/deepseek-responses-truncation-2026-09-09.md), so the default must not think.
+ */
+export type ReasoningMode = "none" | "deepseek";
+
+/**
  * Per-provider WIRE-SHAPE quirks — things a specific host's request validator demands that the
  * protocol itself does not. Deliberately not routing configuration and deliberately not a
  * per-provider switch in `src/`: a labelled provider fact may live in code only while config can
@@ -115,6 +133,8 @@ export interface ProviderCompatConfig {
   toolCallIds?: ToolCallIdMode;
   /** Absent ⇒ resolved from the base host by `resolveThoughtSignatureMode`. */
   thoughtSignature?: ThoughtSignatureMode;
+  /** Absent ⇒ resolved from the base host by `resolveReasoningMode`. */
+  reasoning?: ReasoningMode;
 }
 
 /**
@@ -723,6 +743,22 @@ export interface ResolvedTarget {
    * `"chat"`, the pre-2026-09-09 behaviour byte for byte.
    */
   wire?: ProviderWireMode;
+  /**
+   * RESOLVED reasoning-mapping mode (`resolveReasoningMode`) — an explicit `compat.reasoning` or
+   * the labelled base-host default (`api.deepseek.com` ⇒ `"deepseek"`). Resolved here for the same
+   * reason as `toolCallIds`/`thoughtSignature`: the request mapper is handed a mode, never a
+   * provider identity to sniff one from. Absent (a hand-built target) reads as `"none"` — the
+   * pre-2026-09-10 bytes exactly.
+   */
+  reasoning?: ReasoningMode;
+  /**
+   * The routed POOL's effort band, when the request was resolved through a single dynamic pool
+   * whose policy declares an `effort`. Stamped at resolution time so the request mapper can map
+   * "pool effort → `reasoning_effort`" for a `"deepseek"` target without reaching back into
+   * routing. Absent for a direct spec or a static pool — then the mapper has no effort to map and
+   * a deepseek target defaults its thinking OFF.
+   */
+  effort?: EffortLevel;
 }
 
 export interface Config {
