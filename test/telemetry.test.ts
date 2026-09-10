@@ -116,6 +116,18 @@ describe("telemetry", () => {
     expect(openaiTele?.cooldownRemainingMs).toBeGreaterThan(0);
   });
 
+  it("⚠ an undeclared tier with no preset is null — never a guessed 'free' (F7, 2026-09-10)", () => {
+    // Until 2026-09-10 the fallback was "free", so `/telemetry` called the paid `deepseek` provider
+    // free while `assessCost` called the same provider unknown: the closed-vocabulary fall-through
+    // to the STRONGER claim. A provider name with no preset has nothing to borrow a tier from.
+    const undeclared = { base: "https://example.invalid/v1", kind: "openai" as const, authEnv: "MY_DECLARED_KEY", authHeader: "authorization" as const, timeoutMs: 120000 };
+    const report = getTelemetryReport(cfgWith({ "my-provider": undeclared }), new CircuitBreaker(), NOW);
+    const tele = report.providers.find((p) => p.provider === "my-provider");
+    expect(tele?.hasKey).toBe(true);
+    expect(tele?.tierType).toBeNull();
+    expect(report.freeProvidersCount).toBe(0);
+  });
+
   /**
    * OBS-dc5f56e7. `/telemetry` looked breaker state up by BARE provider name while
    * the breaker keys by `provider/model`, so every lookup missed — and the legacy

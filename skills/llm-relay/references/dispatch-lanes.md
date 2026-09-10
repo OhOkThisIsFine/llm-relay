@@ -105,13 +105,19 @@ ANSWER**, not a command you then have to run correctly:
 dispatch(task: "<the whole task>")            -> the lane's answer, plus which lane produced it
 dispatch(task: "...", tier: "high")           -> pick a capability tier
 dispatch(task: "...", lane: "agy-gemini")     -> force one rung
+dispatch(task: "...", model: "deepseek/deepseek-flash") -> run one named model, no walk
 dispatch(task: "...", mode: "answer")         -> no harness — a direct call, for speed
 ```
 
-If the lane outlives the wait (`routing.mcp.maxWaitMs`, default 40 s; a larger `waitMs` is
-clamped to it and the reply says so) you get a `jobId` instead. Then:
+If the lane outlives the wait (`routing.mcp.maxWaitMs`, default 25 s — under Codex's 31 s script
+limit; a larger `waitMs` is clamped to it and the reply says so) you get a `jobId` instead. Then:
 `dispatch_status(jobId)` -> `dispatch_result(jobId)`, and `dispatch_cancel(jobId)` to stop it.
+`dispatch_status` says how long the running lane usually takes, so keep polling a slow lane.
 `dispatch_lanes()` shows the ladder if you want to choose deliberately.
+
+Follow the last paragraph of a reply with no answer: it names a lane the walk stopped while it was
+still working (dispatch again with that `lane` to let it finish), says when only a lane you named
+ran, and says "do the work here" only when every lane ran and failed on its own.
 
 ⚠ **Prefer this over the CLI whenever it is available.** The CLI hands you a command, and running a
 lane command correctly is the hard part — three client idle timeouts must be lifted or a long think

@@ -1,6 +1,6 @@
 /**
  * The dispatch walk's PER-LANE attempt budget, derived from each lane's own recorded runs
- * (`attemptBudget` in `src/dispatch.ts`, owner direction 2026-09-08).
+ * (`laneHistoryFacts` in `src/dispatch.ts`, owner direction 2026-09-08).
  *
  * The shipped budget was a flat 90 seconds. Measured against the live store the same day, that sat
  * BELOW the median run of two of the three working lanes, and below the free pool's median by a
@@ -18,7 +18,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, type Config } from "../src/config.js";
-import { buildDispatch, formatAttemptBudget, type DispatchLane } from "../src/dispatch.js";
+import { buildDispatch, formatAttemptBudget, MAX_ATTEMPT_BUDGET_MS, type DispatchLane } from "../src/dispatch.js";
 import { parseTelemetryReport, recordLaneRun, laneStatsFor, MAX_LANE_STAT_SAMPLES, quantileWallClockMs } from "../src/dispatch-lane-stats.js";
 
 const dir = mkdtempSync(join(tmpdir(), "llm-relay-attempt-budget-"));
@@ -163,8 +163,15 @@ describe("per-lane attempt budget", () => {
     // dominate the window and collapse the quantile.
     recordAbandoned(cfg, 1_000, 10);
     const after = budgetOf(cfg);
-    expect(after?.ms).toBe(before?.ms);
+    // The window is untouched: still the four completed runs, on the same basis.
     expect(after?.samples).toBe(before?.samples);
+    expect(after?.basis).toBe(before?.basis);
+    // ⚠ And since 2026-09-10 the budget RISES rather than standing still. An abandoned run leaves
+    // no sample, so a window fed only by runs that finished inside the budget could never show that
+    // the lane needed longer — the floor lock (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3b).
+    // Each abandonment since the last success doubles it, capped at MAX_ATTEMPT_BUDGET_MS.
+    expect(after?.raisedBy).toBe(10);
+    expect(after?.ms).toBe(Math.min(MAX_ATTEMPT_BUDGET_MS, (before?.ms ?? 0) * 2 ** 10));
   });
 
   it("an abandoned run still counts as a FAILURE — only its duration is withheld", () => {

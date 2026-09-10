@@ -1,10 +1,10 @@
 import { existsSync } from "node:fs";
-import { expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX } from "./config.js";
+import { AUTO_MODEL, expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX } from "./config.js";
 import type { Config, LadderRung } from "./config-types.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
-import { allLaneStats, laneStatsFor, medianWallClockMs, p95WallClockMs, quantileWallClockMs } from "./dispatch-lane-stats.js";
+import { allLaneStats, DISPATCH_MODES, laneStatsFor, medianWallClockMs, p95WallClockMs, quantileWallClockMs, type DispatchMode, type LaneStats } from "./dispatch-lane-stats.js";
 import { laneDemotion, lanePin, type LaneAffinityRow } from "./lane-affinity.js";
 import { relayStatePath } from "./state-paths.js";
 
@@ -55,6 +55,16 @@ export const OUTCOME_DEFAULT_MS: Record<DispatchOutcome, number> = {
 
 /** Longest caller-supplied id echoed back in a `reason`. See `describeId`. */
 const MAX_ECHOED_ID = 120;
+
+/** The ceiling a RAISED budget stops at — the same one-hour ceiling `attemptMs` is bounded by. */
+export const MAX_ATTEMPT_BUDGET_MS = 3_600_000;
+/**
+ * Own failures in a row after which a lane cannot be relied on to answer. `runWalk` will not stop
+ * an earlier lane that is still working in order to reach lanes that are all past this streak.
+ */
+export const LANE_UNRELIABLE_STREAK = 3;
+/** Own failures in a row after which a lane is ordered behind the lanes that have none. */
+export const FAILING_LANE_STREAK = 5;
 
 export type LaneState = "ready" | "exhausted" | "disabled" | "not-servable";
 
@@ -115,18 +125,27 @@ export function formatAttemptBudget(budget: {
   basis: "history" | "floor" | "clamped";
   samples: number;
   quantileMs?: number;
+  raisedBy?: number;
 }): string {
   const render = (ms: number): string => `${Math.round(ms / 100) / 10}s`;
   const seconds = render(budget.ms);
+  // The raise is stated BESIDE the basis, never folded into it: the basis says where the base
+  // figure came from, the raise says why the figure served is larger than that base. ⚠ No
+  // multiplier is printed: past the ceiling the figure is capped, and "×1099511627776" beside a
+  // one-hour budget would state a raise that was never applied.
+  const raised = budget.raisedBy
+    ? `; raised after ${budget.raisedBy} abandoned run${budget.raisedBy === 1 ? "" : "s"}, ` +
+      `×2 each, at most ${render(MAX_ATTEMPT_BUDGET_MS)}`
+    : "";
   switch (budget.basis) {
     case "history":
-      return `budget: ${seconds} (from ${budget.samples} recorded runs)`;
+      return `budget: ${seconds} (from ${budget.samples} recorded runs${raised})`;
     case "clamped":
       return budget.quantileMs === undefined
-        ? `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs are faster)`
-        : `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs put it at ${render(budget.quantileMs)})`;
+        ? `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs are faster${raised})`
+        : `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs put it at ${render(budget.quantileMs)}${raised})`;
     case "floor":
-      return `budget: ${seconds} (flat — too few recorded runs, ${budget.samples})`;
+      return `budget: ${seconds} (flat — too few recorded runs, ${budget.samples}${raised})`;
     default: {
       const _never: never = budget.basis;
       return _never;
@@ -268,6 +287,16 @@ export interface DispatchLane {
      * came to read and `ms` is not it. Never a guess: absent unless a quantile was computed.
      */
     quantileMs?: number;
+    /**
+     * How many times the budget was DOUBLED because the walk abandoned this lane since its last
+     * success (`LaneStats.abandonedSinceSuccess`). Present only when above zero.
+     *
+     * ⚠ It exists because an abandoned run leaves no duration sample, so a window fed only by runs
+     * that finished inside the budget can never show that the lane needed longer — the floor lock
+     * measured on 2026-09-10 (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3b). Each abandonment
+     * doubles the next budget, capped at `MAX_ATTEMPT_BUDGET_MS`; one success resets the count.
+     */
+    raisedBy?: number;
   };
   /**
    * This lane recently failed to answer inside the budget a dispatch walk gave it, so ready lanes
@@ -286,6 +315,35 @@ export interface DispatchLane {
    * relay, moments ago.
    */
   demoted?: { until: string; reason: string };
+  /**
+   * The lane's usual time to ANSWER in the requested mode: median and 80th percentile of the
+   * COMPLETED runs in the window its budget was read from. Present only when that window holds a
+   * completed run. A poll renders it (`describeJob` in `mcp/server.ts`), so a caller can tell a slow
+   * lane from a stuck one — 23 of the 182 unanswered dispatches in the 2026-09-10 transcript sweep
+   * ended with the caller simply no longer polling.
+   */
+  timeToAnswer?: { medianMs: number; p80Ms: number; samples: number; mode: DispatchMode | null };
+  /**
+   * Own failures (`failed` or `timed_out`, never a walk abandonment) in a row, read from the same
+   * window as the budget. Present only when above zero.
+   *
+   * ⚠ Evidence the walk reads: a later lane on a streak of `LANE_UNRELIABLE_STREAK` or more cannot
+   * be relied on to answer, so the walk does not stop an earlier lane that is still working in
+   * order to reach it (`runWalk`). Measured 2026-09-10: the walk stopped `free-pool` at 90 s to try
+   * `opencode-muse-spark` (0 of 12), `agy-claude-opus` (0 of 34) and `anthropic` (0 of 21).
+   */
+  recentFailures?: number;
+  /**
+   * Set at `FAILING_LANE_STREAK` own failures in a row: the lane is ordered behind every lane that
+   * has none, the same band as a walk demotion, until it answers again. Demoted, never dropped.
+   */
+  failing?: { streak: number; reason: string };
+  /**
+   * Not a ladder rung: built for ONE dispatch from a caller-named `model`. Never reported to
+   * `/dispatch/telemetry`, which knows only ladder lane ids; its HTTP traffic is metered by the
+   * relay's own pipeline anyway.
+   */
+  adHoc?: true;
 }
 
 export interface DispatchView {
@@ -363,6 +421,27 @@ export interface DispatchOptions {
    * existed. Never guess a number here: see `specContextWindow`.
    */
   publishedContextWindow?: (spec: string) => ResolvedContextWindow | null;
+  /**
+   * WHO is asking, when that changes what can run. `"mcp"` is the `llm-relay mcp` server: it runs
+   * lanes itself and has no `Agent` tool, so a pass-through relay rung — one that forwards the
+   * caller's own Anthropic credential — can never run there. It comes back `unreachable`, never as a
+   * lane the walk tries and fails in 0 s (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §4).
+   * Absent ⇒ exactly the behaviour before this existed.
+   */
+  requester?: "mcp";
+  /**
+   * The mode the caller will run lanes in, so each lane's budget comes from runs of the SAME mode
+   * (`attemptBudget`). Absent ⇒ the mode-less legacy window, as before this existed.
+   */
+  mode?: DispatchMode;
+  /**
+   * A routing spec (`deepseek/deepseek-flash`, `pool/high`, …) to run as its OWN one-lane view
+   * instead of the ladder. Validated against the configured providers and pools: an unknown spec
+   * yields no lane and a reason. `dispatch` could not name a model before 2026-09-10, so agents that
+   * had to use DeepSeek wrote their own HTTP calls to the relay
+   * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §7).
+   */
+  model?: string;
 }
 
 /**
@@ -681,6 +760,27 @@ function reachableWithoutRelay(spec: string, cfg: Config): boolean {
 }
 
 /**
+ * Does `spec` reach only the caller's own pass-through vendor (`reachableWithoutRelay`)? Exported
+ * for the MCP server, which filters such a lane out of a walk itself when its view came from a
+ * daemon older than `requester=mcp` — a version-skew guard, because the daemon started at logon
+ * routinely runs older code than a freshly spawned MCP process.
+ */
+export function isPassThroughSpec(spec: string, cfg: Config): boolean {
+  return reachableWithoutRelay(spec, cfg);
+}
+
+/**
+ * Why the MCP server cannot run a pass-through rung — the ONE wording, used for the `unreachable`
+ * verdict here and by the MCP server's own fallback text, so the two never disagree.
+ */
+export function mcpPassThroughReason(spec: string): string {
+  return (
+    `the MCP server cannot run "${describeId(spec)}": it forwards the caller's own Anthropic credential, ` +
+    "which only the calling host holds, so the host must reach it with its own subagent"
+  );
+}
+
+/**
  * Render a `relay` rung's spec as a CLI invocation via the operator's `routing.cliLane` template.
  *
  * `{task}` is substituted only into ARGS, never into env values: env is operator-authored routing,
@@ -877,6 +977,15 @@ function normalizeOptions(opts: DispatchOptions): DispatchOptions {
   if (manifest && typeof manifest === "object" && manifest.version === 1 && typeof manifest.lanes === "object" && manifest.lanes !== null) {
     out.manifest = manifest;
   }
+  // Closed vocabularies, validated HERE because this object can arrive off a raw query string: an
+  // unrecognised value reads as ABSENT — the behaviour before these existed — never as a guess.
+  if (opts.requester === "mcp") out.requester = "mcp";
+  const mode = str(opts.mode);
+  if (mode !== undefined && (DISPATCH_MODES as readonly string[]).includes(mode)) out.mode = mode as DispatchMode;
+  // Bounded like every other id this module echoes back in a reason; a spec longer than any real
+  // `provider/model` id is not one.
+  const model = str(opts.model);
+  if (model !== undefined && model.length <= 200) out.model = model;
   return out;
 }
 
@@ -1028,7 +1137,17 @@ function toLane(
       delete lane.invoke;
     }
   }
-  if (rung.kind === "relay" && rung.spec) {
+  if (rung.kind === "relay" && rung.spec && opts.requester === "mcp" && reachableWithoutRelay(rung.spec, cfg)) {
+    // ⚠ The MCP server runs lanes itself and has no `Agent` tool, so a PASS-THROUGH rung — one that
+    // forwards the caller's own Anthropic credential — can never run there. Agent mode had no
+    // command to run (its error said "no cliLane template configured", which was false), and
+    // answer mode posted the relay's placeholder key straight to Anthropic (HTTP 401). Measured
+    // 2026-09-10: 0 of 21 runs, and as the last lane its 0-second failure headed the reply of every
+    // walk that ran out of lanes. Unreachable, with the true reason; an explicit `lane` override
+    // still reaches it and shows this reason.
+    lane.spec = rung.spec;
+    lane.unreachable = mcpPassThroughReason(rung.spec);
+  } else if (rung.kind === "relay" && rung.spec) {
     lane.spec = rung.spec;
     // ⚠ This used to ask only `host === "bypassed"`, so a STATED `unknown` fell through with
     // `routed` and a headless caller — a cron job, a CI step, `run-headless.ps1` — was handed a
@@ -1159,19 +1278,194 @@ export function buildDispatch(
   const host = opts.host ?? "unknown";
   const now = Date.now();
   const selected = selectLadder(cfg, opts.tier);
-  const rungs = selected.rungs;
   // ⚠ `opts.host`, NOT the `host` above. `host` collapses an ABSENT verdict into "unknown" for
   // the rendered view, and the lane builder must tell those two apart: an absent verdict keeps
   // the pre-existing subagent path, a STATED "unknown" has no subagent mechanism to keep.
-  const ladder = rungs.map((r, i) =>
-    toLane(r, i + 1, cfg, opts, now, client, platform, opts.host, opts.entrypoint, launcherPath),
-  );
-  // Advisory lane-execution stats, filled for every rung that ran under this config and omitted
-  // otherwise. This mutates only the `stats` column: `state`, `next` and the ladder order were
-  // decided above from cooldowns and availability, and nothing here revisits them.
-  // Advisory `stats` column: a PER-LANE aggregate across tiers. One lane's runs under two
-  // tiers count once, in one column — the column answers "how often was this lane taken", and
-  // splitting it per tier would halve every figure the moment a second ladder is configured.
+  const makeLane = (rung: LadderRung, position: number): DispatchLane =>
+    toLane(rung, position, cfg, opts, now, client, platform, opts.host, opts.entrypoint, launcherPath);
+  const ladder = selected.rungs.map((r, i) => makeLane(r, i + 1));
+  // Three COLUMNS: advisory stats, each lane's own history (budget, time to answer, failures), and
+  // the routing memory of previous walks (`lane-affinity.ts`). None of them changes a lane's
+  // `state`; only the ordering of already-selectable lanes reads them, in `rankSelectable`.
+  annotateLaneStats(cfg, ladder);
+  annotateLaneHistory(cfg, ladder, selected.tier, opts.mode ?? null);
+  annotateAffinity(cfg, ladder, selected.tier, now);
+  const offload = offloadRule(cfg, client).enabled;
+  const base: ViewBase = { tier: selected.tier, offload, client, host, ladder };
+
+  // A caller-named model is its own one-lane view and needs no ladder, so it is decided first.
+  if (opts.model !== undefined) return modelView(cfg, base, opts.model, opts.lane, makeLane);
+
+  if (selected.missing) {
+    return {
+      ...base,
+      order: [],
+      next: null,
+      reason: `no dispatch tier "${describeId(selected.missing)}" configured (have: ${Object.keys(cfg.routing.ladders ?? {}).join(", ")})`,
+    };
+  }
+
+  if (ladder.length === 0) {
+    return {
+      ...base,
+      order: [],
+      next: null,
+      reason: "no routing.ladder configured — dispatch order is the host's to choose",
+    };
+  }
+
+  if (opts.lane !== undefined) return forcedLaneView(base, opts.lane);
+  return rankedView(base, opts.after);
+}
+
+
+/**
+ * The stats windows one lane's facts are read from, MOST SPECIFIC FIRST, existing windows only:
+ * (tier, mode) → (tier, legacy) → (no tier, mode) → (no tier, legacy).
+ *
+ * ⚠ The budget is derived ONLY from runs on the ladder it will be used on, and since 2026-09-10 in
+ * the mode it will be used in. A less specific window is a FALLBACK — the legacy rows predate
+ * tiering or modes — and a lane's facts always come from ONE window, never a merge: a merged
+ * quantile would attribute one tier's or one mode's runs to another, the defect this closes.
+ */
+function laneWindows(cfg: Config, laneId: string, tier: string | null, mode: DispatchMode | null): LaneStats[] {
+  const keys: Array<[string | null, DispatchMode | null]> = [];
+  const add = (t: string | null, m: DispatchMode | null): void => {
+    if (!keys.some(([kt, km]) => kt === t && km === m)) keys.push([t, m]);
+  };
+  add(tier, mode);
+  add(tier, null);
+  add(null, mode);
+  add(null, null);
+  const out: LaneStats[] = [];
+  for (const [t, m] of keys) {
+    const w = laneStatsFor(cfg, laneId, t, m);
+    if (w) out.push(w);
+  }
+  return out;
+}
+
+/**
+ * Everything the view says about one lane from its OWN recorded runs: the walk budget, the usual
+ * time to answer, and the streak of own failures.
+ *
+ * The BUDGET is how long a dispatch walk gives ONE lane to answer, derived from that lane's own
+ * recorded runs on THIS tier's ladder, in THIS mode.
+ *
+ * ⚠ Tier-keyed since 2026-09-09 (backlog item 4) and mode-keyed since 2026-09-10: one tier's or one
+ * mode's runs never set another's kill budget. `laneWindows` says how legacy rows are honoured.
+ *
+ * ⚠ This is the owner's request-path mechanism — a threshold read off what THIS endpoint has
+ * actually done — applied to lanes (owner direction 2026-09-08). The METHOD carries over; none of
+ * the request path's NUMBERS do, and must not: `latency-demotion.ts`'s 250 ms/token and 30 s
+ * ceiling are calibrated for single completions, and a lane legitimately runs an agent loop for
+ * minutes. Measured on this machine the same day, a flat 90 s budget sat BELOW the median run of
+ * two of the three working lanes and below the free pool's median by a factor of six.
+ *
+ * ⚠ The quantile defaults to 0.8, not the 0.95 the request path uses, and the data says why: at
+ * p90 and p95 the slowest lane's figure IS its own configured timeout, so a budget there could
+ * never fire for the lane that most needs bounding. p80 is the highest point still carrying
+ * information for every lane measured (165 s, 224 s, 1383 s against timeouts of 1800 s).
+ *
+ * ⚠ Too little history means the FLAT budget, never a quantile over two samples. Unmeasured is "no
+ * opinion", never "slow" — the same asymmetry `latency-demotion.ts` states, and for the same
+ * reason: a brand-new lane must not inherit a ceiling drawn from its single unluckiest run.
+ *
+ * ⚠ The TOKEN-normalised half of the request-path ladder is deliberately absent. A walk budget must
+ * fire BEFORE any answer arrives, so there is no output token to normalise by — which is also why
+ * `hedge-trigger.ts`'s own per-token rung is documented inert on the hedge path. Token
+ * normalisation only has a home in a post-commit policy, which does not exist here.
+ *
+ * - Samples come from the most specific window holding `attemptMinSamples` completed runs; the
+ *   usual time to answer, from that window or else the most specific one holding any.
+ * - The failure streak and the abandonment count come from the most specific window that EXISTS,
+ *   so a fresh mode window's evidence is never hidden behind a legacy window's samples.
+ * - The floor is `agentAttemptMs` for an agent-mode dispatch and `attemptMs` otherwise
+ *   (`DispatchWalkSettings.agentAttemptMs` for why there are two).
+ * - Each abandonment since the last success DOUBLES the budget, up to `MAX_ATTEMPT_BUDGET_MS`. An
+ *   abandoned run leaves no sample, so without the raise the window could never show that the lane
+ *   needed longer (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3b).
+ */
+function laneHistoryFacts(
+  cfg: Config,
+  laneId: string,
+  tier: string | null,
+  mode: DispatchMode | null,
+): {
+  budget: DispatchLane["attemptBudget"];
+  timeToAnswer: DispatchLane["timeToAnswer"];
+  recentFailures: number;
+} {
+  const windows = laneWindows(cfg, laneId, tier, mode);
+  const walk = cfg.routing.dispatchWalk;
+  const minSamples = walk?.attemptMinSamples ?? 5;
+  const sampled = windows.find((w) => w.wallClockMs.length >= minSamples);
+  const hinted = sampled ?? windows.find((w) => w.wallClockMs.length > 0);
+  const timeToAnswer: DispatchLane["timeToAnswer"] =
+    hinted === undefined
+      ? undefined
+      : {
+          medianMs: Math.round(medianWallClockMs(hinted.wallClockMs) ?? 0),
+          p80Ms: Math.round(quantileWallClockMs(hinted.wallClockMs, 0.8) ?? 0),
+          samples: hinted.wallClockMs.length,
+          mode: hinted.mode,
+        };
+  const newest = windows[0];
+  const recentFailures = newest?.consecutiveFailures ?? 0;
+  if (!walk || !walk.enabled) return { budget: undefined, timeToAnswer, recentFailures };
+  const floorMs = mode === "agent" ? Math.max(walk.attemptMs, walk.agentAttemptMs) : walk.attemptMs;
+  const base = budgetFromSamples(sampled?.wallClockMs ?? newest?.wallClockMs ?? [], { ...walk, attemptMs: floorMs });
+  const raisedBy = newest?.abandonedSinceSuccess ?? 0;
+  if (base === undefined || raisedBy <= 0) return { budget: base, timeToAnswer, recentFailures };
+  // The exponent is capped before it is applied, so a long streak cannot overflow to Infinity.
+  const ms = Math.min(MAX_ATTEMPT_BUDGET_MS, base.ms * 2 ** Math.min(raisedBy, 16));
+  return { budget: { ...base, ms, raisedBy }, timeToAnswer, recentFailures };
+}
+
+function budgetFromSamples(
+  samples: readonly number[],
+  walk: { attemptMs: number; attemptMinSamples: number; attemptQuantile: number },
+): DispatchLane["attemptBudget"] {
+  if (samples.length < walk.attemptMinSamples) {
+    return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
+  }
+  const quantile = quantileWallClockMs(samples, walk.attemptQuantile);
+  // A window that cleared the sample floor cannot yield null, but a null here must never become a
+  // zero budget — that would abandon every lane instantly. Fall to the flat figure, the weaker claim.
+  if (quantile === null) return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
+  const own = Math.round(quantile);
+  // ⚠ Never BELOW the flat budget. The floor is what the operator declared a lane is always worth
+  // waiting for; a lane whose history happens to be fast must not be given less than that, or a
+  // single quick run would make the relay impatient with it forever.
+  // ⚠⚠ But the LABEL must follow the number, not the clamp. When the floor wins, the figure served
+  // is the operator's configured default and calling it `history` reports a configuration value as
+  // a measurement of this lane — which is what it did until 2026-09-08. The lane's own quantile
+  // travels beside it, because that is the figure the operator actually wants.
+  if (own < walk.attemptMs) {
+    return { ms: walk.attemptMs, basis: "clamped", samples: samples.length, quantileMs: own };
+  }
+  return { ms: own, basis: "history", samples: samples.length };
+}
+
+/** The fields every view carries whatever it selects: `buildDispatch` computes them once. */
+type ViewBase = Pick<DispatchView, "tier" | "offload" | "client" | "host" | "ladder">;
+
+/**
+ * Can the ordering select this lane at all? Ready, reachable from this host, and servable — the
+ * three conditions every selection pass reads, stated once.
+ */
+function isSelectable(lane: DispatchLane): boolean {
+  return lane.state === "ready" && lane.unreachable === undefined && lane.notServable === undefined;
+}
+
+/**
+ * Fill the advisory `stats` column for every rung that ran under this config, and leave it absent
+ * otherwise. It is a PER-LANE aggregate across tiers and modes: the column answers "how often was
+ * this lane taken", and splitting it per tier would halve every figure the moment a second ladder is
+ * configured. Only `stats` is written — `state`, `next` and the order are decided elsewhere, and
+ * nothing here revisits them.
+ */
+function annotateLaneStats(cfg: Config, ladder: DispatchLane[]): void {
   const statsByLane = new Map<string, { calls: number; successes: number; failures: number; timeouts: number; wallClockMs: number[]; lastAt: number | null }>();
   for (const row of allLaneStats(cfg)) {
     const agg = statsByLane.get(row.laneId);
@@ -1206,187 +1500,170 @@ export function buildDispatch(
       lastAt: row.lastAt,
     };
   }
-  // Every lane gets a budget, whether or not it has ever run: a lane with no history takes the flat
-  // figure at `floor` basis. Written in one pass over the whole ladder rather than only over rungs
-  // that carry stats, so a never-run lane still shows the operator what it will be given.
-  // ⚠ The budget reads the (lane, tier) window for THIS ladder — never the aggregate above.
+}
+
+/**
+ * Fill each lane's history columns from ITS OWN recorded runs on this ladder, in this mode
+ * (`laneHistoryFacts`): the walk budget, the usual time to answer, the streak of own failures, and —
+ * with the walk on — the `failing` mark at `FAILING_LANE_STREAK`.
+ *
+ * Every lane gets a budget, whether or not it has ever run: a lane with no history takes the flat
+ * figure at `floor` basis, so a never-run lane still shows the operator what it will be given.
+ * ⚠ The budget reads this ladder's own window — never the cross-tier aggregate in `stats`.
+ *
+ * ⚠ `failing` is gated on the walk for the reason `annotateAffinity` states: `dispatchWalk: false`
+ * restores the pre-walk order exactly, and a mark that reorders lanes is walk behaviour. It goes on a
+ * selectable lane only, because a mark on a lane nothing can select says nothing.
+ */
+function annotateLaneHistory(cfg: Config, ladder: DispatchLane[], tier: string | null, mode: DispatchMode | null): void {
+  const walkOn = cfg.routing.dispatchWalk?.enabled === true;
   for (const lane of ladder) {
-    const budget = attemptBudget(cfg, lane.id, selected.tier);
-    if (budget !== undefined) lane.attemptBudget = budget;
-  }
-  // Routing memory from previous walks (`lane-affinity.ts`): which lane answered, and which lane
-  // failed to answer inside the budget it was given. Like the stats above these are COLUMNS — they
-  // never change a lane's `state`, and an unavailable lane carries neither. Only the ordering of
-  // already-selectable lanes reads them, below.
-  annotateAffinity(cfg, ladder, selected.tier, now);
-  const offload = offloadRule(cfg, client).enabled;
-  const base = { tier: selected.tier, offload, client, host, ladder };
-
-  if (selected.missing) {
-    return {
-      ...base,
-      order: [],
-      next: null,
-      reason: `no dispatch tier "${describeId(selected.missing)}" configured (have: ${Object.keys(cfg.routing.ladders ?? {}).join(", ")})`,
-    };
-  }
-
-  if (ladder.length === 0) {
-    return {
-      ...base,
-      order: [],
-      next: null,
-      reason: "no routing.ladder configured — dispatch order is the host's to choose",
-    };
-  }
-
-  if (opts.lane !== undefined) {
-    const forced = ladder.find((l) => l.id === opts.lane);
-    if (!forced) {
-      return {
-        ...base,
-        order: [],
-        next: null,
-        reason: `no lane "${describeId(opts.lane)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
+    const facts = laneHistoryFacts(cfg, lane.id, tier, mode);
+    if (facts.budget !== undefined) lane.attemptBudget = facts.budget;
+    if (facts.timeToAnswer !== undefined) lane.timeToAnswer = facts.timeToAnswer;
+    if (facts.recentFailures > 0) lane.recentFailures = facts.recentFailures;
+    if (walkOn && facts.recentFailures >= FAILING_LANE_STREAK && isSelectable(lane)) {
+      lane.failing = {
+        streak: facts.recentFailures,
+        reason: `${facts.recentFailures} own failures in a row; ordered behind the other lanes until it answers again`,
       };
     }
-    // An explicit override is honoured even when the rung is cooling down, parked, or unreachable
-    // from this host: the host asked for THIS target, and second-guessing it would defeat the
-    // point of an override. The `unreachable` field still travels on the lane, so the caller can
-    // see what it overrode rather than discovering it at spawn time.
-    //
-    // ⚠ `order` is that ONE lane, so a walking caller honours the override too: an override means
-    // "use this target", and walking past it to a lane the caller did not ask for would defeat the
-    // override just as silently as ignoring it.
+  }
+}
+
+/**
+ * The view for a host override (`?lane=`): that ONE lane, whatever its state.
+ *
+ * An explicit override is honoured even when the rung is cooling down, parked, or unreachable from
+ * this host: the host asked for THIS target, and second-guessing it would defeat the point of an
+ * override. The `unreachable` field still travels on the lane, so the caller can see what it
+ * overrode rather than discovering it at spawn time.
+ *
+ * ⚠ `order` is that ONE lane, so a walking caller honours the override too: an override means "use
+ * this target", and walking past it to a lane the caller did not ask for would defeat the override
+ * just as silently as ignoring it.
+ */
+function forcedLaneView(base: ViewBase, laneId: string): DispatchView {
+  const forced = base.ladder.find((l) => l.id === laneId);
+  if (!forced) {
     return {
       ...base,
-      order: [forced.id],
-      next: forced,
-      reason:
-        forced.unreachable !== undefined
-          ? `lane "${forced.id}" selected by host override (${forced.unreachable})`
-          : forced.state === "ready"
-            ? `lane "${forced.id}" selected by host override`
-            : `lane "${forced.id}" selected by host override (currently ${forced.state})`,
+      order: [],
+      next: null,
+      reason: `no lane "${describeId(laneId)}" in the ladder (have: ${base.ladder.map((l) => l.id).join(", ")})`,
     };
   }
+  return {
+    ...base,
+    order: [forced.id],
+    next: forced,
+    reason:
+      forced.unreachable !== undefined
+        ? `lane "${forced.id}" selected by host override (${forced.unreachable})`
+        : forced.state === "ready"
+          ? `lane "${forced.id}" selected by host override`
+          : `lane "${forced.id}" selected by host override (currently ${forced.state})`,
+  };
+}
 
-  let pool = ladder;
-  if (opts.after !== undefined) {
-    const idx = ladder.findIndex((l) => l.id === opts.after);
+/**
+ * The view for an ordinary dispatch: the selectable lanes in rank order, optionally only those after
+ * `after`.
+ *
+ * An unreachable rung is skipped like an exhausted one. Auto-selecting a lane already known not to
+ * work for this host is the exact defect this is here to fix — the host would spend a turn
+ * discovering it, and in the Desktop case would discover it as a silent no-op rather than an error.
+ * An explicit `?lane=` override (`forcedLaneView`) still reaches it.
+ */
+function rankedView(base: ViewBase, after: string | undefined): DispatchView {
+  let pool = base.ladder;
+  if (after !== undefined) {
+    const idx = base.ladder.findIndex((l) => l.id === after);
     if (idx < 0) {
       return {
         ...base,
         order: [],
         next: null,
-        reason: `no lane "${describeId(opts.after)}" in the ladder (have: ${ladder.map((l) => l.id).join(", ")})`,
+        reason: `no lane "${describeId(after)}" in the ladder (have: ${base.ladder.map((l) => l.id).join(", ")})`,
       };
     }
-    pool = ladder.slice(idx + 1);
+    pool = base.ladder.slice(idx + 1);
   }
-
-  // An unreachable rung is skipped like an exhausted one. Auto-selecting a lane already known not
-  // to work for this host is the exact defect this is here to fix — the host would spend a turn
-  // discovering it, and in the Desktop case would discover it as a silent no-op rather than an
-  // error. An explicit `?lane=` override above still reaches it.
-  const usable = pool.filter((l) => l.state === "ready" && l.unreachable === undefined && l.notServable === undefined);
+  const usable = pool.filter(isSelectable);
   const ranked = rankSelectable(usable);
   const next = ranked[0] ?? null;
   if (!next) {
     const blocked = pool.filter((l) => l.unreachable !== undefined).length;
     const why =
-      opts.after !== undefined
-        ? `no ready lane after "${describeId(opts.after)}" — the ladder is exhausted`
+      after !== undefined
+        ? `no ready lane after "${describeId(after)}" — the ladder is exhausted`
         : "every lane is exhausted or disabled";
+    return { ...base, order: [], next: null, reason: blocked > 0 ? `${why} (${blocked} unreachable from this host)` : why };
+  }
+  return { ...base, order: ranked.map((l) => l.id), next, reason: selectionReason(next, after, usable) };
+}
+
+/**
+ * Why `spec` names nothing this relay can route, or null when it does: the reserved `auto` model, a
+ * configured `pool/<name>`, or a configured provider with or without a model id. A model id the
+ * provider does not serve is left to the provider's own error, which is more exact than a guess here.
+ */
+function unknownModelReason(cfg: Config, spec: string): string | null {
+  if (/\s/.test(spec) || stripControlCharacters(spec) !== spec) {
+    return `model "${describeId(spec)}" is not a routing spec: it holds whitespace or control characters`;
+  }
+  if (spec === AUTO_MODEL) return null;
+  const { provider, model } = splitSpec(spec);
+  if (provider === POOL_PREFIX) {
+    const pools = Object.keys(cfg.routing.pools ?? {});
+    if (model !== undefined && pools.includes(model)) return null;
+    return `no pool "${describeId(spec)}" configured (have: ${pools.map((p) => `${POOL_PREFIX}/${p}`).join(", ")})`;
+  }
+  if (Object.keys(cfg.providers).includes(provider)) return null;
+  return `model "${describeId(spec)}" names no configured provider or pool (providers: ${Object.keys(cfg.providers).join(", ")})`;
+}
+
+/**
+ * The view for a caller-named `model` (`DispatchOptions.model`): ONE ad-hoc relay lane addressing
+ * that spec, built by `toLane` like any rung, so agent mode gets the same `routing.cliLane`
+ * transposition and the MCP server gets the same pass-through verdict.
+ *
+ * ⚠ The spec is VALIDATED before a lane exists: an unknown one yields no lane and a reason naming
+ * what exists, not a lane that fails at the relay with a routing error. `lane` and `model` together
+ * are refused, because they name two different targets and honouring either would ignore the other.
+ *
+ * ⚠ The lane is appended to `ladder`, because a walk resolves ids against it; `adHoc` marks it so no
+ * surface mistakes it for a configured rung, and its `position` is past every real one.
+ */
+function modelView(
+  cfg: Config,
+  base: ViewBase,
+  spec: string,
+  laneOverride: string | undefined,
+  makeLane: (rung: LadderRung, position: number) => DispatchLane,
+): DispatchView {
+  if (laneOverride !== undefined) {
     return {
       ...base,
       order: [],
       next: null,
-      reason: blocked > 0 ? `${why} (${blocked} unreachable from this host)` : why,
+      reason:
+        `pass lane or model, not both: lane "${describeId(laneOverride)}" names a ladder rung and ` +
+        `model "${describeId(spec)}" names a routing spec`,
     };
   }
-
-  const why = selectionReason(next, opts.after, usable);
-  return { ...base, order: ranked.map((l) => l.id), next, reason: why };
-}
-
-/**
- * How long a dispatch walk gives ONE lane to answer, derived from that lane's own recorded runs
- * on THIS tier's ladder.
- *
- * ⚠ Tier-keyed since 2026-09-09 (backlog item 4): the stats window beside it is keyed by
- * (lane, tier), and the budget reads that window — one tier's runs never set another tier's
- * kill budget. See the fallback comment in the body for how legacy tier-less rows are honoured.
- *
- * ⚠ This is the owner's request-path mechanism — a threshold read off what THIS endpoint has
- * actually done — applied to lanes (owner direction 2026-09-08). The METHOD carries over; none of
- * the request path's NUMBERS do, and must not: `latency-demotion.ts`'s 250 ms/token and 30 s
- * ceiling are calibrated for single completions, and a lane legitimately runs an agent loop for
- * minutes. Measured on this machine the same day, a flat 90 s budget sat BELOW the median run of
- * two of the three working lanes and below the free pool's median by a factor of six.
- *
- * ⚠ The quantile defaults to 0.8, not the 0.95 the request path uses, and the data says why: at
- * p90 and p95 the slowest lane's figure IS its own configured timeout, so a budget there could
- * never fire for the lane that most needs bounding. p80 is the highest point still carrying
- * information for every lane measured (165 s, 224 s, 1383 s against timeouts of 1800 s).
- *
- * ⚠ Too little history means the FLAT budget, never a quantile over two samples. Unmeasured is "no
- * opinion", never "slow" — the same asymmetry `latency-demotion.ts` states, and for the same
- * reason: a brand-new lane must not inherit a ceiling drawn from its single unluckiest run.
- *
- * ⚠ The TOKEN-normalised half of the request-path ladder is deliberately absent. A walk budget must
- * fire BEFORE any answer arrives, so there is no output token to normalise by — which is also why
- * `hedge-trigger.ts`'s own per-token rung is documented inert on the hedge path. Token
- * normalisation only has a home in a post-commit policy, which does not exist here.
- */
-function attemptBudget(
-  cfg: Config,
-  laneId: string,
-  tier: string | null,
-): DispatchLane["attemptBudget"] {
-  const walk = cfg.routing.dispatchWalk;
-  if (!walk || !walk.enabled) return undefined;
-  // ⚠ The budget is derived ONLY from runs on the ladder it will be used on. When the tier's
-  // own window holds fewer than `attemptMinSamples` samples it FALLS BACK to the tier-less
-  // window — the legacy rows, which predate tiering and belong to no ladder — and reports the
-  // basis from whichever window it used. It never merges the two windows into one quantile:
-  // that would attribute one tier's runs to another, the defect this closes. The fallback is
-  // the legacy file's whole purpose, and it expires on its own as tier-keyed samples
-  // accumulate past the floor.
-  const tiered = laneStatsFor(cfg, laneId, tier)?.wallClockMs ?? [];
-  if (tiered.length >= walk.attemptMinSamples) {
-    return budgetFromSamples(tiered, walk);
-  }
-  if (tier === null) {
-    return budgetFromSamples(tiered, walk);
-  }
-  const legacy = laneStatsFor(cfg, laneId, null)?.wallClockMs ?? [];
-  return budgetFromSamples(legacy, walk);
-}
-
-function budgetFromSamples(
-  samples: readonly number[],
-  walk: { attemptMs: number; attemptMinSamples: number; attemptQuantile: number },
-): DispatchLane["attemptBudget"] {
-  if (samples.length < walk.attemptMinSamples) {
-    return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
-  }
-  const quantile = quantileWallClockMs(samples, walk.attemptQuantile);
-  // A window that cleared the sample floor cannot yield null, but a null here must never become a
-  // zero budget — that would abandon every lane instantly. Fall to the flat figure, the weaker claim.
-  if (quantile === null) return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
-  const own = Math.round(quantile);
-  // ⚠ Never BELOW the flat budget. The floor is what the operator declared a lane is always worth
-  // waiting for; a lane whose history happens to be fast must not be given less than that, or a
-  // single quick run would make the relay impatient with it forever.
-  // ⚠⚠ But the LABEL must follow the number, not the clamp. When the floor wins, the figure served
-  // is the operator's configured default and calling it `history` reports a configuration value as
-  // a measurement of this lane — which is what it did until 2026-09-08. The lane's own quantile
-  // travels beside it, because that is the figure the operator actually wants.
-  if (own < walk.attemptMs) {
-    return { ms: walk.attemptMs, basis: "clamped", samples: samples.length, quantileMs: own };
-  }
-  return { ms: own, basis: "history", samples: samples.length };
+  const unknown = unknownModelReason(cfg, spec);
+  if (unknown !== null) return { ...base, order: [], next: null, reason: unknown };
+  const lane = makeLane({ id: `model:${spec}`, kind: "relay", enabled: true, spec }, base.ladder.length + 1);
+  lane.adHoc = true;
+  const named = `model "${spec}" named by the caller`;
+  return {
+    ...base,
+    ladder: [...base.ladder, lane],
+    order: [lane.id],
+    next: lane,
+    reason: lane.unreachable === undefined ? named : `${named} (${lane.unreachable})`,
+  };
 }
 
 /**
@@ -1427,10 +1704,14 @@ function annotateAffinity(cfg: Config, ladder: DispatchLane[], tier: string | nu
 }
 
 /**
- * Order the selectable lanes: pinned first, then undemoted, then demoted. Within a band the
- * configured ladder order is preserved, because `Array.prototype.sort` is stable and the input is
- * already in that order — the operator's own ordering remains the tie-break, exactly as pool
+ * Order the selectable lanes: pinned first, then undemoted, then demoted or failing. Within a band
+ * the configured ladder order is preserved, because `Array.prototype.sort` is stable and the input
+ * is already in that order — the operator's own ordering remains the tie-break, exactly as pool
  * ranking keeps config order on a tie.
+ *
+ * ⚠ A `failing` lane shares the demoted band: `FAILING_LANE_STREAK` own failures in a row is
+ * first-party evidence like a missed budget, and the answer to it is the same — a reorder, never a
+ * drop. Health demotes; it never drops.
  *
  * ⚠ A lane carrying BOTH memories ranks as PINNED. That state is reachable — a lane can answer,
  * be pinned, then miss a budget on a later walk — and the pin is the more recent evidence in the
@@ -1439,7 +1720,7 @@ function annotateAffinity(cfg: Config, ladder: DispatchLane[], tier: string | nu
  * budget outrank a fresh success.
  */
 function rankSelectable(usable: readonly DispatchLane[]): DispatchLane[] {
-  const rank = (lane: DispatchLane): number => (lane.pinned ? 0 : lane.demoted ? 2 : 1);
+  const rank = (lane: DispatchLane): number => (lane.pinned ? 0 : lane.demoted || lane.failing ? 2 : 1);
   return [...usable].sort((a, b) => rank(a) - rank(b));
 }
 
@@ -1464,16 +1745,22 @@ function rankSelectable(usable: readonly DispatchLane[]): DispatchLane[] {
 function selectionReason(next: DispatchLane, after: string | undefined, usable: readonly DispatchLane[]): string {
   if (next.pinned) return `lane "${next.id}" is pinned (${next.pinned.reason})`;
   if (after !== undefined) return `first ready lane after "${describeId(after)}"`;
-  if (next.demoted) return `every ready lane is demoted; "${next.id}" is first among them in the ladder`;
+  if (next.demoted || next.failing) {
+    return `every ready lane is demoted or failing; "${next.id}" is first among them in the ladder`;
+  }
   if (next.position === 1) return "first lane in the ladder";
-  // Ahead of `next` in LADDER order, split by why they did not lead. `next` is undemoted and
-  // unpinned here, so any selectable lane ahead of it must be demoted — a pinned one would be
-  // `next` itself.
-  const aheadDemoted = usable.filter((l) => l.position < next.position).length;
-  const aheadUnavailable = next.position - 1 - aheadDemoted;
+  // Ahead of `next` in LADDER order, split by why they did not lead. `next` is in the middle band
+  // here, so any selectable lane ahead of it is in the last one — demoted by a missed budget, or
+  // failing on its own streak; a pinned one would be `next` itself. The two are named apart because
+  // they call for different responses: a demotion is the walk working, a streak needs a look.
+  const ahead = usable.filter((l) => l.position < next.position);
+  const aheadFailing = ahead.filter((l) => l.failing !== undefined).length;
+  const aheadDemoted = ahead.length - aheadFailing;
+  const aheadUnavailable = next.position - 1 - ahead.length;
   const parts: string[] = [];
   if (aheadUnavailable > 0) parts.push(`${aheadUnavailable} ahead of it unavailable`);
   if (aheadDemoted > 0) parts.push(`${aheadDemoted} ahead of it ready but demoted`);
+  if (aheadFailing > 0) parts.push(`${aheadFailing} ahead of it ready but failing`);
   return parts.length === 0 ? "first lane in the ladder" : `first undemoted lane (${parts.join(", ")})`;
 }
 

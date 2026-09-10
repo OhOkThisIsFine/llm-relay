@@ -2,70 +2,42 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-09 (v0.78.0)
+## 0. State as of 2026-09-10 (v0.81.0)
 
-- **What shipped — the 27-items lap, one day.** Every entry of `docs/backlog.md` that stood open
-  at `3abbafd` is closed with a pinning test, rewritten to its residue, or owner-gated; the file
-  holds the four that remain, two of them the owner's. Landed, in order: `npm run gate`;
-  `docs/project-philosophy.md`; the accounting temp-root and keystore leak-check fixes;
-  `LANE_AFFINITY_DEFAULT_TTL_MS` and 33 dead exports pruned; `routing.mcp.maxWaitMs`; the
-  eligibility triage document; the relay agent template v5; the forward-header ALLOW-list and
-  `onListenError`; cost-class-bounded `clearFacts`; `writerHealth()` on `/telemetry` and in
-  `llm-relay cost`; `wire: "responses"`, the OpenAI Responses UPSTREAM speaker (route B); the
-  post-commit stall measurement; tier-keyed lane history with the calibrated outlier demotion;
-  the probation band and price-suffix resolution; the free-class key probe; the first-byte
-  deadline for non-streamed attempts; the Responses front's retired 1024 cap, `incomplete`
-  announcement and named cut-replay refusal; the post-commit crawl abort (`routing.crawl`);
-  `POST /stop`, `llm-relay stop` and the config-staleness notice; the per-lane `maxConcurrent`
-  cap; and one log verdict for a relay-aborted committed stream on both fronts.
-- **Measured, then built on:** both clients RETRY after a post-commit failure
-  ([docs/post-commit-stall-measurement-2026-09-09.md](docs/post-commit-stall-measurement-2026-09-09.md)),
-  which is what the crawl abort rests on. The DeepSeek capture
-  ([docs/deepseek-responses-truncation-2026-09-09.md](docs/deepseek-responses-truncation-2026-09-09.md))
-  never reproduced the cut string but found the mechanism — 19 of 68 answers hit the relay's own
-  1024 cap, and all 44 `response.completed` events it emitted carried no `incomplete_details`, so
-  every capped answer was announced whole — and filed a second defect, the
-  `reasoning_content` replay.
-- **Closeout, done 2026-09-10.** The daemon now runs v0.78.0: the old one (PID 51960) predated
-  `POST /stop`, so `llm-relay stop` answered `the running relay returned an invalid response` and
-  the first stop was a process kill; it was started again from `Startup\llm-relay.vbs` (PID 28920)
-  and warmed. `GET /telemetry` carries both new fields — `accounting` (the `writerHealth()` block,
-  `state: "writing"`) and `config` (the staleness block). `Startup\llm-relay.vbs` now names
-  `llm-relay stop` and records that a pre-v0.78.0 daemon still needs the hard kill. The verb was
-  then proven against the daemon that carries it: `llm-relay stop` printed `stopping llm-relay at
-  http://127.0.0.1:8791`, PID 28920 exited and port 8791 went free — the graceful path that
-  flushes every write-behind store. The relay runs again from the launcher (PID 29552). The operator
-  config carries the route-B edits with a dated backup.
-- **Route B, live: PARTIAL, and the missing half is the vendor's.** A STREAMED request carrying a
-  tool, sent on BOTH fronts, egressed to OpenCode Zen on the Responses wire and returned
-  `x-llm-relay-served-by: opencode/muse-spark-1.3-contributor-free` with
-  `x-llm-relay-error-origin: upstream` and each front's own error envelope. The upstream answer was
-  `HTTP 429 FreeUsageLimitError` on both — the free contributor allowance, spent by this machine's
-  six Muse Spark packets the day before. A 429 proves egress, never translation, so the entry stays
-  open for the served 200. The same responses carried
-  `x-llm-relay-probation: opencode/muse-spark-1.3-contributor-free (0 of 5 request samples)`, which
-  is the probation band answering on real traffic for the exact member it was built for.
-- **Owner decisions at the hand-back, 2026-09-10.** Three questions were asked and answered.
-  (a) **The refusal queue: run 24 of the 25 triaged commands, skipping the `nim/moonshotai/kimi-k3`
-  eviction.** Done — eighteen accepts and six rejects applied; the queue fell from 26 items to 5.
-  Two stay pending as the stated verdict (the groq client-side network block, and kimi-k3 by this
-  decision), and three arrived during the closeout with no verdict yet. The digest pin proved its
-  worth: the queue reordered under six commands and each one said so and still landed correctly.
-  (b) **The Codex Desktop `relay` check: leave the entry open.** No action; only a live Codex
-  Desktop session can run it.
-  (c) **The nineteen packet worktrees: delete them and their branches now.** Done — nineteen
-  worktrees unregistered, nineteen `pkt/*` branches deleted, and the directories removed from disk.
-  ⚠ Each carried a `node_modules` JUNCTION into this checkout's real dependency tree, so every
-  junction was unlinked with `Directory.Delete(path, false)` BEFORE any recursive delete; the main
-  `node_modules` was counted at 377 entries before and after. `git worktree list` is one entry
-  again. `C:\Code-worktrees\llm-relay\out` survives — it holds the packet BRIEFS, not lane output.
-- **Immediate next:** give the three new unrecognized refusals a verdict (two are this closeout's
-  own route-B probes; one is `nim/deepseek-ai/deepseek-v4-flash-0731` repeating item 3's wording),
-  run the Codex Desktop `relay` check when convenient, and re-run the route-B proof once the
-  OpenCode free allowance refills. `docs/backlog.md` is the queue; it holds four entries.
+- **What this lap shipped — the dispatch give-up fixes.** Diagnosis:
+  [docs/dispatch-giveup-diagnosis-2026-09-10.md](docs/dispatch-giveup-diagnosis-2026-09-10.md).
+  Agents gave up on `dispatch` because the walk stopped the one working lane (`free-pool`) at a
+  90 s budget that its own window could never raise, walked on through lanes that could not
+  answer, ended on the `anthropic` pass-through that the MCP server cannot run, and then told the
+  agent to stop delegating. All nine planned fixes landed (F1–F9), with DeepSeek's two
+  request-shape 400s (F10/F11, written by a Sonnet lane and verified here) and the windowless-console
+  wrap for `routing.cliLane` (the popup fix). The owning symbols are in the `CLAUDE.md` rows for
+  `dispatch.ts`, `dispatch-lane-stats.ts`, `mcp/server.ts`, `mcp/agy-quota-log.ts` and
+  `openai-request.ts`.
+- **What an operator will notice.** `dispatch` takes `model`; the default blocking wait is 25 s
+  (it was 40 s, past Codex's 31 s limit); a reply with no answer names a lane the walk stopped and
+  the call that lets it finish; `dispatch_status` states the running lane's usual time to answer;
+  `dispatch_lanes` shows each lane's time to answer and failure streak; a lane with five own
+  failures in a row is ordered last until it answers; `/telemetry` shows `tierType: null` for an
+  undeclared tier; and an `llm-relay mcp` process older than the installed package says so in
+  every reply.
+- **Operator config, this lap (backups taken).** `routing.dispatchWalk: false` (the stopgap; owner
+  decision "walk off, no restart now"), `providers.deepseek.stallTimeoutMs: 120000` (F7), and the
+  four free-pool rung notes now say that paid DeepSeek leads the pool. None of it is loaded until
+  the daemon restarts.
+- **Immediate next:** the owner decides whether to restart the daemon onto v0.81.0 and whether to
+  turn the walk back on (it is off only as a stopgap for the defects this lap fixed). The three
+  refusal verdicts in `docs/backlog.md` still wait. The two owner-direction entries filed this lap
+  — pacing from observed throttling, and a catalog refresh on a stale hint — are the proposed next
+  lap.
 
 ### 0.1 Previous laps
 
+- **v0.78.0–v0.80.0 (2026-09-09/10).** The 27-items lap closed every backlog entry open at
+  `3abbafd` (route B `wire: "responses"`, the probation band, the first-byte deadline, the crawl
+  abort, `POST /stop`, the `maxConcurrent` cap and more); v0.79.0 carried DeepSeek's thinking
+  control and pool effort; v0.80.0 made the MCP server reap lane process trees, journal running
+  jobs, and refuse a read-only dispatch in the caller's own tree.
 - **v0.77.1, the `parseRouting` split (2026-09-09, morning).** Validation order pinned FIRST
   (`test/config/routing-parser-order.test.ts`; cognitive complexity 125 → 12; `parseOffload` and
   `parseLadder` untouched by design). Two pre-existing quirks pinned as behaviour: the

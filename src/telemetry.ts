@@ -10,7 +10,15 @@ export interface ProviderTelemetry {
   provider: string;
   displayName: string;
   kind: string;
-  tierType: ProviderTierType;
+  /**
+   * The provider's declared tier (`providers.<name>.tierType`), else its preset's, else `null`.
+   *
+   * ⚠ `null`, never a guessed `"free"`. Until 2026-09-10 an undeclared tier fell back to `"free"`,
+   * so `/telemetry` called the paid `deepseek` provider free while `assessCost` treated the same
+   * provider as `unknown` — the closed-vocabulary fall-through to the STRONGER claim that CLAUDE.md
+   * records. Unknown stays null.
+   */
+  tierType: ProviderTierType | null;
   signupUrl?: string | undefined;
   hasKey: boolean;
   isHealthy: boolean | null;
@@ -137,7 +145,7 @@ export function getTelemetryReport(
       provider: name,
       displayName: preset?.displayName ?? name.toUpperCase(),
       kind: p.kind,
-      tierType: p.tierType ?? preset?.tierType ?? "free",
+      tierType: p.tierType ?? preset?.tierType ?? null,
       signupUrl: p.signupUrl ?? preset?.signupUrl,
       hasKey,
       isHealthy,

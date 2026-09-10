@@ -29,8 +29,9 @@ import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js
 import { probeLanes } from "./lane-probe.js";
 import { buildDispatch, allLadderRungs, normalizeCliCommand, resolveLaneLauncherPath, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, formatAttemptBudget, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { flushLaneAffinityPersistence, loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
-import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsRows } from "./dispatch-lane-stats.js";
+import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsRows, type DispatchMode } from "./dispatch-lane-stats.js";
 import { McpDispatchServer } from "./mcp/server.js";
+import { readAgyLog } from "./mcp/agy-quota-log.js";
 import { createJobJournal } from "./mcp/job-journal.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
@@ -2615,6 +2616,8 @@ export async function resolveDispatchView(opts: {
   tier?: string | undefined;
   lane?: string | undefined;
   client?: string | undefined;
+  mode?: DispatchMode | undefined;
+  model?: string | undefined;
   cfg?: Config;
 }): Promise<DispatchView> {
   const cfg = opts.cfg ?? loadOrExit();
@@ -2626,7 +2629,14 @@ export async function resolveDispatchView(opts: {
   if (opts.lane) qs.set("lane", opts.lane);
   if (opts.tier) qs.set("tier", opts.tier);
   if (opts.client) qs.set("client", opts.client);
+  if (opts.mode) qs.set("mode", opts.mode);
+  if (opts.model) qs.set("model", opts.model);
   qs.set("host", "bypassed");
+  // ⚠ This view is for the MCP server, which has no `Agent` tool: a pass-through rung it cannot run
+  // must come back `unreachable`, never as a lane the walk tries and fails in 0 s
+  // (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §4). A daemon older than this parameter ignores
+  // it, and `McpDispatchServer` filters such a rung itself for exactly that case.
+  qs.set("requester", "mcp");
 
   const cachedContextWindow = setupDispatchCatalog(cfg);
 
@@ -2664,6 +2674,9 @@ export async function resolveDispatchView(opts: {
       ...(opts.lane ? { lane: opts.lane } : {}),
       ...(opts.tier ? { tier: opts.tier } : {}),
       ...(opts.client ? { client: opts.client } : {}),
+      ...(opts.mode ? { mode: opts.mode } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
+      requester: "mcp",
       host: "bypassed",
       publishedContextWindow: cachedContextWindow,
       manifest: loadLaneManifest(),
@@ -2687,6 +2700,15 @@ export async function runMcp(): Promise<void> {
     buildView: (o) => resolveDispatchView({ ...o, cfg }),
     ...(allowedRoots ? { allowedRoots } : {}),
     version: currentVersion(),
+    // Read fresh on every reply, so a process that outlived a reinstall says so (`McpServerDeps`).
+    installedVersion: () => {
+      try {
+        return currentVersion();
+      } catch {
+        return null;
+      }
+    },
+    readAgyLog: () => readAgyLog(),
     reportExhaustion: (report) => reportMcpExhaustion(cfg, report),
     reportTelemetry: (report) => { void reportMcpTelemetry(cfg, report); },
     // ⚠ The running-job journal is what makes a restart REPORTABLE. Without it the measured

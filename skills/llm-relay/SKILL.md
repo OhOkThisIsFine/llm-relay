@@ -3,7 +3,8 @@ name: llm-relay
 description: >-
   Operate llm-relay, the loopback multi-provider LLM proxy (default 127.0.0.1:8791) that
   validates/repairs tool calls and offloads Claude, Codex and other client requests to
-  non-Anthropic providers on free capacity. Use it BEFORE spending this session's context or
+  non-Anthropic providers — free tiers first, and paid credits such as DeepSeek where the operator
+  configured them. Use it BEFORE spending this session's context or
   subscription quota on delegatable work — a broad code search, a file-by-file sweep, a survey,
   a bulk edit, a long summary, a second opinion, or any self-contained task whose result is a
   conclusion you can check. Nobody has to ask for offload first. Also use when choosing an

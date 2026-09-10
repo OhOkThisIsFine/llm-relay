@@ -248,6 +248,20 @@ export interface LaneJob {
    * exactly — the pre-walk answer carried no such advice at all.
    */
   walkEnabled?: boolean;
+  /**
+   * The caller NAMED what to run — a `lane` override, or a `model` run as its own one-lane view —
+   * so the walk ran exactly one lane on purpose. `jobAnswer` then says that only that lane ran:
+   * "every dispatch lane has now been tried" would be false there, and it tells an autonomous
+   * caller to stop delegating altogether (measured 2026-09-10 on jobs 0023 and 0024).
+   */
+  forcedLane?: boolean;
+  /**
+   * How long the lane now running usually takes to ANSWER in this dispatch's mode, from that
+   * lane's own completed runs — rendered on every poll so a caller can tell a slow lane from a
+   * stuck one. 23 of the 182 unanswered dispatches in the 2026-09-10 transcript sweep ended with
+   * the caller simply no longer polling. Absent when the lane has no completed run on record.
+   */
+  expected?: { medianMs: number | null; p80Ms: number | null; samples: number };
   startedAt: number;
   endedAt: number | undefined;
   exitCode: number | null;
@@ -896,11 +910,20 @@ export class LaneJobStore {
    * other; without the guard a walk that advanced in the same tick would repoint a job the
    * operator had already stopped.
    */
-  setCurrentLane(id: string, laneId: string, spec: string | undefined): void {
+  setCurrentLane(
+    id: string,
+    laneId: string,
+    spec: string | undefined,
+    expected?: LaneJob["expected"],
+  ): void {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running") return;
     job.laneId = laneId;
     job.spec = spec;
+    // Replaced, never merged: the figure describes the lane now running, so a lane with no record
+    // must clear the previous lane's figure rather than inherit it.
+    if (expected === undefined) delete job.expected;
+    else job.expected = expected;
   }
 
   /**
@@ -923,11 +946,12 @@ export class LaneJobStore {
    * turned off entirely, saying that would be false on the one surface the caller acts on. Zero is
    * not stored, so an uncapped walk renders exactly as it did before this field existed.
    */
-  noteWalkScope(id: string, scope: { enabled: boolean; lanesNotTried: number }): void {
+  noteWalkScope(id: string, scope: { enabled: boolean; lanesNotTried: number; forced?: boolean }): void {
     const job = this.jobs.get(id);
     if (!job) return;
     job.walkEnabled = scope.enabled;
     if (scope.lanesNotTried > 0) job.lanesNotTried = scope.lanesNotTried;
+    if (scope.forced === true) job.forcedLane = true;
   }
 
   /**

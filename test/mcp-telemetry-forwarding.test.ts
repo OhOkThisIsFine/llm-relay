@@ -180,6 +180,8 @@ describe("mcp telemetry forwarding", () => {
     expect(reports[0]!.kind).toBe("relay");
     expect(reports[0]!.laneId).toBe("free-pool");
     expect(reports[0]!.status).toBe("completed");
+    // A relay lane in answer mode RAN in answer mode, so its run keys the answer-mode window.
+    expect(reports[0]!.mode).toBe("answer");
     // Still metadata only, and still a shape the daemon's own validator accepts.
     expect(parseTelemetryReport(JSON.parse(JSON.stringify(reports[0])))).toEqual(reports[0]);
   });
@@ -204,6 +206,9 @@ describe("mcp telemetry forwarding", () => {
     expect(reports[0]!.kind).toBe("cli");
     expect(reports[0]!.laneId).toBe("agy");
     expect(reports[0]!.status).toBe("completed");
+    // ⚠ A cli lane asked for answer mode spawns its harness exactly as in agent mode, so its run is
+    // an AGENT-mode sample: filing it under answer mode would put minutes into a seconds window.
+    expect(reports[0]!.mode).toBe("agent");
     expect(parseTelemetryReport(JSON.parse(JSON.stringify(reports[0])))).toEqual(reports[0]);
   });
 
@@ -312,6 +317,9 @@ describe("mcp telemetry forwarding", () => {
         // a cheap tier steer every reasoning level. A configured ladder name is metadata like the
         // lane id beside it, never task content, which the value assertions below still enforce.
         "tier",
+        // Added 2026-09-10: the mode the lane RAN in keys its stats window, because an agent-mode
+        // run takes minutes and an answer-mode run seconds. A closed two-member vocabulary.
+        "mode",
         "wallClockMs",
         "exitCode",
         "status",
@@ -319,6 +327,7 @@ describe("mcp telemetry forwarding", () => {
         "estimatedOutputTokens",
       ]),
     );
+    expect(reports[0]!.mode).toBe("agent");
     for (const value of Object.values(reports[0]!)) {
       if (typeof value === "string") {
         expect(value).not.toContain(task);

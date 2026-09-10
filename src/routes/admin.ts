@@ -7,7 +7,7 @@ import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { loadLaneManifest } from "../lane-manifest.js";
-import { buildDispatch, findLadderRung, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, resolveLaneLauncherPath, specContextWindow, type DispatchOutcome } from "../dispatch.js";
+import { buildDispatch, findLadderRung, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, resolveLaneLauncherPath, specContextWindow, type DispatchOptions, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
 import { contextWindowResolver, type ContextWindowSource } from "../metadata.js";
 import { snapshotContextWindow } from "../tier-data.js";
@@ -562,6 +562,12 @@ export async function handleAdminRoutes(
         ...(bodyClient ? { client: bodyClient } : {}),
         ...(hostParam ? { host: hostParam } : {}),
         ...(entrypointParam ? { entrypoint: entrypointParam } : {}),
+        // Passed through raw and validated by `buildDispatch` (`normalizeOptions`): an unknown
+        // requester or mode reads as ABSENT — the behaviour before these existed — and an unknown
+        // model spec yields no lane and a reason, never a guess.
+        ...(pickQuery(path, "requester") ? { requester: pickQuery(path, "requester") as NonNullable<DispatchOptions["requester"]> } : {}),
+        ...(pickQuery(path, "mode") ? { mode: pickQuery(path, "mode") as NonNullable<DispatchOptions["mode"]> } : {}),
+        ...(pickQuery(path, "model") ? { model: pickQuery(path, "model") as string } : {}),
         // `cachedLimits` never fetches, so a cold cache degrades to "no window stated" rather than
         // turning a dispatch query into a blocking upstream round-trip — same rule as the request
         // -path context guardrail this reads the numbers from.

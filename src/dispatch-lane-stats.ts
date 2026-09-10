@@ -49,6 +49,19 @@ export const DISPATCH_LANE_STATUSES = Object.freeze(["completed", "failed", "tim
 export type DispatchLaneStatus = (typeof DISPATCH_LANE_STATUSES)[number];
 
 /**
+ * How a dispatch ran the lane: `answer` is one HTTP call to the relay's own `/v1/messages` (a relay
+ * lane in answer mode); `agent` is a spawned harness running a tool loop (every other case).
+ *
+ * ⚠ It keys the lane-stats window since 2026-09-10, because the two are different populations: a
+ * burst of short answer-mode calls set `free-pool`'s p80 to 39.5 s, and that one shared window then
+ * cut every agent-mode task on the same lane at the 90 s floor
+ * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3). One `as const` array, the type indexed from
+ * it and the parser validating against it — the closed-union rule.
+ */
+export const DISPATCH_MODES = Object.freeze(["agent", "answer"] as const);
+export type DispatchMode = (typeof DISPATCH_MODES)[number];
+
+/**
  * What `llm-relay mcp` reports to the daemon when an agent-mode lane run settles. Counts and
  * lengths only — never the task text, never the lane's output (logs-are-metadata-only).
  *
@@ -72,6 +85,11 @@ export interface DispatchedTelemetryReport {
    * reasoning level. Metadata like every other field — a configured ladder name, never task text.
    */
   tier?: string;
+  /**
+   * How the lane ran (`DispatchMode`). Absent from an older MCP child, whose report then lands in
+   * the mode-less legacy window rather than being guessed into one.
+   */
+  mode?: DispatchMode;
   wallClockMs: number;
   exitCode: number | null;
   status: DispatchLaneStatus;
@@ -93,6 +111,7 @@ const REPORT_KEYS = Object.freeze([
   "kind",
   "spec",
   "tier",
+  "mode",
   "wallClockMs",
   "exitCode",
   "status",
@@ -130,11 +149,12 @@ export function parseTelemetryReport(value: unknown): DispatchedTelemetryReport 
   for (const key of Object.keys(body)) {
     if (!REPORT_KEY_SET.has(key)) return null;
   }
-  const { jobId, laneId, kind, spec, tier, wallClockMs, exitCode, status, estimatedInputTokens, estimatedOutputTokens } = body;
+  const { jobId, laneId, kind, spec, tier, mode, wallClockMs, exitCode, status, estimatedInputTokens, estimatedOutputTokens } = body;
   if (!isBoundedId(jobId, MAX_JOB_ID_CHARS)) return null;
   if (!isBoundedId(laneId, MAX_LANE_ID_CHARS)) return null;
   if (spec !== undefined && !isBoundedId(spec, MAX_SPEC_CHARS)) return null;
   if (tier !== undefined && !isBoundedId(tier, MAX_TIER_CHARS)) return null;
+  if (mode !== undefined && !DISPATCH_MODES.includes(mode as DispatchMode)) return null;
   if (!DISPATCH_LANE_KINDS.includes(kind as DispatchLaneKind)) return null;
   if (!DISPATCH_LANE_STATUSES.includes(status as DispatchLaneStatus)) return null;
   if (typeof wallClockMs !== "number" || !Number.isFinite(wallClockMs) || wallClockMs < 0) return null;
@@ -146,6 +166,7 @@ export function parseTelemetryReport(value: unknown): DispatchedTelemetryReport 
     kind: kind as DispatchLaneKind,
     ...(spec === undefined ? {} : { spec }),
     ...(tier === undefined ? {} : { tier }),
+    ...(mode === undefined ? {} : { mode: mode as DispatchMode }),
     wallClockMs,
     exitCode,
     status: status as DispatchLaneStatus,
@@ -159,11 +180,35 @@ export interface LaneStats {
   laneId: string;
   /** Ladder tier this window belongs to, or null for the legacy single ladder. */
   tier: string | null;
+  /**
+   * Dispatch mode this window belongs to, or null for a legacy window recorded before modes were
+   * reported. A legacy window mixes both populations, so it is read only as a fallback.
+   */
+  mode: DispatchMode | null;
   calls: number;
   successes: number;
   failures: number;
   timeouts: number;
-  /** Bounded wall-clock sample window, oldest dropped — advisory percentiles, not scoring. */
+  /**
+   * Runs that FAILED on their own (`failed` or `timed_out`) since the last `completed` one. A walk
+   * abandonment is not counted: that is the relay's decision, not the lane's failure. A success
+   * resets it to 0. The walk reads it (a later lane on a streak cannot be relied on to answer), and
+   * so does the failing-lane demotion in `dispatch.ts`.
+   */
+  consecutiveFailures: number;
+  /**
+   * Walk abandonments since the last `completed` run. Each one DOUBLES the lane's next budget
+   * (`attemptBudget` in `dispatch.ts`): an abandoned run leaves no duration sample, so without this
+   * the window could never show that the lane needed longer.
+   */
+  abandonedSinceSuccess: number;
+  /** When this window last recorded a `completed` run, or null. */
+  lastSuccessAt: number | null;
+  /**
+   * Bounded wall-clock sample window, oldest dropped. Since 2026-09-10 ONLY a `completed` run adds a
+   * sample: a failure's or a timeout's wall clock is time to FAILURE, not time to answer, and it gave
+   * the lane that answers least (six 900 s timeouts) the longest budget.
+   */
   wallClockMs: number[];
   /**
    * Per-sample ISO timestamps, parallel to `wallClockMs` — entry `i` is when sample `i` ran.
@@ -254,8 +299,22 @@ export function quantileWallClockMs(samples: readonly number[], quantile: number
   return sorted[Math.min(sorted.length, Math.max(1, rank)) - 1] ?? null;
 }
 
-function freshLaneStats(laneId: string, tier: string | null): LaneStats {
-  return { laneId, tier, calls: 0, successes: 0, failures: 0, timeouts: 0, wallClockMs: [], wallClockAt: [], lastAt: null };
+function freshLaneStats(laneId: string, tier: string | null, mode: DispatchMode | null): LaneStats {
+  return {
+    laneId,
+    tier,
+    mode,
+    calls: 0,
+    successes: 0,
+    failures: 0,
+    timeouts: 0,
+    consecutiveFailures: 0,
+    abandonedSinceSuccess: 0,
+    lastSuccessAt: null,
+    wallClockMs: [],
+    wallClockAt: [],
+    lastAt: null,
+  };
 }
 
 /**
@@ -265,9 +324,13 @@ function freshLaneStats(laneId: string, tier: string | null): LaneStats {
  * a lane that answered a `low` task says nothing about the `xhigh` ladder — and since
  * 2026-09-08 this window sets each lane's walk budget, so sharing it across tiers would let one
  * tier's runs set another tier's kill budget.
+ *
+ * Since 2026-09-10 the dispatch MODE is part of the key too, for the same reason one level down:
+ * an answer-mode call and an agent-mode run are two populations (`DispatchMode`). A legacy window
+ * has mode `null`. The key is in memory only — a persisted row carries each part as its own field.
  */
-function statsKey(tier: string | null, laneId: string): string {
-  return `${tier ?? ""}:${laneId}`;
+function statsKey(tier: string | null, laneId: string, mode: DispatchMode | null = null): string {
+  return `${tier ?? ""}|${mode ?? ""}|${laneId}`;
 }
 
 /**
@@ -348,29 +411,38 @@ function copyStats(stats: LaneStats): LaneStats {
 export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, now: number = Date.now()): void {
   const map = laneStatsForWrite(cfg);
   const tier = report.tier ?? null;
-  const key = statsKey(tier, report.laneId);
+  const mode = report.mode ?? null;
+  const key = statsKey(tier, report.laneId, mode);
   let entry = map.get(key);
   if (!entry) {
-    entry = freshLaneStats(report.laneId, tier);
+    entry = freshLaneStats(report.laneId, tier, mode);
     map.set(key, entry);
   }
   entry.calls += 1;
   switch (report.status) {
     case "completed":
       entry.successes += 1;
+      entry.consecutiveFailures = 0;
+      entry.abandonedSinceSuccess = 0;
+      entry.lastSuccessAt = now;
       break;
     case "failed":
       entry.failures += 1;
+      entry.consecutiveFailures += 1;
       break;
     case "timed_out":
       entry.timeouts += 1;
       entry.failures += 1;
+      entry.consecutiveFailures += 1;
       break;
     case "abandoned":
       // ⚠ A failure, but NOT a timeout. The lane did not answer inside the walk's budget, which
       // is a failure of this attempt; it never reached its own configured ceiling, so counting it
       // in `timeouts` would inflate a figure that means something narrower.
+      // ⚠ Nor is it one of the lane's OWN failures (`consecutiveFailures` is untouched): the RELAY
+      // stopped it. It raises the next budget instead (`abandonedSinceSuccess`).
       entry.failures += 1;
+      entry.abandonedSinceSuccess += 1;
       break;
     default: {
       const _never: never = report.status;
@@ -394,7 +466,11 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
   // ⚠ The timestamp window moves with the duration window, sample for sample: an abandoned
   // run contributes NEITHER (its wall clock is the relay's own budget, not a lane duration),
   // so position `i` always names the same run in both windows.
-  if (report.status !== "abandoned") {
+  // ⚠ Since 2026-09-10 only a COMPLETED run adds a sample. A failure's or a timeout's wall clock is
+  // time to FAILURE, not time to answer: six 900 s timeouts made `opencode-muse-spark`'s budget 900 s
+  // while it answered 0 of 12, so the walk waited longest on the lane that answered least
+  // (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3c). The abandoned rule above still holds.
+  if (report.status === "completed") {
     entry.wallClockMs.push(report.wallClockMs);
     entry.wallClockAt.push(new Date(now).toISOString());
   }
@@ -407,15 +483,23 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
   notifyLaneStats(cfg);
 }
 
-/** One (lane, tier) window for this config, or undefined when that lane never ran on that tier. A copy. */
-export function laneStatsFor(cfg: Config, laneId: string, tier: string | null = null): LaneStats | undefined {
-  const entry = laneStats.get(cfg)?.get(statsKey(tier, laneId));
+/**
+ * One (lane, tier, mode) window for this config, or undefined when that lane never ran there. A
+ * copy. A null `mode` is the legacy mode-less window.
+ */
+export function laneStatsFor(
+  cfg: Config,
+  laneId: string,
+  tier: string | null = null,
+  mode: DispatchMode | null = null,
+): LaneStats | undefined {
+  const entry = laneStats.get(cfg)?.get(statsKey(tier, laneId, mode));
   return entry ? copyStats(entry) : undefined;
 }
 
 /**
- * Every (lane, tier) window for this config, sorted by lane id then tier (tier-less first) so
- * surfaces render stably. Copies.
+ * Every (lane, tier, mode) window for this config, sorted by lane id, then tier (tier-less first),
+ * then mode (mode-less first) so surfaces render stably. Copies.
  */
 export function allLaneStats(cfg: Config): Array<{ laneId: string } & LaneStats> {
   const compareRows = (a: LaneStats, b: LaneStats): number => {
@@ -424,6 +508,9 @@ export function allLaneStats(cfg: Config): Array<{ laneId: string } & LaneStats>
     const ta = a.tier ?? "";
     const tb = b.tier ?? "";
     if (ta !== tb) return ta < tb ? -1 : 1;
+    const ma = a.mode ?? "";
+    const mb = b.mode ?? "";
+    if (ma !== mb) return ma < mb ? -1 : 1;
     return 0;
   };
   return [...(laneStats.get(cfg) ?? new Map<string, LaneStats>()).values()]
@@ -467,14 +554,24 @@ function notifyLaneStats(cfg: Config): void {
  * the counters, the numeric `wallClockMs`, `lastAt`) and ignores the two keys it does not.
  * No existing field changed meaning, so the schema version does NOT bump (the
  * `breaker-persistence.ts` rule: bump only when the MEANING of an existing field changes).
+ *
+ * Since 2026-09-10 `mode`, `consecutiveFailures`, `abandonedSinceSuccess` and `lastSuccessAt` are
+ * optional on the wire by the same rule, and an older row loads with them derived at restore. The
+ * sample window NARROWED that day — only a completed run adds a sample — and the version still does
+ * not bump: a bump would drop every lane's history, while an older row's mixed samples simply age
+ * out of the bounded window as new runs arrive.
  */
 export interface LaneStatsRow {
   laneId: string;
   tier?: string | null;
+  mode?: DispatchMode | null;
   calls: number;
   successes: number;
   failures: number;
   timeouts: number;
+  consecutiveFailures?: number;
+  abandonedSinceSuccess?: number;
+  lastSuccessAt?: number | null;
   wallClockMs: number[];
   wallClockAt?: (string | null)[];
   lastAt: number | null;
@@ -482,22 +579,31 @@ export interface LaneStatsRow {
 
 /** Still-live rows for persistence and ladder surfaces. */
 export function exportLaneStatsRows(cfg: Config): LaneStatsRow[] {
-  return allLaneStats(cfg).map(({ laneId, tier, calls, successes, failures, timeouts, wallClockMs, wallClockAt, lastAt }) => ({
-    laneId,
-    tier,
-    calls,
-    successes,
-    failures,
-    timeouts,
-    wallClockMs: [...wallClockMs],
-    wallClockAt: [...wallClockAt],
-    lastAt,
+  return allLaneStats(cfg).map((s) => ({
+    laneId: s.laneId,
+    tier: s.tier,
+    mode: s.mode,
+    calls: s.calls,
+    successes: s.successes,
+    failures: s.failures,
+    timeouts: s.timeouts,
+    consecutiveFailures: s.consecutiveFailures,
+    abandonedSinceSuccess: s.abandonedSinceSuccess,
+    lastSuccessAt: s.lastSuccessAt,
+    wallClockMs: [...s.wallClockMs],
+    wallClockAt: [...s.wallClockAt],
+    lastAt: s.lastAt,
   }));
 }
 
 function isLaneTier(value: unknown): value is string | null {
   if (value === undefined || value === null) return true;
   return isBoundedId(value, MAX_TIER_CHARS);
+}
+
+function isLaneMode(value: unknown): value is DispatchMode | null {
+  if (value === undefined || value === null) return true;
+  return DISPATCH_MODES.includes(value as DispatchMode);
 }
 
 function isWallClockAt(value: unknown, samples: number): value is (string | null)[] {
@@ -514,17 +620,36 @@ function isWallClockAt(value: unknown, samples: number): value is (string | null
   return true;
 }
 
+/** The 2026-09-10 counters: each absent (an older row) or a whole count; `lastSuccessAt` a time or null. */
+function hasValidStreakFields(row: Record<string, unknown>): boolean {
+  for (const key of ["consecutiveFailures", "abandonedSinceSuccess"] as const) {
+    if (row[key] !== undefined && !isTokenCount(row[key])) return false;
+  }
+  const at = row["lastSuccessAt"];
+  return at === undefined || at === null || (typeof at === "number" && Number.isFinite(at) && at >= 0);
+}
+
 /** Validate ONE row completely; anything unexpected drops this row and only this row. */
 function isLaneStatsRow(value: unknown): value is LaneStatsRow {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
   if (!isBoundedId(row["laneId"], MAX_LANE_ID_CHARS)) return false;
   // A numeric tier is not a tier that failed to parse — it is a shape this file never wrote,
-  // so the row alone goes rather than the file.
+  // so the row alone goes rather than the file. The same holds for a mode outside the closed list.
   if (!isLaneTier(row["tier"])) return false;
+  if (!isLaneMode(row["mode"])) return false;
   for (const key of ["calls", "successes", "failures", "timeouts"] as const) {
     if (!isTokenCount(row[key])) return false;
   }
+  if (!hasValidStreakFields(row)) return false;
+  if (!hasValidSamples(row)) return false;
+  const lastAt = row["lastAt"];
+  if (lastAt !== null && (typeof lastAt !== "number" || !Number.isFinite(lastAt) || lastAt < 0)) return false;
+  return true;
+}
+
+/** The sample window and its timestamps, validated together (`isLaneStatsRow`). */
+function hasValidSamples(row: Record<string, unknown>): boolean {
   const wallClockMs = row["wallClockMs"];
   if (!Array.isArray(wallClockMs)) return false;
   // The relay never writes more than MAX_LANE_STAT_SAMPLES, so a longer window is corruption,
@@ -533,10 +658,7 @@ function isLaneStatsRow(value: unknown): value is LaneStatsRow {
   for (const sample of wallClockMs) {
     if (typeof sample !== "number" || !Number.isFinite(sample) || sample < 0) return false;
   }
-  if (!isWallClockAt(row["wallClockAt"], wallClockMs.length)) return false;
-  const lastAt = row["lastAt"];
-  if (lastAt !== null && (typeof lastAt !== "number" || !Number.isFinite(lastAt) || lastAt < 0)) return false;
-  return true;
+  return isWallClockAt(row["wallClockAt"], wallClockMs.length);
 }
 
 /**
@@ -548,15 +670,24 @@ export function restoreLaneStatsRows(cfg: Config, rows: readonly LaneStatsRow[])
   let restored = 0;
   for (const row of rows) {
     const tier = row.tier ?? null;
-    const key = statsKey(tier, row.laneId);
+    const mode = row.mode ?? null;
+    const key = statsKey(tier, row.laneId, mode);
     if (map.has(key)) continue;
     map.set(key, {
       laneId: row.laneId,
       tier,
+      mode,
       calls: row.calls,
       successes: row.successes,
       failures: row.failures,
       timeouts: row.timeouts,
+      // ⚠ An older row carries no streak. It is DERIVED where the counters make it exact — a row
+      // with no success at all has failed every run it has (walk abandonments included, which an
+      // older row cannot tell apart), so its streak is its failure count — and set to 0 otherwise,
+      // the weaker claim: an unknown streak must never mark a lane as unable to answer.
+      consecutiveFailures: row.consecutiveFailures ?? (row.successes === 0 ? row.failures : 0),
+      abandonedSinceSuccess: row.abandonedSinceSuccess ?? 0,
+      lastSuccessAt: row.lastSuccessAt ?? null,
       wallClockMs: row.wallClockMs.slice(-MAX_LANE_STAT_SAMPLES),
       wallClockAt: (row.wallClockAt ?? new Array<string | null>(row.wallClockMs.length).fill(null)).slice(-MAX_LANE_STAT_SAMPLES),
       lastAt: row.lastAt,

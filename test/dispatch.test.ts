@@ -493,6 +493,25 @@ describe("dispatch ladder — endpoint", () => {
     });
   });
 
+  it("carries requester, mode and model from the query string into the view (2026-09-10)", async () => {
+    await withProxy(cfgWith({ ladder: LADDER }), async (base) => {
+      // The MCP server's own view: the Anthropic pass-through is unreachable there, with the reason.
+      const mcp = (await (await fetch(`${base}/dispatch?requester=mcp`)).json()) as {
+        order: string[];
+        ladder: Array<{ id: string; unreachable?: string }>;
+      };
+      expect(mcp.ladder.find((l) => l.id === "anthropic")?.unreachable).toContain("the MCP server cannot run");
+      expect(mcp.order).not.toContain("anthropic");
+      // A caller-named model: one ad-hoc lane.
+      const named = (await (await fetch(`${base}/dispatch?model=pool%2Fcoding&mode=answer`)).json()) as {
+        order: string[];
+        next: { id: string; adHoc?: boolean };
+      };
+      expect(named.order).toEqual(["model:pool/coding"]);
+      expect(named.next.adHoc).toBe(true);
+    });
+  });
+
   // A rate limit and a spent quota reset on different clocks, so the host can now say WHICH
   // happened. The relay still never invents the signal — outcome only picks the default wait,
   // and an explicit retryAfterMs (the vendor's own number) beats it.
@@ -598,7 +617,9 @@ describe("tier-keyed attempt budgets (backlog item 4)", () => {
   it("with no legacy window either, the fallback is still the flat figure", () => {
     const cfg = cfgWithTiers();
     recordOn(cfg, "high", [600_000, 600_000]);
-    expect(budgetOf(cfg, "high")).toEqual({ ms: 90_000, basis: "floor", samples: 0 });
+    // `samples` names the two runs the thin window holds (0 before 2026-09-10, which read as "never
+    // ran"): the same count the untiered floor reports (`dispatch-attempt-budget.test.ts`).
+    expect(budgetOf(cfg, "high")).toEqual({ ms: 90_000, basis: "floor", samples: 2 });
   });
 
   it("the advisory `stats` column stays a per-lane aggregate across tiers", () => {

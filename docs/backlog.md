@@ -9,6 +9,19 @@
 
 ## Open
 
+- **The relay does not pace itself from the throttling it sees (2026-09-10, owner direction,
+  high).** Owner, 2026-09-10: *"The relay should be tracking requests from all IDEs on the machine,
+  anything that runs through the relay, so it can use rate-limited messages to calculate when it
+  might need to slow something down. It's supposed to adapt and perfect itself."* Today a 429 cools
+  ONE deployment (a stated `Retry-After`, else the escalation ladder), a provider-stated quota
+  header can demote a spent bucket, and a rate limit stated in a 429 body is learned as a
+  `rate-limit-*` fact that is DISPLAY-ONLY (spec decision M2, opt-in, not built). Nothing uses those
+  facts to slow the relay's own request rate before the next 429, and a 429 wording the relay has
+  not seen before waits in the eligibility queue for a human verdict. **Property:** a deployment
+  with a stated or learned rate limit is paced, across every client that routes through the relay,
+  so the relay's own rate stays under it; a 429 that states a window updates that pacing without a
+  human verdict; and a limit nobody stated has no effect.
+
 - **A pre-commit stream failure names no cause, and the relay keeps no per-request record of it
   (2026-09-10, C:\Code lap 232d8bef, medium).** A streamed `deepseek/deepseek-flash` request that
   spent its whole `max_tokens` on reasoning (the V4.1 Flash default before v0.79.0's
@@ -29,99 +42,24 @@
   making progress is reported as failed well before `timeoutMs`, with the reason, or
   `dispatch_status` states how long the lane has been silent so the caller can decide.
 
-- **The dispatch walk abandons the only working lane, then tells the agent to stop (2026-09-10,
-  live diagnosis, high).** At tier `medium` the walk gives `free-pool` the 90 s `attemptMs` floor:
-  its window holds 100 short answer-mode calls (p80 39.5 s), an abandoned run adds no sample so the
-  p80 can never rise above the budget, and a `timed_out` run does add one (so
-  `opencode-muse-spark`, 0 of 12 at `medium`, earned a 900 s budget). The walk then runs lanes that
-  cannot answer and ends on `anthropic`. Evidence and the full plan:
-  [`dispatch-giveup-diagnosis-2026-09-10.md`](dispatch-giveup-diagnosis-2026-09-10.md) §3 and §9
-  F1–F2. **Property:** `runWalk` never abandons a lane at its budget while no later lane in the
-  selection order has answered in its recent record; the budget window is keyed by dispatch mode
-  and fed only by `completed` runs; and an abandoned run raises the lane's next budget (bounded by
-  its timeout) instead of leaving the window unchanged.
+- **The model catalog refreshes on a clock, not on evidence that it is stale (2026-09-10, owner
+  direction, medium).** Owner, 2026-09-10: *"The relay is supposed to be keeping metadata about
+  providers and models up to date, with regular sampling; if we get a hint that our model catalog
+  might be stale, we update it."* A refusal that says a listed model does not exist (a 404 on a
+  model the catalog lists) is today only a signature for the eligibility queue, while the catalog
+  waits for its TTL. **Property:** such a refusal triggers a catalog refresh for that provider at
+  once, bounded so that a burst of refusals costs one refresh, and dynamic pool membership follows
+  the refreshed list.
 
-- **The MCP walk selects the `anthropic` pass-through rung, which the MCP server cannot run
-  (2026-09-10, live diagnosis, high).** `resolveDispatchView` states `host: "bypassed"`, and `toLane`
-  keeps a pass-through rung for that host because a bypassed host has an `Agent` tool; the MCP
-  server has none. Agent mode fails in 0 s with "no cliLane template configured" (false: the
-  template exists), answer mode with HTTP 401. 0 of 21 runs answered, and as the last lane its error
-  heads the final reply. Diagnosis §4, plan F3. **Property:** the MCP view marks every rung that the
-  MCP server cannot run `unreachable` with a true reason, so no walk attempt runs one; and
-  `startLane`'s default text never claims that a configured template is missing.
-
-- **`LANE_LADDER_EXHAUSTED_ADVICE` tells agents to stop dispatching after a working lane was
-  stopped, or after one forced lane ran (2026-09-10, live diagnosis, high).** `jobAnswer` prints "Do
-  NOT call dispatch again … Do the work in this session instead" whenever nothing answered and no
-  lane is untried — including after the walk abandoned `free-pool` mid-run and after a one-lane
-  `lane:` override (jobs 0023 and 0024 on 2026-09-10). `MCP_INSTRUCTIONS` repeats it, and says "the
-  default lane is free capacity", which the operator config made false on 2026-09-10 (paid DeepSeek
-  is first in every pool). Diagnosis §5, plan F4. **Property:** the stop advice appears only when
-  every lane in the ladder ran and failed on its own; an abandoned lane is named with the call that
-  lets it finish; a forced one-lane run says that only that lane ran; and `MCP_INSTRUCTIONS` makes no
-  cost claim that the operator config can make false.
-
-- **`dispatch` cannot run a named model, so agents that must use DeepSeek go around it (2026-09-10,
-  live diagnosis, high).** `dispatch` takes a rung id and a tier only, and no rung names the direct
-  `deepseek` provider. The lap-232d8bef orchestrator wrote its own HTTP client (`plan.mjs`, posting
-  `deepseek/deepseek-flash` to `/v1/chat/completions`) to reach it. Diagnosis §7, plan F5.
-  **Property:** `dispatch` accepts a routing spec (`model`) and runs exactly that spec — posted as
-  `model` in answer mode, rendered into the `routing.cliLane` template in agent mode — with no walk,
-  and the reply names the spec that served.
-
-- **An AGY lane's quota death reaches the relay only when a run lasts until AGY gives up
-  (2026-09-10, live diagnosis, medium).** AGY logs `RESOURCE_EXHAUSTED … Resets in 144h` to
-  `~/.gemini/antigravity-cli/cli.log` and retries in silence. The walk kills it at 90 s, so
-  `agy-claude-opus` stayed `ready` through 34 failed runs, until one forced 604 s probe recorded the
-  death. No rule demotes a lane with a long run of zero successes. Diagnosis §4, plan F6.
-  **Property:** when the walk stops or ends an AGY lane whose run logged `RESOURCE_EXHAUSTED`, the
-  relay records a quota death with the stated reset; and a lane with no success in its last N runs
-  is demoted until a probe answers. Change the AGY launch path only after the console-window fix of
-  2026-09-10 lands, because both touch it.
-
-- **`/telemetry` labels a provider with no `tierType` as free, and DeepSeek attempts run unhedged
-  for up to 10 minutes (2026-09-10, live diagnosis, medium).** `getTelemetryReport` falls back
-  `p.tierType ?? preset?.tierType ?? "free"`, so paid DeepSeek reads `free` while `assessCost` says
-  `unknown`. A DeepSeek attempt gets no hedge (hedging is for free deployments), and the operator
-  config gives `deepseek` a `timeoutMs` and a `stallTimeoutMs` of 600,000 while DeepSeek is the first
-  member of every pool. Diagnosis §7, plan F7. **Property:** the telemetry label for an undeclared
-  tier is `unknown`, never `free`; and a stalled DeepSeek attempt fails over within a bound that the
-  operator states in minutes (the bound is an operator-config change and an owner decision).
-
-- **A running dispatch's status gives no expected duration, so agents stop polling (2026-09-10, live
-  diagnosis, low).** `dispatch_status` shows the lane and the elapsed time only, while `free-pool`
-  agent-mode runs at tier `high` took up to 2,700 s on 2026-09-10 (median 778 s). Diagnosis §9, plan
-  F8. **Property:** the status of a running job states the lane's usual time to answer in the job's
-  mode (p50 and p80 from completed runs), or says that no record exists.
-
-- **A dispatch call waits longer than some hosts allow, so the caller loses the job handle
-  (2026-09-10, transcript sweep, high).** Codex's code-mode `exec` tool returns "Script running with
-  cell ID N / Wall time 31.0 seconds" with empty output, so a dispatch that blocks for the 40 s
-  `routing.mcp.maxWaitMs` default loses its job id: 29 of 266 first Codex dispatch calls since
-  2026-09-07. In Claude Code, a call with `waitMs: 60000` at 15:14 on 2026-09-10 failed with "Error:
-  Request timed out"; the MCP process that served it was most likely one started before v0.78.0,
-  which honours a wait above the host ceiling (inference from process start times, not measured).
-  Diagnosis Appendix A, plan F9. **Property:** the blocking wait of every dispatch call ends before
-  the lowest host ceiling measured on this machine (Codex: 31 s), and an `llm-relay mcp` process
-  that runs older code than the installed version says so in every reply.
-
-- **DeepSeek refuses a multi-turn tool-call replay from the relay with HTTP 400 because the relay
-  drops `reasoning_content` between turns (2026-09-09, DeepSeek capture, medium).** In thinking
-  mode DeepSeek requires the `reasoning_content` of the assistant turn that made a tool call to be
-  replayed with that turn. `openai-request.ts` drops `thinking`/`redacted_thinking` cross-vendor
-  ("no representation") and `responses-request.ts` drops Codex's `reasoning` items, so the third
-  capture run in
-  [`deepseek-responses-truncation-2026-09-09.md`](deepseek-responses-truncation-2026-09-09.md)
-  ended at HTTP 400 after one or two tool-call turns. A representation EXISTS for this provider:
-  Chat `reasoning_content` on the outbound assistant message. (The same capture's other ancillary
-  finding, DeepSeek naming Codex's `exec` argument `cmd`/`command` as a bare string, is the
-  model's own shape error and repair mode's business, not a relay defect.) **Property:** on a
-  target whose provider declares it (a `compat` key on the `toolCallIds` precedent, defaulting from
-  a labelled host fact for `api.deepseek.com`, an explicit value winning both ways), the reasoning
-  the relay itself emitted for an assistant turn — a Responses `reasoning` item or an Anthropic
-  `thinking` block the CALLER replays — is carried as `reasoning_content` on that outbound
-  assistant message byte-for-byte and never fabricated when absent, pinned on ≥2 candidates, with
-  every other provider's outbound bytes unchanged.
+- **A DeepSeek answer's reasoning never reaches the caller, so pool traffic runs with thinking off
+  after the first tool call (2026-09-10, F11 residue, low).** `openai-request.ts` now carries a
+  replayed `thinking` block onto DeepSeek's `reasoning_content`, and turns thinking off for a replay
+  that has none, so the 400 is gone. But llm-bridge's response translation drops DeepSeek's
+  `reasoning_content`, so a caller never holds DeepSeek's own reasoning to replay, and every
+  multi-turn tool conversation runs with thinking off after its first tool call. **Property:** on a
+  `compat.reasoning: "deepseek"` target, the response's `reasoning_content` reaches the caller — a
+  `thinking` block on the Anthropic front, a `reasoning` item on the Responses front — so the
+  caller's replay carries it back and thinking can stay on; pinned on both fronts.
 
 - **CLOSED 2026-09-10 by owner decision: 24 of the 25 triaged refusal verdicts are applied.** The
   triage is [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries

@@ -208,8 +208,12 @@ describe("mcp server handshake", () => {
     const text = MCP_INSTRUCTIONS.toLowerCase();
     // 1. The trigger is unprompted. Without this the model waits to be told.
     expect(text).toContain("without being asked");
-    // 2. Offloading is cheap, which is the reason to prefer it.
-    expect(text).toContain("free capacity");
+    // 2. Offloading costs this session nothing, which is the reason to prefer it — stated WITHOUT
+    // the old "free capacity" claim: the pool leads with paid DeepSeek, so that claim was false
+    // (owner decision 2026-09-10: keep DeepSeek first, and correct every text that calls it free).
+    expect(text).toContain("spends none of this session's subscription quota");
+    expect(text).toContain("paid provider credits");
+    expect(text).not.toContain("free capacity");
     // 3. And the answer is not authoritative, which bounds what the model may do with it.
     expect(text).toContain("advisory");
     // 4. The always-loaded instructions state why shelling out is the wrong Windows fallback,
@@ -542,8 +546,9 @@ describe("async job path", () => {
 /**
  * The `dispatch` waitMs ceiling, `routing.mcp.maxWaitMs` (packet P8, 2026-09-09) — the server
  * half of the machine-wide job-handle-loss defect. An MCP host tool call fails between 45 s
- * and 100 s and destroys the job handle, so `dispatch` blocks at most the ceiling (40 s by
- * default), clamps a larger `waitMs` and announces it, and refuses a `waitMs` it cannot
+ * and 100 s and destroys the job handle, so `dispatch` blocks at most the ceiling (25 s by
+ * default since 2026-09-10, under Codex's 31 s script limit), clamps a larger `waitMs` and
+ * announces it, and refuses a `waitMs` it cannot
  * honour at all. Uses the injected spawner and fake timers throughout; never real sleeps.
  */
 describe("dispatch waitMs ceiling (routing.mcp.maxWaitMs)", () => {
@@ -567,13 +572,14 @@ describe("dispatch waitMs ceiling (routing.mcp.maxWaitMs)", () => {
         settled = true;
         return r;
       });
-      // The ceiling answers at 40 s; the requested 60 s would still be blocking.
-      await vi.advanceTimersByTimeAsync(40_000);
+      // The ceiling answers at 25 s (under Codex's 31 s script limit since 2026-09-10); the
+      // requested 60 s would still be blocking.
+      await vi.advanceTimersByTimeAsync(25_000);
       expect(settled).toBe(true);
       const { text, isError } = await call;
       expect(isError).toBe(false);
       expect(text).toMatch(/jobId "job-\d+"/);
-      expect(text).toContain("waited 40 s (waitMs 60000 clamped to routing.mcp.maxWaitMs 40000)");
+      expect(text).toContain("waited 25 s (waitMs 60000 clamped to routing.mcp.maxWaitMs 25000)");
     } finally {
       vi.useRealTimers();
     }
@@ -606,12 +612,12 @@ describe("dispatch waitMs ceiling (routing.mcp.maxWaitMs)", () => {
         settled = true;
         return r;
       });
-      await vi.advanceTimersByTimeAsync(39_999);
+      await vi.advanceTimersByTimeAsync(24_999);
       expect(settled).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(settled).toBe(true);
       const { text } = await call;
-      expect(text).toContain("Still running after 40s.");
+      expect(text).toContain("Still running after 25s.");
       expect(text).not.toContain("clamped");
     } finally {
       vi.useRealTimers();

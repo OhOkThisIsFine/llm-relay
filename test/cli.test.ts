@@ -913,6 +913,23 @@ describe("llm-relay dispatch — printed ladder", () => {
     expect(view.task).toBe("hello");
     expect(view.next?.invoke?.args).toEqual(["-p", "hello", "--model", "g-flash"]);
   });
+
+  it("asks the daemon for the MCP server's own view: requester=mcp, plus the mode and model it was given", async () => {
+    let capturedUrl = "";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      capturedUrl = String(input);
+      return new Response(
+        JSON.stringify({ tier: "medium", offload: false, client: "default", host: "bypassed", ladder: [], order: [], next: null, reason: "none" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    await resolveDispatchView({ task: "t", cfg: dispatchConfig, mode: "agent", model: "deepseek/deepseek-flash" });
+    const query = new URL(capturedUrl).searchParams;
+    // ⚠ requester=mcp is what makes a pass-through rung come back `unreachable` for this caller.
+    expect(query.get("requester")).toBe("mcp");
+    expect(query.get("mode")).toBe("agent");
+    expect(query.get("model")).toBe("deepseek/deepseek-flash");
+  });
 });
 
 describe("llm-relay cooldowns clear — live control mutation", () => {

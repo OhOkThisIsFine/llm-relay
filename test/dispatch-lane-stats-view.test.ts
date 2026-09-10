@@ -23,7 +23,7 @@ import type { LaneSpawner } from "../src/mcp/lane-runner.js";
 
 const dir = mkdtempSync(join(tmpdir(), "llm-relay-lane-stats-view-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
-function freshConfig(): Config {
+function freshConfig(dispatchWalk?: boolean): Config {
   const path = join(dir, `config-${Math.random().toString(36).slice(2)}.json`);
   writeFileSync(
     path,
@@ -32,6 +32,7 @@ function freshConfig(): Config {
       providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic", credentialMode: "passthrough" } },
       routing: {
         default: "anthropic",
+        ...(dispatchWalk === undefined ? {} : { dispatchWalk }),
         ladder: [
           { id: "codex-sol", kind: "cli", command: "codex", args: ["exec", "{task}"] },
           { id: "relay-pool", kind: "relay", spec: "anthropic" },
@@ -76,14 +77,20 @@ describe("buildDispatch lane stats columns", () => {
     const cfg = freshConfig();
     const first = report("codex-sol", "completed", 10_000, 1_700_000_000_000);
     recordLaneRun(cfg, first.report, first.now);
-    const second = report("codex-sol", "failed", 30_000, 1_700_000_060_000);
+    const second = report("codex-sol", "completed", 30_000, 1_700_000_030_000);
     recordLaneRun(cfg, second.report, second.now);
+    // ⚠ A FAILED run is counted and adds NO duration (2026-09-10): the window is the lane's time to
+    // ANSWER, and a run that did not answer measures nothing about that
+    // (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3). So the median and p95 below come from the
+    // two completed runs alone, and the failed run's 50 s appears in neither.
+    const third = report("codex-sol", "failed", 50_000, 1_700_000_060_000);
+    recordLaneRun(cfg, third.report, third.now);
 
     const view = buildDispatch(cfg);
     const lane = view.ladder.find((l) => l.id === "codex-sol");
     expect(lane?.stats).toEqual({
-      calls: 2,
-      successes: 1,
+      calls: 3,
+      successes: 2,
       failures: 1,
       timeouts: 0,
       medianWallClockMs: 20_000,
@@ -107,7 +114,26 @@ describe("buildDispatch lane stats columns", () => {
     expect(lane?.stats).toMatchObject({ calls: 1, successes: 0, failures: 1, timeouts: 1 });
   });
 
-  it("⚠ stats never change `next` or the ladder order — many failures on the first ready rung", () => {
+  it("⚠ slow runs never change `next` or the ladder order — the wall clock is a column, not an input", () => {
+    const cfg = freshConfig();
+    for (let i = 0; i < 10; i++) {
+      const run = report("codex-sol", "completed", 900_000 + i, 1_700_000_000_000 + i);
+      recordLaneRun(cfg, run.report, run.now);
+    }
+
+    const view = buildDispatch(cfg);
+    expect(view.ladder.map((l) => l.id)).toEqual(["codex-sol", "relay-pool"]);
+    expect(view.next?.id).toBe("codex-sol");
+    expect(view.reason).toBe("first lane in the ladder");
+    expect(view.ladder[0]?.stats).toMatchObject({ calls: 10, successes: 10 });
+  });
+
+  it("⚠ a streak of own FAILURES orders the lane behind the others while the walk is on, and never drops it", () => {
+    // Changed deliberately on 2026-09-10 (owner decision: all of F1 to F9; F6 asks for it). Until
+    // then this test pinned "stats never change `next`" even for ten failures in a row, and the walk
+    // kept starting on a lane that had not answered for hours. A lane with no success in its last
+    // FAILING_LANE_STREAK runs now goes behind the lanes that have none, until it answers again. It
+    // stays `ready` and stays in `order` — demoted, never dropped.
     const cfg = freshConfig();
     for (let i = 0; i < 10; i++) {
       const run = report("codex-sol", "failed", 5_000 + i, 1_700_000_000_000 + i);
@@ -116,10 +142,26 @@ describe("buildDispatch lane stats columns", () => {
 
     const view = buildDispatch(cfg);
     expect(view.ladder.map((l) => l.id)).toEqual(["codex-sol", "relay-pool"]);
+    expect(view.order).toEqual(["relay-pool", "codex-sol"]);
+    expect(view.next?.id).toBe("relay-pool");
+    expect(view.reason).toBe("first undemoted lane (1 ahead of it ready but failing)");
+    expect(view.ladder[0]?.state).toBe("ready");
+    expect(view.ladder[0]?.failing?.streak).toBe(10);
+    expect(view.ladder[0]?.recentFailures).toBe(10);
+    expect(view.ladder[0]?.stats).toMatchObject({ calls: 10, failures: 10 });
+  });
+
+  it("with the walk OFF the same streak changes nothing — the pre-walk order exactly", () => {
+    const cfg = freshConfig(false);
+    for (let i = 0; i < 10; i++) {
+      const run = report("codex-sol", "failed", 5_000 + i, 1_700_000_000_000 + i);
+      recordLaneRun(cfg, run.report, run.now);
+    }
+
+    const view = buildDispatch(cfg);
     expect(view.next?.id).toBe("codex-sol");
     expect(view.reason).toBe("first lane in the ladder");
-    expect(view.ladder[0]?.state).toBe("ready");
-    expect(view.ladder[0]?.stats).toMatchObject({ calls: 10, failures: 10 });
+    expect(view.ladder[0]?.failing).toBeUndefined();
   });
 });
 

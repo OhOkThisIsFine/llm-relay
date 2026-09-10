@@ -843,8 +843,23 @@ export interface DispatchWalkSettings {
    * ⚠ It is NOT the lane's own timeout. A rung's `--timeout` (2100 s on this machine's slowest
    * rung) still bounds a lane the walk is content to wait for; this bounds how long the WALK
    * waits before trying someone else.
+   *
+   * Since 2026-09-10 this is the floor for an ANSWER-mode call only; `agentAttemptMs` is the floor
+   * for an agent-mode lane.
    */
   attemptMs: number;
+  /**
+   * The FLOOR of an agent-mode lane's walk budget, where `attemptMs` is the floor for an
+   * answer-mode call. Default 600000 (10 minutes).
+   *
+   * ⚠ Two floors because the two modes are two different populations
+   * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3): an answer-mode call is one HTTP round trip
+   * that answers in seconds, while an agent-mode lane runs a whole tool loop for minutes. One floor
+   * fitted to both stopped every real agent task on `free-pool` at 90 s, because a burst of short
+   * answer-mode calls had set the lane's p80 to 39.5 s. Like `attemptMs` it is an operator budget,
+   * not a measurement; a lane's own history can only raise it.
+   */
+  agentAttemptMs: number;
   /**
    * Which point of a lane's OWN recorded wall-clock history the budget sits at, when that lane has
    * enough history to have one (`attemptMinSamples`). Default 0.8.
@@ -936,10 +951,13 @@ export interface McpSettings {
  * Default `routing.mcp.maxWaitMs` — the longest one `dispatch` tool call blocks before handing
  * back a job id to poll.
  *
- * 5 s under the lowest measured MCP host tool-call failure on this machine (45 s): above that
- * ceiling the host fails the call AND destroys the job handle, so a caller that passes nothing
- * already waits past the point of no return. The default sits below the floor rather than on
- * it, and the tool description names the config key rather than this figure so an operator
- * override never leaves the text stale.
+ * It must end before the SHORTEST host limit, because above a host's limit the host fails the call
+ * AND loses the job handle. Two limits are measured on this machine: Claude Code fails an MCP call
+ * somewhere between 45 s and 100 s, and Codex's code-mode `exec` tool yields its script at 31.0 s
+ * with empty output ("Script running with cell ID N / Wall time 31.0 seconds"). The 2026-09-10
+ * transcript sweep counted 29 of 266 first Codex dispatch calls that lost their job id that way
+ * while this default was 40 s (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §8). 25 s sits under
+ * both. The tool description names the config key rather than this figure, so an operator override
+ * never leaves the text stale.
  */
-export const DEFAULT_MCP_MAX_WAIT_MS = 40_000;
+export const DEFAULT_MCP_MAX_WAIT_MS = 25_000;

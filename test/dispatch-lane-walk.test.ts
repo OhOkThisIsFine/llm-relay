@@ -31,6 +31,9 @@ import type { LaneRunResult, LaneSpawner } from "../src/mcp/lane-runner.js";
 const WALK: DispatchWalkSettings = {
   enabled: true,
   attemptMs: 40,
+  // The daemon's agent-mode floor. The walk here reads `attemptMs` and each lane's own budget; this
+  // field only completes the type, so it matches `attemptMs` to keep the timing obvious.
+  agentAttemptMs: 40,
   // ⚠ A sample floor far above anything these fixtures record, so every lane here keeps the flat
   // `attemptMs` and the walk's timing stays deterministic. The per-lane quantile budget has its own
   // suite (`test/dispatch-attempt-budget.test.ts`); mixing it in here would make every walk

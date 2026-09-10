@@ -1459,12 +1459,34 @@ agent had to notice, give up, and name a different lane by hand — which is wha
 A dispatch now WALKS the ladder:
 
 - Each lane gets an **attempt budget** drawn from ITS OWN recorded runs: the 80th percentile of
-  the last 100 wall-clock times for that lane. If it has not answered by then, the relay stops it
-  and starts the next one. A lane with fewer than `attemptMinSamples` recorded runs gets the flat
-  `attemptMs` instead — unmeasured means no opinion, never "slow" — and the budget never falls
-  below that flat figure however fast a lane's history is.
+  the last 100 times it took to ANSWER, on this tier and in this mode. If it has not answered by
+  then, the relay stops it and starts the next one. A lane with fewer than `attemptMinSamples`
+  completed runs gets the flat floor instead — unmeasured means no opinion, never "slow" — and the
+  budget never falls below that floor however fast a lane's history is. The floor is `attemptMs`
+  for answer mode and `agentAttemptMs` (default 10 min) for agent mode, because an agent-mode run
+  takes minutes where an answer-mode call takes seconds: on 2026-09-10 one shared 90 s floor stopped
+  nearly every agent-mode `free-pool` run before it could answer.
+- Only a COMPLETED run adds a time. A failed or timed-out run says nothing about how long the lane
+  takes to answer (a window built from timeouts made one lane's own timeout its budget), and a run
+  the walk stopped measures the budget, not the lane. Instead, **each run the walk stopped since the
+  lane's last answer doubles its next budget**, up to one hour, and one answer resets it — without
+  that, a lane slower than its budget could never show that it needed longer.
 - ⚠ **The LAST lane gets no budget.** There is nowhere to move to, so killing a lane that is still
   working would throw away the only answer still coming. Its own `--timeout` still bounds it.
+- ⚠ **Nor does a lane whose later lanes cannot answer.** When every lane after it is on a streak of
+  three or more own failures, or is marked failing (below), stopping it would trade a lane that may
+  still answer for lanes that most likely will not — which is what every `medium` walk did on
+  2026-09-10. A lane with no record counts as able to answer.
+- A lane with **five own failures in a row** is marked `failing` and ordered behind the lanes that
+  have none, in the same band as a demoted lane, until it answers again. It is never dropped.
+  `dispatch_lanes` shows the streak, and each lane's usual time to answer.
+- The MCP server never runs a **pass-through** rung — one that forwards the caller's own Anthropic
+  credential, which only the calling host holds. `dispatch_lanes` shows it as unreachable, with that
+  reason.
+- When an AGY lane ends or is stopped without an answer, the relay reads AGY's own log for a
+  `RESOURCE_EXHAUSTED … Resets in <duration>` line from THIS run and records the quota death with
+  AGY's stated reset. AGY retries a spent quota in silence, so before this a death was recorded only
+  when a run happened to last until AGY gave up.
 - The lane that answers is **pinned** for `pinMs` (default 15 min), so the next dispatch on that
   tier takes it first. A lane that did not answer is **demoted** for `demoteMs` and is tried after
   the lanes that carry no demotion.
@@ -1482,6 +1504,7 @@ A dispatch now WALKS the ladder:
   "dispatchWalk": {
     "enabled": true,
     "attemptMs": 90000,        // the budget for a lane with too little history, and the floor
+    "agentAttemptMs": 600000,  // the same floor for an agent-mode dispatch
     "attemptQuantile": 0.8,    // which point of a lane's own history the budget sits at
     "attemptMinSamples": 5,    // recorded runs a lane needs before its own history is used
     "maxLanes": 4,        // how many lanes one dispatch may try
@@ -1510,11 +1533,13 @@ lane most in need of bounding. p80 is the highest point still carrying informati
 any answer arrives, so there is no output token to normalise by — the same reason the request
 path's own per-token rung is inert when it decides whether to hedge.
 
-⚠ **The window is keyed by lane AND tier.** Each tier is its own ladder, so a lane's budget on
+⚠ **The window is keyed by lane, tier AND mode** (mode since 2026-09-10: one lane's agent-mode and
+answer-mode runs differ by minutes). Each tier is its own ladder, so a lane's budget on
 `high` is derived only from its runs on `high`; runs on `low` never move it. A stats file written
 before tiering loads unchanged as tier-less rows, and a tier whose own window holds fewer than
 `attemptMinSamples` samples falls back to that tier-less window — never merging the two into one
-quantile — until its own samples pass the floor.
+quantile — until its own samples pass the floor. A mode falls back the same way, most specific
+first: tier and mode, then tier, then mode, then the legacy row.
 
 **A lane whose RECENT runs are an outlier against its OWN history is demoted.** Every recorded run
 carries its timestamp, so "recent" is the tail of the window in time. When the median of the last
@@ -1795,26 +1820,58 @@ Five tools:
 
 | Tool | Purpose |
 |---|---|
-| `dispatch(task, mode?, system?, schema?, maxTokens?, tier?, lane?, cwd?, waitMs?, timeoutMs?, readOnly?)` | Hand a task to the best ready lane and return its answer. |
+| `dispatch(task, mode?, system?, schema?, maxTokens?, tier?, lane?, model?, cwd?, waitMs?, timeoutMs?, readOnly?)` | Hand a task to the best ready lane, or to one named model, and return its answer. |
 | `dispatch_status(jobId)` | Is a long lane still running? |
 | `dispatch_result(jobId)` | Collect a finished lane's answer. |
 | `dispatch_cancel(jobId)` | Stop a running lane. |
 | `dispatch_lanes(tier?)` | Show the ladder, to choose a lane deliberately. |
 
-`dispatch` blocks for at most `routing.mcp.maxWaitMs` (default 40 s) and then hands back
+`dispatch` blocks for at most `routing.mcp.maxWaitMs` (default 25 s) and then hands back
 a `jobId`. A fast lane therefore costs one call, and a long one degrades to polling rather
 than hitting the host's tool timeout. Every answer names the lane that produced it — the
 relay never presents another agent's text as its own.
 
-`routing.mcp.maxWaitMs` bounds that blocking wait because the host bounds it first: an MCP
-client tool call fails between 45 s and 100 s, and above that ceiling the job handle is
-destroyed with it — so the default sits 5 s under the lowest measured failure rather than
-on it. A `waitMs` above the ceiling is clamped to it, never refused, and the reply announces
-the clamp on its own line (`waited 40 s (waitMs 60000 clamped to
-routing.mcp.maxWaitMs 40000)`); a `waitMs` at or below the ceiling is honoured exactly. A
-`waitMs` that is negative, zero, non-finite or not a number is refused, naming the ceiling
-and the accepted range. `dispatch_status` and `dispatch_result` are unaffected — they poll
-and collect whatever the wait handed back.
+`routing.mcp.maxWaitMs` bounds that blocking wait because the host bounds it first. The lowest
+limit measured on this machine is Codex's code-mode `exec`, which gives up on a script at 31 s and
+loses the job handle with it (29 of 266 first Codex dispatch calls, 2026-09-07 to 2026-09-10); an
+MCP tool call in Claude Code fails between 45 s and 100 s. So the default is 25 s, under the lowest
+measured limit rather than on it (40 s until 2026-09-10). A `waitMs` above the ceiling is clamped
+to it, never refused, and the reply announces the clamp on its own line (`waited 25 s (waitMs 60000
+clamped to routing.mcp.maxWaitMs 25000)`); a `waitMs` at or below the ceiling is honoured exactly.
+A `waitMs` that is negative, zero, non-finite or not a number is refused, naming the ceiling and the
+accepted range. `dispatch_status` and `dispatch_result` are unaffected — they poll and collect
+whatever the wait handed back.
+
+While a job runs, `dispatch_status` also states the running lane's usual time to answer — the
+median and 80th percentile of its own completed runs, in this mode when known — or says that none
+is on record, so a caller can tell a slow lane from a stuck one. And every reply from an
+`llm-relay mcp` process that runs older code than the installed package ends with a notice saying
+so: restart the host's MCP connection, or the host, to load the installed code.
+
+#### Naming a model
+
+`model` runs ONE routing spec — `deepseek/deepseek-flash`, `openrouter/<model>`, `pool/high`, or
+`auto` — as its own lane, with no walk: answer mode posts it as the request's `model`, and agent
+mode renders it into the `routing.cliLane` template. The spec must name a configured provider or
+pool; anything else is refused before a lane exists, and the reason names what is configured.
+`lane` and `model` together are refused. The lane's id is `model:<spec>`; `dispatch_lanes` marks it
+as not a ladder rung, and it is never reported to `/dispatch/telemetry`, which knows only rungs.
+
+#### How a reply with no answer ends
+
+The last paragraph of a reply in which no lane answered tells the caller what to do next, and it
+says only what is true:
+
+- the walk STOPPED a lane at its time budget while the lane was still working — the reply names
+  that lane and the call that lets it finish: dispatch again with `lane: "<id>"` (a named lane runs
+  with no budget, only its own timeout);
+- the caller named the lane or the model — only that lane ran, so the reply says to call dispatch
+  without `lane` or `model` to let the walk try the others;
+- lanes remain untried because the walk stopped at `maxLanes` — dispatch again reaches them;
+- every lane ran and failed on its own — only then does the reply say not to dispatch this task
+  again.
+
+With `dispatchWalk: false` no such paragraph is printed at all.
 
 ### `mode: "agent"` vs `mode: "answer"`
 

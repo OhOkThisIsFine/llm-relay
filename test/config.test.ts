@@ -1717,6 +1717,7 @@ describe("routing.dispatchWalk", () => {
     expect(cfg.routing.dispatchWalk).toEqual({
       enabled: true,
       attemptMs: 90_000,
+      agentAttemptMs: 600_000,
       attemptQuantile: 0.8,
       attemptMinSamples: 5,
       maxLanes: 4,
@@ -1764,6 +1765,7 @@ describe("routing.dispatchWalk", () => {
     expect(cfg.routing.dispatchWalk).toEqual({
       enabled: true,
       attemptMs: 45_000,
+      agentAttemptMs: 600_000,
       attemptQuantile: 0.8,
       attemptMinSamples: 5,
       maxLanes: 2,
@@ -2073,10 +2075,12 @@ describe("loadConfig — routing.mcp.maxWaitMs", () => {
     return base({ routing: { default: "nim/z-ai/glm-5.2", mcp } });
   }
 
-  it("defaults to 40000 when the block is present but silent, and stays absent when absent", () => {
+  it("defaults to 25000 when the block is present but silent, and stays absent when absent", () => {
+    // 25 s since 2026-09-10 (40 s before): under Codex's 31 s script limit, so a Codex caller keeps
+    // its job handle (`DEFAULT_MCP_MAX_WAIT_MS`).
     expect(loadConfig(write("mcp-maxwait-absent.json", base())).routing.mcp).toBeUndefined();
     expect(loadConfig(write("mcp-maxwait-empty.json", mcpCfg({}))).routing.mcp).toEqual({
-      maxWaitMs: 40_000,
+      maxWaitMs: 25_000,
     });
   });
 
@@ -2089,7 +2093,7 @@ describe("loadConfig — routing.mcp.maxWaitMs", () => {
   it("keeps allowedRoots beside the defaulted ceiling", () => {
     expect(
       loadConfig(write("mcp-maxwait-roots.json", mcpCfg({ allowedRoots: ["C:/Code"] }))).routing.mcp,
-    ).toEqual({ allowedRoots: ["C:/Code"], maxWaitMs: 40_000 });
+    ).toEqual({ allowedRoots: ["C:/Code"], maxWaitMs: 25_000 });
   });
 
   it("refuses 0, -1, 1.5 and \"40000\" by name — none of them bounds the blocking wait", () => {
