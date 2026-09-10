@@ -186,7 +186,8 @@ describe("accounting store CLI lifecycle", () => {
     signalHandlers.get("SIGINT")!();
     signalHandlers.get("SIGTERM")!();
     // The third close path: the admitted stop's callback, after the signals already ran.
-    const deps = mocks.createProxy.mock.calls[0]![1] as { onStop: () => void };
+    // The mock is untyped, so its call tuple is `[]` to tsc; the cast names the shape asserted above.
+    const [, deps] = mocks.createProxy.mock.calls[0] as unknown as [unknown, { onStop: () => void }];
     deps.onStop();
     closeCallbacks[0]?.();
     expect(mocks.store.close).toHaveBeenCalledTimes(1);

@@ -2,30 +2,46 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-09 (v0.77.1)
+## 0. State as of 2026-09-09 (v0.78.0)
 
-- **What shipped:** the `parseRouting` split with its validation order pinned FIRST
-  (`test/config/routing-parser-order.test.ts`; cognitive complexity 125 → 12; `parseOffload` and
-  `parseLadder` untouched by design). The `config/routing-parser.ts` row of `CLAUDE.md` names the
-  helpers.
-- **Two pre-existing quirks pinned as behaviour:** the pool-member warning lacks the `config.`
-  prefix and the consequence sentence the other five degradation warnings carry;
-  `routing.subagents` stays attached as `{}` when its only entry is dropped.
-- **Daemon note:** the logon-started daemon runs v0.77.0 until the next logon (owner decision
-  2026-09-09), while `llm-relay --version` reports 0.77.1.
-- **Offload record:** both packets of the v0.77.1 lap went to the free pool through MCP
-  `dispatch`, and both needed repair here. The measurement: a free lane follows the SHAPE of a
-  brief and drops its finest constraints, so verify with the suite AND a typecheck; and cancel a
-  stalled lane by hand once its file stops changing, because the walk budget is the lane's own p80.
-- **Docs trimmed (2026-09-09, this lap):** this file and `docs/backlog.md` hold current state and
-  open work only. The backlog's former Closed section and this file's release list are in git
-  history (`git log -p -- docs/backlog.md HANDOFF.md`), not restated anywhere.
-- **Immediate next:** triage the eligibility queue (10 unrecognized refusals; the dispatcher
-  proposes by digest, only the owner accepts). Then the Open entries of `docs/backlog.md`, which
-  is the queue.
+- **What shipped — the 27-items lap, one day.** Every entry of `docs/backlog.md` that stood open
+  at `3abbafd` is closed with a pinning test, rewritten to its residue, or owner-gated; the file
+  holds the five that remain, three of them the owner's. Landed, in order: `npm run gate`;
+  `docs/project-philosophy.md`; the accounting temp-root and keystore leak-check fixes;
+  `LANE_AFFINITY_DEFAULT_TTL_MS` and 33 dead exports pruned; `routing.mcp.maxWaitMs`; the
+  eligibility triage document; the relay agent template v5; the forward-header ALLOW-list and
+  `onListenError`; cost-class-bounded `clearFacts`; `writerHealth()` on `/telemetry` and in
+  `llm-relay cost`; `wire: "responses"`, the OpenAI Responses UPSTREAM speaker (route B); the
+  post-commit stall measurement; tier-keyed lane history with the calibrated outlier demotion;
+  the probation band and price-suffix resolution; the free-class key probe; the first-byte
+  deadline for non-streamed attempts; the Responses front's retired 1024 cap, `incomplete`
+  announcement and named cut-replay refusal; the post-commit crawl abort (`routing.crawl`);
+  `POST /stop`, `llm-relay stop` and the config-staleness notice; the per-lane `maxConcurrent`
+  cap; and one log verdict for a relay-aborted committed stream on both fronts.
+- **Measured, then built on:** both clients RETRY after a post-commit failure
+  ([docs/post-commit-stall-measurement-2026-09-09.md](docs/post-commit-stall-measurement-2026-09-09.md)),
+  which is what the crawl abort rests on. The DeepSeek capture
+  ([docs/deepseek-responses-truncation-2026-09-09.md](docs/deepseek-responses-truncation-2026-09-09.md))
+  never reproduced the cut string but found the mechanism — 20 of 68 answers hit the relay's own
+  1024 cap and every one was announced `completed` — and filed a second defect, the
+  `reasoning_content` replay.
+- **Daemon note:** the logon-started daemon keeps its old binary until it is restarted;
+  `llm-relay stop` exists for exactly that, and `Startup\llm-relay.vbs` still has to use it
+  (machine-wide backlog).
+- **Immediate next:** the owner-gated items — run or decline the 26 eligibility commands in
+  [docs/eligibility-triage-2026-09-09.md](docs/eligibility-triage-2026-09-09.md); the Codex
+  Desktop `relay` check; declare `wire: "responses"` on the `opencode` provider, pin the
+  contributor SKU as `preferred` (the tier snapshot has no `muse-spark-1.3` row, so the price
+  suffix alone does not admit it), restart the daemon and prove route B live. Then the Open
+  entries of `docs/backlog.md`, which is the queue.
 
 ### 0.1 Previous laps
 
+- **v0.77.1, the `parseRouting` split (2026-09-09, morning).** Validation order pinned FIRST
+  (`test/config/routing-parser-order.test.ts`; cognitive complexity 125 → 12; `parseOffload` and
+  `parseLadder` untouched by design). Two pre-existing quirks pinned as behaviour: the
+  pool-member warning lacks the `config.` prefix and the consequence sentence, and
+  `routing.subagents` stays attached as `{}` when its only entry is dropped.
 - **v0.77.0, breaker persistence (2026-09-08/09).** The WHOLE circuit-breaker cell survives a
   restart (failure counters, the credential fault, the served-request ping window
   `GET /telemetry` scores from, quota observations), and every write-behind store flushes at a
@@ -48,8 +64,18 @@ Free lanes CANNOT do open-ended reconnaissance here — 7 of 7 packets fabricate
 They CAN review a concrete diff against a stated claim, and they carry a mechanical rewrite with
 a stated rule. The test is whether the output can be checked by running or reading something
 specific. Never key a fallback on a `null` result; never make a lane the only check.
-`opencode-muse-spark` is congested, not broken (owner, 2026-09-05), and the lane walk routes
-around it.
+
+The 27-items lap (2026-09-09) added the numbers. `opencode-muse-spark` carried six whole
+implementation packets ALONE (101–998 s each, clean at `delegate-gate`) and starved every packet
+handed to it as a second or third concurrent lane (2100 s, nothing written) — `maxConcurrent: 1`
+on its rung is the fix, shipped this lap and owed to the operator config. The free pool hit its
+1800 s ceiling on every implementation packet and left a partial tree worth taking. Codex Spark
+spent two whole usage windows reading (193k and 477k tokens) and wrote nothing, twice. DeepSeek
+on the Codex harness died five of five times on the relay's own 1024 cap. Nine Sonnet lanes
+carried the rest at 25–41 minutes each with honest red-then-green evidence. Verify every lane by
+running and reading: one lane's test passed with its fix removed, one lane's six-step fallback
+silently changed a legacy rule, one lane's threshold triple could never fire, and one lane wrote
+the DeepSeek key literal into a scratch launcher despite a brief that forbade it.
 
 ### 0.3 Earlier releases
 
