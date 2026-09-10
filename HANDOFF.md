@@ -6,7 +6,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 - **What shipped — the 27-items lap, one day.** Every entry of `docs/backlog.md` that stood open
   at `3abbafd` is closed with a pinning test, rewritten to its residue, or owner-gated; the file
-  holds the five that remain, three of them the owner's. Landed, in order: `npm run gate`;
+  holds the four that remain, two of them the owner's. Landed, in order: `npm run gate`;
   `docs/project-philosophy.md`; the accounting temp-root and keystore leak-check fixes;
   `LANE_AFFINITY_DEFAULT_TTL_MS` and 33 dead exports pruned; `routing.mcp.maxWaitMs`; the
   eligibility triage document; the relay agent template v5; the forward-header ALLOW-list and
@@ -25,15 +25,26 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   never reproduced the cut string but found the mechanism — 20 of 68 answers hit the relay's own
   1024 cap and every one was announced `completed` — and filed a second defect, the
   `reasoning_content` replay.
-- **Daemon note:** the logon-started daemon keeps its old binary until it is restarted;
-  `llm-relay stop` exists for exactly that, and `Startup\llm-relay.vbs` still has to use it
-  (machine-wide backlog).
-- **Immediate next:** the owner-gated items — run or decline the 26 eligibility commands in
-  [docs/eligibility-triage-2026-09-09.md](docs/eligibility-triage-2026-09-09.md); the Codex
-  Desktop `relay` check; declare `wire: "responses"` on the `opencode` provider, pin the
-  contributor SKU as `preferred` (the tier snapshot has no `muse-spark-1.3` row, so the price
-  suffix alone does not admit it), restart the daemon and prove route B live. Then the Open
-  entries of `docs/backlog.md`, which is the queue.
+- **Closeout, done 2026-09-10.** The daemon now runs v0.78.0: the old one (PID 51960) predated
+  `POST /stop`, so `llm-relay stop` answered `the running relay returned an invalid response` and
+  the first stop was a process kill; it was started again from `Startup\llm-relay.vbs` (PID 28920)
+  and warmed. `GET /telemetry` carries both new fields — `accounting` (the `writerHealth()` block,
+  `state: "writing"`) and `config` (the staleness block). `Startup\llm-relay.vbs` now names
+  `llm-relay stop` and records that a pre-v0.78.0 daemon still needs the hard kill. The operator
+  config carries the route-B edits with a dated backup.
+- **Route B, live: PARTIAL, and the missing half is the vendor's.** A STREAMED request carrying a
+  tool, sent on BOTH fronts, egressed to OpenCode Zen on the Responses wire and returned
+  `x-llm-relay-served-by: opencode/muse-spark-1.3-contributor-free` with
+  `x-llm-relay-error-origin: upstream` and each front's own error envelope. The upstream answer was
+  `HTTP 429 FreeUsageLimitError` on both — the free contributor allowance, spent by this machine's
+  six Muse Spark packets the day before. A 429 proves egress, never translation, so the entry stays
+  open for the served 200. The same responses carried
+  `x-llm-relay-probation: opencode/muse-spark-1.3-contributor-free (0 of 5 request samples)`, which
+  is the probation band answering on real traffic for the exact member it was built for.
+- **Immediate next:** the two owner-only items — run or decline the 26 eligibility commands in
+  [docs/eligibility-triage-2026-09-09.md](docs/eligibility-triage-2026-09-09.md), and the Codex
+  Desktop `relay` check. Then re-run the route-B proof once the OpenCode free allowance refills.
+  `docs/backlog.md` is the queue; it holds four entries.
 
 ### 0.1 Previous laps
 

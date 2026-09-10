@@ -37,17 +37,25 @@
   declined by name, each listed command, so `llm-relay eligibility` shows no item without a
   verdict except item 1, whose pending state is the stated verdict.
 
-- **Route B is built; prove it live on this machine once the daemon runs the release that
-  carries it** (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider,
-  `src/backend.ts`; the code half of the 2026-09-04 entry is met, tests in
-  `test/backend-responses-upstream.test.ts`). The logon-started daemon keeps its old binary until
-  the owner's next restart, so the live half waits. **Property (what remains):** the operator's
-  `~/.llm-relay/config.json` declares `wire: "responses"` on the `opencode` provider and pins
-  `opencode/muse-spark-1.3-contributor-free` as `preferred` in the effort pools (with price-suffix
-  resolution landed, the pool may also admit it on its own — check `llm-relay pools`); then one
-  real request through `pool/medium` on each front is served by that deployment, with a tool
-  call and streaming, and `llm-relay cost` shows its `cached_tokens`. Recorded with the served-by
-  header and the date.
+- **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
+  (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
+  tests in `test/backend-responses-upstream.test.ts`). Everything this entry asked for except a
+  200 is now measured. **Done and recorded 2026-09-10:** the daemon runs v0.78.0 (restarted from
+  `Startup\llm-relay.vbs`, PID 28920); `~/.llm-relay/config.json` declares
+  `providers.opencode.wire: "responses"`, pins `opencode/muse-spark-1.3-contributor-free` first in
+  `routing.pools.medium.preferred`, and carries `maxConcurrent: 1` on all four
+  `opencode-muse-spark` rungs (backup `config.json.bak-2026-09-09-pre-v0.78.0-route-b`); and a
+  STREAMED request carrying a tool, sent on BOTH fronts (`/v1/messages` and `/v1/responses`),
+  egressed to OpenCode Zen on the Responses wire and came back
+  `x-llm-relay-served-by: opencode/muse-spark-1.3-contributor-free`,
+  `x-llm-relay-error-origin: upstream`, each front's own native error envelope, and
+  `x-llm-relay-probation: opencode/muse-spark-1.3-contributor-free (0 of 5 request samples)`.
+  ⚠ The upstream answer was `HTTP 429 FreeUsageLimitError: Rate limit exceeded` on both. That is
+  the vendor's free contributor allowance, spent by the six Muse Spark packets this machine
+  dispatched on 2026-09-09 — not a relay fault, and a 429 proves egress but not translation.
+  **Property (what remains):** with the allowance refilled, one request per front through
+  `pool/medium` is SERVED (HTTP 200) by that deployment with a tool call and streaming, and
+  `llm-relay cost` shows its `cached_tokens`. Recorded with the served-by header and the date.
 
 - **Verify the Codex `relay` agent end to end in Codex Desktop** (owner-driven, 2026-09-04).
   Commit `e73d113` added `~/.codex/agents/relay.toml` via `scripts/install-skill.mjs`; standalone
