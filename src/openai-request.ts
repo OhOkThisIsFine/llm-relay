@@ -30,10 +30,23 @@ import type { ThoughtSignatureMode, ToolCallIdMode, ReasoningMode, EffortLevel }
  * ⚠ ONE opt-in exception, since 2026-09-10: under `reasoning: "deepseek"` (a RESOLVED
  * `compat.reasoning` mode defaulting from `api.deepseek.com` — never sniffed from provider identity
  * here) the caller's `thinking` CONTROL and effort are carried onto DeepSeek's own vocabulary, by
- * `deepSeekThinkingSpec` below. It forwards only the caller's explicit `thinking: {type:"disabled"}`
- * and a CLOSED effort mapping; it never fabricates a `reasoning_content` or an effort nobody
- * stated. The default with no thinking control is `thinking: {type:"disabled"}`, so a multi-turn
- * DeepSeek lane cannot hit the "reasoning_content must be passed back" 400.
+ * `deepSeekThinkingSpec` below, and a replayed `thinking` block's own text is carried onto that
+ * assistant message's `reasoning_content` (see `assistantMessage`) — byte for byte, and only when
+ * nonempty. It never fabricates a `reasoning_content` or an effort nobody stated.
+ *
+ * ⚠ CORRECTED 2026-09-10 (F10/F11, docs/deepseek-responses-truncation-2026-09-09.md): this
+ * paragraph used to end "The default with no thinking control is `thinking:{type:"disabled"}`, so
+ * a multi-turn DeepSeek lane cannot hit the ... 400" — false for POOL traffic, and never measured
+ * against it before that date. A `pool/*` resolution stamps an effort band on the target on nearly
+ * every call, and `deepSeekThinkingSpec`'s rule 3 (pool effort → `reasoning_effort`) is checked
+ * BEFORE rule 5 ("no thinking control" → disabled), so pool-routed DeepSeek traffic runs with
+ * thinking ON by default, not off. What actually keeps a replay from 400ing is two narrower
+ * overrides applied AFTER `deepSeekThinkingSpec`, in `anthropicRequestToOpenAi`: a FORCED tool
+ * choice always wins over thinking (DeepSeek accepts only one of the two — F10, 15
+ * `400 thinking mode does not support this tool_choice` refusals in one MCP answer-mode burst),
+ * and a conversation replaying an assistant tool-call turn with no reasoning available to carry
+ * forward also forces thinking off for that request (F11). Both are counted through
+ * `onDeepSeekThinkingOverridden`.
  */
 
 import { createHash } from "node:crypto";
@@ -100,6 +113,14 @@ export interface AnthropicToOpenAiOptions {
    * "deepseek"` — the band is what maps to `reasoning_effort`. Absent ⇒ no effort to map.
    */
   effort?: EffortLevel | undefined;
+  /**
+   * Called once per run with 1 when a `"deepseek"` target's NATURAL thinking decision
+   * (`deepSeekThinkingSpec`'s own return) got overridden to `{thinking:{type:"disabled"}}` — a
+   * forced tool choice, or a replayed tool-call turn with no reasoning available to carry forward
+   * (F10/F11, 2026-09-10) — and with 0 otherwise. Only ever fires under `reasoning: "deepseek"`;
+   * the same out-param idiom as `onThoughtSignatureSentinels`.
+   */
+  onDeepSeekThinkingOverridden?: ((count: number) => void) | undefined;
 }
 
 // `ToolCallIdMode` and `ThoughtSignatureMode` are imported from `config-types.ts`, the ONE
@@ -320,17 +341,42 @@ function toolCall(block: Rec, ids: ToolCallIds | null, sigs: ThoughtSignatures |
 }
 
 /**
+ * What one assistant turn produced, plus the one fact the DeepSeek reasoning override
+ * (`anthropicRequestToOpenAi`'s `hasUnreplayableReasoningTurn`) needs about it.
+ */
+interface AssistantMessageResult {
+  message: Rec;
+  /** Did this turn call a tool? DeepSeek's replay requirement is scoped to exactly these turns. */
+  hadToolCall: boolean;
+}
+
+/**
  * An assistant turn → exactly one OpenAI assistant message.
  *
  * Text blocks concatenate (the same rule as the response-direction `anthropicMessageToOpenAi`),
  * `tool_use` blocks become `tool_calls`, and `content` is `null` when nothing but tool calls
  * remains — the shape OpenAI defines for a tool-calling turn.
+ *
+ * `reasoning` is read ONLY to decide whether a `thinking` block's own text becomes this message's
+ * `reasoning_content` (F11, 2026-09-10) — under any other value the block is dropped exactly as it
+ * was before this parameter existed, so every non-"deepseek" target's outbound bytes are
+ * unchanged.
  */
-function assistantMessage(turn: Rec, ids: ToolCallIds | null, sigs: ThoughtSignatures | null): Rec {
+function assistantMessage(
+  turn: Rec,
+  ids: ToolCallIds | null,
+  sigs: ThoughtSignatures | null,
+  reasoning: ReasoningMode | undefined,
+): AssistantMessageResult {
   const content = turn.content;
-  if (typeof content === "string") return { role: "assistant", content };
+  if (typeof content === "string") return { message: { role: "assistant", content }, hadToolCall: false };
   const texts: string[] = [];
   const toolCalls: Rec[] = [];
+  // Only a plain-text `thinking` block carries anything usable to replay — a `redacted_thinking`
+  // block's `data` is Anthropic's own encrypted blob, meaningless to a different vendor, so it
+  // contributes nothing here (see the module header's "never fabricates a `reasoning_content`").
+  // Collected regardless of `reasoning`'s value — cheap, and read below only under "deepseek".
+  const thinkingParts: string[] = [];
   for (const raw of Array.isArray(content) ? content : []) {
     if (!isRecord(raw)) throw new RequestMappingError("assistant content block is not an object");
     switch (raw.type) {
@@ -341,6 +387,8 @@ function assistantMessage(turn: Rec, ids: ToolCallIds | null, sigs: ThoughtSigna
         toolCalls.push(toolCall(raw, ids, sigs));
         break;
       case "thinking":
+        if (typeof raw.thinking === "string" && raw.thinking.length > 0) thinkingParts.push(raw.thinking);
+        break;
       case "redacted_thinking":
         break;
       default:
@@ -353,7 +401,13 @@ function assistantMessage(turn: Rec, ids: ToolCallIds | null, sigs: ThoughtSigna
     content: text.length > 0 ? text : toolCalls.length > 0 ? null : "",
   };
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
-  return message;
+  // Byte-for-byte, and ONLY under the explicit "deepseek" mode — every other provider's outbound
+  // bytes are the pre-2026-09-10 document, untouched. Never a fabricated "": a turn with nothing
+  // usable to replay contributes no field at all.
+  if (reasoning === "deepseek" && thinkingParts.length > 0) {
+    message.reasoning_content = thinkingParts.join("\n\n");
+  }
+  return { message, hadToolCall: toolCalls.length > 0 };
 }
 
 /** An Anthropic `image` block → an OpenAI `image_url` part (base64 sources become data URLs). */
@@ -613,22 +667,38 @@ function deepSeekEffortSpec(level: string): Rec | undefined {
 }
 
 /**
- * What a `"deepseek"` target gets for the caller's reasoning/thinking intent, or undefined when
- * nothing should be added.
+ * What a `"deepseek"` target's NATURAL reasoning/thinking intent is, or undefined when nothing
+ * should be added — BEFORE the two request-shape overrides in `anthropicRequestToOpenAi` are
+ * applied (`forcesToolChoice`, `hasUnreplayableReasoningTurn`).
  *
  * 1. `thinking: {type:"disabled"}` is forwarded VERBATIM — the caller's own words, and the field
  *    the 36k-token probe in docs/deepseek-responses-truncation-2026-09-09.md showed the Anthropic
  *    path dropping (all 32,000 output tokens were reasoning, no answer).
  * 2. An explicit effort (`output_config.effort` / `reasoning.effort`) maps to `reasoning_effort`.
- * 3. The routed pool's effort band maps to `reasoning_effort` — "map pool effort → reasoning_effort
- *    when thinking is on".
+ * 3. ⚠ The routed pool's effort band maps to `reasoning_effort` — checked BEFORE rule 5, and that
+ *    order is why F10 happened (2026-09-10): `ResolvedTarget.effort` is stamped for nearly every
+ *    `pool/*` resolution, so THIS rule fires on nearly every pool-routed DeepSeek request, and
+ *    rule 5 ("no thinking control") is reached only by a direct, non-pool spec or a pool that
+ *    declares no `effort`. **Pool-routed DeepSeek traffic therefore runs with thinking ON by
+ *    default, not off** — whatever this function's own name suggests, and the opposite of what
+ *    this doc comment claimed before that date (never measured against pool traffic until 15
+ *    `400 thinking mode does not support this tool_choice` refusals in one MCP answer-mode burst
+ *    showed it plainly false).
  * 4. `thinking: {type:"enabled"}` with no level to map leaves DeepSeek's OWN default (thinking ON)
  *    alone: the caller asked for thinking, so the relay must not switch it off, and it has no
  *    level to assert.
- * 5. No thinking control at all: default to `thinking: {type:"disabled"}` — DeepSeek's thinking
- *    mode requires the prior turn's `reasoning_content` to be replayed on a multi-turn conversation
- *    (HTTP 400 otherwise), and this relay deliberately holds no store to round-trip it, so the
- *    default must not think.
+ * 5. No thinking control AND no effort of any kind (a direct spec, or a pool declaring none):
+ *    default to `thinking: {type:"disabled"}`.
+ *
+ * None of the above is enough on its own to keep a multi-turn DeepSeek lane out of the
+ * "reasoning_content must be passed back" 400 — rule 3 leaves thinking on for most pool traffic,
+ * and even rule 5's bare default only protects a lane that never asks for thinking at all. What
+ * actually protects a replay is TWO OVERRIDES, applied to whatever this function returns:
+ * `forcesToolChoice` (F10) — DeepSeek accepts only one of "forced tool" and "thinking" — and
+ * `hasUnreplayableReasoningTurn` (F11) — a replayed assistant tool-call turn with no
+ * `reasoning_content` this relay can carry forward forces thinking off for the whole request
+ * rather than risk the 400. Both are counted through `onDeepSeekThinkingOverridden`; neither ever
+ * adds `reasoning_effort`.
  */
 function deepSeekThinkingSpec(body: Rec, effort: EffortLevel | undefined): Rec | undefined {
   const thinking = isRecord(body.thinking) ? body.thinking : undefined;
@@ -638,6 +708,48 @@ function deepSeekThinkingSpec(body: Rec, effort: EffortLevel | undefined): Rec |
   if (effort !== undefined) return deepSeekEffortSpec(effort);
   if (thinking?.type === "enabled") return undefined;
   return { thinking: { type: "disabled" } };
+}
+
+/**
+ * Does the OUTBOUND `tool_choice` force a specific tool call? OpenAI's `"required"` (from
+ * Anthropic's `any`) or the named-function form (from Anthropic's `tool` choice) — both read off
+ * `mapToolChoice`'s own OpenAI-shaped output, never re-derived from the caller's Anthropic
+ * spelling, so a future third OpenAI form only needs adding here once. A forced tool is the
+ * caller's hard output contract; DeepSeek allows only one of "forced tool" and "thinking" (F10).
+ */
+function forcesToolChoice(toolChoice: unknown): boolean {
+  return toolChoice === "required" || (isRecord(toolChoice) && toolChoice.type === "function");
+}
+
+/**
+ * Would `spec` — `deepSeekThinkingSpec`'s own return — leave DeepSeek's thinking mode ON?
+ * `undefined` (rule 4: an explicit `enabled` with no level) and a `reasoning_effort` spec (rules
+ * 2-3) both do; only an explicit `{thinking:{type:"disabled"}}` (rule 1 or 5) does not.
+ */
+function deepSeekThinkingIsOn(spec: Rec | undefined): boolean {
+  return spec === undefined || !isRecord(spec.thinking) || spec.thinking.type !== "disabled";
+}
+
+/**
+ * Apply `"deepseek"` mode's reasoning/thinking decision onto the outbound body, including the two
+ * request-shape overrides (F10, F11) — split out of `anthropicRequestToOpenAi` so that function's
+ * own cognitive complexity does not grow with this rule's branching. `out.tool_choice` must
+ * already be set by the caller: `forcesToolChoice` reads the OUTBOUND (OpenAI-shaped) value.
+ */
+function applyDeepSeekReasoning(
+  out: Rec,
+  body: Rec,
+  opts: AnthropicToOpenAiOptions,
+  hasUnreplayableReasoningTurn: boolean,
+): void {
+  const natural = deepSeekThinkingSpec(body, opts.effort);
+  // Neither override fires when `natural` was already disabled — that is not an override, it is
+  // the rule that already applied.
+  const overridden = deepSeekThinkingIsOn(natural)
+    && (forcesToolChoice(out.tool_choice) || hasUnreplayableReasoningTurn);
+  opts.onDeepSeekThinkingOverridden?.(overridden ? 1 : 0);
+  const spec = overridden ? { thinking: { type: "disabled" } } : natural;
+  if (spec) Object.assign(out, spec);
 }
 
 /**
@@ -680,13 +792,21 @@ export function anthropicRequestToOpenAi(
   const system = systemText(body.system);
   if (system.length > 0) messages.push({ role: "system", content: system });
 
+  // Set when a replayed assistant turn called a tool but carries no reasoning this relay can put
+  // on `reasoning_content` — the "deepseek" thinking override's second trigger (F11), below. Only
+  // ever consulted under `reasoning: "deepseek"`.
+  let hasUnreplayableReasoningTurn = false;
   for (const raw of Array.isArray(body.messages) ? body.messages : []) {
     if (!isRecord(raw)) throw new RequestMappingError("message is not an object");
     // Walked in order, so a `tool_result` is always emitted after its `tool_use` was recorded —
     // and id minting (`tool-use-ids.ts`) is RESPONSE-side, so the echoed pair shares one id here.
     if (raw.role === "assistant") {
       rememberToolNames(raw);
-      messages.push(assistantMessage(raw, ids, sigs));
+      const built = assistantMessage(raw, ids, sigs, opts.reasoning);
+      messages.push(built.message);
+      if (opts.reasoning === "deepseek" && built.hadToolCall && typeof built.message.reasoning_content !== "string") {
+        hasUnreplayableReasoningTurn = true;
+      }
     } else messages.push(...userMessages(raw, toolNames, ids));
   }
   // Announced for the same reason every other automatic fix on this path is: a count, never an id.
@@ -714,10 +834,7 @@ export function anthropicRequestToOpenAi(
     if (toolChoice !== undefined) out.tool_choice = toolChoice;
   }
   // Only under the explicit `"deepseek"` mode — every other provider's outbound bytes are the
-  // pre-2026-09-10 document, untouched.
-  if (opts.reasoning === "deepseek") {
-    const spec = deepSeekThinkingSpec(body, opts.effort);
-    if (spec) Object.assign(out, spec);
-  }
+  // pre-2026-09-10 document, untouched. `out.tool_choice` is already set by now (or absent).
+  if (opts.reasoning === "deepseek") applyDeepSeekReasoning(out, body, opts, hasUnreplayableReasoningTurn);
   return out;
 }

@@ -1,4 +1,5 @@
 import { isRecord } from "./json-shape.js";
+import type { ReasoningMode } from "./config-types.js";
 
 /**
  * OpenAI Responses REQUEST → Anthropic Messages REQUEST.
@@ -47,11 +48,20 @@ import { isRecord } from "./json-shape.js";
  *     relay minted on the way out (`anthropicMessageToOpenAi` sets `call_id` = the Anthropic
  *     `tool_use` id), so the linkage survives the whole round trip and `openai-request.ts` can
  *     re-emit them as `tool_calls[].id` / `tool_call_id` for an `openai`-kind target.
- *   - `reasoning` items are DROPPED: a reasoning summary has no Anthropic representation without
- *     the signature the minting provider issued, and forwarding one vendor's private reasoning to
- *     another vendor is not translation. Same decision as `openai-request.ts` dropping `thinking`.
- *     Dropping is neutral for turn merging, so an assistant turn split by a `reasoning` item still
- *     merges into one.
+ *   - `reasoning` items are DROPPED BY DEFAULT: a reasoning summary has no Anthropic
+ *     representation without the signature the minting provider issued, and forwarding one
+ *     vendor's private reasoning to another vendor is not translation. Same decision as
+ *     `openai-request.ts` dropping `thinking`. Dropping is neutral for turn merging, so an
+ *     assistant turn split by a `reasoning` item still merges into one.
+ *     ⚠ ONE opt-in exception, since 2026-09-10 (F11,
+ *     docs/deepseek-responses-truncation-2026-09-09.md): under a RESOLVED `reasoning: "deepseek"`
+ *     option (the `openai-request.ts` `compat.reasoning` precedent — a decision this module is
+ *     handed, never a provider name it sniffs), the item's own stated `summary` text is carried
+ *     onto a LEADING `thinking` block on the current assistant turn, byte for byte and only when
+ *     nonempty, so `openai-request.ts` can carry it onward as DeepSeek's `reasoning_content`.
+ *     `encrypted_content` is never read — an opaque blob for a different vendor's decoder, and
+ *     reading it would be exactly the fabrication this module refuses everywhere else. Every other
+ *     target's outbound bytes, and this option's own default, are unchanged.
  *   - `reasoning.effort` is DROPPED. llm-bridge turned it into `thinking.budget_tokens: 10240` —
  *     a token budget nobody stated, i.e. an invented figure, which provenance forbids.
  *   - `text.format` of `json_schema`/`json_object` is REFUSED. It is a contract about the shape of
@@ -373,7 +383,26 @@ interface InputCollector {
   addSystemText: (text: string) => void;
 }
 
-function processResponsesInputItem(raw: unknown, collector: InputCollector): void {
+/**
+ * A Responses `reasoning` item's own stated text — every `summary_text` part of `summary`, joined.
+ * `encrypted_content` is never read: it is an opaque blob meant for a DIFFERENT vendor's decoder,
+ * and forwarding it as `reasoning_content` would be exactly the fabrication this module refuses
+ * everywhere else (F11, 2026-09-10). An item with no summary parts (summaries not requested, or
+ * genuinely empty — the common case for Codex today) yields "", which the caller treats as
+ * "nothing to carry", never a placeholder.
+ */
+function reasoningSummaryText(item: Rec): string {
+  if (!Array.isArray(item.summary)) return "";
+  const parts: string[] = [];
+  for (const raw of item.summary) {
+    if (isRecord(raw) && raw.type === "summary_text" && typeof raw.text === "string" && raw.text.length > 0) {
+      parts.push(raw.text);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function processResponsesInputItem(raw: unknown, collector: InputCollector, reasoning: ReasoningMode | undefined): void {
   if (!isRecord(raw)) throw new RequestMappingError("input item is not an object");
   const type = typeof raw.type === "string" ? raw.type : undefined;
   if (type === "function_call") {
@@ -384,9 +413,19 @@ function processResponsesInputItem(raw: unknown, collector: InputCollector): voi
     collector.push("user", [toolResultBlock(raw)], true);
     return;
   }
-  // Dropped, and deliberately WITHOUT flushing: a Codex assistant turn is often
-  // message → reasoning → function_call, and flushing here would split it in two.
-  if (type === "reasoning") return;
+  if (type === "reasoning") {
+    // Dropped by default, and deliberately WITHOUT flushing either way: a Codex assistant turn is
+    // often message → reasoning → function_call, and flushing here would split it in two.
+    // Under "deepseek" mode, carried onto a LEADING block of the current turn instead — Anthropic
+    // requires a `thinking` block to precede any `tool_use` in the same assistant turn, and
+    // `first: true` guarantees that regardless of arrival order. Only when there is text: never a
+    // fabricated block, and every other target's outbound bytes are unchanged.
+    if (reasoning === "deepseek") {
+      const text = reasoningSummaryText(raw);
+      if (text.length > 0) collector.push("assistant", [{ type: "thinking", thinking: text }], true);
+    }
+    return;
+  }
   if (type !== undefined && type !== "message") {
     throw new RequestMappingError(`unsupported Responses input item ${describeType(raw.type)}`);
   }
@@ -438,6 +477,19 @@ function mapResponsesOptions(body: Rec, out: Rec, systemParts: string[]): void {
   if (typeof body.stream === "boolean") out.stream = body.stream;
 }
 
+export interface ResponsesToAnthropicOptions {
+  /**
+   * The RESOLVED reasoning-mapping mode for the target this Anthropic-shaped intermediate will
+   * reach (`config.ts` `resolveReasoningMode`) — the same value `openai-request.ts`'s
+   * `AnthropicToOpenAiOptions.reasoning` carries, since an `openai`-kind target's request is built
+   * FROM this function's own output (see `fetchTranslatedOpenAiFront` in `backend.ts`). Absent ⇒
+   * `"none"` ⇒ a Responses `reasoning` item is dropped exactly as it was before this option
+   * existed — every target but a `"deepseek"` one is unaffected. Never a provider name: this
+   * module is handed a decision, it does not make one (the `openai-request.ts` precedent).
+   */
+  reasoning?: ReasoningMode | undefined;
+}
+
 /**
  * Translate one OpenAI Responses request body into an Anthropic Messages request body.
  *
@@ -446,7 +498,10 @@ function mapResponsesOptions(body: Rec, out: Rec, systemParts: string[]): void {
  *
  * @throws {RequestMappingError} for an item, part or declaration that cannot be represented.
  */
-export function openaiResponsesRequestToAnthropic(reqJson: unknown): Record<string, unknown> {
+export function openaiResponsesRequestToAnthropic(
+  reqJson: unknown,
+  opts: ResponsesToAnthropicOptions = {},
+): Record<string, unknown> {
   const body = isRecord(reqJson) ? reqJson : {};
 
   if (typeof body.previous_response_id === "string" && body.previous_response_id.length > 0) {
@@ -500,7 +555,7 @@ export function openaiResponsesRequestToAnthropic(reqJson: unknown): Record<stri
       addSystemText: (text) => systemParts.push(text),
     };
     for (const raw of input) {
-      processResponsesInputItem(raw, collector);
+      processResponsesInputItem(raw, collector, opts.reasoning);
     }
   } else if (input !== undefined && input !== null) {
     throw new RequestMappingError("input must be a string or a list of items");

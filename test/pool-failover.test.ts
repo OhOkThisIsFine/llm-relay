@@ -2927,3 +2927,145 @@ describe("post-commit STALL watchdog on a TRANSLATED stream — the Responses (a
     expect(globalCircuitBreaker.getState(breakerIdentity("p1", "m1", "anthropic"))).toBeUndefined();
   });
 });
+
+/**
+ * F10/F11 (2026-09-10, docs/deepseek-responses-truncation-2026-09-09.md): a `"deepseek"`-compat
+ * candidate's outbound thinking/reasoning decision must reach the wire correctly AND must not leak
+ * onto a sibling candidate of the SAME walk. Every case here uses TWO candidates — the
+ * deepseek-compat one first (scripted to fail, so the walk reaches the plain one) — per this
+ * file's own standing rule: a single-candidate test cannot distinguish "applies correctly" from
+ * "applies to everything".
+ */
+describe("DeepSeek reasoning wiring is isolated to the declared target (F10/F11)", () => {
+  /** Records the body it received regardless of the scripted reply — the P-DS-c idiom above. */
+  function recordingChat(
+    reply: (n: number) => { status?: number; headers?: Record<string, string>; body: string },
+  ): Promise<{ server: Server; bodies: () => Record<string, unknown>[] }> {
+    const bodies: Record<string, unknown>[] = [];
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          try { bodies.push(JSON.parse(Buffer.concat(chunks).toString())); } catch { bodies.push({}); }
+          const out = reply(bodies.length);
+          res.writeHead(out.status ?? 200, { "content-type": "application/json", ...out.headers });
+          res.end(out.body);
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), bodies: () => bodies }));
+    });
+  }
+
+  /**
+   * A 2-member pool: `p1` carries `compat.reasoning: "deepseek"` EXPLICITLY — no real
+   * `api.deepseek.com` host needed, the same "explicit value wins" rule `resolveReasoningMode`
+   * itself states — and `p2` is a plain `openai`-kind provider with no `compat` at all.
+   * `benchmarkSort: false` keeps config order, matching `poolCfg` above.
+   */
+  function deepSeekPoolCfg(deepSeekBase: string, plainBase: string): Config {
+    return {
+      host: "127.0.0.1",
+      port: 0,
+      providers: {
+        p1: { base: deepSeekBase, kind: "openai", authHeader: "authorization", timeoutMs: 5000, compat: { reasoning: "deepseek" } },
+        p2: { base: plainBase, kind: "openai", authHeader: "authorization", timeoutMs: 5000 },
+      },
+      routing: { default: "pool/coding", tiers: {}, benchmarkSort: false, pools: { coding: ["p1/m1", "p2/m2"] } },
+      mode: "detect",
+      repair: { maxAttempts: 2, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+  }
+
+  const FAIL_429 = () => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) });
+  const chatOkBody = (content: string) => JSON.stringify({
+    id: "c", choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }],
+  });
+
+  it("F10: a forced tool choice disables thinking on the deepseek candidate only — the plain sibling's bytes are unchanged", async () => {
+    const deepseekMember = await recordingChat(FAIL_429);
+    const plainMember = await recordingChat(() => ({ body: chatOkBody("ok") }));
+    const p = port(await startProxy(deepSeekPoolCfg(
+      `http://127.0.0.1:${port(deepseekMember.server)}`,
+      `http://127.0.0.1:${port(plainMember.server)}`,
+    )));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "pool/coding",
+        max_tokens: 20,
+        output_config: { effort: "high" },
+        messages: [{ role: "user", content: "do it" }],
+        tools: [{ name: "answer", input_schema: { type: "object", properties: {} } }],
+        tool_choice: { type: "tool", name: "answer" },
+      }),
+    });
+    expect(resp.status).toBe(200);
+    await resp.text();
+
+    expect(deepseekMember.bodies()).toHaveLength(1);
+    const dsBody = deepseekMember.bodies()[0]!;
+    expect(dsBody.thinking).toEqual({ type: "disabled" });
+    expect(dsBody).not.toHaveProperty("reasoning_effort");
+    expect(dsBody.tool_choice).toEqual({ type: "function", function: { name: "answer" } });
+
+    expect(plainMember.bodies()).toHaveLength(1);
+    const plainBody = plainMember.bodies()[0]!;
+    expect(plainBody).not.toHaveProperty("thinking");
+    expect(plainBody).not.toHaveProperty("reasoning_effort");
+    // The tool_choice mapping itself is provider-agnostic — only the deepseek fields differ.
+    expect(plainBody.tool_choice).toEqual({ type: "function", function: { name: "answer" } });
+  });
+
+  it("F11: a replayed thinking block becomes reasoning_content on the deepseek candidate only — the plain sibling drops it exactly as before", async () => {
+    const deepseekMember = await recordingChat(FAIL_429);
+    const plainMember = await recordingChat(() => ({ body: chatOkBody("ok") }));
+    const p = port(await startProxy(deepSeekPoolCfg(
+      `http://127.0.0.1:${port(deepseekMember.server)}`,
+      `http://127.0.0.1:${port(plainMember.server)}`,
+    )));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "pool/coding",
+        max_tokens: 20,
+        output_config: { effort: "high" },
+        messages: [
+          { role: "user", content: "do it" },
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "reading the file first" },
+              { type: "tool_use", id: "call_1", name: "do_thing", input: {} },
+            ],
+          },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "done" }] },
+        ],
+      }),
+    });
+    expect(resp.status).toBe(200);
+    await resp.text();
+
+    const dsBody = deepseekMember.bodies()[0]!;
+    const dsAssistant = (dsBody.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls),
+    );
+    expect(dsAssistant?.reasoning_content).toBe("reading the file first");
+    // Replay was available, so nothing was overridden — the natural rule-2 (explicit effort) spec.
+    expect(dsBody.reasoning_effort).toBe("high");
+    expect(dsBody).not.toHaveProperty("thinking");
+
+    const plainBody = plainMember.bodies()[0]!;
+    const plainAssistant = (plainBody.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls),
+    );
+    expect(plainAssistant).not.toHaveProperty("reasoning_content");
+    expect(plainBody).not.toHaveProperty("thinking");
+    expect(plainBody).not.toHaveProperty("reasoning_effort");
+  });
+});

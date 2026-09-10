@@ -327,6 +327,23 @@ export const TOOL_USE_IDS_HEADER = "x-llm-relay-tool-use-ids";
 export const TOOL_CALL_IDS_HEADER = "x-llm-relay-tool-call-ids";
 
 /**
+ * The relay overrode a `"deepseek"` target's own natural thinking decision to OFF for this
+ * request — value `"disabled: tool_choice or missing reasoning replay"` (F10/F11, 2026-09-10; see
+ * `openai-request.ts` `deepSeekThinkingSpec`). Either a forced tool choice (DeepSeek accepts only
+ * one of "forced tool" and "thinking") or a replayed assistant tool-call turn with no
+ * `reasoning_content` this relay could carry forward.
+ *
+ * Announced like `TOOL_CALL_IDS_HEADER`, not silent like `thoughtSignatureSentinels`: unlike that
+ * sentinel — vendor-protocol padding that alters nothing about the caller's data — this changes
+ * real behaviour the caller (or the routed pool's effort band) asked for, so it is closer to a
+ * tool-call-id rewrite than to padding. A count, from `onDeepSeekThinkingOverridden`, decides
+ * whether the header is present at all; the reason text is fixed rather than threaded through the
+ * callback, because the callback exists to COUNT (the `onThoughtSignatureSentinels` idiom), not to
+ * explain.
+ */
+export const DEEPSEEK_THINKING_HEADER = "x-llm-relay-thinking-disabled";
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both
@@ -542,6 +559,10 @@ async function fetchOpenAiBackend(
   // The sibling pass, resolved the same way: `none` (everyone but Google's Generative Language
   // API) leaves this 0 and adds nothing to the body.
   let sentinelsStamped = 0;
+  // F10/F11: 1 when a "deepseek" target's natural thinking decision was overridden to disabled
+  // (forced tool choice, or a replay with no reasoning to carry forward); 0 on every other
+  // provider and 0 here too when nothing needed overriding. See `DEEPSEEK_THINKING_HEADER`.
+  let thinkingOverridden = 0;
   try {
     // The REQUEST direction is relay-owned (`openai-request.ts`); only the RESPONSE direction is
     // still llm-bridge's. llm-bridge's `universalToOpenAI` has no case for a tool_call/tool_result
@@ -556,6 +577,7 @@ async function fetchOpenAiBackend(
       onThoughtSignatureSentinels: (n) => { sentinelsStamped = n; },
       ...(target.reasoning !== undefined ? { reasoning: target.reasoning } : {}),
       ...(target.effort !== undefined ? { effort: target.effort } : {}),
+      onDeepSeekThinkingOverridden: (n) => { thinkingOverridden = n; },
     });
   } catch (e) {
     // A block we will not put on the wire is the caller's request being unrepresentable, not a
@@ -666,6 +688,10 @@ async function fetchOpenAiBackend(
             // Unlike the response-direction mint, this count is a REQUEST fact and was final
             // before a byte was sent — so a stream can announce it honestly.
             ...(toolCallIdsRewritten > 0 ? { [TOOL_CALL_IDS_HEADER]: `${toolCallIdsRewritten} rewritten` } : {}),
+            // Same rule: final before egress, so a streamed response can announce it too.
+            ...(thinkingOverridden > 0
+              ? { [DEEPSEEK_THINKING_HEADER]: "disabled: tool_choice or missing reasoning replay" }
+              : {}),
           },
         }),
         metadata,
@@ -740,6 +766,9 @@ async function fetchOpenAiBackend(
         : {}),
       ...(toolCallIdsRewritten > 0
         ? { [TOOL_CALL_IDS_HEADER]: `${toolCallIdsRewritten} rewritten` }
+        : {}),
+      ...(thinkingOverridden > 0
+        ? { [DEEPSEEK_THINKING_HEADER]: "disabled: tool_choice or missing reasoning replay" }
         : {}),
     },
   });
@@ -2740,7 +2769,12 @@ async function fetchTranslatedOpenAiFront(
     // request direction stays llm-bridge's (`openaiToUniversal` does handle `tool_calls` and
     // `role:"tool"`), as does every response/stream direction.
     anthropicBody = protocol === "responses"
-      ? openaiResponsesRequestToAnthropic(base)
+      // `reasoning` is the same resolved mode `anthropicRequestToOpenAi` reads below (via
+      // `fetchOpenAiBackend`, reached through `fetchBackend` for an `openai`-kind target): a
+      // Codex `reasoning` item is carried onto a `thinking` block here ONLY under "deepseek"
+      // (F11), so `openai-request.ts` can carry it onward as `reasoning_content`. Every other
+      // target's outbound bytes are unchanged.
+      ? openaiResponsesRequestToAnthropic(base, { ...(target.reasoning !== undefined ? { reasoning: target.reasoning } : {}) })
       : translateBetweenProviders("openai", "anthropic", base as never) as Record<string, unknown>;
     if (target.model !== undefined) anthropicBody.model = target.model;
     anthropicBody.stream = args.wantsStream;

@@ -305,3 +305,83 @@ side and the relay's emitted Responses side, across all 68/69 captured requests,
   truncation never surfaced, versus the truncation being genuinely rare and the packet simply
   drew three misses, is **not established** — only that it did not reproduce here, three times,
   under the exact specified command.
+
+## F10/F11 fixed (2026-09-10) — the request-shape half of ancillary finding 3
+
+Ancillary finding 3 above ("The relay drops `reasoning_content` across turns, and DeepSeek's API
+refuses a replay without it") was left open by the earlier "Fix landed" section — that section's
+own third bullet ("A DeepSeek lane defaults thinking OFF when the caller sent no thinking control")
+is a correct description of `deepSeekThinkingSpec` rule 5, but it is **not** what protects
+pool-routed traffic, and this section corrects that. **F10** and **F11** are the two request-shape
+defects this closes; both live in `src/openai-request.ts` and `src/responses-request.ts`.
+
+**F10 — a forced tool choice conflicts with DeepSeek's thinking mode.** `deepSeekThinkingSpec`'s
+rule 3 (the routed pool's effort band → `reasoning_effort`) is checked BEFORE rule 5 ("no thinking
+control" → disabled), and `ResolvedTarget.effort` is stamped for nearly every `pool/*` resolution —
+so pool-routed DeepSeek traffic runs with thinking ON by default, not off, whatever rule 5's own
+name suggests. DeepSeek accepts only one of "forced tool" and "thinking", so an MCP `dispatch(...,
+mode:"answer", schema:...)` call — which posts `tool_choice: {type:"tool", name:"answer"}`
+(`runAnswerFetch` in `src/mcp/server.ts`) — 400ed on every pool-routed DeepSeek attempt. The relay's
+own `refusal-interpretations.json` recorded this 18 times against `deepseek-v4-pro` and 2 times
+against `deepseek-flash` as of this section (`deepseek|<model>|400|thinking mode does not support
+this tool_choice`; the count includes this section's own live reproduction below). **Fix:** when
+the outbound `tool_choice` is OpenAI's `"required"` or a named function AND the natural spec would
+leave thinking on, the mapper now sends `thinking:{type:"disabled"}` and omits `reasoning_effort`
+instead — an override, not a reordering of the five rules, counted through the new
+`onDeepSeekThinkingOverridden` option and announced on the response as
+`x-llm-relay-thinking-disabled` (`src/backend.ts`).
+
+**F11 — a replayed tool-call turn with no reasoning fails the same way.** `openai-request.ts` and
+`responses-request.ts` both dropped `thinking`/`redacted_thinking`/a Responses `reasoning` item
+with no representation at all, so a caller could never hold or replay DeepSeek's own chain of
+thought through this relay. The store above independently confirms the resulting 400 is real in
+production: `deepseek|deepseek-v4-pro|400|the \`reasoning_content\` in the thinking mode must be
+passed back to the api.`, count 3, first seen roughly four hours before the tool_choice burst on
+the same day. **Fix, two parts:** (1) a replayed Anthropic `thinking` block's own text (never a
+`redacted_thinking` block — that carries only Anthropic's own encrypted `data`) is now carried onto
+the outbound assistant message's `reasoning_content`, byte for byte, only under the resolved
+`compat.reasoning: "deepseek"` mode, and a Responses `reasoning` item's `summary` text is carried
+the same way through the Anthropic-shaped intermediate `responses-request.ts` produces; (2) a SAFE
+FALLBACK — when thinking would be on and any replayed assistant tool-call turn carries no
+reasoning this relay can put on `reasoning_content`, the request now sends
+`thinking:{type:"disabled"}` instead of risking the 400. The relay still never fabricates a
+`reasoning_content` value.
+
+**Live reproduction (2026-09-10, against the running relay, `deepseek/deepseek-flash` and
+`deepseek/deepseek-v4-pro`, `max_tokens` 32–800):**
+
+| # | Request shape | Result |
+|---|---|---|
+| 1 | `pool/high` + forced `tool_choice:{type:"tool",name:"answer"}`, no explicit thinking control | 200 (failed over to a lower-band member; `x-llm-relay-pool-attempts: 4 tried, 1 served: 2x400, 1x401, 1x200`) |
+| 2 | `deepseek/deepseek-flash` DIRECT + forced tool_choice, no thinking control | 200 — direct specs get no pool effort, so rule 5 already disables thinking; NO conflict |
+| 3 | `deepseek/deepseek-flash` DIRECT + forced tool_choice + `thinking:{type:"enabled"}` | **400** `Thinking mode does not support this tool_choice` |
+| 4 | `deepseek/deepseek-v4-pro` DIRECT + forced tool_choice + `thinking:{type:"enabled"}` | **400**, same message |
+| 5 | `deepseek/deepseek-v4-pro` DIRECT + forced tool_choice + `output_config:{effort:"high"}` (no `thinking` key at all) | **400**, same message — confirms the conflict fires off rule 2 (explicit effort) too, not only rule 3/4 |
+| 6 | `deepseek/deepseek-v4-pro` DIRECT + `tool_choice:"auto"` + `thinking:enabled`, `max_tokens:32` | 502 "tool call could not be repaired" — a `max_tokens` artifact, not F10/F11: re-run at `max_tokens:300` returned 200 cleanly |
+| 7 | Two- and three-turn tool-call conversations on `deepseek/deepseek-v4-pro`, thinking enabled, EACH replay carrying no `reasoning_content` (trivial "2+2", then a heavier 3-turn Fibonacci sequence) | All 200 — F11's exact "reasoning_content must be passed back" 400 did **not** reproduce live today, on either shape |
+
+F10 reproduced cleanly and repeatedly, with two clean negative controls isolating the trigger to
+"forced tool choice + thinking-would-be-on" specifically. **F11 did not reproduce live** despite a
+genuine escalating attempt (mirroring this document's own §"Verdict up front" experience with the
+truncation bug) — but the refusal-interpretations store above shows the identical, verbatim error
+text occurred 3 times in production the same day, so the condition is real; it is simply narrower
+or deeper-conversation-dependent than either this session's live attempts or the original 3 Codex
+runs could reliably trigger.
+
+**Why today's Claude Code lanes succeed on `deepseek-flash` regardless.** `runAnswerFetch` in
+`src/mcp/server.ts` is the ONLY place in this codebase that constructs a forced `tool_choice`, and
+it fires only for MCP answer-mode with an explicit `schema` — an ordinary Claude Code agentic
+session's own multi-tool loop uses `tool_choice:"auto"` (or omits it), so F10 never applies to it.
+For F11, the refusal store shows the reasoning_content-replay 400 recorded only against
+`deepseek-v4-pro` — never once against `deepseek-flash` — even though all four production pool
+tiers (`low`/`medium`/`high`/`xhigh`) route DeepSeek traffic through `deepseek-flash` as the
+preferred member. Whether that is because V4.1 Flash enforces the replay requirement less strictly
+than V4-Pro, or because flash's real traffic simply has not yet hit the narrow trigger shape, is
+**not established** by this evidence alone — both fixes above are written to hold regardless of
+which explanation is true.
+
+Tests: `test/deepseek-thinking.test.ts` (the request-mapper unit tests, including the forced-choice
+and reasoning-replay cases), `test/deepseek-responses-reasoning.test.ts` (the Responses-item
+carrying half), and `test/pool-failover.test.ts` (`describe("DeepSeek reasoning wiring is isolated
+to the declared target (F10/F11)")`, ≥2 candidates, pinning that a sibling candidate with no
+`compat.reasoning` is byte-for-byte unaffected).

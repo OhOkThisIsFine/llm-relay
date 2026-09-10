@@ -79,6 +79,138 @@ describe("DeepSeek reasoning mapping", () => {
   });
 });
 
+/**
+ * F10 — a FORCED tool choice must win over thinking, whatever left thinking on. Reproduces the
+ * relay's own refusal store: `deepseek|deepseek-v4-pro|400|thinking mode does not support this
+ * tool_choice`, 15 times, all under an MCP answer-mode `tool_choice: {type:"tool", name:"answer"}`
+ * plus a routed pool effort band (rule 3 of `deepSeekThinkingSpec`, which fires before rule 5 and
+ * therefore leaves thinking ON for nearly all pool traffic — see that function's doc comment).
+ *
+ * F11 — a replayed assistant tool-call turn with no reasoning to carry forward must ALSO force
+ * thinking off, and when reasoning IS available it must ride the outbound `reasoning_content`
+ * byte for byte, never fabricated.
+ */
+describe("DeepSeek thinking override (F10 forced tool choice, F11 reasoning replay)", () => {
+  const TOOLS = [{ name: "answer", input_schema: { type: "object", properties: {} } }];
+  /** The exact shape `runAnswerFetch` in `src/mcp/server.ts` posts for MCP answer mode + schema. */
+  const FORCED_TOOL_CHOICE = { type: "tool", name: "answer" };
+
+  function withToolCallTurn(reasoningBlock: Record<string, unknown> | null): Record<string, unknown> {
+    const assistantContent: Record<string, unknown>[] = [];
+    if (reasoningBlock) assistantContent.push(reasoningBlock);
+    assistantContent.push({ type: "tool_use", id: "call_1", name: "do_thing", input: {} });
+    return {
+      model: "claude-opus-5",
+      messages: [
+        { role: "user", content: "do it" },
+        { role: "assistant", content: assistantContent },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "done" }] },
+      ],
+    };
+  }
+
+  it("F10: forces thinking off for a named-function tool_choice even though the pool effort would enable reasoning_effort", () => {
+    let overridden = -1;
+    const out = mapped(
+      { ...TURN, tools: TOOLS, tool_choice: FORCED_TOOL_CHOICE },
+      { reasoning: "deepseek", effort: "high", onDeepSeekThinkingOverridden: (n: number) => { overridden = n; } },
+    );
+    expect(out.thinking).toEqual({ type: "disabled" });
+    expect(out).not.toHaveProperty("reasoning_effort");
+    expect(out.tool_choice).toEqual({ type: "function", function: { name: "answer" } });
+    expect(overridden).toBe(1);
+  });
+
+  it("F10: forces thinking off for Anthropic's 'any' tool_choice (mapped to OpenAI's required)", () => {
+    const out = mapped(
+      { ...TURN, tools: TOOLS, tool_choice: { type: "any" } },
+      { reasoning: "deepseek", effort: "xhigh" },
+    );
+    expect(out.tool_choice).toBe("required");
+    expect(out.thinking).toEqual({ type: "disabled" });
+    expect(out).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("F10: the callback reports 0 when the natural spec was already disabled — that is not an override", () => {
+    let overridden = -1;
+    const out = mapped(
+      { ...TURN, tools: TOOLS, tool_choice: FORCED_TOOL_CHOICE, thinking: { type: "disabled" } },
+      { reasoning: "deepseek", effort: "high", onDeepSeekThinkingOverridden: (n: number) => { overridden = n; } },
+    );
+    expect(out.thinking).toEqual({ type: "disabled" });
+    expect(overridden).toBe(0);
+  });
+
+  it("F10: a forced tool choice under the default mode leaves tool_choice mapped and adds nothing else", () => {
+    const out = mapped({ ...TURN, tools: TOOLS, tool_choice: FORCED_TOOL_CHOICE });
+    expect(out.tool_choice).toEqual({ type: "function", function: { name: "answer" } });
+    expect(out).not.toHaveProperty("thinking");
+    expect(out).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("F11: carries a replayed thinking block's own text onto that turn's reasoning_content, byte for byte", () => {
+    let overridden = -1;
+    const out = mapped(
+      withToolCallTurn({ type: "thinking", thinking: "because the file needs a read first" }),
+      { reasoning: "deepseek", effort: "high", onDeepSeekThinkingOverridden: (n: number) => { overridden = n; } },
+    );
+    const assistantMsg = (out.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls),
+    );
+    expect(assistantMsg?.reasoning_content).toBe("because the file needs a read first");
+    // Replay was available, so nothing was overridden — the natural rule-3 spec stands.
+    expect(out.reasoning_effort).toBe("high");
+    expect(out).not.toHaveProperty("thinking");
+    expect(overridden).toBe(0);
+  });
+
+  it("F11: forces thinking off when a replayed tool-call turn carries no reasoning at all, with no forced tool_choice on this request", () => {
+    let overridden = -1;
+    const out = mapped(
+      withToolCallTurn(null),
+      { reasoning: "deepseek", effort: "high", onDeepSeekThinkingOverridden: (n: number) => { overridden = n; } },
+    );
+    expect(out.thinking).toEqual({ type: "disabled" });
+    expect(out).not.toHaveProperty("reasoning_effort");
+    expect(overridden).toBe(1);
+    const assistantMsg = (out.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls),
+    );
+    // Never fabricated: absent, not "".
+    expect(assistantMsg).not.toHaveProperty("reasoning_content");
+  });
+
+  it("F11: a redacted_thinking block counts as NOT available to replay (opaque to every other vendor)", () => {
+    const out = mapped(
+      withToolCallTurn({ type: "redacted_thinking", data: "opaque-anthropic-blob" }),
+      { reasoning: "deepseek", effort: "high" },
+    );
+    expect(out.thinking).toEqual({ type: "disabled" });
+    expect(out).not.toHaveProperty("reasoning_effort");
+    const assistantMsg = (out.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls),
+    );
+    expect(assistantMsg).not.toHaveProperty("reasoning_content");
+  });
+
+  it("F11: a tool-call turn with an EMPTY thinking block is also unavailable to replay — never a fabricated \"\"", () => {
+    const out = mapped(withToolCallTurn({ type: "thinking", thinking: "" }), { reasoning: "deepseek", effort: "high" });
+    expect(out.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("negative control: a replayed thinking block under the default mode is dropped exactly as before — no other provider's bytes move", () => {
+    const body = withToolCallTurn({ type: "thinking", thinking: "some reasoning" });
+    const withDefault = mapped(body);
+    const withNone = mapped(body, { reasoning: "none" });
+    expect(JSON.stringify(withDefault)).toBe(JSON.stringify(withNone));
+    const assistantMsg = (withDefault.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls),
+    );
+    expect(assistantMsg).not.toHaveProperty("reasoning_content");
+    expect(withDefault).not.toHaveProperty("thinking");
+  });
+});
+
 describe("resolveReasoningMode", () => {
   it("defaults to deepseek on api.deepseek.com and none everywhere else", () => {
     expect(resolveReasoningMode({ base: "https://api.deepseek.com/v1" })).toBe("deepseek");
