@@ -210,6 +210,14 @@ const CHECKS: CheckRow[] = [
     conflicts: [],
   },
   {
+    id: "crawl",
+    apply: (raw) => {
+      raw.crawl = 42;
+    },
+    message: `config.routing.crawl must be an object or a boolean`,
+    conflicts: [],
+  },
+  {
     id: "laneProbe",
     apply: (raw) => {
       raw.laneProbe = 42;

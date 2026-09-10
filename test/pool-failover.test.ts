@@ -1,6 +1,9 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createProxy, type ProxyDeps } from "../src/server.js";
 import { ModelCatalog } from "../src/catalog.js";
 import { CircuitBreaker, globalCircuitBreaker } from "../src/circuit-breaker.js";
@@ -2477,4 +2480,219 @@ describe("Responses front — no invented cap, and a capped answer announces its
     await learned.text();
     expect(backend.bodies()[1]!.max_tokens).toBe(3000);
   });
+});
+/**
+ * Post-commit crawl watchdog (backlog item 18) — abort a candidate that committed real content
+ * and then crawled, cool it, and confirm the CLIENT's own retry (measured in
+ * `docs/post-commit-stall-measurement-2026-09-09.md`: Claude Code retries non-streaming, Codex
+ * retries streaming) lands on the second, healthy candidate. ≥2 candidates throughout — the
+ * standing rule that a single-candidate walk proves nothing about failover.
+ *
+ * `routing.crawl: { windowMs: 2000, minTokens: 2, msPerToken: 100 }` keeps the test fast: at that
+ * rate, a candidate sending one ~1-token delta every ~400ms can deliver at most ~5 tokens per
+ * trailing 2s window — far under the 20-token no-abort floor — so the abort is reliable rather
+ * than timing-sensitive. `stallTimeoutMs` is left at its 90s default, well above the 2s crawl
+ * window, so the CRAWL watchdog — not the stall watchdog — is what fires.
+ */
+describe("post-commit crawl watchdog — abort, cool, and let the client's own retry land elsewhere", () => {
+  const CRAWL_SETTINGS = { windowMs: 2000, minTokens: 2, msPerToken: 100 };
+
+  function anthropicFrame(text: string, index = 0): string {
+    return `event: content_block_delta\ndata: ${JSON.stringify({
+      type: "content_block_delta", index, delta: { type: "text_delta", text },
+    })}\n\n`;
+  }
+  function openAiChatFrame(text: string): string {
+    return `data: ${JSON.stringify({ id: "c", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`;
+  }
+
+  /**
+   * A backend that COMMITS with real content, then crawls: one tiny delta every ~400ms until the
+   * relay aborts the connection (or a generous safety cap of 15 ticks / 6s if it somehow does not,
+   * so a broken watchdog fails the test on content/timing rather than hanging the suite forever).
+   */
+  function crawlingBackend(kind: "anthropic" | "openai"): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          n++;
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          const safeWrite = (chunk: string) => {
+            try {
+              if (!res.writableEnded && !res.destroyed) res.write(chunk);
+            } catch {
+              // The relay aborts this connection once it detects the crawl; a write racing that
+              // abort must never crash the test's backend server.
+            }
+          };
+          const frame = kind === "anthropic" ? anthropicFrame : openAiChatFrame;
+          // Real content — this is what COMMITS the stream.
+          safeWrite(frame("hello crawl test"));
+          let ticks = 0;
+          const timer = setInterval(() => {
+            ticks++;
+            if (res.destroyed || res.writableEnded || ticks > 15) {
+              clearInterval(timer);
+              try {
+                if (!res.writableEnded && !res.destroyed) res.end();
+              } catch {
+                // Same race as above.
+              }
+              return;
+            }
+            safeWrite(frame("x"));
+          }, 400);
+          res.on("close", () => clearInterval(timer));
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  /** The clean second candidate — answers immediately, buffered or streamed as asked. */
+  function cleanBackend(kind: "anthropic" | "openai"): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          n++;
+          const wantsStream = (() => {
+            try {
+              return Boolean((JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean }).stream);
+            } catch {
+              return false;
+            }
+          })();
+          if (!wantsStream) {
+            const body = kind === "anthropic"
+              ? JSON.stringify({
+                id: "m", type: "message", role: "assistant", model: "m2",
+                content: [{ type: "text", text: "served clean" }], stop_reason: "end_turn",
+                usage: { input_tokens: 2, output_tokens: 4 },
+              })
+              : JSON.stringify({
+                id: "c", choices: [{ message: { role: "assistant", content: "served clean" }, finish_reason: "stop" }],
+                usage: { prompt_tokens: 2, completion_tokens: 4 },
+              });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(body);
+            return;
+          }
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          if (kind === "anthropic") {
+            res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", type: "message", role: "assistant", model: "m2", content: [] } })}\n\n`);
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`);
+            res.write(anthropicFrame("served clean"));
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+            res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 4 } })}\n\n`);
+            res.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+          } else {
+            res.write(openAiChatFrame("served clean"));
+            res.write(`data: ${JSON.stringify({ id: "c", choices: [], usage: { completion_tokens: 4 } })}\n\n`);
+            res.write("data: [DONE]\n\n");
+          }
+          res.end();
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  function requestBody(path: string, streamed: boolean): object {
+    return path === "/v1/messages"
+      ? { model: "pool/coding", stream: streamed, max_tokens: 200, messages: [{ role: "user", content: "hi" }] }
+      : { model: "pool/coding", stream: streamed, messages: [{ role: "user", content: "hi" }] };
+  }
+
+  function send(p: number, path: string, streamed: boolean): Promise<Response> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (path === "/v1/messages") headers["anthropic-version"] = "2023-06-01";
+    return fetch(`http://127.0.0.1:${p}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestBody(path, streamed)),
+    });
+  }
+
+  const FRONTS = [
+    { name: "Anthropic /v1/messages", path: "/v1/messages", kind: "anthropic" as const },
+    { name: "OpenAI /v1/chat/completions", path: "/v1/chat/completions", kind: "openai" as const },
+  ];
+  const RETRY_SHAPES = [
+    { name: "non-streaming retry (Claude Code shape)", retryStreamed: false },
+    { name: "streaming retry (Codex shape)", retryStreamed: true },
+  ];
+
+  for (const front of FRONTS) {
+    for (const shape of RETRY_SHAPES) {
+      it(`${front.name}: aborts the crawling candidate, cools it, and serves the ${shape.name} on the other candidate`, async () => {
+        const logDir = mkdtempSync(join(tmpdir(), "llm-relay-crawl-test-"));
+        const logFile = join(logDir, "log.ndjson");
+        try {
+          const crawler = await crawlingBackend(front.kind);
+          const clean = await cleanBackend(front.kind);
+          const cfg = poolCfg([
+            `http://127.0.0.1:${port(crawler.server)}`,
+            `http://127.0.0.1:${port(clean.server)}`,
+          ], front.kind);
+          cfg.routing.crawl = CRAWL_SETTINGS;
+          cfg.log = { level: "metadata", file: logFile };
+          const p = port(await startProxy(cfg));
+
+          // The breaker requires TWO CONSECUTIVE failures before it sets a cooldown for a
+          // status/no-retry-after outcome (`MAX_FAILURES_BEFORE_TRIP` in circuit-breaker.ts) — the
+          // same standing rule `test/mid-stream-failure.test.ts` pins for an ordinary STALL abort
+          // ("reports mid-stream failures to circuit breaker and trips breaker on repeated
+          // failures": consecutiveFailures is 1 and the cell is still healthy after the FIRST
+          // failure, only tripping on the second). The crawl watchdog reuses that exact
+          // classification path (deadline provenance, no retryAfterMs), so it is bound by the same
+          // rule, and this is not something backlog item 18 changes. Seed one prior failure
+          // directly on the breaker — never touching the crawling backend's own request count —
+          // so the REAL crawl abort below is the SECOND consecutive failure and actually cools the
+          // candidate, which is what proves the crawl watchdog feeds the same health-accounting
+          // path a stall abort does, without re-proving the unrelated two-strike policy itself.
+          globalCircuitBreaker.recordOutcome(breakerIdentity("p1", "m1", front.kind), {
+            ok: false, elapsedMs: 10, status: 500,
+          });
+
+          // Request 1: always STREAMING — only a streamed response can be aborted mid-response.
+          const first = await send(p, front.path, true);
+          expect(first.status).toBe(200); // headers were already committed before the crawl was detected
+          const firstBody = await first.text();
+          expect(firstBody).toContain("relay aborted a crawling stream:");
+          expect(firstBody).toMatch(/ms\/token over 2 s \(threshold 100\)/);
+
+          // The crawling candidate is now cooling (a `deadline`-provenance failure, same path a
+          // stall abort takes, now the SECOND consecutive one) — it must not be retried at all for
+          // the next request.
+          const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1", front.kind));
+          expect(state?.consecutiveFailures).toBe(2);
+          expect(state?.cooldownUntil).toBeGreaterThan(Date.now());
+
+          // Request 2: the client's own retry, in the shape this scenario is pinning.
+          const retry = await send(p, front.path, shape.retryStreamed);
+          expect(retry.status).toBe(200);
+          const retryBody = await retry.text();
+          expect(retryBody).toContain("served clean");
+          expect(retry.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+
+          // The crawling candidate saw exactly the one request across BOTH calls in this scenario.
+          expect(crawler.calls()).toBe(1);
+          expect(clean.calls()).toBe(1);
+
+          // The aborted attempt's log row carries the new errorKinds member.
+          const lines = readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean);
+          const rows = lines.map((line) => JSON.parse(line) as { errorKinds?: string[] });
+          const crawlRow = rows.find((r) => r.errorKinds?.includes("backend_stream_crawl"));
+          expect(crawlRow, JSON.stringify(rows)).toBeDefined();
+        } finally {
+          rmSync(logDir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
 });

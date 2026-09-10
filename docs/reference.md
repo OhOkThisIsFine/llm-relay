@@ -630,6 +630,19 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
   that could never be met. Never armed on a streamed request, which already has the inter-byte
   watchdog above. A backend that accepts the connection and produces nothing fails over quickly;
   one that is merely slow to finish a buffered body is not killed by it.
+- **Post-commit crawl abort** (`routing.crawl`, default ON) — a COMMITTED stream can still be
+  unusably slow without ever going silent, so this is a SEPARATE watchdog from the stall one
+  above. `minTokens` (default 20) output tokens must be observed since commit — over the whole
+  stream, not just the trailing window — before any judgement runs at all: evidence the stream is
+  producing an answer in the first place. A window is judged only once it is FULL — elapsed time
+  since commit at least `windowMs` (default 30 s). `tokensInWindow` counts only the tokens sampled
+  inside that trailing window, and a full window holding zero tokens yields no opinion at all —
+  that silence is the stall watchdog's job, and this one must never pre-empt it. Otherwise the rate
+  is `windowMs / tokensInWindow`, and the stream is CRAWLING — the backend fetch is aborted — when
+  that rate exceeds `msPerToken` (default 1000 ms/token, 4× the `routing.latency` demotion
+  ceiling, so a merely slow-but-working deployment is never killed mid-response). The client
+  receives a mid-stream error naming the measured rate and must retry; `routing.crawl: false` is a
+  byte-for-byte revert — the watchdog is never installed.
 
 Health **demotes** candidates, never drops them (live → credential-faulted → cooling). Responses
 carry `x-llm-relay-served-by`: the deployment that served, or on error every deployment tried,
@@ -701,6 +714,7 @@ This table is the index — it states no policy of its own.
 | `routing.latency` | ON | `"latency": false` | Demotes a candidate whose MEASURED p95 exceeds a ceiling, into the `slow` band. |
 | `routing.hedge` | ON, and confined to FREE deployments | `"hedge": false` | Starts the next candidate BESIDE a slow one and serves whichever commits first. The only term that duplicates a request. |
 | `routing.probation` | ON | `"probation": false` | Leads a FREE deployment with fewer than 5 served-request samples ahead of `live`, so one untested member at a time gathers data. |
+| `routing.crawl` | ON | `"crawl": false` | Aborts a COMMITTED stream whose sustained per-token rate over a full trailing window (`msPerToken` 1000, `windowMs` 30 s, `minTokens` 20) is far worse than a healthy deployment's — see [Failover](#failover-both-fronts-one-policy) above. |
 | `routing.laneProbe` | ON | `"laneProbe": false` | Re-probes recorded `cli` lane deaths and stale rosters on the relay's own background cadence. |
 | `routing.dispatchWalk` | ON | `"dispatchWalk": false` | Walks the DISPATCH ladder past a lane that does not answer, pins the lane that does. Read by `llm-relay mcp`, not by the request path. |
 

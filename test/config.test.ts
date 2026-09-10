@@ -2003,6 +2003,63 @@ describe("loadConfig — routing.hedge", () => {
 });
 
 /**
+ * `routing.crawl` — the parse contract for the post-commit crawl-abort watchdog (backlog item 18,
+ * built 2026-09-09). Same strictness precedent as `routing.hedge`/`routing.latency` above; what
+ * the watchdog DOES with these numbers is pinned in `test/stream-pipeline.test.ts` and
+ * `test/pool-failover.test.ts` — this is only about what the config file may say.
+ */
+describe("loadConfig — routing.crawl", () => {
+  function crawlCfg(crawl: unknown) {
+    return base({ routing: { default: "nim/z-ai/glm-5.2", crawl } });
+  }
+
+  it("defaults to an empty object, which means every default (i.e. ON)", () => {
+    expect(loadConfig(write("crawl-absent.json", base())).routing.crawl).toEqual({});
+  });
+
+  it("normalizes the boolean shorthand away, so nothing downstream decides what false means", () => {
+    expect(loadConfig(write("crawl-false.json", crawlCfg(false))).routing.crawl).toEqual({ enabled: false });
+    expect(loadConfig(write("crawl-true.json", crawlCfg(true))).routing.crawl).toEqual({ enabled: true });
+  });
+
+  it("round-trips explicit msPerToken, windowMs and minTokens", () => {
+    expect(
+      loadConfig(write("crawl-obj.json", crawlCfg({ msPerToken: 500, windowMs: 10_000, minTokens: 10 })))
+        .routing.crawl,
+    ).toEqual({ msPerToken: 500, windowMs: 10_000, minTokens: 10 });
+  });
+
+  it("REFUSES an unknown key rather than ignoring it", () => {
+    expect(() => loadConfig(write("crawl-typo.json", crawlCfg({ mspertoken: 500 })))).toThrow(
+      /routing\.crawl has an unknown key "mspertoken"/,
+    );
+  });
+
+  it("refuses a 0, a string, or any non-positive-finite value for each numeric key, by name", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "20000"]) {
+      expect(() => loadConfig(write(`crawl-bad-msPerToken-${String(bad)}.json`, crawlCfg({ msPerToken: bad })))).toThrow(
+        /routing\.crawl\.msPerToken must be a positive finite number/,
+      );
+      expect(() => loadConfig(write(`crawl-bad-windowMs-${String(bad)}.json`, crawlCfg({ windowMs: bad })))).toThrow(
+        /routing\.crawl\.windowMs must be a positive finite number/,
+      );
+      expect(() => loadConfig(write(`crawl-bad-minTokens-${String(bad)}.json`, crawlCfg({ minTokens: bad })))).toThrow(
+        /routing\.crawl\.minTokens must be a positive finite number/,
+      );
+    }
+  });
+
+  it("rejects a malformed block outright", () => {
+    expect(() => loadConfig(write("crawl-array.json", crawlCfg([])))).toThrow(
+      /routing\.crawl must be an object or a boolean/,
+    );
+    expect(() => loadConfig(write("crawl-enabled.json", crawlCfg({ enabled: "yes" })))).toThrow(
+      /routing\.crawl\.enabled must be a boolean/,
+    );
+  });
+});
+
+/**
  * `routing.mcp.maxWaitMs` (packet P8, 2026-09-09) — the server half of the machine-wide
  * `dispatch`-loses-the-job defect: an MCP host tool call fails between 45 s and 100 s and
  * destroys the job handle above that, so `dispatch` must never block past a ceiling 5 s under

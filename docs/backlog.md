@@ -86,24 +86,6 @@
   (e.g. spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>"
   returns the version and provenance from a dispatch lane).
 
-- **Build the post-commit CRAWL abort — the measurement said so** (owner decision 2026-09-04:
-  measure first, build only if clients retry; measured 2026-09-09 in
-  [`post-commit-stall-measurement-2026-09-09.md`](post-commit-stall-measurement-2026-09-09.md):
-  after content, Claude Code retries ONCE as a non-streaming request and Codex retries FIVE times
-  streaming, in all four cells, counts cross-checked between the mock and the relay's log). A
-  silent stall after commit is already aborted by `withStallWatchdog` at `stallTimeoutMs`; what
-  nothing catches is a stream that CRAWLS — bytes keep arriving inside the inter-byte window
-  while the per-token rate is far outside what the same deployment's own history supports.
-  **Property (the build half):** on both fronts, a committed stream whose measured output rate
-  stays worse than a per-token threshold over a bounded window is aborted with a mid-stream SSE
-  `error` whose message names the measured rate, the threshold and the window; the log row carries
-  a distinct `errorKinds` member; the breaker cools the member for the time it wasted
-  (`failureCooldown`'s `elapsed` source); the threshold is a tunable default calibrated the way
-  `DEFAULT_LATENCY_MS_PER_TOKEN` (250 ms/token, 68 requests) was, with its calibration recorded
-  beside it; `false` is a byte-for-byte revert; and a test with ≥2 candidates shows the client's
-  retry — Claude Code's non-streaming retry included — reaching the second candidate. Both wire
-  shapes of that retry must be served: Claude Code downgrades to non-streaming, Codex does not.
-
 - **The Responses front logs a mid-stream stall as a clean `backendStatus: 200` with no
   `errorKinds`, while the Anthropic front logs the same condition as `status: "committed"` plus
   `errorKinds: ["backend_stream_failed"]`** (observed 2026-09-09 in the four-cell measurement

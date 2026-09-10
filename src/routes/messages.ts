@@ -74,7 +74,9 @@ import {
   parseAssistant,
   frameEnd,
   frameOpensToolUse,
+  resolveCrawlSettings,
   sseError,
+  withCrawlWatchdog,
   withStallWatchdog,
   writeChunk,
 } from "../stream-pipeline.js";
@@ -221,6 +223,7 @@ export async function transparentPath(
       ctx.reportedModelSource,
       ctx.signal.aborted,
       responseBytesWritten,
+      ctx.signal,
     );
     return;
   } finally {
@@ -382,6 +385,7 @@ export async function repairStreamingPath(
       ctx.reportedModelSource,
       ctx.signal.aborted,
       responseBytesWritten,
+      ctx.signal,
     );
     return;
   } finally {
@@ -494,7 +498,7 @@ export async function repairBufferedPath(
   try {
     bytes = Buffer.from(await backendRes.arrayBuffer());
   } catch (e) {
-    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, ctx.attempt, h, () => null, ctx.reportedModelSource, ctx.signal.aborted);
+    handleMidStreamError(res, e, ctx.started, ctx.path, ctx.hadTools, ctx.streamed, backendRes.status, ctx.target, ctx.attempt, h, () => null, ctx.reportedModelSource, ctx.signal.aborted, false, ctx.signal);
     return null;
   } finally {
     clearTimeout(timer);
@@ -1000,6 +1004,11 @@ export async function anthropicMessagesPath(
       if (streamed && backendRes.status < 400 && stallMs > 0) {
         clearTimeout(timer);
         backendRes = withStallWatchdog(backendRes, controller, stallMs);
+      }
+
+      const crawlSettings = resolveCrawlSettings(ctx.cfg.routing.crawl);
+      if (streamed && backendRes.status < 400 && crawlSettings.enabled) {
+        backendRes = withCrawlWatchdog(backendRes, controller, "anthropic-messages", crawlSettings);
       }
 
       const willValidate = isMessages && ctx.hadTools && backendRes.status < 400;

@@ -2,7 +2,20 @@ import { PassThrough } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import { BODY_TOO_LARGE_CODE } from "../src/dashboard-routes.js";
-import { DEFAULT_MAX_BODY_BYTES, bodyReadStatus, forwardLocalResponse, readBody } from "../src/stream-pipeline.js";
+import {
+  CrawlAbortedError,
+  DEFAULT_CRAWL_MIN_TOKENS,
+  DEFAULT_CRAWL_MS_PER_TOKEN,
+  DEFAULT_CRAWL_WINDOW_MS,
+  DEFAULT_MAX_BODY_BYTES,
+  bodyReadStatus,
+  forwardLocalResponse,
+  readBody,
+  resolveCrawlSettings,
+  withCrawlWatchdog,
+  type CrawlProtocol,
+  type CrawlWatchdogSettings,
+} from "../src/stream-pipeline.js";
 
 function fakeRequest(): PassThrough & IncomingMessage {
   return new PassThrough() as unknown as PassThrough & IncomingMessage;
@@ -173,5 +186,185 @@ describe("readBody default ceiling", () => {
     req.end(Buffer.from("small"));
     expect((await pending).toString()).toBe("small");
     expect(DEFAULT_MAX_BODY_BYTES).toBeGreaterThan(0);
+  });
+});
+
+describe("resolveCrawlSettings", () => {
+  it("defaults to enabled with the tunable defaults", () => {
+    expect(resolveCrawlSettings(undefined)).toEqual({
+      enabled: true,
+      msPerToken: DEFAULT_CRAWL_MS_PER_TOKEN,
+      windowMs: DEFAULT_CRAWL_WINDOW_MS,
+      minTokens: DEFAULT_CRAWL_MIN_TOKENS,
+    });
+  });
+
+  it("honours explicit values and an explicit disable", () => {
+    expect(resolveCrawlSettings({ enabled: false })).toEqual({
+      enabled: false,
+      msPerToken: DEFAULT_CRAWL_MS_PER_TOKEN,
+      windowMs: DEFAULT_CRAWL_WINDOW_MS,
+      minTokens: DEFAULT_CRAWL_MIN_TOKENS,
+    });
+    expect(resolveCrawlSettings({ msPerToken: 500, windowMs: 10_000, minTokens: 5 })).toEqual({
+      enabled: true,
+      msPerToken: 500,
+      windowMs: 10_000,
+      minTokens: 5,
+    });
+  });
+});
+
+describe("withCrawlWatchdog", () => {
+  const encoder = new TextEncoder();
+
+  function anthropicFrame(chars: number): string {
+    return `data: ${JSON.stringify({
+      type: "content_block_delta",
+      delta: { type: "text_delta", text: "a".repeat(chars) },
+    })}\n\n`;
+  }
+  function anthropicPing(): string {
+    return `data: ${JSON.stringify({ type: "ping" })}\n\n`;
+  }
+  function openAiChatFrame(chars: number): string {
+    return `data: ${JSON.stringify({ choices: [{ delta: { content: "a".repeat(chars) } }] })}\n\n`;
+  }
+  function openAiResponsesFrame(chars: number): string {
+    return `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "a".repeat(chars) })}\n\n`;
+  }
+
+  /**
+   * A ReadableStream this test drives directly, plus the controller used to enqueue chunks on
+   * a schedule the test picks.
+   */
+  function controllableSource(): {
+    stream: ReadableStream<Uint8Array>;
+    controller: ReadableStreamDefaultController<Uint8Array>;
+  } {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    return { stream, controller };
+  }
+
+  /**
+   * Feed a scripted sequence of `{ at, frame }` steps through `withCrawlWatchdog` under a fake
+   * clock, awaiting the corresponding output chunk after each enqueue. `transform()` in
+   * `withCrawlWatchdog` is fully synchronous (no `await` inside it), and it enqueues the
+   * passthrough byte chunk as its FIRST statement — so by the time our reader observes that
+   * passthrough chunk, the whole of that transform() call (including any `controller.abort()`)
+   * has already run to completion. That makes this harness race-free with no arbitrary waits.
+   */
+  async function driveCrawl(
+    protocol: CrawlProtocol,
+    settings: CrawlWatchdogSettings,
+    script: readonly { at: number; frame: string }[],
+  ): Promise<AbortController> {
+    let currentTime = 0;
+    const now = () => currentTime;
+    const { stream: source, controller: sourceController } = controllableSource();
+    const abortController = new AbortController();
+    const response = new Response(source, { status: 200 });
+    const wrapped = withCrawlWatchdog(response, abortController, protocol, settings, now);
+    const reader = wrapped.body!.getReader();
+
+    for (const step of script) {
+      currentTime = step.at;
+      sourceController.enqueue(encoder.encode(step.frame));
+      await reader.read();
+    }
+    sourceController.close();
+    await reader.read();
+
+    return abortController;
+  }
+
+  const settings2000_2_100: CrawlWatchdogSettings = {
+    enabled: true,
+    windowMs: 2000,
+    minTokens: 2,
+    msPerToken: 100,
+  };
+
+  it("does not abort a fast stream: 60 tokens inside the first full window", async () => {
+    const controller = await driveCrawl("anthropic-messages", settings2000_2_100, [
+      { at: 100, frame: anthropicFrame(240) }, // 240 chars / 4 = 60 tokens, well before the window is full
+      { at: 2000, frame: anthropicPing() }, // triggers the full-window check at elapsed === windowMs
+    ]);
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  it("aborts a crawl — one token per 1.5s — at the first full window, message pinned verbatim", async () => {
+    const controller = await driveCrawl("anthropic-messages", settings2000_2_100, [
+      { at: 1500, frame: anthropicFrame(4) }, // 1 token; total=1 < minTokens(2) — no full-window check yet
+      { at: 3000, frame: anthropicFrame(4) }, // 1 more token; total=2 >= minTokens; elapsed=3000 >= windowMs(2000)
+    ]);
+    expect(controller.signal.aborted).toBe(true);
+    const reason = controller.signal.reason;
+    expect(reason).toBeInstanceOf(CrawlAbortedError);
+    const crawl = reason as CrawlAbortedError;
+    // windowStart = 3000 - 2000 = 1000; both samples (ts 1500, ts 3000) fall inside [1000, 3000],
+    // so tokensInWindow = 2 and rate = windowMs / tokensInWindow = 2000 / 2 = 1000 ms/token.
+    expect(crawl.rateMsPerToken).toBe(1000);
+    expect(crawl.windowMs).toBe(2000);
+    expect(crawl.thresholdMsPerToken).toBe(100);
+    expect(crawl.message).toBe("relay aborted a crawling stream: 1000 ms/token over 2 s (threshold 100)");
+  });
+
+  it("never judges below minTokens since commit, however slow", async () => {
+    const settings: CrawlWatchdogSettings = { enabled: true, windowMs: 2000, minTokens: 5, msPerToken: 100 };
+    const controller = await driveCrawl("anthropic-messages", settings, [
+      { at: 500, frame: anthropicFrame(4) }, // 1 token total, forever below minTokens(5)
+      { at: 10_000, frame: anthropicPing() }, // elapsed is huge, but gate 1 (minTokens) still fails
+    ]);
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  it("gives no opinion when a full window holds zero tokens — leaves silence to the stall watchdog", async () => {
+    const controller = await driveCrawl("anthropic-messages", settings2000_2_100, [
+      { at: 100, frame: anthropicFrame(8) }, // 2 tokens, clears minTokens, but elapsed(100) < windowMs(2000)
+      { at: 5000, frame: anthropicPing() }, // windowStart = 5000-2000 = 3000; the ts=100 sample fell out
+    ]);
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  // The brief's own worked example, run against the DEFAULT settings (not a custom fixture) —
+  // this is the case that pins the arithmetic fix itself: under the ORIGINAL defaults
+  // (windowMs 20_000, minTokens 50), spanMs could never exceed windowMs and tokensInWindow had to
+  // clear minTokens BEFORE a rate was computed, so the worst case was 20_000 / 50 = 400 ms/token —
+  // always under the 1000 ms/token threshold. This exact scenario could never abort under the old
+  // defaults, whatever the true rate. Under the corrected defaults (windowMs 30_000, minTokens 20,
+  // rate = windowMs / tokensInWindow) it aborts at the first full window.
+  it("aborts the brief's own worked example — 60 tokens over 90 s, one every 1.5 s — under the DEFAULT settings", async () => {
+    const settings = resolveCrawlSettings(undefined);
+    const script: { at: number; frame: string }[] = [];
+    for (let k = 1; k <= 60; k++) script.push({ at: k * 1500, frame: anthropicFrame(4) });
+    const controller = await driveCrawl("anthropic-messages", settings, script);
+    expect(controller.signal.aborted).toBe(true);
+    expect(controller.signal.reason).toBeInstanceOf(CrawlAbortedError);
+  });
+
+  it("never installs the watchdog when disabled — returns the identical Response object", () => {
+    const response = new Response(new ReadableStream(), { status: 200 });
+    const controller = new AbortController();
+    const settings: CrawlWatchdogSettings = { enabled: false, windowMs: 2000, minTokens: 2, msPerToken: 100 };
+    const wrapped = withCrawlWatchdog(response, controller, "anthropic-messages", settings);
+    expect(wrapped).toBe(response);
+  });
+
+  it.each([
+    ["openai-chat" as const, openAiChatFrame] as const,
+    ["openai-responses" as const, openAiResponsesFrame] as const,
+  ])("aborts a crawl on the %s protocol the same way", async (protocol, frame) => {
+    const controller = await driveCrawl(protocol, settings2000_2_100, [
+      { at: 1500, frame: frame(4) },
+      { at: 3000, frame: frame(4) },
+    ]);
+    expect(controller.signal.aborted).toBe(true);
+    expect(controller.signal.reason).toBeInstanceOf(CrawlAbortedError);
   });
 });

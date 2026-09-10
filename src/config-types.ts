@@ -359,6 +359,21 @@ export interface Routing {
    */
   probation?: ProbationConfig;
   /**
+   * Post-commit CRAWL abort (backlog item 18, built 2026-09-09 after
+   * `docs/post-commit-stall-measurement-2026-09-09.md` measured that both Claude Code and Codex
+   * retry a stream that goes bad after content has already arrived — Claude Code once, downgraded
+   * to non-streaming; Codex up to five times, staying streaming). A silent stall after commit is
+   * already caught by `withStallWatchdog` at `stallTimeoutMs`; this catches the case nothing else
+   * does — bytes keep arriving inside that inter-byte window while the sustained per-token rate,
+   * over a sliding window, is far worse than the same deployment's own history supports.
+   *
+   * **Default ON.** `false` is the shorthand for `{ enabled: false }` and restores the pre-crawl
+   * behaviour exactly — the watchdog is not installed at all. An object with no keys is legal and
+   * means the defaults. The thresholds live in `src/stream-pipeline.ts` beside the measurement
+   * that calibrated `msPerToken`.
+   */
+  crawl?: CrawlWatchdogConfig;
+  /**
    * Background lane re-probing (owner decision 2026-08-29,
    * docs/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
    * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
@@ -548,6 +563,44 @@ export interface ProbationConfig {
   enabled?: boolean;
   /** Minimum SERVED-REQUEST samples before a free deployment counts as measured. Default 5. */
   minSamples?: number;
+}
+
+/**
+ * `routing.crawl` — abort a COMMITTED stream whose sustained per-token output rate, over a FULL
+ * trailing window, is far worse than a deployment's own history supports (backlog item 18, built
+ * 2026-09-09, arithmetic corrected the same day — see `DEFAULT_CRAWL_WINDOW_MS` in
+ * `src/stream-pipeline.ts` for why the first pairing of defaults could never fire).
+ *
+ * **Default ON.** `false` is the shorthand for `{ enabled: false }` and restores the pre-crawl
+ * behaviour exactly — the watchdog is never installed. An object with no keys is legal and means
+ * the defaults. Every number must be finite and positive — the `routing.latency` precedent: a `0`
+ * bounds nothing while looking like it does.
+ *
+ * The rule, in words (full detail on `resolveCrawlSettings` in `src/stream-pipeline.ts`):
+ * `minTokens` output tokens must be observed since commit, over the WHOLE stream, before any
+ * judgement runs at all; then a window is judged only once it is FULL (elapsed since commit at
+ * least `windowMs`); `tokensInWindow` counts only tokens sampled in the trailing `windowMs`, and a
+ * full window holding zero tokens yields no opinion (silence is `withStallWatchdog`'s job).
+ * Otherwise the rate is `windowMs / tokensInWindow`, and the stream is CRAWLING — aborted — when
+ * that rate exceeds `msPerToken`.
+ *
+ * The thresholds live in `src/stream-pipeline.ts` beside the measurement that calibrated
+ * `msPerToken`.
+ */
+export interface CrawlWatchdogConfig {
+  /** Default true. false disables the crawl watchdog entirely. */
+  enabled?: boolean;
+  /**
+   * The threshold, in ms per output token. A committed stream whose measured rate over a FULL
+   * trailing window (`windowMs / tokensInWindow`) exceeds this is CRAWLING and gets aborted.
+   */
+  msPerToken?: number;
+  /** Width, in ms, of the trailing window the rate is measured over — judged only once this much
+   * time has elapsed since commit. */
+  windowMs?: number;
+  /** Minimum output tokens that must be observed SINCE COMMIT — across the whole stream, not just
+   * the trailing window — before any judgement runs at all. */
+  minTokens?: number;
 }
 
 /**

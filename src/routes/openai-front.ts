@@ -67,6 +67,8 @@ import {
   failClosed,
   forwardLocalResponse,
   openAiSseError,
+  resolveCrawlSettings,
+  withCrawlWatchdog,
   withStallWatchdog,
   writeChunk,
 } from "../stream-pipeline.js";
@@ -579,6 +581,13 @@ export async function openAiFrontPath(
         upstream = withStallWatchdog(upstream, controller, stallMs);
       }
 
+      const crawlSettings = resolveCrawlSettings(ctx.cfg?.routing.crawl);
+      if (streamed && upstream.status < 400 && crawlSettings.enabled) {
+        upstream = withCrawlWatchdog(
+          upstream, controller, ctx.protocol === "responses" ? "openai-responses" : "openai-chat", crawlSettings,
+        );
+      }
+
       if (upstream.status < 400) {
         recordCredentialOutcome(
           credentialWalk,
@@ -658,6 +667,7 @@ export async function openAiFrontPath(
           reportedModelSource,
           controller.signal.aborted,
           responseBytesWritten,
+          controller.signal,
         );
         return;
       }

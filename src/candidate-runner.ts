@@ -104,7 +104,7 @@ import { DEFAULT_ANTHROPIC_VERSION } from "./config.js";
 import { buildAuthHeaders } from "./authEnv.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "./control-authorization.js";
 import { STICKY_SESSION_HEADER } from "./session-pin.js";
-import { failClosed, HOP_BY_HOP } from "./stream-pipeline.js";
+import { CrawlAbortedError, failClosed, HOP_BY_HOP } from "./stream-pipeline.js";
 
 const INTERNAL_REQUEST_HEADERS = new Set([
   "x-codex-turn-metadata",
@@ -127,6 +127,9 @@ const ALLOWED_FORWARD_HEADERS = new Set([
 ]);
 
 const MID_STREAM_ERROR_KIND = "backend_stream_failed";
+/** Beside `MID_STREAM_ERROR_KIND` — the relay's own crawl watchdog ended this attempt, rather
+ * than an ordinary mid-stream transport/protocol failure. See `stream-pipeline.ts` `CrawlAbortedError`. */
+const CRAWL_ERROR_KIND = "backend_stream_crawl";
 
 export function toolUseIdRewriteField(source: Response): {
   toolUseIdRewrites?: number;
@@ -298,6 +301,43 @@ function midStreamMessage(e: unknown): string {
   return `llm-relay: backend stream failed mid-response: ${errStr}`;
 }
 
+/**
+ * Was this mid-stream failure the relay's OWN crawl watchdog, rather than an ordinary
+ * transport/protocol failure? Read from `AbortSignal.reason`, never from the caught exception
+ * `e` — the fetch machinery may surface an opaque `AbortError` for the abort rather than the
+ * `CrawlAbortedError` reason itself, but `controller.abort(reason)` sets `signal.reason`
+ * synchronously and unconditionally, so it is the reliable side channel. See
+ * `stream-pipeline.ts` `withCrawlWatchdog`.
+ */
+function crawlAbortReason(signal: AbortSignal | undefined): CrawlAbortedError | undefined {
+  return signal?.reason instanceof CrawlAbortedError ? signal.reason : undefined;
+}
+
+/** The attempt-completion half of `handleMidStreamError`, split out to keep that function's own
+ * cognitive complexity within bounds. Mirrors the stall-abort disposition exactly: a client that
+ * is already gone is `cancelled`, never charged to the deployment; everything else is a failure
+ * whose provenance is `deadline` (charging elapsed time toward `failureCooldown`'s `elapsed`
+ * source) when the relay's own timer/watchdog fired, `upstream` otherwise. */
+function completeMidStreamAttempt(
+  h: { breaker: CircuitBreaker; modelCallRecorder?: ModelCallRecorder },
+  res: ServerResponse,
+  attempt: HealthAttempt | undefined,
+  deadlineAborted: boolean,
+  committed: boolean,
+): void {
+  if (!attempt) return;
+  if (res.destroyed) {
+    completeAttemptCancelled(h, attempt, "client disconnected");
+    return;
+  }
+  completeAttemptFailure(h, attempt, {
+    failure: deadlineAborted ? "transport" : "protocol",
+    provenance: deadlineAborted ? "deadline" : "upstream",
+    status: deadlineAborted ? 504 : 502,
+    ...(committed ? { logStatus: "committed" as const } : {}),
+  });
+}
+
 export function handleMidStreamError(
   res: ServerResponse,
   e: unknown,
@@ -313,22 +353,16 @@ export function handleMidStreamError(
   reportedModelSource?: Response,
   deadlineAborted = false,
   committed = false,
+  signal?: AbortSignal,
 ): void {
-  const message = midStreamMessage(e);
+  const crawl = crawlAbortReason(signal);
+  // The crawl watchdog's message IS the client-visible SSE `error` frame text, pinned verbatim
+  // by the backlog entry ("Build the post-commit CRAWL abort") — it is never wrapped in the
+  // generic "backend stream failed mid-response" prefix every other mid-stream failure carries.
+  const message = crawl ? crawl.message : midStreamMessage(e);
   const errorFrame = errorFrameBuilder(message);
   endMidStreamFailure(res, errorFrame, message);
-  if (attempt) {
-    if (res.destroyed) {
-      completeAttemptCancelled(h, attempt, "client disconnected");
-    } else {
-      completeAttemptFailure(h, attempt, {
-        failure: deadlineAborted ? "transport" : "protocol",
-        provenance: deadlineAborted ? "deadline" : "upstream",
-        status: deadlineAborted ? 504 : 502,
-        ...(committed ? { logStatus: "committed" as const } : {}),
-      });
-    }
-  }
+  completeMidStreamAttempt(h, res, attempt, deadlineAborted, committed);
   h.logger.write({
     ...baseLog(
       started,
@@ -341,7 +375,7 @@ export function handleMidStreamError(
       attempt?.trace.snapshot(),
       reportedModelSource ? upstreamReportedModel(reportedModelSource) : undefined,
     ),
-    errorKinds: [MID_STREAM_ERROR_KIND],
+    errorKinds: [crawl ? CRAWL_ERROR_KIND : MID_STREAM_ERROR_KIND],
     ...(reportedModelSource ? toolUseIdRewriteField(reportedModelSource) : {}),
   });
 }

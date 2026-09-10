@@ -1,8 +1,8 @@
 /**
  * Parsing and validating the `routing` block of a config document (HOTSPOT-03).
  *
- * `parseRouting` plus the thirty-five declarations only it reaches: the eight sub-block parsers
- * (`parseQuotaEnforcement`, `parseLatencyDemotion`, `parseHedge`, `parseProbation`,
+ * `parseRouting` plus the thirty-six declarations only it reaches: the nine sub-block parsers
+ * (`parseQuotaEnforcement`, `parseLatencyDemotion`, `parseHedge`, `parseProbation`, `parseCrawl`,
  * `parseMcpSettings`, `parseLaneProbe`, `parseDispatchWalk`, `parseSticky`) assembled by `parseOptionalBlocks`,
  * `parseOffload`, the top-level field parsers `assertNoReservedProviderNames`, `parseDefault`,
  * `parseTiers` and `parseSubagents`, the pool trio `parsePoolPolicy`/`parsePoolEntry`/`parsePools`,
@@ -37,6 +37,7 @@ import {
   EFFORT_LEVELS,
   type CliLaneTemplate,
   type DispatchWalkOutlierSettings,
+  type CrawlWatchdogConfig,
   type DispatchWalkSettings,
   type EffortLevel,
   type HedgeConfig,
@@ -223,6 +224,51 @@ function parseProbation(raw: unknown): ProbationConfig {
   return out;
 }
 
+/**
+ * Validate `routing.crawl`. Malformed is a hard error, and an UNKNOWN KEY is a hard error too —
+ * the `routing.latency`/`routing.hedge` precedent: an operator who wrote `"msPerToken": 500`
+ * believes they lowered the bar, and a silently ignored key leaves the default in force while
+ * looking like it was changed.
+ *
+ * ⚠ Every number must be finite and positive. A `0` `msPerToken` would abort every committed
+ * stream on its first measured window, a `0` `windowMs`/`minTokens` bounds nothing while looking
+ * like it does, and a negative or `NaN` value is the same defect in different clothes.
+ */
+function parseCrawl(raw: unknown): CrawlWatchdogConfig {
+  // ABSENT returns `{}`, not `undefined` — the `parseLatencyDemotion`/`parseHedge` precedent.
+  // Every key is optional and `resolveCrawlSettings` owns the defaults, so `{}` IS "all
+  // defaults", and a total return lets the caller assign unconditionally without another branch
+  // in `parseOptionalBlocks`.
+  if (raw === undefined || raw === null) return {};
+  // The boolean shorthand is NORMALIZED here rather than carried through the type, so the
+  // watchdog module never re-implements "what does `false` mean".
+  if (typeof raw === "boolean") return { enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.crawl must be an object or a boolean");
+  }
+  const value = raw as Record<string, unknown>;
+  const known = new Set(["enabled", "msPerToken", "windowMs", "minTokens"]);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      throw new Error(`config.routing.crawl has an unknown key "${key}"`);
+    }
+  }
+  const out: CrawlWatchdogConfig = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== "boolean") throw new Error("config.routing.crawl.enabled must be a boolean");
+    out.enabled = value.enabled;
+  }
+  for (const key of ["msPerToken", "windowMs", "minTokens"] as const) {
+    const n = value[key];
+    if (n === undefined) continue;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new Error(`config.routing.crawl.${key} must be a positive finite number`);
+    }
+    out[key] = n;
+  }
+  return out;
+}
+
 export function parseRouting(
   raw: unknown,
   providers: Record<string, ProviderConfig>,
@@ -242,6 +288,7 @@ export function parseRouting(
     latency?: unknown;
     hedge?: unknown;
     probation?: unknown;
+    crawl?: unknown;
     laneProbe?: unknown;
     dispatchWalk?: unknown;
     mcp?: unknown;
@@ -267,6 +314,7 @@ export function parseRouting(
   routing.latency = optionalBlocks.latency;
   routing.hedge = optionalBlocks.hedge;
   routing.probation = optionalBlocks.probation;
+  routing.crawl = optionalBlocks.crawl;
   routing.laneProbe = optionalBlocks.laneProbe;
   routing.dispatchWalk = optionalBlocks.dispatchWalk;
   if (optionalBlocks.mcp) routing.mcp = optionalBlocks.mcp;
@@ -734,16 +782,16 @@ function parsePools(
 }
 
 /**
- * The eight optional sub-blocks as `parseRouting` copies them onto the result. `latency`,
- * `hedge`, `probation`, `laneProbe` and `dispatchWalk` are REQUIRED here because their parsers
- * return a total value for an absent block (the `parseLatencyDemotion` precedent); the other
- * three stay absent when absent.
+ * The nine optional sub-blocks as `parseRouting` copies them onto the result. `latency`,
+ * `hedge`, `probation`, `crawl`, `laneProbe` and `dispatchWalk` are REQUIRED here because their
+ * parsers return a total value for an absent block (the `parseLatencyDemotion` precedent); the
+ * other three stay absent when absent.
  */
 type OptionalRoutingBlocks = Pick<Routing, "sticky" | "quota" | "mcp"> &
-  Required<Pick<Routing, "latency" | "hedge" | "probation" | "laneProbe" | "dispatchWalk">>;
+  Required<Pick<Routing, "latency" | "hedge" | "probation" | "crawl" | "laneProbe" | "dispatchWalk">>;
 
 /**
- * Parse the eight optional sub-blocks (sticky, quota, latency, hedge, probation, laneProbe,
+ * Parse the nine optional sub-blocks (sticky, quota, latency, hedge, probation, crawl, laneProbe,
  * dispatchWalk, mcp) in their current validation order. `parseRouting` copies the result key by
  * key in that same order, so the returned object's own key order is not what decides `Routing`'s.
  */
@@ -754,6 +802,7 @@ function parseOptionalBlocks(
     latency?: unknown;
     hedge?: unknown;
     probation?: unknown;
+    crawl?: unknown;
     laneProbe?: unknown;
     dispatchWalk?: unknown;
     mcp?: unknown;
@@ -764,6 +813,7 @@ function parseOptionalBlocks(
   const latency = parseLatencyDemotion(r.latency);
   const hedge = parseHedge(r.hedge);
   const probation = parseProbation(r.probation);
+  const crawl = parseCrawl(r.crawl);
   const laneProbe = parseLaneProbe(r.laneProbe);
   const dispatchWalk = parseDispatchWalk(r.dispatchWalk);
   const mcp = parseMcpSettings(r.mcp);
@@ -773,6 +823,7 @@ function parseOptionalBlocks(
     latency,
     hedge,
     probation,
+    crawl,
     laneProbe,
     dispatchWalk,
     ...(mcp ? { mcp } : {}),

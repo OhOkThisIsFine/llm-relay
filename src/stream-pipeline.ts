@@ -1,6 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { TransformStream } from "node:stream/web";
 import type { AssistantMessage } from "./anthropic.js";
+import type { CrawlWatchdogConfig } from "./config-types.js";
+import { isRecord } from "./json-shape.js";
+import { estimateTokensFromCharacters } from "./metadata.js";
+import { BufferedSseFrames, parseSseEvent } from "./sse-frames.js";
 
 /**
  * The code `readBody` sets when it refused a body for exceeding the cap. Owned HERE, by the
@@ -148,6 +152,275 @@ export function withStallWatchdog(response: Response, controller: AbortControlle
     },
     cancel() {
       if (timer !== null) clearTimeout(timer);
+    },
+  });
+
+  return new Response(originalBody.pipeThrough(transformStream), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/**
+ * Default crawl-abort threshold: ms per output token, sustained over a full trailing window, above
+ * which a COMMITTED stream is judged CRAWLING rather than merely producing a long answer.
+ *
+ * Calibrated 2026-09-09, on the `latency-demotion.ts` precedent: 4 x `DEFAULT_LATENCY_MS_PER_TOKEN`
+ * (250 ms/token, itself measured over 68 real requests on 2026-08-30 — see that file's own
+ * comment). A crawl abort hands the client a failure it must retry — measured in
+ * `docs/post-commit-stall-measurement-2026-09-09.md`: Claude Code retries once, downgraded to a
+ * NON-STREAMING request; Codex retries up to five times, staying streaming, in all four measured
+ * cells — so the bar must sit far above the demotion threshold, or a deployment merely slow enough
+ * to be latency-demoted would also be aborted mid-response. 250 ms/token is itself ~3.5x the
+ * healthy band measured that day, so 1000 ms/token sits well clear of ordinary slow-but-working
+ * traffic. A tunable default, not a provider fact — the provenance invariant permits this.
+ * Re-calibrate by reading `~/.llm-relay/usage/recent.json` the same way `latency-demotion.ts`
+ * describes; there is no dedicated crawl-abort log field to read back yet (see the accepted gaps
+ * in `docs/backlog.md`'s "Build the post-commit CRAWL abort" entry once it is amended).
+ */
+export const DEFAULT_CRAWL_MS_PER_TOKEN = 1000;
+/**
+ * Width of the trailing window the crawl rate is measured over, in ms — and, since the rate is
+ * `windowMs / tokensInWindow` (see `withCrawlWatchdog`), also the numerator of every rate this
+ * watchdog ever computes.
+ *
+ * Corrected 2026-09-09 (fixing a same-day defect the packet that introduced this watchdog shipped
+ * uncaught): the ORIGINAL pairing of `windowMs: 20_000` with `minTokens: 50` could never fire.
+ * That version measured `spanMs = min(elapsed, windowMs)` — so `spanMs` never exceeded 20 000 —
+ * and required `tokensInWindow >= minTokens` (50) before judging `rate = spanMs / tokensInWindow`.
+ * The worst case allowed was 20 000 ms / 50 tokens = 400 ms/token, which can never clear a 1000
+ * ms/token threshold: the three defaults were mutually inconsistent by construction, and the
+ * measured scenario this watchdog exists for (60 tokens over 90 s, one every 1.5 s) could not trip
+ * it either. The rule is now: judge only once a FULL window has elapsed since commit
+ * (`elapsed >= windowMs`), then take `tokensInWindow` as the tokens sampled in the trailing
+ * `windowMs` and compute `rate = windowMs / tokensInWindow` (a fixed numerator, not a growing
+ * `spanMs`) — so with `windowMs: 30_000` and `msPerToken: 1000`, fewer than 30 tokens landing in
+ * any trailing 30 s window trips the abort, which the 90 s/60-token scenario clears easily (one
+ * token per 1.5 s is roughly 20 tokens per 30 s window).
+ */
+export const DEFAULT_CRAWL_WINDOW_MS = 30_000;
+/**
+ * Minimum output tokens that must be observed SINCE COMMIT — across the whole stream, not just the
+ * trailing window — before ANY judgement runs at all: evidence the stream is producing an answer
+ * in the first place, distinct from `tokensInWindow` below. A window judged before this gate clears
+ * would be able to abort a stream that has barely started, on the strength of a single early burst
+ * falling silent — exactly the case the SEPARATE "full window holding zero tokens" rule below
+ * already declines to judge, stated as its own gate so the two can be tested apart.
+ */
+export const DEFAULT_CRAWL_MIN_TOKENS = 20;
+
+export interface CrawlWatchdogSettings {
+  enabled: boolean;
+  msPerToken: number;
+  windowMs: number;
+  minTokens: number;
+}
+
+/**
+ * Resolve `routing.crawl` into a total settings object. Absent, `{}`, or any missing key means
+ * the tunable default for that key — the `resolveHedgeSettings`/`resolveLatencyDemotion`
+ * precedent.
+ *
+ * The rule `withCrawlWatchdog` enforces, in words: `minTokens` (default 20) is the minimum number
+ * of output tokens observed since commit — over the WHOLE stream — before any judgement runs at
+ * all, evidence the stream is producing an answer. A window is judged only once it is FULL —
+ * elapsed time since commit at least `windowMs` (default 30 000). `tokensInWindow` counts only the
+ * tokens whose sample time falls inside the trailing `windowMs`; a full window holding zero tokens
+ * yields no opinion at all (silence is `withStallWatchdog`'s job, and this watchdog must never
+ * pre-empt it). Otherwise `rate = windowMs / tokensInWindow`, and the stream is CRAWLING — the
+ * fetch is aborted — when `rate > msPerToken` (default 1000).
+ */
+export function resolveCrawlSettings(raw: CrawlWatchdogConfig | undefined): CrawlWatchdogSettings {
+  return {
+    enabled: raw?.enabled ?? true,
+    msPerToken: raw?.msPerToken ?? DEFAULT_CRAWL_MS_PER_TOKEN,
+    windowMs: raw?.windowMs ?? DEFAULT_CRAWL_WINDOW_MS,
+    minTokens: raw?.minTokens ?? DEFAULT_CRAWL_MIN_TOKENS,
+  };
+}
+
+/**
+ * The CLIENT-facing wire shape the crawl watchdog reads deltas from. Deliberately the same three
+ * members as `stream-commit.ts`'s `StreamCommitProtocol` (not imported from there — this module
+ * stays a leaf the way `sse-frames.ts` does, and the membership is copied rather than re-exported
+ * so a change to one is never mistaken for a change to the other).
+ */
+export type CrawlProtocol = "anthropic-messages" | "openai-chat" | "openai-responses";
+
+/**
+ * A committed stream the relay itself terminated because its measured per-token rate, over the
+ * sliding window, stayed worse than the configured threshold.
+ *
+ * `message` is EXACTLY the text the client-visible SSE `error` frame carries — no
+ * "backend stream failed mid-response" wrapping prefix — because the backlog entry ("Build the
+ * post-commit CRAWL abort") pins the wording. `candidate-runner.ts` `handleMidStreamError` detects
+ * this type via `AbortSignal.reason` (never by inspecting the caught exception, which may be an
+ * opaque `AbortError` from the fetch machinery rather than this object) and uses `.message`
+ * unwrapped, plus a distinct `errorKinds` member.
+ */
+export class CrawlAbortedError extends Error {
+  constructor(
+    readonly rateMsPerToken: number,
+    readonly windowMs: number,
+    readonly thresholdMsPerToken: number,
+  ) {
+    super(
+      `relay aborted a crawling stream: ${rateMsPerToken} ms/token over ${windowMs / 1000} s ` +
+      `(threshold ${thresholdMsPerToken})`,
+    );
+    this.name = "CrawlAbortedError";
+  }
+}
+
+function deltaText(value: unknown): number {
+  return typeof value === "string" ? value.length : 0;
+}
+
+function anthropicDeltaCharacters(data: Record<string, unknown>): number {
+  if (data.type !== "content_block_delta" || !isRecord(data.delta)) return 0;
+  const delta = data.delta;
+  if (delta.type === "text_delta") return deltaText(delta.text);
+  if (delta.type === "thinking_delta") return deltaText(delta.thinking);
+  if (delta.type === "input_json_delta") return deltaText(delta.partial_json);
+  return 0;
+}
+
+function openAiChatChoiceDeltaCharacters(choice: unknown): number {
+  if (!isRecord(choice) || !isRecord(choice.delta)) return 0;
+  const delta = choice.delta;
+  let total = deltaText(delta.content);
+  const reasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0
+    ? delta.reasoning_content
+    : delta.reasoning;
+  total += deltaText(reasoning);
+  if (!Array.isArray(delta.tool_calls)) return total;
+  for (const call of delta.tool_calls) {
+    if (isRecord(call) && isRecord(call.function)) total += deltaText(call.function.arguments);
+  }
+  return total;
+}
+
+function openAiChatDeltaCharacters(data: Record<string, unknown>): number {
+  if (!Array.isArray(data.choices)) return 0;
+  let total = 0;
+  for (const choice of data.choices) total += openAiChatChoiceDeltaCharacters(choice);
+  return total;
+}
+
+const OPENAI_RESPONSES_TEXT_DELTA_TYPES = new Set([
+  "response.output_text.delta",
+  "response.refusal.delta",
+  "response.reasoning.delta",
+  "response.reasoning_text.delta",
+]);
+
+function openAiResponsesDeltaCharacters(data: Record<string, unknown>): number {
+  const type = typeof data.type === "string" ? data.type : "";
+  if (OPENAI_RESPONSES_TEXT_DELTA_TYPES.has(type)) {
+    const delta = deltaText(data.delta);
+    return delta > 0 ? delta : deltaText(data.text);
+  }
+  if (type === "response.function_call_arguments.delta") return deltaText(data.delta);
+  return 0;
+}
+
+/**
+ * How many characters of TEXT or TOOL-ARGUMENT delta a single parsed SSE event contributes,
+ * per client-facing protocol. Advisory — this is a rate SIGNAL, not the accounting estimate
+ * (`usage-observer.ts` owns that, with its base64/overflow defenses); a missed or double-counted
+ * delta here changes only how quickly the watchdog notices a crawl, never a served figure.
+ */
+function deltaCharacters(protocol: CrawlProtocol, data: Record<string, unknown>): number {
+  if (protocol === "anthropic-messages") return anthropicDeltaCharacters(data);
+  if (protocol === "openai-chat") return openAiChatDeltaCharacters(data);
+  return openAiResponsesDeltaCharacters(data);
+}
+
+/**
+ * Wrap a COMMITTED streaming Response with a crawl watchdog: abort the backend fetch once a FULL
+ * trailing window has elapsed since commit and that window's per-token rate — `settings.windowMs
+ * / tokensInWindow` — exceeds `settings.msPerToken`. Two independent gates guard against judging
+ * too early: `settings.minTokens` tokens must have been observed SINCE COMMIT (the whole stream,
+ * not just the trailing window) before any judgement runs at all, and a full window holding ZERO
+ * tokens yields no opinion rather than an abort (unmeasured is no opinion, never slow — the
+ * `latency-demotion.ts` precedent; silence is `withStallWatchdog`'s job and this watchdog must
+ * never pre-empt it). See `resolveCrawlSettings` for the rule spelled out in full.
+ *
+ * Installed at the SAME call site as `withStallWatchdog`, after the commit probe has already
+ * rebuilt the response from its replayed prefix — so `now() - commitTime` (captured at
+ * installation) approximates the true post-commit elapsed time.
+ *
+ * ⚠ The abort carries the `CrawlAbortedError` as its `AbortSignal.reason` — the same mechanism
+ * `controller.abort(reason)` offers natively — rather than erroring the transform's own
+ * `ReadableStreamDefaultController` directly. Enqueuing the triggering chunk and then erroring
+ * the SAME controller in one microtask risks losing that already-enqueued-but-unread chunk (the
+ * ReadableStream spec does not guarantee it survives an immediately following `error()`); routing
+ * the abort through the existing `AbortController` — exactly how `withStallWatchdog` already ends
+ * a stream — sidesteps that risk entirely and reuses a path already proven correct.
+ */
+export function withCrawlWatchdog(
+  response: Response,
+  controller: AbortController,
+  protocol: CrawlProtocol,
+  settings: CrawlWatchdogSettings,
+  now: () => number = Date.now,
+): Response {
+  if (!settings.enabled) return response;
+  const originalBody = response.body;
+  if (!originalBody) return response;
+
+  const decoder = new TextDecoder();
+  const frames = new BufferedSseFrames();
+  const commitTime = now();
+  const samples: { ts: number; tokens: number }[] = [];
+  let totalTokensSinceCommit = 0;
+  let tripped = false;
+
+  const transformStream = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, streamController) {
+      streamController.enqueue(chunk);
+      if (tripped) return;
+
+      try {
+        frames.append(decoder.decode(chunk, { stream: true }));
+        for (const { frame } of frames) {
+          const event = parseSseEvent(frame);
+          if (!event?.data) continue;
+          const chars = deltaCharacters(protocol, event.data);
+          if (chars <= 0) continue;
+          const tokens = estimateTokensFromCharacters(chars);
+          if (tokens > 0) {
+            const ts = now();
+            samples.push({ ts, tokens });
+            totalTokensSinceCommit += tokens;
+          }
+        }
+      } catch {
+        // Parsing is advisory; a malformed frame must never break pass-through.
+      }
+
+      // Gate 1: not enough evidence yet that the stream is producing an answer at all.
+      if (totalTokensSinceCommit < settings.minTokens) return;
+
+      const t = now();
+      const elapsed = t - commitTime;
+      // Gate 2: only judge a FULL window — a partial one would let an early burst plus silence
+      // read as a fast rate purely because the elapsed span was still short.
+      if (elapsed < settings.windowMs) return;
+
+      const windowStart = t - settings.windowMs;
+      while (samples.length > 0 && samples[0]!.ts < windowStart) samples.shift();
+      const tokensInWindow = samples.reduce((sum, s) => sum + s.tokens, 0);
+      // Gate 3: a full window with literally nothing in it is silence, not a slow trickle —
+      // `withStallWatchdog` owns that case.
+      if (tokensInWindow === 0) return;
+
+      const rate = settings.windowMs / tokensInWindow;
+      if (rate <= settings.msPerToken) return;
+
+      tripped = true;
+      controller.abort(new CrawlAbortedError(Math.round(rate), settings.windowMs, settings.msPerToken));
     },
   });
 
