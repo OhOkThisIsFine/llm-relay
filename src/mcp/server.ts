@@ -451,7 +451,9 @@ function formatTimeToAnswer(t: {
 }): string {
   const s = (ms: number | null): string => (ms === null ? "n/a" : `${Math.round(ms / 1000)}s`);
   const inMode = t.mode ? `, ${t.mode} mode` : "";
-  const runs = `${t.samples} completed run${t.samples === 1 ? "" : "s"}${inMode}`;
+  // "on record", not "completed": a window written before 2026-09-10 may still hold a duration of a
+  // run that did not answer (`restoreLaneStatsRows` empties only a window that PROVABLY does).
+  const runs = `${t.samples} run${t.samples === 1 ? "" : "s"} on record${inMode}`;
   return `usually answers in: median ${s(t.medianMs)}, p80 ${s(t.p80Ms)} (${runs})`;
 }
 

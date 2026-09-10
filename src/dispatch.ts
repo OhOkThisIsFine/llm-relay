@@ -317,8 +317,9 @@ export interface DispatchLane {
   demoted?: { until: string; reason: string };
   /**
    * The lane's usual time to ANSWER in the requested mode: median and 80th percentile of the
-   * COMPLETED runs in the window its budget was read from. Present only when that window holds a
-   * completed run. A poll renders it (`describeJob` in `mcp/server.ts`), so a caller can tell a slow
+   * durations in the window its budget was read from — since 2026-09-10 only a COMPLETED run adds
+   * one, and `restoreLaneStatsRows` empties an older window that provably holds anything else.
+   * Present only when that window holds a duration. A poll renders it (`describeJob` in `mcp/server.ts`), so a caller can tell a slow
    * lane from a stuck one — 23 of the 182 unanswered dispatches in the 2026-09-10 transcript sweep
    * ended with the caller simply no longer polling.
    */

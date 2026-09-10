@@ -662,6 +662,27 @@ function hasValidSamples(row: Record<string, unknown>): boolean {
 }
 
 /**
+ * The duration window a persisted row restores with.
+ *
+ * ⚠ A row written before 2026-09-10 (it carries no `consecutiveFailures`) was fed by failed and
+ * timed-out runs as well as completed ones, so its durations are not all times to ANSWER. When it
+ * holds MORE samples than it has successes, at least one sample is provably not an answer and
+ * nothing says which, so the window restores EMPTY rather than let a timeout read as a time to
+ * answer — measured on the live store, `anthropic` read "usually answers in 0s" at 0 of 24
+ * answered. A window that could hold only answers is kept: its counts cannot prove it clean, and
+ * dropping it would throw away real history. The counts themselves are evidence and are kept whole.
+ */
+function restoredWindow(row: LaneStatsRow): { wallClockMs: number[]; wallClockAt: (string | null)[] } {
+  if (row.consecutiveFailures === undefined && row.wallClockMs.length > row.successes) {
+    return { wallClockMs: [], wallClockAt: [] };
+  }
+  return {
+    wallClockMs: row.wallClockMs.slice(-MAX_LANE_STAT_SAMPLES),
+    wallClockAt: (row.wallClockAt ?? new Array<string | null>(row.wallClockMs.length).fill(null)).slice(-MAX_LANE_STAT_SAMPLES),
+  };
+}
+
+/**
  * Restore persisted rows into this config's live map. It NEVER overwrites stats the live
  * process already learned — the `restoreExhaustedRows` contract. Returns the count restored.
  */
@@ -688,8 +709,7 @@ export function restoreLaneStatsRows(cfg: Config, rows: readonly LaneStatsRow[])
       consecutiveFailures: row.consecutiveFailures ?? (row.successes === 0 ? row.failures : 0),
       abandonedSinceSuccess: row.abandonedSinceSuccess ?? 0,
       lastSuccessAt: row.lastSuccessAt ?? null,
-      wallClockMs: row.wallClockMs.slice(-MAX_LANE_STAT_SAMPLES),
-      wallClockAt: (row.wallClockAt ?? new Array<string | null>(row.wallClockMs.length).fill(null)).slice(-MAX_LANE_STAT_SAMPLES),
+      ...restoredWindow(row),
       lastAt: row.lastAt,
     });
     restored++;

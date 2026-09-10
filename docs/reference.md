@@ -1843,8 +1843,10 @@ accepted range. `dispatch_status` and `dispatch_result` are unaffected — they 
 whatever the wait handed back.
 
 While a job runs, `dispatch_status` also states the running lane's usual time to answer — the
-median and 80th percentile of its own completed runs, in this mode when known — or says that none
-is on record, so a caller can tell a slow lane from a stuck one. And every reply from an
+median and 80th percentile of the durations on record, in this mode when known — or says that none
+is on record, so a caller can tell a slow lane from a stuck one. Since 2026-09-10 only a completed
+run adds a duration; a history row written before that date, whose durations outnumber its
+answers, is emptied when it loads, because at least one of them was not an answer. And every reply from an
 `llm-relay mcp` process that runs older code than the installed package ends with a notice saying
 so: restart the host's MCP connection, or the host, to load the installed code.
 

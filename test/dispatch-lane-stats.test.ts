@@ -442,6 +442,42 @@ describe("tier-keyed windows (backlog item 4)", () => {
     ]);
   });
 
+  it("⚠ a pre-2026-09-10 row whose samples outnumber its successes restores with an EMPTY window", () => {
+    // Before 2026-09-10 a failed or timed-out run added its duration too, so a row holding more
+    // samples than successes provably holds the duration of a run that did not answer — and which
+    // one is unknown. Measured on the live store: `anthropic` read "usually answers in 0s" at 0 of 24.
+    writeFileSync(
+      statePath,
+      '{"version":1,"rows":[' +
+        '{"laneId":"dead","calls":24,"successes":0,"failures":24,"timeouts":0,"wallClockMs":[300,200,250],"lastAt":null},' +
+        '{"laneId":"mixed","calls":13,"successes":1,"failures":12,"timeouts":4,"wallClockMs":[270000,1034000],"lastAt":null},' +
+        '{"laneId":"clean","calls":5,"successes":5,"failures":0,"timeouts":0,"wallClockMs":[10000,12000],"lastAt":null}' +
+        "]}",
+    );
+    const cfg = freshConfig();
+    expect(restoreLaneStatsRows(cfg, loadLaneStatsRows({ path: statePath }))).toBe(3);
+    expect(laneStatsFor(cfg, "dead")!.wallClockMs).toEqual([]);
+    expect(laneStatsFor(cfg, "dead")!.wallClockAt).toEqual([]);
+    expect(laneStatsFor(cfg, "mixed")!.wallClockMs).toEqual([]);
+    // The counts are evidence and are kept whole; only the durations go.
+    expect(laneStatsFor(cfg, "mixed")).toMatchObject({ calls: 13, successes: 1, failures: 12, timeouts: 4 });
+    // A window that could hold only answers is kept: its counts cannot prove it clean, and dropping it
+    // would throw away real history.
+    expect(laneStatsFor(cfg, "clean")!.wallClockMs).toEqual([10000, 12000]);
+  });
+
+  it("negative control: a row written since 2026-09-10 restores its window exactly, whatever its counts", () => {
+    writeFileSync(
+      statePath,
+      '{"version":1,"rows":[' +
+        '{"laneId":"new","calls":1,"successes":0,"failures":1,"timeouts":0,"consecutiveFailures":1,"abandonedSinceSuccess":0,"lastSuccessAt":null,"wallClockMs":[5000],"lastAt":null}' +
+        "]}",
+    );
+    const cfg = freshConfig();
+    expect(restoreLaneStatsRows(cfg, loadLaneStatsRows({ path: statePath }))).toBe(1);
+    expect(laneStatsFor(cfg, "new")!.wallClockMs).toEqual([5000]);
+  });
+
   it("records under the report's tier and keeps one tier's runs out of another's window", () => {
     const cfg = freshConfig();
     for (let i = 0; i < 3; i++) recordLaneRun(cfg, tieredReport("a", "low", 10_000 + i, `low-${i}`));

@@ -402,7 +402,7 @@ describe("F8 — a poll says how long the lane usually takes", () => {
     const jobId = /jobId "(job-\d+)"/.exec(first.text)?.[1];
     expect(jobId, first.text).toBeDefined();
     const status = await h.tool("dispatch_status", { jobId });
-    expect(status.text).toContain("usually answers in: median 45s, p80 90s (12 completed runs, agent mode)");
+    expect(status.text).toContain("usually answers in: median 45s, p80 90s (12 runs on record, agent mode)");
     await h.tool("dispatch_cancel", { jobId });
   });
 });
@@ -448,7 +448,7 @@ describe("dispatch_lanes shows each lane's own evidence", () => {
         ]),
     });
     const { text } = await h.tool("dispatch_lanes", {});
-    expect(text).toContain("usually answers in: median 45s, p80 90s (12 completed runs, agent mode)");
+    expect(text).toContain("usually answers in: median 45s, p80 90s (12 runs on record, agent mode)");
     expect(text).toContain("failing: 7 own failures in a row");
     expect(text).toContain("1 own failure in a row");
     expect(text).toContain("(named by model, not a ladder rung)");
