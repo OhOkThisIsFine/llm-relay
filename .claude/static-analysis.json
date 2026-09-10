@@ -1,0 +1,8 @@
+{
+  "tools": [
+    {
+      "name": "eslint + sonarjs, knip, madge, dependency-cruiser, ts-prune, jscpd",
+      "command": "npm run analysis:run"
+    }
+  ]
+}
