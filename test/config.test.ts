@@ -13,6 +13,7 @@ import {
   clientForPath,
   configStaleness,
 } from "../src/config.js";
+import { DEFAULT_MCP_MAX_WAIT_MS } from "../src/config-types.js";
 import { candidateEnvNames } from "../src/authEnv.js";
 import { addEntry, lock, type KeystoreOptions } from "../src/keystore.js";
 import type { KeyringSpawnSync } from "../src/os-keyring.js";
@@ -2106,6 +2107,30 @@ describe("loadConfig — routing.mcp.maxWaitMs", () => {
     expect(() => loadConfig(write("mcp-maxwait-typo.json", mcpCfg({ maxwaitms: 10_000 })))).toThrow(
       /routing\.mcp\.maxwaitms is not a recognized key/,
     );
+  });
+
+  it("CLAMPS a maxWaitMs above the host ceiling instead of loading a handle-destroying wait", () => {
+    // ⚠ The defect this closes (2026-09-10): the parser accepted ANY positive integer, so an
+    // operator setting `maxWaitMs: 240000` — a value the backlog's own measured calls used —
+    // configured the server to block past the point where the host fails the call AND destroys
+    // the job handle. The property is "`dispatch` returns a jobId before any client-side request
+    // timeout, REGARDLESS of waitMs"; a config value is still a waitMs, and the relay cannot honour
+    // one the host will not survive. Clamped rather than refused so an existing config keeps
+    // loading — the alternative turns a tuning mistake into a relay that will not start.
+    const loaded = loadConfig(write("mcp-maxwait-huge.json", mcpCfg({ maxWaitMs: 240_000 })));
+    expect(loaded.routing.mcp?.maxWaitMs).toBe(DEFAULT_MCP_MAX_WAIT_MS);
+    expect((loaded.warnings ?? []).join("\n")).toMatch(/maxWaitMs/);
+  });
+
+  it("leaves a maxWaitMs at or below the ceiling exactly as written", () => {
+    // `warnings` is absent on a clean config, so read it through `?? []` — a bare `.join` would
+    // fail on the very case this test is asserting is silent.
+    const at = loadConfig(write("mcp-maxwait-at.json", mcpCfg({ maxWaitMs: DEFAULT_MCP_MAX_WAIT_MS })));
+    expect(at.routing.mcp?.maxWaitMs).toBe(DEFAULT_MCP_MAX_WAIT_MS);
+    expect((at.warnings ?? []).join("\n")).not.toMatch(/maxWaitMs/);
+    const below = loadConfig(write("mcp-maxwait-below.json", mcpCfg({ maxWaitMs: 5_000 })));
+    expect(below.routing.mcp?.maxWaitMs).toBe(5_000);
+    expect((below.warnings ?? []).join("\n")).not.toMatch(/maxWaitMs/);
   });
 });
 

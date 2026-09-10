@@ -308,7 +308,7 @@ export function parseRouting(
   const benchmarkSort = typeof r.benchmarkSort === "boolean" ? r.benchmarkSort : true;
   const offload = parseOffload(r.offload);
   const routing: Routing = { default: dflt, tiers, benchmarkSort, offload };
-  const optionalBlocks = parseOptionalBlocks(r);
+  const optionalBlocks = parseOptionalBlocks(r, warnings);
   if (optionalBlocks.sticky) routing.sticky = optionalBlocks.sticky;
   if (optionalBlocks.quota) routing.quota = optionalBlocks.quota;
   routing.latency = optionalBlocks.latency;
@@ -352,7 +352,7 @@ export function parseRouting(
  * is never a duration even when it spells one. Absent fills the default rather than staying
  * absent, so a present-but-silent block still declares the ceiling the server enforces.
  */
-function parseMcpSettings(raw: unknown): McpSettings | undefined {
+function parseMcpSettings(raw: unknown, warnings: string[] = []): McpSettings | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`config.routing.mcp must be an object`);
@@ -374,6 +374,31 @@ function parseMcpSettings(raw: unknown): McpSettings | undefined {
     out.maxWaitMs = DEFAULT_MCP_MAX_WAIT_MS;
   } else if (typeof o.maxWaitMs !== "number" || !Number.isInteger(o.maxWaitMs) || o.maxWaitMs <= 0) {
     throw new Error(`config.routing.mcp.maxWaitMs must be a positive integer (milliseconds)`);
+  } else if (o.maxWaitMs > DEFAULT_MCP_MAX_WAIT_MS) {
+    // ⚠ CLAMPED to the default, not refused and not honoured. The measured defect: calls with
+    // `waitMs` of 100000 to 240000 returned `Error: Request timed out` with NO job id at all,
+    // because above the host's own tool-call ceiling the call fails AND destroys the job handle —
+    // the lane's work is spent and nothing is pollable. The property is "`dispatch` returns a jobId
+    // before any client-side request timeout, regardless of waitMs", and a CONFIGURED wait is still
+    // a waitMs: the relay cannot honour one the host will not survive, so accepting it here would
+    // configure exactly the failure the ceiling exists to prevent.
+    //
+    // Clamped rather than refused so an existing config keeps loading (the `winenv.ts`/`dotenv.ts`
+    // fail-safe direction) — the alternative turns a tuning mistake into a relay that will not
+    // start. The clamp is ANNOUNCED on `warnings`, never silent: a ceiling lowered without a word
+    // would read as the operator's own number taking effect while it did not, which is the
+    // ignored-typo class this parser's own header warns about.
+    //
+    // And it agrees with the per-call path by construction: `resolveWaitMs` clamps a CALLER's
+    // oversized `waitMs` to this same ceiling, so the two halves cannot disagree about what the
+    // server will honour.
+    out.maxWaitMs = DEFAULT_MCP_MAX_WAIT_MS;
+    warnings.push(
+      `config.routing.mcp.maxWaitMs ${o.maxWaitMs} exceeds the ${DEFAULT_MCP_MAX_WAIT_MS} ms ceiling — ` +
+        `using ${DEFAULT_MCP_MAX_WAIT_MS}. An MCP host fails a tool call answered later than that and ` +
+        `DESTROYS the job handle, so a longer blocking wait would lose the lane's work rather than ` +
+        `wait longer for it; poll dispatch_status instead.`,
+    );
   } else {
     out.maxWaitMs = o.maxWaitMs;
   }
@@ -807,6 +832,7 @@ function parseOptionalBlocks(
     dispatchWalk?: unknown;
     mcp?: unknown;
   },
+  warnings: string[] = [],
 ): OptionalRoutingBlocks {
   const sticky = parseSticky(r.sticky);
   const quota = parseQuotaEnforcement(r.quota);
@@ -816,7 +842,7 @@ function parseOptionalBlocks(
   const crawl = parseCrawl(r.crawl);
   const laneProbe = parseLaneProbe(r.laneProbe);
   const dispatchWalk = parseDispatchWalk(r.dispatchWalk);
-  const mcp = parseMcpSettings(r.mcp);
+  const mcp = parseMcpSettings(r.mcp, warnings);
   return {
     ...(sticky ? { sticky } : {}),
     ...(quota ? { quota } : {}),

@@ -25,6 +25,7 @@ import { exec, execFile, execSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { quoteCmdArg } from "../lane-probe.js";
+import { nullJobJournal, type JobJournal } from "./job-journal.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
 import { laneOfRung } from "../lane-manifest.js";
 import type { DispatchLaneStatus } from "../dispatch-lane-stats.js";
@@ -54,25 +55,36 @@ export const DEFAULT_LANE_TIMEOUT_MS = 30 * 60 * 1000;
  * lane vs. maybe poll a little longer next time). `complete()` sets it whenever the run result
  * says `timedOut`, ahead of the exit-code/semantic-failure check.
  */
-export type JobStatus = "running" | "completed" | "failed" | "cancelled" | "timed_out";
+export type JobStatus = "running" | "completed" | "failed" | "cancelled" | "timed_out" | "killed";
 
 /**
  * The four states `LaneJobStore.complete()`/`cancel()` can put a job into — `"running"` is the
  * only non-terminal member of `JobStatus`. Exported so a rendering test can iterate every
  * terminal status the store actually knows, rather than hand-copying the list a second time.
  */
-export const TERMINAL_JOB_STATUSES = ["completed", "failed", "cancelled", "timed_out"] as const satisfies readonly JobStatus[];
+export const TERMINAL_JOB_STATUSES = [
+  "completed",
+  "failed",
+  "cancelled",
+  "timed_out",
+  /**
+   * ⚠ `"killed"` joined on 2026-09-10 and it is NOT a synonym for `"failed"`. A lane killed by its
+   * own MCP server restarting is not a lane that failed — nothing was learned about the lane, and
+   * the caller's next action is different (re-dispatch from scratch, and expect nothing on disk).
+   * It is reachable ONLY from the journal, so a single-server run can never produce it.
+   */
+  "killed",
+] as const satisfies readonly JobStatus[];
 
 export type TerminalJobStatus = (typeof TERMINAL_JOB_STATUSES)[number];
 
 /**
- * Terminal statuses worth reporting as lane telemetry: every terminal status but
- * `cancelled` — a caller cancellation is not lane evidence, so it is discarded, never
- * reported. Keyed as a `Record` over `Exclude<…, "cancelled">` so a NEW terminal status is
+ * Terminal statuses worth reporting as lane telemetry: every terminal status but `cancelled` and
+ * `killed` — a caller cancellation is not lane evidence, so it is discarded, never reported. Keyed as a `Record` over `Exclude<…, "cancelled">` so a NEW terminal status is
  * a compile error HERE, at the classifier, rather than a silent drop at the forwarder (the
  * closed-union gotcha in CLAUDE.md); the forwarder ranges over this list, never a hand copy.
  */
-const REPORTABLE_JOB_STATUS_MAP: Record<Exclude<TerminalJobStatus, "cancelled">, true> = {
+const REPORTABLE_JOB_STATUS_MAP: Record<Exclude<TerminalJobStatus, "cancelled" | "killed">, true> = {
   completed: true,
   failed: true,
   timed_out: true,
@@ -249,6 +261,33 @@ export interface LaneJob {
   relay?: RelayAnnouncements;
   /** Set when the job's dispatch view came from a fallback rather than the live daemon. */
   dispatchSource?: "daemon" | "fallback";
+  /**
+   * What this dispatcher started for this job, and what became of it — written once, when the job
+   * reaches a terminal state. See `LaneProcessReport`.
+   */
+  process?: LaneProcessReport;
+}
+
+/**
+ * The record of one job's OWNED processes, written at the moment the job goes terminal.
+ *
+ * ⚠ It exists because ownership is the only reliable signal. A stale lane and a slow lane are
+ * indistinguishable from the outside (`docs/backlog.md`: one legitimately ran 29 minutes), so a
+ * rule based on age would eventually kill a live lane — which is why the dispatcher terminates what
+ * IT started, and why what it started is enumerable by job id rather than by hand.
+ *
+ * `survivors` is the honest half: a termination that did not take is REPORTED, never assumed away.
+ * `terminated: false` means no process was ever registered for this job (a pre-spawn failure, or an
+ * answer-mode job whose direct HTTP call owns no OS process), and is distinct from `pids: []` with
+ * `terminated: true` — the first says "nothing of ours ran", the second says "ours ran and is gone".
+ */
+export interface LaneProcessReport {
+  /** Root pids this dispatcher started for the job. */
+  pids: number[];
+  /** Pids still alive after termination was attempted. */
+  survivors: number[];
+  /** Whether a termination was attempted at all. */
+  terminated: boolean;
 }
 
 /** What a completed run looks like to a caller. */
@@ -380,11 +419,39 @@ export interface LaneSpawnOptions {
  * the same discipline `lane-quota-probe.ts` applies, and the reason its default spawner refuses to
  * run under vitest.
  */
+/**
+ * What the store needs in order to REAP what a job owns and to report it: a way to stop it, and a
+ * way to name what it started.
+ *
+ * ⚠ Narrower than a spawn handle on purpose. `startLane` wraps the spawner's promise in its own
+ * outcome promise, so the value the walk registers is NOT a `LaneSpawnHandle` — typing this seam as
+ * one would have forced the walk to register something other than what it actually holds.
+ */
+export interface OwnedProcess {
+  /**
+   * Terminate the process TREE this spawn started. Idempotent, and safe to call after the child has
+   * already exited — the descendants are the whole reason it exists.
+   */
+  kill: () => void;
+  /**
+   * The root pids this spawn started, read LAZILY.
+   *
+   * ⚠ A thunk, not a number: the Windows shell fallback REPLACES the root process (an npm `.cmd`
+   * shim answers ENOENT and the real child is spawned through `exec`), so the pid is only knowable
+   * after the fact. Optional, so a hand-written test double that owns no OS process can omit it.
+   */
+  pids?: () => number[];
+}
+
+export interface LaneSpawnHandle extends OwnedProcess {
+  result: Promise<LaneRunResult>;
+}
+
 export type LaneSpawner = (
   command: string,
   args: readonly string[],
   opts: LaneSpawnOptions,
-) => { result: Promise<LaneRunResult>; kill: () => void };
+) => LaneSpawnHandle;
 
 type LaneExecError = Error & { killed?: boolean | undefined; code?: unknown };
 
@@ -550,6 +617,10 @@ export function createLaneSpawner(
         }
         child?.kill();
       },
+      // ⚠ Read lazily, and that is load-bearing rather than tidy: the ENOENT fallback above REPLACES
+      // `child` with the shell-spawned process, so a pid captured at spawn time would name the shim
+      // that never ran. Whatever root the spawn settled on is what a reaper must terminate.
+      pids: () => (child?.pid === undefined ? [] : [child.pid]),
     };
   };
 }
@@ -617,6 +688,24 @@ export function readRelayAnnouncements(headers: Headers): RelayAnnouncements {
   return out;
 }
 
+/**
+ * The pids a spawn handle owns, read through the lazy thunk and bounded to sane values.
+ *
+ * A handle from a test double (or an answer-mode job, which owns no OS process at all) reports
+ * none, and a garbage pid is dropped rather than probed — `process.kill(0, 0)` signals the whole
+ * process group on POSIX, so a `0` that survived the spawn path would be the worst possible input.
+ */
+function readOwnedPids(handle: OwnedProcess | undefined): number[] {
+  if (handle?.pids === undefined) return [];
+  let raw: number[];
+  try {
+    raw = handle.pids();
+  } catch {
+    return [];
+  }
+  return raw.filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+}
+
 /** Monotonic per-process job ids. Readable, and stable to sort. */
 let jobCounter = 0;
 function nextJobId(): string {
@@ -634,6 +723,66 @@ function nextJobId(): string {
 export class LaneJobStore {
   private readonly jobs = new Map<string, LaneJob>();
   private readonly kills = new Map<string, () => void>();
+  private readonly owned = new Map<string, OwnedProcess>();
+
+  /**
+   * Is this pid still alive? Injected so the suite can prove the survivor path without racing a
+   * real termination, and so a platform with no `process.kill(pid, 0)` has one place to change.
+   *
+   * ⚠ `process.kill(pid, 0)` is an EXISTENCE probe, not a signal: it throws ESRCH when the pid is
+   * gone and EPERM when it exists but belongs to another user — both of which mean the process the
+   * dispatcher started is no longer a usable child.
+   */
+  isAlive: (pid: number) => boolean = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
+
+  private readonly journal: JobJournal;
+
+  constructor(journal: JobJournal = nullJobJournal) {
+    this.journal = journal;
+    this.adoptOrphans();
+  }
+
+  /**
+   * The jobs a PREVIOUS process died holding. They are adopted as terminal `"killed"` rows rather
+   * than dropped, because the measured cost of dropping them was ninety lane-minutes lost behind a
+   * bare `unknown jobId: job-0051` on a routine poll (2026-09-06).
+   *
+   * ⚠ No process is terminated here and none could be: this process holds no handle for those pids,
+   * and a pid from a previous process may already belong to something else. `process.terminated` is
+   * therefore false, and `ownedProcesses()` reports the job as un-reaped rather than claiming a
+   * termination that never happened.
+   */
+  private adoptOrphans(): void {
+    for (const row of this.journal.orphans()) {
+      if (this.jobs.has(row.jobId)) continue;
+      this.jobs.set(row.jobId, {
+        id: row.jobId,
+        status: "killed",
+        laneId: row.laneId,
+        spec: row.spec,
+        startedAt: row.startedAt,
+        endedAt: row.startedAt,
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        cwd: row.cwd,
+        error:
+          `the llm-relay MCP server restarted while ${row.jobId} was running on lane "${row.laneId}", ` +
+          "so the lane was killed with it. Nothing was collected from it — check the working " +
+          "directory for partial files before re-dispatching.",
+        attempts: [],
+        process: { pids: [], survivors: [], terminated: false },
+      });
+    }
+  }
 
   create(laneId: string, spec: string | undefined, cwd: string, dispatchSource?: "daemon" | "fallback"): LaneJob {
     const job: LaneJob = {
@@ -653,11 +802,89 @@ export class LaneJobStore {
       ...(dispatchSource !== undefined ? { dispatchSource } : {}),
     };
     this.jobs.set(job.id, job);
+    // ⚠ Recorded BEFORE the lane runs, so a kill between here and the first attempt is still
+    // reported. The row is removed by `reap()` the moment the job goes terminal, which is why what
+    // survives a crash is exactly the set that was still running.
+    this.journal.note({
+      jobId: job.id,
+      laneId: job.laneId,
+      ...(job.spec === undefined ? {} : { spec: job.spec }),
+      cwd: job.cwd,
+      startedAt: job.startedAt,
+    });
     return job;
   }
 
+  /**
+   * Record the process-handle this dispatcher started for `id`, so the job can be REAPED when it
+   * reaches a terminal state and so what it owned is reportable afterwards.
+   */
+  registerProcess(id: string, handle: OwnedProcess): void {
+    this.kills.set(id, handle.kill);
+    this.owned.set(id, handle);
+  }
+
+  /**
+   * Register a bare kill callback — the pre-existing seam, kept because a caller that owns no OS
+   * process (an answer-mode job's direct HTTP call, or a test double) still has something to stop.
+   */
   registerKill(id: string, kill: () => void): void {
     this.kills.set(id, kill);
+    this.owned.set(id, { kill });
+  }
+
+  /**
+   * Terminate everything this dispatcher started for `id`, and record what happened. Called from
+   * EVERY terminal transition — `complete`, `fail` and `cancel` alike — because "the job ended" and
+   * "the job's processes ended" were two different facts on HEAD, and only the second one is true.
+   *
+   * ⚠ Never throws. A termination failure is data (`survivors`), not an exception: the job is
+   * already terminal, and throwing here would replace a reported outcome with a crashed handler.
+   */
+  private reap(id: string): void {
+    const job = this.jobs.get(id);
+    const handle = this.owned.get(id);
+    const kill = this.kills.get(id);
+    this.kills.delete(id);
+    this.owned.delete(id);
+    // The job is no longer running, so it is no longer something a restart could kill.
+    this.journal.clear(id);
+    if (!job) return;
+    const pids = readOwnedPids(handle);
+    if (kill === undefined) {
+      // Nothing of ours ran for this job. Reported rather than omitted, so "no owned process" and
+      // "we forgot to look" cannot read the same way.
+      job.process = { pids, survivors: [], terminated: false };
+      return;
+    }
+    try {
+      kill();
+    } catch {
+      // Fall through: the survivor check below is what reports it.
+    }
+    job.process = { pids, survivors: pids.filter((pid) => this.isAlive(pid)), terminated: true };
+  }
+
+  /**
+   * Every process this dispatcher started for a TERMINAL job, keyed by job id — so a stale lane can
+   * be found without enumerating the machine's processes by hand, which is the only way the
+   * measured case was ever found (four `opencode` processes, ~530 MB, burning CPU hours after their
+   * jobs had returned, appearing in no `dispatch_status` listing).
+   *
+   * A still-running job is deliberately absent: it owns its processes on purpose.
+   */
+  ownedProcesses(): Array<{ jobId: string; laneId: string; spec: string | undefined } & LaneProcessReport> {
+    const rows: Array<{ jobId: string; laneId: string; spec: string | undefined } & LaneProcessReport> = [];
+    for (const job of this.jobs.values()) {
+      if (job.status === "running" || job.process === undefined) continue;
+      rows.push({
+        jobId: job.id,
+        laneId: job.laneId,
+        spec: job.spec,
+        ...job.process,
+      });
+    }
+    return rows;
   }
 
   /**
@@ -780,7 +1007,11 @@ export class LaneJobStore {
       job.status = run.code === 0 && semanticFailure === undefined ? "completed" : "failed";
       if (semanticFailure !== undefined) job.error = semanticFailure;
     }
-    this.kills.delete(id);
+    // ⚠ AFTER the status is set and BEFORE the caller sees it. The unmet property is that a
+    // terminal state ACCOUNTS FOR process-tree termination — reporting `timed_out` while the tree
+    // still runs is the measured defect (three OpenCode jobs reported `timed_out` at 1,800 s with
+    // their original processes found alive in their exact assigned worktrees).
+    this.reap(id);
   }
 
   fail(id: string, error: string): void {
@@ -789,22 +1020,23 @@ export class LaneJobStore {
     job.status = "failed";
     job.error = error;
     job.endedAt = Date.now();
-    this.kills.delete(id);
+    this.reap(id);
   }
 
   cancel(id: string): boolean {
     const job = this.jobs.get(id);
     if (!job) return false;
     if (job.status !== "running") return false;
-    this.kills.get(id)?.();
-    this.kills.delete(id);
     job.status = "cancelled";
     job.endedAt = Date.now();
+    this.reap(id);
     return true;
   }
 
   cancelAll(): void {
-    for (const id of [...this.kills.keys()]) this.cancel(id);
+    for (const id of [...this.jobs.values()].filter((j) => j.status === "running").map((j) => j.id)) {
+      this.cancel(id);
+    }
   }
 }
 

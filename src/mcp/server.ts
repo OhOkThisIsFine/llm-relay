@@ -53,6 +53,8 @@ import {
   type DispatchedQuotaReport,
   type RelayAnnouncements,
 } from "./lane-runner.js";
+import { readOnlyVerdict } from "./readonly-boundary.js";
+import { nullJobJournal, type JobJournal } from "./job-journal.js";
 import {
   RPC_INTERNAL_ERROR,
   RPC_INVALID_PARAMS,
@@ -115,6 +117,12 @@ export interface McpServerDeps {
    * never the lane's output.
    */
   reportTelemetry?: (report: DispatchedTelemetryReport) => Promise<void> | void;
+  /**
+   * The running-job journal. Absent ⇒ `nullJobJournal`, which records nothing: a programmatic
+   * embed that does not want a file gets the pre-journal behaviour exactly. `cli.ts` passes the
+   * real one, so a host-launched server can report the jobs a previous instance died holding.
+   */
+  journal?: JobJournal;
   write: (chunk: string) => void;
 }
 
@@ -246,6 +254,16 @@ const TOOLS: ToolDefinition[] = [
           type: "number",
           description: `Hard ceiling on the lane run (default ${DEFAULT_LANE_TIMEOUT_MS}).`,
         },
+        readOnly: {
+          type: "boolean",
+          description:
+            "Declare that this dispatch must not mutate anything — a review, a survey, a second " +
+            "opinion. The relay then REFUSES a working directory inside the caller's own tree, " +
+            "rather than trusting the task text to say \"do not edit\": a measured read-only lane " +
+            "committed and pushed the caller's in-progress files, and another silently reverted a " +
+            "staged one. Pass cwd pointing at a separate checkout, or use mode \"answer\", which " +
+            "spawns no harness and cannot touch the filesystem at all.",
+        },
       },
       required: ["task"],
       additionalProperties: false,
@@ -360,11 +378,30 @@ function readRecord(params: Record<string, unknown>, key: string): Record<string
 }
 
 /**
- * `"timed_out"` joins `"failed"` as an error result for the MCP `isError` flag — a caller that
- * only checks `isError` must not read a lane that never finished as a success.
+ * `"timed_out"` and `"killed"` join `"failed"` as error results for the MCP `isError` flag — a
+ * caller that only checks `isError` must not read a lane that never finished as a success.
+ *
+ * ⚠ A total switch closed with `const _never: never`, not an `||` chain. The union grew a member
+ * this lap (`"killed"`) and the chain form would have absorbed it silently as a SUCCESS — the
+ * closed-union defect CLAUDE.md records eight times, in the one function whose whole job is to keep
+ * a dead lane from reading as a live answer.
  */
 function isFailureStatus(status: JobStatus): boolean {
-  return status === "failed" || status === "timed_out";
+  switch (status) {
+    case "completed":
+      return false;
+    case "failed":
+    case "timed_out":
+    case "killed":
+      return true;
+    case "running":
+    case "cancelled":
+      return false;
+    default: {
+      const _never: never = status;
+      return _never;
+    }
+  }
 }
 
 /**
@@ -393,6 +430,16 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.relay?.latencyDemoted) head.push(`latency-demoted: ${job.relay.latencyDemoted}`);
   if (job.relay?.degraded) head.push(`degraded: ${job.relay.degraded}`);
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
+  // ⚠ Only when there is something to say. Every ordinary job reaps cleanly, and a line on all of
+  // them would be noise that trains the reader to skip the one that matters. A SURVIVOR is the case
+  // `docs/backlog.md` measured — nothing short of a process enumeration finds those — so it is
+  // named here with the pid, beside the job id that owned it.
+  if (job.process?.survivors.length) {
+    head.push(
+      `owned processes STILL RUNNING after ${job.id} ended: ${job.process.survivors.join(", ")} ` +
+        "(relay-started, not reaped)",
+    );
+  }
   // ⚠ The lanes already tried belong HERE, not only on the final answer. A poll of a running walk
   // has to say which lanes it has already spent — otherwise `dispatch_status` reports one lane
   // name and the operator cannot tell a walk on its third lane from one that never moved.
@@ -486,6 +533,14 @@ function jobAnswer(job: LaneJob, now: number): string {
         : `\n\n${LANE_LADDER_EXHAUSTED_ADVICE}`;
   if (job.status === "running") {
     return `${header}\n\nStill running. Poll dispatch_status, then call dispatch_result.`;
+  }
+  if (job.status === "killed") {
+    // ⚠ Its own branch, NOT folded into `timed_out`. The lane did not exceed anything and it did not
+    // fail: the MCP server restarted underneath it. The next action differs too — nothing is
+    // collectable and nothing is on disk unless the lane wrote it early — so the header's `error:`
+    // line explains the restart, and the empty-output branch below (which advises a retry) is
+    // deliberately not reached.
+    return `${header}\n\nThe lane was KILLED when the llm-relay MCP server restarted — it did not fail and it did not time out. Its process is gone. Re-dispatch from scratch, and check the working directory first: only files the lane wrote before the restart survive.`;
   }
   if (job.status === "timed_out") {
     // ⚠ A timed-out dispatch must never render nothing (C:\Code\docs\backlog.md — a bounded
@@ -635,7 +690,7 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
 }
 
 export class McpDispatchServer {
-  private readonly jobs = new LaneJobStore();
+  private readonly jobs: LaneJobStore;
   private readonly spawn: LaneSpawner;
   private readonly fetchImpl: AnswerFetch;
   private readonly now: () => number;
@@ -644,6 +699,7 @@ export class McpDispatchServer {
   private buffer = "";
 
   constructor(private readonly deps: McpServerDeps) {
+    this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal);
     this.spawn = deps.spawn ?? defaultLaneSpawner;
     this.fetchImpl = deps.fetch ?? defaultAnswerFetch;
     this.now = deps.now ?? Date.now;
@@ -884,6 +940,18 @@ export class McpDispatchServer {
       dispatchSource: view.source === "local-fallback" ? "fallback" : "daemon",
     };
 
+    // ⚠ The read-only boundary is checked HERE, before anything spawns. A read-only dispatch asked
+    // to run in the caller's own tree is refused with zero egress, for the same reason the recursion
+    // bound and the `waitMs` refusal are checked before the spawn: a refusal must cost no lane run.
+    // The instruction "do not edit any file" is advice; the working directory is the mechanism.
+    const readOnlyVerdictResult = readOnlyVerdict({
+      readOnly: args["readOnly"] === true,
+      mode: opts.mode,
+      cwd: opts.cwd,
+      callerRoot: this.cwd(),
+    });
+    if (!readOnlyVerdictResult.ok) return textResult(readOnlyVerdictResult.refusal, true);
+
     const first = view.ladder.find((l) => l.id === ordered[0]) ?? view.next;
     const job = this.jobs.create(first.id, first.spec, opts.cwd, opts.dispatchSource);
     // What this dispatch was allowed to reach. Both halves gate the terminal advice below: it may
@@ -1083,7 +1151,10 @@ export class McpDispatchServer {
   ): Promise<LaneAttemptOutcome> {
     const started = this.startLane(jobId, lane, task, opts);
     if ("refusal" in started) return { run: emptyRun(), abandoned: false, refusal: started.refusal };
-    this.jobs.registerKill(jobId, started.kill);
+    // ⚠ `registerProcess`, never the bare kill callback: the handle carries the pids this
+    // dispatcher STARTED, which is the only reliable signal for a reaper. Age is not — a long
+    // lane and a stale one look identical from outside, and one legitimately ran 29 minutes.
+    this.jobs.registerProcess(jobId, started);
 
     // The attempt promise is made total here, once, so neither branch below has to repeat it and
     // no rejection can escape into the walk.
@@ -1336,11 +1407,26 @@ export class McpDispatchServer {
     }
 
     if (!response.ok) {
-      // ⚠ Never read headers on a failure — status and a BOUNDED body excerpt only.
+      // ⚠ This READ HEADERS ON A FAILURE, which reverses the rule stated here until 2026-09-10, and
+      // the reversal is deliberate rather than an oversight. The old rule — status and a bounded
+      // body excerpt only — was written to keep a PROVIDER's arbitrary headers out of a
+      // relay-authored message. `readRelayAnnouncements` is a closed allow-list of five names the
+      // relay itself writes, so it carries none of that risk, and the measured cost of the rule was
+      // a failure the caller could not act on: `relay answered HTTP 504` names the LANE as the
+      // failure while the 504 came from the relay's OWN `/v1/messages`, and a pool exhaustion and a
+      // relay-side timeout call for opposite responses.
       const bodyText = await response.text().catch(() => "");
+      const relay = readRelayAnnouncements(response.headers);
+      // The model this dispatch asked for is the one relay-side fact the caller already holds, so
+      // it is named even when the relay's walk exit stated no `served-by`.
+      const timeline = [
+        relay.servedBy === undefined ? `asked for ${spec}` : `served-by: ${relay.servedBy}`,
+        relay.poolAttempts === undefined ? undefined : `pool-attempts: ${relay.poolAttempts}`,
+      ].filter((part): part is string => part !== undefined);
       return {
         run: { code: null, stdout: "", stderr: bodyText.slice(0, 300), timedOut: false },
-        semanticFailure: `relay answered HTTP ${response.status}`,
+        semanticFailure: `relay answered HTTP ${response.status} (${timeline.join("; ")})`,
+        relay,
       };
     }
 

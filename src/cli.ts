@@ -31,6 +31,7 @@ import { buildDispatch, allLadderRungs, normalizeCliCommand, restoreExhaustedRow
 import { flushLaneAffinityPersistence, loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
 import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsRows } from "./dispatch-lane-stats.js";
 import { McpDispatchServer } from "./mcp/server.js";
+import { createJobJournal } from "./mcp/job-journal.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
 import { flushDispatchExhaustionPersistence, loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
@@ -2688,6 +2689,11 @@ export async function runMcp(): Promise<void> {
     version: currentVersion(),
     reportExhaustion: (report) => reportMcpExhaustion(cfg, report),
     reportTelemetry: (report) => { void reportMcpTelemetry(cfg, report); },
+    // ⚠ The running-job journal is what makes a restart REPORTABLE. Without it the measured
+    // symptom was five lanes disappearing behind a bare `unknown jobId: job-0051` on a routine
+    // poll (2026-09-06, ~90 lane-minutes lost). A row survives only while its job runs, so
+    // whatever the next process finds is exactly the set this one died holding.
+    journal: createJobJournal(),
     write: (chunk) => process.stdout.write(chunk),
   });
 

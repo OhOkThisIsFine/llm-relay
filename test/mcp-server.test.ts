@@ -28,6 +28,7 @@ import {
   type LaneRunResult,
   type LaneSpawner,
 } from "../src/mcp/lane-runner.js";
+import { createJobJournal } from "../src/mcp/job-journal.js";
 import {
   SUPPORTED_PROTOCOL_VERSIONS,
   encodeMessage,
@@ -1087,7 +1088,29 @@ describe("isContentEmpty", () => {
 
 describe("terminal job rendering never returns nothing", () => {
   it("TERMINAL_JOB_STATUSES names every non-running status — extend the test below if this grows", () => {
-    expect([...TERMINAL_JOB_STATUSES].sort()).toEqual(["cancelled", "completed", "failed", "timed_out"]);
+    // `killed` joined 2026-09-10 (a lane that died with its MCP server restarting). It is
+    // reachable only through the journal, so its rendering case below is driven through one.
+    expect([...TERMINAL_JOB_STATUSES].sort()).toEqual(["cancelled", "completed", "failed", "killed", "timed_out"]);
+  });
+
+  it("renders a killed-by-restart job as killed, with an error result — never as an empty answer", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-relay-mcp-killed-"));
+    try {
+      const path = join(dir, "mcp-jobs.json");
+      // Process 1: a job that never finished.
+      const first = new LaneJobStore(createJobJournal(path));
+      const gone = first.create("free-pool", "pool/high", process.cwd());
+      // Process 2: the restart, with the same journal.
+      const h = new Harness({ journal: createJobJournal(path) });
+      const result = await h.tool("dispatch_result", { jobId: gone.id });
+
+      expect(result.isError).toBe(true);
+      expect(result.text).toContain("status: killed");
+      expect(result.text).toContain("restarted");
+      expect(result.text).toContain(gone.id);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("renders a non-empty structured result for every terminal status the store knows", async () => {
@@ -1245,13 +1268,26 @@ describe("dispatch tool — answer mode", () => {
     expect(body["max_tokens"]).toBe(128);
   });
 
-  it("reports a non-2xx answer as a failure carrying status and a bounded body excerpt, never headers", async () => {
+  it("reports a non-2xx answer with a bounded body excerpt, the relay's announcing headers, and no foreign ones", async () => {
+    // ⚠ This test was named "…never headers" and asserted an `x-llm-relay-served-by` value was
+    // ABSENT from the failure. That was the rule until 2026-09-10 and it is now deliberately
+    // REVERSED, not drifted: the rule was written to keep a PROVIDER's arbitrary headers out of a
+    // relay-authored message, but the measured cost was a failure the caller could not act on —
+    // `relay answered HTTP 504` named the LANE while the 504 came from the relay's OWN
+    // /v1/messages, leaving a pool exhaustion and a relay-side timeout indistinguishable.
+    // `readRelayAnnouncements` is a closed five-name allow-list of headers the RELAY writes, so it
+    // carries none of the risk the old rule addressed. The foreign-header half still binds.
     const longBody = "x".repeat(500);
     const { fetch: fetchImpl } = fakeAnswerFetch(
       () =>
         new Response(longBody, {
           status: 429,
-          headers: { "retry-after": "30", "x-llm-relay-served-by": "should-not-appear" },
+          headers: {
+            "retry-after": "30",
+            "x-llm-relay-served-by": "nim/z-ai/glm-5.2",
+            "x-llm-relay-pool-attempts": "3 tried, 0 served: 3x429",
+            "x-some-vendor-header": "foreign-value",
+          },
         }),
     );
     const h = new Harness({ fetch: fetchImpl });
@@ -1262,8 +1298,12 @@ describe("dispatch tool — answer mode", () => {
     expect(text).toContain("429");
     expect(text).toContain("x".repeat(300));
     expect(text).not.toContain("x".repeat(301));
+    // The relay's own announcement is now NAMED — it is the attempt timeline.
+    expect(text).toContain("nim/z-ai/glm-5.2");
+    expect(text).toContain("3 tried, 0 served: 3x429");
+    // Still never a foreign header, and still never the status the caller must not act on.
     expect(text).not.toContain("retry-after");
-    expect(text).not.toContain("should-not-appear");
+    expect(text).not.toContain("foreign-value");
   });
 
   it("captures the relay's announcing headers into the answer's provenance", async () => {

@@ -1795,7 +1795,7 @@ Five tools:
 
 | Tool | Purpose |
 |---|---|
-| `dispatch(task, mode?, system?, schema?, maxTokens?, tier?, lane?, cwd?, waitMs?, timeoutMs?)` | Hand a task to the best ready lane and return its answer. |
+| `dispatch(task, mode?, system?, schema?, maxTokens?, tier?, lane?, cwd?, waitMs?, timeoutMs?, readOnly?)` | Hand a task to the best ready lane and return its answer. |
 | `dispatch_status(jobId)` | Is a long lane still running? |
 | `dispatch_result(jobId)` | Collect a finished lane's answer. |
 | `dispatch_cancel(jobId)` | Stop a running lane. |
@@ -1838,11 +1838,42 @@ Three answer-mode-only parameters:
 Answer mode still returns a `jobId`/polls/cancels exactly like agent mode; `dispatch_cancel`
 aborts the in-flight fetch. Its provenance line also carries whichever of the relay's own
 `x-llm-relay-served-by` / `-pool-attempts` / `-hedged` / `-latency-demoted` / `-degraded`
-headers the response announced, when it answered 2xx — a non-2xx response is reported as a
-failure carrying the HTTP status and a bounded excerpt of the body, never headers. If the
+headers the response announced. If the
 resolved spec happens to be the plain Anthropic passthrough, the dummy credential this mode
 sends fails there and the pool walk moves on to the next candidate, same as any other rejected
 attempt.
+
+A **non-2xx** response is reported as a failure carrying the HTTP status, a bounded excerpt of
+the body, and those same relay-authored announcement headers — the `pool-attempts` header *is*
+the attempt timeline (`4 tried, 0 served: 3x429, 1x504`), and without it a 504 from the relay's
+own `/v1/messages` is indistinguishable from a pool exhaustion. Only that closed allow-list of
+relay-written names is read; a provider's own headers never reach the message.
+
+### `readOnly: true` — the read-only boundary is a mechanism, not an instruction
+
+Pass `readOnly: true` for a review, a survey, or a second opinion. The relay then **refuses** an
+agent-mode dispatch whose working directory sits inside the caller's own tree (the server's own
+working directory, or an explicit `cwd`), naming the two escapes:
+
+- pass `cwd` pointing at a **separate checkout**, or
+- use `mode: "answer"`, which spawns no harness at all.
+
+The refusal costs no lane run — it is checked before anything spawns. This exists because the
+instruction alone was measured failing three times: a lane told "do NOT edit any file" wrote a
+scratch script into the caller's checkout; another edited a spec file and then *reverted* it in
+both worktree and index after the orchestrating session had staged its own edit, so a commit
+landed with only half its change; and a read-only review returned after 1,151 s having committed
+and pushed nine of the caller's in-progress files. A `readOnly` dispatch that is not in the
+caller's tree is allowed, and an ordinary dispatch (no `readOnly`) is completely unaffected.
+
+**A killed lane is distinguished from a failed one.** The MCP server writes a running-job journal
+under the cache directory (`mcp-jobs.json`, honouring `XDG_CACHE_HOME`); a row is removed the
+moment its job ends, so whatever a restarting server finds is exactly the set of jobs it killed.
+Those are adopted and reported as `killed` — with an explanation, and as an error result — rather
+than answering `unknown jobId` for a job that had been running. Measured 2026-09-06: five lanes
+in flight were destroyed by one restart, ~90 lane-minutes lost, and nothing announced it. A
+killed lane wrote nothing unless it wrote early, so **check the working directory before
+re-dispatching**.
 
 **Bounds.** Delegation depth is capped at 3 through `LLM_RELAY_DISPATCH_DEPTH`, because a
 dispatched lane can reach this server again. A lane runs in the server's own working directory
@@ -1857,11 +1888,23 @@ cannot escape a declared root):
 Answer mode needs no working directory at all — the `cwd`/`allowedRoots` check applies only to
 agent mode and to a `cli`-kind rung in answer mode, both of which spawn a process.
 
-**A timed-out dispatch never returns nothing.** Whether the timeout kills a spawned child (agent
-mode) or aborts the fetch (answer mode), the job's status becomes the distinct `timed_out` —
-never a bare `failed` that hides *why* — and `dispatch`/`dispatch_result` render whatever partial
-output survived plus a one-line reason, so a caller polling a long lane is never left with an
-empty response to interpret.
+**A timed-out dispatch never returns nothing — and it terminates what it started.** Whether the
+timeout kills a spawned child (agent mode) or aborts the fetch (answer mode), the job's status
+becomes the distinct `timed_out` — never a bare `failed` that hides *why* — and
+`dispatch`/`dispatch_result` render whatever partial output survived plus a one-line reason, so a
+caller polling a long lane is never left with an empty response to interpret.
+
+⚠ Reaching a terminal state now **terminates the process tree this dispatcher started** and
+removes the job's journal row *before* the caller sees the status, on every terminal path
+(`completed`, `failed`, `cancelled`, `timed_out`). Measured 2026-09-09: three lane jobs reported
+`timed_out` at 1,800 s while their original processes were still alive in their exact assigned
+worktrees, and a separate measurement found four processes from *finished* runs still burning CPU
+hours later (~530 MB). The distinguishing signal is **ownership, not age** — a slow lane and a
+stale one look identical from outside, and one legitimately ran 29 minutes — so the dispatcher
+reaps only what it started. What it started is enumerable through `ownedProcesses()` by job id,
+and any pid still alive after termination is **reported** in the job's rendering (`owned processes
+STILL RUNNING after <job> ended: <pids>`) rather than assumed gone. A survivor is the one case
+worth acting on, so it is named rather than logged.
 
 **A content-empty answer is reported as a failure, not a success.** A lane can exit 0 (or answer
 HTTP 200) with text that is syntactically nonempty but carries nothing usable — a lone `#`, a bare
