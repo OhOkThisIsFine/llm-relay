@@ -208,6 +208,22 @@ export const QUOTA_DEMOTED_HEADER = "x-llm-relay-quota-demoted";
 export const LATENCY_DEMOTED_HEADER = "x-llm-relay-latency-demoted";
 
 /**
+ * The serving candidate was placed by the PROBATION band: a free deployment with fewer than
+ * `minSamples` served-request samples that the relay deliberately put first to gather data on
+ * it (`routing.probation`, default ON).
+ *
+ * Fourth member of the `DEGRADED_HEADER` family, and it exists for the same reason: an
+ * automatic reorder is acceptable only because it is announced. Unlike its three siblings it
+ * does not state that the first choice was displaced — the probation member usually IS the
+ * first choice — but that the answer came from a deployment with almost no served-traffic
+ * evidence behind it.
+ *
+ * Value is one bounded line, e.g. `opencode/muse-spark-1.3-contributor-free (0 of 5 request
+ * samples)` — the spec and the sample count behind the banding. Nothing secret.
+ */
+export const PROBATION_HEADER = "x-llm-relay-probation";
+
+/**
  * A HEDGE ran: a slow in-flight attempt had the next candidate started beside it, rather than
  * after it. Fourth member of the `DEGRADED_HEADER` family, and the announcement half of the
  * duplication bound.

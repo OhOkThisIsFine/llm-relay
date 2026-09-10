@@ -202,6 +202,14 @@ const CHECKS: CheckRow[] = [
     conflicts: [],
   },
   {
+    id: "probation",
+    apply: (raw) => {
+      raw.probation = 42;
+    },
+    message: `config.routing.probation must be an object or a boolean`,
+    conflicts: [],
+  },
+  {
     id: "laneProbe",
     apply: (raw) => {
       raw.laneProbe = 42;

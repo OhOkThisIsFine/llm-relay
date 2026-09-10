@@ -1,9 +1,9 @@
 /**
  * Parsing and validating the `routing` block of a config document (HOTSPOT-03).
  *
- * `parseRouting` plus the thirty-four declarations only it reaches: the seven sub-block parsers
- * (`parseQuotaEnforcement`, `parseLatencyDemotion`, `parseHedge`, `parseMcpSettings`,
- * `parseLaneProbe`, `parseDispatchWalk`, `parseSticky`) assembled by `parseOptionalBlocks`,
+ * `parseRouting` plus the thirty-five declarations only it reaches: the eight sub-block parsers
+ * (`parseQuotaEnforcement`, `parseLatencyDemotion`, `parseHedge`, `parseProbation`,
+ * `parseMcpSettings`, `parseLaneProbe`, `parseDispatchWalk`, `parseSticky`) assembled by `parseOptionalBlocks`,
  * `parseOffload`, the top-level field parsers `assertNoReservedProviderNames`, `parseDefault`,
  * `parseTiers` and `parseSubagents`, the pool trio `parsePoolPolicy`/`parsePoolEntry`/`parsePools`,
  * the ladder family (`parseLadder`, `parseLadders`, `parseCliLane`, `parseSpawnEnv` and its three
@@ -47,6 +47,7 @@ import {
   type OffloadConfig,
   type OffloadRule,
   type PoolPolicy,
+  type ProbationConfig,
   type ProviderConfig,
   type QuotaEnforcementConfig,
   type Routing,
@@ -179,6 +180,49 @@ function parseHedge(raw: unknown): HedgeConfig {
   return out;
 }
 
+/**
+ * Validate `routing.probation`. Malformed is a hard error, and an UNKNOWN KEY is a hard error
+ * too — the `routing.latency`/`routing.hedge` precedent: an operator who wrote `"min-samples"`
+ * believes they lowered the floor, and a silently ignored key leaves the default in force while
+ * looking like it was changed.
+ *
+ * ⚠ `minSamples` must be a POSITIVE INTEGER, not merely a positive number. A fractional sample
+ * count bounds nothing while looking like it does, and 0 would admit every free deployment to
+ * the band at once — the point of the floor is that members leave it one at a time.
+ */
+function parseProbation(raw: unknown): ProbationConfig {
+  // ABSENT returns `{}`, not `undefined` — the `parseLatencyDemotion` precedent. Every key is
+  // optional and the consumer resolves its own defaults (`{}` IS "all defaults", i.e. ON with
+  // `minSamples: 5`), so a total return keeps `parseOptionalBlocks` branch-free.
+  if (raw === undefined || raw === null) return {};
+  // The boolean shorthand is NORMALIZED here rather than carried through the type, so the
+  // probation check never re-implements "what does `false` mean".
+  if (typeof raw === "boolean") return { enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.probation must be an object or a boolean");
+  }
+  const value = raw as Record<string, unknown>;
+  const known = new Set(["enabled", "minSamples"]);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      throw new Error(`config.routing.probation has an unknown key "${key}"`);
+    }
+  }
+  const out: ProbationConfig = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== "boolean") throw new Error("config.routing.probation.enabled must be a boolean");
+    out.enabled = value.enabled;
+  }
+  if (value.minSamples !== undefined) {
+    const n = value.minSamples;
+    if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
+      throw new Error("config.routing.probation.minSamples must be a positive integer");
+    }
+    out.minSamples = n;
+  }
+  return out;
+}
+
 export function parseRouting(
   raw: unknown,
   providers: Record<string, ProviderConfig>,
@@ -197,6 +241,7 @@ export function parseRouting(
     quota?: unknown;
     latency?: unknown;
     hedge?: unknown;
+    probation?: unknown;
     laneProbe?: unknown;
     dispatchWalk?: unknown;
     mcp?: unknown;
@@ -221,6 +266,7 @@ export function parseRouting(
   if (optionalBlocks.quota) routing.quota = optionalBlocks.quota;
   routing.latency = optionalBlocks.latency;
   routing.hedge = optionalBlocks.hedge;
+  routing.probation = optionalBlocks.probation;
   routing.laneProbe = optionalBlocks.laneProbe;
   routing.dispatchWalk = optionalBlocks.dispatchWalk;
   if (optionalBlocks.mcp) routing.mcp = optionalBlocks.mcp;
@@ -688,17 +734,18 @@ function parsePools(
 }
 
 /**
- * The seven optional sub-blocks as `parseRouting` copies them onto the result. `latency`, `hedge`,
- * `laneProbe` and `dispatchWalk` are REQUIRED here because their parsers return a total value for
- * an absent block (the `parseLatencyDemotion` precedent); the other three stay absent when absent.
+ * The eight optional sub-blocks as `parseRouting` copies them onto the result. `latency`,
+ * `hedge`, `probation`, `laneProbe` and `dispatchWalk` are REQUIRED here because their parsers
+ * return a total value for an absent block (the `parseLatencyDemotion` precedent); the other
+ * three stay absent when absent.
  */
 type OptionalRoutingBlocks = Pick<Routing, "sticky" | "quota" | "mcp"> &
-  Required<Pick<Routing, "latency" | "hedge" | "laneProbe" | "dispatchWalk">>;
+  Required<Pick<Routing, "latency" | "hedge" | "probation" | "laneProbe" | "dispatchWalk">>;
 
 /**
- * Parse the seven optional sub-blocks (sticky, quota, latency, hedge, laneProbe, dispatchWalk, mcp)
- * in their current validation order. `parseRouting` copies the result key by key in that same
- * order, so the returned object's own key order is not what decides `Routing`'s.
+ * Parse the eight optional sub-blocks (sticky, quota, latency, hedge, probation, laneProbe,
+ * dispatchWalk, mcp) in their current validation order. `parseRouting` copies the result key by
+ * key in that same order, so the returned object's own key order is not what decides `Routing`'s.
  */
 function parseOptionalBlocks(
   r: {
@@ -706,6 +753,7 @@ function parseOptionalBlocks(
     quota?: unknown;
     latency?: unknown;
     hedge?: unknown;
+    probation?: unknown;
     laneProbe?: unknown;
     dispatchWalk?: unknown;
     mcp?: unknown;
@@ -715,6 +763,7 @@ function parseOptionalBlocks(
   const quota = parseQuotaEnforcement(r.quota);
   const latency = parseLatencyDemotion(r.latency);
   const hedge = parseHedge(r.hedge);
+  const probation = parseProbation(r.probation);
   const laneProbe = parseLaneProbe(r.laneProbe);
   const dispatchWalk = parseDispatchWalk(r.dispatchWalk);
   const mcp = parseMcpSettings(r.mcp);
@@ -723,6 +772,7 @@ function parseOptionalBlocks(
     ...(quota ? { quota } : {}),
     latency,
     hedge,
+    probation,
     laneProbe,
     dispatchWalk,
     ...(mcp ? { mcp } : {}),

@@ -98,18 +98,6 @@
   call and streaming, and `llm-relay cost` shows its `cached_tokens`. Recorded with the served-by
   header and the date.
 
-- **A zero-priced deployment with no exact tier-data row can never enter any effort pool, and a
-  `-free` / `-contributor-free` suffix defeats the match against its base SKU's row.**
-  `strengthAllowedForEffort` in `src/benchmarks.ts` requires `basis: "snapshot"`,
-  `match: "exact"` and ≥3 published signals, so every Zen `-free` SKU is absent from all four
-  pools while the paid Zen SKUs are members. "A model clearing NO band is admitted nowhere" is a
-  stated rule, so this is a cost, not a defect — but it falls on the free capacity the pools exist
-  to spend. **Property:** a free-class, tool-capable deployment that no benchmark source has
-  scored yet has some deliberate route into a pool short of `preferred` — e.g. treating
-  `-free`/`-contributor-free` as a PRICE suffix that resolves to the base SKU's row (same weights,
-  different price; unlike an effort suffix, which `normName()` rightly never strips), or a bounded
-  probation band — and the choice is recorded.
-
 - **`llm-relay keys` cannot verify a mixed provider whose completion probe model is paid.**
   `opencode#default` reports `UNVERIFIED` because `/models` is public and the probe model answers
   HTTP 401 with or without the key, while one completion on `opencode/nemotron-3.5-lightning-free`

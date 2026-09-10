@@ -886,7 +886,7 @@ describe("freeOnly offload guard", () => {
    * "paidp" declares no tierType and the test catalog has no prices, so it assesses `unknown`
    * — which the guard must treat as paid (a guess must not spend money).
    */
-  async function guardSetup(name: string, opts: { offload: unknown; pool?: string[] }) {
+  async function guardSetup(name: string, opts: { offload: unknown; pool?: string[]; probation?: unknown }) {
     const paid = await counting("from-paid");
     const free = await counting("from-free");
     const path = join(dir, name);
@@ -906,6 +906,8 @@ describe("freeOnly offload guard", () => {
           pools: { offloaded: opts.pool ?? ["paidp/model-x", "freep/model-y"] },
           subagents: { default: "pool/offloaded" },
           offload: opts.offload,
+          // `undefined` is dropped by JSON.stringify, so an absent option leaves the default ON.
+          probation: opts.probation,
         },
         mode: "detect",
         log: { level: "silent", file: null },
@@ -1029,8 +1031,12 @@ describe("freeOnly offload guard", () => {
   it("an explicit false still opts into spending", async () => {
     // The owner's escape hatch, and the reason `loadConfig` keeps "unset" distinguishable from
     // "false": this machine runs with an explicit false and must be unaffected by the new default.
+    // The probation band (default ON since 2026-09-09) would lead with the UNTESTED free member
+    // and serve from it, which is its design and not this test's subject; the band is switched
+    // off here so the assertion still pins what `freeOnly: false` permits, not the walk order.
     const { paid, port } = await guardSetup("freeonly-explicit-off.json", {
       offload: { claude: { enabled: true, scope: "subagents", freeOnly: false } },
+      probation: { enabled: false },
     });
     const resp = await subagentCall(port);
     expect(resp.status).toBe(200);

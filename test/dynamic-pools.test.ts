@@ -491,5 +491,51 @@ describe("dynamic free-model pools", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("admits a -contributor-free deployment into pool/high through its base SKU's row", async () => {
+    // Packet P13, half (a). Every Zen `-free` SKU was absent from all four pools while the paid
+    // SKUs were members: `strengthAllowedForEffort` needs an exact snapshot row the suffixed id
+    // never matched. The price suffix resolves to the base row (same weights, the SKU's own
+    // price), so a suffixed deployment whose base clears `high` materializes into `pool/high`.
+    const dir = mkdtempSync(join(tmpdir(), "rp-dyn-price-suffix-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: { free: { base: "https://free.test/v1", kind: "openai", tierType: "free" } },
+        routing: {
+          default: "free/acme/spark-1.3-contributor-free",
+          pools: { high: { preferred: [], include: "free", effort: "high" } },
+        },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      await catalog.list("free", cfg.providers.free!, {
+        fetchFn: (async () => new Response(JSON.stringify({ data: [
+          { id: "acme/spark-1.3-contributor-free" },
+        ] }), { status: 200 })) as unknown as typeof fetch,
+      });
+
+      // ⚠ Injected, never the live snapshot — a real model's band moves when the population does.
+      const models = [{
+        norm: "spark-1.3",
+        strength: 0.8,
+        signal_count: 4,
+        published_signal_count: 4,
+        effort_eligibility: ["low", "medium", "high"],
+      }];
+      const tierData = {
+        models,
+        byNorm: models.map((rec) => ({ norm: rec.norm, rec })),
+        exactByNorm: new Map(models.map((rec) => [rec.norm, rec])),
+        revision: "price-suffix-fixture",
+      };
+
+      materializeDynamicPools(cfg, catalog, { tierData });
+      expect(cfg.routing.pools!.high).toContain("free/acme/spark-1.3-contributor-free");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 

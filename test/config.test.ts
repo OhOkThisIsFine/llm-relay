@@ -2004,3 +2004,63 @@ describe("loadConfig — routing.mcp.maxWaitMs", () => {
     );
   });
 });
+
+/**
+ * `routing.probation` — the parse contract for the untested-free-members-first band (owner
+ * direction 2026-09-09). Sibling of the `routing.latency`/`routing.hedge` blocks above, and
+ * deliberately the same strictness. What the band DOES to a walk is pinned in
+ * test/candidate-runner.test.ts and test/pool-failover.test.ts; this is only about what the
+ * file may say.
+ */
+describe("loadConfig — routing.probation", () => {
+  function probationCfg(probation: unknown) {
+    return base({ routing: { default: "nim/z-ai/glm-5.2", probation } });
+  }
+
+  it("defaults to an empty object, which means every default (i.e. ON with minSamples 5)", () => {
+    // Deliberately NOT undefined: the parser is total so `parseRouting` needs no extra branch,
+    // and `{}` and absence are the same statement because every key is optional.
+    expect(loadConfig(write("prob-absent.json", base())).routing.probation).toEqual({});
+  });
+
+  it("normalizes the boolean shorthand away, so nothing downstream decides what false means", () => {
+    expect(loadConfig(write("prob-false.json", probationCfg(false))).routing.probation).toEqual({ enabled: false });
+    expect(loadConfig(write("prob-true.json", probationCfg(true))).routing.probation).toEqual({ enabled: true });
+  });
+
+  it("round-trips the sample floor", () => {
+    expect(
+      loadConfig(write("prob-obj.json", probationCfg({ minSamples: 3 }))).routing.probation,
+    ).toEqual({ minSamples: 3 });
+    expect(
+      loadConfig(write("prob-both.json", probationCfg({ enabled: true, minSamples: 10 }))).routing.probation,
+    ).toEqual({ enabled: true, minSamples: 10 });
+  });
+
+  it("REFUSES an unknown key rather than ignoring it", () => {
+    // An operator who wrote `min-samples` believes they lowered the floor; ignoring the key
+    // leaves the default in force while looking changed.
+    expect(() => loadConfig(write("prob-typo.json", probationCfg({ "min-samples": 3 })))).toThrow(
+      /routing\.probation has an unknown key "min-samples"/,
+    );
+  });
+
+  it("refuses a sample floor that is not a positive integer", () => {
+    // 0 would admit every free deployment to the band at once; a fractional or non-numeric
+    // floor bounds nothing while looking like it does.
+    for (const bad of [0, -2, 2.5, Number.NaN, Number.POSITIVE_INFINITY, "5"]) {
+      expect(() => loadConfig(write(`prob-bad-${String(bad)}.json`, probationCfg({ minSamples: bad })))).toThrow(
+        /routing\.probation\.minSamples must be a positive integer/,
+      );
+    }
+  });
+
+  it("rejects a malformed block outright", () => {
+    expect(() => loadConfig(write("prob-array.json", probationCfg([])))).toThrow(
+      /routing\.probation must be an object or a boolean/,
+    );
+    expect(() => loadConfig(write("prob-enabled.json", probationCfg({ enabled: "yes" })))).toThrow(
+      /routing\.probation\.enabled must be a boolean/,
+    );
+  });
+});

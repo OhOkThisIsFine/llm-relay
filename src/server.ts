@@ -92,6 +92,7 @@ import {
 } from "./stream-pipeline.js";
 import {
   applyStickyOrdering,
+  createProbationFn,
   CredentialAttemptTrace,
   credentialEvidence,
   DEFAULT_WALK_BUDGET_MS,
@@ -100,8 +101,11 @@ import {
   orderDeploymentGroupsByUsability,
   stickyProvenanceHeaders,
   type CostClassFn,
+  type ProbationDeps,
+  type ProbationFn,
   type StickyRequestContext,
 } from "./candidate-runner.js";
+import { countRequestSamples } from "./ping/probe-cache.js";
 import { detectOpenAiFrontProtocol, openAiFrontPath } from "./routes/openai-front.js";
 import { anthropicMessagesPath } from "./routes/messages.js";
 
@@ -361,6 +365,7 @@ export interface Handlers {
   server: Server;
   quotaDemotion: QuotaDemotionFn;
   latencyDemotion: LatencyDemotionFn;
+  probation: ProbationFn;
   hedgeDelay: (attempt: ResolvedAttempt, estimatedInputTokens: number) => HedgeDelayDecision | null;
   hedgeMaxInFlight: number;
   costClassOf: CostClassFn;
@@ -563,13 +568,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   const rankedAttempts = rankCredentialAttempts(attempts, h.credentialLru, {
     evidenceFor: (attempt) => credentialEvidence(attempt, cfg, h.breaker, routingNow),
   });
-  const { ordered: orderedAttempts, quotaDemotedFirst, latencyDemotedFirst } = orderDeploymentGroupsByUsability(
+  const {
+    ordered: orderedAttempts,
+    quotaDemotedFirst,
+    latencyDemotedFirst,
+  } = orderDeploymentGroupsByUsability(
     rankedAttempts,
     h.breaker,
     routingNow,
     h.quotaDemotion,
     h.costClassOf,
     h.latencyDemotion,
+    h.probation,
   );
   let walkAttempts = orderedAttempts;
   let sticky: StickyRequestContext | null = null;
@@ -591,6 +601,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           routingNow,
           h.quotaDemotion,
           h.costClassOf,
+          // `latencyDemotion` intentionally not threaded here — a pre-existing gap at this call
+          // site, unchanged by this packet.
+          undefined,
+          h.probation,
         );
         walkAttempts = applied.targets;
         sticky.provenance = `${pinnedSpec} (${applied.status})`;
@@ -779,6 +793,17 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       return undefined;
     }
   };
+  // routing.probation (owner direction 2026-09-09): an untested FREE deployment leads its pool
+  // so the relay gathers data on it. `readRequestSamples` is `countRequestSamples` from
+  // `ping/probe-cache.ts` bound with no explicit path — the real, default probe cache, same
+  // singleton `latencyDemotion` above reads through `pingLoop`. Tests inject their own stub
+  // through `ProbationDeps.readRequestSamples` rather than this real seam.
+  const probationDeps: ProbationDeps = {
+    readRequestSamples: countRequestSamples,
+    settings: cfg.routing.probation,
+    costClassOf,
+  };
+  const probation: ProbationFn = createProbationFn(probationDeps);
   const hedgeSettings = resolveHedgeSettings(cfg.routing?.hedge);
   const hedgeDelay = (
     attempt: ResolvedAttempt,
@@ -903,6 +928,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       ...(controlAuthorization ? { controlAuthorization } : {}),
       quotaDemotion,
       latencyDemotion,
+      probation,
       hedgeDelay,
       hedgeMaxInFlight: hedgeSettings.enabled ? 2 : 1,
       costClassOf,

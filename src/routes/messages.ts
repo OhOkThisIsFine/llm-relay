@@ -45,6 +45,7 @@ import {
   observeAttemptHeaders,
   paidLabel,
   Pool429Tracker,
+  probationLabelForAttempt,
   recordCredentialOutcome,
   recordCredentialStarted,
   recordStickySuccess,
@@ -147,6 +148,7 @@ export interface AnthropicCtx {
   degraded?: string | null;
   quotaDemoted?: string | null;
   latencyDemoted?: string | null;
+  probation?: string | null;
   hedged?: string | null;
   paid?: string | null;
   sticky?: StickyRequestContext | null;
@@ -1023,6 +1025,9 @@ export async function anthropicMessagesPath(
         degraded: degradedLabel(ctx.addressedPool, ctx.degradedSpecs, target),
         quotaDemoted: ctx.quotaDemotedFirst,
         latencyDemoted: ctx.latencyDemotedFirst,
+        // Per SERVING candidate, evaluated here — not the walk leader at routing time. A
+        // probation leader that fails over to a live member serves WITHOUT this header.
+        probation: probationLabelForAttempt(h, resolvedAttempt, ctx.routingNow),
         hedged,
         paid: paidLabel(ctx.cfg, h, target),
         credentialHeaders: backendRes.status < 400

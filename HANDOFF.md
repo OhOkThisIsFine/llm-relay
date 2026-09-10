@@ -156,17 +156,27 @@ Everything here is a settled trade kept for its reason, not work; the queue is `
 
 1. **Custody residuals (v0.45.0):** `keys rotate` mints the control token when no relay runs (same
    side effect as `cooldowns clear`); the macOS `security` and Linux `secret-tool` lanes have
-   injected-double coverage only, no CI leg runs them. (The shared worker-default keystore path
-   is a backlog item since 2026-09-09: it made the gate flake.) Plan:
+   injected-double coverage only, no CI leg runs them. (The keystore flake of 2026-09-09 is
+   closed: its mechanism was a four-character leak-check needle colliding with base64 ciphertext,
+   and the shared worker-default path only made the haystack longer; both halves fixed in
+   `test/keystore.test.ts`.) Plan:
    [docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md).
 2. **SPA and test nits standing:** the flat 30 s poll with no failure backoff (mitigated by
    abort-on-hide/offline), the CSS-structure test mirroring styles.css, a few wall-clock-sleep
    tests, dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
    described-by, theme preference not persisted, SIGKILL leaking the test interpretations file;
    and the misleading body-problem error codes (N8), a versioned wire change no consumer reads.
-3. **`delegate-gate` findings waived (2026-09-04):** the module-level `servers` test-fixture
-   pattern and `as unknown as typeof fetch` casts are pre-existing repository convention, not new
-   defects.
+3. **`delegate-gate` findings waived (2026-09-04, extended 2026-09-09):** the module-level
+   `servers` test-fixture pattern and `as unknown as typeof fetch` casts are pre-existing
+   repository convention, not new defects. Added 2026-09-09, each with its reason in the commit
+   that carries it: a partial-`Config` fixture cast `as unknown as Config` where the file's own
+   `Harness` already casts a partial literal (P8); the tautological-assertion detector's
+   local-helper false positive (`provider()`, `budgetOf()`); a double cast through the accounting
+   store's returned `writerStatus` reference to reach a `lease_refused` state that has no
+   single-process producer (P11-b); a `WeakMap` set on the Responses path that the Chat path
+   in the same file already performs (P7); and, for the probation band (P13), the same
+   local-helper false positive (`attempt()`) plus an `as unknown as typeof fetch` cast that is
+   `test/dynamic-pools.test.ts`'s existing fixture convention.
 4. **Where every other settled decision lives:** the owner decisions of 2026-09-04 (`freeOnly`
    stays `false`; contributor SKUs route automatically) in the `dynamic-pools.ts` row of
    `CLAUDE.md` and `docs/muse-spark-1.3-opencode-zen-2026-09-04.md`; the Class B deferrals, the

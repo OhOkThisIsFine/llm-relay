@@ -336,6 +336,17 @@ export interface Routing {
    */
   hedge?: HedgeConfig;
   /**
+   * Untested-free-members-first probation band (owner direction 2026-09-09). **Default ON** —
+   * absent means enabled with `minSamples: 5`.
+   *
+   * Like latency and hedging, it only ever REORDERS (probation members lead; nothing is
+   * dropped and nothing is refused), and unmeasured PAID/unknown deployments are unaffected.
+   *
+   * `false` is the documented shorthand for `{ enabled: false }` and restores the
+   * pre-probation behaviour exactly, byte for byte.
+   */
+  probation?: ProbationConfig;
+  /**
    * Background lane re-probing (owner decision 2026-08-29,
    * docs/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
    * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
@@ -500,6 +511,30 @@ export interface HedgeConfig {
   /** How far past the expected time an attempt must run before a hedge starts. */
   margin?: number;
   /** Minimum samples before a measured statistic may set the bar instead of the floor. */
+  minSamples?: number;
+}
+
+/**
+ * `routing.probation` — put an untested FREE deployment at the start of the pool so the relay
+ * gathers data on it (owner direction 2026-09-09).
+ *
+ * **Default ON.** A free-class candidate with fewer than `minSamples` SERVED-REQUEST samples in
+ * the probe dataset (the samples `recordRequestSample` writes — probe samples do not count)
+ * joins a `probation` band AHEAD of `live`, in config order. It leaves the band by itself as
+ * its request samples accumulate, so one untested member at a time gathers data. Breaker
+ * cooling, credential faults, hard caps, quota demotion and latency demotion all OUTRANK
+ * probation — a cooling probation member goes to `cooling`, a slow one to `slow`.
+ *
+ * `false` is the documented shorthand for `{ enabled: false }` and restores the pre-probation
+ * behaviour exactly, byte for byte. An object with no keys is legal and means the defaults.
+ *
+ * An unmeasured free primary is already hedged (`hedge-trigger.ts`: unmeasured IS hedged), so
+ * a probation member that hangs costs one hedge, not a timeout — no second mechanism here.
+ */
+export interface ProbationConfig {
+  /** Default true. false disables the probation band entirely. */
+  enabled?: boolean;
+  /** Minimum SERVED-REQUEST samples before a free deployment counts as measured. Default 5. */
   minSamples?: number;
 }
 

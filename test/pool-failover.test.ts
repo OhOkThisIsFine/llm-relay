@@ -9,6 +9,7 @@ import {
   CREDENTIAL_HEADER,
   SERVED_BY_HEADER,
   POOL_ATTEMPTS_HEADER,
+  PROBATION_HEADER,
   UNKNOWN_REFUSAL_HEADER,
 } from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
@@ -19,6 +20,7 @@ import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
 import type { Reshaper } from "../src/reshaper.js";
 import { makeCredentialId } from "../src/credential-id.js";
 import { resolveAttempt } from "../src/resolved-attempt.js";
+import { recordProbeResult, recordRequestSample } from "../src/ping/probe-cache.js";
 import type { AssistantMessage } from "../src/anthropic.js";
 function breakerIdentity(provider: string, model: string | null, kind: "anthropic" | "openai" = "openai"): ProviderTargetIdentity {
   return { provider, model, kind, credentialId: makeCredentialId(provider) };
@@ -1956,5 +1958,202 @@ describe("Messages front — tool_use ids minted on the serving candidate", () =
     expect(response.status).toBe(200);
     expect(body.content[0]!.id).toBe("Read:0");
     expect(response.headers.get("x-llm-relay-tool-use-ids")).toBeNull();
+  });
+});
+
+/**
+ * The probation band end to end (packet P13, half b): a free member with fewer than
+ * `minSamples` (default 5) SERVED-REQUEST samples in the probe dataset leads its pool so the
+ * relay gathers data on it, announced as `x-llm-relay-probation`.
+ *
+ * ⚠ Provider/model names carry a per-test tag (`p13a1`, `p13b2`, …) — unique across the
+ * suite on purpose. The probe cache under VITEST is one shared file AND served requests append
+ * samples to it, so reusing one name across tests would inherit counts another test left behind
+ * and read as measured. Sample counts here are seeded through the real
+ * `recordProbeResult` + `recordRequestSample` seam, never a stub.
+ *
+ * ⚠ Every walk has ≥2 candidates (the file's own rule): with one candidate, "leads the pool"
+ * and "is the only member" are the same observation.
+ */
+describe("probation band — untested free members lead to gather data", () => {
+  /** Two-member static pool. `benchmarkSort: false` keeps CONFIG order, so any reorder is the band's. */
+  function probationPoolCfg(
+    tag: string,
+    bases: string[],
+    opts: { probationOff?: boolean; free?: boolean } = {},
+  ): { cfg: Config; first: string; second: string } {
+    const providers: Record<string, ProviderConfig> = {};
+    const specs: string[] = [];
+    bases.forEach((base, i) => {
+      const provider = `p13${tag}${i + 1}`;
+      const model = `p13${tag}m${i + 1}`;
+      providers[provider] = {
+        base,
+        kind: "openai",
+        authHeader: "authorization",
+        timeoutMs: 5000,
+        ...(opts.free === false ? {} : { tierType: "free" as const }),
+      };
+      specs.push(`${provider}/${model}`);
+    });
+    return {
+      cfg: {
+        host: "127.0.0.1",
+        port: 0,
+        providers,
+        routing: {
+          default: "pool/probe",
+          tiers: {},
+          benchmarkSort: false,
+          pools: { probe: specs },
+          // Normalized form (`{ enabled: false }`), exactly what `parseRouting` produces for
+          // `"probation": false` — that normalization itself is pinned in test/config.test.ts.
+          ...(opts.probationOff ? { probation: { enabled: false } } : {}),
+        },
+        mode: "detect",
+        repair: { maxAttempts: 2, destructiveTools: [] },
+        log: { level: "silent", file: null },
+      },
+      first: specs[0]!,
+      second: specs[1]!,
+    };
+  }
+
+  /** Seed n SERVED-REQUEST samples (probe samples never count toward the band — pin that too). */
+  function seedRequestSamples(provider: string, model: string, n: number, probes = 0): void {
+    recordProbeResult(provider, model, { code: "200", ms: 10, quotaObservations: [] });
+    for (let i = 0; i < probes; i++) {
+      recordProbeResult(provider, model, { code: "200", ms: 10, quotaObservations: [] });
+    }
+    for (let i = 0; i < n; i++) recordRequestSample(provider, model, { ms: 10, tokens: 5 });
+  }
+
+  const CHAT = (p: number) =>
+    fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/probe", max_tokens: 20, messages: [{ role: "user", content: "hi" }] }),
+    });
+
+  it("a free member with 0 request samples leads a measured live member, on both fronts", async () => {
+    // Config order is [measured, untested]: the band must REORDER, live must not.
+    const measured = await scripted(() => ({ body: OK_BODY }));
+    const untested = await scripted(() => ({ body: OK_BODY }));
+    seedRequestSamples("p13a1", "p13am1", 5);
+    const { cfg, second } = probationPoolCfg("a", [
+      `http://127.0.0.1:${port(measured.server)}`,
+      `http://127.0.0.1:${port(untested.server)}`,
+    ]);
+    const p = port(await startProxy(cfg));
+
+    for (const [name, response] of [
+      ["messages", await messages(p, "pool/probe")],
+      ["chat", await CHAT(p)],
+    ] as const) {
+      expect(response.status, name).toBe(200);
+      await response.text();
+      expect(response.headers.get(SERVED_BY_HEADER), name).toBe(second);
+      expect(response.headers.get(PROBATION_HEADER), name).toBe(`${second} (0 of 5 request samples)`);
+    }
+  });
+
+  it("the same member with 5 samples sits in live in config order and the header is absent", async () => {
+    const first = await scripted(() => ({ body: OK_BODY }));
+    const second = await scripted(() => ({ body: OK_BODY }));
+    seedRequestSamples("p13b1", "p13bm1", 5);
+    // 5 PROBE samples plus 5 request samples: probes must not move the count either way.
+    seedRequestSamples("p13b2", "p13bm2", 5, 5);
+    const { cfg, first: firstSpec } = probationPoolCfg("b", [
+      `http://127.0.0.1:${port(first.server)}`,
+      `http://127.0.0.1:${port(second.server)}`,
+    ]);
+    const p = port(await startProxy(cfg));
+
+    const response = await messages(p, "pool/probe");
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe(firstSpec);
+    expect(response.headers.get(PROBATION_HEADER)).toBeNull();
+  });
+
+  it("a paid (unknown-cost) member with 0 samples is NOT in probation", async () => {
+    // No tierType and no catalog prices: `assessCost` reads `unknown`, which counts as paid on
+    // purpose — a guess must not reorder paid traffic. Config order must survive untouched.
+    const first = await scripted(() => ({ body: OK_BODY }));
+    const second = await scripted(() => ({ body: OK_BODY }));
+    const { cfg, first: firstSpec } = probationPoolCfg(
+      "c",
+      [`http://127.0.0.1:${port(first.server)}`, `http://127.0.0.1:${port(second.server)}`],
+      { free: false },
+    );
+    const p = port(await startProxy(cfg));
+
+    const response = await messages(p, "pool/probe");
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe(firstSpec);
+    expect(response.headers.get(PROBATION_HEADER)).toBeNull();
+  });
+
+  it("a probation member with a breaker cooldown sits in cooling", async () => {
+    const cooled = await scripted(() => ({ body: OK_BODY }));
+    const live = await scripted(() => ({ body: OK_BODY }));
+    seedRequestSamples("p13d2", "p13dm2", 5);
+    // p13d1 is free and unmeasured — probation-eligible — but breaker-cooling outranks.
+    globalCircuitBreaker.recordOutcome(
+      { provider: "p13d1", model: "p13dm1", kind: "openai", credentialId: makeCredentialId("p13d1") },
+      { ok: false, status: 429, elapsedMs: 5 },
+    );
+    const { cfg, second } = probationPoolCfg("d", [
+      `http://127.0.0.1:${port(cooled.server)}`,
+      `http://127.0.0.1:${port(live.server)}`,
+    ]);
+    const p = port(await startProxy(cfg));
+
+    const response = await messages(p, "pool/probe");
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe(second);
+    expect(response.headers.get(PROBATION_HEADER)).toBeNull();
+  });
+
+  it("routing.probation { enabled: false } yields today's order exactly", async () => {
+    // Same fixture as the lead test, band switched off: config order rules, no header.
+    const measured = await scripted(() => ({ body: OK_BODY }));
+    const untested = await scripted(() => ({ body: OK_BODY }));
+    seedRequestSamples("p13e1", "p13em1", 5);
+    const { cfg, first: firstSpec } = probationPoolCfg(
+      "e",
+      [`http://127.0.0.1:${port(measured.server)}`, `http://127.0.0.1:${port(untested.server)}`],
+      { probationOff: true },
+    );
+    const p = port(await startProxy(cfg));
+
+    const response = await messages(p, "pool/probe");
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe(firstSpec);
+    expect(response.headers.get(PROBATION_HEADER)).toBeNull();
+  });
+
+  it("a walk whose probation leader 429s fails over to the live member — header absent", async () => {
+    // The band reorders, never drops: the 429'd leader is stepped over and the live member
+    // serves. And the header names the SERVING candidate's band — the live member was never
+    // placed by probation, so the response carries no header even though the walk LED with one.
+    const measured = await scripted(() => ({ body: OK_BODY }));
+    const flaky = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+    seedRequestSamples("p13f1", "p13fm1", 5);
+    const { cfg, first: firstSpec } = probationPoolCfg("f", [
+      `http://127.0.0.1:${port(measured.server)}`,
+      `http://127.0.0.1:${port(flaky.server)}`,
+    ]);
+    const p = port(await startProxy(cfg));
+
+    const response = await messages(p, "pool/probe");
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe(firstSpec);
+    expect(response.headers.get(POOL_ATTEMPTS_HEADER)).toContain("2 tried");
+    expect(response.headers.get(PROBATION_HEADER)).toBeNull();
   });
 });

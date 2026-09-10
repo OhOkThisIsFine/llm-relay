@@ -43,6 +43,7 @@ import {
   observeAttemptHeaders,
   paidLabel,
   Pool429Tracker,
+  probationLabelForAttempt,
   recordCredentialOutcome,
   recordCredentialStarted,
   recordStickySuccess,
@@ -594,6 +595,11 @@ export async function openAiFrontPath(
           degraded: degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target),
           quotaDemoted: ctx.quotaDemotedFirst,
           latencyDemoted: ctx.latencyDemotedFirst,
+          // Per SERVING candidate, evaluated here — not the walk leader at routing time. A
+          // probation leader that fails over to a live member serves WITHOUT this header.
+          // (`Date.now()` is threaded only for the shared evaluator shape; the verdict itself
+          // is clock-free — served-request counts, never a deadline.)
+          probation: probationLabelForAttempt(h, resolvedAttempt, Date.now()),
           hedged,
           paid: ctx.cfg ? paidLabel(ctx.cfg, h, target) : null,
           sticky: ctx.sticky,

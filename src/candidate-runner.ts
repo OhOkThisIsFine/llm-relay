@@ -23,6 +23,7 @@
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Config, ResolvedTarget } from "./config.js";
+import type { ProbationConfig } from "./config-types.js";
 import type { ModelLimits } from "./catalog.js";
 import { specOfTarget } from "./benchmarks.js";
 import {
@@ -38,6 +39,7 @@ import {
   PAID_HEADER,
   QUOTA_DEMOTED_HEADER,
   LATENCY_DEMOTED_HEADER,
+  PROBATION_HEADER,
   HEDGED_HEADER,
   dialectRefusalSignalOf,
   errorOrigin,
@@ -178,7 +180,7 @@ export interface StickyRequestContext {
   provenance: string | null;
 }
 
-export type TargetUsability = "live" | "slow" | "credential-fault" | "cooling";
+export type TargetUsability = "live" | "slow" | "credential-fault" | "cooling" | "probation";
 type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
 type OutcomeClass = "ok" | "retriable" | "credential" | "client";
 
@@ -193,6 +195,13 @@ export interface CandidateRunnerHandlers {
   hedgeDelay: (attempt: ResolvedAttempt, estimatedInputTokens: number) => HedgeDelayDecision | null;
   modelCallRecorder?: ModelCallRecorder;
   stickySessions?: StickySessionManager;
+  /**
+   * Untested-free-members-first probation (`routing.probation`, default ON). Optional so
+   * hand-built handler literals in tests keep compiling — absent reads as "band unreachable",
+   * the pre-probation behaviour. The request path always sets it (see `createProxy`); a call
+   * site that omits it silently disables the band there.
+   */
+  probation?: ProbationFn | null;
 }
 
 interface ServedAnnouncementContext {
@@ -205,6 +214,7 @@ interface ServedAnnouncementContext {
   readonly degraded?: string | null | undefined;
   readonly quotaDemoted?: string | null | undefined;
   readonly latencyDemoted?: string | null | undefined;
+  readonly probation?: string | null | undefined;
   readonly hedged?: string | null | undefined;
   readonly paid?: string | null | undefined;
   readonly sticky?: StickyRequestContext | null | undefined;
@@ -253,6 +263,7 @@ export function responseHeadersForTarget(
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   if (ctx.quotaDemoted) responseHeaders[QUOTA_DEMOTED_HEADER] = ctx.quotaDemoted;
   if (ctx.latencyDemoted) responseHeaders[LATENCY_DEMOTED_HEADER] = ctx.latencyDemoted;
+  if (ctx.probation) responseHeaders[PROBATION_HEADER] = ctx.probation;
   if (ctx.hedged) responseHeaders[HEDGED_HEADER] = ctx.hedged;
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
   if (ctx.credentialHeaders) {
@@ -348,6 +359,126 @@ export function degradedLabel(pool: string | null, degraded: Set<string> | null,
   return degraded.has(spec) ? `${spec} (below ${pool})` : null;
 }
 
+/**
+ * Minimum SERVED-REQUEST samples before a free deployment counts as measured.
+ *
+ * Five is the smallest count for which a sample window is not simply "the last couple of
+ * requests" — the same standing rule that keeps `latency-demotion.ts` from acting on one
+ * request's latency.
+ */
+export const DEFAULT_PROBATION_MIN_SAMPLES = 5;
+
+/** One probation verdict — the smallest honest statement of "why this cell leads the walk". */
+export interface ProbationVerdict {
+  /** Served-request samples behind the verdict. Always below `minSamples`. */
+  readonly samples: number;
+  /** The floor it has not reached yet. */
+  readonly minSamples: number;
+}
+
+export type ProbationFn = (attempt: ResolvedAttempt, now: number) => ProbationVerdict | null;
+
+/**
+ * How the probation check reads its two facts.
+ *
+ * ⚠ A plain reader, NOT the probe cache. Keeping the seam narrow is what lets this check stay
+ * pure and testable — the server passes `countRequestSamples` from `ping/probe-cache.ts`, the
+ * suite passes a stub. Probe samples never reach the reader's answer: the count is
+ * served-request samples only, which is what distinguishes "this deployment served traffic"
+ * from "a probe found it alive".
+ */
+export interface ProbationDeps {
+  readonly readRequestSamples: (provider: string, model: string) => number;
+  /**
+   * ⚠ The SHAPE is owned by `config-types.ts` (`ProbationConfig`) and imported, never
+   * re-declared here — the same rule `latency-demotion.ts` follows for its own settings.
+   * `config/routing-parser.ts` normalizes the boolean shorthand away, so this check never has
+   * to decide what `false` means.
+   */
+  readonly settings?: ProbationConfig | undefined;
+  /** Free-ness comes from the caller's cost assessment (`assessCost`), never a second opinion. */
+  readonly costClassOf?: CostClassFn | null | undefined;
+}
+
+/** Resolve the knobs once. Absent, or an empty object, means every default — which is ON. */
+export function resolveProbationSettings(settings: ProbationConfig | undefined): {
+  enabled: boolean;
+  minSamples: number;
+} {
+  return {
+    enabled: settings?.enabled ?? true,
+    minSamples: settings?.minSamples ?? DEFAULT_PROBATION_MIN_SAMPLES,
+  };
+}
+
+export function resolveProbation(deps: ProbationDeps, attempt: ResolvedAttempt): ProbationVerdict | null {
+  const { enabled, minSamples } = resolveProbationSettings(deps.settings);
+  if (!enabled) return null;
+
+  // No model means no deployment key, so there are no samples to count and no opinion to give.
+  const model = attempt.target.model;
+  if (typeof model !== "string" || model.length === 0) return null;
+  // Only FREE deployments are ever probationed. `unknown` counts as paid on purpose — a guess
+  // must not reorder paid traffic — which is the same fail-safe `hedge-trigger.ts` applies.
+  let cost: CostClass | undefined;
+  try {
+    cost = deps.costClassOf?.(attempt);
+  } catch {
+    return null;
+  }
+  if (cost !== "free") return null;
+  let samples: number;
+  try {
+    samples = deps.readRequestSamples(attempt.target.provider, model);
+  } catch {
+    return null;
+  }
+  if (!Number.isFinite(samples) || samples >= minSamples) return null;
+  return { samples: Math.max(0, Math.floor(samples)), minSamples };
+}
+
+/**
+ * Build the request-path evaluator. The wrapper is the safety seam: NOTHING inside may throw
+ * into the request path, and a failure degrades to "no opinion" — the pre-probation behaviour
+ * — rather than to a refused request. Deliberately silent: routing hints are not log-worthy
+ * events.
+ */
+export function createProbationFn(deps: ProbationDeps): ProbationFn {
+  return (attempt) => {
+    try {
+      return resolveProbation(deps, attempt);
+    } catch {
+      return null;
+    }
+  };
+}
+
+/**
+ * `"<spec> (0 of 5 request samples)"` — bounded, metadata only: a spec and a count, never a
+ * prompt, a credential or an id.
+ */
+export function probationLabel(spec: string, verdict: ProbationVerdict): string {
+  return `${spec} (${verdict.samples} of ${verdict.minSamples} request samples)`;
+}
+
+/**
+ * The probation announcement for the candidate that actually SERVED the response, or null.
+ *
+ * ⚠ Evaluated against the SERVING attempt at response time, not against the walk leader at
+ * routing time: a probation leader that 429s fails over to a live member, and that response
+ * must NOT carry the header — its serving candidate was never placed by the band. Both fronts
+ * call this with their serving attempt and hand the string to `ServedAnnouncementContext`;
+ * the header itself is written only by `responseHeadersForTarget`, the one owner.
+ */
+export function probationLabelForAttempt(
+  h: { probation?: ProbationFn | null },
+  attempt: ResolvedAttempt,
+  now: number,
+): string | null {
+  const verdict = h.probation?.(attempt, now) ?? null;
+  return verdict ? probationLabel(specOfTarget(attempt.target), verdict) : null;
+}
+
 function cooledByAllowance(attempt: ResolvedAttempt, now: number, costClass: CostClass | undefined): boolean {
   try {
     const { target } = attempt;
@@ -381,6 +512,7 @@ export function targetUsability(
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
+  probation?: ProbationFn | null,
 ): TargetUsability {
   const identity = targetIdentity(attempt);
   if (!breaker.isHealthy(identity, now)) return "cooling";
@@ -388,6 +520,10 @@ export function targetUsability(
   if (cooledByQuota(attempt, breaker, quotaDemotion, now)) return "cooling";
   if (breaker.hasCredentialFault(identity, now)) return "credential-fault";
   if (latencyDemotion?.(attempt, now)) return "slow";
+  // Probation is checked LAST: every stronger band outranks it, so a cooling probation member
+  // goes to `cooling` and a slow one to `slow`. What remains is free, healthy, fast — and
+  // unmeasured, which is exactly the member the relay wants data on.
+  if (probation?.(attempt, now)) return "probation";
   return "live";
 }
 
@@ -461,16 +597,25 @@ export function orderDeploymentGroupsByUsability(
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
-): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null; latencyDemotedFirst: string | null } {
+  probation?: ProbationFn | null,
+): {
+  ordered: ResolvedAttempt[];
+  quotaDemotedFirst: string | null;
+  latencyDemotedFirst: string | null;
+} {
   type Group = ReturnType<typeof groupCredentialAttempts>[number];
   const preferred = groupCredentialAttempts(attempts)[0]?.attempts[0];
+  const probationGroups: Group[] = [];
   const live: Group[] = [];
   const slow: Group[] = [];
   const faulted: Group[] = [];
   const cooling: Group[] = [];
   for (const group of groupCredentialAttempts(attempts)) {
-    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
+    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
     switch (usability) {
+      case "probation":
+        probationGroups.push(group);
+        break;
       case "live":
         live.push(group);
         break;
@@ -499,7 +644,7 @@ export function orderDeploymentGroupsByUsability(
     return liftA - liftB;
   });
 
-  const ordered = [...live, ...slow, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  const ordered = [...probationGroups, ...live, ...slow, ...faulted, ...cooling].flatMap((group) => group.attempts);
   let latencyDemotedFirst: string | null = null;
   if (
     preferred !== undefined &&
@@ -995,6 +1140,13 @@ export function applyStickyOrdering(
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
+  // ⚠ Threaded so a pinned candidate the probation band would place is judged by the SAME
+  // closed union as every other caller of `targetUsability` — a call site that omits it would
+  // silently read such a candidate as "live" and pin it, defeating "a pin may promote only a
+  // live member" (see the gotcha in CLAUDE.md). `latencyDemotion` above is left exactly as this
+  // call site already had it (undefined at the one production call site in `server.ts`); fixing
+  // that pre-existing gap is out of this packet's scope.
+  probation?: ProbationFn | null,
 ): { targets: ResolvedAttempt[]; status: string } {
   const groups = groupCredentialAttempts(ordered);
   const pinnedIndex = groups.findIndex((group) => specOfTarget(group.attempts[0]!.target) === pinnedSpec);
@@ -1002,7 +1154,7 @@ export function applyStickyOrdering(
   const pinned = pinnedGroup?.attempts[0];
   if (!pinned || !pinnedGroup) return { targets: ordered, status: "bypassed: not-in-pool" };
 
-  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
+  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
   if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
 
   if (degraded?.has(pinnedSpec)) {
@@ -1010,7 +1162,7 @@ export function applyStickyOrdering(
       (group) => {
         const candidate = group.attempts[0]!;
         return !degraded.has(specOfTarget(candidate.target)) &&
-          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf, latencyDemotion) === "live";
+          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation) === "live";
       },
     );
     if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
@@ -1071,6 +1223,15 @@ export function recordStickySuccess(
  * What forced the amendment: measured 2026-08-30, banding on breaker state ALONE walked a
  * breaker-CLOSED member with a p95 of 70364 ms ahead of every cooling one, and single requests cost
  * 120-123 s across 2-6 attempts.
+ *
+ * ⚠⚠ **AMENDED AGAIN BY OWNER DIRECTION 2026-09-09, same standing — do not "restore" it.** A
+ * free deployment with fewer than `minSamples` served-request samples now LEADS, in a
+ * `probation` band AHEAD of `live` (config order within the band), so one untested member at a
+ * time gathers data and leaves the band by itself as its request samples accumulate. Like the
+ * 2026-08-30 term this is a one-way placement, not a second ranking pass: fitness still decides
+ * the order everywhere else, nothing is dropped, and an unmeasured free primary is already
+ * hedged (`hedge-trigger.ts`: unmeasured IS hedged), so a probation member that hangs costs one
+ * hedge, not a timeout — no second mechanism is added here.
  */
 export function orderByUsability(
   attempts: ResolvedAttempt[],
@@ -1079,8 +1240,9 @@ export function orderByUsability(
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
+  probation?: ProbationFn | null,
 ): ResolvedAttempt[] {
-  const { ordered } = orderByUsabilityTracked(attempts, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
+  const { ordered } = orderByUsabilityTracked(attempts, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
   return ordered;
 }
 
@@ -1091,14 +1253,23 @@ export function orderByUsabilityTracked(
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
-): { ordered: ResolvedAttempt[]; quotaDemotedFirst: string | null; latencyDemotedFirst: string | null } {
+  probation?: ProbationFn | null,
+): {
+  ordered: ResolvedAttempt[];
+  quotaDemotedFirst: string | null;
+  latencyDemotedFirst: string | null;
+} {
+  const probationMembers: ResolvedAttempt[] = [];
   const live: ResolvedAttempt[] = [];
   const slow: ResolvedAttempt[] = [];
   const faulted: ResolvedAttempt[] = [];
   const cooling: ResolvedAttempt[] = [];
   for (const attempt of attempts) {
-    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf, latencyDemotion);
+    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
     switch (usability) {
+      case "probation":
+        probationMembers.push(attempt);
+        break;
       case "live":
         live.push(attempt);
         break;
@@ -1127,7 +1298,8 @@ export function orderByUsabilityTracked(
     return liftA - liftB;
   });
 
-  return { ordered: [...live, ...slow, ...faulted, ...cooling], quotaDemotedFirst: null, latencyDemotedFirst: null };
+  const ordered = [...probationMembers, ...live, ...slow, ...faulted, ...cooling];
+  return { ordered, quotaDemotedFirst: null, latencyDemotedFirst: null };
 }
 
 /** What one HTTP status means to the walk: how to classify the outcome, and whether the body may

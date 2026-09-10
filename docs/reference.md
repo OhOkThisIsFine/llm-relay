@@ -665,11 +665,18 @@ members while `pool/low` answered from 46 on the same credentials at the same mo
 from getting what you asked for. ⚠ A model that clears **no** band is admitted nowhere, tail
 included: unassessed is not the same as weaker.
 
+A free deployment with fewer than 5 served-request samples leads its pool in a `probation`
+band ahead of `live`, so one untested member at a time gathers data and leaves the band by
+itself as its requests accumulate. Probe samples do not count toward the 5, and breaker
+cooling, credential faults, hard caps, quota demotion and latency demotion all outrank the
+band. The response announces it as `x-llm-relay-probation: <spec> (0 of 5 request samples)`,
+and `"probation": false` restores the pre-probation order exactly.
+
 Ordering also **interleaves providers** within a rank band, so the first N attempts land in N
 distinct quota domains rather than N members sharing one credential. The top-ranked candidate is
 still tried first; interleaving only decides who is tried second.
 
-**Four routing terms are ON by default**, each reverting with one boolean. Each is documented in
+**Five routing terms are ON by default**, each reverting with one boolean. Each is documented in
 full below, except the two that belong to dispatch rather than to the HTTP request path —
 `routing.laneProbe` under [Background lane re-probing](#background-lane-re-probing-routinglaneprobe)
 and `routing.dispatchWalk` under [The automatic lane walk](#the-automatic-lane-walk-routingdispatchwalk).
@@ -679,6 +686,7 @@ This table is the index — it states no policy of its own.
 |---|---|---|---|
 | `routing.latency` | ON | `"latency": false` | Demotes a candidate whose MEASURED p95 exceeds a ceiling, into the `slow` band. |
 | `routing.hedge` | ON, and confined to FREE deployments | `"hedge": false` | Starts the next candidate BESIDE a slow one and serves whichever commits first. The only term that duplicates a request. |
+| `routing.probation` | ON | `"probation": false` | Leads a FREE deployment with fewer than 5 served-request samples ahead of `live`, so one untested member at a time gathers data. |
 | `routing.laneProbe` | ON | `"laneProbe": false` | Re-probes recorded `cli` lane deaths and stale rosters on the relay's own background cadence. |
 | `routing.dispatchWalk` | ON | `"dispatchWalk": false` | Walks the DISPATCH ladder past a lane that does not answer, pins the lane that does. Read by `llm-relay mcp`, not by the request path. |
 

@@ -112,7 +112,30 @@ export interface TierMatch {
   rec: TierModel;
   /** `fuzzy` means a DIFFERENT model's row whose name contains this one's — indicative, not measured. */
   match: "exact" | "fuzzy";
+  /**
+   * Price suffix stripped to reach the row, or null when the id matched as written.
+   *
+   * A price suffix names what the deployment COSTS, not what the model CAN DO — unlike an
+   * effort suffix (`-high`), which `normName()` rightly never strips. So a suffixed id that
+   * resolves through its base still reports `match: "exact"`: the base id matched exactly.
+   * The deployment's own PRICE still comes from `resolveMetadata`/the catalog — the tier row
+   * lends weights, never a price.
+   */
+  priceSuffix: PriceSuffix | null;
 }
+
+/**
+ * Closed list of trailing PRICE suffixes `findTierModel` may strip — longest first, so
+ * `-contributor-free` wins over `-free` on an id carrying the longer one.
+ *
+ * ⚠ ONE suffix is stripped, never two, and never from the middle: `foo-free-high` keeps its
+ * effort tail and resolves as written (or not at all). An effort suffix names a different
+ * capability and is never a price suffix — stripping it would be the borrowed-score bug.
+ */
+export const PRICE_SUFFIXES = ["-contributor-free", "-free"] as const;
+
+/** One member of `PRICE_SUFFIXES` — the suffix a suffixed id was resolved through. */
+export type PriceSuffix = (typeof PRICE_SUFFIXES)[number];
 
 /**
  * Look a routing spec up in the snapshot. Matches on the id's last segment, which is exactly the
@@ -126,7 +149,7 @@ export function findTierModel<T = TierModel>(
   modelId: string,
   byNorm: Array<{ norm: string; rec: T }>,
   exactByNorm?: ReadonlyMap<string, T>,
-): { rec: T; match: "exact" | "fuzzy" } | null {
+): { rec: T; match: "exact" | "fuzzy"; priceSuffix: PriceSuffix | null } | null {
   const seg = (modelId.split("/").pop() ?? modelId).toLowerCase().trim();
   if (!seg) return null;
   // Exact equality is tried FIRST and is deliberately not subject to the length floor below. An id
@@ -135,12 +158,25 @@ export function findTierModel<T = TierModel>(
   // away measurements we hold: `o3` and `o1` are real snapshot rows carrying real published
   // signals, and every spec ending in one resolved to "nothing known" instead.
   const exact = exactByNorm?.get(seg) ?? byNorm.find((e) => e.norm === seg)?.rec;
-  if (exact) return { rec: exact, match: "exact" };
+  if (exact) return { rec: exact, match: "exact", priceSuffix: null };
+  // Price-suffix resolution: a `-free` / `-contributor-free` tail names the deployment's price,
+  // not a different model, so one trailing suffix is stripped and the BASE id is retried as an
+  // EXACT match. A hit lends the base row's weights with `match: "exact"` (the base id matched
+  // exactly) and names the suffix it came through. A miss stays unresolved — no fabricated row —
+  // and never falls through to the fuzzy path below, which could otherwise lend a DIFFERENT
+  // model's scores to a free SKU that has none of its own.
+  for (const suffix of PRICE_SUFFIXES) {
+    if (!seg.endsWith(suffix) || seg.length === suffix.length) continue;
+    const base = seg.slice(0, seg.length - suffix.length);
+    const baseHit = exactByNorm?.get(base) ?? byNorm.find((e) => e.norm === base)?.rec;
+    if (baseHit) return { rec: baseHit, match: "exact", priceSuffix: suffix };
+    return null;
+  }
   // Containment only: a short fragment matches promiscuously (`gpt` would land on whichever
   // `gpt-*` row happens to come first), so below the floor a miss beats a wrong SKU's scores.
   if (seg.length < 5) return null;
   const contained = byNorm.find((e) => e.norm.includes(seg));
-  return contained ? { rec: contained.rec, match: "fuzzy" } : null;
+  return contained ? { rec: contained.rec, match: "fuzzy", priceSuffix: null } : null;
 }
 
 /**

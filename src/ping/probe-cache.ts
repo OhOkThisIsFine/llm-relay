@@ -300,6 +300,31 @@ export function loadTotals(
 }
 
 /**
+ * How many REAL SERVED-REQUEST samples a deployment has in the probe dataset.
+ *
+ * The count the probation band (`routing.probation`) reads: a free deployment with fewer than
+ * `minSamples` of these leads its pool so the relay gathers data on it. PROBE samples do NOT
+ * count — a probe asks for one token and proves availability, not served traffic; only samples
+ * `recordRequestSample` wrote carry `source: "request"` (absence means `"probe"`, the
+ * `PingRecord` contract). Unknown deployment, missing entry or corrupt samples read as 0 —
+ * "unmeasured", which is exactly what the band is for.
+ */
+export function countRequestSamples(
+  providerKey: string,
+  modelId: string,
+  opts: { path?: string } = {},
+): number {
+  const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
+  const samples = cache.providers[providerKey]?.models[modelId]?.samples;
+  if (!Array.isArray(samples)) return 0;
+  let n = 0;
+  for (const sample of samples) {
+    if (sample !== null && typeof sample === "object" && (sample as { source?: unknown }).source === "request") n++;
+  }
+  return n;
+}
+
+/**
  * Typed quota observations persisted by the default synthetic probe, or none when this entry is
  * not current. In particular, a v2 scalar `quotaPercent` is intentionally never reconstructed.
  */
