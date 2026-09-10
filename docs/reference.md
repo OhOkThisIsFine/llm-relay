@@ -306,7 +306,7 @@ that started earlier can see.
 
 | Command | Behaviour |
 | :--- | :--- |
-| `llm-relay keys` / `llm-relay keys check` / `llm-relay check-keys` | Check every configured credential slot; bare `keys` and `check-keys` retain the historical status output. |
+| `llm-relay keys` / `llm-relay keys check` / `llm-relay check-keys` | Check every configured credential slot; bare `keys` and `check-keys` retain the historical status output. The escalation probe prefers a free-class model from the catalog when one is available. |
 | `llm-relay keys add <provider> [--label <label>] [--env-name <NAME>] [--check]` | Store one stdin/prompted secret. The provider must exist, declare an auth environment name or matching credential slot, and not be passthrough; the name must pass the strict write gate above. The default label is `default`, or the matching slot label; the default name is the provider/slot declaration. `--check` validates after storing, and a failed or inconclusive check never rolls storage back. If an environment or env-file value shadows the stored row, the check names that winning variable and source and says the stored key was not probed. Every successful add prints the threat boundary above. |
 | `llm-relay keys list` | List non-secret resolution and lifecycle metadata plus store status. |
 | `llm-relay keys rotate <provider[#label]>` | Replace ciphertext under the same id and set `rotatedAt`; a bare provider means `provider#default`. Rotation deliberately un-revokes an entry and says so when it does. It refuses a shadowed entry. |

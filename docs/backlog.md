@@ -98,13 +98,6 @@
   call and streaming, and `llm-relay cost` shows its `cached_tokens`. Recorded with the served-by
   header and the date.
 
-- **`llm-relay keys` cannot verify a mixed provider whose completion probe model is paid.**
-  `opencode#default` reports `UNVERIFIED` because `/models` is public and the probe model answers
-  HTTP 401 with or without the key, while one completion on `opencode/nemotron-3.5-lightning-free`
-  through the relay answered 200 (2026-09-04). **Property:** the escalation probe picks a
-  free-class model of the provider when the catalog has one (`assessCost` over `cachedModels`), so
-  a valid key on a billing-gated account reports `valid`, not `unverified`.
-
 - **Verify the Codex `relay` agent end to end in Codex Desktop** (owner-driven, 2026-09-04).
   Commit `e73d113` added `~/.codex/agents/relay.toml` via `scripts/install-skill.mjs`; standalone
   `codex exec` exposes no MCP tools, so only a live Codex Desktop session driven by the owner can

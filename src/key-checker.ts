@@ -3,6 +3,8 @@ import { fetchProviderQuota } from "./ping/quota.js";
 import { buildAuthHeaders, candidateEnvNames } from "./authEnv.js";
 import { providerCredentialSlots, resolveCredentialSlot, slotAllowsModel, type CredentialSlot } from "./credential-fleet.js";
 import { splitSpec } from "./config.js";
+import { assessCost } from "./metadata.js";
+import { ModelCatalog } from "./catalog.js";
 
 /**
  * Per-request cap for key checking. Independent of a provider's own `timeoutMs`, which is
@@ -207,9 +209,9 @@ async function probeAuthenticated(
   }
 }
 
-/** First model id this config routes to each provider, across pools, tiers and default. */
-function routedModelsByProvider(cfg: Config): Map<string, string> {
-  const out = new Map<string, string>();
+/** ALL models this config routes to each provider, in config order. */
+function allRoutedModelsByProvider(cfg: Config): Map<string, string[]> {
+  const out = new Map<string, string[]>();
   const raw: (string | string[] | undefined)[] = [
     ...Object.values(cfg.routing.pools ?? {}),
     ...Object.values(cfg.routing.tiers ?? {}),
@@ -218,10 +220,64 @@ function routedModelsByProvider(cfg: Config): Map<string, string> {
   for (const entry of raw) {
     for (const spec of Array.isArray(entry) ? entry : entry ? [entry] : []) {
       const { provider, model } = splitSpec(spec);
-      if (model && !out.has(provider)) out.set(provider, model);
+      if (model) {
+        const arr = out.get(provider) ?? [];
+        if (!arr.includes(model)) arr.push(model);
+        out.set(provider, arr);
+      }
     }
   }
   return out;
+}
+
+/**
+ * Choose the probe model for the authenticated completion escalation.
+ *
+ * Order of preference (first match wins):
+ *   1. A routed model (in config order) that the slot allows AND `assessCost` calls free-class.
+ *   2. A model from the provider's /models listing that the slot allows AND `assessCost` calls
+ *      free-class.
+ *   3. Otherwise EXACTLY the pre-2026-09-09 choice, byte for byte: the FIRST routed model when the
+ *      slot allows it, else the slot's own first declared model, else the first listed id.
+ *
+ * `tierType` reaches `assessCost` so a zero-priced model with NO catalog row on a
+ * `tierType: "free"` provider is still free-class (the `provider-tier` basis): a null row is not
+ * evidence of a price. A catalog that knows nothing therefore changes nothing — steps 1–2 find no
+ * free-class model and step 3 is the legacy rule, so a provider with no free model behaves as it
+ * did before the free-model preference existed.
+ */
+export function chooseProbeModel(
+  providerName: string,
+  routedModels: Map<string, string[]>,
+  listedModels: string[],
+  slot: CredentialSlot,
+  catalog: Pick<ModelCatalog, "cachedLimits">,
+  tierType: ProviderConfig["tierType"],
+): string | undefined {
+  const routed = routedModels.get(providerName) ?? [];
+  const listed = listedModels;
+
+  // Step 1: routed free-class models (in config order)
+  for (const model of routed) {
+    if (!slotAllowsModel(slot, model)) continue;
+    const limits = catalog.cachedLimits(providerName, model);
+    if (assessCost(model, limits, tierType).costClass === "free") return model;
+  }
+
+  // Step 2: listed free-class models
+  for (const model of listed) {
+    if (!slotAllowsModel(slot, model)) continue;
+    const limits = catalog.cachedLimits(providerName, model);
+    if (assessCost(model, limits, tierType).costClass === "free") return model;
+  }
+
+  // Step 3: the legacy choice, unchanged. A lane's first cut replaced it with four ranked scans
+  // (first routed the slot allows, first listed the slot allows, routed[0], listed[0]), which
+  // dropped the slot's own declared model and preferred a routed id over a listed one where the
+  // old code did the reverse; `test/key-checker.test.ts` pins each of those differences.
+  const firstRouted = routed[0];
+  if (firstRouted !== undefined && slotAllowsModel(slot, firstRouted)) return firstRouted;
+  return slot.models?.[0] ?? listed[0];
 }
 
 /**
@@ -235,12 +291,13 @@ function routedModelsByProvider(cfg: Config): Map<string, string> {
 export async function validateProviderKeys(
   cfg: Config,
   fetchFn: typeof fetch = fetch,
-  opts: { budgetMs?: number; env?: NodeJS.ProcessEnv } = {},
+  opts: { budgetMs?: number; env?: NodeJS.ProcessEnv; catalog?: Pick<ModelCatalog, "cachedLimits"> } = {},
 ): Promise<KeyCheckResult[]> {
   const entries = Object.entries(cfg.providers);
-  const routed = routedModelsByProvider(cfg);
+  const allRouted = allRoutedModelsByProvider(cfg);
   const budgetMs = opts.budgetMs ?? PROVIDER_CHECK_BUDGET_MS;
   const env = opts.env ?? process.env;
+  const catalog = opts.catalog ?? new ModelCatalog();
 
  const checkOne = async (name: string, p: ProviderConfig, slot: CredentialSlot): Promise<KeyCheckResult> => {
   const envVarName = slot.authEnv;
@@ -310,14 +367,15 @@ export async function validateProviderKeys(
       } else if (resp.ok) {
         // 200 OK — may prove the key works if /models is auth-gated; otherwise escalate.
         let modelsCount: number | undefined;
-        let firstModelId: string | undefined;
+        let listedModels: string[] = [];
         if (url.endsWith("/models")) {
           try {
             const body = (await resp.json()) as { data?: { id?: unknown }[] };
             if (Array.isArray(body.data)) {
               modelsCount = body.data.length;
-              const first = body.data.find((m) => typeof m?.id === "string");
-              if (first) firstModelId = first.id as string;
+              listedModels = body.data
+                .filter((m): m is { id: string } => typeof m?.id === "string")
+                .map((m) => m.id);
             }
           } catch {
             /* ignore JSON parse */
@@ -331,15 +389,10 @@ export async function validateProviderKeys(
         // endpoint proved nothing and we must ask an authenticated endpoint instead.
         // Needs a real model id to probe with; without one, escalation is less reliable
         // than the listing we already have, so keep the listing verdict.
-        // Prefer a model this config actually ROUTES to the provider over the catalogue's
-        // first entry. Free-tier rosters list premium models the key legitimately cannot
-        // touch, and probing one of those produces a 401/403 that says nothing about the
-        // key. The routed model is both the one the user cares about and the one most
-        // likely to be reachable on their plan.
-        const configuredModel = routed.get(name);
-        const probeModel = configuredModel && slotAllowsModel(slot, configuredModel)
-          ? configuredModel
-          : (slot.models?.[0] ?? firstModelId);
+        // Prefer a FREE-CLASS model this config routes to the provider (via catalog),
+        // then a free-class model from the listing, then the legacy fallback chain.
+        // This avoids probing a paid SKU on a billing-gated free account.
+        const probeModel = chooseProbeModel(name, allRouted, listedModels, slot, catalog, p.tierType);
         if (apiKey && url.endsWith("/models") && probeModel) {
           const gated = await isAuthGated(p, url, fetchFn);
           if (!gated) {

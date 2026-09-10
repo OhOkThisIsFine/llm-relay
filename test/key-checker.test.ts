@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { validateProviderKeys } from "../src/key-checker.js";
-import type { Config } from "../src/config.js";
+import { validateProviderKeys, chooseProbeModel } from "../src/key-checker.js";
+import type { Config, Kind } from "../src/config.js";
+import type { ModelCatalog } from "../src/catalog.js";
+import { implicitCredentialSlot, type CredentialSlot } from "../src/credential-fleet.js";
 
 describe("key-checker", () => {
   const baseConfig: Config = {
@@ -296,6 +298,97 @@ describe("key-checker", () => {
     expect(calls).toBe(0);
   });
 
+  describe("validateProviderKeys — free model probe preference (backlog item 14)", () => {
+    const mockCatalog: Pick<ModelCatalog, "cachedLimits"> = {
+      cachedLimits: (_provider: string, model: string) => {
+        if (model === "premium-model" || model === "paid-model") {
+          return { pricePromptPerToken: 0.001, priceCompletionPerToken: 0.002, contextLength: null, maxOutputTokens: null, rateLimits: null };
+        }
+        if (model === "free-model" || model === "another-free" || model === "routed-free") {
+          return { pricePromptPerToken: 0, priceCompletionPerToken: 0, contextLength: null, maxOutputTokens: null, rateLimits: null };
+        }
+        return null;
+      },
+    };
+
+    it("validates a mixed provider via its free model (opencode scenario)", async () => {
+      process.env.MOCK_PROV_KEY = "good";
+      const seenModels: string[] = [];
+      const mockFetch = (async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/models")) {
+          // Public /models returns both paid and free models
+          return new Response(
+            JSON.stringify({ data: [{ id: "premium-model" }, { id: "free-model" }] }),
+            { status: 200 },
+          );
+        }
+        // Authenticated probe: paid model answers 401 both ways, free model answers 200
+        const body = JSON.parse(String(init?.body));
+        seenModels.push(body.model);
+        if (body.model === "premium-model") {
+          const hasAuth = Boolean((init?.headers as Record<string, string> | undefined)?.["authorization"]);
+          return new Response("no", { status: hasAuth ? 401 : 401 });
+        }
+        if (body.model === "free-model") {
+          return new Response(JSON.stringify({ choices: [] }), { status: 200 });
+        }
+        return new Response("{}", { status: 401 });
+      }) as unknown as typeof fetch;
+
+      const config: Config = {
+        ...baseConfig,
+        providers: {
+          mockProv: {
+            base: "http://mock.provider",
+            kind: "openai" as Kind,
+            authEnv: "MOCK_PROV_KEY",
+            authHeader: "authorization",
+            timeoutMs: 1000,
+            tierType: "mixed",
+          },
+        },
+        routing: { default: "mockProv/premium-model", tiers: {} },
+      };
+      const results = await validateProviderKeys(config, mockFetch, { catalog: mockCatalog });
+      expect(results[0]?.status).toBe("valid");
+      // The probe should have gone to free-model, not premium-model
+      expect(seenModels).toContain("free-model");
+      expect(seenModels).not.toContain("premium-model");
+    });
+
+    it("falls back to unverified when NO free model exists in catalog", async () => {
+      process.env.MOCK_PROV_KEY = "unknown";
+      const seenModels: string[] = [];
+      const mockFetch = (async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/models")) {
+          return new Response(JSON.stringify({ data: [{ id: "premium-model" }, { id: "paid-model" }] }), { status: 200 });
+        }
+        const body = JSON.parse(String(init?.body));
+        seenModels.push(body.model);
+        return new Response("no", { status: 401 });
+      }) as unknown as typeof fetch;
+
+      const config: Config = {
+        ...baseConfig,
+        providers: {
+          mockProv: {
+            base: "http://mock.provider",
+            kind: "openai" as Kind,
+            authEnv: "MOCK_PROV_KEY",
+            authHeader: "authorization",
+            timeoutMs: 1000,
+            tierType: "mixed",
+          },
+        },
+        routing: { default: "mockProv/premium-model", tiers: {} },
+      };
+      const results = await validateProviderKeys(config, mockFetch, { catalog: mockCatalog });
+      expect(results[0]?.status).toBe("unverified");
+      // It should have tried the first routed model (premium-model) and fallen back to unverified
+      expect(seenModels).toContain("premium-model");
+    });
+  });
+
   describe("credential headers come from the shared builder", () => {
     const anthropicKind: Config = {
       ...baseConfig,
@@ -536,5 +629,111 @@ describe("key-checker", () => {
       expect(seenSignal).toBeDefined();
       expect(seenSignal).toBeInstanceOf(AbortSignal);
     }, 15000);
+  });
+
+  describe("chooseProbeModel — free-class model preference", () => {
+    const mockCatalog: Pick<ModelCatalog, "cachedLimits"> = {
+      cachedLimits: (_provider: string, model: string) => {
+        // Simulate: premium models are paid, free models are free
+        if (model === "premium-model" || model === "paid-model") {
+          return { pricePromptPerToken: 0.001, priceCompletionPerToken: 0.002, contextLength: null, maxOutputTokens: null, rateLimits: null };
+        }
+        if (model === "free-model" || model === "another-free" || model === "routed-free" || model === "listed-free") {
+          return { pricePromptPerToken: 0, priceCompletionPerToken: 0, contextLength: null, maxOutputTokens: null, rateLimits: null };
+        }
+        return null;
+      },
+    };
+
+    // Real slots, never a shape cast through `any`: `implicitCredentialSlot` is the same
+    // constructor the fleet uses for a provider that declares no `credentials` block.
+    const anySlot = implicitCredentialSlot("opencode");
+    const slotWith = (models: readonly string[]): CredentialSlot => ({ ...anySlot, models });
+
+    it("picks a free-class model from routed models when available", () => {
+      const routed = new Map([["opencode", ["free-model"]]]);
+      const listed = ["premium-model", "free-model"];
+      const slot = anySlot;
+      const result = chooseProbeModel("opencode", routed, listed, slot, mockCatalog, "mixed");
+      expect(result).toBe("free-model");
+    });
+
+    it("picks a free-class model from listed models when no routed free model exists", () => {
+      const routed = new Map([["opencode", ["premium-model"]]]);
+      const listed = ["premium-model", "free-model"];
+      const slot = anySlot;
+      const result = chooseProbeModel("opencode", routed, listed, slot, mockCatalog, "mixed");
+      expect(result).toBe("free-model");
+    });
+
+    it("falls back to first routed model when no free model exists in catalog", () => {
+      const routed = new Map([["opencode", ["premium-model"]]]);
+      const listed = ["premium-model", "paid-model"];
+      const slot = anySlot;
+      const result = chooseProbeModel("opencode", routed, listed, slot, mockCatalog, "mixed");
+      expect(result).toBe("premium-model");
+    });
+
+    it("falls back to first listed model when no routed model and no free model", () => {
+      const routed = new Map<string, string[]>();
+      const listed = ["premium-model", "paid-model"];
+      const slot = anySlot;
+      const result = chooseProbeModel("opencode", routed, listed, slot, mockCatalog, "mixed");
+      expect(result).toBe("premium-model");
+    });
+
+    it("respects slotAllowsModel filtering — skips models not allowed by slot", () => {
+      const routed = new Map([["opencode", ["free-model"]]]);
+      const listed = ["premium-model", "free-model"];
+      const slot = slotWith(["premium-model"]); // the slot allows premium only
+      const result = chooseProbeModel("opencode", routed, listed, slot, mockCatalog, "mixed");
+      // free-model is not allowed by slot, so falls back to premium-model
+      expect(result).toBe("premium-model");
+    });
+
+    it("routed free model outranks listed free model", () => {
+      const routed = new Map([["opencode", ["routed-free"]]]);
+      const listed = ["listed-free", "premium-model"];
+      const slot = anySlot;
+      const result = chooseProbeModel("opencode", routed, listed, slot, mockCatalog, "mixed");
+      expect(result).toBe("routed-free");
+    });
+
+    it("free-tier provider with null catalog row still probes routed model as free-class (provider-tier basis)", () => {
+      const routed = new Map([["opencode", ["routed-free"]]]);
+      const listed = ["premium-model", "routed-free"];
+      const slot = anySlot;
+      const nullCatalog = {
+        cachedLimits: () => null, // no catalog rows at all
+      };
+      // tierType "free" makes assessCost return "free" via provider-tier basis
+      const result = chooseProbeModel("opencode", routed, listed, slot, nullCatalog, "free");
+      expect(result).toBe("routed-free");
+    });
+
+    it("legacy fallback: the first routed model when the slot allows it, else the slot's own first model, else the first listed id", () => {
+      // No free-class candidate anywhere, so the choice must be byte-for-byte the pre-2026-09-09
+      // one. Each case below is chosen so that the six-step rewrite a lane first shipped
+      // (first routed the slot allows → first listed the slot allows → routed[0] → listed[0])
+      // answers DIFFERENTLY from the legacy rule.
+      const routed = new Map([["opencode", ["premium-model", "paid-model"]]]);
+      const listed = ["paid-model", "premium-model"];
+
+      // The slot allows the first routed model → that model, never a later routed one.
+      expect(chooseProbeModel("opencode", routed, listed, slotWith(["premium-model"]), mockCatalog, "mixed")).toBe("premium-model");
+
+      // The slot does not allow the first routed model → the slot's OWN first declared model,
+      // even one that is neither routed nor listed (the branch the six-step rewrite had lost).
+      expect(chooseProbeModel("opencode", routed, listed, slotWith(["declared-only"]), mockCatalog, "mixed")).toBe("declared-only");
+
+      // The slot allows nothing and declares nothing → the first LISTED id, not the first routed.
+      expect(chooseProbeModel("opencode", routed, listed, slotWith([]), mockCatalog, "mixed")).toBe("paid-model");
+
+      // No routed model and an unrestricted slot → the first listed id.
+      expect(chooseProbeModel("opencode", new Map<string, string[]>(), listed, anySlot, mockCatalog, "mixed")).toBe("paid-model");
+
+      // Nothing at all → undefined, never an invented id.
+      expect(chooseProbeModel("opencode", new Map<string, string[]>(), [], anySlot, mockCatalog, "mixed")).toBeUndefined();
+    });
   });
 });
