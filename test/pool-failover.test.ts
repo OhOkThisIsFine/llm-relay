@@ -2494,130 +2494,148 @@ describe("Responses front — no invented cap, and a capped answer announces its
  * than timing-sensitive. `stallTimeoutMs` is left at its 90s default, well above the 2s crawl
  * window, so the CRAWL watchdog — not the stall watchdog — is what fires.
  */
-describe("post-commit crawl watchdog — abort, cool, and let the client's own retry land elsewhere", () => {
-  const CRAWL_SETTINGS = { windowMs: 2000, minTokens: 2, msPerToken: 100 };
+const CRAWL_SETTINGS = { windowMs: 2000, minTokens: 2, msPerToken: 100 };
 
-  function anthropicFrame(text: string, index = 0): string {
-    return `event: content_block_delta\ndata: ${JSON.stringify({
-      type: "content_block_delta", index, delta: { type: "text_delta", text },
-    })}\n\n`;
-  }
-  function openAiChatFrame(text: string): string {
-    return `data: ${JSON.stringify({ id: "c", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`;
-  }
+function anthropicFrame(text: string, index = 0): string {
+  return `event: content_block_delta\ndata: ${JSON.stringify({
+    type: "content_block_delta", index, delta: { type: "text_delta", text },
+  })}\n\n`;
+}
+function openAiChatFrame(text: string): string {
+  return `data: ${JSON.stringify({ id: "c", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`;
+}
 
-  /**
-   * A backend that COMMITS with real content, then crawls: one tiny delta every ~400ms until the
-   * relay aborts the connection (or a generous safety cap of 15 ticks / 6s if it somehow does not,
-   * so a broken watchdog fails the test on content/timing rather than hanging the suite forever).
-   */
-  function crawlingBackend(kind: "anthropic" | "openai"): Promise<{ server: Server; calls: () => number }> {
-    let n = 0;
-    return new Promise((resolve) => {
-      const s = createServer((req, res) => {
-        req.on("data", () => {});
-        req.on("end", () => {
-          n++;
-          res.writeHead(200, { "content-type": "text/event-stream" });
-          const safeWrite = (chunk: string) => {
+/**
+ * A backend that COMMITS with real content, then crawls: one tiny delta every ~400ms until the
+ * relay aborts the connection (or a generous safety cap of 15 ticks / 6s if it somehow does not,
+ * so a broken watchdog fails the test on content/timing rather than hanging the suite forever).
+ *
+ * Hoisted to module scope (packet PLOG, 2026-09-09) so the post-commit STALL-watchdog describe
+ * block below can reuse it verbatim for its own crawl-route assertion — see that block's own
+ * comment for why the SAME fixture proves the crawl kind rides the same classifier the stall kind
+ * does. Content unchanged from the item-18 packet that introduced it.
+ */
+function crawlingBackend(kind: "anthropic" | "openai"): Promise<{ server: Server; calls: () => number }> {
+  let n = 0;
+  return new Promise((resolve) => {
+    const s = createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        n++;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const safeWrite = (chunk: string) => {
+          try {
+            if (!res.writableEnded && !res.destroyed) res.write(chunk);
+          } catch {
+            // The relay aborts this connection once it detects the crawl; a write racing that
+            // abort must never crash the test's backend server.
+          }
+        };
+        const frame = kind === "anthropic" ? anthropicFrame : openAiChatFrame;
+        // Real content — this is what COMMITS the stream.
+        safeWrite(frame("hello crawl test"));
+        let ticks = 0;
+        const timer = setInterval(() => {
+          ticks++;
+          if (res.destroyed || res.writableEnded || ticks > 15) {
+            clearInterval(timer);
             try {
-              if (!res.writableEnded && !res.destroyed) res.write(chunk);
+              if (!res.writableEnded && !res.destroyed) res.end();
             } catch {
-              // The relay aborts this connection once it detects the crawl; a write racing that
-              // abort must never crash the test's backend server.
+              // Same race as above.
             }
-          };
-          const frame = kind === "anthropic" ? anthropicFrame : openAiChatFrame;
-          // Real content — this is what COMMITS the stream.
-          safeWrite(frame("hello crawl test"));
-          let ticks = 0;
-          const timer = setInterval(() => {
-            ticks++;
-            if (res.destroyed || res.writableEnded || ticks > 15) {
-              clearInterval(timer);
-              try {
-                if (!res.writableEnded && !res.destroyed) res.end();
-              } catch {
-                // Same race as above.
-              }
-              return;
-            }
-            safeWrite(frame("x"));
-          }, 400);
-          res.on("close", () => clearInterval(timer));
-        });
-      });
-      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
-    });
-  }
-
-  /** The clean second candidate — answers immediately, buffered or streamed as asked. */
-  function cleanBackend(kind: "anthropic" | "openai"): Promise<{ server: Server; calls: () => number }> {
-    let n = 0;
-    return new Promise((resolve) => {
-      const s = createServer((req, res) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c) => chunks.push(c));
-        req.on("end", () => {
-          n++;
-          const wantsStream = (() => {
-            try {
-              return Boolean((JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean }).stream);
-            } catch {
-              return false;
-            }
-          })();
-          if (!wantsStream) {
-            const body = kind === "anthropic"
-              ? JSON.stringify({
-                id: "m", type: "message", role: "assistant", model: "m2",
-                content: [{ type: "text", text: "served clean" }], stop_reason: "end_turn",
-                usage: { input_tokens: 2, output_tokens: 4 },
-              })
-              : JSON.stringify({
-                id: "c", choices: [{ message: { role: "assistant", content: "served clean" }, finish_reason: "stop" }],
-                usage: { prompt_tokens: 2, completion_tokens: 4 },
-              });
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(body);
             return;
           }
-          res.writeHead(200, { "content-type": "text/event-stream" });
-          if (kind === "anthropic") {
-            res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", type: "message", role: "assistant", model: "m2", content: [] } })}\n\n`);
-            res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`);
-            res.write(anthropicFrame("served clean"));
-            res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
-            res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 4 } })}\n\n`);
-            res.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-          } else {
-            res.write(openAiChatFrame("served clean"));
-            res.write(`data: ${JSON.stringify({ id: "c", choices: [], usage: { completion_tokens: 4 } })}\n\n`);
-            res.write("data: [DONE]\n\n");
-          }
-          res.end();
-        });
+          safeWrite(frame("x"));
+        }, 400);
+        res.on("close", () => clearInterval(timer));
       });
-      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
     });
-  }
+    s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+  });
+}
 
-  function requestBody(path: string, streamed: boolean): object {
-    return path === "/v1/messages"
-      ? { model: "pool/coding", stream: streamed, max_tokens: 200, messages: [{ role: "user", content: "hi" }] }
-      : { model: "pool/coding", stream: streamed, messages: [{ role: "user", content: "hi" }] };
-  }
-
-  function send(p: number, path: string, streamed: boolean): Promise<Response> {
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (path === "/v1/messages") headers["anthropic-version"] = "2023-06-01";
-    return fetch(`http://127.0.0.1:${p}${path}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(requestBody(path, streamed)),
+/**
+ * The clean second candidate — answers immediately, buffered or streamed as asked.
+ * Hoisted to module scope alongside `crawlingBackend` (packet PLOG, 2026-09-09) for the same
+ * reason; content unchanged.
+ */
+function cleanBackend(kind: "anthropic" | "openai"): Promise<{ server: Server; calls: () => number }> {
+  let n = 0;
+  return new Promise((resolve) => {
+    const s = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        n++;
+        const wantsStream = (() => {
+          try {
+            return Boolean((JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean }).stream);
+          } catch {
+            return false;
+          }
+        })();
+        if (!wantsStream) {
+          const body = kind === "anthropic"
+            ? JSON.stringify({
+              id: "m", type: "message", role: "assistant", model: "m2",
+              content: [{ type: "text", text: "served clean" }], stop_reason: "end_turn",
+              usage: { input_tokens: 2, output_tokens: 4 },
+            })
+            : JSON.stringify({
+              id: "c", choices: [{ message: { role: "assistant", content: "served clean" }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 2, completion_tokens: 4 },
+            });
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(body);
+          return;
+        }
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        if (kind === "anthropic") {
+          res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", type: "message", role: "assistant", model: "m2", content: [] } })}\n\n`);
+          res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`);
+          res.write(anthropicFrame("served clean"));
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 4 } })}\n\n`);
+          res.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        } else {
+          res.write(openAiChatFrame("served clean"));
+          res.write(`data: ${JSON.stringify({ id: "c", choices: [], usage: { completion_tokens: 4 } })}\n\n`);
+          res.write("data: [DONE]\n\n");
+        }
+        res.end();
+      });
     });
-  }
+    s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+  });
+}
 
+/**
+ * `requestBody`/`send` also hoisted (packet PLOG). The `/v1/responses` branch is NEW — the
+ * pre-existing function only ever built an anthropic-messages- or chat-shaped body, because
+ * neither prior caller addressed the Responses front.
+ */
+function requestBody(path: string, streamed: boolean): object {
+  if (path === "/v1/messages") {
+    return { model: "pool/coding", stream: streamed, max_tokens: 200, messages: [{ role: "user", content: "hi" }] };
+  }
+  if (path === "/v1/responses") {
+    return { model: "pool/coding", stream: streamed, input: "hi" };
+  }
+  return { model: "pool/coding", stream: streamed, messages: [{ role: "user", content: "hi" }] };
+}
+
+function send(p: number, path: string, streamed: boolean): Promise<Response> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (path === "/v1/messages") headers["anthropic-version"] = "2023-06-01";
+  return fetch(`http://127.0.0.1:${p}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(requestBody(path, streamed)),
+  });
+}
+
+describe("post-commit crawl watchdog — abort, cool, and let the client's own retry land elsewhere", () => {
   const FRONTS = [
     { name: "Anthropic /v1/messages", path: "/v1/messages", kind: "anthropic" as const },
     { name: "OpenAI /v1/chat/completions", path: "/v1/chat/completions", kind: "openai" as const },
@@ -2695,4 +2713,217 @@ describe("post-commit crawl watchdog — abort, cool, and let the client's own r
       });
     }
   }
+});
+
+/**
+ * Packet PLOG (backlog: "The Responses front logs a mid-stream stall as a clean
+ * `backendStatus: 200`") — the property, verbatim:
+ *
+ *   a committed stream that the relay's own watchdog aborts logs the same attempt status and
+ *   the same `errorKinds` member on both fronts, pinned by one test that drives both.
+ *
+ * The mechanism (measured in `docs/post-commit-stall-measurement-2026-09-09.md`, confirmed here
+ * by reading `node_modules/llm-bridge/dist/index.mjs`): the Anthropic front is a direct
+ * passthrough for an `anthropic`-kind target, so `withStallWatchdog`/`withCrawlWatchdog` wrap the
+ * RAW backend fetch stream, and the relay's own `controller.abort()` makes that stream's reader
+ * THROW — `openAiFrontPath`'s Anthropic-front sibling (`transparentPath`/`repairStreamingPath` in
+ * `routes/messages.ts`) catches it and calls `handleMidStreamError`. A Responses-front (and any
+ * Chat-front request whose target is not a native OpenAI-chat passthrough) request instead runs
+ * through `fetchTranslatedOpenAiFront`, whose output stream is built by llm-bridge's own
+ * `emitOpenAIStream`/`emitOpenAIResponsesStream` (`handleUniversalStreamRequest` in
+ * `src/backend.ts`). Both of those functions wrap their whole per-event loop in
+ * `try { ... } catch (err) { controller.enqueue(<in-band error frame>); } finally { controller.close(); }`
+ * — so the SAME abort that throws on the Anthropic front is caught INSIDE llm-bridge, turned into
+ * an in-band SSE error frame, and the stream ends NORMALLY. `openAiFrontPath`'s own `for await`
+ * loop over `upstream.body` therefore never throws, falls through to `completeAttemptSuccess`, and
+ * the metadata log records a clean `backendStatus: 200` with no `errorKinds` — exactly the
+ * asymmetry the backlog entry names, and exactly what cell 3/4 of the measurement doc shows.
+ *
+ * The fix (`src/routes/openai-front.ts`) does not patch llm-bridge (out of `src/`, out of Scope):
+ * after the for-await loop finishes WITHOUT throwing, `controller.signal.aborted` is the one
+ * signal that survives the swallow. By that point in the walk the attempt's own total-deadline
+ * `timer` has already been cleared (right before `withStallWatchdog` is installed, same as the
+ * Anthropic front), so the only remaining sources of an abort on that controller are this
+ * attempt's OWN stall/crawl watchdog — a client disconnect is caught by `res.destroyed` first, and
+ * `res.destroyed` is checked before the new branch so a disconnect is never misread as a watchdog
+ * abort. When the signal is aborted and the client is still there, the fix routes the outcome
+ * through the SAME `handleMidStreamError` the Anthropic front calls (never a second log-writing
+ * path), passing an inert `() => null` error-frame builder — the client already received
+ * llm-bridge's own in-band error frame, so no duplicate is written; `handleMidStreamError` only
+ * needs to run the health/log classification and close the response.
+ */
+describe("post-commit STALL watchdog on a TRANSLATED stream — the Responses (and Chat) front must log the same verdict as the Anthropic front", () => {
+  const STALL_TIMEOUT_MS = 300;
+
+  /**
+   * A backend that COMMITS with real content, then goes SILENT forever (never another byte,
+   * never `res.end()`) — the sibling of `crawlingBackend` above, but for the STALL watchdog
+   * rather than the crawl one. Always `anthropic`-kind: the Anthropic front reaches it as a
+   * direct passthrough (no llm-bridge layer in between — the GREEN baseline), while the
+   * Responses/Chat fronts reach the SAME backend only through the translated path that swallows
+   * the abort — the apples-to-apples asymmetry the property is about.
+   */
+  function stallingBackend(): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          n++;
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          try {
+            res.write(anthropicFrame("hello stall test"));
+          } catch {
+            // best effort — a client that never reads this far is not this test's concern.
+          }
+          // Never write again and never end: the socket stays open until the relay's own
+          // `stallTimeoutMs` watchdog aborts it, or (in the disconnect test below) the client's
+          // own abort closes it first.
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  const FRONTS = [
+    { name: "Anthropic /v1/messages (GREEN baseline — direct passthrough, no swallow)", path: "/v1/messages" },
+    { name: "OpenAI Responses /v1/responses (RED before the fix — llm-bridge's emitter swallows the abort)", path: "/v1/responses" },
+  ];
+
+  for (const front of FRONTS) {
+    it(`${front.name}: a committed stream the relay's stall watchdog aborts logs status:"committed" and errorKinds:["backend_stream_failed"], the client sees a mid-stream error frame, the breaker charges the first member, and the next request reaches the second`, async () => {
+      const logDir = mkdtempSync(join(tmpdir(), "llm-relay-plog-stall-test-"));
+      const logFile = join(logDir, "log.ndjson");
+      try {
+        const stalling = await stallingBackend();
+        const clean = await cleanBackend("anthropic");
+        const cfg = poolCfg([
+          `http://127.0.0.1:${port(stalling.server)}`,
+          `http://127.0.0.1:${port(clean.server)}`,
+        ], "anthropic");
+        cfg.providers["p1"]!.stallTimeoutMs = STALL_TIMEOUT_MS;
+        cfg.log = { level: "metadata", file: logFile };
+        const p = port(await startProxy(cfg));
+
+        // Seed one prior failure directly on the breaker (identical technique to the crawl
+        // describe block above, and for the same reason): `MAX_FAILURES_BEFORE_TRIP` is 2, so
+        // without a seed the real stall abort below would only be the FIRST consecutive failure
+        // and would not cool the candidate — the retry would stall a second time instead of
+        // proving failover, on EITHER front. This never touches the stalling backend's own
+        // request count.
+        globalCircuitBreaker.recordOutcome(breakerIdentity("p1", "m1", "anthropic"), {
+          ok: false, elapsedMs: 10, status: 500,
+        });
+
+        const first = await send(p, front.path, true);
+        expect(first.status).toBe(200); // headers were already committed before the stall was detected
+        const firstBody = await first.text();
+        // llm-bridge's own swallow (on a translated front) and the relay's own `sseError`/
+        // `openAiSseError` (on the Anthropic front, or once the fix routes through
+        // `handleMidStreamError`) both write an in-band `event: error` — this assertion holds
+        // whether or not the fix has landed, and is part of the property, not the RED/GREEN proof.
+        expect(firstBody).toContain("event: error");
+
+        // THE RED/GREEN ASSERTION: before the fix, the Responses front's `for await` loop never
+        // throws (llm-bridge already closed the stream "normally"), so `completeAttemptSuccess`
+        // runs instead of a breaker failure — `consecutiveFailures` stays at the seeded 1, not 2,
+        // and no cooldown is set. On the Anthropic front (no translation layer) this already
+        // passes today.
+        const state = globalCircuitBreaker.getState(breakerIdentity("p1", "m1", "anthropic"));
+        expect(state?.consecutiveFailures).toBe(2);
+        expect(state?.cooldownUntil).toBeGreaterThan(Date.now());
+
+        // The log row for the aborted attempt carries the SAME status and errorKinds on both
+        // fronts — before the fix, the Responses front instead writes an ordinary success row
+        // with no `errorKinds` at all, which is exactly the backlog's "logs ... a clean
+        // `backendStatus: 200`" symptom.
+        const lines = readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean);
+        const rows = lines.map((line) => JSON.parse(line) as {
+          errorKinds?: string[];
+          attempts?: Array<{ status: unknown }>;
+        });
+        const stallRow = rows.find((r) => r.errorKinds?.includes("backend_stream_failed"));
+        expect(stallRow, JSON.stringify(rows)).toBeDefined();
+        expect(stallRow!.attempts?.[0]?.status).toBe("committed");
+
+        // A later request from the same client reaches the second, healthy candidate — proof the
+        // breaker's charge (not merely the log row) actually steers the walk.
+        const retry = await send(p, front.path, true);
+        expect(retry.status).toBe(200);
+        const retryBody = await retry.text();
+        expect(retryBody).toContain("served clean");
+        expect(retry.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+
+        expect(stalling.calls()).toBe(1);
+        expect(clean.calls()).toBe(1);
+      } finally {
+        rmSync(logDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  // Design item 3: the crawl watchdog's kind must ride the SAME route as the stall kind — reusing
+  // `crawlingBackend`/`cleanBackend`/`CRAWL_SETTINGS` from the item-18 packet's own fixtures
+  // (hoisted to module scope above) rather than re-deriving a second crawling backend. The
+  // Anthropic front is already covered by the describe block above (direct passthrough, no
+  // swallow); the Responses front is the one this packet must prove rides through the fix too.
+  for (const front of FRONTS) {
+    it(`${front.name}: a CRAWL-aborted committed stream also logs errorKinds:["backend_stream_crawl"]`, async () => {
+      const logDir = mkdtempSync(join(tmpdir(), "llm-relay-plog-crawl-test-"));
+      const logFile = join(logDir, "log.ndjson");
+      try {
+        const crawler = await crawlingBackend("anthropic");
+        const clean = await cleanBackend("anthropic");
+        const cfg = poolCfg([
+          `http://127.0.0.1:${port(crawler.server)}`,
+          `http://127.0.0.1:${port(clean.server)}`,
+        ], "anthropic");
+        cfg.routing.crawl = CRAWL_SETTINGS;
+        cfg.log = { level: "metadata", file: logFile };
+        const p = port(await startProxy(cfg));
+
+        globalCircuitBreaker.recordOutcome(breakerIdentity("p1", "m1", "anthropic"), {
+          ok: false, elapsedMs: 10, status: 500,
+        });
+
+        const first = await send(p, front.path, true);
+        expect(first.status).toBe(200);
+        const firstBody = await first.text();
+        expect(firstBody).toContain("relay aborted a crawling stream:");
+
+        const lines = readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean);
+        const rows = lines.map((line) => JSON.parse(line) as { errorKinds?: string[] });
+        const crawlRow = rows.find((r) => r.errorKinds?.includes("backend_stream_crawl"));
+        expect(crawlRow, JSON.stringify(rows)).toBeDefined();
+      } finally {
+        rmSync(logDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  // Design item 4: nothing changes on a client disconnect — it stays `cancelled` and is never
+  // charged to the breaker. Pinned on the Responses front specifically, since the file had no
+  // such case for it before this packet (the existing disconnect test, "does not failover to
+  // subsequent candidates if client socket is destroyed", covers only the Anthropic front).
+  // `stallTimeoutMs` is generous here so the CLIENT's own abort wins the race, never the relay's
+  // own watchdog — this test is not about the watchdog at all.
+  it("OpenAI Responses /v1/responses: a client disconnect after commit is 'cancelled', never charged to the breaker", async () => {
+    const stalling = await stallingBackend();
+    const cfg = poolCfg([`http://127.0.0.1:${port(stalling.server)}`], "anthropic");
+    cfg.providers["p1"]!.stallTimeoutMs = 5000;
+    const p = port(await startProxy(cfg));
+
+    const controller = new AbortController();
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", stream: true, input: "hi" }),
+      signal: controller.signal,
+    });
+    await resp.body?.getReader().read();
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(globalCircuitBreaker.getState(breakerIdentity("p1", "m1", "anthropic"))).toBeUndefined();
+  });
 });

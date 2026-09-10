@@ -77,6 +77,18 @@ function dedupe(xs: string[]): string[] {
   return [...new Set(xs)];
 }
 
+/**
+ * Did THIS attempt's OWN watchdog (stall or crawl) abort the backend fetch, with the client still
+ * connected? A translated stream's `for await` loop over `upstream.body` never throws for such an
+ * abort — see the long comment at the one call site — so `controller.signal.aborted` is read
+ * AFTER that loop finishes normally, and `res.destroyed` is checked first so an ordinary client
+ * disconnect (which also aborts this controller, via `abortOnClientClose`) is never misread as a
+ * watchdog abort.
+ */
+function watchdogAbortedThisAttempt(res: ServerResponse, controller: AbortController): boolean {
+  return !res.destroyed && controller.signal.aborted;
+}
+
 export function detectOpenAiFrontProtocol(method: string | undefined, pathname: string): OpenAiFrontProtocol | null {
   if (method !== "POST") return null;
   if (pathname === "/v1/chat/completions" || pathname === "/chat/completions") return "chat";
@@ -644,9 +656,58 @@ export async function openAiFrontPath(
               if (bytes.length > 0) responseBytesWritten = true;
             }
           }
+          // A TRANSLATED stream (`fetchOpenAiFront`'s Anthropic<->OpenAI/Responses path, i.e. any
+          // target this relay does not pass through byte-for-byte) is built by llm-bridge's own
+          // `emitOpenAIStream`/`emitOpenAIResponsesStream` (`handleUniversalStreamRequest` in
+          // `src/backend.ts`). Both wrap their whole per-event loop in `try { ... } catch (err) {
+          // controller.enqueue(<in-band error frame>) } finally { controller.close() }`, so the
+          // SAME `controller.abort()` that makes the Anthropic front's raw-passthrough stream
+          // THROW (caught below, in the Anthropic front's own `handleMidStreamError` call) is
+          // instead caught INSIDE llm-bridge on a translated stream, turned into an in-band SSE
+          // error frame, and the stream is closed NORMALLY — so the `for await` loop above never
+          // throws, and without this check the request would fall through to
+          // `completeAttemptSuccess` and log a clean `backendStatus: 200` with no `errorKinds`
+          // (the exact symptom this packet's backlog entry names).
+          //
+          // `controller.signal.aborted` is the one signal that survives the swallow. By this point
+          // in the walk the attempt's own total-deadline `timer` has already been cleared (right
+          // before `withStallWatchdog` is installed, a few lines above), so the only remaining
+          // sources of an abort on THIS controller are this attempt's own stall/crawl watchdog — a
+          // client disconnect is caught by `res.destroyed` instead, checked FIRST so a disconnect
+          // is never misread as a watchdog abort. Route the outcome through the SAME classifier
+          // the Anthropic front uses rather than writing a second log-writing path; the
+          // error-frame builder is inert (`() => null`) because the client already received
+          // llm-bridge's own in-band error frame — this call only needs to run the health/log
+          // classification and close the response.
           if (!res.writableEnded) res.end();
-          if (res.destroyed) completeAttemptCancelled(h, attempt, "client disconnected");
-          else {
+          // Folded into the existing three-way outcome decision below (rather than a standalone
+          // `if` ahead of it) so a watchdog abort, a client disconnect, and an ordinary success
+          // are one classification, not two: `handleMidStreamError` still runs the correct
+          // health/log outcome even though `res.end()` already ran just above — its OWN
+          // `endMidStreamFailure` no-ops the (here inert, `() => null`) frame write once
+          // `res.writableEnded` is true, but unconditionally still completes the attempt and
+          // writes the log row, which is all this branch needs.
+          if (watchdogAbortedThisAttempt(res, controller)) {
+            handleMidStreamError(
+              res,
+              new Error("llm-relay: backend stream aborted by the relay's own watchdog"),
+              ctx.started,
+              ctx.path,
+              ctx.hadTools,
+              streamed,
+              upstream.status,
+              target,
+              attempt,
+              h,
+              () => null,
+              reportedModelSource,
+              controller.signal.aborted,
+              responseBytesWritten,
+              controller.signal,
+            );
+          } else if (res.destroyed) {
+            completeAttemptCancelled(h, attempt, "client disconnected");
+          } else {
             completeAttemptSuccess(h, attempt, upstream.status);
             recordStickySuccess(h, ctx.sticky, target, upstream.status);
           }

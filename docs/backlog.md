@@ -55,11 +55,3 @@
   verify it. **Property:** one Codex Desktop `relay` subagent reply carries a `provenance:` line
   (e.g. spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>"
   returns the version and provenance from a dispatch lane).
-
-- **The Responses front logs a mid-stream stall as a clean `backendStatus: 200` with no
-  `errorKinds`, while the Anthropic front logs the same condition as `status: "committed"` plus
-  `errorKinds: ["backend_stream_failed"]`** (observed 2026-09-09 in the four-cell measurement
-  above, cells 2 vs 4; not diagnosed there because it is a relay log question, not a client one).
-  Two fronts, one policy, and the log disagrees about what happened. **Property:** a committed
-  stream that the relay's own watchdog aborts logs the same attempt status and the same
-  `errorKinds` member on both fronts, pinned by one test that drives both.
