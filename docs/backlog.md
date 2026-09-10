@@ -9,6 +9,26 @@
 
 ## Open
 
+- **A pre-commit stream failure names no cause, and the relay keeps no per-request record of it
+  (2026-09-10, C:\Code lap 232d8bef, medium).** A streamed `deepseek/deepseek-flash` request that
+  spent its whole `max_tokens` on reasoning (the V4.1 Flash default before v0.79.0's
+  `compat.reasoning`) answered `502 stream completed without meaningful content`. The real cause —
+  a `length`/`max_tokens` stop with reasoning-only content — was visible only by re-sending the
+  request directly. With `log.file` null (the default) and `/telemetry` carrying no per-request
+  rows, the relay had nothing to diagnose it from. **Property:** a pre-commit empty-stream failure
+  in `stream-commit.ts` names the upstream stop reason when one was sent (for example "the backend
+  stopped at max_tokens after N reasoning tokens and no text"), and that reason reaches the
+  served error and the metadata log.
+
+- **An OpenCode lane that dies on a stream error in its first second stays `running` until its
+  timeout (2026-09-10, C:\Code lap 232d8bef, medium).** Muse Spark job-0017 logged `stream error` in
+  `~/.local/share/opencode/log/opencode.log` in its first second and produced nothing more; the
+  process stayed alive and `dispatch_status` reported `running` for 9+ minutes, until it was
+  cancelled by hand. v0.80.0's process-tree reaping ends the process at the budget but does not
+  shorten the wait. **Property:** a lane that has produced no output and whose harness has stopped
+  making progress is reported as failed well before `timeoutMs`, with the reason, or
+  `dispatch_status` states how long the lane has been silent so the caller can decide.
+
 - **The dispatch walk abandons the only working lane, then tells the agent to stop (2026-09-10,
   live diagnosis, high).** At tier `medium` the walk gives `free-pool` the 90 s `attemptMs` floor:
   its window holds 100 short answer-mode calls (p80 39.5 s), an abandoned run adds no sample so the
