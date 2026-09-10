@@ -2223,3 +2223,42 @@ describe("configStaleness", () => {
     });
   });
 });
+
+/**
+ * A `cli` ladder rung's `maxConcurrent` (backlog item "a per-lane CONCURRENCY cap on cli dispatch
+ * rungs", 2026-09-09) — the most jobs one MCP server process will run against that rung at once.
+ * Parsed by `applyCliMaxConcurrent` in `config/routing-parser.ts`. What the parser is allowed to
+ * SAY is pinned here; what the WALK does with the cap (the skip, its reason, the PARTIAL-vs-
+ * EXHAUSTED advice) is pinned in test/mcp-server.test.ts.
+ */
+describe("routing.ladder — cli rung maxConcurrent", () => {
+  function ladderCfg(maxConcurrent: unknown) {
+    return base({
+      routing: {
+        default: "nim/z-ai/glm-5.2",
+        ladder: [
+          { id: "cli-1", kind: "cli", command: "echo", args: ["{task}"], ...(maxConcurrent === undefined ? {} : { maxConcurrent }) },
+        ],
+      },
+    });
+  }
+
+  it("loads a positive integer and carries it on the parsed rung", () => {
+    const cfg = loadConfig(write("mc-ok.json", ladderCfg(2)));
+    expect(cfg.routing.ladder?.[0]?.maxConcurrent).toBe(2);
+  });
+
+  it("absent stays absent on the parsed rung — unbounded, byte for byte the pre-existing behaviour", () => {
+    const cfg = loadConfig(write("mc-absent.json", ladderCfg(undefined)));
+    expect(cfg.routing.ladder?.[0]?.maxConcurrent).toBeUndefined();
+  });
+
+  it("rejects 0, -1, 1.5 and \"2\" by name, naming the rung id — an ignored typo would read as a cap while bounding nothing", () => {
+    for (const bad of [0, -1, 1.5, "2"]) {
+      expect(
+        () => loadConfig(write(`mc-bad-${String(bad)}.json`, ladderCfg(bad))),
+        `maxConcurrent: ${JSON.stringify(bad)}`,
+      ).toThrow(/routing\.ladder\[0\]\.maxConcurrent must be a positive integer \(rung "cli-1"\)/);
+    }
+  });
+});

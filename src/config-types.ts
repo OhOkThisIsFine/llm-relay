@@ -658,6 +658,19 @@ export interface LadderRung {
    * substituted here — env values are operator-authored routing, not task content.
    */
   env?: Record<string, string | null>;
+  /**
+   * cli rungs: the most jobs this MCP server process will run against THIS rung at once. A
+   * dispatch walk whose turn reaches a rung already at this many spawned processes SKIPS it for
+   * that walk rather than starting a competing one — see `mcp/lane-runner.ts` `LaneJobStore.inFlight`
+   * and `mcp/server.ts`'s walk. Absent means unbounded, which is the byte-for-byte pre-existing
+   * behaviour: nothing here changes for an operator who never sets it.
+   *
+   * ⚠ The count this bounds is per MCP SERVER PROCESS, by construction — the daemon never spawns a
+   * lane, so the only process that knows a lane is running is the one that spawned it. Two host
+   * sessions each running their own `llm-relay mcp` can still together exceed this figure; it bounds
+   * one host's own concurrency, not a machine-wide total.
+   */
+  maxConcurrent?: number;
   /** relay rungs: the spec to address (`pool/<name>`, `<provider>/<model>`, a provider name). */
   spec?: string;
 }

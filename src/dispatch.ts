@@ -141,6 +141,15 @@ export interface DispatchLane {
   /** Shared quota bucket, when the rung declares one. Rungs sharing a bucket go down together. */
   quota?: string;
   note?: string;
+  /**
+   * cli rungs: the configured per-MCP-server-process concurrency cap, or `null` when unbounded.
+   * Set on every `cli` lane (never on a `relay` lane, which has no such config field) so a reader
+   * of the ladder can always see whether one is in force, even before any job has run against it —
+   * the live IN-FLIGHT count is a different question this module cannot answer (only the MCP server
+   * process that would spawn a job knows what it is currently running), so `mcp/server.ts` renders
+   * that count itself alongside this figure rather than this module inventing one.
+   */
+  maxConcurrent?: number | null;
   /** When an exhausted rung becomes eligible again (ISO 8601). */
   readyAt?: string;
   /**
@@ -903,6 +912,11 @@ function toLane(
   if (rung.quota) lane.quota = rung.quota;
   if (rung.note) lane.note = rung.note;
   if (until !== null) lane.readyAt = new Date(until).toISOString();
+  // Rendered even when absent (`null`), so a reader never has to infer "unbounded" from a missing
+  // key. No `rung.kind` branch needed: only a `cli` rung's parser ever sets `rung.maxConcurrent`
+  // (`applyCliMaxConcurrent` in `config/routing-parser.ts`), so it is already `undefined` — and
+  // therefore `null` here — on every `relay` rung.
+  lane.maxConcurrent = rung.maxConcurrent ?? null;
 
   if (rung.kind === "cli" && rung.command && rung.args) {
     lane.invoke = {

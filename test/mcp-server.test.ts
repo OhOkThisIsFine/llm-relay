@@ -8,6 +8,8 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  LANE_LADDER_EXHAUSTED_ADVICE,
+  LANE_LADDER_PARTIAL_ADVICE,
   MCP_INSTRUCTIONS,
   McpDispatchServer,
   type DispatchViewBuilder,
@@ -686,6 +688,167 @@ describe("dispatch_lanes", () => {
     const { text } = await h.tool("dispatch_lanes", {});
     expect(text).toContain("No dispatch ladder is configured");
     expect(text).toContain("routing.ladder");
+  });
+});
+
+/**
+ * A `cli` rung's per-MCP-server-process `maxConcurrent` cap (backlog item "a per-lane CONCURRENCY
+ * cap on cli dispatch rungs", 2026-09-09). What the CONFIG is allowed to say is pinned in
+ * test/config.test.ts; what `buildDispatch` carries onto the view is pinned in test/dispatch.test.ts;
+ * this is the WALK's own behaviour — the skip, its reason, `dispatch_lanes`' `in flight:` line, and
+ * the PARTIAL-vs-EXHAUSTED choice when every remaining lane is capped and busy.
+ */
+describe("maxConcurrent (per-lane concurrency cap)", () => {
+  const WALK = {
+    enabled: true,
+    attemptMs: 30_000, // real-clock; large enough that this test's own timing never trips it
+    attemptQuantile: 0.8,
+    attemptMinSamples: 1000, // no fixture here sets attemptBudget, so this never matters either way
+    maxLanes: 4,
+    pinMs: 60_000,
+    demoteMs: 60_000,
+    outlier: false,
+  };
+
+  function walkConfig(): Config {
+    return { host: "127.0.0.1", port: 8791, routing: { dispatchWalk: WALK } } as unknown as Config;
+  }
+
+  function cliLane(id: string, position: number, maxConcurrent: number | null = null): DispatchLane {
+    return {
+      id,
+      kind: "cli",
+      position,
+      state: "ready",
+      invoke: { command: id, args: ["{task}"] },
+      maxConcurrent,
+    };
+  }
+
+  /** Every command HANGS until explicitly `settle`d, except the ones named in `instant`. */
+  function controllableSpawner(instant: Record<string, LaneRunResult> = {}): LaneSpawner & {
+    calls: string[];
+    settle: (command: string, r: LaneRunResult) => void;
+  } {
+    const calls: string[] = [];
+    const pending: Record<string, (r: LaneRunResult) => void> = {};
+    const fn: LaneSpawner = (command) => {
+      calls.push(command);
+      const fixed = instant[command];
+      if (fixed) return { result: Promise.resolve(fixed), kill: () => {} };
+      const result = new Promise<LaneRunResult>((resolve) => {
+        pending[command] = resolve;
+      });
+      return {
+        result,
+        kill: () => pending[command]?.({ code: null, stdout: "", stderr: "killed", timedOut: false }),
+      };
+    };
+    return Object.assign(fn, {
+      calls,
+      settle: (command: string, r: LaneRunResult) => pending[command]?.(r),
+    });
+  }
+
+  /** Poll `dispatch_status` on real timers until the job leaves `notStatus`, or throw. */
+  async function waitForJobStatus(
+    h: Harness,
+    jobId: string,
+    notStatus: string,
+    timeoutMs = 3000,
+  ): Promise<{ text: string; isError: boolean }> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const r = await h.tool("dispatch_status", { jobId });
+      if (!r.text.includes(`status: ${notStatus}`)) return r;
+      if (Date.now() > deadline) throw new Error(`job ${jobId} still ${notStatus} after ${timeoutMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  it("skips a lane already at its cap, runs the next lane, shows it on dispatch_lanes, and reuses the freed lane once its job settles", async () => {
+    const laneA = cliLane("A", 1, 1);
+    const laneB = cliLane("B", 2);
+    const v = view({ ladder: [laneA, laneB], order: ["A", "B"], next: laneA });
+    const spawn = controllableSpawner({ B: { code: 0, stdout: "B answered", stderr: "", timedOut: false } });
+    const h = new Harness({ config: walkConfig(), buildView: async () => v, spawn });
+
+    // Dispatch #1 takes lane A. A never settles on its own, so a short waitMs is the only way to
+    // get a job handle back rather than waiting out the real ceiling.
+    const started1 = await h.tool("dispatch", { task: "t1", waitMs: 20 });
+    expect(started1.text).toContain("status: running");
+    const jobId1 = /job: (job-\d+)/.exec(started1.text)?.[1];
+    expect(jobId1).toBeDefined();
+
+    // Dispatch #2: A is at its maxConcurrent (1 in flight from job 1), so it SKIPS A and runs B.
+    const dispatched2 = await h.tool("dispatch", { task: "t2" });
+    expect(dispatched2.isError).toBe(false);
+    expect(dispatched2.text).toContain("B answered");
+    expect(dispatched2.text).toContain('lane "A" is at its maxConcurrent (1 in flight)');
+
+    // dispatch_lanes shows the live count beside the cap for A, and nothing extra for uncapped B
+    // (job 2's own B attempt already settled, so B's own in-flight count is back to 0).
+    const lanesView = await h.tool("dispatch_lanes", {});
+    expect(lanesView.text).toContain("in flight: 1 of 1");
+    expect(lanesView.text).not.toMatch(/2\. B.*in flight/);
+
+    // Release job 1's lane A. Once it settles, a third dispatch reaches A again — the cap freed up.
+    spawn.settle("A", { code: 0, stdout: "A finally answered", stderr: "", timedOut: false });
+    await waitForJobStatus(h, jobId1 as string, "running");
+    const result1 = await h.tool("dispatch_result", { jobId: jobId1 as string });
+    expect(result1.text).toContain("A finally answered");
+    expect(result1.text).toContain("status: completed");
+
+    const started3 = await h.tool("dispatch", { task: "t3", waitMs: 20 });
+    expect(started3.text).toContain("status: running");
+    expect(spawn.calls.filter((c) => c === "A")).toHaveLength(2);
+
+    // Clean up the still-hanging third attempt on A so nothing is left running past the test.
+    spawn.settle("A", { code: 0, stdout: "done", stderr: "", timedOut: false });
+  });
+
+  it("every remaining lane capped and busy: PARTIAL advice, never EXHAUSTED, and no telemetry for a skip", async () => {
+    const laneA = cliLane("A", 1, 1);
+    const laneB = cliLane("B", 2, 1);
+    const v = view({ ladder: [laneA, laneB], order: ["A", "B"], next: laneA });
+    const spawn = controllableSpawner(); // both A and B hang until released — never released here
+    const reports: unknown[] = [];
+    const h = new Harness({
+      config: walkConfig(),
+      buildView: async () => v,
+      spawn,
+      reportTelemetry: async (r) => {
+        reports.push(r);
+      },
+    });
+
+    // Job 1 occupies A, job 2 occupies B — both hang, both never settle in this test.
+    await h.tool("dispatch", { task: "t1", waitMs: 20 });
+    await h.tool("dispatch", { task: "t2", waitMs: 20 });
+
+    // Job 3: A is capped and busy, B is capped and busy. Both SKIP; nothing to try at all.
+    const dispatched3 = await h.tool("dispatch", { task: "t3" });
+    expect(dispatched3.isError).toBe(true);
+    expect(dispatched3.text).toContain('lane "A" is at its maxConcurrent (1 in flight)');
+    expect(dispatched3.text).toContain('lane "B" is at its maxConcurrent (1 in flight)');
+    expect(dispatched3.text).toContain(LANE_LADDER_PARTIAL_ADVICE);
+    expect(dispatched3.text).not.toContain(LANE_LADDER_EXHAUSTED_ADVICE);
+
+    // Nothing ran, so nothing is reported: not job 1 or 2 (still hanging, never settled) and not
+    // job 3's two skips (skipping is not running).
+    expect(reports).toHaveLength(0);
+  });
+
+  it("with no maxConcurrent configured anywhere, the walk never skips and nothing new renders", async () => {
+    const spawn = fakeSpawner({ code: 0, stdout: "ordinary answer", stderr: "", timedOut: false });
+    const h = new Harness({ spawn });
+    const dispatched = await h.tool("dispatch", { task: "t" });
+    expect(dispatched.isError).toBe(false);
+    expect(dispatched.text).not.toContain("maxConcurrent");
+    expect(dispatched.text).not.toContain("in flight");
+    const lanesView = await h.tool("dispatch_lanes", {});
+    expect(lanesView.text).not.toContain("maxConcurrent");
+    expect(lanesView.text).not.toContain("in flight");
   });
 });
 

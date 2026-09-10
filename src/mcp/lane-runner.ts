@@ -107,19 +107,70 @@ export interface RelayAnnouncements {
 }
 
 /**
+ * "skipped" — a rung the walk never started at all, because it was already at its configured
+ * `maxConcurrent` cap when its turn in the ladder came (backlog item "a per-lane CONCURRENCY cap
+ * on cli dispatch rungs", 2026-09-09).
+ *
+ * ⚠ Deliberately NOT a member of `DispatchLaneStatus`. That type is what a settled RUN is reported
+ * to the daemon as (`DispatchedTelemetryReport.status`, validated by `routes/admin.ts`'s pin/demote
+ * and failure-kind total tables, and folded into `dispatch-lane-stats.json`'s wall-clock window by
+ * `recordLaneRun`), and a skipped rung never ran — "spawn nothing … report no telemetry for it,
+ * nothing ran" is the brief's whole point. Widening the REPORTED vocabulary to include a state
+ * nothing ever reports would be exactly the closed-union defect CLAUDE.md warns about: a member
+ * reachable only in theory, decided nowhere real.
+ */
+export const SKIPPED_LANE_STATUS = "skipped" as const;
+
+/**
+ * Every state one WALK ATTEMPT can end in — `LaneAttempt.status`'s own closed union, strictly wider
+ * than `DispatchLaneStatus` by the one member above. The two unions describe different questions
+ * (this one is "what happened to this attempt in THIS job's record"; `DispatchLaneStatus` is "what
+ * does the daemon's persisted lane history say"), so they are two types on purpose rather than one
+ * reused for both.
+ */
+export type LaneAttemptStatus = DispatchLaneStatus | typeof SKIPPED_LANE_STATUS;
+
+/**
+ * Did this attempt actually run a lane, or was it skipped before any process started? Total over
+ * `LaneAttemptStatus` (`const _never: never` below), so a future member — whether added here or
+ * inherited from a `DispatchLaneStatus` that grows — is a compile error at this switch rather than
+ * a silent "counts as tried" default (the closed-union gotcha in CLAUDE.md). `mcp/server.ts` uses
+ * it to keep a walk's terminal "N tried" message honest when every remaining lane was capped rather
+ * than actually attempted — a skipped rung "counts as NOT TRIED" per the backlog item's own wording.
+ */
+export function attemptWasTried(status: LaneAttemptStatus): boolean {
+  switch (status) {
+    case "completed":
+    case "failed":
+    case "timed_out":
+    case "abandoned":
+      return true;
+    case SKIPPED_LANE_STATUS:
+      return false;
+    default: {
+      const _never: never = status;
+      return _never;
+    }
+  }
+}
+
+/**
  * One lane a dispatch WALK tried, in the order it tried them.
  *
- * ⚠ Its `status` is a `DispatchLaneStatus`, IMPORTED rather than restated. Two hand-written copies
- * of one closed set is the most-repeated defect in this repository's history, and here the type
- * additionally buys a guarantee: that union has no `cancelled` member, so "a caller cancellation is
- * never reported as lane evidence" becomes a property the compiler enforces at every call site
- * rather than a runtime check somebody can forget.
+ * ⚠ Its `status` is a `LaneAttemptStatus`, IMPORTED rather than restated — see that type's own
+ * doc comment for why it is not simply `DispatchLaneStatus`. Two hand-written copies of one closed
+ * set is the most-repeated defect in this repository's history, and here the type additionally buys
+ * a guarantee: that union has no `cancelled` member, so "a caller cancellation is never reported as
+ * lane evidence" becomes a property the compiler enforces at every call site rather than a runtime
+ * check somebody can forget.
  */
 export interface LaneAttempt {
   laneId: string;
   spec: string | undefined;
-  status: DispatchLaneStatus;
-  /** Wall clock for THIS attempt, not for the walk. */
+  status: LaneAttemptStatus;
+  /** Wall clock for THIS attempt, not for the walk. Always 0 for a `"skipped"` attempt — nothing
+   *  ran, so there is no duration to report, the same rule an `"abandoned"` run's OWN duration
+   *  is withheld from `dispatch-lane-stats.ts`'s persisted window for. */
   elapsedMs: number;
   /** Why the attempt ended this way, when it did not succeed. */
   reason?: string;
@@ -650,6 +701,46 @@ export class LaneJobStore {
     if (!job) return;
     job.walkEnabled = scope.enabled;
     if (scope.lanesNotTried > 0) job.lanesNotTried = scope.lanesNotTried;
+  }
+
+  /**
+   * A rung the walk SKIPPED for its `maxConcurrent` cap "counts as NOT TRIED" (the backlog item's
+   * own wording), so it grows the same counter `noteWalkScope`'s `maxLanes` bound uses — one caller
+   * before the walk starts (a fixed bound known in advance), this one during it (a skip discovered
+   * lane by lane) — so `jobAnswer` cannot tell them apart and always prefers the PARTIAL advice over
+   * the EXHAUSTED one whenever anything was left untried, whichever reason left it untried.
+   */
+  noteSkippedLane(id: string): void {
+    const job = this.jobs.get(id);
+    if (!job) return;
+    job.lanesNotTried = (job.lanesNotTried ?? 0) + 1;
+  }
+
+  /**
+   * How many jobs THIS MCP server process currently has a spawned process running for `laneId` —
+   * the job's CURRENT attempt (`job.laneId`, repointed by `setCurrentLane` as the walk advances
+   * from lane to lane), never its history. A job counts only while `status === "running"`: the
+   * moment an attempt settles (or the whole job ends), it stops occupying a slot.
+   *
+   * ⚠ `excludeJobId` matters, and omitting it is a real bug, not a cosmetic nicety: `create()` sets
+   * a fresh job's `laneId` to its FIRST candidate lane at CREATION, before the walk has attempted
+   * anything — so a walk asking "is my own first lane already at its cap?" would count ITSELF and
+   * skip its own opening attempt, on every dispatch, the moment any `maxConcurrent` is configured.
+   * Passing the asking job's own id excludes it, so this answers "how many OTHER jobs are running
+   * this lane right now" — the question a skip check actually needs.
+   *
+   * ⚠ Per-process by construction, and that is the whole design, not a limitation to work around:
+   * the daemon never spawns a lane, so the only process that ever knows a `cli` rung's process is
+   * running is the one that spawned it. Two host sessions each running their own `llm-relay mcp`
+   * can together exceed a rung's `maxConcurrent` — this bounds one host's own concurrency, and
+   * `docs/reference.md` says so rather than implying a machine-wide guarantee this cannot make.
+   */
+  inFlight(laneId: string, excludeJobId?: string): number {
+    let count = 0;
+    for (const job of this.jobs.values()) {
+      if (job.status === "running" && job.laneId === laneId && job.id !== excludeJobId) count++;
+    }
+    return count;
   }
 
   get(id: string): LaneJob | undefined {

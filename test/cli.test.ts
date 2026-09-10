@@ -819,6 +819,39 @@ describe("llm-relay dispatch — printed ladder", () => {
     expect(printed).toMatch(/quoted for (PowerShell 7\+ \(pwsh\)|sh\/bash)/);
   });
 
+  /**
+   * `maxConcurrent` (backlog item "a per-lane CONCURRENCY cap on cli dispatch rungs", 2026-09-09).
+   * This process is the CLI, never the MCP server that would spawn a job for the rung, so it
+   * renders the configured cap alone — no live in-flight count (that is `dispatch_lanes`' job).
+   */
+  it("renders maxConcurrent from config alone, with no live in-flight count", async () => {
+    const cfgPath = join(dir, "config-maxconcurrent.json");
+    writeFileSync(cfgPath, JSON.stringify({
+      ...CONFIG,
+      routing: {
+        ...CONFIG.routing,
+        ladder: [
+          { id: "agy-gemini", kind: "cli", command: "agy", args: ["-p", "{task}", "--model", "g-flash"], maxConcurrent: 2 },
+        ],
+      },
+    }, null, 2));
+
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("no proxy in tests"));
+    process.argv = ["node", "cli.ts", "dispatch", "--config", cfgPath, "--task", "x"];
+
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+
+    await runDispatch(undefined);
+    const printed = out.join("");
+    expect(printed).toContain("maxConcurrent: 2");
+    // The CLI has no live count to add — that is `dispatch_lanes`' surface, not this one's.
+    expect(printed).not.toContain("in flight");
+  });
+
   const dispatchCfgPath = join(dir, "dispatch-test-config.json");
   writeFileSync(dispatchCfgPath, JSON.stringify({
     ...CONFIG,

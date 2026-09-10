@@ -146,6 +146,46 @@ describe("dispatch ladder — cli rung env", () => {
   });
 });
 
+/**
+ * `DispatchLane.maxConcurrent` (backlog item "a per-lane CONCURRENCY cap on cli dispatch rungs",
+ * 2026-09-09) — the config-declared cap carried onto the VIEW so a reader can see it before any
+ * job has run against the rung. What the WALK does with it (the skip, the reason, the rendered
+ * `in flight:` count) is pinned in test/mcp-server.test.ts; this is only about what `toLane`
+ * carries onto `DispatchLane` from `LadderRung`.
+ */
+describe("dispatch ladder — maxConcurrent on the view", () => {
+  it("carries a configured cap onto the lane", () => {
+    const view = buildDispatch(cfgWith({ ladder: [{ id: "capped", kind: "cli", command: "agy", args: ["{task}"], maxConcurrent: 2 }] }));
+    expect(view.next?.maxConcurrent).toBe(2);
+    expect(view.ladder[0]?.maxConcurrent).toBe(2);
+  });
+
+  it("is null on the view when unconfigured — unbounded, byte for byte the pre-existing behaviour", () => {
+    const view = buildDispatch(cfgWith({ ladder: [{ id: "uncapped", kind: "cli", command: "agy", args: ["{task}"] }] }));
+    expect(view.next?.maxConcurrent).toBeNull();
+  });
+
+  it("is null on a relay lane, which has no such config field", () => {
+    const view = buildDispatch(cfgWith({ ladder: [{ id: "r", kind: "relay", spec: "anthropic" }] }));
+    expect(view.next?.maxConcurrent).toBeNull();
+  });
+
+  it("with no maxConcurrent anywhere in the ladder, every lane's rendering is byte-for-byte unchanged", () => {
+    // Pins design note 3: default unbounded must not alter what an operator sees when they never
+    // touch this feature. Two uncapped cli rungs plus a relay rung, none of them at any risk of a
+    // skip — this is the config-load half of that guarantee; the walk half (no skip record) is
+    // pinned in test/mcp-server.test.ts.
+    const view = buildDispatch(cfgWith({
+      ladder: [
+        { id: "a", kind: "cli", command: "agy", args: ["{task}"] },
+        { id: "b", kind: "cli", command: "codex", args: ["exec", "{task}"] },
+        { id: "c", kind: "relay", spec: "anthropic" },
+      ],
+    }));
+    for (const lane of view.ladder) expect(lane.maxConcurrent).toBeNull();
+  });
+});
+
 describe("dispatch ladder — ordering", () => {
   it("selects tier-specific ladders and infers coding from the default subagent pool", () => {
     const ladders = {
@@ -387,11 +427,13 @@ describe("dispatch ladder — order, never execution", () => {
     // rendering defect the audit is removing — the task must stay inside one argv element.
     const view = buildDispatch(cfgWith({ ladder: LADDER }), { task: "rm -rf /; echo $(whoami)" });
     const lane = view.next!;
-    // `attemptBudget` joined the shape on 2026-09-08 (the walk's per-lane budget). The guarantee
-    // this test exists for is the two assertions BELOW — the task stays inside one argv element and
-    // no field carries a pre-joined command line — so a new structured field is an update, not a
-    // weakening. Keep the exact-key list: it is what would catch a convenience "commandLine" string.
-    expect(Object.keys(lane).sort()).toEqual(["attemptBudget", "id", "invoke", "kind", "position", "quota", "state"]);
+    // `attemptBudget` joined the shape on 2026-09-08 (the walk's per-lane budget); `maxConcurrent`
+    // joined it on 2026-09-09 (the per-lane concurrency cap, rendered even when `null`). The
+    // guarantee this test exists for is the two assertions BELOW — the task stays inside one argv
+    // element and no field carries a pre-joined command line — so a new structured field is an
+    // update, not a weakening. Keep the exact-key list: it is what would catch a convenience
+    // "commandLine" string.
+    expect(Object.keys(lane).sort()).toEqual(["attemptBudget", "id", "invoke", "kind", "maxConcurrent", "position", "quota", "state"]);
     expect(lane.invoke?.args).toEqual(["-p", "rm -rf /; echo $(whoami)", "--model", "g-flash"]);
     for (const value of Object.values(view)) {
       expect(typeof value === "string" ? value : "").not.toContain("rm -rf /;");

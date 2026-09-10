@@ -1023,6 +1023,30 @@ function parseCliLane(raw: unknown, root: string): CliLaneTemplate | undefined {
 }
 
 /**
+ * Validate and apply a `cli` rung's `maxConcurrent` — the most jobs one MCP server process will
+ * run against this rung at once (`mcp/lane-runner.ts` `LaneJobStore.inFlight`; backlog item "a
+ * per-lane CONCURRENCY cap on cli dispatch rungs"). Absent leaves `rung.maxConcurrent` unset,
+ * meaning unbounded — the byte-for-byte pre-existing behaviour. A positive integer is the only
+ * other legal shape: the `compat`/`configured-limits` precedent — an ignored typo (`0`, a negative
+ * number, a fraction, a quoted `"2"`) would read as a cap while bounding nothing, so it is a hard
+ * load error naming both the key and the rung id rather than a silent no-op.
+ *
+ * Extracted from `parseLadder` — and MUTATING rather than returning, so the call site is one bare
+ * statement with no conditional of its own — because that function already carries the sonarjs
+ * cognitive-complexity warning CLAUDE.md records as accepted and out of scope for this repository's
+ * one approved refactor (parseOffload/parseLadder were explicitly left untouched); a returned value
+ * would need an `if` at the call site to decide whether to assign it, raising the very score this
+ * shape exists to leave alone.
+ */
+function applyCliMaxConcurrent(rung: LadderRung, raw: unknown, where: string, id: string): void {
+  if (raw === undefined) return;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
+    throw new Error(`${where}.maxConcurrent must be a positive integer (rung "${id}")`);
+  }
+  rung.maxConcurrent = raw;
+}
+
+/**
  * Validate `routing.ladder` at load, not at request time — a ladder whose rung cannot be invoked
  * is a configuration mistake, and discovering it only when the host is mid-fallback is exactly
  * when it is least useful. Absent/empty is legal and simply means "no opinion".
@@ -1069,6 +1093,7 @@ function parseLadder(raw: unknown, root: string): LadderRung[] {
       rung.args = args;
       const env = parseSpawnEnv(e.env, where);
       if (env) rung.env = env;
+      applyCliMaxConcurrent(rung, e.maxConcurrent, where, id);
     } else {
       if (typeof e.spec !== "string" || e.spec.length === 0) {
         throw new Error(`${where}.spec must be a non-empty string for a "relay" rung`);

@@ -34,6 +34,8 @@ import {
   DEPTH_ENV,
   EMPTY_OUTPUT_REASON,
   LaneJobStore,
+  SKIPPED_LANE_STATUS,
+  attemptWasTried,
   classifyDispatchedResult,
   classifyLaneAttempt,
   checkCwd,
@@ -601,7 +603,16 @@ function applyLaneEnv(base: NodeJS.ProcessEnv, deltas: Record<string, string | n
   return env;
 }
 
-function laneSummary(lane: DispatchLane): string {
+/**
+ * `inFlight` is THIS MCP server process's own live count for `lane.id` (`LaneJobStore.inFlight`) —
+ * a caller-supplied number, never read here, because only the process that could spawn a job knows
+ * what it is currently running. Rendered beside the attempt budget: `in flight: <n> of <max>` for a
+ * capped rung (always, even at 0, so an operator sees the cap is configured before it ever binds),
+ * and `in flight: <n>` for an uncapped one ONLY when `n > 0` — an uncapped rung with nothing running
+ * renders exactly as it did before this field existed, which is the "byte-for-byte unchanged with
+ * no maxConcurrent configured" guarantee made visible in the rendering, not just in the data.
+ */
+function laneSummary(lane: DispatchLane, inFlight: number): string {
   const bits = [`${lane.position}. ${lane.id}`, `[${lane.state}]`];
   if (lane.spec) bits.push(lane.spec);
   if (lane.readyAt) bits.push(`ready ${lane.readyAt}`);
@@ -611,6 +622,11 @@ function laneSummary(lane: DispatchLane): string {
   // The routing memory from previous walks, on the lane rather than only in the selection reason —
   // an operator reading `dispatch_lanes` to understand an unexpected order needs to see it here.
   if (lane.attemptBudget) bits.push(formatAttemptBudget(lane.attemptBudget));
+  if (lane.maxConcurrent !== null && lane.maxConcurrent !== undefined) {
+    bits.push(`in flight: ${inFlight} of ${lane.maxConcurrent}`);
+  } else if (inFlight > 0) {
+    bits.push(`in flight: ${inFlight}`);
+  }
   if (lane.pinned) bits.push(`pinned until ${lane.pinned.until} (${lane.pinned.reason})`);
   if (lane.demoted) bits.push(`demoted until ${lane.demoted.until} (${lane.demoted.reason})`);
   // Advisory only: a rung that never ran here carries no `stats` and renders as before.
@@ -781,7 +797,7 @@ export class McpDispatchServer {
           "Add rungs under routing.ladder (or routing.ladders.<tier>) in the relay config.",
       );
     }
-    const lines = view.ladder.map(laneSummary);
+    const lines = view.ladder.map((l) => laneSummary(l, this.jobs.inFlight(l.id)));
     const next = view.next ? `\n\nnext: ${view.next.id} — ${view.reason}` : `\n\nnext: none — ${view.reason}`;
     return textResult(`tier: ${view.tier ?? "default"}\n\n${lines.join("\n")}${next}`);
   }
@@ -928,6 +944,11 @@ export class McpDispatchServer {
       const laneId = laneIds[i];
       const lane = laneId === undefined ? undefined : view.ladder.find((l) => l.id === laneId);
       if (lane === undefined) continue;
+
+      // ⚠ Checked BEFORE `setCurrentLane`/`runOneLane`, so nothing has been spawned for THIS
+      // attempt yet and a rung can never count against its own cap.
+      if (this.skipIfAtConcurrencyCap(jobId, lane)) continue;
+
       this.jobs.setCurrentLane(jobId, lane.id, lane.spec);
 
       // ⚠ The LAST lane gets NO attempt budget. The budget exists to move on; with nowhere to move
@@ -991,20 +1012,53 @@ export class McpDispatchServer {
       }
     }
     // Reached only when the selection order named ids the ladder does not hold — a view and a
-    // ladder that disagree, which a stale local fallback can produce. Report it rather than
-    // returning a job that silently never ran anything.
+    // ladder that disagree, which a stale local fallback can produce — OR when every remaining
+    // lane was SKIPPED for its maxConcurrent cap. Report it rather than returning a job that
+    // silently never ran anything.
     //
-    // ⚠ The message distinguishes the two cases, because the first wording would otherwise LIE
-    // about a walk that did run lanes: with any attempt recorded, "no lane matched" is false and
-    // would send the reader looking for a configuration fault that is not there.
-    const ran = this.jobs.get(jobId)?.attempts.length ?? 0;
+    // ⚠ The message distinguishes three cases, because the first two would otherwise LIE about
+    // what happened: with any TRIED attempt recorded, "no lane matched" is false and sends the
+    // reader looking for a configuration fault that is not there; and with every recorded attempt
+    // a SKIP, "the ladder no longer holds the remaining lanes" is false too — the ladder holds them
+    // fine, they were simply all busy. `attemptWasTried` is the one place that distinction lives.
+    const attempts = this.jobs.get(jobId)?.attempts ?? [];
+    const ran = attempts.filter((a) => attemptWasTried(a.status)).length;
+    const allSkipped = attempts.length > 0 && ran === 0;
     this.jobs.fail(
       jobId,
-      ran === 0
-        ? "no lane in the dispatch ladder matched the selection order"
-        : `no lane answered, and the ladder no longer holds the remaining lanes in the selection order (${ran} tried)`,
+      allSkipped
+        ? "every remaining lane in the selection order is at its maxConcurrent cap"
+        : ran === 0
+          ? "no lane in the dispatch ladder matched the selection order"
+          : `no lane answered, and the ladder no longer holds the remaining lanes in the selection order (${ran} tried)`,
     );
     return "done";
+  }
+
+  /**
+   * A `cli` rung whose configured `maxConcurrent` this MCP server process has already reached for
+   * — SKIP it for this walk rather than starting a competing process. Records the skip as an
+   * attempt (so the walk's own "lanes tried" rendering shows it) and grows `lanesNotTried` (so a
+   * walk that skips everything reports the PARTIAL advice, never the EXHAUSTED one — a skipped
+   * rung "counts as NOT TRIED", not as a lane that ran and failed). Spawns nothing, demotes
+   * nothing: no telemetry is forwarded for a skip, so `lane-affinity.ts` never hears about it.
+   *
+   * Only `cli` rungs carry a `maxConcurrent` at all (`dispatch.ts` `toLane`) — a `relay` lane's is
+   * always `null`, so this returns `false` for one without needing a `kind` check of its own.
+   */
+  private skipIfAtConcurrencyCap(jobId: string, lane: DispatchLane): boolean {
+    if (lane.maxConcurrent === null || lane.maxConcurrent === undefined) return false;
+    const inFlight = this.jobs.inFlight(lane.id, jobId);
+    if (inFlight < lane.maxConcurrent) return false;
+    this.jobs.recordAttempt(jobId, {
+      laneId: lane.id,
+      spec: lane.spec,
+      status: SKIPPED_LANE_STATUS,
+      elapsedMs: 0,
+      reason: `lane "${lane.id}" is at its maxConcurrent (${inFlight} in flight)`,
+    });
+    this.jobs.noteSkippedLane(jobId);
+    return true;
   }
 
   /**

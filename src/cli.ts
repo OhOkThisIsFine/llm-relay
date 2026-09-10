@@ -2935,6 +2935,12 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     // because the reason names one lane while the reordering it caused affects the whole list —
     // an operator seeing rung 3 tried first must be able to see WHY without inferring it.
     if (l.attemptBudget) process.stdout.write(`   ${formatAttemptBudget(l.attemptBudget)}\n`);
+    // Config alone — this process is not the MCP server that would spawn a job for this rung, so
+    // it has no live in-flight count to add beside it (see `LaneJobStore.inFlight`, per-process by
+    // construction). `dispatch_lanes` is where the live count renders.
+    if (l.maxConcurrent !== null && l.maxConcurrent !== undefined) {
+      process.stdout.write(`   maxConcurrent: ${l.maxConcurrent}\n`);
+    }
     if (l.pinned) process.stdout.write(`   pinned until ${l.pinned.until} (${l.pinned.reason})\n`);
     if (l.demoted) process.stdout.write(`   demoted until ${l.demoted.until} (${l.demoted.reason})\n`);
     // Advisory execution stats, same wording as `dispatch_lanes`. A rung that never ran here

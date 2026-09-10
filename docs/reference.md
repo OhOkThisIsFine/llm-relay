@@ -1589,6 +1589,33 @@ sh, `$env:`/`Remove-Item Env:` statements for PowerShell). This is what makes a 
 }
 ```
 
+#### Per-lane concurrency cap (`maxConcurrent`)
+
+A `cli` rung may also declare `maxConcurrent`, a positive integer: the most jobs this MCP server
+process will run against that rung at once. A dispatch WALK whose turn reaches a rung already at
+this many spawned processes SKIPS it for that walk — no process is started, nothing is demoted —
+and records the skip with the reason `lane "<id>" is at its maxConcurrent (<n> in flight)`. A
+skipped rung counts as NOT TRIED, so if every remaining lane is skipped the caller gets the same
+"lanes remain, call dispatch again" PARTIAL advice a `maxLanes` cutoff gives, never the "every lane
+has been tried" EXHAUSTED one.
+
+```jsonc
+{ "id": "opencode-muse-spark", "kind": "cli", "command": "opencode", "args": ["run", "{task}"], "maxConcurrent": 1 }
+```
+
+`dispatch_lanes` shows the live count beside the budget line — `in flight: 1 of 1` for a capped
+rung (always, even at 0, so the cap is visible before it ever binds), `in flight: <n>` for an
+uncapped one only when something is actually running. `llm-relay dispatch` shows `maxConcurrent:
+<n>` from config alone; that CLI process is not the one that would spawn a job for this rung, so it
+has no live count to add. Absent means unbounded — the pre-existing behaviour, byte for byte.
+
+⚠ **The count is per MCP SERVER PROCESS, not per machine.** The daemon never spawns a lane, so the
+only process that ever knows one of this rung's jobs is running is the `llm-relay mcp` process that
+spawned it — each host session (Claude Code, Codex, a second terminal) runs its own. Two host
+sessions can therefore each run up to `maxConcurrent` jobs against the same rung at the same time,
+for up to `2 × maxConcurrent` together; this is the stated limit of what one process can observe,
+not a claim about the rung's real-world concurrency everywhere it might be dispatched from.
+
 #### Host-adaptive lanes (`routing.cliLane`)
 
 `llm-relay dispatch` is meant to be the **one verb** a host agent uses, whatever harness it runs

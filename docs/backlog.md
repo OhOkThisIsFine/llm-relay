@@ -63,14 +63,3 @@
   Two fronts, one policy, and the log disagrees about what happened. **Property:** a committed
   stream that the relay's own watchdog aborts logs the same attempt status and the same
   `errorKinds` member on both fronts, pinned by one test that drives both.
-
-- **The dispatch walk has no per-lane CONCURRENCY cap, and `opencode-muse-spark` starves at three
-  lanes** (measured 2026-09-09: six fresh packets finished in 101–998 s while one or two ran on that
-  lane; three concurrent lanes each wrote nothing for 10–15 minutes and were cancelled by hand —
-  the 2026-09-05 683 s no-answer probe was the same lane at the same load). Nothing in
-  `dispatch.ts` or `mcp/server.ts` counts the jobs already running on a `cli` rung, so a caller
-  that dispatches a third packet gets a lane that will answer none of them, and the walk budget
-  (a p80 near 1400 s there) means it waits the whole ceiling before moving. **Property:** a `cli`
-  rung may declare `maxConcurrent` (default unbounded, so nothing changes until an operator sets
-  it); a dispatch that would exceed it skips that rung for THIS walk with a stated reason, and
-  `dispatch_lanes` shows the count in flight beside the budget.
