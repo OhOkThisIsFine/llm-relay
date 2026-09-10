@@ -1,4 +1,4 @@
-import type { Config, ProviderTierType } from "./config.js";
+import { configStaleness, type Config, type ConfigStalenessReport, type ProviderTierType } from "./config.js";
 import type { CircuitBreaker, CircuitState } from "./circuit-breaker.js";
 import type { WriterHealth } from "./dashboard-contract.js";
 import { aggregateHasKey } from "./credential-fleet.js";
@@ -39,6 +39,10 @@ export interface TelemetryReport {
    * programmatic proxy): unknown stays null, never a fabricated state.
    */
   accounting: WriterHealth | null;
+  /** Does the config file on disk still match what this process loaded? See `configStaleness()`
+   *  in config.ts — the relay does not hot-reload, so this is how an operator (or the CLI's own
+   *  stderr notice) finds out an edit has not taken effect. */
+  config: ConfigStalenessReport;
 }
 
 type StoredCircuitState = CircuitState & { readonly target: ProviderTargetIdentity };
@@ -162,5 +166,6 @@ export function getTelemetryReport(
     providers,
     routingTiers: cfg.routing.tiers,
     accounting,
+    config: configStaleness(cfg),
   };
 }

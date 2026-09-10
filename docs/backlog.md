@@ -27,36 +27,6 @@
   assistant message byte-for-byte and never fabricated when absent, pinned on ≥2 candidates, with
   every other provider's outbound bytes unchanged.
 
-- **A config change needs a full daemon restart, and the shape of the server makes that avoidable
-  (2026-09-09, DeepSeek provider survey, low).** `runProxy` calls `loadOrExit()` once and captures
-  `cfg` in the `createServer` closure; every request then receives it as `handle(req, res, cfg,
-  …)`. So the per-request read is already indirect — swapping one binding would move every
-  SUBSEQUENT request onto a new config while in-flight requests keep the one they started with.
-  `loadConfigSafely()` in `src/cli.ts` is already the exact primitive (it returns `null` instead
-  of exiting on an unreadable file), and today only the dispatch CLI path calls it.
-  ⚠ **The work is not the swap; it is deciding which startup-built objects must be rebuilt.**
-  `catalog`, `pingLoop`, `breaker`, `credentialLru`, `dashboardAuth`, `dashboardStatic` and the
-  validator are all constructed once from `cfg`. A naive assignment leaves them keyed to the old
-  providers. The listen address cannot change at all without rebinding.
-  ⚠ **A reload can never pick up a new OS environment variable.** A running process holds the
-  environment block it was given. `~/.llm-relay/.env` and the DPAPI keystore ARE files, so a
-  reload does cover a new credential written to either of those.
-  Measured on 2026-09-09: raising `providers.nim.timeoutMs` from 100000 to 300000 had no effect
-  until the daemon was restarted — a probe after the edit still aborted at exactly 100.04 s.
-  **Property:** an operator edit to `~/.llm-relay/config.json` takes effect on the next request
-  without a restart, or the relay states clearly that it will not; a malformed edit leaves the
-  running config untouched and logs the parse failure.
-
-- **The logon-started daemon is stopped by `TerminateProcess`, so no shutdown flush ever runs on
-  this machine (2026-09-08, breaker-persistence lap, low).** `flushBreakerPersistence` and its
-  siblings run in `runProxy` only when a signal is delivered; `Startup\llm-relay.vbs` starts the
-  relay with no console, and `Stop-Process` is `TerminateProcess`. The loss is bounded by
-  `MAX_FLUSH_DELAY_MS` (2 s):
-  [`breaker-persistence-audit-2026-09-08.md`](breaker-persistence-audit-2026-09-08.md) §3.
-  **Property:** the relay exposes a control-token-admitted stop (a `POST` on the existing
-  admission boundary, or a documented console-signal launcher) that runs the same shutdown path
-  as `SIGTERM`, and the way this machine restarts the daemon uses it.
-
 - **Accept or decline the 26 triaged refusals** (owner-only; triaged 2026-09-09 in
   [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries every
   verdict pinned to its digest and the exact `accept`/`reject` commands). Nineteen accepts, six

@@ -1,6 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildForwardHeaders,
   createProxy,
@@ -49,6 +52,23 @@ async function boot(): Promise<string> {
   await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
   const { port } = server!.address() as AddressInfo;
   return `http://127.0.0.1:${port}`;
+}
+
+/** Same as `boot()`, but with an injectable `onStop` seam — the same shutdown callback
+ *  `runProxy` threads through `ProxyDeps.onStop` for `POST /stop` to call. */
+async function bootWithOnStop(onStop: (() => void) | undefined): Promise<string> {
+  server = createProxy(baseConfig(), {
+    controlAuthorization: { validate: (candidate) => candidate === CONTROL_TOKEN },
+    ...(onStop ? { onStop } : {}),
+  });
+  await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
+  const { port } = server!.address() as AddressInfo;
+  return `http://127.0.0.1:${port}`;
+}
+
+/** Waits for a `setImmediate`-scheduled callback to have run. */
+function tick(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 describe("loopback admission (ARC-c9155ca2)", () => {
@@ -340,6 +360,119 @@ describe("loopback admission (ARC-c9155ca2)", () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error?: { message?: string } };
     expect(body.error?.message).toContain('no provider "typo-provider" configured');
+  });
+
+  it("rejects a POST /stop with no control token, and never calls onStop", async () => {
+    let calls = 0;
+    const url = await bootWithOnStop(() => { calls++; });
+    const res = await fetch(`${url}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(403);
+    await tick();
+    expect(calls).toBe(0);
+  });
+
+  it("rejects a cross-origin POST /stop even with a valid capability, and never calls onStop", async () => {
+    let calls = 0;
+    const url = await bootWithOnStop(() => { calls++; });
+    const res = await fetch(`${url}/stop`, {
+      method: "POST",
+      headers: { origin: "https://evil.example", "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(403);
+    await tick();
+    expect(calls).toBe(0);
+  });
+
+  it("admits a token-and-JSON POST /stop with 202, calling onStop exactly once even on a repeat", async () => {
+    // Mirrors runProxy's own idempotent `shutdown`: the ROUTE may call onStop on every admitted
+    // POST, but the shutdown callback itself is the layer that holds the once-only latch.
+    let stopped = false;
+    let calls = 0;
+    const url = await bootWithOnStop(() => {
+      if (stopped) return;
+      stopped = true;
+      calls++;
+    });
+
+    const first = await fetch(`${url}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({}),
+    });
+    expect(first.status).toBe(202);
+    expect(await first.json()).toEqual({ stopping: true });
+    await tick();
+    expect(calls).toBe(1);
+
+    const second = await fetch(`${url}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({}),
+    });
+    expect(second.status).toBe(202);
+    await tick();
+    expect(calls).toBe(1);
+  });
+
+  it("answers GET /stop with 404, never the model-path fall-through", async () => {
+    const url = await bootWithOnStop(() => {});
+    const res = await fetch(`${url}/stop`, { method: "GET", headers: CONTROL_HEADERS });
+    expect(res.status).toBe(404);
+  });
+
+  it("answers POST /stop with 503 when the proxy has no shutdown handler, and never answers 202 for a stop that will not happen", async () => {
+    const url = await boot();
+    const res = await fetch(`${url}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...CONTROL_HEADERS },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error?: { message?: string } };
+    expect(body.error?.message).toContain("the relay has no stop handler");
+  });
+
+  it("logs the config-staleness notice on stderr exactly once across repeated GET /telemetry calls", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rp-loopback-stale-"));
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, "{}");
+    try {
+      // A Config carrying a sourcePath/sourceMtimeMs pair that cannot match the real file's
+      // current mtime — the same shape `loadConfig` produces, without needing to race a real
+      // file-write's mtime resolution.
+      const staleCfg: Config = { ...baseConfig(), sourcePath: configPath, sourceMtimeMs: 1 } as Config;
+      server = createProxy(staleCfg, {
+        controlAuthorization: { validate: (candidate) => candidate === CONTROL_TOKEN },
+      });
+      await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
+      const { port } = server!.address() as AddressInfo;
+      const url = `http://127.0.0.1:${port}`;
+
+      const stderrLines: string[] = [];
+      const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+        stderrLines.push(String(chunk));
+        return true;
+      });
+      try {
+        const first = await fetch(`${url}/telemetry`);
+        expect((await first.json() as { config?: { changedOnDisk?: boolean } }).config?.changedOnDisk).toBe(true);
+        await fetch(`${url}/telemetry`);
+      } finally {
+        spy.mockRestore();
+      }
+
+      const matches = stderrLines.filter((line) =>
+        line.includes("config changed on disk since the relay loaded it — restart required"),
+      );
+      expect(matches).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("bounds the ?task= query parameter", async () => {

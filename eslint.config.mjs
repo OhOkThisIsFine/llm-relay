@@ -19,6 +19,8 @@ const NODE_GLOBALS = {
   clearTimeout: 'readonly',
   setInterval: 'readonly',
   clearInterval: 'readonly',
+  setImmediate: 'readonly',
+  clearImmediate: 'readonly',
   performance: 'readonly',
   NodeJS: 'readonly',
   AbortSignal: 'readonly',

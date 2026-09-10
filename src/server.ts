@@ -131,6 +131,7 @@ const CONTROL_ROUTES = new Set([
   "/health/stats",
   "/health",
   "/candidates",
+  "/stop",
 ]);
 
 interface NormalizedAuthority {
@@ -246,6 +247,8 @@ export interface ProxyDeps {
   dashboardRelayVersion?: string;
   dashboardAttributionPolicy?: AttributionPolicy;
   controlAuthorization?: ControlAuthorizationPort | null;
+  /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
+  onStop?: () => void;
 }
 
 function dashboardHeaders(req: IncomingMessage): DashboardHeaderMap {
@@ -370,6 +373,11 @@ export interface Handlers {
   hedgeMaxInFlight: number;
   costClassOf: CostClassFn;
   hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null;
+  /** Optional shutdown callback — called by POST /stop after responding 202. */
+  onStop?: () => void;
+  /** True the first time GET /telemetry observes the loaded config changed on disk, false on
+   *  every call after — so the daemon logs the fact exactly once (see config.ts `configStaleness`). */
+  claimConfigStalenessLogOnce: () => boolean;
 }
 
 function pickString(obj: unknown, key: string): string | null {
@@ -731,6 +739,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
 export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const validator = new ToolUseValidator();
   const logger = new MetadataLogger(cfg.log);
+  // The relay does not hot-reload (see config.ts `configStaleness`). GET /telemetry is the only
+  // point inside a running process that evaluates it, so this latch makes the daemon log the fact
+  // exactly ONCE per process the first time that route observes the change — never on every poll.
+  let configStalenessLogged = false;
+  const claimConfigStalenessLogOnce = (): boolean => {
+    if (configStalenessLogged) return false;
+    configStalenessLogged = true;
+    return true;
+  };
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
   const catalog = deps.catalog ?? new ModelCatalog();
   const laneCadence = process.env.VITEST ? null : new LaneCadence(cfg);
@@ -933,6 +950,8 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       hedgeMaxInFlight: hedgeSettings.enabled ? 2 : 1,
       costClassOf,
       hardCap: hardCapEvaluator,
+      claimConfigStalenessLogOnce,
+      ...(deps.onStop ? { onStop: deps.onStop } : {}),
     }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);
       logger.write(baseLog(started, req.url ?? "/", false, false, 502, "skipped", null));

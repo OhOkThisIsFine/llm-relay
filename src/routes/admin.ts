@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { AUTO_MODEL, unroutableOffloadClient, type Config, type OffloadScope } from "../config.js";
+import { AUTO_MODEL, CONFIG_STALENESS_NOTICE, unroutableOffloadClient, type Config, type OffloadScope } from "../config.js";
 import type { ModelCatalog } from "../catalog.js";
 import type { PingLoop } from "../ping/cadence.js";
 import type { MetadataLogger } from "../log.js";
@@ -174,6 +174,11 @@ export interface AdminHandlers {
    * the shared no-op recorder — the same default `createProxy` uses.
    */
   accountingRecorder: AccountingRecorder;
+  /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
+  onStop?: () => void;
+  /** True the first time GET /telemetry observes the loaded config changed on disk, false on
+   *  every call after — so the daemon logs the fact exactly once (see config.ts `configStaleness`). */
+  claimConfigStalenessLogOnce: () => boolean;
 }
 
 function failClosed(res: ServerResponse, status: number, message: string): void {
@@ -617,7 +622,50 @@ export async function handleAdminRoutes(
   if (req.method === "GET" && pathname === "/telemetry") {
     const accounting =
       typeof h.accountingReader?.writerHealth === "function" ? h.accountingReader.writerHealth() : null;
-    return ok(getTelemetryReport(cfg, h.breaker, Date.now(), accounting), true);
+    const report = getTelemetryReport(cfg, h.breaker, Date.now(), accounting);
+    // Log the fact exactly once per process — see the doc comment on
+    // AdminHandlers.claimConfigStalenessLogOnce and config.ts `configStaleness`.
+    if (report.config.changedOnDisk && h.claimConfigStalenessLogOnce()) {
+      process.stderr.write(`llm-relay: ${CONFIG_STALENESS_NOTICE}\n`);
+    }
+    return ok(report, true);
+  }
+
+  // POST /stop — admitted by the same control-token boundary as /cooldowns/clear.
+  // Responds 202 {"stopping":true} FIRST, then shuts down on the next tick so the
+  // response leaves before the listener closes. GET /stop is an explicit 404
+  // (never the model-path fall-through — /dispatch/telemetry precedent).
+  if (req.method === "GET" && pathname === "/stop") {
+    return bad(404, `GET /stop is not a route — POST to stop the relay`);
+  }
+  if (req.method === "POST" && pathname === "/stop") {
+    if (typeof reqJson !== "object" || reqJson === null || Array.isArray(reqJson)) {
+      return bad(400, `POST /stop body must be a JSON object`);
+    }
+    // Reject unknown body keys (cooldowns/clear precedent).
+    const body = reqJson as Record<string, unknown>;
+    if (Object.keys(body).length > 0) {
+      return bad(400, `POST /stop does not accept any properties`);
+    }
+    // Admission boundary is checked by the caller (handleAdminRoutes is only
+    // reached after admissionFailure passes — /stop is in server.ts's
+    // CONTROL_ROUTES, so a mutating request needs the control token).
+    // Check onStop BEFORE writing any response: a bare programmatic proxy
+    // with no shutdown handler must never answer 202 for a stop that will
+    // not happen.
+    const onStop = h.onStop;
+    if (typeof onStop !== "function") {
+      return bad(503, `the relay has no stop handler`);
+    }
+    // Respond 202 FIRST, then call onStop on the next tick so the response
+    // leaves before the listener closes.
+    res.writeHead(202, { "content-type": "application/json" });
+    res.end(JSON.stringify({ stopping: true }));
+    h.logger.write(baseLog(started, path, false, false, 202, "skipped", null));
+    setImmediate(() => {
+      onStop();
+    });
+    return true;
   }
 
   return false;

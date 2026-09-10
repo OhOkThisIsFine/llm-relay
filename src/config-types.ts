@@ -754,6 +754,15 @@ export interface Config {
    *  Only consumer is the runtime offload toggle, which persists back to the same file. */
   sourcePath?: string;
   /**
+   * The config file's mtime (ms since epoch) at the moment `loadConfig` read it — paired with
+   * `sourcePath` for the config-staleness notice (`configStaleness()` below). Set by `loadConfig`
+   * as a NON-ENUMERABLE property (see there) so it never appears in a `JSON.stringify` of the
+   * whole config, a `toEqual` comparison of a loaded `Config`, or `Object.keys(cfg)`; absent for
+   * a hand-built test config with no backing file. The relay does not hot-reload — this field
+   * exists only to let the relay and the CLI SAY so, never to trigger a reload.
+   */
+  sourceMtimeMs?: number;
+  /**
    * Non-fatal load-time problems (a provider disabled for an unset `${ENV}`, a pool member
    * dropped with it). Present so startup can print them — a degraded config that boots
    * silently is how you end up running on one provider without noticing.

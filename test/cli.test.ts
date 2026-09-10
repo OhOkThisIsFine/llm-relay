@@ -27,6 +27,7 @@ import {
   runDispatch,
   runCooldowns,
   runOffload,
+  runStop,
   runConfigCommand,
   runPools,
   runRoutingCommand,
@@ -1214,6 +1215,149 @@ describe("llm-relay cooldowns clear — live control mutation", () => {
   });
 });
 
+describe("llm-relay stop — live control mutation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-cli-stop-"));
+  const originalArgv = process.argv;
+  const configAt = (listen: string) => ({
+    listen,
+    providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic" } },
+    routing: { default: "anthropic", tiers: {}, benchmarkSort: false },
+    repair: { maxAttempts: 2, destructiveTools: [] },
+    mode: "detect",
+    log: { level: "silent", file: null },
+  });
+
+  afterEach(() => {
+    process.argv = originalArgv;
+    vi.restoreAllMocks();
+  });
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("prints the stopping line and exits 0 when the relay admits the stop", async () => {
+    const server = createServer((req, res) => {
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(JSON.stringify({ stopping: true }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("missing test listener");
+      const configPath = join(dir, "config.json");
+      writeFileSync(configPath, JSON.stringify(configAt(`127.0.0.1:${address.port}`), null, 2));
+      process.argv = ["node", "cli.ts", "--config", configPath, "stop"];
+      const output: string[] = [];
+      vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        output.push(String(chunk));
+        return true;
+      });
+      vi.spyOn(process, "exit").mockImplementation((code) => {
+        throw new Error(`exit:${code}`);
+      });
+
+      await expect(runStop()).rejects.toThrow("exit:0");
+      expect(output.join("")).toContain(`stopping llm-relay at http://127.0.0.1:${address.port}`);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("prints the no-relay line and exits 1 when a closed port answers nothing", async () => {
+    const configPath = join(dir, "offline-config.json");
+    writeFileSync(configPath, JSON.stringify(configAt("127.0.0.1:65533"), null, 2));
+    process.argv = ["node", "cli.ts", "--config", configPath, "stop"];
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+    const output: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      output.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(runStop()).rejects.toThrow("exit:1");
+    expect(output.join("")).toContain("no relay is listening at http://127.0.0.1:65533");
+  });
+});
+
+describe("routing show — config-staleness notice", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-cli-routing-stale-"));
+  const originalArgv = process.argv;
+  const routingBlock = { default: "anthropic", tiers: {}, benchmarkSort: false };
+  const configAt = (listen: string) => ({
+    listen,
+    providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic" } },
+    routing: routingBlock,
+    repair: { maxAttempts: 2, destructiveTools: [] },
+    mode: "detect",
+    log: { level: "silent", file: null },
+  });
+
+  afterEach(() => {
+    process.argv = originalArgv;
+    vi.restoreAllMocks();
+  });
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("prints the staleness notice on stderr when the running relay reports changedOnDisk, leaving stdout unchanged", async () => {
+    const server = createServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ config: { path: "x", loadedAt: 1, changedOnDisk: true, diskMtime: 2 } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("missing test listener");
+      const configPath = join(dir, "config.json");
+      writeFileSync(configPath, JSON.stringify(configAt(`127.0.0.1:${address.port}`), null, 2));
+      process.argv = ["node", "cli.ts", "--config", configPath, "routing", "show"];
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        stdout.push(String(chunk));
+        return true;
+      });
+      vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+        stderr.push(String(chunk));
+        return true;
+      });
+
+      await runRoutingCommand();
+
+      expect(JSON.parse(stdout.join(""))).toMatchObject(routingBlock);
+      expect(stderr.join("")).toContain(
+        "config changed on disk since the relay loaded it — restart required (llm-relay stop, then start)",
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("prints no staleness notice when no relay is listening, and stdout is unaffected", async () => {
+    const configPath = join(dir, "offline-config.json");
+    writeFileSync(configPath, JSON.stringify(configAt("127.0.0.1:65533"), null, 2));
+    process.argv = ["node", "cli.ts", "--config", configPath, "routing", "show"];
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+
+    await runRoutingCommand();
+
+    expect(JSON.parse(stdout.join(""))).toMatchObject(routingBlock);
+    expect(stderr.join("")).not.toContain("config changed on disk");
+  });
+});
+
 /**
  * The status view must render the EFFECTIVE freeOnly, not the bare optional. `freeOnlyApplies`
  * (server.ts) is `rule.freeOnly ?? rerouted`: an UNSET flag is ON for offload-rerouted traffic
@@ -1827,32 +1971,32 @@ describe("CLI configuration editing", () => {
 
   it("configures fallback, tiers, subagents, sorting, and arbitrary routing fields", async () => {
     process.argv.push("routing", "default", "test/strong", "other/fallback");
-    runRoutingCommand();
+    await runRoutingCommand();
     expect(document().routing.default).toEqual(["test/strong", "other/fallback"]);
 
     process.argv = ["node", "cli.ts", "--config", configPath, "routing", "tier", "sonnet", "test/sonnet"];
-    runRoutingCommand();
+    await runRoutingCommand();
     expect(document().routing.tiers.sonnet).toBe("test/sonnet");
 
     // The pool must exist before a subagent mapping can reference it.
     process.argv = ["node", "cli.ts", "--config", configPath, "pools", "set", "coding", "test/cheap"];
     await runPools();
     process.argv = ["node", "cli.ts", "--config", configPath, "routing", "subagent", "default", "pool/coding"];
-    runRoutingCommand();
+    await runRoutingCommand();
     expect(document().routing.subagents.default).toBe("pool/coding");
 
     process.argv = ["node", "cli.ts", "--config", configPath, "routing", "sort", "on"];
-    runRoutingCommand();
+    await runRoutingCommand();
     expect(document().routing.benchmarkSort).toBe(true);
 
     process.argv = ["node", "cli.ts", "--config", configPath, "config", "set", "routing.ladder", "[]"];
-    runConfigCommand();
+    await runConfigCommand();
     expect(document().routing.ladder).toEqual([]);
   });
 
-  it("rejects edits that would make the config unloadable", () => {
+  it("rejects edits that would make the config unloadable", async () => {
     process.argv = ["node", "cli.ts", "--config", configPath, "routing", "default", "missing/model"];
-    expect(() => runRoutingCommand()).toThrow(/unknown provider/);
+    await expect(runRoutingCommand()).rejects.toThrow(/unknown provider/);
     expect(document().routing.default).toBe("test/base");
   });
 });

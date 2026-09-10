@@ -159,6 +159,18 @@ relay starts, so a restart does not send it back into a wall it already knows. E
 re-learnable, so the file is cache-kind and safe to delete. Written on a short debounce (at most
 two seconds behind) and flushed on a graceful shutdown; a hard kill can lose that last window.
 
+**The relay does not hot-reload `config.json`.** An edit takes effect only on the next start, and
+the relay says so rather than leaving you to wonder why nothing changed: `GET /telemetry` carries
+`config: { path, loadedAt, changedOnDisk, diskMtime }`, comparing the file's mtime when this
+process loaded it against its mtime right now. When a config-reading command talks to a running
+relay (`routing show`, `offload status`, `pools`, `routing`, `config`) and that relay reports
+`changedOnDisk: true`, the command prints one notice on stderr —
+`config changed on disk since the relay loaded it — restart required (llm-relay stop, then start)`
+— while its own stdout output is unaffected, because these commands are JSON surfaces. The daemon
+also logs the same fact once to its own log/stderr, the first time `GET /telemetry` observes the
+change, so an operator watching the log sees it without running a command. Restart with
+`llm-relay stop` (see [CLI reference](#cli-reference)) followed by starting the relay again.
+
 ### Where state actually lives
 
 `~/.llm-relay/` is the default. If you set an XDG base directory, **every** artifact honours it,
@@ -2035,6 +2047,7 @@ and `keys` diagnostics have always refused to echo argv for that reason.
 | `llm-relay candidates [-p <name>]` | Compare deployment × credential-slot targets |
 | `llm-relay eligibility [<propose\|accept\|reject> ...]` | Review or record backend eligibility refusals; `reject` records that no durable fact should be learned |
 | `llm-relay dispatch [lane] [options]` | Choose the next dispatch lane |
+| `llm-relay stop` | Stop the running relay through the admitted `POST /stop` (requires the control token); runs the same shutdown path as a console `SIGTERM` |
 | `llm-relay help` / `llm-relay version` | Help / version |
 
 Config editors validate the complete JSON before writing and need a proxy restart; the offload
@@ -2267,6 +2280,7 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 | `GET\|POST /dispatch` | Read/advance the dispatch ladder |
 | `POST /dispatch/telemetry` | Record lane-execution telemetry (lane stats for every kind; an accounting row for `cli`-kind lanes only) |
 | `POST /cooldowns/clear` | Clear scoped live cooling state; identifiers-only grouped response |
+| `POST /stop` | Stop the relay: `202 {"stopping":true}` on admission, then the same shutdown path as a console `SIGTERM`; `GET /stop` is an explicit `404` |
 | `GET /telemetry`, `GET /ping`, `GET /health`, `GET /health/stats` | Provider telemetry, probe, health (`/health/stats` is the protected `/health` alias) |
 | `GET|HEAD /dashboard/`, `GET|HEAD /dashboard/assets/*` | Read-only dashboard SPA shell and static assets |
 | `GET|HEAD /dashboard/api/v1/snapshot`, `GET|HEAD /dashboard/api/v1/requests/:requestId` | Session-authenticated dashboard reads |
@@ -2294,6 +2308,18 @@ exact `Host`, the `Origin`/`content-type` rules, and the control token (the CLI 
 automatically). `/telemetry` remains
 tokenless provider-aggregate data. Response attribution and walk headers are documented under
 Failover above.
+
+**`POST /stop`** sits on the exact same admission boundary as `/cooldowns/clear` — a JSON body
+with no properties, the control token, the `Host`/`Origin` checks above. On admission the relay
+answers `202 {"stopping":true}` first, then runs the same shutdown path a console `SIGTERM`
+triggers (flushing the breaker/dispatch/lane-affinity write-behind stores and closing the
+accounting ledger) on the next tick, so the response leaves before the listener closes. A bare
+programmatic proxy built with no shutdown callback (`ProxyDeps.onStop` unset) answers `503` —
+never `202` for a stop that will not happen. `llm-relay stop` is the CLI front door for this route;
+see [CLI reference](#cli-reference). The daemon itself is otherwise stopped by whatever the host OS
+does to end the process (`Ctrl+C`, `Stop-Process`, `TerminateProcess`) — `POST /stop` is the one
+path that is guaranteed to run the flush, which matters most for a logon-started daemon that a
+`TerminateProcess`-style stop would otherwise end with no flush at all.
 
 ---
 

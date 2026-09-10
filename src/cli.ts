@@ -16,6 +16,7 @@ import {
   EFFORT_LEVELS,
   FRONT_DOOR_CLIENTS,
   CLAUDE_CLIENT,
+  CONFIG_STALENESS_NOTICE,
   type OffloadRule,
 } from "./config.js";
 import { loadEnvFile } from "./dotenv.js";
@@ -321,6 +322,7 @@ ${formatTextTable([
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
   ["llm-relay delegate-gate <diff-file> --repo <root> [--fix]", "Quality-gate a delegated lane's diff before judgment/merge."],
   ["llm-relay mcp", "Preferred dispatch entry point for every MCP host; one call returns an answer."],
+  ["llm-relay stop", "Stop the running relay (requires control token)."],
   ["llm-relay help | --help | -h", "Show help."],
   ["llm-relay version | --version | -v", "Print version."],
 ], "  ")}
@@ -1001,6 +1003,7 @@ export function runProxy() {
     dashboardRelayVersion: currentVersion(),
     // The projector aggregates every labeled attribution by default; query filters narrow it.
     dashboardAttributionPolicy: "include_all_labeled",
+    onStop: () => shutdown("POST /stop"),
   });
   server.once("close", closeAccountingStore);
   // ⚠ Registered BEFORE `listen`, and it must never reach `closeAccountingStore`: `process.exit`
@@ -1023,10 +1026,17 @@ export function runProxy() {
     void warmAndValidate(cfg, catalog);
   });
 
+  // ⚠ The ONE shutdown path, shared by a console signal and the admitted `POST /stop`.
+  // The logon-started daemon is stopped by `TerminateProcess` on this machine, so no
+  // signal ever fires and this function is what `llm-relay stop` must reach (item 3,
+  // docs/backlog.md). Idempotent: a second call while the first runs does nothing.
   let shutdownStarted = false;
-  const shutdown = () => {
+  const shutdown = (reason: string) => {
     if (shutdownStarted) return;
     shutdownStarted = true;
+    if (reason !== "SIGINT" && reason !== "SIGTERM") {
+      process.stderr.write(`llm-relay: stopping (${reason})...\n`);
+    }
     if (typeof server.closeIdleConnections === "function") {
       server.closeIdleConnections();
     }
@@ -1050,8 +1060,11 @@ export function runProxy() {
   };
 
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, shutdown);
+    process.on(sig, () => shutdown(sig));
   }
+  // `POST /stop` from `routes/admin.ts` calls the SAME function via the onStop dep.
+  // The server is created after the accounting store below, so the daemon passes
+  // the shutdown closure through ProxyDeps.onStop.
 
   return server;
 }
@@ -1237,6 +1250,26 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
   }
 }
 
+/**
+ * Ask a running relay whether the config it loaded still matches the file on disk, and warn on
+ * stderr when it does not. Best-effort and silent otherwise: no relay running, an unreachable
+ * relay, or a malformed response all mean nothing to say — a config-reading command must still
+ * work with no relay running, and its own stdout output is unaffected either way (stderr only,
+ * the same rule `printFirstRunNotice` follows: these commands are JSON surfaces on stdout).
+ */
+async function warnIfConfigStaleOnRunningRelay(cfg: Config): Promise<void> {
+  const live = await tryServer(cfg, "/telemetry");
+  if (live === null || typeof live !== "object") return;
+  const config = (live as { config?: unknown }).config;
+  if (
+    config !== null &&
+    typeof config === "object" &&
+    (config as { changedOnDisk?: unknown }).changedOnDisk === true
+  ) {
+    process.stderr.write(`llm-relay: ${CONFIG_STALENESS_NOTICE}\n`);
+  }
+}
+
 export interface TelemetryDeps {
   readonly loadConfig?: () => Config;
   readonly request?: (cfg: Config) => Promise<unknown | null>;
@@ -1326,7 +1359,7 @@ const COOLDOWN_CLEAR_OPTIONS: ReadonlyMap<string, CooldownClearOption> = new Map
 export const CLI_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "onboard", "setup", "keys", "check-keys", "models", "ping", "dashboard", "telemetry",
   "offload", "lanes", "dispatch", "cooldowns", "eligibility", "candidates", "cost", "pools",
-  "routing", "route", "config", "delegate-gate", "mcp", "help", "version",
+  "routing", "route", "config", "delegate-gate", "mcp", "stop", "help", "version",
 ]);
 
 interface CommandArity {
@@ -1404,6 +1437,8 @@ const COMMAND_ARITY: Readonly<Record<string, CommandArity>> = {
   // Reads no positional at all: every knob is a config setting, because a stdio server is launched
   // by a host config line that nobody re-types.
   mcp: { min: 1, max: 1, hint: "llm-relay mcp" },
+  // `llm-relay stop` POSTs to the running relay; it takes no positionals.
+  stop: { min: 1, max: 1, hint: "llm-relay stop" },
 };
 
 /**
@@ -1456,6 +1491,7 @@ export const CLI_OPTIONS: CliOptionSpec = {
   config: ["--config"],
   "delegate-gate": ["--repo", "--fix"],
   mcp: ["--config"],
+  stop: ["--config"],
 };
 
 export const ACTION_OPTIONS: Readonly<Record<string, CliOptionSpec>> = {
@@ -3042,7 +3078,12 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   // the switch reporting ON while nothing changes is precisely how the no-op went unnoticed.
   // The other surface an agent reaches for when it is about to steer traffic. Stderr, so the
   // stdout report stays exactly what it was for anything parsing it.
-  if (want === null) printFirstRunNotice(undefined, cfg);
+  if (want === null) {
+    printFirstRunNotice(undefined, cfg);
+    // Only worth asking when a relay just answered the /offload query above — no relay means
+    // nothing to warn about, and it would just be a second doomed round trip.
+    if (live !== null) await warnIfConfigStaleOnRunningRelay(cfg);
+  }
   const hostRouting = detectHostRouting();
   if (hostRouting.state === "bypassed" && state.enabled) {
     process.stdout.write(`  ⚠ ${hostRouting.reason}\n`);
@@ -3122,6 +3163,58 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   } else {
     process.stdout.write("  offload is disabled; an `@relay: <spec>` line still offloads one marked subagent call\n");
   }
+}
+
+/** `llm-relay stop` — stop the running relay via the admitted POST /stop. */
+export async function runStop(): Promise<void> {
+  const cfg = loadOrExit();
+
+  let authorization;
+  try {
+    authorization = createControlAuthorization(resolveControlAuthorizationConfigDir(cfg.sourcePath));
+  } catch {
+    process.stderr.write("llm-relay stop: control authorization is unavailable; the relay must be running with this config\n");
+    process.exit(1);
+  }
+
+  let response: Response | null = null;
+  try {
+    response = await fetch(proxyUrl(cfg, "/stop"), {
+      method: "POST",
+      headers: authorization.attach({ "content-type": "application/json" }),
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // Transport failure — report below with the same explicit no-file-fallback outcome.
+  }
+
+  if (response === null) {
+    process.stdout.write(`no relay is listening at ${proxyUrl(cfg, "")}\n`);
+    process.exit(1);
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    process.stderr.write("llm-relay stop: the running relay returned an invalid response\n");
+    process.exit(1);
+  }
+
+  if (!response.ok) {
+    const detail = controlErrorMessage(payload);
+    process.stderr.write(`llm-relay stop: the running relay rejected the stop${detail === null ? "" : `: ${detail}`}\n`);
+    process.exit(1);
+  }
+
+  if (payload && typeof payload === "object" && (payload as Record<string, unknown>).stopping === true) {
+    process.stdout.write(`stopping llm-relay at ${proxyUrl(cfg, "")}\n`);
+    process.exit(0);
+  }
+
+  process.stderr.write("llm-relay stop: unexpected response from the relay\n");
+  process.exit(1);
 }
 
 function fmt(v: number | null | undefined, suffix = ""): string {
@@ -3741,7 +3834,7 @@ function scalarOrArray(values: string[]): string | string[] {
 }
 
 /** `llm-relay config show|get|set|unset` — generic, scriptable JSON configuration editing. */
-export function runConfigCommand(): void {
+export async function runConfigCommand(): Promise<void> {
   const cfg = loadOrExit();
   const path = configSourcePath(cfg);
   const positionals = getPositionalArgs(process.argv);
@@ -3753,6 +3846,7 @@ export function runConfigCommand(): void {
     const value = target ? readConfigPath(document, target) : document;
     if (target && value === undefined) configCommandError(`config ${action}: no value at "${target}"`);
     outputJson(value);
+    await warnIfConfigStaleOnRunningRelay(cfg);
     return;
   }
 
@@ -3783,7 +3877,7 @@ export function runConfigCommand(): void {
 }
 
 /** `llm-relay routing ...` — convenient typed commands for the fields operators edit most. */
-export function runRoutingCommand(): void {
+export async function runRoutingCommand(): Promise<void> {
   const cfg = loadOrExit();
   const path = configSourcePath(cfg);
   const positionals = getPositionalArgs(process.argv);
@@ -3792,6 +3886,7 @@ export function runRoutingCommand(): void {
   if (action === "show" || action === "get") {
     outputJson(cfg.routing);
     printFirstRunNotice(undefined, cfg);
+    await warnIfConfigStaleOnRunningRelay(cfg);
     return;
   }
 
@@ -4364,6 +4459,13 @@ function runKeysSubcommand(action: string | undefined, target: string | undefine
     });
     return;
   }
+  if (arg2 === "stop") {
+    runStop().catch((e) => {
+      process.stderr.write(`llm-relay stop: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
   if (arg2 === "lanes") {
     runLanes().catch((e) => {
       process.stderr.write(`llm-relay lanes: ${(e as Error).message}\n`);
@@ -4409,21 +4511,17 @@ function runKeysSubcommand(action: string | undefined, target: string | undefine
     return;
   }
   if (arg2 === "routing" || arg2 === "route") {
-    try {
-      runRoutingCommand();
-    } catch (e) {
+    runRoutingCommand().catch((e) => {
       process.stderr.write(`llm-relay routing: ${(e as Error).message}\n`);
       process.exit(1);
-    }
+    });
     return;
   }
   if (arg2 === "config") {
-    try {
-      runConfigCommand();
-    } catch (e) {
+    runConfigCommand().catch((e) => {
       process.stderr.write(`llm-relay config: ${(e as Error).message}\n`);
       process.exit(1);
-    }
+    });
     return;
   }
   if (arg2 === "ping" || hasFlag("--ping")) {
@@ -4554,6 +4652,9 @@ export function classifyCommand(argv: string[]): CommandEffect {
     // and a stale GLOBAL install then downloads a replacement and RE-EXECS - which for a stdio
     // server means the host's pipe dies mid-session with no diagnosable error.
     case "mcp":
+      return "read-only";
+    // POST /stop only reads control token and signals shutdown; no config files are touched.
+    case "stop":
       return "read-only";
     // check-keys, models, telemetry, candidates, pools, ping, help, version — and anything not
     // yet listed. Dispatch exhaustion is persisted locally, so `-x` is a mutation.

@@ -11,6 +11,7 @@ import {
   subagentSpec,
   offloadRule,
   clientForPath,
+  configStaleness,
 } from "../src/config.js";
 import { candidateEnvNames } from "../src/authEnv.js";
 import { addEntry, lock, type KeystoreOptions } from "../src/keystore.js";
@@ -2165,5 +2166,60 @@ describe("loadConfig — routing.probation", () => {
     expect(() => loadConfig(write("prob-enabled.json", probationCfg({ enabled: "yes" })))).toThrow(
       /routing\.probation\.enabled must be a boolean/,
     );
+  });
+});
+
+describe("configStaleness", () => {
+  it("loadConfig records sourcePath and sourceMtimeMs, non-enumerably", () => {
+    const p = write("staleness-loaded.json", base());
+    const cfg = loadConfig(p);
+    expect(cfg.sourcePath).toBe(p);
+    expect(cfg.sourceMtimeMs).toBe(statSync(p).mtimeMs);
+    // Non-enumerable: absent from Object.keys and from a JSON.stringify of the whole config, so
+    // it can never surface in a toEqual comparison of a loaded Config or leak into a wire body.
+    expect(Object.keys(cfg)).not.toContain("sourceMtimeMs");
+    expect(JSON.stringify(cfg)).not.toContain("sourceMtimeMs");
+  });
+
+  it("reports unchanged when the disk mtime matches what was recorded at load", () => {
+    const report = configStaleness(
+      { sourcePath: "/fake/config.json", sourceMtimeMs: 1000 },
+      () => ({ mtimeMs: 1000 }),
+    );
+    expect(report).toEqual({ path: "/fake/config.json", loadedAt: 1000, changedOnDisk: false, diskMtime: 1000 });
+  });
+
+  it("reports changed when the disk mtime is newer than what was recorded at load", () => {
+    const report = configStaleness(
+      { sourcePath: "/fake/config.json", sourceMtimeMs: 1000 },
+      () => ({ mtimeMs: 2000 }),
+    );
+    expect(report).toEqual({ path: "/fake/config.json", loadedAt: 1000, changedOnDisk: true, diskMtime: 2000 });
+  });
+
+  it("reports changed with a null diskMtime when the file is missing (stat throws)", () => {
+    const report = configStaleness(
+      { sourcePath: "/fake/config.json", sourceMtimeMs: 1000 },
+      () => {
+        throw new Error("ENOENT: no such file or directory");
+      },
+    );
+    expect(report).toEqual({ path: "/fake/config.json", loadedAt: 1000, changedOnDisk: true, diskMtime: null });
+  });
+
+  it("reports unchanged for a Config with no recorded source (never file-backed)", () => {
+    const report = configStaleness({});
+    expect(report).toEqual({ path: null, loadedAt: null, changedOnDisk: false, diskMtime: null });
+  });
+
+  it("never throws — a real stat against a real, unchanged file reports unchanged", () => {
+    const p = write("staleness-real.json", base());
+    const cfg = loadConfig(p);
+    expect(configStaleness(cfg)).toEqual({
+      path: p,
+      loadedAt: cfg.sourceMtimeMs,
+      changedOnDisk: false,
+      diskMtime: cfg.sourceMtimeMs,
+    });
   });
 });

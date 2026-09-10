@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { POOL_PREFIX, splitSpec } from "./spec.js";
 import { parseRouting } from "./config/routing-parser.js";
 import { rankTargetsByBenchmark } from "./benchmarks.js";
@@ -845,6 +845,14 @@ export function loadConfig(
   } catch (e) {
     throw new Error(`could not read/parse config at ${path}: ${(e as Error).message}`, { cause: e });
   }
+  // Captured for the config-staleness notice (`configStaleness()` below). Never fails config
+  // load over a stat failure — the read above already succeeded, so this is best-effort.
+  let sourceMtimeMs: number | undefined;
+  try {
+    sourceMtimeMs = statSync(path).mtimeMs;
+  } catch {
+    sourceMtimeMs = undefined;
+  }
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`config at ${path} is not a JSON object`);
   }
@@ -954,7 +962,7 @@ export function loadConfig(
 
   const leaveMeAlone = parseLeaveMeAlone(c["leave_me_alone"]);
 
-  return {
+  const cfg: Config = {
     host,
     port,
     providers,
@@ -971,6 +979,72 @@ export function loadConfig(
     sourcePath: path,
     ...(warnings.length > 0 ? { warnings } : {}),
   };
+  if (sourceMtimeMs !== undefined) {
+    // Non-enumerable so it never appears in a JSON.stringify of the whole config, a `toEqual`
+    // comparison of a loaded Config, or Object.keys(cfg) — see the config-types.ts doc comment.
+    Object.defineProperty(cfg, "sourceMtimeMs", {
+      value: sourceMtimeMs,
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
+  }
+  return cfg;
+}
+
+export interface ConfigStalenessReport {
+  /** The config file this process loaded from, or null for a hand-built Config with no file. */
+  path: string | null;
+  /** This config's recorded mtime (ms since epoch) at load time, or null if never recorded. */
+  loadedAt: number | null;
+  /** True when the file on disk no longer matches what this process loaded, including when the
+   *  file has been deleted. False for a Config with no recorded source (never file-backed) —
+   *  there is nothing on disk to have diverged from. */
+  changedOnDisk: boolean;
+  /** The file's CURRENT mtime (ms since epoch), read live at call time; null when it cannot be
+   *  stat'd (missing, permission denied, or no source recorded at all). */
+  diskMtime: number | null;
+}
+
+/**
+ * The ONE text of the config-staleness notice — printed by the daemon (once, to its log/stderr,
+ * the first time `GET /telemetry` observes the change) and by every config-reading CLI command
+ * that talks to a running relay (`routing show`, `offload status`, `pools`, `routing`, `config`),
+ * so every surface says exactly the same thing rather than each hand-copying its own wording.
+ */
+export const CONFIG_STALENESS_NOTICE =
+  "config changed on disk since the relay loaded it — restart required (llm-relay stop, then start)";
+
+/**
+ * Does the config file on disk still match what this process loaded? Pure over its inputs aside
+ * from the injectable `stat` — the default reads the real filesystem, a caller may inject one for
+ * tests. NEVER throws: a missing or otherwise unreadable file reads as `changedOnDisk: true` with
+ * `diskMtime: null`, because "the relay's copy no longer matches whatever is on disk" is the true
+ * state whether the file was edited or removed out from under it.
+ *
+ * The relay does not hot-reload (see `Config.sourceMtimeMs`) — this is the one helper that turns
+ * "the file changed" into a fact `GET /telemetry` and the CLI can both report, so an operator who
+ * edits `config.json` is told to restart rather than being left to wonder why nothing took effect.
+ */
+export function configStaleness(
+  cfg: Pick<Config, "sourcePath" | "sourceMtimeMs">,
+  stat: (path: string) => { mtimeMs: number } = (p) => statSync(p),
+): ConfigStalenessReport {
+  const path = cfg.sourcePath ?? null;
+  const loadedAt = cfg.sourceMtimeMs ?? null;
+  if (path === null) {
+    // Never file-backed (a hand-built Config, e.g. under test) — nothing can have "changed
+    // on disk" under a config that was never read from disk.
+    return { path: null, loadedAt: null, changedOnDisk: false, diskMtime: null };
+  }
+  let diskMtime: number | null;
+  try {
+    diskMtime = stat(path).mtimeMs;
+  } catch {
+    diskMtime = null;
+  }
+  const changedOnDisk = diskMtime === null || loadedAt === null || diskMtime !== loadedAt;
+  return { path, loadedAt, changedOnDisk, diskMtime };
 }
 
 /**
