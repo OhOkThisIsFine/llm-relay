@@ -174,6 +174,8 @@ describe("accounting store CLI lifecycle", () => {
       accountingReader: mocks.store,
       dashboardRelayVersion: currentVersion(),
       dashboardAttributionPolicy: "include_all_labeled",
+      // `POST /stop` (backlog item 3, 2026-09-09) reaches the SAME shutdown as a signal.
+      onStop: expect.any(Function),
     });
     expect(server).toBe(mocks.server);
     expect(closeListeners).toHaveLength(1);
@@ -183,6 +185,9 @@ describe("accounting store CLI lifecycle", () => {
     closeListeners[0]!();
     signalHandlers.get("SIGINT")!();
     signalHandlers.get("SIGTERM")!();
+    // The third close path: the admitted stop's callback, after the signals already ran.
+    const deps = mocks.createProxy.mock.calls[0]![1] as { onStop: () => void };
+    deps.onStop();
     closeCallbacks[0]?.();
     expect(mocks.store.close).toHaveBeenCalledTimes(1);
     expect(mocks.server.close).toHaveBeenCalledTimes(1);
