@@ -15,14 +15,15 @@ import { RequestMappingError } from "../src/openai-request.js";
 describe("openaiResponsesRequestToAnthropic", () => {
   const user = (text: string) => ({ role: "user", content: [{ type: "input_text", text }] });
 
-  it("maps a plain string input to one user turn, with the carried max_tokens default", () => {
+  it("maps a plain string input to one user turn, carrying NO max_tokens when the caller stated none", () => {
+    // Until 2026-09-09 this carried llm-bridge's flat 1024 unconditionally — an invented cap that
+    // reached DeepSeek as a real ceiling on every request (docs/deepseek-responses-truncation-2026-09-09.md).
     const out = openaiResponsesRequestToAnthropic({ model: "m", input: "hi" });
     expect(out).toEqual({
-      // Mandatory downstream; llm-bridge's default is carried, not measured.
-      max_tokens: 1024,
       model: "m",
       messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
     });
+    expect("max_tokens" in out).toBe(false);
   });
 
   it("round-trips a tool call's id unchanged, in both id vocabularies", () => {
@@ -186,6 +187,17 @@ describe("openaiResponsesRequestToAnthropic", () => {
       model: "m",
       input: [{ type: "function_call", call_id: "c1", name: "A", arguments: '"a string"' }],
     })).toThrow(/not a JSON object/);
+  });
+
+  it("names the call_id and says the string was cut when a truncated argument string fails to parse", () => {
+    // The refusal a harness needs to REPAIR the turn instead of replaying the same cut string
+    // forever (docs/deepseek-responses-truncation-2026-09-09.md — the mechanism this packet closes).
+    expect(() => openaiResponsesRequestToAnthropic({
+      model: "m",
+      input: [{ type: "function_call", call_id: "call_abc", name: "exec_command", arguments: '{"cmd": "ls -la' }],
+    })).toThrow(
+      /function_call "exec_command" \(call_id call_abc\) arguments are not valid JSON: the string was cut, most likely by an output-token cap; repair or drop that item and retry/,
+    );
   });
 
   it("refuses a function_call or function_call_output with no call_id — the linkage IS the id", () => {

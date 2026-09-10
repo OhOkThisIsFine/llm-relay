@@ -33,7 +33,12 @@ config, routing, pools, offload, repair, the CLI, endpoints, and the caveats.
   representation — an `input_file` that is not a base64 PDF, a non-text part of a
   `system`/`developer` item, an image the relay cannot resolve — and a `tools` field that is not a
   list. `reasoning` items and `reasoning.effort` are dropped; hosted tool declarations
-  (`web_search_preview`, `file_search`, …) are dropped as before.
+  (`web_search_preview`, `file_search`, …) are dropped as before. An absent `max_output_tokens`
+  is never defaulted to an invented cap — it reaches an `openai`-kind target's ceiling untouched
+  and is resolved only for an `anthropic`-kind target, which requires the field — and a
+  `max_tokens` stop reaches the caller as `status: "incomplete"` /
+  `incomplete_details: {reason: "max_output_tokens"}`, buffered and streamed, instead of a silent
+  `"completed"`.
 - **Streaming repair** — text SSE frames stream to the client as they arrive; the proxy only
   withholds from the first `tool_use` block. Pure-text responses are byte-for-byte passthrough
   with zero added latency. A mid-stream repair failure surfaces as an SSE `error` event, never a

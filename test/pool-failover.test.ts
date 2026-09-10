@@ -14,6 +14,7 @@ import {
 } from "../src/backend.js";
 import { orderByUsability } from "../src/server.js";
 import { factsFor, recordFact, resetFacts, isCostBlocked, cooldownUntil } from "../src/target-facts.js";
+import { recordObservedMaxOutput } from "../src/context-limits.js";
 import { resetInterpretations } from "../src/refusal-interpretation.js";
 import type { Config, ProviderConfig, ResolvedTarget } from "../src/config.js";
 import type { ProviderTargetIdentity } from "../src/kernel/contracts.js";
@@ -2261,5 +2262,219 @@ describe("probation band — untested free members lead to gather data", () => {
     expect(response.headers.get(SERVED_BY_HEADER)).toBe(firstSpec);
     expect(response.headers.get(POOL_ATTEMPTS_HEADER)).toContain("2 tried");
     expect(response.headers.get(PROBATION_HEADER)).toBeNull();
+  });
+});
+
+/**
+ * P-DS-c: the Responses front must not invent a `max_tokens` cap on an `openai`-kind target's
+ * outbound Chat body, must announce a token-capped answer as `status: "incomplete"` (buffered AND
+ * streamed), and must refuse a truncated `function_call` `arguments` string by NAME so a harness
+ * can repair the turn instead of replaying it forever.
+ * (docs/deepseek-responses-truncation-2026-09-09.md — the measurement this packet closes.)
+ *
+ * Every walk here uses >=2 candidates, per this file's own standing rule.
+ */
+describe("Responses front — no invented cap, and a capped answer announces itself (P-DS-c)", () => {
+  /** `scripted`, but keeping the request bodies — the outbound wire shape IS half the assertion. */
+  function recordingChat(
+    reply: (n: number) => { status?: number; headers?: Record<string, string>; body: string },
+  ): Promise<{ server: Server; bodies: () => Record<string, unknown>[] }> {
+    const bodies: Record<string, unknown>[] = [];
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          try { bodies.push(JSON.parse(Buffer.concat(chunks).toString())); } catch { bodies.push({}); }
+          const out = reply(bodies.length);
+          res.writeHead(out.status ?? 200, { "content-type": "application/json", ...out.headers });
+          res.end(out.body);
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), bodies: () => bodies }));
+    });
+  }
+
+  const chatOkBody = (content: string) => JSON.stringify({
+    id: "cmpl_ok", object: "chat.completion",
+    choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }],
+  });
+  const chatCappedBody = (content: string) => JSON.stringify({
+    id: "cmpl_cap", object: "chat.completion",
+    choices: [{ message: { role: "assistant", content }, finish_reason: "length" }],
+  });
+  const chatCappedStream = (content: string) => [
+    `data: ${JSON.stringify({ id: "c", model: "m2", choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }] })}\n\n`,
+    `data: ${JSON.stringify({ id: "c", model: "m2", choices: [{ index: 0, delta: {}, finish_reason: "length" }] })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  /** Every OpenAI Responses SSE event, parsed in order — the streamed-response analogue of the
+   * buffered JSON assertions below. */
+  function parseResponsesSse(text: string): Array<{ type: string; data: Record<string, unknown> }> {
+    return text
+      .split(/\n\n+/)
+      .map((block) => block.trim())
+      .filter((block) => block.length > 0)
+      .map((block) => {
+        const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
+        return JSON.parse((dataLine ?? "data: {}").slice(5).trim()) as { type: string } & Record<string, unknown>;
+      })
+      .map((data) => ({ type: data.type, data }));
+  }
+
+  it("omits max_tokens from the outbound Chat body when the caller stated none, and carries it when stated", async () => {
+    const failed = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+    const winner = await recordingChat(() => ({ body: chatOkBody("ok") }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(failed.server)}`,
+      `http://127.0.0.1:${port(winner.server)}`,
+    ])));
+
+    const omitted = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", input: "hi" }),
+    });
+    expect(omitted.status).toBe(200);
+    await omitted.text();
+    expect(winner.bodies()).toHaveLength(1);
+    expect("max_tokens" in winner.bodies()[0]!).toBe(false);
+
+    const stated = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", input: "hi", max_output_tokens: 55 }),
+    });
+    expect(stated.status).toBe(200);
+    await stated.text();
+    expect(winner.bodies()).toHaveLength(2);
+    expect(winner.bodies()[1]!.max_tokens).toBe(55);
+  });
+
+  it("serves a token-capped Chat answer as status: incomplete, buffered", async () => {
+    const failed = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+    const capped = await scripted(() => ({ body: chatCappedBody("cut off mid") }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(failed.server)}`,
+      `http://127.0.0.1:${port(capped.server)}`,
+    ])));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", input: "hi" }),
+    });
+    expect(resp.status).toBe(200);
+    const j = await resp.json() as Record<string, unknown>;
+    expect(j.status).toBe("incomplete");
+    expect(j.incomplete_details).toEqual({ reason: "max_output_tokens" });
+    expect((j.output as Array<Record<string, unknown>>)[0]!.status).toBe("incomplete");
+  });
+
+  it("stays status: completed for an ordinary stop reason, buffered — negative control", async () => {
+    const failed = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+    const ok = await scripted(() => ({ body: chatOkBody("done") }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(failed.server)}`,
+      `http://127.0.0.1:${port(ok.server)}`,
+    ])));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", input: "hi" }),
+    });
+    expect(resp.status).toBe(200);
+    const j = await resp.json() as Record<string, unknown>;
+    expect(j.status).toBe("completed");
+    expect(j.incomplete_details).toBeUndefined();
+  });
+
+  it("serves a token-capped Chat answer as response.incomplete, streamed", async () => {
+    const failed = await scripted(() => ({ status: 429, body: JSON.stringify({ error: { message: "busy" } }) }));
+    const capped = await scripted(() => ({
+      headers: { "content-type": "text/event-stream" },
+      body: chatCappedStream("cut"),
+    }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(failed.server)}`,
+      `http://127.0.0.1:${port(capped.server)}`,
+    ])));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pool/coding", stream: true, input: "hi" }),
+    });
+    expect(resp.status).toBe(200);
+    const events = parseResponsesSse(await resp.text());
+    const terminal = events.filter((e) => e.type === "response.completed" || e.type === "response.incomplete");
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]!.type).toBe("response.incomplete");
+    const response = terminal[0]!.data.response as Record<string, unknown>;
+    expect(response.status).toBe("incomplete");
+    expect(response.incomplete_details).toEqual({ reason: "max_output_tokens" });
+  });
+
+  it("refuses a truncated function_call arguments string by name, with zero egress across the whole pool", async () => {
+    const a = await scripted(() => ({ body: OK_BODY }));
+    const b = await scripted(() => ({ body: OK_BODY }));
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(a.server)}`,
+      `http://127.0.0.1:${port(b.server)}`,
+    ])));
+
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "pool/coding",
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "find it" }] },
+          { type: "function_call", call_id: "call_abc", name: "exec_command", arguments: '{"cmd": "ls -la' },
+        ],
+      }),
+    });
+    expect(resp.status).toBe(400);
+    const j = await resp.json() as { error: { message: string } };
+    expect(j.error.message).toContain("call_abc");
+    expect(j.error.message).toContain("cut");
+    expect(a.calls()).toBe(0);
+    expect(b.calls()).toBe(0);
+  });
+
+  it("resolves the anthropic-kind fallback max_tokens: the learned max-output fact, else 8192", async () => {
+    const backend = await recordingChat(() => ({
+      body: JSON.stringify({
+        id: "msg_r", model: "claude-sonnet", role: "assistant", type: "message",
+        content: [{ type: "text", text: "done" }], stop_reason: "end_turn",
+      }),
+    }));
+    const c = poolCfg([`http://127.0.0.1:${port(backend.server)}`], "anthropic");
+    c.routing.default = "p1/m1";
+    delete c.routing.pools;
+    const p = port(await startProxy(c));
+
+    // No learned fact yet, no catalog entry: falls to the named tunable default.
+    const bare = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "p1/m1", input: "hi" }),
+    });
+    expect(bare.status).toBe(200);
+    await bare.text();
+    expect(backend.bodies()[0]!.max_tokens).toBe(8192);
+
+    // A learned max-output fact for this exact deployment outranks the default.
+    recordObservedMaxOutput("p1", "m1", 3000);
+    const learned = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "p1/m1", input: "hi" }),
+    });
+    expect(learned.status).toBe(200);
+    await learned.text();
+    expect(backend.bodies()[1]!.max_tokens).toBe(3000);
   });
 });

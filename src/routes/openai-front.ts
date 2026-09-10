@@ -215,6 +215,10 @@ export async function openAiFrontPath(
         isDestructive: h.isDestructive,
         processRecoveredChat,
         usage: run.usage,
+        // Bound: `cachedLimits` is an instance method that reads its own `this`, and handing it
+        // over bare (the way every other handler function here is a plain closure) drops that
+        // binding — measured live as `Cannot read properties of undefined (reading 'loadDisk')`.
+        catalogLimits: (provider, model) => h.catalog.cachedLimits(provider, model),
         onEgress: () => {
           run.egressCallbackCalled = true;
           pool429.noteEgress();

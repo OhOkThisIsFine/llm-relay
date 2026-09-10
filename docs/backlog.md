@@ -9,20 +9,23 @@
 
 ## Open
 
-- **A Codex run on the relay's Responses front dies the moment a tool-call argument string
-  arrives truncated — five of five DeepSeek lanes, 2026-09-09.** `codex exec -c
-  model_provider=llm-relay -m deepseek/deepseek-v4-pro` reaches `/v1/responses`; on every run the
-  model's `exec_command` arguments were cut mid-string (Codex: `failed to parse function
-  arguments: EOF while parsing a string at line 1 column 86`), Codex replayed the item on its next
-  turn, and `responses-request.ts` refused the replay (`function_call "exec_command" arguments are
-  not valid JSON`), ending an agentic run at 3k–20k tokens. Which side truncates is NOT known: the
-  provider's stream, or the relay's translation of `function_call_arguments` deltas on the
-  Responses front → Anthropic → Chat → back path. **Property:** a capture of one failing run's
-  upstream Chat stream beside the relay's emitted Responses stream shows where the string was cut.
-  If the relay drops or truncates a delta, that is fixed with a pinning test on ≥2 candidates. If
-  the provider truncates, the Responses front refuses the REPLAYED item with a message naming the
-  call id and that its arguments were truncated, so a harness can repair the turn instead of
-  replaying a broken one forever.
+- **DeepSeek refuses a multi-turn tool-call replay from the relay with HTTP 400 because the relay
+  drops `reasoning_content` between turns (2026-09-09, DeepSeek capture, medium).** In thinking
+  mode DeepSeek requires the `reasoning_content` of the assistant turn that made a tool call to be
+  replayed with that turn. `openai-request.ts` drops `thinking`/`redacted_thinking` cross-vendor
+  ("no representation") and `responses-request.ts` drops Codex's `reasoning` items, so the third
+  capture run in
+  [`deepseek-responses-truncation-2026-09-09.md`](deepseek-responses-truncation-2026-09-09.md)
+  ended at HTTP 400 after one or two tool-call turns. A representation EXISTS for this provider:
+  Chat `reasoning_content` on the outbound assistant message. (The same capture's other ancillary
+  finding, DeepSeek naming Codex's `exec` argument `cmd`/`command` as a bare string, is the
+  model's own shape error and repair mode's business, not a relay defect.) **Property:** on a
+  target whose provider declares it (a `compat` key on the `toolCallIds` precedent, defaulting from
+  a labelled host fact for `api.deepseek.com`, an explicit value winning both ways), the reasoning
+  the relay itself emitted for an assistant turn — a Responses `reasoning` item or an Anthropic
+  `thinking` block the CALLER replays — is carried as `reasoning_content` on that outbound
+  assistant message byte-for-byte and never fabricated when absent, pinned on ≥2 candidates, with
+  every other provider's outbound bytes unchanged.
 
 - **A config change needs a full daemon restart, and the shape of the server makes that avoidable
   (2026-09-09, DeepSeek provider survey, low).** `runProxy` calls `loadOrExit()` once and captures

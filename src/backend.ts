@@ -14,7 +14,8 @@ import { isRecord } from "./json-shape.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
 import { DocumentError, transcodeDocuments } from "./documents.js";
 import { anthropicRequestToOpenAi, RequestMappingError, ToolCallIds, ThoughtSignatures } from "./openai-request.js";
-import { openaiResponsesRequestToAnthropic } from "./responses-request.js";
+import { openaiResponsesRequestToAnthropic, DEFAULT_RESPONSES_MAX_TOKENS } from "./responses-request.js";
+import { observedMaxOutput } from "./context-limits.js";
 import { DIALECT_REFUSED_DESTRUCTIVE_CODE, describeRefused, dialectRefusalSignal, recoverToolCalls, type DialectRefusalSignal, type DialectToolCall } from "./tool-dialects.js";
 import { recoverDialectInStream } from "./dialect-stream.js";
 import { toolSchemaMap } from "./anthropic.js";
@@ -28,7 +29,7 @@ import {
   type RecoveredOpenAiChatProcessor,
 } from "./openai-dialect.js";
 import { observeUsage, type UsageAccumulator } from "./usage-observer.js";
-import { createSseTransformStream, parseSseEvent } from "./sse-frames.js";
+import { createSseTransformStream, parseSseEvent, BufferedSseFrames } from "./sse-frames.js";
 import { syntheticMessageId } from "./emitSse.js";
 import type { ThoughtSignatureMode, ToolCallIdMode } from "./config-types.js";
 
@@ -2211,6 +2212,15 @@ function formatOpenAiChatCompletion(
   return out;
 }
 
+/**
+ * `stop_reason: "max_tokens"` → the OpenAI Responses spelling for a token-capped answer, the same
+ * one `mapResponsesStopReason` already READS in the other direction
+ * (`incompleteReason === "max_output_tokens"`). Until 2026-09-09 this builder hardcoded
+ * `status: "completed"` regardless, so a cap landing mid tool-call-argument JSON reached the
+ * caller labelled as a finished answer — the mechanism behind
+ * docs/deepseek-responses-truncation-2026-09-09.md's Codex replay loop. Every other stop reason
+ * is unchanged.
+ */
 function formatOpenAiResponses(
   body: Record<string, unknown>,
   text: string,
@@ -2218,12 +2228,14 @@ function formatOpenAiResponses(
   model: string,
   usage: ReturnType<typeof openAiUsage>,
 ): Record<string, unknown> {
+  const capped = body.stop_reason === "max_tokens";
+  const itemStatus = capped ? "incomplete" : "completed";
   const output: Array<Record<string, unknown>> = [];
   if (text) {
     output.push({
       type: "message",
       id: `msg_${typeof body.id === "string" ? body.id : "relay"}`,
-      status: "completed",
+      status: itemStatus,
       role: "assistant",
       content: [{ type: "output_text", text, annotations: [] }],
     });
@@ -2236,18 +2248,19 @@ function formatOpenAiResponses(
       call_id: call.id,
       name: fn.name,
       arguments: fn.arguments,
-      status: "completed",
+      status: itemStatus,
     });
   }
   const out: Record<string, unknown> = {
     id: typeof body.id === "string" ? body.id : "resp_relay",
     object: "response",
     created_at: Math.floor(Date.now() / 1000),
-    status: "completed",
+    status: capped ? "incomplete" : "completed",
     model,
     output,
     output_text: text,
   };
+  if (capped) out.incomplete_details = { reason: "max_output_tokens" };
   if (usage) out.usage = withOpenAiTotal(usage);
   return out;
 }
@@ -2464,6 +2477,38 @@ export interface FetchOpenAiFrontArgs {
   processRecoveredChat?: RecoveredOpenAiChatProcessor;
   usage?: UsageAccumulator;
   onEgress?: OnEgress;
+  /**
+   * Catalog max-output lookup for the Responses front's `anthropic`-kind fallback (2026-09-09).
+   * Anthropic's Messages API REQUIRES `max_tokens`, and `openaiResponsesRequestToAnthropic` no
+   * longer invents a value when the caller stated none (see that module's header) — so a
+   * passthrough target still needs one resolved, and the catalog's published figure is the
+   * second-strongest evidence after the deployment's own learned `max-output` fact. Optional:
+   * absent (or a provider/model the catalog holds nothing for) falls straight through to
+   * `DEFAULT_RESPONSES_MAX_TOKENS`.
+   */
+  catalogLimits?: (provider: string, model: string) => { maxOutputTokens: number | null } | null | undefined;
+}
+
+/**
+ * The Responses front's `max_tokens` for an `anthropic`-kind target when the caller's own
+ * `max_output_tokens` was absent — Anthropic's Messages API requires the field, so ONE of these
+ * three rungs must fill it, most-authoritative first: the deployment's own learned `max-output`
+ * fact (`context-limits.ts` — first-party, this exact deployment stated its ceiling while
+ * refusing an over-sized request), the catalog's published figure for it, then the named tunable
+ * default `DEFAULT_RESPONSES_MAX_TOKENS`. No model on the target (a bare passthrough entry with
+ * no `model` field) skips straight to the default — there is nothing to key a lookup on.
+ */
+function resolveAnthropicResponsesMaxTokens(
+  target: { provider: string; model?: string },
+  catalogLimits?: (provider: string, model: string) => { maxOutputTokens: number | null } | null | undefined,
+): number {
+  if (target.model) {
+    const learned = observedMaxOutput(target.provider, target.model);
+    if (typeof learned === "number" && learned > 0) return learned;
+    const published = catalogLimits?.(target.provider, target.model)?.maxOutputTokens;
+    if (typeof published === "number" && published > 0) return published;
+  }
+  return DEFAULT_RESPONSES_MAX_TOKENS;
 }
 
 async function fetchDirectOpenAiChat(
@@ -2590,6 +2635,91 @@ async function fetchDirectOpenAiChat(
   return attachUpstreamMetadata(res, metadata);
 }
 
+/**
+ * Watch an Anthropic SSE stream for its `message_delta`'s `stop_reason`, calling `onStopReason`
+ * the moment it is seen, while passing every byte through UNCHANGED.
+ *
+ * Why a tap and not a tee: the scan runs SYNCHRONOUSLY inside the same `transform()` call that
+ * re-enqueues the chunk, so by the time any downstream reader of the returned stream (here,
+ * llm-bridge's own translator) observes a given byte, this tap has already inspected it — no
+ * race, and no second reader competing with the real one for backpressure. `stop_reason` always
+ * arrives on `message_delta`, strictly before `message_stop`, so it is available before llm-bridge
+ * ever reaches the point of emitting `response.completed` from it.
+ */
+function tapAnthropicStopReason(
+  source: ReadableStream<Uint8Array>,
+  onStopReason: (reason: string) => void,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const frames = new BufferedSseFrames();
+  let seen = false;
+  return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+      if (seen) return;
+      frames.append(decoder.decode(chunk, { stream: true }));
+      for (const { frame } of frames) {
+        if (seen) break;
+        const ev = parseSseEvent(frame);
+        if (ev?.type !== "message_delta" || !isRecord(ev.data)) continue;
+        const delta = ev.data.delta;
+        if (isRecord(delta) && typeof delta.stop_reason === "string") {
+          seen = true;
+          onStopReason(delta.stop_reason);
+        }
+      }
+    },
+  }));
+}
+
+/** One OpenAI Responses SSE frame: `event: <type>\ndata: {"type":<type>,...}\n\n`. */
+function responsesSseEvent(type: string, data: Record<string, unknown>): string {
+  return `event: ${type}\ndata: ${JSON.stringify({ ...data, type })}\n\n`;
+}
+
+/**
+ * Rewrite the Responses front's terminal `response.completed` event to `response.incomplete`
+ * (`status: "incomplete"`, `incomplete_details: {reason: "max_output_tokens"}`) whenever the
+ * underlying Anthropic message stopped on `max_tokens` — mirroring the `response.incomplete`
+ * event this file already handles INBOUND (`RESPONSES_STREAM_HANDLERS`, above).
+ *
+ * llm-bridge's own Anthropic→Responses stream emitter — there is no relay-owned mirror for this
+ * direction, unlike the reverse (`translateResponsesStreamToAnthropic`) — always answers
+ * `"completed"` for every non-error stop reason, dropping `stop_reason` entirely. This wraps its
+ * output rather than duplicating its whole translation: `stopReason` is read from the SAME
+ * Anthropic stream via `tapAnthropicStopReason`, populated before this wrapper ever sees the
+ * matching `response.completed` frame. Every other stop reason passes the frame through verbatim.
+ */
+function markResponsesIncompleteOnMaxTokens(
+  source: ReadableStream<Uint8Array>,
+  stopReason: { value: string | null },
+): ReadableStream<Uint8Array> {
+  return createSseTransformStream(source, ({ push, frames }) => ({
+    processFrames: () => {
+      for (const { frame, raw } of frames) {
+        const ev = parseSseEvent(frame);
+        if (
+          stopReason.value === "max_tokens" &&
+          ev?.type === "response.completed" &&
+          isRecord(ev.data) &&
+          isRecord(ev.data.response)
+        ) {
+          push(responsesSseEvent("response.incomplete", {
+            ...ev.data,
+            response: {
+              ...ev.data.response,
+              status: "incomplete",
+              incomplete_details: { reason: "max_output_tokens" },
+            },
+          }));
+          continue;
+        }
+        push(raw);
+      }
+    },
+  }));
+}
+
 async function fetchTranslatedOpenAiFront(
   attempt: ResolvedAttempt,
   args: FetchOpenAiFrontArgs,
@@ -2612,6 +2742,13 @@ async function fetchTranslatedOpenAiFront(
       : translateBetweenProviders("openai", "anthropic", base as never) as Record<string, unknown>;
     if (target.model !== undefined) anthropicBody.model = target.model;
     anthropicBody.stream = args.wantsStream;
+    // The Responses front carries NO `max_tokens` when the caller's `max_output_tokens` was
+    // absent (`responses-request.ts`). An `openai`-kind target is fine with that — the mapper
+    // ahead omits the field and the provider applies its own ceiling — but Anthropic's Messages
+    // API REQUIRES it, so a passthrough target needs one resolved here, at the target.
+    if (protocol === "responses" && target.kind === "anthropic" && typeof anthropicBody.max_tokens !== "number") {
+      anthropicBody.max_tokens = resolveAnthropicResponsesMaxTokens(target, args.catalogLimits);
+    }
   } catch (e) {
     // A shape we will not put on the wire is the caller's request being unrepresentable, not a
     // provider failure — the same clean local 400 the Messages front raises.
@@ -2687,7 +2824,14 @@ async function fetchTranslatedOpenAiFront(
     }
     const targetProtocol = protocol === "responses" ? "openai-responses" : "openai";
     try {
-      const output = handleUniversalStreamRequest(preflight.body, "anthropic", targetProtocol);
+      // Responses-only: the Chat protocol already carries `finish_reason: "length"` correctly
+      // (`openAiFinishReason`, the buffered path's sibling), so there is nothing to announce there.
+      const stopReason: { value: string | null } = { value: null };
+      const anthropicSource = protocol === "responses"
+        ? tapAnthropicStopReason(preflight.body, (r) => { stopReason.value = r; })
+        : preflight.body;
+      let output = handleUniversalStreamRequest(anthropicSource, "anthropic", targetProtocol);
+      if (protocol === "responses") output = markResponsesIncompleteOnMaxTokens(output, stopReason);
       // Same rule as the buffered rebuild below: rebuilding the response must not swallow the
       // announcement of a fix the relay applied one Response ago.
       const rewritten = backendRes.headers.get(TOOL_CALL_IDS_HEADER);

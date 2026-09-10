@@ -59,9 +59,16 @@ import { isRecord } from "./json-shape.js";
  *     that will parse it as JSON — a silent corruption, and the one thing worse than a 400.
  *   - `previous_response_id` is REFUSED: the relay holds no response state, so honouring it
  *     silently would drop the whole conversation prefix it names.
- *   - `max_output_tokens` → `max_tokens`; absent falls back to 1024 — llm-bridge's carried default,
- *     kept ONLY because the field is mandatory downstream. It is a default, not a measurement, and
- *     nothing labels it otherwise.
+ *   - `max_output_tokens` → `max_tokens`, carried ONLY when the caller stated one. Absent is carried
+ *     as absent — never llm-bridge's old flat 1024, which this relay was inventing and sending to
+ *     every backend as a real ceiling (docs/deepseek-responses-truncation-2026-09-09.md: 20 of 68
+ *     captured DeepSeek answers hit that exact invented cap mid-answer, and the Responses front
+ *     labelled every one of them `"status":"completed"` regardless — a token-capped answer reaching
+ *     a harness labelled complete). `openai-request.ts` already omits an absent `max_tokens` from
+ *     the outbound Chat body, so an `openai`-kind target's own provider applies its own ceiling; an
+ *     `anthropic`-kind target REQUIRES the field, so `backend.ts` resolves one AT THE TARGET — the
+ *     deployment's own learned `max-output` fact (`context-limits.ts`), then the catalog's, then
+ *     the named tunable default `DEFAULT_RESPONSES_MAX_TOKENS` below. Never an invented measurement.
  *   - `store`, `prompt_cache_key`, `include`, `metadata`, `user`, `truncation`, `text.verbosity`,
  *     `service_tier`, `background` and non-function tool declarations (`web_search_preview`, …)
  *     are dropped: no representation, and no effect on the conversation. That is also exactly
@@ -80,6 +87,27 @@ import { isRecord } from "./json-shape.js";
 import { RequestMappingError } from "./openai-request.js";
 
 type Rec = Record<string, unknown>;
+
+/**
+ * The Responses front's LAST-RESORT `max_tokens` for an `anthropic`-kind target when the caller
+ * stated no `max_output_tokens` and this deployment has taught the relay no ceiling of its own
+ * (`context-limits.ts`'s learned `max-output` fact) and the catalog publishes none either.
+ * `backend.ts`'s `resolveAnthropicResponsesMaxTokens` is the one place this constant is read —
+ * an `openai`-kind target never reaches it, because `openai-request.ts` omits `max_tokens`
+ * entirely when the caller stated none and the provider applies its own ceiling.
+ *
+ * A TUNABLE DEFAULT, never a provider figure — the provenance invariant this whole module already
+ * follows. Until 2026-09-09 this module substituted llm-bridge's flat 1024 here UNCONDITIONALLY,
+ * even for an `openai`-kind target's outbound Chat body, where the field is genuinely optional.
+ * Measured against DeepSeek (docs/deepseek-responses-truncation-2026-09-09.md): 20 of 68 captured
+ * upstream answers ended `finish_reason: "length"` at EXACTLY `completion_tokens: 1024` — the
+ * relay's own invented cap, not anything the caller or the provider asked for — and every one of
+ * the 44 emitted `response.completed` events still carried `"status":"completed"`, so a cap
+ * landing mid tool-call-argument JSON reached the caller looking like a finished answer. 8192 is
+ * 8x that figure and is still just a guess bounding an `anthropic`-kind passthrough, which
+ * REQUIRES the field.
+ */
+export const DEFAULT_RESPONSES_MAX_TOKENS = 8192;
 
 /** Name an unexpected type in an error without echoing an arbitrary payload back at the caller. */
 function describeType(t: unknown): string {
@@ -218,8 +246,14 @@ function systemTextOf(content: unknown): string {
  * spells differently and becomes `{}`; anything else that does not parse to an object is REFUSED,
  * because wrapping a string in a synthetic key (`{"input": "…"}`) would invent a schema the tool
  * never declared and the model would read the invention back as its own prior call.
+ *
+ * ⚠ The invalid-JSON refusal NAMES the `call_id` and says the string was CUT — the most likely
+ * cause is an output-token cap landing mid-argument (docs/deepseek-responses-truncation-2026-09-09.md),
+ * and a harness replaying the same malformed call forever cannot tell that from any other
+ * malformed-JSON cause without this. A harness reading the message can instead repair or drop that
+ * one item and retry, rather than looping.
  */
-function toolArguments(raw: unknown, name: string): Rec {
+function toolArguments(raw: unknown, name: string, callId: string): Rec {
   if (raw === undefined || raw === null) return {};
   if (isRecord(raw)) return raw;
   if (typeof raw !== "string") {
@@ -230,7 +264,9 @@ function toolArguments(raw: unknown, name: string): Rec {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new RequestMappingError(`function_call ${describeType(name)} arguments are not valid JSON`);
+    throw new RequestMappingError(
+      `function_call ${describeType(name)} (call_id ${callId}) arguments are not valid JSON: the string was cut, most likely by an output-token cap; repair or drop that item and retry`,
+    );
   }
   if (!isRecord(parsed)) {
     throw new RequestMappingError(`function_call ${describeType(name)} arguments are not a JSON object`);
@@ -247,7 +283,7 @@ function toolUseBlock(item: Rec): Rec {
   if (id.length === 0) throw new RequestMappingError("function_call without a call_id");
   const name = typeof item.name === "string" ? item.name : "";
   if (name.length === 0) throw new RequestMappingError("function_call without a name");
-  return { type: "tool_use", id, name, input: toolArguments(item.arguments, name) };
+  return { type: "tool_use", id, name, input: toolArguments(item.arguments, name, id) };
 }
 
 /** A `function_call_output` item → the user-side `tool_result` block it is. */
@@ -471,12 +507,10 @@ export function openaiResponsesRequestToAnthropic(reqJson: unknown): Record<stri
   }
   flush();
 
-  const out: Rec = {
-    // Mandatory downstream, so llm-bridge's 1024 is carried when the caller stated nothing.
-    // A carried default, not a measurement of anything.
-    max_tokens: typeof body.max_output_tokens === "number" ? body.max_output_tokens : 1024,
-    messages,
-  };
+  const out: Rec = { messages };
+  // Carried ONLY when the caller stated one — absent is carried as absent. See the module header
+  // and `DEFAULT_RESPONSES_MAX_TOKENS` for why nothing is invented here any more.
+  if (typeof body.max_output_tokens === "number") out.max_tokens = body.max_output_tokens;
   mapResponsesOptions(body, out, systemParts);
   return out;
 }
