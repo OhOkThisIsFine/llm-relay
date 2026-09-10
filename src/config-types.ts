@@ -229,6 +229,18 @@ export interface ProviderConfig {
    * Default 90000 (fork-validated in freellmapi). Adoption review §1.2.
    */
   stallTimeoutMs?: number;
+  /**
+   * Time-to-first-byte deadline for a NON-STREAMED attempt, in ms — separate from `timeoutMs` so a
+   * backend that has produced no bytes at all fails fast while one that is merely slow to finish a
+   * buffered body is not killed. "First byte" is the moment `fetch()` resolves (response headers
+   * arrived); from there `timeoutMs` governs the body read exactly as before this existed. Default:
+   * `stallTimeoutMs` when that is set (same intent — "no bytes for this long means dead") — a
+   * value that is not explicit takes it, an explicit value wins over it. Otherwise OFF (no
+   * first-byte deadline, the pre-existing behaviour). Never armed on a streamed attempt, which
+   * already has `stallTimeoutMs`'s inter-byte watchdog once its own head is being served. `0` is a
+   * hard config-load error naming the key — it would bound nothing while looking like it did.
+   */
+  firstByteTimeoutMs?: number;
   /** "free": wholly free/free-tier catalog. "mixed": catalog contains free and paid models. */
   tierType?: ProviderTierType;
   /**
@@ -616,6 +628,14 @@ export interface ResolvedTarget {
   timeoutMs: number;
   /** Carried from the provider: inter-byte stall watchdog for streamed responses. */
   stallTimeoutMs?: number;
+  /**
+   * RESOLVED time-to-first-byte deadline for a non-streamed attempt (`resolveFirstByteTimeoutMs`)
+   * — an explicit `ProviderConfig.firstByteTimeoutMs`, or `stallTimeoutMs` as the default, or
+   * absent when neither is set. Resolved here so the attempt runner is handed a number and never
+   * re-derives a default from two provider fields. Absent (a hand-built target) means no
+   * first-byte deadline, the pre-2026-09-09 behaviour byte for byte.
+   */
+  firstByteTimeoutMs?: number;
   /**
    * RESOLVED outbound tool-call-id shape (`resolveToolCallIdMode`) — an explicit
    * `compat.toolCallIds` or the labelled base-host default. Resolved here so the request mapper

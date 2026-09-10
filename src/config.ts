@@ -146,6 +146,31 @@ function parseProviderWire(raw: unknown, kind: Kind, name: string): ProviderWire
   return raw as ProviderWireMode;
 }
 
+/**
+ * Parse a provider's `firstByteTimeoutMs` — the `compat`/`wire` precedent: any value present but
+ * not a positive integer is a hard load error naming the key, rather than the lenient
+ * silently-dropped parse `stallTimeoutMs` uses. `0` bounds nothing while looking like it did (an
+ * armed-but-instant deadline would abort every non-streamed attempt), so it is refused by name
+ * exactly like a negative or fractional value.
+ */
+function parseProviderFirstByteTimeout(raw: unknown, name: string): number | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || !Number.isInteger(raw) || raw <= 0) {
+    throw new Error(`config.providers.${name}.firstByteTimeoutMs must be a positive integer`);
+  }
+  return raw;
+}
+
+/**
+ * The RESOLVED time-to-first-byte deadline for one provider: an explicit `firstByteTimeoutMs`, or
+ * `stallTimeoutMs` as the default (same intent — "no bytes for this long means dead"), or absent
+ * when neither is configured. An explicit value always wins, even `undefined` cannot occur here
+ * since `parseProviderFirstByteTimeout` never returns `0` or another falsy-but-present value.
+ */
+export function resolveFirstByteTimeoutMs(p: { stallTimeoutMs?: number; firstByteTimeoutMs?: number }): number | undefined {
+  return p.firstByteTimeoutMs !== undefined ? p.firstByteTimeoutMs : p.stallTimeoutMs;
+}
+
 /** The host of a base URL, lowercased — or null when it is not a URL at all. */
 function baseHost(base: string): string | null {
   try {
@@ -582,6 +607,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
   if (p.kind === "openai" && !realModel) {
     throw new RoutingError(`provider "${provider}" is openai and needs a model id (spec "${spec}")`);
   }
+  const firstByteTimeoutMs = resolveFirstByteTimeoutMs(p);
   return {
     provider,
     base: p.base,
@@ -589,6 +615,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
     authHeader: p.authHeader,
     timeoutMs: p.timeoutMs,
     ...(p.stallTimeoutMs !== undefined ? { stallTimeoutMs: p.stallTimeoutMs } : {}),
+    ...(firstByteTimeoutMs !== undefined ? { firstByteTimeoutMs } : {}),
     ...(realModel !== undefined ? { model: realModel } : {}),
     ...(p.authEnv ? { authEnv: p.authEnv } : {}),
     credentialSlots: providerCredentialSlots(provider, p),
@@ -1102,6 +1129,7 @@ interface RawProviderFields {
   authHeader?: unknown;
   timeoutMs?: unknown;
   stallTimeoutMs?: unknown;
+  firstByteTimeoutMs?: unknown;
   tierType?: unknown;
   signupUrl?: unknown;
   limits?: unknown;
@@ -1129,6 +1157,7 @@ function buildProviderConfig(
   limits: ReturnType<typeof parseConfiguredLimits>,
   compat: ProviderCompatConfig | undefined,
   wire: ProviderWireMode | undefined,
+  firstByteTimeoutMs: number | undefined,
 ): ProviderConfig {
   return {
     base: expanded.value.trim().replace(/\/+$/, ""),
@@ -1138,6 +1167,7 @@ function buildProviderConfig(
     ...(typeof p.stallTimeoutMs === "number" && Number.isFinite(p.stallTimeoutMs) && p.stallTimeoutMs >= 0
       ? { stallTimeoutMs: Math.floor(p.stallTimeoutMs) }
       : {}),
+    ...(firstByteTimeoutMs !== undefined ? { firstByteTimeoutMs } : {}),
     ...(declaredAuthEnv ? { authEnv: declaredAuthEnv } : {}),
     ...(credentials !== undefined ? { credentials } : {}),
     ...(credentialMode !== undefined ? { credentialMode } : {}),
@@ -1187,6 +1217,7 @@ function parseSingleProvider(
   const limits = parseConfiguredLimits(p.limits, `config.providers.${name}.limits`);
   const compat = parseProviderCompat(p.compat, `config.providers.${name}.compat`);
   const wire = parseProviderWire(p.wire, kind, name);
+  const firstByteTimeoutMs = parseProviderFirstByteTimeout(p.firstByteTimeoutMs, name);
 
   if (expanded.missing.length > 0) {
     warnings.push(
@@ -1207,6 +1238,7 @@ function parseSingleProvider(
 
   return buildProviderConfig(
     p, expanded, kind, defaultAuthHeader, declaredAuthEnv, credentials, credentialMode, maxConcurrent, limits, compat, wire,
+    firstByteTimeoutMs,
   );
 }
 

@@ -1663,6 +1663,52 @@ describe("loadConfig — provider wire (Responses vs. Chat upstream)", () => {
   });
 });
 
+/**
+ * `providers.<name>.firstByteTimeoutMs` — backlog item 1: a non-streamed attempt separates a
+ * time-to-first-byte deadline from the total `timeoutMs`, so a backend that has produced no bytes
+ * fails fast while one that is merely slow to finish is not killed. Resolved onto
+ * `ResolvedTarget.firstByteTimeoutMs` (`resolveFirstByteTimeoutMs`).
+ */
+describe("loadConfig — provider firstByteTimeoutMs", () => {
+  const provider = (p: Record<string, unknown>) => (name: string) =>
+    loadConfig(write(name, base({ providers: { x: { kind: "openai", base: "https://nim.test/v1", ...p } }, routing: { default: "x/m" } })));
+
+  it("defaults from stallTimeoutMs when no explicit value is set — same intent, 'no bytes for this long means dead'", () => {
+    const c = provider({ stallTimeoutMs: 45000 })("fbt-default.json");
+    expect(c.providers.x!.firstByteTimeoutMs).toBeUndefined(); // the raw config carries no field of its own
+    expect(resolveTarget("m", c).firstByteTimeoutMs).toBe(45000); // the RESOLVED default
+  });
+
+  it("is OFF (absent) when neither firstByteTimeoutMs nor stallTimeoutMs is configured", () => {
+    const c = provider({})("fbt-absent.json");
+    expect(c.providers.x!.firstByteTimeoutMs).toBeUndefined();
+    expect(resolveTarget("m", c).firstByteTimeoutMs).toBeUndefined();
+  });
+
+  it("lets an explicit value win over the stallTimeoutMs default", () => {
+    const c = provider({ stallTimeoutMs: 45000, firstByteTimeoutMs: 5000 })("fbt-explicit.json");
+    expect(c.providers.x!.firstByteTimeoutMs).toBe(5000);
+    expect(resolveTarget("m", c).firstByteTimeoutMs).toBe(5000);
+  });
+
+  it("rejects 0 by name — it would bound nothing while looking like it did", () => {
+    expect(() => provider({ firstByteTimeoutMs: 0 })("fbt-zero.json"))
+      .toThrow(/config\.providers\.x\.firstByteTimeoutMs must be a positive integer/);
+  });
+
+  it("rejects a negative or fractional value by name", () => {
+    expect(() => provider({ firstByteTimeoutMs: -1 })("fbt-negative.json"))
+      .toThrow(/config\.providers\.x\.firstByteTimeoutMs must be a positive integer/);
+    expect(() => provider({ firstByteTimeoutMs: 12.5 })("fbt-fractional.json"))
+      .toThrow(/config\.providers\.x\.firstByteTimeoutMs must be a positive integer/);
+  });
+
+  it("rejects a string by name", () => {
+    expect(() => provider({ firstByteTimeoutMs: "300" })("fbt-string.json"))
+      .toThrow(/config\.providers\.x\.firstByteTimeoutMs must be a positive integer/);
+  });
+});
+
 describe("routing.dispatchWalk", () => {
   it("defaults ON with the standard budget when absent — the 2026-09-06 owner request", () => {
     const cfg = loadConfig(write("dw-absent.json", base()));

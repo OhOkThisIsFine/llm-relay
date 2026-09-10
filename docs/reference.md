@@ -616,6 +616,15 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
   `"stallTimeoutMs"`, default 90 s, `0` restores the single deadline) aborts only when no byte
   arrives for the whole window. A healthy long generation is never killed by the total deadline,
   and a dead stream is detected by silence, not by waiting out the deadline.
+- **First-byte deadline (non-streamed only)** — a separate, shorter deadline for the time to the
+  FIRST byte of a non-streamed response (per-provider `"firstByteTimeoutMs"`, in ms): once the raw
+  HTTP call resolves with headers, this deadline clears and `timeoutMs` alone governs the body
+  read, exactly as before it existed. Absent, it defaults to `stallTimeoutMs` when that is set
+  (same intent — "no bytes for this long means dead") and is otherwise OFF; an explicit value wins
+  over the default in both directions, and `0` is a hard config-load error rather than a deadline
+  that could never be met. Never armed on a streamed request, which already has the inter-byte
+  watchdog above. A backend that accepts the connection and produces nothing fails over quickly;
+  one that is merely slow to finish a buffered body is not killed by it.
 
 Health **demotes** candidates, never drops them (live → credential-faulted → cooling). Responses
 carry `x-llm-relay-served-by`: the deployment that served, or on error every deployment tried,

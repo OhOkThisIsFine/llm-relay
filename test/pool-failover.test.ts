@@ -1466,6 +1466,112 @@ describe("request-scoped provider skip — transport evidence condemns the host,
   });
 });
 
+describe("first-byte deadline — non-streamed attempts only (backlog item 1)", () => {
+  // Measured against nim at timeoutMs 100000: deepseek-v4-flash returned 504 at 100.03s twice
+  // while a sibling answered 200 in 81.6s for two tokens — the free queue exceeded the flat
+  // deadline, and an operator read the 504 as "model gone". A time-to-first-byte deadline lets a
+  // backend that has produced NO bytes fail fast while one merely slow to finish is not killed.
+
+  /** Accepts the connection and sends nothing at all, ever — no headers. Only a deadline (either
+   *  one) ends it; `fetch()` itself never resolves without one. */
+  function hangsForever(): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer(() => {
+        n++;
+        // never respond — the raw fetch() promise stays pending until a deadline aborts it.
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  /** Sends headers AT ONCE — fetch() resolves right away — then waits `bodyDelayMs` before
+   *  finishing the body. The shape a first-byte deadline must NOT kill. */
+  function slowBody(bodyDelayMs: number, body: string): Promise<{ server: Server; calls: () => number }> {
+    let n = 0;
+    return new Promise((resolve) => {
+      const s = createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          n++;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.flushHeaders();
+          setTimeout(() => res.end(body), bodyDelayMs);
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve({ server: track(s), calls: () => n }));
+    });
+  }
+
+  it("kills a non-streamed attempt whose headers never arrive, well before the total deadline — the next candidate serves", async () => {
+    const dead = await hangsForever();
+    const ok = await scripted(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(dead.server)}`, `http://127.0.0.1:${port(ok.server)}`]);
+    cfg.providers["p1"]!.firstByteTimeoutMs = 300; // p1's own timeoutMs stays poolCfg's 5000ms
+    const p = port(await startProxy(cfg));
+
+    const started = Date.now();
+    const resp = await chat(p);
+    const elapsed = Date.now() - started;
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+    expect(dead.calls()).toBe(1);
+    expect(ok.calls()).toBe(1);
+    expect(elapsed).toBeLessThan(2500); // half of p1's 5000ms total deadline
+  });
+
+  it("does NOT kill a non-streamed attempt whose headers arrive at once but whose body is merely slow", async () => {
+    const slow = await slowBody(500, OK_BODY); // body finishes at 500ms > firstByteTimeoutMs (300ms)
+    const other = await scripted(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(slow.server)}`, `http://127.0.0.1:${port(other.server)}`]);
+    cfg.providers["p1"]!.firstByteTimeoutMs = 300;
+    const p = port(await startProxy(cfg));
+
+    const resp = await chat(p);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p1/m1"); // the FIRST candidate served — not killed
+    expect(slow.calls()).toBe(1);
+    expect(other.calls()).toBe(0); // never reached — p1 answered
+  });
+
+  it("streamed request: the same slow-headers shape is unaffected — no first-byte failure fires", async () => {
+    const dead = await hangsForever();
+    const cfg = poolCfg([`http://127.0.0.1:${port(dead.server)}`]);
+    cfg.providers["p1"]!.firstByteTimeoutMs = 100; // would kill it at 100ms if wrongly armed
+    cfg.providers["p1"]!.timeoutMs = 600; // the ONLY deadline that may govern a streamed attempt
+    const p = port(await startProxy(cfg));
+
+    const started = Date.now();
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "pool/coding", stream: true, max_tokens: 20, messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    const elapsed = Date.now() - started;
+    await resp.text();
+    // Proof the first-byte timer never armed: the walk waited out the TOTAL 600ms deadline, not
+    // the 100ms first-byte one.
+    expect(elapsed).toBeGreaterThanOrEqual(550);
+  });
+
+  it("firstByteTimeoutMs absent and stallTimeoutMs absent: the slow-headers backend is waited for up to timeoutMs, as today", async () => {
+    const dead = await hangsForever();
+    const ok = await scripted(() => ({ body: OK_BODY }));
+    const cfg = poolCfg([`http://127.0.0.1:${port(dead.server)}`, `http://127.0.0.1:${port(ok.server)}`]);
+    cfg.providers["p1"]!.timeoutMs = 300; // no firstByteTimeoutMs, no stallTimeoutMs configured
+    const p = port(await startProxy(cfg));
+
+    const started = Date.now();
+    const resp = await chat(p);
+    const elapsed = Date.now() - started;
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+    expect(elapsed).toBeGreaterThanOrEqual(280); // waited out p1's OWN 300ms total deadline
+  });
+});
+
 describe("live-traffic quota headers reach the breaker (adoption review §1.9)", () => {
   const quotaHeaders = (requestRemaining: string, tokenRemaining?: string) => ({
     "x-ratelimit-limit-requests-day": "100",

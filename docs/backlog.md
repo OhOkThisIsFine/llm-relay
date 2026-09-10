@@ -24,28 +24,6 @@
   call id and that its arguments were truncated, so a harness can repair the turn instead of
   replaying a broken one forever.
 
-- **A NON-STREAMED request has no time-to-first-byte protection, so a slow QUEUE reads as a dead
-  backend (2026-09-09, DeepSeek provider survey, medium).** `beginAttemptRun` in
-  `src/candidate-runner.ts` arms one flat `target.timeoutMs` deadline for the whole request.
-  `routes/messages.ts` and `routes/openai-front.ts` then clear that timer and install
-  `withStallWatchdog` — but only `if (streamed && backendRes.status < 400 && stallMs > 0)`. The
-  doc comment on `stallTimeoutMs` in `src/config-types.ts` states the intent plainly: "one flat
-  deadline kills a healthy long generation at minute two while letting a dead stream hang until
-  the same minute two". **That reasoning applies to a non-streamed request too, and a non-streamed
-  request gets none of the protection.** It keeps the flat deadline for its whole life, including
-  the queue wait before the backend emits anything.
-  Measured against `nim` at `timeoutMs: 100000`: `deepseek-ai/deepseek-v4-flash-0731` returned 504
-  at 100.03 s and again at 100.04 s, while `deepseek-ai/deepseek-v4-pro-0813` answered 200 in
-  81.6 s for TWO output tokens, and `relay-restart.log` holds the same Flash model answering 200
-  in 38.1 s on 2026-08-27. The model was never unservable; the free NIM queue simply exceeded the
-  deadline. A 504 does not write a `not-servable` fact, so nothing is poisoned — but an operator
-  reading the 504 concludes the model is gone, which is what happened here.
-  Raising `timeoutMs` is the wrong lever alone: it lengthens the wait for a genuinely dead
-  backend by exactly as much.
-  **Property:** a non-streamed attempt separates a time-to-first-byte deadline from the total
-  deadline, so a backend that has produced no bytes fails fast while one that is merely slow to
-  finish is not killed; the existing streamed path keeps its current behaviour.
-
 - **A config change needs a full daemon restart, and the shape of the server makes that avoidable
   (2026-09-09, DeepSeek provider survey, low).** `runProxy` calls `loadOrExit()` once and captures
   `cfg` in the `createServer` closure; every request then receives it as `handle(req, res, cfg,

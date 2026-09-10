@@ -234,7 +234,10 @@ export async function openAiFrontPath(
           recordCredentialStarted(credentialWalk, credentialTrace, run.resolvedAttempt);
           tried.push(specOfTarget(run.target));
         },
-      }), {
+        // ⚠ NOT the global `fetch` — `run.fetchFn` is what actually clears the first-byte deadline
+        // (`candidate-runner.ts` `beginAttemptRun`) the instant the raw HTTP call resolves. Passing
+        // the default here would arm the timer and never clear it before the total deadline does.
+      }, run.fetchFn), {
         // The commit probe runs inside the attempt so the hedge race settles at first content.
         protocol: ctx.protocol === "responses" ? "openai-responses" : "openai-chat",
         isCancelled: () => res.destroyed,
@@ -242,7 +245,7 @@ export async function openAiFrontPath(
       });
     };
 
-    const primaryRun = beginAttemptRun(res, primaryOffer);
+    const primaryRun = beginAttemptRun(res, primaryOffer, ctx.wantsStream);
     let resolvedAttempt = primaryRun.resolvedAttempt;
     let target = primaryRun.target;
     let timer = primaryRun.timer;
@@ -290,7 +293,7 @@ export async function openAiFrontPath(
             attemptTrace,
             tracker: pool429,
             startRun: (offer) => {
-              const hedgeRun = beginAttemptRun(res, offer);
+              const hedgeRun = beginAttemptRun(res, offer, ctx.wantsStream);
               try {
                 return { run: hedgeRun, promise: startAttempt(hedgeRun, buildForwardHeaders(ctx.inboundHeaders, offer)) };
               } catch {

@@ -802,9 +802,55 @@ export interface AttemptRun {
   readonly usage: UsageAccumulator;
   attempt: HealthAttempt | undefined;
   egressCallbackCalled: boolean;
+  /**
+   * The `fetch` this attempt's egress MUST use — both fronts' `startAttempt` pass this as
+   * `fetchBackend`'s / `fetchOpenAiFront`'s third argument. Plain `fetch` unless a first-byte
+   * deadline is armed below, in which case it wraps `fetch` to clear `firstByteTimer` the instant
+   * the underlying HTTP call resolves — headers arrived — which is BEFORE `fetchBackend()` /
+   * `fetchOpenAiFront()` finish reading a buffered body or preflighting a stream. That earlier
+   * moment is the only place "first byte" can be observed; the OUTER promise those two functions
+   * return already reflects the full non-streamed body read.
+   */
+  fetchFn: typeof fetch;
+  /**
+   * Armed only for a non-streamed attempt whose target resolved a `firstByteTimeoutMs`
+   * (`ResolvedTarget.firstByteTimeoutMs`) — never for a streamed one, which already has
+   * `stallTimeoutMs`'s inter-byte watchdog once its own head is being served. Cleared by
+   * `fetchFn` above the moment the raw `fetch()` resolves; the total `timer` above then governs
+   * the body read exactly as before this existed. `undefined` when no first-byte deadline applies.
+   */
+  firstByteTimer?: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Set by the first-byte timer's own callback, before it aborts `controller` — the SAME
+   * controller the total-deadline `timer` above aborts, so a caller reading
+   * `controller.signal.aborted` alone cannot tell which deadline fired. The metadata-only log
+   * distinction (`first-byte deadline <n>ms`, never a new outcome kind) reads this flag.
+   */
+  firstByteTimedOut?: boolean;
+  /** The first-byte deadline that fired, carried only for the log's reason string above. */
+  firstByteTimeoutMs?: number;
 }
 
-export function beginAttemptRun(res: ServerResponse, offer: ResolvedAttempt): AttemptRun {
+/**
+ * Wrap `fetchFn` so the FIRST underlying call's settlement (success OR failure) notifies
+ * `onFirstByte` exactly once, then never again. A non-streamed `openai`-kind attempt may retry the
+ * raw fetch once (dropping an unsupported `stream_options` hint), but that retry is gated on
+ * `args.wantsStream`, which a first-byte-armed attempt never sets — so one notification is correct
+ * for every case this wrapper is used for, and a stray second settlement is a no-op.
+ */
+function firstByteFetch(fetchFn: typeof fetch, onFirstByte: () => void): typeof fetch {
+  let notified = false;
+  return (input, init) => {
+    const p = fetchFn(input, init);
+    if (!notified) {
+      notified = true;
+      void p.then(onFirstByte, onFirstByte);
+    }
+    return p;
+  };
+}
+
+export function beginAttemptRun(res: ServerResponse, offer: ResolvedAttempt, wantsStream: boolean): AttemptRun {
   const target = offer.target;
   const controller = new AbortController();
   const callerController = new AbortController();
@@ -818,13 +864,33 @@ export function beginAttemptRun(res: ServerResponse, offer: ResolvedAttempt): At
     usage: createUsageAccumulator(),
     attempt: undefined,
     egressCallbackCalled: false,
+    fetchFn: fetch,
   };
+  // "First byte" for a non-streamed attempt is the moment fetch() resolves — response HEADERS
+  // have arrived (design: docs/backlog.md item 1). Never armed on a streamed attempt: that path
+  // already has `withStallWatchdog`'s inter-byte watchdog once its own head is being served, and
+  // its pre-head wait is governed by `timer` plus the commit probe exactly as before this existed.
+  const firstByteTimeoutMs = wantsStream ? undefined : target.firstByteTimeoutMs;
+  if (firstByteTimeoutMs !== undefined) {
+    run.firstByteTimeoutMs = firstByteTimeoutMs;
+    run.firstByteTimer = setTimeout(() => {
+      run.firstByteTimedOut = true;
+      controller.abort();
+    }, firstByteTimeoutMs);
+    run.fetchFn = firstByteFetch(fetch, () => {
+      if (run.firstByteTimer !== undefined) {
+        clearTimeout(run.firstByteTimer);
+        run.firstByteTimer = undefined;
+      }
+    });
+  }
   res.on("close", run.onResClose);
   return run;
 }
 
 export function releaseAttemptRun(res: ServerResponse, run: AttemptRun): void {
   clearTimeout(run.timer);
+  if (run.firstByteTimer !== undefined) clearTimeout(run.firstByteTimer);
   res.off("close", run.onResClose);
 }
 
