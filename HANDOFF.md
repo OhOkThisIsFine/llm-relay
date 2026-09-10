@@ -45,10 +45,24 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   open for the served 200. The same responses carried
   `x-llm-relay-probation: opencode/muse-spark-1.3-contributor-free (0 of 5 request samples)`, which
   is the probation band answering on real traffic for the exact member it was built for.
-- **Immediate next:** the two owner-only items — run or decline the 26 eligibility commands in
-  [docs/eligibility-triage-2026-09-09.md](docs/eligibility-triage-2026-09-09.md), and the Codex
-  Desktop `relay` check. Then re-run the route-B proof once the OpenCode free allowance refills.
-  `docs/backlog.md` is the queue; it holds four entries.
+- **Owner decisions at the hand-back, 2026-09-10.** Three questions were asked and answered.
+  (a) **The refusal queue: run 24 of the 25 triaged commands, skipping the `nim/moonshotai/kimi-k3`
+  eviction.** Done — eighteen accepts and six rejects applied; the queue fell from 26 items to 5.
+  Two stay pending as the stated verdict (the groq client-side network block, and kimi-k3 by this
+  decision), and three arrived during the closeout with no verdict yet. The digest pin proved its
+  worth: the queue reordered under six commands and each one said so and still landed correctly.
+  (b) **The Codex Desktop `relay` check: leave the entry open.** No action; only a live Codex
+  Desktop session can run it.
+  (c) **The nineteen packet worktrees: delete them and their branches now.** Done — nineteen
+  worktrees unregistered, nineteen `pkt/*` branches deleted, and the directories removed from disk.
+  ⚠ Each carried a `node_modules` JUNCTION into this checkout's real dependency tree, so every
+  junction was unlinked with `Directory.Delete(path, false)` BEFORE any recursive delete; the main
+  `node_modules` was counted at 377 entries before and after. `git worktree list` is one entry
+  again. `C:\Code-worktrees\llm-relay\out` survives — it holds the packet BRIEFS, not lane output.
+- **Immediate next:** give the three new unrecognized refusals a verdict (two are this closeout's
+  own route-B probes; one is `nim/deepseek-ai/deepseek-v4-flash-0731` repeating item 3's wording),
+  run the Codex Desktop `relay` check when convenient, and re-run the route-B proof once the
+  OpenCode free allowance refills. `docs/backlog.md` is the queue; it holds four entries.
 
 ### 0.1 Previous laps
 

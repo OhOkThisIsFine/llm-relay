@@ -27,15 +27,29 @@
   assistant message byte-for-byte and never fabricated when absent, pinned on ≥2 candidates, with
   every other provider's outbound bytes unchanged.
 
-- **Accept or decline the 26 triaged refusals** (owner-only; triaged 2026-09-09 in
-  [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries every
-  verdict pinned to its digest and the exact `accept`/`reject` commands). Nineteen accepts, six
-  rejects, one deliberate pending (the groq client-side network block, never rejected by the
-  `network-block.ts` rule). Two accepts evict: `nim/moonshotai/kimi-k3` (48 × "degraded function
-  cannot be invoked") and seven ollama-cloud paid-plan SKUs seen once each. The dispatcher may
-  `propose`; only the owner may `accept`. **Property (what remains):** the owner has run, or
-  declined by name, each listed command, so `llm-relay eligibility` shows no item without a
-  verdict except item 1, whose pending state is the stated verdict.
+- **CLOSED 2026-09-10 by owner decision: 24 of the 25 triaged refusal verdicts are applied.** The
+  triage is [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries
+  every verdict pinned to its digest. The owner chose "run 24; skip the kimi-k3 eviction", so
+  eighteen `accept` and six `reject` commands ran: three groq per-minute throughput limits and one
+  OpenRouter free-models-per-minute limit as `rate-limited`; four gemini free-tier quotas as
+  `allowance-exhausted` filtered to free deployments; two OpenRouter batch-only SKUs as
+  `not-servable`; seven ollama-cloud paid-plan SKUs as `subscription-required`; and six generation
+  failures and bare 429s rejected as teaching the router nothing. ⚠ **The digest pin earned its
+  keep in the doing:** the queue reordered under six of the commands and each one reported
+  `--sig <digest> now sits at position N, acting on it` — an index-only accept would have landed
+  those six verdicts on the wrong refusal.
+  **Two items remain pending on purpose, and both are the stated verdict, not an omission:**
+  item 1, the groq client-side network block, which `network-block.ts` says never to reject because
+  rejecting suppresses the signature for good; and item 3, `nim/moonshotai/kimi-k3`'s 48 × "degraded
+  function cannot be invoked", which the owner declined so the model stays in the walk and a
+  recovery can show up as a real success. The cost of that choice, stated: the relay keeps spending
+  one attempt per walk on that deployment.
+  ⚠ **Three NEW unrecognized refusals arrived during this closeout and have no verdict** —
+  `opencode/muse-spark-1.3-contributor-free` 429 ×5 and `opencode/mimo-v2.5-free` 429 ×1 (both
+  produced by this closeout's own route-B probes), and `nim/deepseek-ai/deepseek-v4-flash-0731`
+  400 "degraded function cannot be invoked" ×2, which is the same wording as item 3 on a different
+  NIM deployment. **Property:** each of the three carries a verdict the owner accepted or rejected,
+  or a recorded reason for staying pending.
 
 - **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
   (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
