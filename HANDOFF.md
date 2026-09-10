@@ -30,7 +30,10 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   the first stop was a process kill; it was started again from `Startup\llm-relay.vbs` (PID 28920)
   and warmed. `GET /telemetry` carries both new fields — `accounting` (the `writerHealth()` block,
   `state: "writing"`) and `config` (the staleness block). `Startup\llm-relay.vbs` now names
-  `llm-relay stop` and records that a pre-v0.78.0 daemon still needs the hard kill. The operator
+  `llm-relay stop` and records that a pre-v0.78.0 daemon still needs the hard kill. The verb was
+  then proven against the daemon that carries it: `llm-relay stop` printed `stopping llm-relay at
+  http://127.0.0.1:8791`, PID 28920 exited and port 8791 went free — the graceful path that
+  flushes every write-behind store. The relay runs again from the launcher (PID 29552). The operator
   config carries the route-B edits with a dated backup.
 - **Route B, live: PARTIAL, and the missing half is the vendor's.** A STREAMED request carrying a
   tool, sent on BOTH fronts, egressed to OpenCode Zen on the Responses wire and returned
