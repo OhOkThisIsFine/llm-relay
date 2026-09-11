@@ -69,8 +69,9 @@ otherwise ask the CLI. In particular, Codex Desktop collaboration is not a relay
 ChatGPT account it validates a `pool/*` child against the parent account, ignores the child's
 `model_provider`, and fails before contacting llm-relay. Use MCP `dispatch` there.
 
-⚠ Free capacity is spent before any metered or subscription lane, so an offloaded task normally
-costs no subscription quota.
+⚠ An offloaded task costs none of this session's subscription quota. The default lane is the
+relay's model pool, which spends free capacity first unless the operator placed paid credits (such
+as DeepSeek) ahead of it.
 
 ⚠ **Lane output is advisory.** Verify every claim against the source before you act on it. For a
 lane that WRITES, inspect the tree yourself (`git status --porcelain`, `git diff`,

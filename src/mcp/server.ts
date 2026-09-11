@@ -556,7 +556,7 @@ export const LANE_LADDER_EXHAUSTED_ADVICE =
  * (found by adversarial review, 2026-09-06). Both of its sentences were then false: lanes remained,
  * and "it would pick the same lanes" is wrong precisely because the walk has just DEMOTED every
  * lane it tried, so the next dispatch reorders around them. Telling an autonomous caller to stop
- * delegating, on a false premise, abandons free capacity that was never contacted.
+ * delegating, on a false premise, abandons capacity that was never contacted.
  */
 export const LANE_LADDER_PARTIAL_ADVICE =
   "Lanes remain untried: this dispatch stopped at its maxLanes bound. Call dispatch again to "
@@ -642,7 +642,7 @@ function jobAnswer(job: LaneJob, now: number): string {
   //     no advice at all — emitting it there breaks the documented byte-for-byte revert;
   //   - with `maxLanes` below the selectable count the walk stopped early, and the answer would
   //     then contain BOTH "N further lanes not tried" and "every lane has now been tried".
-  // A caller that stops delegating on a false premise abandons free capacity nothing contacted.
+  // A caller that stops delegating on a false premise abandons capacity nothing contacted.
   const nothingAnswered =
     job.status !== "running"
     && job.status !== "cancelled"

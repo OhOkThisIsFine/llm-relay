@@ -20,7 +20,8 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   `dispatch_lanes` shows each lane's time to answer and failure streak; a lane with five own
   failures in a row is ordered last until it answers; `/telemetry` shows `tierType: null` for an
   undeclared tier; and an `llm-relay mcp` process older than the installed package says so in
-  every reply.
+  every reply. The `relay` agent description (Claude v7, Codex v2), the skill and the MCP
+  instructions no longer call the pools free, because paid DeepSeek leads them.
 - **Verified live on an isolated relay** (port 8792, this lap's build, a copy of the operator's
   config and lane history). `dispatch_lanes` showed `anthropic` unreachable for the MCP server and
   `opencode-muse-spark` failing at 12 own failures; `model: "deepseek/deepseek-flash"` answered in

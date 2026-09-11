@@ -78,10 +78,10 @@ const LEGACY_CODEX_AGENTS = [
  * `enabled_tools` grants direct access with no deferred-loading discovery call to make first.
  */
 const CODEX_RELAY_AGENT_MARKER_PREFIX = "# llm-relay:codex-relay-agent";
-const CODEX_RELAY_AGENT_MARKER = "# llm-relay:codex-relay-agent v1";
+const CODEX_RELAY_AGENT_MARKER = "# llm-relay:codex-relay-agent v2";
 const CODEX_RELAY_AGENT_TEMPLATE = `${CODEX_RELAY_AGENT_MARKER}
 name = "relay"
-description = "Hands one self-contained task to llm-relay dispatch, free model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another agent can do: a search, a sweep, a draft, a summary, a second opinion."
+description = "Hands one self-contained task to llm-relay dispatch, relay model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another agent can do: a search, a sweep, a draft, a summary, a second opinion."
 sandbox_mode = "read-only"
 developer_instructions = """
 You have no knowledge of your own and no permission to answer any task yourself. The only

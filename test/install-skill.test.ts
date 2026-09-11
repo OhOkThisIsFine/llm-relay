@@ -312,7 +312,10 @@ describe("install-skill postinstall hook", () => {
       expect(r.status).toBe(0);
       const content = readFileSync(paths.relayAgent, "utf8");
       expect(content).toContain('name = "relay"');
-      expect(content).toContain("# llm-relay:codex-relay-agent v1");
+      expect(content).toContain("# llm-relay:codex-relay-agent v2");
+      // v2 (2026-09-10): the description no longer calls the pools free, because paid DeepSeek
+      // leads them (owner decision: correct every text that calls that lane free).
+      expect(content).not.toMatch(/free model pools/i);
       expect(content).toContain("[mcp_servers.llm-relay]");
       expect(content).toContain('command = "llm-relay"');
       expect(content).toContain('args = ["mcp"]');
@@ -371,7 +374,7 @@ describe("install-skill postinstall hook", () => {
 
       expect(r.status).toBe(0);
       const afterContent = readFileSync(paths.relayAgent, "utf8");
-      expect(afterContent).toContain("# llm-relay:codex-relay-agent v1");
+      expect(afterContent).toContain("# llm-relay:codex-relay-agent v2");
       expect(afterContent).not.toContain("codex-relay-agent v0");
       expect(afterContent).not.toContain("old rule text");
       expect(r.stderr).toContain(`Codex relay agent updated at ${paths.relayAgent}`);

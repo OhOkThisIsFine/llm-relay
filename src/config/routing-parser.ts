@@ -456,7 +456,7 @@ function parseLaneProbe(raw: unknown): LaneProbeSettings {
  * common case finish inside ONE blocking call rather than degrading to a poll. Above, the recorded
  * lane wall-clock window has a median of 111.5 s, so a much smaller budget would abandon lanes
  * that were about to answer. 90 s sits under the ceiling and just under the median, which is the
- * right side to err on: abandoning costs one wasted free lane run, waiting costs the whole turn.
+ * right side to err on: abandoning costs one wasted lane run, waiting costs the whole turn.
  * ⚠ It is NOT a calibrated statistic and must not be quoted as one — the recorded window mixes
  * several sessions' traffic, which is exactly why `docs/backlog.md` still carries the calibration
  * as open work.

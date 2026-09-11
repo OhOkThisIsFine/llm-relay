@@ -897,7 +897,7 @@ function isAlreadyLaneLaunched(command: string, args: readonly string[]): boolea
  *
  * ⚠ The `execFile` call in `mcp/lane-runner.ts` — `windowsHide: true` — covers only the IMMEDIATE child;
  * that document's own finding is that a console-subsystem descendant spawned later — a detached
- * updater probe, an IDE-detection helper, a nested nested MCP client — is unaffected by a flag the
+ * updater probe, an IDE-detection helper, a nested MCP client — is unaffected by a flag the
  * relay set on a process two generations up, and allocates its own new, VISIBLE console. That is
  * exactly the shape `routing.cliLane`'s transposition left open: every hand-authored `cli` ladder
  * rung already wraps itself with `pwsh -File lane-launch.ps1` in its own configured `command`/`args`,

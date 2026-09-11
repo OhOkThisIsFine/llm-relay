@@ -295,18 +295,22 @@ describe("setup-claude", () => {
   // ⚠ Bumped v5 → v6 in the dispatch-lifecycle lap (2026-09-10). The version moved because the
   // template's provenance CONTRACT changed — `provenance: job=…` is now required evidence from a
   // completed dispatch, and `RELAY_DISPATCH_UNAVAILABLE` was added for the case where no lane was
-  // ever reached. Flipped here in the same commit as the source, per the standing protocol.
-  it("(j) the marker is bumped to v6", () => {
-    expect(RELAY_AGENT_MARKER).toContain("v6");
-    expect(RELAY_AGENT_MARKER).not.toContain("v5");
+  // ever reached. Bumped v6 → v7 the same day (the dispatch-fixes lap): the description no longer
+  // calls the pools free, because paid DeepSeek leads them (owner decision 2026-09-10: correct every
+  // text that calls that lane free). Flipped here in the same commit as the source, per the
+  // standing protocol.
+  it("(j) the marker is bumped to v7", () => {
+    expect(RELAY_AGENT_MARKER).toContain("v7");
+    expect(RELAY_AGENT_MARKER).not.toContain("v6");
     const injectedHome = join(dir, "injected-home-j");
     installRelayAgent({ homeDir: injectedHome });
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     const content = readFileSync(agentPath, "utf8");
-    expect(content).toContain("<!-- llm-relay:relay-agent v6 -->");
+    expect(content).toContain("<!-- llm-relay:relay-agent v7 -->");
+    expect(content).not.toMatch(/free model pools/i);
   });
 
-  it("(k) a file carrying the OLD v1 marker is recognised as our own and upgraded to v6, not refused as foreign", () => {
+  it("(k) a file carrying the OLD v1 marker is recognised as our own and upgraded to v7, not refused as foreign", () => {
     const injectedHome = join(dir, "injected-home-k");
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     mkdirSync(dirname(agentPath), { recursive: true });

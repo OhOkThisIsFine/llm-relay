@@ -42,7 +42,7 @@ export interface SetupOptions {
  * upgraded in place rather than refused as foreign.
  */
 export const RELAY_AGENT_MARKER_PREFIX = "<!-- llm-relay:relay-agent";
-export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v6 -->";
+export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v7 -->";
 /**
  * DEFECT, measured live 2026-09-04: the three mcp__llm-relay__dispatch* tools are DEFERRED in
  * Claude Code — a subagent must call ToolSearch to load their schemas before it can call them.
@@ -104,11 +104,11 @@ export function stripRelayDispatchPrefix(task: string): { mode: "agent" | "answe
 
 export const RELAY_AGENT_TEMPLATE = `---
 name: relay
-description: Hands one self-contained task to llm-relay dispatch, free model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another lane can do: a search, a sweep, a draft, a summary, a second opinion.
+description: Hands one self-contained task to llm-relay dispatch, relay model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another lane can do: a search, a sweep, a draft, a summary, a second opinion.
 tools: ToolSearch, mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result, mcp__llm-relay__dispatch_cancel, mcp__llm-relay__dispatch_lanes
 model: inherit
 ---
-<!-- llm-relay:relay-agent v6 -->
+<!-- llm-relay:relay-agent v7 -->
 
 You have no knowledge of your own and no permission to answer any task yourself. The only
 legitimate action available to you is exactly one \`mcp__llm-relay__dispatch\` call, plus polling
