@@ -33,6 +33,25 @@ import {
   IGNORED_TTL_MS,
 } from "../src/refusal-interpretation.js";
 
+/**
+ * ⚠ `resetFacts` under vitest is a clean slate — the 2026-09-10 cross-front-convergence flake. The
+ * store keeps its DEFAULT test copy in a temp file, and `load` re-reads that file once a reset has
+ * dropped the memoized copy. So a fact that an earlier test's write-behind flush had already
+ * written came back in every later test of the file: one attempt-scope `not-servable` fact failed
+ * 26 tests in one loaded gate run, while the file passed alone. `flushFacts` stands in for the
+ * timer firing on a busy machine. ⚠ `resetInterpretations` keeps its file on purpose: the
+ * eligibility tests in `test/cli.test.ts` use that reset to simulate a restart that re-reads the
+ * store.
+ */
+describe("resetFacts under vitest is a clean slate", () => {
+  it("drops a fact an earlier test flushed to the default store", () => {
+    recordFact("not-servable", { kind: "attempt", provider: "p1", credentialId: makeCredentialId("p1"), model: "m1" });
+    flushFacts();
+    resetFacts();
+    expect(allFacts()).toEqual([]);
+  });
+});
+
 // Legacy single-slot scenarios remain useful coverage. Their former provider/model calls now
 // explicitly resolve the implicit default credential; v2-specific cases below call the direct API.
 const defaultCredential = (provider: string) => makeCredentialId(provider);

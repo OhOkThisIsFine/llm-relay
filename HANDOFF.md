@@ -33,8 +33,11 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   fixed in `3a798ca`.
 - **Operator config, this lap (backups taken).** `routing.dispatchWalk: false` (the stopgap; owner
   decision "walk off, no restart now"), `providers.deepseek.stallTimeoutMs: 120000` (F7), and the
-  four free-pool rung notes now say that paid DeepSeek leads the pool. None of it is loaded until
-  the daemon restarts.
+  four free-pool rung notes now say that paid DeepSeek leads the pool. All three are LOADED: the
+  daemon was restarted at 13:55 (PID 20364) onto the global v0.80.0, after the last config write
+  (13:15), and `GET /telemetry` reports `changedOnDisk: false`. This lap's daemon-side code
+  (`requester=mcp`, mode-keyed windows, `model`, `tierType: null`, the launcher wrap in
+  `GET /dispatch`) loads only when the daemon restarts onto v0.81.0.
 - **Immediate next:** the owner decides whether to restart the daemon onto v0.81.0 and whether to
   turn the walk back on (it is off only as a stopgap for the defects this lap fixed). The three
   refusal verdicts in `docs/backlog.md` still wait. The two owner-direction entries filed this lap

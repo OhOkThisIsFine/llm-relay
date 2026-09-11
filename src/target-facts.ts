@@ -1,5 +1,6 @@
 import { relayStatePath } from "./state-paths.js";
 import { hasExactKeys } from "./json-shape.js";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseCredentialId, type CredentialId } from "./credential-id.js";
@@ -626,4 +627,13 @@ export function resetFacts(): void {
   _store = null;
   _path = null;
   writer.clear();
+  // ⚠ Under vitest the default store is a temp FILE, and `load` re-reads it once `_store` is gone.
+  // Without this, a fact that an earlier test's write-behind flush had written came back in every
+  // later test of the file — measured 2026-09-10: one attempt-scope `not-servable` fact failed 26
+  // tests of `test/cross-front-convergence.test.ts` in a loaded gate run, green when run alone. So
+  // this reset is a clean slate. The vitest default only: an explicit path is the caller's own file,
+  // and outside vitest the default path is the operator's real store. ⚠ `resetInterpretations`
+  // keeps its file on purpose: the eligibility tests in `test/cli.test.ts` use that reset to
+  // simulate a restart that re-reads the store.
+  if (process.env.VITEST !== undefined) rmSync(defaultPath(), { force: true });
 }
