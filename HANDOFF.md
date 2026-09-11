@@ -31,18 +31,28 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   `lane-launch.ps1`, and a window watcher saw no new window and no focus change from it. The first
   run also found old lane history reading as a time to answer (`anthropic` "0s" at 0 of 24),
   fixed in `3a798ca`.
-- **Operator config, this lap (backups taken).** `routing.dispatchWalk: false` (the stopgap; owner
-  decision "walk off, no restart now"), `providers.deepseek.stallTimeoutMs: 120000` (F7), and the
-  four free-pool rung notes now say that paid DeepSeek leads the pool. All three are LOADED: the
+- **Operator config, this lap (backups taken).** `providers.deepseek.stallTimeoutMs: 120000` (F7)
+  and the four free-pool rung notes, which say that paid DeepSeek leads the pool, are LOADED: the
   daemon was restarted at 13:55 (PID 20364) onto the global v0.80.0, after the last config write
-  (13:15), and `GET /telemetry` reports `changedOnDisk: false`. This lap's daemon-side code
-  (`requester=mcp`, mode-keyed windows, `model`, `tierType: null`, the launcher wrap in
-  `GET /dispatch`) loads only when the daemon restarts onto v0.81.0.
-- **Immediate next:** the owner decides whether to restart the daemon onto v0.81.0 and whether to
-  turn the walk back on (it is off only as a stopgap for the defects this lap fixed). The three
-  refusal verdicts in `docs/backlog.md` still wait. The two owner-direction entries filed this lap
-  — pacing from observed throttling, and a catalog refresh on a stale hint — are the proposed next
-  lap.
+  (13:15). The stopgap `routing.dispatchWalk: false` (owner decision "walk off, no restart now")
+  was loaded then too. The closeout REMOVED it again (owner decision 2026-09-10: turn the walk
+  back on; backup `config.json.bak-2026-09-11-pre-walk-on`), so the default walk returns at the
+  next restart.
+- **Immediate next:** the owner restarts the daemon onto v0.81.0; the global package is already
+  reinstalled (owner decision 2026-09-10: "reinstall now, I'll restart"). The restart loads this
+  lap's daemon-side code (`requester=mcp`, mode-keyed windows, `model`, `tierType: null`, the
+  launcher wrap in `GET /dispatch`) and the walk. After it, `GET /dispatch` should show walk
+  budgets, and a view built with `requester=mcp` should show `anthropic` unreachable. The next lap
+  is decided (owner, same day): pacing from observed throttling, then a catalog refresh on a stale
+  hint — the two owner-direction entries in `docs/backlog.md`.
+- **Refusal queue (owner decision 2026-09-10).** The two OpenCode Zen 429s
+  (`muse-spark-1.3-contributor-free`, `mimo-v2.5-free`) are no longer in the queue, so there is
+  nothing to accept: the circuit breaker cools a model that answers 429, and a served success
+  clears it. `nim/deepseek-ai/deepseek-v4-flash-0731`'s "degraded function cannot be invoked"
+  stays pending, as kimi-k3's does; the stated cost of both is one attempt per walk on each of those
+  NIM deployments. The groq network-block refusal also stays pending on purpose (`network-block.ts`
+  says never to reject it). The three DeepSeek request-shape refusals in the queue are the
+  F10/F11 defects this lap fixed; they should stop once the daemon runs v0.81.0.
 
 ### 0.1 Previous laps
 

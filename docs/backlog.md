@@ -17,10 +17,15 @@
   header can demote a spent bucket, and a rate limit stated in a 429 body is learned as a
   `rate-limit-*` fact that is DISPLAY-ONLY (spec decision M2, opt-in, not built). Nothing uses those
   facts to slow the relay's own request rate before the next 429, and a 429 wording the relay has
-  not seen before waits in the eligibility queue for a human verdict. **Property:** a deployment
-  with a stated or learned rate limit is paced, across every client that routes through the relay,
-  so the relay's own rate stays under it; a 429 that states a window updates that pacing without a
-  human verdict; and a limit nobody stated has no effect.
+  not seen before waits in the eligibility queue for a human verdict. A probe that answers 200
+  retracts a cooling fact but never a breaker cooldown — `PingLoop` holds no breaker reference
+  (`ping/cadence.ts`) — so a model cooled by 429s waits out its escalation step (2 min, 10 min,
+  1 h, 24 h) even after a probe shows it answers again. Owner, 2026-09-10: *"The relay should be
+  polling to see if things start working again anyway."* **Property:** a deployment with a stated
+  or learned rate limit is paced, across every client that routes through the relay, so the
+  relay's own rate stays under it; a 429 that states a window updates that pacing without a human
+  verdict; a probe that answers 200 ends a rate-limit cooldown early; and a limit nobody stated
+  has no effect.
 
 - **A pre-commit stream failure names no cause, and the relay keeps no per-request record of it
   (2026-09-10, C:\Code lap 232d8bef, medium).** A streamed `deepseek/deepseek-flash` request that
@@ -69,30 +74,6 @@
   `compat.reasoning: "deepseek"` target, the response's `reasoning_content` reaches the caller — a
   `thinking` block on the Anthropic front, a `reasoning` item on the Responses front — so the
   caller's replay carries it back and thinking can stay on; pinned on both fronts.
-
-- **CLOSED 2026-09-10 by owner decision: 24 of the 25 triaged refusal verdicts are applied.** The
-  triage is [`eligibility-triage-2026-09-09.md`](eligibility-triage-2026-09-09.md), which carries
-  every verdict pinned to its digest. The owner chose "run 24; skip the kimi-k3 eviction", so
-  eighteen `accept` and six `reject` commands ran: three groq per-minute throughput limits and one
-  OpenRouter free-models-per-minute limit as `rate-limited`; four gemini free-tier quotas as
-  `allowance-exhausted` filtered to free deployments; two OpenRouter batch-only SKUs as
-  `not-servable`; seven ollama-cloud paid-plan SKUs as `subscription-required`; and six generation
-  failures and bare 429s rejected as teaching the router nothing. ⚠ **The digest pin earned its
-  keep in the doing:** the queue reordered under six of the commands and each one reported
-  `--sig <digest> now sits at position N, acting on it` — an index-only accept would have landed
-  those six verdicts on the wrong refusal.
-  **Two items remain pending on purpose, and both are the stated verdict, not an omission:**
-  item 1, the groq client-side network block, which `network-block.ts` says never to reject because
-  rejecting suppresses the signature for good; and item 3, `nim/moonshotai/kimi-k3`'s 48 × "degraded
-  function cannot be invoked", which the owner declined so the model stays in the walk and a
-  recovery can show up as a real success. The cost of that choice, stated: the relay keeps spending
-  one attempt per walk on that deployment.
-  ⚠ **Three NEW unrecognized refusals arrived during this closeout and have no verdict** —
-  `opencode/muse-spark-1.3-contributor-free` 429 ×5 and `opencode/mimo-v2.5-free` 429 ×1 (both
-  produced by this closeout's own route-B probes), and `nim/deepseek-ai/deepseek-v4-flash-0731`
-  400 "degraded function cannot be invoked" ×2, which is the same wording as item 3 on a different
-  NIM deployment. **Property:** each of the three carries a verdict the owner accepted or rejected,
-  or a recorded reason for staying pending.
 
 - **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
   (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
