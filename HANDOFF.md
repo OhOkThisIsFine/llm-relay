@@ -30,7 +30,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   every later lane was failing, exhausted or unreachable. The transposed lane ran through
   `lane-launch.ps1`, and a window watcher saw no new window and no focus change from it. The first
   run also found old lane history reading as a time to answer (`anthropic` "0s" at 0 of 24),
-  fixed in `5607e6d`.
+  fixed in `3a798ca`.
 - **Operator config, this lap (backups taken).** `routing.dispatchWalk: false` (the stopgap; owner
   decision "walk off, no restart now"), `providers.deepseek.stallTimeoutMs: 120000` (F7), and the
   four free-pool rung notes now say that paid DeepSeek leads the pool. None of it is loaded until
