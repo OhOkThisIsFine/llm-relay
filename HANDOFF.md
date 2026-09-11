@@ -21,6 +21,15 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   failures in a row is ordered last until it answers; `/telemetry` shows `tierType: null` for an
   undeclared tier; and an `llm-relay mcp` process older than the installed package says so in
   every reply.
+- **Verified live on an isolated relay** (port 8792, this lap's build, a copy of the operator's
+  config and lane history). `dispatch_lanes` showed `anthropic` unreachable for the MCP server and
+  `opencode-muse-spark` failing at 12 own failures; `model: "deepseek/deepseek-flash"` answered in
+  1.8 s; an agent-mode dispatch handed back its job at 25.0 s; and with the agent floor set to 60 s,
+  `free-pool` ran a 100 s command to its answer in 107 s — the walk withheld the budget because
+  every later lane was failing, exhausted or unreachable. The transposed lane ran through
+  `lane-launch.ps1`, and a window watcher saw no new window and no focus change from it. The first
+  run also found old lane history reading as a time to answer (`anthropic` "0s" at 0 of 24),
+  fixed in `5607e6d`.
 - **Operator config, this lap (backups taken).** `routing.dispatchWalk: false` (the stopgap; owner
   decision "walk off, no restart now"), `providers.deepseek.stallTimeoutMs: 120000` (F7), and the
   four free-pool rung notes now say that paid DeepSeek leads the pool. None of it is loaded until
