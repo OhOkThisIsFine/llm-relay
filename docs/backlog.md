@@ -80,15 +80,6 @@
   (e.g. spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>"
   returns the version and provenance from a dispatch lane).
 
-- **The dashboard Quota panel shows the data but not clearly (2026-09-16, owner request,
-  medium).** `QuotaRowV1` already carries per-deployment remaining/reset data
-  (`dashboard-contract.ts`, fed by `availability-snapshot.ts`), and the SPA already renders a Quota
-  panel from it. The owner asked, while approving this lap, to be able to "view remaining quotas"
-  more clearly from the dashboard — read as a display-clarity gap, not a missing data field.
-  **Property:** the dashboard's Quota panel shows, per deployment, the remaining amount, its basis
-  (`provider-stated` / `derived` / etc.), and its reset time, legible at a glance, with no new wire
-  field required.
-
 - **The dashboard SPA has no control for the operator pin yet (2026-09-16, owner request, high —
   the UI half of the dashboard's first write).** The ENDPOINT half landed 2026-09-16:
   `POST /dispatch {"pin"|"unpin"}` (`routes/admin.ts` `operatorLanePin`) reuses `lane-affinity.ts`'s
@@ -104,14 +95,3 @@
   tier, sends the operator-entered control token on `POST /dispatch`, and re-reads the ladder after
   the response; the token is never persisted by the page and never appears in the snapshot.
 
-- **The dashboard's usability and visual design need a general pass (2026-09-16, owner request,
-  medium).** No single measured defect; a standing ask from the owner while approving this lap.
-  **Property:** a pass over the existing SPA (`dashboard/src/`) for layout, density and
-  navigability, scoped to what a reviewer can point at concretely — this entry is closed by naming
-  the specific changes made, not by a vague "polish" commit.
-
-- **Dark mode should be the dashboard's default theme (2026-09-16, owner request, low).** The SPA
-  already supports a theme preference (recorded standing trade: "theme preference not persisted" in
-  `HANDOFF.md` §6.2); the owner asked for dark mode as the DEFAULT rather than only an available
-  option. **Property:** a fresh session with no stored preference renders in dark mode; an explicit
-  light-mode choice, once persisted, is honoured.
