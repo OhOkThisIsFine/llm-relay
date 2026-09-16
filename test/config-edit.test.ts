@@ -131,6 +131,18 @@ describe("config dot-path editing", () => {
     expect(deleteConfigPath(doc, "routing.ladders.medium.foo")).toBe(false);
   });
 
+  it("deleting an array ELEMENT shortens the array instead of leaving a hole", () => {
+    // `delete arr[i]` keeps the length and leaves the index reading `undefined`, which the caller
+    // then hands to `loadConfig()` — a spilled hole wearing a valid array's shape. The write is
+    // persisted to `config.json`, so the difference survives the process.
+    const doc = document();
+    expect(deleteConfigPath(doc, "routing.ladders.medium.1")).toBe(true);
+    const medium = (doc.routing as never as { ladders: { medium: unknown[] } }).ladders.medium;
+    expect(medium.length).toBe(2);
+    expect(medium).toEqual([{ id: "r0", note: "first" }, { id: "r2" }]);
+    expect(Object.keys(medium)).toEqual(["0", "1"]);
+  });
+
   it("still rejects prototype-pollution path segments, on every entry point", () => {
     for (const path of ["__proto__.polluted", "routing.constructor.prototype", "prototype.x"]) {
       expect(() => parseConfigPath(path)).toThrow(/dot-separated names/);

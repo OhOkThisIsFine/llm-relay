@@ -48,6 +48,23 @@ red without anyone invoking a script by hand:
   `Failures: none` while the run it summarized held 572 clone blocks (audit DR-018). A `.json`
   report is written only from stdout and only when it parses; jscpd's JSON comes from its own
   reporter (`jscpd-report.json` in the report directory).
+  ⚠ **`--only <step>` runs ONE step and exits with THAT step's status** (2026-09-16). It exists for
+  the machine-wide nightly sweep (`~/.claude/scheduled-tasks/nightly-maintenance/
+  static-analysis-runner.mjs`), which reads `.claude/static-analysis.json`, runs each declared
+  tool's `command`, and keys its report by that tool's `name`. llm-relay used to be declared as ONE
+  entry whose `name` was the whole six-tool list, so a failure anywhere inside the sweep surfaced as
+  a single opaque `FINDING llm-relay — eslint + sonarjs, knip, …: exit 1` naming none of the six —
+  and the runner captures only two `npm notice` lines, not this script's summary.
+  `.claude/static-analysis.json` therefore declares **six** entries, one per step, each running
+  `npm run analysis:run -- --only <step>`. ⚠ The swept names are the STEP names
+  (`eslint-after-fixes`, `knip-after-fixes`, `madge`, `dependency-cruiser`, `ts-prune`, `jscpd`), not
+  the tool names — `--only eslint` is refused by name, listing the real ones. `similarity-ts-attempt`
+  is deliberately NOT declared: it is `optional: true`, the sweep would report it as a permanent
+  finding, and its non-zero exits are expected.
+  ⚠ An `--only` run does **not** rewrite `run-summary.txt`: it would otherwise leave the file
+  describing only whichever step ran last, reading as a clean sweep of one tool. It still writes the
+  per-step report and `<step>.exit.txt`, which is the attribution the sweep consumes. An unknown
+  `--only` name, or any other argument, exits 2 touching nothing.
 
 Offline / unit-test-safe (no external creds):
 - `calibrate-lane-outlier.mjs` (`node scripts/calibrate-lane-outlier.mjs [--file <dispatch-lane-stats.json>]

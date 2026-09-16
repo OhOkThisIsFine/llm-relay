@@ -22,6 +22,36 @@ if (!existsSync(reportDir)) {
   mkdirSync(reportDir, { recursive: true });
 }
 
+// ---------------------------------------------------------------------------
+// ATTRIBUTION. `--only <step>` runs exactly ONE step and exits with ITS status.
+//
+// It exists for the machine-wide nightly sweep
+// (`~/.claude/scheduled-tasks/nightly-maintenance/static-analysis-runner.mjs`), which
+// reads `.claude/static-analysis.json`, runs each declared tool's `command`, and keys
+// its report by that tool's `name`. This script used to be declared as ONE entry whose
+// name was the whole six-tool list, so a failure anywhere inside it surfaced as a
+// single opaque line — `FINDING llm-relay — eslint + sonarjs, knip, madge, …: exit 1`
+// — naming none of the six. Splitting the declaration into one entry per step only
+// works if each entry can run just its own step, which is what this flag is for.
+//
+// ⚠ The sweep spawns WITHOUT a shell (see `~/.agent-config/spawn-safe.mjs`), so the
+// declared command lines are tokenized once: `npm run analysis:run -- --only eslint`
+// is the spelling that survives that, and a step name is therefore safe to quote when
+// it holds a hyphen (`--only "dependency-cruiser"`).
+// ---------------------------------------------------------------------------
+const argv = process.argv.slice(2);
+let only = null;
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--only') {
+    only = argv[++i] ?? '';
+  } else if (argv[i].startsWith('--only=')) {
+    only = argv[i].slice('--only='.length);
+  } else {
+    console.error(`analysis-run: unknown argument "${argv[i]}" (the only flag is --only <step>)`);
+    process.exit(2);
+  }
+}
+
 const steps = [
   {
     name: 'eslint-after-fixes',
@@ -141,7 +171,17 @@ async function runStep(step) {
   });
 }
 
-const results = await Promise.all(steps.map(runStep));
+// The full sweep runs every step CONCURRENTLY; a single-step run is the same code path with a
+// one-element list, so the two cannot drift in how a step is spawned, timed or written out.
+const selected = only === null ? steps : steps.filter((s) => s.name === only);
+if (only !== null && selected.length === 0) {
+  console.error(
+    `analysis-run: no step named "${only}". Known steps: ${steps.map((s) => s.name).join(', ')}`,
+  );
+  process.exit(2);
+}
+
+const results = await Promise.all(selected.map(runStep));
 
 // The summary states each figure for what it is. Until 2026-09-04 it printed the process EXIT
 // CODE under the tool's bare name (`jscpd: 0`) beside `Failures: none`, which read as a finding
@@ -149,6 +189,9 @@ const results = await Promise.all(steps.map(runStep));
 // Findings live in the per-tool files; this summary only says whether each tool RAN.
 const summary = [
   `Generated: ${new Date().toISOString()}`,
+  only === null
+    ? 'Scope: the full sweep.'
+    : `Scope: ONLY the "${only}" step (--only); other steps are untouched from their last full run.`,
   'Each line is the tool\'s process exit code, not a finding count. Read the per-tool report files for findings.',
 ];
 const failures = [];
@@ -161,8 +204,20 @@ for (const res of results) {
 }
 
 summary.push(`\nTools exiting non-zero: ${failures.length ? failures.join(', ') : 'none'}`);
-writeFileSync(join(reportDir, 'run-summary.txt'), `${summary.join('\n')}\n`);
+// ⚠ A RUN OF ONE STEP MUST NOT OVERWRITE THE FULL SWEEP'S SUMMARY. The nightly sweep runs each
+// step as its own process, i.e. six consecutive single-step runs; writing the summary from each
+// would leave `run-summary.txt` describing only whichever step finished last, which reads as a
+// clean sweep of one tool. The per-step report files and `<step>.exit.txt` are still written —
+// they are the attribution the sweep needs — and the summary is the full sweep's alone.
+if (only === null) {
+  writeFileSync(join(reportDir, 'run-summary.txt'), `${summary.join('\n')}\n`);
+}
 
-if (failures.length > 0) {
+// A single-step run is an ATTRIBUTED exit: it reports THAT step's status, so the caller can key
+// its report by the step it asked for. A step that legitimately exits non-zero (jscpd reports
+// clones with exit 1) is the finding; a step that never ran is exit 2, already handled above.
+if (only !== null) {
+  process.exitCode = results[0].status;
+} else if (failures.length > 0) {
   process.exitCode = 1;
 }

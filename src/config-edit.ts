@@ -199,7 +199,11 @@ export function deleteConfigPath(document: ConfigDocument, path: string): boolea
   if (Array.isArray(current)) {
     const index = arrayIndexPart(last);
     if (index === null || index >= current.length) return false;
-    delete current[index];
+    // Splice, never `delete`: `delete arr[i]` leaves a HOLE, so the array keeps its length and
+    // the removed element reads as `undefined` — which `loadConfig()` would then reject, or (for
+    // an optional position) accept as a spilled hole. Removing an array element means shortening
+    // the array. sonarjs/no-array-delete flags exactly this, and it is a real defect here.
+    current.splice(index, 1);
     return true;
   }
   if (typeof current !== "object" || current === null) return false;

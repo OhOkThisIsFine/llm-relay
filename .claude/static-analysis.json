@@ -1,8 +1,28 @@
 {
   "tools": [
     {
-      "name": "eslint + sonarjs, knip, madge, dependency-cruiser, ts-prune, jscpd",
-      "command": "npm run analysis:run"
+      "name": "eslint + sonarjs",
+      "command": "npm run analysis:run -- --only eslint-after-fixes"
+    },
+    {
+      "name": "knip",
+      "command": "npm run analysis:run -- --only knip-after-fixes"
+    },
+    {
+      "name": "madge",
+      "command": "npm run analysis:run -- --only madge"
+    },
+    {
+      "name": "dependency-cruiser",
+      "command": "npm run analysis:run -- --only dependency-cruiser"
+    },
+    {
+      "name": "ts-prune",
+      "command": "npm run analysis:run -- --only ts-prune"
+    },
+    {
+      "name": "jscpd",
+      "command": "npm run analysis:run -- --only jscpd"
     }
   ]
 }

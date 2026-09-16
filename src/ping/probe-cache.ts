@@ -315,10 +315,18 @@ export function countRequestSamples(
   opts: { path?: string } = {},
 ): number {
   const cache = opts.path ? loadProbeCache({ path: opts.path }) : (_cache ?? loadProbeCache());
-  const samples = cache.providers[providerKey]?.models[modelId]?.samples;
+  // ⚠ Read the window as `unknown[]`, never as the DECLARED `PingRecord[]`. `loadProbeCache` is
+  // deliberately shallow (a re-learnable cache degrades to empty, see its own note), so the
+  // declared element type is a claim about what SHOULD be on disk, not evidence about what is —
+  // and reading it as the latter is exactly how a corrupt row gets counted as a measurement. The
+  // `unknown` view is what makes the element guard below a real check instead of a restatement of
+  // the type (sonarjs flagged the old code for comparing a value it believed was never null, and
+  // it was right to: the narrower the type, the less the guard did).
+  const entry: { samples?: unknown } | undefined = cache.providers[providerKey]?.models[modelId];
+  const samples = entry?.samples;
   if (!Array.isArray(samples)) return 0;
   let n = 0;
-  for (const sample of samples) {
+  for (const sample of samples as unknown[]) {
     if (sample !== null && typeof sample === "object" && (sample as { source?: unknown }).source === "request") n++;
   }
   return n;
