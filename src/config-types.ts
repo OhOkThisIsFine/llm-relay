@@ -379,6 +379,18 @@ export interface Routing {
    */
   probation?: ProbationConfig;
   /**
+   * Self-pacing against a STATED rate limit (owner direction 2026-09-10, built 2026-09-15). **Default
+   * ON.** A cell whose provider-stated, operator-configured or LEARNED (`rate-limit-*` fact) ceiling
+   * the relay's own trailing-window attempt count has reached joins a `paced` band behind `live`
+   * and `slow`, so the next request goes elsewhere while the window drains. Counted from the
+   * breaker's per-cell attempt-start log, which every client routing through the relay feeds.
+   *
+   * Like latency and probation it only ever REORDERS — nothing is dropped, nothing is refused —
+   * and a limit nobody stated has no effect at all. `false` is the shorthand for
+   * `{ enabled: false }` and restores the pre-pacing order exactly, byte for byte.
+   */
+  pacing?: PacingConfig;
+  /**
    * Post-commit CRAWL abort (backlog item 18, built 2026-09-09 after
    * `docs/post-commit-stall-measurement-2026-09-09.md` measured that both Claude Code and Codex
    * retry a stream that goes bad after content has already arrived — Claude Code once, downgraded
@@ -583,6 +595,33 @@ export interface ProbationConfig {
   enabled?: boolean;
   /** Minimum SERVED-REQUEST samples before a free deployment counts as measured. Default 5. */
   minSamples?: number;
+}
+
+/**
+ * `routing.pacing` — hold the relay's OWN request rate under a ceiling a deployment stated
+ * (owner direction 2026-09-10: *"use rate-limited messages to calculate when it might need to
+ * slow something down"*; built 2026-09-15, `src/pacing.ts`).
+ *
+ * **Default ON.** For each credential×model cell, every (axis, period) bucket carrying a stated
+ * ceiling — a provider-stated quota header's `limit`, an operator-declared `limits` figure, or a
+ * LEARNED `rate-limit-rpm|rpd|tpm|tpd` fact parsed from a 429 body — is held against the
+ * attempts this relay itself started in the trailing window of that period (a sliding window
+ * over the breaker's per-cell start log; tokens count the request's own input estimate). At or
+ * past the ceiling the cell joins a `paced` band behind `live` and `slow`, ahead of the failure
+ * bands, and leaves it by itself as the window drains. Breaker cooling, credential faults and
+ * quota demotion outrank it.
+ *
+ * ⚠ A learned ceiling PACES here without the `routing.quota.enforceLearned` opt-in — that is the
+ * owner's 2026-09-10 direction and the backlog property ("a 429 that states a window updates
+ * that pacing without a human verdict"). `routing.quota`'s own M2 gate is untouched: it governs
+ * the ALLOWANCE path (remaining ≤ 0 ⇒ cooling until reset), which is a different question.
+ *
+ * `false` is the documented shorthand for `{ enabled: false }` and restores the pre-pacing
+ * order exactly, byte for byte. An object with no keys is legal and means the defaults.
+ */
+export interface PacingConfig {
+  /** Default true. false disables the paced band entirely. */
+  enabled?: boolean;
 }
 
 /**

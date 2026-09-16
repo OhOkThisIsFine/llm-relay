@@ -40,6 +40,7 @@ import {
   QUOTA_DEMOTED_HEADER,
   LATENCY_DEMOTED_HEADER,
   PROBATION_HEADER,
+  PACED_HEADER,
   HEDGED_HEADER,
   dialectRefusalSignalOf,
   errorOrigin,
@@ -82,6 +83,7 @@ import { looksLikeRateLimitError, parseStatedRateLimit, recordObservedRateLimit 
 import { clearFacts, cooldownUntil, factsFor, recordFact, type FactResetBasis } from "./target-facts.js";
 import { quotaDemotionLabel, type QuotaDemotionFn } from "./quota-demotion.js";
 import { latencyDemotionLabel, type LatencyDemotionFn } from "./latency-demotion.js";
+import { pacingLabel, type PacingFn } from "./pacing.js";
 import type { HedgeDelayDecision } from "./hedge-trigger.js";
 import { raceWithHedge, type HedgeRaceResult, type RaceEntrant, type Settled } from "./hedge-race.js";
 import { hardCapLabel, type HardCapVerdict } from "./hard-cap.js";
@@ -183,7 +185,13 @@ export interface StickyRequestContext {
   provenance: string | null;
 }
 
-export type TargetUsability = "live" | "slow" | "credential-fault" | "cooling" | "probation";
+/**
+ * The walk's health bands, best first: `probation` → `live` → `slow` → `paced` →
+ * `credential-fault` → `cooling`. `paced` (2026-09-15, `pacing.ts`) sits behind `slow` because a
+ * slow member most likely answers while one at its stated ceiling most likely 429s — and ahead of
+ * the failure bands because it is healthy, merely full for the moment.
+ */
+export type TargetUsability = "live" | "slow" | "paced" | "credential-fault" | "cooling" | "probation";
 type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
 type OutcomeClass = "ok" | "retriable" | "credential" | "client";
 
@@ -217,6 +225,7 @@ interface ServedAnnouncementContext {
   readonly degraded?: string | null | undefined;
   readonly quotaDemoted?: string | null | undefined;
   readonly latencyDemoted?: string | null | undefined;
+  readonly paced?: string | null | undefined;
   readonly probation?: string | null | undefined;
   readonly hedged?: string | null | undefined;
   readonly paid?: string | null | undefined;
@@ -266,6 +275,7 @@ export function responseHeadersForTarget(
   if (ctx.degraded) responseHeaders[DEGRADED_HEADER] = ctx.degraded;
   if (ctx.quotaDemoted) responseHeaders[QUOTA_DEMOTED_HEADER] = ctx.quotaDemoted;
   if (ctx.latencyDemoted) responseHeaders[LATENCY_DEMOTED_HEADER] = ctx.latencyDemoted;
+  if (ctx.paced) responseHeaders[PACED_HEADER] = ctx.paced;
   if (ctx.probation) responseHeaders[PROBATION_HEADER] = ctx.probation;
   if (ctx.hedged) responseHeaders[HEDGED_HEADER] = ctx.hedged;
   if (ctx.paid) responseHeaders[PAID_HEADER] = ctx.paid;
@@ -547,12 +557,16 @@ export function targetUsability(
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
   probation?: ProbationFn | null,
+  pacing?: PacingFn | null,
 ): TargetUsability {
   const identity = targetIdentity(attempt);
   if (!breaker.isHealthy(identity, now)) return "cooling";
   if (cooledByAllowance(attempt, now, costClassOf?.(attempt))) return "cooling";
   if (cooledByQuota(attempt, breaker, quotaDemotion, now)) return "cooling";
   if (breaker.hasCredentialFault(identity, now)) return "credential-fault";
+  // Bands are tested lowest first, so a member that is both paced and slow lands in the LOWER
+  // one (`paced`) — the walk order is what the classifier must agree with.
+  if (pacing?.(attempt, now)) return "paced";
   if (latencyDemotion?.(attempt, now)) return "slow";
   // Probation is checked LAST: every stronger band outranks it, so a cooling probation member
   // goes to `cooling` and a slow one to `slow`. What remains is free, healthy, fast — and
@@ -632,20 +646,23 @@ export function orderDeploymentGroupsByUsability(
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
   probation?: ProbationFn | null,
+  pacing?: PacingFn | null,
 ): {
   ordered: ResolvedAttempt[];
   quotaDemotedFirst: string | null;
   latencyDemotedFirst: string | null;
+  pacedFirst: string | null;
 } {
   type Group = ReturnType<typeof groupCredentialAttempts>[number];
   const preferred = groupCredentialAttempts(attempts)[0]?.attempts[0];
   const probationGroups: Group[] = [];
   const live: Group[] = [];
   const slow: Group[] = [];
+  const paced: Group[] = [];
   const faulted: Group[] = [];
   const cooling: Group[] = [];
   for (const group of groupCredentialAttempts(attempts)) {
-    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
+    const usability = targetUsability(group.attempts[0]!, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation, pacing);
     switch (usability) {
       case "probation":
         probationGroups.push(group);
@@ -655,6 +672,9 @@ export function orderDeploymentGroupsByUsability(
         break;
       case "slow":
         slow.push(group);
+        break;
+      case "paced":
+        paced.push(group);
         break;
       case "credential-fault":
         faulted.push(group);
@@ -678,7 +698,18 @@ export function orderDeploymentGroupsByUsability(
     return liftA - liftB;
   });
 
-  const ordered = [...probationGroups, ...live, ...slow, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  const ordered = [...probationGroups, ...live, ...slow, ...paced, ...faulted, ...cooling].flatMap((group) => group.attempts);
+  let pacedFirst: string | null = null;
+  if (
+    preferred !== undefined &&
+    pacing !== undefined &&
+    pacing !== null &&
+    ordered[0] !== undefined &&
+    ordered[0] !== preferred
+  ) {
+    const pacedVerdict = pacing(preferred, now);
+    if (pacedVerdict) pacedFirst = pacingLabel(specOfTarget(preferred.target), pacedVerdict);
+  }
   let latencyDemotedFirst: string | null = null;
   if (
     preferred !== undefined &&
@@ -701,7 +732,7 @@ export function orderDeploymentGroupsByUsability(
   ) {
     quotaDemotedFirst = quotaDemotionLabel(specOfTarget(preferred.target), quotaDemotion(preferred, now)!);
   }
-  return { ordered, quotaDemotedFirst, latencyDemotedFirst };
+  return { ordered, quotaDemotedFirst, latencyDemotedFirst, pacedFirst };
 }
 
 export class CredentialAttemptTrace {
@@ -1258,6 +1289,9 @@ export function applyStickyOrdering(
   // call site already had it (undefined at the one production call site in `server.ts`); fixing
   // that pre-existing gap is out of this packet's scope.
   probation?: ProbationFn | null,
+  // Threaded for the same reason as `probation`: a pinned candidate at its stated ceiling must
+  // read as `paced`, not `live`, or the pin would promote exactly the member pacing stepped aside.
+  pacing?: PacingFn | null,
 ): { targets: ResolvedAttempt[]; status: string } {
   const groups = groupCredentialAttempts(ordered);
   const pinnedIndex = groups.findIndex((group) => specOfTarget(group.attempts[0]!.target) === pinnedSpec);
@@ -1265,7 +1299,7 @@ export function applyStickyOrdering(
   const pinned = pinnedGroup?.attempts[0];
   if (!pinned || !pinnedGroup) return { targets: ordered, status: "bypassed: not-in-pool" };
 
-  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
+  const usability = targetUsability(pinned, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation, pacing);
   if (usability !== "live") return { targets: ordered, status: `bypassed: ${usability}` };
 
   if (degraded?.has(pinnedSpec)) {
@@ -1273,7 +1307,7 @@ export function applyStickyOrdering(
       (group) => {
         const candidate = group.attempts[0]!;
         return !degraded.has(specOfTarget(candidate.target)) &&
-          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation) === "live";
+          targetUsability(candidate, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation, pacing) === "live";
       },
     );
     if (hasLiveInBand) return { targets: ordered, status: "bypassed: degraded" };
@@ -1352,8 +1386,9 @@ export function orderByUsability(
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
   probation?: ProbationFn | null,
+  pacing?: PacingFn | null,
 ): ResolvedAttempt[] {
-  const { ordered } = orderByUsabilityTracked(attempts, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
+  const { ordered } = orderByUsabilityTracked(attempts, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation, pacing);
   return ordered;
 }
 
@@ -1365,18 +1400,21 @@ export function orderByUsabilityTracked(
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
   probation?: ProbationFn | null,
+  pacing?: PacingFn | null,
 ): {
   ordered: ResolvedAttempt[];
   quotaDemotedFirst: string | null;
   latencyDemotedFirst: string | null;
+  pacedFirst: string | null;
 } {
   const probationMembers: ResolvedAttempt[] = [];
   const live: ResolvedAttempt[] = [];
   const slow: ResolvedAttempt[] = [];
+  const paced: ResolvedAttempt[] = [];
   const faulted: ResolvedAttempt[] = [];
   const cooling: ResolvedAttempt[] = [];
   for (const attempt of attempts) {
-    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation);
+    const usability = targetUsability(attempt, breaker, now, quotaDemotion, costClassOf, latencyDemotion, probation, pacing);
     switch (usability) {
       case "probation":
         probationMembers.push(attempt);
@@ -1386,6 +1424,9 @@ export function orderByUsabilityTracked(
         break;
       case "slow":
         slow.push(attempt);
+        break;
+      case "paced":
+        paced.push(attempt);
         break;
       case "credential-fault":
         faulted.push(attempt);
@@ -1409,8 +1450,8 @@ export function orderByUsabilityTracked(
     return liftA - liftB;
   });
 
-  const ordered = [...probationMembers, ...live, ...slow, ...faulted, ...cooling];
-  return { ordered, quotaDemotedFirst: null, latencyDemotedFirst: null };
+  const ordered = [...probationMembers, ...live, ...slow, ...paced, ...faulted, ...cooling];
+  return { ordered, quotaDemotedFirst: null, latencyDemotedFirst: null, pacedFirst: null };
 }
 
 /** What one HTTP status means to the walk: how to classify the outcome, and whether the body may
@@ -1652,6 +1693,12 @@ export function targetIdentity(attempt: ResolvedAttempt): ProviderTargetIdentity
   });
 }
 
+/**
+ * Begin the breaker attempt for one egress. `estimatedInputTokens` is REQUIRED, not optional, so
+ * the compiler enumerates both fronts' call sites: it feeds the cell's attempt-start log that
+ * `pacing.ts` counts token windows over, and an optional parameter would let one front silently
+ * pace on requests alone — the one-front gap this repo's history warns about most.
+ */
 export function beginHealthAttempt(
   h: { breaker: CircuitBreaker },
   resolvedAttempt: ResolvedAttempt,
@@ -1659,9 +1706,10 @@ export function beginHealthAttempt(
   trace: RequestAttemptTrace,
   usage: UsageAccumulator,
   accounting: RequestAccountingState | null,
+  estimatedInputTokens: number,
 ): HealthAttempt | null {
   const identity = targetIdentity(resolvedAttempt);
-  const begun = h.breaker.beginAttempt(identity);
+  const begun = h.breaker.beginAttempt(identity, { at: started, estimatedInputTokens });
   if (!begun.ok) return null;
   return {
     committed: false,

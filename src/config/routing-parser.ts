@@ -47,6 +47,7 @@ import {
   type McpSettings,
   type OffloadConfig,
   type OffloadRule,
+  type PacingConfig,
   type PoolPolicy,
   type ProbationConfig,
   type ProviderConfig,
@@ -225,6 +226,35 @@ function parseProbation(raw: unknown): ProbationConfig {
 }
 
 /**
+ * Validate `routing.pacing`. Malformed is a hard error, and an UNKNOWN KEY is a hard error too —
+ * the `routing.probation` precedent: an operator who wrote `"enable": false` believes they turned
+ * the band off, and a silently ignored key leaves it in force while looking like it was changed.
+ * The block carries no numbers on purpose: every ceiling pacing holds a cell to is STATED by the
+ * provider, the operator's `limits` block or a learned fact — a tunable here would be an invented
+ * one.
+ */
+function parsePacing(raw: unknown): PacingConfig {
+  // ABSENT returns `{}`, not `undefined` — the `parseProbation` precedent: `{}` IS "all defaults"
+  // (ON), so a total return keeps `parseOptionalBlocks` branch-free.
+  if (raw === undefined || raw === null) return {};
+  // The boolean shorthand is NORMALIZED here, so `pacing.ts` never decides what `false` means.
+  if (typeof raw === "boolean") return { enabled: raw };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("config.routing.pacing must be an object or a boolean");
+  }
+  const value = raw as Record<string, unknown>;
+  for (const key of Object.keys(value)) {
+    if (key !== "enabled") throw new Error(`config.routing.pacing has an unknown key "${key}"`);
+  }
+  const out: PacingConfig = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== "boolean") throw new Error("config.routing.pacing.enabled must be a boolean");
+    out.enabled = value.enabled;
+  }
+  return out;
+}
+
+/**
  * Validate `routing.crawl`. Malformed is a hard error, and an UNKNOWN KEY is a hard error too —
  * the `routing.latency`/`routing.hedge` precedent: an operator who wrote `"msPerToken": 500`
  * believes they lowered the bar, and a silently ignored key leaves the default in force while
@@ -288,6 +318,7 @@ export function parseRouting(
     latency?: unknown;
     hedge?: unknown;
     probation?: unknown;
+    pacing?: unknown;
     crawl?: unknown;
     laneProbe?: unknown;
     dispatchWalk?: unknown;
@@ -314,6 +345,7 @@ export function parseRouting(
   routing.latency = optionalBlocks.latency;
   routing.hedge = optionalBlocks.hedge;
   routing.probation = optionalBlocks.probation;
+  routing.pacing = optionalBlocks.pacing;
   routing.crawl = optionalBlocks.crawl;
   routing.laneProbe = optionalBlocks.laneProbe;
   routing.dispatchWalk = optionalBlocks.dispatchWalk;
@@ -810,18 +842,19 @@ function parsePools(
 }
 
 /**
- * The nine optional sub-blocks as `parseRouting` copies them onto the result. `latency`,
- * `hedge`, `probation`, `crawl`, `laneProbe` and `dispatchWalk` are REQUIRED here because their
- * parsers return a total value for an absent block (the `parseLatencyDemotion` precedent); the
- * other three stay absent when absent.
+ * The ten optional sub-blocks as `parseRouting` copies them onto the result. `latency`,
+ * `hedge`, `probation`, `pacing`, `crawl`, `laneProbe` and `dispatchWalk` are REQUIRED here
+ * because their parsers return a total value for an absent block (the `parseLatencyDemotion`
+ * precedent); the other three stay absent when absent.
  */
 type OptionalRoutingBlocks = Pick<Routing, "sticky" | "quota" | "mcp"> &
-  Required<Pick<Routing, "latency" | "hedge" | "probation" | "crawl" | "laneProbe" | "dispatchWalk">>;
+  Required<Pick<Routing, "latency" | "hedge" | "probation" | "pacing" | "crawl" | "laneProbe" | "dispatchWalk">>;
 
 /**
- * Parse the nine optional sub-blocks (sticky, quota, latency, hedge, probation, crawl, laneProbe,
- * dispatchWalk, mcp) in their current validation order. `parseRouting` copies the result key by
- * key in that same order, so the returned object's own key order is not what decides `Routing`'s.
+ * Parse the ten optional sub-blocks (sticky, quota, latency, hedge, probation, pacing, crawl,
+ * laneProbe, dispatchWalk, mcp) in their current validation order. `parseRouting` copies the
+ * result key by key in that same order, so the returned object's own key order is not what
+ * decides `Routing`'s.
  */
 function parseOptionalBlocks(
   r: {
@@ -830,6 +863,7 @@ function parseOptionalBlocks(
     latency?: unknown;
     hedge?: unknown;
     probation?: unknown;
+    pacing?: unknown;
     crawl?: unknown;
     laneProbe?: unknown;
     dispatchWalk?: unknown;
@@ -842,6 +876,7 @@ function parseOptionalBlocks(
   const latency = parseLatencyDemotion(r.latency);
   const hedge = parseHedge(r.hedge);
   const probation = parseProbation(r.probation);
+  const pacing = parsePacing(r.pacing);
   const crawl = parseCrawl(r.crawl);
   const laneProbe = parseLaneProbe(r.laneProbe);
   const dispatchWalk = parseDispatchWalk(r.dispatchWalk);
@@ -852,6 +887,7 @@ function parseOptionalBlocks(
     latency,
     hedge,
     probation,
+    pacing,
     crawl,
     laneProbe,
     dispatchWalk,

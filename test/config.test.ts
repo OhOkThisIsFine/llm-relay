@@ -2007,6 +2007,45 @@ describe("loadConfig — routing.hedge", () => {
 });
 
 /**
+ * `routing.pacing` — the parse contract for self-pacing against a stated rate limit (owner
+ * direction 2026-09-10, built 2026-09-15). Same strictness precedent as `routing.probation`; what
+ * the term DOES is pinned in `test/pacing.test.ts` — this is only about what the config may say.
+ */
+describe("loadConfig — routing.pacing", () => {
+  function pacingCfg(pacing: unknown) {
+    return base({ routing: { default: "nim/z-ai/glm-5.2", pacing } });
+  }
+
+  it("defaults to an empty object, which means every default (i.e. ON)", () => {
+    expect(loadConfig(write("pacing-absent.json", base())).routing.pacing).toEqual({});
+  });
+
+  it("normalizes the boolean shorthand away, so nothing downstream decides what false means", () => {
+    expect(loadConfig(write("pacing-false.json", pacingCfg(false))).routing.pacing).toEqual({ enabled: false });
+    expect(loadConfig(write("pacing-true.json", pacingCfg(true))).routing.pacing).toEqual({ enabled: true });
+    expect(loadConfig(write("pacing-obj.json", pacingCfg({ enabled: false }))).routing.pacing).toEqual({ enabled: false });
+  });
+
+  it("REFUSES an unknown key rather than ignoring it — there are no numbers to tune here", () => {
+    expect(() => loadConfig(write("pacing-typo.json", pacingCfg({ enable: false })))).toThrow(
+      /routing\.pacing has an unknown key "enable"/,
+    );
+    expect(() => loadConfig(write("pacing-margin.json", pacingCfg({ margin: 0.9 })))).toThrow(
+      /routing\.pacing has an unknown key "margin"/,
+    );
+  });
+
+  it("rejects a malformed block outright", () => {
+    expect(() => loadConfig(write("pacing-array.json", pacingCfg([])))).toThrow(
+      /routing\.pacing must be an object or a boolean/,
+    );
+    expect(() => loadConfig(write("pacing-enabled.json", pacingCfg({ enabled: "yes" })))).toThrow(
+      /routing\.pacing\.enabled must be a boolean/,
+    );
+  });
+});
+
+/**
  * `routing.crawl` — the parse contract for the post-commit crawl-abort watchdog (backlog item 18,
  * built 2026-09-09). Same strictness precedent as `routing.hedge`/`routing.latency` above; what
  * the watchdog DOES with these numbers is pinned in `test/stream-pipeline.test.ts` and

@@ -43,6 +43,58 @@ export interface CircuitState {
 }
 
 /**
+ * One started attempt: when, and the relay's own chars/4 estimate of its input size — an entry in
+ * the per-cell attempt-start log `pacing.ts` counts its trailing window over (2026-09-15).
+ *
+ * ⚠ The log is NOT part of `CircuitState`, deliberately. It is recorded in `beginAttempt` — the
+ * one choke point every egress on both fronts passes through — and creating HEALTH state there
+ * would surface a deployment in `/candidates`, telemetry and the breaker export before any
+ * outcome existed, and would break the pinned rule that a relay-local fault creates no provider
+ * health state (`test/closed-vocabulary-routing.test.ts`). So it lives in its own map keyed by the
+ * same cell, in memory only and NOT carried by `breaker-persistence.ts`: a restart forgets at most
+ * one window of pacing memory, and the failure direction is LESS pacing (the provider's own 429
+ * then teaches the cell, as before), never more. Bounded by `ATTEMPT_START_WINDOW_MS` and
+ * `MAX_ATTEMPT_STARTS`.
+ */
+export interface AttemptStart {
+  readonly at: number;
+  /**
+   * `estimateRequestTokens` for the request — INPUT only, an estimate, and a LOWER bound of what a
+   * provider meters (it counts output too). Null when the caller had no estimate; a null never
+   * contributes to a token count, so a window holding one is reported as partial, never as 0.
+   */
+  readonly estimatedInputTokens: number | null;
+}
+
+/** What `CircuitBreaker.attemptsInWindow` answers about one cell's trailing window. */
+export interface AttemptWindow {
+  /** Attempts started inside the window. A LOWER bound while `saturated` is true. */
+  readonly requests: number;
+  /**
+   * Sum of the estimated INPUT tokens of those attempts, or null when any attempt in the window
+   * carried no estimate — an unknown must not read as 0 (the provenance invariant).
+   */
+  readonly estimatedInputTokens: number | null;
+  /**
+   * True when the log was capped at `MAX_ATTEMPT_STARTS` with every retained entry inside the
+   * window, so the true count is unknowable from here and `requests` is only a floor.
+   */
+  readonly saturated: boolean;
+}
+
+/** The narrowest handle that names one breaker cell: exactly what `getKey` reads. */
+export type BreakerCellSelector = Pick<ProviderTargetIdentity, "credentialId" | "model">;
+
+/** One cell cooling on a rung the relay may re-test by probing — see `rateLimitCoolingCells`. */
+export interface RateLimitCoolingCell {
+  readonly provider: string;
+  readonly model: string | null;
+  readonly credentialId: string;
+  readonly cooldownUntil: number;
+  readonly source: CooldownSource;
+}
+
+/**
  * One whole circuit-breaker cell, in a shape that can be written to disk and read back.
  *
  * Declared here rather than in `breaker-persistence.ts` so the dependency runs one way only
@@ -243,6 +295,58 @@ const MAX_PING_HISTORY = 10;
 const CREDENTIAL_FAULT_TTL_MS = 300_000;
 const MIN_RETRY_AFTER_MS = 1_000;
 const MAX_RETRY_AFTER_MS = 900_000;
+/**
+ * The widest trailing window `pacing.ts` may ask for — one day, the longest period a stated
+ * rate limit names (`rpd`/`tpd`). An older start can never be inside any window, so it is dropped
+ * at the next append.
+ */
+export const ATTEMPT_START_WINDOW_MS = 86_400_000;
+/**
+ * Hard cap on retained starts per cell. Ten thousand covers every daily free-tier ceiling this
+ * relay has met (the largest measured was 1,500 RPD) with room; above it the count is a FLOOR
+ * (`AttemptWindow.saturated`) and pacing declines rather than guess.
+ */
+export const MAX_ATTEMPT_STARTS = 10_000;
+
+/**
+ * Which cooldown SOURCES a successful probe may end early (`endRateLimitCooldown`).
+ *
+ * ⚠ A total table, closed with `satisfies`, so a new `CooldownSource` is a compile error here
+ * rather than a member that silently falls to either side. The values are a policy, stated:
+ *
+ * - `default` / `escalation` — the relay's OWN guessed 429 rungs (2 m → 10 m → 1 h → 24 h). A
+ *   probe that answers proves the guess overshot; end it. (`default` is also the generic-failure
+ *   floor and the 402 rung — `endRateLimitCooldown` disambiguates by `lastStatus`.)
+ * - `retry-after` — a stated figure, but a probe that ANSWERED is first-party evidence the window
+ *   already lifted; a statement about the future does not outrank an observation of the present.
+ * - `loopback` — a 5 s rung on a local daemon; harmless to end.
+ * - `quota` — a spent allowance with a stated `resetsAt`; re-registered by `cooledByQuota` on the
+ *   next request anyway, and a one-token probe does not disprove a spent token allowance.
+ * - `elapsed` — a slow failure's measured waste; a fast probe says nothing about a slow request.
+ */
+const PROBE_SUCCESS_ENDS_COOLDOWN = {
+  "default": true,
+  "escalation": true,
+  "retry-after": true,
+  "loopback": true,
+  "quota": false,
+  "elapsed": false,
+} as const satisfies Record<CooldownSource, boolean>;
+
+/**
+ * Which cooldown SOURCES the ping loop SPENDS a probe on (`rateLimitCoolingCells`). Narrower than
+ * the table above on purpose: ending a cooldown a probe happened to disprove costs nothing, but
+ * choosing to send a request against a limit the provider just stated does — so only the rungs
+ * the relay itself invented are re-tested. Same total-table discipline.
+ */
+const REPROBE_TARGETS_COOLDOWN = {
+  "default": true,
+  "escalation": true,
+  "retry-after": false,
+  "loopback": false,
+  "quota": false,
+  "elapsed": false,
+} as const satisfies Record<CooldownSource, boolean>;
 /** Ordering-only middle band retained for telemetry consumers during migration. */
 export const UNMEASURED_STABILITY = 50;
 
@@ -337,13 +441,15 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   private states = new Map<string, CircuitState>();
   /** Credential-domain leases are deliberately wider than a deployment cell. */
   private credentialInFlight = new Map<string, number>();
+  /** Per-cell attempt-start log, same key as `states` — pacing's dataset, not health (see `AttemptStart`). */
+  private attemptStarts = new Map<string, AttemptStart[]>();
   readonly #owner = Object.freeze({});
   #generation = 1;
   #lifecycle = new AttemptLifecycle(this.#generation);
   #attempts = new WeakMap<object, BreakerAttemptRecord>();
 
   /** Cell key. This intentionally has no provider/model-string compatibility path. */
-  private getKey(target: ProviderTargetIdentity): string {
+  private getKey(target: BreakerCellSelector): string {
     return target.model === null
       ? target.credentialId
       : `${target.credentialId}/${target.model}`;
@@ -369,8 +475,14 @@ export class CircuitBreaker implements AttemptLifecyclePort {
     return state;
   }
 
+  /**
+   * Begin an attempt. `start` is optional so the `AttemptLifecyclePort` contract is unchanged;
+   * the request path passes its egress instant and the request's own input estimate so the
+   * cell's attempt-start log (`pacing.ts`'s dataset) records the same clock the walk runs on.
+   */
   beginAttempt(
     target: ProviderTargetIdentity,
+    start: { at?: number; estimatedInputTokens?: number | null } = {},
   ): TransitionResult<AttemptHandle, AttemptBeginFailure> {
     const begun = this.#lifecycle.beginAttempt(target);
     if (!begun.ok) return begun;
@@ -384,7 +496,123 @@ export class CircuitBreaker implements AttemptLifecyclePort {
       (this.credentialInFlight.get(target.credentialId) ?? 0) + 1,
     );
     breakerHandleOwners.set(handle as object, this.#owner);
+    this.recordAttemptStart(target, start.at ?? Date.now(), start.estimatedInputTokens ?? null);
     return begun;
+  }
+
+  /**
+   * Append one start to the cell's log and prune it: entries older than the widest window
+   * `pacing.ts` reads (`ATTEMPT_START_WINDOW_MS`) fall off, then the newest `MAX_ATTEMPT_STARTS`
+   * are kept. Pruning at both bounds keeps a hot cell at a fixed cost and a quiet one empty.
+   */
+  private recordAttemptStart(
+    target: ProviderTargetIdentity,
+    at: number,
+    estimatedInputTokens: number | null,
+  ): void {
+    if (!Number.isFinite(at)) return;
+    const key = this.getKey(target);
+    let log = this.attemptStarts.get(key);
+    if (log === undefined) {
+      log = [];
+      this.attemptStarts.set(key, log);
+    }
+    const tokens =
+      typeof estimatedInputTokens === "number" && Number.isFinite(estimatedInputTokens) && estimatedInputTokens >= 0
+        ? estimatedInputTokens
+        : null;
+    log.push({ at, estimatedInputTokens: tokens });
+    const floor = at - ATTEMPT_START_WINDOW_MS;
+    let drop = 0;
+    while (drop < log.length && log[drop]!.at < floor) drop += 1;
+    const overflow = log.length - drop - MAX_ATTEMPT_STARTS;
+    if (overflow > 0) drop += overflow;
+    if (drop > 0) log.splice(0, drop);
+  }
+
+  /**
+   * The attempts this relay started against ONE cell inside the trailing `windowMs` — the
+   * sliding-window count `pacing.ts` holds against a stated ceiling. Exact-cell only, like every
+   * other reader here: a sibling credential's starts are that credential's own rate.
+   *
+   * ⚠ A sliding window is the conservative reading on purpose. A count that never exceeds L in
+   * ANY trailing window cannot exceed L in a provider's fixed window either (a fixed window is
+   * one position of the sliding one), so this bound holds whichever window shape the provider
+   * runs — which the relay is never told.
+   */
+  attemptsInWindow(cell: BreakerCellSelector, windowMs: number, now: number): AttemptWindow {
+    const log = this.attemptStarts.get(this.getKey(cell));
+    if (log === undefined || !Number.isFinite(windowMs) || windowMs <= 0) {
+      return { requests: 0, estimatedInputTokens: 0, saturated: false };
+    }
+    const since = now - windowMs;
+    let requests = 0;
+    let tokens: number | null = 0;
+    // Newest last, so walk from the end and stop at the first entry outside the window.
+    for (let i = log.length - 1; i >= 0; i -= 1) {
+      const start = log[i]!;
+      if (start.at <= since) break;
+      if (start.at > now) continue;
+      requests += 1;
+      if (tokens !== null) tokens = start.estimatedInputTokens === null ? null : tokens + start.estimatedInputTokens;
+    }
+    const saturated = log.length >= MAX_ATTEMPT_STARTS && requests === log.length;
+    return { requests, estimatedInputTokens: tokens, saturated };
+  }
+
+  /**
+   * A PROBE answered 200 for this exact cell: end its 429-sourced cooldown now (2026-09-15, the
+   * backlog's "a probe that answers 200 ends a rate-limit cooldown early").
+   *
+   * Two gates, both required, and the second exists because the first cannot decide alone:
+   * `PROBE_SUCCESS_ENDS_COOLDOWN` names which SOURCES a probe may end, but `default` and
+   * `retry-after` are shared with a 402 and with generic failures, so the cell's `lastStatus`
+   * must be the 429 that set it. A cooldown that came from a quota statement, a credential
+   * fault (its own axis, untouched here), an operator hard cap (never on the breaker) or a slow
+   * failure is left exactly as it was.
+   *
+   * ⚠ `unexplained429s` — the escalation ladder's index — is deliberately NOT reset. A probe is a
+   * one-token completion; the ladder counts what REAL traffic saw, and only a real success (the
+   * ordinary `applyHealthOutcome` path) resets it. So a cell that keeps 429ing real requests while
+   * passing probes still escalates its nominal rung, and the probe cadence sets the effective
+   * floor — that is the stated cost of polling for recovery.
+   */
+  endRateLimitCooldown(cell: BreakerCellSelector, at = Date.now()): boolean {
+    const state = this.states.get(this.getKey(cell));
+    if (state === undefined || state.cooldownUntil <= at) return false;
+    if (state.lastStatus !== 429 || state.cooldownSource === null) return false;
+    if (!PROBE_SUCCESS_ENDS_COOLDOWN[state.cooldownSource]) return false;
+    state.cooldownUntil = 0;
+    state.cooldownSource = null;
+    this.notifyStateChanged();
+    return true;
+  }
+
+  /**
+   * Every cell cooling on a 429 rung the relay GUESSED — the set the ping loop re-probes so a
+   * deployment that has recovered is not parked for the rest of its escalation step (the owner's
+   * "the relay should be polling to see if things start working again anyway").
+   *
+   * Only `REPROBE_TARGETS_COOLDOWN` sources qualify, and only with `lastStatus` 429: a stated
+   * `Retry-After` is the provider's own figure and is honoured rather than second-guessed with a
+   * request the provider just declined to serve; a loopback rung is 5 s; quota/elapsed are not
+   * rate-limit cooldowns at all. Sorted by soonest lift so a bounded re-probe budget reaches the
+   * cells closest to recovery first.
+   */
+  rateLimitCoolingCells(now = Date.now()): RateLimitCoolingCell[] {
+    const out: RateLimitCoolingCell[] = [];
+    for (const state of this.states.values()) {
+      if (state.cooldownUntil <= now || state.lastStatus !== 429 || state.cooldownSource === null) continue;
+      if (!REPROBE_TARGETS_COOLDOWN[state.cooldownSource]) continue;
+      out.push({
+        provider: state.target.provider,
+        model: state.target.model,
+        credentialId: state.target.credentialId,
+        cooldownUntil: state.cooldownUntil,
+        source: state.cooldownSource,
+      });
+    }
+    return out.sort((a, b) => a.cooldownUntil - b.cooldownUntil);
   }
 
   observeHeaders(
@@ -965,6 +1193,7 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   reset(): void {
     this.states.clear();
     this.credentialInFlight.clear();
+    this.attemptStarts.clear();
     this.#lifecycle.close();
     this.#generation += 1;
     this.#lifecycle = new AttemptLifecycle(this.#generation);

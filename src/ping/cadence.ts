@@ -39,6 +39,34 @@ export const IDLE_SLOW_AFTER_MS = 300000; // 5 min
  */
 export const SPEND_POLL_INTERVAL_MS = 15 * 60 * 1000;
 
+/**
+ * How often ONE cell cooling on a guessed 429 rung is re-probed (`reprobeRateLimited`). A minute
+ * bounds the spend to one request per cooling cell per minute — against a cell the walk is not
+ * serving anyway — while cutting a 2 m / 10 m / 1 h / 24 h guess down to at most a minute past
+ * the moment the deployment actually recovers. A stated `Retry-After` is never re-probed early
+ * (`REPROBE_TARGETS_COOLDOWN` in `circuit-breaker.ts`), so this cadence only ever shortens the
+ * relay's OWN guesses.
+ */
+export const RATE_LIMIT_REPROBE_INTERVAL_MS = 60_000;
+/** Re-probes spent per tick, soonest-lifting cells first — the same flooding bound as the catalog probe. */
+export const MAX_RATE_LIMIT_REPROBES_PER_TICK = 3;
+
+/**
+ * The ONE thing the ping loop may do to the breaker (2026-09-15): end a 429-sourced cooldown when
+ * a probe answers 200, and ask which cells are worth probing for that. A narrow structural port,
+ * not a `CircuitBreaker` import — the loop must not be able to reach outcome recording, and
+ * `CircuitBreaker` satisfies it directly so `server.ts` passes the breaker itself.
+ */
+export interface RateLimitRecoveryPort {
+  rateLimitCoolingCells(now: number): ReadonlyArray<{
+    readonly provider: string;
+    readonly model: string | null;
+    readonly credentialId: string;
+    readonly cooldownUntil: number;
+  }>;
+  endRateLimitCooldown(cell: { credentialId: string; model: string | null }, at: number): boolean;
+}
+
 export interface ModelHealthSummary {
   providerKey: string;
   modelId: string;
@@ -117,6 +145,8 @@ export class PingLoop {
   private credentialCursors = new Map<string, number>();
   /** When each credential's spend headroom was last asked for — the SPEND_POLL_INTERVAL_MS gate. */
   private spendPolledAt = new Map<CredentialId, number>();
+  /** When each cooling cell was last re-probed — the RATE_LIMIT_REPROBE_INTERVAL_MS gate, keyed `credentialId/model`. */
+  private rateLimitReprobedAt = new Map<string, number>();
 
   constructor(
     private cfg: Config,
@@ -134,6 +164,12 @@ export class PingLoop {
        * 2026-08-30 caught exactly that leak) — only the timer loop advances the lane cadence.
        */
       onTick?: ((now: number) => void) | undefined;
+      /**
+       * The breaker, through `RateLimitRecoveryPort` (2026-09-15). Absent ⇒ a probe success
+       * still retracts cooling FACTS as before and touches no breaker cooldown, and no cell is
+       * re-probed for recovery — the pre-2026-09-15 behaviour exactly.
+       */
+      rateLimitRecovery?: RateLimitRecoveryPort | undefined;
     } = {},
   ) {}
 
@@ -228,8 +264,9 @@ export class PingLoop {
     // week-long operator-asserted reset is safe to record at all.
     // ⚠ Measurements are never touched: `clearFacts` excludes them, because a success disproves
     // a condition and never a measurement.
-    // ⚠ Unlike the served path this does NOT also clear the breaker's credential faults —
-    // `PingLoop` holds no breaker reference, and those carry their own 5-minute TTL.
+    // ⚠ Unlike the served path this does NOT also clear the breaker's credential faults — those
+    // carry their own 5-minute TTL, and the only breaker reach this loop has is the narrow
+    // `rateLimitRecovery` port below.
     // ⚠ Contained: the fact store must never be able to break the probe loop.
     if (res.code === "200") {
       try {
@@ -243,7 +280,83 @@ export class PingLoop {
       } catch {
         /* best-effort */
       }
+      // The same first-party proof, applied to the BREAKER's 429 cooldown (2026-09-15): a
+      // deployment that just answered this credential is not rate-limiting it, whatever rung
+      // the relay guessed. Exact cell only — `endRateLimitCooldown` keys by credential × model,
+      // so a sibling credential's cooldown is untouched, and the port itself declines every
+      // cooldown that did not come from a 429 (quota, elapsed, credential faults).
+      try {
+        this.opts.rateLimitRecovery?.endRateLimitCooldown({ credentialId, model: modelId }, timestamp);
+      } catch {
+        /* best-effort: a persistence failure inside the breaker must never break the probe loop */
+      }
     }
+  }
+
+  /**
+   * Re-probe cells cooling on a 429 rung the relay GUESSED, so a recovered deployment is not
+   * parked for the rest of its escalation step (owner, 2026-09-10: *"The relay should be polling
+   * to see if things start working again anyway."*). Without this the catalog cadence would reach
+   * such a cell only at its 24 h TTL, which is longer than three of the four rungs.
+   *
+   * Bounded twice: one probe per cell per `RATE_LIMIT_REPROBE_INTERVAL_MS`, and at most
+   * `MAX_RATE_LIMIT_REPROBES_PER_TICK` per tick, soonest-lifting cells first. The probe goes
+   * through `recordPing`, so a 200 ends the cooldown through the port and a 429 records an
+   * ordinary failed probe — it never reaches the breaker's escalation ladder, which counts what
+   * REAL traffic saw. Only openai-kind deployments are probed, as the catalog cadence does; a
+   * model-less cell (a passthrough) has nothing to probe. Contained per cell.
+   */
+  public async reprobeRateLimited(now = Date.now()): Promise<void> {
+    const port = this.opts.rateLimitRecovery;
+    if (!port) return;
+    let cells: ReturnType<RateLimitRecoveryPort["rateLimitCoolingCells"]>;
+    try {
+      cells = port.rateLimitCoolingCells(now);
+    } catch {
+      return;
+    }
+    let spent = 0;
+    for (const cell of cells) {
+      if (spent >= MAX_RATE_LIMIT_REPROBES_PER_TICK) return;
+      const due = this.reprobeTarget(cell, now);
+      if (due === null) continue;
+      // Stamped BEFORE the probe, so a hanging or failing probe is not re-asked every tick.
+      this.rateLimitReprobedAt.set(due.key, now);
+      spent += 1;
+      try {
+        const res = await pingProviderModel(cell.provider, due.model, due.pCfg, due.apiKey, {
+          ...optsObj(this.opts.fetchFn),
+          timeoutMs: due.pCfg.timeoutMs,
+        });
+        this.recordPing(cell.provider, due.model, res, Date.now(), due.credentialId);
+      } catch {
+        // Probe failure contained per cell.
+      }
+    }
+  }
+
+  /**
+   * What `reprobeRateLimited` needs to probe one cooling cell, or null when the cell is not due
+   * (probed within the interval), has no model, is not an openai-kind provider, or names no
+   * enabled credential slot that allows the model and resolves to a key.
+   */
+  private reprobeTarget(
+    cell: { provider: string; model: string | null; credentialId: string },
+    now: number,
+  ): { key: string; model: string; pCfg: ProviderConfig; apiKey: string | undefined; credentialId: CredentialId } | null {
+    if (cell.model === null) return null;
+    const model = cell.model;
+    const pCfg = this.cfg.providers[cell.provider];
+    if (!pCfg || pCfg.kind !== "openai") return null;
+    const key = `${cell.credentialId}/${model}`;
+    if (now - (this.rateLimitReprobedAt.get(key) ?? 0) < RATE_LIMIT_REPROBE_INTERVAL_MS) return null;
+    const slot = providerCredentialSlots(cell.provider, pCfg).find(
+      (s) => s.enabled && s.credentialId === cell.credentialId && slotAllowsModel(s, model),
+    );
+    if (!slot) return null;
+    const resolution = resolveCredentialSlot(slot);
+    if (resolution.state === "declared-missing") return null;
+    return { key, model, pCfg, apiKey: resolution.value, credentialId: slot.credentialId };
   }
 
   /**
@@ -440,6 +553,10 @@ export class PingLoop {
   public async tickOnce(scope: "catalog" | "routable" = "catalog"): Promise<void> {
     this.refreshAutoPingMode();
     await this.pollSpendHeadroom().catch(() => {});
+    // HTTP probe work, so it belongs in `tickOnce` beside the spend poll (unlike the lane hook,
+    // which only the self-scheduled loop may fire): a GET /ping that re-tests a cooling cell
+    // spends one bounded probe, never a lane.
+    await this.reprobeRateLimited().catch(() => {});
     if (scope === "routable") materializeDynamicPools(this.cfg, this.catalog);
     const providers = Object.entries(this.cfg.providers) as Array<[string, ProviderConfig]>;
     const beforeRefresh = scope === "routable" ? collectRoutableModels(this.cfg) : null;

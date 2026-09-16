@@ -656,7 +656,8 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
   receives a mid-stream error naming the measured rate and must retry; `routing.crawl: false` is a
   byte-for-byte revert — the watchdog is never installed.
 
-Health **demotes** candidates, never drops them (live → credential-faulted → cooling). Responses
+Health **demotes** candidates, never drops them (probation → live → slow → paced →
+credential-faulted → cooling). Responses
 carry `x-llm-relay-served-by`: the deployment that served, or on error every deployment tried,
 in order. Background: [pool-failover.md](pool-failover.md).
 
@@ -711,11 +712,31 @@ cooling, credential faults, hard caps, quota demotion and latency demotion all o
 band. The response announces it as `x-llm-relay-probation: <spec> (0 of 5 request samples)`,
 and `"probation": false` restores the pre-probation order exactly.
 
+The relay also **paces itself** against a rate limit a deployment has stated (`routing.pacing`,
+default ON). For each credential × model, every ceiling the relay knows — a quota header's
+`limit`, an operator `limits` figure, or a `rate-limit-*` fact learned from a 429 body — is held
+against the attempts the relay itself started in the trailing minute or day (a sliding window
+counting every client that routes through the relay; token ceilings count the request's own
+input estimate). At the ceiling the member joins a `paced` band behind `live` and `slow`, ahead
+of the failure bands, and comes back by itself as the window drains; with no alternative it is
+still served. A learned ceiling paces with no human verdict and no opt-in — the `enforceLearned`
+gate below governs only the allowance path. The response announces a displaced first choice as
+`x-llm-relay-paced: <spec> (requests/minute 30 of 30 in the trailing minute, learned)`. A limit
+nobody stated has no effect, and there is no margin to tune: the relay steps aside exactly at the
+stated figure.
+
+A deployment cooled by 429s is **re-probed while it cools**: the background loop sends one probe
+per cooling cell per minute (at most three per tick) against the cooldowns the relay itself
+guessed (the 2 min → 10 min → 1 h → 24 h escalation rungs), and a probe that answers 200 ends the
+cooldown at once. A stated `Retry-After` is honoured, not re-probed early. The escalation index
+is kept — only a real served success resets it — so a member that keeps refusing real requests
+while passing probes still escalates its nominal step.
+
 Ordering also **interleaves providers** within a rank band, so the first N attempts land in N
 distinct quota domains rather than N members sharing one credential. The top-ranked candidate is
 still tried first; interleaving only decides who is tried second.
 
-**Five routing terms are ON by default**, each reverting with one boolean. Each is documented in
+**Six routing terms are ON by default**, each reverting with one boolean. Each is documented in
 full below, except the two that belong to dispatch rather than to the HTTP request path —
 `routing.laneProbe` under [Background lane re-probing](#background-lane-re-probing-routinglaneprobe)
 and `routing.dispatchWalk` under [The automatic lane walk](#the-automatic-lane-walk-routingdispatchwalk).
@@ -726,6 +747,7 @@ This table is the index — it states no policy of its own.
 | `routing.latency` | ON | `"latency": false` | Demotes a candidate whose MEASURED p95 exceeds a ceiling, into the `slow` band. |
 | `routing.hedge` | ON, and confined to FREE deployments | `"hedge": false` | Starts the next candidate BESIDE a slow one and serves whichever commits first. The only term that duplicates a request. |
 | `routing.probation` | ON | `"probation": false` | Leads a FREE deployment with fewer than 5 served-request samples ahead of `live`, so one untested member at a time gathers data. |
+| `routing.pacing` | ON | `"pacing": false` | Holds the relay's own attempt rate under a STATED ceiling (header, operator `limits`, or a learned `rate-limit-*` fact) per credential × model, into a `paced` band behind `slow`; a limit nobody stated has no effect. |
 | `routing.crawl` | ON | `"crawl": false` | Aborts a COMMITTED stream whose sustained per-token rate over a full trailing window (`msPerToken` 1000, `windowMs` 30 s, `minTokens` 20) is far worse than a healthy deployment's — see [Failover](#failover-both-fronts-one-policy) above. |
 | `routing.laneProbe` | ON | `"laneProbe": false` | Re-probes recorded `cli` lane deaths and stale rosters on the relay's own background cadence. |
 | `routing.dispatchWalk` | ON | `"dispatchWalk": false` | Walks the DISPATCH ladder past a lane that does not answer, pins the lane that does. Read by `llm-relay mcp`, not by the request path. |

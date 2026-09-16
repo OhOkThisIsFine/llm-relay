@@ -9,24 +9,6 @@
 
 ## Open
 
-- **The relay does not pace itself from the throttling it sees (2026-09-10, owner direction,
-  high).** Owner, 2026-09-10: *"The relay should be tracking requests from all IDEs on the machine,
-  anything that runs through the relay, so it can use rate-limited messages to calculate when it
-  might need to slow something down. It's supposed to adapt and perfect itself."* Today a 429 cools
-  ONE deployment (a stated `Retry-After`, else the escalation ladder), a provider-stated quota
-  header can demote a spent bucket, and a rate limit stated in a 429 body is learned as a
-  `rate-limit-*` fact that is DISPLAY-ONLY (spec decision M2, opt-in, not built). Nothing uses those
-  facts to slow the relay's own request rate before the next 429, and a 429 wording the relay has
-  not seen before waits in the eligibility queue for a human verdict. A probe that answers 200
-  retracts a cooling fact but never a breaker cooldown — `PingLoop` holds no breaker reference
-  (`ping/cadence.ts`) — so a model cooled by 429s waits out its escalation step (2 min, 10 min,
-  1 h, 24 h) even after a probe shows it answers again. Owner, 2026-09-10: *"The relay should be
-  polling to see if things start working again anyway."* **Property:** a deployment with a stated
-  or learned rate limit is paced, across every client that routes through the relay, so the
-  relay's own rate stays under it; a 429 that states a window updates that pacing without a human
-  verdict; a probe that answers 200 ends a rate-limit cooldown early; and a limit nobody stated
-  has no effect.
-
 - **The model catalog refreshes on a clock, not on evidence that it is stale (2026-09-10, owner
   direction, medium).** Owner, 2026-09-10: *"The relay is supposed to be keeping metadata about
   providers and models up to date, with regular sampling; if we get a hint that our model catalog

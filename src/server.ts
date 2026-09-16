@@ -72,6 +72,7 @@ import { observedContextLimit } from "./context-limits.js";
 import { isCostBlockedForEverySlot } from "./target-facts.js";
 import { createQuotaDemotionFn, type QuotaDemotionFn } from "./quota-demotion.js";
 import { createLatencyDemotionFn, type LatencyDemotionFn } from "./latency-demotion.js";
+import { createPacingFn, type PacingFn } from "./pacing.js";
 import { hedgeDelayDecision, resolveHedgeSettings, type HedgeDelayDecision } from "./hedge-trigger.js";
 import { createHardCapLedgerReader, evaluateHardCap, type HardCapVerdict } from "./hard-cap.js";
 import {
@@ -369,6 +370,7 @@ export interface Handlers {
   quotaDemotion: QuotaDemotionFn;
   latencyDemotion: LatencyDemotionFn;
   probation: ProbationFn;
+  pacing: PacingFn;
   hedgeDelay: (attempt: ResolvedAttempt, estimatedInputTokens: number) => HedgeDelayDecision | null;
   hedgeMaxInFlight: number;
   costClassOf: CostClassFn;
@@ -580,6 +582,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     ordered: orderedAttempts,
     quotaDemotedFirst,
     latencyDemotedFirst,
+    pacedFirst,
   } = orderDeploymentGroupsByUsability(
     rankedAttempts,
     h.breaker,
@@ -588,6 +591,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     h.costClassOf,
     h.latencyDemotion,
     h.probation,
+    h.pacing,
   );
   let walkAttempts = orderedAttempts;
   let sticky: StickyRequestContext | null = null;
@@ -613,6 +617,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           // site, unchanged by this packet.
           undefined,
           h.probation,
+          h.pacing,
         );
         walkAttempts = applied.targets;
         sticky.provenance = `${pinnedSpec} (${applied.status})`;
@@ -687,6 +692,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
       accounting,
       quotaDemotedFirst,
       latencyDemotedFirst,
+      pacedFirst,
     }, {
       ...h,
       withRepairAccounting,
@@ -727,6 +733,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     sticky,
     quotaDemotedFirst,
     latencyDemotedFirst,
+    pacedFirst,
     accounting,
     cfg,
     routingNow,
@@ -751,10 +758,18 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
   const catalog = deps.catalog ?? new ModelCatalog();
   const laneCadence = process.env.VITEST ? null : new LaneCadence(cfg);
+  // The breaker is built BEFORE the ping loop because the loop holds a narrow port onto it
+  // (`rateLimitRecovery`, 2026-09-15): a probe that answers 200 ends a 429-sourced cooldown
+  // early, and the loop re-probes the cells cooling on the relay's own guessed rungs. The port is
+  // the breaker itself — `CircuitBreaker` satisfies `RateLimitRecoveryPort` structurally — so
+  // there is no adapter to drift. An injected `deps.pingLoop` (a test's stub) keeps its own wiring.
+  const breaker = deps.breaker ?? new CircuitBreaker();
   const pingLoop =
     deps.pingLoop ??
-    new PingLoop(cfg, catalog, laneCadence ? { onTick: (now) => laneCadence.poke(now) } : {});
-  const breaker = deps.breaker ?? new CircuitBreaker();
+    new PingLoop(cfg, catalog, {
+      ...(laneCadence ? { onTick: (now: number) => laneCadence.poke(now) } : {}),
+      rateLimitRecovery: breaker,
+    });
   if (!process.env.VITEST) installBreakerPersistence(breaker);
   if (!process.env.VITEST) installDispatchExhaustionPersistence(cfg);
   if (!process.env.VITEST) installDispatchLaneStatsPersistence(cfg);
@@ -821,6 +836,11 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
     costClassOf,
   };
   const probation: ProbationFn = createProbationFn(probationDeps);
+  // routing.pacing (owner direction 2026-09-10): hold this relay's own attempt rate under a
+  // ceiling the deployment stated. Reads the breaker's per-cell attempt-start log — the ONE
+  // dataset every egress on both fronts feeds through `beginHealthAttempt` — so every client on
+  // the machine that routes through the relay is counted against the same window.
+  const pacing: PacingFn = createPacingFn({ cfg, breaker, settings: cfg.routing.pacing });
   const hedgeSettings = resolveHedgeSettings(cfg.routing?.hedge);
   const hedgeDelay = (
     attempt: ResolvedAttempt,
@@ -946,6 +966,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       quotaDemotion,
       latencyDemotion,
       probation,
+      pacing,
       hedgeDelay,
       hedgeMaxInFlight: hedgeSettings.enabled ? 2 : 1,
       costClassOf,

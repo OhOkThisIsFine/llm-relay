@@ -210,6 +210,14 @@ const CHECKS: CheckRow[] = [
     conflicts: [],
   },
   {
+    id: "pacing",
+    apply: (raw) => {
+      raw.pacing = 42;
+    },
+    message: `config.routing.pacing must be an object or a boolean`,
+    conflicts: [],
+  },
+  {
     id: "crawl",
     apply: (raw) => {
       raw.crawl = 42;

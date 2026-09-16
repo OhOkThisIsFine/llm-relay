@@ -113,6 +113,7 @@ export interface MessagesContext {
   sticky: StickyRequestContext | null;
   quotaDemotedFirst: string | null;
   latencyDemotedFirst: string | null;
+  pacedFirst: string | null;
   accounting: RequestAccountingState | null;
   cfg: Config;
   /**
@@ -150,6 +151,7 @@ export interface AnthropicCtx {
   degraded?: string | null;
   quotaDemoted?: string | null;
   latencyDemoted?: string | null;
+  paced?: string | null;
   probation?: string | null;
   hedged?: string | null;
   paid?: string | null;
@@ -708,7 +710,7 @@ export async function anthropicMessagesPath(
           // target-identity construction, the drift `kernel/contracts.ts` records having already
           // closed once, and it drops `targetIdentity`'s `Object.freeze`.
           run.attempt =
-            beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, ctx.accounting) ??
+            beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, ctx.accounting, ctx.estimatedInputTokens) ??
             undefined;
           if (!run.attempt) throw new Error("llm-relay: could not begin provider attempt");
           run.attempt.accountingAttempt = ctx.accounting?.startServe(run.resolvedAttempt, egressAt) ?? null;
@@ -1042,6 +1044,7 @@ export async function anthropicMessagesPath(
         degraded: degradedLabel(ctx.addressedPool, ctx.degradedSpecs, target),
         quotaDemoted: ctx.quotaDemotedFirst,
         latencyDemoted: ctx.latencyDemotedFirst,
+        paced: ctx.pacedFirst,
         // Per SERVING candidate, evaluated here — not the walk leader at routing time. A
         // probation leader that fails over to a live member serves WITHOUT this header.
         probation: probationLabelForAttempt(h, resolvedAttempt, ctx.routingNow),

@@ -225,6 +225,23 @@ export const LATENCY_DEMOTED_HEADER = "x-llm-relay-latency-demoted";
 export const PROBATION_HEADER = "x-llm-relay-probation";
 
 /**
+ * The walk's FIRST choice was PACED: this relay's own attempts against it in the trailing window
+ * had reached a ceiling the deployment stated (a quota header's `limit`, an operator `limits`
+ * figure, or a `rate-limit-*` fact learned from a 429 body), so it stepped behind the live and
+ * slow bands and another candidate led (`routing.pacing`, default ON, `src/pacing.ts`).
+ *
+ * Fifth member of the `DEGRADED_HEADER` family, and it exists for the same reason: an automatic
+ * reorder is acceptable only because it is announced. Like `LATENCY_DEMOTED_HEADER` it is the
+ * term's ONLY surface — pacing registers no breaker cooldown (it re-resolves from the start log
+ * on every request and lifts by itself as the window drains), so `/candidates` and the dashboard
+ * Cooldowns panel show nothing for it.
+ *
+ * Value is one bounded line, e.g. `groq/llama-3.3-70b (requests/minute 30 of 30 in the trailing
+ * minute, learned)` — the spec, the count, the ceiling and who stated it. Nothing secret.
+ */
+export const PACED_HEADER = "x-llm-relay-paced";
+
+/**
  * A HEDGE ran: a slow in-flight attempt had the next candidate started beside it, rather than
  * after it. Fourth member of the `DEGRADED_HEADER` family, and the announcement half of the
  * duplication bound.

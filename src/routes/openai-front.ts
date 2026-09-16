@@ -122,6 +122,7 @@ export interface OpenAiFrontContext {
   accounting: RequestAccountingState | null;
   quotaDemotedFirst?: string | null;
   latencyDemotedFirst?: string | null;
+  pacedFirst?: string | null;
   /**
    * The relay's own chars/4 estimate of this request's INPUT size (`estimateRequestTokens` in
    * `metadata.ts`) — the sibling of `AnthropicCtx`'s field in `routes/messages.ts`, threaded rather
@@ -245,7 +246,7 @@ export async function openAiFrontPath(
           // dropped `targetIdentity`'s `Object.freeze`, so the identity a completed attempt carries
           // was mutable here and frozen on the other front.
           run.attempt =
-            beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, ctx.accounting) ??
+            beginHealthAttempt(h, run.resolvedAttempt, egressAt, attemptTrace, run.usage, ctx.accounting, ctx.estimatedInputTokens) ??
             undefined;
           if (!run.attempt) throw new Error("llm-relay: could not begin provider attempt");
           run.attempt.accountingAttempt = ctx.accounting?.startServe(run.resolvedAttempt, egressAt) ?? null;
@@ -628,6 +629,7 @@ export async function openAiFrontPath(
           degraded: degradedLabel(ctx.addressedPool ?? null, ctx.degradedSpecs ?? null, target),
           quotaDemoted: ctx.quotaDemotedFirst,
           latencyDemoted: ctx.latencyDemotedFirst,
+          paced: ctx.pacedFirst,
           // Per SERVING candidate, evaluated here — not the walk leader at routing time. A
           // probation leader that fails over to a live member serves WITHOUT this header.
           // (`Date.now()` is threaded only for the shared evaluator shape; the verdict itself
