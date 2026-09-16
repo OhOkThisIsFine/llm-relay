@@ -2,9 +2,53 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-10 (v0.81.0)
+## 0. State as of 2026-09-16 (unreleased, on top of v0.81.0)
 
-- **What this lap shipped — the dispatch give-up fixes.** Diagnosis:
+- **What this lap shipped — the backlog-clearing lap.** Owner instruction: clear up everything from
+  the backlog and open bugs, orchestrated through parallel relay-agent dispatches. Eight pieces
+  landed, each independently gate-verified (typecheck, full suite, dashboard checks, package
+  checks) after merge, not just trusted from the dispatching agent's own report:
+  - **Self-pacing from observed throttling** (`src/pacing.ts`, new) — the relay now holds its own
+    attempt rate under a stated or learned rate limit, across every client, via a third demotion
+    term beside `quota-demotion.ts`/`latency-demotion.ts`. A learned `rate-limit-*` fact paces
+    live without the `routing.quota.enforceLearned` opt-in. `ping/cadence.ts` gained a narrow
+    `RateLimitRecoveryPort` so a 200 probe ends a 429-sourced breaker cooldown early, with bounded
+    re-probing of cooling cells. `routing.pacing: false` reverts byte-for-byte.
+  - **Model catalog refreshes on evidence** (`src/catalog.ts` `noteProviderStale`) — a 404 stating
+    a currently-listed model does not exist now triggers one bounded per-provider re-fetch, wired
+    through `candidate-runner.ts`/`server.ts`.
+  - **MCP dispatch subsystem** (`src/mcp/lane-runner.ts`, `src/mcp/server.ts`,
+    `src/mcp/job-archive.ts` new, `src/mcp/readonly-boundary.ts`) — a silent, stalled lane is now
+    reported (not silently left `running`); finished dispatch jobs and the job-id counter survive
+    a daemon restart via the new archive; `dispatch(readOnly: true)` now binds the lane's own
+    read-only tool flags (`claude`/`codex`), not only its cwd (`opencode`/`agy` refused by name,
+    the gap stated rather than claimed).
+  - **Dashboard's first write** (`routes/admin.ts` `operatorLanePin`) — `POST /dispatch
+    {"pin"|"unpin"}` reuses the existing `lane-affinity.ts` pin, on the same admission boundary as
+    every other `POST /dispatch` (Host, Origin, content-type, control token). The SPA control for
+    it is NOT built yet — left open, see below.
+  - **Dashboard usability pass** — Quota panel grouped by provider with basis badges and relative
+    reset times, dark mode as the default theme (persisted, try/catch-wrapped), a collapsible-panel
+    pass, empty-state styling, hover/focus states.
+  - **Three smaller fixes**, each closing its own backlog item: `config set` can address a numbered
+    ladder-rung array segment; a pre-commit stream failure names its upstream stop reason
+    (`stream-commit.ts`); a DeepSeek response's `reasoning_content` now reaches the caller on both
+    fronts, closing the loop `openai-request.ts` opened.
+- **Verification note.** One dispatched agent's own report claimed a green gate that a second,
+  independent run in a properly-wired worktree contradicted (a real double-count regression in the
+  catalog-staleness change, found and fixed as a test-hermeticity bug, not a source bug — see git
+  log `ad6f4e9`). Full suite at this lap's HEAD: 191 test files, 4275 tests, 0 failures.
+- **What remains open, all three deliberately left, not overlooked** (see `docs/backlog.md`):
+  Route B's live served request (blocked on a NEW vendor session-identity check, not the rate
+  limit the item was written against — not fixable by a stronger request); the Codex Desktop
+  `relay`-agent live verification (needs the owner at the keyboard); the dashboard SPA control for
+  the operator pin (the endpoint half landed this lap, the UI half did not).
+- **Immediate next:** land this lap onto `main`, then carry the pipeline through release,
+  reinstall and a daemon restart so the pacing/catalog/MCP-dispatch/dashboard changes take effect.
+
+### 0.1 Prior lap (2026-09-10, v0.81.0)
+
+- **What that lap shipped — the dispatch give-up fixes.** Diagnosis:
   [docs/dispatch-giveup-diagnosis-2026-09-10.md](docs/dispatch-giveup-diagnosis-2026-09-10.md).
   Agents gave up on `dispatch` because the walk stopped the one working lane (`free-pool`) at a
   90 s budget that its own window could never raise, walked on through lanes that could not
@@ -54,7 +98,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   says never to reject it). The three DeepSeek request-shape refusals in the queue are the
   F10/F11 defects this lap fixed; they should stop once the daemon runs v0.81.0.
 
-### 0.1 Previous laps
+### 0.2 Previous laps
 
 - **v0.78.0–v0.80.0 (2026-09-09/10).** The 27-items lap closed every backlog entry open at
   `3abbafd` (route B `wire: "responses"`, the probation band, the first-byte deadline, the crawl
@@ -82,7 +126,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   not a calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
   [docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md).
 
-### 0.2 Offload, measured
+### 0.3 Offload, measured
 
 Free lanes CANNOT do open-ended reconnaissance here — 7 of 7 packets fabricated on 2026-09-05.
 They CAN review a concrete diff against a stated claim, and they carry a mechanical rewrite with
@@ -101,7 +145,7 @@ running and reading: one lane's test passed with its fix removed, one lane's six
 silently changed a legacy rule, one lane's threshold triple could never fire, and one lane wrote
 the DeepSeek key literal into a scratch launcher despite a brief that forbade it.
 
-### 0.3 Earlier releases
+### 0.4 Earlier releases
 
 Earlier releases are deliberately not restated here. `git log --oneline`, the tags, and the dated
 documents under `docs/` are the trail; what survived each release lives in the `CLAUDE.md` rows
@@ -214,8 +258,9 @@ Everything here is a settled trade kept for its reason, not work; the queue is `
 2. **SPA and test nits standing:** the flat 30 s poll with no failure backoff (mitigated by
    abort-on-hide/offline), the CSS-structure test mirroring styles.css, a few wall-clock-sleep
    tests, dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
-   described-by, theme preference not persisted, SIGKILL leaking the test interpretations file;
-   and the misleading body-problem error codes (N8), a versioned wire change no consumer reads.
+   described-by, SIGKILL leaking the test interpretations file; and the misleading body-problem
+   error codes (N8), a versioned wire change no consumer reads. (Theme preference now defaults to
+   dark and persists via `localStorage`, closed 2026-09-16.)
 3. **`delegate-gate` findings waived (2026-09-04, extended 2026-09-09):** the module-level
    `servers` test-fixture pattern and `as unknown as typeof fetch` casts are pre-existing
    repository convention, not new defects. Added 2026-09-09, each with its reason in the commit
