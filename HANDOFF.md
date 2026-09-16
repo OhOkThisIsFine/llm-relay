@@ -45,8 +45,12 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   limit the item was written against — not fixable by a stronger request); the Codex Desktop
   `relay`-agent live verification (needs the owner at the keyboard); the dashboard SPA control for
   the operator pin (the endpoint half landed this lap, the UI half did not).
-- **Immediate next:** land this lap onto `main`, then carry the pipeline through release,
-  reinstall and a daemon restart so the pacing/catalog/MCP-dispatch/dashboard changes take effect.
+- **Pipeline carried through to release.** Landed on `main`, released as v0.82.0 (npm Trusted
+  Publishing, run 35093394265), global bin reinstalled, and the daemon restarted via its own
+  `Startup\llm-relay.vbs` launcher — confirmed live (`/telemetry`, `/dispatch` both answering on
+  the fresh process). **Immediate next:** none from this lap; the three open items above are each
+  blocked on something outside this repo (a vendor, the owner's own keyboard, or a follow-up SPA
+  change nobody has started).
 
 ### 0.1 Prior lap (2026-09-10, v0.81.0)
 
