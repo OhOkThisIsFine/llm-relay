@@ -55,9 +55,10 @@ import {
   type DispatchedQuotaReport,
   type RelayAnnouncements,
 } from "./lane-runner.js";
-import { readOnlyVerdict } from "./readonly-boundary.js";
+import { readOnlyInvoke, readOnlyVerdict, type LaneInvocation } from "./readonly-boundary.js";
 import { agyQuotaStatement, type AgyLogSnapshot } from "./agy-quota-log.js";
 import { nullJobJournal, type JobJournal } from "./job-journal.js";
+import { nullJobArchive, type JobArchive } from "./job-archive.js";
 import {
   RPC_INTERNAL_ERROR,
   RPC_INVALID_PARAMS,
@@ -133,6 +134,12 @@ export interface McpServerDeps {
    * real one, so a host-launched server can report the jobs a previous instance died holding.
    */
   journal?: JobJournal;
+  /**
+   * The finished-job archive. Absent ⇒ `nullJobArchive`, which keeps nothing. `cli.ts` passes the
+   * real one, so a job that ENDED before a restart still answers `dispatch_result` afterwards and
+   * job ids continue past the highest one the previous process minted (`job-archive.ts`).
+   */
+  archive?: JobArchive;
   /**
    * The llm-relay version INSTALLED on disk now, read fresh on each call — or null when unknown.
    * When it differs from `version` (the code this process started with), every tool reply says so:
@@ -297,7 +304,11 @@ const TOOLS: ToolDefinition[] = [
             "rather than trusting the task text to say \"do not edit\": a measured read-only lane " +
             "committed and pushed the caller's in-progress files, and another silently reverted a " +
             "staged one. Pass cwd pointing at a separate checkout, or use mode \"answer\", which " +
-            "spawns no harness and cannot touch the filesystem at all.",
+            "spawns no harness and cannot touch the filesystem at all. It ALSO binds the lane's " +
+            "TOOLS: a claude lane runs with only Read/Glob/Grep/WebFetch/WebSearch under " +
+            "--permission-mode dontAsk, a codex lane runs under --sandbox read-only, and a lane " +
+            "whose CLI offers no read-only binding (opencode, agy) is skipped with the reason " +
+            "rather than run unbound.",
         },
       },
       required: ["task"],
@@ -469,6 +480,31 @@ function runningTimeToAnswer(job: LaneJob): string | null {
 }
 
 /**
+ * A RUNNING spawned attempt's output so far: how long the lane has been silent, or how much it has
+ * written and how long ago. Null for anything else — a finished job, or an answer-mode call, which
+ * has no output stream and must not read as "silent".
+ *
+ * ⚠ The zero-output line says why silence alone proves nothing: `claude -p` buffers its whole
+ * answer until exit. Without that, a caller reading "silent for 300 s" on the free pool would cancel
+ * a healthy run — the false failure the backlog item names as worse than an honest slow status.
+ */
+export function describeActivity(job: LaneJob, now: number): string | null {
+  if (job.status !== "running" || job.activity === undefined) return null;
+  const a = job.activity;
+  const s = (ms: number): string => `${Math.max(0, Math.round(ms / 1000))}s`;
+  if (a.lastOutputAt === null) {
+    return (
+      `output: none yet — silent for ${s(now - a.attemptStartedAt)} since this lane started ` +
+      "(a lane that buffers its answer until exit, such as claude -p, is silent while it works)"
+    );
+  }
+  return (
+    `output: ${a.stdoutBytes + a.stderrBytes} bytes so far (stdout ${a.stdoutBytes}, stderr ${a.stderrBytes}); ` +
+    `last output ${s(now - a.lastOutputAt)} ago`
+  );
+}
+
+/**
  * What `dispatch_lanes` says about a lane beyond its configuration: where an ad-hoc lane came from,
  * its usual time to answer, and its own failures in a row.
  */
@@ -507,10 +543,16 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.relay?.latencyDemoted) head.push(`latency-demoted: ${job.relay.latencyDemoted}`);
   if (job.relay?.degraded) head.push(`degraded: ${job.relay.degraded}`);
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
+  if (job.restored === true) head.push("record: restored from disk — this job ended before the llm-relay MCP server last restarted");
+  if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
   // While it runs: the lane's usual time to answer, from its own completed runs, so a caller can tell
   // a slow lane from a stuck one instead of giving up (`LaneJob.expected`).
   const usually = runningTimeToAnswer(job);
   if (usually !== null) head.push(usually);
+  // And what the running attempt has produced, so a caller can see a SILENT lane for what it is
+  // rather than reading `running` for nine minutes (`LaneActivity`).
+  const output = describeActivity(job, now);
+  if (output !== null) head.push(output);
   // ⚠ Only when there is something to say. Every ordinary job reaps cleanly, and a line on all of
   // them would be noise that trains the reader to skip the one that matters. A SURVIVOR is the case
   // `docs/backlog.md` measured — nothing short of a process enumeration finds those — so it is
@@ -696,6 +738,12 @@ interface WalkOptions {
   mode: "agent" | "answer";
   cwd: string;
   depth: number;
+  /**
+   * The caller declared the dispatch read-only. Every SPAWNED lane is then handed a read-only tool
+   * binding (`readOnlyInvoke`) or skipped when its CLI offers none; an answer-mode relay call needs
+   * neither, since it spawns nothing.
+   */
+  readOnly: boolean;
   /** Ladder tier the lanes came from, for quota reports and the daemon's routing memory. */
   tier: string | undefined;
   /** The lane's OWN ceiling, unchanged by this feature. */
@@ -833,7 +881,7 @@ export class McpDispatchServer {
   private buffer = "";
 
   constructor(private readonly deps: McpServerDeps) {
-    this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal);
+    this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
     this.spawn = deps.spawn ?? defaultLaneSpawner;
     this.fetchImpl = deps.fetch ?? defaultAnswerFetch;
     this.now = deps.now ?? Date.now;
@@ -886,9 +934,14 @@ export class McpDispatchServer {
     await Promise.all(inFlight);
   }
 
-  /** Kill every running child. Wired to process exit so nothing is orphaned. */
+  /**
+   * Kill every running child, then flush the finished-job archive. Wired to process exit so nothing
+   * is orphaned and nothing the archive still owes to disk is lost on a graceful stop (a hard kill
+   * is covered by the archive's eager terminal writes — `job-archive.ts`).
+   */
   shutdown(): void {
     this.jobs.cancelAll();
+    this.jobs.flush();
   }
 
   private send(message: JsonRpcResponse): void {
@@ -1095,6 +1148,7 @@ export class McpDispatchServer {
       mode,
       cwd: readString(args, "cwd") ?? this.cwd(),
       depth,
+      readOnly: args["readOnly"] === true,
       tier: view.tier ?? undefined,
       timeoutMs: readNumber(args, "timeoutMs") ?? DEFAULT_LANE_TIMEOUT_MS,
       attemptMs: walk !== null ? walk.attemptMs : null,
@@ -1109,7 +1163,7 @@ export class McpDispatchServer {
     // bound and the `waitMs` refusal are checked before the spawn: a refusal must cost no lane run.
     // The instruction "do not edit any file" is advice; the working directory is the mechanism.
     const readOnlyVerdictResult = readOnlyVerdict({
-      readOnly: args["readOnly"] === true,
+      readOnly: opts.readOnly,
       mode: opts.mode,
       cwd: opts.cwd,
       callerRoot: this.cwd(),
@@ -1219,8 +1273,14 @@ export class McpDispatchServer {
       // attempt yet and a rung can never count against its own cap.
       if (this.skipIfAtConcurrencyCap(jobId, lane)) continue;
 
+      // ⚠ Same place, same shape: a read-only dispatch either hands the lane a bound invocation or
+      // skips it before anything spawns. `bound` is undefined when the lane runs as configured.
+      const readOnly = this.bindReadOnlyOrSkip(jobId, lane, opts);
+      if (readOnly.skipped) continue;
+
       // The lane's usual time to answer rides the job, so a poll can tell a slow lane from a stuck one.
       this.jobs.setCurrentLane(jobId, lane.id, lane.spec, lane.timeToAnswer);
+      if (readOnly.bound !== undefined) this.jobs.noteReadOnly(jobId, lane.id, readOnly.bound.binding);
 
       // ⚠ The LAST lane gets NO attempt budget. The budget exists to move on; with nowhere to move
       // to, killing a lane that is still working would throw away the only answer still coming.
@@ -1234,7 +1294,7 @@ export class McpDispatchServer {
       // is where the history lives and this child holds none. `opts.attemptMs` is the fall-back for
       // a view that carries no budget — a daemon older than this field, or the local fallback view.
       const budgetMs = lane.attemptBudget?.ms ?? opts.attemptMs;
-      const outcome = await this.runOneLane(jobId, lane, task, opts, noBudget ? null : budgetMs);
+      const outcome = await this.runOneLane(jobId, lane, task, opts, noBudget ? null : budgetMs, readOnly.bound?.invoke);
       const elapsedMs = Math.max(0, this.now() - startedAt);
 
       // A cancellation that landed WHILE the attempt ran discards it whole: the caller changed its
@@ -1301,14 +1361,17 @@ export class McpDispatchServer {
     // what happened: with any TRIED attempt recorded, "no lane matched" is false and sends the
     // reader looking for a configuration fault that is not there; and with every recorded attempt
     // a SKIP, "the ladder no longer holds the remaining lanes" is false too — the ladder holds them
-    // fine, they were simply all busy. `attemptWasTried` is the one place that distinction lives.
+    // fine, they were simply all skipped. `attemptWasTried` is the one place that distinction lives,
+    // and the skip REASONS are quoted rather than assumed: a skip is a concurrency cap OR a lane
+    // that cannot be bound read-only, and naming the wrong one sends the reader to the wrong fix.
     const attempts = this.jobs.get(jobId)?.attempts ?? [];
     const ran = attempts.filter((a) => attemptWasTried(a.status)).length;
     const allSkipped = attempts.length > 0 && ran === 0;
+    const skipReasons = [...new Set(attempts.filter((a) => !attemptWasTried(a.status)).map((a) => a.reason ?? "skipped"))];
     this.jobs.fail(
       jobId,
       allSkipped
-        ? "every remaining lane in the selection order is at its maxConcurrent cap"
+        ? `every lane in the selection order was skipped before it ran: ${skipReasons.join("; ")}`
         : ran === 0
           ? "no lane in the dispatch ladder matched the selection order"
           : `no lane answered, and the ladder no longer holds the remaining lanes in the selection order (${ran} tried)`,
@@ -1359,6 +1422,38 @@ export class McpDispatchServer {
   }
 
   /**
+   * For a read-only dispatch, the invocation this lane will be spawned with — its own CLI's
+   * read-only tool binding (`readOnlyInvoke`) — or a SKIP when its CLI offers none. Recorded exactly
+   * like a concurrency-cap skip: an attempt in the walk's own record, `lanesNotTried` grown so the
+   * terminal advice is PARTIAL rather than EXHAUSTED, nothing spawned, no telemetry, no demotion —
+   * a lane the relay declined to run unbound has not failed.
+   *
+   * Not consulted at all for an ordinary dispatch, for an answer-mode relay call (no harness, so
+   * nothing to bind), or for a lane with no invocation (the existing "cannot be run from here" path
+   * reports that on its own).
+   */
+  private bindReadOnlyOrSkip(
+    jobId: string,
+    lane: DispatchLane,
+    opts: WalkOptions,
+  ): { skipped: false; bound?: { invoke: LaneInvocation; binding: string } } | { skipped: true } {
+    if (!opts.readOnly) return { skipped: false };
+    if (opts.mode === "answer" && lane.kind === "relay") return { skipped: false };
+    if (lane.invoke === undefined) return { skipped: false };
+    const verdict = readOnlyInvoke(lane.invoke);
+    if (verdict.ok) return { skipped: false, bound: { invoke: verdict.invoke, binding: verdict.binding } };
+    this.jobs.recordAttempt(jobId, {
+      laneId: lane.id,
+      spec: lane.spec,
+      status: SKIPPED_LANE_STATUS,
+      elapsedMs: 0,
+      reason: `lane "${lane.id}" skipped: ${verdict.reason}`,
+    });
+    this.jobs.noteSkippedLane(jobId);
+    return { skipped: true };
+  }
+
+  /**
    * Run ONE lane, optionally bounded by an attempt budget. Returns what happened; never throws.
    *
    * With `budgetMs === null` the lane is simply awaited — its own `timeoutMs` is the only bound.
@@ -1377,8 +1472,9 @@ export class McpDispatchServer {
     task: string,
     opts: WalkOptions,
     budgetMs: number | null,
+    invoke?: LaneInvocation,
   ): Promise<LaneAttemptOutcome> {
-    const started = this.startLane(jobId, lane, task, opts);
+    const started = this.startLane(jobId, lane, task, opts, invoke);
     if ("refusal" in started) return { run: emptyRun(), abandoned: false, refusal: started.refusal };
     // ⚠ `registerProcess`, never the bare kill callback: the handle carries the pids this
     // dispatcher STARTED, which is the only reliable signal for a reaper. Age is not — a long
@@ -1427,6 +1523,8 @@ export class McpDispatchServer {
     lane: DispatchLane,
     task: string,
     opts: WalkOptions,
+    /** The invocation to spawn instead of `lane.invoke` — a read-only binding of it. */
+    invokeOverride?: LaneInvocation,
   ): { result: Promise<LaneAttemptOutcome>; kill: () => void; pids?: () => number[] } | { refusal: string } {
     if (opts.mode === "answer" && lane.kind === "relay") {
       // ⚠ Skips the whole cwd/invoke/spawn path on purpose: a direct HTTP call to this relay's own
@@ -1465,7 +1563,7 @@ export class McpDispatchServer {
     const cwdCheck = checkCwd(opts.cwd, this.deps.allowedRoots);
     if (!cwdCheck.ok) return { refusal: `dispatch refused: ${cwdCheck.reason}` };
 
-    const invoke = lane.invoke;
+    const invoke = invokeOverride ?? lane.invoke;
     if (!invoke) {
       // `buildDispatch` already excludes an unreachable rung from the selection order, so this is
       // defence rather than an expected path — report why rather than inventing a command, the
@@ -1486,9 +1584,17 @@ export class McpDispatchServer {
     const env = applyLaneEnv(process.env, invoke.env);
     env[DEPTH_ENV] = String(opts.depth + 1);
     const startedAt = this.now();
+    // From here the job's output figure describes THIS attempt: zero bytes, until the spawner's
+    // observer reports the first chunk. Counts and timestamps only; the bytes stay in the run.
+    this.jobs.beginAttemptActivity(jobId, startedAt);
     let run: LaneSpawnHandle;
     try {
-      run = this.spawn(invoke.command, invoke.args, { env, cwd: opts.cwd, timeoutMs: opts.timeoutMs });
+      run = this.spawn(invoke.command, invoke.args, {
+        env,
+        cwd: opts.cwd,
+        timeoutMs: opts.timeoutMs,
+        onOutput: ({ stream, bytes }) => this.jobs.noteOutput(jobId, stream, bytes, this.now()),
+      });
     } catch (e) {
       return { result: Promise.resolve(failedOutcome((e as Error).message)), kill: () => {} };
     }

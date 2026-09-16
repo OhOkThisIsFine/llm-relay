@@ -33,6 +33,7 @@ import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsR
 import { McpDispatchServer } from "./mcp/server.js";
 import { readAgyLog } from "./mcp/agy-quota-log.js";
 import { createJobJournal } from "./mcp/job-journal.js";
+import { createJobArchive } from "./mcp/job-archive.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
 import type { DispatchedTelemetryReport } from "./dispatch-lane-stats.js";
 import { flushDispatchExhaustionPersistence, loadExhaustedRows } from "./dispatch-exhaustion-persistence.js";
@@ -2716,6 +2717,12 @@ export async function runMcp(): Promise<void> {
     // poll (2026-09-06, ~90 lane-minutes lost). A row survives only while its job runs, so
     // whatever the next process finds is exactly the set this one died holding.
     journal: createJobJournal(),
+    // ⚠ The finished-job archive is what makes a restart survivable for a job that had ENDED:
+    // `job-0140`/`job-0143` finished their tree work and their final reports lived only in this
+    // process's memory, so a restart between sessions cost two re-runs (2026-09-11, 2026-09-15).
+    // It also seeds the id counter, so a handle from before the restart never names a different
+    // job after it.
+    archive: createJobArchive(),
     write: (chunk) => process.stdout.write(chunk),
   });
 

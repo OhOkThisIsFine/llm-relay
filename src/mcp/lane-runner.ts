@@ -26,6 +26,7 @@ import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { quoteCmdArg } from "../lane-probe.js";
 import { nullJobJournal, type JobJournal } from "./job-journal.js";
+import { jobSeqOf, nullJobArchive, type JobArchive } from "./job-archive.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
 import { laneOfRung } from "../lane-manifest.js";
 import type { DispatchLaneStatus } from "../dispatch-lane-stats.js";
@@ -280,6 +281,43 @@ export interface LaneJob {
    * reaches a terminal state. See `LaneProcessReport`.
    */
   process?: LaneProcessReport;
+  /**
+   * What the lane now running has produced so far, and when it last produced anything — so a poll
+   * can say how long a lane has been SILENT (`docs/backlog.md`: a Muse Spark lane logged a stream
+   * error in its first second, produced nothing more, and read `running` for nine minutes with
+   * nothing on the status to distinguish it from a lane still thinking). Present only while a
+   * SPAWNED attempt runs; an answer-mode call has no output stream and carries none.
+   */
+  activity?: LaneActivity;
+  /**
+   * This record was read back from the archive after an MCP server restart: the job ended in a
+   * previous process, and its report is exactly what that process wrote (`job-archive.ts`).
+   */
+  restored?: boolean;
+  /**
+   * The read-only TOOL binding applied to the lane now running (`readonly-boundary.ts`
+   * `readOnlyInvoke`). Replaced per lane, like `expected`; absent for an ordinary dispatch.
+   */
+  readOnly?: { laneId: string; binding: string };
+}
+
+/**
+ * Output progress of the attempt now running. Byte counts and timestamps only — never the bytes.
+ *
+ * ⚠ Silence is REPORTED here, never acted on. `claude -p` — the transposed `cliLane` form every
+ * `relay` rung takes in agent mode, i.e. the free pool itself — buffers its whole answer until
+ * exit (module header), so "zero bytes after N seconds" is the ordinary shape of a healthy run on
+ * the most-used lane. A threshold that killed on it would manufacture the false failure the backlog
+ * item names as worse than a slow honest status. The figure lets the CALLER decide, which is the
+ * property's second branch.
+ */
+export interface LaneActivity {
+  /** When the running attempt was spawned. */
+  attemptStartedAt: number;
+  /** When the lane last wrote anything to either stream; null while it has written nothing. */
+  lastOutputAt: number | null;
+  stdoutBytes: number;
+  stderrBytes: number;
 }
 
 /**
@@ -426,6 +464,12 @@ export interface LaneSpawnOptions {
   env: NodeJS.ProcessEnv;
   cwd: string;
   timeoutMs: number;
+  /**
+   * Called for every chunk the child writes to either stream, with the chunk's SIZE — the bytes
+   * themselves stay in the exec buffer that becomes `LaneRunResult`. Optional so every existing
+   * caller and test double is unchanged; the store's silence figure is fed from it.
+   */
+  onOutput?: ((chunk: { stream: "stdout" | "stderr"; bytes: number }) => void) | undefined;
 }
 
 /**
@@ -491,11 +535,46 @@ export function terminateProcessTree(pid: number, platform: NodeJS.Platform = pr
   }
 }
 
+/** A readable the spawner can watch for progress; the `data` event is all it subscribes to. */
+export interface LaneOutputStream {
+  on: (event: "data", listener: (chunk: string | Buffer) => void) => unknown;
+}
+
 /** The small child-process surface the lane spawner needs. */
 export interface LaneChildProcess {
   pid?: number | undefined;
   stdin: { end: () => void } | null | undefined;
+  /**
+   * Optional, so a test double that models no streams is unchanged. When present, the spawner
+   * subscribes for `onOutput` ALONGSIDE `execFile`'s own buffering listener — a second `data`
+   * listener never consumes what the first collects, so `LaneRunResult` is byte-identical.
+   */
+  stdout?: LaneOutputStream | null | undefined;
+  stderr?: LaneOutputStream | null | undefined;
   kill: () => boolean;
+}
+
+/** Subscribe `onOutput` to both of a child's streams, when the child exposes them. */
+function observeOutput(child: LaneChildProcess, onOutput: LaneSpawnOptions["onOutput"]): void {
+  if (!onOutput) return;
+  const size = (chunk: string | Buffer): number => (typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length);
+  const watch = (stream: "stdout" | "stderr"): void => {
+    const s = child[stream];
+    if (!s) return;
+    try {
+      s.on("data", (chunk) => {
+        try {
+          onOutput({ stream, bytes: size(chunk) });
+        } catch {
+          // A progress observer must never fail the lane it observes.
+        }
+      });
+    } catch {
+      // A stream that cannot be observed leaves the figure absent, never a crashed spawn.
+    }
+  };
+  watch("stdout");
+  watch("stderr");
 }
 
 /** Spawn options common to the direct and Windows shell-fallback paths. */
@@ -612,6 +691,7 @@ export function createLaneSpawner(
           child = fallback;
           // ⚠ Same stdin rule as the direct spawn below.
           fallback.stdin?.end();
+          observeOutput(fallback, opts.onOutput);
           return;
         }
         settle(err, stdout ?? "", stderr ?? "");
@@ -620,6 +700,7 @@ export function createLaneSpawner(
       // ⚠ An async execFile leaves stdin an OPEN pipe. `agy` reads stdin, finds no EOF, and produces
       // zero bytes until the timeout kills it. Measured live; the synchronous form hid it.
       child.stdin?.end();
+      observeOutput(child, opts.onOutput);
     });
 
     return {
@@ -720,19 +801,32 @@ function readOwnedPids(handle: OwnedProcess | undefined): number[] {
   return raw.filter((pid) => Number.isSafeInteger(pid) && pid > 0);
 }
 
-/** Monotonic per-process job ids. Readable, and stable to sort. */
+/**
+ * Monotonic job ids. Readable, and stable to sort. Process-global, and SEEDED from what a previous
+ * process left on disk (`seedJobCounter`), so a restart never mints an id the previous process
+ * already handed out — `job-0001` after a restart used to name a different job than the same
+ * handle did before it (C:\Code\docs\backlog.md, 2026-09-11).
+ */
 let jobCounter = 0;
 function nextJobId(): string {
   jobCounter += 1;
   return `job-${String(jobCounter).padStart(4, "0")}`;
 }
 
+/** Raise the counter to at least `seq`; never lowers it. */
+export function seedJobCounter(seq: number): void {
+  if (Number.isSafeInteger(seq) && seq > jobCounter) jobCounter = seq;
+}
+
 /**
  * The job store.
  *
- * Deliberately IN MEMORY. This process is stdio-attached to one host session, so its children die
- * with it; a durable store would outlive the processes it describes and start reporting jobs whose
- * output no longer exists. `cancelAll` is wired to process exit so nothing is orphaned.
+ * IN MEMORY for what RUNS: this process is stdio-attached to one host session, so its children die
+ * with it, and a durable record of a running job would describe a process that no longer exists.
+ * Two things ARE durable, each in its own file: the set of jobs a restart killed (`job-journal.ts`,
+ * a row per running job, cleared when it ends) and every job's FINAL record once it is terminal
+ * (`job-archive.ts`, written eagerly at the terminal transition). `cancelAll` is wired to process
+ * exit so nothing is orphaned.
  */
 export class LaneJobStore {
   private readonly jobs = new Map<string, LaneJob>();
@@ -757,10 +851,37 @@ export class LaneJobStore {
   };
 
   private readonly journal: JobJournal;
+  private readonly archive: JobArchive;
 
-  constructor(journal: JobJournal = nullJobJournal) {
+  constructor(journal: JobJournal = nullJobJournal, archive: JobArchive = nullJobArchive) {
     this.journal = journal;
+    this.archive = archive;
+    // Archive first, then orphans: a job can be in only one of the two (the journal row is cleared
+    // at the same transition the archive row is written), and the counter is seeded from BOTH so a
+    // fresh id can collide with neither a finished job's nor a killed one's.
+    this.restoreArchive();
     this.adoptOrphans();
+  }
+
+  /**
+   * The finished jobs a previous process archived, read back so `dispatch_status`/`dispatch_result`
+   * answer for them after a restart instead of `unknown jobId`. Marked `restored` so the rendering
+   * can say the report predates this process.
+   */
+  private restoreArchive(): void {
+    const { jobs, lastSeq } = this.archive.restore();
+    seedJobCounter(lastSeq);
+    for (const row of jobs) {
+      if (this.jobs.has(row.id)) continue;
+      this.jobs.set(row.id, { ...row, restored: true });
+      const seq = jobSeqOf(row.id);
+      if (seq !== null) seedJobCounter(seq);
+    }
+  }
+
+  /** Run the archive's pending write now — the shutdown seam, called from `McpDispatchServer.shutdown`. */
+  flush(): void {
+    this.archive.flush();
   }
 
   /**
@@ -776,7 +897,9 @@ export class LaneJobStore {
   private adoptOrphans(): void {
     for (const row of this.journal.orphans()) {
       if (this.jobs.has(row.jobId)) continue;
-      this.jobs.set(row.jobId, {
+      const seq = jobSeqOf(row.jobId);
+      if (seq !== null) seedJobCounter(seq);
+      const killed: LaneJob = {
         id: row.jobId,
         status: "killed",
         laneId: row.laneId,
@@ -794,7 +917,12 @@ export class LaneJobStore {
           "directory for partial files before re-dispatching.",
         attempts: [],
         process: { pids: [], survivors: [], terminated: false },
-      });
+      };
+      this.jobs.set(row.jobId, killed);
+      // ⚠ Archived at adoption, because the journal's first write by THIS process rewrites the file
+      // with only its own rows — so without this, the killed report survived exactly one restart
+      // and a second one answered `unknown jobId` for it all over again.
+      this.archive.record(killed);
     }
   }
 
@@ -816,6 +944,8 @@ export class LaneJobStore {
       ...(dispatchSource !== undefined ? { dispatchSource } : {}),
     };
     this.jobs.set(job.id, job);
+    const seq = jobSeqOf(job.id);
+    if (seq !== null) this.archive.noteSeq(seq);
     // ⚠ Recorded BEFORE the lane runs, so a kill between here and the first attempt is still
     // reported. The row is removed by `reap()` the moment the job goes terminal, which is why what
     // survives a crash is exactly the set that was still running.
@@ -864,11 +994,14 @@ export class LaneJobStore {
     // The job is no longer running, so it is no longer something a restart could kill.
     this.journal.clear(id);
     if (!job) return;
+    // The attempt is over, so "silent for N s" no longer describes anything.
+    delete job.activity;
     const pids = readOwnedPids(handle);
     if (kill === undefined) {
       // Nothing of ours ran for this job. Reported rather than omitted, so "no owned process" and
       // "we forgot to look" cannot read the same way.
       job.process = { pids, survivors: [], terminated: false };
+      this.archive.record(job);
       return;
     }
     try {
@@ -877,6 +1010,9 @@ export class LaneJobStore {
       // Fall through: the survivor check below is what reports it.
     }
     job.process = { pids, survivors: pids.filter((pid) => this.isAlive(pid)), terminated: true };
+    // ⚠ After the process report, so what is archived is the whole terminal record — and eagerly,
+    // because the restart this guards against runs no shutdown handler (`job-archive.ts`).
+    this.archive.record(job);
   }
 
   /**
@@ -924,6 +1060,37 @@ export class LaneJobStore {
     // must clear the previous lane's figure rather than inherit it.
     if (expected === undefined) delete job.expected;
     else job.expected = expected;
+    // Same rule for the previous lane's output progress and read-only binding: both describe an
+    // attempt that is over. `beginAttemptActivity`/`noteReadOnly` set the new lane's own.
+    delete job.activity;
+    delete job.readOnly;
+  }
+
+  /**
+   * A spawned attempt has started for `id`: from now until it settles, `noteOutput` counts what it
+   * writes and a poll can say how long it has been silent. Not called for an answer-mode HTTP call,
+   * which has no output stream — its absence is what keeps the figure honest there.
+   */
+  beginAttemptActivity(id: string, now: number): void {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running") return;
+    job.activity = { attemptStartedAt: now, lastOutputAt: null, stdoutBytes: 0, stderrBytes: 0 };
+  }
+
+  /** The running attempt wrote `bytes` to `stream` at `now`. Ignored once the attempt is over. */
+  noteOutput(id: string, stream: "stdout" | "stderr", bytes: number, now: number): void {
+    const activity = this.jobs.get(id)?.activity;
+    if (!activity || !Number.isFinite(bytes) || bytes <= 0) return;
+    activity.lastOutputAt = now;
+    if (stream === "stdout") activity.stdoutBytes += bytes;
+    else activity.stderrBytes += bytes;
+  }
+
+  /** Record the read-only tool binding the lane now running was given, so the reply can state it. */
+  noteReadOnly(id: string, laneId: string, binding: string): void {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running") return;
+    job.readOnly = { laneId, binding };
   }
 
   /**

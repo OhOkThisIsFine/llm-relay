@@ -1959,6 +1959,36 @@ landed with only half its change; and a read-only review returned after 1,151 s 
 and pushed nine of the caller's in-progress files. A `readOnly` dispatch that is not in the
 caller's tree is allowed, and an ordinary dispatch (no `readOnly`) is completely unaffected.
 
+**It also binds the lane's tools.** The working directory alone was measured insufficient: a
+read-only review lane in a *separate* worktree still made three scratch edits to source files and
+restored them by hand. So a read-only dispatch hands each spawned lane its own CLI's documented
+read-only form, and the reply's `read-only:` line states what was applied:
+
+| Lane CLI | What the relay runs |
+|---|---|
+| `claude` | Every permission flag the template carried is replaced by `--permission-mode dontAsk --tools Read,Glob,Grep,WebFetch,WebSearch --allowedTools <same> --disallowedTools Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,Task,Agent`. Never `plan`: a headless `claude -p` cannot leave plan mode. |
+| `codex` | `--sandbox read-only`, with `--full-auto` and every bypass flag stripped. Enforcement is Codex's own sandbox; the relay states the policy. |
+| `opencode`, `agy`, anything else | **Skipped**, with the reason in `lanes tried:` — OpenCode's tool permissions live per agent in its own `opencode.json`, and AGY's permission flags are unverified (a denied AGY tool discards the whole answer). A lane the relay cannot bind is never run unbound under a flag that claims protection. |
+
+A skipped lane counts as *not tried*: the walk moves to the next lane, nothing is spawned, and no
+telemetry or demotion is recorded for it. Answer mode spawns nothing and is unaffected.
+
+**A silent lane says so.** While a spawned lane runs, `dispatch_status` reports its output so far
+— `output: none yet — silent for 540s since this lane started`, or `output: 512 bytes so far
+(stdout 512, stderr 0); last output 30s ago` — so a lane that died on a stream error in its first
+second (measured: nine minutes of `running` with nothing to distinguish it from a lane still
+thinking) is legible on the first poll. Silence is *reported, never acted on*: `claude -p` buffers
+its whole answer until exit, so a healthy run on the free pool is silent while it works, and the
+status line says so. The caller decides.
+
+**A finished job survives a restart of the MCP server.** Every terminal job is written to
+`mcp-job-archive.json` under the cache directory the moment it ends (eagerly — the measured restart
+runs no shutdown handler), and read back on the next start marked `record: restored from disk`, so
+`dispatch_status`/`dispatch_result` answer for it instead of `unknown jobId`. Job ids continue past
+the highest one any previous process minted, finished or killed — a handle from before the restart
+never names a different job after it. The archive keeps the newest 100 jobs, each stream capped at
+512 KiB (tail kept, with a marker).
+
 **A killed lane is distinguished from a failed one.** The MCP server writes a running-job journal
 under the cache directory (`mcp-jobs.json`, honouring `XDG_CACHE_HOME`); a row is removed the
 moment its job ends, so whatever a restarting server finds is exactly the set of jobs it killed.

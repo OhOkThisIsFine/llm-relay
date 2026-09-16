@@ -27,15 +27,6 @@
   verdict; a probe that answers 200 ends a rate-limit cooldown early; and a limit nobody stated
   has no effect.
 
-- **An OpenCode lane that dies on a stream error in its first second stays `running` until its
-  timeout (2026-09-10, C:\Code lap 232d8bef, medium).** Muse Spark job-0017 logged `stream error` in
-  `~/.local/share/opencode/log/opencode.log` in its first second and produced nothing more; the
-  process stayed alive and `dispatch_status` reported `running` for 9+ minutes, until it was
-  cancelled by hand. v0.80.0's process-tree reaping ends the process at the budget but does not
-  shorten the wait. **Property:** a lane that has produced no output and whose harness has stopped
-  making progress is reported as failed well before `timeoutMs`, with the reason, or
-  `dispatch_status` states how long the lane has been silent so the caller can decide.
-
 - **The model catalog refreshes on a clock, not on evidence that it is stale (2026-09-10, owner
   direction, medium).** Owner, 2026-09-10: *"The relay is supposed to be keeping metadata about
   providers and models up to date, with regular sampling; if we get a hint that our model catalog
