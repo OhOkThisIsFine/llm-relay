@@ -45,16 +45,6 @@
   once, bounded so that a burst of refusals costs one refresh, and dynamic pool membership follows
   the refreshed list.
 
-- **A DeepSeek answer's reasoning never reaches the caller, so pool traffic runs with thinking off
-  after the first tool call (2026-09-10, F11 residue, low).** `openai-request.ts` now carries a
-  replayed `thinking` block onto DeepSeek's `reasoning_content`, and turns thinking off for a replay
-  that has none, so the 400 is gone. But llm-bridge's response translation drops DeepSeek's
-  `reasoning_content`, so a caller never holds DeepSeek's own reasoning to replay, and every
-  multi-turn tool conversation runs with thinking off after its first tool call. **Property:** on a
-  `compat.reasoning: "deepseek"` target, the response's `reasoning_content` reaches the caller — a
-  `thinking` block on the Anthropic front, a `reasoning` item on the Responses front — so the
-  caller's replay carries it back and thinking can stay on; pinned on both fronts.
-
 - **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
   (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
   tests in `test/backend-responses-upstream.test.ts`). Everything this entry asked for except a
