@@ -15,6 +15,12 @@ import { utcBucketLabel } from "./formatters.js";
 const media = "application/vnd.llm-relay.dashboard+json; version=1";
 const response = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": media } });
 async function flush(): Promise<void> { await act(async () => { await Promise.resolve(); await Promise.resolve(); }); }
+// This jsdom test environment has no real global localStorage, so theme-persistence tests inject
+// their own in-memory Storage the same way app.test.tsx injects sessionStorage.
+function fakeLocalStorage(seed: Record<string, string> = {}): Storage {
+  const values = new Map(Object.entries(seed));
+  return { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => void values.set(key, value), removeItem: (key: string) => void values.delete(key), clear: () => values.clear(), key: (_index: number) => null, get length() { return values.size; } } as unknown as Storage;
+}
 
 describe("dashboard accessibility and truthfulness", () => {
   it("renders every safe panel with labelled coverage, controls, tables, and unblended spend", async () => {
@@ -31,12 +37,41 @@ describe("dashboard accessibility and truthfulness", () => {
     expect((await axe(container, { rules: { "color-contrast": { enabled: false } } })).violations).toEqual([]);
   });
   it("keeps labelled table data usable at 320, 768, and 1280px; themes and reduced motion stay self-hosted", async () => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(snapshot)));
     const { container } = render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />);
     await flush();
     for (const width of [320, 768, 1280]) { Object.defineProperty(window, "innerWidth", { configurable: true, value: width }); window.dispatchEvent(new Event("resize")); expect(container.querySelectorAll("[data-label]").length).toBeGreaterThan(20); }
-    fireEvent.click(screen.getByRole("button", { name: "Use dark theme" })); expect(container.querySelector("main")?.getAttribute("data-theme")).toBe("dark");
+    expect(container.querySelector("main")?.getAttribute("data-theme")).toBe("dark");
+    fireEvent.click(screen.getByRole("button", { name: "Use light theme" })); expect(container.querySelector("main")?.getAttribute("data-theme")).toBe("light");
     expect(container.querySelectorAll("table").item(0)?.getAttribute("style")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+  it("defaults to dark with no stored preference, and honours an explicit light choice on the next mount", async () => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(snapshot)));
+    const first = render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />);
+    await flush();
+    expect(first.container.querySelector("main")?.getAttribute("data-theme")).toBe("dark");
+    fireEvent.click(screen.getByRole("button", { name: "Use light theme" }));
+    expect(first.container.querySelector("main")?.getAttribute("data-theme")).toBe("light");
+    first.unmount();
+    const second = render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />);
+    await flush();
+    expect(second.container.querySelector("main")?.getAttribute("data-theme")).toBe("light");
+    second.unmount();
+    vi.unstubAllGlobals();
+  });
+  it("keeps the theme toggle working when localStorage throws (a private window or blocked site data)", async () => {
+    const throwing = { getItem: vi.fn(() => { throw new Error("storage blocked"); }), setItem: vi.fn(() => { throw new Error("storage blocked"); }), removeItem: vi.fn() };
+    vi.stubGlobal("localStorage", throwing);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(snapshot)));
+    const { container } = render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />);
+    await flush();
+    expect(container.querySelector("main")?.getAttribute("data-theme")).toBe("dark");
+    fireEvent.click(screen.getByRole("button", { name: "Use light theme" }));
+    expect(container.querySelector("main")?.getAttribute("data-theme")).toBe("light");
+    vi.unstubAllGlobals();
   });
   it("keeps dialog focus trapped and exposes bounded projection coverage without raw content", async () => {
     const close = vi.fn(); const { container } = render(<DetailDialog detail={detail} onClose={close} />);

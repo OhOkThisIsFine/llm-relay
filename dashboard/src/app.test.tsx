@@ -22,7 +22,12 @@ describe("dashboard application startup", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/dashboard/api/v1/session", expect.anything()));
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ body: JSON.stringify({ schema: "dashboard.session.request.v1", bootstrap: "fresh-bootstrap" }) });
     await waitFor(() => expect(browserStorage.getItem(SESSION_STORAGE_KEY)).toBe("fresh-session"));
-    expect(localStorageSpy.getItem).not.toHaveBeenCalled(); expect(localStorageSpy.setItem).not.toHaveBeenCalled(); expect(localStorageSpy.removeItem).not.toHaveBeenCalled(); expect(document.cookie).toBe("");
+    // The session token must never reach window.localStorage or a cookie — only the injected
+    // `storage` (sessionStorage in production) is a legitimate home for it. The dashboard's own
+    // theme preference is a separate, unrelated key in real localStorage (per-viewer convenience,
+    // not session state), so this narrows to the session key rather than banning every call.
+    const usedSessionKey = (spy: Readonly<{ mock: Readonly<{ calls: readonly unknown[][] }> }>) => spy.mock.calls.some((call) => call[0] === SESSION_STORAGE_KEY);
+    expect(usedSessionKey(localStorageSpy.getItem)).toBe(false); expect(usedSessionKey(localStorageSpy.setItem)).toBe(false); expect(usedSessionKey(localStorageSpy.removeItem)).toBe(false); expect(document.cookie).toBe("");
   });
   it("has a pure startup resolver that never reads stale storage when bootstrap exists", () => {
     const browserStorage = storage({ [SESSION_STORAGE_KEY]: "stale-session" });

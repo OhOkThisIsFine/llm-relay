@@ -1,6 +1,12 @@
 import type { ReactElement } from "react";
 import type { PanelCoverageV1, SpendTotalsV1, TokenTotalsV1 } from "../../../src/dashboard-contract.js";
-import { coverage, currencyMicrousd, number, stamp } from "../formatters.js";
+import { basisLabel, coverage, currencyMicrousd, number, stamp } from "../formatters.js";
+import { basisTone } from "../view-model.js";
+
+/** A small pill for a provenance/basis value, tinted by `basisTone()` so a reader can tell a first-party figure from a derived or weaker one at a glance without reading the label text. */
+export function BasisBadge({ value }: Readonly<{ value: string | null }>): ReactElement {
+  return <span className={`basis-badge basis-${basisTone(value)}`}>{basisLabel(value)}</span>;
+}
 
 export function PanelCoverage({ value, label }: Readonly<{ value: PanelCoverageV1 | undefined; label: string }>): ReactElement {
   if (value === undefined) return <aside className="coverage unavailable" aria-label={`${label} data status`} aria-description="Unavailable; reason unavailable; provenance unavailable; observed unavailable"><strong>Unavailable</strong><span>State: unavailable. Reason: unavailable. Provenance: unavailable. Observed: unavailable.</span></aside>;
