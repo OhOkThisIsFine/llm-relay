@@ -94,6 +94,14 @@
   **Property (what remains):** with the allowance refilled, one request per front through
   `pool/medium` is SERVED (HTTP 200) by that deployment with a tool call and streaming, and
   `llm-relay cost` shows its `cached_tokens`. Recorded with the served-by header and the date.
+  **Checked 2026-09-16, still open, and the blocker changed.** A direct request to
+  `opencode/muse-spark-1.3-contributor-free` now answers `HTTP 400 MissingSessionID: "OpenCode's
+  free tier can only be used in OpenCode"` — a vendor session-identity check, not the rate limit
+  this entry was written against. This is not fixable by sending a stronger request: the vendor is
+  asking the caller to prove it IS the OpenCode CLI, and manufacturing that proof would mean the
+  relay impersonating another vendor's own client, which this project's terms-compliance position
+  rules out. The property stays open; the honest next step is confirming with OpenCode Zen support
+  whether a relay-forwarded request can ever qualify, not a code change here.
 
 - **Verify the Codex `relay` agent end to end in Codex Desktop** (owner-driven, 2026-09-04).
   Commit `e73d113` added `~/.codex/agents/relay.toml` via `scripts/install-skill.mjs`; standalone
@@ -101,3 +109,36 @@
   verify it. **Property:** one Codex Desktop `relay` subagent reply carries a `provenance:` line
   (e.g. spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>"
   returns the version and provenance from a dispatch lane).
+
+- **The dashboard Quota panel shows the data but not clearly (2026-09-16, owner request,
+  medium).** `QuotaRowV1` already carries per-deployment remaining/reset data
+  (`dashboard-contract.ts`, fed by `availability-snapshot.ts`), and the SPA already renders a Quota
+  panel from it. The owner asked, while approving this lap, to be able to "view remaining quotas"
+  more clearly from the dashboard — read as a display-clarity gap, not a missing data field.
+  **Property:** the dashboard's Quota panel shows, per deployment, the remaining amount, its basis
+  (`provider-stated` / `derived` / etc.), and its reset time, legible at a glance, with no new wire
+  field required.
+
+- **The dashboard has no way to reorder dispatch targets (2026-09-16, owner request, high — new
+  write surface).** The dashboard session is deliberately READ-ONLY today (`dashboard-auth.ts`): it
+  never mutates config or routing. The owner asked for a control to reorder dispatch targets from
+  the dashboard. This is the dashboard's FIRST write capability, and it must not bypass the
+  invariant that a mutating endpoint needs admission checks beyond loopback (exact `Host`, `Origin`
+  when present, `content-type: application/json`, and — matching `/offload`/`/dispatch` — the
+  control-token where the operator route already requires one). **Property:** an authenticated
+  dashboard write endpoint reorders `routing.ladder`/`routing.ladders.<tier>` or pins a lane
+  (reusing the existing `offload.ts` / `dispatch.ts` mutation paths rather than a new parallel one),
+  admits only what those paths already admit, and the change is visible on the next `GET /dispatch`
+  with no relay restart.
+
+- **The dashboard's usability and visual design need a general pass (2026-09-16, owner request,
+  medium).** No single measured defect; a standing ask from the owner while approving this lap.
+  **Property:** a pass over the existing SPA (`dashboard/src/`) for layout, density and
+  navigability, scoped to what a reviewer can point at concretely — this entry is closed by naming
+  the specific changes made, not by a vague "polish" commit.
+
+- **Dark mode should be the dashboard's default theme (2026-09-16, owner request, low).** The SPA
+  already supports a theme preference (recorded standing trade: "theme preference not persisted" in
+  `HANDOFF.md` §6.2); the owner asked for dark mode as the DEFAULT rather than only an available
+  option. **Property:** a fresh session with no stored preference renders in dark mode; an explicit
+  light-mode choice, once persisted, is honoured.
