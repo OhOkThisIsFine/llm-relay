@@ -11,6 +11,7 @@ import {
   recordUnknownRefusal,
   refusalSignature,
   resetInterpretations,
+  statesModelDoesNotExist,
 } from "../src/refusal-interpretation.js";
 
 /**
@@ -263,5 +264,67 @@ describe("stored signatures migrate through the current normalizer at load", () 
     flushInterpretations({ path });
     const onDisk = JSON.parse(readFileSync(path, "utf8")) as { confirmed: Record<string, unknown> };
     expect(Object.keys(onDisk.confirmed)).toEqual([migrated]);
+  });
+});
+
+/**
+ * The catalog-staleness classifier: does this refusal STATE that the requested model does not
+ * exist?
+ *
+ * This decides only whether the relay re-fetches a provider's roster — never what the refusal
+ * means for routing, which stays `interpretRefusal`'s job. It is exported and pinned separately
+ * because the REQUEST path is a thin caller of it, and the boundary between "the provider said the
+ * model is gone" and "the request was bad" is the whole containment of the feature: get it wrong in
+ * the permissive direction and any failing request can drive a provider's `/models` endpoint.
+ */
+describe("statesModelDoesNotExist — the roster-staleness signal", () => {
+  it("recognises the stated-absence wording family on a 404", () => {
+    const bodies = [
+      `{"error":{"message":"The requested model 'x' does not exist."}}`,
+      `{"error":{"message":"model_not_found","type":"invalid_request_error"}}`,
+      `{"error":{"message":"unknown model: x"}}`,
+      `{"error":{"message":"no such model"}}`,
+    ];
+    for (const body of bodies) {
+      expect(statesModelDoesNotExist(404, body), body).toBe(true);
+    }
+  });
+
+  it("refuses every status that is not 404, whatever the wording says", () => {
+    // ⚠ These bodies DO carry absence wording. A control whose message could not match anyway
+    // proves nothing about the status gate — it passes with the gate removed.
+    const absence = `{"error":{"message":"the requested model does not exist"}}`;
+    for (const status of [400, 401, 402, 403, 410, 429, 500, 503, 200]) {
+      expect(statesModelDoesNotExist(status, absence), `status ${status}`).toBe(false);
+    }
+  });
+
+  it("declines a 404 that states something other than a model's absence", () => {
+    // A 404 is not by itself evidence about a roster: a wrong path, a gated endpoint, a policy
+    // refusal all answer 404, and none of them has contradicted our model list.
+    for (const body of [
+      `{"error":{"message":"the requested endpoint is not available on this plan"}}`,
+      `{"error":{"message":"insufficient credits"}}`,
+      `{"error":{"message":"rate limit exceeded"}}`,
+      "",
+    ]) {
+      expect(statesModelDoesNotExist(404, body), body).toBe(false);
+    }
+  });
+
+  it("reads THROUGH the relay's own wrapper, because that prose is ours", () => {
+    // The walk lane hands this the relay's synthesized envelope, whose `error.message` is the
+    // `openai backend HTTP <n> — model "…" is not served by provider "…" (…)` wrapper around the
+    // provider's body. The wrapper NAMES the model but is written by the relay; a recogniser bound
+    // to that text would fire on the relay's own diagnostic rather than the provider's statement,
+    // so the normalized message — not the raw body — is what is tested.
+    const wrapped = JSON.stringify({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: `openai backend HTTP 404: {"error":{"message":"The requested model 'x' does not exist."}}`,
+      },
+    });
+    expect(statesModelDoesNotExist(404, wrapped)).toBe(true);
   });
 });

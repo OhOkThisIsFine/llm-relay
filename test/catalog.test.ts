@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ModelCatalog } from "../src/catalog.js";
+import { ModelCatalog, MODEL_MISSING_REFRESH_COOLDOWN_MS } from "../src/catalog.js";
 import type { ProviderConfig } from "../src/config.js";
 import { candidateEnvNames } from "../src/authEnv.js";
 
@@ -315,6 +315,123 @@ describe("ModelCatalog", () => {
     await c.list("p", { ...provider, timeoutMs: 3000 }, { fetchFn: inspectFetch });
     expect(receivedSignal).toBeDefined();
     expect(receivedSignal?.aborted).toBe(false);
+  });
+});
+
+/**
+ * The backlog property "the model catalog refreshes on evidence, not only on a clock": a 404
+ * stating that a model this catalog LISTS does not exist re-fetches that provider's roster at once.
+ *
+ * These pin the CATALOG's half — that the trigger re-fetches, that a burst costs one fetch, and
+ * that a failed re-fetch is fail-open. The request-path half (which refusals qualify, and the "on a
+ * model the catalog currently lists" containment) is pinned in `test/server.test.ts`, because the
+ * classification and the containment live there.
+ */
+describe("ModelCatalog — evidence-driven refresh (noteProviderStale)", () => {
+  /** A fetch whose every call is recorded, serving `next()`'s list. */
+  function countingFetch(lists: string[][]): { fetchFn: typeof fetch; calls: () => number } {
+    let n = 0;
+    const fetchFn = (async () => {
+      const models = lists[Math.min(n, lists.length - 1)] ?? [];
+      n++;
+      return new Response(JSON.stringify({ data: models.map((id) => ({ id })) }), { status: 200 });
+    }) as unknown as typeof fetch;
+    return { fetchFn, calls: () => n };
+  }
+
+  it("re-fetches a warm catalog rather than waiting out the TTL", async () => {
+    const c = new ModelCatalog({ cachePath: null, ttlMs: 10 * 60 * 1000 });
+    const { fetchFn, calls } = countingFetch([["gone", "kept"], ["kept"]]);
+    await c.list("p", provider, { now: 0, fetchFn });
+    expect(calls()).toBe(1);
+
+    // The 404 happened, so the roster is re-read even though the TTL is nowhere near expiry.
+    expect(c.noteProviderStale("p", provider, { now: 1000, fetchFn })).toBe(true);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(calls()).toBe(2);
+    expect(c.cachedModels("p")).toEqual(["kept"]);
+  });
+
+  it("costs ONE fetch for a burst inside the cooldown, then allows the next one", async () => {
+    const c = new ModelCatalog({ cachePath: null, ttlMs: 10 * 60 * 1000 });
+    const { fetchFn, calls } = countingFetch([["m1"], ["m1"], ["m1"]]);
+    await c.list("p", provider, { now: 0, fetchFn });
+    expect(calls()).toBe(1);
+
+    // A pool walking into the same dead deployment repeatedly: the first signal refreshes, the
+    // rest inside the window are refused. Without the floor this would be one fetch per refusal.
+    const first = 1000;
+    expect(c.noteProviderStale("p", provider, { now: first, fetchFn })).toBe(true);
+    for (const now of [1001, 2000, 30_000, first + MODEL_MISSING_REFRESH_COOLDOWN_MS - 1]) {
+      expect(c.noteProviderStale("p", provider, { now, fetchFn }), `at ${now}`).toBe(false);
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls()).toBe(2);
+
+    // Past the window the signal is honoured again — the cooldown throttles, it does not latch.
+    expect(
+      c.noteProviderStale("p", provider, { now: first + MODEL_MISSING_REFRESH_COOLDOWN_MS, fetchFn }),
+    ).toBe(true);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls()).toBe(3);
+  });
+
+  it("holds the cooldown PER PROVIDER — a second provider is not starved by the first", async () => {
+    const c = new ModelCatalog({ cachePath: null, ttlMs: 10 * 60 * 1000 });
+    const { fetchFn, calls } = countingFetch([["m1"]]);
+    await c.list("a", provider, { now: 0, fetchFn });
+    await c.list("b", provider, { now: 0, fetchFn });
+    expect(calls()).toBe(2);
+
+    expect(c.noteProviderStale("a", provider, { now: 1000, fetchFn })).toBe(true);
+    expect(c.noteProviderStale("b", provider, { now: 1000, fetchFn })).toBe(true);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls()).toBe(4);
+  });
+
+  it("keeps the previous list when the forced re-fetch fails (fail-open)", async () => {
+    const c = new ModelCatalog({ cachePath: null, ttlMs: 10 * 60 * 1000 });
+    await c.list("p", provider, { now: 0, fetchFn: okFetch(["kept"]) });
+
+    expect(c.noteProviderStale("p", provider, { now: 1000, fetchFn: failFetch })).toBe(true);
+    await new Promise((r) => setTimeout(r, 0));
+    // A refresh is not an edit: the provider's endpoint is the measurement, and an endpoint that
+    // did not answer has measured nothing. The roster stands.
+    expect(c.cachedModels("p")).toEqual(["kept"]);
+  });
+
+  it("treats an unusable clock as 'no cooldown recorded', never as an inert one", async () => {
+    // A NaN would make every `now - last < cooldown` comparison false, so the floor would silently
+    // stop existing for the rest of the process's life. Unmeasured is no opinion: the signal is
+    // honoured rather than assumed to be inside a window nobody can evaluate.
+    const c = new ModelCatalog({ cachePath: null, ttlMs: 10 * 60 * 1000 });
+    const { fetchFn, calls } = countingFetch([["m1"], ["m1"]]);
+    await c.list("p", provider, { now: 0, fetchFn });
+
+    expect(c.noteProviderStale("p", provider, { now: Number.NaN, fetchFn })).toBe(true);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls()).toBe(2);
+    // The NaN was NOT stored as the last-forced stamp, so the provider reads as having no recorded
+    // cooldown rather than as permanently inside one — the next finite signal is honoured.
+    expect(c.noteProviderStale("p", provider, { now: 1001, fetchFn })).toBe(true);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls()).toBe(3);
+    // ...and THAT finite stamp now throttles normally.
+    expect(c.noteProviderStale("p", provider, { now: 1002, fetchFn })).toBe(false);
+  });
+
+  it("does not contend with the TTL path: a refresh still updates the revision", async () => {
+    // `materializeDynamicPools` re-materializes when the catalog revision moves, which is how the
+    // refreshed roster reaches pool membership on the next resolution.
+    const c = new ModelCatalog({ cachePath: null, ttlMs: 10 * 60 * 1000 });
+    const { fetchFn } = countingFetch([["old"], ["new"]]);
+    await c.list("p", provider, { now: 0, fetchFn });
+    const before = c.getRevision();
+
+    c.noteProviderStale("p", provider, { now: 1000, fetchFn });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(c.getRevision()).toBeGreaterThan(before);
   });
 });
 

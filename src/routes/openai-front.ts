@@ -447,7 +447,7 @@ export async function openAiFrontPath(
       const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
       observeAttemptHeaders(h, attempt, upstream.status, retryAfterMs, upstream.headers);
 
-      const inspected = await inspectCandidateResponse(upstream, resolvedAttempt, retryAfterMs);
+      const inspected = await inspectCandidateResponse(upstream, resolvedAttempt, retryAfterMs, h);
       if (inspected.kind === "post-header-body-failure") {
         const disposition = completePostHeaderBodyFailure(
           h, res, controller.signal, attempt, credentialWalk, credentialTrace, resolvedAttempt,

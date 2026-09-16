@@ -376,6 +376,48 @@ describe("dynamic free-model pools", () => {
     }
   });
 
+  it("follows an EVIDENCE-driven refresh on the next resolution, not just a forced one", async () => {
+    // The backlog property's second half: "dynamic pool membership follows the refreshed list".
+    // The previous test drives the invalidation through `list(..., { force: true })`, which is the
+    // EXPLICIT path. This drives it through `noteProviderStale` — the path a 404 takes — so the
+    // property is pinned end to end: a model-missing signal, the re-fetch it causes, the revision
+    // bump, and a re-materialized pool that no longer offers the model the provider retired.
+    const dir = mkdtempSync(join(tmpdir(), "rp-pool-stale-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({
+        listen: "127.0.0.1:8791",
+        providers: { free: { base: "https://free.test/v1", kind: "openai", tierType: "free" } },
+        routing: {
+          default: "pool/lazy",
+          pools: { lazy: { preferred: [], include: "free" } },
+        },
+      }));
+      const cfg = loadConfig(path);
+      const catalog = new ModelCatalog({ cachePath: null });
+      const feed = (ids: string[]) => (async () => new Response(JSON.stringify({
+        data: ids.map((id) => ({ id })),
+      }), { status: 200 })) as unknown as typeof fetch;
+      const now = 1_800_000_000_000;
+      await catalog.list("free", cfg.providers.free!, { now, fetchFn: feed(["retired", "kept"]) });
+      expect(materializeDynamicPools(cfg, catalog, { now })).toBe(true);
+      expect(cfg.routing.pools!.lazy).toEqual(expect.arrayContaining(["free/retired", "free/kept"]));
+
+      // The provider 404'd `retired` and the trigger re-fetched; its roster no longer lists it.
+      expect(catalog.noteProviderStale("free", cfg.providers.free!, {
+        now: now + 1_000,
+        fetchFn: feed(["kept"]),
+      })).toBe(true);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(materializeDynamicPools(cfg, catalog, { now: now + 1_000 })).toBe(true);
+      expect(cfg.routing.pools!.lazy).toContain("free/kept");
+      expect(cfg.routing.pools!.lazy).not.toContain("free/retired");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("excludes p/m from dynamic free pool when only slot carries credential-scoped subscription-required fact", async () => {
     const dir = mkdtempSync(join(tmpdir(), "rp-dyn-cred-fact-"));
     try {

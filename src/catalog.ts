@@ -12,6 +12,23 @@ import {
 import { WriteBehindTimer } from "./write-behind.js";
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 min
+
+/**
+ * How long one provider is held off after a model-missing signal forced its catalog to refresh.
+ *
+ * The TTL above answers "how old may a catalog be before we re-read it on a clock". This answers a
+ * different question: "how often may EVIDENCE make us re-read it". A 404 stating that a listed model
+ * does not exist is real evidence the roster moved, but it is also the shape a broken or
+ * half-migrated deployment produces on EVERY request — so without a floor, one member of a pool
+ * would drive the provider's `/models` endpoint as fast as traffic arrives, which is the stampede
+ * the TTL exists to prevent in the first place. One refresh per provider per window, and the
+ * evidence inside the window is not lost: the refresh it caused is the response to all of it.
+ *
+ * 60 s, not the 10-minute TTL: the point of the signal is to act sooner than the clock would, and a
+ * roster change is discovered by the very refresh this bounds. It is a floor on FREQUENCY, never a
+ * claim about how stale the roster is.
+ */
+export const MODEL_MISSING_REFRESH_COOLDOWN_MS = 60_000;
 /**
  * Where the catalog caches `/models` when no explicit `cachePath` is given.
  *
@@ -297,6 +314,8 @@ export class ModelCatalog {
   private refreshing = new Set<string>();
   /** In-flight blocking fetches (cold start / forced) — dedups concurrent requests. */
   private pending = new Map<string, Promise<string[]>>();
+  /** provider → the last time EVIDENCE forced a refresh; see `noteProviderStale`. */
+  private readonly forcedAt = new Map<string, number>();
   private revision = 0;
   private readonly writeBehind: boolean;
   private readonly flushTimer = new WriteBehindTimer();
@@ -448,6 +467,54 @@ export class ModelCatalog {
         this.refreshing.delete(name);
       }
     })();
+  }
+
+  /**
+   * Evidence that a provider's roster moved: refresh it now, rather than waiting for the TTL.
+   *
+   * The backlog property this exists for — "if we get a hint that our model catalog might be stale,
+   * we update it" — is deliberately narrower than "something went wrong". Exactly one signal
+   * qualifies: a refusal that STATES, on a model this catalog currently lists, that the model does
+   * not exist. That is the provider contradicting our own roster, which is the one thing a TTL
+   * cannot know about. Rate limits, auth walls, quota exhaustion and generic 5xx all say something
+   * about the ACCOUNT or the moment, never about which models exist, and none of them re-fetch a
+   * roster the provider has not contradicted.
+   *
+   * ⚠ **This TRIGGERS a re-fetch; it never edits the catalog.** The refreshed list is whatever the
+   * provider's own endpoint answers next — nothing here removes the 404'd model by hand, because
+   * "the model is gone" is a guess about the roster while the endpoint is the measurement. A model
+   * that 404s and is then re-listed by the refresh stays exactly where it was.
+   *
+   * ⚠ **Fire-and-forget and FAIL-OPEN, like every other fetch here.** It never throws, never
+   * blocks a request, and a failed re-fetch leaves the previous list in place — the caller is a
+   * failing request path, and a catalog refresh must not be able to turn one failure into two.
+   *
+   * The cooldown is per provider and holds off CONSECUTIVE signals, so a burst — a pool walking
+   * into the same dead deployment several times in a minute — costs one upstream fetch. The
+   * in-flight dedup in `refreshInBackground` covers the overlapping case the cooldown cannot.
+   *
+   * Returns whether this call actually started a refresh, which is what the tests read.
+   */
+  noteProviderStale(
+    name: string,
+    cfg: ProviderConfig,
+    opts: { now?: number; fetchFn?: typeof fetch; cooldownMs?: number } = {},
+  ): boolean {
+    const now = opts.now ?? Date.now();
+    const cooldown = opts.cooldownMs ?? MODEL_MISSING_REFRESH_COOLDOWN_MS;
+    // An unusable clock is "no evidence of a recent refresh", never a comparison that quietly
+    // answers false forever: a stored NaN would make `now - last < cooldown` false for the rest of
+    // the process's life and leave the throttle inert on a provider that then hammers its endpoint.
+    const last = this.forcedAt.get(name);
+    if (last !== undefined && !Number.isFinite(last)) this.forcedAt.delete(name);
+    else if (last !== undefined && now - last < cooldown) return false;
+    this.loadDisk();
+    // Only a finite stamp is RECORDED; an unusable one leaves the provider with no cooldown, which
+    // honours the signal now and lets the next one through too — the fail-open direction.
+    if (Number.isFinite(now)) this.forcedAt.set(name, now);
+    else this.forcedAt.delete(name);
+    this.refreshInBackground(name, cfg, opts.fetchFn);
+    return true;
   }
 
   /**

@@ -863,7 +863,7 @@ export async function anthropicMessagesPath(
       const retryAfterMs = parseRetryAfterMs(backendRes.headers.get("retry-after"));
       observeAttemptHeaders(h, attempt, backendRes.status, retryAfterMs, backendRes.headers);
 
-      const inspected = await inspectCandidateResponse(backendRes, resolvedAttempt, retryAfterMs);
+      const inspected = await inspectCandidateResponse(backendRes, resolvedAttempt, retryAfterMs, h);
       if (inspected.kind === "post-header-body-failure") {
         const disposition = completePostHeaderBodyFailure(
           h, res, controller.signal, attempt, credentialWalk, credentialTrace, resolvedAttempt,

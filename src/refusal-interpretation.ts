@@ -502,6 +502,50 @@ export function signatureDigest(signature: string): string {
 }
 
 /**
+ * The wording family that states a MODEL does not exist — "the requested model 'x' does not exist"
+ * (HuggingFace), `model_not_found` (the OpenAI-compatible envelope), "unknown model", "no such
+ * model".
+ *
+ * A named constant because TWO things read it and they must never disagree: the `not-servable`
+ * seed below, which decides what the refusal MEANS, and `statesModelDoesNotExist`, which decides
+ * whether the catalog is allowed to treat the refusal as evidence its roster has moved. Two copies
+ * of one closed pattern set is this repository's most-repeated defect; the seed object is not
+ * addressable from outside, so the pattern itself is the shared artifact.
+ */
+const STATED_MODEL_ABSENCE =
+  /does\s+not\s+exist|model_not_found|unknown\s+model|no\s+such\s+model/;
+
+/**
+ * Does this refusal STATE that the requested model does not exist?
+ *
+ * ⚠ **Exactly one status qualifies: 404.** The seed above also fires on 400 because some providers
+ * answer a bad model that way, and `interpretRefusal` remains the authority on what the refusal
+ * MEANS for routing purposes. This predicate answers a narrower question — may the catalog treat it
+ * as evidence its roster moved — and there the status is load-bearing: a 400 is a
+ * request-validation error (CLAUDE.md's `pool-health.ts` row: mistral's 9-char tool-call-id
+ * refusal, a `max_tokens` complaint), and the same phrase appearing in one is far more likely to be
+ * about the request the caller sent than about a roster. A 400 still records its `not-servable`
+ * fact and still fails over; it just does not re-fetch a provider's model list.
+ *
+ * ⚠ Deterministic classification on the request path — a status and a wording pattern, no LLM. This
+ * is the `network-block.ts` shape: a pure recogniser that reads what the provider said. It decides
+ * only whether a REFRESH is warranted, never what the catalog then contains: the re-fetch is the
+ * measurement, and `catalog.ts` writes nothing the endpoint did not answer.
+ *
+ * ⚠ Matching runs on the NORMALIZED message, the same text the signature is keyed on, so the
+ * relay's own `openai backend HTTP <n> — model "…" is not served by provider "…" (…)` wrapper is
+ * unwrapped before the test — the wrapper names the model but is prose the RELAY wrote, and a
+ * recogniser bound to it would fire on the relay's own diagnostic rather than the provider's
+ * statement.
+ */
+export function statesModelDoesNotExist(status: number, body: string): boolean {
+  if (status !== 404) return false;
+  const normalized = normalizeRefusalMessage(body);
+  if (!normalized) return false;
+  return STATED_MODEL_ABSENCE.test(normalized);
+}
+
+/**
  * Interpretations shipped with the relay, each derived from a refusal observed first-party against
  * a real account (probed 2026-08-08). These bind without review: they are deterministic code in
  * version control, and an operator who disagrees can override the entry.
@@ -580,7 +624,7 @@ export const SEED_INTERPRETATIONS: Array<{
   },
   {
     status: (s) => s === 400 || s === 404,
-    pattern: /does\s+not\s+exist|model_not_found|unknown\s+model|no\s+such\s+model/,
+    pattern: STATED_MODEL_ABSENCE,
     class: "not-servable",
     scope: { kind: "deployment" },
     note: "stated non-existence; catalog rot",

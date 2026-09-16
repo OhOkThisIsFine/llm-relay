@@ -2115,6 +2115,15 @@ warms routed and free providers and warns about any routing target its provider 
 Where a provider publishes rate limits in its `/models` records (rpm/rpd/tpm/tpd), those are
 harvested alongside the other limits; most providers publish none.
 
+The cache also refreshes on **evidence**, not only on the clock: when a provider answers a 404
+stating that a model the relay currently lists **does not exist**, that provider's roster is
+re-fetched at once, and dynamic pool membership follows the new list. A burst of such refusals
+costs one re-fetch per provider per minute, so a deployment that has gone bad cannot make the
+relay hammer its catalogue endpoint. Nothing is removed by hand — the refreshed list is whatever
+the provider's own endpoint answers next, and a failed re-fetch leaves the previous list in place.
+Rate limits, auth failures, 5xx and any other refusal leave the cache alone: they say something
+about the account or the moment, not about which models exist.
+
 ```bash
 llm-relay models                 # every provider
 llm-relay models -p nim -r       # one provider, force re-fetch

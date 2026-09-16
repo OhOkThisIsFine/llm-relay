@@ -93,6 +93,7 @@ import {
   materializeScope,
   parseStatedResetMs,
   recordUnknownRefusal,
+  statesModelDoesNotExist,
   type Interpretation,
 } from "./refusal-interpretation.js";
 import type {
@@ -213,6 +214,20 @@ export interface CandidateRunnerHandlers {
    * site that omits it silently disables the band there.
    */
   probation?: ProbationFn | null;
+  /**
+   * Evidence that a provider's own roster has moved: a 404 stating that a model THIS RELAY LISTS
+   * does not exist. The request path wires it to `ModelCatalog.noteProviderStale`, which re-fetches
+   * that provider's `/models` behind a per-provider cooldown.
+   *
+   * Optional, like `probation` and for the same reason — hand-built handler literals in tests keep
+   * compiling — and absent reads as "no trigger", which is the pre-existing behaviour: the catalog
+   * waits for its TTL. `createProxy` always sets it.
+   *
+   * ⚠ The handler is handed the attempt, not a provider name, so the containment the trigger needs
+   * — "on a model the catalog currently lists" — is decided where the catalog is, and not by a
+   * caller that would have to re-derive it.
+   */
+  catalogStale?: ((attempt: ResolvedAttempt) => void) | null;
 }
 
 interface ServedAnnouncementContext {
@@ -1846,10 +1861,44 @@ function refusalBodyCandidates(body: string): string[] {
   return candidates;
 }
 
-export function observeEligibility(attempt: ResolvedAttempt, status: number, retryAfterMs: number | null, body: string): EligibilityObservation {
+/**
+ * Does ANY candidate reading of this body state that the model does not exist?
+ *
+ * A refusal body is not one string: `refusalBodyCandidates` walks an envelope's nested strings and
+ * embedded JSON precisely because the statement may live under `error.message` or inside a wrapper.
+ * The catalog trigger reads the same candidates as the interpretation lookup, for the reason that
+ * helper exists — otherwise a provider whose wording sits one layer down would record a
+ * `not-servable` fact and never refresh the roster that fact is about.
+ *
+ * ⚠ There is deliberately NO status test here. The status is part of the classifier
+ * (`statesModelDoesNotExist` owns it), and a second copy guarding this loop would be a closed rule
+ * written down twice — the copy that is easier to forget is the one that stops being updated, and
+ * the failure would be silent in both directions. `statesModelDoesNotExist` is called per
+ * candidate, so the status is checked on every pass.
+ */
+function statesModelDoesNotExistInAny(status: number, body: string): boolean {
+  for (const candidate of refusalBodyCandidates(body)) {
+    if (statesModelDoesNotExist(status, candidate)) return true;
+  }
+  return false;
+}
+
+export function observeEligibility(
+  attempt: ResolvedAttempt,
+  status: number,
+  retryAfterMs: number | null,
+  body: string,
+  h?: Pick<CandidateRunnerHandlers, "catalogStale">,
+): EligibilityObservation {
   const { target } = attempt;
   if (target.model === undefined) return { unknown: false };
   try {
+    // The catalog-staleness signal runs over the SAME candidate bodies the interpretation is looked
+    // up in, and independently of whether a verdict was found. It is deliberately not folded into
+    // the branch below: an operator who REJECTED a "does not exist" signature has judged what the
+    // refusal means for routing, which says nothing about whether the provider's roster moved —
+    // and the evidence that a listed model 404s is first-party regardless of any verdict.
+    if (statesModelDoesNotExistInAny(status, body)) h?.catalogStale?.(attempt);
     let matchedBody = body;
     let verdict: ReturnType<typeof interpretRefusal> = null;
     for (const candidate of refusalBodyCandidates(body)) {
@@ -1921,6 +1970,7 @@ export async function inspectCandidateResponse(
   res: Response,
   attempt: ResolvedAttempt,
   retryAfterMs: number | null,
+  h?: Pick<CandidateRunnerHandlers, "catalogStale">,
 ): Promise<InspectedCandidateResponse> {
   const propagatedFailure = postHeaderBodyFailure(res);
   if (propagatedFailure) return propagatedFailure;
@@ -1939,7 +1989,7 @@ export async function inspectCandidateResponse(
   observeMaxOutput(status, attempt.target, body);
   observeRateLimit(attempt, status, body);
   const eligibility = carriesEligibilityFact(status) && body
-    ? observeEligibility(attempt, status, retryAfterMs, body)
+    ? observeEligibility(attempt, status, retryAfterMs, body, h)
     : { unknown: false };
   return {
     kind: "response",

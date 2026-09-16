@@ -374,6 +374,8 @@ export interface Handlers {
   hedgeDelay: (attempt: ResolvedAttempt, estimatedInputTokens: number) => HedgeDelayDecision | null;
   hedgeMaxInFlight: number;
   costClassOf: CostClassFn;
+  /** See `CandidateRunnerHandlers.catalogStale` — wired to `ModelCatalog.noteProviderStale`. */
+  catalogStale: (attempt: ResolvedAttempt) => void;
   hardCap: (attempt: ResolvedAttempt, now: number) => HardCapVerdict | null;
   /** Optional shutdown callback — called by POST /stop after responding 202. */
   onStop?: () => void;
@@ -825,6 +827,34 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       return undefined;
     }
   };
+  /**
+   * A 404 stating that a model does not exist is evidence the provider's ROSTER moved, so re-fetch
+   * it rather than waiting out the TTL (`ModelCatalog.noteProviderStale`).
+   *
+   * The containment lives here, where the catalog is: the model must be one the relay CURRENTLY
+   * LISTS for that provider. A 404 for a model the catalog never listed (a caller naming something
+   * that never existed, a typed id, another provider's SKU) contradicts no roster and there is
+   * nothing to refresh — re-fetching on it would let a single client drive a provider's `/models`
+   * endpoint with requests that are simply wrong. `cachedModels` is synchronous and cache-only, so
+   * this costs no network I/O and never blocks the failing request it is riding on.
+   *
+   * The provider CONFIG is read through the same map `resolveTargets` used, and a provider that
+   * vanished from it resolves to nothing — a refresh for it would be a fetch the config no longer
+   * describes, so it is skipped rather than attempted with a synthesized target.
+   */
+  const catalogStale = (attempt: ResolvedAttempt): void => {
+    try {
+      const t = attempt.target;
+      if (t.kind !== "openai" || !t.model) return;
+      const provider = cfg.providers[t.provider];
+      if (!provider || provider.kind !== "openai") return;
+      if (!catalog.cachedModels(t.provider).includes(t.model)) return;
+      catalog.noteProviderStale(t.provider, provider);
+    } catch {
+      // A catalog hint must never fail a request — same contract as every other best-effort
+      // observer on this path.
+    }
+  };
   // routing.probation (owner direction 2026-09-09): an untested FREE deployment leads its pool
   // so the relay gathers data on it. `readRequestSamples` is `countRequestSamples` from
   // `ping/probe-cache.ts` bound with no explicit path — the real, default probe cache, same
@@ -967,6 +997,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       latencyDemotion,
       probation,
       pacing,
+      catalogStale,
       hedgeDelay,
       hedgeMaxInFlight: hedgeSettings.enabled ? 2 : 1,
       costClassOf,

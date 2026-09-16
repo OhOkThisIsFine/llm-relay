@@ -9,15 +9,6 @@
 
 ## Open
 
-- **The model catalog refreshes on a clock, not on evidence that it is stale (2026-09-10, owner
-  direction, medium).** Owner, 2026-09-10: *"The relay is supposed to be keeping metadata about
-  providers and models up to date, with regular sampling; if we get a hint that our model catalog
-  might be stale, we update it."* A refusal that says a listed model does not exist (a 404 on a
-  model the catalog lists) is today only a signature for the eligibility queue, while the catalog
-  waits for its TTL. **Property:** such a refusal triggers a catalog refresh for that provider at
-  once, bounded so that a burst of refusals costs one refresh, and dynamic pool membership follows
-  the refreshed list.
-
 - **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
   (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
   tests in `test/backend-responses-upstream.test.ts`). Everything this entry asked for except a

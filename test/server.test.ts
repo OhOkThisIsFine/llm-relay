@@ -1827,6 +1827,168 @@ describe("eligibility → untilBasis wiring", () => {
 });
 
 /**
+ * The backlog property: "the model catalog refreshes on a clock, not on evidence that it is
+ * stale" — a 404 stating that a model this catalog LISTS does not exist re-fetches that provider's
+ * roster at once, bounded so a burst costs one refresh.
+ *
+ * The CATALOG's half of this (the re-fetch, the cooldown, fail-open) is pinned in
+ * `test/catalog.test.ts`. What is pinned HERE is the half that decides WHETHER to call it: which
+ * refusals qualify, and the containment "on a model the catalog currently lists".
+ *
+ * Hermeticity: the mock backend serves BOTH the refusal (any path) and the `/models` roster, so a
+ * refresh is a real HTTP round-trip to a loopback listener this file owns and counts. `up` must be
+ * `kind: "openai"` for the catalog to have a roster at all — an anthropic-kind provider's `fetch`
+ * returns an empty list by construction, and a test built on one would assert "no refresh" for a
+ * reason that has nothing to do with what it means to test.
+ */
+describe("catalog staleness trigger on a stated model absence", () => {
+  let dir: string;
+  beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "rp-catstale-")); });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    resetFacts();
+    resetInterpretations();
+  });
+  afterEach(() => {
+    resetFacts();
+    resetInterpretations();
+  });
+
+  /**
+   * Boot a backend that answers `/models` with `roster` and every other path with `refusal`, then a
+   * proxy routing `up/m` at it. Returns the proxy port and a counter for `/models` hits — the
+   * observable the property is stated in.
+   */
+  async function bootStale(
+    refusal: { status: number; body: string },
+    roster: string[],
+  ): Promise<{ p: number; modelsHits: () => number }> {
+    let hits = 0;
+    const backend = await new Promise<Server>((resolve) => {
+      const s = createServer((req, res) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          if ((req.url ?? "").endsWith("/models")) {
+            hits++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ data: roster.map((id) => ({ id })) }));
+            return;
+          }
+          res.writeHead(refusal.status, { "content-type": "application/json" });
+          res.end(refusal.body);
+        });
+      });
+      s.listen(0, "127.0.0.1", () => resolve(track(s)));
+    });
+    const base = `http://127.0.0.1:${port(backend)}`;
+    // `catalogWithLimits` seeds `models` from the seed's key list, so the roster the relay holds is
+    // exactly `roster` without any fetch having to succeed first.
+    const catalog = catalogWithLimits(dir, { up: Object.fromEntries(roster.map((m) => [m, {}])) });
+    const cfg: Config = {
+      host: "127.0.0.1", port: 0,
+      providers: { up: { base, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
+      routing: { default: "up/m", tiers: {} },
+      mode: "detect",
+      repair: { maxAttempts: 1, destructiveTools: [] },
+      log: { level: "silent", file: null },
+    };
+    return { p: port(await startProxy(cfg, { catalog })), modelsHits: () => hits };
+  }
+
+  const body = (model: string) =>
+    JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] });
+
+  it("re-fetches the provider's roster when a 404 states a LISTED model does not exist", async () => {
+    const { p, modelsHits } = await bootStale(
+      { status: 404, body: JSON.stringify({ error: { message: "The requested model 'm' does not exist." } }) },
+      ["m", "other"],
+    );
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+    });
+    expect(resp.status).toBe(404);
+    // The refresh is fire-and-forget, so let its round-trip settle before reading the counter.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(modelsHits()).toBe(1);
+  });
+
+  it("costs ONE re-fetch for a burst of such refusals inside the cooldown", async () => {
+    const { p, modelsHits } = await bootStale(
+      { status: 404, body: JSON.stringify({ error: { message: "model_not_found" } }) },
+      ["m"],
+    );
+    for (let i = 0; i < 4; i++) {
+      const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+      });
+      expect(resp.status).toBe(404);
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    expect(modelsHits()).toBe(1);
+  });
+
+  it("does NOT re-fetch for a 404 on a model the catalog does not list", async () => {
+    // Containment, not classification: the wording and status qualify, but the provider never
+    // claimed to serve this model, so no roster has been contradicted. A caller naming a typo must
+    // not be able to drive a provider's `/models` endpoint.
+    const { p, modelsHits } = await bootStale(
+      { status: 404, body: JSON.stringify({ error: { message: "The requested model 'nope' does not exist." } }) },
+      ["m"],
+    );
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: body("up/nope"),
+    });
+    expect(resp.status).toBe(404);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(modelsHits()).toBe(0);
+  });
+
+  it("does NOT re-fetch for a 429, a 401/403, or a 5xx — none of them says a model is gone", async () => {
+    // The negative controls the property is stated against.
+    //
+    // ⚠ EVERY body here carries model-absence WORDING on purpose. A control whose message could not
+    // match the pattern anyway proves nothing about the status gate — it passes with the gate
+    // removed, which is exactly what a first draft of these tests did. Putting the same wording on
+    // statuses that are not a 404 isolates the one thing under test: that the STATUS is what makes
+    // a model's absence evidence about a roster, and the phrase alone is not.
+    const absence = "the requested model does not exist";
+    const cases: Array<{ status: number; message: string }> = [
+      { status: 429, message: `rate limit reached: ${absence}` },
+      { status: 403, message: `invalid api key: ${absence}` },
+      { status: 400, message: `invalid request: ${absence}` },
+      { status: 500, message: `upstream error: ${absence}` },
+    ];
+    for (const c of cases) {
+      const { p, modelsHits } = await bootStale(
+        { status: c.status, body: JSON.stringify({ error: { message: c.message } }) },
+        ["m"],
+      );
+      const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+      });
+      expect(resp.status, `status ${c.status}`).toBe(c.status);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(modelsHits(), `status ${c.status}`).toBe(0);
+    }
+  });
+
+  it("does NOT re-fetch when a LISTED model's 404 states something else entirely", async () => {
+    // A 404 with wording outside the absence family — a wrong path, a policy refusal, a provider
+    // quirk. The status alone is not the signal; the provider must STATE the model is gone.
+    const { p, modelsHits } = await bootStale(
+      { status: 404, body: JSON.stringify({ error: { message: "the requested endpoint is not available on this plan" } }) },
+      ["m"],
+    );
+    const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+    });
+    expect(resp.status).toBe(404);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(modelsHits()).toBe(0);
+  });
+});
+
+/**
  * Regression: observeEligibility called twice for terminal buffered 4xx on Anthropic front.
  *
  * The bug: a terminal buffered 4xx (single-candidate walk, or the last candidate's response)
