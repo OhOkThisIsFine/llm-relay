@@ -31,7 +31,7 @@ import {
 import { observeUsage, type UsageAccumulator } from "./usage-observer.js";
 import { createSseTransformStream, parseSseEvent, BufferedSseFrames } from "./sse-frames.js";
 import { syntheticMessageId } from "./emitSse.js";
-import type { ThoughtSignatureMode, ToolCallIdMode } from "./config-types.js";
+import type { ReasoningMode, ThoughtSignatureMode, ToolCallIdMode } from "./config-types.js";
 
 /**
  * A tool-call envelope was present in the response text but could not be parsed — truncated, or a
@@ -344,6 +344,156 @@ export const TOOL_CALL_IDS_HEADER = "x-llm-relay-tool-call-ids";
 export const DEEPSEEK_THINKING_HEADER = "x-llm-relay-thinking-disabled";
 
 /**
+ * ============================================================================================
+ * The RESPONSE-direction half of `compat.reasoning: "deepseek"` (F11's missing other end).
+ * ============================================================================================
+ *
+ * `openai-request.ts` carries a REPLAYED `thinking` block onto DeepSeek's outbound
+ * `reasoning_content`, and turns thinking off for a replay that has none — that closes the HTTP
+ * 400. But llm-bridge's response translation never reads the field in the other direction: its
+ * `openaiToUniversal` (buffered) and `parseOpenAIStream` (streamed) consult only `content` and
+ * `tool_calls` on a message/delta, and a grep for `reasoning_content` across the published bundle
+ * returns nothing at all. So a caller never received DeepSeek's own reasoning, had nothing to
+ * replay on the next turn, and `openai-request.ts`'s F11 override turned thinking OFF for every
+ * tool-call turn after the first — a multi-turn DeepSeek lane silently ran without reasoning.
+ *
+ * The fix is the established one for an llm-bridge gap (the `openai-request.ts` precedent): the
+ * RELAY injects the field at a named seam and never modifies the dependency. Each direction has
+ * its own native block to build —
+ *
+ *   - Anthropic front (`/v1/messages`): a `thinking` content block. The whole downstream pipeline
+ *     already models these (`stream-commit.ts` counts a `thinking` block's text as READY,
+ *     `emitSse.ts` echoes the whole block opaquely, `sse.ts` rebuilds it, `openai-request.ts`
+ *     replays it), so nothing downstream needed changing.
+ *   - OpenAI Responses front (`/v1/responses`): a `reasoning` output item, which is what
+ *     `responses-request.ts` reads back on the next turn (its `summary_text` parts become a
+ *     leading `thinking` block, F11).
+ *
+ * ⚠ Gated on the RESOLVED `ReasoningMode` and nothing else. Every other target's response bytes —
+ * buffered and streamed, both fronts — are the pre-2026-09-15 document exactly. That is the same
+ * "handed a mode, never a provider identity to sniff" rule the request direction states.
+ *
+ * ⚠ A `signature` is deliberately NOT invented. Anthropic's own thinking blocks carry one, and
+ * `emitSse.ts` preserves it when a backend supplied it, but DeepSeek states no signature and
+ * fabricating one would be the invented measurement this repo's provenance invariant forbids. The
+ * block is replayed to DeepSeek as `reasoning_content` — text only — so nothing needs it.
+ */
+function deepSeekReasoningText(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * The Anthropic `thinking` block for a DeepSeek answer's `reasoning_content`, or null when there
+ * is nothing to carry (a non-`"deepseek"` target, an absent field, or an empty string — never a
+ * fabricated empty block).
+ */
+function deepSeekThinkingBlock(
+  reasoningContent: unknown,
+  mode: ReasoningMode | undefined,
+): { type: "thinking"; thinking: string } | null {
+  if (mode !== "deepseek") return null;
+  const text = deepSeekReasoningText(reasoningContent);
+  return text === null ? null : { type: "thinking", thinking: text };
+}
+
+/**
+ * The marker a DeepSeek reasoning delta is rewritten to carry, so the field survives llm-bridge's
+ * parser and can be turned back into a `thinking` delta one layer later.
+ *
+ * ⚠ A NUL byte, deliberately: it cannot appear in model-authored text, and a provider that emitted
+ * one at all would have to escape it in the JSON — which `JSON.stringify` re-emits verbatim on the
+ * way back out, so this rewrite cannot manufacture a false positive out of ordinary prose. A
+ * printable marker would be a string a model could legitimately emit and have silently
+ * reinterpreted as its own reasoning.
+ */
+const DEEPSEEK_REASONING_SENTINEL = " llm-relay-reasoning ";
+
+/**
+ * Rewrite one RAW Chat SSE frame so DeepSeek's `reasoning_content` survives llm-bridge's parser.
+ *
+ * llm-bridge's `parseOpenAIStream` reads only `delta.content` and `delta.tool_calls`, so a
+ * reasoning delta becomes NOTHING and there is no later layer to recover it from — the `transform`
+ * hook `handleUniversalStreamRequest` accepts is downstream of the drop. This rewrite moves the
+ * field to where the parser DOES look: the reasoning text is prepended to `delta.content` behind
+ * the sentinel, and `reasoning_content` itself is left in place (untouched and therefore still
+ * honest on the wire this frame describes — only the parser's view of `content` is redirected).
+ *
+ * ⚠ Content that is not a string (null is what DeepSeek sends alongside reasoning, and an array is
+ * legal for some hosts) is REPLACED, not merged: there is no text to prepend to, and dropping a
+ * structured content array into a string would corrupt it. Such a frame carries no answer text by
+ * construction — the reasoning and the answer never share a frame — so nothing is lost.
+ *
+ * Every other frame is returned byte-for-byte unchanged, and the caller only invokes this at all
+ * under a RESOLVED `"deepseek"` mode.
+ */
+function rewriteChatFrameForReasoning(frame: string): string {
+  const event = parseSseEvent(frame);
+  const data = event?.data;
+  if (!data) return frame;
+  const choice = Array.isArray(data.choices) ? data.choices[0] : undefined;
+  if (!isRecord(choice) || !isRecord(choice.delta)) return frame;
+  const reasoning = deepSeekReasoningText(choice.delta.reasoning_content);
+  if (reasoning === null) return frame;
+  const text = typeof choice.delta.content === "string" ? choice.delta.content : "";
+  const rewritten = {
+    ...data,
+    choices: [
+      { ...choice, delta: { ...choice.delta, content: `${DEEPSEEK_REASONING_SENTINEL}${reasoning}${text}` } },
+      ...(data.choices as unknown[]).slice(1),
+    ],
+  };
+  // Re-emitted on the SAME `data:` line shape the parser reads. Only the fields this rewrite
+  // touched are rebuilt; the rest of the frame's JSON is carried through by the spread.
+  return frame.replace(/^(data:\s*)[\s\S]*$/m, `$1${JSON.stringify(rewritten)}`);
+}
+
+/**
+ * Turn the sentinel-prefixed `content_delta` back into a `thinking` delta, passing everything else
+ * through untouched.
+ *
+ * This is the `transform` `handleUniversalStreamRequest` accepts, and it is what makes the ordering
+ * exact: llm-bridge preserves event order, so a reasoning delta lands in the Anthropic stream at
+ * the position its frame occupied — including a reasoning frame that arrives BETWEEN answer
+ * chunks, which DeepSeek's own captures show it can. llm-bridge's own `emitAnthropicStream` then
+ * does the block bookkeeping (opening a `thinking` block, closing the text block before it,
+ * emitting `thinking_delta` frames), so no Anthropic SSE is hand-built here.
+ */
+async function* deepSeekReasoningTransform(
+  events: AsyncIterable<{ type: string; delta?: Record<string, unknown>; [k: string]: unknown }>,
+): AsyncGenerator<{ type: string; delta?: Record<string, unknown>; [k: string]: unknown }> {
+  for await (const event of events) {
+    const text = event.type === "content_delta" ? event.delta?.text : undefined;
+    if (typeof text === "string" && text.startsWith(DEEPSEEK_REASONING_SENTINEL)) {
+      yield { type: "content_delta", delta: { thinking: text.slice(DEEPSEEK_REASONING_SENTINEL.length) } };
+    } else {
+      yield event;
+    }
+  }
+}
+
+/**
+ * The RAW Chat SSE of a `"deepseek"` target, with every reasoning frame rewritten through
+ * `rewriteChatFrameForReasoning` and every other frame passed through byte-for-byte.
+ *
+ * Frame-framed rather than string-replaced on purpose: a `data:` payload is JSON that may legally
+ * contain the substring `reasoning_content` inside a model's own answer text, and only a parsed
+ * frame can tell the field from the prose. The rewrite is a no-op — and this stream a pass-through
+ * that touches no bytes — when the target sent no reasoning at all.
+ */
+function deepSeekReasoningFrames(
+  upstream: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  return createSseTransformStream(upstream, ({ push, frames }) => ({
+    processFrames: () => {
+      for (const { frame, raw, separator } of frames) {
+        const rewritten = rewriteChatFrameForReasoning(frame);
+        push(rewritten === frame ? raw : `${rewritten}${separator}`);
+      }
+    },
+  }));
+}
+
+/**
  * The provider's `Retry-After` in milliseconds, or null.
  *
  * Accepts both RFC 9110 forms — delta-seconds and an HTTP-date — because providers use both
@@ -649,7 +799,19 @@ async function fetchOpenAiBackend(
       }, "invalid_upstream_envelope");
     }
     try {
-      const anthStream = handleUniversalStreamRequest(preflight.body, "openai", "anthropic");
+      // A "deepseek" target gets its reasoning carried through: llm-bridge's parser reads only
+      // `content`/`tool_calls` and would drop `reasoning_content` outright, so the relay rewrites
+      // the RAW frames to smuggle it past the parser and turns it back into `thinking` deltas one
+      // layer up — see `deepSeekReasoningFrames`. Every other target takes the plain call below,
+      // byte for byte, with no extra stream in the path.
+      const anthStream = target.reasoning === "deepseek"
+        ? handleUniversalStreamRequest(
+          deepSeekReasoningFrames(preflight.body),
+          "openai",
+          "anthropic",
+          deepSeekReasoningTransform as never,
+        )
+        : handleUniversalStreamRequest(preflight.body, "openai", "anthropic");
       // Strip a complete message-opening think block BEFORE dialect scanning. Otherwise the
       // preamble can hide a tool envelope from recovery. Native Anthropic streams never enter
       // this branch, and direct OpenAI Chat passthrough is handled on the other front.
@@ -722,7 +884,13 @@ async function fetchOpenAiBackend(
   let anthropicJson: object;
   try {
     const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
-    anthropicJson = openAiResponseToAnthropic(upstreamJson as Record<string, unknown>, target.model ?? "", schemas, args.isDestructive);
+    anthropicJson = openAiResponseToAnthropic(
+      upstreamJson as Record<string, unknown>,
+      target.model ?? "",
+      schemas,
+      args.isDestructive,
+      target.reasoning,
+    );
   } catch (e) {
     if (e instanceof DialectUnparseableError) {
       // NOT a mapper defect — the translation is fine and the HOST returned an unusable body. It
@@ -1137,10 +1305,12 @@ export function anthropicRequestToOpenAiResponses(
 // ---------------------------------------------------------------------------------------------
 
 interface ParsedResponsesOutput {
-  /** `message`/`refusal` output text, concatenated in order (reasoning items dropped). */
+  /** `message`/`refusal` output text, concatenated in order. */
   text: string;
   /** Native `function_call` output items, in order. */
   functionCalls: Array<{ id: string; name: string; input: unknown }>;
+  /** `reasoning` items' `summary_text` parts, joined; empty when the response carried none. */
+  reasoning: string;
 }
 
 /** One `function_call` output item -> its id/name/parsed-arguments triple. */
@@ -1177,14 +1347,22 @@ function parseResponsesMessageOutputItem(raw: Record<string, unknown>): string[]
 }
 
 /**
- * Walk a Responses `output[]` array into text + native tool calls. `reasoning` items and any
- * other item kind this relay does not model are DROPPED — the same rule the request-direction
- * mapper applies to `thinking`/`redacted_thinking`: no representation, no invented one.
+ * Walk a Responses `output[]` array into text + native tool calls. Any item kind this relay does
+ * not model is DROPPED — the same rule the request-direction mapper applies to
+ * `thinking`/`redacted_thinking`: no representation, no invented one.
+ *
+ * ⚠ A `reasoning` item is no longer dropped: its `summary_text` parts are collected so
+ * `openAiResponsesToAnthropicMessage` can hand them to the caller as a `thinking` block, which is
+ * the response-direction end of the `"deepseek"` seam (see the module note above). It is a
+ * MEASUREMENT carried through, never an inference — an item with no summary text contributes an
+ * empty string and the caller emits no block at all, which is the request direction's rule facing
+ * the other way (`openaiResponsesRequestToAnthropic` fabricates nothing either).
  */
 function parseOpenAiResponsesOutput(j: Record<string, unknown>): ParsedResponsesOutput {
   const outputs = Array.isArray(j.output) ? j.output : [];
   const textParts: string[] = [];
   const functionCalls: Array<{ id: string; name: string; input: unknown }> = [];
+  const reasoningParts: string[] = [];
   for (const raw of outputs) {
     if (!isRecord(raw)) continue;
     const type = typeof raw.type === "string" ? raw.type : "";
@@ -1192,10 +1370,27 @@ function parseOpenAiResponsesOutput(j: Record<string, unknown>): ParsedResponses
       functionCalls.push(parseResponsesFunctionCallOutputItem(raw, functionCalls.length));
     } else if (type === "message") {
       textParts.push(...parseResponsesMessageOutputItem(raw));
+    } else if (type === "reasoning") {
+      reasoningParts.push(...parseResponsesReasoningSummary(raw));
     }
-    // "reasoning" and any other item kind: dropped.
   }
-  return { text: textParts.join(""), functionCalls };
+  return { text: textParts.join(""), functionCalls, reasoning: reasoningParts.join("\n\n") };
+}
+
+/**
+ * The `summary_text` parts of one Responses `reasoning` item, in order.
+ *
+ * ⚠ `summary` ONLY — `content` and `encrypted_content` are deliberately absent. The
+ * request-direction inverse (`responses-request.ts`) reads `summary_text` for the same reason and
+ * refuses the encrypted blob there; a caller's opaque ciphertext is not this relay's to re-emit as
+ * readable reasoning, and DeepSeek states its reasoning as plain text on the Chat wire anyway.
+ */
+function parseResponsesReasoningSummary(raw: Record<string, unknown>): string[] {
+  if (!Array.isArray(raw.summary)) return [];
+  return raw.summary
+    .filter((part): part is Record<string, unknown> => isRecord(part))
+    .filter((part) => part.type === "summary_text" && typeof part.text === "string" && part.text.length > 0)
+    .map((part) => part.text as string);
 }
 
 /**
@@ -1312,10 +1507,16 @@ function openAiResponsesToAnthropicMessage(
   model: string,
   schemas: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }> | undefined,
   isDestructive: (name: string) => boolean,
+  reasoning?: ReasoningMode | undefined,
 ): object {
   const parsed = parseOpenAiResponsesOutput(j);
   const content: object[] = [];
   let functionCalls = parsed.functionCalls;
+
+  // FIRST, ahead of the answer text and its tool calls: Anthropic's `thinking` blocks lead the
+  // turn they explain. Gated on the RESOLVED mode like every other half of this seam.
+  const reasoningBlock = deepSeekThinkingBlock(parsed.reasoning, reasoning);
+  if (reasoningBlock) content.push(reasoningBlock);
 
   if (functionCalls.length === 0 && parsed.text.length > 0) {
     const { recoveredCalls, textParts } = recoverOpenAiTextDialect(parsed.text, schemas, isDestructive);
@@ -1377,9 +1578,21 @@ interface ResponsesStreamState {
   toolBlocks: Map<number, number>;
   /** `output_index` -> Anthropic block indices opened for it, closed together on `output_item.done`. */
   openBlocksByItem: Map<number, number[]>;
+  /**
+   * `output_index` -> Anthropic block index, for a `reasoning` item's thinking block. Keyed like
+   * `toolBlocks` because a Responses reasoning item has exactly one summary stream, and closed
+   * through the same `openBlocksByItem` bookkeeping every other block uses.
+   */
+  reasoningBlocks: Map<number, number>;
+  /**
+   * The RESOLVED `compat.reasoning` mode, handed in from the target exactly as the request mapper
+   * receives it — never sniffed from a provider identity. Only `"deepseek"` opens a thinking block
+   * for a reasoning item; every other target's Anthropic stream is the pre-2026-09-15 bytes.
+   */
+  reasoning: ReasoningMode | undefined;
 }
 
-function newResponsesStreamState(): ResponsesStreamState {
+function newResponsesStreamState(reasoning?: ReasoningMode | undefined): ResponsesStreamState {
   return {
     messageStarted: false,
     messageStopped: false,
@@ -1387,6 +1600,8 @@ function newResponsesStreamState(): ResponsesStreamState {
     textBlocks: new Map(),
     toolBlocks: new Map(),
     openBlocksByItem: new Map(),
+    reasoningBlocks: new Map(),
+    reasoning,
   };
 }
 
@@ -1446,6 +1661,33 @@ function openResponsesToolBlock(
   push(anthropicSseEvent("content_block_start", {
     index, content_block: { type: "tool_use", id: callId, name, input: {} },
   }));
+  return index;
+}
+
+/**
+ * Open the Anthropic `thinking` block for a Responses `reasoning` item — the streamed sibling of
+ * `openAiResponsesToAnthropicMessage`'s leading thinking block, and the reason
+ * `deepSeekThinkingBlock` has a shared home rather than two copies.
+ *
+ * Nothing is pushed for an empty text: an item that states no summary opens no block, so a caller
+ * never receives an empty `thinking` block (the request direction's "never fabricate" rule).
+ */
+function openResponsesThinkingBlock(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  outputIndex: number,
+  text: string,
+): number {
+  if (state.reasoning !== "deepseek") return -1;
+  const existing = state.reasoningBlocks.get(outputIndex);
+  if (existing !== undefined) return existing;
+  const index = state.nextBlockIndex++;
+  state.reasoningBlocks.set(outputIndex, index);
+  state.openBlocksByItem.set(outputIndex, [index]);
+  push(anthropicSseEvent("content_block_start", { index, content_block: { type: "thinking", thinking: "" } }));
+  if (text.length > 0) {
+    push(anthropicSseEvent("content_block_delta", { index, delta: { type: "thinking_delta", thinking: text } }));
+  }
   return index;
 }
 
@@ -1521,8 +1763,31 @@ function synthesizeMissingResponsesBlocks(
     if (!isRecord(raw)) return;
     if (raw.type === "function_call") synthesizeResponsesFunctionCallBlock(state, push, outputIndex, raw);
     else if (raw.type === "message") synthesizeResponsesMessageBlocks(state, push, outputIndex, raw);
-    // "reasoning" and any other item kind: dropped, same rule as everywhere else in this module.
+    else if (raw.type === "reasoning") synthesizeResponsesReasoningBlock(state, push, outputIndex, raw);
+    // Any other item kind: dropped, same rule as everywhere else in this module.
   });
+}
+
+/**
+ * A `reasoning` output item whose summary the incremental events never announced — synthesized the
+ * same way `synthesizeResponsesMessageBlocks` is, from the item's own `summary_text` parts.
+ * Already-opened blocks are left untouched, so a fully-streamed reasoning item synthesizes nothing.
+ */
+function synthesizeResponsesReasoningBlock(
+  state: ResponsesStreamState,
+  push: (text: string) => void,
+  outputIndex: number,
+  item: Record<string, unknown>,
+): void {
+  if (state.reasoning !== "deepseek" || state.reasoningBlocks.has(outputIndex)) return;
+  const parts = Array.isArray(item.summary)
+    ? item.summary
+      .filter((part): part is Record<string, unknown> => isRecord(part))
+      .filter((part) => part.type === "summary_text" && typeof part.text === "string" && part.text.length > 0)
+      .map((part) => part.text as string)
+    : [];
+  if (parts.length === 0) return;
+  openResponsesThinkingBlock(state, push, outputIndex, parts.join("\n\n"));
 }
 
 function finishResponsesStream(
@@ -1588,6 +1853,28 @@ function handleResponsesToolArgumentsDelta(state: ResponsesStreamState, push: (t
   }
 }
 
+/**
+ * `response.reasoning_summary_text.delta` — the incremental form of a reasoning item's summary.
+ *
+ * A `reasoning` item is dropped by llm-bridge and by the relay's own Responses translator alike, so
+ * this handler is the streamed half of the DeepSeek seam. It routes through the SAME
+ * `openResponsesThinkingBlock` the completion-time synthesis uses, so a provider that streams its
+ * summary and one that only states it at `response.completed` produce one identical block.
+ */
+function handleResponsesReasoningDelta(state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>): void {
+  const outputIndex = typeof data.output_index === "number" ? data.output_index : -1;
+  const delta = typeof data.delta === "string" ? data.delta : "";
+  if (outputIndex < 0 || delta.length === 0) return;
+  // Checked BEFORE `ensureResponsesMessageStarted`: for every target but a `"deepseek"` one this
+  // event must leave zero bytes behind — not even an early `message_start` — so the stream stays
+  // the pre-2026-09-15 document.
+  if (state.reasoning !== "deepseek") return;
+  ensureResponsesMessageStarted(state, push, undefined);
+  const index = openResponsesThinkingBlock(state, push, outputIndex, "");
+  if (index < 0) return;
+  push(anthropicSseEvent("content_block_delta", { index, delta: { type: "thinking_delta", thinking: delta } }));
+}
+
 function handleResponsesOutputItemDone(state: ResponsesStreamState, push: (text: string) => void, data: Record<string, unknown>): void {
   const outputIndex = typeof data.output_index === "number" ? data.output_index : -1;
   if (outputIndex >= 0) closeResponsesItemBlocks(state, push, outputIndex);
@@ -1627,6 +1914,7 @@ const RESPONSES_STREAM_HANDLERS: Record<string, (state: ResponsesStreamState, pu
   "response.output_text.delta": handleResponsesTextDelta,
   "response.refusal.delta": handleResponsesTextDelta,
   "response.function_call_arguments.delta": handleResponsesToolArgumentsDelta,
+  "response.reasoning_summary_text.delta": handleResponsesReasoningDelta,
   "response.output_item.done": handleResponsesOutputItemDone,
   "response.completed": (state, push, data) => finishResponsesStream(state, push, isRecord(data.response) ? data.response : undefined),
   "response.incomplete": (state, push, data) => finishResponsesStream(state, push, isRecord(data.response) ? data.response : undefined),
@@ -1654,9 +1942,12 @@ function processResponsesStreamEvent(
  * policy below is this translator's own, the same division `stripThinkTagsInStream` and
  * `rewriteToolUseIdsInStream` already keep.
  */
-function translateResponsesStreamToAnthropic(upstream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+function translateResponsesStreamToAnthropic(
+  upstream: ReadableStream<Uint8Array>,
+  reasoning?: ReasoningMode | undefined,
+): ReadableStream<Uint8Array> {
   return createSseTransformStream(upstream, ({ push, frames }) => {
-    const state = newResponsesStreamState();
+    const state = newResponsesStreamState(reasoning);
     return {
       flushHeld: () => finishResponsesStream(state, push, undefined),
       processFrames: () => {
@@ -1745,6 +2036,7 @@ async function postResponsesRequest(
  */
 async function fetchResponsesStreamed(
   args: FetchBackendArgs,
+  target: ResolvedAttempt["target"],
   res: Response,
   toolCallIdsRewritten: number,
   sentinelsStamped: number,
@@ -1761,7 +2053,7 @@ async function fetchResponsesStreamed(
     }, "invalid_upstream_envelope");
   }
   try {
-    const anthStream = translateResponsesStreamToAnthropic(preflight.body);
+    const anthStream = translateResponsesStreamToAnthropic(preflight.body, target.reasoning);
     // Tee usage off THIS relay's own translated Anthropic-shaped bytes (protocol
     // "anthropic-messages", which `usage-observer.ts` already fully supports) rather than the raw
     // Responses bytes (no `"openai-responses"` `UsageProtocol` member exists, deliberately, per
@@ -1813,7 +2105,7 @@ function mapResponsesJsonToAnthropicOrError(
 ): { ok: true; message: object } | { ok: false; response: Response } {
   try {
     const schemas = toolSchemaMap(args.reqJson) as Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }>;
-    const message = openAiResponsesToAnthropicMessage(upstreamJson, target.model ?? "", schemas, args.isDestructive);
+    const message = openAiResponsesToAnthropicMessage(upstreamJson, target.model ?? "", schemas, args.isDestructive, target.reasoning);
     return { ok: true, message };
   } catch (e) {
     if (e instanceof DialectUnparseableError) {
@@ -1907,7 +2199,7 @@ async function fetchOpenAiResponsesBackend(
   if (!posted.ok) return posted.response;
 
   if (args.wantsStream) {
-    return fetchResponsesStreamed(args, posted.res, posted.toolCallIdsRewritten, posted.sentinelsStamped);
+    return fetchResponsesStreamed(args, attempt.target, posted.res, posted.toolCallIdsRewritten, posted.sentinelsStamped);
   }
   return fetchResponsesBuffered(args, attempt.target, posted.res, posted.toolCallIdsRewritten, posted.sentinelsStamped);
 }
@@ -2037,6 +2329,7 @@ export function openAiResponseToAnthropic(
   model: string,
   schemas: Map<string, { type?: unknown; properties?: Record<string, { type?: unknown }> }> | undefined,
   isDestructive: (name: string) => boolean,
+  reasoning?: ReasoningMode | undefined,
 ): object {
   const choice = (j.choices as Array<Record<string, unknown>> | undefined)?.[0] ?? {};
   const msg = (choice.message as Record<string, unknown> | undefined) ?? {};
@@ -2045,6 +2338,13 @@ export function openAiResponseToAnthropic(
   // This mapper is the translated OpenAI→Anthropic seam. Strip first so an opening think block
   // cannot conceal a following dialect envelope from the recovery pass below.
   const messageText = typeof msg.content === "string" ? stripOpeningThinkTag(msg.content) : null;
+
+  // FIRST, ahead of the answer text and any `tool_use`: Anthropic's `thinking` blocks lead the
+  // assistant turn they explain, and the request-direction inverse (`openai-request.ts`
+  // `assistantMessage`) reads them back from wherever they appear. Dropped unchanged for every
+  // target but a `"deepseek"` one — see `deepSeekThinkingBlock`.
+  const reasoningBlock = deepSeekThinkingBlock(msg.reasoning_content, reasoning);
+  if (reasoningBlock) content.push(reasoningBlock);
 
   // Recover ONLY when the host parsed nothing. A host that populated `tool_calls` has already
   // spoken; second-guessing it here would be inference, not translation.
@@ -2189,12 +2489,21 @@ function nativeResponseIsStreamed(response: Response, wantsStream: boolean): boo
 interface ExtractedAnthropicBlocks {
   text: string;
   toolCalls: Array<Record<string, unknown>>;
+  /**
+   * Every `thinking` block's own text, joined — the response-direction sibling of
+   * `openai-request.ts` `assistantMessage`'s `thinkingParts`, read by `formatOpenAiResponses` to
+   * rebuild a `reasoning` item for a Responses caller (see the DeepSeek response seam note above).
+   * A `redacted_thinking` block contributes nothing: its `data` is Anthropic's own encrypted blob,
+   * meaningless to another vendor, exactly as the request direction states.
+   */
+  thinking: string;
 }
 
 function extractAnthropicMessageBlocks(content: unknown): ExtractedAnthropicBlocks {
   const contentArray = Array.isArray(content) ? content : [];
   const textParts: string[] = [];
   const toolCalls: Array<Record<string, unknown>> = [];
+  const thinkingParts: string[] = [];
 
   for (const raw of contentArray) {
     if (!isRecord(raw)) continue;
@@ -2210,10 +2519,12 @@ function extractAnthropicMessageBlocks(content: unknown): ExtractedAnthropicBloc
           arguments: typeof input === "string" ? input : JSON.stringify(input),
         },
       });
+    } else if (raw.type === "thinking" && typeof raw.thinking === "string" && raw.thinking.length > 0) {
+      thinkingParts.push(raw.thinking);
     }
   }
 
-  return { text: textParts.join(""), toolCalls };
+  return { text: textParts.join(""), toolCalls, thinking: thinkingParts.join("\n\n") };
 }
 
 function formatOpenAiChatCompletion(
@@ -2258,10 +2569,23 @@ function formatOpenAiResponses(
   toolCalls: Array<Record<string, unknown>>,
   model: string,
   usage: ReturnType<typeof openAiUsage>,
+  thinking = "",
 ): Record<string, unknown> {
   const capped = body.stop_reason === "max_tokens";
   const itemStatus = capped ? "incomplete" : "completed";
   const output: Array<Record<string, unknown>> = [];
+  // FIRST, ahead of the message and its function calls: a Responses `reasoning` item describes the
+  // turn that follows it, and `responses-request.ts` reads it back that way (a `summary_text` part
+  // becomes a LEADING `thinking` block). Dropped entirely when empty, never emitted as an empty
+  // item — the same "never fabricate" rule the request direction states for a missing summary.
+  if (thinking.length > 0) {
+    output.push({
+      type: "reasoning",
+      id: `rs_${typeof body.id === "string" ? body.id : "relay"}`,
+      status: itemStatus,
+      summary: [{ type: "summary_text", text: thinking }],
+    });
+  }
   if (text) {
     output.push({
       type: "message",
@@ -2308,15 +2632,27 @@ export function anthropicMessageToOpenAi(
   body: Record<string, unknown>,
   protocol: OpenAiFrontProtocol,
   fallbackModel = "",
+  /**
+   * The RESOLVED `compat.reasoning` mode of the target that answered, handed in exactly as the
+   * request mapper receives it — never sniffed from a provider identity. ONLY `"deepseek"` lets a
+   * `thinking` block ride the Responses envelope as a `reasoning` item (the response-direction end
+   * of that seam); every other target's bytes are the pre-2026-09-15 document, thinking dropped as
+   * before. Absent ⇒ `"none"` ⇒ dropped, so the existing three-argument callers are unchanged.
+   */
+  reasoning?: ReasoningMode | undefined,
 ): Record<string, unknown> {
-  const { text, toolCalls } = extractAnthropicMessageBlocks(body.content);
+  const { text, toolCalls, thinking } = extractAnthropicMessageBlocks(body.content);
   const model = typeof body.model === "string" && body.model ? body.model : fallbackModel;
   const usage = openAiUsage(body.usage);
 
+  // `thinking` rides ONLY the Responses envelope. Chat Completions has no reasoning field this
+  // relay may write (DeepSeek's `reasoning_content` is the vendor's own extension and a caller's
+  // own body is never rewritten — see `compat`'s authored-bodies SCOPE note), so a Chat caller
+  // gets exactly the pre-existing bytes.
   if (protocol === "chat") {
     return formatOpenAiChatCompletion(body, text, toolCalls, model, usage);
   }
-  return formatOpenAiResponses(body, text, toolCalls, model, usage);
+  return formatOpenAiResponses(body, text, toolCalls, model, usage, reasoning === "deepseek" ? thinking : "");
 }
 
 /**
@@ -2751,6 +3087,117 @@ function markResponsesIncompleteOnMaxTokens(
   }));
 }
 
+/**
+ * Lift every `thinking` content block OUT of an Anthropic SSE stream, collecting its text.
+ *
+ * The Responses FRONT's streamed lane runs through llm-bridge's Anthropic→Responses emitter, and
+ * that emitter has no `thinking` representation: it funnels a thinking block's deltas into the
+ * SAME `output_text` item as the answer, so DeepSeek's reasoning arrives at a Codex caller fused
+ * into the visible reply (`"deep thought" + "hi"` → `"deep thoughthi"`, measured 2026-09-15 against
+ * llm-bridge 2.0.1). That is not a formatting wrinkle — it puts chain-of-thought in the answer.
+ *
+ * So the block is removed before llm-bridge sees it and re-emitted as a native `reasoning` output
+ * item by `emitResponsesReasoningItem` below, which is where a Responses caller reads it (and what
+ * `responses-request.ts` turns back into a leading `thinking` block on the next turn).
+ *
+ * ⚠ Frame-framed and index-preserving: only `content_block_start`/`delta`/`stop` frames whose
+ * block is a thinking one are swallowed, and the surrounding frames keep their own indices, so
+ * every other block's numbering is exactly what llm-bridge would have produced.
+ */
+function liftThinkingFromAnthropicStream(
+  source: ReadableStream<Uint8Array>,
+  onThinking: (text: string) => void,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const frames = new BufferedSseFrames();
+  // Anthropic content-block indices currently open as a thinking block.
+  const thinkingBlocks = new Map<number, string>();
+  return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      frames.append(decoder.decode(chunk, { stream: true }));
+      for (const { frame, raw } of frames) {
+        const ev = parseSseEvent(frame);
+        const data = ev && isRecord(ev.data) ? ev.data : null;
+        const index = data && typeof data.index === "number" ? data.index : -1;
+        if (ev?.type === "content_block_start" && isRecord(data?.content_block) && data.content_block.type === "thinking") {
+          const text = typeof data.content_block.thinking === "string" ? data.content_block.thinking : "";
+          thinkingBlocks.set(index, text);
+          continue;
+        }
+        if (ev?.type === "content_block_delta" && thinkingBlocks.has(index)) {
+          const delta = isRecord(data?.delta) ? data.delta : {};
+          if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+            thinkingBlocks.set(index, (thinkingBlocks.get(index) ?? "") + delta.thinking);
+          }
+          continue;
+        }
+        if (ev?.type === "content_block_stop" && thinkingBlocks.has(index)) {
+          const text = thinkingBlocks.get(index) ?? "";
+          thinkingBlocks.delete(index);
+          if (text.length > 0) onThinking(text);
+          continue;
+        }
+        controller.enqueue(new TextEncoder().encode(raw));
+      }
+    },
+  }));
+}
+
+/**
+ * Announce a `reasoning` output item at the head of a Responses stream, from text
+ * `liftThinkingFromAnthropicStream` collected — the Responses-front sibling of the buffered
+ * `formatOpenAiResponses` reasoning item, and emitted for the same reason: a Codex caller replays
+ * it as a `reasoning` item, which `responses-request.ts` reads back as a leading `thinking` block.
+ *
+ * Written BEFORE the first content-bearing frame llm-bridge emits, so the item precedes the answer
+ * it explains (Responses orders reasoning ahead of the message it belongs to). `response.created`
+ * is the natural anchor — it is the first frame of every stream and carries no output indices yet.
+ * A stream that never reaches it falls back to the first frame seen, so the item is still ahead of
+ * anything with an `output_index`.
+ *
+ * ⚠ Nothing is emitted when no reasoning was collected, so a target that sent none produces the
+ * byte-for-byte pre-existing stream.
+ */
+function emitResponsesReasoningItem(
+  source: ReadableStream<Uint8Array>,
+  thinking: { text: string },
+): ReadableStream<Uint8Array> {
+  let emitted = false;
+  const frame = (): string => responsesSseEvent("response.output_item.done", {
+    output_index: -1,
+    item: {
+      type: "reasoning",
+      id: "rs_relay",
+      status: "completed",
+      summary: [{ type: "summary_text", text: thinking.text }],
+    },
+  });
+  return createSseTransformStream(source, ({ push, frames }) => ({
+    processFrames: () => {
+      for (const { frame: rawFrame, raw } of frames) {
+        if (!emitted && thinking.text.length > 0) {
+          const ev = parseSseEvent(rawFrame);
+          if (ev?.type === "response.created" || ev?.type === "response.in_progress") {
+            push(raw);
+            push(frame());
+            emitted = true;
+            continue;
+          }
+        }
+        push(raw);
+      }
+    },
+    // A stream that ended without a reasoning item announced still owes the caller its reasoning —
+    // nothing has been sent yet at this point only if the whole stream was reasoning.
+    flushHeld: () => {
+      if (!emitted && thinking.text.length > 0) {
+        push(frame());
+        emitted = true;
+      }
+    },
+  }));
+}
+
 async function fetchTranslatedOpenAiFront(
   attempt: ResolvedAttempt,
   args: FetchOpenAiFrontArgs,
@@ -2863,11 +3310,24 @@ async function fetchTranslatedOpenAiFront(
       // Responses-only: the Chat protocol already carries `finish_reason: "length"` correctly
       // (`openAiFinishReason`, the buffered path's sibling), so there is nothing to announce there.
       const stopReason: { value: string | null } = { value: null };
+      // A `"deepseek"` target's reasoning must be LIFTED OUT before llm-bridge sees it: its
+      // Anthropic→Responses emitter has no thinking representation and folds a thinking block's
+      // deltas into the answer text, so a streamed reasoning block would reach the caller fused
+      // into its reply. Every other target takes the untouched source (see
+      // `liftThinkingFromAnthropicStream`).
+      const carryReasoning = protocol === "responses" && target.reasoning === "deepseek";
+      const lifted = { text: "" };
       const anthropicSource = protocol === "responses"
-        ? tapAnthropicStopReason(preflight.body, (r) => { stopReason.value = r; })
+        ? tapAnthropicStopReason(
+          carryReasoning
+            ? liftThinkingFromAnthropicStream(preflight.body, (t) => { lifted.text += t; })
+            : preflight.body,
+          (r) => { stopReason.value = r; },
+        )
         : preflight.body;
       let output = handleUniversalStreamRequest(anthropicSource, "anthropic", targetProtocol);
       if (protocol === "responses") output = markResponsesIncompleteOnMaxTokens(output, stopReason);
+      if (carryReasoning) output = emitResponsesReasoningItem(output, lifted);
       // Same rule as the buffered rebuild below: rebuilding the response must not swallow the
       // announcement of a fix the relay applied one Response ago.
       const rewritten = backendRes.headers.get(TOOL_CALL_IDS_HEADER);
@@ -2926,7 +3386,11 @@ async function fetchTranslatedOpenAiFront(
     const minted = backendRes.headers.get(TOOL_USE_IDS_HEADER);
     // …and the outbound-id rewrite the same request mapper applied on the way IN.
     const rewritten = backendRes.headers.get(TOOL_CALL_IDS_HEADER);
-    const response = new Response(JSON.stringify(anthropicMessageToOpenAi(body as Record<string, unknown>, protocol, target.model ?? String(base.model ?? ""))), {
+    // A `thinking` block reaches a Responses caller as a `reasoning` item ONLY for a
+    // `"deepseek"` target (the response-direction end of that seam) — the mode is the resolved
+    // one from the target, never a provider identity. Every other target's rebuilt body is the
+    // pre-2026-09-15 document, thinking dropped as before.
+    const response = new Response(JSON.stringify(anthropicMessageToOpenAi(body as Record<string, unknown>, protocol, target.model ?? String(base.model ?? ""), target.reasoning)), {
       status: backendRes.status,
       headers: {
         "content-type": "application/json",
