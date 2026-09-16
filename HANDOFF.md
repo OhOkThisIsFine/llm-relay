@@ -35,9 +35,11 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     (`stream-commit.ts`); a DeepSeek response's `reasoning_content` now reaches the caller on both
     fronts, closing the loop `openai-request.ts` opened.
 - **Verification note.** One dispatched agent's own report claimed a green gate that a second,
-  independent run in a properly-wired worktree contradicted (a real double-count regression in the
+  independent run in a properly-wired worktree contradicted (a double-count failure in the
   catalog-staleness change, found and fixed as a test-hermeticity bug, not a source bug — see git
-  log `ad6f4e9`). Full suite at this lap's HEAD: 191 test files, 4275 tests, 0 failures.
+  log `ad6f4e9`). Full suite at this lap's HEAD: 191 test files, 4280 tests on CI's Linux leg
+  (GitHub Actions run 35076653338); a local Windows run reports 4275, the documented gap
+  ("Some tests are POSIX-only and skip on Windows" — §3) — CI is the authoritative count.
 - **What remains open, all three deliberately left, not overlooked** (see `docs/backlog.md`):
   Route B's live served request (blocked on a NEW vendor session-identity check, not the rate
   limit the item was written against — not fixable by a stronger request); the Codex Desktop
