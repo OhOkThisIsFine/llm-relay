@@ -1115,6 +1115,12 @@ interface WalkExitData {
   errorOrigin?: ErrorOrigin;
   servedBy?: string;
   shouldTryNext?: boolean;
+  /**
+   * The dead stream's classified cause, when the backend stated one — see `stream-commit.ts`
+   * `stopCauseToken`. The WIRE half is already carried by `message`; this is the half that reaches
+   * the metadata log, and it is an enum-like token rather than any part of the backend's words.
+   */
+  streamStopCause?: string | undefined;
 }
 
 export function walkExitHeaders(
@@ -1194,7 +1200,12 @@ export function endWalk(
       error: { message: exit.message, type: exit.errorType ?? "api_error" },
     }));
   }
-  h.logger.write(log());
+  // The stop cause is merged HERE rather than built into each front's `log()` callback, because
+  // both fronts ship the identical `baseLog(...)` record and a field added twice is a field that
+  // will eventually be spelled two ways. The served body already carries it inside `message`; this
+  // is the machine-readable twin, and it is the half the metadata log was missing entirely.
+  const record = log();
+  h.logger.write(exit.streamStopCause ? { ...record, streamStopCause: exit.streamStopCause } : record);
   return false;
 }
 

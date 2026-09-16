@@ -9,7 +9,7 @@ import {
   dialectRefusalSignalOf,
   POOL_ATTEMPTS_HEADER,
 } from "../backend.js";
-import { probeStreamForCommit, relayAuthoredResponse } from "../stream-commit.js";
+import { probeStreamForCommit, relayAuthoredResponse, stopCauseToken } from "../stream-commit.js";
 import { reconstructFromSse } from "../sse.js";
 import { emitSse, emitSseTail, syntheticMessageId } from "../emitSse.js";
 import { repair, type RepairOutcome } from "../repair.js";
@@ -988,6 +988,11 @@ export async function anthropicMessagesPath(
               errorOrigin: probe.provenance,
               servedBy: tried.join(", "),
               shouldTryNext: probe.provenance === "upstream",
+              // Only when the backend stated a cause. Absent leaves the log exactly as it was,
+              // so a stream that died for an unknown reason is recorded as it always has been.
+              ...(probe.classification
+                ? { streamStopCause: stopCauseToken(probe.classification) }
+                : {}),
             },
           );
           if (walkEnd) continue;

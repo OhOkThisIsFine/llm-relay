@@ -10,7 +10,7 @@ import {
   upstreamReportedModel,
   type OpenAiFrontProtocol,
 } from "../backend.js";
-import { probeStreamForCommit, relayAuthoredResponse, type StreamCommitProtocol } from "../stream-commit.js";
+import { probeStreamForCommit, relayAuthoredResponse, stopCauseToken, type StreamCommitProtocol } from "../stream-commit.js";
 import { toolSchemaMap, type AssistantMessage } from "../anthropic.js";
 import type { RecoveredOpenAiChat, RecoveredOpenAiChatProcessor } from "../openai-dialect.js";
 import { repair, type RepairOutcome } from "../repair.js";
@@ -575,6 +575,11 @@ export async function openAiFrontPath(
               errorOrigin: probe.provenance,
               servedBy: tried.join(", "),
               shouldTryNext: probe.provenance === "upstream",
+              // The same merge the Anthropic front makes, from the same classifier — one policy
+              // for both fronts, so the two cannot come to log this differently.
+              ...(probe.classification
+                ? { streamStopCause: stopCauseToken(probe.classification) }
+                : {}),
             },
           );
           if (walkEnd) continue;

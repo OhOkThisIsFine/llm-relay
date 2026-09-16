@@ -91,6 +91,7 @@ describe("metadata-only logging", () => {
       toolUseIdRewrites: 2,
       toolCallIdRewrites: 3,
       thoughtSignatureSentinels: 4,
+      streamStopCause: "backend_stopped_at_max_tokens",
     };
     new MetadataLogger({ level: "metadata", file }).write(full);
     const [line] = linesIn(file);
@@ -109,6 +110,7 @@ describe("metadata-only logging", () => {
       "toolUseCount",
       "uncheckableCount",
       "errorKinds",
+      "streamStopCause",
       "repair",
       "toolUseIdRewrites",
       "toolCallIdRewrites",

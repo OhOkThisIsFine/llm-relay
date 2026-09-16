@@ -68,6 +68,22 @@ export interface RequestLog {
   toolUseCount: number;
   uncheckableCount: number;
   errorKinds: string[];
+  /**
+   * Why a pre-commit stream died, in the backend's own terms, when the backend stated it
+   * (`src/stream-commit.ts` `stopCauseToken`): `backend_stopped_at_max_tokens`,
+   * `backend_stopped_at_tool_use`, `backend_stopped_at_end_turn`, or `stop_reason_unknown`.
+   *
+   * ⚠ Absent unless a stream actually died before commit. A request that answered normally leaves
+   * no trace here, and neither does a failure that is not a dead stream.
+   *
+   * ⚠ An ENUM-LIKE CLASSIFICATION and never the backend's words. It is derived in `stream-commit.ts`
+   * from a closed stop-reason vocabulary, so nothing a provider wrote can reach this field — which
+   * is what makes it admissible under the metadata-only rule. It exists because the measured
+   * failure (2026-09-10: a `deepseek` stream that spent its whole `max_tokens` on reasoning and sent
+   * no text) surfaced as a bare 502 with `errorKinds: []` and was diagnosable only by re-sending the
+   * request outside the relay.
+   */
+  streamStopCause?: string;
   /** Repair outcome (repair mode only); "none" when repair did not run. "cancelled"
    *  means the caller went away mid-repair — distinct from "failed" (nothing was
    *  reachable), because the two call for opposite responses. */
@@ -128,6 +144,7 @@ const LOG_FIELDS = [
   "toolUseCount",
   "uncheckableCount",
   "errorKinds",
+  "streamStopCause",
   "repair",
   "toolUseIdRewrites",
   "toolCallIdRewrites",
