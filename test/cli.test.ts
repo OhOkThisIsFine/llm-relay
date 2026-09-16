@@ -2049,6 +2049,122 @@ describe("CLI configuration editing", () => {
     await expect(runRoutingCommand()).rejects.toThrow(/unknown provider/);
     expect(document().routing.default).toBe("test/base");
   });
+
+  describe("dot paths through arrays", () => {
+    /** A ladder whose rungs all parse, so only the edit under test can fail the candidate. */
+    const ladderTier = {
+      ...baseConfig,
+      routing: {
+        ...baseConfig.routing,
+        ladders: {
+          medium: [
+            { kind: "cli", id: "r0", command: "echo", args: ["{task}"], model: "m0" },
+            { kind: "cli", id: "r1", command: "echo", args: ["{task}"], model: "m1" },
+            { kind: "cli", id: "r2", command: "echo", args: ["{task}"], model: "m2" },
+          ],
+        },
+      },
+    };
+
+    beforeEach(() => {
+      writeFileSync(configPath, JSON.stringify(ladderTier, null, 2));
+    });
+
+    it("sets a field on an existing array element", async () => {
+      process.argv = [
+        "node", "cli.ts", "--config", configPath,
+        "config", "set", "routing.ladders.medium.2.note", "third rung",
+      ];
+      await runConfigCommand();
+
+      const rungs = document().routing.ladders.medium;
+      // The index addresses the ELEMENT, not a `"2"` key hung off the array — the shape the
+      // pre-fix editor produced, which JSON.stringify then dropped on the way to disk.
+      expect(rungs).toHaveLength(3);
+      expect(rungs[2].note).toBe("third rung");
+      expect(rungs.map((r: { id: string }) => r.id)).toEqual(["r0", "r1", "r2"]);
+      expect(document()).toEqual({
+        ...ladderTier,
+        routing: {
+          ...ladderTier.routing,
+          ladders: {
+            medium: [
+              ladderTier.routing.ladders.medium[0],
+              ladderTier.routing.ladders.medium[1],
+              { ...ladderTier.routing.ladders.medium[2], note: "third rung" },
+            ],
+          },
+        },
+      });
+    });
+
+    it("sets a field through a nested path that crosses an array", async () => {
+      process.argv = [
+        "node", "cli.ts", "--config", configPath,
+        "config", "set", "routing.ladders.medium.1.env.NESTED_VAR", "on",
+      ];
+      await runConfigCommand();
+      expect(document().routing.ladders.medium[1].env).toEqual({ NESTED_VAR: "on" });
+
+      // And reads back through the same shape, so `get` and `set` agree about the path.
+      process.argv = [
+        "node", "cli.ts", "--config", configPath,
+        "config", "get", "routing.ladders.medium.1.env",
+      ];
+      const written = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await runConfigCommand();
+      expect(written).toHaveBeenCalledWith(`${JSON.stringify({ NESTED_VAR: "on" }, null, 2)}\n`);
+    });
+
+    it("refuses an out-of-range index by name instead of appending a rung", async () => {
+      process.argv = [
+        "node", "cli.ts", "--config", configPath,
+        "config", "set", "routing.ladders.medium.3.note", "fourth",
+      ];
+      await expect(runConfigCommand()).rejects.toThrow(
+        'config path "routing.ladders.medium.3.note": index 3 is out of range for an array of length 3',
+      );
+      // Nothing was written: the file still holds exactly the three configured rungs, and no
+      // half-built rung was invented for the loader to reject on our behalf.
+      expect(document()).toEqual(ladderTier);
+    });
+
+    it("still refuses a non-numeric segment against an array", async () => {
+      process.argv = [
+        "node", "cli.ts", "--config", configPath,
+        "config", "set", "routing.ladders.medium.foo", "x",
+      ];
+      await expect(runConfigCommand()).rejects.toThrow(
+        'config path "routing.ladders.medium.foo": "foo" is not an index (the value at that path is an array of length 3)',
+      );
+      expect(document()).toEqual(ladderTier);
+    });
+
+    it("refuses an out-of-range index in an INTERMEDIATE segment too", async () => {
+      process.argv = [
+        "node", "cli.ts", "--config", configPath,
+        "config", "set", "routing.ladders.medium.9.note.deep", "x",
+      ];
+      await expect(runConfigCommand()).rejects.toThrow(
+        'config path "routing.ladders.medium.9.note.deep": index 9 is out of range for an array of length 3',
+      );
+      expect(document()).toEqual(ladderTier);
+    });
+
+    it("treats a read that misses as a miss, never as a refusal", async () => {
+      // `get` and `unset` ask whether a path EXISTS; a read that cannot continue must answer
+      // "no value at" rather than diagnosing the path, or the write-path refusals above leak
+      // into a read-only command.
+      for (const target of ["routing.ladders.medium.foo", "routing.ladders.medium.99"]) {
+        process.argv = ["node", "cli.ts", "--config", configPath, "config", "get", target];
+        await expect(runConfigCommand()).rejects.toThrow(`config get: no value at "${target}"`);
+
+        process.argv = ["node", "cli.ts", "--config", configPath, "config", "unset", target];
+        await expect(runConfigCommand()).rejects.toThrow(`config unset: no value at "${target}"`);
+      }
+      expect(document()).toEqual(ladderTier);
+    });
+  });
 });
 
 describe("keys subcommand router", () => {
