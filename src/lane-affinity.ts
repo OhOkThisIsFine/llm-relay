@@ -375,6 +375,29 @@ export function clearLaneAffinity(cfg: Config, tier: string | null, laneId: stri
   if (changed) notify(cfg);
 }
 
+/**
+ * Retract ONE memory kind for one lane on one tier — the operator's `unpin` (`POST /dispatch
+ * {"unpin": …}`). Narrower than `clearLaneAffinity` on purpose: an operator withdrawing a pin
+ * they placed has said nothing about a demotion the walk recorded from its own measurement, so
+ * that evidence stands. Returns whether a live memory of that kind existed; a lapsed row counts
+ * as absent, because `recall` would have deleted it on the next read anyway.
+ */
+export function forgetLaneMemory(
+  cfg: Config,
+  kind: LaneAffinityKind,
+  tier: string | null,
+  laneId: string,
+  now: number = Date.now(),
+): boolean {
+  const map = mapFor(cfg);
+  const key = memoryKey(tier, laneId, kind);
+  const row = map.get(key);
+  if (row === undefined) return false;
+  map.delete(key);
+  notify(cfg);
+  return row.until > now;
+}
+
 /** Every live memory for this config, lapsed rows dropped. Copies, sorted for stable rendering. */
 export function exportLaneAffinityRows(cfg: Config, now: number = Date.now()): LaneAffinityRow[] {
   const map = mapFor(cfg);

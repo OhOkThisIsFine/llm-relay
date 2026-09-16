@@ -1564,6 +1564,40 @@ they survive an MCP restart and are visible to `llm-relay dispatch` as well. Wit
 unreachable the walk still runs, but the memory has nowhere to go and the ladder falls back to
 configured order.
 
+#### Pinning a lane by hand (`POST /dispatch {"pin"}`)
+
+The operator can place the same pin the walk records, without waiting for a lane to answer:
+
+```
+POST /dispatch  {"pin": "<lane id>", "tier"?: "<ladder tier>", "ttlMs"?: <ms>}
+POST /dispatch  {"unpin": "<lane id>", "tier"?: "<ladder tier>"}
+```
+
+A pin promotes that lane to the front of its tier's ladder for `routing.dispatchWalk.pinMs`
+(default 15 minutes) or the body's `ttlMs` — at most six hours, the ceiling every lane memory
+carries — and the response is the ladder view for that tier, already showing it; the next
+`GET /dispatch` reads it with no restart, and `llm-relay dispatch` prints `pinned by the operator`
+as the reason. The response also carries `x-llm-relay-lane-pin: pinned <lane>` (or `unpinned`,
+plus `(replaced a live pin)` when one existed). `unpin` withdraws only the pin, leaving a
+demotion the walk measured; it is idempotent.
+
+It is a **memory, not a config edit**: `routing.ladder` on disk is untouched, the pin lapses on
+its own, a pin never resurrects an exhausted, disabled, unreachable or not-servable lane, and the
+walk's next missed budget on that lane retracts it (newest evidence wins — the same rule a pin
+the walk recorded lives under). A persistent reorder is `llm-relay config set routing.ladder …`.
+The request is refused by name rather than recording a pin nothing would read: a lane on no
+ladder, a lane not on the named tier's ladder, an unknown tier, a `tier` on a config with a
+single `routing.ladder`, a rung with `"enabled": false`, a `ttlMs` outside `(0, 6h]` (refused,
+never clamped), an unknown body key, and `routing.dispatchWalk: false` (with the walk off the
+ladder view reads no memory at all, so the pin would be inert).
+
+It sits on the same admission boundary as every other `POST /dispatch` — exact `Host`, exact
+`Origin` when present, `content-type: application/json`, and the control token (see *Loopback is
+not authorization* under [Endpoints](#endpoints)). The dashboard SPA is served from the same
+listener, so its own `Origin` is admitted; it still has to present the control token
+(`~/.llm-relay/control-token`), because a dashboard session is read-only by design and does not
+carry it.
+
 #### Background lane re-probing (`routing.laneProbe`)
 
 A recorded lane death is a snapshot, not a standing fact — a quota can reset early. The relay
@@ -2406,7 +2440,7 @@ reported)`), `-` for unpriced (never `$0.00`), and the `unpricedRequests` /
 | `GET /registry` | Provider/routing/capability and nested credential metadata |
 | `GET /candidates` | Deployment × credential policy/state/quota/breaker data |
 | `GET\|POST /offload` | Read/set offload rules |
-| `GET\|POST /dispatch` | Read/advance the dispatch ladder |
+| `GET\|POST /dispatch` | Read/advance the dispatch ladder; `POST {"pin"\|"unpin"}` places or withdraws an operator pin (control token required) |
 | `POST /dispatch/telemetry` | Record lane-execution telemetry (lane stats for every kind; an accounting row for `cli`-kind lanes only) |
 | `POST /cooldowns/clear` | Clear scoped live cooling state; identifiers-only grouped response |
 | `POST /stop` | Stop the relay: `202 {"stopping":true}` on admission, then the same shutdown path as a console `SIGTERM`; `GET /stop` is an explicit `404` |

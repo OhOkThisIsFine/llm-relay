@@ -89,17 +89,20 @@
   (`provider-stated` / `derived` / etc.), and its reset time, legible at a glance, with no new wire
   field required.
 
-- **The dashboard has no way to reorder dispatch targets (2026-09-16, owner request, high — new
-  write surface).** The dashboard session is deliberately READ-ONLY today (`dashboard-auth.ts`): it
-  never mutates config or routing. The owner asked for a control to reorder dispatch targets from
-  the dashboard. This is the dashboard's FIRST write capability, and it must not bypass the
-  invariant that a mutating endpoint needs admission checks beyond loopback (exact `Host`, `Origin`
-  when present, `content-type: application/json`, and — matching `/offload`/`/dispatch` — the
-  control-token where the operator route already requires one). **Property:** an authenticated
-  dashboard write endpoint reorders `routing.ladder`/`routing.ladders.<tier>` or pins a lane
-  (reusing the existing `offload.ts` / `dispatch.ts` mutation paths rather than a new parallel one),
-  admits only what those paths already admit, and the change is visible on the next `GET /dispatch`
-  with no relay restart.
+- **The dashboard SPA has no control for the operator pin yet (2026-09-16, owner request, high —
+  the UI half of the dashboard's first write).** The ENDPOINT half landed 2026-09-16:
+  `POST /dispatch {"pin"|"unpin"}` (`routes/admin.ts` `operatorLanePin`) reuses `lane-affinity.ts`'s
+  pin, sits on the same admission as every `POST /dispatch` (exact `Host`, `Origin` when present,
+  JSON content-type, control token), refuses by name anything it cannot honour, and is visible on
+  the next `GET /dispatch` with no restart (`test/admin-dispatch-pin.test.ts`; `docs/reference.md`
+  "Pinning a lane by hand"). What remains is the SPA: `dashboard/src/` reads only
+  `dashboard.snapshot.v1` and renders no ladder at all, and a dashboard session is read-only by
+  design (`dashboard-auth.ts`) — it does not carry the control token, so the control must take the
+  token from the operator (pasted once from `~/.llm-relay/control-token`, held in memory only) and
+  send it on the write, rather than widening the session. **Property:** a ladder panel in the SPA
+  reads `GET /dispatch` (tokenless, same origin), offers pin/unpin per selectable lane on the shown
+  tier, sends the operator-entered control token on `POST /dispatch`, and re-reads the ladder after
+  the response; the token is never persisted by the page and never appears in the snapshot.
 
 - **The dashboard's usability and visual design need a general pass (2026-09-16, owner request,
   medium).** No single measured defect; a standing ask from the owner while approving this lap.

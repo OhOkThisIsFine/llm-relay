@@ -7,7 +7,7 @@ import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
 import { loadLaneManifest } from "../lane-manifest.js";
-import { buildDispatch, findLadderRung, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, resolveLaneLauncherPath, specContextWindow, type DispatchOptions, type DispatchOutcome } from "../dispatch.js";
+import { buildDispatch, describeId, findLadderRung, lookupLadderRung, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, resolveLaneLauncherPath, specContextWindow, type DispatchOptions, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
 import { contextWindowResolver, type ContextWindowSource } from "../metadata.js";
 import { snapshotContextWindow } from "../tier-data.js";
@@ -26,7 +26,7 @@ import {
   type DispatchedTelemetryReport,
   type DispatchLaneStatus,
 } from "../dispatch-lane-stats.js";
-import { clearLaneAffinity, demoteLane, pinLane, recordLaneOutlier } from "../lane-affinity.js";
+import { clearLaneAffinity, demoteLane, forgetLaneMemory, lanePin, MAX_AFFINITY_MS, pinLane, recordLaneOutlier } from "../lane-affinity.js";
 
 const MAX_TASK_LEN = 4096;
 
@@ -342,6 +342,177 @@ function recordDispatchLaneAccounting(recorder: AccountingRecorder, report: Disp
   throw new Error(`unhandled dispatch lane status: ${String(_never)}`);
 }
 
+/** The reason an operator pin carries onto the ladder view. Fixed text, never caller prose. */
+export const OPERATOR_PIN_REASON = "pinned by the operator";
+
+/** Longest lane id or tier name `POST /dispatch` will even look up — bounded like every other echo. */
+const MAX_PIN_ID_CHARS = 200;
+
+/** The closed set of body keys a `{"pin"|"unpin"}` request may carry (the `/cooldowns/clear` precedent). */
+const PIN_BODY_KEYS = new Set(["pin", "unpin", "tier", "ttlMs", "client"]);
+
+type OperatorPinOutcome =
+  | { ok: true; tier: string | null; action: "pinned" | "unpinned"; laneId: string; hadPin: boolean }
+  | { ok: false; message: string };
+
+/**
+ * `POST /dispatch {"pin": "<lane>"}` / `{"unpin": "<lane>"}` — the operator's own hand on the
+ * dispatch order, and the dashboard's FIRST write (backlog 2026-09-16). It REUSES the walk's
+ * routing memory (`lane-affinity.ts`): a pin promotes the lane to the front of its tier's ladder
+ * for `routing.dispatchWalk.pinMs` (or the body's `ttlMs`), exactly as a lane that just answered
+ * is promoted, and the next `GET /dispatch` reads it with no restart — the same live-state
+ * mutation `POST /dispatch {"exhausted"}` already performs on the same route, behind the same
+ * admission (`CONTROL_ROUTES` in `server.ts`: exact `Host`, exact `Origin` when present,
+ * `content-type: application/json`, the control token).
+ *
+ * ⚠ It is NOT a config rewrite. `routing.ladder` on disk is untouched, so the order the operator
+ * chose lapses with the pin (six hours at most, `MAX_AFFINITY_MS`) and a restart restores it only
+ * through the persisted `lane-affinity.json` while the pin is still live. That is the design: a
+ * pin reorders lanes that are ALREADY selectable and never resurrects one (`DispatchLane.pinned`),
+ * so this write can neither break "health demotes, never drops" nor promote a lane the config,
+ * a cooldown, the manifest or the host says is unavailable. A persistent reorder is
+ * `llm-relay config set routing.ladder …`, a validated config edit, and deliberately not this.
+ *
+ * ⚠ Everything below REFUSES rather than silently doing nothing, because the memory is silent by
+ * design and an inert pin would read as a pin that took effect: the walk must be ON (with it off
+ * `annotateAffinity` reads no memory at all — the documented byte-for-byte revert); the tier must
+ * name a ladder this config declares, and must be absent on a legacy single-ladder config (where
+ * `selectLadder` would ignore it); the lane must be a rung ON THAT LADDER — `lookupLadderRung`,
+ * the same tier-scoped lookup `markExhausted` uses; the rung must be enabled (a pin cannot
+ * resurrect a parked one); and an explicit `ttlMs` must be inside the window this relay will hold
+ * a memory for — refused, never clamped, since a silently lowered figure would read as the
+ * operator's own number taking effect.
+ *
+ * ⚠ A pin RETRACTS a live demotion first (`clearLaneAffinity` then `pinLane`) — the walk's own
+ * retract-then-record rule in `recordLaneAffinity` — and the walk's next missed budget on that
+ * lane retracts the pin in turn: an operator pin is a memory like any other, and the newest
+ * evidence wins. `unpin` retracts ONLY the pin (`forgetLaneMemory`), leaving a demotion the walk
+ * measured; it is idempotent, reporting whether a live pin existed.
+ */
+function operatorLanePin(cfg: Config, body: Record<string, unknown>): OperatorPinOutcome {
+  const refuse = (message: string): OperatorPinOutcome => ({ ok: false, message: `POST /dispatch: ${message}` });
+  const unknownKey = Object.keys(body).find((key) => !PIN_BODY_KEYS.has(key));
+  if (unknownKey !== undefined) {
+    return refuse(`a pin/unpin request does not accept property "${describeId(unknownKey)}"`);
+  }
+  if (body.pin !== undefined && body.unpin !== undefined) {
+    return refuse(`"pin" and "unpin" are exclusive — send one`);
+  }
+  const action = body.pin !== undefined ? "pin" : "unpin";
+  const rawId = body[action];
+  if (typeof rawId !== "string" || rawId.length === 0 || rawId.length > MAX_PIN_ID_CHARS) {
+    return refuse(`"${action}" must be a lane id (a non-empty string of at most ${MAX_PIN_ID_CHARS} characters)`);
+  }
+  const walk = cfg.routing.dispatchWalk;
+  if (!walk || !walk.enabled) {
+    return refuse(
+      `routing.dispatchWalk is off, so a pin would reorder nothing — enable it, or reorder routing.ladder in config.json`,
+    );
+  }
+  if (body.tier !== undefined) {
+    if (typeof body.tier !== "string" || body.tier.length === 0 || body.tier.length > MAX_PIN_ID_CHARS) {
+      return refuse(`tier must be a non-empty string when provided`);
+    }
+    if (!cfg.routing.ladders) {
+      return refuse(`this config declares a single routing.ladder and no routing.ladders — omit tier`);
+    }
+  }
+  const tier = typeof body.tier === "string" ? body.tier : undefined;
+  const lookup = lookupLadderRung(cfg, rawId, tier);
+  if (lookup.missingTier !== undefined) {
+    return refuse(`no ladder tier "${describeId(lookup.missingTier)}" in routing.ladders`);
+  }
+  if (!lookup.rung) {
+    const where = lookup.tier === null ? "routing.ladder" : `routing.ladders.${describeId(lookup.tier)}`;
+    return refuse(`no lane "${describeId(rawId)}" in ${where}`);
+  }
+  if (!lookup.rung.enabled) {
+    return refuse(`lane "${describeId(rawId)}" is disabled in config — a pin promotes only a selectable lane, it never resurrects one`);
+  }
+  if (action === "unpin") {
+    if (body.ttlMs !== undefined) return refuse(`ttlMs applies to "pin" only`);
+    const hadPin = forgetLaneMemory(cfg, "pin", lookup.tier, lookup.rung.id);
+    return { ok: true, tier: lookup.tier, action: "unpinned", laneId: lookup.rung.id, hadPin };
+  }
+  let ttlMs = walk.pinMs;
+  if (body.ttlMs !== undefined) {
+    if (typeof body.ttlMs !== "number" || !Number.isFinite(body.ttlMs) || body.ttlMs <= 0 || body.ttlMs > MAX_AFFINITY_MS) {
+      return refuse(`ttlMs must be a number of milliseconds greater than 0 and at most ${MAX_AFFINITY_MS}`);
+    }
+    ttlMs = Math.floor(body.ttlMs);
+  }
+  const hadPin = lanePin(cfg, lookup.tier, lookup.rung.id) !== null;
+  clearLaneAffinity(cfg, lookup.tier, lookup.rung.id);
+  pinLane(cfg, lookup.tier, lookup.rung.id, OPERATOR_PIN_REASON, ttlMs);
+  return { ok: true, tier: lookup.tier, action: "pinned", laneId: lookup.rung.id, hadPin };
+}
+
+/**
+ * Announces what an operator pin/unpin did, on the `POST /dispatch` response that carries the
+ * resulting ladder view: `pinned <lane>` / `unpinned <lane>`, plus `(replaced a live pin)` when
+ * one existed. A lane id from config, never caller prose.
+ */
+export const LANE_PIN_HEADER = "x-llm-relay-lane-pin";
+
+type DispatchMutationOutcome =
+  | { ok: true; tier: string | undefined; client: string | undefined; pin: string | undefined }
+  | { ok: false; message: string };
+
+/**
+ * Apply one `POST /dispatch` body to the live config — exhaustion (`exhausted`/`clear`), or the
+ * operator pin (`pin`/`unpin`) — and say which tier and client the view should then be built for.
+ * The pin shape is decided FIRST, so a body carrying both shapes is refused by the pin's closed
+ * key set rather than half-applied.
+ */
+function applyDispatchMutation(cfg: Config, reqJson: unknown): DispatchMutationOutcome {
+  const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown; tier?: unknown; client?: unknown; outcome?: unknown; retryAfterMs?: unknown; pin?: unknown; unpin?: unknown };
+  if (body.pin !== undefined || body.unpin !== undefined) {
+    const pinned = operatorLanePin(cfg, body as Record<string, unknown>);
+    if (!pinned.ok) return pinned;
+    return {
+      ok: true,
+      // The view is built for the tier the pin landed on, so the response itself shows it.
+      tier: pinned.tier ?? undefined,
+      client: typeof body.client === "string" && body.client.length > 0 ? body.client : undefined,
+      pin: `${pinned.action} ${pinned.laneId}${pinned.hadPin ? " (replaced a live pin)" : ""}`,
+    };
+  }
+  let outcome: DispatchOutcome | undefined;
+  if (body.outcome !== undefined) {
+    if (body.outcome !== "rate_limited" && body.outcome !== "quota_exhausted") {
+      return { ok: false, message: `POST /dispatch outcome must be "rate_limited" or "quota_exhausted"` };
+    }
+    outcome = body.outcome;
+  }
+  // Explicit wins over vendor-reported wins over the outcome's default; markExhausted's own
+  // default covers the plain {"exhausted"} report. normalizeTtl clamps whatever arrives.
+  const retryAfterMs = typeof body.retryAfterMs === "number" ? body.retryAfterMs : undefined;
+  const ttlMs =
+    (typeof body.ttlMs === "number" ? body.ttlMs : undefined) ??
+    retryAfterMs ??
+    (outcome !== undefined ? OUTCOME_DEFAULT_MS[outcome] : undefined);
+  const tier = typeof body.tier === "string" ? body.tier : undefined;
+  if (body.client !== undefined && (typeof body.client !== "string" || body.client.length === 0)) {
+    return { ok: false, message: `POST /dispatch client must be a non-empty string` };
+  }
+  const client = typeof body.client === "string" ? body.client : undefined;
+  if (typeof body.clear === "string") {
+    clearExhausted(cfg, body.clear, tier);
+  } else if (body.clear === true) {
+    clearExhausted(cfg);
+  } else if (typeof body.exhausted === "string") {
+    if (!markExhausted(cfg, body.exhausted, ttlMs, tier)) {
+      return { ok: false, message: `POST /dispatch: no lane "${describeId(body.exhausted)}" in routing.ladder` };
+    }
+  } else {
+    return {
+      ok: false,
+      message: `POST /dispatch needs {"exhausted":"<lane>"}, {"clear":"<lane>"|true}, {"pin":"<lane>"} or {"unpin":"<lane>"}`,
+    };
+  }
+  return { ok: true, tier, client, pin: undefined };
+}
+
 /**
  * Handles control-plane administrative endpoints.
  * Returns true if the request was an admin route and has been handled, false otherwise.
@@ -505,37 +676,11 @@ export async function handleAdminRoutes(
     let bodyTier: string | undefined;
     let bodyClient: string | undefined = pickQuery(path, "client");
     if (req.method === "POST") {
-      const body = (reqJson ?? {}) as { exhausted?: unknown; clear?: unknown; ttlMs?: unknown; tier?: unknown; client?: unknown; outcome?: unknown; retryAfterMs?: unknown };
-      let outcome: DispatchOutcome | undefined;
-      if (body.outcome !== undefined) {
-        if (body.outcome !== "rate_limited" && body.outcome !== "quota_exhausted") {
-          return bad(400, `POST /dispatch outcome must be "rate_limited" or "quota_exhausted"`);
-        }
-        outcome = body.outcome;
-      }
-      // Explicit wins over vendor-reported wins over the outcome's default; markExhausted's own
-      // default covers the plain {"exhausted"} report. normalizeTtl clamps whatever arrives.
-      const retryAfterMs = typeof body.retryAfterMs === "number" ? body.retryAfterMs : undefined;
-      const ttlMs =
-        (typeof body.ttlMs === "number" ? body.ttlMs : undefined) ??
-        retryAfterMs ??
-        (outcome !== undefined ? OUTCOME_DEFAULT_MS[outcome] : undefined);
-      bodyTier = typeof body.tier === "string" ? body.tier : undefined;
-      if (body.client !== undefined && (typeof body.client !== "string" || body.client.length === 0)) {
-        return bad(400, `POST /dispatch client must be a non-empty string`);
-      }
-      if (typeof body.client === "string") bodyClient = body.client;
-      if (typeof body.clear === "string") {
-        clearExhausted(cfg, body.clear, bodyTier);
-      } else if (body.clear === true) {
-        clearExhausted(cfg);
-      } else if (typeof body.exhausted === "string") {
-        if (!markExhausted(cfg, body.exhausted, ttlMs, bodyTier)) {
-          return bad(400, `POST /dispatch: no lane "${body.exhausted}" in routing.ladder`);
-        }
-      } else {
-        return bad(400, `POST /dispatch needs {"exhausted":"<lane>"} or {"clear":"<lane>"|true}`);
-      }
+      const applied = applyDispatchMutation(cfg, reqJson);
+      if (!applied.ok) return bad(400, applied.message);
+      bodyTier = applied.tier;
+      if (applied.client !== undefined) bodyClient = applied.client;
+      if (applied.pin) res.setHeader(LANE_PIN_HEADER, applied.pin);
     }
     const rawTask = pickQuery(path, "task");
     if (typeof rawTask === "string" && rawTask.length > MAX_TASK_LEN) {

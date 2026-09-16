@@ -526,8 +526,7 @@ export function markExhausted(
   ttlMs: number = DEFAULT_EXHAUSTED_MS,
   tier?: string,
 ): boolean {
-  if (typeof id !== "string" || id.length === 0) return false;
-  const rung = selectLadder(cfg, tier).rungs.find((r) => r.id === id);
+  const { rung } = lookupLadderRung(cfg, id, tier);
   if (!rung) return false;
   markExhaustedKey(cfg, cooldownKey(rung), Date.now() + normalizeTtl(ttlMs));
   return true;
@@ -543,9 +542,35 @@ export function clearExhausted(cfg: Config, id?: string, tier?: string): void {
     }
     return;
   }
-  if (typeof id !== "string") return;
-  const rung = selectLadder(cfg, tier).rungs.find((r) => r.id === id);
+  const { rung } = lookupLadderRung(cfg, id, tier);
   if (rung) clearExhaustedKey(cfg, cooldownKey(rung));
+}
+
+/**
+ * What a tier-scoped ladder lookup found: the tier the ladder resolved to (`null` for the legacy
+ * single ladder), the rung when the id names one ON THAT LADDER, and — when `routing.ladders`
+ * exists but holds no ladder under the requested name — that name, so a caller can say so.
+ */
+export interface LadderRungLookup {
+  tier: string | null;
+  rung: LadderRung | undefined;
+  missingTier: string | undefined;
+}
+
+/**
+ * The tier-scoped rung lookup — the ONE resolution `markExhausted`, `clearExhausted` and the
+ * operator pin in `routes/admin.ts` share. It answers with the SAME `(tier, rung)` pair
+ * `buildDispatch` annotates a view with (`selectLadder` on both sides), which is what makes a
+ * pin recorded through it land where the next `GET /dispatch` reads. ⚠ Distinct from
+ * `findLadderRung`, which is tier-AGNOSTIC (a telemetry report names a lane, not a tier); a
+ * memory or a cooldown written here is keyed by tier, so the lookup must be too.
+ */
+export function lookupLadderRung(cfg: Config, laneId: unknown, tier?: string): LadderRungLookup {
+  const selected = selectLadder(cfg, tier);
+  const rung = typeof laneId === "string" && laneId.length > 0
+    ? selected.rungs.find((r) => r.id === laneId)
+    : undefined;
+  return { tier: selected.tier, rung, missingTier: selected.missing };
 }
 
 /**
@@ -1047,9 +1072,10 @@ function stripControlCharacters(value: string): string {
  * JSON response AND printed to a terminal by `llm-relay dispatch`, so echoing raw caller input let
  * a `?lane=` carrying ESC sequences rewrite the operator's terminal, and an arbitrarily long one
  * bloat a response about a lane that does not exist. Control characters go, and the echo is capped
- * — enough to recognise your own typo, not a channel.
+ * — enough to recognise your own typo, not a channel. Exported for `routes/admin.ts`, whose
+ * `POST /dispatch` 400s echo a caller-supplied lane id or tier under the same rule.
  */
-function describeId(id: string): string {
+export function describeId(id: string): string {
   const clean = stripControlCharacters(id);
   return clean.length > MAX_ECHOED_ID ? `${clean.slice(0, MAX_ECHOED_ID)}\u2026` : clean;
 }
