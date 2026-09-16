@@ -1836,10 +1836,18 @@ describe("eligibility → untilBasis wiring", () => {
  * refusals qualify, and the containment "on a model the catalog currently lists".
  *
  * Hermeticity: the mock backend serves BOTH the refusal (any path) and the `/models` roster, so a
- * refresh is a real HTTP round-trip to a loopback listener this file owns and counts. `up` must be
+ * refresh is a real HTTP round-trip to a loopback listener this file owns and counts. `catup` must be
  * `kind: "openai"` for the catalog to have a roster at all — an anthropic-kind provider's `fetch`
  * returns an empty list by construction, and a test built on one would assert "no refresh" for a
  * reason that has nothing to do with what it means to test.
+ *
+ * The provider is `catup`, NOT the `up` every other describe in this file uses, on purpose. Two of
+ * the refusals below (the 500 carrying absence wording, the 404 stating something else) match no
+ * seed and land in the unknown-refusal queue — and `resetInterpretations` drops only the memoized
+ * copy, so an entry its write-behind flush already wrote comes back in every later test of the
+ * file (the 2026-09-10 `resetFacts` flake, same class; `resetInterpretations` keeps its file on
+ * purpose for the cli.test.ts restart simulation). A later test filtering the queue for provider
+ * `up` would then see these leftovers. A distinct provider name decouples the two unconditionally.
  */
 describe("catalog staleness trigger on a stated model absence", () => {
   let dir: string;
@@ -1856,7 +1864,7 @@ describe("catalog staleness trigger on a stated model absence", () => {
 
   /**
    * Boot a backend that answers `/models` with `roster` and every other path with `refusal`, then a
-   * proxy routing `up/m` at it. Returns the proxy port and a counter for `/models` hits — the
+   * proxy routing `catup/m` at it. Returns the proxy port and a counter for `/models` hits — the
    * observable the property is stated in.
    */
   async function bootStale(
@@ -1883,11 +1891,11 @@ describe("catalog staleness trigger on a stated model absence", () => {
     const base = `http://127.0.0.1:${port(backend)}`;
     // `catalogWithLimits` seeds `models` from the seed's key list, so the roster the relay holds is
     // exactly `roster` without any fetch having to succeed first.
-    const catalog = catalogWithLimits(dir, { up: Object.fromEntries(roster.map((m) => [m, {}])) });
+    const catalog = catalogWithLimits(dir, { catup: Object.fromEntries(roster.map((m) => [m, {}])) });
     const cfg: Config = {
       host: "127.0.0.1", port: 0,
-      providers: { up: { base, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
-      routing: { default: "up/m", tiers: {} },
+      providers: { catup: { base, kind: "openai", authHeader: "authorization", timeoutMs: 5000 } },
+      routing: { default: "catup/m", tiers: {} },
       mode: "detect",
       repair: { maxAttempts: 1, destructiveTools: [] },
       log: { level: "silent", file: null },
@@ -1904,7 +1912,7 @@ describe("catalog staleness trigger on a stated model absence", () => {
       ["m", "other"],
     );
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+      method: "POST", headers: { "content-type": "application/json" }, body: body("catup/m"),
     });
     expect(resp.status).toBe(404);
     // The refresh is fire-and-forget, so let its round-trip settle before reading the counter.
@@ -1919,7 +1927,7 @@ describe("catalog staleness trigger on a stated model absence", () => {
     );
     for (let i = 0; i < 4; i++) {
       const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+        method: "POST", headers: { "content-type": "application/json" }, body: body("catup/m"),
       });
       expect(resp.status).toBe(404);
     }
@@ -1936,7 +1944,7 @@ describe("catalog staleness trigger on a stated model absence", () => {
       ["m"],
     );
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: body("up/nope"),
+      method: "POST", headers: { "content-type": "application/json" }, body: body("catup/nope"),
     });
     expect(resp.status).toBe(404);
     await new Promise((r) => setTimeout(r, 50));
@@ -1964,7 +1972,7 @@ describe("catalog staleness trigger on a stated model absence", () => {
         ["m"],
       );
       const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+        method: "POST", headers: { "content-type": "application/json" }, body: body("catup/m"),
       });
       expect(resp.status, `status ${c.status}`).toBe(c.status);
       await new Promise((r) => setTimeout(r, 30));
@@ -1980,7 +1988,7 @@ describe("catalog staleness trigger on a stated model absence", () => {
       ["m"],
     );
     const resp = await fetch(`http://127.0.0.1:${p}/v1/messages`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: body("up/m"),
+      method: "POST", headers: { "content-type": "application/json" }, body: body("catup/m"),
     });
     expect(resp.status).toBe(404);
     await new Promise((r) => setTimeout(r, 50));
