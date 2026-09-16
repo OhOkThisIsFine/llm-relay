@@ -56,15 +56,6 @@
   once, bounded so that a burst of refusals costs one refresh, and dynamic pool membership follows
   the refreshed list.
 
-- **`llm-relay config set` cannot reach a field inside a ladder rung (2026-09-10, friction:
-  missing_affordance, low).** Correcting the four free-pool rung notes, `llm-relay config set
-  routing.ladders.<tier>.<i>.note "<text>"` failed with "must be an array of rungs": the dot-path
-  editor does not treat a numeric segment as an array index, so the only way to change one rung
-  field was a hand edit of `config.json` — the path `config-edit.ts` exists to replace, because it
-  validates the whole document through `loadConfig()` before writing. **Property:** a numeric
-  path segment addresses that element of an array, the candidate document still passes
-  `loadConfig()` before it is written, and an index past the end is refused by name.
-
 - **A DeepSeek answer's reasoning never reaches the caller, so pool traffic runs with thinking off
   after the first tool call (2026-09-10, F11 residue, low).** `openai-request.ts` now carries a
   replayed `thinking` block onto DeepSeek's `reasoning_content`, and turns thinking off for a replay
