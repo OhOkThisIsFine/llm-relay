@@ -449,24 +449,32 @@ describe("async job path", () => {
   it("hands back a job handle when the lane outlives waitMs, then serves the result", async () => {
     vi.useFakeTimers();
     try {
-      const h = new Harness({ spawn: fakeSpawner({ code: 0, stdout: "slow answer", stderr: "", timedOut: false }, 5000) });
+      // A multi-line answer with surrounding whitespace, so "unchanged" means more than a substring.
+      const answer = "slow answer\n  line two\n\n| a | b |";
+      const h = new Harness({ spawn: fakeSpawner({ code: 0, stdout: answer, stderr: "", timedOut: false }, 5000) });
       const call = h.tool("dispatch", { task: "x", waitMs: 100 });
       await vi.advanceTimersByTimeAsync(150);
       const started = await call;
       expect(started.isError).toBe(false);
       expect(started.text).toContain("status: running");
       expect(started.text).toMatch(/jobId "job-\d+"/);
+      expect(started.text).not.toContain("slow answer");
 
       const jobId = /job: (job-\d+)/.exec(started.text)?.[1];
       expect(jobId).toBeDefined();
 
       const running = await h.tool("dispatch_status", { jobId: jobId as string });
       expect(running.text).toContain("status: running");
+      expect(running.text).not.toContain("slow answer");
 
       await vi.advanceTimersByTimeAsync(6000);
       const done = await h.tool("dispatch_result", { jobId: jobId as string });
-      expect(done.text).toContain("slow answer");
+      expect(done.isError).toBe(false);
+      expect(done.text).toContain(answer);
       expect(done.text).toContain("status: completed");
+      // The first poll that sees the finished job already holds the same text.
+      const finished = await h.tool("dispatch_status", { jobId: jobId as string });
+      expect(finished.text).toBe(done.text);
     } finally {
       vi.useRealTimers();
     }

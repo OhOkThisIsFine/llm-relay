@@ -72,13 +72,6 @@
   argument `scope: string[]` (paths or globs relative to `cwd`) tags every delta path outside it
   `OUT OF SCOPE`. Report only — the relay never refuses or reverts; the caller's own gates decide.
 
-- **No test replays a lane that outlives `waitMs` (moved from the machine backlog 2026-09-16,
-  low).** The wait-ceiling clamp (`749be44`, v0.80.0) and the `relay` agent template obligation to
-  return the job id are shipped; what is missing is the replay that pins them together.
-  **Property:** a test in `test/mcp-server.test.ts` dispatches to a fake lane that answers after
-  `waitMs` has elapsed and asserts the reply carries a `jobId`, that `dispatch_status` reports
-  `running`, and that `dispatch_result` later returns the lane's answer unchanged.
-
 
 - **A lane inherits an unexpanded `%VAR%` environment value and Git Bash turns it into a
   directory (2026-09-16, medium).** Measured on Windows: the host that starts `llm-relay mcp`
