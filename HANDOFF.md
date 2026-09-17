@@ -33,6 +33,10 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     budget extension was replaced by the idle-only stop in v0.84.0.
   - The Codex `relay` agent template writes provenance only from a real dispatch result
     (`05db5b8`), and a test replays a lane that outlives `waitMs` (`d984b87`).
+- **The work queue is planned (2026-09-17, planning lap, no source change).**
+  [docs/stabilization-plan-2026-09-17.md](docs/stabilization-plan-2026-09-17.md) splits every open
+  backlog entry, the stated residues and the findings of a live survey into packets for cheap
+  models, in waves. Start with packet W0-1: the package ceiling has room for two more entries.
 - **Immediate next.** No rung in `~/.llm-relay/config.json` declares `capability` yet, so the
   lower-tier skip does nothing on this machine until the owner sets one (for example `medium` on
   the `opencode-muse-spark` rungs). After the owner restarts Claude Desktop: run a Code tab

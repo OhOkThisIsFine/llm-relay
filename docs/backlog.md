@@ -9,6 +9,15 @@
 
 ## Open
 
+> Implementation packets for every entry below, plus the stability items a live survey found on
+> 2026-09-17, are in [`stabilization-plan-2026-09-17.md`](stabilization-plan-2026-09-17.md). Delete
+> this pointer when that plan's exit condition is met.
+
+- **The stabilization plan holds work that has no entry here (2026-09-17).** Packets W0-1 to W0-3,
+  S2 to S4, M1 and R1, operator tasks O1 to O5, and design items D1 to D5 of
+  `stabilization-plan-2026-09-17.md`. **Property:** each of those packets is shipped, or the owner
+  declined it and the plan says so.
+
 - **The dispatch walk carries budget code that stops no lane.** Since 2026-09-17 the walk stops a
   lane only when it is idle (`routing.dispatchWalk.idleMs`, `src/mcp/server.ts` `latestActivity`).
   The daemon still computes `DispatchLane.attemptBudget` (`laneHistoryFacts` in `src/dispatch.ts`,
