@@ -8,18 +8,28 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   `cfb5420`, no source change).** Owner instruction: third-party contributors and testers are
   coming, so everything must be clear, succinct and free of personal information.
   - `docs/` top level holds LIVE documents only. The 73 dated records moved to `docs/history/`,
-    whose README states they are evidence and points at the live document for each subject. The
-    rule is now in `CLAUDE.md`: a dated file is WRITTEN into `docs/history/`, never moved later.
+    whose README states they are evidence and points at the live document for each subject. Six
+    undated records of the same kind and the two existing evidence subdirectories (`reviews/`,
+    `evidence-2026-08-16/`) moved with them, so the move is 99 files and `docs/history/` holds 100.
+    The rule is now in `CLAUDE.md`: a dated file is WRITTEN into `docs/history/`, never moved later.
   - Machine paths and personal identifiers are scrubbed from every tracked text file.
   - New: `CONTRIBUTING.md` (set up, the gate, the seven invariants, four test conventions, and the
     tester section naming the three files that hold credentials), `docs/architecture.md` (a source
     map for a person), `docs/README.md` (the index).
   - `docs/reference.md` gained a 48-entry table of contents. No heading TEXT changed, so every
     existing deep link still resolves.
-  - Verified: gate green on tree `fa86cf9813ea`, CI green on `main` (run 35266840782). 404
-    relative links checked; the 4 that stay broken sit inside generated installer marker blocks and
-    are logged in `C:\Code\docs\backlog.md`, not here.
-  - **No release was cut.** The change is documentation only, so npm still shows v0.84.0's README.
+  - Verified: gate green on tree `fa86cf9813ea` for `cfb5420` and on tree `55531b8b1d60` for
+    `6ca62d0`; CI green on `main` for both (runs 35266840782 and 35268109263). A link check over
+    all 130 tracked documents, using the resolution rules of `test/doc-links.test.ts`, found 408
+    relative links and 4 broken. Inside that test's own scope there are 378 links and 0 broken. The
+    4 sit in `AGENTS.md` and `.github/copilot-instructions.md`, inside generated installer marker
+    blocks, and are logged in `C:\Code\docs\backlog.md`, not here.
+  - **Released as v0.84.1** (commit `f9fff49`, publish run 35270604176, owner decision). The
+    release carries NO source change — the built output differs from v0.84.0 only in the version
+    string — and exists so the npm page points at `CONTRIBUTING.md` and `docs/architecture.md`.
+    The global binary is reinstalled at 0.84.1. ⚠ The running daemon and every `llm-relay mcp`
+    process still hold v0.84.0 code, which is behaviourally identical, so `withVersionNotice`
+    appends a version notice to MCP replies until those processes restart.
 - **Later the same day (v0.83.2, v0.84.0).**
   - The desktop Code tab did not get the long wait: Desktop gave the session its own server copy,
     named `llm-relay`, which hid the Code tab's own server, and Desktop calls as `claude-ai` with a
