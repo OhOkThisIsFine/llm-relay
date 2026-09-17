@@ -95,8 +95,13 @@ Offline / unit-test-safe (no external creds):
   directories — `~/.claude/skills/llm-relay/`, `~/.codex/skills/llm-relay/` and
   `<XDG_CONFIG_HOME or ~/.config>/opencode/skills/llm-relay/` — on GLOBAL installs only (env var or
   global-tree path detection); a repo-local `npm install` touches no host directory. The primary
-  `SKILL.md` is deliberately single-response sized and routes advanced work to three focused
-  `references/` files, so all four files must be copied together. `--force` overrides for manual
+  `SKILL.md` is deliberately single-response sized and routes advanced work to four focused
+  `references/` files, so all five files must be copied together. ⚠ `references/lane-field-notes.md`
+  joined the bundle on 2026-09-17: it is the one home for MEASURED traps about USING dispatch and
+  the lanes (owner instruction the same day — such notes belong with the skill every host reads, not
+  in `C:\Code\docs\backlog.md`, which keeps only what breaks every repository the same way).
+  The file list lives in TWO places, `install-skill.mjs` and `test/install-skill.test.ts`; add a
+  reference to both, or the test proves the old bundle. `--force` overrides for manual
   runs. Host failures are independent. Ships in the package, so the self-updater refreshes every
   host's complete skill bundle on every upgrade.
   ⚠ **OpenCode was added 2026-08-30 (v0.62.0) and it is the only target that is not a fixed

@@ -161,6 +161,10 @@ Do not read every reference by default.
   read [references/dispatch-lanes.md](references/dispatch-lanes.md).
 - For health commands, control authorization, failures, pool-walk headers, eligibility
   interpretation, or safety invariants, read [references/operations.md](references/operations.md).
+- Before you dispatch a packet, write a brief, judge a lane's output, run several lanes at once, or
+  diagnose a lost job, read [references/lane-field-notes.md](references/lane-field-notes.md). It
+  holds the measured traps: the CLI-rung reply envelope, lost job ids, restarts that kill lanes,
+  the concurrency cap, what each lane can carry, and why a brief's wording is not a boundary.
 
 The CLI's `help`, `dispatch_lanes`, and live status commands are authoritative for current
 configuration and quota. Do not copy a dated lane roster from prose.

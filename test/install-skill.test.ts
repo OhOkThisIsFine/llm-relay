@@ -30,6 +30,7 @@ const skillFiles = [
   join("references", "direct-routing.md"),
   join("references", "dispatch-lanes.md"),
   join("references", "operations.md"),
+  join("references", "lane-field-notes.md"),
 ];
 
 function run(args: string[], home: string, extraEnv: Record<string, string> = {}) {

@@ -240,6 +240,7 @@ try {
     join("references", "direct-routing.md"),
     join("references", "dispatch-lanes.md"),
     join("references", "operations.md"),
+    join("references", "lane-field-notes.md"),
   ];
   for (const relativePath of skillFiles) {
     const sourcePath = join(skillSourceDir, relativePath);

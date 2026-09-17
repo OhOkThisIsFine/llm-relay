@@ -367,8 +367,12 @@ digest that the listing prints, never a bare index.
 Also remove `opencode/muse-spark-1.3-contributor-free` from `routing.pools.medium.preferred` in
 `~/.llm-relay/config.json` (it was pinned first on 2026-09-10 for route B; it now only fails).
 
-### O5 Retire untrue entries in `C:\Code\docs\backlog.md` (machine-wide scope; ask the owner first)
-Verified against source on 2026-09-17:
+### O5 DONE (2026-09-17) — the llm-relay notes left the machine-wide backlog
+The owner ruled the same day that nothing llm-relay-specific belongs in `C:\Code\docs\backlog.md`:
+such instructions live with the llm-relay skill. Twenty-nine entries moved into
+`skills/llm-relay/references/lane-field-notes.md`, which the installer now ships to all three
+hosts, and each was refreshed against v0.84.0 first. The table below records what was corrected,
+because a later reader may meet the old wording in git history.
 
 | Entry | Verdict |
 |---|---|

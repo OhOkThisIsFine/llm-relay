@@ -4,8 +4,12 @@
 > met. Shipped work lives in git history and in the dated documents under `docs/`;
 > [`../HANDOFF.md`](../HANDOFF.md) holds current state plus the immediate next; `CLAUDE.md` holds
 > invariants and rationale. Nothing here is a status log. A machine-wide item (a global hook, a
-> shared instruction file, the offload lanes themselves) belongs in `C:\Code\docs\backlog.md`,
-> not here.
+> shared instruction file, the lap and closeout ceremony) belongs in `C:\Code\docs\backlog.md`,
+> not here. ⚠ A measured fact about USING the relay — dispatch mechanics, what a lane can carry,
+> reading a reply, lane concurrency, operating the daemon — belongs in
+> [`../skills/llm-relay/references/lane-field-notes.md`](../skills/llm-relay/references/lane-field-notes.md),
+> the bundle every host installs (owner, 2026-09-17). It is reference, not work, so it never
+> belongs in either backlog.
 
 ## Open
 
