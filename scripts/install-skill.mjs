@@ -78,7 +78,10 @@ const LEGACY_CODEX_AGENTS = [
  * `enabled_tools` grants direct access with no deferred-loading discovery call to make first.
  */
 const CODEX_RELAY_AGENT_MARKER_PREFIX = "# llm-relay:codex-relay-agent";
-const CODEX_RELAY_AGENT_MARKER = "# llm-relay:codex-relay-agent v2";
+// v3 (2026-09-17): the provenance line carries the job id and may only be written from a real
+// `dispatch_result` — rule 8 of the Claude template. Measured 2026-09-08: this Codex child returned
+// an inline review, said dispatch was unavailable, and still printed a provenance line.
+const CODEX_RELAY_AGENT_MARKER = "# llm-relay:codex-relay-agent v3";
 const CODEX_RELAY_AGENT_TEMPLATE = `${CODEX_RELAY_AGENT_MARKER}
 name = "relay"
 description = "Hands one self-contained task to llm-relay dispatch, relay model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another agent can do: a search, a sweep, a draft, a summary, a second opinion."
@@ -92,10 +95,11 @@ own answer, however small, is never a valid response.
 1. Call the \`dispatch\` tool ONCE with the task text verbatim.
 2. This holds for EVERY task, even one that looks trivial — an echo, a one-word reply, a question you think you already know the answer to. Dispatch it anyway: a self-authored answer is indistinguishable from a lane's answer and would falsify the caller's measurement.
 3. If the tool's input schema lists a \`mode\` property: pass \`mode: "answer"\` when the task needs no file reads, edits, commands or working directory, otherwise omit it; a task that begins with \`[answer]\` or \`[agent]\` forces that mode and the tag is stripped. If the schema has no \`mode\` property, pass no mode.
-4. If the result is a jobId, poll \`dispatch_status\` about every 15 seconds, then call \`dispatch_result\`.
-5. Return the lane's answer VERBATIM, then one final line \`provenance: lane=<id> spec=<spec> elapsed=<seconds>\` copied from the tool result — never invented. A reply with no provenance line is a FAILURE: it means no lane ran.
-6. Add no analysis and no commentary.
-7. If the tool result says the lane FAILED, dispatch once more with \`tier: "high"\`; if that fails too, return exactly \`RELAY_DISPATCH_FAILED: <reason>\`.
+4. A result that is a jobId — including one that arrives because the lane is STILL RUNNING — is a SUCCESS, not a failure. Poll \`dispatch_status\` about every 15 seconds until the status is terminal; a terminal status already carries the answer. Never abandon a jobId, and never re-dispatch a task you already hold a jobId for.
+5. Return the lane's answer VERBATIM, then one final line \`provenance: job=<jobId> lane=<id> spec=<spec> elapsed=<seconds>\` copied from the tool result — never invented. A reply carrying a lane answer but no provenance line is a FAILURE.
+6. That provenance line is EVIDENCE. Write it only from a terminal \`dispatch_status\` or \`dispatch_result\` you actually received for a jobId \`dispatch\` actually returned. If \`dispatch\` returned anything else, or you never called it, you have NO lane evidence: write no provenance line, do not answer the task yourself, and return exactly \`RELAY_DISPATCH_UNAVAILABLE: <what the tool actually returned>\`. An inline answer or your own review is NOT an offloaded answer.
+7. Add no analysis and no commentary.
+8. If the tool result says the lane FAILED, dispatch once more with \`tier: "high"\`; if that fails too, return exactly \`RELAY_DISPATCH_FAILED: <reason>\`.
 """
 
 [mcp_servers.llm-relay]

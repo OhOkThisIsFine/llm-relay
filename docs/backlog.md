@@ -79,15 +79,6 @@
   `waitMs` has elapsed and asserts the reply carries a `jobId`, that `dispatch_status` reports
   `running`, and that `dispatch_result` later returns the lane's answer unchanged.
 
-- **The Codex `relay` agent can report lane provenance for its own inline review (moved from the
-  machine backlog 2026-09-16, low).** Measured 2026-09-08: the Codex-side `relay` child returned
-  an inline review while stating that dispatch was unavailable, and still printed a provenance
-  line. The Claude template (v8, `src/setup-claude.ts`) carries rule 8 (no provenance line without
-  a real `dispatch_result`); the Codex template in `scripts/install-skill.mjs` is a prompt
-  obligation with no test. **Property:** `scripts/install-skill.mjs`'s Codex template carries the
-  same rule, and a test asserts the generated `~/.codex/agents/relay.toml` text contains it, the
-  way `test/relay-agent-provenance.test.ts` pins the Claude one.
-
 
 - **A lane inherits an unexpanded `%VAR%` environment value and Git Bash turns it into a
   directory (2026-09-16, medium).** Measured on Windows: the host that starts `llm-relay mcp`

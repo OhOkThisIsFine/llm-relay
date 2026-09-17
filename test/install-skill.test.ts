@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RELAY_DISPATCH_FAILED_TOKEN, RELAY_DISPATCH_UNAVAILABLE_TOKEN } from "../src/setup-claude.js";
 
 /**
  * `scripts/install-skill.mjs` is the npm `postinstall` hook, so its contract is not "does it copy
@@ -312,7 +313,7 @@ describe("install-skill postinstall hook", () => {
       expect(r.status).toBe(0);
       const content = readFileSync(paths.relayAgent, "utf8");
       expect(content).toContain('name = "relay"');
-      expect(content).toContain("# llm-relay:codex-relay-agent v2");
+      expect(content).toContain("# llm-relay:codex-relay-agent v3");
       // v2 (2026-09-10): the description no longer calls the pools free, because paid DeepSeek
       // leads them (owner decision: correct every text that calls that lane free).
       expect(content).not.toMatch(/free model pools/i);
@@ -320,7 +321,13 @@ describe("install-skill postinstall hook", () => {
       expect(content).toContain('command = "llm-relay"');
       expect(content).toContain('args = ["mcp"]');
       expect(content).toContain("dispatch");
-      expect(content).toContain("provenance");
+      // v3 (2026-09-17): the provenance claims `test/relay-agent-provenance.test.ts` pins for the
+      // Claude template. ⚠ RED on v2: its provenance line had no job id and no rule forbade it
+      // without a real dispatch result, and the Codex child printed one for its own inline review.
+      expect(content).toMatch(/provenance: job=/);
+      expect(content).toContain(RELAY_DISPATCH_UNAVAILABLE_TOKEN);
+      expect(content).toContain(RELAY_DISPATCH_FAILED_TOKEN);
+      expect(content).toMatch(/still running/i);
       // The whole point: no line pins a model or provider for this agent.
       const lines = content.split("\n").map((l) => l.trim());
       expect(lines.some((l) => l.startsWith("model ="))).toBe(false);
@@ -374,7 +381,7 @@ describe("install-skill postinstall hook", () => {
 
       expect(r.status).toBe(0);
       const afterContent = readFileSync(paths.relayAgent, "utf8");
-      expect(afterContent).toContain("# llm-relay:codex-relay-agent v2");
+      expect(afterContent).toContain("# llm-relay:codex-relay-agent v3");
       expect(afterContent).not.toContain("codex-relay-agent v0");
       expect(afterContent).not.toContain("old rule text");
       expect(r.stderr).toContain(`Codex relay agent updated at ${paths.relayAgent}`);
