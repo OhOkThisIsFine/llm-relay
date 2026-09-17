@@ -928,6 +928,14 @@ function recentOf(job: LaneJob, elsewhere: boolean): RecentJob {
 }
 
 /**
+ * Newest start first. Two jobs can start in the same millisecond, so the job number breaks the tie:
+ * ids are minted in order across every process (`seedJobCounter`).
+ */
+function newestFirst(a: Pick<RecentJob, "id" | "startedAt">, b: Pick<RecentJob, "id" | "startedAt">): number {
+  return b.startedAt - a.startedAt || (jobSeqOf(b.id) ?? 0) - (jobSeqOf(a.id) ?? 0);
+}
+
+/**
  * Monotonic job ids. Readable, and stable to sort. Process-global, and SEEDED from what a previous
  * process left on disk (`seedJobCounter`), so a restart never mints an id the previous process
  * already handed out — `job-0001` after a restart used to name a different job than the same
@@ -1373,7 +1381,7 @@ export class LaneJobStore {
         ...(row.label === undefined ? {} : { label: row.label }),
       });
     }
-    return [...byId.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, Math.max(0, limit));
+    return [...byId.values()].sort(newestFirst).slice(0, Math.max(0, limit));
   }
 
   /**
@@ -1393,7 +1401,7 @@ export class LaneJobStore {
   }
 
   list(): LaneJob[] {
-    return [...this.jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
+    return [...this.jobs.values()].sort(newestFirst);
   }
 
   /**

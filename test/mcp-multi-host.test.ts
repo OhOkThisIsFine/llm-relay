@@ -11,7 +11,7 @@
  * Also: a terminal `dispatch_status` carries the answer (2026-09-16: one caller polled a finished
  * job 2,023 times over 71 minutes and never called `dispatch_result`).
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -218,9 +218,13 @@ describe("dispatch_status and dispatch_result across hosts", () => {
         createJobJournal(join(dir, "mcp-jobs.json"), { pid: OTHER_PID, isAlive: () => true }),
         createJobArchive(join(dir, "mcp-job-archive.json")),
       );
+      // Both jobs start in the same millisecond, as they did on CI (v0.83.0 publish run): the job
+      // number must decide the order. RED before `newestFirst` broke the tie.
+      const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
       const finished = other.create("free-pool", "pool/high", "C:/tree", undefined, "Summarise the backlog");
       other.complete(finished.id, ok("summary"));
       const live = other.create("agy", undefined, "C:/tree", undefined, taskLabel("\n  Review the diff\nsecond line"));
+      clock.mockRestore();
       const { server, out } = serverOver(dir, () => true);
 
       const body = await call(server, out, "dispatch_status", {});
