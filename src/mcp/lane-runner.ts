@@ -301,6 +301,12 @@ export interface LaneJob {
    * `readOnlyInvoke`). Replaced per lane, like `expected`; absent for an ordinary dispatch.
    */
   readOnly?: { laneId: string; binding: string };
+  /**
+   * What the launcher changed before the lane now running started (`prepareLaneLaunch`): an
+   * environment value expanded or removed, or the working directory given to AGY. Names only, never
+   * a value. Replaced per lane, like `readOnly`; absent when the launcher changed nothing.
+   */
+  launch?: string[];
 }
 
 /**
@@ -376,6 +382,90 @@ export function isContentEmpty(text: string): boolean {
  * literal token, rather than each spelling it out separately.
  */
 export const EMPTY_OUTPUT_REASON = "empty-output: the lane's output has no usable content after stripping formatting";
+
+const ENV_REFERENCE = /%([A-Za-z_][A-Za-z0-9_()]*)%/g;
+const WHOLE_ENV_REFERENCE = /^%[A-Za-z_][A-Za-z0-9_()]*%$/;
+
+/**
+ * Expand the `%NAME%` references a Windows environment value still holds (`docs/backlog.md`: a lane
+ * inherited `HOME=%USERPROFILE%` literally, and a child that honours `HOME` wrote into a directory
+ * named `%USERPROFILE%`). A reference expands from the SAME environment, looked up without case as
+ * Windows does, in one pass. A value that is ONE unresolved reference is removed, because the literal
+ * is never a usable value. An unresolved reference inside a longer value (a `PATH` entry) stays: removing
+ * the whole value would lose the parts that are real. Windows only — `%` has no meaning to a POSIX
+ * shell, and a POSIX value that holds one is data.
+ *
+ * Returns the notes `LaneJobStore.noteLaunch` records: variable and reference NAMES, never a value.
+ */
+export function expandEnvReferences(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): { env: NodeJS.ProcessEnv; notes: string[] } {
+  if (platform !== "win32") return { env, notes: [] };
+  const lookup = new Map<string, string>();
+  for (const [name, value] of Object.entries(env)) {
+    if (typeof value === "string") lookup.set(name.toUpperCase(), value);
+  }
+  const out: NodeJS.ProcessEnv = { ...env };
+  const notes: string[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (typeof value !== "string" || !value.includes("%")) continue;
+    if (WHOLE_ENV_REFERENCE.test(value) && !lookup.has(value.slice(1, -1).toUpperCase())) {
+      delete out[name];
+      notes.push(`${name} removed (${value} does not resolve)`);
+      continue;
+    }
+    const expanded = new Set<string>();
+    const next = value.replace(ENV_REFERENCE, (token: string, ref: string) => {
+      const found = lookup.get(ref.toUpperCase());
+      if (found === undefined) return token;
+      expanded.add(token);
+      return found;
+    });
+    if (expanded.size === 0) continue;
+    out[name] = next;
+    notes.push(`${name} expanded from ${[...expanded].join(", ")}`);
+  }
+  return { env: out, notes };
+}
+
+type LaneInvoke = { command: string; args: string[]; env?: Record<string, string | null> };
+
+/**
+ * Give an AGY lane the caller's working directory (`docs/backlog.md`: AGY works in its own scratch
+ * directory whatever `cwd` its process gets, so a lane asked to edit a worktree saw none of its
+ * files). AGY reads a directory only through `--add-dir`, so the directory goes on the command line,
+ * and the task text names it. Null for every other lane.
+ *
+ * The prompt is the argument after AGY's own `-p`; a rung with no `-p` gets `--add-dir` alone. An
+ * `--add-dir` the rung already declares for the same directory is not repeated.
+ */
+export function agyWorkingDirInvoke<T extends LaneInvoke>(
+  invoke: T,
+  cwd: string,
+): { invoke: T; note: string } | null {
+  const rung = laneOfRung(invoke.command, invoke.args);
+  if (rung?.lane !== "agy") return null;
+  const args = [...invoke.args];
+  const start = rung.binary === invoke.command ? 0 : args.indexOf(rung.binary) + 1;
+  const prompt = args.indexOf("-p", start);
+  if (prompt >= 0 && prompt + 1 < args.length) {
+    args[prompt + 1] = `Work in this directory: ${cwd}\n\n${args[prompt + 1]}`;
+  }
+  const target = samePathKey(cwd);
+  const declared = args.some(
+    (a, i) =>
+      (a === "--add-dir" && args[i + 1] !== undefined && samePathKey(args[i + 1] as string) === target) ||
+      (a.startsWith("--add-dir=") && samePathKey(a.slice("--add-dir=".length)) === target),
+  );
+  if (!declared) args.push("--add-dir", cwd);
+  return { invoke: { ...invoke, args }, note: `agy works in ${cwd} (--add-dir)` };
+}
+
+function samePathKey(path: string): string {
+  const resolved = resolvePath(path).replace(/\\/g, "/");
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
 
 export interface DispatchedQuotaReport {
   laneId: string;
@@ -1102,6 +1192,7 @@ export class LaneJobStore {
     // attempt that is over. `beginAttemptActivity`/`noteReadOnly` set the new lane's own.
     delete job.activity;
     delete job.readOnly;
+    delete job.launch;
   }
 
   /**
@@ -1129,6 +1220,13 @@ export class LaneJobStore {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running") return;
     job.readOnly = { laneId, binding };
+  }
+
+  /** Record what the launcher changed for the lane now running, so the reply can state it. */
+  noteLaunch(id: string, notes: readonly string[]): void {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running" || notes.length === 0) return;
+    job.launch = [...notes];
   }
 
   /**

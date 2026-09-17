@@ -16,7 +16,7 @@ in `src/mcp/server.ts`; tests: `test/mcp-blocking-wait.test.ts`.
 |---|---|---|
 | Claude Code 2.1.237 (`claude-code`), headless `claude -p`, Haiku | A probe MCP server (`wait_then_answer`) held one `tools/call` for 240 s and sent `notifications/progress` every 10 s. | Answer received. The call carried `_meta.progressToken: 2`. |
 | Same, no progress notifications | Same probe, progress off. | Answer received at 240 s. |
-| Same, no progress, 1,500 s | Same probe, progress off. | See the result section below. |
+| Same, no progress, 1,500 s | Same probe, progress off. | Answer received at 1,500 s (`DONE after 1500s`, run 1,508 s). |
 | Claude desktop chat client (`claude-ai`) | `%APPDATA%\Claude\logs\mcp*.log` | The client cancels a call at exactly 60 s: `-32001 Request timed out`. |
 | Codex (code-mode `exec`) | 2026-09-10 transcript sweep (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §8) | The `exec` tool yields its script at 31.0 s; a longer MCP call loses its result. |
 
@@ -57,4 +57,9 @@ Collected by a documentation lookup, not measured here:
 
 ## Result of the 1,500 s probe
 
-Pending when this document was written.
+The call completed. The probe server logged the `tools/call` at 7.3 s and its answer at 1,507.3 s.
+Claude Code returned `DONE after 1500s` with `is_error: false`. The run cost USD 0.26.
+
+So Claude Code 2.1.237 held one tool call for 25 minutes without any progress notification. The
+30-minute stdio idle timeout was not reached. The 25-minute default cap is therefore measured, not
+only documented. The progress notifications stay: they show the caller that the lane still runs.

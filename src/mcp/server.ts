@@ -36,6 +36,7 @@ import {
   EMPTY_OUTPUT_REASON,
   LaneJobStore,
   SKIPPED_LANE_STATUS,
+  agyWorkingDirInvoke,
   attemptWasTried,
   classifyDispatchedResult,
   classifyLaneAttempt,
@@ -43,6 +44,7 @@ import {
   currentDepth,
   defaultAnswerFetch,
   defaultLaneSpawner,
+  expandEnvReferences,
   isContentEmpty,
   readRelayAnnouncements,
   relayLoopbackUrl,
@@ -116,6 +118,8 @@ export interface McpServerDeps {
   cwd?: () => string;
   /** Operator bound on caller-supplied directories; absent ⇒ existence check only. */
   allowedRoots?: readonly string[];
+  /** The platform whose environment rules the lane launcher applies; defaults to `process.platform`. */
+  platform?: NodeJS.Platform;
   maxDepth?: number;
   /**
    * Version reported in `serverInfo`. Injected because `process.env.npm_package_version` is only
@@ -532,6 +536,22 @@ function laneEvidenceBits(lane: DispatchLane): string[] {
  * repository's rule is that dispatch "never pretends a CLI answered" — a result that hid which
  * lane produced it would do exactly that, so provenance rides every response.
  */
+/**
+ * Answer-mode provenance — the direct-HTTP sibling of the lane id/spec/elapsed every job already
+ * carries. Empty for every agent-mode job, which never touches HTTP directly.
+ */
+function relayProvenanceLines(job: LaneJob): string[] {
+  const relay = job.relay;
+  if (!relay) return [];
+  const lines: string[] = [];
+  if (relay.servedBy) lines.push(`served-by: ${relay.servedBy}`);
+  if (relay.poolAttempts) lines.push(`pool-attempts: ${relay.poolAttempts}`);
+  if (relay.hedged) lines.push(`hedged: ${relay.hedged}`);
+  if (relay.latencyDemoted) lines.push(`latency-demoted: ${relay.latencyDemoted}`);
+  if (relay.degraded) lines.push(`degraded: ${relay.degraded}`);
+  return lines;
+}
+
 function describeJob(job: LaneJob, now: number): string {
   const elapsed = Math.round(((job.endedAt ?? now) - job.startedAt) / 1000);
   const head = [
@@ -543,13 +563,7 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.exitCode !== null) head.push(`exit: ${job.exitCode}`);
   if (job.timedOut) head.push("timed out: yes");
   if (job.error) head.push(`error: ${job.error}`);
-  // Answer-mode provenance — the direct-HTTP sibling of the lane id/spec/elapsed every job
-  // already carries. Absent for every agent-mode job, which never touches HTTP directly.
-  if (job.relay?.servedBy) head.push(`served-by: ${job.relay.servedBy}`);
-  if (job.relay?.poolAttempts) head.push(`pool-attempts: ${job.relay.poolAttempts}`);
-  if (job.relay?.hedged) head.push(`hedged: ${job.relay.hedged}`);
-  if (job.relay?.latencyDemoted) head.push(`latency-demoted: ${job.relay.latencyDemoted}`);
-  if (job.relay?.degraded) head.push(`degraded: ${job.relay.degraded}`);
+  head.push(...relayProvenanceLines(job));
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
   if (job.restored === true) {
     head.push(
@@ -557,6 +571,7 @@ function describeJob(job: LaneJob, now: number): string {
     );
   }
   if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
+  if (job.launch?.length) head.push(`launch: ${job.launch.join("; ")}`);
   // While it runs: the lane's usual time to answer, from its own completed runs, so a caller can tell
   // a slow lane from a stuck one instead of giving up (`LaneJob.expected`).
   const usually = runningTimeToAnswer(job);
@@ -1688,8 +1703,8 @@ export class McpDispatchServer {
     const cwdCheck = checkCwd(opts.cwd, this.deps.allowedRoots);
     if (!cwdCheck.ok) return { refusal: `dispatch refused: ${cwdCheck.reason}` };
 
-    const invoke = invokeOverride ?? lane.invoke;
-    if (!invoke) {
+    const declared = invokeOverride ?? lane.invoke;
+    if (!declared) {
       // `buildDispatch` already excludes an unreachable rung from the selection order, so this is
       // defence rather than an expected path — report why rather than inventing a command, the
       // rule `cli.ts` already states. ⚠ A pass-through rung reaches here from a daemon older than
@@ -1706,8 +1721,13 @@ export class McpDispatchServer {
       };
     }
 
-    const env = applyLaneEnv(process.env, invoke.env);
+    // The launcher's own corrections, recorded on the job so the reply names them.
+    const agy = agyWorkingDirInvoke(declared, opts.cwd);
+    const invoke = agy?.invoke ?? declared;
+    const expansion = expandEnvReferences(applyLaneEnv(process.env, invoke.env), this.deps.platform);
+    const env = expansion.env;
     env[DEPTH_ENV] = String(opts.depth + 1);
+    this.jobs.noteLaunch(jobId, [...expansion.notes, ...(agy === null ? [] : [agy.note])]);
     const startedAt = this.now();
     // From here the job's output figure describes THIS attempt: zero bytes, until the spawner's
     // observer reports the first chunk. Counts and timestamps only; the bytes stay in the run.
