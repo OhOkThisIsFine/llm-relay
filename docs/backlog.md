@@ -111,3 +111,23 @@
   either expanded from the same environment (when `NAME` resolves) or removed, and the job
   journal names each value it changed; a test spawns a lane with `HOME=%USERPROFILE%` and asserts
   the child sees `C:\Users\<user>` (or no `HOME`), never the literal.
+
+- **The ladder walk abandons a lane that is still producing at the p80 budget and hands an
+  implementation packet to the next rung regardless of its fitness (2026-09-16, medium).** Job
+  0041 (tier high, free-pool, a hook implementation with tests) was stopped at 789 s, the lane's
+  p80 budget, while it had already written +203 lines and was mid-way through the tests; the walk
+  then started `opencode-muse-spark`, a lane the machine instructions reserve for short
+  advisory tasks, with the same packet. The caller had to `dispatch_cancel`, confirm the
+  processes were gone, and re-dispatch with `lane: "free-pool"` as a continuation (job-0045,
+  908 s, green). **Property:** a lane whose working tree changed within the last N seconds (or
+  whose log grew) is not abandoned at p80 but extended toward the hard ceiling, and the walk
+  never moves a packet to a rung whose declared capability tier is below the packet's; the reply
+  names the extension when it happens.
+
+- **An AGY lane ignores the `cwd` the caller passes and runs in
+  `~/.gemini/antigravity-cli/scratch` (2026-09-16, low).** Every `agy-gemini` dispatch this
+  lap (jobs 0043, 0046, 0047, 0048) reported `process.cwd()` as AGY's own scratch directory
+  although `cwd` named a worktree; a task that must read or write the caller's tree silently
+  works elsewhere. AGY sees a directory only through `--add-dir`. **Property:** the AGY lane
+  launcher passes the dispatch `cwd` as `--add-dir <cwd>` and the task text is prefixed with the
+  directory it must work in, or the reply states that the lane ran in AGY's scratch directory.
