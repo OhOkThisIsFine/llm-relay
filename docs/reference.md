@@ -1913,6 +1913,15 @@ environment, or removed when the reference does not resolve. An AGY lane gets th
 `--add-dir <cwd>`, and its task starts with `Work in this directory: <cwd>`; without it AGY works in
 its own scratch directory.
 
+**The answer lists what the lane changed in the git tree.** For an agent-mode dispatch whose `cwd`
+is inside a git work tree, the relay reads `git status` before the first lane starts and again when
+the job ends (completed, failed, timed out or cancelled). The answer then ends with a
+`tree delta (<cwd>):` block — `+` a path that appeared, `~` a path whose status changed, `-` a path
+that became clean — or with `tree delta: none`. Pass `scope` (paths or globs relative to `cwd`,
+for example `["src", "test/**/*.test.ts"]`) to mark every other changed path `OUT OF SCOPE`. The
+relay only reports: it never refuses and never reverts. A file that was already modified and that
+the lane modified again keeps its status, so the block does not list it.
+
 While a job runs, `dispatch_status` also states the running lane's usual time to answer — the
 median and 80th percentile of the durations on record, in this mode when known — or says that none
 is on record, so a caller can tell a slow lane from a stuck one. Since 2026-09-10 only a completed

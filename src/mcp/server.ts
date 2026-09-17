@@ -27,6 +27,7 @@ import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
 import { formatAttemptBudget, formatLaneStats, isPassThroughSpec, LANE_UNRELIABLE_STREAK, mcpPassThroughReason } from "../dispatch.js";
 import { laneOfRung } from "../lane-manifest.js";
+import { defaultTreeSnapshot, renderTreeDelta, type TreeSnapshot, type TreeSnapshotReader } from "./tree-delta.js";
 import { estimateTokensFromCharacters } from "../metadata.js";
 import type { DispatchedTelemetryReport, DispatchLaneStatus, DispatchMode } from "../dispatch-lane-stats.js";
 import {
@@ -118,6 +119,8 @@ export interface McpServerDeps {
   cwd?: () => string;
   /** Operator bound on caller-supplied directories; absent ⇒ existence check only. */
   allowedRoots?: readonly string[];
+  /** Reads `git status` for the tree delta (`tree-delta.ts`); defaults to the real git reader. */
+  treeSnapshot?: TreeSnapshotReader;
   /** The platform whose environment rules the lane launcher applies; defaults to `process.platform`. */
   platform?: NodeJS.Platform;
   maxDepth?: number;
@@ -305,6 +308,15 @@ const TOOLS: ToolDefinition[] = [
           type: "number",
           description: `Hard ceiling on the lane run (default ${DEFAULT_LANE_TIMEOUT_MS}).`,
         },
+        scope: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Agent mode only: the paths or globs (relative to cwd) the task may change. The answer " +
+            "always lists what changed in the git tree (a `tree delta` block); with scope, every " +
+            "changed path outside it is marked OUT OF SCOPE. The relay reports only — it never " +
+            "refuses or reverts.",
+        },
         readOnly: {
           type: "boolean",
           description:
@@ -430,6 +442,14 @@ export function resolveWaitMs(requested: unknown, ceiling: number): ResolvedWait
 }
 
 /** A JSON Schema object for `schema`. Arrays and `null` are not schemas, so both are declined. */
+/** A non-empty array of non-empty strings, or undefined. Any other shape is ignored, as with `readString`. */
+function readStringArray(params: Record<string, unknown>, key: string): string[] | undefined {
+  const value = params[key];
+  if (!Array.isArray(value)) return undefined;
+  const strings = value.filter((v): v is string => typeof v === "string" && v.trim() !== "");
+  return strings.length > 0 ? strings : undefined;
+}
+
 function readRecord(params: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
   const v = params[key];
   return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
@@ -698,7 +718,13 @@ function describeAttempts(job: LaneJob): string {
   return `lanes tried:\n${lines.join("\n")}${capped}`;
 }
 
+/** The answer, plus the tree delta when the job recorded one (`tree-delta.ts`). */
 function jobAnswer(job: LaneJob, now: number): string {
+  const answer = jobAnswerBody(job, now);
+  return job.treeDelta === undefined ? answer : `${answer}\n\n${job.treeDelta}`;
+}
+
+function jobAnswerBody(job: LaneJob, now: number): string {
   const header = describeJob(job, now);
   const body = job.stdout.trim();
   // ⚠ The lanes tried are NOT rendered here — `describeJob` owns them now, so a poll and the final
@@ -771,6 +797,8 @@ interface WalkOptions {
    * neither, since it spawns nothing.
    */
   readOnly: boolean;
+  /** The caller's declared scope for the tree delta: paths or globs relative to `cwd`. */
+  scope: readonly string[] | undefined;
   /** Ladder tier the lanes came from, for quota reports and the daemon's routing memory. */
   tier: string | undefined;
   /** The lane's OWN ceiling, unchanged by this feature. */
@@ -932,6 +960,8 @@ export class McpDispatchServer {
   private clientName: string | undefined;
   /** In-flight `tools/call` requests the host may cancel, by request id. */
   private readonly cancellable = new Map<string | number, AbortController>();
+  /** The `git status` each running agent-mode job started from, with the caller's scope. */
+  private readonly trees = new Map<string, { cwd: string; before: TreeSnapshot; scope: readonly string[] | undefined }>();
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1222,6 +1252,7 @@ export class McpDispatchServer {
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     const cancelled = this.jobs.cancel(jobId);
+    if (cancelled) void this.recordTreeDelta(jobId);
     return textResult(cancelled ? `cancelled ${jobId}` : `${jobId} was already ${job.status}`);
   }
 
@@ -1287,6 +1318,7 @@ export class McpDispatchServer {
       cwd: readString(args, "cwd") ?? this.cwd(),
       depth,
       readOnly: args["readOnly"] === true,
+      scope: readStringArray(args, "scope"),
       tier: view.tier ?? undefined,
       timeoutMs: readNumber(args, "timeoutMs") ?? DEFAULT_LANE_TIMEOUT_MS,
       attemptMs: walk !== null ? walk.attemptMs : null,
@@ -1329,7 +1361,8 @@ export class McpDispatchServer {
     // failure a lane can produce is an attempt — but the worst outcome available here is a caller
     // polling a handle that can never settle, so an unexpected throw is caught and turned into a
     // terminal failure rather than trusted not to happen.
-    const settled = this.runWalk(job.id, view, ordered, task, opts).catch((e: Error) => {
+    const settled = this.runWalk(job.id, view, ordered, task, opts).catch(async (e: Error) => {
+      await this.recordTreeDelta(job.id);
       this.jobs.fail(job.id, `dispatch walk failed: ${e.message}`);
       return "done" as const;
     });
@@ -1401,6 +1434,7 @@ export class McpDispatchServer {
     task: string,
     opts: WalkOptions,
   ): Promise<"done"> {
+    await this.startTreeDelta(jobId, opts);
     for (let i = 0; i < laneIds.length; i++) {
       // A cancellation is checked at the TOP of every iteration, so an operator who stops a walk
       // stops it — rather than watching it advance to the next lane.
@@ -1445,6 +1479,7 @@ export class McpDispatchServer {
       if (outcome.refusal !== undefined) {
         // The CALLER's error, not the lane's. Walking on would hide a bad `cwd` behind a lane
         // failure and send the operator looking in the wrong place.
+        await this.recordTreeDelta(jobId);
         this.jobs.fail(jobId, outcome.refusal);
         return "done";
       }
@@ -1483,6 +1518,7 @@ export class McpDispatchServer {
       );
 
       if (status === "completed" || isLast) {
+        await this.recordTreeDelta(jobId);
         this.jobs.complete(
           jobId,
           outcome.run,
@@ -1508,6 +1544,7 @@ export class McpDispatchServer {
     const ran = attempts.filter((a) => attemptWasTried(a.status)).length;
     const allSkipped = attempts.length > 0 && ran === 0;
     const skipReasons = [...new Set(attempts.filter((a) => !attemptWasTried(a.status)).map((a) => a.reason ?? "skipped"))];
+    await this.recordTreeDelta(jobId);
     this.jobs.fail(
       jobId,
       allSkipped
@@ -1517,6 +1554,38 @@ export class McpDispatchServer {
           : `no lane answered, and the ladder no longer holds the remaining lanes in the selection order (${ran} tried)`,
     );
     return "done";
+  }
+
+  /**
+   * Record the `git status` an agent-mode walk starts from (`tree-delta.ts`). Answer mode spawns no
+   * harness for a relay lane, so it has nothing to compare. A cwd outside a git work tree records
+   * nothing, and the answer then carries no delta block.
+   */
+  private async startTreeDelta(jobId: string, opts: WalkOptions): Promise<void> {
+    if (opts.mode !== "agent") return;
+    const before = await this.readTree(opts.cwd);
+    if (before !== null) this.trees.set(jobId, { cwd: opts.cwd, before, scope: opts.scope });
+  }
+
+  /**
+   * Read the tree again and put the delta on the job, BEFORE the job goes terminal on the walk's own
+   * paths so the archived record carries it. Report only: nothing here refuses or reverts.
+   */
+  private async recordTreeDelta(jobId: string): Promise<void> {
+    const tree = this.trees.get(jobId);
+    if (tree === undefined) return;
+    this.trees.delete(jobId);
+    const after = await this.readTree(tree.cwd);
+    this.jobs.noteTreeDelta(jobId, renderTreeDelta(tree.cwd, tree.before, after, tree.scope));
+  }
+
+  /** The snapshot reader, contained: a throwing injected reader reads as "no git tree". */
+  private async readTree(cwd: string): Promise<TreeSnapshot | null> {
+    try {
+      return await (this.deps.treeSnapshot ?? defaultTreeSnapshot)(cwd);
+    } catch {
+      return null;
+    }
   }
 
   /**

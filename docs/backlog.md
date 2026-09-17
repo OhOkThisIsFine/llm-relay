@@ -59,18 +59,11 @@
   tier, sends the operator-entered control token on `POST /dispatch`, and re-reads the ladder after
   the response; the token is never persisted by the page and never appears in the snapshot.
 
-- **An agent-mode lane's result does not say what the lane wrote (2026-09-16, medium).** The
-  runner checks that `cwd` exists and sits inside `routing.mcp.allowedRoots` (`checkCwd`) and binds
-  read-only tool flags when asked (`readonly-boundary.ts`), but never compares the tree before and
-  after the run. A caller learns what changed only by running `git status` itself, and a cancelled
-  lane leaves files behind the same way a completed one does — measured: a lane asked to audit
-  wrote an unrequested deliverable into a repository root and nothing reported it. **Property:**
-  for an agent-mode job whose `cwd` is inside a git work tree, `lane-runner.ts` records
-  `git status --porcelain --untracked-files=all` at start and at every terminal state (completed,
-  failed, timed out, cancelled, killed); `jobAnswer` appends a `tree delta (<cwd>):` block listing
-  paths that appeared, changed status or vanished, or `tree delta: none`; an optional `dispatch`
-  argument `scope: string[]` (paths or globs relative to `cwd`) tags every delta path outside it
-  `OUT OF SCOPE`. Report only — the relay never refuses or reverts; the caller's own gates decide.
+- **A job killed by an MCP server restart carries no tree delta (2026-09-17, low).** Since
+  2026-09-17 a completed, failed, timed-out or cancelled agent-mode job ends with a `tree delta`
+  block (`src/mcp/tree-delta.ts`). A `killed` job does not: the `git status` it started from lives
+  only in the process that died. **Property:** the running-job journal (`job-journal.ts`) keeps a
+  bounded copy of the starting status, and orphan adoption renders the delta for the killed job.
 
 
 - **The ladder walk abandons a lane that is still producing at the p80 budget and hands an

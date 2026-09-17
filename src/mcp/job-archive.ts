@@ -275,6 +275,7 @@ export function isArchivedJob(value: unknown): value is ArchivedJob {
     optBool("forcedLane") &&
     optBool("restored") &&
     optString("label") &&
+    optString("treeDelta") &&
     (value["launch"] === undefined ||
       (Array.isArray(value["launch"]) && value["launch"].every((n) => typeof n === "string"))) &&
     (value["process"] === undefined || isProcessReport(value["process"])) &&

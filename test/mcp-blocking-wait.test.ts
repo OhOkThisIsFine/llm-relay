@@ -103,7 +103,10 @@ describe("blocking dispatch for Claude Code", () => {
     expect(reply?.result?.content[0]?.text).toContain("status: completed");
 
     const notes = h.progress();
-    expect(notes.length).toBe(Math.floor(LANE_MS / PROGRESS_INTERVAL_MS) - 1);
+    // The last tick and the lane's answer fall on the same instant; either may run first.
+    const ticks = Math.floor(LANE_MS / PROGRESS_INTERVAL_MS);
+    expect(notes.length).toBeGreaterThanOrEqual(ticks - 1);
+    expect(notes.length).toBeLessThanOrEqual(ticks);
     expect(notes.every((n) => n.params?.progressToken === "tok-1")).toBe(true);
     const values = notes.map((n) => n.params?.progress ?? 0);
     expect(values).toEqual([...values].sort((a, b) => a - b));

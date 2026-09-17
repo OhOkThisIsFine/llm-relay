@@ -307,6 +307,11 @@ export interface LaneJob {
    * a value. Replaced per lane, like `readOnly`; absent when the launcher changed nothing.
    */
   launch?: string[];
+  /**
+   * What the job changed in its git working tree, rendered (`tree-delta.ts`): set once, when the job
+   * ends, for an agent-mode job whose cwd is in a git work tree. Report only.
+   */
+  treeDelta?: string;
 }
 
 /**
@@ -1223,6 +1228,17 @@ export class LaneJobStore {
   }
 
   /** Record what the launcher changed for the lane now running, so the reply can state it. */
+  /**
+   * Record the job's tree delta. Accepted on a TERMINAL job too — a cancellation ends the job before
+   * the second `git status` returns — and the archive row is then written again so it carries it.
+   */
+  noteTreeDelta(id: string, text: string): void {
+    const job = this.jobs.get(id);
+    if (!job) return;
+    job.treeDelta = text;
+    if (job.status !== "running") this.archive.record(job);
+  }
+
   noteLaunch(id: string, notes: readonly string[]): void {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running" || notes.length === 0) return;
