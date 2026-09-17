@@ -2,7 +2,20 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-17 (on top of v0.82.2)
+## 0. State as of 2026-09-17 (v0.84.0)
+
+- **Later the same day (v0.83.2, v0.84.0).**
+  - The desktop Code tab did not get the long wait: Desktop gave the session its own server copy,
+    named `llm-relay`, which hid the Code tab's own server, and Desktop calls as `claude-ai` with a
+    60 s limit on that path. v0.83.2 gives `claude-ai` a 50 s wait and renames the Desktop entry to
+    `llm-relay-desktop` (setup was re-run on this machine). Evidence:
+    `docs/mcp-host-timeouts-2026-09-17.md`.
+  - v0.84.0 (owner decision): the walk stops a lane only when it is IDLE for
+    `routing.dispatchWalk.idleMs` (300 s): no tagged relay traffic, no output, no file change. New
+    `src/lane-activity.ts` and `GET /dispatch/activity`. Verified live on the restarted daemon: a
+    headless `claude -p` with `ANTHROPIC_CUSTOM_HEADERS` sent its tag, and the route reported it.
+  - **Not verified yet:** a walk through a restarted MCP process. The Desktop and Code tab MCP
+    processes still run v0.83.2 until Claude Desktop restarts.
 
 - **What the dispatch-fidelity lap shipped (2026-09-17, lap `f8d56109`).** Goal: dispatch from
   Claude Desktop, Codex Desktop and other hosts works as closely as possible to each host's
@@ -16,15 +29,17 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     and an AGY lane gets `--add-dir <cwd>`. The job shows both on a `launch:` line (`9f341da`).
   - An agent-mode answer ends with a `tree delta` block: what the lane changed in `git status`,
     with an optional `scope` that marks paths OUT OF SCOPE. Report only (`4e1899e`).
-  - The walk does not stop a lane that still works at its budget (output, or a tree change, in
-    the last 60 s), and skips a rung whose new `capability` is below the dispatch tier (`42b2745`).
+  - The walk skips a rung whose new `capability` is below the dispatch tier (`42b2745`). Its
+    budget extension was replaced by the idle-only stop in v0.84.0.
   - The Codex `relay` agent template writes provenance only from a real dispatch result
     (`05db5b8`), and a test replays a lane that outlives `waitMs` (`d984b87`).
 - **Immediate next.** No rung in `~/.llm-relay/config.json` declares `capability` yet, so the
   lower-tier skip does nothing on this machine until the owner sets one (for example `medium` on
-  the `opencode-muse-spark` rungs). The live Claude Code check needs a restart of the llm-relay MCP
-  connection, because the desktop app keeps the old MCP process. Open backlog: route B, the Codex
-  Desktop check, the dashboard pin control, and the tree delta for a `killed` job.
+  the `opencode-muse-spark` rungs). After the owner restarts Claude Desktop: run a Code tab
+  dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that
+  `last activity:` names relay traffic. Open backlog: route B, the Codex Desktop check, the
+  dashboard pin control, the tree delta for a `killed` job, the unused budget code, and the idle
+  signal for lanes that do not use the relay.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
