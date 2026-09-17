@@ -1697,6 +1697,28 @@ sessions can therefore each run up to `maxConcurrent` jobs against the same rung
 for up to `2 × maxConcurrent` together; this is the stated limit of what one process can observe,
 not a claim about the rung's real-world concurrency everywhere it might be dispatched from.
 
+#### Rung capability (`capability`) and the budget extension
+
+A rung may declare `capability`, one of `low`, `medium`, `high`, `xhigh`: the highest dispatch
+tier the operator trusts that lane with. A dispatch WALK at a higher tier SKIPS the rung and records
+the reason `lane "<id>" declares capability <c>, below this <tier> dispatch`. The skip works like a
+`maxConcurrent` skip: nothing starts, nothing is demoted, and the rung counts as not tried. A rung
+the caller names with `lane` always runs. Absent means no limit. Any other value is a load error
+that names the rung.
+
+```jsonc
+{ "id": "opencode-muse-spark", "kind": "cli", "command": "opencode", "args": ["run", "{task}"], "capability": "medium" }
+```
+
+The walk also does not stop a lane that still works when its attempt budget ends. At the budget,
+the MCP server looks for three signs, in this order: the lane wrote output in the last 60 s; the
+`git status` of its `cwd` changed since the last reading; or a changed file in that tree has an
+mtime in the last 60 s. The last two signs are for `claude -p`, which writes no output until it
+exits. If a sign is present, the walk gives the lane 60 s more and checks again. The lane's own
+`timeoutMs` stays the hard limit. The job shows each extension on an `extended:` line, for example
+`extended: free-pool kept past its 789s budget because its working tree changed`. A lane with no
+sign stops at its budget, as before.
+
 #### Host-adaptive lanes (`routing.cliLane`)
 
 `llm-relay dispatch` is meant to be the **one verb** a host agent uses, whatever harness it runs

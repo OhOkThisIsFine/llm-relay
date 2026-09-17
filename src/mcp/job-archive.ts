@@ -254,6 +254,10 @@ export function isArchivedJob(value: unknown): value is ArchivedJob {
   if (!isRecord(value)) return false;
   const optString = (k: string): boolean => value[k] === undefined || typeof value[k] === "string";
   const optBool = (k: string): boolean => value[k] === undefined || typeof value[k] === "boolean";
+  const optStrings = (k: string): boolean => {
+    const v = value[k];
+    return v === undefined || (Array.isArray(v) && v.every((n) => typeof n === "string"));
+  };
   return (
     typeof value["id"] === "string" &&
     typeof value["status"] === "string" &&
@@ -276,8 +280,8 @@ export function isArchivedJob(value: unknown): value is ArchivedJob {
     optBool("restored") &&
     optString("label") &&
     optString("treeDelta") &&
-    (value["launch"] === undefined ||
-      (Array.isArray(value["launch"]) && value["launch"].every((n) => typeof n === "string"))) &&
+    optStrings("launch") &&
+    optStrings("extended") &&
     (value["process"] === undefined || isProcessReport(value["process"])) &&
     (value["dispatchSource"] === undefined || value["dispatchSource"] === "daemon" || value["dispatchSource"] === "fallback") &&
     (value["relay"] === undefined || isRecord(value["relay"])) &&

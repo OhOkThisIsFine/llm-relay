@@ -1128,6 +1128,20 @@ function applyCliMaxConcurrent(rung: LadderRung, raw: unknown, where: string, id
 }
 
 /**
+ * Validate and apply a rung's `capability` — the highest dispatch tier it may take. Mutating, for
+ * the same reason as `applyCliMaxConcurrent`: `parseLadder` stays one statement longer and no more
+ * complex. An unknown tier is a hard load error naming the key and the rung: an ignored typo would
+ * read as a limit while limiting nothing.
+ */
+function applyRungCapability(rung: LadderRung, raw: unknown, where: string, id: string): void {
+  if (raw === undefined) return;
+  if (typeof raw !== "string" || !EFFORT_LEVEL_SET.has(raw)) {
+    throw new Error(`${where}.capability must be one of ${EFFORT_LEVELS.join(", ")} (rung "${id}")`);
+  }
+  rung.capability = raw as EffortLevel;
+}
+
+/**
  * Validate `routing.ladder` at load, not at request time — a ladder whose rung cannot be invoked
  * is a configuration mistake, and discovering it only when the host is mid-fallback is exactly
  * when it is least useful. Absent/empty is legal and simply means "no opinion".
@@ -1156,6 +1170,7 @@ function parseLadder(raw: unknown, root: string): LadderRung[] {
     const rung: LadderRung = { id, kind, enabled: e.enabled !== false };
     if (typeof e.quota === "string" && e.quota.length > 0) rung.quota = e.quota;
     if (typeof e.note === "string" && e.note.length > 0) rung.note = e.note;
+    applyRungCapability(rung, e.capability, where, id);
 
     if (kind === "cli") {
       if (typeof e.command !== "string" || e.command.length === 0) {

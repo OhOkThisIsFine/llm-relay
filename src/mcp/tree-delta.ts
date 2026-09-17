@@ -11,6 +11,46 @@
  * modified again keeps its status and is not reported — the stated limit of a status comparison.
  */
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
+import { join as joinPath, resolve as resolvePath } from "node:path";
+
+/** At most this many dirty paths are stat-ed when the walk asks whether a lane still writes. */
+export const MAX_ACTIVITY_STAT_PATHS = 500;
+
+/** Do two readings hold the same dirty paths with the same status? */
+export function sameTree(a: TreeSnapshot, b: TreeSnapshot): boolean {
+  if (a.entries.size !== b.entries.size) return false;
+  for (const [path, status] of a.entries) {
+    if (b.entries.get(path) !== status) return false;
+  }
+  return true;
+}
+
+/**
+ * The newest modification time among a reading's dirty paths, or null when none can be read. This
+ * catches a lane that keeps editing a file whose STATUS does not change (`M` stays `M`). A deleted
+ * path cannot be read and is skipped; `sameTree` catches a deletion.
+ */
+export function newestChangeMs(
+  cwd: string,
+  snapshot: TreeSnapshot,
+  stat: (path: string) => { mtimeMs: number } = statSync,
+): number | null {
+  const up = snapshot.prefix.split("/").filter((s) => s !== "").map(() => "..");
+  const root = resolvePath(cwd, ...up);
+  let newest: number | null = null;
+  let seen = 0;
+  for (const path of snapshot.entries.keys()) {
+    if (++seen > MAX_ACTIVITY_STAT_PATHS) break;
+    try {
+      const mtime = stat(joinPath(root, path)).mtimeMs;
+      if (newest === null || mtime > newest) newest = mtime;
+    } catch {
+      // Gone or unreadable: no evidence either way.
+    }
+  }
+  return newest;
+}
 
 /** One `git status` reading: the cwd's path inside the repository, and each dirty path's status. */
 export interface TreeSnapshot {

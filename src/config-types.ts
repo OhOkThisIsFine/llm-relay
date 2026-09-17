@@ -730,6 +730,12 @@ export interface LadderRung {
    * one host's own concurrency, not a machine-wide total.
    */
   maxConcurrent?: number;
+  /**
+   * The highest dispatch tier this rung may take (2026-09-17). A dispatch walk for a HIGHER tier
+   * skips the rung unless the caller named it, so a packet is never moved to a weaker lane only
+   * because it sits in that tier's ladder. Absent means no limit — the pre-existing behaviour.
+   */
+  capability?: EffortLevel;
   /** relay rungs: the spec to address (`pool/<name>`, `<provider>/<model>`, a provider name). */
   spec?: string;
 }

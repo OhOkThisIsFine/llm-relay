@@ -171,6 +171,8 @@ export interface DispatchLane {
    * that count itself alongside this figure rather than this module inventing one.
    */
   maxConcurrent?: number | null;
+  /** The highest dispatch tier the rung may take (`LadderRung.capability`); absent = no limit. */
+  capability?: LadderRung["capability"];
   /** When an exhausted rung becomes eligible again (ISO 8601). */
   readyAt?: string;
   /**
@@ -1113,6 +1115,11 @@ function unreachableReason(host: HostRoutingState | undefined, who: string): str
     : `${who} does not route its traffic through this relay, so a subagent cannot reach`;
 }
 
+/** The rung's `capability` as a spreadable field — no key at all when the rung declares none. */
+function rungCapability(rung: LadderRung): Pick<DispatchLane, "capability"> {
+  return rung.capability === undefined ? {} : { capability: rung.capability };
+}
+
 function toLane(
   rung: LadderRung,
   position: number,
@@ -1128,7 +1135,7 @@ function toLane(
   const until = cooldownUntil(cfg, rung, now);
   const state: LaneState = !rung.enabled ? "disabled" : until !== null ? "exhausted" : "ready";
 
-  const lane: DispatchLane = { id: rung.id, kind: rung.kind, position, state };
+  const lane: DispatchLane = { id: rung.id, kind: rung.kind, position, state, ...rungCapability(rung) };
   if (rung.quota) lane.quota = rung.quota;
   if (rung.note) lane.note = rung.note;
   if (until !== null) lane.readyAt = new Date(until).toISOString();

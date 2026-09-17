@@ -21,13 +21,20 @@
  * discipline as `lane-quota-probe.ts` and `availability-snapshot.ts`.
  */
 import type { Config } from "../config.js";
-import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS } from "../config-types.js";
+import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS, EFFORT_LEVELS, type EffortLevel } from "../config-types.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
 import { formatAttemptBudget, formatLaneStats, isPassThroughSpec, LANE_UNRELIABLE_STREAK, mcpPassThroughReason } from "../dispatch.js";
 import { laneOfRung } from "../lane-manifest.js";
-import { defaultTreeSnapshot, renderTreeDelta, type TreeSnapshot, type TreeSnapshotReader } from "./tree-delta.js";
+import {
+  defaultTreeSnapshot,
+  newestChangeMs,
+  renderTreeDelta,
+  sameTree,
+  type TreeSnapshot,
+  type TreeSnapshotReader,
+} from "./tree-delta.js";
 import { estimateTokensFromCharacters } from "../metadata.js";
 import type { DispatchedTelemetryReport, DispatchLaneStatus, DispatchMode } from "../dispatch-lane-stats.js";
 import {
@@ -592,6 +599,7 @@ function describeJob(job: LaneJob, now: number): string {
   }
   if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
   if (job.launch?.length) head.push(`launch: ${job.launch.join("; ")}`);
+  if (job.extended?.length) head.push(`extended: ${job.extended.join("; ")}`);
   // While it runs: the lane's usual time to answer, from its own completed runs, so a caller can tell
   // a slow lane from a stuck one instead of giving up (`LaneJob.expected`).
   const usually = runningTimeToAnswer(job);
@@ -879,6 +887,20 @@ function flagValue(args: readonly string[], flag: string): string | null {
   return joined === undefined ? null : joined.slice(flag.length + 1);
 }
 
+/**
+ * How recent a lane's output or file change must be for the walk to keep it past its budget, and
+ * how long each extension lasts.
+ */
+export const LANE_ACTIVITY_WINDOW_MS = 60_000;
+
+/** Resolves `{ kind: "budget" }` after `ms`, without holding the event loop open. */
+function budgetTimer(ms: number): Promise<{ kind: "budget" }> {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ kind: "budget" }), ms);
+    if (typeof t.unref === "function") t.unref();
+  });
+}
+
 /** Did a spawned lane produce a usable answer? Exit 0, inside its own time, with real content. */
 function laneAnswered(r: LaneRunResult): boolean {
   return r.code === 0 && !r.timedOut && !isContentEmpty(r.stdout);
@@ -961,7 +983,10 @@ export class McpDispatchServer {
   /** In-flight `tools/call` requests the host may cancel, by request id. */
   private readonly cancellable = new Map<string | number, AbortController>();
   /** The `git status` each running agent-mode job started from, with the caller's scope. */
-  private readonly trees = new Map<string, { cwd: string; before: TreeSnapshot; scope: readonly string[] | undefined }>();
+  private readonly trees = new Map<
+    string,
+    { cwd: string; before: TreeSnapshot; scope: readonly string[] | undefined; lastSeen?: TreeSnapshot }
+  >();
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1445,7 +1470,7 @@ export class McpDispatchServer {
 
       // ⚠ Checked BEFORE `setCurrentLane`/`runOneLane`, so nothing has been spawned for THIS
       // attempt yet and a rung can never count against its own cap.
-      if (this.skipIfAtConcurrencyCap(jobId, lane)) continue;
+      if (this.skipBeforeStart(jobId, lane, opts)) continue;
 
       // ⚠ Same place, same shape: a read-only dispatch either hands the lane a bound invocation or
       // skips it before anything spawns. `bound` is undefined when the lane runs as configured.
@@ -1630,6 +1655,63 @@ export class McpDispatchServer {
     return true;
   }
 
+  /** The skips decided before a lane starts: its concurrency cap, then its declared capability. */
+  private skipBeforeStart(jobId: string, lane: DispatchLane, opts: WalkOptions): boolean {
+    return this.skipIfAtConcurrencyCap(jobId, lane) || this.skipIfBelowTier(jobId, lane, opts);
+  }
+
+  /**
+   * A rung that declares a `capability` below this dispatch's tier — SKIP it, so the walk never
+   * moves a packet to a weaker lane only because the operator listed it in that tier's ladder
+   * (measured 2026-09-16: a `high` implementation packet was stopped on `free-pool` and restarted on
+   * a lane kept for short advisory work). Recorded like a concurrency-cap skip. A caller who NAMED
+   * the lane or a model still reaches it, and a tier or capability outside the effort vocabulary
+   * limits nothing.
+   */
+  private skipIfBelowTier(jobId: string, lane: DispatchLane, opts: WalkOptions): boolean {
+    if (lane.capability === undefined || opts.tier === undefined) return false;
+    if (this.jobs.get(jobId)?.forcedLane === true) return false;
+    const packet = EFFORT_LEVELS.indexOf(opts.tier as EffortLevel);
+    const rung = EFFORT_LEVELS.indexOf(lane.capability);
+    if (packet < 0 || rung < 0 || rung >= packet) return false;
+    this.jobs.recordAttempt(jobId, {
+      laneId: lane.id,
+      spec: lane.spec,
+      status: SKIPPED_LANE_STATUS,
+      elapsedMs: 0,
+      reason: `lane "${lane.id}" declares capability ${lane.capability}, below this ${opts.tier} dispatch`,
+    });
+    this.jobs.noteSkippedLane(jobId);
+    return true;
+  }
+
+  /**
+   * Is the running lane still WORKING? A reason string when it is, else null. Evidence, in order: the
+   * lane wrote output inside `LANE_ACTIVITY_WINDOW_MS`; its git tree changed since the last reading;
+   * a dirty file changed inside the window. `claude -p` buffers its whole answer until exit, so for
+   * the free pool the tree is the only evidence there is. No evidence (answer mode, a cwd outside a
+   * git tree) means not working, and the budget applies as before.
+   */
+  private async laneStillWorking(jobId: string): Promise<string | null> {
+    const now = this.now();
+    const lastOutput = this.jobs.get(jobId)?.activity?.lastOutputAt;
+    if (typeof lastOutput === "number" && now - lastOutput <= LANE_ACTIVITY_WINDOW_MS) {
+      return `it wrote output ${Math.round((now - lastOutput) / 1000)}s ago`;
+    }
+    const tree = this.trees.get(jobId);
+    if (tree === undefined) return null;
+    const reading = await this.readTree(tree.cwd);
+    if (reading === null) return null;
+    const previous = tree.lastSeen ?? tree.before;
+    tree.lastSeen = reading;
+    if (!sameTree(previous, reading)) return "its working tree changed";
+    const newest = newestChangeMs(tree.cwd, reading);
+    if (newest !== null && now - newest <= LANE_ACTIVITY_WINDOW_MS) {
+      return `a file in its working tree changed ${Math.max(0, Math.round((now - newest) / 1000))}s ago`;
+    }
+    return null;
+  }
+
   /**
    * For a read-only dispatch, the invocation this lane will be spawned with — its own CLI's
    * read-only tool binding (`readOnlyInvoke`) — or a SKIP when its CLI offers none. Recorded exactly
@@ -1701,15 +1783,25 @@ export class McpDispatchServer {
     );
     if (budgetMs === null) return guarded;
 
-    const raced = await Promise.race([
-      guarded.then((o) => ({ kind: "settled" as const, outcome: o })),
-      new Promise<{ kind: "budget" }>((resolve) => {
-        const t = setTimeout(() => resolve({ kind: "budget" }), budgetMs);
-        // Do not hold the event loop open on the budget timer alone.
-        if (typeof t.unref === "function") t.unref();
-      }),
-    ]);
-    if (raced.kind === "settled") return raced.outcome;
+    const settled = guarded.then((o) => ({ kind: "settled" as const, outcome: o }));
+    // ⚠ A lane that is still WORKING when its budget passes is not stopped (2026-09-16: `free-pool`
+    // was stopped at its 789 s p80 with +203 lines written and its tests half done). The budget is
+    // extended in `LANE_ACTIVITY_WINDOW_MS` steps while the lane shows activity, up to its own
+    // `timeoutMs`, which still ends it. The job names the extension.
+    let waitMs = budgetMs;
+    for (;;) {
+      const raced = await Promise.race([settled, budgetTimer(waitMs)]);
+      if (raced.kind === "settled") return raced.outcome;
+      if (this.jobs.get(jobId)?.status !== "running") break;
+      const working = await this.laneStillWorking(jobId);
+      if (working === null) break;
+      this.jobs.noteExtension(
+        jobId,
+        lane.id,
+        `${lane.id} kept past its ${Math.round(budgetMs / 1000)}s budget because ${working}`,
+      );
+      waitMs = LANE_ACTIVITY_WINDOW_MS;
+    }
 
     // The budget passed and another lane remains. Kill this one and move on. `guarded` never
     // rejects, so the killed child's late settlement needs no further handler — it resolves into a

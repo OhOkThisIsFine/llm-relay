@@ -312,6 +312,12 @@ export interface LaneJob {
    * ends, for an agent-mode job whose cwd is in a git work tree. Report only.
    */
   treeDelta?: string;
+  /**
+   * Each lane the walk kept past its attempt budget because it was still working, one line per lane,
+   * with the reason. Kept for the whole job — not replaced per lane — because the lane that was kept
+   * can still be stopped later, and the record of why it ran long must survive that.
+   */
+  extended?: string[];
 }
 
 /**
@@ -1237,6 +1243,14 @@ export class LaneJobStore {
     if (!job) return;
     job.treeDelta = text;
     if (job.status !== "running") this.archive.record(job);
+  }
+
+  /** Record (or update) why the walk kept `laneId` past its budget. One line per lane. */
+  noteExtension(id: string, laneId: string, text: string): void {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running") return;
+    const others = (job.extended ?? []).filter((line) => !line.startsWith(`${laneId} `));
+    job.extended = [...others, text];
   }
 
   noteLaunch(id: string, notes: readonly string[]): void {
